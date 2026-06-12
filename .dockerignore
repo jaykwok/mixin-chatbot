@@ -1,0 +1,16 @@
+.git
+.vscode
+.venv
+.claude
+.codefree
+__pycache__
+logs
+data
+*.pyc
+*.pyo
+.env
+deploy.sh
+setup-server.sh
+README.md
+.gitignore
+.dockerignore
