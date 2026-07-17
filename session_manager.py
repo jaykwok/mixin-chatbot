@@ -126,12 +126,7 @@ async def get_all_sessions():
         ) as cursor:
             rows = await cursor.fetchall()
     return [
-        {
-            "phone": row[0],
-            "messages": json.loads(row[1]),
-            "last_active": row[2],
-            "group_id": row[3] if len(row) > 3 else "",
-        }
+        {"phone": row[0], "messages": json.loads(row[1]), "last_active": row[2], "group_id": row[3]}
         for row in rows
     ]
 
@@ -139,32 +134,35 @@ async def get_all_sessions():
 async def clean_expired_sessions():
     """清理过期会话 + 磁盘容量控制"""
     db = await _get_db()
-    cleaned = 0
+    expired_cleaned = 0
+    shrink_cleaned = 0
 
-    # 仅在设置了超时时间时清理过期会话
+    # 1. 过期会话清理（仅在设置了超时时间时执行）
     if SESSION_TIMEOUT > 0:
         cutoff = time.time() - SESSION_TIMEOUT
         cursor = await db.execute(
             "DELETE FROM sessions WHERE last_active <= ?", (cutoff,)
         )
-        cleaned = cursor.rowcount
+        expired_cleaned = cursor.rowcount
         await db.commit()
 
-    # 检查磁盘容量
+    # 2. 磁盘容量控制（独立于过期清理）
     if os.path.exists(DB_PATH):
         db_size = os.path.getsize(DB_PATH)
         if db_size > MAX_DB_SIZE_BYTES:
             logger.warning(
                 f"数据库大小 {db_size / 1024 / 1024:.0f}MB 超过限制，开始清理"
             )
-            cleaned += await _shrink_db(db)
+            shrink_cleaned = await _shrink_db(db)
 
-    # 大量删除后回收空间
-    if cleaned > 50:
+    total_cleaned = expired_cleaned + shrink_cleaned
+
+    # 3. 大量删除后回收磁盘空间
+    if total_cleaned > 50:
         await db.execute("PRAGMA incremental_vacuum")
         await db.commit()
 
-    # 清理内存缓存中的过期条目
+    # 4. 清理内存缓存中的过期条目
     if SESSION_TIMEOUT > 0:
         expired_keys = [
             k for k, v in _cache.items() if time.time() - v["last_active"] > SESSION_TIMEOUT
@@ -172,9 +170,11 @@ async def clean_expired_sessions():
         for k in expired_keys:
             del _cache[k]
 
-    if cleaned > 0:
-        logger.info(f"清理了 {cleaned} 个会话")
-    return cleaned
+    if total_cleaned > 0:
+        logger.info(
+            f"清理完成 - 过期: {expired_cleaned}, 容量: {shrink_cleaned}, 合计: {total_cleaned}"
+        )
+    return total_cleaned
 
 
 async def _shrink_db(db):

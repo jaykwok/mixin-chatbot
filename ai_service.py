@@ -3,7 +3,7 @@ import logging
 from openai import AsyncOpenAI
 from config import (
     DASHSCOPE_API_KEY, AI_BASE_URL, AI_TIMEOUT, AI_MAX_RETRIES,
-    GROUP_CONFIGS, DEFAULT_GROUP_CONFIG,
+    GROUP_CONFIGS, DEFAULT_GROUP_CONFIG, MAX_USER_LOCKS,
 )
 from session_manager import get_session, save_session
 
@@ -21,17 +21,25 @@ client = AsyncOpenAI(
 _user_locks: dict[str, asyncio.Lock] = {}
 
 
+def _get_user_lock(phone: str) -> asyncio.Lock:
+    """获取或创建用户锁，超出上限时清理空闲锁"""
+    if phone not in _user_locks:
+        # 清理未被持有的锁
+        if len(_user_locks) >= MAX_USER_LOCKS:
+            idle = [k for k, v in _user_locks.items() if not v.locked()]
+            for k in idle:
+                del _user_locks[k]
+        _user_locks[phone] = asyncio.Lock()
+    return _user_locks[phone]
+
+
 async def get_ai_response(message: str, phone: str, group_id: str) -> str:
     """调用 AI 模型生成对话回复"""
-    # 获取或创建该用户的锁，确保同一用户的请求串行处理
-    if phone not in _user_locks:
-        _user_locks[phone] = asyncio.Lock()
-    lock = _user_locks[phone]
+    lock = _get_user_lock(phone)
 
     async with lock:
         try:
-            group_config = GROUP_CONFIGS.get(group_id, {})
-            model = group_config.get("model", DEFAULT_GROUP_CONFIG["model"])
+            model = GROUP_CONFIGS.get(group_id, {}).get("model", DEFAULT_GROUP_CONFIG["model"])
             system_prompt = DEFAULT_GROUP_CONFIG["system_prompt"]
 
             # 构建消息

@@ -17,6 +17,7 @@ from auth import verify_auth
 from config import (
     GROUP_CONFIGS, DEFAULT_GROUP_CONFIG, VALID_HOSTNAMES,
     REQUIRED_WEBHOOK_FIELDS, DEDUP_TTL, MAX_DEDUP_SIZE, CLEANUP_INTERVAL,
+    RATE_LIMIT_WINDOW, RATE_LIMIT_MAX_REQUESTS,
 )
 
 # 初始化日志
@@ -25,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 # 请求去重（OrderedDict 保持插入顺序，清理时从头部弹出过期条目）
 _recent_requests: OrderedDict[str, float] = OrderedDict()
+
+# 速率限制（每用户在窗口内的请求时间戳列表）
+_rate_limits: dict[str, list] = {}
+
+# 后台任务引用集合，防止任务被 GC 回收导致静默取消
+_background_tasks: set = set()
 
 
 async def _background_cleanup():
@@ -47,6 +54,10 @@ async def lifespan(app: FastAPI):
     logger.info("服务启动完成，监听端口: 1011")
     yield
     cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
     await close_client()
     await close_db()
 
@@ -116,6 +127,24 @@ def is_duplicate_request(phone: str, content: str) -> bool:
     return False
 
 
+def is_rate_limited(phone: str) -> bool:
+    """检查用户是否超出速率限制"""
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW
+
+    timestamps = _rate_limits.get(phone, [])
+    # 移除窗口外的时间戳
+    timestamps = [t for t in timestamps if t > window_start]
+
+    if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+        _rate_limits[phone] = timestamps
+        return True
+
+    timestamps.append(now)
+    _rate_limits[phone] = timestamps
+    return False
+
+
 async def process_request(
     content: str, phone: str, group_id: str, callback_url: str, client_ip: str
 ):
@@ -164,10 +193,16 @@ async def webhook(request: Request):
         logger.info(f"跳过重复请求 - 用户: {phone}")
         return {"status": "success"}
 
+    if is_rate_limited(phone):
+        logger.warning(f"速率限制触发 - 用户: {phone}")
+        raise HTTPException(429, "请求过于频繁，请稍后再试")
+
     # 异步处理：立即返回 200
-    asyncio.create_task(
+    task = asyncio.create_task(
         process_request(content, phone, group_id, callback_url, client_ip)
     )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {"status": "success"}
 

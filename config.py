@@ -30,6 +30,10 @@ REQUIRED_WEBHOOK_FIELDS = ["type", "textMsg", "phone", "groupId", "callBackUrl"]
 DEDUP_TTL = 30           # 请求去重窗口（秒）
 MAX_DEDUP_SIZE = 1000    # 去重字典最大容量
 
+# ===== 速率限制 =====
+RATE_LIMIT_WINDOW = 60       # 速率限制窗口（秒）
+RATE_LIMIT_MAX_REQUESTS = 10 # 窗口内每用户最大请求数
+
 # ===== 后台任务 =====
 CLEANUP_INTERVAL = 300   # 过期会话清理间隔（秒）
 
@@ -40,6 +44,7 @@ MAX_CACHE_SIZE = 100
 MAX_ADMIN_SESSIONS = 500 # 管理 API 最大返回会话数
 MAX_DB_SIZE_BYTES = 5 * 1024 * 1024 * 1024   # 5GB
 TARGET_DB_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # 4GB
+MAX_USER_LOCKS = 500    # per-user 锁字典最大容量
 
 # ===== 日志 =====
 LOG_DIR = "logs"
@@ -56,8 +61,8 @@ DEFAULT_GROUP_CONFIG = {
 # 从 .env 解析群组配置，格式: GROUP_CONFIGS=群组ID1:模型名1,群组ID2:模型名2
 GROUP_CONFIGS = {}
 _raw = os.getenv("GROUP_CONFIGS", "")
-for _pair in _raw.split(","):
-    _pair = _pair.strip()
-    if ":" in _pair:
-        _gid, _model = _pair.split(":", 1)
+for _item in _raw.split(","):
+    _item = _item.strip()
+    if ":" in _item:
+        _gid, _model = _item.split(":", 1)
         GROUP_CONFIGS[_gid.strip()] = {"model": _model.strip()}
