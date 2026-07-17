@@ -1,6 +1,6 @@
-# AI 聊天机器人
+# 量子密信聊天机器人
 
-量子密信 IM 平台聊天机器人，基于 FastAPI + 阿里云 DashScope API。
+量子密信 IM 平台聊天机器人 (Mixin Chatbot)，基于 FastAPI + 阿里云 DashScope API。
 
 ## 技术栈
 
@@ -33,7 +33,7 @@ sudo ./setup-server.sh
 | 配置项 | 说明 |
 |--------|------|
 | Docker | 安装并启用 docker.io |
-| UFW 防火墙 | 默认拒绝入站，仅开放 22 (SSH) 和 1011 (Chatbot) |
+| UFW 防火墙 | 默认拒绝入站，仅开放 22 (SSH) 和 1011 (Mixin-Chatbot) |
 | fail2ban | SSH 连续 3 次登录失败后封禁 IP 2 小时 |
 | 自动安全更新 | 通过 unattended-upgrades 自动安装安全补丁 |
 | 内核优化 | swappiness=10、TCP 加固、SYN Flood 防护 |
@@ -45,56 +45,34 @@ sudo ./setup-server.sh
 sudo usermod -aG docker $USER
 newgrp docker
 ```
-
-### 第二步：配置文件
-
-#### `.env` (必填)
-
-```
-DASHSCOPE_API_KEY=your_api_key
-APP_USERNAME=admin
-APP_PASSWORD=your_password
-GROUP_CONFIGS=群组ID1:模型名1,群组ID2:模型名2
-AI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-```
-
-实际示例：
-
-```
-DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxx
-APP_USERNAME=admin
-APP_PASSWORD=MyStr0ngPass!
-GROUP_CONFIGS=10086:qwen-plus,10010:kimi-k2.5
-AI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-```
-
-| 变量 | 说明 |
-|------|------|
-| `DASHSCOPE_API_KEY` | 阿里云 DashScope API 密钥 |
-| `APP_USERNAME` | 管理页面登录用户名 |
-| `APP_PASSWORD` | 管理页面登录密码 |
-| `GROUP_CONFIGS` | 群组模型配置 (可选)，格式为 `群组ID:模型名`，多个用逗号分隔 |
-| `AI_BASE_URL` | AI API 地址 (可选)，默认阿里云国内版，国际版改为 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
-
-- 群组 ID 可在管理页面的活跃会话列表中查看，也可从服务器日志获取
-- 未匹配到配置的群组使用默认模型 `kimi-k2.5`
-- 修改后需重启容器生效：`docker restart chatbot`
-
-### 第三步：部署应用
+### 第二步：部署应用
 
 ```bash
 ./deploy.sh
 ```
 
+**首次部署时**，脚本会检测到 `.env` 不存在，自动进入交互式配置流程，按提示输入即可：
+
+| 提示项 | 说明 | 默认值 |
+|--------|------|--------|
+| DashScope API Key | 阿里云 API 密钥，以 `sk-` 开头 (必填) | 无 |
+| 管理页面用户名 | 管理后台登录用户名 | `admin` |
+| 管理页面密码 | 管理后台登录密码 (必填，需输入两次确认) | 无 |
+| 群组模型配置 | 格式 `群组ID:模型名`，多个逗号分隔，可留空 | 空 |
+| AI API 地址 | DashScope 接口地址 | 阿里云国内版 |
+
+配置完成后脚本自动生成 `.env`（权限 600）并继续部署。后续部署会跳过配置步骤，如需修改直接编辑 `.env` 后重新运行即可。
+
 脚本执行流程：
 
-1. 检查 Docker 权限、必要文件、API Key 配置
-2. 创建 `logs/`、`data/` 目录并设置权限
-3. 停止并清理旧容器 (如有)
-4. 构建 Docker 镜像，清理悬空镜像回收磁盘
-5. 启动容器 (只读文件系统、最小权限)
-6. 等待健康检查通过
-7. 输出服务信息
+1. 检查 Docker 权限、必要文件
+2. **交互式生成 `.env`**（仅首次，已存在则跳过）
+3. 创建 `logs/`、`data/` 目录并设置权限
+4. 停止并清理旧容器 (如有)
+5. 构建 Docker 镜像，清理悬空镜像回收磁盘
+6. 启动容器 (只读文件系统、最小权限)
+7. 等待健康检查通过
+8. 输出服务信息
 
 部署成功后输出：
 
@@ -118,24 +96,40 @@ git pull
 
 会话数据保存在 `data/` 目录中，更新不会丢失。
 
+### `.env` 变量说明
+
+如需手动编辑 `.env`，各变量含义如下：
+
+| 变量 | 说明 |
+|------|------|
+| `DASHSCOPE_API_KEY` | 阿里云 DashScope API 密钥 |
+| `APP_USERNAME` | 管理页面登录用户名 |
+| `APP_PASSWORD` | 管理页面登录密码 |
+| `GROUP_CONFIGS` | 群组模型配置 (可选)，格式为 `群组ID:模型名`，多个用逗号分隔 |
+| `AI_BASE_URL` | AI API 地址 (可选)，默认阿里云国内版，国际版改为 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
+
+- 群组 ID 可在管理页面的活跃会话列表中查看，也可从服务器日志获取
+- 未匹配到配置的群组使用默认模型 `kimi-k2.5`
+- 修改后需重启容器生效：`docker restart mixin-chatbot`
+
 ## 日常运维
 
 ### 常用命令
 
 ```bash
-docker logs -f chatbot        # 查看实时日志
-docker restart chatbot         # 重启服务
-docker stop chatbot            # 停止服务
-docker stats chatbot           # 查看资源占用
-docker exec -it chatbot bash    # 进入容器 (只读，仅供排查)
+docker logs -f mixin-chatbot        # 查看实时日志
+docker restart mixin-chatbot         # 重启服务
+docker stop mixin-chatbot            # 停止服务
+docker stats mixin-chatbot           # 查看资源占用
+docker exec -it mixin-chatbot bash    # 进入容器 (只读，仅供排查)
 ```
 
 ### 日志位置
 
 | 日志 | 位置 | 轮转策略 |
 |------|------|---------|
-| 应用日志 | `logs/chatbot.log` | 5MB x 3 份 |
-| Docker 日志 | `docker logs chatbot` | 5MB x 2 份 |
+| 应用日志 | `logs/mixin-chatbot.log` | 5MB x 3 份 |
+| Docker 日志 | `docker logs mixin-chatbot` | 5MB x 2 份 |
 
 ### 数据管理
 
@@ -180,7 +174,7 @@ IM 平台推送的 JSON 格式：
 ## 目录结构
 
 ```
-chatbot/
+mixin-chatbot/
 ├── app.py                # FastAPI 主应用 (路由、去重、异步调度)
 ├── ai_service.py         # AI 模型调用 (AsyncOpenAI 流式接收)
 ├── im_service.py         # IM 平台消息回调 (httpx + 失败重试)
@@ -251,11 +245,11 @@ chatbot/
 
 | 现象 | 可能原因 | 解决方法 |
 |------|---------|---------|
-| 容器启动后立刻退出 | `.env` 配置缺失或格式错误 | `docker logs chatbot` 查看错误信息，检查 `.env` 中必填项是否完整 |
-| 健康检查超时 | 端口冲突或应用启动异常 | `docker logs chatbot` 查看启动日志，确认 1011 端口未被占用 |
+| 容器启动后立刻退出 | `.env` 配置缺失或格式错误 | `docker logs mixin-chatbot` 查看错误信息，检查 `.env` 中必填项是否完整 |
+| 健康检查超时 | 端口冲突或应用启动异常 | `docker logs mixin-chatbot` 查看启动日志，确认 1011 端口未被占用 |
 | IM 消息收不到回复 | 回调地址不可达或防火墙拦截 | 确认 webhook 地址配置正确，检查 `ufw status` 确认 1011 端口已开放 |
 | AI 回复超时或报错 | API Key 无效或网络不通 | 检查 `.env` 中 `DASHSCOPE_API_KEY` 是否正确，确认服务器可访问阿里云 API |
-| 管理页面无法登录 | 用户名密码错误 | 检查 `.env` 中 `APP_USERNAME` 和 `APP_PASSWORD`，修改后 `docker restart chatbot` |
+| 管理页面无法登录 | 用户名密码错误 | 检查 `.env` 中 `APP_USERNAME` 和 `APP_PASSWORD`，修改后 `docker restart mixin-chatbot` |
 | 磁盘空间不足 | 日志或数据库过大 | `docker system prune -f` 清理镜像缓存，检查 `data/sessions.db` 大小 |
 
 ## 更新日志
@@ -270,3 +264,9 @@ chatbot/
 - **错误回复容错**: 请求处理失败后发送错误提示时，捕获发送异常避免静默丢失
 - **修复 incremental_vacuum 无效问题**: 数据库初始化时设置 `auto_vacuum=INCREMENTAL`
 - **优化数据库容量清理**: 基于行数比例一次性清理，替代 WAL 模式下文件大小不准确的循环检测
+
+### 2026-07-17
+
+- **项目重命名**: 从 `chatbot` 重命名为 `mixin-chatbot`，统一容器名、镜像名、日志文件名
+- **交互式部署配置**: 首次部署时自动检测 `.env` 是否存在，不存在则通过问答式交互收集 API Key、管理员账号密码、群组配置等信息，自动生成 `.env`，无需手动创建
+- **清理死代码**: 移除未被调用的 `get_session_count()` 函数

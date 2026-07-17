@@ -136,21 +136,6 @@ async def get_all_sessions():
     ]
 
 
-async def get_session_count():
-    """获取活跃会话数量"""
-    db = await _get_db()
-    if SESSION_TIMEOUT > 0:
-        cutoff = time.time() - SESSION_TIMEOUT
-        async with db.execute(
-            "SELECT COUNT(*) FROM sessions WHERE last_active > ?", (cutoff,)
-        ) as cursor:
-            row = await cursor.fetchone()
-    else:
-        async with db.execute("SELECT COUNT(*) FROM sessions") as cursor:
-            row = await cursor.fetchone()
-    return row[0]
-
-
 async def clean_expired_sessions():
     """清理过期会话 + 磁盘容量控制"""
     db = await _get_db()

@@ -43,7 +43,7 @@ TARGET_DB_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # 4GB
 
 # ===== 日志 =====
 LOG_DIR = "logs"
-LOG_FILE = "chatbot.log"
+LOG_FILE = "mixin-chatbot.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024   # 5MB
 LOG_BACKUP_COUNT = 3
 

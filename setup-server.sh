@@ -39,8 +39,8 @@ ufw default allow outgoing
 # SSH
 ufw allow 22/tcp comment 'SSH'
 
-# 聊天机器人端口
-ufw allow 1011/tcp comment 'Chatbot'
+# Mixin Chatbot 端口
+ufw allow 1011/tcp comment 'Mixin-Chatbot'
 
 # 启用防火墙 (幂等：已启用则跳过)
 if ufw status | grep -q "Status: active"; then
@@ -50,7 +50,7 @@ else
 fi
 ufw status
 
-echo "[+] 防火墙已启用: 仅开放 SSH(22) 和 Chatbot(1011)"
+echo "[+] 防火墙已启用: 仅开放 SSH(22) 和 Mixin-Chatbot(1011)"
 
 # ---- fail2ban ----
 
@@ -97,7 +97,7 @@ echo "[+] 自动安全更新已启用"
 # ---- 内核参数优化 (1核1GB) ----
 
 echo "[*] 优化内核参数..."
-cat > /etc/sysctl.d/99-chatbot.conf << 'SYSEOF'
+cat > /etc/sysctl.d/99-mixin-chatbot.conf << 'SYSEOF'
 # 减少 swap 使用倾向 (1GB 内存尽量用物理内存)
 vm.swappiness=10
 

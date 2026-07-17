@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
-app = FastAPI(title="AI Chatbot", lifespan=lifespan)
+app = FastAPI(title="量子密信聊天机器人", lifespan=lifespan)
 
 # 挂载静态文件
 app.mount("/static", StaticFiles(directory="static"), name="static")
