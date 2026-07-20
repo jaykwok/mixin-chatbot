@@ -41,28 +41,50 @@ print_success "环境检查通过"
 
 # ---- 交互式生成 .env ----
 
+# 从 .env 读取指定 key 的值（不存在返回空）
+env_get() {
+    local key="$1"
+    [ -f ".env" ] || return 0
+    # 只匹配 KEY=VALUE 形式，去掉首尾空白和引号
+    grep -E "^${key}=" .env 2>/dev/null | head -1 | sed -E "s/^${key}=//; s/^\"//; s/\"$//; s/^'//; s/'$//"
+}
+
+# 判断某 key 是否已存在于 .env
+env_has() {
+    [ -f ".env" ] && grep -qE "^$1=" .env 2>/dev/null
+}
+
 setup_env() {
+    local is_update="no"
     if [ -f ".env" ]; then
-        print_success ".env 已存在，跳过配置"
-        # 仍校验是否为默认占位值
-        if grep -q "your_api_key" .env 2>/dev/null; then
-            print_error ".env 中的 DASHSCOPE_API_KEY 还是默认占位值，请手动编辑 .env 后重新运行"
-            exit 1
-        fi
-        return 0
+        is_update="yes"
+        print_status "检测到已有 .env，将逐项确认（回车保留原值，输入则覆盖）"
     fi
 
     echo ""
     echo "=========================================="
-    echo "  首次部署配置 (.env)"
+    if [ "$is_update" = "yes" ]; then
+        echo "  更新配置 (.env)"
+        echo "  直接回车 = 保留当前值；输入新值 = 覆盖"
+    else
+        echo "  首次部署配置 (.env)"
+        echo "  请按提示输入各项配置，直接回车可使用 [默认值]"
+    fi
     echo "=========================================="
-    echo "  请按提示输入各项配置，直接回车可使用 [默认值]"
     echo ""
 
     # --- DASHSCOPE_API_KEY ---
+    local cur_api_key
+    cur_api_key=$(env_get DASHSCOPE_API_KEY)
     while true; do
-        print_prompt "请输入阿里云 DashScope API Key (必填，以 sk- 开头):"
+        if [ -n "$cur_api_key" ]; then
+            print_prompt "请输入阿里云 DashScope API Key (回车保留当前: ${cur_api_key:0:8}****${cur_api_key: -4}):"
+        else
+            print_prompt "请输入阿里云 DashScope API Key (必填，以 sk- 开头):"
+        fi
         read -r api_key
+        # 回车则保留当前值
+        [ -z "$api_key" ] && api_key="$cur_api_key"
         if [ -z "$api_key" ]; then
             print_error "API Key 不能为空，请重新输入"
             continue
@@ -77,18 +99,38 @@ setup_env() {
     done
 
     # --- APP_USERNAME ---
-    print_prompt "请输入管理页面用户名 [默认: admin]:"
-    read -r username
-    username=${username:-admin}
+    local cur_username
+    cur_username=$(env_get APP_USERNAME)
+    if [ -n "$cur_username" ]; then
+        print_prompt "请输入管理页面用户名 (回车保留当前: $cur_username):"
+        read -r username
+        username=${username:-$cur_username}
+    else
+        print_prompt "请输入管理页面用户名 [默认: admin]:"
+        read -r username
+        username=${username:-admin}
+    fi
 
     # --- APP_PASSWORD ---
+    local cur_password
+    cur_password=$(env_get APP_PASSWORD)
     while true; do
-        print_prompt "请输入管理页面密码 (必填，建议 8 位以上，含大小写字母和数字):"
+        if [ -n "$cur_password" ]; then
+            print_prompt "请输入管理页面密码 (回车保留当前值；输入新值则覆盖，建议 8 位以上):"
+        else
+            print_prompt "请输入管理页面密码 (必填，建议 8 位以上，含大小写字母和数字):"
+        fi
         read -rs password
         echo ""
+        # 回车则保留当前值
+        [ -z "$password" ] && password="$cur_password"
         if [ -z "$password" ]; then
             print_error "密码不能为空，请重新输入"
             continue
+        fi
+        # 仅在输入了新值时要求二次确认（保留旧值无需确认）
+        if [ -n "$cur_password" ] && [ "$password" = "$cur_password" ]; then
+            break
         fi
         print_prompt "请再次输入密码确认:"
         read -rs password_confirm
@@ -101,28 +143,66 @@ setup_env() {
     done
 
     # --- DEFAULT_MODEL ---
+    local cur_default_model
+    cur_default_model=$(env_get DEFAULT_MODEL)
     echo ""
     print_status "默认 AI 模型: 未在群组配置中单独指定的群组使用此模型"
     print_status "常见可选: qwen3.7-plus / qwen-plus / kimi-k2.5 / qwen-max 等"
-    print_prompt "请输入默认模型名 [默认: qwen3.7-plus]:"
-    read -r default_model
-    default_model=${default_model:-qwen3.7-plus}
+    if [ -n "$cur_default_model" ]; then
+        print_prompt "请输入默认模型名 (回车保留当前: $cur_default_model):"
+        read -r default_model
+        default_model=${default_model:-$cur_default_model}
+    else
+        print_prompt "请输入默认模型名 [默认: qwen3.7-plus]:"
+        read -r default_model
+        default_model=${default_model:-qwen3.7-plus}
+    fi
 
     # --- GROUP_CONFIGS ---
+    local cur_group_configs
+    cur_group_configs=$(env_get GROUP_CONFIGS)
     echo ""
     print_status "群组模型配置 (可选): 为不同群组指定 AI 模型"
     print_status "格式: 群组ID:模型名，多个用逗号分隔"
     print_status "示例: 10086:qwen-plus,10010:kimi-k2.5"
-    print_prompt "请输入群组配置 (可留空，稍后在 .env 中编辑):"
-    read -r group_configs
+    if [ -n "$cur_group_configs" ]; then
+        print_prompt "请输入群组配置 (回车保留当前: $cur_group_configs；输入空格清空):"
+        read -r group_configs
+        # 输入空格视为清空，回车保留
+        if [ "$group_configs" = " " ]; then
+            group_configs=""
+        elif [ -z "$group_configs" ]; then
+            group_configs="$cur_group_configs"
+        fi
+    else
+        print_prompt "请输入群组配置 (可留空，稍后在 .env 中编辑):"
+        read -r group_configs
+    fi
 
     # --- AI_BASE_URL ---
-    print_prompt "请输入 AI API 地址 [默认: 阿里云国内版]:"
-    read -r ai_base_url
-    ai_base_url=${ai_base_url:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+    local cur_ai_base_url
+    cur_ai_base_url=$(env_get AI_BASE_URL)
+    if [ -n "$cur_ai_base_url" ]; then
+        print_prompt "请输入 AI API 地址 (回车保留当前: $cur_ai_base_url):"
+        read -r ai_base_url
+        ai_base_url=${ai_base_url:-$cur_ai_base_url}
+    else
+        print_prompt "请输入 AI API 地址 [默认: 阿里云国内版]:"
+        read -r ai_base_url
+        ai_base_url=${ai_base_url:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+    fi
 
-    # --- 生成 .env ---
-    cat > .env << EOF
+    # --- 重建 .env ---
+    # 策略：交互项以本次输入为准（覆盖或新增）；
+    #       .env 中其他非交互项原样保留；最后 append 交互项。
+    local tmp_env
+    tmp_env=$(mktemp)
+    if [ -f ".env" ]; then
+        # 复制原 .env，但剔除所有交互项（稍后统一重写）
+        grep -vE "^(DASHSCOPE_API_KEY|APP_USERNAME|APP_PASSWORD|DEFAULT_MODEL|GROUP_CONFIGS|AI_BASE_URL)=" .env > "$tmp_env" 2>/dev/null || true
+    fi
+    # 追加交互项（以本次输入为准）
+    cat >> "$tmp_env" << EOF
 DASHSCOPE_API_KEY=$api_key
 APP_USERNAME=$username
 APP_PASSWORD=$password
@@ -130,8 +210,8 @@ DEFAULT_MODEL=$default_model
 GROUP_CONFIGS=$group_configs
 AI_BASE_URL=$ai_base_url
 EOF
+    mv "$tmp_env" .env
 
-    chmod 600 .env
     # 容器内 appuser(1001) 需要读取挂载进来的 .env，
     # volume 挂载无法在容器内改属主，故宿主机上把属主设为 1001、权限 640：
     # root 仍可读，appuser 可读，其他普通用户不可读
