@@ -61,8 +61,10 @@ LOG_MAX_BYTES = 5 * 1024 * 1024   # 5MB
 LOG_BACKUP_COUNT = 3
 
 # ===== 群组配置 =====
+# 默认 AI 模型（未在 GROUP_CONFIGS 中单独配置的群组使用此模型）
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3.7-plus")
 DEFAULT_GROUP_CONFIG = {
-    "model": "kimi-k2.5",
+    "model": DEFAULT_MODEL,
     "system_prompt": "你是聊天机器人，以纯文本形式回复用户的问题。不要使用任何格式，例如Markdown。",
 }
 

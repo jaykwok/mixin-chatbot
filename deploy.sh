@@ -100,6 +100,14 @@ setup_env() {
         break
     done
 
+    # --- DEFAULT_MODEL ---
+    echo ""
+    print_status "默认 AI 模型: 未在群组配置中单独指定的群组使用此模型"
+    print_status "常见可选: qwen3.7-plus / qwen-plus / kimi-k2.5 / qwen-max 等"
+    print_prompt "请输入默认模型名 [默认: qwen3.7-plus]:"
+    read -r default_model
+    default_model=${default_model:-qwen3.7-plus}
+
     # --- GROUP_CONFIGS ---
     echo ""
     print_status "群组模型配置 (可选): 为不同群组指定 AI 模型"
@@ -118,6 +126,7 @@ setup_env() {
 DASHSCOPE_API_KEY=$api_key
 APP_USERNAME=$username
 APP_PASSWORD=$password
+DEFAULT_MODEL=$default_model
 GROUP_CONFIGS=$group_configs
 AI_BASE_URL=$ai_base_url
 EOF
@@ -138,7 +147,8 @@ EOF
     echo "  API Key:        ${api_key:0:8}****${api_key: -4}"
     echo "  管理员用户名:    $username"
     echo "  管理员密码:      ******"
-    echo "  群组配置:        ${group_configs:-（未配置，使用默认模型 kimi-k2.5）}"
+    echo "  默认模型:        $default_model"
+    echo "  群组配置:        ${group_configs:-（未配置，全部使用默认模型）}"
     echo "  AI API 地址:     $ai_base_url"
     echo "=========================================="
     echo ""
