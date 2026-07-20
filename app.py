@@ -19,7 +19,7 @@ from config import (
     GROUP_CONFIGS, DEFAULT_GROUP_CONFIG, VALID_HOSTNAMES,
     REQUIRED_WEBHOOK_FIELDS, DEDUP_TTL, MAX_DEDUP_SIZE, CLEANUP_INTERVAL,
     RATE_LIMIT_WINDOW, RATE_LIMIT_MAX_REQUESTS, DEBUG,
-    RATE_LIMIT_CLEANUP_INTERVAL, VALID_CALLBACK_PORTS,
+    RATE_LIMIT_CLEANUP_INTERVAL, RATE_LIMIT_MAX_USERS, VALID_CALLBACK_PORTS,
 )
 
 # 初始化日志
@@ -204,6 +204,12 @@ async def process_request(
 
     try:
         ai_response = await get_ai_response(content, phone, group_id)
+        # 调试模式：记录 AI 响应内容
+        if DEBUG:
+            logger.info(
+                "[DEBUG] AI 响应 - 用户: %s, 响应长度: %d, 响应内容: %s",
+                phone, len(ai_response), ai_response,
+            )
         await send_message_to_im(ai_response, group_id, phone, callback_url)
 
         elapsed = time.time() - start_time
