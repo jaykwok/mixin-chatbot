@@ -123,7 +123,12 @@ AI_BASE_URL=$ai_base_url
 EOF
 
     chmod 600 .env
-    print_success ".env 配置文件已生成 (权限 600)"
+    # 容器内 appuser(1001) 需要读取挂载进来的 .env，
+    # volume 挂载无法在容器内改属主，故宿主机上把属主设为 1001、权限 640：
+    # root 仍可读，appuser 可读，其他普通用户不可读
+    chown 1001:1001 .env 2>/dev/null || true
+    chmod 640 .env
+    print_success ".env 配置文件已生成 (权限 640, 属主 1001)"
 
     # 配置摘要
     echo ""
@@ -140,6 +145,15 @@ EOF
 }
 
 setup_env
+
+# ---- 统一修正 .env 权限/属主 ----
+# 无论 .env 是本次新生成还是已存在，都确保容器内 appuser(1001) 可读：
+# volume 挂载无法在容器内改属主，故宿主机上设属主 1001、权限 640
+if [ -f ".env" ]; then
+    chown 1001:1001 .env 2>/dev/null || true
+    chmod 640 .env
+    print_status ".env 权限已修正 (640, 属主 1001)"
+fi
 
 # ---- 创建目录 ----
 
