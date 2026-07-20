@@ -1,6 +1,7 @@
 import time
 import asyncio
 import logging
+import hashlib
 from collections import OrderedDict
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
@@ -17,7 +18,8 @@ from auth import verify_auth
 from config import (
     GROUP_CONFIGS, DEFAULT_GROUP_CONFIG, VALID_HOSTNAMES,
     REQUIRED_WEBHOOK_FIELDS, DEDUP_TTL, MAX_DEDUP_SIZE, CLEANUP_INTERVAL,
-    RATE_LIMIT_WINDOW, RATE_LIMIT_MAX_REQUESTS,
+    RATE_LIMIT_WINDOW, RATE_LIMIT_MAX_REQUESTS, DEBUG,
+    RATE_LIMIT_CLEANUP_INTERVAL, VALID_CALLBACK_PORTS,
 )
 
 # 初始化日志
@@ -46,18 +48,31 @@ async def _background_cleanup():
             logger.error(f"后台清理出错: {e}")
 
 
+async def _background_rate_limit_cleanup():
+    """后台定时清理速率限制字典，防止内存无限增长"""
+    while True:
+        await asyncio.sleep(RATE_LIMIT_CLEANUP_INTERVAL)
+        try:
+            cleanup_rate_limits()
+        except Exception as e:
+            logger.error(f"速率限制清理出错: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     await init_db()
     cleanup_task = asyncio.create_task(_background_cleanup())
+    rate_limit_cleanup_task = asyncio.create_task(_background_rate_limit_cleanup())
     logger.info("服务启动完成，监听端口: 1011")
     yield
     cleanup_task.cancel()
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
+    rate_limit_cleanup_task.cancel()
+    for task in (cleanup_task, rate_limit_cleanup_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await close_client()
     await close_db()
 
@@ -99,13 +114,24 @@ def validate_webhook_data(data: dict) -> tuple:
     if parsed.scheme != "https" or parsed.hostname not in VALID_HOSTNAMES:
         raise HTTPException(403, f"无效的回调URL: {callback_url}")
 
+    # 端口校验：未显式指定端口时 port 为 None（走默认 443），允许通过；
+    # 显式指定端口时必须在白名单内（白名单为空则禁止任何非默认端口）
+    if parsed.port is not None and parsed.port not in VALID_CALLBACK_PORTS:
+        raise HTTPException(403, f"无效的回调URL端口: {parsed.port}")
+
+    # 拒绝用户信息（user:pass@host）形式，防止绕过域名白名单
+    if parsed.username or parsed.password:
+        raise HTTPException(403, "回调URL不允许包含用户信息")
+
     return phone, group_id, content, callback_url
 
 
 def is_duplicate_request(phone: str, content: str) -> bool:
     """检查是否为重复请求（OrderedDict 按插入顺序清理过期条目）"""
     now = time.time()
-    key = f"{phone}:{content}"
+    # 用 hash 摘要作为 key，避免长消息导致内存膨胀
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    key = f"{phone}:{content_hash}"
 
     # 从头部弹出过期条目
     while _recent_requests:
@@ -145,6 +171,30 @@ def is_rate_limited(phone: str) -> bool:
     return False
 
 
+def cleanup_rate_limits():
+    """清理速率限制字典中窗口外已无时间戳的用户，防止内存无限增长"""
+    if not _rate_limits:
+        return
+    window_start = time.time() - RATE_LIMIT_WINDOW
+    # 删除窗口内已无任何时间戳的用户
+    stale = [
+        phone for phone, ts in _rate_limits.items()
+        if not any(t > window_start for t in ts)
+    ]
+    for phone in stale:
+        del _rate_limits[phone]
+    # 兜底：若仍超容量，按最近活跃时间淘汰最旧的
+    if len(_rate_limits) > RATE_LIMIT_MAX_USERS:
+        # 取每个用户最新时间戳，按升序淘汰
+        sorted_phones = sorted(
+            _rate_limits,
+            key=lambda p: max(_rate_limits[p]) if _rate_limits[p] else 0,
+        )
+        excess = len(_rate_limits) - RATE_LIMIT_MAX_USERS
+        for phone in sorted_phones[:excess]:
+            del _rate_limits[phone]
+
+
 async def process_request(
     content: str, phone: str, group_id: str, callback_url: str, client_ip: str
 ):
@@ -182,11 +232,24 @@ async def webhook(request: Request):
     except Exception:
         raise HTTPException(400, "请求必须是JSON格式")
 
+    # 调试模式：记录完整请求头和 body，用于分析 IM 平台转发特征
+    if DEBUG:
+        try:
+            import json as _json
+            logger.info(
+                "[DEBUG] webhook 原始请求 - IP: %s, headers: %s, body: %s",
+                client_ip,
+                dict(request.headers),
+                _json.dumps(data, ensure_ascii=False),
+            )
+        except Exception as dbg_err:
+            logger.error(f"[DEBUG] 记录调试日志失败: {dbg_err}")
+
     phone, group_id, content, callback_url = validate_webhook_data(data)
 
     logger.info(
         f"收到请求 - IP: {client_ip}, 用户: {phone}, "
-        f"群组: {group_id}, 内容: {content[:50]}..."
+        f"群组: {group_id}, 内容长度: {len(content)}"
     )
 
     if is_duplicate_request(phone, content):

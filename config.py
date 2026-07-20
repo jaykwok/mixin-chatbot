@@ -26,6 +26,8 @@ IM_RETRY_DELAY = 2      # 重试间隔（秒）
 
 # ===== Webhook =====
 VALID_HOSTNAMES = {"imtwo.zdxlz.com", "im.zdxlz.com"}
+# 回调 URL 允许的端口（空集合表示仅允许默认 https 端口 443）
+VALID_CALLBACK_PORTS: set[int] = set()
 REQUIRED_WEBHOOK_FIELDS = ["type", "textMsg", "phone", "groupId", "callBackUrl"]
 DEDUP_TTL = 30           # 请求去重窗口（秒）
 MAX_DEDUP_SIZE = 1000    # 去重字典最大容量
@@ -33,6 +35,12 @@ MAX_DEDUP_SIZE = 1000    # 去重字典最大容量
 # ===== 速率限制 =====
 RATE_LIMIT_WINDOW = 60       # 速率限制窗口（秒）
 RATE_LIMIT_MAX_REQUESTS = 10 # 窗口内每用户最大请求数
+RATE_LIMIT_CLEANUP_INTERVAL = 300  # 速率限制字典清理间隔（秒）
+RATE_LIMIT_MAX_USERS = 10000  # 速率限制字典最大用户数（兜底保护）
+
+# ===== 调试 =====
+# DEBUG=1 时记录 webhook 完整请求头和 body 到日志，用于分析 IM 平台转发特征
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
 # ===== 后台任务 =====
 CLEANUP_INTERVAL = 300   # 过期会话清理间隔（秒）

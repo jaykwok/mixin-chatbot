@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import copy
 import aiosqlite
 import logging
 from collections import OrderedDict
@@ -28,6 +29,16 @@ async def _get_db():
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA synchronous=NORMAL")
     return _db
+
+
+def _db_total_size() -> int:
+    """获取数据库实际磁盘占用（主文件 + WAL + SHM）"""
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        path = DB_PATH + suffix
+        if os.path.exists(path):
+            total += os.path.getsize(path)
+    return total
 
 
 async def close_db():
@@ -65,7 +76,8 @@ async def get_session(phone):
         session = _cache[phone]
         if SESSION_TIMEOUT <= 0 or current_time - session["last_active"] <= SESSION_TIMEOUT:
             _cache.move_to_end(phone)
-            return list(session["messages"])
+            # 深拷贝，防止调用方修改消息 dict 污染缓存
+            return copy.deepcopy(session["messages"])
         else:
             del _cache[phone]
 
@@ -147,13 +159,12 @@ async def clean_expired_sessions():
         await db.commit()
 
     # 2. 磁盘容量控制（独立于过期清理）
-    if os.path.exists(DB_PATH):
-        db_size = os.path.getsize(DB_PATH)
-        if db_size > MAX_DB_SIZE_BYTES:
-            logger.warning(
-                f"数据库大小 {db_size / 1024 / 1024:.0f}MB 超过限制，开始清理"
-            )
-            shrink_cleaned = await _shrink_db(db)
+    db_size = _db_total_size()
+    if db_size > MAX_DB_SIZE_BYTES:
+        logger.warning(
+            f"数据库大小 {db_size / 1024 / 1024:.0f}MB 超过限制，开始清理"
+        )
+        shrink_cleaned = await _shrink_db(db)
 
     total_cleaned = expired_cleaned + shrink_cleaned
 
@@ -179,7 +190,7 @@ async def clean_expired_sessions():
 
 async def _shrink_db(db):
     """缩减数据库到目标大小（基于行数比例估算，避免 WAL 模式下文件大小不准确的问题）"""
-    db_size = os.path.getsize(DB_PATH)
+    db_size = _db_total_size()
     if db_size <= TARGET_DB_SIZE_BYTES:
         return 0
 
