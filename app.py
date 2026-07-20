@@ -20,6 +20,7 @@ from config import (
     REQUIRED_WEBHOOK_FIELDS, DEDUP_TTL, MAX_DEDUP_SIZE, CLEANUP_INTERVAL,
     RATE_LIMIT_WINDOW, RATE_LIMIT_MAX_REQUESTS, DEBUG,
     RATE_LIMIT_CLEANUP_INTERVAL, RATE_LIMIT_MAX_USERS, VALID_CALLBACK_PORTS,
+    ALLOWED_ROBOT_IDS, ALLOWED_IPS,
 )
 
 # 初始化日志
@@ -89,6 +90,27 @@ def get_client_ip(request: Request) -> str:
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "Unknown"
+
+
+def authorize_webhook(data: dict, client_ip: str):
+    """webhook 鉴权：robotId 白名单（强校验）+ 来源 IP 白名单（可选）。
+
+    IM 平台不携带签名，只能基于请求固有特征校验：
+    - robotId 必须在 ALLOWED_ROBOT_IDS 内（攻击者不知道 robotId 即无法伪造）
+    - 若配置了 ALLOWED_IPS，来源 IP 必须在白名单内（未配置则跳过，便于观察期）
+    """
+    if not ALLOWED_ROBOT_IDS:
+        raise HTTPException(
+            503, "未配置 ROBOT_IDS 白名单，服务暂不可用"
+        )
+    robot_id = str(data.get("robotId", "")).strip()
+    if robot_id not in ALLOWED_ROBOT_IDS:
+        logger.warning(f"webhook 鉴权失败 - robotId 不在白名单: {robot_id}, IP: {client_ip}")
+        raise HTTPException(403, "拒绝访问")
+
+    if ALLOWED_IPS and client_ip not in ALLOWED_IPS:
+        logger.warning(f"webhook 鉴权失败 - IP 不在白名单: {client_ip}, robotId: {robot_id}")
+        raise HTTPException(403, "拒绝访问")
 
 
 def validate_webhook_data(data: dict) -> tuple:
@@ -250,6 +272,9 @@ async def webhook(request: Request):
             )
         except Exception as dbg_err:
             logger.error(f"[DEBUG] 记录调试日志失败: {dbg_err}")
+
+    # 鉴权：robotId 白名单 + 来源 IP 白名单（可选）
+    authorize_webhook(data, client_ip)
 
     phone, group_id, content, callback_url = validate_webhook_data(data)
 

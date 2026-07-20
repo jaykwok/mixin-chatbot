@@ -45,6 +45,20 @@ REQUIRED_WEBHOOK_FIELDS = ["type", "textMsg", "phone", "groupId", "callBackUrl"]
 DEDUP_TTL = 30           # 请求去重窗口（秒）
 MAX_DEDUP_SIZE = 1000    # 去重字典最大容量
 
+# ===== Webhook 鉴权（基于请求固有特征，IM 平台不携带签名）=====
+# robotId 白名单：必填，请求体 robotId 必须在此集合内（强校验）
+#   .env 中 ROBOT_IDS=2038929310892589058,2038929310892589059
+_robot_ids_raw = _env("ROBOT_IDS", "")
+ALLOWED_ROBOT_IDS: set[str] = {
+    s.strip() for s in _robot_ids_raw.split(",") if s.strip()
+}
+# 来源 IP 白名单：可选，配置后才校验（空则跳过 IP 校验）
+#   .env 中 ALLOWED_IPS=223.244.14.237,223.244.14.238
+_allowed_ips_raw = _env("ALLOWED_IPS", "")
+ALLOWED_IPS: set[str] = {
+    s.strip() for s in _allowed_ips_raw.split(",") if s.strip()
+}
+
 # ===== 速率限制 =====
 RATE_LIMIT_WINDOW = 60       # 速率限制窗口（秒）
 RATE_LIMIT_MAX_REQUESTS = 10 # 窗口内每用户最大请求数

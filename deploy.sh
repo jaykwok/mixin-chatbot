@@ -179,6 +179,43 @@ setup_env() {
         read -r group_configs
     fi
 
+    # --- ROBOT_IDS（webhook 鉴权：robotId 白名单，必填）---
+    local cur_robot_ids
+    cur_robot_ids=$(env_get ROBOT_IDS)
+    echo ""
+    print_status "Webhook 鉴权 - robotId 白名单 (必填): 仅允许指定机器人 ID 的请求"
+    print_status "机器人 ID 可在 IM 平台机器人配置中查看，多个用逗号分隔"
+    if [ -n "$cur_robot_ids" ]; then
+        print_prompt "请输入机器人 ID (回车保留当前: $cur_robot_ids):"
+        read -r robot_ids
+        robot_ids=${robot_ids:-$cur_robot_ids}
+    else
+        while true; do
+            print_prompt "请输入机器人 ID (必填，如 2038929310892589058):"
+            read -r robot_ids
+            [ -n "$robot_ids" ] && break
+            print_error "robotId 白名单不能为空，否则 webhook 拒绝所有请求"
+        done
+    fi
+
+    # --- ALLOWED_IPS（webhook 鉴权：来源 IP 白名单，可选）---
+    local cur_allowed_ips
+    cur_allowed_ips=$(env_get ALLOWED_IPS)
+    print_status "Webhook 鉴权 - 来源 IP 白名单 (可选): 留空则不校验 IP"
+    print_status "量子公司服务器出口 IP，多个用逗号分隔；观察日志确认固定后再填"
+    if [ -n "$cur_allowed_ips" ]; then
+        print_prompt "请输入允许的 IP (回车保留当前: $cur_allowed_ips；输入空格清空):"
+        read -r allowed_ips
+        if [ "$allowed_ips" = " " ]; then
+            allowed_ips=""
+        elif [ -z "$allowed_ips" ]; then
+            allowed_ips="$cur_allowed_ips"
+        fi
+    else
+        print_prompt "请输入允许的 IP (可留空，稍后观察日志确认后填):"
+        read -r allowed_ips
+    fi
+
     # --- AI_BASE_URL ---
     local cur_ai_base_url
     cur_ai_base_url=$(env_get AI_BASE_URL)
@@ -199,7 +236,7 @@ setup_env() {
     tmp_env=$(mktemp)
     if [ -f ".env" ]; then
         # 复制原 .env，但剔除所有交互项（稍后统一重写）
-        grep -vE "^(DASHSCOPE_API_KEY|APP_USERNAME|APP_PASSWORD|DEFAULT_MODEL|GROUP_CONFIGS|AI_BASE_URL)=" .env > "$tmp_env" 2>/dev/null || true
+        grep -vE "^(DASHSCOPE_API_KEY|APP_USERNAME|APP_PASSWORD|DEFAULT_MODEL|GROUP_CONFIGS|ROBOT_IDS|ALLOWED_IPS|AI_BASE_URL)=" .env > "$tmp_env" 2>/dev/null || true
     fi
     # 追加交互项（以本次输入为准）
     cat >> "$tmp_env" << EOF
@@ -208,6 +245,8 @@ APP_USERNAME=$username
 APP_PASSWORD=$password
 DEFAULT_MODEL=$default_model
 GROUP_CONFIGS=$group_configs
+ROBOT_IDS=$robot_ids
+ALLOWED_IPS=$allowed_ips
 AI_BASE_URL=$ai_base_url
 EOF
     mv "$tmp_env" .env
@@ -229,6 +268,8 @@ EOF
     echo "  管理员密码:      ******"
     echo "  默认模型:        $default_model"
     echo "  群组配置:        ${group_configs:-（未配置，全部使用默认模型）}"
+    echo "  robotId 白名单:  $robot_ids"
+    echo "  IP 白名单:       ${allowed_ips:-（未配置，不校验 IP）}"
     echo "  AI API 地址:     $ai_base_url"
     echo "=========================================="
     echo ""
