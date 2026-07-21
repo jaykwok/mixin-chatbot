@@ -47,7 +47,7 @@ MAX_DEDUP_SIZE = 1000    # 去重字典最大容量
 
 # ===== Webhook 鉴权（基于请求固有特征，IM 平台不携带签名）=====
 # robotId 白名单：必填，请求体 robotId 必须在此集合内（强校验）
-#   .env 中 ROBOT_IDS=2038929310892589058,2038929310892589059
+#   .env 中 ROBOT_IDS=2038929310892589099,2038929310892589059
 _robot_ids_raw = _env("ROBOT_IDS", "")
 ALLOWED_ROBOT_IDS: set[str] = {
     s.strip() for s in _robot_ids_raw.split(",") if s.strip()

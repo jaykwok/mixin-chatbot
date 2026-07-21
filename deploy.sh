@@ -191,7 +191,7 @@ setup_env() {
         robot_ids=${robot_ids:-$cur_robot_ids}
     else
         while true; do
-            print_prompt "请输入机器人 ID (必填，如 2038929310892589058):"
+            print_prompt "请输入机器人 ID (必填，如 2038929310892589099):"
             read -r robot_ids
             [ -n "$robot_ids" ] && break
             print_error "robotId 白名单不能为空，否则 webhook 拒绝所有请求"
