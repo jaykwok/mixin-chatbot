@@ -77,7 +77,7 @@ git pull && ./deploy.sh
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/webhook` | POST | IM 平台回调入口（无应用层鉴权，靠防火墙） |
+| `/webhook/<secret>` | POST | IM 平台回调入口；secret 来自 `data/webhook-secret`（未配置时回退开放 `/webhook`，仅内网） |
 | `/favicon.svg` | GET | 图标（健康检查用） |
 
 ### Webhook 请求格式
@@ -92,7 +92,7 @@ git pull && ./deploy.sh
 }
 ```
 
-`callBackUrl` 的 hostname 必须在白名单（`imtwo.zdxlz.com` / `im.zdxlz.com`），防止 SSRF。
+`callBackUrl` 严格校验：协议 https、hostname 在白名单（`imtwo.zdxlz.com` / `im.zdxlz.com`）、路径须为 `/im-external/v1/webhook/send` 且带 `key` 参数——防 SSRF 与伪造回调。
 
 ## 目录结构
 
@@ -123,6 +123,16 @@ mixin-chatbot/
 
 ## 安全
 
+### 公网暴露（Cloudflare 三层防护）
+
+平台 webhook **不带签名**，公网靠三层组合挡未授权调用与重放：
+
+1. **Cloudflare WAF**（IP 闸门）：仅放行平台出口 IP `223.244.14.237` + POST + 路径形状 `^/webhook/[0-9a-f]{32,64}$`，其余 Block。用 `ip.src`（勿用可伪造的 `X-Forwarded-For`）；只匹配**形状**不匹配密钥值——密钥轮换不动 Cloudflare 规则。
+2. **随机密钥路径** `/webhook/<64hex>`（256bit）：存 `data/webhook-secret`，deploy 首次生成、恒定时长比对、不匹配返 404，旧 `/webhook` 直接 404。泄露时删 `data/webhook-secret` 重部署即重生成。
+3. **应用层 payload 校验**（见下）：phone 格式、内容长度、callBackUrl 结构。
+
+> WAF 规则在 Cloudflare 侧配置，切 cloudflared 公网时启用。未配 `data/webhook-secret` 时应用回退开放 `/webhook`（仅内网/本地）。
+
 ### 容器层
 
 - `--read-only` 只读根文件系统
@@ -132,7 +142,9 @@ mixin-chatbot/
 
 ### 应用层
 
-- 回调 URL hostname 白名单（防 SSRF）
+- 随机密钥路径鉴权（`data/webhook-secret`，见上）
+- 回调 URL 结构校验：https + hostname 白名单 + 路径 `/im-external/v1/webhook/send` + `key` 参数（防 SSRF / 伪造）
+- `phone` 格式校验（防会话文件名路径穿越）、消息内容 16KB 上限
 - 请求去重（30 秒内相同请求跳过，防重复回复）
 - 错误信息脱敏（仅记日志，不回传用户）
 - ⚠️ agent 有 `bash` 工具：仅可信群成员可 @ 触发；工具工作目录限定在 `./data`

@@ -1,11 +1,14 @@
 // webhook 处理逻辑：字段校验、请求去重、速率限制、后台异步处理（per-phone 串行）。
-// 对应 Python 版 app.py 的 webhook 部分。
+// 校验含安全约束：phone 格式（防会话文件名路径穿越）、内容长度、callBackUrl 结构（防 SSRF/伪造）。
 import { createHash } from "node:crypto";
 import { log } from "../lib/log.ts";
 import {
+  CALLBACK_PATH_PREFIX,
   DEDUP_TTL,
   DEBUG,
+  MAX_CONTENT_LENGTH,
   MAX_DEDUP_SIZE,
+  PHONE_PATTERN,
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW,
   REQUIRED_WEBHOOK_FIELDS,
@@ -48,15 +51,22 @@ export function validateWebhookData(data: WebhookData): ValidatedRequest {
   if (!phone || !groupId || !content) {
     throw new HttpError(400, "phone、groupId 或 content 不能为空");
   }
+  // phone 被用作会话文件名，必须严格字符集（防 ../ 路径穿越）
+  if (!PHONE_PATTERN.test(phone)) {
+    throw new HttpError(400, "无效的 phone");
+  }
+  if (content.length > MAX_CONTENT_LENGTH) {
+    throw new HttpError(413, `消息内容过长（上限 ${MAX_CONTENT_LENGTH} 字节）`);
+  }
 
   let parsed: URL;
   try {
     parsed = new URL(callbackUrl);
   } catch {
-    throw new HttpError(403, `无效的回调URL: ${callbackUrl}`);
+    throw new HttpError(403, "无效的回调URL");
   }
   if (parsed.protocol !== "https:" || !VALID_HOSTNAMES.has(parsed.hostname)) {
-    throw new HttpError(403, `无效的回调URL: ${callbackUrl}`);
+    throw new HttpError(403, "无效的回调URL");
   }
   // 端口校验：未显式指定端口时为空字符串（走默认 443）允许；显式端口必须在白名单
   if (parsed.port && !VALID_CALLBACK_PORTS.has(Number(parsed.port))) {
@@ -64,6 +74,13 @@ export function validateWebhookData(data: WebhookData): ValidatedRequest {
   }
   if (parsed.username || parsed.password) {
     throw new HttpError(403, "回调URL不允许包含用户信息");
+  }
+  // 路径必须是量子密信出站发送端点，且带 key 参数（防 SSRF / 伪造回调）
+  if (parsed.pathname !== CALLBACK_PATH_PREFIX) {
+    throw new HttpError(403, "无效的回调URL路径");
+  }
+  if (!parsed.searchParams.has("key")) {
+    throw new HttpError(403, "回调URL缺少 key 参数");
   }
   return { phone, groupId, content, callbackUrl };
 }
