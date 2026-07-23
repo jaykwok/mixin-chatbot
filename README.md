@@ -1,6 +1,6 @@
-# 量子密信聊天机器人
+# 量子密信群聊协作机器人
 
-量子密信 IM 平台聊天机器人 (Mixin Chatbot)，基于 FastAPI + 阿里云 DashScope API。
+量子密信 IM 平台群聊协作机器人 (Mixin Chatbot)，基于 FastAPI + 阿里云 DashScope API。
 
 ## 技术栈
 
