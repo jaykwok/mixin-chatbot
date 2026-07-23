@@ -1,0 +1,21 @@
+{
+  "name": "mixin-chatbot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4",
+    "@earendil-works/pi-agent-core": "latest",
+    "@earendil-works/pi-ai": "latest",
+    "@earendil-works/pi-coding-agent": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
