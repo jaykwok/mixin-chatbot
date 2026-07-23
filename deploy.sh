@@ -90,6 +90,29 @@ else
     fi
 fi
 
+# ---- Webhook 随机密钥路径（公网鉴权）----
+# data/webhook-secret 存 64hex（256bit）；应用启动读它，存在则启用 /webhook/<secret>。
+if [ ! -f "data/webhook-secret" ]; then
+    print_status "生成 webhook 随机密钥路径..."
+    if SECRET=$(openssl rand -hex 32 2>/dev/null) && [ -n "$SECRET" ]; then
+        : # openssl 可用
+    else
+        SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n') # 回退
+    fi
+    printf '%s' "$SECRET" > data/webhook-secret
+    chown 1001:1001 data/webhook-secret 2>/dev/null || true
+    chmod 600 data/webhook-secret
+    print_success "已生成 webhook 密钥（仅本次显示）"
+    echo ""
+    print_prompt "把下面这个回调地址填到 IM 平台（公网经 Cloudflare 用 https）："
+    echo "    https://<你的域名>/webhook/$SECRET"
+    echo ""
+    print_warning "公网部署还需在 Cloudflare WAF 放行：ip.src=223.244.14.237 && POST && 路径 ^/webhook/[0-9a-f]{32,64}\$，其余 Block"
+    print_warning "密钥不会再输出、不进容器日志；泄露时删除 data/webhook-secret 重新部署即重新生成"
+else
+    print_status "检测到已有 data/webhook-secret（沿用）"
+fi
+
 # ---- 启动容器 ----
 
 print_status "启动容器..."
