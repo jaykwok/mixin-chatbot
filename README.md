@@ -26,7 +26,7 @@
 应用层无 `.env`、无 `config.json`：
 
 - **AI 配置**（provider / key / model / 元数据）：全部在 `data/models.json`，由 TUI 工具 `scripts/configure.ts` 生成，Pi 原生读取。
-- **应用参数**：端口 1011 等均为代码常量（`src/config.ts`）。
+- **应用参数**：端口 1011 等均为代码常量（`src/lib/config.ts`）。
 - **访问控制**：无应用层鉴权 / 白名单，交给服务器防火墙（见 `setup-server.sh`）。
 
 ## 部署
@@ -99,13 +99,17 @@ git pull && ./deploy.sh
 ```
 mixin-chatbot/
 ├── src/
-│   ├── index.ts        # 入口：Hono + Bun.serve + /webhook 路由
-│   ├── webhook.ts      # 字段校验、去重、限流、后台异步（per-phone 串行）
-│   ├── pi.ts           # Pi agent 集成（models.json 加载 + 工具 + prompt）
-│   ├── im.ts           # 量子密信发送层（text/markdown/image/file + 上传）
-│   ├── auth.ts         # HttpError + 客户端 IP（鉴权已移除）
-│   ├── config.ts       # 纯常量（端口 / 限流 / 日志等）
-│   └── log.ts          # 日志（console + 文件轮转）
+│   ├── server/                 # HTTP 层
+│   │   ├── index.ts            # 入口：Hono + Bun.serve + /webhook 路由
+│   │   ├── webhook.ts          # 字段校验、去重、限流、后台异步（per-phone 串行）
+│   │   └── http.ts             # HttpError + 客户端 IP
+│   ├── agent/                  # Pi agent 大脑
+│   │   ├── agent.ts            # models.json 加载 + 运行时 + 会话 + 对话入口
+│   │   └── tools.ts            # 发送工具 send_image / send_file
+│   ├── im/im.ts                # 量子密信发送层（text/markdown/image/file + 上传）
+│   └── lib/                    # 共享基础
+│       ├── config.ts           # 纯常量（端口 / 限流 / 日志等）
+│       └── log.ts              # 日志（console + 文件轮转）
 ├── scripts/
 │   └── configure.ts    # TUI：生成 data/models.json（LiteLLM 元数据）
 ├── static/favicon.svg
