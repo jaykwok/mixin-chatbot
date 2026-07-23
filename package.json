@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun run src/index.ts",
-    "dev": "bun --watch run src/index.ts",
+    "start": "bun run src/server/index.ts",
+    "dev": "bun --watch run src/server/index.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

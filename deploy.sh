@@ -29,7 +29,7 @@ if ! docker info > /dev/null 2>&1; then
     exit 1
 fi
 
-required_files=("package.json" "src/index.ts" "scripts/configure.ts")
+required_files=("package.json" "src/server/index.ts" "scripts/configure.ts")
 for file in "${required_files[@]}"; do
     if [ ! -f "$file" ]; then
         print_error "缺少必要文件: $file"

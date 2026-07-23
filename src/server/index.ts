@@ -4,9 +4,9 @@ import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { log } from "./log.ts";
-import { PORT, RATE_LIMIT_CLEANUP_INTERVAL } from "./config.ts";
-import { getClientIp, HttpError } from "./auth.ts";
+import { log } from "../lib/log.ts";
+import { PORT, RATE_LIMIT_CLEANUP_INTERVAL } from "../lib/config.ts";
+import { getClientIp, HttpError } from "./http.ts";
 import {
   cleanupRateLimits,
   enqueueUserRequest,
@@ -14,7 +14,7 @@ import {
   isRateLimited,
   validateWebhookData,
 } from "./webhook.ts";
-import { disposeAllSessions } from "./pi.ts";
+import { disposeAllSessions } from "../agent/agent.ts";
 
 const app = new Hono();
 

@@ -1,7 +1,7 @@
 // 发送层：向量子密信群聊 webhook 发送多种消息 + 附件上传。
 // 对应 Python 版 im_service.py，复刻已实测验证的 A 套协议。
-import { log } from "./log.ts";
-import { IM_RETRY_COUNT, IM_RETRY_DELAY } from "./config.ts";
+import { log } from "../lib/log.ts";
+import { IM_RETRY_COUNT, IM_RETRY_DELAY } from "../lib/config.ts";
 
 const IM_SEND_HOST = "imtwo.zdxlz.com";
 const UPLOAD_PATH = "/im-external/v1/webhook/upload-attachment";
