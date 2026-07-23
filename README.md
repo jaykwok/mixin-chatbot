@@ -96,7 +96,9 @@ git pull && ./deploy.sh
 
 1. `git clone` 仓库到云电脑，`./deploy.sh` 选 **Cloudflare 模式**（bot 起在 :1011，生成 webhook 密钥）。
 2. 从服务器拷贝隧道 token：把 `/root/.cpa-bot-tunnel-token.env` 里的 `TUNNEL_TOKEN` 写入云电脑 `data/tunnel-token`（或 `export TUNNEL_TOKEN=...`）。
-3. 起隧道：`./scripts/start-tunnel.sh`（自动装 cloudflared + 连接，前台运行）。
+3. 起隧道（按云电脑系统选一个）：
+   - **Linux/macOS**：`./scripts/start-tunnel.sh`
+   - **Windows Server**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\start-tunnel.ps1`（装 cloudflared + 注册为 Windows 服务，开机自启）
 4. IM 平台回调填：`https://im-bot.jaykwok.net/webhook/<secret>`（secret 来自 deploy 输出）。
 
 > 公网 1011 无需开放（`cloudflared` 本地连）。Cloudflare WAF（平台 IP 白名单）在服务端配置。隧道/域名已在服务端建好（`im-bot.jaykwok.net` → 隧道 → 本机 :1011）。
@@ -139,8 +141,9 @@ mixin-chatbot/
 │       ├── config.ts           # 纯常量（端口 / 限流 / 日志等）
 │       └── log.ts              # 日志（console + 文件轮转）
 ├── scripts/
-│   ├── configure.ts    # TUI：生成 data/models.json（LiteLLM 元数据）
-│   └── start-tunnel.sh # 云电脑本地 cloudflared 对接（Cloudflare 模式）
+│   ├── configure.ts     # TUI：生成 data/models.json（LiteLLM 元数据）
+│   ├── start-tunnel.sh  # 云电脑 cloudflared 对接（Linux/macOS）
+│   └── start-tunnel.ps1 # 同上（Windows Server，注册为服务）
 ├── static/favicon.svg
 ├── data/               # models.json + sessions/*.jsonl（Pi 会话持久化）
 ├── logs/               # 应用日志
