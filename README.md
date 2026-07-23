@@ -27,7 +27,24 @@
 
 - **AI 配置**（provider / key / model / 元数据）：全部在 `data/models.json`，由 TUI 工具 `scripts/configure.ts` 生成，Pi 原生读取。
 - **应用参数**：端口 1011 等均为代码常量（`src/lib/config.ts`）。
-- **访问控制**：无应用层鉴权 / 白名单，交给服务器防火墙（见 `setup-server.sh`）。
+- **访问控制**：随机密钥路径（`data/webhook-secret`，应用层）+ 网络层 IP 闸门（直连=UFW / Cloudflare=WAF），见下方「部署模式」与「安全」。
+
+## 部署模式：直连 / Cloudflare
+
+应用层零配置且与模式无关（随机密钥路径 + payload 校验对两种模式都生效）。区别只在**网络层**——IP 闸门放哪、webhook URL 怎么填：
+
+| | 直连模式 | Cloudflare 模式 |
+|---|---|---|
+| 适用 | 有公网 IP、能管防火墙 | 无公网 IP（云电脑/NAT）或想要边缘防护 |
+| IP 闸门 | UFW 只放行平台 IP `223.244.14.237`→1011 | Cloudflare WAF `ip.src=223.244.14.237` |
+| webhook URL | `http://<IP>:1011/webhook/<secret>` | `https://<域名>/webhook/<secret>` |
+| TLS | HTTP（可选：自带反代套 HTTPS） | Cloudflare 自动 |
+| 1011 暴露 | 对平台 IP 开放 | 关闭公网（cloudflared 本地连） |
+
+`deploy.sh` 启动时交互选择模式并给出对应回调地址 + 配置指引：
+
+- **直连模式**：靠 `setup-server.sh` 把 UFW 1011 限定到平台 IP（安全基线）+ 随机密钥路径。走 HTTP，secret 在「平台→服务器」明文，但仅平台 IP 可达；有域名可在前面套 nginx/caddy + 证书反代到 `:1011` 升级 HTTPS。
+- **Cloudflare 模式**：`cloudflared` 隧道指向本机 `:1011`（公网 1011 关闭）+ WAF 限定平台 IP + 随机密钥路径。详见下方「安全 → 公网暴露（Cloudflare 三层防护）」。
 
 ## 部署
 
@@ -40,7 +57,7 @@ chmod +x setup-server.sh deploy.sh
 sudo ./setup-server.sh
 ```
 
-完成：安装 Docker、UFW 防火墙（仅 22 SSH + 1011）、fail2ban、自动安全更新、内核优化、Docker 日志轮转。
+完成：安装 Docker、UFW 防火墙（22 SSH + 1011 仅平台 IP）、fail2ban、自动安全更新、内核优化、Docker 日志轮转。
 
 ```bash
 sudo usermod -aG docker $USER && newgrp docker

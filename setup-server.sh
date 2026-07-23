@@ -5,6 +5,9 @@
 
 set -e
 
+# 量子密信平台出口 IP（webhook 来源）；UFW 只放行它访问 1011。可用环境变量覆盖。
+PLATFORM_IP="${PLATFORM_IP:-223.244.14.237}"
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "请使用 root 运行: sudo ./setup-server.sh"
     exit 1
@@ -39,8 +42,8 @@ ufw default allow outgoing
 # SSH
 ufw allow 22/tcp comment 'SSH'
 
-# Mixin Chatbot 端口
-ufw allow 1011/tcp comment 'Mixin-Chatbot'
+# Mixin Chatbot 端口（仅平台出口 IP 可达；直连模式安全基线）
+ufw allow from $PLATFORM_IP to any port 1011 proto tcp comment 'Mixin-Chatbot (平台IP)'
 
 # 启用防火墙 (幂等：已启用则跳过)
 if ufw status | grep -q "Status: active"; then
@@ -50,7 +53,7 @@ else
 fi
 ufw status
 
-echo "[+] 防火墙已启用: 仅开放 SSH(22) 和 Mixin-Chatbot(1011)"
+echo "[+] 防火墙已启用: 仅开放 SSH(22) 和 Mixin-Chatbot(1011, 仅 ${PLATFORM_IP})"
 
 # ---- fail2ban ----
 

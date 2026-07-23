@@ -1,10 +1,14 @@
 #!/bin/bash
 
-# 量子密信聊天机器人部署脚本 (Debian + Docker, Bun)
+# 量子密信群聊协作机器人部署脚本 (Debian + Docker, Bun)
 # 应用层零配置：AI 配置（provider/key/model）由 data/models.json 承载，容器内 TUI 生成；
-# 访问控制交给服务器防火墙。无 .env、无 config.json。
+# 访问控制交给网络层（直连=UFW / Cloudflare=WAF）。无 .env、无 config.json。
+# 两种部署模式：直连（公网 IP + UFW 限平台 IP）/ Cloudflare（cloudflared 隧道 + WAF）。
 
 set -e
+
+# 量子密信平台出口 IP（webhook 来源；UFW/WAF 按此放行）。变更可在此改或用环境变量覆盖。
+PLATFORM_IP="${PLATFORM_IP:-223.244.14.237}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,6 +42,21 @@ for file in "${required_files[@]}"; do
 done
 
 print_success "环境检查通过"
+
+# ---- 部署模式 ----
+
+echo ""
+print_prompt "选择部署模式："
+echo "  1) 直连模式 — 服务器有公网 IP，直接暴露 :1011（UFW 只放行平台 IP）"
+echo "  2) Cloudflare 模式 — 经 cloudflared 隧道 + WAF（无公网 IP / 想要边缘防护）"
+print_prompt "输入 1 或 2 [默认 1]:"
+read -r mode_choice
+case "$mode_choice" in
+    2) DEPLOY_MODE="cloudflare" ;;
+    *) DEPLOY_MODE="direct" ;;
+esac
+print_status "部署模式：$DEPLOY_MODE"
+echo ""
 
 # ---- 目录 ----
 
@@ -90,7 +109,7 @@ else
     fi
 fi
 
-# ---- Webhook 随机密钥路径（公网鉴权）----
+# ---- Webhook 随机密钥路径（两模式共用，应用层鉴权）----
 # data/webhook-secret 存 64hex（256bit）；应用启动读它，存在则启用 /webhook/<secret>。
 if [ ! -f "data/webhook-secret" ]; then
     print_status "生成 webhook 随机密钥路径..."
@@ -102,16 +121,42 @@ if [ ! -f "data/webhook-secret" ]; then
     printf '%s' "$SECRET" > data/webhook-secret
     chown 1001:1001 data/webhook-secret 2>/dev/null || true
     chmod 600 data/webhook-secret
-    print_success "已生成 webhook 密钥（仅本次显示）"
-    echo ""
-    print_prompt "把下面这个回调地址填到 IM 平台（公网经 Cloudflare 用 https）："
-    echo "    https://<你的域名>/webhook/$SECRET"
-    echo ""
-    print_warning "公网部署还需在 Cloudflare WAF 放行：ip.src=223.244.14.237 && POST && 路径 ^/webhook/[0-9a-f]{32,64}\$，其余 Block"
-    print_warning "密钥不会再输出、不进容器日志；泄露时删除 data/webhook-secret 重新部署即重新生成"
+    print_success "已生成 webhook 密钥"
+    SHOW_SECRET=1
 else
+    SECRET=$(cat data/webhook-secret 2>/dev/null || echo "")
+    SHOW_SECRET=0
     print_status "检测到已有 data/webhook-secret（沿用）"
 fi
+
+SERVER_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "<服务器IP>")
+
+echo ""
+print_prompt "把回调地址填到 IM 平台（webhook URL）："
+if [ "$DEPLOY_MODE" = "direct" ]; then
+    if [ "$SHOW_SECRET" = "1" ]; then
+        echo "    http://${SERVER_IP}:1011/webhook/$SECRET"
+    else
+        echo "    http://${SERVER_IP}:1011/webhook/<secret>（密钥未变；忘记可 cat data/webhook-secret）"
+    fi
+    echo ""
+    print_warning "直连走 HTTP：secret 在 URL 里明文经「平台→服务器」传输，但 UFW 只放行 ${PLATFORM_IP}，仅平台流量可达"
+    print_warning "确认 UFW：sudo ufw status（应为 allow from ${PLATFORM_IP} to any port 1011；setup-server.sh 已配）"
+    print_warning "有域名想加密可自行套 nginx/caddy + 证书反代到 :1011（URL 改 https://<域名>/webhook/<secret>）"
+else
+    if [ "$SHOW_SECRET" = "1" ]; then
+        echo "    https://<你的域名>/webhook/$SECRET"
+    else
+        echo "    https://<你的域名>/webhook/<secret>（密钥未变；忘记可 cat data/webhook-secret）"
+    fi
+    echo ""
+    print_warning "关闭公网 1011（cloudflared 本地连）：sudo ufw delete allow from ${PLATFORM_IP} to any port 1011 ; sudo ufw deny 1011/tcp"
+    print_warning "还需：1) 装 cloudflared 起隧道指向 http://localhost:1011；2) Cloudflare WAF 放行 ip.src=${PLATFORM_IP} && POST && 路径 ^/webhook/[0-9a-f]{32,64}\$，其余 Block（详见 README 部署模式）"
+fi
+if [ "$SHOW_SECRET" = "1" ]; then
+    print_warning "密钥仅本次显示、不进容器日志；泄露时删 data/webhook-secret 重新部署即重新生成"
+fi
+echo ""
 
 # ---- 启动容器 ----
 
@@ -166,14 +211,18 @@ done
 if docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     print_success "服务启动成功"
 
-    SERVER_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "localhost")
-
     echo ""
     echo "=========================================="
-    echo "  量子密信聊天机器人部署完成"
+    echo "  量子密信群聊协作机器人部署完成"
     echo "=========================================="
     echo ""
-    echo "  Webhook:   http://${SERVER_IP}:1011/webhook"
+    if [ "$DEPLOY_MODE" = "direct" ]; then
+        echo "  模式:      直连（UFW 限 ${PLATFORM_IP}）"
+        echo "  Webhook:   http://${SERVER_IP}:1011/webhook/<secret>"
+    else
+        echo "  模式:      Cloudflare（隧道 + WAF）"
+        echo "  Webhook:   https://<你的域名>/webhook/<secret>"
+    fi
     echo "  AI 配置:   $(pwd)/data/models.json"
     echo "  日志:      $(pwd)/logs/"
     echo "  数据:      $(pwd)/data/"
