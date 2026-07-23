@@ -15,6 +15,7 @@
     "@earendil-works/pi-coding-agent": "latest"
   },
   "devDependencies": {
+    "@clack/prompts": "latest",
     "@types/bun": "latest",
     "typescript": "^5"
   }

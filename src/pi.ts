@@ -1,108 +1,188 @@
 // Pi agent 集成：用 pi-coding-agent 的 AgentSession + SessionManager 内嵌大脑。
-// Provider 参数化（AI_BASE_URL/AI_API_KEY/DEFAULT_MODEL），支持 DashScope/DeepSeek/智谱等
-// 任意 openai-completions 兼容端点，改 config 即可切换。会话持久化到 data/sessions/<phone>.jsonl。
+// 纯适配——只用 Pi 公开 API：
+//   - provider/model/key 由 data/models.json 承载，Pi 原生读取（ModelRuntime.create({modelsPath})）
+//   - 内置工具 read/bash/edit/write 由 createAgentSession 自动构建（按 tools 名启用），绑定 cwd=./data
+//   - 发送工具 send_image/send_file 经 customTools（ToolDefinition）注册
+//   - system prompt 用 Pi 默认 + appendSystemPromptOverride 追加最小群聊/中文上下文（方便上游升级）
+// 会话持久化到 data/sessions/<phone>.jsonl。
+import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { createProvider, envApiKeyAuth, type Model } from "@earendil-works/pi-ai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { Type } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
   SettingsManager,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { BASE_URL, DEFAULT_GROUP_CONFIG, GROUP_CONFIGS, MODEL, PROVIDER } from "./config.ts";
+import { MODELS_JSON_PATH } from "./config.ts";
 import { log } from "./log.ts";
-import { sendReplyWithMention, sendText } from "./im.ts";
+import {
+  sendFile,
+  sendImage,
+  sendReplyWithMention,
+  sendText,
+  uploadAttachment,
+} from "./im.ts";
 
-// provider id（来自 config.PROVIDER，自洽：model.provider 与 provider.id 一致即可）
-const PROVIDER_ID = PROVIDER;
-
-function buildModel(modelId: string): Model<"openai-completions"> {
-  return {
-    id: modelId,
-    name: modelId,
-    api: "openai-completions",
-    provider: PROVIDER_ID,
-    baseUrl: BASE_URL,
-    reasoning: false,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 131072,
-    maxTokens: 8192,
-  };
-}
-
-function buildProvider() {
-  return createProvider({
-    id: PROVIDER_ID,
-    name: "AI Provider",
-    baseUrl: BASE_URL,
-    auth: { apiKey: envApiKeyAuth("AI API key", ["API_KEY"]) },
-    models: [buildModel(MODEL)],
-    api: openAICompletionsApi(),
-  });
-}
-
-// ModelRuntime 单例（注册 provider，所有 session 共享）
+// ModelRuntime 单例 + 解析出的单模型。从 data/models.json 加载（Pi 原生）。
 let modelRuntime: ModelRuntime | null = null;
-async function getModelRuntime(): Promise<ModelRuntime> {
-  if (!modelRuntime) {
-    modelRuntime = await ModelRuntime.create();
-    modelRuntime.registerNativeProvider(buildProvider());
-    log.info(`Pi ModelRuntime 初始化完成（provider=${PROVIDER}, baseUrl=${BASE_URL}, model=${MODEL}）`);
-  }
-  return modelRuntime;
-}
+let resolvedModel: Model<Api> | null = null;
 
-function resolveModelId(groupId: string): string {
-  return GROUP_CONFIGS[groupId]?.model ?? MODEL;
+async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> }> {
+  if (modelRuntime && resolvedModel) {
+    return { runtime: modelRuntime, model: resolvedModel };
+  }
+
+  // 显式读 models.json 拿到声明的 provider/model id（getProviders() 会混入内置 provider，不能取 [0]）。
+  let providerId: string | undefined;
+  let modelId: string | undefined;
+  try {
+    const raw = JSON.parse(readFileSync(MODELS_JSON_PATH, "utf8")) as {
+      providers?: Record<string, { models?: { id?: string }[] }>;
+    };
+    providerId = Object.keys(raw.providers ?? {})[0];
+    modelId = raw.providers?.[providerId]?.models?.[0]?.id;
+  } catch {
+    throw new Error(
+      `无法读取 ${MODELS_JSON_PATH}。请先生成 AI 配置：` +
+        `docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run scripts/configure.ts`
+    );
+  }
+  if (!providerId || !modelId) {
+    throw new Error(`${MODELS_JSON_PATH} 未声明 provider/model，请重新运行 configure 工具。`);
+  }
+
+  const runtime = await ModelRuntime.create({ modelsPath: MODELS_JSON_PATH });
+  const model = runtime.getModel(providerId, modelId);
+  if (!model) {
+    throw new Error(`${MODELS_JSON_PATH} 中未找到 ${providerId}/${modelId}，请检查配置。`);
+  }
+  modelRuntime = runtime;
+  resolvedModel = model;
+  log.info(`Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}）`);
+  return { runtime, model };
 }
 
 type AgentSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
-// 每用户 AgentSession 缓存（内存）。注：第一步未做 LRU 上限清理。
-const sessions = new Map<string, { session: AgentSession; modelId: string }>();
+// 每用户 AgentSession 缓存（内存）。
+const sessions = new Map<string, AgentSession>();
 
-async function getOrCreateSession(phone: string, groupId: string): Promise<AgentSession> {
-  const modelId = resolveModelId(groupId);
-  const existing = sessions.get(phone);
-  if (existing && existing.modelId === modelId) return existing.session;
-  if (existing) {
-    try {
-      await existing.session.dispose();
-    } catch {
-      /* 忽略 dispose 错误 */
-    }
+/** 追加到 Pi 默认 system prompt 的最小上下文（群聊 + 中文）。刻意最小化，方便 Pi 上游升级。 */
+const CHAT_CONTEXT = `## 运行环境
+你在「量子密信」群聊机器人里。用户用中文 @你 提问，请用中文、用 Markdown 简洁回复。纯文字回复会自动发到群里。`;
+
+/** 加载图片/文件字节：http(s) URL 走 fetch，否则视为 ./data 下的路径读取。 */
+async function loadBytes(source: string): Promise<Uint8Array> {
+  if (/^https?:\/\//i.test(source)) {
+    const r = await fetch(source);
+    if (!r.ok) throw new Error(`下载失败 HTTP ${r.status}: ${source}`);
+    return new Uint8Array(await r.arrayBuffer());
   }
+  const path = source.startsWith("./data/") || source.startsWith("data/") ? source : join("data", source);
+  return new Uint8Array(await readFile(path));
+}
 
-  const runtime = await getModelRuntime();
+function filenameFromSource(source: string): string {
+  const clean = source.split("?")[0];
+  if (/^https?:\/\//i.test(clean)) return clean.split("/").pop() || "download";
+  return clean.split(/[\\/]/).pop() || "file";
+}
+
+/** 构造发送工具（ToolDefinition，闭包捕获 callbackUrl）。 */
+function buildSendTools(callbackUrl: string): ToolDefinition[] {
+  const imageParams = Type.Object({
+    source: Type.String({ description: "图片来源：http(s) URL 或 ./data 下相对路径" }),
+    width: Type.Optional(Type.Number({ description: "宽度（像素，可选）" })),
+    height: Type.Optional(Type.Number({ description: "高度（像素，可选）" })),
+  });
+  const fileParams = Type.Object({
+    source: Type.String({ description: "文件来源：http(s) URL 或 ./data 下相对路径" }),
+    filename: Type.Optional(Type.String({ description: "文件名（可选，默认从 source 推断）" })),
+  });
+
+  const sendImageTool: ToolDefinition<typeof imageParams> = {
+    name: "send_image",
+    label: "发送图片",
+    description: "向当前群聊发送一张图片。source 为图片的 http(s) URL 或 ./data 目录下的本地路径。",
+    promptSnippet: "向群聊发送图片",
+    parameters: imageParams,
+    async execute(_toolCallId, params) {
+      const data = await loadBytes(params.source);
+      const fileId = await uploadAttachment(
+        callbackUrl,
+        data,
+        filenameFromSource(params.source),
+        "image"
+      );
+      if (!fileId) throw new Error(`图片上传失败: ${params.source}`);
+      const ok = await sendImage(fileId, callbackUrl, undefined, params.width, params.height);
+      if (!ok) throw new Error(`图片发送失败: ${params.source}`);
+      return {
+        content: [
+          { type: "text", text: `已发送图片 (${params.width ?? "?"}×${params.height ?? "?"})` },
+        ],
+        details: { fileId, source: params.source },
+      };
+    },
+  };
+
+  const sendFileTool: ToolDefinition<typeof fileParams> = {
+    name: "send_file",
+    label: "发送文件",
+    description: "向当前群聊发送一个文件。source 为文件的 http(s) URL 或 ./data 目录下的本地路径。",
+    promptSnippet: "向群聊发送文件",
+    parameters: fileParams,
+    async execute(_toolCallId, params) {
+      const data = await loadBytes(params.source);
+      const name = params.filename ?? filenameFromSource(params.source);
+      const fileId = await uploadAttachment(callbackUrl, data, name, "file");
+      if (!fileId) throw new Error(`文件上传失败: ${params.source}`);
+      const ok = await sendFile(fileId, callbackUrl);
+      if (!ok) throw new Error(`文件发送失败: ${params.source}`);
+      return { content: [{ type: "text", text: `已发送文件: ${name}` }], details: { fileId, name } };
+    },
+  };
+
+  return [sendImageTool, sendFileTool];
+}
+
+async function getOrCreateSession(phone: string, callbackUrl: string): Promise<AgentSession> {
+  const existing = sessions.get(phone);
+  if (existing) return existing;
+
+  const { runtime, model } = await getRuntime();
   const sessionManager = SessionManager.open(join("data", "sessions", `${phone}.jsonl`));
   const settingsManager = SettingsManager.inMemory();
   const resourceLoader = new DefaultResourceLoader({
-    cwd: "./data", // 隔离 Pi 的 context：避免读到项目根的 README/AGENTS.md 污染对话
+    cwd: "./data", // 隔离 Pi context + 内置工具的工作目录
     agentDir: "./.pi",
     settingsManager,
-    systemPrompt: DEFAULT_GROUP_CONFIG.system_prompt,
-    noExtensions: true,
+    noExtensions: true, // 不加载发现的 .pi 扩展（不影响 createAgentSession 自建的内置工具）
     noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
+    appendSystemPromptOverride: (base) => [...base, CHAT_CONTEXT], // 保留 Pi 默认 prompt + 追加最小群聊上下文
   });
   await resourceLoader.reload();
 
   const { session } = await createAgentSession({
-    cwd: "./data", // 同上，隔离 context
-    model: buildModel(modelId),
+    cwd: "./data", // 内置工具（read/bash/edit/write）绑定到此目录
+    model,
     modelRuntime: runtime,
     sessionManager,
     settingsManager,
     resourceLoader,
-    noTools: "all",
+    tools: ["read", "bash", "edit", "write", "send_image", "send_file"], // 启用内置 + 发送工具
+    customTools: buildSendTools(callbackUrl),
     thinkingLevel: "off",
   });
-  sessions.set(phone, { session, modelId });
+  sessions.set(phone, session);
   return session;
 }
 
@@ -123,10 +203,10 @@ export async function handleUserMessage(
   content: string,
   callbackUrl: string
 ): Promise<void> {
-  const session = await getOrCreateSession(phone, groupId);
+  const session = await getOrCreateSession(phone, callbackUrl);
   // 开始反馈：让用户知道已收到、正在处理（@ 触发通知）
   await sendText("🤔 正在思考...", groupId, phone, callbackUrl);
-  // 订阅工具执行事件 → 每步 text@ 进度（agent 启用工具后生效；第一步 noTools 无工具事件）
+  // 订阅工具执行事件 → 每步 text@ 进度（agent 调 read/bash/send_* 等工具时触发）
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const unsub: (() => void) | undefined =
     typeof session.subscribe === "function"
@@ -155,9 +235,9 @@ export async function handleUserMessage(
 
 /** 应用关闭时释放所有 session。 */
 export async function disposeAllSessions(): Promise<void> {
-  for (const [, entry] of sessions) {
+  for (const [, session] of sessions) {
     try {
-      await entry.session.dispose();
+      await session.dispose();
     } catch {
       /* 忽略 */
     }
