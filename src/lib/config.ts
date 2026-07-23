@@ -1,4 +1,4 @@
-// 全局常量。应用层零配置：AI 配置由 data/models.json 承载（Pi 原生读取，见 pi.ts），
+// 全局常量。应用层零配置：AI 配置由 data/models.json 承载（Pi 原生读取，见 src/agent/agent.ts），
 // 由 scripts/configure.ts 生成。无 .env、无 config.json；访问控制交给服务器防火墙。
 // 所有时间常量统一毫秒（Date.now()/setTimeout 均为 ms）。
 

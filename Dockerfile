@@ -25,4 +25,4 @@ EXPOSE 1011
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD bun -e "fetch('http://localhost:1011/favicon.svg').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-CMD ["bun", "run", "src/index.ts"]
+CMD ["bun", "run", "src/server/index.ts"]

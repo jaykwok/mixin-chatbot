@@ -1,9 +1,8 @@
 ﻿__pycache__/
 .vscode/
 .claude/
-.codefree/
 .venv/
-logs/*.log
+logs/
 data/
 .env
 node_modules/

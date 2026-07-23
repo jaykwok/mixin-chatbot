@@ -1,7 +1,7 @@
 // webhook 处理逻辑：字段校验、请求去重、速率限制、后台异步处理（per-phone 串行）。
 // 对应 Python 版 app.py 的 webhook 部分。
 import { createHash } from "node:crypto";
-import { log } from "./log.ts";
+import { log } from "../lib/log.ts";
 import {
   DEDUP_TTL,
   DEBUG,
@@ -11,10 +11,10 @@ import {
   REQUIRED_WEBHOOK_FIELDS,
   VALID_CALLBACK_PORTS,
   VALID_HOSTNAMES,
-} from "./config.ts";
-import { HttpError } from "./auth.ts";
-import { sendReplyWithMention } from "./im.ts";
-import { handleUserMessage } from "./pi.ts";
+} from "../lib/config.ts";
+import { HttpError } from "./http.ts";
+import { sendReplyWithMention } from "../im/im.ts";
+import { handleUserMessage } from "../agent/agent.ts";
 
 // 请求去重（Map 保持插入顺序，按序清过期）
 const recentRequests = new Map<string, number>();
