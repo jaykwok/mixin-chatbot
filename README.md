@@ -1,272 +1,170 @@
 # 量子密信群聊协作机器人
 
-量子密信 IM 平台群聊协作机器人 (Mixin Chatbot)，基于 FastAPI + 阿里云 DashScope API。
+量子密信 IM 平台群聊协作机器人，以 [Pi agent](https://pi.dev)（TypeScript agent 框架）为大脑：收到群聊 @ 消息 → Pi agent 推理（可调用工具）→ 把回复发回群里。
 
 ## 技术栈
 
 | 组件 | 技术 |
 |------|------|
-| 框架 | FastAPI + Uvicorn |
-| AI | AsyncOpenAI (DashScope 兼容接口) |
-| 存储 | SQLite (aiosqlite) 会话持久化 |
-| HTTP | httpx 异步请求 |
-| 部署 | Docker (Debian 13) |
+| 运行时 | Bun（原生 TS） |
+| Web 框架 | Hono（跑在 Bun.serve） |
+| Agent 大脑 | `@earendil-works/pi-coding-agent`（AgentSession + SessionManager） |
+| 模型接入 | Pi 原生读 `data/models.json`，支持 DashScope / DeepSeek / 智谱等 openai 兼容端点 |
+| 部署 | Docker（Debian，oven/bun 镜像） |
 
-## 部署指南
+## 工作方式
 
-### 前提条件
+机器人只接收**文字**消息（群聊 webhook）。Pi agent 拿到后可调用工具：
 
-- Debian 13 服务器 (已测试)
-- 阿里云 DashScope API Key
+- 内置：`read` / `bash` / `edit` / `write`（在 `./data` 目录读写文件、运行终端命令、联网查询）
+- 自定义：`send_image` / `send_file`（往群里发送图片或文件）
 
-### 第一步：服务器初始化 (仅首次)
+最终文字回复自动以 **markdown 正文 + text@ 通知**双消息发到群里（markdown 不支持 @，故另发一条 text 触发通知）。
 
-将项目上传到服务器后，运行初始化脚本：
+## 配置：零应用配置
+
+应用层无 `.env`、无 `config.json`：
+
+- **AI 配置**（provider / key / model / 元数据）：全部在 `data/models.json`，由 TUI 工具 `scripts/configure.ts` 生成，Pi 原生读取。
+- **应用参数**：端口 1011 等均为代码常量（`src/config.ts`）。
+- **访问控制**：无应用层鉴权 / 白名单，交给服务器防火墙（见 `setup-server.sh`）。
+
+## 部署
+
+### 1. 服务器初始化（仅首次）
+
+Debian 服务器，root 运行：
 
 ```bash
 chmod +x setup-server.sh deploy.sh
 sudo ./setup-server.sh
 ```
 
-该脚本会自动完成以下配置：
-
-| 配置项 | 说明 |
-|--------|------|
-| Docker | 安装并启用 docker.io |
-| UFW 防火墙 | 默认拒绝入站，仅开放 22 (SSH) 和 1011 (Mixin-Chatbot) |
-| fail2ban | SSH 连续 3 次登录失败后封禁 IP 2 小时 |
-| 自动安全更新 | 通过 unattended-upgrades 自动安装安全补丁 |
-| 内核优化 | swappiness=10、TCP 加固、SYN Flood 防护 |
-| Docker 日志 | 全局日志轮转 (单文件 5MB，最多 2 份) |
-
-脚本需要 root 权限。执行完成后，确保当前用户已加入 docker 组：
+完成：安装 Docker、UFW 防火墙（仅 22 SSH + 1011）、fail2ban、自动安全更新、内核优化、Docker 日志轮转。
 
 ```bash
-sudo usermod -aG docker $USER
-newgrp docker
+sudo usermod -aG docker $USER && newgrp docker
 ```
-### 第二步：部署应用
+
+### 2. 部署应用
 
 ```bash
 ./deploy.sh
 ```
 
-**首次部署时**，脚本会检测到 `.env` 不存在，自动进入交互式配置流程，按提示输入即可：
+流程：
 
-| 提示项 | 说明 | 默认值 |
-|--------|------|--------|
-| DashScope API Key | 阿里云 API 密钥，以 `sk-` 开头 (必填) | 无 |
-| 管理页面用户名 | 管理后台登录用户名 | `admin` |
-| 管理页面密码 | 管理后台登录密码 (必填，需输入两次确认) | 无 |
-| 群组模型配置 | 格式 `群组ID:模型名`，多个逗号分隔，可留空 | 空 |
-| AI API 地址 | DashScope 接口地址 | 阿里云国内版 |
+1. 构建 Docker 镜像（bun）
+2. **AI 配置**：若 `data/models.json` 不存在，在容器内运行 TUI（选 provider、填 key、选模型，元数据从 LiteLLM 抓取）；已存在则询问是否重配
+3. 启动容器（只读根文件系统、最小权限、挂载 `data/` 与 `logs/`）
+4. 等待健康检查、输出服务信息
 
-配置完成后脚本自动生成 `.env`（权限 600）并继续部署。后续部署会跳过配置步骤，如需修改直接编辑 `.env` 后重新运行即可。
-
-脚本执行流程：
-
-1. 检查 Docker 权限、必要文件
-2. **交互式生成 `.env`**（仅首次，已存在则跳过）
-3. 创建 `logs/`、`data/` 目录并设置权限
-4. 停止并清理旧容器 (如有)
-5. 构建 Docker 镜像，清理悬空镜像回收磁盘
-6. 启动容器 (只读文件系统、最小权限)
-7. 等待健康检查通过
-8. 输出服务信息
-
-部署成功后输出：
-
-```
-==========================================
-  部署完成
-==========================================
-
-  Webhook:  http://<服务器IP>:1011/webhook
-  管理页面: http://<服务器IP>:1011/admin
-```
-
-### 更新部署
-
-代码更新后重新运行即可，会自动替换旧容器：
+重新配置 AI（不重新部署）：
 
 ```bash
-git pull
-./deploy.sh
+docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run scripts/configure.ts
 ```
 
-会话数据保存在 `data/` 目录中，更新不会丢失。
-
-### `.env` 变量说明
-
-如需手动编辑 `.env`，各变量含义如下：
-
-| 变量 | 说明 |
-|------|------|
-| `DASHSCOPE_API_KEY` | 阿里云 DashScope API 密钥 |
-| `APP_USERNAME` | 管理页面登录用户名 |
-| `APP_PASSWORD` | 管理页面登录密码 |
-| `GROUP_CONFIGS` | 群组模型配置 (可选)，格式为 `群组ID:模型名`，多个用逗号分隔 |
-| `AI_BASE_URL` | AI API 地址 (可选)，默认阿里云国内版，国际版改为 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
-
-- 群组 ID 可在管理页面的活跃会话列表中查看，也可从服务器日志获取
-- 未匹配到配置的群组使用默认模型 `kimi-k2.5`
-- 修改后需重启容器生效：`docker restart mixin-chatbot`
-
-## 日常运维
-
-### 常用命令
+### 更新
 
 ```bash
-docker logs -f mixin-chatbot        # 查看实时日志
-docker restart mixin-chatbot         # 重启服务
-docker stop mixin-chatbot            # 停止服务
-docker stats mixin-chatbot           # 查看资源占用
-docker exec -it mixin-chatbot bash    # 进入容器 (只读，仅供排查)
+git pull && ./deploy.sh
 ```
 
-### 日志位置
+会话历史保存在 `data/sessions/*.jsonl`，更新不丢失。
 
-| 日志 | 位置 | 轮转策略 |
-|------|------|---------|
-| 应用日志 | `logs/mixin-chatbot.log` | 5MB x 3 份 |
-| Docker 日志 | `docker logs mixin-chatbot` | 5MB x 2 份 |
+## 接口
 
-### 数据管理
-
-- 会话数据库：`data/sessions.db` (SQLite)
-- 会话可永久保留（设置config.py的SESSION_TIMEOUT=0），避免超时清空
-- 历史消息上限：每用户保留最近 20 条消息（约 10 轮对话）
-- 管理页面最多展示最近 500 个会话
-- 后台每 5 分钟执行磁盘容量检查
-- 数据库超过 5GB 自动按比例删除最旧会话
-
-## 接口说明
-
-| 端点 | 方法 | 认证 | 说明 |
-|------|------|------|------|
-| `/webhook` | POST | 无 | IM 平台 Webhook 回调入口 |
-| `/admin` | GET | Basic Auth | Web 管理页面 |
-| `/admin/api` | GET | Basic Auth | 管理页面数据接口 (JSON) |
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/webhook` | POST | IM 平台回调入口（无应用层鉴权，靠防火墙） |
+| `/favicon.svg` | GET | 图标（健康检查用） |
 
 ### Webhook 请求格式
 
-IM 平台推送的 JSON 格式：
-
 ```json
 {
-    "type": "text",
-    "textMsg": { "content": "用户消息内容" },
-    "phone": "用户手机号",
-    "groupId": "群组ID",
-    "callBackUrl": "https://im.zdxlz.com/..."
+  "type": "text",
+  "textMsg": { "content": "用户消息内容" },
+  "phone": "用户手机号",
+  "groupId": "群组ID",
+  "callBackUrl": "https://imtwo.zdxlz.com/send?key=<robot_key>"
 }
 ```
 
-### 管理页面
-
-访问 `http://<服务器IP>:1011/admin`，浏览器会弹出 Basic Auth 登录框。
-
-功能：
-- 查看所有活跃会话、所属群组 ID 及最近对话预览
-- 查看群组模型配置
-- 每 30 秒自动刷新
+`callBackUrl` 的 hostname 必须在白名单（`imtwo.zdxlz.com` / `im.zdxlz.com`），防止 SSRF。
 
 ## 目录结构
 
 ```
 mixin-chatbot/
-├── app.py                # FastAPI 主应用 (路由、去重、异步调度)
-├── ai_service.py         # AI 模型调用 (AsyncOpenAI 流式接收)
-├── im_service.py         # IM 平台消息回调 (httpx + 失败重试)
-├── session_manager.py    # 会话持久化 (aiosqlite + LRU 缓存)
-├── auth.py               # Basic Auth 认证 (常量时间比较)
-├── config.py             # 集中配置管理 (.env 加载 + 所有常量)
-├── utils.py              # 日志配置
-├── requirements.txt      # Python 依赖
-├── Dockerfile            # Docker 镜像定义 (Python 3.13-slim)
-├── .dockerignore         # Docker 构建排除列表
-├── .gitignore            # Git 忽略规则
-├── deploy.sh             # 应用部署脚本
-├── setup-server.sh       # 服务器初始化脚本 (防火墙/fail2ban/内核)
-├── static/
-│   ├── admin.html        # 管理页面 (前后端分离，fetch API)
-│   └── favicon.svg       # 网站图标
-├── data/                 # SQLite 数据库 (Docker volume 挂载)
-└── logs/                 # 应用日志 (Docker volume 挂载)
+├── src/
+│   ├── index.ts        # 入口：Hono + Bun.serve + /webhook 路由
+│   ├── webhook.ts      # 字段校验、去重、限流、后台异步（per-phone 串行）
+│   ├── pi.ts           # Pi agent 集成（models.json 加载 + 工具 + prompt）
+│   ├── im.ts           # 量子密信发送层（text/markdown/image/file + 上传）
+│   ├── auth.ts         # HttpError + 客户端 IP（鉴权已移除）
+│   ├── config.ts       # 纯常量（端口 / 限流 / 日志等）
+│   └── log.ts          # 日志（console + 文件轮转）
+├── scripts/
+│   └── configure.ts    # TUI：生成 data/models.json（LiteLLM 元数据）
+├── static/favicon.svg
+├── data/               # models.json + sessions/*.jsonl（Pi 会话持久化）
+├── logs/               # 应用日志
+├── Dockerfile          # oven/bun:1-debian
+├── deploy.sh           # 部署脚本
+├── setup-server.sh     # 服务器加固脚本
+└── package.json
 ```
 
-## 安全措施
+## 安全
 
 ### 容器层
 
-| 措施 | 说明 |
-|------|------|
-| `--read-only` | 容器文件系统只读，无法写入恶意文件 |
-| `--cap-drop ALL` | 移除所有 Linux capabilities |
-| `--security-opt no-new-privileges` | 禁止进程提权 |
-| 非 root 运行 | 容器内以 UID 1001 (appuser) 运行 |
-| `--tmpfs /tmp:size=10m` | 仅 /tmp 可写，限制 10MB |
+- `--read-only` 只读根文件系统
+- `--cap-drop ALL` + `--security-opt no-new-privileges`
+- 非 root 运行（UID 1001）
+- `--tmpfs /tmp` + `--tmpfs /app/.pi`（Pi agentDir）
 
 ### 应用层
 
-| 措施 | 说明 |
-|------|------|
-| 回调 URL 校验 | 解析 hostname 校验，防止 SSRF |
-| 请求去重 | 30 秒内相同请求自动跳过，防止重复回复 |
-| 错误脱敏 | 异常信息不返回给用户，仅记录到服务端日志 |
-| Auth 时序安全 | 使用 `hmac.compare_digest` 防止时序攻击 |
+- 回调 URL hostname 白名单（防 SSRF）
+- 请求去重（30 秒内相同请求跳过，防重复回复）
+- 错误信息脱敏（仅记日志，不回传用户）
+- ⚠️ agent 有 `bash` 工具：仅可信群成员可 @ 触发；工具工作目录限定在 `./data`
 
-### 系统层
+### 系统层（setup-server.sh）
 
-| 措施 | 说明 |
-|------|------|
-| UFW 防火墙 | 仅开放 22 和 1011 端口 |
-| fail2ban | SSH 暴力破解防护 |
-| 自动安全更新 | Debian 安全补丁自动安装 |
-| TCP 加固 | SYN Cookie、禁用 ICMP 重定向 |
+- UFW 防火墙（22 + 1011）
+- fail2ban（SSH 暴力破解防护）
+- 自动安全更新、TCP 加固
 
-## 资源限制
-
-针对低配服务器 (1核 / 1GB 内存 / 20GB SSD) 优化：
+## 资源限制（1C1G 服务器）
 
 | 资源 | 限制 |
 |------|------|
-| 容器内存 | 400MB (swap 512MB) |
+| 容器内存 | 512MB（swap 768MB） |
 | 容器 CPU | 1 核 |
-| 应用日志 | 5MB x 3 份 = 15MB |
-| Docker 日志 | 5MB x 2 份 = 10MB |
-| 会话数据库 | 超过 5GB 按比例清理至 4GB |
-| 内存缓存 | LRU 100 个活跃会话 |
-| 去重字典 | 最多 1000 条（30秒 TTL） |
-| 管理 API | 最多返回 500 个会话 |
-| 内核 swappiness | 10 (优先使用物理内存) |
+| 应用日志 | 5MB × 3 |
+| Docker 日志 | 5MB × 2 |
+| 去重字典 | 1000 条 / 30s |
+
+## 日常运维
+
+```bash
+docker logs -f mixin-chatbot          # 实时日志
+docker restart mixin-chatbot          # 重启
+docker stats mixin-chatbot            # 资源占用
+```
+
+应用日志：`logs/mixin-chatbot.log`（5MB × 3 轮转）。
 
 ## 故障排查
 
 | 现象 | 可能原因 | 解决方法 |
 |------|---------|---------|
-| 容器启动后立刻退出 | `.env` 配置缺失或格式错误 | `docker logs mixin-chatbot` 查看错误信息，检查 `.env` 中必填项是否完整 |
-| 健康检查超时 | 端口冲突或应用启动异常 | `docker logs mixin-chatbot` 查看启动日志，确认 1011 端口未被占用 |
-| IM 消息收不到回复 | 回调地址不可达或防火墙拦截 | 确认 webhook 地址配置正确，检查 `ufw status` 确认 1011 端口已开放 |
-| AI 回复超时或报错 | API Key 无效或网络不通 | 检查 `.env` 中 `DASHSCOPE_API_KEY` 是否正确，确认服务器可访问阿里云 API |
-| 管理页面无法登录 | 用户名密码错误 | 检查 `.env` 中 `APP_USERNAME` 和 `APP_PASSWORD`，修改后 `docker restart mixin-chatbot` |
-| 磁盘空间不足 | 日志或数据库过大 | `docker system prune -f` 清理镜像缓存，检查 `data/sessions.db` 大小 |
-
-## 更新日志
-
-### 2026-04-01
-
-- **会话永久保留**: 取消 30 分钟无活动自动清空机制，会话不再因超时丢失
-- **修复并发竞态**: 同一用户快速连发消息时，使用 per-user 锁保护会话读写，防止历史消息丢失
-- **管理 API 加分页上限**: 最多返回最近 500 个会话，防止数据量过大导致内存爆炸或浏览器崩溃
-- **去重字典加容量上限**: 限制最大 1000 条，防止高并发下内存无限增长
-- **去重 key 改用原始内容**: 替换 `hash()` 避免哈希碰撞和跨进程不一致问题
-- **错误回复容错**: 请求处理失败后发送错误提示时，捕获发送异常避免静默丢失
-- **修复 incremental_vacuum 无效问题**: 数据库初始化时设置 `auto_vacuum=INCREMENTAL`
-- **优化数据库容量清理**: 基于行数比例一次性清理，替代 WAL 模式下文件大小不准确的循环检测
-
-### 2026-07-17
-
-- **项目重命名**: 从 `chatbot` 重命名为 `mixin-chatbot`，统一容器名、镜像名、日志文件名
-- **交互式部署配置**: 首次部署时自动检测 `.env` 是否存在，不存在则通过问答式交互收集 API Key、管理员账号密码、群组配置等信息，自动生成 `.env`，无需手动创建
-- **清理死代码**: 移除未被调用的 `get_session_count()` 函数
+| 启动报 `无法读取 data/models.json` | 未配置 AI | 运行 configure TUI 生成 `data/models.json` |
+| 健康检查超时 | 端口冲突 / 启动异常 | `docker logs mixin-chatbot`，确认 1011 未被占用 |
+| IM 收不到回复 | 回调地址不可达 / 防火墙 | 确认 `callBackUrl`、`ufw status` 确认 1011 开放 |
+| AI 回复报错 | models.json 的 key / 模型有误 | 重跑 configure TUI |
+| 云电脑迁移后偶发不通 | 前半段（平台→边缘）不稳 | 见 cloudflared 隧道方案（另文） |
