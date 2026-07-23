@@ -4,6 +4,7 @@
 .claude
 .codefree
 __pycache__
+node_modules
 logs
 data
 *.pyc

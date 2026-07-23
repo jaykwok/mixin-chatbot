@@ -1,11 +1,12 @@
-// 入口：Hono app + Bun.serve + 路由 + lifespan。对应 Python app.py。
+// 入口：Hono app + Bun.serve + /webhook 路由 + lifespan。
+// 无管理页面、无鉴权白名单（安全交防火墙）；AI 配置见 data/models.json。
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { log } from "./log.ts";
-import { DEFAULT_GROUP_CONFIG, RATE_LIMIT_CLEANUP_INTERVAL } from "./config.ts";
-import { authorizeWebhook, getClientIp, HttpError, requireAdminAuth } from "./auth.ts";
+import { PORT, RATE_LIMIT_CLEANUP_INTERVAL } from "./config.ts";
+import { getClientIp, HttpError } from "./auth.ts";
 import {
   cleanupRateLimits,
   enqueueUserRequest,
@@ -29,7 +30,6 @@ app.post("/webhook", async (c) => {
     throw new HttpError(400, "请求必须是JSON格式");
   }
 
-  authorizeWebhook(data, clientIp);
   const { phone, groupId, content, callbackUrl } = validateWebhookData(
     data as Record<string, unknown>
   );
@@ -50,44 +50,6 @@ app.post("/webhook", async (c) => {
   // ack 200，后台异步处理（per-phone 串行）
   enqueueUserRequest(content, phone, groupId, callbackUrl, clientIp);
   return c.json({ status: "success" });
-});
-
-app.get("/admin", requireAdminAuth, async (c) => {
-  const html = await readFile(join("static", "admin.html"));
-  return new Response(html, {
-    headers: { "Content-Type": "text/html; charset=utf-8" },
-  });
-});
-
-app.get("/admin/api", requireAdminAuth, async (c) => {
-  // 扫描 data/sessions/*.jsonl 列出会话（Pi SessionManager 持久化于此）
-  const now = Date.now();
-  const sessions: Record<string, Record<string, unknown>> = {};
-  try {
-    const dir = join("data", "sessions");
-    for (const f of await readdir(dir)) {
-      if (!f.endsWith(".jsonl")) continue;
-      const phone = f.slice(0, -6); // 去掉 .jsonl
-      const st = await stat(join(dir, f));
-      sessions[phone] = {
-        message_count: 0,
-        group_id: "",
-        model: DEFAULT_GROUP_CONFIG.model,
-        last_active: new Date(st.mtimeMs).toLocaleString("zh-CN", { hour12: false }),
-        active_duration: Math.floor((now - st.mtimeMs) / 1000),
-        recent_messages: [],
-      };
-    }
-  } catch {
-    // data/sessions 不存在（尚无会话）
-  }
-  return c.json({
-    status: "success",
-    active_sessions: Object.keys(sessions).length,
-    sessions,
-    default_model: DEFAULT_GROUP_CONFIG.model,
-    current_time: new Date().toLocaleString("zh-CN", { hour12: false }),
-  });
 });
 
 app.get("/favicon.svg", async (c) =>
@@ -111,7 +73,6 @@ app.onError((err, c) => {
 });
 app.notFound((c) => c.json({ status: "error", message: "Not Found" }, 404));
 
-const PORT = Number(process.env.PORT ?? "1011");
 log.info(`服务启动完成，监听端口: ${PORT}`);
 
 const rateLimitTimer = setInterval(() => {
