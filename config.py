@@ -93,7 +93,12 @@ LOG_BACKUP_COUNT = 3
 DEFAULT_MODEL = _env("DEFAULT_MODEL", "qwen3.7-plus")
 DEFAULT_GROUP_CONFIG = {
     "model": DEFAULT_MODEL,
-    "system_prompt": "你是聊天机器人，以纯文本形式回复用户的问题。不要使用任何格式，例如Markdown。",
+    # 群聊 webhook 的 type=markdown 消息会被客户端原生渲染（已实测），
+    # 因此鼓励 AI 用 markdown 输出，比纯文本更清晰。
+    "system_prompt": (
+        "你是聊天机器人。请使用 Markdown 格式回复，恰当使用标题、**粗体**、"
+        "列表、表格、代码块等让回复清晰易读。保持简洁、聚焦问题，避免过度装饰。"
+    ),
 }
 
 # 从 .env 解析群组配置，格式: GROUP_CONFIGS=群组ID1:模型名1,群组ID2:模型名2

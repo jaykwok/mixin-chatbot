@@ -13,7 +13,12 @@ from fastapi.responses import JSONResponse, FileResponse
 from utils import setup_logging
 from session_manager import init_db, get_all_sessions, clean_expired_sessions, close_db
 from ai_service import get_ai_response
-from im_service import send_message_to_im, close_client
+from im_service import (
+    send_message_to_im,
+    send_markdown_to_im,
+    send_reply_with_mention,
+    close_client,
+)
 from auth import verify_auth
 from config import (
     GROUP_CONFIGS, DEFAULT_GROUP_CONFIG, VALID_HOSTNAMES,
@@ -232,7 +237,7 @@ async def process_request(
                 "[DEBUG] AI 响应 - 用户: %s, 响应长度: %d, 响应内容: %s",
                 phone, len(ai_response), ai_response,
             )
-        await send_message_to_im(ai_response, group_id, phone, callback_url)
+        await send_reply_with_mention(ai_response, group_id, phone, callback_url)
 
         elapsed = time.time() - start_time
         logger.info(f"请求处理完成 - 用户: {phone}, 耗时: {elapsed:.2f}秒")
@@ -240,11 +245,10 @@ async def process_request(
         elapsed = time.time() - start_time
         logger.error(f"请求处理失败 - 用户: {phone}, 耗时: {elapsed:.2f}秒, 错误: {e}")
         try:
-            await send_message_to_im(
-                "抱歉，处理您的请求时出现了问题，请稍后再试。",
-                group_id,
-                phone,
+            await send_markdown_to_im(
+                "⚠️ 抱歉，处理您的请求时出现了问题，请稍后再试。",
                 callback_url,
+                phone,
             )
         except Exception as send_err:
             logger.error(f"错误回复发送失败 - 用户: {phone}, 错误: {send_err}")
