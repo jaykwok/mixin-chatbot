@@ -64,6 +64,16 @@ if (-not (Test-Path "data/webhook-secret")) {
     Done "existing webhook-secret reused"
 }
 
+# ---- 4b. Pi agent working directory (where read/bash/edit/write operate) ----
+Step "Pi agent working directory"
+Write-Host "  Default 'data' = .\data inside the repo (isolated scratch + tool workspace)."
+Write-Host "  Pick another folder to let the agent work elsewhere (relative to repo, or absolute)."
+Write-Host "  Sessions stay in data\sessions regardless of this choice."
+$wdIn = Read-Host "Agent working dir [default: data]"
+$AgentCwd = if ($wdIn) { $wdIn.Trim() } else { "data" }
+if (-not (Test-Path $AgentCwd)) { New-Item -ItemType Directory -Force -Path $AgentCwd | Out-Null }
+Done "agent cwd: $AgentCwd"
+
 # ---- 5. deploy mode ----
 Step "Deploy mode:"
 Write-Host "  1) Direct      - server has a public IP; open port $Port in Windows Firewall"
@@ -78,12 +88,25 @@ Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyCont
     Where-Object { $_.CommandLine -like "*index.ts*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-# ---- 7. run (scheduled task if admin, else foreground) ----
+# ---- 7. launcher (bakes AGENT_CWD into the launch cmd; scheduled tasks don't re-read User env) + run ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $bunPath = (Get-Command bun).Source
+
+# single-quote-escape for embedding paths into the generated launcher
+function Sq($s) { return "'" + ($s -replace "'", "''") + "'" }
+$launcher = Join-Path $Project "scripts\.bot-launcher.ps1"
+$launcherBody = @"
+`$ErrorActionPreference = 'Stop'
+`$env:AGENT_CWD = $(Sq $AgentCwd)
+Set-Location $(Sq $Project)
+& $(Sq $bunPath) run $(Sq $Entry)
+"@
+Set-Content -Path $launcher -Value $launcherBody -Encoding UTF8
+
 if ($isAdmin) {
     Step "Installing as Windows Scheduled Task '$TaskName' (auto-start, restart on failure)..."
-    $action    = New-ScheduledTaskAction -Execute $bunPath -Argument "run `"$Entry`"" -WorkingDirectory $Project
+    $fileArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcher + '"'
+    $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $fileArg -WorkingDirectory $Project
     $trigger   = New-ScheduledTaskTrigger -AtStartup
     $settings  = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
@@ -92,10 +115,12 @@ if ($isAdmin) {
     }
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
     Start-ScheduledTask -TaskName $TaskName
-    Done "bot started. Manage: Get-ScheduledTask $TaskName | Stop-ScheduledTask ; logs: logs\mixin-chatbot.log"
+    Done "bot started (agent cwd=$AgentCwd). Manage: Get-ScheduledTask $TaskName | Stop-ScheduledTask ; logs: logs\mixin-chatbot.log"
     Warn "task runs at startup/logon as $env:USERNAME (needs the user logged on; enable auto-logon for always-on)."
 } else {
     Warn "non-admin: running in foreground (Ctrl+C to stop). Re-run as admin to install as a service."
+    $env:AGENT_CWD = $AgentCwd
+    Set-Location $Project
     & $bunPath run $Entry
 }
 

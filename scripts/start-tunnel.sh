@@ -3,26 +3,54 @@
 #
 # 前置：
 #   1) 机器人已在本机 :1011 跑起来（./deploy.sh 选 Cloudflare 模式）
-#   2) 隧道 token 已放到 data/tunnel-token（从服务器 /root/.cpa-bot-tunnel-token.env 拷过来）
-#      或导出环境变量 TUNNEL_TOKEN
+#   2) 隧道 token。来源（按优先级）：
+#        位置参数：./scripts/start-tunnel.sh <token-file>   # 路径，相对或绝对
+#        环境变量：TUNNEL_TOKEN_FILE=<path>                 # 指定文件
+#        环境变量：TUNNEL_TOKEN=<raw-token>                 # 直接给值
+#        默认：    data/tunnel-token                        # raw 值或 .env 形式均可
+#      token 文件可以是 raw token，也可以是直接拷来的 .env
+#      （如服务器 .cpa-bot-tunnel-token.env，内含 TUNNEL_TOKEN=<value>）。
 #
-# 用法： ./scripts/start-tunnel.sh
+# 用法： ./scripts/start-tunnel.sh [token-file]
 set -euo pipefail
 
 BOT_PORT="${BOT_PORT:-1011}"
-TOKEN_FILE="data/tunnel-token"
 
-# ---- 1. 取 token ----
+# 从 .env 形式文件取 TUNNEL_TOKEN 的值（取等号后整段）；非 .env 则退出 7。
+extract_env_token() {
+    awk '
+        /^[[:space:]]*TUNNEL_TOKEN[[:space:]]*=/ { sub(/^[^=]*=/, ""); print; found=1; exit }
+        END { exit (found ? 0 : 7) }
+    ' "$1"
+}
+
+# ---- 1. 取 token（位置参数 > $TUNNEL_TOKEN_FILE > 默认 data/tunnel-token）----
+TOKEN_FILE="${1:-${TUNNEL_TOKEN_FILE:-data/tunnel-token}}"
+
 if [ -z "${TUNNEL_TOKEN:-}" ]; then
     if [ -f "$TOKEN_FILE" ]; then
-        TUNNEL_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+        if val="$(extract_env_token "$TOKEN_FILE")" && [ -n "$val" ]; then
+            TUNNEL_TOKEN="$val"
+        else
+            TUNNEL_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+        fi
+        echo "ℹ token 来自文件：$(cd "$(dirname "$TOKEN_FILE")" && pwd)/$(basename "$TOKEN_FILE")"
     else
         echo "✗ 未找到隧道 token。" >&2
-        echo "  把服务器 /root/.cpa-bot-tunnel-token.env 里的 TUNNEL_TOKEN 值写入 $TOKEN_FILE，" >&2
-        echo "  或： export TUNNEL_TOKEN=<...>" >&2
+        echo "  用法（按优先级）：" >&2
+        echo "    ./scripts/start-tunnel.sh [token-file]   # 相对/绝对路径，默认 data/tunnel-token" >&2
+        echo "    export TUNNEL_TOKEN_FILE=/path/to/file   # 或指定文件" >&2
+        echo "    export TUNNEL_TOKEN=<raw-token>          # 或直接给值" >&2
+        echo "  token 可直接拷服务器 .cpa-bot-tunnel-token.env 整个文件来用" >&2
         exit 1
     fi
+else
+    echo "ℹ 使用环境变量 TUNNEL_TOKEN"
 fi
+
+# 统一清洗：只保留 base64 字符（去空白/引号/BOM/CR）
+TUNNEL_TOKEN="$(printf '%s' "$TUNNEL_TOKEN" | tr -cd 'A-Za-z0-9+/=_-')"
+[ -n "$TUNNEL_TOKEN" ] || { echo "✗ token 清洗后为空" >&2; exit 1; }
 
 # ---- 2. 确保 cloudflared ----
 if ! command -v cloudflared >/dev/null 2>&1; then

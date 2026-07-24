@@ -16,7 +16,7 @@
 
 机器人只接收**文字**消息（群聊 webhook）。Pi agent 拿到后可调用工具：
 
-- 内置：`read` / `bash` / `edit` / `write`（在 `./data` 目录读写文件、运行终端命令、联网查询）
+- 内置：`read` / `bash` / `edit` / `write`（在 **agent 工作目录**读写文件、运行终端命令、联网查询；默认 `./data`，部署时可改为任意目录）
 - 自定义：`send_image` / `send_file`（往群里发送图片或文件）
 
 最终文字回复自动以 **markdown 正文 + text@ 通知**双消息发到群里（markdown 不支持 @，故另发一条 text 触发通知）。
@@ -27,6 +27,7 @@
 
 - **AI 配置**（provider / key / model / 元数据）：全部在 `data/models.json`，由 TUI 工具 `scripts/configure.ts` 生成，Pi 原生读取。
 - **应用参数**：端口 1011 等均为代码常量（`src/lib/config.ts`）。
+- **agent 工作目录**（可选）：内置工具 `read/bash/edit/write` 的根，默认 `./data`。部署时交互可改（`deploy.ps1`/`deploy.sh` 会问），或直接设环境变量 `AGENT_CWD`（相对仓库或绝对路径均可）。会话历史仍存 `data/sessions`，不随工作目录移动。
 - **访问控制**：随机密钥路径（`data/webhook-secret`，应用层）+ 网络层 IP 闸门（直连=UFW / Cloudflare=WAF），见下方「部署模式」与「安全」。
 
 ## 部署模式：直连 / Cloudflare
@@ -97,10 +98,15 @@ git pull && ./deploy.sh
 1. `git clone` 仓库到云电脑，按系统部署（选 **Cloudflare 模式**，bot 起在 :1011 + 生成 webhook 密钥）：
    - **Windows Server（云电脑）**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1`（**原生 Bun，无需 Docker**；先装 Git for Windows + Bun。agent 的 bash 工具靠 Git Bash 的 bash.exe——pi 的 `getShellConfig` 在 win32 自动找 Git Bash，所以必须装 Git for Windows）
    - **Linux**：`./deploy.sh`（Docker）
-2. 从服务器拷贝隧道 token：把 `/root/.cpa-bot-tunnel-token.env` 里的 `TUNNEL_TOKEN` 写入云电脑 `data/tunnel-token`（或 `export TUNNEL_TOKEN=...`）。
-3. 起隧道（按云电脑系统选一个）：
-   - **Linux/macOS**：`./scripts/start-tunnel.sh`
-   - **Windows Server**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\start-tunnel.ps1`（装 cloudflared + 注册为 Windows 服务，开机自启）
+2. 准备隧道 token（来自服务器 `/root/.cpa-bot-tunnel-token.env`），任选一种：
+   - 最省事：把服务器那个 `.env` **整个文件**拷到云电脑，起隧道时把路径传给脚本即可（脚本能解析 `TUNNEL_TOKEN=...` 形式）。
+   - 或把里面的 `TUNNEL_TOKEN` 值写入云电脑 `data/tunnel-token`（默认读取位置）。
+   - 或 `export TUNNEL_TOKEN=<值>`。
+3. 起隧道（按云电脑系统选一个；均可选传 token 文件路径，**相对/绝对都行**）：
+   - **Linux/macOS**：`./scripts/start-tunnel.sh [token-file]`
+   - **Windows Server**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\start-tunnel.ps1 [token-file]`（装 cloudflared + 注册为 Windows 服务，开机自启）
+
+   token 解析优先级：位置参数文件 → `$TUNNEL_TOKEN_FILE` → `$TUNNEL_TOKEN`（裸值）→ `data/tunnel-token`。token 文件可以是裸 token，也可以是 `.env` 形式（含 `TUNNEL_TOKEN=...`）。
 4. IM 平台回调填：`https://im-bot.jaykwok.net/webhook/<secret>`（secret 来自 deploy 输出）。
 
 > 公网 1011 无需开放（`cloudflared` 本地连）。Cloudflare WAF（平台 IP 白名单）在服务端配置。隧道/域名已在服务端建好（`im-bot.jaykwok.net` → 隧道 → 本机 :1011）。

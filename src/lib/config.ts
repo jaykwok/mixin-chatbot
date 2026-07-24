@@ -7,6 +7,13 @@
 export const MODELS_JSON_PATH = "data/models.json";
 /** Webhook 随机密钥路径文件（持久卷 data/ 下，64hex/256bit）。存在 → 启用 /webhook/:secret；不存在 → 回退开放 /webhook（仅内网/本地）。 */
 export const WEBHOOK_SECRET_FILE = "data/webhook-secret";
+/**
+ * Pi agent 工作目录（内置 read/bash/edit/write 的根，agent 在此读写文件 / 跑命令）。
+ * 默认 "data"（相对进程 cwd，即仓库 ./data）。部署时可经环境变量 AGENT_CWD 覆盖
+ * （绝对或相对路径均可；见 deploy.ps1 / deploy.sh）。应用仍零必需配置——未设时回落 ./data。
+ * 注意：会话历史仍存 data/sessions（应用状态，与 agent 工作区分离，不随此值移动）。
+ */
+export const AGENT_CWD = process.env.AGENT_CWD?.trim() || "data";
 
 // ===== 服务 =====
 export const PORT = 1011;
