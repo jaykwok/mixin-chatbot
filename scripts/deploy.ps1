@@ -77,11 +77,10 @@ Done "agent cwd: $AgentCwd"
 # ---- 5. deploy mode ----
 Step "Deploy mode:"
 Write-Host "  1) Direct      - server has a public IP; open port $Port in Windows Firewall"
-Write-Host "  2) Cloudflare  - cloud PC; run scripts/start-tunnel.ps1 after this"
+Write-Host "  2) Cloudflare  - cloud PC; cloudflared tunnel started automatically after deploy"
 $modeIn = Read-Host "Choose 1 or 2 [default 1]"
 $mode = if ($modeIn -eq "2") { "cloudflare" } else { "direct" }
 Done "mode: $mode"
-if ($mode -eq "cloudflare") { Warn "next step: scripts/start-tunnel.ps1 (as admin) brings up the tunnel." }
 
 # ---- 6. stop stale bot (avoid port conflict on re-deploy) ----
 Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyContinue |
@@ -124,6 +123,29 @@ if ($isAdmin) {
     $env:AGENT_CWD = $AgentCwd
     Set-Location $Project
     & $bunPath run $Entry
+}
+
+# ---- 7b. Cloudflare mode: ensure the tunnel is up (service running, or install via start-tunnel.ps1) ----
+if ($mode -eq "cloudflare") {
+    Step "Cloudflare mode: ensuring cloudflared tunnel is up..."
+    $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+    if ($svc) {
+        if ($svc.Status -ne "Running") {
+            try { Start-Service "Cloudflared"; Done "Cloudflared service started (was $($svc.Status))." }
+            catch { Warn "Start-Service failed: $($_.Exception.Message). Check Event Viewer (eventvwr)." }
+        } else {
+            Done "Cloudflared service already running."
+        }
+    } elseif ($isAdmin) {
+        Warn "Cloudflared service not installed. Installing via scripts\start-tunnel.ps1..."
+        $tokIn = Read-Host "Tunnel token file [default: data\tunnel-token]"
+        $tokArg = if ($tokIn) { $tokIn.Trim() } else { "data\tunnel-token" }
+        $stPath = Join-Path $Project "scripts\start-tunnel.ps1"
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $stPath $tokArg
+        if ($LASTEXITCODE -ne 0) { Warn "start-tunnel.ps1 exited $LASTEXITCODE - tunnel may not be up; run it manually as admin." }
+    } else {
+        Warn "non-admin: cannot install Cloudflared service. Run scripts\start-tunnel.ps1 as admin after this."
+    }
 }
 
 # ---- 8. webhook URL ----

@@ -175,7 +175,7 @@ else
     fi
     echo ""
     print_warning "关闭公网 1011（cloudflared 本地连）：sudo ufw delete allow from ${PLATFORM_IP} to any port 1011 ; sudo ufw deny 1011/tcp"
-    print_warning "还需：1) 装 cloudflared 起隧道指向 http://localhost:1011；2) Cloudflare WAF 放行 ip.src=${PLATFORM_IP} && POST && 路径 ^/webhook/[0-9a-f]{32,64}\$，其余 Block（详见 README 部署模式）"
+    print_warning "部署末尾会自动起 cloudflared 隧道（指向 http://localhost:1011）；另需 Cloudflare WAF 放行 ip.src=${PLATFORM_IP} && POST && 路径 ^/webhook/[0-9a-f]{32,64}\$，其余 Block（详见 README 部署模式）"
 fi
 if [ "$SHOW_SECRET" = "1" ]; then
     print_warning "密钥仅本次显示、不进容器日志；泄露时删 data/webhook-secret 重新部署即重新生成"
@@ -231,6 +231,27 @@ for i in $(seq 1 18); do
     fi
     sleep 5
 done
+
+# ---- Cloudflare 模式：确保 cloudflared 在线 ----
+if [ "$DEPLOY_MODE" = "cloudflare" ]; then
+    print_status "Cloudflare 模式：确保 cloudflared 隧道在线..."
+    if pgrep -x cloudflared >/dev/null 2>&1; then
+        print_success "cloudflared 已在运行（pid $(pgrep -x cloudflared | head -n1)）"
+    elif [ -x scripts/start-tunnel.sh ]; then
+        print_warning "cloudflared 未运行，后台启动 start-tunnel.sh..."
+        mkdir -p logs
+        nohup ./scripts/start-tunnel.sh >>"logs/cloudflared.log" 2>&1 &
+        sleep 3
+        if pgrep -x cloudflared >/dev/null 2>&1; then
+            print_success "cloudflared 已后台启动（日志 logs/cloudflared.log）"
+            print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
+        else
+            print_error "cloudflared 未能启动；查 logs/cloudflared.log（可能缺 token：data/tunnel-token 或 TUNNEL_TOKEN）"
+        fi
+    else
+        print_warning "未找到 scripts/start-tunnel.sh，跳过隧道；请手动起 cloudflared"
+    fi
+fi
 
 # ---- 输出信息 ----
 

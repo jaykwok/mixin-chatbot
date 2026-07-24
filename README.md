@@ -104,7 +104,7 @@ git pull && ./deploy.sh
    - 最省事：把服务器那个 `.env` **整个文件**拷到云电脑，起隧道时把路径传给脚本即可（脚本能解析 `TUNNEL_TOKEN=...` 形式）。
    - 或把里面的 `TUNNEL_TOKEN` 值写入云电脑 `data/tunnel-token`（默认读取位置）。
    - 或 `export TUNNEL_TOKEN=<值>`。
-3. 起隧道（按云电脑系统选一个；均可选传 token 文件路径，**相对/绝对都行**）：
+3. 起隧道。选 Cloudflare 模式时，`deploy.ps1`/`deploy.sh` 会在 bot 起来后**自动确保隧道在线**（Windows：`Cloudflared` 服务没跑就 Start、没装就调 `start-tunnel.ps1` 装；Linux：没跑就后台起 `start-tunnel.sh`）。下面这条仅用于首次手动装 / 后续重装重启：
    - **Linux/macOS**：`./scripts/start-tunnel.sh [token-file]`
    - **Windows Server**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\start-tunnel.ps1 [token-file]`（装 cloudflared + 注册为 Windows 服务，开机自启）
 
