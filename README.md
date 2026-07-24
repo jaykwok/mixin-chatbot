@@ -10,7 +10,7 @@
 | Web 框架 | Hono（跑在 Bun.serve） |
 | Agent 大脑 | `@earendil-works/pi-coding-agent`（AgentSession + SessionManager） |
 | 模型接入 | Pi 原生读 `data/models.json`，支持 DashScope / DeepSeek / 智谱等 openai 兼容端点 |
-| 部署 | Docker（Debian，oven/bun 镜像） |
+| 部署 | Docker（Debian，oven/bun 镜像）/ Windows 原生 Bun（`deploy.ps1`） |
 
 ## 工作方式
 
@@ -120,20 +120,6 @@ git pull && ./deploy.sh
 | `/webhook/<secret>` | POST | IM 平台回调入口；secret 来自 `data/webhook-secret`（未配置时回退开放 `/webhook`，仅内网） |
 | `/favicon.svg` | GET | 图标（健康检查用） |
 
-### Webhook 请求格式
-
-```json
-{
-  "type": "text",
-  "textMsg": { "content": "用户消息内容" },
-  "phone": "用户手机号",
-  "groupId": "群组ID",
-  "callBackUrl": "https://imtwo.zdxlz.com/send?key=<robot_key>"
-}
-```
-
-`callBackUrl` 严格校验：协议 https、hostname 在白名单（`imtwo.zdxlz.com` / `im.zdxlz.com`）、路径须为 `/im-external/v1/webhook/send` 且带 `key` 参数——防 SSRF 与伪造回调。
-
 ## 目录结构
 
 ```
@@ -141,7 +127,7 @@ mixin-chatbot/
 ├── src/
 │   ├── server/                 # HTTP 层
 │   │   ├── index.ts            # 入口：Hono + Bun.serve + /webhook 路由
-│   │   ├── webhook.ts          # 字段校验、去重、限流、后台异步（per-phone 串行）
+│   │   ├── webhook.ts          # 字段校验、去重、限流、后台异步（per-(phone, 群) 串行）
 │   │   └── http.ts             # HttpError + 客户端 IP
 │   ├── agent/                  # Pi agent 大脑
 │   │   ├── agent.ts            # models.json 加载 + 运行时 + 会话 + 对话入口
@@ -187,11 +173,11 @@ mixin-chatbot/
 ### 应用层
 
 - 随机密钥路径鉴权（`data/webhook-secret`，见上）
-- 回调 URL 结构校验：https + hostname 白名单 + 路径 `/im-external/v1/webhook/send` + `key` 参数（防 SSRF / 伪造）
+- 回调 URL 结构校验：https + hostname 白名单 + 约定发送端点 + `key` 参数（防 SSRF / 伪造；细节见 `src/lib/config.ts`）
 - `phone` 格式校验（防会话文件名路径穿越）、消息内容 16KB 上限
 - 请求去重（30 秒内相同请求跳过，防重复回复）
 - 错误信息脱敏（仅记日志，不回传用户）
-- ⚠️ agent 有 `bash` 工具：仅可信群成员可 @ 触发；工具工作目录限定在 `./data`
+- ⚠️ agent 有 `bash` 工具（**非 cwd 沙箱**，可执行任意命令，权限=bot 进程用户）：仅可信群成员可 @ 触发；`read/write/edit` 绑定 `AGENT_CWD`（默认 `./data`）
 
 ### 系统层（setup-server.sh）
 

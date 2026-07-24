@@ -41,8 +41,7 @@ async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> 
     modelId = raw.providers?.[providerId]?.models?.[0]?.id;
   } catch {
     throw new Error(
-      `无法读取 ${MODELS_JSON_PATH}。请先生成 AI 配置：` +
-        `docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run scripts/configure.ts`
+      `无法读取 ${MODELS_JSON_PATH}。请先生成 AI 配置：运行 scripts/configure.ts（部署脚本会自动调；或手动 bun run scripts/configure.ts）`
     );
   }
   if (!providerId || !modelId) {
