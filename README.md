@@ -141,7 +141,8 @@ mixin-chatbot/
 │   ├── deploy.ps1       # Windows Server 部署（原生 Bun，无 Docker）
 │   ├── start-tunnel.sh  # 云电脑 cloudflared 对接（Linux/macOS）
 │   ├── start-tunnel.ps1 # 同上（Windows Server，注册为服务）
-│   └── ops.ps1          # Windows 运维：doctor/restart/stop/start/logs/uninstall
+│   ├── ops.sh           # Linux 运维（Docker）：doctor/restart/stop/start/logs/uninstall
+│   └── ops.ps1          # Windows 运维：同上
 ├── static/favicon.svg
 ├── data/               # models.json + sessions/*.jsonl（Pi 会话持久化）
 ├── logs/               # 应用日志
@@ -198,13 +199,17 @@ mixin-chatbot/
 
 ## 日常运维
 
+**Linux（Docker 部署）**——`scripts/ops.sh` 一站式运维：
+
 ```bash
-docker logs -f mixin-chatbot          # 实时日志
-docker restart mixin-chatbot          # 重启
-docker stats mixin-chatbot            # 资源占用
+./scripts/ops.sh doctor     # 健康检查（容器/本地+公网/cloudflared/配置）
+./scripts/ops.sh restart    # 重启（docker restart）
+./scripts/ops.sh logs       # 实时日志（docker logs -f --tail 50）
+./scripts/ops.sh stop       # 停止
+./scripts/ops.sh uninstall  # 卸载（容器，可选清 image/cloudflared/data）
 ```
 
-应用日志：`logs/mixin-chatbot.log`（5MB × 3 轮转）。
+应用日志：`logs/mixin-chatbot.log`（5MB × 3 轮转）；容器层日志 `docker logs mixin-chatbot`。
 
 **Windows Server（云电脑，`deploy.ps1` 部署的）**——`scripts\ops.ps1` 一站式运维：
 
