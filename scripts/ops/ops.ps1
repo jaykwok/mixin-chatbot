@@ -88,9 +88,11 @@ function Wait-Local {
 
 function Test-Public {
     # Prefer curl.exe for consistent TLS behavior, with an IWR fallback on older hosts.
-    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path } |
+        Select-Object -First 1
     if ($curl) {
-        $code = & $curl.Source --ssl-no-revoke -m 10 -s -o NUL -w "%{http_code}" "https://$Domain/favicon.svg" 2>$null
+        $code = & ([string]$curl.Path) --ssl-no-revoke -m 10 -s -o NUL -w "%{http_code}" "https://$Domain/favicon.svg" 2>$null
         if ($LASTEXITCODE -ne 0) { return $null }
         return "$code".Trim()
     }
@@ -195,9 +197,11 @@ function Uninstall-Bot {
         if ($a -match "^[yY]$") {
             if (IsAdmin) {
                 Stop-Service Cloudflared -ErrorAction SilentlyContinue
-                $cf = Get-Command cloudflared -CommandType Application -ErrorAction SilentlyContinue
+                $cf = Get-Command cloudflared -CommandType Application -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Path } |
+                    Select-Object -First 1
                 $localCf = Join-Path $Project "cloudflared.exe"
-                $cfPath = if ($cf) { $cf.Source } elseif (Test-Path -LiteralPath $localCf) { $localCf } else { $null }
+                $cfPath = if ($cf) { [string]$cf.Path } elseif (Test-Path -LiteralPath $localCf) { $localCf } else { $null }
                 if ($cfPath) {
                     & $cfPath service uninstall
                     if ($LASTEXITCODE -eq 0) { Done "cloudflared service uninstalled" }

@@ -27,13 +27,14 @@ function Test-Hostname([string]$Value) {
 
 # ---- 1. prerequisites ----
 Step "Checking prerequisites..."
-$gitCommand = Get-Command git -ErrorAction SilentlyContinue
+$gitCommand = Get-Command git -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
 if (-not $gitCommand) {
     Write-Host "MISSING: git. Install Git for Windows (also provides bash.exe for the agent bash tool):" -ForegroundColor Red
     Write-Host "  https://git-scm.com/download/win"
     exit 1
 }
-$gitRoot = Split-Path (Split-Path $gitCommand.Source -Parent) -Parent
+$gitRoot = Split-Path (Split-Path ([string]$gitCommand.Path) -Parent) -Parent
 $BashPath = @(
     (Join-Path $gitRoot "bin\bash.exe"),
     (Join-Path $gitRoot "usr\bin\bash.exe")
@@ -41,9 +42,11 @@ $BashPath = @(
 if (-not $BashPath) {
     # Never accept Windows' WSL launcher (C:\Windows\System32\bash.exe) as the
     # agent shell. A non-Git bash is only accepted after a GNU Bash probe.
-    $bashCommand = Get-Command bash -CommandType Application -ErrorAction SilentlyContinue
-    if ($bashCommand -and $bashCommand.Source -notmatch '(?i)(\\Windows\\System32\\bash\.exe$|\\WindowsApps\\bash\.exe$)') {
-        $BashPath = $bashCommand.Source
+    $bashCommand = Get-Command bash -CommandType Application -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path -notmatch '(?i)(\\Windows\\System32\\bash\.exe$|\\WindowsApps\\bash\.exe$)' } |
+        Select-Object -First 1
+    if ($bashCommand) {
+        $BashPath = [string]$bashCommand.Path
     }
 }
 if (-not $BashPath) {
@@ -59,14 +62,18 @@ if ($bashExitCode -ne 0 -or $bashVersion -notmatch "GNU bash") {
 }
 $BashDir = Split-Path $BashPath -Parent
 Done "git and GNU bash present ($BashPath)"
-$bunCommand = Get-Command bun -CommandType Application -ErrorAction SilentlyContinue
+# npm-style Bun installs can expose both bun.cmd and bun; keep one concrete path
+# instead of allowing PowerShell to turn all matching Source values into one string.
+$bunCommand = Get-Command bun -CommandType Application -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path } |
+    Select-Object -First 1
 if (-not $bunCommand) {
     Write-Host "MISSING: bun. Install one of:" -ForegroundColor Red
     Write-Host "  powershell -c ""irm bun.sh/install.ps1 | iex"""
     Write-Host "  winget install Oven-sh.Bun"
     exit 1
 }
-$bunPath = $bunCommand.Source
+$bunPath = [string]$bunCommand.Path
 $bunVersion = & $bunPath --version
 if ($LASTEXITCODE -ne 0) { Write-Host "bun --version failed" -ForegroundColor Red; exit 1 }
 Done "bun $bunVersion"

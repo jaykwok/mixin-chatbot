@@ -103,8 +103,10 @@ if (-not $token) {
 Write-Host "[*] token from: $source" -ForegroundColor Cyan
 
 # ---- 2. cloudflared.exe ----
-$cf = Get-Command cloudflared -CommandType Application -ErrorAction SilentlyContinue
-if ($cf) { $cfPath = $cf.Source }
+$cf = Get-Command cloudflared -CommandType Application -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path } |
+    Select-Object -First 1
+if ($cf) { $cfPath = [string]$cf.Path }
 else {
     $exe = Join-Path $PWD "cloudflared.exe"
     if (-not (Test-Path $exe)) {
