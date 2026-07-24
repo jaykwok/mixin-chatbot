@@ -93,16 +93,6 @@ export async function sendText(
   return ok;
 }
 
-export async function sendMarkdown(
-  content: string,
-  callbackUrl: string,
-  phone?: string
-): Promise<boolean> {
-  const ok = await postWithRetry(callbackUrl, buildMarkdown(content), "markdown");
-  if (ok) log.info(`markdown 发送成功，用户: ${phone ?? "-"}`);
-  return ok;
-}
-
 /** 群聊回复：markdown 正文 + text@ 通知（双消息）。
  *  markdown 不支持 @（已实测），故用一条 text 消息触发通知，markdown 承载渲染内容。 */
 export async function sendReplyWithMention(

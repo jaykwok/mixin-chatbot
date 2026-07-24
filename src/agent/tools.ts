@@ -2,6 +2,7 @@
 // 从 im 层封装：agent 给 source（URL 或 ./data 路径），工具负责下载/读取 + 上传 + 发送。
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { AGENT_CWD } from "../lib/config.ts";
 import { Type } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { sendFile, sendImage, uploadAttachment } from "../im/im.ts";
@@ -13,7 +14,9 @@ async function loadBytes(source: string): Promise<Uint8Array> {
     if (!r.ok) throw new Error(`下载失败 HTTP ${r.status}: ${source}`);
     return new Uint8Array(await r.arrayBuffer());
   }
-  const path = source.startsWith("./data/") || source.startsWith("data/") ? source : join("data", source);
+  // 本地路径按 agent 工作目录（AGENT_CWD）解析；默认 data 时行为同前。
+  const cwd = AGENT_CWD.replace(/[\\/]+$/, "");
+  const path = source.startsWith(`./${cwd}/`) || source.startsWith(`${cwd}/`) ? source : join(cwd, source);
   return new Uint8Array(await readFile(path));
 }
 
