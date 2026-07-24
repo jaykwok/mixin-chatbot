@@ -109,7 +109,9 @@ if ($isAdmin) {
     $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $fileArg -WorkingDirectory $Project
     $trigger   = New-ScheduledTaskTrigger -AtStartup
     $settings  = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+    # RunLevel Limited：bot 只需监听 1011 + 写 data/logs，无需管理员；
+    # 降权可缩小 agent bash 工具（非 cwd 沙箱）的爆炸半径。
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
