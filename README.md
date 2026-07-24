@@ -140,7 +140,8 @@ mixin-chatbot/
 │   ├── configure.ts     # TUI：生成 data/models.json（LiteLLM 元数据）
 │   ├── deploy.ps1       # Windows Server 部署（原生 Bun，无 Docker）
 │   ├── start-tunnel.sh  # 云电脑 cloudflared 对接（Linux/macOS）
-│   └── start-tunnel.ps1 # 同上（Windows Server，注册为服务）
+│   ├── start-tunnel.ps1 # 同上（Windows Server，注册为服务）
+│   └── ops.ps1          # Windows 运维：doctor/restart/stop/start/logs/uninstall
 ├── static/favicon.svg
 ├── data/               # models.json + sessions/*.jsonl（Pi 会话持久化）
 ├── logs/               # 应用日志
@@ -204,6 +205,16 @@ docker stats mixin-chatbot            # 资源占用
 ```
 
 应用日志：`logs/mixin-chatbot.log`（5MB × 3 轮转）。
+
+**Windows Server（云电脑，`deploy.ps1` 部署的）**——`scripts\ops.ps1` 一站式运维：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 doctor     # 健康检查（task/端口/本地+公网/cloudflared/配置）
+powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 restart    # 重启
+powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 logs       # 实时日志
+powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 stop       # 停止
+powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 uninstall  # 卸载（task/进程，可选清 cloudflared/data）
+```
 
 ## 故障排查
 
