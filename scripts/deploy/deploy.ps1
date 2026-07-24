@@ -50,8 +50,10 @@ if (-not $BashPath) {
     Write-Host "MISSING: bash.exe. Install Git for Windows with Git Bash enabled; the agent bash tool requires it." -ForegroundColor Red
     exit 1
 }
-$bashVersion = & $BashPath --version 2>$null | Select-Object -First 1
-if ($LASTEXITCODE -ne 0 -or $bashVersion -notmatch "GNU bash") {
+$bashVersionOutput = @(& $BashPath --version 2>$null)
+$bashExitCode = $LASTEXITCODE
+$bashVersion = $bashVersionOutput | Select-Object -First 1
+if ($bashExitCode -ne 0 -or $bashVersion -notmatch "GNU bash") {
     Write-Host "INVALID: $BashPath is not a working GNU bash.exe." -ForegroundColor Red
     exit 1
 }
