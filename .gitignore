@@ -6,4 +6,5 @@
 logs/
 data/
 cloudflared.exe
+cloudflared.exe.download-*
 node_modules/
