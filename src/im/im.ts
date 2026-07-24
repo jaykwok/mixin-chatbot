@@ -93,18 +93,36 @@ export async function sendText(
   return ok;
 }
 
-/** 群聊回复：markdown 正文 + text@ 通知（双消息）。
- *  markdown 不支持 @（已实测），故用一条 text 消息触发通知，markdown 承载渲染内容。 */
+/** 内容是否含 markdown 格式（代码块/粗体/标题/列表/引用/空行分段）——决定走 markdown 卡片还是纯 text。 */
+function looksLikeMarkdown(s: string): boolean {
+  return (
+    /```|\*\*[^*]+\*\*|__[^_]+__|(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)/.test(s) ||
+    /\n\s*\n/.test(s)
+  );
+}
+
+/** 群聊回复：
+ *  - 内容含格式 → markdown 卡片（渲染正文）+ 一条 text@（仅触发 @ 通知，不重复正文）。
+ *    markdown 不支持 @（已实测），故 @ 通知单独走 text。
+ *  - 纯文本 → 只发一条 text（带 @），避免「同内容发两次」。 */
 export async function sendReplyWithMention(
   content: string,
   groupId: string,
   phone: string,
   callbackUrl: string
 ): Promise<boolean> {
-  const summary = buildMarkdownTitle(content, 40);
-  await postWithRetry(callbackUrl, buildMarkdown(content), "markdown");
-  const ok = await postWithRetry(callbackUrl, buildText(summary, groupId, phone), "text@");
-  if (ok) log.info(`回复发送完成（markdown + text@），用户: ${phone}`);
+  if (looksLikeMarkdown(content)) {
+    await postWithRetry(callbackUrl, buildMarkdown(content), "markdown");
+    const ok = await postWithRetry(
+      callbackUrl,
+      buildText("（已回复，见上方卡片）", groupId, phone),
+      "text@"
+    );
+    if (ok) log.info(`回复发送完成（markdown + text@），用户: ${phone}`);
+    return ok;
+  }
+  const ok = await postWithRetry(callbackUrl, buildText(content, groupId, phone), "text");
+  if (ok) log.info(`回复发送完成（text@），用户: ${phone}`);
   return ok;
 }
 
