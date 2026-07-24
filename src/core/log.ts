@@ -1,4 +1,4 @@
-// 日志：console + 文件轮转。对应 Python 版 utils.py 的 RotatingFileHandler。
+// 日志：console + 简单文件轮转。
 import {
   appendFileSync,
   existsSync,

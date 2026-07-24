@@ -2,19 +2,20 @@
 # One-stop: doctor / restart / stop / start / logs / uninstall.
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 <command>
+#   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <command>
 #   commands: doctor, restart, stop, start, logs, uninstall   (no arg -> menu)
 #
 # restart/stop/start/uninstall may need admin (scheduled task + Cloudflared service control).
 $ErrorActionPreference = "Stop"
 
-$Project  = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $TaskName = "mixin-chatbot"
 $portFile = Join-Path $Project "data\bot-port"
 $Port     = if ($env:BOT_PORT) { $env:BOT_PORT } elseif (Test-Path $portFile) { (Get-Content $portFile -Raw).Trim() } else { "1011" }
 $modeFile = Join-Path $Project "data\deploy-mode"
 $DeployMode = if (Test-Path $modeFile) { (Get-Content $modeFile -Raw).Trim() } else { "direct" }
-$Domain   = if ($env:BOT_DOMAIN) { $env:BOT_DOMAIN } else { "im-bot.jaykwok.net" }
+$domainFile = Join-Path $Project "data\bot-domain"
+$Domain   = if ($env:BOT_DOMAIN) { $env:BOT_DOMAIN.Trim() } elseif (Test-Path $domainFile) { (Get-Content $domainFile -Raw).Trim() } else { "" }
 $LogPath  = Join-Path $Project "logs\mixin-chatbot.log"
 $Command  = "$args"
 
@@ -23,6 +24,16 @@ function Done($m) { Write-Host "[+] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
 function Err($m)  { Write-Host "[x] $m" -ForegroundColor Red }
 function IsAdmin  { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+function Test-Hostname([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Length -gt 253) { return $false }
+    foreach ($label in $Value.Split('.')) {
+        if ($label.Length -lt 1 -or $label.Length -gt 63 -or
+            $label -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$') {
+            return $false
+        }
+    }
+    return $true
+}
 
 $portNumber = 0
 if (-not [int]::TryParse($Port, [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
@@ -31,6 +42,9 @@ if (-not [int]::TryParse($Port, [ref]$portNumber) -or $portNumber -lt 1 -or $por
 $Port = "$portNumber"
 if ($DeployMode -notin @("direct", "cloudflare")) {
     throw "Invalid deployment mode in data/deploy-mode: $DeployMode"
+}
+if ($Domain -and -not (Test-Hostname $Domain)) {
+    throw "Invalid hostname in BOT_DOMAIN/data/bot-domain: $Domain"
 }
 
 # bot bun.exe processes running src/server/index.ts
@@ -52,21 +66,39 @@ function Stop-Bot {
 
 function Start-Bot {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $t) { Err "scheduled task '$TaskName' not found; run deploy.ps1 first"; return $false }
+    if (-not $t) { Err "scheduled task '$TaskName' not found; run scripts\deploy\deploy.ps1 first"; return $false }
     Start-ScheduledTask -TaskName $TaskName | Out-Null
     return $true
 }
 
 function Test-Local {
-    try { return (Invoke-WebRequest -Uri "http://localhost:$Port/favicon.svg" -UseBasicParsing -TimeoutSec 6).StatusCode }
+    try { return (Invoke-WebRequest -Uri "http://localhost:$Port/favicon.svg" -UseBasicParsing -TimeoutSec 2).StatusCode }
     catch { return $null }
 }
 
+function Wait-Local {
+    $lastStatus = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        $lastStatus = Test-Local
+        if ($lastStatus -eq 200) { return $lastStatus }
+        if ($attempt -lt 10) { Start-Sleep -Seconds 1 }
+    }
+    return $lastStatus
+}
+
 function Test-Public {
-    # curl.exe handles TLS cleanly (incl. --ssl-no-revoke); returns HTTP code or $null
-    $code = & curl.exe --ssl-no-revoke -m 10 -s -o NUL -w "%{http_code}" "https://$Domain/favicon.svg" 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return "$code".Trim()
+    # Prefer curl.exe for consistent TLS behavior, with an IWR fallback on older hosts.
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($curl) {
+        $code = & $curl.Source --ssl-no-revoke -m 10 -s -o NUL -w "%{http_code}" "https://$Domain/favicon.svg" 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return "$code".Trim()
+    }
+    try {
+        return "" + (Invoke-WebRequest -Uri "https://$Domain/favicon.svg" -UseBasicParsing -TimeoutSec 10).StatusCode
+    } catch {
+        return $null
+    }
 }
 
 function Show-Doctor {
@@ -87,8 +119,12 @@ function Show-Doctor {
         $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
         $rows += [pscustomobject]@{ Name = "cloudflared service"; OK = ($null -ne $svc -and $svc.Status -eq "Running"); Detail = $(if ($svc) { $svc.Status } else { "not installed" }) }
 
-        $pc = Test-Public
-        $rows += [pscustomobject]@{ Name = "public CF->tunnel->bot"; OK = ($pc -eq 200); Detail = $(if ($pc) { "HTTP $pc" } else { "fail (tunnel/bot down?)" }) }
+        if ($Domain) {
+            $pc = Test-Public
+            $rows += [pscustomobject]@{ Name = "public CF->tunnel->bot"; OK = ($pc -eq 200); Detail = $(if ($pc) { "HTTP $pc" } else { "fail (tunnel/bot down?)" }) }
+        } else {
+            Warn "BOT_DOMAIN/data/bot-domain is not set; skipping public health check"
+        }
     }
 
     $mj = Join-Path $Project "data\models.json"
@@ -119,9 +155,11 @@ function Show-Doctor {
         if ($DeployMode -eq "cloudflare") {
             Warn "hints: public 530/1033 -> tunnel down; public 502 -> tunnel up but bot down;"
         }
-        Warn "       local fail -> bot down; secret MISSING -> re-run deploy.ps1."
+        Warn "       local fail -> bot down; secret MISSING -> re-run scripts\deploy\deploy.ps1."
+        return $false
     } else {
         Done "all checks passed"
+        return $true
     }
 }
 
@@ -129,15 +167,14 @@ function Restart-Bot {
     Step "restarting bot..."
     Stop-Bot
     Start-Sleep -Seconds 1
-    if (-not (Start-Bot)) { return }
-    Start-Sleep -Seconds 2
-    $lc = Test-Local
-    if ($lc -eq 200) { Done "bot back up (HTTP 200 on :$Port)" }
-    else { Warn "bot not responding yet (HTTP $lc); check 'ops.ps1 logs'." }
+    if (-not (Start-Bot)) { return $false }
+    $lc = Wait-Local
+    if ($lc -eq 200) { Done "bot back up (HTTP 200 on :$Port)"; return $true }
+    Warn "bot not responding yet (HTTP $lc); check 'scripts\ops\ops.ps1 logs'."
+    return $false
 }
 
 function Show-Logs {
-    if (-not (Test-Path $LogPath)) { Warn "no log file at $LogPath (bot may never have started)"; return }
     Step "tailing $LogPath  (Ctrl+C to exit)"
     Get-Content $LogPath -Tail 50 -Wait
 }
@@ -149,7 +186,7 @@ function Uninstall-Bot {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($t) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false; Done "scheduled task removed" }
     else { Warn "no scheduled task to remove" }
-    $launcher = Join-Path $Project "scripts\.bot-launcher.ps1"
+    $launcher = Join-Path $Project "data\runtime\bot-launcher.ps1"
     if (Test-Path $launcher) { Remove-Item $launcher -Force; Done "launcher removed" }
 
     $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
@@ -158,35 +195,48 @@ function Uninstall-Bot {
         if ($a -match "^[yY]$") {
             if (IsAdmin) {
                 Stop-Service Cloudflared -ErrorAction SilentlyContinue
-                $cf = Get-Command cloudflared -ErrorAction SilentlyContinue
-                if ($cf) { & $cf.Source service uninstall } else { Warn "cloudflared not on PATH; stop manually: Stop-Service Cloudflared" }
-                Done "cloudflared service uninstalled"
+                $cf = Get-Command cloudflared -CommandType Application -ErrorAction SilentlyContinue
+                $localCf = Join-Path $Project "cloudflared.exe"
+                $cfPath = if ($cf) { $cf.Source } elseif (Test-Path -LiteralPath $localCf) { $localCf } else { $null }
+                if ($cfPath) {
+                    & $cfPath service uninstall
+                    if ($LASTEXITCODE -eq 0) { Done "cloudflared service uninstalled" }
+                    else { Warn "cloudflared service uninstall returned $LASTEXITCODE" }
+                } else { Warn "cloudflared executable not found; service was stopped but not uninstalled" }
             } else { Warn "need admin to uninstall cloudflared service" }
         }
     }
 
-    $d = Read-Host "Delete data/ (models.json, webhook-secret, default user data) and logs/? [y/N]"
+    $d = Read-Host "Delete data/ (models.json, webhook-secret, default group data) and logs/? [y/N]"
     if ($d -match "^[yY]$") {
         Remove-Item (Join-Path $Project "data") -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item (Join-Path $Project "logs") -Recurse -Force -ErrorAction SilentlyContinue
         Done "data/ and logs/ removed"
     } else {
-        Done "data/ and logs/ kept (config + default user data preserved)"
+        Done "data/ and logs/ kept (config + default group data preserved)"
     }
     Done "uninstall complete."
 }
 
 switch ($Command) {
-    "doctor"    { Show-Doctor }
-    "status"    { Show-Doctor }
-    "restart"   { Restart-Bot }
+    "doctor"    { if (-not (Show-Doctor)) { exit 1 } }
+    "status"    { if (-not (Show-Doctor)) { exit 1 } }
+    "restart"   { if (-not (Restart-Bot)) { exit 1 } }
     "stop"      { Step "stopping bot..."; Stop-Bot; Done "bot stopped" }
-    "start"     { Start-Bot | Out-Null }
-    "logs"      { Show-Logs }
+    "start"     {
+        if (-not (Start-Bot)) { exit 1 }
+        $lc = Wait-Local
+        if ($lc -eq 200) { Done "bot started (HTTP 200 on :$Port)" }
+        else { Warn "bot did not become healthy (HTTP $lc); check 'scripts\ops\ops.ps1 logs'."; exit 1 }
+    }
+    "logs"      {
+        if (-not (Test-Path $LogPath)) { Warn "no log file at $LogPath (bot may never have started)"; exit 1 }
+        Show-Logs
+    }
     "uninstall" { Uninstall-Bot }
     default {
         Write-Host "mixin-chatbot ops tool" -ForegroundColor Cyan
-        Write-Host "usage: powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 <command>"
+        Write-Host "usage: powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <command>"
         Write-Host ""
         Write-Host "  doctor     health check: task, :$Port, config; Cloudflare checks only in tunnel mode"
         Write-Host "  restart    stop + start the bot"

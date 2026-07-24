@@ -1,5 +1,5 @@
-// 全局参数与默认值。AI 配置由 data/models.json 承载（Pi 原生读取，见 src/agent/agent.ts），
-// 由 scripts/configure.ts 生成。Webhook 公网鉴权密钥存 data/webhook-secret（见 src/server/index.ts）。
+// 全局参数与默认值。AI 配置由 data/models.json 承载（Pi 原生读取，见 src/agent/runtime.ts），
+// 由 scripts/config/configure.ts 生成。Webhook 公网鉴权密钥存 data/webhook-secret（见 src/server/index.ts）。
 // 无必需 .env/config.json；可选环境变量覆盖部署参数。访问控制由 webhook secret + 防火墙/WAF 共同承担。
 // 所有时间常量统一毫秒（Date.now()/setTimeout 均为 ms）。
 
@@ -18,12 +18,13 @@ export const MODELS_JSON_PATH = "data/models.json";
 /** Webhook 随机密钥路径文件（持久卷 data/ 下，64hex/256bit）。缺失或无效时服务默认拒绝启动。 */
 export const WEBHOOK_SECRET_FILE = "data/webhook-secret";
 /**
- * Pi 用户目录的总根：每个用户实际在 <AGENT_CWD>/<phone>/tmp 中使用工具，
- * 会话保存在 <AGENT_CWD>/<phone>/sessions/<groupId>.jsonl。
- * 默认 "data"（相对进程 cwd，即仓库 ./data）。部署时可经环境变量 AGENT_CWD 覆盖
+ * Pi 群数据总根：agent 的 cwd 是 <AGENT_DATA_ROOT>/<group>/workspace，当前调用用户的
+ * 临时目录和会话分别位于 <AGENT_DATA_ROOT>/<group>/<phone>/tmp 与
+ * <AGENT_DATA_ROOT>/<group>/<phone>/sessions/session.jsonl。
+ * 默认 "data"（相对进程 cwd，即仓库 ./data）。部署时可经环境变量 AGENT_DATA_ROOT 覆盖
  * （绝对或相对路径均可；见 deploy.ps1 / deploy.sh）。应用仍零必需配置——未设时回落 ./data。
  */
-export const AGENT_CWD = process.env.AGENT_CWD?.trim() || "data";
+export const AGENT_DATA_ROOT = process.env.AGENT_DATA_ROOT?.trim() || "data";
 
 // ===== 服务 =====
 export const PORT = integerEnv("BOT_PORT", 1011, 1, 65_535);
@@ -63,8 +64,10 @@ export const REQUIRED_WEBHOOK_FIELDS = [
   "groupId",
   "callBackUrl",
 ];
-/** phone 合法字符集（用作用户目录名，同时防路径穿越）。 */
+/** phone 合法字符集（用作群内用户目录名，同时防路径穿越）。 */
 export const PHONE_PATTERN = /^[A-Za-z0-9_+\-]{1,32}$/;
+/** groupId 可含 Unicode，但拒绝会污染日志或无法放入子进程环境的控制字符。 */
+export const GROUP_ID_PATTERN = /^[^\u0000-\u001f\u007f]+$/u;
 export const MAX_GROUP_ID_LENGTH = 256;
 export const MAX_CALLBACK_URL_LENGTH = 2048;
 /** 单条消息内容上限（防超大 payload）。 */

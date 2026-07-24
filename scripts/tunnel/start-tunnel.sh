@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# 云电脑本地对接脚本：起 cloudflared，把 im-bot.jaykwok.net 经 Cloudflare 隧道接到本机 BOT_PORT（默认 1011）。
+# 云电脑本地对接脚本：起 cloudflared，把 Cloudflare Tunnel 接到本机 BOT_PORT（默认 1011）。
 #
 # 前置：
-#   1) 机器人已在本机 BOT_PORT 跑起来（./scripts/deploy.sh 选 Cloudflare 模式）
+#   1) 机器人已在本机 BOT_PORT 跑起来（./scripts/deploy/deploy.sh 选 Cloudflare 模式）
 #   2) 隧道 token。来源（按优先级）：
-#        位置参数：./scripts/start-tunnel.sh <token-file>   # 路径，相对或绝对
+#        位置参数：./scripts/tunnel/start-tunnel.sh <token-file>   # 路径，相对或绝对
 #        环境变量：TUNNEL_TOKEN_FILE=<path>                 # 指定文件
 #        环境变量：TUNNEL_TOKEN=<raw-token>                 # 直接给值
 #        默认：    data/tunnel-token                        # raw 值或 .env 形式均可
 #      token 文件可以是 raw token，也可以是直接拷来的 .env
-#      （如服务器 .cpa-bot-tunnel-token.env，内含 TUNNEL_TOKEN=<value>）。
+#      （也可直接使用内含 TUNNEL_TOKEN=<value> 的 .env 文件）。
 #
-# 用法： ./scripts/start-tunnel.sh [token-file]
+# 用法： ./scripts/tunnel/start-tunnel.sh [token-file]
 set -euo pipefail
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
 
 if [ -n "${BOT_PORT:-}" ]; then
@@ -76,9 +76,22 @@ if ! command -v cloudflared >/dev/null 2>&1; then
             aarch64|arm64) BIN=cloudflared-linux-arm64;;
             *) echo "✗ 不支持的架构 $ARCH，请手动安装 cloudflared" >&2; exit 1;;
         esac
-        sudo curl -fsSL -o /usr/local/bin/cloudflared \
+        CF_TMP="$(mktemp)"
+        trap 'rm -f "$CF_TMP"' EXIT
+        curl -fsSL -o "$CF_TMP" \
             "https://github.com/cloudflare/cloudflared/releases/latest/download/$BIN"
-        sudo chmod +x /usr/local/bin/cloudflared
+        chmod +x "$CF_TMP"
+        "$CF_TMP" --version >/dev/null
+        if [ "$(id -u)" -eq 0 ]; then
+            install -m 0755 "$CF_TMP" /usr/local/bin/cloudflared
+        elif command -v sudo >/dev/null 2>&1; then
+            sudo install -m 0755 "$CF_TMP" /usr/local/bin/cloudflared
+        else
+            echo "✗ 安装到 /usr/local/bin 需要 root 或 sudo" >&2
+            exit 1
+        fi
+        rm -f "$CF_TMP"
+        trap - EXIT
     else
         echo "✗ 请先安装 cloudflared：" >&2
         echo "  Linux:   https://pkg.cloudflare.com/cloudflared 或下载二进制到 /usr/local/bin" >&2
@@ -92,7 +105,7 @@ fi
 if curl -fsS "http://localhost:${BOT_PORT}/favicon.svg" >/dev/null 2>&1; then
     echo "✓ 本机 :${BOT_PORT} 机器人在线"
 else
-    echo "⚠ 本机 :${BOT_PORT} 无响应——先 ./scripts/deploy.sh 把机器人起来（Cloudflare 模式）" >&2
+    echo "⚠ 本机 :${BOT_PORT} 无响应——先 ./scripts/deploy/deploy.sh 把机器人起来（Cloudflare 模式）" >&2
 fi
 
 # ---- 4. 起隧道（前台）----

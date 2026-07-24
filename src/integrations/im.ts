@@ -1,6 +1,5 @@
-// 发送层：向量子密信群聊 webhook 发送多种消息 + 附件上传。
-// 对应 Python 版 im_service.py，复刻已实测验证的 A 套协议。
-import { log } from "../lib/log.ts";
+// 发送层：量子密信群聊 webhook 消息、附件上传和出站限流。
+import { log } from "../core/log.ts";
 import {
   ATTACHMENT_HTTP_TIMEOUT,
   IM_HEARTBEAT_PAUSE_AT,
@@ -11,7 +10,7 @@ import {
   IM_RETRY_COUNT,
   IM_RETRY_DELAY,
   MAX_ATTACHMENT_BYTES,
-} from "../lib/config.ts";
+} from "../core/config.ts";
 
 const IM_SEND_HOST = "imtwo.zdxlz.com";
 const UPLOAD_PATH = "/im-external/v1/webhook/upload-attachment";
@@ -224,7 +223,7 @@ function noteServerRateLimit(callbackUrl: string, response: Response): void {
 }
 
 /** 从 callBackUrl（send?key=xxx）解析机器人 key，用于上传附件。 */
-export function extractKeyFromCallback(callbackUrl: string): string | null {
+function extractKeyFromCallback(callbackUrl: string): string | null {
   try {
     return new URL(callbackUrl).searchParams.get("key");
   } catch {
@@ -290,7 +289,7 @@ async function postWithRetry(
 }
 
 /** 从 markdown 正文提取首行作卡片标题（去标记、截断）。A 套 markdown 的 title 必填。 */
-export function buildMarkdownTitle(content: string, limit = 24): string {
+function buildMarkdownTitle(content: string, limit = 24): string {
   const firstLine = content.trim().split("\n", 1)[0]?.trim() ?? "";
   let clean = firstLine.replace(/^[#>\*\-\d\.\s]+/, "");
   clean = clean.replace(/^[*_`\t ]+/, "").replace(/[*_`\t ]+$/, "");
@@ -298,7 +297,7 @@ export function buildMarkdownTitle(content: string, limit = 24): string {
 }
 
 // ===== 消息构建器（A 套群聊 webhook 协议，已实测验证）=====
-export function buildText(content: string, groupId: string, phone: string) {
+function buildText(content: string, groupId: string, phone: string) {
   return {
     type: "text" as const,
     textMsg: {
@@ -311,21 +310,21 @@ export function buildText(content: string, groupId: string, phone: string) {
   };
 }
 
-export function buildMarkdown(content: string) {
+function buildMarkdown(content: string) {
   return {
     type: "markdown" as const,
     markdown: { title: buildMarkdownTitle(content), content },
   };
 }
 
-export function buildImage(fileId: string, width?: number, height?: number) {
+function buildImage(fileId: string, width?: number, height?: number) {
   const body: Record<string, unknown> = { fileId };
   if (width !== undefined) body.width = width;
   if (height !== undefined) body.height = height;
   return { type: "image" as const, imageMsg: body };
 }
 
-export function buildFile(fileId: string) {
+function buildFile(fileId: string) {
   return { type: "file" as const, fileMsg: { fileId } };
 }
 

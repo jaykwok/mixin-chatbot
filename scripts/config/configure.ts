@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 // AI 配置 TUI：交互生成 data/models.json（provider + key + model，Pi 原生读取）。
 // 通常在容器内运行：
-//   docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run scripts/configure.ts
-// 也可本地 bun run scripts/configure.ts。
+//   docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure
+// 也可本地 bun run configure。
 import {
   cancel,
   confirm,
@@ -15,7 +15,8 @@ import {
   text,
   isCancel,
 } from "@clack/prompts";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import {
   getBuiltinModels,
@@ -58,8 +59,11 @@ type JsonObject = Record<string, unknown>;
 async function loadExisting(): Promise<ExistingDoc> {
   try {
     return JSON.parse(await readFile(MODELS_JSON_PATH, "utf8")) as ExistingDoc;
-  } catch {
-    return {};
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new Error(`${MODELS_JSON_PATH} 无法读取或不是有效 JSON`, {
+      cause: error,
+    });
   }
 }
 
@@ -72,6 +76,7 @@ interface LiteLLMEntry {
   cache_read_input_token_cost?: number;
   cache_creation_input_token_cost?: number;
   supports_vision?: boolean;
+  supports_reasoning?: boolean;
   mode?: string;
 }
 
@@ -105,19 +110,24 @@ function matchLitellm(
   return null;
 }
 
-function entryToModel(modelId: string, e: LiteLLMEntry): JsonObject {
+export function entryToModel(modelId: string, e: LiteLLMEntry): JsonObject {
+  // LiteLLM 是美元/token，Pi 的 Model.cost 是美元/百万 token。
+  const perMillion = (value: number | undefined): number =>
+    typeof value === "number" && Number.isFinite(value)
+      ? value * 1_000_000
+      : 0;
   return {
     id: modelId,
     name: modelId,
     contextWindow: e.max_input_tokens ?? e.max_tokens ?? 131072,
     maxTokens: e.max_output_tokens ?? e.max_tokens ?? 8192,
     input: e.supports_vision ? ["text", "image"] : ["text"],
-    reasoning: false,
+    reasoning: e.supports_reasoning ?? false,
     cost: {
-      input: e.input_cost_per_token ?? 0,
-      output: e.output_cost_per_token ?? 0,
-      cacheRead: e.cache_read_input_token_cost ?? 0,
-      cacheWrite: e.cache_creation_input_token_cost ?? 0,
+      input: perMillion(e.input_cost_per_token),
+      output: perMillion(e.output_cost_per_token),
+      cacheRead: perMillion(e.cache_read_input_token_cost),
+      cacheWrite: perMillion(e.cache_creation_input_token_cost),
     },
   };
 }
@@ -185,9 +195,9 @@ async function main(): Promise<void> {
     const apiKey = bail<string>(
       await password({
         message: `输入 ${providerId} 的 API Key`,
-        validate: (v) => (v ? undefined : "不能为空"),
+        validate: (v) => (v?.trim() ? undefined : "不能为空"),
       })
-    );
+    ).trim();
     // 内置 provider：baseUrl/元数据 Pi 目录自带，models.json 只需 key + 模型 id。
     entry = { apiKey, models: [{ id: modelId }] };
   } else {
@@ -196,8 +206,9 @@ async function main(): Promise<void> {
         message: "provider id（自洽即可，如 deepseek）",
         defaultValue: firstId ?? "deepseek",
         initialValue: firstId ?? "deepseek",
+        validate: (v) => (v?.trim() ? undefined : "不能为空"),
       })
-    );
+    ).trim();
     const baseUrl = bail<string>(
       await text({
         message: "baseUrl（openai 兼容端点）",
@@ -216,21 +227,21 @@ async function main(): Promise<void> {
           }
         },
       })
-    );
+    ).trim();
     const apiKey = bail<string>(
       await password({
         message: "API Key",
-        validate: (v) => (v ? undefined : "不能为空"),
+        validate: (v) => (v?.trim() ? undefined : "不能为空"),
       })
-    );
+    ).trim();
     const modelId = bail<string>(
       await text({
         message: "模型 id",
         defaultValue: (firstModel?.id as string) ?? "deepseek-v4-flash",
         initialValue: (firstModel?.id as string) ?? "deepseek-v4-flash",
-        validate: (v) => (v ? undefined : "不能为空"),
+        validate: (v) => (v?.trim() ? undefined : "不能为空"),
       })
-    );
+    ).trim();
 
     // 从 LiteLLM 抓元数据（自定义 provider 的模型不在 Pi 内置目录）。
     let model: JsonObject = firstModel ? { ...firstModel } : defaultModel(modelId);
@@ -277,16 +288,27 @@ async function main(): Promise<void> {
 
   const doc = { providers: { [providerId]: entry } };
   await mkdir(dirname(MODELS_JSON_PATH), { recursive: true });
-  await writeFile(MODELS_JSON_PATH, JSON.stringify(doc, null, 2) + "\n", "utf8");
-  await chmod(MODELS_JSON_PATH, 0o600).catch(() => {
-    // Windows ACL 不使用 POSIX mode；部署脚本仍限制运行身份。
-  });
+  const tempPath = `${MODELS_JSON_PATH}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    await writeFile(tempPath, JSON.stringify(doc, null, 2) + "\n", {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    await chmod(tempPath, 0o600).catch(() => {
+      // Windows ACL 不使用 POSIX mode；部署脚本仍限制运行身份。
+    });
+    await rename(tempPath, MODELS_JSON_PATH);
+  } finally {
+    await unlink(tempPath).catch(() => {});
+  }
 
   note(`已写入 ${MODELS_JSON_PATH}\nprovider=${providerId}`, "完成");
   outro("✅ AI 配置完成。");
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}

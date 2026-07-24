@@ -8,20 +8,24 @@
 |------|------|
 | 运行时 | Bun（原生 TS） |
 | Web 框架 | Hono（跑在 Bun.serve） |
-| Agent 大脑 | `@earendil-works/pi-coding-agent`（AgentSession + SessionManager） |
+| Agent 大脑 | `@earendil-works/pi-coding-agent`（经审计追随最新版，由 `bun.lock` 锁定） |
 | 模型接入 | Pi 原生读 `data/models.json`，支持 DashScope / DeepSeek / 智谱等 openai 兼容端点 |
-| 部署 | Docker（Debian，oven/bun 镜像）/ Windows 原生 Bun（`deploy.ps1`） |
+| 部署 | Docker（Debian，oven/bun 镜像）/ Windows 原生 Bun（`scripts/deploy/deploy.ps1`） |
 
 ## 工作方式
 
 机器人只接收**文字**消息（群聊 webhook）。Pi agent 拿到后可调用工具：
 
-- 内置：`read` / `bash` / `edit` / `write`（每个用户在独立的 `<AGENT_CWD>/<phone>/tmp` 中读写文件、运行终端命令、联网查询）
+- 官方工厂：`read` / `bash` / `edit` / `write`（cwd 为本群共享的 `<AGENT_DATA_ROOT>/<group>/workspace`；文件工具只允许访问该 workspace 与当前用户 tmp）
 - 自定义：`send_image` / `send_file`（往群里发送图片或文件）
 
 最终回复含 Markdown 格式时发送 **markdown 正文 + text@ 通知**两条消息（markdown 不支持 @，故另发 text 触发通知）；纯文本回复只发送一条带 @ 的 text，避免重复。
 
-**文件与会话隔离**：每个用户有独立的 `<AGENT_CWD>/<phone>/tmp` 工作目录；会话按 **(phone, 群)** 隔离，保存在 `<AGENT_CWD>/<phone>/sessions/<groupId>.jsonl`。`groupId` 不符合安全字符集时用完整 SHA-256 命名，防穿越、防碰撞。
+**群共享工作区 + 用户临时区**：每个群共用 `<AGENT_DATA_ROOT>/<group>/workspace`，只存长期成果；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<AGENT_DATA_ROOT>/<group>/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip 缓存指向用户临时区；Pi 因输出截断产生的完整日志也会迁入这里。会话按 **(群, phone)** 分开，保存在 `<AGENT_DATA_ROOT>/<group>/<phone>/sessions/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
+
+**phone 与 Pi sessionId**：`(groupId, phone)` 唯一定位一份会话文件，Pi 的 sessionId 保存在该 JSONL 头部；`/reset` 删除文件后生成新 sessionId。Pi 0.82 自动向 bash 注入 `PI_SESSION_ID`、`PI_SESSION_FILE`、`PI_PROVIDER`、`PI_MODEL`、`PI_REASONING_LEVEL`，适配层再注入 `PI_GROUP_ID`、`PI_CALLER_PHONE`、`PI_USER_TMP`。`/status` 和创建日志都会显示这层绑定。
+
+**共享工作区串行化**：不同用户仍使用各自会话，但同一群的完整 agent 轮次按 FIFO 串行，避免两个 session 同时改同一 workspace；不同群可并行。当前用户正在执行时发普通消息仍直接走 `session.steer`，指令也不会被队列阻塞。排队请求会收到状态回执，`/reset` 会让该用户尚未执行的旧请求失效。
 
 **长任务心跳**：工具调用不逐条发群消息。正常负载下，任务开始时发送 `🤔 正在思考...`，超过 20 秒后每 20 秒发送一次存活心跳，完成或中断时立即停止；高负载时这些状态消息会优先降频。
 
@@ -35,9 +39,9 @@
 |---|---|
 | `/help` | 列出指令 |
 | `/stop` | **硬中断**当前任务（`session.abort`，连在跑的工具一并取消） |
-| `/status` | 查看忙/闲、待消化的干预、最近工具及机器人共享 RPM 窗口 |
+| `/status` | 查看忙/闲、Pi sessionId、群工作区队列、待消化干预、最近工具及共享 RPM 窗口 |
 | `/cancel` | 撤销尚未被消化的干预消息 |
-| `/reset` | 清空本群会话历史，重新开始 |
+| `/reset` | 清空当前用户在本群的会话历史，重新开始 |
 
 > 区别：发普通消息（含「停止」）= **软干预**，等当前这批工具调用完、下次调 LLM 前注入，靠模型自觉改方向（杀不掉正在跑的长命令）；`/stop` = **硬停**，立刻取消（含在跑的 bash）。
 
@@ -45,12 +49,20 @@
 
 项目无必需的 `.env` 或 `config.json`：
 
-- **AI 配置**（provider / key / model / 元数据）：全部在 `data/models.json`，由 TUI 工具 `scripts/configure.ts` 生成，Pi 原生读取。
-- **监听端口**：`deploy.sh` 和 `deploy.ps1` 每次部署都会询问，默认优先沿用 `BOT_PORT` 或 `data/bot-port`，否则为 `1011`；选择结果写入 `data/bot-port`，服务、健康检查、隧道探测和运维脚本共用。
+- **AI 配置**（provider / key / model / 元数据）：全部在 `data/models.json`，由 `bun run configure` 调用 `scripts/config/configure.ts` 生成，Pi 原生读取。
+- **监听端口**：Linux/Windows 部署脚本每次都会询问，默认优先沿用 `BOT_PORT` 或 `data/bot-port`，否则为 `1011`；选择结果写入 `data/bot-port`，服务、健康检查、隧道探测和运维脚本共用。
 - **监听地址**：部署脚本自动设置；直连模式为 `0.0.0.0`，Cloudflare 模式为 `127.0.0.1`。手动启动时可用 `BOT_HOST` 覆盖。
-- **用户目录总根**（可选）：默认 `./data`，部署时可改（`deploy.ps1`/`deploy.sh` 会问），或直接设环境变量 `AGENT_CWD`（相对仓库或绝对路径均可）。每个用户的临时文件和会话分别位于 `<AGENT_CWD>/<phone>/tmp`、`<AGENT_CWD>/<phone>/sessions`。
+- **群数据总根**（可选）：默认 `./data`，部署时可改（`deploy.ps1`/`deploy.sh` 会问），或直接设环境变量 `AGENT_DATA_ROOT`（相对仓库或绝对路径均可）。群共享成果、当前用户临时文件和独立会话分别位于 `<AGENT_DATA_ROOT>/<group>/workspace`、`<AGENT_DATA_ROOT>/<group>/<phone>/tmp`、`<AGENT_DATA_ROOT>/<group>/<phone>/sessions/session.jsonl`。
 - **访问控制**：随机密钥路径（`data/webhook-secret`，应用层）+ 网络层 IP 闸门（直连=UFW / Cloudflare=WAF），见下方「部署模式」与「安全」。
 - **开发开关**：生产环境缺少有效 `data/webhook-secret` 时服务拒绝启动；只有隔离的本地调试可显式设置 `ALLOW_INSECURE_WEBHOOK=1`。`BOT_DEBUG=1` 会记录用户消息正文，默认关闭。
+
+Pi 依赖声明保持 `latest`，但部署使用提交进仓库的 `bun.lock` 和 `bun install --frozen-lockfile`，避免未经审计的自动升级。主动追 Pi 新版时运行 `bun update @earendil-works/pi-ai @earendil-works/pi-coding-agent && bun run check`，确认通过后一起提交锁文件。
+
+## Pi 官方实现取舍
+
+- 当前核心直接复用 [Pi SDK](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) 的 `AgentSession`、`SessionManager`、`ModelRuntime`、默认资源加载器、compaction/steer/abort，以及 read/bash/edit/write 工具工厂；本项目只保留量子密信回调、群/用户目录策略、工作区队列和发送附件工具。0.82 新增的 bash 会话环境已启用，所有工具也以 `prefer` 使用其 constrained JSON Schema sampling（模型不支持时自动回退）。
+- 官方 [pi-chat](https://github.com/earendil-works/pi-chat) 提供 Discord/Telegram 与 Gondolin 微型虚拟机隔离，证明“一频道一个 workspace/runner”的方向合理；但它依赖 QEMU、tmux、Gondolin，并仍面向旧包名的 peer API，不适合直接嵌入现有 Windows/Linux/Docker 部署。
+- 历史 Slack bot [`@mariozechner/pi-mom`](https://www.npmjs.com/package/@mariozechner/pi-mom) 已停留在旧命名空间；[`pi-messenger-bridge`](https://pi.dev/packages/pi-messenger-bridge) 是第三方 Slack bridge。二者都不能替代量子密信 webhook 适配。
 
 ## 部署模式：直连 / Cloudflare
 
@@ -64,7 +76,7 @@
 | TLS | HTTP（可选：自带反代套 HTTPS） | Cloudflare 自动 |
 | 监听范围 | 所选端口对平台 IP 开放 | 仅 `127.0.0.1:<port>`，不直接暴露公网 |
 
-`deploy.sh` 启动时交互选择模式并给出对应回调地址 + 配置指引：
+`scripts/deploy/deploy.sh` 启动时交互选择模式并给出对应回调地址 + 配置指引：
 
 - **直连模式**：部署脚本把所选端口的 UFW 规则限定到平台 IP（安全基线）+ 随机密钥路径。走 HTTP，secret 在「平台→服务器」明文，但仅平台 IP 可达；有域名可在前面套 nginx/caddy + 证书升级 HTTPS。
 - **Cloudflare 模式**：bot 只监听 `127.0.0.1:<port>`，再由 cloudflared + WAF + 随机密钥路径接入。token 启动的是远程管理隧道，必须在 Cloudflare 控制台把 **Published application → Service** 设为 `http://localhost:<port>`；脚本无法替控制台修改这个源站地址。
@@ -76,17 +88,19 @@
 Debian 服务器，root 运行：
 
 ```bash
-chmod +x scripts/setup-server.sh scripts/deploy.sh scripts/ops.sh scripts/start-tunnel.sh
-sudo ./scripts/setup-server.sh
+chmod +x scripts/deploy/*.sh scripts/ops/*.sh scripts/tunnel/*.sh
+sudo ./scripts/deploy/setup-server.sh
 ```
 
-默认按端口 `1011` 初始化；需要其他初始端口时：
+默认按直连模式、bot 端口 `1011` 初始化；SSH 端口优先从当前 SSH 连接和 `sshd` 自动识别。需要覆盖时：
 
 ```bash
-sudo BOT_PORT=12011 ./scripts/setup-server.sh
+sudo BOT_PORT=12011 SSH_PORT=2222 ./scripts/deploy/setup-server.sh
+# Cloudflare 模式不开放 bot 公网端口：
+sudo DEPLOY_MODE=cloudflare ./scripts/deploy/setup-server.sh
 ```
 
-完成：安装 Docker、UFW 防火墙（22 SSH + bot 端口仅平台 IP）、fail2ban、自动安全更新、内核优化、Docker 日志轮转。之后 `deploy.sh` 若选择不同端口，也会同步新增对应 UFW 规则。
+完成：安装 Docker、UFW 防火墙、fail2ban、自动安全更新、内核优化和 Docker 日志轮转。脚本会先确保当前 SSH/webhook 入口存在，再清理本项目遗留的 UFW 规则；换端口或切换 Cloudflare 不会留下旧入口，也不会因新规则写入失败先删掉仍在工作的入口。
 
 ```bash
 sudo usermod -aG docker $USER && newgrp docker
@@ -95,50 +109,52 @@ sudo usermod -aG docker $USER && newgrp docker
 ### 2. 部署应用
 
 ```bash
-./scripts/deploy.sh
+./scripts/deploy/deploy.sh
 ```
 
 流程：
 
-1. 询问监听端口（默认沿用已有值，否则 `1011`）、部署模式和用户目录总根
+1. 询问监听端口（默认沿用已有值，否则 `1011`）、部署模式和群数据总根
 2. 构建 Docker 镜像（Bun）
 3. **AI 配置**：若 `data/models.json` 不存在，在容器内运行 TUI（选 provider、填 key、选模型，元数据从 LiteLLM 抓取）；已存在则询问是否重配
-4. 启动容器（host 网络、只读根文件系统、最小权限，挂载 `data/`、`logs/` 和选择的用户目录总根）
+4. 启动容器（host 网络、只读根文件系统、最小权限，挂载 `data/`、`logs/` 和选择的群数据总根）
 5. 等待健康检查；失败或超时会中止部署并打印日志
 
 重新配置 AI 后重启 bot 让运行时重新加载：
 
 ```bash
-docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run scripts/configure.ts &&
+docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure &&
 docker restart mixin-chatbot
 ```
 
 ### 更新
 
 ```bash
-git pull && ./scripts/deploy.sh
+git pull && ./scripts/deploy/deploy.sh
 ```
 
-默认配置下，会话历史保存在 `data/<phone>/sessions/<groupId>.jsonl`（按 phone+群隔离），工作文件保存在 `data/<phone>/tmp/`，更新不丢失。
+默认配置下，群共享成果保存在 `data/<group>/workspace/`；当前用户的临时文件和会话历史分别保存在 `data/<group>/<phone>/tmp/` 与 `data/<group>/<phone>/sessions/session.jsonl`，更新不丢失。
 
 ### Cloudflare 模式（云电脑）部署
 
 适合无公网 IP 的云电脑：bot 只监听云电脑 `127.0.0.1:<port>`，`cloudflared` 经 Cloudflare 隧道接入。
 
 1. `git clone` 仓库到云电脑，按系统部署（选择 **Cloudflare 模式**、确认端口并生成 webhook 密钥）：
-   - **Windows Server（云电脑）**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1`（**原生 Bun，无需 Docker**；先装 Git for Windows + Bun。部署脚本会定位 Git Bash 并把它加入 bot 的 PATH）
-   - **Linux**：`./scripts/deploy.sh`（Docker）
+   - **Windows Server（云电脑）**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1`（**原生 Bun，无需 Docker**；先装 Git for Windows + Bun。部署脚本会定位 Git Bash 并把它加入 bot 的 PATH）
+   - **Linux**：`./scripts/deploy/deploy.sh`（Docker）
 2. 在 Cloudflare Tunnel 控制台把 Published application 的 Service 改为本次选择的 `http://localhost:<port>`。
-3. 准备隧道 token（来自服务器 `/root/.cpa-bot-tunnel-token.env`），任选一种：
-   - 最省事：把服务器那个 `.env` **整个文件**拷到云电脑，起隧道时把路径传给脚本即可（脚本能解析 `TUNNEL_TOKEN=...` 形式）。
+3. 从 Cloudflare Tunnel 获取 token，任选一种：
+   - 把包含 token 的 `.env` **整个文件**拷到云电脑，起隧道时把路径传给脚本即可（脚本能解析 `TUNNEL_TOKEN=...` 形式）。
    - 或把里面的 `TUNNEL_TOKEN` 值写入云电脑 `data/tunnel-token`（默认读取位置）。
    - 或 `export TUNNEL_TOKEN=<值>`。
-4. 起隧道。选 Cloudflare 模式时，`deploy.ps1`/`deploy.sh` 会在 bot 起来后**自动确保 connector 在线**（Windows：`Cloudflared` 服务没跑就 Start、没装就调 `start-tunnel.ps1` 装；Linux：没跑就后台起 `start-tunnel.sh`）。下面命令仅用于首次手动安装或后续重装：
-   - **Linux/macOS**：`./scripts/start-tunnel.sh [token-file]`
-   - **Windows Server**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\start-tunnel.ps1 [token-file]`（装 cloudflared + 注册为 Windows 服务，开机自启）
+4. 起隧道。选择 Cloudflare 模式时，部署脚本会在 bot 起来后**自动确保 connector 在线**（Windows：`Cloudflared` 服务没跑就 Start、没装就调用 tunnel 脚本；Linux：没跑就后台启动）。下面命令仅用于首次手动安装或后续重装：
+   - **Linux/macOS**：`./scripts/tunnel/start-tunnel.sh [token-file]`
+   - **Windows Server**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\tunnel\start-tunnel.ps1 [token-file]`（装 cloudflared + 注册为 Windows 服务，开机自启）
 
    token 解析优先级：位置参数文件 → `$TUNNEL_TOKEN_FILE` → `$TUNNEL_TOKEN`（裸值）→ `data/tunnel-token`。token 文件可以是裸 token，也可以是 `.env` 形式（含 `TUNNEL_TOKEN=...`）。
-5. IM 平台回调填：`https://im-bot.jaykwok.net/webhook/<secret>`（secret 来自 deploy 输出）。
+5. IM 平台回调填：`https://<你的域名>/webhook/<secret>`（secret 来自 deploy 输出）。设置纯 hostname 形式的 `BOT_DOMAIN`（例如 `bot.example.com`，不含协议/端口/路径）后，部署成功会写入 `data/bot-domain`，后续运维脚本会自动检查该域名。
+
+Windows 上轮换已经安装到服务里的 tunnel token 时，设置 `$env:CLOUDFLARED_REINSTALL='1'` 后重新运行 `scripts\tunnel\start-tunnel.ps1`；默认重跑只会启动现有服务，不会静默替换它的 token。
 
 > bot 端口无需对公网开放。Cloudflare WAF（平台 IP 白名单）和 Published application 的源站端口都在 Cloudflare 侧配置。
 
@@ -154,30 +170,31 @@ git pull && ./scripts/deploy.sh
 ```
 mixin-chatbot/
 ├── src/
-│   ├── server/                 # HTTP 层
-│   │   ├── index.ts            # 入口：Hono + Bun.serve + /webhook 路由
-│   │   ├── webhook.ts          # 字段校验、去重、入站限流、后台并发派发
-│   │   └── http.ts             # HttpError + 客户端 IP
-│   ├── agent/                  # Pi agent 大脑
-│   │   ├── agent.ts            # models.json 加载 + 运行时 + 会话 + 对话入口
-│   │   └── tools.ts            # 发送工具 send_image / send_file
-│   ├── im/im.ts                # 发送层（消息/附件 + 共享 RPM 滑动窗口）
-│   └── lib/                    # 共享基础
-│       ├── config.ts           # 参数读取与常量（端口 / 限流 / 日志等）
-│       └── log.ts              # 日志（console + 文件轮转）
+│   ├── agent/                  # Pi 运行时、目录策略与工具适配
+│   │   ├── runtime.ts          # models.json 加载 + 会话 + 对话入口
+│   │   ├── group-queue.ts      # 同群共享 workspace 的 FIFO 执行队列
+│   │   ├── local-tools.ts      # Pi 官方工具工厂 + 路径/临时环境适配
+│   │   ├── paths.ts            # 群优先的数据目录布局与安全目录名
+│   │   └── send-tools.ts       # 发送工具 send_image / send_file
+│   ├── core/                   # 共享基础设施
+│   │   ├── config.ts           # 参数读取与常量（端口 / 限流 / 日志等）
+│   │   └── log.ts              # 日志（console + 文件轮转）
+│   ├── integrations/
+│   │   └── im.ts               # 量子密信消息/附件与共享 RPM 窗口
+│   └── server/                 # HTTP 层
+│       ├── index.ts            # 入口：Hono + Bun.serve + /webhook 路由
+│       ├── webhook.ts          # 字段校验、去重、入站限流、后台并发派发
+│       └── http.ts             # HttpError + 客户端 IP
 ├── scripts/
-│   ├── configure.ts     # TUI：生成 data/models.json（LiteLLM 元数据）
-│   ├── deploy.sh        # Linux 部署（Docker）
-│   ├── deploy.ps1       # Windows Server 部署（原生 Bun，无 Docker）
-│   ├── setup-server.sh  # Linux 服务器加固（Docker/UFW/fail2ban）
-│   ├── start-tunnel.sh  # 云电脑 cloudflared 对接（Linux/macOS）
-│   ├── start-tunnel.ps1 # 同上（Windows Server，注册为服务）
-│   ├── ops.sh           # Linux 运维（Docker）：doctor/restart/stop/start/logs/uninstall
-│   └── ops.ps1          # Windows 运维：同上
-├── static/favicon.svg
-├── data/               # 配置/部署状态 + 默认用户根：<phone>/{tmp,sessions/<groupId>.jsonl}
-├── logs/               # 应用日志
-├── Dockerfile          # oven/bun:1-debian
+│   ├── config/          # AI 配置 TUI
+│   ├── deploy/          # Linux/Windows 部署 + 服务器初始化
+│   ├── ops/             # doctor/restart/stop/start/logs/uninstall
+│   └── tunnel/          # Linux/Windows cloudflared connector
+├── tests/               # 按 agent/config/server 分类的 Bun 测试
+├── public/favicon.svg
+├── data/                # 配置/部署状态/runtime + 群 workspace/用户 tmp/会话
+├── logs/                # 应用日志
+├── Dockerfile           # oven/bun:1-debian
 └── package.json
 ```
 
@@ -199,20 +216,21 @@ mixin-chatbot/
 - `--read-only` 只读根文件系统
 - `--cap-drop ALL` + `--security-opt no-new-privileges`
 - 非 root 运行（UID 1001）
-- `--tmpfs /tmp` + `--tmpfs /app/.pi`（运行时内部临时空间）；agent 产出的工作文件仍在每个用户自己的 `<phone>/tmp`
+- `--tmpfs /tmp` + `--tmpfs /app/.pi`（运行时内部临时空间）；agent 的共享成果在 `<group>/workspace`，任务中间产物定向到当前用户 `<group>/<phone>/tmp`
 
 ### 应用层
 
 - 随机密钥路径鉴权（`data/webhook-secret`，见上）
-- 回调 URL 结构校验：https + hostname 白名单 + 约定发送端点 + `key` 参数（防 SSRF / 伪造；细节见 `src/lib/config.ts`）
-- `phone` 格式校验（防会话文件名路径穿越）、消息内容 16KB 上限
+- 回调 URL 结构校验：https + hostname 白名单 + 约定发送端点 + `key` 参数（防 SSRF / 伪造；细节见 `src/core/config.ts`）
+- `phone` 格式、`groupId` 控制字符校验（防路径穿越、日志注入和非法子进程环境）、消息内容 16KB 上限
 - 请求去重（30 秒内相同请求跳过，防重复回复）
 - 错误信息脱敏（仅记日志，不回传用户）
-- ⚠️ agent 有 `bash` 工具（**非 cwd 沙箱**，可执行任意命令，权限=bot 进程用户）：仅可信群成员可 @ 触发；内置工具默认工作目录按用户绑定到 `<AGENT_CWD>/<phone>/tmp`
+- read/write/edit 文件工具会解析真实路径，只允许本群 workspace 与当前用户 tmp，阻止 `..` 和符号链接越界。
+- ⚠️ `bash` 仍是**非 cwd 沙箱**，可执行任意命令，权限=bot 进程用户；cwd 和临时环境不是 OS 级隔离。仅可信群成员可触发，生产优先使用只读、非 root、丢弃 capabilities 的 Docker 部署。若以后要求对不可信用户开放，应整体接入 Gondolin/容器级沙箱，而不是依赖 shell 字符串过滤。
 
-### 系统层（setup-server.sh）
+### 系统层（`scripts/deploy/setup-server.sh`）
 
-- UFW 防火墙（22 + 部署所选 bot 端口，bot 端口仅平台 IP）
+- UFW 防火墙（自动识别 SSH 端口；直连时 bot 端口仅平台 IP，Cloudflare 时不开放 bot 端口）
 - fail2ban（SSH 暴力破解防护）
 - 自动安全更新、TCP 加固
 
@@ -228,28 +246,28 @@ mixin-chatbot/
 
 ## 日常运维
 
-**Linux（Docker 部署）**——`scripts/ops.sh` 一站式运维：
+**Linux（Docker 部署）**——`scripts/ops/ops.sh` 一站式运维：
 
 ```bash
-./scripts/ops.sh doctor     # 健康检查（容器/本地/配置；仅 Cloudflare 模式检查隧道和公网）
-./scripts/ops.sh restart    # 重启（docker restart）
-./scripts/ops.sh logs       # 实时日志（docker logs -f --tail 50）
-./scripts/ops.sh stop       # 停止
-./scripts/ops.sh uninstall  # 卸载（容器，可选清 image/cloudflared/data）
+./scripts/ops/ops.sh doctor     # 健康检查（容器/本地/配置；仅 Cloudflare 模式检查隧道和公网）
+./scripts/ops/ops.sh restart    # 重启（docker restart）
+./scripts/ops/ops.sh logs       # 实时日志（docker logs -f --tail 50）
+./scripts/ops/ops.sh stop       # 停止
+./scripts/ops/ops.sh uninstall  # 卸载（容器，可选清 image/cloudflared/data）
 ```
 
 应用日志：`logs/mixin-chatbot.log`（5MB × 3 轮转）；容器层日志 `docker logs mixin-chatbot`。
 
-> 卸载时删除 `data/` 只会清理 AI 配置、webhook 密钥及默认用户根。若 `AGENT_CWD` 指向其他目录，该自定义用户根会保留，需确认后另行处理。
+> 卸载时删除 `data/` 只会清理 AI 配置、webhook 密钥及默认群数据根。若 `AGENT_DATA_ROOT` 指向其他目录，该自定义群数据根会保留，需确认后另行处理。
 
-**Windows Server（云电脑，`deploy.ps1` 部署的）**——`scripts\ops.ps1` 一站式运维：
+**Windows Server（云电脑，由 `scripts\deploy\deploy.ps1` 部署）**——`scripts\ops\ops.ps1` 一站式运维：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 doctor     # 健康检查（task/端口/配置；隧道检查按部署模式启用）
-powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 restart    # 重启
-powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 logs       # 实时日志
-powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 stop       # 停止
-powershell -ExecutionPolicy Bypass -File scripts\ops.ps1 uninstall  # 卸载（task/进程，可选清 cloudflared/data）
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor     # 健康检查（task/端口/配置；隧道检查按部署模式启用）
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 restart    # 重启
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 logs       # 实时日志
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 stop       # 停止
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 卸载（task/进程，可选清 cloudflared/data）
 ```
 
 ## 故障排查

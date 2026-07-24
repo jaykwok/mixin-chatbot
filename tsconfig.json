@@ -17,5 +17,5 @@
     "esModuleInterop": true,
     "verbatimModuleSyntax": false
   },
-  "include": ["src", "scripts/**/*.ts"]
+  "include": ["src", "scripts/**/*.ts", "tests/**/*.ts"]
 }

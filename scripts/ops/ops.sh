@@ -2,11 +2,11 @@
 # mixin-chatbot ops tool (Linux / Docker).
 # One-stop: doctor / restart / stop / start / logs / uninstall.
 #
-# Usage: ./scripts/ops.sh <command>
+# Usage: ./scripts/ops/ops.sh <command>
 #   commands: doctor, restart, stop, start, logs, uninstall   (no arg -> menu)
 set -uo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTAINER="mixin-chatbot"
 if [ -n "${BOT_PORT:-}" ]; then
     PORT="$BOT_PORT"
@@ -20,13 +20,35 @@ if [ -f "${PROJECT_DIR}/data/deploy-mode" ]; then
 else
     DEPLOY_MODE="direct"
 fi
-DOMAIN="${BOT_DOMAIN:-im-bot.jaykwok.net}"
+if [ -n "${BOT_DOMAIN:-}" ]; then
+    DOMAIN="$BOT_DOMAIN"
+elif [ -f "${PROJECT_DIR}/data/bot-domain" ]; then
+    DOMAIN="$(tr -d '[:space:]' < "${PROJECT_DIR}/data/bot-domain")"
+else
+    DOMAIN=""
+fi
+is_valid_hostname() {
+    local hostname="$1"
+    [ -n "$hostname" ] && [ "${#hostname}" -le 253 ] || return 1
+    [[ "$hostname" != .* && "$hostname" != *. && "$hostname" != *..* ]] || return 1
+    local labels=()
+    IFS='.' read -r -a labels <<< "$hostname"
+    local label
+    for label in "${labels[@]}"; do
+        [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
     echo "invalid bot port in BOT_PORT/data/bot-port: $PORT" >&2
     exit 1
 fi
 if [ "$DEPLOY_MODE" != "direct" ] && [ "$DEPLOY_MODE" != "cloudflare" ]; then
     echo "invalid deployment mode in data/deploy-mode: $DEPLOY_MODE" >&2
+    exit 1
+fi
+if [ -n "$DOMAIN" ] && ! is_valid_hostname "$DOMAIN"; then
+    echo "invalid hostname in BOT_DOMAIN/data/bot-domain: $DOMAIN" >&2
     exit 1
 fi
 
@@ -45,7 +67,21 @@ check() {
 
 # HTTP status code of a URL (curl prints "000" on connection failure).
 code_of() {
-    curl -s -o /dev/null -w "%{http_code}" -m 10 "$1" 2>/dev/null || true
+    curl -s -o /dev/null -w "%{http_code}" -m "${2:-10}" "$1" 2>/dev/null || true
+}
+
+wait_for_local() {
+    local attempt code=""
+    for attempt in $(seq 1 10); do
+        code="$(code_of "http://localhost:${PORT}/favicon.svg" 2)"
+        if [ "$code" = "200" ]; then
+            printf '%s' "$code"
+            return 0
+        fi
+        [ "$attempt" -eq 10 ] || sleep 1
+    done
+    printf '%s' "$code"
+    return 1
 }
 
 has_container() {
@@ -72,8 +108,12 @@ doctor() {
         fi
         check "cloudflared running" "$crunning" "$cdetail"
 
-        local pc; pc="$(code_of "https://${DOMAIN}/favicon.svg")"
-        check "public CF->tunnel->bot" "$([ "$pc" = "200" ] && echo 1 || echo 0)" "HTTP $pc"
+        if [ -n "$DOMAIN" ]; then
+            local pc; pc="$(code_of "https://${DOMAIN}/favicon.svg")"
+            check "public CF->tunnel->bot" "$([ "$pc" = "200" ] && echo 1 || echo 0)" "HTTP $pc"
+        else
+            WA "BOT_DOMAIN/data/bot-domain 未设置，跳过公网健康检查"
+        fi
     fi
 
     local models_ok="0"
@@ -98,21 +138,22 @@ doctor() {
         if [ "$DEPLOY_MODE" = "cloudflare" ]; then
             WA "hints: public 530/1033 -> tunnel down; public 502 -> tunnel up but bot down;"
         fi
-        WA "       local fail -> container down (ops.sh restart);"
-        WA "       secret MISSING -> re-run deploy.sh"
+        WA "       local fail -> container down (scripts/ops/ops.sh restart);"
+        WA "       secret MISSING -> re-run scripts/deploy/deploy.sh"
+        return 1
     else
         OK "all checks passed"
+        return 0
     fi
 }
 
 restart_bot() {
     P "restarting container..."
-    if ! has_container; then ER "container '$CONTAINER' not found; run deploy.sh first"; return; fi
-    docker restart "$CONTAINER" >/dev/null 2>&1 || { ER "docker restart failed"; return; }
-    sleep 2
-    local lc; lc="$(code_of "http://localhost:${PORT}/favicon.svg")"
-    if [ "$lc" = "200" ]; then OK "bot back up (HTTP 200 on :${PORT})"
-    else WA "bot not responding yet (HTTP $lc); try 'ops.sh logs'"; fi
+    if ! has_container; then ER "container '$CONTAINER' not found; run scripts/deploy/deploy.sh first"; return 1; fi
+    docker restart "$CONTAINER" >/dev/null 2>&1 || { ER "docker restart failed"; return 1; }
+    local lc
+    if lc="$(wait_for_local)"; then OK "bot back up (HTTP 200 on :${PORT})"
+    else WA "bot not responding yet (HTTP $lc); try 'scripts/ops/ops.sh logs'"; return 1; fi
 }
 
 stop_bot() {
@@ -123,12 +164,14 @@ stop_bot() {
 
 start_bot() {
     P "starting container..."
-    if docker start "$CONTAINER" >/dev/null 2>&1; then OK "container started"
-    else ER "start failed; run deploy.sh first"; fi
+    docker start "$CONTAINER" >/dev/null 2>&1 || { ER "start failed; run scripts/deploy/deploy.sh first"; return 1; }
+    local lc
+    if lc="$(wait_for_local)"; then OK "bot started (HTTP 200 on :${PORT})"
+    else WA "bot did not become healthy (HTTP $lc); try 'scripts/ops/ops.sh logs'"; return 1; fi
 }
 
 show_logs() {
-    if ! has_container; then ER "container '$CONTAINER' not found"; return; fi
+    if ! has_container; then ER "container '$CONTAINER' not found"; return 1; fi
     P "tailing docker logs (Ctrl+C to exit)"
     docker logs -f --tail 50 "$CONTAINER"
 }
@@ -153,12 +196,12 @@ uninstall() {
     fi
 
     local d=""
-    read -rp "Delete data/ (models.json, webhook-secret, default user data) and logs/? [y/N] " d || true
+    read -rp "Delete data/ (models.json, webhook-secret, default group data) and logs/? [y/N] " d || true
     if [[ "$d" =~ ^[Yy]$ ]]; then
         rm -rf "${PROJECT_DIR}/data" "${PROJECT_DIR}/logs"
         OK "data/ and logs/ removed"
     else
-        OK "data/ and logs/ kept (config + default user data preserved)"
+        OK "data/ and logs/ kept (config + default group data preserved)"
     fi
     OK "uninstall complete."
 }
@@ -172,7 +215,7 @@ case "${1:-}" in
     uninstall) uninstall ;;
     *)
         echo -e "${CYAN}mixin-chatbot ops tool (Linux/Docker)${NC}"
-        echo "usage: ./scripts/ops.sh <command>"
+        echo "usage: ./scripts/ops/ops.sh <command>"
         echo ""
         echo "  doctor     health check: container, :$PORT, config; Cloudflare checks only in tunnel mode"
         echo "  restart    docker restart"

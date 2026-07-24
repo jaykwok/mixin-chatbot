@@ -9,7 +9,7 @@ WORKDIR /app
 
 # 先装依赖（利用层缓存；.dockerignore 排除本地 node_modules，容器内重装）
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
+RUN bun install --frozen-lockfile --production
 
 # 拷贝源码
 COPY --chown=appuser:appgroup . .

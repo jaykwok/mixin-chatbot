@@ -1,22 +1,81 @@
 #!/bin/bash
 
 # Debian 13 服务器安全加固脚本
-# 用法: sudo ./scripts/setup-server.sh
+# 用法: sudo ./scripts/deploy/setup-server.sh
 
 set -euo pipefail
 
 # 量子密信平台出口 IP（webhook 来源）；UFW 只放行它访问机器人端口。均可用环境变量覆盖。
 PLATFORM_IP="${PLATFORM_IP:-223.244.14.237}"
 BOT_PORT="${BOT_PORT:-1011}"
+DEPLOY_MODE="${DEPLOY_MODE:-direct}"
 if ! [[ "$BOT_PORT" =~ ^[0-9]+$ ]] || [ "$BOT_PORT" -lt 1 ] || [ "$BOT_PORT" -gt 65535 ]; then
     echo "BOT_PORT 必须是 1–65535 的整数" >&2
     exit 1
 fi
-
-if [ "$(id -u)" -ne 0 ]; then
-    echo "请使用 root 运行: sudo ./scripts/setup-server.sh"
+if [ "$DEPLOY_MODE" != "direct" ] && [ "$DEPLOY_MODE" != "cloudflare" ]; then
+    echo "DEPLOY_MODE 必须是 direct 或 cloudflare" >&2
     exit 1
 fi
+
+# 优先沿用显式 SSH_PORT，其次取当前 SSH 连接的服务端口，再查询 sshd。
+if [ -z "${SSH_PORT:-}" ] && [ -n "${SSH_CONNECTION:-}" ]; then
+    SSH_PORT="$(printf '%s\n' "$SSH_CONNECTION" | awk '{print $4}')"
+fi
+if [ -z "${SSH_PORT:-}" ] && command -v sshd >/dev/null 2>&1; then
+    SSH_PORT="$(sshd -T 2>/dev/null | awk '$1 == "port" { print $2; exit }' || true)"
+fi
+SSH_PORT="${SSH_PORT:-22}"
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt 65535 ]; then
+    echo "SSH_PORT 必须是 1–65535 的整数" >&2
+    exit 1
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "请使用 root 运行: sudo ./scripts/deploy/setup-server.sh"
+    exit 1
+fi
+
+remove_managed_ufw_rules() {
+    local preserve_port="${1:-}" preserve_ip="${2:-}" kept=0
+    local rule_numbers=()
+    local line number
+    while IFS= read -r line; do
+        [[ "$line" == *"Mixin-Chatbot (平台IP)"* ]] || continue
+        if [ -n "$preserve_port" ] && [ "$kept" -eq 0 ] &&
+            [[ "$line" == *"${preserve_port}/tcp"* && "$line" == *"$preserve_ip"* ]]; then
+            kept=1
+            continue
+        fi
+        number="$(sed -n 's/^[[:space:]]*\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<< "$line")"
+        [ -n "$number" ] && rule_numbers+=("$number")
+    done < <(ufw status numbered)
+    local sorted_numbers=()
+    mapfile -t sorted_numbers < <(printf '%s\n' "${rule_numbers[@]}" | sed '/^$/d' | sort -rn)
+    for number in "${sorted_numbers[@]}"; do
+        ufw --force delete "$number" >/dev/null
+    done
+}
+
+remove_managed_ssh_rules() {
+    local kept=0
+    local rule_numbers=()
+    local line number
+    while IFS= read -r line; do
+        [[ "$line" == *"Mixin-Chatbot SSH"* ]] || continue
+        if [ "$kept" -eq 0 ] && [[ "$line" == *"${SSH_PORT}/tcp"* ]]; then
+            kept=1
+            continue
+        fi
+        number="$(sed -n 's/^[[:space:]]*\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<< "$line")"
+        [ -n "$number" ] && rule_numbers+=("$number")
+    done < <(ufw status numbered)
+    local sorted_numbers=()
+    mapfile -t sorted_numbers < <(printf '%s\n' "${rule_numbers[@]}" | sed '/^$/d' | sort -rn)
+    for number in "${sorted_numbers[@]}"; do
+        ufw --force delete "$number" >/dev/null
+    done
+}
 
 echo "[*] Debian 13 服务器安全加固..."
 
@@ -45,11 +104,17 @@ echo "[*] 配置防火墙..."
 ufw default deny incoming
 ufw default allow outgoing
 
-# SSH
-ufw allow 22/tcp comment 'SSH'
+# SSH：使用当前连接/sshd 检测到的端口，避免自定义端口服务器被锁在门外。
+ufw allow "$SSH_PORT"/tcp comment 'Mixin-Chatbot SSH'
+remove_managed_ssh_rules
 
-# Mixin Chatbot 端口（仅平台出口 IP 可达；直连模式安全基线）
-ufw allow from "$PLATFORM_IP" to any port "$BOT_PORT" proto tcp comment 'Mixin-Chatbot (平台IP)'
+# Mixin Chatbot 端口仅直连模式开放；先添加当前入口，再删除旧入口，避免失败时锁死 webhook。
+if [ "$DEPLOY_MODE" = "direct" ]; then
+    ufw allow from "$PLATFORM_IP" to any port "$BOT_PORT" proto tcp comment 'Mixin-Chatbot (平台IP)'
+    remove_managed_ufw_rules "$BOT_PORT" "$PLATFORM_IP"
+else
+    remove_managed_ufw_rules
+fi
 
 # 启用防火墙 (幂等：已启用则跳过)
 if ufw status | grep -q "Status: active"; then
@@ -59,12 +124,16 @@ else
 fi
 ufw status
 
-echo "[+] 防火墙已启用: 仅开放 SSH(22) 和 Mixin-Chatbot(${BOT_PORT}, 仅 ${PLATFORM_IP})"
+if [ "$DEPLOY_MODE" = "direct" ]; then
+    echo "[+] 防火墙已启用: SSH(${SSH_PORT}) + Mixin-Chatbot(${BOT_PORT}, 仅 ${PLATFORM_IP})"
+else
+    echo "[+] 防火墙已启用: 仅开放 SSH(${SSH_PORT})；机器人使用 Cloudflare loopback 模式"
+fi
 
 # ---- fail2ban ----
 
 echo "[*] 配置 fail2ban..."
-cat > /etc/fail2ban/jail.d/mixin-chatbot.local << 'JAILEOF'
+cat > /etc/fail2ban/jail.d/mixin-chatbot.local << JAILEOF
 [DEFAULT]
 bantime = 3600
 findtime = 600
@@ -73,7 +142,7 @@ backend = systemd
 
 [sshd]
 enabled = true
-port = ssh
+port = $SSH_PORT
 maxretry = 3
 bantime = 7200
 JAILEOF
@@ -157,10 +226,14 @@ echo "=========================================="
 echo "  服务器加固完成"
 echo "=========================================="
 echo ""
-echo "  防火墙:     UFW (22, ${BOT_PORT})"
+if [ "$DEPLOY_MODE" = "direct" ]; then
+    echo "  防火墙:     UFW (SSH ${SSH_PORT}, bot ${BOT_PORT})"
+else
+    echo "  防火墙:     UFW (SSH ${SSH_PORT}; bot 仅 loopback)"
+fi
 echo "  入侵防护:   fail2ban (SSH)"
 echo "  自动更新:   安全补丁"
 echo "  内核优化:   低内存 + TCP 加固"
 echo ""
-echo "  下一步: cd /你的项目目录 && ./scripts/deploy.sh"
+echo "  下一步: cd /你的项目目录 && ./scripts/deploy/deploy.sh"
 echo ""
