@@ -153,7 +153,7 @@ async function main(): Promise<void> {
         },
         {
           value: "custom",
-          label: "自定义（任意 openai 兼容端点，如 DashScope 直连；元数据从 LiteLLM 抓）",
+          label: "自定义（任意 openai 兼容端点，如 DeepSeek 直连；元数据从 LiteLLM 抓）",
         },
       ],
     })
@@ -190,20 +190,18 @@ async function main(): Promise<void> {
   } else {
     providerId = bail<string>(
       await text({
-        message: "provider id（自洽即可，如 dashscope）",
-        defaultValue: firstId ?? "dashscope",
-        initialValue: firstId ?? "dashscope",
+        message: "provider id（自洽即可，如 deepseek）",
+        defaultValue: firstId ?? "deepseek",
+        initialValue: firstId ?? "deepseek",
       })
     );
     const baseUrl = bail<string>(
       await text({
         message: "baseUrl（openai 兼容端点）",
         defaultValue:
-          (firstEntry?.baseUrl as string) ??
-          "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          (firstEntry?.baseUrl as string) ?? "https://api.deepseek.com",
         initialValue:
-          (firstEntry?.baseUrl as string) ??
-          "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          (firstEntry?.baseUrl as string) ?? "https://api.deepseek.com",
         validate: (v) => (v && v.startsWith("http") ? undefined : "需以 http 开头"),
       })
     );
@@ -216,8 +214,8 @@ async function main(): Promise<void> {
     const modelId = bail<string>(
       await text({
         message: "模型 id",
-        defaultValue: (firstModel?.id as string) ?? "qwen3.7-plus",
-        initialValue: (firstModel?.id as string) ?? "qwen3.7-plus",
+        defaultValue: (firstModel?.id as string) ?? "deepseek-v4-flash",
+        initialValue: (firstModel?.id as string) ?? "deepseek-v4-flash",
         validate: (v) => (v ? undefined : "不能为空"),
       })
     );
