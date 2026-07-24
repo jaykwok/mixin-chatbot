@@ -1,7 +1,7 @@
 // Pi agent 集成：用 pi-coding-agent 的 AgentSession + SessionManager 内嵌大脑。
 // 纯适配——只用 Pi 公开 API：
 //   - provider/model/key 由 data/models.json 承载，Pi 原生读取（ModelRuntime.create({modelsPath})）
-//   - 内置工具 read/bash/edit/write 由 createAgentSession 自动构建（按 tools 名启用），绑定 cwd=./data
+//   - 内置工具 read/bash/edit/write 由 createAgentSession 自动构建（按 tools 名启用），绑定 cwd=AGENT_CWD（默认 ./data，可经环境变量覆盖）
 //   - 发送工具 send_image/send_file 经 customTools（ToolDefinition）注册，定义在 ./tools.ts
 //   - system prompt 用 Pi 默认 + appendSystemPromptOverride 追加最小群聊/中文上下文（方便上游升级）
 // 会话持久化到 data/sessions/<phone>.jsonl。
@@ -15,7 +15,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { MODELS_JSON_PATH } from "../lib/config.ts";
+import { MODELS_JSON_PATH, AGENT_CWD } from "../lib/config.ts";
 import { log } from "../lib/log.ts";
 import { sendReplyWithMention, sendText } from "../im/im.ts";
 import { buildSendTools } from "./tools.ts";
@@ -55,7 +55,7 @@ async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> 
   }
   modelRuntime = runtime;
   resolvedModel = model;
-  log.info(`Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}）`);
+  log.info(`Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}, 工作目录=${AGENT_CWD}）`);
   return { runtime, model };
 }
 
@@ -76,7 +76,7 @@ async function getOrCreateSession(phone: string, callbackUrl: string): Promise<A
   const sessionManager = SessionManager.open(join("data", "sessions", `${phone}.jsonl`));
   const settingsManager = SettingsManager.inMemory();
   const resourceLoader = new DefaultResourceLoader({
-    cwd: "./data", // 隔离 Pi context + 内置工具的工作目录
+    cwd: AGENT_CWD, // 隔离 Pi context + 内置工具的工作目录（默认 ./data，可经 AGENT_CWD 覆盖）
     agentDir: "./.pi",
     settingsManager,
     noExtensions: true, // 不加载发现的 .pi 扩展（不影响 createAgentSession 自建的内置工具）
@@ -89,7 +89,7 @@ async function getOrCreateSession(phone: string, callbackUrl: string): Promise<A
   await resourceLoader.reload();
 
   const { session } = await createAgentSession({
-    cwd: "./data", // 内置工具（read/bash/edit/write）绑定到此目录
+    cwd: AGENT_CWD, // 内置工具（read/bash/edit/write）绑定到此目录
     model,
     modelRuntime: runtime,
     sessionManager,

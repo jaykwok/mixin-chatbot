@@ -56,6 +56,30 @@ case "$mode_choice" in
     *) DEPLOY_MODE="direct" ;;
 esac
 print_status "部署模式：$DEPLOY_MODE"
+
+# ---- Pi agent 工作目录（read/bash/edit/write 根）----
+AGENT_CWD="${AGENT_CWD:-data}"
+print_prompt "Pi agent 工作目录（默认 data = 容器内 /app/data）："
+read -r cwd_in
+[ -n "$cwd_in" ] && AGENT_CWD="$cwd_in"
+CWD_ARGS=()
+if [ "$AGENT_CWD" = "data" ]; then
+    CWD_ENV_VAL="data"
+elif [[ "$AGENT_CWD" = /* ]]; then
+    mkdir -p "$AGENT_CWD"
+    chown -R 1001:1001 "$AGENT_CWD" 2>/dev/null || true
+    chmod 755 "$AGENT_CWD"
+    CWD_ARGS+=(-v "$AGENT_CWD:/app/workspace")
+    CWD_ENV_VAL="/app/workspace"
+    print_warning "绝对主机路径挂到容器 /app/workspace（agent 在此读写/执行）"
+else
+    mkdir -p "$AGENT_CWD"
+    chown -R 1001:1001 "$AGENT_CWD" 2>/dev/null || true
+    chmod 755 "$AGENT_CWD"
+    CWD_ARGS+=(-v "$(pwd)/$AGENT_CWD:/app/$AGENT_CWD")
+    CWD_ENV_VAL="$AGENT_CWD"
+fi
+print_status "Pi agent 工作目录：$AGENT_CWD（容器内：$CWD_ENV_VAL）"
 echo ""
 
 # ---- 目录 ----
@@ -163,6 +187,8 @@ echo ""
 print_status "启动容器..."
 if docker run -d \
   -p 1011:1011 \
+  -e AGENT_CWD="$CWD_ENV_VAL" \
+  "${CWD_ARGS[@]}" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/data:/app/data" \
   --restart unless-stopped \
