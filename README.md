@@ -21,6 +21,8 @@
 
 最终文字回复自动以 **markdown 正文 + text@ 通知**双消息发到群里（markdown 不支持 @，故另发一条 text 触发通知）。
 
+**会话隔离**：按 **(phone, 群)** 隔离——同一个人在不同群各有独立上下文，不同人在同群也各自独立。会话文件 `data/sessions/<phone>.<group>.jsonl`（`groupId` 不符合标识符字符集时用 sha256 片段做文件名，防穿越、防碰撞）。
+
 ## 配置：零应用配置
 
 应用层无 `.env`、无 `config.json`：
@@ -89,7 +91,7 @@ docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run scripts/con
 git pull && ./deploy.sh
 ```
 
-会话历史保存在 `data/sessions/*.jsonl`，更新不丢失。
+会话历史保存在 `data/sessions/<phone>.<group>.jsonl`（按 phone+群隔离），更新不丢失。
 
 ### Cloudflare 模式（云电脑）部署
 

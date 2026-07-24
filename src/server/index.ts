@@ -69,7 +69,7 @@ const webhookHandler = async (c: Context) => {
     `收到请求 - IP: ${clientIp}, 用户: ${phone}, 群组: ${groupId}, 内容长度: ${content.length}`
   );
 
-  if (isDuplicate(phone, content)) {
+  if (isDuplicate(phone, groupId, content)) {
     log.info(`跳过重复请求 - 用户: ${phone}`);
     return c.json({ status: "success" });
   }
