@@ -85,11 +85,11 @@ export function validateWebhookData(data: WebhookData): ValidatedRequest {
   return { phone, groupId, content, callbackUrl };
 }
 
-/** 请求去重（DEDUP_TTL 内相同 phone+content 跳过）。 */
-export function isDuplicate(phone: string, content: string): boolean {
+/** 请求去重（DEDUP_TTL 内相同 phone+群+content 跳过）。 */
+export function isDuplicate(phone: string, groupId: string, content: string): boolean {
   const now = Date.now();
   const hash = createHash("sha256").update(content, "utf8").digest("hex");
-  const key = `${phone}:${hash}`;
+  const key = `${phone}:${groupId}:${hash}`;
   // 从头部清过期（Map 按插入顺序）
   for (const [k, t] of recentRequests) {
     if (now - t > DEDUP_TTL) recentRequests.delete(k);
@@ -130,8 +130,8 @@ export function cleanupRateLimits(): void {
   }
 }
 
-// per-phone 串行链：同一用户的消息依次处理，避免并发改会话历史竞态。
-// 等价 Python 的 per-user asyncio.Lock。
+// per-(phone, 群) 串行链：同一会话的消息依次处理，避免并发改同一份会话历史竞态。
+// 粒度与 session 文件一致（等价 Python 的 per-conversation asyncio.Lock）。
 const userChains = new Map<string, Promise<void>>();
 
 /** 后台异步处理：调 Pi agent 生成回复并发送。失败则发错误提示。 */
@@ -163,7 +163,8 @@ export async function processRequest(
   }
 }
 
-/** 把请求串行化到该用户的处理链后（fire-and-forget）。webhook ack 后调用。 */
+/** 把请求串行化到该 (phone, 群) 的处理链后（fire-and-forget）。webhook ack 后调用。
+ *  粒度与 session 文件一致，避免并发改同一份会话历史。 */
 export function enqueueUserRequest(
   content: string,
   phone: string,
@@ -171,12 +172,13 @@ export function enqueueUserRequest(
   callbackUrl: string,
   clientIp: string
 ): void {
-  const prev = userChains.get(phone) ?? Promise.resolve();
+  const chainKey = `${phone}:${groupId}`;
+  const prev = userChains.get(chainKey) ?? Promise.resolve();
   const next = prev.then(() =>
     processRequest(content, phone, groupId, callbackUrl, clientIp)
   );
-  userChains.set(phone, next);
+  userChains.set(chainKey, next);
   next.finally(() => {
-    if (userChains.get(phone) === next) userChains.delete(phone);
+    if (userChains.get(chainKey) === next) userChains.delete(chainKey);
   });
 }

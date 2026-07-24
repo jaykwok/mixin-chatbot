@@ -5,6 +5,7 @@
 //   - 发送工具 send_image/send_file 经 customTools（ToolDefinition）注册，定义在 ./tools.ts
 //   - system prompt 用 Pi 默认 + appendSystemPromptOverride 追加最小群聊/中文上下文（方便上游升级）
 // 会话持久化到 data/sessions/<phone>.jsonl。
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -68,12 +69,24 @@ const sessions = new Map<string, AgentSession>();
 const CHAT_CONTEXT = `## 运行环境
 你在「量子密信」群聊机器人里。用户用中文 @你 提问，请用中文、用 Markdown 简洁回复。纯文字回复会自动发到群里。`;
 
-async function getOrCreateSession(phone: string, callbackUrl: string): Promise<AgentSession> {
-  const existing = sessions.get(phone);
+/** 把 groupId 解析为安全的会话文件名片段：符合标识符字符集则原样用，否则用 sha256 片段。
+ *  绝不把原始 groupId 直接拼进路径（防路径穿越）；哈希兜底——不拒绝任何合法 id，且无碰撞。 */
+function safeGroupSegment(groupId: string): string {
+  return /^[A-Za-z0-9_+\-]{1,64}$/.test(groupId)
+    ? groupId
+    : createHash("sha256").update(groupId, "utf8").digest("hex").slice(0, 16);
+}
+
+async function getOrCreateSession(phone: string, groupId: string, callbackUrl: string): Promise<AgentSession> {
+  const key = `${phone}:${groupId}`;
+  const existing = sessions.get(key);
   if (existing) return existing;
 
   const { runtime, model } = await getRuntime();
-  const sessionManager = SessionManager.open(join("data", "sessions", `${phone}.jsonl`));
+  // 会话按 (phone, 群) 隔离：同一人在不同群各自独立历史；文件名 = phone.<group段>.jsonl
+  const sessionManager = SessionManager.open(
+    join("data", "sessions", `${phone}.${safeGroupSegment(groupId)}.jsonl`)
+  );
   const settingsManager = SettingsManager.inMemory();
   const resourceLoader = new DefaultResourceLoader({
     cwd: AGENT_CWD, // 隔离 Pi context + 内置工具的工作目录（默认 ./data，可经 AGENT_CWD 覆盖）
@@ -99,7 +112,8 @@ async function getOrCreateSession(phone: string, callbackUrl: string): Promise<A
     customTools: buildSendTools(callbackUrl),
     thinkingLevel: "off",
   });
-  sessions.set(phone, session);
+  sessions.set(key, session);
+  log.info(`新建会话 - 用户: ${phone}, 群: ${groupId}`);
   return session;
 }
 
@@ -120,7 +134,7 @@ export async function handleUserMessage(
   content: string,
   callbackUrl: string
 ): Promise<void> {
-  const session = await getOrCreateSession(phone, callbackUrl);
+  const session = await getOrCreateSession(phone, groupId, callbackUrl);
   // 开始反馈：让用户知道已收到、正在处理（@ 触发通知）
   await sendText("🤔 正在思考...", groupId, phone, callbackUrl);
   // 订阅工具执行事件 → 每步 text@ 进度（agent 调 read/bash/send_* 等工具时触发）
