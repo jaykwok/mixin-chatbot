@@ -72,8 +72,8 @@
 Debian 服务器，root 运行：
 
 ```bash
-chmod +x setup-server.sh deploy.sh
-sudo ./setup-server.sh
+chmod +x scripts/setup-server.sh scripts/deploy.sh
+sudo ./scripts/setup-server.sh
 ```
 
 完成：安装 Docker、UFW 防火墙（22 SSH + 1011 仅平台 IP）、fail2ban、自动安全更新、内核优化、Docker 日志轮转。
@@ -85,7 +85,7 @@ sudo usermod -aG docker $USER && newgrp docker
 ### 2. 部署应用
 
 ```bash
-./deploy.sh
+./scripts/deploy.sh
 ```
 
 流程：
@@ -104,7 +104,7 @@ docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run scripts/con
 ### 更新
 
 ```bash
-git pull && ./deploy.sh
+git pull && ./scripts/deploy.sh
 ```
 
 会话历史保存在 `data/sessions/<phone>.<group>.jsonl`（按 phone+群隔离），更新不丢失。
@@ -115,7 +115,7 @@ git pull && ./deploy.sh
 
 1. `git clone` 仓库到云电脑，按系统部署（选 **Cloudflare 模式**，bot 起在 :1011 + 生成 webhook 密钥）：
    - **Windows Server（云电脑）**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1`（**原生 Bun，无需 Docker**；先装 Git for Windows + Bun。agent 的 bash 工具靠 Git Bash 的 bash.exe——pi 的 `getShellConfig` 在 win32 自动找 Git Bash，所以必须装 Git for Windows）
-   - **Linux**：`./deploy.sh`（Docker）
+   - **Linux**：`./scripts/deploy.sh`（Docker）
 2. 准备隧道 token（来自服务器 `/root/.cpa-bot-tunnel-token.env`），任选一种：
    - 最省事：把服务器那个 `.env` **整个文件**拷到云电脑，起隧道时把路径传给脚本即可（脚本能解析 `TUNNEL_TOKEN=...` 形式）。
    - 或把里面的 `TUNNEL_TOKEN` 值写入云电脑 `data/tunnel-token`（默认读取位置）。
@@ -154,7 +154,9 @@ mixin-chatbot/
 │       └── log.ts              # 日志（console + 文件轮转）
 ├── scripts/
 │   ├── configure.ts     # TUI：生成 data/models.json（LiteLLM 元数据）
+│   ├── deploy.sh        # Linux 部署（Docker）
 │   ├── deploy.ps1       # Windows Server 部署（原生 Bun，无 Docker）
+│   ├── setup-server.sh  # Linux 服务器加固（Docker/UFW/fail2ban）
 │   ├── start-tunnel.sh  # 云电脑 cloudflared 对接（Linux/macOS）
 │   ├── start-tunnel.ps1 # 同上（Windows Server，注册为服务）
 │   ├── ops.sh           # Linux 运维（Docker）：doctor/restart/stop/start/logs/uninstall
@@ -163,8 +165,6 @@ mixin-chatbot/
 ├── data/               # models.json + sessions/*.jsonl（Pi 会话持久化）
 ├── logs/               # 应用日志
 ├── Dockerfile          # oven/bun:1-debian
-├── deploy.sh           # 部署脚本
-├── setup-server.sh     # 服务器加固脚本
 └── package.json
 ```
 

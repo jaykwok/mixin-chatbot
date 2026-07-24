@@ -10,8 +10,8 @@ data
 *.pyc
 *.pyo
 .env
-deploy.sh
-setup-server.sh
+scripts/deploy.sh
+scripts/setup-server.sh
 README.md
 .gitignore
 .dockerignore
