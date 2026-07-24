@@ -159,7 +159,8 @@ mixin-chatbot/
 
 平台 webhook **不带签名**，公网靠三层组合挡未授权调用与重放：
 
-1. **Cloudflare WAF**（IP 闸门）：仅放行平台出口 IP `223.244.14.237` + POST + 路径形状 `^/webhook/[0-9a-f]{32,64}$`，其余 Block。用 `ip.src`（勿用可伪造的 `X-Forwarded-For`）；只匹配**形状**不匹配密钥值——密钥轮换不动 Cloudflare 规则。
+1. **Cloudflare WAF**（IP 闸门）：仅放行平台出口 IP `223.244.14.237` + POST + 路径前缀 `/webhook`，其余 Block。用 `ip.src`（勿用可伪造的 `X-Forwarded-For`）。
+   > Free plan 的 `matches`（正则）需 Business+，故 WAF 只做 IP+POST+前缀；`/webhook/<64hex>` 密钥校验由应用层完成。规则匹配前缀不匹配密钥值——密钥轮换不动 Cloudflare。
 2. **随机密钥路径** `/webhook/<64hex>`（256bit）：存 `data/webhook-secret`，deploy 首次生成、恒定时长比对、不匹配返 404，旧 `/webhook` 直接 404。泄露时删 `data/webhook-secret` 重部署即重生成。
 3. **应用层 payload 校验**（见下）：phone 格式、内容长度、callBackUrl 结构。
 
