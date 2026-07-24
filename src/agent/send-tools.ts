@@ -1,17 +1,22 @@
 // 发送工具定义：send_image / send_file（ToolDefinition，Pi agent 经 customTools 调用）。
-// 从 im 层封装：agent 给 source（URL 或当前用户 tmp 内路径），工具负责下载/读取 + 上传 + 发送。
+// 从 im 层封装：agent 给 source（URL、群 workspace 或当前用户 tmp 内路径），工具负责读取 + 上传 + 发送。
 import { readFile, realpath, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   ATTACHMENT_HTTP_TIMEOUT,
   MAX_ATTACHMENT_BYTES,
-} from "../lib/config.ts";
-import { sendFile, sendImage, uploadAttachment } from "../im/im.ts";
+} from "../core/config.ts";
+import { sendFile, sendImage, uploadAttachment } from "../integrations/im.ts";
+import { isPathInside } from "./paths.ts";
 
-/** 加载图片/文件字节：http(s) URL 走 fetch，本地文件必须位于当前用户的 tmp 工作目录。 */
-async function loadBytes(source: string, workspaceDir: string): Promise<Uint8Array> {
+/** 加载图片/文件字节：http(s) URL 走 fetch；本地文件限制在群 workspace 或当前用户 tmp。 */
+async function loadBytes(
+  source: string,
+  workspaceDir: string,
+  tempDir: string
+): Promise<Uint8Array> {
   if (/^https?:\/\//i.test(source)) {
     const r = await fetch(source, {
       signal: AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT),
@@ -45,12 +50,14 @@ async function loadBytes(source: string, workspaceDir: string): Promise<Uint8Arr
     return data;
   }
 
-  const root = await realpath(resolve(workspaceDir));
-  const requestedPath = isAbsolute(source) ? resolve(source) : resolve(root, source);
+  const roots = await Promise.all([
+    realpath(resolve(workspaceDir)),
+    realpath(resolve(tempDir)),
+  ]);
+  const requestedPath = isAbsolute(source) ? resolve(source) : resolve(roots[0], source);
   const path = await realpath(requestedPath);
-  const fromRoot = relative(root, path);
-  if (fromRoot === ".." || fromRoot.startsWith(`..\\`) || fromRoot.startsWith("../") || isAbsolute(fromRoot)) {
-    throw new Error("只能发送当前用户 tmp 工作目录内的文件");
+  if (!roots.some((root) => isPathInside(path, root))) {
+    throw new Error("只能发送本群 workspace 或当前调用用户 tmp 目录内的文件");
   }
   const info = await stat(path);
   if (!info.isFile()) throw new Error(`不是普通文件: ${source}`);
@@ -83,23 +90,30 @@ function sanitizeFilename(filename: string): string {
 /** 构造发送工具；callback URL 用 getter 读取，以支持平台轮换机器人 key。 */
 export function buildSendTools(
   getCallbackUrl: () => string,
-  workspaceDir: string
+  workspaceDir: string,
+  tempDir: string
 ): ToolDefinition[] {
   const imageParams = Type.Object({
-    source: Type.String({ description: "图片来源：http(s) URL 或当前 tmp 工作目录内的路径" }),
+    source: Type.String({
+      description: "图片来源：http(s) URL、本群 workspace 或当前用户 tmp 内的路径",
+    }),
     width: Type.Optional(Type.Number({ description: "宽度（像素，可选）" })),
     height: Type.Optional(Type.Number({ description: "高度（像素，可选）" })),
   });
   const fileParams = Type.Object({
-    source: Type.String({ description: "文件来源：http(s) URL 或当前 tmp 工作目录内的路径" }),
+    source: Type.String({
+      description: "文件来源：http(s) URL、本群 workspace 或当前用户 tmp 内的路径",
+    }),
     filename: Type.Optional(Type.String({ description: "文件名（可选，默认从 source 推断）" })),
   });
 
   const sendImageTool: ToolDefinition<typeof imageParams> = {
     name: "send_image",
     label: "发送图片",
-    description: "向当前群聊发送一张图片。source 为图片的 http(s) URL 或当前用户 tmp 工作目录内的本地路径。",
+    description:
+      "向当前群聊发送一张图片。source 为 http(s) URL、本群 workspace 或当前调用用户 tmp 内的路径。",
     promptSnippet: "向群聊发送图片",
+    constrainedSampling: { type: "json_schema", strict: "prefer" },
     parameters: imageParams,
     async execute(_toolCallId, params) {
       if (
@@ -108,7 +122,7 @@ export function buildSendTools(
       ) {
         throw new Error("图片 width/height 必须是正整数");
       }
-      const data = await loadBytes(params.source, workspaceDir);
+      const data = await loadBytes(params.source, workspaceDir, tempDir);
       const callbackUrl = getCallbackUrl();
       const fileId = await uploadAttachment(
         callbackUrl,
@@ -131,11 +145,13 @@ export function buildSendTools(
   const sendFileTool: ToolDefinition<typeof fileParams> = {
     name: "send_file",
     label: "发送文件",
-    description: "向当前群聊发送一个文件。source 为文件的 http(s) URL 或当前用户 tmp 工作目录内的本地路径。",
+    description:
+      "向当前群聊发送一个文件。source 为 http(s) URL、本群 workspace 或当前调用用户 tmp 内的路径。",
     promptSnippet: "向群聊发送文件",
+    constrainedSampling: { type: "json_schema", strict: "prefer" },
     parameters: fileParams,
     async execute(_toolCallId, params) {
-      const data = await loadBytes(params.source, workspaceDir);
+      const data = await loadBytes(params.source, workspaceDir, tempDir);
       const name = sanitizeFilename(params.filename ?? filenameFromSource(params.source));
       const callbackUrl = getCallbackUrl();
       const fileId = await uploadAttachment(callbackUrl, data, name, "file");

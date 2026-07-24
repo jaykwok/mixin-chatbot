@@ -2,12 +2,11 @@
 // 公网鉴权：data/webhook-secret 存在时启用 /webhook/:secret（恒定时长比对，不匹配 404）；
 // 缺失或无效时默认拒绝启动；仅显式设置 ALLOW_INSECURE_WEBHOOK=1 才开放开发端点。AI 配置见 data/models.json。
 import { Hono, type Context } from "hono";
-import { serveStatic } from "hono/bun";
 import { readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
-import { log } from "../lib/log.ts";
+import { log } from "../core/log.ts";
 import {
   ALLOW_INSECURE_WEBHOOK,
   HOST,
@@ -15,7 +14,7 @@ import {
   PORT,
   RATE_LIMIT_CLEANUP_INTERVAL,
   WEBHOOK_SECRET_FILE,
-} from "../lib/config.ts";
+} from "../core/config.ts";
 import { getClientIp, HttpError } from "./http.ts";
 import {
   cleanupRateLimits,
@@ -24,12 +23,9 @@ import {
   isRateLimited,
   validateWebhookData,
 } from "./webhook.ts";
-import { cleanupIdleSessions, disposeAllSessions } from "../agent/agent.ts";
+import { cleanupIdleSessions, disposeAllSessions } from "../agent/runtime.ts";
 
 const app = new Hono();
-
-// 静态文件（static/ 下）
-app.use("/static/*", serveStatic({ root: "./static" }));
 
 /** 读取 webhook 随机密钥；文件不存在/格式无效返回 null，由启动逻辑决定是否拒绝。 */
 function readWebhookSecret(): string | null {
@@ -153,11 +149,11 @@ if (webhookSecret) {
 }
 
 app.get("/favicon.svg", async () =>
-  new Response(await readFile(join("static", "favicon.svg")), {
+  new Response(await readFile(join("public", "favicon.svg")), {
     headers: { "Content-Type": "image/svg+xml" },
   }));
 app.get("/favicon.ico", async () =>
-  new Response(await readFile(join("static", "favicon.svg")), {
+  new Response(await readFile(join("public", "favicon.svg")), {
     headers: { "Content-Type": "image/svg+xml" },
   }));
 

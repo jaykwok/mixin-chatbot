@@ -6,16 +6,21 @@
   "scripts": {
     "start": "bun run src/server/index.ts",
     "dev": "bun --watch run src/server/index.ts",
-    "typecheck": "tsc --noEmit"
+    "configure": "bun run scripts/config/configure.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "deadcode": "knip",
+    "check": "bun run typecheck && bun test && bun run deadcode"
   },
   "dependencies": {
-    "hono": "^4",
+    "@clack/prompts": "latest",
+    "hono": "^4.12.32",
     "@earendil-works/pi-ai": "latest",
     "@earendil-works/pi-coding-agent": "latest"
   },
   "devDependencies": {
-    "@clack/prompts": "latest",
     "@types/bun": "latest",
-    "typescript": "^5"
+    "knip": "latest",
+    "typescript": "^5.9.3"
   }
 }

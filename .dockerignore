@@ -10,8 +10,10 @@ data
 *.pyc
 *.pyo
 .env
-scripts/*.sh
-scripts/*.ps1
+scripts/**/*.sh
+scripts/**/*.ps1
 README.md
+knip.json
+tests
 .gitignore
 .dockerignore

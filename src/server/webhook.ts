@@ -1,11 +1,12 @@
 // webhook 处理逻辑：字段校验、请求去重、入站速率限制、后台并发派发。
-// 校验含安全约束：phone 格式（防会话文件名路径穿越）、内容长度、callBackUrl 结构（防 SSRF/伪造）。
+// 校验含安全约束：调用者/群标识、内容长度、callBackUrl 结构（防 SSRF/伪造）。
 import { createHash } from "node:crypto";
-import { log } from "../lib/log.ts";
+import { log } from "../core/log.ts";
 import {
   CALLBACK_PATH_PREFIX,
   DEDUP_TTL,
   DEBUG,
+  GROUP_ID_PATTERN,
   MAX_CALLBACK_URL_LENGTH,
   MAX_CONTENT_LENGTH,
   MAX_DEDUP_SIZE,
@@ -16,10 +17,10 @@ import {
   REQUIRED_WEBHOOK_FIELDS,
   VALID_CALLBACK_PORTS,
   VALID_HOSTNAMES,
-} from "../lib/config.ts";
+} from "../core/config.ts";
 import { HttpError } from "./http.ts";
-import { sendReplyWithMention } from "../im/im.ts";
-import { handleUserMessage } from "../agent/agent.ts";
+import { sendReplyWithMention } from "../integrations/im.ts";
+import { handleUserMessage } from "../agent/runtime.ts";
 
 // 请求去重（Map 保持插入顺序，按序清过期）
 const recentRequests = new Map<string, number>();
@@ -55,9 +56,12 @@ export function validateWebhookData(data: WebhookData): ValidatedRequest {
   if (!phone || !groupId || !content) {
     throw new HttpError(400, "phone、groupId 或 content 不能为空");
   }
-  // phone 被用作用户目录名，必须严格字符集（防 ../ 路径穿越）
+  // phone 同时是群内用户身份和可读目录段，只接受平台约定字符集。
   if (!PHONE_PATTERN.test(phone)) {
     throw new HttpError(400, "无效的 phone");
+  }
+  if (!GROUP_ID_PATTERN.test(groupId)) {
+    throw new HttpError(400, "无效的 groupId");
   }
   if (Buffer.byteLength(groupId, "utf8") > MAX_GROUP_ID_LENGTH) {
     throw new HttpError(400, `groupId 过长（上限 ${MAX_GROUP_ID_LENGTH} 字节）`);
@@ -143,7 +147,7 @@ export function cleanupRateLimits(): void {
 
 /** 后台异步处理：调 Pi agent 生成回复并发送。失败则发错误提示。
  *  agent 干活途中的新消息/指令由 agent.ts 内部 steer/abort 处理，故此处不再串行化。 */
-export async function processRequest(
+async function processRequest(
   content: string,
   phone: string,
   groupId: string,
@@ -172,8 +176,8 @@ export async function processRequest(
   }
 }
 
-/** 后台 fire-and-forget 派发（webhook 已 ack 200）。不再串行化：agent 正忙时新消息走
- *  steer（中途干预）、/指令立即处理，需并发进入 handleUserMessage；会话历史由 Pi 内部串行写。 */
+/** 后台 fire-and-forget 派发（webhook 已 ack 200）。agent 正忙时新消息走
+ *  steer、指令立即处理；新的完整轮次由 agent 层按群共享 workspace 串行。 */
 export function enqueueUserRequest(
   content: string,
   phone: string,
