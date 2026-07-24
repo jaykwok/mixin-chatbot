@@ -1,8 +1,8 @@
 # Cloud PC (Windows Server) connector: install cloudflared and run it as a Windows service.
-#   im-bot.jaykwok.net  <==>  localhost:1011
+#   im-bot.jaykwok.net  <==>  localhost:BOT_PORT (default 1011)
 #
 # Prereqs:
-#   1) Bot running on localhost:1011 (deploy.ps1, Cloudflare mode)
+#   1) Bot running on localhost:BOT_PORT (deploy.ps1, Cloudflare mode)
 #   2) Tunnel token. Sources, in priority order:
 #        arg:    .\start-tunnel.ps1 <token-file>     # path, relative or absolute
 #        env:    $env:TUNNEL_TOKEN_FILE='<path>'      # path
@@ -14,8 +14,23 @@
 # Run in an ADMIN PowerShell:
 #   powershell -ExecutionPolicy Bypass -File scripts\start-tunnel.ps1 [token-file]
 $ErrorActionPreference = "Stop"
+$Project = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+Set-Location $Project
 
-$BotPort = if ($env:BOT_PORT) { $env:BOT_PORT } else { "1011" }
+$persistedPort = Join-Path $Project "data\bot-port"
+$BotPort = if ($env:BOT_PORT) {
+    $env:BOT_PORT
+} elseif (Test-Path $persistedPort) {
+    (Get-Content $persistedPort -Raw).Trim()
+} else {
+    "1011"
+}
+$portNumber = 0
+if (-not [int]::TryParse($BotPort, [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
+    Write-Host "ERROR: BOT_PORT must be an integer from 1 to 65535." -ForegroundColor Red
+    exit 1
+}
+$BotPort = "$portNumber"
 
 # ---- 1. token ----
 function Read-TokenFile($path) {
@@ -31,12 +46,20 @@ function Read-TokenFile($path) {
     return @{ token = $content; from = $abs }
 }
 
-$token = $env:TUNNEL_TOKEN
-$source = "env:TUNNEL_TOKEN"
-if (-not $token) {
-    if ($args.Count -ge 1 -and $args[0]) { $file = $args[0] }
-    elseif ($env:TUNNEL_TOKEN_FILE) { $file = $env:TUNNEL_TOKEN_FILE }
-    else { $file = "data\tunnel-token" }
+$token = $null
+$source = $null
+if ($args.Count -ge 1 -and $args[0]) {
+    $file = $args[0]
+} elseif ($env:TUNNEL_TOKEN_FILE) {
+    $file = $env:TUNNEL_TOKEN_FILE
+} elseif ($env:TUNNEL_TOKEN) {
+    $file = $null
+    $token = $env:TUNNEL_TOKEN
+    $source = "env:TUNNEL_TOKEN"
+} else {
+    $file = "data\tunnel-token"
+}
+if ($file) {
     $r = Read-TokenFile $file
     if ($null -eq $r) {
         Write-Host "ERROR: tunnel token file not found: $file" -ForegroundColor Red
@@ -82,7 +105,7 @@ try {
 
 # ---- 4. run tunnel ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Write-Host "cloudflared: im-bot.jaykwok.net  <==>  localhost:$BotPort"
+Write-Host "cloudflared connector: set the dashboard Published application service URL to http://localhost:$BotPort"
 if ($isAdmin) {
     $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if ($svc) {

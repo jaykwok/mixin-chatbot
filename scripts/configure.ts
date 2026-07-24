@@ -15,8 +15,8 @@ import {
   text,
   isCancel,
 } from "@clack/prompts";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import {
   getBuiltinModels,
   getBuiltinProviders,
@@ -42,8 +42,7 @@ const BUILTIN_WHITELIST = [
 ];
 
 // @clack/prompts 取消即退出。
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function bail<T>(v: T | any): T {
+function bail<T>(v: T | symbol): T {
   if (isCancel(v)) {
     cancel("已取消");
     process.exit(0);
@@ -54,8 +53,7 @@ function bail<T>(v: T | any): T {
 interface ExistingDoc {
   providers?: Record<string, Record<string, unknown>>;
 }
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyObj = Record<string, any>;
+type JsonObject = Record<string, unknown>;
 
 async function loadExisting(): Promise<ExistingDoc> {
   try {
@@ -79,7 +77,10 @@ interface LiteLLMEntry {
 
 async function fetchLitellm(): Promise<Record<string, LiteLLMEntry> | null> {
   try {
-    const r = await fetch(LITELLM_URL, { headers: { "User-Agent": CHROME_UA } });
+    const r = await fetch(LITELLM_URL, {
+      headers: { "User-Agent": CHROME_UA },
+      signal: AbortSignal.timeout(15_000),
+    });
     if (!r.ok) {
       log.warn(`LiteLLM 抓取返回 ${r.status}，将手动填写元数据`);
       return null;
@@ -104,7 +105,7 @@ function matchLitellm(
   return null;
 }
 
-function entryToModel(modelId: string, e: LiteLLMEntry): AnyObj {
+function entryToModel(modelId: string, e: LiteLLMEntry): JsonObject {
   return {
     id: modelId,
     name: modelId,
@@ -121,7 +122,7 @@ function entryToModel(modelId: string, e: LiteLLMEntry): AnyObj {
   };
 }
 
-function defaultModel(modelId: string): AnyObj {
+function defaultModel(modelId: string): JsonObject {
   return {
     id: modelId,
     name: modelId,
@@ -139,8 +140,8 @@ async function main(): Promise<void> {
   const existing = await loadExisting();
   const existingProviders = existing.providers ?? {};
   const firstId = Object.keys(existingProviders)[0];
-  const firstEntry = firstId ? (existingProviders[firstId] as AnyObj) : null;
-  const firstModel = (firstEntry?.models as AnyObj[] | undefined)?.[0];
+  const firstEntry = firstId ? (existingProviders[firstId] as JsonObject) : null;
+  const firstModel = (firstEntry?.models as JsonObject[] | undefined)?.[0];
 
   const kind = bail<string>(
     await select({
@@ -160,10 +161,11 @@ async function main(): Promise<void> {
   );
 
   let providerId: string;
-  let entry: AnyObj;
+  let entry: JsonObject;
 
   if (kind === "builtin") {
     const providers = getBuiltinProviders().filter((p) => BUILTIN_WHITELIST.includes(p));
+    if (providers.length === 0) throw new Error("Pi 未返回可用的内置 provider");
     providerId = bail<string>(
       await select({
         message: "选择内置 provider",
@@ -172,6 +174,7 @@ async function main(): Promise<void> {
       })
     );
     const modelIds = getBuiltinModels(providerId as never).map((m) => m.id);
+    if (modelIds.length === 0) throw new Error(`provider ${providerId} 没有可用模型`);
     const modelId = bail<string>(
       await select({
         message: `选择模型（${providerId} 目录）`,
@@ -202,7 +205,16 @@ async function main(): Promise<void> {
           (firstEntry?.baseUrl as string) ?? "https://api.deepseek.com",
         initialValue:
           (firstEntry?.baseUrl as string) ?? "https://api.deepseek.com",
-        validate: (v) => (v && v.startsWith("http") ? undefined : "需以 http 开头"),
+        validate: (v) => {
+          try {
+            const protocol = new URL(v ?? "").protocol;
+            return protocol === "http:" || protocol === "https:"
+              ? undefined
+              : "仅支持 http:// 或 https://";
+          } catch {
+            return "请输入有效 URL";
+          }
+        },
       })
     );
     const apiKey = bail<string>(
@@ -221,7 +233,7 @@ async function main(): Promise<void> {
     );
 
     // 从 LiteLLM 抓元数据（自定义 provider 的模型不在 Pi 内置目录）。
-    let model: AnyObj = firstModel ?? defaultModel(modelId);
+    let model: JsonObject = firstModel ? { ...firstModel } : defaultModel(modelId);
     model.id = modelId;
     model.name = modelId;
     const catalog = await fetchLitellm();
@@ -246,7 +258,7 @@ async function main(): Promise<void> {
         message: "contextWindow",
         defaultValue: String(model.contextWindow ?? 131072),
         initialValue: String(model.contextWindow ?? 131072),
-        validate: (v) => (/^\d+$/.test(v) ? undefined : "需为数字"),
+        validate: (v) => (v && /^[1-9]\d*$/.test(v) ? undefined : "需为正整数"),
       })
     );
     const mt = bail<string>(
@@ -254,7 +266,7 @@ async function main(): Promise<void> {
         message: "maxTokens",
         defaultValue: String(model.maxTokens ?? 8192),
         initialValue: String(model.maxTokens ?? 8192),
-        validate: (v) => (/^\d+$/.test(v) ? undefined : "需为数字"),
+        validate: (v) => (v && /^[1-9]\d*$/.test(v) ? undefined : "需为正整数"),
       })
     );
     model.contextWindow = Number(cw);
@@ -264,8 +276,11 @@ async function main(): Promise<void> {
   }
 
   const doc = { providers: { [providerId]: entry } };
-  await mkdir(dirname(join(MODELS_JSON_PATH)), { recursive: true });
+  await mkdir(dirname(MODELS_JSON_PATH), { recursive: true });
   await writeFile(MODELS_JSON_PATH, JSON.stringify(doc, null, 2) + "\n", "utf8");
+  await chmod(MODELS_JSON_PATH, 0o600).catch(() => {
+    // Windows ACL 不使用 POSIX mode；部署脚本仍限制运行身份。
+  });
 
   note(`已写入 ${MODELS_JSON_PATH}\nprovider=${providerId}`, "完成");
   outro("✅ AI 配置完成。");

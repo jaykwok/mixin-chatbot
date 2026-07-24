@@ -9,12 +9,9 @@ export class HttpError extends Error {
   }
 }
 
-/** 从请求提取客户端 IP（X-Forwarded-For 优先，否则回退 x-real-ip）。仅用于日志。 */
+/** 从请求提取客户端 IP（X-Forwarded-For 优先，否则回退 X-Real-IP）。仅用于日志，不参与鉴权。 */
 export function getClientIp(c: Context): string {
   const xff = c.req.header("X-Forwarded-For");
   if (xff) return xff.split(",")[0].trim();
-  // Hono on Bun：尝试从原始请求拿 remote addr，拿不到则 Unknown
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const addr = (c.req.raw as any)?.headers?.get("x-real-ip");
-  return addr ?? "Unknown";
+  return c.req.header("X-Real-IP") ?? "Unknown";
 }

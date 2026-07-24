@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 云电脑本地对接脚本：起 cloudflared，把 im-bot.jaykwok.net 经 Cloudflare 隧道接到本机 :1011。
+# 云电脑本地对接脚本：起 cloudflared，把 im-bot.jaykwok.net 经 Cloudflare 隧道接到本机 BOT_PORT（默认 1011）。
 #
 # 前置：
-#   1) 机器人已在本机 :1011 跑起来（./scripts/deploy.sh 选 Cloudflare 模式）
+#   1) 机器人已在本机 BOT_PORT 跑起来（./scripts/deploy.sh 选 Cloudflare 模式）
 #   2) 隧道 token。来源（按优先级）：
 #        位置参数：./scripts/start-tunnel.sh <token-file>   # 路径，相对或绝对
 #        环境变量：TUNNEL_TOKEN_FILE=<path>                 # 指定文件
@@ -13,8 +13,20 @@
 #
 # 用法： ./scripts/start-tunnel.sh [token-file]
 set -euo pipefail
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_DIR"
 
-BOT_PORT="${BOT_PORT:-1011}"
+if [ -n "${BOT_PORT:-}" ]; then
+    BOT_PORT="$BOT_PORT"
+elif [ -f data/bot-port ]; then
+    BOT_PORT="$(tr -d '[:space:]' < data/bot-port)"
+else
+    BOT_PORT="1011"
+fi
+if ! [[ "$BOT_PORT" =~ ^[0-9]+$ ]] || [ "$BOT_PORT" -lt 1 ] || [ "$BOT_PORT" -gt 65535 ]; then
+    echo "✗ BOT_PORT 必须是 1–65535 的整数" >&2
+    exit 1
+fi
 
 # 从 .env 形式文件取 TUNNEL_TOKEN 的值（取等号后整段）；非 .env 则退出 7。
 extract_env_token() {
@@ -24,28 +36,30 @@ extract_env_token() {
     ' "$1"
 }
 
-# ---- 1. 取 token（位置参数 > $TUNNEL_TOKEN_FILE > 默认 data/tunnel-token）----
-TOKEN_FILE="${1:-${TUNNEL_TOKEN_FILE:-data/tunnel-token}}"
+# ---- 1. 取 token（位置参数 > TUNNEL_TOKEN_FILE > TUNNEL_TOKEN > 默认文件）----
+if [ "$#" -ge 1 ] && [ -n "$1" ]; then
+    TOKEN_FILE="$1"
+elif [ -n "${TUNNEL_TOKEN_FILE:-}" ]; then
+    TOKEN_FILE="$TUNNEL_TOKEN_FILE"
+elif [ -n "${TUNNEL_TOKEN:-}" ]; then
+    TOKEN_FILE=""
+    echo "ℹ 使用环境变量 TUNNEL_TOKEN"
+else
+    TOKEN_FILE="data/tunnel-token"
+fi
 
-if [ -z "${TUNNEL_TOKEN:-}" ]; then
-    if [ -f "$TOKEN_FILE" ]; then
-        if val="$(extract_env_token "$TOKEN_FILE")" && [ -n "$val" ]; then
-            TUNNEL_TOKEN="$val"
-        else
-            TUNNEL_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
-        fi
-        echo "ℹ token 来自文件：$(cd "$(dirname "$TOKEN_FILE")" && pwd)/$(basename "$TOKEN_FILE")"
-    else
-        echo "✗ 未找到隧道 token。" >&2
-        echo "  用法（按优先级）：" >&2
-        echo "    ./scripts/start-tunnel.sh [token-file]   # 相对/绝对路径，默认 data/tunnel-token" >&2
-        echo "    export TUNNEL_TOKEN_FILE=/path/to/file   # 或指定文件" >&2
-        echo "    export TUNNEL_TOKEN=<raw-token>          # 或直接给值" >&2
-        echo "  token 可直接拷服务器 .cpa-bot-tunnel-token.env 整个文件来用" >&2
+if [ -n "$TOKEN_FILE" ]; then
+    if [ ! -f "$TOKEN_FILE" ]; then
+        echo "✗ 未找到隧道 token 文件：$TOKEN_FILE" >&2
+        echo "  优先级：位置参数 > TUNNEL_TOKEN_FILE > TUNNEL_TOKEN > data/tunnel-token" >&2
         exit 1
     fi
-else
-    echo "ℹ 使用环境变量 TUNNEL_TOKEN"
+    if val="$(extract_env_token "$TOKEN_FILE")" && [ -n "$val" ]; then
+        TUNNEL_TOKEN="$val"
+    else
+        TUNNEL_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+    fi
+    echo "ℹ token 来自文件：$(cd "$(dirname "$TOKEN_FILE")" && pwd)/$(basename "$TOKEN_FILE")"
 fi
 
 # 统一清洗：只保留 base64 字符（去空白/引号/BOM/CR）
@@ -82,6 +96,6 @@ else
 fi
 
 # ---- 4. 起隧道（前台）----
-echo "▶ 启动 cloudflared：im-bot.jaykwok.net  <==>  localhost:${BOT_PORT}"
+echo "▶ 启动 cloudflared connector（控制台 Published application 应配置为 http://localhost:${BOT_PORT}）"
 echo "  （前台运行，Ctrl+C 停止。常驻开机自启可用 systemd/tmux 包一层）"
 exec cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN"

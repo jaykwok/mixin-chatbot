@@ -3,10 +3,15 @@
 # Debian 13 服务器安全加固脚本
 # 用法: sudo ./scripts/setup-server.sh
 
-set -e
+set -euo pipefail
 
-# 量子密信平台出口 IP（webhook 来源）；UFW 只放行它访问 1011。可用环境变量覆盖。
+# 量子密信平台出口 IP（webhook 来源）；UFW 只放行它访问机器人端口。均可用环境变量覆盖。
 PLATFORM_IP="${PLATFORM_IP:-223.244.14.237}"
+BOT_PORT="${BOT_PORT:-1011}"
+if ! [[ "$BOT_PORT" =~ ^[0-9]+$ ]] || [ "$BOT_PORT" -lt 1 ] || [ "$BOT_PORT" -gt 65535 ]; then
+    echo "BOT_PORT 必须是 1–65535 的整数" >&2
+    exit 1
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "请使用 root 运行: sudo ./scripts/setup-server.sh"
@@ -27,6 +32,7 @@ apt-get install -y -qq \
     docker.io \
     ufw \
     fail2ban \
+    jq \
     unattended-upgrades \
     apt-listchanges
 
@@ -43,7 +49,7 @@ ufw default allow outgoing
 ufw allow 22/tcp comment 'SSH'
 
 # Mixin Chatbot 端口（仅平台出口 IP 可达；直连模式安全基线）
-ufw allow from $PLATFORM_IP to any port 1011 proto tcp comment 'Mixin-Chatbot (平台IP)'
+ufw allow from "$PLATFORM_IP" to any port "$BOT_PORT" proto tcp comment 'Mixin-Chatbot (平台IP)'
 
 # 启用防火墙 (幂等：已启用则跳过)
 if ufw status | grep -q "Status: active"; then
@@ -53,12 +59,12 @@ else
 fi
 ufw status
 
-echo "[+] 防火墙已启用: 仅开放 SSH(22) 和 Mixin-Chatbot(1011, 仅 ${PLATFORM_IP})"
+echo "[+] 防火墙已启用: 仅开放 SSH(22) 和 Mixin-Chatbot(${BOT_PORT}, 仅 ${PLATFORM_IP})"
 
 # ---- fail2ban ----
 
 echo "[*] 配置 fail2ban..."
-cat > /etc/fail2ban/jail.local << 'JAILEOF'
+cat > /etc/fail2ban/jail.d/mixin-chatbot.local << 'JAILEOF'
 [DEFAULT]
 bantime = 3600
 findtime = 600
@@ -80,16 +86,13 @@ echo "[+] fail2ban 已启用: SSH 3次失败封禁2小时"
 # ---- 自动安全更新 ----
 
 echo "[*] 配置自动安全更新..."
-cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'UUEOF'
-Unattended-Upgrade::Allowed-Origins {
-    "${distro_id}:${distro_codename}-security";
-};
+cat > /etc/apt/apt.conf.d/52mixin-chatbot-unattended-upgrades << 'UUEOF'
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
 UUEOF
 
-cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AUEOF'
+cat > /etc/apt/apt.conf.d/52mixin-chatbot-periodic << 'AUEOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
@@ -130,16 +133,18 @@ echo "[+] 内核参数已优化"
 
 echo "[*] 配置 Docker 日志轮转..."
 mkdir -p /etc/docker
-cat > /etc/docker/daemon.json << 'DJEOF'
-{
-    "log-driver": "json-file",
-    "log-opts": {
-        "max-size": "5m",
-        "max-file": "2"
-    },
-    "storage-driver": "overlay2"
-}
-DJEOF
+DOCKER_CONFIG='{"log-driver":"json-file","log-opts":{"max-size":"5m","max-file":"2"}}'
+if [ -s /etc/docker/daemon.json ]; then
+    if ! jq empty /etc/docker/daemon.json >/dev/null 2>&1; then
+        echo "[-] /etc/docker/daemon.json 不是有效 JSON，拒绝覆盖；请先修复该文件" >&2
+        exit 1
+    fi
+    jq --argjson desired "$DOCKER_CONFIG" '. * $desired' /etc/docker/daemon.json > /etc/docker/daemon.json.mixin-chatbot.tmp
+else
+    printf '%s\n' "$DOCKER_CONFIG" | jq . > /etc/docker/daemon.json.mixin-chatbot.tmp
+fi
+install -m 0644 /etc/docker/daemon.json.mixin-chatbot.tmp /etc/docker/daemon.json
+rm -f /etc/docker/daemon.json.mixin-chatbot.tmp
 
 systemctl restart docker
 
@@ -152,7 +157,7 @@ echo "=========================================="
 echo "  服务器加固完成"
 echo "=========================================="
 echo ""
-echo "  防火墙:     UFW (22, 1011)"
+echo "  防火墙:     UFW (22, ${BOT_PORT})"
 echo "  入侵防护:   fail2ban (SSH)"
 echo "  自动更新:   安全补丁"
 echo "  内核优化:   低内存 + TCP 加固"

@@ -1,4 +1,4 @@
-// webhook 处理逻辑：字段校验、请求去重、速率限制、后台异步处理（per-phone 串行）。
+// webhook 处理逻辑：字段校验、请求去重、入站速率限制、后台并发派发。
 // 校验含安全约束：phone 格式（防会话文件名路径穿越）、内容长度、callBackUrl 结构（防 SSRF/伪造）。
 import { createHash } from "node:crypto";
 import { log } from "../lib/log.ts";
@@ -6,8 +6,10 @@ import {
   CALLBACK_PATH_PREFIX,
   DEDUP_TTL,
   DEBUG,
+  MAX_CALLBACK_URL_LENGTH,
   MAX_CONTENT_LENGTH,
   MAX_DEDUP_SIZE,
+  MAX_GROUP_ID_LENGTH,
   PHONE_PATTERN,
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW,
@@ -24,8 +26,7 @@ const recentRequests = new Map<string, number>();
 // 速率限制（每用户在窗口内的时间戳列表）
 const rateLimits = new Map<string, number[]>();
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type WebhookData = Record<string, any>;
+export type WebhookData = Record<string, unknown>;
 
 export interface ValidatedRequest {
   phone: string;
@@ -39,24 +40,33 @@ export function validateWebhookData(data: WebhookData): ValidatedRequest {
   const missing = REQUIRED_WEBHOOK_FIELDS.filter((f) => !(f in data));
   if (missing.length) throw new HttpError(400, `缺少必要字段: ${missing.join(", ")}`);
 
-  if (data.type !== "text") throw new HttpError(400, `不支持的消息类型: ${data.type}`);
+  if (data.type !== "text") throw new HttpError(400, `不支持的消息类型: ${String(data.type)}`);
 
   const phone = String(data.phone ?? "").trim();
   const groupId = String(data.groupId ?? "").trim();
   const callbackUrl = String(data.callBackUrl ?? "").trim();
-  const textMsg = data.textMsg ?? {};
+  const textMsg =
+    data.textMsg && typeof data.textMsg === "object" && !Array.isArray(data.textMsg)
+      ? (data.textMsg as Record<string, unknown>)
+      : {};
   const content =
-    typeof textMsg === "object" ? String(textMsg.content ?? "").trim() : "";
+    String(textMsg.content ?? "").trim();
 
   if (!phone || !groupId || !content) {
     throw new HttpError(400, "phone、groupId 或 content 不能为空");
   }
-  // phone 被用作会话文件名，必须严格字符集（防 ../ 路径穿越）
+  // phone 被用作用户目录名，必须严格字符集（防 ../ 路径穿越）
   if (!PHONE_PATTERN.test(phone)) {
     throw new HttpError(400, "无效的 phone");
   }
-  if (content.length > MAX_CONTENT_LENGTH) {
+  if (Buffer.byteLength(groupId, "utf8") > MAX_GROUP_ID_LENGTH) {
+    throw new HttpError(400, `groupId 过长（上限 ${MAX_GROUP_ID_LENGTH} 字节）`);
+  }
+  if (Buffer.byteLength(content, "utf8") > MAX_CONTENT_LENGTH) {
     throw new HttpError(413, `消息内容过长（上限 ${MAX_CONTENT_LENGTH} 字节）`);
+  }
+  if (callbackUrl.length > MAX_CALLBACK_URL_LENGTH) {
+    throw new HttpError(403, "回调URL过长");
   }
 
   let parsed: URL;
@@ -79,7 +89,8 @@ export function validateWebhookData(data: WebhookData): ValidatedRequest {
   if (parsed.pathname !== CALLBACK_PATH_PREFIX) {
     throw new HttpError(403, "无效的回调URL路径");
   }
-  if (!parsed.searchParams.has("key")) {
+  const callbackKey = parsed.searchParams.get("key")?.trim();
+  if (!callbackKey) {
     throw new HttpError(403, "回调URL缺少 key 参数");
   }
   return { phone, groupId, content, callbackUrl };
@@ -148,12 +159,13 @@ export async function processRequest(
     const elapsed = ((Date.now() - start) / 1000).toFixed(2);
     log.error(`请求处理失败 - 用户: ${phone}, 耗时: ${elapsed}秒, 错误: ${String(e)}`);
     try {
-      await sendReplyWithMention(
+      const sent = await sendReplyWithMention(
         "⚠️ 抱歉，处理您的请求时出现了问题，请稍后再试。",
         groupId,
         phone,
         callbackUrl
       );
+      if (!sent) log.error(`错误回复未送达 - 用户: ${phone}`);
     } catch (sendErr) {
       log.error(`错误回复发送失败 - 用户: ${phone}, 错误: ${String(sendErr)}`);
     }

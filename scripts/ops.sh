@@ -8,8 +8,27 @@ set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTAINER="mixin-chatbot"
-PORT="${BOT_PORT:-1011}"
+if [ -n "${BOT_PORT:-}" ]; then
+    PORT="$BOT_PORT"
+elif [ -f "${PROJECT_DIR}/data/bot-port" ]; then
+    PORT="$(tr -d '[:space:]' < "${PROJECT_DIR}/data/bot-port")"
+else
+    PORT="1011"
+fi
+if [ -f "${PROJECT_DIR}/data/deploy-mode" ]; then
+    DEPLOY_MODE="$(tr -d '[:space:]' < "${PROJECT_DIR}/data/deploy-mode")"
+else
+    DEPLOY_MODE="direct"
+fi
 DOMAIN="${BOT_DOMAIN:-im-bot.jaykwok.net}"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    echo "invalid bot port in BOT_PORT/data/bot-port: $PORT" >&2
+    exit 1
+fi
+if [ "$DEPLOY_MODE" != "direct" ] && [ "$DEPLOY_MODE" != "cloudflare" ]; then
+    echo "invalid deployment mode in data/deploy-mode: $DEPLOY_MODE" >&2
+    exit 1
+fi
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 P()  { echo -e "${BLUE}[*]${NC} $1"; }
@@ -34,7 +53,7 @@ has_container() {
 }
 
 doctor() {
-    P "mixin-chatbot health check (domain=$DOMAIN, port=$PORT)"
+    P "mixin-chatbot health check (mode=$DEPLOY_MODE, port=$PORT)"
     PASS=0; FAIL=0
 
     local cstate="missing"
@@ -46,25 +65,40 @@ doctor() {
     local lc; lc="$(code_of "http://localhost:${PORT}/favicon.svg")"
     check "local bot health" "$([ "$lc" = "200" ] && echo 1 || echo 0)" "HTTP $lc"
 
-    local crunning="0" cdetail="no"
-    if pgrep -x cloudflared >/dev/null 2>&1; then
-        crunning="1"; cdetail="pid $(pgrep -x cloudflared | head -n1)"
+    if [ "$DEPLOY_MODE" = "cloudflare" ]; then
+        local crunning="0" cdetail="no"
+        if pgrep -x cloudflared >/dev/null 2>&1; then
+            crunning="1"; cdetail="pid $(pgrep -x cloudflared | head -n1)"
+        fi
+        check "cloudflared running" "$crunning" "$cdetail"
+
+        local pc; pc="$(code_of "https://${DOMAIN}/favicon.svg")"
+        check "public CF->tunnel->bot" "$([ "$pc" = "200" ] && echo 1 || echo 0)" "HTTP $pc"
     fi
-    check "cloudflared running" "$crunning" "$cdetail"
 
-    local pc; pc="$(code_of "https://${DOMAIN}/favicon.svg")"
-    check "public CF->tunnel->bot" "$([ "$pc" = "200" ] && echo 1 || echo 0)" "HTTP $pc"
+    local models_ok="0"
+    if [ -s "${PROJECT_DIR}/data/models.json" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            jq -e '.providers | type == "object" and length > 0' "${PROJECT_DIR}/data/models.json" >/dev/null 2>&1 && models_ok="1"
+        else
+            grep -q '"providers"' "${PROJECT_DIR}/data/models.json" && models_ok="1"
+        fi
+    fi
+    check "data/models.json" "$models_ok" "$([ "$models_ok" = "1" ] && echo valid || echo 'MISSING/INVALID')"
 
-    check "data/models.json"    "$([ -f "${PROJECT_DIR}/data/models.json" ] && echo 1 || echo 0)" \
-        "$([ -f "${PROJECT_DIR}/data/models.json" ] && echo present || echo MISSING)"
-    check "data/webhook-secret" "$([ -f "${PROJECT_DIR}/data/webhook-secret" ] && echo 1 || echo 0)" \
-        "$([ -f "${PROJECT_DIR}/data/webhook-secret" ] && echo present || echo 'MISSING (open /webhook)')"
+    local secret_ok="0"
+    [ -f "${PROJECT_DIR}/data/webhook-secret" ] &&
+        grep -Eq '^[0-9a-fA-F]{32,64}$' "${PROJECT_DIR}/data/webhook-secret" &&
+        secret_ok="1"
+    check "data/webhook-secret" "$secret_ok" "$([ "$secret_ok" = "1" ] && echo valid || echo 'MISSING/INVALID (service refuses to start)')"
 
     echo ""
     echo -e "result: ${GREEN}${PASS} pass${NC}, ${RED}${FAIL} fail${NC}"
     if [ "$FAIL" -gt 0 ]; then
-        WA "hints: public 530/1033 -> tunnel down (start cloudflared / start-tunnel.sh);"
-        WA "       public 502 -> tunnel up but bot down (ops.sh restart); local fail -> container down (ops.sh restart);"
+        if [ "$DEPLOY_MODE" = "cloudflare" ]; then
+            WA "hints: public 530/1033 -> tunnel down; public 502 -> tunnel up but bot down;"
+        fi
+        WA "       local fail -> container down (ops.sh restart);"
         WA "       secret MISSING -> re-run deploy.sh"
     else
         OK "all checks passed"
@@ -119,12 +153,12 @@ uninstall() {
     fi
 
     local d=""
-    read -rp "Delete data/ (models.json, sessions, webhook-secret) and logs/? [y/N] " d || true
+    read -rp "Delete data/ (models.json, webhook-secret, default user data) and logs/? [y/N] " d || true
     if [[ "$d" =~ ^[Yy]$ ]]; then
         rm -rf "${PROJECT_DIR}/data" "${PROJECT_DIR}/logs"
         OK "data/ and logs/ removed"
     else
-        OK "data/ and logs/ kept (models.json + sessions preserved)"
+        OK "data/ and logs/ kept (config + default user data preserved)"
     fi
     OK "uninstall complete."
 }
@@ -140,7 +174,7 @@ case "${1:-}" in
         echo -e "${CYAN}mixin-chatbot ops tool (Linux/Docker)${NC}"
         echo "usage: ./scripts/ops.sh <command>"
         echo ""
-        echo "  doctor     health check: container, :$PORT local+public reachability, cloudflared, config files"
+        echo "  doctor     health check: container, :$PORT, config; Cloudflare checks only in tunnel mode"
         echo "  restart    docker restart"
         echo "  stop       docker stop"
         echo "  start      docker start"
