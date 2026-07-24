@@ -4,14 +4,14 @@
 # 前置：
 #   1) 机器人已在本机 BOT_PORT 跑起来（./scripts/deploy/deploy.sh 选 Cloudflare 模式）
 #   2) 隧道 token。来源（按优先级）：
-#        位置参数：./scripts/tunnel/start-tunnel.sh <token-file>   # 路径，相对或绝对
-#        环境变量：TUNNEL_TOKEN_FILE=<path>                 # 指定文件
-#        环境变量：TUNNEL_TOKEN=<raw-token>                 # 直接给值
-#        默认：    data/tunnel-token                        # raw 值或 .env 形式均可
-#      token 文件可以是 raw token，也可以是直接拷来的 .env
-#      （也可直接使用内含 TUNNEL_TOKEN=<value> 的 .env 文件）。
+#        位置参数：./scripts/tunnel/start-tunnel.sh <token文件>   # 路径，相对或绝对
+#        环境变量：TUNNEL_TOKEN_FILE=<路径>                   # 指定文件
+#        环境变量：TUNNEL_TOKEN=<裸 token>                    # 直接给值
+#        默认：    data/tunnel-token                          # 裸值或 .env 形式均可
+#      token 文件可以是裸 token，也可以是直接拷来的 .env
+#      （也可直接使用内含 TUNNEL_TOKEN=<值> 的 .env 文件）。
 #
-# 用法： ./scripts/tunnel/start-tunnel.sh [token-file]
+# 用法： ./scripts/tunnel/start-tunnel.sh [token文件]
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
@@ -78,14 +78,26 @@ if ! command -v cloudflared >/dev/null 2>&1; then
         esac
         CF_TMP="$(mktemp)"
         trap 'rm -f "$CF_TMP"' EXIT
-        curl -fsSL -o "$CF_TMP" \
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/$BIN"
+        if ! curl -fsSL -o "$CF_TMP" \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/$BIN"; then
+            echo "✗ 下载 cloudflared 失败，请检查网络后重试" >&2
+            exit 1
+        fi
         chmod +x "$CF_TMP"
-        "$CF_TMP" --version >/dev/null
+        if ! "$CF_TMP" --version >/dev/null 2>&1; then
+            echo "✗ 下载的 cloudflared 无法运行" >&2
+            exit 1
+        fi
         if [ "$(id -u)" -eq 0 ]; then
-            install -m 0755 "$CF_TMP" /usr/local/bin/cloudflared
+            install -m 0755 "$CF_TMP" /usr/local/bin/cloudflared || {
+                echo "✗ 安装 cloudflared 失败" >&2
+                exit 1
+            }
         elif command -v sudo >/dev/null 2>&1; then
-            sudo install -m 0755 "$CF_TMP" /usr/local/bin/cloudflared
+            sudo install -m 0755 "$CF_TMP" /usr/local/bin/cloudflared || {
+                echo "✗ 通过 sudo 安装 cloudflared 失败" >&2
+                exit 1
+            }
         else
             echo "✗ 安装到 /usr/local/bin 需要 root 或 sudo" >&2
             exit 1

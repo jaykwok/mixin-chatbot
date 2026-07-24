@@ -124,10 +124,12 @@ case "$mode_choice" in
 esac
 if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     BOT_HOST="127.0.0.1"
+    DEPLOY_MODE_LABEL="Cloudflare"
 else
     BOT_HOST="0.0.0.0"
+    DEPLOY_MODE_LABEL="直连"
 fi
-print_status "部署模式：$DEPLOY_MODE"
+print_status "部署模式：$DEPLOY_MODE_LABEL"
 if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     print_warning "请把 Cloudflare Tunnel 的 Published application 服务地址设为 http://localhost:${BOT_PORT}"
 fi
@@ -179,17 +181,23 @@ fi
 
 if [ ! -f "data/models.json" ]; then
     print_status "首次配置 AI（provider/key/model）..."
-    docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure
+    if ! docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
+        print_error "AI 配置命令执行失败"
+        exit 1
+    fi
     if [ ! -f "data/models.json" ]; then
         print_error "未生成 data/models.json，已中止"
         exit 1
     fi
 else
     print_status "检测到已有 data/models.json"
-    print_prompt "重新配置 AI (provider/key/model)? [y/N]:"
+    print_prompt "是否重新配置 AI（provider/key/model）？[y/N]："
     read -r reconf
     if [[ "$reconf" =~ ^[Yy]$ ]]; then
-        docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure
+        if ! docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
+            print_error "AI 配置命令执行失败"
+            exit 1
+        fi
     fi
 fi
 chown 1001:1001 data/models.json 2>/dev/null || true
@@ -395,10 +403,10 @@ if docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo ""
     if [ "$DEPLOY_MODE" = "direct" ]; then
         echo "  模式:      直连（UFW 限 ${PLATFORM_IP}）"
-        echo "  Webhook:   http://${SERVER_IP}:${BOT_PORT}/webhook/<secret>"
+        echo "  回调地址:   http://${SERVER_IP}:${BOT_PORT}/webhook/<secret>"
     else
         echo "  模式:      Cloudflare（隧道 + WAF）"
-        echo "  Webhook:   https://${PUBLIC_DOMAIN_DISPLAY}/webhook/<secret>"
+        echo "  回调地址:   https://${PUBLIC_DOMAIN_DISPLAY}/webhook/<secret>"
     fi
     echo "  AI 配置:   $(pwd)/data/models.json"
     echo "  日志:      $(pwd)/logs/"

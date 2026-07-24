@@ -140,7 +140,7 @@ git pull && ./scripts/deploy/deploy.sh
 适合无公网 IP 的云电脑：bot 只监听云电脑 `127.0.0.1:<port>`，`cloudflared` 经 Cloudflare 隧道接入。
 
 1. `git clone` 仓库到云电脑，按系统部署（选择 **Cloudflare 模式**、确认端口并生成 webhook 密钥）：
-   - **Windows Server（云电脑）**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1`（**原生 Bun，无需 Docker**；先装 Git for Windows + Bun。部署脚本会定位 Git Bash 并把它加入 bot 的 PATH）
+   - **Windows Server（云电脑）**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1`（**原生 Bun，无需 Docker**；先装 Git for Windows + Bun。部署脚本使用中文交互，并逐个验证 Git/GNU Bash/Bun 候选路径，避免 `.cmd` 与无扩展名 shim 被合并成一个命令）
    - **Linux**：`./scripts/deploy/deploy.sh`（Docker）
 2. 在 Cloudflare Tunnel 控制台把 Published application 的 Service 改为本次选择的 `http://localhost:<port>`。
 3. 从 Cloudflare Tunnel 获取 token，任选一种：
@@ -154,7 +154,15 @@ git pull && ./scripts/deploy/deploy.sh
    token 解析优先级：位置参数文件 → `$TUNNEL_TOKEN_FILE` → `$TUNNEL_TOKEN`（裸值）→ `data/tunnel-token`。token 文件可以是裸 token，也可以是 `.env` 形式（含 `TUNNEL_TOKEN=...`）。
 5. IM 平台回调填：`https://<你的域名>/webhook/<secret>`（secret 来自 deploy 输出）。设置纯 hostname 形式的 `BOT_DOMAIN`（例如 `bot.example.com`，不含协议/端口/路径）后，部署成功会写入 `data/bot-domain`，后续运维脚本会自动检查该域名。
 
-Windows 上轮换已经安装到服务里的 tunnel token 时，设置 `$env:CLOUDFLARED_REINSTALL='1'` 后重新运行 `scripts\tunnel\start-tunnel.ps1`；默认重跑只会启动现有服务，不会静默替换它的 token。
+Windows 上的 `data/tunnel-token` 只是安装/修复时的 token 来源；Cloudflared 服务会保存安装时使用的 token，单独修改该文件不会自动更新已安装服务。轮换 token 后运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 repair-tunnel
+```
+
+该命令会隐藏 token 内容、强制重装 Cloudflared 服务并复查公网状态。直接重跑 `start-tunnel.ps1` 默认只会启动现有服务，不会静默替换 token。
+
+Windows 管理员部署会优先创建“开机启动、无需用户登录”的 S4U 计划任务；如果服务器策略在注册或实际启动阶段拒绝 S4U，会自动回退为当前用户登录时启动。非管理员部署仍保留前台运行模式；后续也可用 `ops.ps1 foreground` 显式以前台方式启动。
 
 > bot 端口无需对公网开放。Cloudflare WAF（平台 IP 白名单）和 Published application 的源站端口都在 Cloudflare 侧配置。
 
@@ -264,11 +272,17 @@ mixin-chatbot/
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor     # 健康检查（task/端口/配置；隧道检查按部署模式启用）
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor -Repair # 诊断后自动修复可安全处理的本地故障
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 repair-tunnel  # 按当前 token 来源重装 Cloudflared 服务
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 restart    # 重启
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 foreground # 前台运行（Ctrl+C 停止）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 logs       # 实时日志
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 stop       # 停止
-powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 卸载（task/进程，可选清 cloudflared/data）
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall-tunnel # 停止并卸载 Cloudflared 服务
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理 task/进程/防火墙/launcher，可选清隧道/data/logs
 ```
+
+`doctor` 会检查计划任务及上次结果、端口占用进程、本地 HTTP、token 来源、Cloudflared 服务、`data/bot-domain` 和公网链路，并为失败项打印对应修复命令。它只确认 token 来源是否可用，无法从 Cloudflared 服务中反查并比较已安装 token；token 有变化时应显式执行 `repair-tunnel`。
 
 ## 故障排查
 
@@ -276,8 +290,12 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 卸载
 |------|---------|---------|
 | 启动报 `无法读取 data/models.json` | 未配置 AI | 运行 configure TUI 生成 `data/models.json` |
 | 启动报 `data/webhook-secret 缺失或格式无效` | 密钥文件不存在、编码错误或内容损坏 | 删除该文件后重跑部署脚本生成；不要在生产设置 `ALLOW_INSECURE_WEBHOOK=1` |
-| 健康检查超时 | 所选端口冲突 / 启动异常 | `docker logs mixin-chatbot`，并查看 `data/bot-port` 确认实际端口 |
+| 健康检查超时 | 所选端口冲突 / 启动异常 | Linux 查看 `docker logs mixin-chatbot`；Windows 运行 `ops.ps1 doctor` 与 `ops.ps1 logs`；两边都检查 `data/bot-port` |
+| Windows 计划任务存在但机器人未启动 | S4U 被服务器策略拒绝 / task 上次结果异常 | 重跑最新版 `scripts\deploy\deploy.ps1`（会自动回退登录时启动），再执行 `scripts\ops\ops.ps1 doctor` 查看十六进制任务结果 |
 | IM 收不到回复 | 回调地址不可达 / 防火墙 / Cloudflare 源站端口不一致 | 直连检查 `ufw status`；Tunnel 检查 Published application 是否指向 `http://localhost:<data/bot-port>` |
+| Cloudflare 公网返回 502 | 隧道在线，但本地机器人未启动或源站端口不一致 | 先运行 `ops.ps1 doctor -Repair`，再确认 Published application 指向 `http://localhost:<data/bot-port>` |
+| Cloudflare 公网返回 530/1033 或连接失败 | connector 未运行、服务安装 token 已失效、hostname/DNS 异常 | 将最新 token 放到 `data/tunnel-token`，以管理员运行 `ops.ps1 repair-tunnel`，再检查 Cloudflare hostname/DNS |
+| 修改 `data/tunnel-token` 后仍连不上 | 已安装服务仍使用旧 token | 运行 `ops.ps1 repair-tunnel`；修改文件本身不会更新服务 |
 | 日志显示“发送成功”但群里只收到前 20 条 | 平台对超限请求返回 HTTP 200 后静默丢弃 | 当前版本用本地 60 秒滑动窗口保护，不依赖 429；确认所有实例都已更新且没有另一份 bot 共用同一 callback key |
 | AI 回复报错 | models.json 的 key / 模型有误 | 重跑 configure TUI |
 | 云电脑迁移后偶发不通 | 前半段（平台→边缘）不稳 | 见 cloudflared 隧道方案（另文） |
