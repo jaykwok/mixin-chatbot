@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Debian 13 服务器安全加固脚本
-# 用法: sudo ./setup-server.sh
+# 用法: sudo ./scripts/setup-server.sh
 
 set -e
 
@@ -9,7 +9,7 @@ set -e
 PLATFORM_IP="${PLATFORM_IP:-223.244.14.237}"
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "请使用 root 运行: sudo ./setup-server.sh"
+    echo "请使用 root 运行: sudo ./scripts/setup-server.sh"
     exit 1
 fi
 
@@ -157,5 +157,5 @@ echo "  入侵防护:   fail2ban (SSH)"
 echo "  自动更新:   安全补丁"
 echo "  内核优化:   低内存 + TCP 加固"
 echo ""
-echo "  下一步: cd /你的项目目录 && ./deploy.sh"
+echo "  下一步: cd /你的项目目录 && ./scripts/deploy.sh"
 echo ""

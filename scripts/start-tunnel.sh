@@ -2,7 +2,7 @@
 # 云电脑本地对接脚本：起 cloudflared，把 im-bot.jaykwok.net 经 Cloudflare 隧道接到本机 :1011。
 #
 # 前置：
-#   1) 机器人已在本机 :1011 跑起来（./deploy.sh 选 Cloudflare 模式）
+#   1) 机器人已在本机 :1011 跑起来（./scripts/deploy.sh 选 Cloudflare 模式）
 #   2) 隧道 token。来源（按优先级）：
 #        位置参数：./scripts/start-tunnel.sh <token-file>   # 路径，相对或绝对
 #        环境变量：TUNNEL_TOKEN_FILE=<path>                 # 指定文件
@@ -78,7 +78,7 @@ fi
 if curl -fsS "http://localhost:${BOT_PORT}/favicon.svg" >/dev/null 2>&1; then
     echo "✓ 本机 :${BOT_PORT} 机器人在线"
 else
-    echo "⚠ 本机 :${BOT_PORT} 无响应——先 ./deploy.sh 把机器人起来（Cloudflare 模式）" >&2
+    echo "⚠ 本机 :${BOT_PORT} 无响应——先 ./scripts/deploy.sh 把机器人起来（Cloudflare 模式）" >&2
 fi
 
 # ---- 4. 起隧道（前台）----
