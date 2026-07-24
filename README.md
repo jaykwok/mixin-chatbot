@@ -94,7 +94,9 @@ git pull && ./deploy.sh
 
 适合无公网 IP 的云电脑：bot 跑在云电脑 :1011，`cloudflared` 把 `im-bot.jaykwok.net` 经 Cloudflare 隧道接到本机。
 
-1. `git clone` 仓库到云电脑，`./deploy.sh` 选 **Cloudflare 模式**（bot 起在 :1011，生成 webhook 密钥）。
+1. `git clone` 仓库到云电脑，按系统部署（选 **Cloudflare 模式**，bot 起在 :1011 + 生成 webhook 密钥）：
+   - **Windows Server（云电脑）**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1`（**原生 Bun，无需 Docker**；先装 Git for Windows + Bun。agent 的 bash 工具靠 Git Bash 的 bash.exe——pi 的 `getShellConfig` 在 win32 自动找 Git Bash，所以必须装 Git for Windows）
+   - **Linux**：`./deploy.sh`（Docker）
 2. 从服务器拷贝隧道 token：把 `/root/.cpa-bot-tunnel-token.env` 里的 `TUNNEL_TOKEN` 写入云电脑 `data/tunnel-token`（或 `export TUNNEL_TOKEN=...`）。
 3. 起隧道（按云电脑系统选一个）：
    - **Linux/macOS**：`./scripts/start-tunnel.sh`
@@ -142,6 +144,7 @@ mixin-chatbot/
 │       └── log.ts              # 日志（console + 文件轮转）
 ├── scripts/
 │   ├── configure.ts     # TUI：生成 data/models.json（LiteLLM 元数据）
+│   ├── deploy.ps1       # Windows Server 部署（原生 Bun，无 Docker）
 │   ├── start-tunnel.sh  # 云电脑 cloudflared 对接（Linux/macOS）
 │   └── start-tunnel.ps1 # 同上（Windows Server，注册为服务）
 ├── static/favicon.svg
