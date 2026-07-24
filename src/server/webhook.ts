@@ -130,11 +130,8 @@ export function cleanupRateLimits(): void {
   }
 }
 
-// per-(phone, 群) 串行链：同一会话的消息依次处理，避免并发改同一份会话历史竞态。
-// 粒度与 session 文件一致（等价 Python 的 per-conversation asyncio.Lock）。
-const userChains = new Map<string, Promise<void>>();
-
-/** 后台异步处理：调 Pi agent 生成回复并发送。失败则发错误提示。 */
+/** 后台异步处理：调 Pi agent 生成回复并发送。失败则发错误提示。
+ *  agent 干活途中的新消息/指令由 agent.ts 内部 steer/abort 处理，故此处不再串行化。 */
 export async function processRequest(
   content: string,
   phone: string,
@@ -163,8 +160,8 @@ export async function processRequest(
   }
 }
 
-/** 把请求串行化到该 (phone, 群) 的处理链后（fire-and-forget）。webhook ack 后调用。
- *  粒度与 session 文件一致，避免并发改同一份会话历史。 */
+/** 后台 fire-and-forget 派发（webhook 已 ack 200）。不再串行化：agent 正忙时新消息走
+ *  steer（中途干预）、/指令立即处理，需并发进入 handleUserMessage；会话历史由 Pi 内部串行写。 */
 export function enqueueUserRequest(
   content: string,
   phone: string,
@@ -172,13 +169,7 @@ export function enqueueUserRequest(
   callbackUrl: string,
   clientIp: string
 ): void {
-  const chainKey = `${phone}:${groupId}`;
-  const prev = userChains.get(chainKey) ?? Promise.resolve();
-  const next = prev.then(() =>
-    processRequest(content, phone, groupId, callbackUrl, clientIp)
+  void processRequest(content, phone, groupId, callbackUrl, clientIp).catch((e) =>
+    log.error(`后台处理异常 - 用户: ${phone}, 错误: ${String(e)}`)
   );
-  userChains.set(chainKey, next);
-  next.finally(() => {
-    if (userChains.get(chainKey) === next) userChains.delete(chainKey);
-  });
 }
