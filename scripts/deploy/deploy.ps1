@@ -29,6 +29,16 @@ if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsP
 function Step($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Done($m) { Write-Host "[+] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
+function Read-YesNo([string]$Prompt, [bool]$Default = $false) {
+    while ($true) {
+        $rawAnswer = Read-Host $Prompt
+        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim().ToLowerInvariant() }
+        if (-not $answer) { return $Default }
+        if ($answer -in @("y", "yes", "是")) { return $true }
+        if ($answer -in @("n", "no", "否")) { return $false }
+        Warn "请输入 y 或 n（也可直接回车采用默认值）"
+    }
+}
 function Get-ApplicationPaths([string]$Name) {
     $paths = @()
     foreach ($command in @(Get-Command $Name -All -CommandType Application -ErrorAction SilentlyContinue)) {
@@ -107,6 +117,24 @@ function Test-Hostname([string]$Value) {
         }
     }
     return $true
+}
+function ConvertTo-Hostname([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $candidate = $Value.Trim()
+    if (Test-Hostname $candidate) { return $candidate.ToLowerInvariant() }
+
+    $uri = $null
+    if ([Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -and
+        $uri.Scheme -in @("http", "https") -and
+        $uri.IsDefaultPort -and
+        [string]::IsNullOrEmpty($uri.UserInfo) -and
+        $uri.AbsolutePath -eq "/" -and
+        [string]::IsNullOrEmpty($uri.Query) -and
+        [string]::IsNullOrEmpty($uri.Fragment) -and
+        (Test-Hostname $uri.DnsSafeHost)) {
+        return $uri.DnsSafeHost.ToLowerInvariant()
+    }
+    return $null
 }
 
 # ---- 1. 前置检查 ----
@@ -241,8 +269,7 @@ if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
     if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) { Write-Host "未生成 data\config\models.json，部署中止。" -ForegroundColor Red; exit 1 }
 } else {
     Done "data\config\models.json 已存在"
-    $ans = Read-Host "是否重新配置 AI（provider/key/model）？[y/N]"
-    if ($ans -match "^[yY]$") {
+    if (Read-YesNo "是否重新配置 AI（provider/key/model）？[y/N]" $false) {
         $previousErrorActionPreference = $ErrorActionPreference
         $configureExitCode = 1
         try {
@@ -278,17 +305,24 @@ if (-not (Test-Path -LiteralPath $WebhookSecretFile -PathType Leaf)) {
 }
 
 $persistDomain = $false
+$clearPersistedDomain = $false
+$invalidConfiguredDomain = ""
 if (-not [string]::IsNullOrWhiteSpace($env:BOT_DOMAIN)) {
-    $publicDomain = $env:BOT_DOMAIN.Trim()
-    $persistDomain = $true
+    $rawPublicDomain = $env:BOT_DOMAIN.Trim()
+    $domainSource = "BOT_DOMAIN"
 } elseif (Test-Path -LiteralPath $DomainFile) {
-    $publicDomain = (Get-Content -LiteralPath $DomainFile -Raw).Trim()
+    $rawPublicDomain = (Get-Content -LiteralPath $DomainFile -Raw).Trim()
+    $domainSource = "data\state\bot-domain"
 } else {
-    $publicDomain = ""
+    $rawPublicDomain = ""
+    $domainSource = ""
 }
-if ($publicDomain -and -not (Test-Hostname $publicDomain)) {
-    Write-Host "BOT_DOMAIN/data\state\bot-domain 必须是纯 hostname（不能包含协议、端口或路径）：$publicDomain" -ForegroundColor Red
-    exit 1
+$publicDomain = ConvertTo-Hostname $rawPublicDomain
+if ($rawPublicDomain -and -not $publicDomain) {
+    $invalidConfiguredDomain = $rawPublicDomain
+    $clearPersistedDomain = $domainSource -eq "data\state\bot-domain"
+} elseif ($publicDomain -and ($domainSource -eq "BOT_DOMAIN" -or $publicDomain -cne $rawPublicDomain)) {
+    $persistDomain = $true
 }
 
 # ---- 4b. Pi 群数据总根（<group>/workspace + <group>/users/<phone>/{tmp,session.jsonl}）----
@@ -309,47 +343,75 @@ Write-Host "  默认 data\groups；GROUP_DATA_ROOT 可覆盖到其他磁盘。"
 Write-Host "  部署成功后会记入 data\state\group-data-root，下次自动沿用。"
 Write-Host "  如需调整，可输入相对仓库路径或绝对路径。"
 Write-Host "  每个群使用 <root>\<group>\workspace；每个调用用户使用 <group>\users\<phone>\tmp 和 session.jsonl。"
-$wdIn = Read-Host "群数据总根 [默认：$groupRootDefault]"
-$groupRootCandidate = if ($wdIn) { $wdIn.Trim() } else { $groupRootDefault }
-try {
-    $GroupDataRoot = if ([System.IO.Path]::IsPathRooted($groupRootCandidate)) {
-        [System.IO.Path]::GetFullPath($groupRootCandidate)
+while ($true) {
+    $wdIn = Read-Host "群数据总根 [默认：$groupRootDefault]"
+    $groupRootCandidate = if ($wdIn) { $wdIn.Trim() } else { $groupRootDefault }
+    try {
+        $GroupDataRoot = if ([System.IO.Path]::IsPathRooted($groupRootCandidate)) {
+            [System.IO.Path]::GetFullPath($groupRootCandidate)
+        } else {
+            [System.IO.Path]::GetFullPath((Join-Path $Project $groupRootCandidate))
+        }
+    } catch {
+        Warn "群数据总根路径无效：$groupRootCandidate"
+        continue
+    }
+    $volumeRoot = [System.IO.Path]::GetPathRoot($GroupDataRoot).TrimEnd('\')
+    if ($GroupDataRoot.TrimEnd('\') -eq $volumeRoot -or $GroupDataRoot.TrimEnd('\') -eq $Project.TrimEnd('\')) {
+        Warn "群数据总根不能是文件系统根目录或项目根目录：$GroupDataRoot"
+        continue
+    }
+    $projectChildPrefix = $Project.TrimEnd('\') + '\'
+    if ($GroupDataRoot.StartsWith($projectChildPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $GroupDataRoot.TrimEnd('\') -ne $DefaultGroupDataRoot.TrimEnd('\')) {
+        Warn "项目内群数据目录固定为 data\groups；如需自定义，请选择项目外的路径：$GroupDataRoot"
+        continue
+    }
+    if (Test-Path -LiteralPath $GroupDataRoot) {
+        if (-not (Test-Path -LiteralPath $GroupDataRoot -PathType Container)) {
+            Warn "群数据总根不是目录：$GroupDataRoot"
+            continue
+        }
     } else {
-        [System.IO.Path]::GetFullPath((Join-Path $Project $groupRootCandidate))
+        try {
+            New-Item -ItemType Directory -Force -Path $GroupDataRoot | Out-Null
+        } catch {
+            Warn "无法创建群数据总根：$GroupDataRoot（$($_.Exception.Message)）"
+            continue
+        }
     }
-} catch {
-    Write-Host "群数据总根路径无效：$groupRootCandidate" -ForegroundColor Red
-    exit 1
-}
-$volumeRoot = [System.IO.Path]::GetPathRoot($GroupDataRoot).TrimEnd('\')
-if ($GroupDataRoot.TrimEnd('\') -eq $volumeRoot -or $GroupDataRoot.TrimEnd('\') -eq $Project.TrimEnd('\')) {
-    Write-Host "群数据总根不能是文件系统根目录或项目根目录：$GroupDataRoot" -ForegroundColor Red
-    exit 1
-}
-$projectChildPrefix = $Project.TrimEnd('\') + '\'
-if ($GroupDataRoot.StartsWith($projectChildPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
-    $GroupDataRoot.TrimEnd('\') -ne $DefaultGroupDataRoot.TrimEnd('\')) {
-    Write-Host "项目内群数据目录固定为 data\groups；如需自定义，请选择项目外的路径：$GroupDataRoot" -ForegroundColor Red
-    exit 1
-}
-if (Test-Path -LiteralPath $GroupDataRoot) {
-    if (-not (Test-Path -LiteralPath $GroupDataRoot -PathType Container)) {
-        Write-Host "群数据总根不是目录：$GroupDataRoot" -ForegroundColor Red
-        exit 1
+    $GroupDataRoot = (Resolve-Path -LiteralPath $GroupDataRoot).Path
+    $writeProbe = Join-Path $GroupDataRoot (".mixin-chatbot-write-test-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        [System.IO.File]::WriteAllText($writeProbe, "")
+    } catch {
+        Warn "群数据总根不可写：$GroupDataRoot（$($_.Exception.Message)）"
+        continue
+    } finally {
+        Remove-Item -LiteralPath $writeProbe -Force -ErrorAction SilentlyContinue
     }
-} else {
-    New-Item -ItemType Directory -Force -Path $GroupDataRoot | Out-Null
+    break
 }
-$GroupDataRoot = (Resolve-Path -LiteralPath $GroupDataRoot).Path
 Done "群数据总根：$GroupDataRoot"
 
 # ---- 4c. 监听端口（显式环境变量 > 已保存值 > 1011）----
-$portDefault = if ($env:BOT_PORT) {
-    $env:BOT_PORT
+$portDefaultSource = ""
+$rawPortDefault = if (-not [string]::IsNullOrWhiteSpace($env:BOT_PORT)) {
+    $portDefaultSource = "BOT_PORT"
+    $env:BOT_PORT.Trim()
 } elseif (Test-Path -LiteralPath $PortFile) {
+    $portDefaultSource = "data\state\bot-port"
     (Get-Content -LiteralPath $PortFile -Raw).Trim()
 } else {
     "1011"
+}
+$defaultPortNumber = 0
+if ([int]::TryParse($rawPortDefault, [ref]$defaultPortNumber) -and
+    $defaultPortNumber -ge 1 -and $defaultPortNumber -le 65535) {
+    $portDefault = "$defaultPortNumber"
+} else {
+    Warn "$portDefaultSource 中的端口无效，已改用安全默认值 1011：$rawPortDefault"
+    $portDefault = "1011"
 }
 while ($true) {
     $portIn = Read-Host "机器人监听端口 [默认：$portDefault]"
@@ -364,26 +426,70 @@ while ($true) {
 Done "监听端口：$Port"
 
 # ---- 5. 部署模式 ----
+$modeDefaultSource = ""
+$rawModeDefault = if (-not [string]::IsNullOrWhiteSpace($env:DEPLOY_MODE)) {
+    $modeDefaultSource = "DEPLOY_MODE"
+    $env:DEPLOY_MODE.Trim().ToLowerInvariant()
+} elseif (Test-Path -LiteralPath $ModeFile -PathType Leaf) {
+    $modeDefaultSource = "data\state\deploy-mode"
+    (Get-Content -LiteralPath $ModeFile -Raw).Trim().ToLowerInvariant()
+} else {
+    "direct"
+}
+if ($rawModeDefault -in @("direct", "cloudflare")) {
+    $modeDefault = $rawModeDefault
+} else {
+    Warn "$modeDefaultSource 中的部署模式无效，已改用安全默认值 direct：$rawModeDefault"
+    $modeDefault = "direct"
+}
+$modeDefaultChoice = if ($modeDefault -eq "cloudflare") { "2" } else { "1" }
+$modeDefaultLabel = if ($modeDefault -eq "cloudflare") { "Cloudflare" } else { "直连" }
 Step "选择部署模式："
 Write-Host "  1) 直连模式       - 服务器有公网 IP；在 Windows 防火墙放行端口 $Port"
 Write-Host "  2) Cloudflare 模式 - 云电脑；部署后自动启动 cloudflared 隧道"
-$modeIn = Read-Host "输入 1 或 2 [默认：1]"
-$mode = if ($modeIn -eq "2") { "cloudflare" } else { "direct" }
+while ($true) {
+    $modeIn = Read-Host "输入 1 或 2 [默认：$modeDefaultChoice / $modeDefaultLabel]"
+    $modeChoice = if ([string]::IsNullOrWhiteSpace($modeIn)) { $modeDefaultChoice } else { $modeIn.Trim() }
+    if ($modeChoice -eq "1") {
+        $mode = "direct"
+        break
+    }
+    if ($modeChoice -eq "2") {
+        $mode = "cloudflare"
+        break
+    }
+    Warn "请输入 1 或 2"
+}
 $modeLabel = if ($mode -eq "cloudflare") { "Cloudflare" } else { "直连" }
 $BotHost = if ($mode -eq "cloudflare") { "127.0.0.1" } else { "0.0.0.0" }
 Done "部署模式：$modeLabel"
+if ($invalidConfiguredDomain) {
+    Warn "$domainSource 中的域名无效，已忽略：$invalidConfiguredDomain"
+}
 if ($mode -eq "cloudflare") {
     Warn "请在 Cloudflare Tunnel 控制台将 Published application 的服务地址设为 http://localhost:$Port"
-    if ([string]::IsNullOrWhiteSpace($publicDomain)) {
-        $domainIn = Read-Host "Cloudflare 公网域名（可留空；留空会跳过公网健康检查）"
-        if ($domainIn) {
-            $publicDomain = $domainIn.Trim()
-            if (-not (Test-Hostname $publicDomain)) {
-                Write-Host "域名必须是纯 hostname（不能包含协议、端口或路径）：$publicDomain" -ForegroundColor Red
-                exit 1
-            }
-            $persistDomain = $true
+    $domainDefault = $publicDomain
+    while ($true) {
+        $domainPrompt = if ($domainDefault) {
+            "Cloudflare 公网域名 [默认：$domainDefault；支持完整根 URL]"
+        } else {
+            "Cloudflare 公网域名（可留空；支持 im-bot.example.com 或 https://im-bot.example.com）"
         }
+        $domainIn = Read-Host $domainPrompt
+        if ([string]::IsNullOrWhiteSpace($domainIn)) {
+            $publicDomain = $domainDefault
+            break
+        }
+        $normalizedDomain = ConvertTo-Hostname $domainIn
+        if ($normalizedDomain) {
+            $publicDomain = $normalizedDomain
+            $persistDomain = $true
+            if ($publicDomain -cne $domainIn.Trim()) {
+                Done "已规范化公网域名：$publicDomain"
+            }
+            break
+        }
+        Warn "域名格式无效；请输入纯 hostname，或只含 hostname 的 http(s) URL（不能带端口、路径、查询参数）"
     }
 }
 
@@ -520,6 +626,8 @@ if ($isAdmin) {
     Set-Content -LiteralPath $GroupRootFile -Value $GroupDataRoot -NoNewline -Encoding UTF8
     if ($persistDomain) {
         Set-Content -LiteralPath $DomainFile -Value $publicDomain -NoNewline -Encoding ASCII
+    } elseif ($clearPersistedDomain) {
+        Remove-Item -LiteralPath $DomainFile -Force -ErrorAction SilentlyContinue
     }
     Done "机器人健康（群数据总根=$GroupDataRoot）。管理：Get-ScheduledTask $TaskName | Stop-ScheduledTask；日志：logs\mixin-chatbot.log"
     Warn "任务启动方式：$taskStartDescription。"
@@ -533,6 +641,8 @@ if ($isAdmin) {
     Set-Content -LiteralPath $GroupRootFile -Value $GroupDataRoot -NoNewline -Encoding UTF8
     if ($persistDomain) {
         Set-Content -LiteralPath $DomainFile -Value $publicDomain -NoNewline -Encoding ASCII
+    } elseif ($clearPersistedDomain) {
+        Remove-Item -LiteralPath $DomainFile -Force -ErrorAction SilentlyContinue
     }
     $env:GROUP_DATA_ROOT = $GroupDataRoot
     $env:BOT_PORT = $Port
@@ -568,21 +678,30 @@ if ($mode -eq "cloudflare") {
         }
     } else {
         Warn "未安装 Cloudflared 服务，将通过 scripts\tunnel\start-tunnel.ps1 安装..."
-        $tokIn = Read-Host "隧道 token 文件 [默认：data\config\tunnel-token]"
-        $tokArg = if ($tokIn) { $tokIn.Trim() } else { "data\config\tunnel-token" }
         $stPath = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
-        $previousErrorActionPreference = $ErrorActionPreference
-        $tunnelExitCode = 1
-        try {
-            # Windows PowerShell 5.1 会把原生命令的 stderr 包装为 ErrorRecord；
-            # 此处让子脚本直接输出，再按真实退出码判断，避免错误提示中断退出码采集。
-            $ErrorActionPreference = "Continue"
-            & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stPath $tokArg
-            $tunnelExitCode = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previousErrorActionPreference
+        while ($true) {
+            $tokIn = Read-Host "隧道 token 文件 [直接回车按 TUNNEL_TOKEN_FILE / TUNNEL_TOKEN / data\config\tunnel-token 的顺序查找]"
+            $previousErrorActionPreference = $ErrorActionPreference
+            $tunnelExitCode = 1
+            try {
+                # Windows PowerShell 5.1 会把原生命令的 stderr 包装为 ErrorRecord；
+                # 此处让子脚本直接输出，再按真实退出码判断，避免错误提示中断退出码采集。
+                $ErrorActionPreference = "Continue"
+                if ([string]::IsNullOrWhiteSpace($tokIn)) {
+                    & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stPath
+                } else {
+                    & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stPath $tokIn.Trim()
+                }
+                $tunnelExitCode = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            $installedTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+            if ($tunnelExitCode -eq 0 -and $installedTunnelService -and $installedTunnelService.Status -eq "Running") {
+                break
+            }
+            Warn "Cloudflared 未安装成功或尚未运行，请检查上方提示后重新输入 token 来源。按 Ctrl+C 可取消部署。"
         }
-        if ($tunnelExitCode -ne 0) { Warn "start-tunnel.ps1 返回退出码 $tunnelExitCode，隧道可能未上线；请运行 scripts\ops\ops.ps1 doctor 查看修复建议。" }
     }
     if ($isAdmin) {
         $finalTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
