@@ -1,6 +1,7 @@
 // 入口：Hono app + Bun.serve + /webhook 路由 + lifespan。
-// 公网鉴权：data/webhook-secret 存在时启用 /webhook/:secret（恒定时长比对，不匹配 404）；
-// 缺失或无效时默认拒绝启动；仅显式设置 ALLOW_INSECURE_WEBHOOK=1 才开放开发端点。AI 配置见 data/models.json。
+// 公网鉴权：data/config/webhook-secret 存在时启用 /webhook/:secret（恒定时长比对，不匹配 404）；
+// 缺失或无效时默认拒绝启动；仅显式设置 ALLOW_INSECURE_WEBHOOK=1 才开放开发端点。
+// AI 配置见 data/config/models.json。
 import { Hono, type Context } from "hono";
 import { readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
@@ -13,8 +14,8 @@ import {
   MAX_WEBHOOK_BODY_BYTES,
   PORT,
   RATE_LIMIT_CLEANUP_INTERVAL,
-  WEBHOOK_SECRET_FILE,
 } from "../core/config.ts";
+import { WEBHOOK_SECRET_FILE } from "../core/storage.ts";
 import { getClientIp, HttpError } from "./http.ts";
 import {
   cleanupRateLimits,

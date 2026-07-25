@@ -17,15 +17,28 @@ $ErrorActionPreference = "Stop"
 
 $Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $TaskName = "mixin-chatbot"
-$portFile = Join-Path $Project "data\bot-port"
+$DataDir = Join-Path $Project "data"
+$ConfigDir = Join-Path $DataDir "config"
+$StateDir = Join-Path $DataDir "state"
+$RuntimeDir = Join-Path $DataDir "runtime"
+$DefaultGroupDataRoot = Join-Path $DataDir "groups"
+$portFile = Join-Path $StateDir "bot-port"
 $Port     = if ($env:BOT_PORT) { $env:BOT_PORT } elseif (Test-Path $portFile) { (Get-Content $portFile -Raw).Trim() } else { "1011" }
-$modeFile = Join-Path $Project "data\deploy-mode"
+$modeFile = Join-Path $StateDir "deploy-mode"
 $DeployMode = if (Test-Path $modeFile) { (Get-Content $modeFile -Raw).Trim() } else { "direct" }
-$domainFile = Join-Path $Project "data\bot-domain"
+$domainFile = Join-Path $StateDir "bot-domain"
 $Domain   = if ($env:BOT_DOMAIN) { $env:BOT_DOMAIN.Trim() } elseif (Test-Path $domainFile) { (Get-Content $domainFile -Raw).Trim() } else { "" }
+$groupRootFile = Join-Path $StateDir "group-data-root"
+$DeployedGroupDataRoot = if (Test-Path -LiteralPath $groupRootFile -PathType Leaf) {
+    (Get-Content -LiteralPath $groupRootFile -Raw).Trim()
+} else {
+    $DefaultGroupDataRoot
+}
 $LogPath  = Join-Path $Project "logs\mixin-chatbot.log"
 $TunnelScript = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
-$DefaultTunnelTokenFile = Join-Path $Project "data\tunnel-token"
+$ModelsFile = Join-Path $ConfigDir "models.json"
+$WebhookSecretFile = Join-Path $ConfigDir "webhook-secret"
+$DefaultTunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
 $LocalCloudflared = Join-Path $Project "cloudflared.exe"
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsPowerShell = "powershell.exe" }
@@ -212,7 +225,7 @@ function Get-TunnelTokenSource {
             Detail    = $(if ($valid) { "env:TUNNEL_TOKEN（值已隐藏）" } else { "env:TUNNEL_TOKEN 为空或无效" })
         }
     }
-    return Get-TunnelTokenFileInfo $DefaultTunnelTokenFile "data\tunnel-token"
+    return Get-TunnelTokenFileInfo $DefaultTunnelTokenFile "data\config\tunnel-token"
 }
 
 function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]$Fix = "") {
@@ -226,14 +239,14 @@ function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]
 
 $portNumber = 0
 if (-not [int]::TryParse($Port, [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
-    throw "BOT_PORT/data/bot-port 中的端口无效：$Port"
+    throw "BOT_PORT/data/state/bot-port 中的端口无效：$Port"
 }
 $Port = "$portNumber"
 if ($DeployMode -notin @("direct", "cloudflare")) {
-    throw "data/deploy-mode 中的部署模式无效：$DeployMode"
+    throw "data/state/deploy-mode 中的部署模式无效：$DeployMode"
 }
 if ($Domain -and -not (Test-Hostname $Domain)) {
-    throw "BOT_DOMAIN/data/bot-domain 中的 hostname 无效：$Domain"
+    throw "BOT_DOMAIN/data/state/bot-domain 中的 hostname 无效：$Domain"
 }
 
 # 识别正在运行 src/server/index.ts 的 bun.exe 进程
@@ -314,7 +327,7 @@ function Wait-Public {
 
 function Invoke-TunnelRepair {
     if ($DeployMode -ne "cloudflare") {
-        Err "repair-tunnel 只适用于 data\deploy-mode 为 cloudflare 的部署"
+        Err "repair-tunnel 只适用于 data\state\deploy-mode 为 cloudflare 的部署"
         return $false
     }
     if (-not (IsAdmin)) {
@@ -330,7 +343,7 @@ function Invoke-TunnelRepair {
     $tokenSource = Get-TunnelTokenSource
     if (-not $tokenSource.Available) {
         Err "没有可用的 Cloudflare 隧道 token 来源：$($tokenSource.Detail)"
-        Warn "请将裸 token（或 TUNNEL_TOKEN=...）放入 data\tunnel-token 后重试"
+        Warn "请将裸 token（或 TUNNEL_TOKEN=...）放入 data\config\tunnel-token 后重试"
         return $false
     }
 
@@ -391,13 +404,24 @@ function Invoke-TunnelRepair {
         return $false
     }
 
-    Warn "缺少 data\bot-domain；连接器已修复，但无法验证公网健康状态"
+    Warn "缺少 data\state\bot-domain；连接器已修复，但无法验证公网健康状态"
     return $true
 }
 
 function Show-Doctor {
     Step "mixin-chatbot 健康检查（模式=$(Get-DeployModeLabel $DeployMode)，端口=$Port）"
     $rows = @()
+
+    try {
+        $resolvedGroupDataRoot = Resolve-ProjectPath $DeployedGroupDataRoot
+        if (Test-Path -LiteralPath $resolvedGroupDataRoot -PathType Container) {
+            $rows += New-DoctorRow "群数据总根" "pass" $resolvedGroupDataRoot
+        } else {
+            $rows += New-DoctorRow "群数据总根" "fail" "目录不存在：$resolvedGroupDataRoot" "重新运行 scripts\deploy\deploy.ps1 并确认群数据总根。"
+        }
+    } catch {
+        $rows += New-DoctorRow "群数据总根" "fail" "路径无效：$DeployedGroupDataRoot" "重新运行 scripts\deploy\deploy.ps1 并选择有效目录。"
+    }
 
     $localStatus = Test-Local
     $botPids = @(Get-BotPids)
@@ -446,7 +470,7 @@ function Show-Doctor {
     if ($DeployMode -eq "cloudflare") {
         $tokenSource = Get-TunnelTokenSource
         $tokenDetail = if ($tokenSource.Available) { "$($tokenSource.Detail)；仅表示可用于修复，无法证明服务已安装同一 token" } else { $tokenSource.Detail }
-        $rows += New-DoctorRow "隧道 token 来源" $(if ($tokenSource.Available) { "pass" } else { "warn" }) $tokenDetail $(if ($tokenSource.Available) { "" } else { "将 token（裸值或 TUNNEL_TOKEN=...）放入 data\tunnel-token，然后执行 ops.ps1 repair-tunnel。" })
+        $rows += New-DoctorRow "隧道 token 来源" $(if ($tokenSource.Available) { "pass" } else { "warn" }) $tokenDetail $(if ($tokenSource.Available) { "" } else { "将 token（裸值或 TUNNEL_TOKEN=...）放入 data\config\tunnel-token，然后执行 ops.ps1 repair-tunnel。" })
 
         $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
         if (-not $svc) {
@@ -458,7 +482,7 @@ function Show-Doctor {
         }
 
         if ($Domain) {
-            $rows += New-DoctorRow "data/bot-domain" "pass" $Domain
+            $rows += New-DoctorRow "data/state/bot-domain" "pass" $Domain
             $publicStatus = Test-Public
             if ($publicStatus -eq "200") {
                 $rows += New-DoctorRow "公网 CF→隧道→机器人" "pass" "HTTP 200"
@@ -472,24 +496,22 @@ function Show-Doctor {
                 $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" $(if ($publicStatus) { "HTTP $publicStatus" } else { "DNS/TLS/连接失败" }) "执行 ops.ps1 repair-tunnel，然后检查 Cloudflare DNS、WAF 和 Published application。"
             }
         } else {
-            $rows += New-DoctorRow "data/bot-domain" "warn" "缺少；跳过公网健康检查" "运行：Set-Content -LiteralPath .\data\bot-domain -Value 'bot.example.com' -NoNewline"
-            $rows += New-DoctorRow "公网 CF→隧道→机器人" "warn" "没有 data/bot-domain，未测试" "设置 data\bot-domain 后重新执行 ops.ps1 doctor。"
+            $rows += New-DoctorRow "data/state/bot-domain" "warn" "缺少；跳过公网健康检查" "运行：Set-Content -LiteralPath .\data\state\bot-domain -Value 'bot.example.com' -NoNewline"
+            $rows += New-DoctorRow "公网 CF→隧道→机器人" "warn" "没有 data/state/bot-domain，未测试" "设置 data\state\bot-domain 后重新执行 ops.ps1 doctor。"
         }
     }
 
-    $mj = Join-Path $Project "data\models.json"
     $modelsOk = $false
-    if (Test-Path $mj) {
+    if (Test-Path -LiteralPath $ModelsFile) {
         try {
-            $modelsDoc = Get-Content $mj -Raw | ConvertFrom-Json
+            $modelsDoc = Get-Content -LiteralPath $ModelsFile -Raw | ConvertFrom-Json
             $modelsOk = $null -ne $modelsDoc.providers -and @($modelsDoc.providers.PSObject.Properties).Count -gt 0
         } catch {}
     }
-    $rows += New-DoctorRow "data/models.json" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } else { "执行 bun run configure。" })
+    $rows += New-DoctorRow "data/config/models.json" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } else { "执行 bun run configure。" })
 
-    $ws = Join-Path $Project "data\webhook-secret"
-    $secretOk = (Test-Path $ws) -and ((Get-Content $ws -Raw).Trim() -match "^[0-9a-fA-F]{32,64}$")
-    $rows += New-DoctorRow "data/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "执行 scripts\deploy\deploy.ps1；密钥变化后还必须更新 IM webhook URL。" })
+    $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ((Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim() -match "^[0-9a-fA-F]{32,64}$")
+    $rows += New-DoctorRow "data/config/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "执行 scripts\deploy\deploy.ps1；密钥变化后还必须更新 IM webhook URL。" })
 
     foreach ($r in $rows) {
         $tag = switch ($r.Status) { "pass" { "[+]" }; "warn" { "[!]" }; default { "[x]" } }
@@ -554,7 +576,7 @@ function Invoke-DoctorRepair {
                 }
             } else {
                 Err "Cloudflared 需要修复，但没有可用的 token 来源"
-                Warn "请将 token 放入 data\tunnel-token，然后以管理员身份执行 ops.ps1 repair-tunnel"
+                Warn "请将 token 放入 data\config\tunnel-token，然后以管理员身份执行 ops.ps1 repair-tunnel"
                 $ok = $false
             }
         }
@@ -581,7 +603,7 @@ function Show-Logs {
 }
 
 function Run-Foreground {
-    $launcher = Join-Path $Project "data\runtime\bot-launcher.ps1"
+    $launcher = Join-Path $RuntimeDir "bot-launcher.ps1"
     if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
         Err "找不到前台 launcher；请先运行 scripts\deploy\deploy.ps1"
         return $false
@@ -699,6 +721,7 @@ function Uninstall-TunnelService([switch]$Confirmed) {
 
 function Uninstall-Bot {
     Step "卸载 mixin-chatbot"
+    $resolvedGroupDataRoot = try { Resolve-ProjectPath $DeployedGroupDataRoot } catch { $null }
     if (-not (IsAdmin)) { Warn "当前不是管理员，任务/服务删除可能失败；如失败请以管理员身份重跑。" }
     Stop-Bot
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -720,12 +743,11 @@ function Uninstall-Bot {
             Warn "未注销计划任务；请以管理员身份重新运行 uninstall"
         }
     } else { Warn "没有可删除的计划任务" }
-    $runtimeDir = Join-Path $Project "data\runtime"
-    $launcher = Join-Path $runtimeDir "bot-launcher.ps1"
+    $launcher = Join-Path $RuntimeDir "bot-launcher.ps1"
     if (Test-Path -LiteralPath $launcher -PathType Leaf) { Remove-Item -LiteralPath $launcher -Force; Done "机器人 launcher 已删除" }
-    if ((Test-Path -LiteralPath $runtimeDir -PathType Container) -and
-        @(Get-ChildItem -LiteralPath $runtimeDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
-        Remove-Item -LiteralPath $runtimeDir -Force
+    if ((Test-Path -LiteralPath $RuntimeDir -PathType Container) -and
+        @(Get-ChildItem -LiteralPath $RuntimeDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+        Remove-Item -LiteralPath $RuntimeDir -Force
         Done "空的 data\runtime 目录已删除"
     }
     [void](Remove-ManagedFirewallRules)
@@ -750,13 +772,17 @@ function Uninstall-Bot {
     Get-ChildItem -LiteralPath $Project -Filter "cloudflared.exe.download-*" -File -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 
-    $d = Read-Host "是否删除 data/（models.json、webhook-secret、默认群数据）和 logs/？[y/N]"
+    $d = Read-Host "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N]"
     if ($d -match "^[yY]$") {
-        Remove-Item (Join-Path $Project "data") -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path $Project "logs") -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $Project "logs") -Recurse -Force -ErrorAction SilentlyContinue
         Done "data/ 和 logs/ 已删除"
     } else {
-        Done "已保留 data/ 和 logs/（配置与默认群数据保留）"
+        Done "已保留 data/ 和 logs/（配置、状态与默认群数据保留）"
+    }
+    if ($resolvedGroupDataRoot -and
+        $resolvedGroupDataRoot.TrimEnd('\') -ne $DefaultGroupDataRoot.TrimEnd('\')) {
+        Warn "自定义群数据根未删除：$resolvedGroupDataRoot"
     }
     Done "卸载流程完成；如上方有警告，请按提示补充清理。"
     return $true

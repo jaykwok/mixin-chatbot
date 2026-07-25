@@ -1,11 +1,11 @@
 // Pi agent 集成：用 pi-coding-agent 的 AgentSession + SessionManager 内嵌大脑。
 // 纯适配——只用 Pi 公开 API：
-//   - provider/model/key 由 data/models.json 承载，Pi 原生读取（ModelRuntime.create({modelsPath})）
+//   - provider/model/key 由 data/config/models.json 承载，Pi 原生读取（ModelRuntime.create({modelsPath})）
 //   - read/bash/edit/write 复用 Pi 官方工具工厂，同名覆盖只增加路径边界和用户临时环境；
-//     cwd 绑定到 <AGENT_DATA_ROOT>/<group>/workspace，临时文件写当前用户的 <group>/<phone>/tmp
+//     cwd 绑定到 <GROUP_DATA_ROOT>/<group>/workspace，临时文件写当前用户的 users/<phone>/tmp
 //   - 发送工具 send_image/send_file 经 customTools（ToolDefinition）注册，定义在 ./send-tools.ts
 //   - system prompt 用 Pi 默认 + appendSystemPromptOverride 追加最小群聊/中文上下文（方便上游升级）
-// 会话持久化到 <AGENT_DATA_ROOT>/<group>/<phone>/sessions/session.jsonl。
+// 会话持久化到 <GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl。
 //
 // 中途干预（Pi 官方 API）：
 //   - agent 正忙时，普通消息 → session.steer()（等当前这批工具调用完、下次调 LLM 前注入，软干预）
@@ -13,7 +13,7 @@
 //   - /status /cancel /reset /help → 队列查询/清空、清会话、帮助
 import { readFileSync } from "node:fs";
 import { mkdir, unlink } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
@@ -24,12 +24,12 @@ import {
   type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
-  AGENT_DATA_ROOT,
   AGENT_HEARTBEAT_INTERVAL,
-  MODELS_JSON_PATH,
+  GROUP_DATA_ROOT,
   SESSION_IDLE_TTL,
 } from "../core/config.ts";
 import { log } from "../core/log.ts";
+import { MODELS_JSON_PATH, PI_AGENT_DIR } from "../core/storage.ts";
 import { getOutboundRateStatus, sendReplyWithMention, sendText } from "../integrations/im.ts";
 import {
   groupWorkspaceDir,
@@ -40,7 +40,7 @@ import { getGroupQueueStatus, runInGroupQueue } from "./group-queue.ts";
 import { buildLocalTools } from "./local-tools.ts";
 import { buildSendTools } from "./send-tools.ts";
 
-// ModelRuntime 单例 + 解析出的单模型。从 data/models.json 加载（Pi 原生）。
+// ModelRuntime 单例 + 解析出的单模型。从 data/config/models.json 加载（Pi 原生）。
 let modelRuntime: ModelRuntime | null = null;
 let resolvedModel: Model<Api> | null = null;
 let runtimePromise: Promise<{ runtime: ModelRuntime; model: Model<Api> }> | null = null;
@@ -77,7 +77,7 @@ async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> 
     }
     modelRuntime = runtime;
     resolvedModel = model;
-    log.info(`Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}, 群数据总根=${AGENT_DATA_ROOT}）`);
+    log.info(`Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}, 群数据总根=${GROUP_DATA_ROOT}）`);
     return { runtime, model };
   })();
 
@@ -180,17 +180,19 @@ async function createSession(
 ): Promise<AgentSession> {
   const key = sessionKey(phone, groupId);
   const { runtime, model } = await getRuntime();
-  const cwd = resolve(groupWorkspaceDir(AGENT_DATA_ROOT, groupId));
-  const tempDir = resolve(userTempDir(AGENT_DATA_ROOT, groupId, phone));
-  const historyPath = resolve(sessionFilePath(AGENT_DATA_ROOT, groupId, phone));
+  const cwd = resolve(groupWorkspaceDir(GROUP_DATA_ROOT, groupId));
+  const tempDir = resolve(userTempDir(GROUP_DATA_ROOT, groupId, phone));
+  const historyPath = resolve(sessionFilePath(GROUP_DATA_ROOT, groupId, phone));
+  const piAgentDir = resolve(PI_AGENT_DIR);
   await mkdir(cwd, { recursive: true });
   await mkdir(tempDir, { recursive: true });
   await mkdir(dirname(historyPath), { recursive: true });
+  await mkdir(piAgentDir, { recursive: true });
   const sessionManager = SessionManager.open(historyPath);
   const settingsManager = SettingsManager.inMemory();
   const resourceLoader = new DefaultResourceLoader({
     cwd, // 群共享工作目录（<group>/workspace/）
-    agentDir: join(process.cwd(), ".pi"), // 共享 Pi 内部缓存，避免落入用户 tmp/
+    agentDir: piAgentDir, // 可重建的共享 Pi 内部目录，避免污染仓库根目录或用户 tmp。
     settingsManager,
     noExtensions: true, // 不加载磁盘上的 .pi 扩展；本进程显式注册工具。
     noSkills: true,
@@ -304,7 +306,7 @@ async function resetUserSession(
     busySessions.delete(session);
 
     const historyPath = resolve(
-      sessionFilePath(AGENT_DATA_ROOT, groupId, phone)
+      sessionFilePath(GROUP_DATA_ROOT, groupId, phone)
     );
     try {
       await unlink(historyPath);

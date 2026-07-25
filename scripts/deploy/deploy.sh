@@ -1,13 +1,26 @@
 #!/bin/bash
 
 # 量子密信群聊协作机器人部署脚本 (Debian + Docker, Bun)
-# AI 配置（provider/key/model）由 data/models.json 承载，容器内 TUI 生成；
+# AI 配置（provider/key/model）由 data/config/models.json 承载，容器内 TUI 生成；
 # 无必需 .env/config.json。访问控制由应用 secret + 网络层（直连=UFW / Cloudflare=WAF）共同承担。
 # 两种部署模式：直连（公网 IP + UFW 限平台 IP）/ Cloudflare（cloudflared 隧道 + WAF）。
 
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
+DATA_DIR="${PROJECT_DIR}/data"
+CONFIG_DIR="${DATA_DIR}/config"
+STATE_DIR="${DATA_DIR}/state"
+RUNTIME_DIR="${DATA_DIR}/runtime"
+DEFAULT_GROUP_DATA_ROOT="${DATA_DIR}/groups"
+LOG_DIR="${PROJECT_DIR}/logs"
+MODELS_FILE="${CONFIG_DIR}/models.json"
+WEBHOOK_SECRET_FILE="${CONFIG_DIR}/webhook-secret"
+TUNNEL_TOKEN_FILE="${CONFIG_DIR}/tunnel-token"
+BOT_PORT_FILE="${STATE_DIR}/bot-port"
+DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
+BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
+GROUP_DATA_ROOT_FILE="${STATE_DIR}/group-data-root"
 
 # 量子密信平台出口 IP（webhook 来源；UFW/WAF 按此放行）。变更可在此改或用环境变量覆盖。
 PLATFORM_IP="${PLATFORM_IP:-223.244.14.237}"
@@ -93,11 +106,11 @@ print_success "环境检查通过"
 
 # ---- 目录 + 监听端口 ----
 
-mkdir -p logs data
+mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 if [ -n "${BOT_PORT:-}" ]; then
     PORT_DEFAULT="$BOT_PORT"
-elif [ -f data/bot-port ]; then
-    PORT_DEFAULT="$(tr -d '[:space:]' < data/bot-port)"
+elif [ -f "$BOT_PORT_FILE" ]; then
+    PORT_DEFAULT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"
 else
     PORT_DEFAULT="1011"
 fi
@@ -134,36 +147,59 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     print_warning "请把 Cloudflare Tunnel 的 Published application 服务地址设为 http://localhost:${BOT_PORT}"
 fi
 
-# ---- Pi 群数据总根（<group>/workspace + <group>/<phone>/{tmp,sessions}）----
-AGENT_DATA_ROOT="${AGENT_DATA_ROOT:-data}"
-print_prompt "Pi 群数据总根（默认 data = 容器内 /app/data）："
+# ---- Pi 群数据总根（<group>/workspace + <group>/users/<phone>/{tmp,session.jsonl}）----
+if [ -n "${GROUP_DATA_ROOT:-}" ]; then
+    GROUP_DATA_ROOT_DEFAULT="$GROUP_DATA_ROOT"
+elif [ -s "$GROUP_DATA_ROOT_FILE" ]; then
+    GROUP_DATA_ROOT_DEFAULT="$(tr -d '\r\n' < "$GROUP_DATA_ROOT_FILE")"
+else
+    GROUP_DATA_ROOT_DEFAULT="$DEFAULT_GROUP_DATA_ROOT"
+fi
+GROUP_DATA_ROOT="$GROUP_DATA_ROOT_DEFAULT"
+print_prompt "Pi 群数据总根（默认 ${GROUP_DATA_ROOT_DEFAULT}；首次为 ${DEFAULT_GROUP_DATA_ROOT}）："
 read -r cwd_in
-[ -n "$cwd_in" ] && AGENT_DATA_ROOT="$cwd_in"
-mkdir -p "$AGENT_DATA_ROOT"
-HOST_AGENT_DATA_ROOT="$(realpath "$AGENT_DATA_ROOT")"
-if [ "$HOST_AGENT_DATA_ROOT" = "/" ] || [ "$HOST_AGENT_DATA_ROOT" = "$PROJECT_DIR" ]; then
-    print_error "群数据总根不能是文件系统根目录或项目根目录：$HOST_AGENT_DATA_ROOT"
+[ -n "$cwd_in" ] && GROUP_DATA_ROOT="$cwd_in"
+if ! HOST_GROUP_DATA_ROOT="$(realpath -m -- "$GROUP_DATA_ROOT")"; then
+    print_error "群数据总根路径无效：$GROUP_DATA_ROOT"
     exit 1
 fi
-DATA_ROOT_ARGS=()
-if [ "$HOST_AGENT_DATA_ROOT" = "$PROJECT_DIR/data" ]; then
-    DATA_ROOT_ENV_VAL="data"
+if [ "$HOST_GROUP_DATA_ROOT" = "/" ] || [ "$HOST_GROUP_DATA_ROOT" = "$PROJECT_DIR" ]; then
+    print_error "群数据总根不能是文件系统根目录或项目根目录：$HOST_GROUP_DATA_ROOT"
+    exit 1
+fi
+case "$HOST_GROUP_DATA_ROOT" in
+    "$PROJECT_DIR"/*)
+        if [ "$HOST_GROUP_DATA_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
+            print_error "项目内群数据目录固定为 data/groups；如需自定义，请选择项目外的绝对路径：$HOST_GROUP_DATA_ROOT"
+            exit 1
+        fi
+        ;;
+esac
+if [ -e "$HOST_GROUP_DATA_ROOT" ] && [ ! -d "$HOST_GROUP_DATA_ROOT" ]; then
+    print_error "群数据总根不是目录：$HOST_GROUP_DATA_ROOT"
+    exit 1
+fi
+mkdir -p -- "$HOST_GROUP_DATA_ROOT"
+HOST_GROUP_DATA_ROOT="$(realpath -- "$HOST_GROUP_DATA_ROOT")"
+GROUP_ROOT_ARGS=()
+if [ "$HOST_GROUP_DATA_ROOT" = "$DEFAULT_GROUP_DATA_ROOT" ]; then
+    GROUP_ROOT_ENV_VAL="/app/data/groups"
 else
-    chown 1001:1001 "$HOST_AGENT_DATA_ROOT" 2>/dev/null || true
-    chmod 755 "$HOST_AGENT_DATA_ROOT"
-    DATA_ROOT_ARGS+=(-v "$HOST_AGENT_DATA_ROOT:/app/group-data")
-    DATA_ROOT_ENV_VAL="/app/group-data"
+    chown 1001:1001 "$HOST_GROUP_DATA_ROOT" 2>/dev/null || true
+    chmod 755 "$HOST_GROUP_DATA_ROOT"
+    GROUP_ROOT_ARGS+=(-v "$HOST_GROUP_DATA_ROOT:/app/group-data")
+    GROUP_ROOT_ENV_VAL="/app/group-data"
     print_warning "主机群数据目录挂到容器 /app/group-data"
 fi
-print_status "Pi 群数据总根：$AGENT_DATA_ROOT（容器内：$DATA_ROOT_ENV_VAL）"
+print_status "Pi 群数据总根：$HOST_GROUP_DATA_ROOT（容器内：$GROUP_ROOT_ENV_VAL）"
 echo ""
 
 # ---- 目录 ----
 
 print_status "设置目录权限..."
-# data/logs 需要容器内 appuser(1001) 可写（默认群数据根、models.json、日志）
-chown -R 1001:1001 data logs 2>/dev/null || true
-chmod 755 data logs
+# data/logs 需要容器内 appuser(1001) 可写（配置、状态、runtime、默认群数据和日志）
+chown -R 1001:1001 "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
+chmod 755 "$DATA_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 print_success "目录就绪"
 
 # ---- 构建镜像 ----
@@ -176,21 +212,21 @@ else
     exit 1
 fi
 
-# ---- AI 配置（容器内 TUI 写 data/models.json）----
+# ---- AI 配置（容器内 TUI 写 data/config/models.json）----
 # 首次必须配置；已存在则询问是否重配。
 
-if [ ! -f "data/models.json" ]; then
+if [ ! -f "$MODELS_FILE" ]; then
     print_status "首次配置 AI（provider/key/model）..."
     if ! docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
         print_error "AI 配置命令执行失败"
         exit 1
     fi
-    if [ ! -f "data/models.json" ]; then
-        print_error "未生成 data/models.json，已中止"
+    if [ ! -f "$MODELS_FILE" ]; then
+        print_error "未生成 data/config/models.json，已中止"
         exit 1
     fi
 else
-    print_status "检测到已有 data/models.json"
+    print_status "检测到已有 data/config/models.json"
     print_prompt "是否重新配置 AI（provider/key/model）？[y/N]："
     read -r reconf
     if [[ "$reconf" =~ ^[Yy]$ ]]; then
@@ -200,31 +236,31 @@ else
         fi
     fi
 fi
-chown 1001:1001 data/models.json 2>/dev/null || true
-chmod 600 data/models.json
+chown 1001:1001 "$MODELS_FILE" 2>/dev/null || true
+chmod 600 "$MODELS_FILE"
 
 # ---- Webhook 随机密钥路径（两模式共用，应用层鉴权）----
-# data/webhook-secret 存 64hex（256bit）；应用启动读它，存在则启用 /webhook/<secret>。
-if [ ! -f "data/webhook-secret" ]; then
+# data/config/webhook-secret 存 64hex（256bit）；应用启动读它，存在则启用 /webhook/<secret>。
+if [ ! -f "$WEBHOOK_SECRET_FILE" ]; then
     print_status "生成 webhook 随机密钥路径..."
     if SECRET=$(openssl rand -hex 32 2>/dev/null) && [ -n "$SECRET" ]; then
         : # openssl 可用
     else
         SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n') # 回退
     fi
-    printf '%s' "$SECRET" > data/webhook-secret
-    chown 1001:1001 data/webhook-secret 2>/dev/null || true
-    chmod 600 data/webhook-secret
+    printf '%s' "$SECRET" > "$WEBHOOK_SECRET_FILE"
+    chown 1001:1001 "$WEBHOOK_SECRET_FILE" 2>/dev/null || true
+    chmod 600 "$WEBHOOK_SECRET_FILE"
     print_success "已生成 webhook 密钥"
     SHOW_SECRET=1
 else
-    SECRET="$(tr -d '[:space:]' < data/webhook-secret)"
+    SECRET="$(tr -d '[:space:]' < "$WEBHOOK_SECRET_FILE")"
     if ! [[ "$SECRET" =~ ^[0-9a-fA-F]{32,64}$ ]]; then
-        print_error "data/webhook-secret 格式无效（应为 32–64 位十六进制）；请删除该文件后重新部署以生成新密钥"
+        print_error "data/config/webhook-secret 格式无效（应为 32–64 位十六进制）；请删除该文件后重新部署以生成新密钥"
         exit 1
     fi
     SHOW_SECRET=0
-    print_status "检测到已有 data/webhook-secret（沿用）"
+    print_status "检测到已有 data/config/webhook-secret（沿用）"
 fi
 
 # 域名只接受 hostname，不接受 scheme、端口或路径。显式环境变量会在部署成功后持久化，
@@ -233,13 +269,13 @@ PERSIST_BOT_DOMAIN=0
 if [ -n "${BOT_DOMAIN:-}" ]; then
     PUBLIC_DOMAIN="$BOT_DOMAIN"
     PERSIST_BOT_DOMAIN=1
-elif [ -f data/bot-domain ]; then
-    PUBLIC_DOMAIN="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' data/bot-domain)"
+elif [ -f "$BOT_DOMAIN_FILE" ]; then
+    PUBLIC_DOMAIN="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$BOT_DOMAIN_FILE")"
 else
     PUBLIC_DOMAIN=""
 fi
 if [ -n "$PUBLIC_DOMAIN" ] && ! is_valid_hostname "$PUBLIC_DOMAIN"; then
-    print_error "BOT_DOMAIN/data/bot-domain 必须是纯 hostname（不能包含协议、端口或路径）：$PUBLIC_DOMAIN"
+    print_error "BOT_DOMAIN/data/state/bot-domain 必须是纯 hostname（不能包含协议、端口或路径）：$PUBLIC_DOMAIN"
     exit 1
 fi
 
@@ -252,7 +288,7 @@ if [ "$DEPLOY_MODE" = "direct" ]; then
     if [ "$SHOW_SECRET" = "1" ]; then
         echo "    http://${SERVER_IP}:${BOT_PORT}/webhook/$SECRET"
     else
-        echo "    http://${SERVER_IP}:${BOT_PORT}/webhook/<secret>（密钥未变；忘记可 cat data/webhook-secret）"
+        echo "    http://${SERVER_IP}:${BOT_PORT}/webhook/<secret>（密钥未变；忘记可 cat data/config/webhook-secret）"
     fi
     echo ""
     print_warning "直连走 HTTP：secret 在 URL 里明文经「平台→服务器」传输，但 UFW 只放行 ${PLATFORM_IP}，仅平台流量可达"
@@ -263,7 +299,7 @@ else
     if [ "$SHOW_SECRET" = "1" ]; then
         echo "    https://${PUBLIC_DOMAIN_DISPLAY}/webhook/$SECRET"
     else
-        echo "    https://${PUBLIC_DOMAIN_DISPLAY}/webhook/<secret>（密钥未变；忘记可 cat data/webhook-secret）"
+        echo "    https://${PUBLIC_DOMAIN_DISPLAY}/webhook/<secret>（密钥未变；忘记可 cat data/config/webhook-secret）"
     fi
     echo ""
     print_warning "Cloudflare 模式仅监听 127.0.0.1:${BOT_PORT}，不会直接暴露公网端口"
@@ -271,7 +307,7 @@ else
     print_warning "WAF 应只限制 /webhook/ 前缀：平台 IP + POST 放行，其他 webhook 请求 Block；可保留 /favicon.svg 供健康检查"
 fi
 if [ "$SHOW_SECRET" = "1" ]; then
-    print_warning "密钥仅本次显示、不进容器日志；泄露时删 data/webhook-secret 重新部署即重新生成"
+    print_warning "密钥仅本次显示、不进容器日志；泄露时删 data/config/webhook-secret 重新部署即重新生成"
 fi
 echo ""
 
@@ -313,10 +349,10 @@ fi
 print_status "启动容器..."
 if docker run -d \
   --network host \
-  -e AGENT_DATA_ROOT="$DATA_ROOT_ENV_VAL" \
+  -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
   -e BOT_PORT="$BOT_PORT" \
   -e BOT_HOST="$BOT_HOST" \
-  "${DATA_ROOT_ARGS[@]}" \
+  "${GROUP_ROOT_ARGS[@]}" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/data:/app/data" \
   --restart unless-stopped \
@@ -327,7 +363,6 @@ if docker run -d \
   --cpus="1.0" \
   --read-only \
   --tmpfs /tmp:size=64m \
-  --tmpfs /app/.pi:size=32m \
   --security-opt no-new-privileges:true \
   --cap-drop ALL \
   --log-driver json-file \
@@ -364,10 +399,11 @@ for i in $(seq 1 18); do
 done
 
 # 只有新容器健康后才提交部署状态，避免构建/启动失败时让运维脚本读取到未生效配置。
-printf '%s' "$BOT_PORT" > data/bot-port
-printf '%s' "$DEPLOY_MODE" > data/deploy-mode
+printf '%s' "$BOT_PORT" > "$BOT_PORT_FILE"
+printf '%s' "$DEPLOY_MODE" > "$DEPLOY_MODE_FILE"
+printf '%s' "$HOST_GROUP_DATA_ROOT" > "$GROUP_DATA_ROOT_FILE"
 if [ "$PERSIST_BOT_DOMAIN" = "1" ]; then
-    printf '%s' "$PUBLIC_DOMAIN" > data/bot-domain
+    printf '%s' "$PUBLIC_DOMAIN" > "$BOT_DOMAIN_FILE"
 fi
 
 # ---- Cloudflare 模式：确保 cloudflared 在线 ----
@@ -384,7 +420,7 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
             print_success "cloudflared 已后台启动（日志 logs/cloudflared.log）"
             print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
         else
-            print_error "cloudflared 未能启动；查 logs/cloudflared.log（可能缺 token：data/tunnel-token 或 TUNNEL_TOKEN）"
+            print_error "cloudflared 未能启动；查 logs/cloudflared.log（可能缺 token：data/config/tunnel-token 或 TUNNEL_TOKEN）"
         fi
     else
         print_warning "未找到 scripts/tunnel/start-tunnel.sh，跳过隧道；请手动起 cloudflared"
@@ -408,10 +444,10 @@ if docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
         echo "  模式:      Cloudflare（隧道 + WAF）"
         echo "  回调地址:   https://${PUBLIC_DOMAIN_DISPLAY}/webhook/<secret>"
     fi
-    echo "  AI 配置:   $(pwd)/data/models.json"
+    echo "  AI 配置:   $(pwd)/data/config/models.json"
     echo "  日志:      $(pwd)/logs/"
     echo "  数据:      $(pwd)/data/"
-    echo "  群数据根:  $AGENT_DATA_ROOT"
+    echo "  群数据根:  $HOST_GROUP_DATA_ROOT"
     echo "  监听:      $BOT_HOST:$BOT_PORT"
     echo ""
     echo "  内存限制: 512MB | CPU: 1核"

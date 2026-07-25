@@ -7,7 +7,7 @@
 #        参数： .\scripts\tunnel\start-tunnel.ps1 <token文件>  # 相对或绝对路径
 #        环境： $env:TUNNEL_TOKEN_FILE='<路径>'                  # token 文件路径
 #        环境： $env:TUNNEL_TOKEN='<裸 token>'                  # 直接提供 token
-#        默认： data\tunnel-token                                # 裸 token 或 .env 形式
+#        默认： data\config\tunnel-token                         # 裸 token 或 .env 形式
 #      token 文件可以是裸 token，也可以是复制来的 .env 文件。
 #      任何包含 TUNNEL_TOKEN=<值> 的 .env 文件都可以直接使用。
 #
@@ -16,6 +16,11 @@
 $ErrorActionPreference = "Stop"
 $Project = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $Project
+$DataDir = Join-Path $Project "data"
+$ConfigDir = Join-Path $DataDir "config"
+$StateDir = Join-Path $DataDir "state"
+$PersistedPortFile = Join-Path $StateDir "bot-port"
+$DefaultTunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
 
 function Get-ApplicationPaths([string]$Name) {
     $paths = @()
@@ -60,11 +65,10 @@ function Get-ServiceStateLabel($State) {
     }
 }
 
-$persistedPort = Join-Path $Project "data\bot-port"
 $BotPort = if ($env:BOT_PORT) {
     $env:BOT_PORT
-} elseif (Test-Path $persistedPort) {
-    (Get-Content $persistedPort -Raw).Trim()
+} elseif (Test-Path -LiteralPath $PersistedPortFile) {
+    (Get-Content -LiteralPath $PersistedPortFile -Raw).Trim()
 } else {
     "1011"
 }
@@ -131,7 +135,7 @@ if ($args.Count -ge 1 -and $args[0]) {
     $token = $env:TUNNEL_TOKEN
     $source = "env:TUNNEL_TOKEN"
 } else {
-    $file = "data\tunnel-token"
+    $file = $DefaultTunnelTokenFile
 }
 if ($file) {
     $r = Read-TokenFile $file
@@ -141,7 +145,7 @@ if ($file) {
         Write-Host "    .\scripts\tunnel\start-tunnel.ps1 <token文件>   # 相对或绝对路径" -ForegroundColor Red
         Write-Host "    `$env:TUNNEL_TOKEN_FILE='<路径>'             # 指定 token 文件" -ForegroundColor Red
         Write-Host "    `$env:TUNNEL_TOKEN='<裸 token>'             # 直接提供 token 值" -ForegroundColor Red
-        Write-Host "    默认：data\tunnel-token                 # 裸 token 或 .env 文件" -ForegroundColor Red
+        Write-Host "    默认：data\config\tunnel-token          # 裸 token 或 .env 文件" -ForegroundColor Red
         Write-Host "  （包含 TUNNEL_TOKEN=<值> 的 .env 文件可直接使用）" -ForegroundColor Red
         exit 1
     }

@@ -1,7 +1,10 @@
-// 全局参数与默认值。AI 配置由 data/models.json 承载（Pi 原生读取，见 src/agent/runtime.ts），
-// 由 scripts/config/configure.ts 生成。Webhook 公网鉴权密钥存 data/webhook-secret（见 src/server/index.ts）。
+// 全局参数与默认值。持久化目录统一由 src/core/storage.ts 定义：
+// data/config 放配置与密钥，data/state 放部署状态，data/runtime 放可重建运行文件，
+// data/groups 放群共享工作区、用户临时文件与会话。
 // 无必需 .env/config.json；可选环境变量覆盖部署参数。访问控制由 webhook secret + 防火墙/WAF 共同承担。
 // 所有时间常量统一毫秒（Date.now()/setTimeout 均为 ms）。
+
+import { DEFAULT_GROUP_DATA_ROOT } from "./storage.ts";
 
 function integerEnv(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name]?.trim();
@@ -13,18 +16,15 @@ function integerEnv(name: string, fallback: number, min: number, max: number): n
   return value;
 }
 
-/** Pi 模型/provider 配置文件（持久卷 data/ 下）。 */
-export const MODELS_JSON_PATH = "data/models.json";
-/** Webhook 随机密钥路径文件（持久卷 data/ 下，64hex/256bit）。缺失或无效时服务默认拒绝启动。 */
-export const WEBHOOK_SECRET_FILE = "data/webhook-secret";
 /**
- * Pi 群数据总根：agent 的 cwd 是 <AGENT_DATA_ROOT>/<group>/workspace，当前调用用户的
- * 临时目录和会话分别位于 <AGENT_DATA_ROOT>/<group>/<phone>/tmp 与
- * <AGENT_DATA_ROOT>/<group>/<phone>/sessions/session.jsonl。
- * 默认 "data"（相对进程 cwd，即仓库 ./data）。部署时可经环境变量 AGENT_DATA_ROOT 覆盖
- * （绝对或相对路径均可；见 deploy.ps1 / deploy.sh）。应用仍零必需配置——未设时回落 ./data。
+ * 群数据总根：agent 的 cwd 是 <GROUP_DATA_ROOT>/<group>/workspace，当前调用用户的
+ * 临时目录和会话分别位于 <GROUP_DATA_ROOT>/<group>/users/<phone>/tmp 与
+ * <GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl。
+ * 默认 data/groups。部署时可经 GROUP_DATA_ROOT 指向其他磁盘；配置、部署状态和 runtime
+ * 仍固定在项目 data/ 的分类子目录中，避免运维脚本失去统一入口。
  */
-export const AGENT_DATA_ROOT = process.env.AGENT_DATA_ROOT?.trim() || "data";
+export const GROUP_DATA_ROOT =
+  process.env.GROUP_DATA_ROOT?.trim() || DEFAULT_GROUP_DATA_ROOT;
 
 // ===== 服务 =====
 export const PORT = integerEnv("BOT_PORT", 1011, 1, 65_535);

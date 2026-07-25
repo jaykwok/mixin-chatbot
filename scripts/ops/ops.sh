@@ -8,25 +8,47 @@ set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTAINER="mixin-chatbot"
+DATA_DIR="${PROJECT_DIR}/data"
+CONFIG_DIR="${DATA_DIR}/config"
+STATE_DIR="${DATA_DIR}/state"
+DEFAULT_GROUP_DATA_ROOT="${DATA_DIR}/groups"
+MODELS_FILE="${CONFIG_DIR}/models.json"
+WEBHOOK_SECRET_FILE="${CONFIG_DIR}/webhook-secret"
+BOT_PORT_FILE="${STATE_DIR}/bot-port"
+DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
+BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
+GROUP_DATA_ROOT_FILE="${STATE_DIR}/group-data-root"
 if [ -n "${BOT_PORT:-}" ]; then
     PORT="$BOT_PORT"
-elif [ -f "${PROJECT_DIR}/data/bot-port" ]; then
-    PORT="$(tr -d '[:space:]' < "${PROJECT_DIR}/data/bot-port")"
+elif [ -f "$BOT_PORT_FILE" ]; then
+    PORT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"
 else
     PORT="1011"
 fi
-if [ -f "${PROJECT_DIR}/data/deploy-mode" ]; then
-    DEPLOY_MODE="$(tr -d '[:space:]' < "${PROJECT_DIR}/data/deploy-mode")"
+if [ -f "$DEPLOY_MODE_FILE" ]; then
+    DEPLOY_MODE="$(tr -d '[:space:]' < "$DEPLOY_MODE_FILE")"
 else
     DEPLOY_MODE="direct"
 fi
 if [ -n "${BOT_DOMAIN:-}" ]; then
     DOMAIN="$BOT_DOMAIN"
-elif [ -f "${PROJECT_DIR}/data/bot-domain" ]; then
-    DOMAIN="$(tr -d '[:space:]' < "${PROJECT_DIR}/data/bot-domain")"
+elif [ -f "$BOT_DOMAIN_FILE" ]; then
+    DOMAIN="$(tr -d '[:space:]' < "$BOT_DOMAIN_FILE")"
 else
     DOMAIN=""
 fi
+if [ -s "$GROUP_DATA_ROOT_FILE" ]; then
+    DEPLOYED_GROUP_DATA_ROOT="$(tr -d '\r\n' < "$GROUP_DATA_ROOT_FILE")"
+else
+    DEPLOYED_GROUP_DATA_ROOT="$DEFAULT_GROUP_DATA_ROOT"
+fi
+resolve_group_data_root() {
+    local value="$1"
+    case "$value" in
+        /*) realpath -m -- "$value" ;;
+        *) realpath -m -- "${PROJECT_DIR}/${value}" ;;
+    esac
+}
 is_valid_hostname() {
     local hostname="$1"
     [ -n "$hostname" ] && [ "${#hostname}" -le 253 ] || return 1
@@ -40,15 +62,15 @@ is_valid_hostname() {
     done
 }
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-    echo "BOT_PORT/data/bot-port 中的端口无效：$PORT" >&2
+    echo "BOT_PORT/data/state/bot-port 中的端口无效：$PORT" >&2
     exit 1
 fi
 if [ "$DEPLOY_MODE" != "direct" ] && [ "$DEPLOY_MODE" != "cloudflare" ]; then
-    echo "data/deploy-mode 中的部署模式无效：$DEPLOY_MODE" >&2
+    echo "data/state/deploy-mode 中的部署模式无效：$DEPLOY_MODE" >&2
     exit 1
 fi
 if [ -n "$DOMAIN" ] && ! is_valid_hostname "$DOMAIN"; then
-    echo "BOT_DOMAIN/data/bot-domain 中的 hostname 无效：$DOMAIN" >&2
+    echo "BOT_DOMAIN/data/state/bot-domain 中的 hostname 无效：$DOMAIN" >&2
     exit 1
 fi
 
@@ -94,6 +116,15 @@ doctor() {
     P "mixin-chatbot 健康检查（模式=$mode_label，端口=$PORT）"
     PASS=0; FAIL=0
 
+    local resolved_group_root=""
+    resolved_group_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null || true)"
+    local group_root_ok="0" group_root_detail="目录不存在或路径无效：$DEPLOYED_GROUP_DATA_ROOT"
+    if [ -n "$resolved_group_root" ] && [ -d "$resolved_group_root" ]; then
+        group_root_ok="1"
+        group_root_detail="$resolved_group_root"
+    fi
+    check "群数据总根" "$group_root_ok" "$group_root_detail"
+
     local cstate="缺少"
     if has_container; then
         cstate="$(docker inspect --format '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo "?")"
@@ -117,29 +148,30 @@ doctor() {
             local pc; pc="$(code_of "https://${DOMAIN}/favicon.svg")"
             check "公网 CF→隧道→机器人" "$([ "$pc" = "200" ] && echo 1 || echo 0)" "HTTP $pc"
         else
-            WA "BOT_DOMAIN/data/bot-domain 未设置，跳过公网健康检查"
+            WA "BOT_DOMAIN/data/state/bot-domain 未设置，跳过公网健康检查"
         fi
     fi
 
     local models_ok="0"
-    if [ -s "${PROJECT_DIR}/data/models.json" ]; then
+    if [ -s "$MODELS_FILE" ]; then
         if command -v jq >/dev/null 2>&1; then
-            jq -e '.providers | type == "object" and length > 0' "${PROJECT_DIR}/data/models.json" >/dev/null 2>&1 && models_ok="1"
+            jq -e '.providers | type == "object" and length > 0' "$MODELS_FILE" >/dev/null 2>&1 && models_ok="1"
         else
-            grep -q '"providers"' "${PROJECT_DIR}/data/models.json" && models_ok="1"
+            grep -q '"providers"' "$MODELS_FILE" && models_ok="1"
         fi
     fi
-    check "data/models.json" "$models_ok" "$([ "$models_ok" = "1" ] && echo 有效 || echo '缺少或无效')"
+    check "data/config/models.json" "$models_ok" "$([ "$models_ok" = "1" ] && echo 有效 || echo '缺少或无效')"
 
     local secret_ok="0"
-    [ -f "${PROJECT_DIR}/data/webhook-secret" ] &&
-        grep -Eq '^[0-9a-fA-F]{32,64}$' "${PROJECT_DIR}/data/webhook-secret" &&
+    [ -f "$WEBHOOK_SECRET_FILE" ] &&
+        grep -Eq '^[0-9a-fA-F]{32,64}$' "$WEBHOOK_SECRET_FILE" &&
         secret_ok="1"
-    check "data/webhook-secret" "$secret_ok" "$([ "$secret_ok" = "1" ] && echo 有效 || echo '缺少或无效（生产服务拒绝启动）')"
+    check "data/config/webhook-secret" "$secret_ok" "$([ "$secret_ok" = "1" ] && echo 有效 || echo '缺少或无效（生产服务拒绝启动）')"
 
     echo ""
     echo -e "结果：${GREEN}${PASS} 项通过${NC}，${RED}${FAIL} 项失败${NC}"
     if [ "$FAIL" -gt 0 ]; then
+        [ "$group_root_ok" = "1" ] || WA "       群数据根失败 -> 重新运行 scripts/deploy/deploy.sh 并确认目录；"
         if [ "$DEPLOY_MODE" = "cloudflare" ]; then
             WA "提示：公网 530/1033 通常表示隧道断开；公网 502 表示隧道到达但机器人源站不可用。"
         fi
@@ -183,6 +215,8 @@ show_logs() {
 
 uninstall() {
     P "卸载 mixin-chatbot"
+    local resolved_group_root=""
+    resolved_group_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null || true)"
     docker stop "$CONTAINER" >/dev/null 2>&1 || true
     if docker rm "$CONTAINER" >/dev/null 2>&1; then OK "容器已删除"; else WA "没有可删除的容器"; fi
 
@@ -201,12 +235,15 @@ uninstall() {
     fi
 
     local d=""
-    read -rp "是否删除 data/（models.json、webhook-secret、默认群数据）和 logs/？[y/N] " d || true
+    read -rp "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N] " d || true
     if [[ "$d" =~ ^[Yy]$ ]]; then
         rm -rf "${PROJECT_DIR}/data" "${PROJECT_DIR}/logs"
         OK "data/ 和 logs/ 已删除"
     else
-        OK "已保留 data/ 和 logs/（配置与默认群数据保留）"
+        OK "已保留 data/ 和 logs/（配置、状态与默认群数据保留）"
+    fi
+    if [ -n "$resolved_group_root" ] && [ "$resolved_group_root" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
+        WA "自定义群数据根未删除：$resolved_group_root"
     fi
     OK "卸载流程完成。"
 }
@@ -222,7 +259,7 @@ case "${1:-}" in
         echo -e "${CYAN}mixin-chatbot 运维工具（Linux/Docker）${NC}"
         echo "用法：./scripts/ops/ops.sh <命令>"
         echo ""
-        echo "  doctor     健康检查：容器、:$PORT、配置；隧道模式额外检查 Cloudflare"
+        echo "  doctor     健康检查：群数据根、容器、:$PORT、配置；隧道模式额外检查 Cloudflare"
         echo "  restart    重启 Docker 容器"
         echo "  stop       停止 Docker 容器"
         echo "  start      启动 Docker 容器"

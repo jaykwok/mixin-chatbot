@@ -25,16 +25,16 @@ describe("group-first agent paths", () => {
   });
 
   test("puts shared work at group level and scratch/history under the user", () => {
-    const root = "data";
+    const root = join("data", "groups");
     const groupId = "group-a";
     const phone = "+8613800000000";
 
     expect(groupWorkspaceDir(root, groupId)).toBe(join(root, groupId, "workspace"));
     expect(userTempDir(root, groupId, phone)).toBe(
-      join(root, groupId, phone, "tmp")
+      join(root, groupId, "users", phone, "tmp")
     );
     expect(sessionFilePath(root, groupId, phone)).toBe(
-      join(root, groupId, phone, "sessions", "session.jsonl")
+      join(root, groupId, "users", phone, "session.jsonl")
     );
     expect(userTempDir(root, groupId, "+8613900000000")).not.toBe(
       userTempDir(root, groupId, phone)
@@ -45,11 +45,14 @@ describe("group-first agent paths", () => {
   });
 
   test("recognizes only paths inside an allowed root", () => {
-    const root = join("data", "group-a", "workspace");
+    const root = join("data", "groups", "group-a", "workspace");
     expect(isPathInside(join(root, "result.md"), root)).toBe(true);
     expect(isPathInside(root, root)).toBe(true);
     expect(
-      isPathInside(join(root, "..", "+8613800000000", "tmp", "draft.md"), root)
+      isPathInside(
+        join(root, "..", "users", "+8613800000000", "tmp", "draft.md"),
+        root
+      )
     ).toBe(false);
   });
 });

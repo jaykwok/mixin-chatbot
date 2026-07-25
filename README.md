@@ -9,19 +9,19 @@
 | 运行时 | Bun（原生 TS） |
 | Web 框架 | Hono（跑在 Bun.serve） |
 | Agent 大脑 | `@earendil-works/pi-coding-agent`（经审计追随最新版，由 `bun.lock` 锁定） |
-| 模型接入 | Pi 原生读 `data/models.json`，支持 DashScope / DeepSeek / 智谱等 openai 兼容端点 |
+| 模型接入 | Pi 原生读 `data/config/models.json`，支持 DashScope / DeepSeek / 智谱等 openai 兼容端点 |
 | 部署 | Docker（Debian，oven/bun 镜像）/ Windows 原生 Bun（`scripts/deploy/deploy.ps1`） |
 
 ## 工作方式
 
 机器人只接收**文字**消息（群聊 webhook）。Pi agent 拿到后可调用工具：
 
-- 官方工厂：`read` / `bash` / `edit` / `write`（cwd 为本群共享的 `<AGENT_DATA_ROOT>/<group>/workspace`；文件工具只允许访问该 workspace 与当前用户 tmp）
+- 官方工厂：`read` / `bash` / `edit` / `write`（cwd 为本群共享的 `<GROUP_DATA_ROOT>/<group>/workspace`；文件工具只允许访问该 workspace 与当前用户 tmp）
 - 自定义：`send_image` / `send_file`（往群里发送图片或文件）
 
 最终回复含 Markdown 格式时发送 **markdown 正文 + text@ 通知**两条消息（markdown 不支持 @，故另发 text 触发通知）；纯文本回复只发送一条带 @ 的 text，避免重复。
 
-**群共享工作区 + 用户临时区**：每个群共用 `<AGENT_DATA_ROOT>/<group>/workspace`，只存长期成果；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<AGENT_DATA_ROOT>/<group>/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip 缓存指向用户临时区；Pi 因输出截断产生的完整日志也会迁入这里。会话按 **(群, phone)** 分开，保存在 `<AGENT_DATA_ROOT>/<group>/<phone>/sessions/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
+**群共享工作区 + 用户临时区**：每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace`，只存长期成果；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip 缓存指向用户临时区；Pi 因输出截断产生的完整日志也会迁入这里。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
 
 **phone 与 Pi sessionId**：`(groupId, phone)` 唯一定位一份会话文件，Pi 的 sessionId 保存在该 JSONL 头部；`/reset` 删除文件后生成新 sessionId。Pi 0.82 自动向 bash 注入 `PI_SESSION_ID`、`PI_SESSION_FILE`、`PI_PROVIDER`、`PI_MODEL`、`PI_REASONING_LEVEL`，适配层再注入 `PI_GROUP_ID`、`PI_CALLER_PHONE`、`PI_USER_TMP`。`/status` 和创建日志都会显示这层绑定。
 
@@ -47,14 +47,36 @@
 
 ## 配置
 
-项目无必需的 `.env` 或 `config.json`：
+项目无必需的 `.env` 或 `config.json`。运行时文件统一放入分层的 `data/`，根目录不再直接堆放文件：
 
-- **AI 配置**（provider / key / model / 元数据）：全部在 `data/models.json`，由 `bun run configure` 调用 `scripts/config/configure.ts` 生成，Pi 原生读取。
-- **监听端口**：Linux/Windows 部署脚本每次都会询问，默认优先沿用 `BOT_PORT` 或 `data/bot-port`，否则为 `1011`；选择结果写入 `data/bot-port`，服务、健康检查、隧道探测和运维脚本共用。
+```text
+data/
+├── config/                         # 用户配置与密钥
+│   ├── models.json
+│   ├── webhook-secret
+│   └── tunnel-token
+├── state/                          # 部署脚本生成的状态
+│   ├── bot-port
+│   ├── deploy-mode
+│   ├── bot-domain
+│   └── group-data-root
+├── runtime/                        # 可删除、可重建的运行文件
+│   ├── bot-launcher.ps1
+│   └── pi/
+└── groups/                         # 默认 GROUP_DATA_ROOT
+    └── <group>/
+        ├── workspace/
+        └── users/<phone>/
+            ├── tmp/
+            └── session.jsonl
+```
+
+- **AI 配置**（provider / key / model / 元数据）：全部在 `data/config/models.json`，由 `bun run configure` 调用 `scripts/config/configure.ts` 生成，Pi 原生读取。
+- **监听端口与部署状态**：Linux/Windows 部署脚本每次都会询问，默认优先沿用 `BOT_PORT` 或 `data/state/bot-port`，否则为 `1011`；模式、公网域名和主机侧群数据根统一写入 `data/state/`。
 - **监听地址**：部署脚本自动设置；直连模式为 `0.0.0.0`，Cloudflare 模式为 `127.0.0.1`。手动启动时可用 `BOT_HOST` 覆盖。
-- **群数据总根**（可选）：默认 `./data`，部署时可改（`deploy.ps1`/`deploy.sh` 会问），或直接设环境变量 `AGENT_DATA_ROOT`（相对仓库或绝对路径均可）。群共享成果、当前用户临时文件和独立会话分别位于 `<AGENT_DATA_ROOT>/<group>/workspace`、`<AGENT_DATA_ROOT>/<group>/<phone>/tmp`、`<AGENT_DATA_ROOT>/<group>/<phone>/sessions/session.jsonl`。
-- **访问控制**：随机密钥路径（`data/webhook-secret`，应用层）+ 网络层 IP 闸门（直连=UFW / Cloudflare=WAF），见下方「部署模式」与「安全」。
-- **开发开关**：生产环境缺少有效 `data/webhook-secret` 时服务拒绝启动；只有隔离的本地调试可显式设置 `ALLOW_INSECURE_WEBHOOK=1`。`BOT_DEBUG=1` 会记录用户消息正文，默认关闭。
+- **群数据总根**（可选）：首次默认 `./data/groups`，部署时可改（`deploy.ps1`/`deploy.sh` 会问），或直接设环境变量 `GROUP_DATA_ROOT`（相对仓库或绝对路径均可）。部署成功后主机路径写入 `data/state/group-data-root`，下次部署自动沿用，避免群数据被切到另一目录；配置、部署状态和 runtime 始终保留在项目 `data/` 的分类目录中。
+- **访问控制**：随机密钥路径（`data/config/webhook-secret`，应用层）+ 网络层 IP 闸门（直连=UFW / Cloudflare=WAF），见下方「部署模式」与「安全」。
+- **开发开关**：生产环境缺少有效 `data/config/webhook-secret` 时服务拒绝启动；只有隔离的本地调试可显式设置 `ALLOW_INSECURE_WEBHOOK=1`。`BOT_DEBUG=1` 会记录用户消息正文，默认关闭。
 
 Pi 依赖声明保持 `latest`，但部署使用提交进仓库的 `bun.lock` 和 `bun install --frozen-lockfile`，避免未经审计的自动升级。主动追 Pi 新版时运行 `bun update @earendil-works/pi-ai @earendil-works/pi-coding-agent && bun run check`，确认通过后一起提交锁文件。
 
@@ -116,7 +138,7 @@ sudo usermod -aG docker $USER && newgrp docker
 
 1. 询问监听端口（默认沿用已有值，否则 `1011`）、部署模式和群数据总根
 2. 构建 Docker 镜像（Bun）
-3. **AI 配置**：若 `data/models.json` 不存在，在容器内运行 TUI（选 provider、填 key、选模型，元数据从 LiteLLM 抓取）；已存在则询问是否重配
+3. **AI 配置**：若 `data/config/models.json` 不存在，在容器内运行 TUI（选 provider、填 key、选模型，元数据从 LiteLLM 抓取）；已存在则询问是否重配
 4. 启动容器（host 网络、只读根文件系统、最小权限，挂载 `data/`、`logs/` 和选择的群数据总根）
 5. 等待健康检查；失败或超时会中止部署并打印日志
 
@@ -133,7 +155,7 @@ docker restart mixin-chatbot
 git pull && ./scripts/deploy/deploy.sh
 ```
 
-默认配置下，群共享成果保存在 `data/<group>/workspace/`；当前用户的临时文件和会话历史分别保存在 `data/<group>/<phone>/tmp/` 与 `data/<group>/<phone>/sessions/session.jsonl`，更新不丢失。
+默认配置下，群共享成果保存在 `data/groups/<group>/workspace/`；当前用户的临时文件和会话历史分别保存在 `data/groups/<group>/users/<phone>/tmp/` 与 `data/groups/<group>/users/<phone>/session.jsonl`，更新不丢失。
 
 ### Cloudflare 模式（云电脑）部署
 
@@ -145,16 +167,16 @@ git pull && ./scripts/deploy/deploy.sh
 2. 在 Cloudflare Tunnel 控制台把 Published application 的 Service 改为本次选择的 `http://localhost:<port>`。
 3. 从 Cloudflare Tunnel 获取 token，任选一种：
    - 把包含 token 的 `.env` **整个文件**拷到云电脑，起隧道时把路径传给脚本即可（脚本能解析 `TUNNEL_TOKEN=...` 形式）。
-   - 或把里面的 `TUNNEL_TOKEN` 值写入云电脑 `data/tunnel-token`（默认读取位置）。
+   - 或把里面的 `TUNNEL_TOKEN` 值写入云电脑 `data/config/tunnel-token`（默认读取位置）。
    - 或 `export TUNNEL_TOKEN=<值>`。
 4. 起隧道。选择 Cloudflare 模式时，部署脚本会在 bot 起来后**自动确保 connector 在线**（Windows：`Cloudflared` 服务没跑就 Start、没装就调用 tunnel 脚本；Linux：没跑就后台启动）。下面命令仅用于首次手动安装或后续重装：
    - **Linux/macOS**：`./scripts/tunnel/start-tunnel.sh [token-file]`
    - **Windows Server**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\tunnel\start-tunnel.ps1 [token-file]`（装 cloudflared + 注册为 Windows 服务，开机自启）
 
-   token 解析优先级：位置参数文件 → `$TUNNEL_TOKEN_FILE` → `$TUNNEL_TOKEN`（裸值）→ `data/tunnel-token`。token 文件可以是裸 token，也可以是 `.env` 形式（含 `TUNNEL_TOKEN=...`）。
-5. IM 平台回调填：`https://<你的域名>/webhook/<secret>`（secret 来自 deploy 输出）。设置纯 hostname 形式的 `BOT_DOMAIN`（例如 `bot.example.com`，不含协议/端口/路径）后，部署成功会写入 `data/bot-domain`，后续运维脚本会自动检查该域名。
+   token 解析优先级：位置参数文件 → `$TUNNEL_TOKEN_FILE` → `$TUNNEL_TOKEN`（裸值）→ `data/config/tunnel-token`。token 文件可以是裸 token，也可以是 `.env` 形式（含 `TUNNEL_TOKEN=...`）。
+5. IM 平台回调填：`https://<你的域名>/webhook/<secret>`（secret 来自 deploy 输出）。设置纯 hostname 形式的 `BOT_DOMAIN`（例如 `bot.example.com`，不含协议/端口/路径）后，部署成功会写入 `data/state/bot-domain`，后续运维脚本会自动检查该域名。
 
-Windows 上的 `data/tunnel-token` 只是安装/修复时的 token 来源；Cloudflared 服务会保存安装时使用的 token，单独修改该文件不会自动更新已安装服务。轮换 token 后运行：
+Windows 上的 `data/config/tunnel-token` 只是安装/修复时的 token 来源；Cloudflared 服务会保存安装时使用的 token，单独修改该文件不会自动更新已安装服务。轮换 token 后运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 repair-tunnel
@@ -170,7 +192,7 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/webhook/<secret>` | POST | IM 平台回调入口；secret 来自 `data/webhook-secret`。缺失或无效时生产服务拒绝启动 |
+| `/webhook/<secret>` | POST | IM 平台回调入口；secret 来自 `data/config/webhook-secret`。缺失或无效时生产服务拒绝启动 |
 | `/favicon.svg` | GET | 图标（健康检查用） |
 
 ## 目录结构
@@ -179,13 +201,14 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 mixin-chatbot/
 ├── src/
 │   ├── agent/                  # Pi 运行时、目录策略与工具适配
-│   │   ├── runtime.ts          # models.json 加载 + 会话 + 对话入口
+│   │   ├── runtime.ts          # 模型加载 + 会话 + 对话入口
 │   │   ├── group-queue.ts      # 同群共享 workspace 的 FIFO 执行队列
 │   │   ├── local-tools.ts      # Pi 官方工具工厂 + 路径/临时环境适配
 │   │   ├── paths.ts            # 群优先的数据目录布局与安全目录名
 │   │   └── send-tools.ts       # 发送工具 send_image / send_file
 │   ├── core/                   # 共享基础设施
 │   │   ├── config.ts           # 参数读取与常量（端口 / 限流 / 日志等）
+│   │   ├── storage.ts          # data/config、state、runtime、groups 路径定义
 │   │   └── log.ts              # 日志（console + 文件轮转）
 │   ├── integrations/
 │   │   └── im.ts               # 量子密信消息/附件与共享 RPM 窗口
@@ -198,9 +221,13 @@ mixin-chatbot/
 │   ├── deploy/          # Linux/Windows 部署 + 服务器初始化
 │   ├── ops/             # doctor/restart/stop/start/logs/uninstall
 │   └── tunnel/          # Linux/Windows cloudflared connector
-├── tests/               # 按 agent/config/server 分类的 Bun 测试
+├── tests/               # 按 agent/config/core/server 分类的 Bun 测试
 ├── public/favicon.svg
-├── data/                # 配置/部署状态/runtime + 群 workspace/用户 tmp/会话
+├── data/
+│   ├── config/          # models.json、webhook-secret、tunnel-token
+│   ├── state/           # bot-port、deploy-mode、bot-domain、group-data-root
+│   ├── runtime/         # Windows launcher、Pi 可重建运行目录
+│   └── groups/          # <group>/workspace + users/<phone>/{tmp,session.jsonl}
 ├── logs/                # 应用日志
 ├── Dockerfile           # oven/bun:1-debian
 └── package.json
@@ -214,21 +241,21 @@ mixin-chatbot/
 
 1. **Cloudflare WAF**（IP 闸门）：对路径前缀 `/webhook`，仅放行平台出口 IP `223.244.14.237` + POST，其他 webhook 请求 Block；`/favicon.svg` 可保留用于公网健康检查。用 `ip.src`（勿用可伪造的 `X-Forwarded-For`）。
    > WAF 只需匹配 IP、POST 和路径前缀；`/webhook/<64hex>` 的密钥值由应用层校验，因此轮换密钥时无需改 WAF。
-2. **随机密钥路径** `/webhook/<64hex>`（256bit）：存 `data/webhook-secret`，deploy 首次生成、恒定时长比对、不匹配返 404，旧 `/webhook` 直接 404。泄露时删 `data/webhook-secret` 重部署即重生成。
+2. **随机密钥路径** `/webhook/<64hex>`（256bit）：存 `data/config/webhook-secret`，deploy 首次生成、恒定时长比对、不匹配返 404，旧 `/webhook` 直接 404。泄露时删该文件、重部署即重新生成。
 3. **应用层 payload 校验**（见下）：phone 格式、内容长度、callBackUrl 结构。
 
-> WAF 规则在 Cloudflare 侧配置，使用 tunnel 公网接入时启用。未配或误配 `data/webhook-secret` 时生产服务默认拒绝启动；只有显式设置 `ALLOW_INSECURE_WEBHOOK=1` 才开放本地开发端点 `/webhook`。
+> WAF 规则在 Cloudflare 侧配置，使用 tunnel 公网接入时启用。未配或误配 `data/config/webhook-secret` 时生产服务默认拒绝启动；只有显式设置 `ALLOW_INSECURE_WEBHOOK=1` 才开放本地开发端点 `/webhook`。
 
 ### 容器层
 
 - `--read-only` 只读根文件系统
 - `--cap-drop ALL` + `--security-opt no-new-privileges`
 - 非 root 运行（UID 1001）
-- `--tmpfs /tmp` + `--tmpfs /app/.pi`（运行时内部临时空间）；agent 的共享成果在 `<group>/workspace`，任务中间产物定向到当前用户 `<group>/<phone>/tmp`
+- `--tmpfs /tmp` 提供容器系统临时空间；Pi 内部可重建文件集中在 `data/runtime/pi/`，agent 的任务中间产物定向到 `data/groups/<group>/users/<phone>/tmp/`
 
 ### 应用层
 
-- 随机密钥路径鉴权（`data/webhook-secret`，见上）
+- 随机密钥路径鉴权（`data/config/webhook-secret`，见上）
 - 回调 URL 结构校验：https + hostname 白名单 + 约定发送端点 + `key` 参数（防 SSRF / 伪造；细节见 `src/core/config.ts`）
 - `phone` 格式、`groupId` 控制字符校验（防路径穿越、日志注入和非法子进程环境）、消息内容 16KB 上限
 - 请求去重（30 秒内相同请求跳过，防重复回复）
@@ -257,7 +284,7 @@ mixin-chatbot/
 **Linux（Docker 部署）**——`scripts/ops/ops.sh` 一站式运维：
 
 ```bash
-./scripts/ops/ops.sh doctor     # 健康检查（容器/本地/配置；仅 Cloudflare 模式检查隧道和公网）
+./scripts/ops/ops.sh doctor     # 健康检查（群数据根/容器/本地/配置；仅 Cloudflare 模式检查隧道和公网）
 ./scripts/ops/ops.sh restart    # 重启（docker restart）
 ./scripts/ops/ops.sh logs       # 实时日志（docker logs -f --tail 50）
 ./scripts/ops/ops.sh stop       # 停止
@@ -266,7 +293,7 @@ mixin-chatbot/
 
 应用日志：`logs/mixin-chatbot.log`（5MB × 3 轮转）；容器层日志 `docker logs mixin-chatbot`。
 
-> 卸载时删除 `data/` 只会清理 AI 配置、webhook 密钥及默认群数据根。若 `AGENT_DATA_ROOT` 指向其他目录，该自定义群数据根会保留，需确认后另行处理。
+> 卸载时删除 `data/` 会清理配置、部署状态、runtime 和默认群数据根。若 `GROUP_DATA_ROOT` 指向其他目录，该自定义群数据根会保留，需确认后另行处理。
 
 **Windows Server（云电脑，由 `scripts\deploy\deploy.ps1` 部署）**——`scripts\ops\ops.ps1` 一站式运维：
 
@@ -282,20 +309,20 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall-tunnel # 
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理 task/进程/防火墙/launcher，可选清隧道/data/logs
 ```
 
-`doctor` 会检查计划任务及上次结果、端口占用进程、本地 HTTP、token 来源、Cloudflared 服务、`data/bot-domain` 和公网链路，并为失败项打印对应修复命令。它只确认 token 来源是否可用，无法从 Cloudflared 服务中反查并比较已安装 token；token 有变化时应显式执行 `repair-tunnel`。
+`doctor` 会检查群数据总根、计划任务及上次结果、端口占用进程、本地 HTTP、token 来源、Cloudflared 服务、`data/state/bot-domain` 和公网链路，并为失败项打印对应修复命令。它只确认 token 来源是否可用，无法从 Cloudflared 服务中反查并比较已安装 token；token 有变化时应显式执行 `repair-tunnel`。
 
 ## 故障排查
 
 | 现象 | 可能原因 | 解决方法 |
 |------|---------|---------|
-| 启动报 `无法读取 data/models.json` | 未配置 AI | 运行 configure TUI 生成 `data/models.json` |
-| 启动报 `data/webhook-secret 缺失或格式无效` | 密钥文件不存在、编码错误或内容损坏 | 删除该文件后重跑部署脚本生成；不要在生产设置 `ALLOW_INSECURE_WEBHOOK=1` |
-| 健康检查超时 | 所选端口冲突 / 启动异常 | Linux 查看 `docker logs mixin-chatbot`；Windows 运行 `ops.ps1 doctor` 与 `ops.ps1 logs`；两边都检查 `data/bot-port` |
+| 启动报 `无法读取 data/config/models.json` | 未配置 AI | 运行 configure TUI 生成 `data/config/models.json` |
+| 启动报 `data/config/webhook-secret 缺失或格式无效` | 密钥文件不存在、编码错误或内容损坏 | 删除该文件后重跑部署脚本生成；不要在生产设置 `ALLOW_INSECURE_WEBHOOK=1` |
+| 健康检查超时 | 所选端口冲突 / 启动异常 | Linux 查看 `docker logs mixin-chatbot`；Windows 运行 `ops.ps1 doctor` 与 `ops.ps1 logs`；两边都检查 `data/state/bot-port` |
 | Windows 计划任务存在但机器人未启动 | S4U 被服务器策略拒绝 / task 上次结果异常 | 重跑最新版 `scripts\deploy\deploy.ps1`（会自动回退登录时启动），再执行 `scripts\ops\ops.ps1 doctor` 查看十六进制任务结果 |
-| IM 收不到回复 | 回调地址不可达 / 防火墙 / Cloudflare 源站端口不一致 | 直连检查 `ufw status`；Tunnel 检查 Published application 是否指向 `http://localhost:<data/bot-port>` |
-| Cloudflare 公网返回 502 | 隧道在线，但本地机器人未启动或源站端口不一致 | 先运行 `ops.ps1 doctor -Repair`，再确认 Published application 指向 `http://localhost:<data/bot-port>` |
-| Cloudflare 公网返回 530/1033 或连接失败 | connector 未运行、服务安装 token 已失效、hostname/DNS 异常 | 将最新 token 放到 `data/tunnel-token`，以管理员运行 `ops.ps1 repair-tunnel`，再检查 Cloudflare hostname/DNS |
-| 修改 `data/tunnel-token` 后仍连不上 | 已安装服务仍使用旧 token | 运行 `ops.ps1 repair-tunnel`；修改文件本身不会更新服务 |
+| IM 收不到回复 | 回调地址不可达 / 防火墙 / Cloudflare 源站端口不一致 | 直连检查 `ufw status`；Tunnel 检查 Published application 是否指向 `http://localhost:<data/state/bot-port>` |
+| Cloudflare 公网返回 502 | 隧道在线，但本地机器人未启动或源站端口不一致 | 先运行 `ops.ps1 doctor -Repair`，再确认 Published application 指向 `http://localhost:<data/state/bot-port>` |
+| Cloudflare 公网返回 530/1033 或连接失败 | connector 未运行、服务安装 token 已失效、hostname/DNS 异常 | 将最新 token 放到 `data/config/tunnel-token`，以管理员运行 `ops.ps1 repair-tunnel`，再检查 Cloudflare hostname/DNS |
+| 修改 `data/config/tunnel-token` 后仍连不上 | 已安装服务仍使用旧 token | 运行 `ops.ps1 repair-tunnel`；修改文件本身不会更新服务 |
 | 日志显示“发送成功”但群里只收到前 20 条 | 平台对超限请求返回 HTTP 200 后静默丢弃 | 当前版本用本地 60 秒滑动窗口保护，不依赖 429；确认所有实例都已更新且没有另一份 bot 共用同一 callback key |
 | AI 回复报错 | models.json 的 key / 模型有误 | 重跑 configure TUI |
 | 云电脑迁移后偶发不通 | 前半段（平台→边缘）不稳 | 见 cloudflared 隧道方案（另文） |

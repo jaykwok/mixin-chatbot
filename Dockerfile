@@ -14,7 +14,13 @@ RUN bun install --frozen-lockfile --production
 # 拷贝源码
 COPY --chown=appuser:appgroup . .
 
-RUN mkdir -p /app/data /app/logs && chown -R appuser:appgroup /app
+RUN mkdir -p \
+      /app/data/config \
+      /app/data/state \
+      /app/data/runtime/pi \
+      /app/data/groups \
+      /app/logs && \
+    chown -R appuser:appgroup /app
 
 USER appuser
 ENV TZ=Asia/Shanghai

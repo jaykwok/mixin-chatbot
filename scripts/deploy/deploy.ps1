@@ -10,6 +10,19 @@ $Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $Project
 $Entry    = Join-Path $Project "src\server\index.ts"
 $TaskName = "mixin-chatbot"
+$DataDir = Join-Path $Project "data"
+$ConfigDir = Join-Path $DataDir "config"
+$StateDir = Join-Path $DataDir "state"
+$RuntimeDir = Join-Path $DataDir "runtime"
+$DefaultGroupDataRoot = Join-Path $DataDir "groups"
+$ModelsFile = Join-Path $ConfigDir "models.json"
+$WebhookSecretFile = Join-Path $ConfigDir "webhook-secret"
+$TunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
+$PortFile = Join-Path $StateDir "bot-port"
+$ModeFile = Join-Path $StateDir "deploy-mode"
+$DomainFile = Join-Path $StateDir "bot-domain"
+$GroupRootFile = Join-Path $StateDir "group-data-root"
+$LauncherFile = Join-Path $RuntimeDir "bot-launcher.ps1"
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsPowerShell = "powershell.exe" }
 
@@ -211,9 +224,9 @@ try {
 }
 if ($bunInstallExitCode -ne 0) { Write-Host "bun install 执行失败（退出码 $bunInstallExitCode）。" -ForegroundColor Red; exit 1 }
 
-# ---- 3. AI 配置（models.json）----
-New-Item -ItemType Directory -Force -Path "data", "data\runtime", "logs" | Out-Null
-if (-not (Test-Path "data/models.json")) {
+# ---- 3. 持久化目录 + AI 配置 ----
+New-Item -ItemType Directory -Force -Path $ConfigDir, $StateDir, $RuntimeDir, (Join-Path $Project "logs") | Out-Null
+if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
     Step "首次配置 AI（provider/key/model）..."
     $previousErrorActionPreference = $ErrorActionPreference
     $configureExitCode = 1
@@ -225,9 +238,9 @@ if (-not (Test-Path "data/models.json")) {
         $ErrorActionPreference = $previousErrorActionPreference
     }
     if ($configureExitCode -ne 0) { Write-Host "AI 配置失败（退出码 $configureExitCode）。" -ForegroundColor Red; exit 1 }
-    if (-not (Test-Path "data/models.json")) { Write-Host "未生成 models.json，部署中止。" -ForegroundColor Red; exit 1 }
+    if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) { Write-Host "未生成 data\config\models.json，部署中止。" -ForegroundColor Red; exit 1 }
 } else {
-    Done "data/models.json 已存在"
+    Done "data\config\models.json 已存在"
     $ans = Read-Host "是否重新配置 AI（provider/key/model）？[y/N]"
     if ($ans -match "^[yY]$") {
         $previousErrorActionPreference = $ErrorActionPreference
@@ -245,70 +258,96 @@ if (-not (Test-Path "data/models.json")) {
 
 # ---- 4. webhook 密钥 ----
 $showSecret = $false
-if (-not (Test-Path "data/webhook-secret")) {
+if (-not (Test-Path -LiteralPath $WebhookSecretFile -PathType Leaf)) {
     Step "生成 webhook 随机密钥..."
     $bytes = New-Object byte[] 32
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     $rng.GetBytes($bytes)
     $secret = -join ($bytes | ForEach-Object { $_.ToString("x2") })
-    Set-Content -Path "data\webhook-secret" -Value $secret -NoNewline -Encoding ASCII
+    Set-Content -LiteralPath $WebhookSecretFile -Value $secret -NoNewline -Encoding ASCII
     $showSecret = $true
     Done "webhook 密钥已生成"
 } else {
-    $secret = (Get-Content "data\webhook-secret" -Raw).Trim()
+    $secret = (Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim()
     if ($secret -notmatch "^[0-9a-fA-F]{32,64}$") {
-        Write-Host "data\webhook-secret 格式无效（应为 32–64 位十六进制字符）。" -ForegroundColor Red
+        Write-Host "data\config\webhook-secret 格式无效（应为 32–64 位十六进制字符）。" -ForegroundColor Red
         Write-Host "删除该文件后重新运行 scripts\deploy\deploy.ps1 可生成新密钥。" -ForegroundColor Red
         exit 1
     }
     Done "沿用已有 webhook-secret"
 }
 
-$domainFile = Join-Path $Project "data\bot-domain"
 $persistDomain = $false
 if (-not [string]::IsNullOrWhiteSpace($env:BOT_DOMAIN)) {
     $publicDomain = $env:BOT_DOMAIN.Trim()
     $persistDomain = $true
-} elseif (Test-Path -LiteralPath $domainFile) {
-    $publicDomain = (Get-Content -LiteralPath $domainFile -Raw).Trim()
+} elseif (Test-Path -LiteralPath $DomainFile) {
+    $publicDomain = (Get-Content -LiteralPath $DomainFile -Raw).Trim()
 } else {
     $publicDomain = ""
 }
 if ($publicDomain -and -not (Test-Hostname $publicDomain)) {
-    Write-Host "BOT_DOMAIN/data\bot-domain 必须是纯 hostname（不能包含协议、端口或路径）：$publicDomain" -ForegroundColor Red
+    Write-Host "BOT_DOMAIN/data\state\bot-domain 必须是纯 hostname（不能包含协议、端口或路径）：$publicDomain" -ForegroundColor Red
     exit 1
 }
 
-# ---- 4b. Pi 群数据总根（<group>/workspace + <group>/<phone>/{tmp,sessions}）----
+# ---- 4b. Pi 群数据总根（<group>/workspace + <group>/users/<phone>/{tmp,session.jsonl}）----
 Step "配置 Pi 群数据总根"
-$agentRootDefault = if ([string]::IsNullOrWhiteSpace($env:AGENT_DATA_ROOT)) { "data" } else { $env:AGENT_DATA_ROOT.Trim() }
-Write-Host "  默认 data = 仓库内的 .\data；AGENT_DATA_ROOT 可覆盖此默认值。"
+$savedGroupRoot = if (Test-Path -LiteralPath $GroupRootFile -PathType Leaf) {
+    (Get-Content -LiteralPath $GroupRootFile -Raw).Trim()
+} else {
+    ""
+}
+$groupRootDefault = if (-not [string]::IsNullOrWhiteSpace($env:GROUP_DATA_ROOT)) {
+    $env:GROUP_DATA_ROOT.Trim()
+} elseif (-not [string]::IsNullOrWhiteSpace($savedGroupRoot)) {
+    $savedGroupRoot
+} else {
+    "data\groups"
+}
+Write-Host "  默认 data\groups；GROUP_DATA_ROOT 可覆盖到其他磁盘。"
+Write-Host "  部署成功后会记入 data\state\group-data-root，下次自动沿用。"
 Write-Host "  如需调整，可输入相对仓库路径或绝对路径。"
-Write-Host "  每个群使用 <folder>\<group>\workspace；每个调用用户使用 <group>\<phone>\tmp 和 sessions。"
-$wdIn = Read-Host "群数据总根 [默认：$agentRootDefault]"
-$AgentDataRoot = if ($wdIn) { $wdIn.Trim() } else { $agentRootDefault }
-if (Test-Path -LiteralPath $AgentDataRoot) {
-    if (-not (Test-Path -LiteralPath $AgentDataRoot -PathType Container)) {
-        Write-Host "群数据总根不是目录：$AgentDataRoot" -ForegroundColor Red
+Write-Host "  每个群使用 <root>\<group>\workspace；每个调用用户使用 <group>\users\<phone>\tmp 和 session.jsonl。"
+$wdIn = Read-Host "群数据总根 [默认：$groupRootDefault]"
+$groupRootCandidate = if ($wdIn) { $wdIn.Trim() } else { $groupRootDefault }
+try {
+    $GroupDataRoot = if ([System.IO.Path]::IsPathRooted($groupRootCandidate)) {
+        [System.IO.Path]::GetFullPath($groupRootCandidate)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $Project $groupRootCandidate))
+    }
+} catch {
+    Write-Host "群数据总根路径无效：$groupRootCandidate" -ForegroundColor Red
+    exit 1
+}
+$volumeRoot = [System.IO.Path]::GetPathRoot($GroupDataRoot).TrimEnd('\')
+if ($GroupDataRoot.TrimEnd('\') -eq $volumeRoot -or $GroupDataRoot.TrimEnd('\') -eq $Project.TrimEnd('\')) {
+    Write-Host "群数据总根不能是文件系统根目录或项目根目录：$GroupDataRoot" -ForegroundColor Red
+    exit 1
+}
+$projectChildPrefix = $Project.TrimEnd('\') + '\'
+if ($GroupDataRoot.StartsWith($projectChildPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
+    $GroupDataRoot.TrimEnd('\') -ne $DefaultGroupDataRoot.TrimEnd('\')) {
+    Write-Host "项目内群数据目录固定为 data\groups；如需自定义，请选择项目外的路径：$GroupDataRoot" -ForegroundColor Red
+    exit 1
+}
+if (Test-Path -LiteralPath $GroupDataRoot) {
+    if (-not (Test-Path -LiteralPath $GroupDataRoot -PathType Container)) {
+        Write-Host "群数据总根不是目录：$GroupDataRoot" -ForegroundColor Red
         exit 1
     }
 } else {
-    New-Item -ItemType Directory -Force -Path $AgentDataRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $GroupDataRoot | Out-Null
 }
-$AgentDataRoot = (Resolve-Path -LiteralPath $AgentDataRoot).Path
-$volumeRoot = [System.IO.Path]::GetPathRoot($AgentDataRoot).TrimEnd('\')
-if ($AgentDataRoot.TrimEnd('\') -eq $volumeRoot -or $AgentDataRoot.TrimEnd('\') -eq $Project.TrimEnd('\')) {
-    Write-Host "群数据总根不能是文件系统根目录或项目根目录：$AgentDataRoot" -ForegroundColor Red
-    exit 1
-}
-Done "群数据总根：$AgentDataRoot"
+$GroupDataRoot = (Resolve-Path -LiteralPath $GroupDataRoot).Path
+Done "群数据总根：$GroupDataRoot"
 
 # ---- 4c. 监听端口（显式环境变量 > 已保存值 > 1011）----
-$portFile = Join-Path $Project "data\bot-port"
 $portDefault = if ($env:BOT_PORT) {
     $env:BOT_PORT
-} elseif (Test-Path $portFile) {
-    (Get-Content $portFile -Raw).Trim()
+} elseif (Test-Path -LiteralPath $PortFile) {
+    (Get-Content -LiteralPath $PortFile -Raw).Trim()
 } else {
     "1011"
 }
@@ -395,10 +434,9 @@ Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyCont
 
 # 为写入生成的 launcher，对路径执行单引号转义
 function Sq($s) { return "'" + ($s -replace "'", "''") + "'" }
-$launcher = Join-Path $Project "data\runtime\bot-launcher.ps1"
 $launcherBody = @"
 `$ErrorActionPreference = 'Stop'
-`$env:AGENT_DATA_ROOT = $(Sq $AgentDataRoot)
+`$env:GROUP_DATA_ROOT = $(Sq $GroupDataRoot)
 `$env:BOT_PORT = $(Sq $Port)
 `$env:BOT_HOST = $(Sq $BotHost)
 `$env:PATH = $(Sq ($BashDir + ";")) + `$env:PATH
@@ -409,7 +447,7 @@ Set-Location $(Sq $Project)
 exit `$botExitCode
 "@
 $utf8WithBom = New-Object System.Text.UTF8Encoding($true)
-[System.IO.File]::WriteAllText($launcher, $launcherBody, $utf8WithBom)
+[System.IO.File]::WriteAllText($LauncherFile, $launcherBody, $utf8WithBom)
 
 $publicDomainDisplay = if ($publicDomain) { $publicDomain } else { "<你的域名>" }
 $url = if ($mode -eq "cloudflare") {
@@ -421,18 +459,18 @@ Write-Host ""
 Write-Host "==== 回调 URL（填入 IM 平台）====" -ForegroundColor Cyan
 if ($showSecret) {
     Write-Host ("  " + ($url -replace "<SECRET>", $secret)) -ForegroundColor White
-    Warn "密钥仅显示一次；如需轮换，删除 data\webhook-secret 后重新运行部署。"
+    Warn "密钥仅显示一次；如需轮换，删除 data\config\webhook-secret 后重新运行部署。"
 } else {
     Write-Host "  $url" -ForegroundColor White
-    Warn "密钥未变化；查看命令：Get-Content data\webhook-secret"
+    Warn "密钥未变化；查看命令：Get-Content data\config\webhook-secret"
 }
 
 if ($isAdmin) {
     Step "安装 Windows 计划任务 '$TaskName'（优先开机启动，失败自动重试）..."
-    $fileArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $launcher + '"'
+    $fileArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $LauncherFile + '"'
     $action    = New-ScheduledTaskAction -Execute $WindowsPowerShell -Argument $fileArg -WorkingDirectory $Project
     $settings  = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-    # RunLevel Limited：bot 只需监听所选端口并写入 data/logs，无需管理员；
+    # RunLevel Limited：bot 只需监听所选端口并写入 data/ 与 logs/，无需管理员；
     # 降权可缩小 agent bash 工具（非 cwd 沙箱）的影响范围。
     $taskStartDescription = "开机启动（无需用户登录）"
     $taskUsesS4U = $true
@@ -477,24 +515,26 @@ if ($isAdmin) {
         Write-Host "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请查看 logs\mixin-chatbot.log，并运行 scripts\ops\ops.ps1 doctor。" -ForegroundColor Red
         exit 1
     }
-    Set-Content -LiteralPath $portFile -Value $Port -NoNewline -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $Project "data\deploy-mode") -Value $mode -NoNewline -Encoding ASCII
+    Set-Content -LiteralPath $PortFile -Value $Port -NoNewline -Encoding ASCII
+    Set-Content -LiteralPath $ModeFile -Value $mode -NoNewline -Encoding ASCII
+    Set-Content -LiteralPath $GroupRootFile -Value $GroupDataRoot -NoNewline -Encoding UTF8
     if ($persistDomain) {
-        Set-Content -LiteralPath $domainFile -Value $publicDomain -NoNewline -Encoding ASCII
+        Set-Content -LiteralPath $DomainFile -Value $publicDomain -NoNewline -Encoding ASCII
     }
-    Done "机器人健康（群数据总根=$AgentDataRoot）。管理：Get-ScheduledTask $TaskName | Stop-ScheduledTask；日志：logs\mixin-chatbot.log"
+    Done "机器人健康（群数据总根=$GroupDataRoot）。管理：Get-ScheduledTask $TaskName | Stop-ScheduledTask；日志：logs\mixin-chatbot.log"
     Warn "任务启动方式：$taskStartDescription。"
 } else {
     Warn "当前不是管理员，将以前台方式运行（Ctrl+C 停止）；请以管理员身份重跑以安装计划任务。"
     if ($mode -eq "cloudflare") {
         Warn "请在另一个 PowerShell 窗口运行 scripts\tunnel\start-tunnel.ps1；当前窗口将被前台机器人占用。"
     }
-    Set-Content -LiteralPath $portFile -Value $Port -NoNewline -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $Project "data\deploy-mode") -Value $mode -NoNewline -Encoding ASCII
+    Set-Content -LiteralPath $PortFile -Value $Port -NoNewline -Encoding ASCII
+    Set-Content -LiteralPath $ModeFile -Value $mode -NoNewline -Encoding ASCII
+    Set-Content -LiteralPath $GroupRootFile -Value $GroupDataRoot -NoNewline -Encoding UTF8
     if ($persistDomain) {
-        Set-Content -LiteralPath $domainFile -Value $publicDomain -NoNewline -Encoding ASCII
+        Set-Content -LiteralPath $DomainFile -Value $publicDomain -NoNewline -Encoding ASCII
     }
-    $env:AGENT_DATA_ROOT = $AgentDataRoot
+    $env:GROUP_DATA_ROOT = $GroupDataRoot
     $env:BOT_PORT = $Port
     $env:BOT_HOST = $BotHost
     # 非管理员前台模式也必须继承已探测到的 Git Bash，避免 bash 不在系统 PATH 时工具启动失败。
@@ -523,13 +563,13 @@ if ($mode -eq "cloudflare") {
         } else {
             Done "Cloudflared 服务已经在运行。"
         }
-        if (Test-Path -LiteralPath (Join-Path $Project "data\tunnel-token") -PathType Leaf) {
-            Warn "检测到 data\tunnel-token；现有服务可能仍使用旧 token。token 更新后请执行 scripts\ops\ops.ps1 repair-tunnel。"
+        if (Test-Path -LiteralPath $TunnelTokenFile -PathType Leaf) {
+            Warn "检测到 data\config\tunnel-token；现有服务可能仍使用旧 token。token 更新后请执行 scripts\ops\ops.ps1 repair-tunnel。"
         }
     } else {
         Warn "未安装 Cloudflared 服务，将通过 scripts\tunnel\start-tunnel.ps1 安装..."
-        $tokIn = Read-Host "隧道 token 文件 [默认：data\tunnel-token]"
-        $tokArg = if ($tokIn) { $tokIn.Trim() } else { "data\tunnel-token" }
+        $tokIn = Read-Host "隧道 token 文件 [默认：data\config\tunnel-token]"
+        $tokArg = if ($tokIn) { $tokIn.Trim() } else { "data\config\tunnel-token" }
         $stPath = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
         $previousErrorActionPreference = $ErrorActionPreference
         $tunnelExitCode = 1
