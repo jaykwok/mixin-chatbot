@@ -61,6 +61,22 @@ is_valid_hostname() {
         [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
     done
 }
+normalize_hostname_input() {
+    local value host
+    value="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if is_valid_hostname "$value"; then
+        printf '%s' "${value,,}"
+        return 0
+    fi
+    if [[ "$value" =~ ^[Hh][Tt][Tt][Pp][Ss]?://([^/:?#]+)(/)?$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        if is_valid_hostname "$host"; then
+            printf '%s' "${host,,}"
+            return 0
+        fi
+    fi
+    return 1
+}
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
     echo "BOT_PORT/data/state/bot-port 中的端口无效：$PORT" >&2
     exit 1
@@ -69,9 +85,13 @@ if [ "$DEPLOY_MODE" != "direct" ] && [ "$DEPLOY_MODE" != "cloudflare" ]; then
     echo "data/state/deploy-mode 中的部署模式无效：$DEPLOY_MODE" >&2
     exit 1
 fi
-if [ -n "$DOMAIN" ] && ! is_valid_hostname "$DOMAIN"; then
-    echo "BOT_DOMAIN/data/state/bot-domain 中的 hostname 无效：$DOMAIN" >&2
-    exit 1
+if [ -n "$DOMAIN" ]; then
+    if NORMALIZED_DOMAIN="$(normalize_hostname_input "$DOMAIN")"; then
+        DOMAIN="$NORMALIZED_DOMAIN"
+    else
+        echo "BOT_DOMAIN/data/state/bot-domain 中的域名无效：$DOMAIN" >&2
+        exit 1
+    fi
 fi
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -79,6 +99,24 @@ P()  { echo -e "${BLUE}[*]${NC} $1"; }
 OK() { echo -e "${GREEN}[+]${NC} $1"; }
 WA() { echo -e "${YELLOW}[!]${NC} $1"; }
 ER() { echo -e "${RED}[x]${NC} $1"; }
+
+ask_yes_no() {
+    local prompt="$1" answer=""
+    while true; do
+        if ! IFS= read -r -p "$prompt" answer; then
+            echo ""
+            WA "输入已结束，按默认值“否”处理"
+            return 1
+        fi
+        answer="$(printf '%s' "$answer" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        answer="${answer,,}"
+        case "$answer" in
+            ""|n|no|否) return 1 ;;
+            y|yes|是) return 0 ;;
+            *) WA "请输入 y 或 n（也可直接回车采用默认值）" ;;
+        esac
+    done
+}
 
 PASS=0; FAIL=0
 check() {
@@ -220,23 +258,17 @@ uninstall() {
     docker stop "$CONTAINER" >/dev/null 2>&1 || true
     if docker rm "$CONTAINER" >/dev/null 2>&1; then OK "容器已删除"; else WA "没有可删除的容器"; fi
 
-    local a=""
-    read -rp "是否删除 Docker 镜像 mixin-chatbot？[y/N] " a || true
-    if [[ "$a" =~ ^[Yy]$ ]]; then
+    if ask_yes_no "是否删除 Docker 镜像 mixin-chatbot？[y/N] "; then
         if docker rmi mixin-chatbot >/dev/null 2>&1; then OK "镜像已删除"; else WA "镜像删除失败"; fi
     fi
 
     if pgrep -x cloudflared >/dev/null 2>&1; then
-        local b=""
-        read -rp "是否停止 cloudflared（结束进程）？[y/N] " b || true
-        if [[ "$b" =~ ^[Yy]$ ]]; then
+        if ask_yes_no "是否停止 cloudflared（结束进程）？[y/N] "; then
             if pkill -x cloudflared; then OK "cloudflared 已停止"; else WA "结束进程失败"; fi
         fi
     fi
 
-    local d=""
-    read -rp "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N] " d || true
-    if [[ "$d" =~ ^[Yy]$ ]]; then
+    if ask_yes_no "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N] "; then
         rm -rf "${PROJECT_DIR}/data" "${PROJECT_DIR}/logs"
         OK "data/ 和 logs/ 已删除"
     else

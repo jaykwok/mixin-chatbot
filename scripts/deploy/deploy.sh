@@ -16,7 +16,7 @@ DEFAULT_GROUP_DATA_ROOT="${DATA_DIR}/groups"
 LOG_DIR="${PROJECT_DIR}/logs"
 MODELS_FILE="${CONFIG_DIR}/models.json"
 WEBHOOK_SECRET_FILE="${CONFIG_DIR}/webhook-secret"
-TUNNEL_TOKEN_FILE="${CONFIG_DIR}/tunnel-token"
+DEFAULT_TUNNEL_TOKEN_FILE="${CONFIG_DIR}/tunnel-token"
 BOT_PORT_FILE="${STATE_DIR}/bot-port"
 DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
 BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
@@ -38,6 +38,21 @@ print_warning() { echo -e "${YELLOW}[!] $1${NC}"; }
 print_error() { echo -e "${RED}[-] $1${NC}"; }
 print_prompt() { echo -e "${CYAN}?> $1${NC}"; }
 
+trim_input() {
+    printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+read_input() {
+    local prompt="$1" output_name="$2" input_value=""
+    print_prompt "$prompt"
+    if ! IFS= read -r input_value; then
+        echo ""
+        print_warning "输入已结束，部署已取消"
+        exit 130
+    fi
+    printf -v "$output_name" '%s' "$input_value"
+}
+
 is_valid_hostname() {
     local hostname="$1"
     [ -n "$hostname" ] && [ "${#hostname}" -le 253 ] || return 1
@@ -48,6 +63,41 @@ is_valid_hostname() {
     for label in "${labels[@]}"; do
         [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
         [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+normalize_hostname_input() {
+    local value host
+    value="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if is_valid_hostname "$value"; then
+        printf '%s' "${value,,}"
+        return 0
+    fi
+    if [[ "$value" =~ ^[Hh][Tt][Tt][Pp][Ss]?://([^/:?#]+)(/)?$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        if is_valid_hostname "$host"; then
+            printf '%s' "${host,,}"
+            return 0
+        fi
+    fi
+    return 1
+}
+ask_yes_no() {
+    local prompt="$1" default_answer="${2:-n}" answer
+    while true; do
+        read_input "$prompt" answer
+        answer="$(trim_input "$answer")"
+        answer="${answer,,}"
+        if [ -z "$answer" ]; then
+            if [ "$default_answer" = "y" ]; then
+                return 0
+            fi
+            return 1
+        fi
+        case "$answer" in
+            y|yes|是) return 0 ;;
+            n|no|否) return 1 ;;
+            *) print_warning "请输入 y 或 n（也可直接回车采用默认值）" ;;
+        esac
     done
 }
 
@@ -108,33 +158,68 @@ print_success "环境检查通过"
 
 mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 if [ -n "${BOT_PORT:-}" ]; then
-    PORT_DEFAULT="$BOT_PORT"
+    PORT_DEFAULT_SOURCE="BOT_PORT"
+    PORT_DEFAULT="$(trim_input "$BOT_PORT")"
 elif [ -f "$BOT_PORT_FILE" ]; then
+    PORT_DEFAULT_SOURCE="data/state/bot-port"
     PORT_DEFAULT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"
 else
+    PORT_DEFAULT_SOURCE=""
     PORT_DEFAULT="1011"
 fi
-print_prompt "机器人监听端口 [默认 ${PORT_DEFAULT}]:"
-read -r port_in
-BOT_PORT="${port_in:-$PORT_DEFAULT}"
-if ! [[ "$BOT_PORT" =~ ^[0-9]+$ ]] || [ "$BOT_PORT" -lt 1 ] || [ "$BOT_PORT" -gt 65535 ]; then
-    print_error "端口必须是 1–65535 的整数"
-    exit 1
+if ! [[ "$PORT_DEFAULT" =~ ^[0-9]+$ ]] || [ "$PORT_DEFAULT" -lt 1 ] || [ "$PORT_DEFAULT" -gt 65535 ]; then
+    print_warning "${PORT_DEFAULT_SOURCE} 中的端口无效，已改用安全默认值 1011：${PORT_DEFAULT}"
+    PORT_DEFAULT="1011"
 fi
+while true; do
+    read_input "机器人监听端口 [默认 ${PORT_DEFAULT}]：" port_in
+    port_in="$(trim_input "$port_in")"
+    BOT_PORT="${port_in:-$PORT_DEFAULT}"
+    if [[ "$BOT_PORT" =~ ^[0-9]+$ ]] && [ "$BOT_PORT" -ge 1 ] && [ "$BOT_PORT" -le 65535 ]; then
+        break
+    fi
+    print_warning "端口必须是 1–65535 的整数，请重新输入"
+done
 print_success "监听端口：$BOT_PORT"
 
 # ---- 部署模式 ----
+
+if [ -n "${DEPLOY_MODE:-}" ]; then
+    DEPLOY_MODE_DEFAULT_SOURCE="DEPLOY_MODE"
+    DEPLOY_MODE_DEFAULT="$(trim_input "${DEPLOY_MODE,,}")"
+elif [ -f "$DEPLOY_MODE_FILE" ]; then
+    DEPLOY_MODE_DEFAULT_SOURCE="data/state/deploy-mode"
+    DEPLOY_MODE_DEFAULT="$(tr '[:upper:]' '[:lower:]' < "$DEPLOY_MODE_FILE" | tr -d '[:space:]')"
+else
+    DEPLOY_MODE_DEFAULT_SOURCE=""
+    DEPLOY_MODE_DEFAULT="direct"
+fi
+if [ "$DEPLOY_MODE_DEFAULT" != "direct" ] && [ "$DEPLOY_MODE_DEFAULT" != "cloudflare" ]; then
+    print_warning "${DEPLOY_MODE_DEFAULT_SOURCE} 中的部署模式无效，已改用安全默认值 direct：${DEPLOY_MODE_DEFAULT}"
+    DEPLOY_MODE_DEFAULT="direct"
+fi
+if [ "$DEPLOY_MODE_DEFAULT" = "cloudflare" ]; then
+    DEPLOY_MODE_DEFAULT_CHOICE="2"
+    DEPLOY_MODE_DEFAULT_LABEL="Cloudflare"
+else
+    DEPLOY_MODE_DEFAULT_CHOICE="1"
+    DEPLOY_MODE_DEFAULT_LABEL="直连"
+fi
 
 echo ""
 print_prompt "选择部署模式："
 echo "  1) 直连模式 — 服务器有公网 IP，直接暴露 :${BOT_PORT}（UFW 只放行平台 IP）"
 echo "  2) Cloudflare 模式 — 经 cloudflared 隧道 + WAF（无公网 IP / 想要边缘防护）"
-print_prompt "输入 1 或 2 [默认 1]:"
-read -r mode_choice
-case "$mode_choice" in
-    2) DEPLOY_MODE="cloudflare" ;;
-    *) DEPLOY_MODE="direct" ;;
-esac
+while true; do
+    read_input "输入 1 或 2 [默认 ${DEPLOY_MODE_DEFAULT_CHOICE} / ${DEPLOY_MODE_DEFAULT_LABEL}]：" mode_choice
+    mode_choice="$(trim_input "$mode_choice")"
+    mode_choice="${mode_choice:-$DEPLOY_MODE_DEFAULT_CHOICE}"
+    case "$mode_choice" in
+        1) DEPLOY_MODE="direct"; break ;;
+        2) DEPLOY_MODE="cloudflare"; break ;;
+        *) print_warning "请输入 1 或 2" ;;
+    esac
+done
 if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     BOT_HOST="127.0.0.1"
     DEPLOY_MODE_LABEL="Cloudflare"
@@ -148,45 +233,64 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
 fi
 
 # ---- Pi 群数据总根（<group>/workspace + <group>/users/<phone>/{tmp,session.jsonl}）----
-if [ -n "${GROUP_DATA_ROOT:-}" ]; then
-    GROUP_DATA_ROOT_DEFAULT="$GROUP_DATA_ROOT"
+GROUP_DATA_ROOT_ENV="$(trim_input "${GROUP_DATA_ROOT:-}")"
+if [ -n "$GROUP_DATA_ROOT_ENV" ]; then
+    GROUP_DATA_ROOT_DEFAULT="$GROUP_DATA_ROOT_ENV"
 elif [ -s "$GROUP_DATA_ROOT_FILE" ]; then
-    GROUP_DATA_ROOT_DEFAULT="$(tr -d '\r\n' < "$GROUP_DATA_ROOT_FILE")"
+    GROUP_DATA_ROOT_DEFAULT="$(trim_input "$(tr -d '\r\n' < "$GROUP_DATA_ROOT_FILE")")"
 else
     GROUP_DATA_ROOT_DEFAULT="$DEFAULT_GROUP_DATA_ROOT"
 fi
 GROUP_DATA_ROOT="$GROUP_DATA_ROOT_DEFAULT"
-print_prompt "Pi 群数据总根（默认 ${GROUP_DATA_ROOT_DEFAULT}；首次为 ${DEFAULT_GROUP_DATA_ROOT}）："
-read -r cwd_in
-[ -n "$cwd_in" ] && GROUP_DATA_ROOT="$cwd_in"
-if ! HOST_GROUP_DATA_ROOT="$(realpath -m -- "$GROUP_DATA_ROOT")"; then
-    print_error "群数据总根路径无效：$GROUP_DATA_ROOT"
-    exit 1
-fi
-if [ "$HOST_GROUP_DATA_ROOT" = "/" ] || [ "$HOST_GROUP_DATA_ROOT" = "$PROJECT_DIR" ]; then
-    print_error "群数据总根不能是文件系统根目录或项目根目录：$HOST_GROUP_DATA_ROOT"
-    exit 1
-fi
-case "$HOST_GROUP_DATA_ROOT" in
-    "$PROJECT_DIR"/*)
-        if [ "$HOST_GROUP_DATA_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
-            print_error "项目内群数据目录固定为 data/groups；如需自定义，请选择项目外的绝对路径：$HOST_GROUP_DATA_ROOT"
-            exit 1
-        fi
-        ;;
-esac
-if [ -e "$HOST_GROUP_DATA_ROOT" ] && [ ! -d "$HOST_GROUP_DATA_ROOT" ]; then
-    print_error "群数据总根不是目录：$HOST_GROUP_DATA_ROOT"
-    exit 1
-fi
-mkdir -p -- "$HOST_GROUP_DATA_ROOT"
-HOST_GROUP_DATA_ROOT="$(realpath -- "$HOST_GROUP_DATA_ROOT")"
+while true; do
+    read_input "Pi 群数据总根 [默认 ${GROUP_DATA_ROOT_DEFAULT}；首次为 ${DEFAULT_GROUP_DATA_ROOT}]：" cwd_in
+    cwd_in="$(trim_input "$cwd_in")"
+    GROUP_DATA_ROOT="${cwd_in:-$GROUP_DATA_ROOT_DEFAULT}"
+    if ! HOST_GROUP_DATA_ROOT="$(realpath -m -- "$GROUP_DATA_ROOT")"; then
+        print_warning "群数据总根路径无效：$GROUP_DATA_ROOT"
+        continue
+    fi
+    if [ "$HOST_GROUP_DATA_ROOT" = "/" ] || [ "$HOST_GROUP_DATA_ROOT" = "$PROJECT_DIR" ]; then
+        print_warning "群数据总根不能是文件系统根目录或项目根目录：$HOST_GROUP_DATA_ROOT"
+        continue
+    fi
+    case "$HOST_GROUP_DATA_ROOT" in
+        "$PROJECT_DIR"/*)
+            if [ "$HOST_GROUP_DATA_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
+                print_warning "项目内群数据目录固定为 data/groups；如需自定义，请选择项目外的路径：$HOST_GROUP_DATA_ROOT"
+                continue
+            fi
+            ;;
+    esac
+    if [ -e "$HOST_GROUP_DATA_ROOT" ] && [ ! -d "$HOST_GROUP_DATA_ROOT" ]; then
+        print_warning "群数据总根不是目录：$HOST_GROUP_DATA_ROOT"
+        continue
+    fi
+    if ! mkdir -p -- "$HOST_GROUP_DATA_ROOT"; then
+        print_warning "无法创建群数据总根：$HOST_GROUP_DATA_ROOT"
+        continue
+    fi
+    HOST_GROUP_DATA_ROOT="$(realpath -- "$HOST_GROUP_DATA_ROOT")"
+    if ! chmod 755 "$HOST_GROUP_DATA_ROOT"; then
+        print_warning "无法设置群数据总根权限：$HOST_GROUP_DATA_ROOT"
+        continue
+    fi
+    write_probe="${HOST_GROUP_DATA_ROOT}/.mixin-chatbot-write-test-$$"
+    if ! (umask 077 && : > "$write_probe") 2>/dev/null; then
+        print_warning "群数据总根不可写：$HOST_GROUP_DATA_ROOT"
+        continue
+    fi
+    if ! rm -f -- "$write_probe"; then
+        print_warning "无法清理群数据总根写入测试文件：$write_probe"
+        continue
+    fi
+    break
+done
 GROUP_ROOT_ARGS=()
 if [ "$HOST_GROUP_DATA_ROOT" = "$DEFAULT_GROUP_DATA_ROOT" ]; then
     GROUP_ROOT_ENV_VAL="/app/data/groups"
 else
     chown 1001:1001 "$HOST_GROUP_DATA_ROOT" 2>/dev/null || true
-    chmod 755 "$HOST_GROUP_DATA_ROOT"
     GROUP_ROOT_ARGS+=(-v "$HOST_GROUP_DATA_ROOT:/app/group-data")
     GROUP_ROOT_ENV_VAL="/app/group-data"
     print_warning "主机群数据目录挂到容器 /app/group-data"
@@ -227,9 +331,7 @@ if [ ! -f "$MODELS_FILE" ]; then
     fi
 else
     print_status "检测到已有 data/config/models.json"
-    print_prompt "是否重新配置 AI（provider/key/model）？[y/N]："
-    read -r reconf
-    if [[ "$reconf" =~ ^[Yy]$ ]]; then
+    if ask_yes_no "是否重新配置 AI（provider/key/model）？[y/N]：" "n"; then
         if ! docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
             print_error "AI 配置命令执行失败"
             exit 1
@@ -263,20 +365,59 @@ else
     print_status "检测到已有 data/config/webhook-secret（沿用）"
 fi
 
-# 域名只接受 hostname，不接受 scheme、端口或路径。显式环境变量会在部署成功后持久化，
-# 方便 ops 脚本在后续 shell 中继续做公网健康检查。
+# 域名接受 hostname 或仅含 hostname 的 http(s) 根 URL，并统一规范化为 hostname。
+# 显式环境变量会在部署成功后持久化，方便 ops 脚本在后续 shell 中继续做公网健康检查。
 PERSIST_BOT_DOMAIN=0
+CLEAR_PERSISTED_BOT_DOMAIN=0
+INVALID_CONFIGURED_DOMAIN=""
+DOMAIN_SOURCE=""
 if [ -n "${BOT_DOMAIN:-}" ]; then
-    PUBLIC_DOMAIN="$BOT_DOMAIN"
-    PERSIST_BOT_DOMAIN=1
+    RAW_PUBLIC_DOMAIN="$BOT_DOMAIN"
+    DOMAIN_SOURCE="BOT_DOMAIN"
 elif [ -f "$BOT_DOMAIN_FILE" ]; then
-    PUBLIC_DOMAIN="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$BOT_DOMAIN_FILE")"
+    RAW_PUBLIC_DOMAIN="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$BOT_DOMAIN_FILE")"
+    DOMAIN_SOURCE="data/state/bot-domain"
 else
-    PUBLIC_DOMAIN=""
+    RAW_PUBLIC_DOMAIN=""
 fi
-if [ -n "$PUBLIC_DOMAIN" ] && ! is_valid_hostname "$PUBLIC_DOMAIN"; then
-    print_error "BOT_DOMAIN/data/state/bot-domain 必须是纯 hostname（不能包含协议、端口或路径）：$PUBLIC_DOMAIN"
-    exit 1
+PUBLIC_DOMAIN=""
+if [ -n "$RAW_PUBLIC_DOMAIN" ]; then
+    if PUBLIC_DOMAIN="$(normalize_hostname_input "$RAW_PUBLIC_DOMAIN")"; then
+        if [ "$DOMAIN_SOURCE" = "BOT_DOMAIN" ] || [ "$PUBLIC_DOMAIN" != "$RAW_PUBLIC_DOMAIN" ]; then
+            PERSIST_BOT_DOMAIN=1
+        fi
+    else
+        INVALID_CONFIGURED_DOMAIN="$RAW_PUBLIC_DOMAIN"
+        PUBLIC_DOMAIN=""
+        if [ "$DOMAIN_SOURCE" = "data/state/bot-domain" ]; then
+            CLEAR_PERSISTED_BOT_DOMAIN=1
+        fi
+    fi
+fi
+if [ -n "$INVALID_CONFIGURED_DOMAIN" ]; then
+    print_warning "$DOMAIN_SOURCE 中的域名无效，已忽略：$INVALID_CONFIGURED_DOMAIN"
+fi
+if [ "$DEPLOY_MODE" = "cloudflare" ]; then
+    DOMAIN_DEFAULT="$PUBLIC_DOMAIN"
+    while true; do
+        if [ -n "$DOMAIN_DEFAULT" ]; then
+            read_input "Cloudflare 公网域名 [默认 ${DOMAIN_DEFAULT}；支持完整根 URL]：" domain_in
+        else
+            read_input "Cloudflare 公网域名（可留空；支持 im-bot.example.com 或 https://im-bot.example.com）：" domain_in
+        fi
+        if [ -z "$domain_in" ]; then
+            PUBLIC_DOMAIN="$DOMAIN_DEFAULT"
+            break
+        fi
+        if PUBLIC_DOMAIN="$(normalize_hostname_input "$domain_in")"; then
+            PERSIST_BOT_DOMAIN=1
+            if [ "$PUBLIC_DOMAIN" != "$domain_in" ]; then
+                print_success "已规范化公网域名：$PUBLIC_DOMAIN"
+            fi
+            break
+        fi
+        print_warning "域名格式无效；请输入纯 hostname，或只含 hostname 的 http(s) URL（不能带端口、路径、查询参数）"
+    done
 fi
 
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
@@ -404,6 +545,8 @@ printf '%s' "$DEPLOY_MODE" > "$DEPLOY_MODE_FILE"
 printf '%s' "$HOST_GROUP_DATA_ROOT" > "$GROUP_DATA_ROOT_FILE"
 if [ "$PERSIST_BOT_DOMAIN" = "1" ]; then
     printf '%s' "$PUBLIC_DOMAIN" > "$BOT_DOMAIN_FILE"
+elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = "1" ]; then
+    rm -f -- "$BOT_DOMAIN_FILE"
 fi
 
 # ---- Cloudflare 模式：确保 cloudflared 在线 ----
@@ -412,18 +555,56 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     if pgrep -x cloudflared >/dev/null 2>&1; then
         print_success "cloudflared 已在运行（pid $(pgrep -x cloudflared | head -n1)）"
     elif [ -f scripts/tunnel/start-tunnel.sh ]; then
-        print_warning "cloudflared 未运行，后台启动 scripts/tunnel/start-tunnel.sh..."
-        mkdir -p logs
-        BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh >>"logs/cloudflared.log" 2>&1 &
-        sleep 3
-        if pgrep -x cloudflared >/dev/null 2>&1; then
-            print_success "cloudflared 已后台启动（日志 logs/cloudflared.log）"
-            print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
-        else
-            print_error "cloudflared 未能启动；查 logs/cloudflared.log（可能缺 token：data/config/tunnel-token 或 TUNNEL_TOKEN）"
+        mkdir -p "$LOG_DIR"
+        tunnel_token_args=()
+        need_tunnel_token_prompt=0
+        if [ -n "${TUNNEL_TOKEN:-}" ]; then
+            : # 裸 token 由子脚本读取。
+        elif [ -n "${TUNNEL_TOKEN_FILE:-}" ]; then
+            if [ ! -f "$TUNNEL_TOKEN_FILE" ]; then
+                print_warning "TUNNEL_TOKEN_FILE 指向的文件不存在：$TUNNEL_TOKEN_FILE"
+                need_tunnel_token_prompt=1
+            fi
+        elif [ ! -f "$DEFAULT_TUNNEL_TOKEN_FILE" ]; then
+            need_tunnel_token_prompt=1
         fi
+        while ! pgrep -x cloudflared >/dev/null 2>&1; do
+            if [ "$need_tunnel_token_prompt" = "1" ]; then
+                read_input "隧道 token 文件 [直接回车按 TUNNEL_TOKEN_FILE / TUNNEL_TOKEN / data/config/tunnel-token 的顺序查找]：" tunnel_token_file_in
+                tunnel_token_file_in="$(trim_input "$tunnel_token_file_in")"
+                tunnel_token_args=()
+                if [ -n "$tunnel_token_file_in" ]; then
+                    if [ ! -f "$tunnel_token_file_in" ]; then
+                        print_warning "找不到 token 文件：$tunnel_token_file_in"
+                        continue
+                    fi
+                    tunnel_token_args=("$tunnel_token_file_in")
+                elif [ -n "${TUNNEL_TOKEN_FILE:-}" ] && [ ! -f "$TUNNEL_TOKEN_FILE" ] && [ -f "$DEFAULT_TUNNEL_TOKEN_FILE" ]; then
+                    tunnel_token_args=("$DEFAULT_TUNNEL_TOKEN_FILE")
+                elif [ -z "${TUNNEL_TOKEN:-}" ] &&
+                     { [ -z "${TUNNEL_TOKEN_FILE:-}" ] || [ ! -f "$TUNNEL_TOKEN_FILE" ]; } &&
+                     [ ! -f "$DEFAULT_TUNNEL_TOKEN_FILE" ]; then
+                    print_warning "没有可用的 token 来源，请输入 token 文件路径"
+                    continue
+                fi
+            fi
+
+            print_warning "cloudflared 未运行，后台启动 scripts/tunnel/start-tunnel.sh..."
+            BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh "${tunnel_token_args[@]}" >>"$LOG_DIR/cloudflared.log" 2>&1 &
+            sleep 3
+            if pgrep -x cloudflared >/dev/null 2>&1; then
+                print_success "cloudflared 已后台启动（日志 logs/cloudflared.log）"
+                print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
+                break
+            fi
+            print_warning "cloudflared 未能启动，最近日志："
+            tail -n 10 "$LOG_DIR/cloudflared.log" 2>/dev/null || true
+            print_warning "请修正 token 来源后重试；按 Ctrl+C 可取消部署。"
+            need_tunnel_token_prompt=1
+        done
     else
-        print_warning "未找到 scripts/tunnel/start-tunnel.sh，跳过隧道；请手动起 cloudflared"
+        print_error "未找到 scripts/tunnel/start-tunnel.sh，无法启动 Cloudflare 隧道"
+        exit 1
     fi
 fi
 

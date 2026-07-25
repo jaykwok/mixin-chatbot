@@ -48,6 +48,16 @@ function Done($m) { Write-Host "[+] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
 function Err($m)  { Write-Host "[x] $m" -ForegroundColor Red }
 function IsAdmin  { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+function Read-YesNo([string]$Prompt, [bool]$Default = $false) {
+    while ($true) {
+        $rawAnswer = Read-Host $Prompt
+        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim().ToLowerInvariant() }
+        if (-not $answer) { return $Default }
+        if ($answer -in @("y", "yes", "是")) { return $true }
+        if ($answer -in @("n", "no", "否")) { return $false }
+        Warn "请输入 y 或 n（也可直接回车采用默认值）"
+    }
+}
 function Get-ApplicationPaths([string]$Name) {
     $paths = @()
     foreach ($command in @(Get-Command $Name -All -CommandType Application -ErrorAction SilentlyContinue)) {
@@ -161,6 +171,24 @@ function Test-Hostname([string]$Value) {
     }
     return $true
 }
+function ConvertTo-Hostname([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $candidate = $Value.Trim()
+    if (Test-Hostname $candidate) { return $candidate.ToLowerInvariant() }
+
+    $uri = $null
+    if ([Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -and
+        $uri.Scheme -in @("http", "https") -and
+        $uri.IsDefaultPort -and
+        [string]::IsNullOrEmpty($uri.UserInfo) -and
+        $uri.AbsolutePath -eq "/" -and
+        [string]::IsNullOrEmpty($uri.Query) -and
+        [string]::IsNullOrEmpty($uri.Fragment) -and
+        (Test-Hostname $uri.DnsSafeHost)) {
+        return $uri.DnsSafeHost.ToLowerInvariant()
+    }
+    return $null
+}
 
 function Resolve-ProjectPath([string]$Value) {
     if ([System.IO.Path]::IsPathRooted($Value)) {
@@ -245,8 +273,12 @@ $Port = "$portNumber"
 if ($DeployMode -notin @("direct", "cloudflare")) {
     throw "data/state/deploy-mode 中的部署模式无效：$DeployMode"
 }
-if ($Domain -and -not (Test-Hostname $Domain)) {
-    throw "BOT_DOMAIN/data/state/bot-domain 中的 hostname 无效：$Domain"
+if ($Domain) {
+    $normalizedDomain = ConvertTo-Hostname $Domain
+    if (-not $normalizedDomain) {
+        throw "BOT_DOMAIN/data/state/bot-domain 中的域名无效：$Domain"
+    }
+    $Domain = $normalizedDomain
 }
 
 # 识别正在运行 src/server/index.ts 的 bun.exe 进程
@@ -641,8 +673,7 @@ function Uninstall-TunnelService([switch]$Confirmed) {
 
     $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if ($svc -and -not $Confirmed) {
-        $confirm = Read-Host "确认停止并删除 Cloudflared 系统服务？[y/N]"
-        if ($confirm -notmatch "^[yY]$") {
+        if (-not (Read-YesNo "确认停止并删除 Cloudflared 系统服务？[y/N]" $false)) {
             Warn "已取消 Cloudflared 服务卸载"
             return $true
         }
@@ -701,8 +732,7 @@ function Uninstall-TunnelService([switch]$Confirmed) {
     Done "Cloudflared 服务已清理"
 
     if (Test-Path -LiteralPath $LocalCloudflared -PathType Leaf) {
-        $removeExe = Read-Host "是否删除项目内下载的 cloudflared.exe？[y/N]"
-        if ($removeExe -match "^[yY]$") {
+        if (Read-YesNo "是否删除项目内下载的 cloudflared.exe？[y/N]" $false) {
             try {
                 Remove-Item -LiteralPath $LocalCloudflared -Force
                 Done "项目内 cloudflared.exe 已删除"
@@ -754,13 +784,11 @@ function Uninstall-Bot {
 
     $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if ($svc) {
-        $a = Read-Host "是否同时停止并卸载 Cloudflared 隧道服务？[y/N]"
-        if ($a -match "^[yY]$") {
+        if (Read-YesNo "是否同时停止并卸载 Cloudflared 隧道服务？[y/N]" $false) {
             [void](Uninstall-TunnelService -Confirmed)
         }
     } elseif (Test-Path -LiteralPath $LocalCloudflared -PathType Leaf) {
-        $a = Read-Host "Cloudflared 服务不存在；是否清理项目内 cloudflared.exe？[y/N]"
-        if ($a -match "^[yY]$") {
+        if (Read-YesNo "Cloudflared 服务不存在；是否清理项目内 cloudflared.exe？[y/N]" $false) {
             try {
                 Remove-Item -LiteralPath $LocalCloudflared -Force
                 Done "项目内 cloudflared.exe 已删除"
@@ -772,8 +800,7 @@ function Uninstall-Bot {
     Get-ChildItem -LiteralPath $Project -Filter "cloudflared.exe.download-*" -File -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 
-    $d = Read-Host "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N]"
-    if ($d -match "^[yY]$") {
+    if (Read-YesNo "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N]" $false) {
         Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $Project "logs") -Recurse -Force -ErrorAction SilentlyContinue
         Done "data/ 和 logs/ 已删除"

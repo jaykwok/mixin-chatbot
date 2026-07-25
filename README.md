@@ -72,7 +72,7 @@ data/
 ```
 
 - **AI 配置**（provider / key / model / 元数据）：全部在 `data/config/models.json`，由 `bun run configure` 调用 `scripts/config/configure.ts` 生成，Pi 原生读取。
-- **监听端口与部署状态**：Linux/Windows 部署脚本每次都会询问，默认优先沿用 `BOT_PORT` 或 `data/state/bot-port`，否则为 `1011`；模式、公网域名和主机侧群数据根统一写入 `data/state/`。
+- **监听端口与部署状态**：Linux/Windows 部署脚本每次都会询问；端口默认优先沿用 `BOT_PORT` 或 `data/state/bot-port`，否则为 `1011`，部署模式默认优先沿用 `DEPLOY_MODE` 或 `data/state/deploy-mode`。模式、公网域名和主机侧群数据根统一写入 `data/state/`。
 - **监听地址**：部署脚本自动设置；直连模式为 `0.0.0.0`，Cloudflare 模式为 `127.0.0.1`。手动启动时可用 `BOT_HOST` 覆盖。
 - **群数据总根**（可选）：首次默认 `./data/groups`，部署时可改（`deploy.ps1`/`deploy.sh` 会问），或直接设环境变量 `GROUP_DATA_ROOT`（相对仓库或绝对路径均可）。部署成功后主机路径写入 `data/state/group-data-root`，下次部署自动沿用，避免群数据被切到另一目录；配置、部署状态和 runtime 始终保留在项目 `data/` 的分类目录中。
 - **访问控制**：随机密钥路径（`data/config/webhook-secret`，应用层）+ 网络层 IP 闸门（直连=UFW / Cloudflare=WAF），见下方「部署模式」与「安全」。
@@ -102,6 +102,8 @@ Pi 依赖声明保持 `latest`，但部署使用提交进仓库的 `bun.lock` �
 
 - **直连模式**：部署脚本把所选端口的 UFW 规则限定到平台 IP（安全基线）+ 随机密钥路径。走 HTTP，secret 在「平台→服务器」明文，但仅平台 IP 可达；有域名可在前面套 nginx/caddy + 证书升级 HTTPS。
 - **Cloudflare 模式**：bot 只监听 `127.0.0.1:<port>`，再由 cloudflared + WAF + 随机密钥路径接入。token 启动的是远程管理隧道，必须在 Cloudflare 控制台把 **Published application → Service** 设为 `http://localhost:<port>`；脚本无法替控制台修改这个源站地址。
+
+Windows 与 Linux 的部署交互保持一致：直接回车采用显示的默认值；端口、模式、目录、域名、确认项或 token 来源输入无效时会说明原因并原地重试，不会因普通输入错误退出整个部署。Cloudflare 公网域名既可输入纯 hostname，也可粘贴不带端口、路径或查询参数的 `http(s)` 根 URL，脚本会规范化为 hostname；按 `Ctrl+C` 可主动取消。
 
 ## 部署
 
@@ -136,7 +138,7 @@ sudo usermod -aG docker $USER && newgrp docker
 
 流程：
 
-1. 询问监听端口（默认沿用已有值，否则 `1011`）、部署模式和群数据总根
+1. 询问监听端口（默认沿用已有值，否则 `1011`）、部署模式、群数据总根和 Cloudflare 公网域名；无效输入会原地重试
 2. 构建 Docker 镜像（Bun）
 3. **AI 配置**：若 `data/config/models.json` 不存在，在容器内运行 TUI（选 provider、填 key、选模型，元数据从 LiteLLM 抓取）；已存在则询问是否重配
 4. 启动容器（host 网络、只读根文件系统、最小权限，挂载 `data/`、`logs/` 和选择的群数据总根）
@@ -174,7 +176,7 @@ git pull && ./scripts/deploy/deploy.sh
    - **Windows Server**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\tunnel\start-tunnel.ps1 [token-file]`（装 cloudflared + 注册为 Windows 服务，开机自启）
 
    token 解析优先级：位置参数文件 → `$TUNNEL_TOKEN_FILE` → `$TUNNEL_TOKEN`（裸值）→ `data/config/tunnel-token`。token 文件可以是裸 token，也可以是 `.env` 形式（含 `TUNNEL_TOKEN=...`）。
-5. IM 平台回调填：`https://<你的域名>/webhook/<secret>`（secret 来自 deploy 输出）。设置纯 hostname 形式的 `BOT_DOMAIN`（例如 `bot.example.com`，不含协议/端口/路径）后，部署成功会写入 `data/state/bot-domain`，后续运维脚本会自动检查该域名。
+5. IM 平台回调填：`https://<你的域名>/webhook/<secret>`（secret 来自 deploy 输出）。部署交互或 `BOT_DOMAIN` 可填写纯 hostname（如 `bot.example.com`），也可填写仅含根域名的 URL（如 `https://bot.example.com`）；脚本会规范化后写入 `data/state/bot-domain`，后续运维脚本自动检查该域名。
 
 Windows 上的 `data/config/tunnel-token` 只是安装/修复时的 token 来源；Cloudflared 服务会保存安装时使用的 token，单独修改该文件不会自动更新已安装服务。轮换 token 后运行：
 
@@ -310,6 +312,8 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理
 ```
 
 `doctor` 会检查群数据总根、计划任务及上次结果、端口占用进程、本地 HTTP、token 来源、Cloudflared 服务、`data/state/bot-domain` 和公网链路，并为失败项打印对应修复命令。它只确认 token 来源是否可用，无法从 Cloudflared 服务中反查并比较已安装 token；token 有变化时应显式执行 `repair-tunnel`。
+
+`uninstall` / `uninstall-tunnel` 的删除确认在 Windows 与 Linux 上都只接受 y/n；输入其他内容会重新询问，直接回车默认取消，避免误删服务或数据。
 
 ## 故障排查
 
