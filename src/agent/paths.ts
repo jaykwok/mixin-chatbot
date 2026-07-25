@@ -31,7 +31,7 @@ export function groupWorkspaceDir(root: string, groupId: string): string {
 
 /** Per-user scratch directory inside a group. */
 export function userTempDir(root: string, groupId: string, phone: string): string {
-  return join(root, groupSegment(groupId), userSegment(phone), "tmp");
+  return join(root, groupSegment(groupId), "users", userSegment(phone), "tmp");
 }
 
 /** Per-user conversation history inside a group. */
@@ -39,8 +39,8 @@ export function sessionFilePath(root: string, groupId: string, phone: string): s
   return join(
     root,
     groupSegment(groupId),
+    "users",
     userSegment(phone),
-    "sessions",
     "session.jsonl"
   );
 }

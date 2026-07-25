@@ -1,0 +1,22 @@
+import { join } from "node:path";
+
+/** Repository-local persistent storage layout. */
+export const DATA_DIR = "data";
+export const CONFIG_DIR = join(DATA_DIR, "config");
+export const STATE_DIR = join(DATA_DIR, "state");
+export const RUNTIME_DIR = join(DATA_DIR, "runtime");
+export const DEFAULT_GROUP_DATA_ROOT = join(DATA_DIR, "groups");
+
+/** User-managed configuration and secrets. */
+export const MODELS_JSON_PATH = join(CONFIG_DIR, "models.json");
+export const WEBHOOK_SECRET_FILE = join(CONFIG_DIR, "webhook-secret");
+export const TUNNEL_TOKEN_FILE = join(CONFIG_DIR, "tunnel-token");
+
+/** Deployment-generated state shared by deploy, ops and tunnel scripts. */
+export const BOT_PORT_FILE = join(STATE_DIR, "bot-port");
+export const DEPLOY_MODE_FILE = join(STATE_DIR, "deploy-mode");
+export const BOT_DOMAIN_FILE = join(STATE_DIR, "bot-domain");
+export const GROUP_DATA_ROOT_FILE = join(STATE_DIR, "group-data-root");
+
+/** Rebuildable process-local Pi resources; conversation history lives under GROUP_DATA_ROOT. */
+export const PI_AGENT_DIR = join(RUNTIME_DIR, "pi");

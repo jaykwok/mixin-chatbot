@@ -7,7 +7,7 @@
 #        位置参数：./scripts/tunnel/start-tunnel.sh <token文件>   # 路径，相对或绝对
 #        环境变量：TUNNEL_TOKEN_FILE=<路径>                   # 指定文件
 #        环境变量：TUNNEL_TOKEN=<裸 token>                    # 直接给值
-#        默认：    data/tunnel-token                          # 裸值或 .env 形式均可
+#        默认：    data/config/tunnel-token                   # 裸值或 .env 形式均可
 #      token 文件可以是裸 token，也可以是直接拷来的 .env
 #      （也可直接使用内含 TUNNEL_TOKEN=<值> 的 .env 文件）。
 #
@@ -15,11 +15,13 @@
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
+BOT_PORT_FILE="${PROJECT_DIR}/data/state/bot-port"
+DEFAULT_TUNNEL_TOKEN_FILE="${PROJECT_DIR}/data/config/tunnel-token"
 
 if [ -n "${BOT_PORT:-}" ]; then
     BOT_PORT="$BOT_PORT"
-elif [ -f data/bot-port ]; then
-    BOT_PORT="$(tr -d '[:space:]' < data/bot-port)"
+elif [ -f "$BOT_PORT_FILE" ]; then
+    BOT_PORT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"
 else
     BOT_PORT="1011"
 fi
@@ -45,13 +47,13 @@ elif [ -n "${TUNNEL_TOKEN:-}" ]; then
     TOKEN_FILE=""
     echo "ℹ 使用环境变量 TUNNEL_TOKEN"
 else
-    TOKEN_FILE="data/tunnel-token"
+    TOKEN_FILE="$DEFAULT_TUNNEL_TOKEN_FILE"
 fi
 
 if [ -n "$TOKEN_FILE" ]; then
     if [ ! -f "$TOKEN_FILE" ]; then
         echo "✗ 未找到隧道 token 文件：$TOKEN_FILE" >&2
-        echo "  优先级：位置参数 > TUNNEL_TOKEN_FILE > TUNNEL_TOKEN > data/tunnel-token" >&2
+        echo "  优先级：位置参数 > TUNNEL_TOKEN_FILE > TUNNEL_TOKEN > data/config/tunnel-token" >&2
         exit 1
     fi
     if val="$(extract_env_token "$TOKEN_FILE")" && [ -n "$val" ]; then

@@ -2,6 +2,7 @@
 .vscode
 .venv
 .claude
+.pi
 .codefree
 __pycache__
 node_modules

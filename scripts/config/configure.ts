@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// AI 配置 TUI：交互生成 data/models.json（provider + key + model，Pi 原生读取）。
+// AI 配置 TUI：交互生成 data/config/models.json（provider + key + model，Pi 原生读取）。
 // 通常在容器内运行：
 //   docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure
 // 也可本地 bun run configure。
@@ -22,8 +22,8 @@ import {
   getBuiltinModels,
   getBuiltinProviders,
 } from "@earendil-works/pi-ai/providers/all";
+import { MODELS_JSON_PATH } from "../../src/core/storage.ts";
 
-const MODELS_JSON_PATH = "data/models.json";
 const LITELLM_URL =
   "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 // raw GitHub 对默认 fetch UA 指纹拦截，必须带浏览器 UA。
@@ -145,7 +145,7 @@ function defaultModel(modelId: string): JsonObject {
 }
 
 async function main(): Promise<void> {
-  intro("🤖 AI 配置（生成 data/models.json）");
+  intro(`🤖 AI 配置（生成 ${MODELS_JSON_PATH}）`);
 
   const existing = await loadExisting();
   const existingProviders = existing.providers ?? {};
