@@ -1,24 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import {
   markdownToPlainText,
-  requiresStructuredMarkdown,
+  shouldRenderMarkdown,
 } from "../../src/integrations/markdown.ts";
 
 describe("Markdown reply adaptation", () => {
-  test("reserves rich Markdown for tables and fenced code", () => {
+  test("renders actual Markdown syntax but not ordinary paragraphs", () => {
     expect(
-      requiresStructuredMarkdown("| 项目 | 状态 |\n| --- | --- |\n| 路由 | 正常 |")
+      shouldRenderMarkdown("| 项目 | 状态 |\n| --- | --- |\n| 路由 | 正常 |")
     ).toBe(true);
-    expect(requiresStructuredMarkdown("```ts\nconst ok = true;\n```")).toBe(true);
-    expect(requiresStructuredMarkdown("~~~sh\necho ok\n~~~")).toBe(true);
+    expect(shouldRenderMarkdown("```ts\nconst ok = true;\n```")).toBe(true);
+    expect(shouldRenderMarkdown("~~~sh\necho ok\n~~~")).toBe(true);
 
-    expect(
-      requiresStructuredMarkdown("## 标题\n这是 **重点** 和 *说明*。")
-    ).toBe(false);
-    expect(requiresStructuredMarkdown("- 第一项\n- 第二项")).toBe(false);
-    expect(
-      requiresStructuredMarkdown("查看 [文档](https://example.com)")
-    ).toBe(false);
+    expect(shouldRenderMarkdown("## 标题\n这是 **重点** 和 *说明*。")).toBe(true);
+    expect(shouldRenderMarkdown("- 第一项\n- 第二项")).toBe(true);
+    expect(shouldRenderMarkdown("查看 [文档](https://example.com)")).toBe(true);
+    expect(shouldRenderMarkdown("第一段普通文字。\n\n第二段普通文字。")).toBe(false);
   });
 
   test("converts presentation-only Markdown to readable text", () => {

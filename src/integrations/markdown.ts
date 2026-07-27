@@ -3,17 +3,24 @@
  * https://github.com/wong2/weixin-agent-sdk/blob/main/packages/sdk/src/messaging/send.ts
  * MIT License, Copyright (c) 2026 wong2。完整许可见 THIRD_PARTY_NOTICES.md。
  *
- * 本项目额外处理了波浪线代码围栏、标题和引用，并把富文本判断限制为
- * 真正依赖结构渲染的表格与围栏代码块。
+ * 本项目额外处理了波浪线代码围栏、标题和引用，并负责判断回复是否
+ * 确实包含可渲染的 Markdown 标记。
  */
 
 const TABLE_PATTERN =
   /(^|\n)\s*\|?.+\|.+\r?\n\s*\|?\s*:?-{3,}:?\s*\|\s*:?-{3,}:?(?:\s*\|\s*:?-{3,}:?)*\s*\|?/;
-const FENCED_CODE_PATTERN = /(^|\n)\s*(?:```|~~~)/;
+const BLOCK_PATTERN =
+  /```|~~~|(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s|(?:[-*_]\s*){3,}$)/m;
+const INLINE_PATTERN =
+  /\*\*[^*\n]+\*\*|__[^_\n]+__|(?<!\*)\*[^*\n]+\*(?!\*)|(?<!_)_[^_\n]+_(?!_)|~~[^~\n]+~~|`[^`\n]+`|\[[^\]\n]+\]\([^\s)]+\)/;
 
-/** 只有纯文本无法清楚保留结构时，才值得冒险使用未正式文档化的 Markdown 消息。 */
-export function requiresStructuredMarkdown(text: string): boolean {
-  return TABLE_PATTERN.test(text) || FENCED_CODE_PATTERN.test(text);
+/** 普通段落走 text；确实带标题、强调、列表、链接、表格或代码时才渲染 Markdown。 */
+export function shouldRenderMarkdown(text: string): boolean {
+  return (
+    TABLE_PATTERN.test(text) ||
+    BLOCK_PATTERN.test(text) ||
+    INLINE_PATTERN.test(text)
+  );
 }
 
 /**
