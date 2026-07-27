@@ -6,7 +6,7 @@ import {
 } from "../../src/integrations/im.ts";
 
 describe("IM outbound group routing", () => {
-  test("keeps groupId explicit when two groups share a callback key", async () => {
+  test("uses text for presentation formatting and markdown only for structure", async () => {
     const payloads: Record<string, unknown>[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (_input, init) => {
@@ -14,24 +14,52 @@ describe("IM outbound group routing", () => {
       return new Response(null, { status: 200 });
     }) as typeof fetch;
 
-    const sharedCallback =
-      `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=shared-${crypto.randomUUID()}`;
+    const callbackUrl =
+      `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=format-${crypto.randomUUID()}`;
 
     try {
-      await sendReplyWithMention("**A 群回复**", "group-a", "+8613800000000", sharedCallback);
-      await sendReplyWithMention("**B 群回复**", "group-b", "+8613800000000", sharedCallback);
+      await sendReplyWithMention(
+        "第一段普通文字。\n\n第二段普通文字。",
+        "group-a",
+        "+8613800000000",
+        callbackUrl
+      );
+      await sendReplyWithMention(
+        "## 标题\n这是 **重点** 和 [链接](https://example.com)",
+        "group-a",
+        "+8613800000000",
+        callbackUrl
+      );
+      await sendReplyWithMention(
+        "| 项目 | 状态 |\n| --- | --- |\n| 路由 | 正常 |",
+        "group-a",
+        "+8613800000000",
+        callbackUrl
+      );
     } finally {
       globalThis.fetch = originalFetch;
     }
 
-    expect(payloads).toHaveLength(2);
-    expect(payloads).toMatchObject([
-      { type: "markdown", groupId: "group-a", markdown: { groupId: "group-a" } },
-      { type: "markdown", groupId: "group-b", markdown: { groupId: "group-b" } },
-    ]);
+    expect(payloads).toHaveLength(3);
+    expect(payloads[0]).toMatchObject({
+      type: "text",
+      textMsg: { content: "第一段普通文字。\n\n第二段普通文字。" },
+    });
+    expect(payloads[1]).toMatchObject({
+      type: "text",
+      textMsg: {
+        content: "标题\n这是 重点 和 链接",
+      },
+    });
+    expect(payloads[2]).toMatchObject({
+      type: "markdown",
+      markdown: {
+        content: "| 项目 | 状态 |\n| --- | --- |\n| 路由 | 正常 |",
+      },
+    });
   });
 
-  test("keeps callback URL and groupId bound to the current group", async () => {
+  test("uses each incoming callback URL and the documented outbound schema", async () => {
     const requests: { url: string; payload: Record<string, unknown> }[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (input, init) => {
@@ -64,22 +92,24 @@ describe("IM outbound group routing", () => {
       callbackB,
     ]);
     expect(requests[0]?.payload).toMatchObject({
-      type: "markdown",
-      groupId: "group-a",
-      markdown: { groupId: "group-a" },
+      type: "text",
+      textMsg: { content: "A 群回复" },
     });
     expect(requests[1]?.payload).toMatchObject({
-      type: "markdown",
-      groupId: "group-b",
-      markdown: { groupId: "group-b" },
+      type: "text",
+      textMsg: { content: "B 群回复" },
     });
     expect(requests[2]?.payload).toMatchObject({
       type: "image",
-      imageMsg: { fileId: "image-b", groupId: "group-b" },
+      imageMsg: { fileId: "image-b" },
     });
     expect(requests[3]?.payload).toMatchObject({
       type: "file",
-      fileMsg: { fileId: "file-b", groupId: "group-b" },
+      fileMsg: { fileId: "file-b" },
     });
+    for (const { payload } of requests) {
+      expect(payload).not.toHaveProperty("groupId");
+      expect(JSON.stringify(payload)).not.toContain('"groupId"');
+    }
   });
 });
