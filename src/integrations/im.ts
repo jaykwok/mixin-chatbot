@@ -296,7 +296,10 @@ function buildMarkdownTitle(content: string, limit = 24): string {
   return (clean || "AI 回复").slice(0, limit);
 }
 
-// ===== 消息构建器（A 套群聊 webhook 协议，已实测验证）=====
+// ===== 消息构建器 =====
+// 官方推送机器人文档依赖 webhook key 绑定目标群；会话机器人回调还会提供
+// 当前 groupId。实测会话回复接口接受消息对象内的 groupId，因此所有类型都
+// 显式携带它，避免同一机器人/回调 key 被多个群复用时回落到旧群。
 function buildText(content: string, groupId: string, phone: string) {
   return {
     type: "text" as const,
@@ -310,22 +313,22 @@ function buildText(content: string, groupId: string, phone: string) {
   };
 }
 
-function buildMarkdown(content: string) {
+function buildMarkdown(content: string, groupId: string) {
   return {
     type: "markdown" as const,
-    markdown: { title: buildMarkdownTitle(content), content },
+    markdown: { title: buildMarkdownTitle(content), content, groupId },
   };
 }
 
-function buildImage(fileId: string, width?: number, height?: number) {
-  const body: Record<string, unknown> = { fileId };
+function buildImage(fileId: string, groupId: string, width?: number, height?: number) {
+  const body: Record<string, unknown> = { fileId, groupId };
   if (width !== undefined) body.width = width;
   if (height !== undefined) body.height = height;
   return { type: "image" as const, imageMsg: body };
 }
 
-function buildFile(fileId: string) {
-  return { type: "file" as const, fileMsg: { fileId } };
+function buildFile(fileId: string, groupId: string) {
+  return { type: "file" as const, fileMsg: { fileId, groupId } };
 }
 
 // ===== 发送接口 =====
@@ -348,7 +351,7 @@ export async function sendText(
     options?.traffic ?? "required",
     warning
   );
-  if (ok) log.info(`消息发送成功，用户: ${phone}`);
+  if (ok) log.info(`消息发送成功，群: ${groupId}, 用户: ${phone}`);
   return ok;
 }
 
@@ -373,17 +376,19 @@ export async function sendReplyWithMention(
   if (looksLikeMarkdown(content)) {
     const markdownOk = await postWithRetry(
       callbackUrl,
-      buildMarkdown(content),
+      buildMarkdown(content, groupId),
       "markdown"
     );
     if (!markdownOk) {
-      log.warn(`markdown 发送失败，降级为纯 text - 用户: ${phone}`);
+      log.warn(`markdown 发送失败，降级为纯 text - 群: ${groupId}, 用户: ${phone}`);
       const fallbackOk = await postWithRetry(
         callbackUrl,
         buildText(content, groupId, phone),
         "text fallback"
       );
-      if (fallbackOk) log.info(`回复发送完成（text fallback），用户: ${phone}`);
+      if (fallbackOk) {
+        log.info(`回复发送完成（text fallback），群: ${groupId}, 用户: ${phone}`);
+      }
       return fallbackOk;
     }
 
@@ -394,35 +399,43 @@ export async function sendReplyWithMention(
     );
     if (!mentionOk) {
       // 正文已经送达，@ 通知失败不应触发一条误导性的“处理请求失败”回复。
-      log.warn(`markdown 正文已发送，但 text@ 通知失败 - 用户: ${phone}`);
+      log.warn(`markdown 正文已发送，但 text@ 通知失败 - 群: ${groupId}, 用户: ${phone}`);
     }
-    log.info(`回复发送完成（markdown${mentionOk ? " + text@" : ""}），用户: ${phone}`);
+    log.info(
+      `回复发送完成（markdown${mentionOk ? " + text@" : ""}），群: ${groupId}, 用户: ${phone}`
+    );
     return true;
   }
   const ok = await postWithRetry(callbackUrl, buildText(content, groupId, phone), "text");
-  if (ok) log.info(`回复发送完成（text@），用户: ${phone}`);
+  if (ok) log.info(`回复发送完成（text@），群: ${groupId}, 用户: ${phone}`);
   return ok;
 }
 
 export async function sendImage(
   fileId: string,
+  groupId: string,
   callbackUrl: string,
   phone?: string,
   width?: number,
   height?: number
 ): Promise<boolean> {
-  const ok = await postWithRetry(callbackUrl, buildImage(fileId, width, height), "image");
-  if (ok) log.info(`image 发送成功，用户: ${phone ?? "-"}`);
+  const ok = await postWithRetry(
+    callbackUrl,
+    buildImage(fileId, groupId, width, height),
+    "image"
+  );
+  if (ok) log.info(`image 发送成功，群: ${groupId}, 用户: ${phone ?? "-"}`);
   return ok;
 }
 
 export async function sendFile(
   fileId: string,
+  groupId: string,
   callbackUrl: string,
   phone?: string
 ): Promise<boolean> {
-  const ok = await postWithRetry(callbackUrl, buildFile(fileId), "file");
-  if (ok) log.info(`file 发送成功，用户: ${phone ?? "-"}`);
+  const ok = await postWithRetry(callbackUrl, buildFile(fileId, groupId), "file");
+  if (ok) log.info(`file 发送成功，群: ${groupId}, 用户: ${phone ?? "-"}`);
   return ok;
 }
 

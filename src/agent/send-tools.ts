@@ -87,9 +87,11 @@ function sanitizeFilename(filename: string): string {
   return clean || "file";
 }
 
-/** 构造发送工具；callback URL 用 getter 读取，以支持平台轮换机器人 key。 */
+/** 构造发送工具；callback URL 用 getter 读取，以支持平台轮换机器人 key；
+ *  groupId 固定为创建当前用户会话时所属的群，不能从模型参数中获取。 */
 export function buildSendTools(
   getCallbackUrl: () => string,
+  groupId: string,
   workspaceDir: string,
   tempDir: string
 ): ToolDefinition[] {
@@ -131,7 +133,14 @@ export function buildSendTools(
         "image"
       );
       if (!fileId) throw new Error(`图片上传失败: ${params.source}`);
-      const ok = await sendImage(fileId, callbackUrl, undefined, params.width, params.height);
+      const ok = await sendImage(
+        fileId,
+        groupId,
+        callbackUrl,
+        undefined,
+        params.width,
+        params.height
+      );
       if (!ok) throw new Error(`图片发送失败: ${params.source}`);
       return {
         content: [
@@ -156,7 +165,7 @@ export function buildSendTools(
       const callbackUrl = getCallbackUrl();
       const fileId = await uploadAttachment(callbackUrl, data, name, "file");
       if (!fileId) throw new Error(`文件上传失败: ${params.source}`);
-      const ok = await sendFile(fileId, callbackUrl);
+      const ok = await sendFile(fileId, groupId, callbackUrl);
       if (!ok) throw new Error(`文件发送失败: ${params.source}`);
       return { content: [{ type: "text", text: `已发送文件: ${name}` }], details: { fileId, name } };
     },
