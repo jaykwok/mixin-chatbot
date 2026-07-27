@@ -41,13 +41,11 @@ export const IM_RETRY_DELAY = 2000; // ms
 export const IM_HTTP_TIMEOUT = 15_000; // 单次 webhook 发送超时
 export const ATTACHMENT_HTTP_TIMEOUT = 60_000;
 export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
-/** 长任务心跳间隔：3 条/分钟，正常单任务远低于机器人发送限额。 */
-export const AGENT_HEARTBEAT_INTERVAL = 20_000; // ms
 /** 机器人出站发送滑动窗口（按 callback key 全局统计，多用户共享）。 */
 export const IM_RATE_LIMIT_WINDOW = 60_000; // ms
 export const IM_RATE_LIMIT_MAX_MESSAGES = 20;
-/** 达到此用量后暂停可丢弃的心跳，为最终回复、指令和附件预留额度。 */
-export const IM_HEARTBEAT_PAUSE_AT = 12;
+/** 达到此用量后暂停可丢弃的状态消息，为最终回复、指令和附件预留额度。 */
+export const IM_STATUS_PAUSE_AT = 12;
 /** 达到此用量后尝试向当前群发送一次压力预警（每窗口最多一次）。 */
 export const IM_RATE_WARNING_AT = 16;
 

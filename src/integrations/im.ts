@@ -1,14 +1,18 @@
 // 发送层：量子密信群聊 webhook 消息、附件上传和出站限流。
 import { log } from "../core/log.ts";
 import {
+  markdownToPlainText,
+  requiresStructuredMarkdown,
+} from "./markdown.ts";
+import {
   ATTACHMENT_HTTP_TIMEOUT,
-  IM_HEARTBEAT_PAUSE_AT,
   IM_HTTP_TIMEOUT,
   IM_RATE_LIMIT_MAX_MESSAGES,
   IM_RATE_LIMIT_WINDOW,
   IM_RATE_WARNING_AT,
   IM_RETRY_COUNT,
   IM_RETRY_DELAY,
+  IM_STATUS_PAUSE_AT,
   MAX_ATTACHMENT_BYTES,
 } from "../core/config.ts";
 
@@ -100,7 +104,7 @@ export function getOutboundRateStatus(callbackUrl: string): {
       ? "cooldown"
       : used >= IM_RATE_LIMIT_MAX_MESSAGES
         ? "full"
-        : used >= IM_HEARTBEAT_PAUSE_AT
+        : used >= IM_STATUS_PAUSE_AT
           ? "reduced"
           : "normal";
   return {
@@ -113,7 +117,7 @@ export function getOutboundRateStatus(callbackUrl: string): {
 
 /**
  * 为一次真实 HTTP 发送预留滑动窗口名额。
- * - status（思考提示/心跳）达到 12/60s 后直接丢弃，为关键消息留出 8 个名额；
+ * - status（排队等非关键状态）达到 12/60s 后直接丢弃，为关键消息留出 8 个名额；
  * - required 达到 20/60s 后按 FIFO 等待，绝不丢最终回复/指令/附件；
  * - 所有重试也重新占名额，因为平台通常按 HTTP 请求次数计算 RPM。
  */
@@ -126,10 +130,10 @@ async function reserveOutboundSlot(
   let now = Date.now();
   pruneWindow(state, now);
 
-  // 心跳是可降级消息，先快速判定，避免排在已拥堵的关键消息后面。
+  // 状态消息可降级，先快速判定，避免排在已拥堵的关键消息后面。
   if (
     traffic === "status" &&
-    (state.blockedUntil > now || state.timestamps.length >= IM_HEARTBEAT_PAUSE_AT)
+    (state.blockedUntil > now || state.timestamps.length >= IM_STATUS_PAUSE_AT)
   ) {
     const shouldWarn =
       canSendPressureWarning &&
@@ -140,7 +144,7 @@ async function reserveOutboundSlot(
     if (shouldWarn) state.lastWarningAt = now;
     state.lastActivity = now;
     log.warn(
-      `出站 RPM 保护：暂停心跳，当前窗口 ${state.timestamps.length}/${IM_RATE_LIMIT_MAX_MESSAGES}`
+      `出站 RPM 保护：暂停非关键状态消息，当前窗口 ${state.timestamps.length}/${IM_RATE_LIMIT_MAX_MESSAGES}`
     );
     return { allowed: false, shouldWarn };
   }
@@ -297,10 +301,9 @@ function buildMarkdownTitle(content: string, limit = 24): string {
 }
 
 // ===== 消息构建器 =====
-// 官方推送机器人文档依赖 webhook key 绑定目标群；会话机器人回调还会提供
-// 当前 groupId。实测会话回复接口接受消息对象内的 groupId，因此所有类型都
-// 显式携带它，避免同一机器人/回调 key 被多个群复用时回落到旧群。
-function buildText(content: string, groupId: string, phone: string) {
+// 官方出站消息完全由 webhook key 路由，消息体没有 groupId 字段。
+// groupId 只用于本地会话隔离、日志和 callback key 冲突保护。
+function buildText(content: string, phone: string) {
   return {
     type: "text" as const,
     textMsg: {
@@ -308,30 +311,27 @@ function buildText(content: string, groupId: string, phone: string) {
       isMentioned: true,
       mentionType: 2,
       mentionedMobileList: [phone],
-      groupId,
     },
   };
 }
 
-/** Markdown 是实测可用但未写入官方文档的扩展。
- *  groupId 同时放在公共顶层和类型对象内，兼容服务端可能采用的两种路由解析位置。 */
-function buildMarkdown(content: string, groupId: string) {
+/** Markdown 是实测可用但未写入官方文档的扩展，同样由 webhook key 路由。 */
+function buildMarkdown(content: string) {
   return {
     type: "markdown" as const,
-    groupId,
-    markdown: { title: buildMarkdownTitle(content), content, groupId },
+    markdown: { title: buildMarkdownTitle(content), content },
   };
 }
 
-function buildImage(fileId: string, groupId: string, width?: number, height?: number) {
-  const body: Record<string, unknown> = { fileId, groupId };
+function buildImage(fileId: string, width?: number, height?: number) {
+  const body: Record<string, unknown> = { fileId };
   if (width !== undefined) body.width = width;
   if (height !== undefined) body.height = height;
   return { type: "image" as const, imageMsg: body };
 }
 
-function buildFile(fileId: string, groupId: string) {
-  return { type: "file" as const, fileMsg: { fileId, groupId } };
+function buildFile(fileId: string) {
+  return { type: "file" as const, fileMsg: { fileId } };
 }
 
 // ===== 发送接口 =====
@@ -343,13 +343,12 @@ export async function sendText(
   options?: { traffic?: OutboundTraffic }
 ): Promise<boolean> {
   const warning = buildText(
-    "⚠️ 当前机器人消息较多，已自动减少心跳并排队保护最终回复；任务仍在继续。",
-    groupId,
+    "⚠️ 当前机器人消息较多，已自动减少非关键状态消息并排队保护最终回复；任务仍在继续。",
     phone
   );
   const ok = await postWithRetry(
     callbackUrl,
-    buildText(content, groupId, phone),
+    buildText(content, phone),
     "text",
     options?.traffic ?? "required",
     warning
@@ -358,29 +357,20 @@ export async function sendText(
   return ok;
 }
 
-/** 内容是否包含值得渲染的 Markdown 格式。 */
-function looksLikeMarkdown(content: string): boolean {
-  return (
-    /```|\|[^\n]+\||\*\*[^*]+\*\*|__[^_]+__|(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)/.test(
-      content
-    ) || /\n\s*\n/.test(content)
-  );
-}
-
 /** 群聊回复只产生一条成功消息：
- *  - 富文本发送一条 Markdown，不再追加可能落到另一群的 text@；
- *  - 纯文本发送一条官方 text@；
- *  - Markdown HTTP 明确失败时才降级为 text@。 */
+ *  - 只有表格和围栏代码块发送 Markdown；
+ *  - 其他 Markdown 展示标记转为纯文本后发送官方 text@；
+ *  - Markdown HTTP 明确失败时也转换后降级为 text@。 */
 export async function sendReplyWithMention(
   content: string,
   groupId: string,
   phone: string,
   callbackUrl: string
 ): Promise<boolean> {
-  if (looksLikeMarkdown(content)) {
+  if (requiresStructuredMarkdown(content)) {
     const markdownOk = await postWithRetry(
       callbackUrl,
-      buildMarkdown(content, groupId),
+      buildMarkdown(content),
       "markdown"
     );
     if (markdownOk) {
@@ -389,7 +379,12 @@ export async function sendReplyWithMention(
     }
     log.warn(`markdown 发送失败，降级为 text@ - 群: ${groupId}, 用户: ${phone}`);
   }
-  const ok = await postWithRetry(callbackUrl, buildText(content, groupId, phone), "text");
+  const plainText = markdownToPlainText(content) || "（回复内容无法以纯文本显示）";
+  const ok = await postWithRetry(
+    callbackUrl,
+    buildText(plainText, phone),
+    "text"
+  );
   if (ok) log.info(`回复发送完成（text@），群: ${groupId}, 用户: ${phone}`);
   return ok;
 }
@@ -404,7 +399,7 @@ export async function sendImage(
 ): Promise<boolean> {
   const ok = await postWithRetry(
     callbackUrl,
-    buildImage(fileId, groupId, width, height),
+    buildImage(fileId, width, height),
     "image"
   );
   if (ok) log.info(`image 发送成功，群: ${groupId}, 用户: ${phone ?? "-"}`);
@@ -417,7 +412,7 @@ export async function sendFile(
   callbackUrl: string,
   phone?: string
 ): Promise<boolean> {
-  const ok = await postWithRetry(callbackUrl, buildFile(fileId, groupId), "file");
+  const ok = await postWithRetry(callbackUrl, buildFile(fileId), "file");
   if (ok) log.info(`file 发送成功，群: ${groupId}, 用户: ${phone ?? "-"}`);
   return ok;
 }

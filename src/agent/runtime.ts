@@ -24,7 +24,6 @@ import {
   type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
-  AGENT_HEARTBEAT_INTERVAL,
   GROUP_DATA_ROOT,
   SESSION_IDLE_TTL,
 } from "../core/config.ts";
@@ -118,7 +117,7 @@ let acceptingRequests = true;
 /** 追加到 Pi 默认 system prompt 的群聊、共享工作区与当前用户临时目录上下文。 */
 function buildChatContext(tempDir: string): string {
   return `## 运行环境
-你在「量子密信」群聊机器人里。用户用中文 @你 提问，请用中文、用 Markdown 简洁回复；表格、标题、加粗和列表可按需使用。回复会自动发到群里。
+你在「量子密信」群聊机器人里。用户用中文 @你 提问，请用中文简洁回复；只有确实需要表格或围栏代码块时才使用 Markdown，普通标题、强调、链接和列表用自然纯文本即可。回复会自动发到群里。
 当前工作目录是本群共享的 workspace，只放需要让群成员长期复用的成果。先检查已有文件，不要覆盖或删除无关内容。
 当前调用用户的专属临时目录是：${resolve(tempDir)}
 下载、缓存、解压、转换产物、草稿和其他中间文件必须放进上述临时目录；不要放进 workspace、系统临时目录、其他用户目录或上级目录。
@@ -385,54 +384,6 @@ function recordToolProgress(event: AgentSessionEvent, session: AgentSession): vo
   }
 }
 
-function formatElapsed(ms: number): string {
-  const seconds = Math.max(1, Math.floor(ms / 1000));
-  if (seconds < 60) return `${seconds} 秒`;
-  const minutes = Math.floor(seconds / 60);
-  const rest = seconds % 60;
-  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`;
-}
-
-/**
- * 长任务心跳：首次反馈由调用方立即发送；之后每 20 秒发送一次。
- * 使用递归 setTimeout，确保上一次发送结束后才安排下一次，不会因网络变慢而并发堆积。
- */
-function startHeartbeat(
-  startedAt: number,
-  groupId: string,
-  phone: string,
-  getCallbackUrl: () => string
-): () => Promise<void> {
-  let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let activeTick: Promise<void> | undefined;
-
-  const tick = () => {
-    if (stopped) return;
-    activeTick = sendText(
-      `⏳ 仍在处理，已用时 ${formatElapsed(Date.now() - startedAt)}…`,
-      groupId,
-      phone,
-      getCallbackUrl(),
-      { traffic: "status" }
-    )
-      .catch((e) => {
-        log.error(`任务心跳发送失败 - 用户: ${phone}, 错误: ${String(e)}`);
-      })
-      .then(() => {
-        activeTick = undefined;
-        if (!stopped) timer = setTimeout(tick, AGENT_HEARTBEAT_INTERVAL);
-      });
-  };
-
-  timer = setTimeout(tick, AGENT_HEARTBEAT_INTERVAL);
-  return async () => {
-    stopped = true;
-    if (timer) clearTimeout(timer);
-    await activeTick;
-  };
-}
-
 /** /指令 路由：立即处理，不进 prompt/steer。 */
 async function handleCommand(
   session: AgentSession,
@@ -484,7 +435,7 @@ async function handleCommand(
       const workspaceQueue = getGroupQueueStatus(groupId);
       const rateMode = {
         normal: "正常",
-        reduced: "心跳已降频",
+        reduced: "状态消息已降频",
         full: "关键消息排队中",
         cooldown: "平台限流冷却中",
       }[rate.mode];
@@ -542,20 +493,16 @@ async function runPrompt(
   const start = Date.now();
   const key = sessionKey(phone, groupId);
   const getCallbackUrl = () => sessionCallbackUrls.get(key) ?? callbackUrl;
-  let stopHeartbeat: (() => Promise<void>) | undefined;
   try {
     await sendText("🤔 正在思考...", groupId, phone, getCallbackUrl(), {
       traffic: "status",
     });
-    // /stop 或 /reset 可能发生在上面的状态消息尚未发送完时。
+    // /stop 或 /reset 可能发生在状态消息发送期间。
     if (abortingSessions.has(session)) {
       abortingSessions.delete(session);
       return;
     }
-    stopHeartbeat = startHeartbeat(start, groupId, phone, getCallbackUrl);
     await session.prompt(content);
-    await stopHeartbeat();
-    stopHeartbeat = undefined;
     // 被 /stop /reset 中断 → 不发回复（指令已自己回执）
     if (abortingSessions.has(session)) {
       abortingSessions.delete(session);
@@ -583,7 +530,6 @@ async function runPrompt(
     }
     throw e;
   } finally {
-    await stopHeartbeat?.();
     try {
       unsub?.();
     } catch {

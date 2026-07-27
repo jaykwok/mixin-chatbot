@@ -16,6 +16,7 @@ import {
   RATE_LIMIT_CLEANUP_INTERVAL,
 } from "../core/config.ts";
 import { WEBHOOK_SECRET_FILE } from "../core/storage.ts";
+import { observeCallbackRoute } from "../integrations/callback-route.ts";
 import { getClientIp, HttpError } from "./http.ts";
 import {
   cleanupRateLimits,
@@ -107,10 +108,21 @@ const webhookHandler = async (c: Context) => {
   const clientIp = getClientIp(c);
   const data = await readJsonBody(c);
   const { phone, groupId, content, callbackUrl } = validateWebhookData(data);
+  const callbackRoute = observeCallbackRoute(callbackUrl, groupId);
 
   log.info(
-    `收到请求 - IP: ${clientIp}, 用户: ${phone}, 群组: ${groupId}, 内容长度: ${content.length}`
+    `收到请求 - IP: ${clientIp}, 用户: ${phone}, 群组: ${groupId}, 回复key指纹: ${callbackRoute.fingerprint}, 内容长度: ${content.length}`
   );
+
+  if (!callbackRoute.safe) {
+    log.error(
+      `阻止跨群广播：回复 key ${callbackRoute.fingerprint} 同时对应多个群 (${callbackRoute.groups.join(", ")})；请为每个群重新创建独立的会话机器人`
+    );
+    throw new HttpError(
+      409,
+      "同一个机器人回复 key 被多个群共用；为防止消息串群，本次请求已停止"
+    );
+  }
 
   if (isRateLimited(phone)) {
     log.warn(`速率限制触发 - 用户: ${phone}`);
