@@ -24,12 +24,10 @@ describe("IM outbound group routing", () => {
       globalThis.fetch = originalFetch;
     }
 
-    expect(payloads).toHaveLength(4);
+    expect(payloads).toHaveLength(2);
     expect(payloads).toMatchObject([
-      { markdown: { groupId: "group-a" } },
-      { textMsg: { groupId: "group-a" } },
-      { markdown: { groupId: "group-b" } },
-      { textMsg: { groupId: "group-b" } },
+      { type: "markdown", groupId: "group-a", markdown: { groupId: "group-a" } },
+      { type: "markdown", groupId: "group-b", markdown: { groupId: "group-b" } },
     ]);
   });
 
@@ -58,36 +56,28 @@ describe("IM outbound group routing", () => {
       globalThis.fetch = originalFetch;
     }
 
-    expect(requests).toHaveLength(6);
+    expect(requests).toHaveLength(4);
     expect(requests.map(({ url }) => url)).toEqual([
       callbackA,
-      callbackA,
-      callbackB,
       callbackB,
       callbackB,
       callbackB,
     ]);
     expect(requests[0]?.payload).toMatchObject({
       type: "markdown",
+      groupId: "group-a",
       markdown: { groupId: "group-a" },
     });
     expect(requests[1]?.payload).toMatchObject({
-      type: "text",
-      textMsg: { groupId: "group-a" },
-    });
-    expect(requests[2]?.payload).toMatchObject({
       type: "markdown",
+      groupId: "group-b",
       markdown: { groupId: "group-b" },
     });
-    expect(requests[3]?.payload).toMatchObject({
-      type: "text",
-      textMsg: { groupId: "group-b" },
-    });
-    expect(requests[4]?.payload).toMatchObject({
+    expect(requests[2]?.payload).toMatchObject({
       type: "image",
       imageMsg: { fileId: "image-b", groupId: "group-b" },
     });
-    expect(requests[5]?.payload).toMatchObject({
+    expect(requests[3]?.payload).toMatchObject({
       type: "file",
       fileMsg: { fileId: "file-b", groupId: "group-b" },
     });

@@ -19,7 +19,7 @@
 - 官方工厂：`read` / `bash` / `edit` / `write`（cwd 为本群共享的 `<GROUP_DATA_ROOT>/<group>/workspace`；文件工具只允许访问该 workspace 与当前用户 tmp）
 - 自定义：`send_image` / `send_file`（往群里发送图片或文件）
 
-最终回复含 Markdown 格式时发送 **markdown 正文 + text@ 通知**两条消息（markdown 不支持 @，故另发 text 触发通知）；纯文本回复只发送一条带 @ 的 text，避免重复。
+最终回复含 Markdown 格式时只发送一条 Markdown 富文本；不再额外发送 `text@` 通知，避免 callback key 与 `groupId` 的路由语义不一致时把正文和通知拆到不同群。纯文本回复发送一条带 @ 的官方 `text`；Markdown HTTP 明确失败时也会降级为 `text`。
 
 **群共享工作区 + 用户临时区**：每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace`，只存长期成果；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip 缓存指向用户临时区；Pi 因输出截断产生的完整日志也会迁入这里。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
 

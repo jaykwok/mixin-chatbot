@@ -118,7 +118,7 @@ let acceptingRequests = true;
 /** 追加到 Pi 默认 system prompt 的群聊、共享工作区与当前用户临时目录上下文。 */
 function buildChatContext(tempDir: string): string {
   return `## 运行环境
-你在「量子密信」群聊机器人里。用户用中文 @你 提问，请用中文、用 Markdown 简洁回复。纯文字回复会自动发到群里。
+你在「量子密信」群聊机器人里。用户用中文 @你 提问，请用中文、用 Markdown 简洁回复；表格、标题、加粗和列表可按需使用。回复会自动发到群里。
 当前工作目录是本群共享的 workspace，只放需要让群成员长期复用的成果。先检查已有文件，不要覆盖或删除无关内容。
 当前调用用户的专属临时目录是：${resolve(tempDir)}
 下载、缓存、解压、转换产物、草稿和其他中间文件必须放进上述临时目录；不要放进 workspace、系统临时目录、其他用户目录或上级目录。

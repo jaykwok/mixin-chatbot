@@ -288,7 +288,7 @@ async function postWithRetry(
   return false;
 }
 
-/** 从 markdown 正文提取首行作卡片标题（去标记、截断）。A 套 markdown 的 title 必填。 */
+/** 从 markdown 正文提取首行作卡片标题（去标记、截断）。 */
 function buildMarkdownTitle(content: string, limit = 24): string {
   const firstLine = content.trim().split("\n", 1)[0]?.trim() ?? "";
   let clean = firstLine.replace(/^[#>\*\-\d\.\s]+/, "");
@@ -313,9 +313,12 @@ function buildText(content: string, groupId: string, phone: string) {
   };
 }
 
+/** Markdown 是实测可用但未写入官方文档的扩展。
+ *  groupId 同时放在公共顶层和类型对象内，兼容服务端可能采用的两种路由解析位置。 */
 function buildMarkdown(content: string, groupId: string) {
   return {
     type: "markdown" as const,
+    groupId,
     markdown: { title: buildMarkdownTitle(content), content, groupId },
   };
 }
@@ -355,18 +358,19 @@ export async function sendText(
   return ok;
 }
 
-/** 内容是否含 markdown 格式（代码块/粗体/标题/列表/引用/空行分段）——决定走 markdown 卡片还是纯 text。 */
-function looksLikeMarkdown(s: string): boolean {
+/** 内容是否包含值得渲染的 Markdown 格式。 */
+function looksLikeMarkdown(content: string): boolean {
   return (
-    /```|\*\*[^*]+\*\*|__[^_]+__|(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)/.test(s) ||
-    /\n\s*\n/.test(s)
+    /```|\|[^\n]+\||\*\*[^*]+\*\*|__[^_]+__|(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)/.test(
+      content
+    ) || /\n\s*\n/.test(content)
   );
 }
 
-/** 群聊回复：
- *  - 内容含格式 → markdown 卡片（渲染正文）+ 一条 text@（仅触发 @ 通知，不重复正文）。
- *    markdown 不支持 @（已实测），故 @ 通知单独走 text。
- *  - 纯文本 → 只发一条 text（带 @），避免「同内容发两次」。 */
+/** 群聊回复只产生一条成功消息：
+ *  - 富文本发送一条 Markdown，不再追加可能落到另一群的 text@；
+ *  - 纯文本发送一条官方 text@；
+ *  - Markdown HTTP 明确失败时才降级为 text@。 */
 export async function sendReplyWithMention(
   content: string,
   groupId: string,
@@ -379,32 +383,11 @@ export async function sendReplyWithMention(
       buildMarkdown(content, groupId),
       "markdown"
     );
-    if (!markdownOk) {
-      log.warn(`markdown 发送失败，降级为纯 text - 群: ${groupId}, 用户: ${phone}`);
-      const fallbackOk = await postWithRetry(
-        callbackUrl,
-        buildText(content, groupId, phone),
-        "text fallback"
-      );
-      if (fallbackOk) {
-        log.info(`回复发送完成（text fallback），群: ${groupId}, 用户: ${phone}`);
-      }
-      return fallbackOk;
+    if (markdownOk) {
+      log.info(`回复发送完成（markdown），群: ${groupId}, 用户: ${phone}`);
+      return true;
     }
-
-    const mentionOk = await postWithRetry(
-      callbackUrl,
-      buildText("（已回复，见上方卡片）", groupId, phone),
-      "text@"
-    );
-    if (!mentionOk) {
-      // 正文已经送达，@ 通知失败不应触发一条误导性的“处理请求失败”回复。
-      log.warn(`markdown 正文已发送，但 text@ 通知失败 - 群: ${groupId}, 用户: ${phone}`);
-    }
-    log.info(
-      `回复发送完成（markdown${mentionOk ? " + text@" : ""}），群: ${groupId}, 用户: ${phone}`
-    );
-    return true;
+    log.warn(`markdown 发送失败，降级为 text@ - 群: ${groupId}, 用户: ${phone}`);
   }
   const ok = await postWithRetry(callbackUrl, buildText(content, groupId, phone), "text");
   if (ok) log.info(`回复发送完成（text@），群: ${groupId}, 用户: ${phone}`);
