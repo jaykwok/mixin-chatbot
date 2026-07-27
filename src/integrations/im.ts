@@ -2,7 +2,7 @@
 import { log } from "../core/log.ts";
 import {
   markdownToPlainText,
-  requiresStructuredMarkdown,
+  shouldRenderMarkdown,
 } from "./markdown.ts";
 import {
   ATTACHMENT_HTTP_TIMEOUT,
@@ -358,23 +358,34 @@ export async function sendText(
 }
 
 /** 群聊回复只产生一条成功消息：
- *  - 只有表格和围栏代码块发送 Markdown；
- *  - 其他 Markdown 展示标记转为纯文本后发送官方 text@；
- *  - Markdown HTTP 明确失败时也转换后降级为 text@。 */
+ *  - 普通文本直接发送一条 text@，它本身就是完成通知；
+ *  - 带格式的回复先发 Markdown，再发一条简短 text@ 完成提醒；
+ *  - Markdown HTTP 明确失败时转换并降级为一条 text@，不重复提醒。 */
 export async function sendReplyWithMention(
   content: string,
   groupId: string,
   phone: string,
   callbackUrl: string
 ): Promise<boolean> {
-  if (requiresStructuredMarkdown(content)) {
+  if (shouldRenderMarkdown(content)) {
     const markdownOk = await postWithRetry(
       callbackUrl,
       buildMarkdown(content),
       "markdown"
     );
     if (markdownOk) {
-      log.info(`回复发送完成（markdown），群: ${groupId}, 用户: ${phone}`);
+      const notified = await sendText(
+        "✅ 任务已完成，请查看上方回复",
+        groupId,
+        phone,
+        callbackUrl
+      );
+      if (!notified) {
+        log.warn(`markdown 已送达，但完成提醒发送失败 - 群: ${groupId}, 用户: ${phone}`);
+      }
+      log.info(
+        `回复发送完成（markdown + text@${notified ? "" : "失败"}），群: ${groupId}, 用户: ${phone}`
+      );
       return true;
     }
     log.warn(`markdown 发送失败，降级为 text@ - 群: ${groupId}, 用户: ${phone}`);

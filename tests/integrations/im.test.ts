@@ -6,7 +6,7 @@ import {
 } from "../../src/integrations/im.ts";
 
 describe("IM outbound group routing", () => {
-  test("uses text for presentation formatting and markdown only for structure", async () => {
+  test("uses text for plain replies and markdown plus completion mention for formatting", async () => {
     const payloads: Record<string, unknown>[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (_input, init) => {
@@ -40,21 +40,37 @@ describe("IM outbound group routing", () => {
       globalThis.fetch = originalFetch;
     }
 
-    expect(payloads).toHaveLength(3);
+    expect(payloads).toHaveLength(5);
     expect(payloads[0]).toMatchObject({
       type: "text",
       textMsg: { content: "第一段普通文字。\n\n第二段普通文字。" },
     });
     expect(payloads[1]).toMatchObject({
-      type: "text",
-      textMsg: {
-        content: "标题\n这是 重点 和 链接",
+      type: "markdown",
+      markdown: {
+        content: "## 标题\n这是 **重点** 和 [链接](https://example.com)",
       },
     });
     expect(payloads[2]).toMatchObject({
+      type: "text",
+      textMsg: {
+        content: "✅ 任务已完成，请查看上方回复",
+        isMentioned: true,
+        mentionedMobileList: ["+8613800000000"],
+      },
+    });
+    expect(payloads[3]).toMatchObject({
       type: "markdown",
       markdown: {
         content: "| 项目 | 状态 |\n| --- | --- |\n| 路由 | 正常 |",
+      },
+    });
+    expect(payloads[4]).toMatchObject({
+      type: "text",
+      textMsg: {
+        content: "✅ 任务已完成，请查看上方回复",
+        isMentioned: true,
+        mentionedMobileList: ["+8613800000000"],
       },
     });
   });
@@ -76,8 +92,8 @@ describe("IM outbound group routing", () => {
       `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=b-${crypto.randomUUID()}`;
 
     try {
-      await sendReplyWithMention("**A 群回复**", "group-a", "+8613800000000", callbackA);
-      await sendReplyWithMention("**B 群回复**", "group-b", "+8613800000000", callbackB);
+      await sendReplyWithMention("A 群回复", "group-a", "+8613800000000", callbackA);
+      await sendReplyWithMention("B 群回复", "group-b", "+8613800000000", callbackB);
       await sendImage("image-b", "group-b", callbackB);
       await sendFile("file-b", "group-b", callbackB);
     } finally {
