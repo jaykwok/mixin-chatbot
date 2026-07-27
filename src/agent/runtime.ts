@@ -217,6 +217,7 @@ async function createSession(
       ...localTools,
       ...buildSendTools(
         () => sessionCallbackUrls.get(key) ?? callbackUrl,
+        groupId,
         cwd,
         tempDir
       ),
