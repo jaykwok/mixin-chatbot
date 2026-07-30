@@ -21,6 +21,7 @@ $ConfigDir = Join-Path $DataDir "config"
 $StateDir = Join-Path $DataDir "state"
 $PersistedPortFile = Join-Path $StateDir "bot-port"
 $DefaultTunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
+$TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
 
 function Get-ApplicationPaths([string]$Name) {
     $paths = @()
@@ -102,6 +103,9 @@ if ($existingService -and $env:CLOUDFLARED_REINSTALL -ne "1") {
         }
     }
     Write-Host "现有服务会继续使用已安装的 token；如需替换，请设置 CLOUDFLARED_REINSTALL=1。" -ForegroundColor Yellow
+    if (-not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
+        Write-Host "该服务没有本项目归属标记；切换回直连模式时部署脚本不会自动停止它。" -ForegroundColor Yellow
+    }
     Write-Host "也可以运行：powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 repair-tunnel" -ForegroundColor Yellow
     Write-Host "完成。检查命令：Get-Service Cloudflared；日志：事件查看器（eventvwr）。" -ForegroundColor Green
     exit 0
@@ -260,6 +264,8 @@ if ($isAdmin) {
         $installedService = Get-Service -Name "Cloudflared"
     }
     if ($installedService.Status -ne "Running") { throw "Cloudflared 服务已安装，但未能进入运行状态" }
+    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    Set-Content -LiteralPath $TunnelManagedFile -Value "Cloudflared" -NoNewline -Encoding ASCII
     Write-Host "完成。检查命令：Get-Service Cloudflared；日志：事件查看器（eventvwr）。" -ForegroundColor Green
 } else {
     Write-Host "（当前不是管理员：以前台方式运行；请以管理员身份重跑以安装服务。）" -ForegroundColor Yellow

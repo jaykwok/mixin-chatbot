@@ -39,6 +39,8 @@ export const MAX_WEBHOOK_BODY_BYTES = 64 * 1024;
 export const IM_RETRY_COUNT = 2; // 总尝试次数（首次 + 1 次重试）
 export const IM_RETRY_DELAY = 2000; // ms
 export const IM_HTTP_TIMEOUT = 15_000; // 单次 webhook 发送超时
+/** 官方 textMsg.content 单条上限。 */
+export const IM_TEXT_MAX_LENGTH = 5000;
 export const ATTACHMENT_HTTP_TIMEOUT = 60_000;
 export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 /** 机器人出站发送滑动窗口（按 callback key 全局统计，多用户共享）。 */
@@ -64,19 +66,32 @@ export const REQUIRED_WEBHOOK_FIELDS = [
 ];
 /** phone 合法字符集（用作群内用户目录名，同时防路径穿越）。 */
 export const PHONE_PATTERN = /^[A-Za-z0-9_+\-]{1,32}$/;
-/** groupId 可含 Unicode，但拒绝会污染日志或无法放入子进程环境的控制字符。 */
-export const GROUP_ID_PATTERN = /^[^\u0000-\u001f\u007f]+$/u;
+/** groupId 可含 Unicode，但拒绝控制字符和 Unicode 行分隔符。 */
+export const GROUP_ID_PATTERN = /^[^\u0000-\u001f\u007f-\u009f\u2028\u2029]+$/u;
 export const MAX_GROUP_ID_LENGTH = 256;
 export const MAX_CALLBACK_URL_LENGTH = 2048;
 /** 单条消息内容上限（防超大 payload）。 */
 export const MAX_CONTENT_LENGTH = 16 * 1024;
 export const DEDUP_TTL = 30_000; // 请求去重窗口（ms）
 export const MAX_DEDUP_SIZE = 1000; // 去重字典最大容量
+/** callback key 到群路由观察的闲置保留时间与容量；超限时对未知 key 失败关闭。 */
+export const CALLBACK_ROUTE_TTL = 24 * 60 * 60_000;
+export const MAX_CALLBACK_ROUTES = 1000;
 
 // ===== 速率限制 =====
 export const RATE_LIMIT_WINDOW = 60_000; // ms
+/** 本应用自设的入站防滥用阈值；与自定义 Webhook 机器人官方 20 RPM 出站额度无关。 */
 export const RATE_LIMIT_MAX_REQUESTS = 10;
+/** 入站限流键容量；容量耗尽时把新 (群, phone) 按限流处理并回调通知，避免内存无界增长。 */
+export const MAX_RATE_LIMIT_KEYS = 10_000;
 export const RATE_LIMIT_CLEANUP_INTERVAL = 300_000; // ms
+/** 已确认但尚未完成清理的 Pi 后台任务总数；超限时通过 callback 通知用户重发。 */
+export const MAX_ACTIVE_REQUESTS = integerEnv(
+  "BOT_MAX_ACTIVE_REQUESTS",
+  32,
+  1,
+  1000
+);
 
 // ===== Session 缓存 =====
 /** 空闲会话从内存释放；历史仍保留在 jsonl，下次自动重开。 */

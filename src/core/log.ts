@@ -26,6 +26,20 @@ function timestamp(): string {
   )}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+/** 日志严格保持单行，并转义终端控制字符，避免外部字段伪造日志记录。 */
+export function sanitizeLogMessage(message: string): string {
+  return message.replace(
+    /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu,
+    (character) => {
+      const code = character.charCodeAt(0);
+      if (code === 0x09) return "\\t";
+      if (code === 0x0a) return "\\n";
+      if (code === 0x0d) return "\\r";
+      return `\\u${code.toString(16).padStart(4, "0")}`;
+    }
+  );
+}
+
 /** 当前日志文件超限时滚动：删除最旧的 .backupCount，依次上移，当前重命名为 .1。 */
 function rotateIfNeeded(): void {
   try {
@@ -46,7 +60,7 @@ function rotateIfNeeded(): void {
 }
 
 function write(level: string, msg: string): void {
-  const line = `${timestamp()} - ${level} - ${msg}`;
+  const line = `${timestamp()} - ${level} - ${sanitizeLogMessage(msg)}`;
   console.log(line);
   try {
     rotateIfNeeded();

@@ -18,6 +18,7 @@ import {
   createEditToolDefinition,
   createReadToolDefinition,
   createWriteToolDefinition,
+  defineTool,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { log } from "../core/log.ts";
@@ -25,13 +26,16 @@ import { isPathInside } from "./paths.ts";
 
 type BashToolDefinition = ReturnType<typeof createBashToolDefinition>;
 
-// Pi 0.82 的公开 CreateAgentSessionOptions 把 customTools 写成 ToolDefinition[]，
-// 其可选 renderCall 参数导致具体工厂返回值在 strictFunctionTypes 下无法直接协变。
-function asSdkTool(tool: ToolDefinition<any, any, any>): ToolDefinition {
-  return {
+/** 使用 Pi 0.83 的官方类型收窄助手，使独立工具可安全放入 customTools。 */
+function asSdkTool<T extends ToolDefinition<any, any, any>>(tool: T) {
+  return defineTool({
     ...tool,
     constrainedSampling: { type: "json_schema", strict: "prefer" },
-  } as unknown as ToolDefinition;
+  });
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 class AllowedPathGuard {
@@ -134,22 +138,31 @@ function createBashTool(
   phone: string,
   groupId: string
 ): BashToolDefinition {
+  const callerEnvironment = {
+    TMPDIR: tempDir,
+    TMP: tempDir,
+    TEMP: tempDir,
+    XDG_CACHE_HOME: join(tempDir, ".cache"),
+    npm_config_cache: join(tempDir, ".npm"),
+    BUN_INSTALL_CACHE_DIR: join(tempDir, ".bun-install-cache"),
+    PIP_CACHE_DIR: join(tempDir, ".cache", "pip"),
+    PI_CALLER_PHONE: phone,
+    PI_GROUP_ID: groupId,
+    PI_USER_TMP: tempDir,
+  };
+  const shellExports = Object.entries(callerEnvironment)
+    .map(([name, value]) => `export ${name}=${shellQuote(value)}`)
+    .join("\n");
   const official = createBashToolDefinition(cwd, {
     exposeSessionEnvironment: true,
     spawnHook: (context) => ({
       ...context,
+      // Git Bash can replace inherited TMPDIR while starting; export inside the
+      // shell so Pi commands consistently use the caller's isolated temp area.
+      command: `${shellExports}\n${context.command}`,
       env: {
         ...context.env,
-        TMPDIR: tempDir,
-        TMP: tempDir,
-        TEMP: tempDir,
-        XDG_CACHE_HOME: join(tempDir, ".cache"),
-        npm_config_cache: join(tempDir, ".npm"),
-        BUN_INSTALL_CACHE_DIR: join(tempDir, ".bun-install-cache"),
-        PIP_CACHE_DIR: join(tempDir, ".cache", "pip"),
-        PI_CALLER_PHONE: phone,
-        PI_GROUP_ID: groupId,
-        PI_USER_TMP: tempDir,
+        ...callerEnvironment,
       },
     }),
   });

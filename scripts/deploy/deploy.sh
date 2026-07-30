@@ -12,6 +12,7 @@ DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
 STATE_DIR="${DATA_DIR}/state"
 RUNTIME_DIR="${DATA_DIR}/runtime"
+RUNTIME_HOME_DIR="${RUNTIME_DIR}/home"
 DEFAULT_GROUP_DATA_ROOT="${DATA_DIR}/groups"
 LOG_DIR="${PROJECT_DIR}/logs"
 MODELS_FILE="${CONFIG_DIR}/models.json"
@@ -21,9 +22,30 @@ BOT_PORT_FILE="${STATE_DIR}/bot-port"
 DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
 BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
 GROUP_DATA_ROOT_FILE="${STATE_DIR}/group-data-root"
+TUNNEL_PID_FILE="${STATE_DIR}/cloudflared.pid"
 
 # 量子密信平台出口 IP（webhook 来源；UFW/WAF 按此放行）。变更可在此改或用环境变量覆盖。
 PLATFORM_IP="${PLATFORM_IP:-223.244.14.237}"
+BOT_DEBUG_VALUE="${BOT_DEBUG:-0}"
+if [ "$BOT_DEBUG_VALUE" != "0" ] && [ "$BOT_DEBUG_VALUE" != "1" ]; then
+    echo "BOT_DEBUG 只能是 0 或 1" >&2
+    exit 1
+fi
+BOT_MAX_ACTIVE_REQUESTS_VALUE="${BOT_MAX_ACTIVE_REQUESTS:-32}"
+if ! [[ "$BOT_MAX_ACTIVE_REQUESTS_VALUE" =~ ^[0-9]+$ ]] ||
+   [ "$BOT_MAX_ACTIVE_REQUESTS_VALUE" -lt 1 ] ||
+   [ "$BOT_MAX_ACTIVE_REQUESTS_VALUE" -gt 1000 ]; then
+    echo "BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数" >&2
+    exit 1
+fi
+if [ "$(id -u)" -eq 0 ]; then
+    CONTAINER_UID=1001
+    CONTAINER_GID=1001
+else
+    # bind mount 由当前部署用户拥有；用同一非 root 身份运行可同时保证主机与容器可维护。
+    CONTAINER_UID="$(id -u)"
+    CONTAINER_GID="$(id -g)"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -134,6 +156,31 @@ remove_managed_ufw_rules() {
     done
 }
 
+managed_cloudflared_pid() {
+    local pid="" process_name=""
+    [ -f "$TUNNEL_PID_FILE" ] || return 1
+    pid="$(tr -d '[:space:]' < "$TUNNEL_PID_FILE")"
+    [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
+    process_name="$(ps -p "$pid" -o comm= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ "${process_name##*/}" = "cloudflared" ] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
+    printf '%s' "$pid"
+}
+
+stop_managed_cloudflared() {
+    local pid="" attempt
+    pid="$(managed_cloudflared_pid)" || return 1
+    # 归属记录可能来自由 root/systemd 启动的 connector；无权限停止时必须失败关闭，
+    # 不能把 kill -0 的 EPERM 误判为“进程已退出”并删除 PID 记录。
+    kill "$pid" || return 1
+    for attempt in $(seq 1 10); do
+        if ! managed_cloudflared_pid >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 # ---- 前置检查 ----
 
 print_status "检查运行环境..."
@@ -156,7 +203,7 @@ print_success "环境检查通过"
 
 # ---- 目录 + 监听端口 ----
 
-mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
+mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 if [ -n "${BOT_PORT:-}" ]; then
     PORT_DEFAULT_SOURCE="BOT_PORT"
     PORT_DEFAULT="$(trim_input "$BOT_PORT")"
@@ -290,7 +337,9 @@ GROUP_ROOT_ARGS=()
 if [ "$HOST_GROUP_DATA_ROOT" = "$DEFAULT_GROUP_DATA_ROOT" ]; then
     GROUP_ROOT_ENV_VAL="/app/data/groups"
 else
-    chown 1001:1001 "$HOST_GROUP_DATA_ROOT" 2>/dev/null || true
+    if [ "$(id -u)" -eq 0 ]; then
+        chown "$CONTAINER_UID:$CONTAINER_GID" "$HOST_GROUP_DATA_ROOT"
+    fi
     GROUP_ROOT_ARGS+=(-v "$HOST_GROUP_DATA_ROOT:/app/group-data")
     GROUP_ROOT_ENV_VAL="/app/group-data"
     print_warning "主机群数据目录挂到容器 /app/group-data"
@@ -301,9 +350,11 @@ echo ""
 # ---- 目录 ----
 
 print_status "设置目录权限..."
-# data/logs 需要容器内 appuser(1001) 可写（配置、状态、runtime、默认群数据和日志）
-chown -R 1001:1001 "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
-chmod 755 "$DATA_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
+# root 部署固定降权到 appuser(1001)；普通 Docker 用户则由容器沿用当前 UID/GID。
+if [ "$(id -u)" -eq 0 ]; then
+    chown -R "$CONTAINER_UID:$CONTAINER_GID" "$DATA_DIR" "$LOG_DIR" "$HOST_GROUP_DATA_ROOT"
+fi
+chmod 755 "$DATA_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 print_success "目录就绪"
 
 # ---- 构建镜像 ----
@@ -316,12 +367,38 @@ else
     exit 1
 fi
 
+verify_container_storage() {
+    docker run --rm \
+      --user "$CONTAINER_UID:$CONTAINER_GID" \
+      -e HOME=/app/data/runtime/home \
+      -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
+      "${GROUP_ROOT_ARGS[@]}" \
+      -v "$(pwd)/logs:/app/logs" \
+      -v "$(pwd)/data:/app/data" \
+      --entrypoint sh \
+      mixin-chatbot \
+      -c 'for directory in /app/data/config /app/data/state /app/data/runtime /app/data/runtime/home /app/logs "$GROUP_DATA_ROOT"; do
+              [ -d "$directory" ] && [ -w "$directory" ] || { echo "容器用户不可写: $directory" >&2; exit 1; }
+          done
+          for file in /app/data/config/models.json /app/data/config/webhook-secret; do
+              [ ! -e "$file" ] || { [ -r "$file" ] && [ -w "$file" ]; } || { echo "容器用户不可读写: $file" >&2; exit 1; }
+          done'
+}
+
+print_status "验证容器用户对持久化目录的权限..."
+if ! verify_container_storage; then
+    print_error "容器运行用户（UID ${CONTAINER_UID}）无法读写持久化目录"
+    echo "  请修复 data/、logs/ 与群数据根的属主/权限后重试；也可用 sudo 运行部署，让容器固定降权到 UID 1001。"
+    exit 1
+fi
+print_success "持久化目录权限正常"
+
 # ---- AI 配置（容器内 TUI 写 data/config/models.json）----
 # 首次必须配置；已存在则询问是否重配。
 
 if [ ! -f "$MODELS_FILE" ]; then
     print_status "首次配置 AI（provider/key/model）..."
-    if ! docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
+    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
         print_error "AI 配置命令执行失败"
         exit 1
     fi
@@ -332,13 +409,15 @@ if [ ! -f "$MODELS_FILE" ]; then
 else
     print_status "检测到已有 data/config/models.json"
     if ask_yes_no "是否重新配置 AI（provider/key/model）？[y/N]：" "n"; then
-        if ! docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
+        if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
             print_error "AI 配置命令执行失败"
             exit 1
         fi
     fi
 fi
-chown 1001:1001 "$MODELS_FILE" 2>/dev/null || true
+if [ "$(id -u)" -eq 0 ]; then
+    chown "$CONTAINER_UID:$CONTAINER_GID" "$MODELS_FILE"
+fi
 chmod 600 "$MODELS_FILE"
 
 # ---- Webhook 随机密钥路径（两模式共用，应用层鉴权）----
@@ -351,18 +430,24 @@ if [ ! -f "$WEBHOOK_SECRET_FILE" ]; then
         SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n') # 回退
     fi
     printf '%s' "$SECRET" > "$WEBHOOK_SECRET_FILE"
-    chown 1001:1001 "$WEBHOOK_SECRET_FILE" 2>/dev/null || true
+    if [ "$(id -u)" -eq 0 ]; then
+        chown "$CONTAINER_UID:$CONTAINER_GID" "$WEBHOOK_SECRET_FILE"
+    fi
     chmod 600 "$WEBHOOK_SECRET_FILE"
     print_success "已生成 webhook 密钥"
     SHOW_SECRET=1
 else
     SECRET="$(tr -d '[:space:]' < "$WEBHOOK_SECRET_FILE")"
-    if ! [[ "$SECRET" =~ ^[0-9a-fA-F]{32,64}$ ]]; then
-        print_error "data/config/webhook-secret 格式无效（应为 32–64 位十六进制）；请删除该文件后重新部署以生成新密钥"
+    if ! [[ "$SECRET" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        print_error "data/config/webhook-secret 格式无效（应为 64 位十六进制）；请删除该文件后重新部署以生成新密钥"
         exit 1
     fi
     SHOW_SECRET=0
     print_status "检测到已有 data/config/webhook-secret（沿用）"
+fi
+if ! verify_container_storage; then
+    print_error "models.json 或 webhook-secret 对容器用户（UID ${CONTAINER_UID}）不可读写；请修复目录/文件权限后重试"
+    exit 1
 fi
 
 # 域名接受 hostname 或仅含 hostname 的 http(s) 根 URL，并统一规范化为 hostname。
@@ -432,8 +517,12 @@ if [ "$DEPLOY_MODE" = "direct" ]; then
         echo "    http://${SERVER_IP}:${BOT_PORT}/webhook/<secret>（密钥未变；忘记可 cat data/config/webhook-secret）"
     fi
     echo ""
-    print_warning "直连走 HTTP：secret 在 URL 里明文经「平台→服务器」传输，但 UFW 只放行 ${PLATFORM_IP}，仅平台流量可达"
-    print_warning "确认 UFW：sudo ufw status（应为 allow from ${PLATFORM_IP} to any port ${BOT_PORT}）"
+    print_warning "直连走 HTTP：secret 在 URL 里明文经「平台→服务器」传输，网络层必须只允许配置的回调来源访问"
+    if [ "${ALLOW_UNMANAGED_FIREWALL:-0}" = "1" ]; then
+        print_warning "已显式跳过 UFW 安全基线；请确认云防火墙/其他系统防火墙已限制 TCP ${BOT_PORT}"
+    else
+        print_warning "确认 UFW：sudo ufw status（应仅允许配置的回调来源访问 TCP ${BOT_PORT}）"
+    fi
     print_warning "有域名想加密可自行套 nginx/caddy + 证书反代到 :${BOT_PORT}（URL 改 https://<域名>/webhook/<secret>）"
 else
     PUBLIC_DOMAIN_DISPLAY="${PUBLIC_DOMAIN:-<你的域名>}"
@@ -454,33 +543,120 @@ echo ""
 
 # ---- 停止旧容器 ----
 # 镜像、配置和密钥全部准备成功后才产生服务停机窗口。
-if command -v ufw >/dev/null 2>&1 && can_manage_ufw; then
-    if [ "$DEPLOY_MODE" = "direct" ]; then
+if [ "$DEPLOY_MODE" = "direct" ]; then
+    if command -v ufw >/dev/null 2>&1 && can_manage_ufw; then
         print_status "同步 UFW 规则到端口 ${BOT_PORT}..."
-        # 先写入新入口，再删除旧规则；写入失败时仍保留当前可用入口。
-        run_ufw allow from "$PLATFORM_IP" to any port "$BOT_PORT" proto tcp comment 'Mixin-Chatbot (平台IP)'
-        remove_managed_ufw_rules "$BOT_PORT" "$PLATFORM_IP"
-        if run_ufw status | grep -q "Status: active"; then
-            print_success "UFW 仅允许 ${PLATFORM_IP} 访问 TCP ${BOT_PORT}"
+        # 先写入新入口；旧规则到新部署提交时才删除，失败回滚仍保留原入口。
+        UFW_RULE_WRITTEN=0
+        if run_ufw allow from "$PLATFORM_IP" to any port "$BOT_PORT" proto tcp comment 'Mixin-Chatbot (平台IP)'; then
+            UFW_RULE_WRITTEN=1
         else
-            print_warning "UFW 规则已写入但尚未启用；请运行 scripts/deploy/setup-server.sh 或 sudo ufw enable"
+            if [ "${ALLOW_UNMANAGED_FIREWALL:-0}" != "1" ]; then
+                print_error "无法写入 UFW 规则；直连模式拒绝在 0.0.0.0 上启动"
+                echo "  修复 UFW/sudo，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。"
+                exit 1
+            fi
+            print_warning "ALLOW_UNMANAGED_FIREWALL=1：UFW 规则写入失败，依赖你已配置的外部防火墙"
         fi
+        if [ "$UFW_RULE_WRITTEN" = "1" ]; then
+            # 旧入口保留到新容器健康且模式切换完成，便于失败时恢复旧容器。
+            CLEANUP_UFW_AFTER_HEALTH=1
+        fi
+        if [ "$UFW_RULE_WRITTEN" = "1" ] && run_ufw status | grep -q "Status: active"; then
+            print_success "UFW 已确认允许配置的回调来源访问 TCP ${BOT_PORT}"
+        elif [ "${ALLOW_UNMANAGED_FIREWALL:-0}" = "1" ]; then
+            print_warning "ALLOW_UNMANAGED_FIREWALL=1：UFW 未启用，依赖你已配置的外部防火墙"
+        else
+            print_error "UFW 未启用；直连模式拒绝在 0.0.0.0 上启动"
+            echo "  运行 scripts/deploy/setup-server.sh / sudo ufw enable，或确认已有等效云防火墙后设置 ALLOW_UNMANAGED_FIREWALL=1。"
+            exit 1
+        fi
+    elif [ "${ALLOW_UNMANAGED_FIREWALL:-0}" = "1" ]; then
+        print_warning "ALLOW_UNMANAGED_FIREWALL=1：UFW 不可管理，依赖你已配置的外部防火墙"
     else
-        print_status "清理本项目旧 UFW 规则..."
-        remove_managed_ufw_rules
-        print_success "Cloudflare 模式已移除本项目的直连 UFW 规则"
+        print_error "UFW 不可用或当前用户没有 root/sudo 权限；直连模式拒绝在 0.0.0.0 上启动"
+        echo "  修复 UFW/sudo，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。"
+        exit 1
     fi
-elif [ "$DEPLOY_MODE" = "direct" ]; then
-    print_warning "UFW 不可用或当前用户没有 root/sudo 权限；请在云防火墙/系统防火墙中仅允许 ${PLATFORM_IP} 访问 TCP ${BOT_PORT}"
 else
-    print_warning "UFW 不可用或当前用户没有 root/sudo 权限；无法自动清理以前的直连规则"
+    if command -v ufw >/dev/null 2>&1 && can_manage_ufw; then
+        CLEANUP_UFW_AFTER_HEALTH=1
+        print_status "Cloudflare 模式将在新部署成功后清理本项目旧直连规则"
+    else
+        print_warning "UFW 不可用或当前用户没有 root/sudo 权限；无法自动清理以前的直连规则"
+    fi
 fi
+
+# 在产生机器人停机窗口前确认未托管 connector 的归属；用户拒绝时旧服务保持不变。
+UNMANAGED_TUNNEL_CONFIRMED=0
+if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1; then
+    unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
+    if [ "$DEPLOY_MODE" = "cloudflare" ]; then
+        print_warning "检测到未由本项目记录的 cloudflared（pid ${unmanaged_pid}），无法自动确认它连接的是当前隧道"
+        unmanaged_prompt="确认该 connector 正在服务本项目，继续沿用？[y/N]："
+    else
+        print_warning "系统有未由本项目记录的 cloudflared（pid ${unmanaged_pid}）；不会自动停止，以免影响其他隧道"
+        unmanaged_prompt="确认该 connector 与本项目无关或其入口仍受保护，继续直连部署？[y/N]："
+    fi
+    if ! ask_yes_no "$unmanaged_prompt" "n"; then
+        print_error "未确认未托管 cloudflared 的安全边界；尚未停止现有机器人"
+        exit 1
+    fi
+    UNMANAGED_TUNNEL_CONFIRMED=1
+fi
+
+ROLLBACK_CONTAINER="mixin-chatbot-rollback"
+PREVIOUS_CONTAINER_SAVED=0
+NEW_CONTAINER_ATTEMPTED=0
+TUNNEL_STARTED_BY_DEPLOY=0
+DEPLOYMENT_COMMITTED=0
+
+rollback_deployment() {
+    local exit_status=$?
+    trap - EXIT
+    if [ "$DEPLOYMENT_COMMITTED" = "1" ]; then
+        exit "$exit_status"
+    fi
+    set +e
+    if [ "$TUNNEL_STARTED_BY_DEPLOY" = "1" ]; then
+        stop_managed_cloudflared >/dev/null 2>&1
+    fi
+    if [ "$NEW_CONTAINER_ATTEMPTED" = "1" ] &&
+       docker ps -a --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
+        docker rm -f mixin-chatbot >/dev/null 2>&1
+    fi
+    if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ] &&
+       docker ps -a --format '{{.Names}}' | grep -q "^${ROLLBACK_CONTAINER}$"; then
+        if docker rename "$ROLLBACK_CONTAINER" mixin-chatbot >/dev/null 2>&1 &&
+           docker start mixin-chatbot >/dev/null 2>&1; then
+            print_warning "新部署未完成，已恢复并启动旧容器"
+        else
+            print_error "新部署未完成，旧容器自动恢复失败；请检查 docker ps -a"
+        fi
+    fi
+    exit "$exit_status"
+}
+
+if docker ps -a --format '{{.Names}}' | grep -q "^${ROLLBACK_CONTAINER}$"; then
+    print_error "发现上次遗留的 ${ROLLBACK_CONTAINER}；请先确认容器状态，避免覆盖可恢复版本"
+    exit 1
+fi
+trap rollback_deployment EXIT
 
 print_status "停止现有容器..."
 if docker ps -a --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
-    docker stop mixin-chatbot 2>/dev/null || true
-    docker rm mixin-chatbot 2>/dev/null || true
-    print_success "旧容器已清理"
+    if ! docker stop mixin-chatbot >/dev/null 2>&1; then
+        print_error "旧容器停止失败；未继续覆盖部署"
+        docker start mixin-chatbot >/dev/null 2>&1 || true
+        exit 1
+    fi
+    if ! docker rename mixin-chatbot "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+        print_error "旧容器保存为回滚版本失败；未继续覆盖部署"
+        docker start mixin-chatbot >/dev/null 2>&1 || true
+        exit 1
+    fi
+    PREVIOUS_CONTAINER_SAVED=1
+    print_success "旧容器已保存为临时回滚版本"
 else
     print_success "没有发现旧容器"
 fi
@@ -488,11 +664,17 @@ fi
 # ---- 启动容器 ----
 
 print_status "启动容器..."
+NEW_CONTAINER_ATTEMPTED=1
 if docker run -d \
+  --init \
+  --user "$CONTAINER_UID:$CONTAINER_GID" \
   --network host \
+  -e HOME=/app/data/runtime/home \
   -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
   -e BOT_PORT="$BOT_PORT" \
   -e BOT_HOST="$BOT_HOST" \
+  -e BOT_DEBUG="$BOT_DEBUG_VALUE" \
+  -e BOT_MAX_ACTIVE_REQUESTS="$BOT_MAX_ACTIVE_REQUESTS_VALUE" \
   "${GROUP_ROOT_ARGS[@]}" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/data:/app/data" \
@@ -502,6 +684,7 @@ if docker run -d \
   --memory="512m" \
   --memory-swap="768m" \
   --cpus="1.0" \
+  --pids-limit=256 \
   --read-only \
   --tmpfs /tmp:size=64m \
   --security-opt no-new-privileges:true \
@@ -539,21 +722,21 @@ for i in $(seq 1 18); do
     sleep 5
 done
 
-# 只有新容器健康后才提交部署状态，避免构建/启动失败时让运维脚本读取到未生效配置。
-printf '%s' "$BOT_PORT" > "$BOT_PORT_FILE"
-printf '%s' "$DEPLOY_MODE" > "$DEPLOY_MODE_FILE"
-printf '%s' "$HOST_GROUP_DATA_ROOT" > "$GROUP_DATA_ROOT_FILE"
-if [ "$PERSIST_BOT_DOMAIN" = "1" ]; then
-    printf '%s' "$PUBLIC_DOMAIN" > "$BOT_DOMAIN_FILE"
-elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = "1" ]; then
-    rm -f -- "$BOT_DOMAIN_FILE"
-fi
-
 # ---- Cloudflare 模式：确保 cloudflared 在线 ----
 if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     print_status "Cloudflare 模式：确保 cloudflared 隧道在线..."
-    if pgrep -x cloudflared >/dev/null 2>&1; then
-        print_success "cloudflared 已在运行（pid $(pgrep -x cloudflared | head -n1)）"
+    if managed_pid="$(managed_cloudflared_pid)"; then
+        print_success "本项目 cloudflared 已在运行（pid ${managed_pid}）"
+    elif pgrep -x cloudflared >/dev/null 2>&1; then
+        unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
+        if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ]; then
+            print_warning "检测到部署期间出现的未托管 cloudflared（pid ${unmanaged_pid}），无法自动确认归属"
+        fi
+        if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ] &&
+           ! ask_yes_no "确认该 connector 正在服务本项目，继续沿用？[y/N]：" "n"; then
+            print_error "未确认未托管的 cloudflared 归属；Cloudflare 模式部署已停止"
+            exit 1
+        fi
     elif [ -f scripts/tunnel/start-tunnel.sh ]; then
         mkdir -p "$LOG_DIR"
         tunnel_token_args=()
@@ -568,7 +751,7 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
         elif [ ! -f "$DEFAULT_TUNNEL_TOKEN_FILE" ]; then
             need_tunnel_token_prompt=1
         fi
-        while ! pgrep -x cloudflared >/dev/null 2>&1; do
+        while ! managed_cloudflared_pid >/dev/null 2>&1; do
             if [ "$need_tunnel_token_prompt" = "1" ]; then
                 read_input "隧道 token 文件 [直接回车按 TUNNEL_TOKEN_FILE / TUNNEL_TOKEN / data/config/tunnel-token 的顺序查找]：" tunnel_token_file_in
                 tunnel_token_file_in="$(trim_input "$tunnel_token_file_in")"
@@ -591,9 +774,15 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
 
             print_warning "cloudflared 未运行，后台启动 scripts/tunnel/start-tunnel.sh..."
             BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh "${tunnel_token_args[@]}" >>"$LOG_DIR/cloudflared.log" 2>&1 &
-            sleep 3
-            if pgrep -x cloudflared >/dev/null 2>&1; then
-                print_success "cloudflared 已后台启动（日志 logs/cloudflared.log）"
+            tunnel_launcher_pid=$!
+            for attempt in $(seq 1 30); do
+                managed_cloudflared_pid >/dev/null 2>&1 && break
+                kill -0 "$tunnel_launcher_pid" 2>/dev/null || break
+                sleep 1
+            done
+            if managed_pid="$(managed_cloudflared_pid)"; then
+                TUNNEL_STARTED_BY_DEPLOY=1
+                print_success "cloudflared 已后台启动（pid ${managed_pid}，日志 logs/cloudflared.log）"
                 print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
                 break
             fi
@@ -605,6 +794,58 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     else
         print_error "未找到 scripts/tunnel/start-tunnel.sh，无法启动 Cloudflare 隧道"
         exit 1
+    fi
+else
+    if managed_pid="$(managed_cloudflared_pid)"; then
+        print_status "直连模式：停止本项目记录的 cloudflared（pid ${managed_pid}）..."
+        if stop_managed_cloudflared; then
+            print_success "本项目 cloudflared 已停止，旧隧道入口不再由本机 connector 提供"
+        else
+            print_error "无法停止本项目 cloudflared（pid ${managed_pid}）；为避免保留旧隧道入口，部署未完成"
+            exit 1
+        fi
+    elif pgrep -x cloudflared >/dev/null 2>&1; then
+        unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
+        if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ]; then
+            print_warning "部署期间出现未由本项目记录的 cloudflared（pid ${unmanaged_pid}）；不会自动停止"
+        fi
+        if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ] &&
+           ! ask_yes_no "确认该 connector 与本项目无关或其入口仍受保护，继续直连部署？[y/N]：" "n"; then
+            print_error "未确认遗留隧道的安全边界；直连模式部署已停止"
+            exit 1
+        fi
+    fi
+fi
+
+if [ "${CLEANUP_UFW_AFTER_HEALTH:-0}" = "1" ]; then
+    if [ "$DEPLOY_MODE" = "direct" ]; then
+        print_status "新入口已就绪，清理本项目旧 UFW 规则..."
+        remove_managed_ufw_rules "$BOT_PORT" "$PLATFORM_IP"
+        print_success "UFW 仅保留当前机器人入口"
+    else
+        print_status "新隧道部署已就绪，清理本项目旧 UFW 规则..."
+        remove_managed_ufw_rules
+        print_success "Cloudflare 模式已移除本项目的直连 UFW 规则"
+    fi
+fi
+
+# 只有机器人健康且部署模式切换完成后才提交状态，避免运维脚本读取到半完成配置。
+printf '%s' "$BOT_PORT" > "$BOT_PORT_FILE"
+printf '%s' "$DEPLOY_MODE" > "$DEPLOY_MODE_FILE"
+printf '%s' "$HOST_GROUP_DATA_ROOT" > "$GROUP_DATA_ROOT_FILE"
+if [ "$PERSIST_BOT_DOMAIN" = "1" ]; then
+    printf '%s' "$PUBLIC_DOMAIN" > "$BOT_DOMAIN_FILE"
+elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = "1" ]; then
+    rm -f -- "$BOT_DOMAIN_FILE"
+fi
+
+DEPLOYMENT_COMMITTED=1
+trap - EXIT
+if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ]; then
+    if docker rm "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+        print_success "部署已提交，旧容器回滚版本已清理"
+    else
+        print_warning "部署已成功，但旧回滚容器 ${ROLLBACK_CONTAINER} 清理失败；可确认后手动 docker rm"
     fi
 fi
 
@@ -619,7 +860,7 @@ if docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo "=========================================="
     echo ""
     if [ "$DEPLOY_MODE" = "direct" ]; then
-        echo "  模式:      直连（UFW 限 ${PLATFORM_IP}）"
+        echo "  模式:      直连（来源 IP 闸门）"
         echo "  回调地址:   http://${SERVER_IP}:${BOT_PORT}/webhook/<secret>"
     else
         echo "  模式:      Cloudflare（隧道 + WAF）"
@@ -636,7 +877,7 @@ if docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo "  常用命令:"
     echo "    docker logs -f mixin-chatbot                         # 实时日志"
     echo "    docker restart mixin-chatbot                         # 重启"
-    echo "    docker run --rm -it -v \"\$(pwd)/data:/app/data\" mixin-chatbot bun run configure && docker restart mixin-chatbot   # 重配 AI"
+    echo "    docker run --rm -it --user \"\$(stat -c '%u:%g' data)\" -e HOME=/app/data/runtime/home -v \"\$(pwd)/data:/app/data\" mixin-chatbot bun run configure && docker restart mixin-chatbot   # 重配 AI"
     echo ""
 
     print_status "最近日志:"

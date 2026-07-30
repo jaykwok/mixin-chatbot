@@ -22,5 +22,8 @@
     "@types/bun": "latest",
     "knip": "latest",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.8"
   }
 }

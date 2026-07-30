@@ -17,6 +17,22 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
 BOT_PORT_FILE="${PROJECT_DIR}/data/state/bot-port"
 DEFAULT_TUNNEL_TOKEN_FILE="${PROJECT_DIR}/data/config/tunnel-token"
+TUNNEL_PID_FILE="${PROJECT_DIR}/data/state/cloudflared.pid"
+
+managed_tunnel_pid() {
+    local pid="" process_name=""
+    [ -f "$TUNNEL_PID_FILE" ] || return 1
+    pid="$(tr -d '[:space:]' < "$TUNNEL_PID_FILE")"
+    [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
+    process_name="$(ps -p "$pid" -o comm= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ "${process_name##*/}" = "cloudflared" ] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
+    printf '%s' "$pid"
+}
+
+if existing_pid="$(managed_tunnel_pid)"; then
+    echo "✓ 本项目 cloudflared 已在运行（pid ${existing_pid}）"
+    exit 0
+fi
 
 if [ -n "${BOT_PORT:-}" ]; then
     BOT_PORT="$BOT_PORT"
@@ -125,4 +141,6 @@ fi
 # ---- 4. 起隧道（前台）----
 echo "▶ 启动 cloudflared connector（控制台 Published application 应配置为 http://localhost:${BOT_PORT}）"
 echo "  （前台运行，Ctrl+C 停止。常驻开机自启可用 systemd/tmux 包一层）"
+mkdir -p "$(dirname "$TUNNEL_PID_FILE")"
+(umask 077 && printf '%s' "$$" > "$TUNNEL_PID_FILE")
 exec cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN"

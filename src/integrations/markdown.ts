@@ -1,7 +1,8 @@
 /**
  * Markdown 纯文本转换核心改编自 wong2/weixin-agent-sdk：
  * https://github.com/wong2/weixin-agent-sdk/blob/main/packages/sdk/src/messaging/send.ts
- * MIT License, Copyright (c) 2026 wong2。完整许可见 THIRD_PARTY_NOTICES.md。
+ * 原实现采用 MIT License，Copyright (c) 2026 wong2；完整许可见
+ * THIRD_PARTY_NOTICES.md。
  *
  * 本项目额外处理了波浪线代码围栏、标题和引用，并负责判断回复是否
  * 确实包含可渲染的 Markdown 标记。

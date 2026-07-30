@@ -72,6 +72,7 @@ describe("local Pi tool boundaries", () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-bash-"));
     const workspace = join(root, "workspace");
     const userTemp = join(root, "user-tmp");
+    const groupId = "group-a'; printf injected; #";
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
     try {
@@ -79,7 +80,7 @@ describe("local Pi tool boundaries", () => {
         workspace,
         userTemp,
         "+8613800000000",
-        "group-a"
+        groupId
       );
       const bash = tools.find((tool) => tool.name === "bash")!;
       const context = {
@@ -103,7 +104,7 @@ describe("local Pi tool boundaries", () => {
       );
       expect(envResult.content[0]).toMatchObject({
         type: "text",
-        text: `+8613800000000|group-a|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}`,
+        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}`,
       });
 
       const outputResult = await bash.execute(

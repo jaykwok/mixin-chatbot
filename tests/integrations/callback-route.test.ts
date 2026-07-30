@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { observeCallbackRoute } from "../../src/integrations/callback-route.ts";
+import { CALLBACK_ROUTE_TTL } from "../../src/core/config.ts";
+import {
+  cleanupCallbackRoutes,
+  observeCallbackRoute,
+} from "../../src/integrations/callback-route.ts";
 
 describe("callback key group routing", () => {
   test("fails closed when one callback key appears in multiple groups", () => {
@@ -13,6 +17,7 @@ describe("callback key group routing", () => {
 
     const conflict = observeCallbackRoute(callbackUrl, "group-b");
     expect(conflict.safe).toBe(false);
+    expect(conflict.reason).toBe("conflict");
     expect(conflict.groups).toEqual(["group-a", "group-b"]);
     expect(observeCallbackRoute(callbackUrl, "group-a").safe).toBe(false);
   });
@@ -26,5 +31,19 @@ describe("callback key group routing", () => {
 
     expect(observeCallbackRoute(callbackA, "group-a").safe).toBe(true);
     expect(observeCallbackRoute(callbackB, "group-b").safe).toBe(true);
+  });
+
+  test("reclaims route observations after their idle TTL", () => {
+    const callbackUrl =
+      `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=stale-${crypto.randomUUID()}`;
+    expect(observeCallbackRoute(callbackUrl, "group-a").safe).toBe(true);
+
+    cleanupCallbackRoutes(Date.now() + CALLBACK_ROUTE_TTL + 1);
+
+    expect(observeCallbackRoute(callbackUrl, "group-b")).toMatchObject({
+      safe: true,
+      reason: "ok",
+      groups: ["group-b"],
+    });
   });
 });
