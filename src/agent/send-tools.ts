@@ -15,15 +15,26 @@ import { isPathInside } from "./paths.ts";
 async function loadBytes(
   source: string,
   workspaceDir: string,
-  tempDir: string
+  tempDir: string,
+  signal?: AbortSignal
 ): Promise<Uint8Array> {
+  signal?.throwIfAborted();
   if (/^https?:\/\//i.test(source)) {
     const r = await fetch(source, {
-      signal: AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT),
+      signal: signal
+        ? AbortSignal.any([
+            signal,
+            AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT),
+          ])
+        : AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT),
     });
-    if (!r.ok) throw new Error(`下载失败 HTTP ${r.status}: ${source}`);
+    if (!r.ok) {
+      await r.body?.cancel().catch(() => {});
+      throw new Error(`下载失败 HTTP ${r.status}: ${source}`);
+    }
     const declared = Number(r.headers.get("content-length"));
     if (Number.isFinite(declared) && declared > MAX_ATTACHMENT_BYTES) {
+      await r.body?.cancel().catch(() => {});
       throw new Error(`远程文件超过 ${MAX_ATTACHMENT_BYTES} 字节上限`);
     }
     if (!r.body) throw new Error(`下载响应没有内容: ${source}`);
@@ -32,6 +43,7 @@ async function loadBytes(
     const chunks: Uint8Array[] = [];
     let total = 0;
     while (true) {
+      signal?.throwIfAborted();
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
@@ -64,7 +76,12 @@ async function loadBytes(
   if (info.size > MAX_ATTACHMENT_BYTES) {
     throw new Error(`本地文件超过 ${MAX_ATTACHMENT_BYTES} 字节上限`);
   }
-  return new Uint8Array(await readFile(path));
+  const data = new Uint8Array(await readFile(path));
+  if (data.byteLength > MAX_ATTACHMENT_BYTES) {
+    throw new Error(`本地文件超过 ${MAX_ATTACHMENT_BYTES} 字节上限`);
+  }
+  signal?.throwIfAborted();
+  return data;
 }
 
 function filenameFromSource(source: string): string {
@@ -117,20 +134,21 @@ export function buildSendTools(
     promptSnippet: "向群聊发送图片",
     constrainedSampling: { type: "json_schema", strict: "prefer" },
     parameters: imageParams,
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       if (
         (params.width !== undefined && (!Number.isInteger(params.width) || params.width <= 0)) ||
         (params.height !== undefined && (!Number.isInteger(params.height) || params.height <= 0))
       ) {
         throw new Error("图片 width/height 必须是正整数");
       }
-      const data = await loadBytes(params.source, workspaceDir, tempDir);
+      const data = await loadBytes(params.source, workspaceDir, tempDir, signal);
       const callbackUrl = getCallbackUrl();
       const fileId = await uploadAttachment(
         callbackUrl,
         data,
         filenameFromSource(params.source),
-        "image"
+        "image",
+        signal
       );
       if (!fileId) throw new Error(`图片上传失败: ${params.source}`);
       const ok = await sendImage(
@@ -139,7 +157,8 @@ export function buildSendTools(
         callbackUrl,
         undefined,
         params.width,
-        params.height
+        params.height,
+        signal
       );
       if (!ok) throw new Error(`图片发送失败: ${params.source}`);
       return {
@@ -159,13 +178,13 @@ export function buildSendTools(
     promptSnippet: "向群聊发送文件",
     constrainedSampling: { type: "json_schema", strict: "prefer" },
     parameters: fileParams,
-    async execute(_toolCallId, params) {
-      const data = await loadBytes(params.source, workspaceDir, tempDir);
+    async execute(_toolCallId, params, signal) {
+      const data = await loadBytes(params.source, workspaceDir, tempDir, signal);
       const name = sanitizeFilename(params.filename ?? filenameFromSource(params.source));
       const callbackUrl = getCallbackUrl();
-      const fileId = await uploadAttachment(callbackUrl, data, name, "file");
+      const fileId = await uploadAttachment(callbackUrl, data, name, "file", signal);
       if (!fileId) throw new Error(`文件上传失败: ${params.source}`);
-      const ok = await sendFile(fileId, groupId, callbackUrl);
+      const ok = await sendFile(fileId, groupId, callbackUrl, undefined, signal);
       if (!ok) throw new Error(`文件发送失败: ${params.source}`);
       return { content: [{ type: "text", text: `已发送文件: ${name}` }], details: { fileId, name } };
     },

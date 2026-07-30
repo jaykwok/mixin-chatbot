@@ -8,6 +8,7 @@ set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTAINER="mixin-chatbot"
+ROLLBACK_CONTAINER="${CONTAINER}-rollback"
 DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
 STATE_DIR="${DATA_DIR}/state"
@@ -18,6 +19,7 @@ BOT_PORT_FILE="${STATE_DIR}/bot-port"
 DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
 BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
 GROUP_DATA_ROOT_FILE="${STATE_DIR}/group-data-root"
+TUNNEL_PID_FILE="${STATE_DIR}/cloudflared.pid"
 if [ -n "${BOT_PORT:-}" ]; then
     PORT="$BOT_PORT"
 elif [ -f "$BOT_PORT_FILE" ]; then
@@ -144,8 +146,34 @@ wait_for_local() {
     return 1
 }
 
+managed_cloudflared_pid() {
+    local pid="" process_name=""
+    [ -f "$TUNNEL_PID_FILE" ] || return 1
+    pid="$(tr -d '[:space:]' < "$TUNNEL_PID_FILE")"
+    [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
+    process_name="$(ps -p "$pid" -o comm= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ "${process_name##*/}" = "cloudflared" ] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
+    printf '%s' "$pid"
+}
+
+stop_managed_cloudflared() {
+    local pid="" attempt
+    pid="$(managed_cloudflared_pid)" || return 1
+    kill "$pid" || return 1
+    for attempt in $(seq 1 10); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    kill -0 "$pid" 2>/dev/null && return 1
+    rm -f -- "$TUNNEL_PID_FILE"
+}
+
 has_container() {
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"
+}
+
+has_rollback_container() {
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${ROLLBACK_CONTAINER}$"
 }
 
 doctor() {
@@ -171,14 +199,20 @@ doctor() {
     [ "$cstate" = "running" ] && cstate_label="运行中"
     [ "$cstate" = "exited" ] && cstate_label="已退出"
     check "容器" "$([ "$cstate" = "running" ] && echo 1 || echo 0)" "$cstate_label"
+    check "部署回滚容器" "$(! has_rollback_container && echo 1 || echo 0)" \
+        "$(! has_rollback_container && echo 无 || echo "发现 ${ROLLBACK_CONTAINER}，请确认后恢复或删除")"
 
     local lc; lc="$(code_of "http://localhost:${PORT}/favicon.svg")"
     check "本地机器人健康" "$([ "$lc" = "200" ] && echo 1 || echo 0)" "HTTP $lc"
 
     if [ "$DEPLOY_MODE" = "cloudflare" ]; then
         local crunning="0" cdetail="未运行"
-        if pgrep -x cloudflared >/dev/null 2>&1; then
-            crunning="1"; cdetail="pid $(pgrep -x cloudflared | head -n1)"
+        local managed_pid=""
+        if managed_pid="$(managed_cloudflared_pid)"; then
+            crunning="1"; cdetail="本项目 pid $managed_pid"
+        elif pgrep -x cloudflared >/dev/null 2>&1; then
+            crunning="1"; cdetail="未记录归属的 pid $(pgrep -x cloudflared | head -n1)"
+            WA "检测到 cloudflared，但它没有本项目 PID 记录；请确认该进程连接的是当前隧道"
         fi
         check "cloudflared 运行状态" "$crunning" "$cdetail"
 
@@ -202,7 +236,7 @@ doctor() {
 
     local secret_ok="0"
     [ -f "$WEBHOOK_SECRET_FILE" ] &&
-        grep -Eq '^[0-9a-fA-F]{32,64}$' "$WEBHOOK_SECRET_FILE" &&
+        grep -Eq '^[0-9a-fA-F]{64}$' "$WEBHOOK_SECRET_FILE" &&
         secret_ok="1"
     check "data/config/webhook-secret" "$secret_ok" "$([ "$secret_ok" = "1" ] && echo 有效 || echo '缺少或无效（生产服务拒绝启动）')"
 
@@ -255,22 +289,56 @@ uninstall() {
     P "卸载 mixin-chatbot"
     local resolved_group_root=""
     resolved_group_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null || true)"
-    docker stop "$CONTAINER" >/dev/null 2>&1 || true
-    if docker rm "$CONTAINER" >/dev/null 2>&1; then OK "容器已删除"; else WA "没有可删除的容器"; fi
+    if has_container; then
+        if ! docker stop "$CONTAINER" >/dev/null 2>&1; then
+            ER "容器停止失败；为避免删除仍在使用的数据，卸载已停止"
+            return 1
+        fi
+        if ! docker rm "$CONTAINER" >/dev/null 2>&1; then
+            ER "容器删除失败；卸载已停止"
+            return 1
+        fi
+        OK "容器已删除"
+    else
+        WA "没有可删除的容器"
+    fi
+    if has_rollback_container; then
+        if ! docker stop "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+            ER "回滚容器停止失败；卸载已停止"
+            return 1
+        fi
+        if ! docker rm "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+            ER "回滚容器删除失败；卸载已停止"
+            return 1
+        fi
+        OK "部署遗留回滚容器已删除"
+    fi
 
     if ask_yes_no "是否删除 Docker 镜像 mixin-chatbot？[y/N] "; then
         if docker rmi mixin-chatbot >/dev/null 2>&1; then OK "镜像已删除"; else WA "镜像删除失败"; fi
     fi
 
-    if pgrep -x cloudflared >/dev/null 2>&1; then
-        if ask_yes_no "是否停止 cloudflared（结束进程）？[y/N] "; then
-            if pkill -x cloudflared; then OK "cloudflared 已停止"; else WA "结束进程失败"; fi
+    local managed_pid=""
+    if managed_pid="$(managed_cloudflared_pid)"; then
+        if ask_yes_no "是否停止本项目 cloudflared（pid ${managed_pid}）？[y/N] "; then
+            if stop_managed_cloudflared; then OK "本项目 cloudflared 已停止"; else WA "结束 pid ${managed_pid} 失败"; fi
         fi
+    elif pgrep -x cloudflared >/dev/null 2>&1; then
+        WA "检测到未记录归属的 cloudflared；不会用 pkill 批量停止，请先确认进程归属"
     fi
 
     if ask_yes_no "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N] "; then
-        rm -rf "${PROJECT_DIR}/data" "${PROJECT_DIR}/logs"
-        OK "data/ 和 logs/ 已删除"
+        if managed_pid="$(managed_cloudflared_pid)"; then
+            ER "本项目 cloudflared（pid ${managed_pid}）仍在运行；为避免删除其归属/token 状态，已保留 data/ 和 logs/"
+            return 1
+        fi
+        if rm -rf -- "${PROJECT_DIR}/data" "${PROJECT_DIR}/logs" &&
+            [ ! -e "${PROJECT_DIR}/data" ] && [ ! -e "${PROJECT_DIR}/logs" ]; then
+            OK "data/ 和 logs/ 已删除"
+        else
+            ER "data/ 或 logs/ 删除不完整；请检查权限后重试"
+            return 1
+        fi
     else
         OK "已保留 data/ 和 logs/（配置、状态与默认群数据保留）"
     fi

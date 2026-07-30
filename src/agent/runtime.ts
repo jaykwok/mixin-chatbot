@@ -29,7 +29,12 @@ import {
 } from "../core/config.ts";
 import { log } from "../core/log.ts";
 import { MODELS_JSON_PATH, PI_AGENT_DIR } from "../core/storage.ts";
-import { getOutboundRateStatus, sendReplyWithMention, sendText } from "../integrations/im.ts";
+import {
+  abortOutboundRequests,
+  getOutboundRateStatus,
+  sendReplyWithMention,
+  sendText,
+} from "../integrations/im.ts";
 import {
   groupWorkspaceDir,
   sessionFilePath,
@@ -104,12 +109,16 @@ const sessionLastUsed = new Map<string, number>();
 const sessionCallbackUrls = new Map<string, string>();
 // /reset 递增代次，使同一用户尚在群工作区队列里的旧请求失效。
 const sessionEpochs = new Map<string, number>();
+// 尚未完成群工作区队列阶段的完整轮次，用于安全回收 /reset 代次。
+const pendingFullTurns = new Map<string, number>();
 // 正在跑 prompt 的 session（中途来的消息走 steer；同一 session 同时只允许一个 prompt）。
 const busySessions = new WeakSet<AgentSession>();
 // 被指令（/stop /reset）主动中断的 session——其 in-flight prompt 不再发回复/错误（指令已自己回执）。
 const abortingSessions = new WeakSet<AgentSession>();
 // 让 /reset 与进程关闭能等 runPrompt 的外围发送/清理逻辑真正结束。
 const activeRuns = new Map<AgentSession, Promise<void>>();
+// /stop 与 /reset 同时取消适配层自己的状态/最终回复发送，不只中断 Pi prompt。
+const runOutboundControllers = new WeakMap<AgentSession, AbortController>();
 // 每个session最近一次工具调用摘要，供 /status 展示。
 const lastTool = new WeakMap<AgentSession, string>();
 let acceptingRequests = true;
@@ -127,6 +136,11 @@ Pi 还会向 bash 注入 PI_SESSION_ID、PI_SESSION_FILE、PI_PROVIDER、PI_MODE
 干活途中用户可能插话干预（ steer ），请把后续用户消息当作对当前任务的补充/纠正，及时调整。`;
 }
 
+/** 在开放 HTTP 端口前验证 models.json 与目标模型确实可加载。 */
+export async function initializeAgentRuntime(): Promise<void> {
+  await getRuntime();
+}
+
 const HELP_TEXT = `可用指令（在群里直接发送，必须以 / 开头）：
 /help   查看本帮助
 /stop   强制停止当前任务（硬中断）
@@ -138,6 +152,38 @@ const HELP_TEXT = `可用指令（在群里直接发送，必须以 / 开头）�
 
 function sessionKey(phone: string, groupId: string): string {
   return JSON.stringify([groupId, phone]);
+}
+
+function retainFullTurn(key: string): void {
+  pendingFullTurns.set(key, (pendingFullTurns.get(key) ?? 0) + 1);
+}
+
+function maybeCleanupSessionEpoch(key: string): void {
+  if (
+    (pendingFullTurns.get(key) ?? 0) === 0 &&
+    !sessions.has(key) &&
+    !sessionCreations.has(key) &&
+    !sessionDisposals.has(key) &&
+    !sessionResets.has(key)
+  ) {
+    sessionEpochs.delete(key);
+  }
+}
+
+function releaseFullTurn(key: string): void {
+  const remaining = (pendingFullTurns.get(key) ?? 1) - 1;
+  if (remaining > 0) pendingFullTurns.set(key, remaining);
+  else pendingFullTurns.delete(key);
+  maybeCleanupSessionEpoch(key);
+}
+
+/** 后台错误回执也使用会话最近一次收到的 callback URL。 */
+export function resolveSessionCallbackUrl(
+  phone: string,
+  groupId: string,
+  fallback: string
+): string {
+  return sessionCallbackUrls.get(sessionKey(phone, groupId)) ?? fallback;
 }
 
 async function disposeSession(key: string, session: AgentSession): Promise<void> {
@@ -168,6 +214,7 @@ export async function cleanupIdleSessions(now = Date.now()): Promise<void> {
     sessionCallbackUrls.delete(key);
     lastTool.delete(session);
     await disposeSession(key, session);
+    maybeCleanupSessionEpoch(key);
     log.info(`已释放空闲会话缓存 - 会话: ${key}`);
   }
 }
@@ -262,6 +309,9 @@ async function getOrCreateSession(
     const session = await creation;
     sessionLastUsed.set(key, Date.now());
     return acceptingRequests ? session : null;
+  } catch (error) {
+    if (!sessions.has(key)) sessionCallbackUrls.delete(key);
+    throw error;
   } finally {
     if (sessionCreations.get(key) === creation) sessionCreations.delete(key);
   }
@@ -284,6 +334,7 @@ async function resetUserSession(
   const reset = (async (): Promise<ResetResult> => {
     if (busySessions.has(session)) {
       abortingSessions.add(session);
+      runOutboundControllers.get(session)?.abort();
       try {
         await session.abort();
         await activeRuns.get(session);
@@ -333,6 +384,7 @@ async function resetUserSession(
     return await reset;
   } finally {
     if (sessionResets.get(key) === reset) sessionResets.delete(key);
+    maybeCleanupSessionEpoch(key);
   }
 }
 
@@ -416,8 +468,10 @@ async function handleCommand(
         return;
       }
       abortingSessions.add(session);
+      runOutboundControllers.get(session)?.abort();
       try {
         await session.abort();
+        await activeRuns.get(session);
       } catch (e) {
         log.error(`abort 失败 - 用户: ${phone}, 错误: ${String(e)}`);
         abortingSessions.delete(session);
@@ -483,7 +537,9 @@ async function runPrompt(
   const runFinished = new Promise<void>((resolve) => {
     finishRun = resolve;
   });
+  const outboundController = new AbortController();
   activeRuns.set(session, runFinished);
+  runOutboundControllers.set(session, outboundController);
   busySessions.add(session);
   const unsub: (() => void) | undefined =
     typeof session.subscribe === "function"
@@ -496,6 +552,7 @@ async function runPrompt(
   try {
     await sendText("🤔 正在思考...", groupId, phone, getCallbackUrl(), {
       traffic: "status",
+      signal: outboundController.signal,
     });
     // /stop 或 /reset 可能发生在状态消息发送期间。
     if (abortingSessions.has(session)) {
@@ -518,7 +575,8 @@ async function runPrompt(
       replyText,
       groupId,
       phone,
-      getCallbackUrl()
+      getCallbackUrl(),
+      outboundController.signal
     );
     if (!sent) throw new Error("Pi 回复生成成功，但群聊消息发送失败");
   } catch (e) {
@@ -538,6 +596,9 @@ async function runPrompt(
     busySessions.delete(session);
     if (sessions.get(key) === session) sessionLastUsed.set(key, Date.now());
     if (activeRuns.get(session) === runFinished) activeRuns.delete(session);
+    if (runOutboundControllers.get(session) === outboundController) {
+      runOutboundControllers.delete(session);
+    }
     finishRun();
   }
 }
@@ -559,7 +620,10 @@ export async function handleUserMessage(
     return;
   }
 
-  if (busySessions.has(session)) {
+  if (busySessions.has(session) && abortingSessions.has(session)) {
+    await activeRuns.get(session);
+    if (!acceptingRequests) return;
+  } else if (busySessions.has(session)) {
     try {
       await session.steer(content);
       await sendText("↩️ 已插入干预，agent 将在下一步纳入", groupId, phone, callbackUrl);
@@ -571,43 +635,52 @@ export async function handleUserMessage(
   }
 
   const key = sessionKey(phone, groupId);
-  const epoch = sessionEpochs.get(key) ?? 0;
-  await runInGroupQueue(
-    groupId,
-    async (ahead) => {
-      await sendText(
-        `⏳ 本群共享工作区正在使用，任务已排队（前面 ${ahead} 个）`,
-        groupId,
-        phone,
-        sessionCallbackUrls.get(key) ?? callbackUrl,
-        { traffic: "status" }
-      ).catch((error) =>
-        log.error(`任务排队回执失败 - 用户: ${phone}, 错误: ${String(error)}`)
-      );
-    },
-    async () => {
-      if (!acceptingRequests) return;
-      if ((sessionEpochs.get(key) ?? 0) !== epoch) {
-        log.info(`跳过 /reset 前排队的旧任务 - 用户: ${phone}, 群: ${groupId}`);
-        return;
+  retainFullTurn(key);
+  try {
+    const epoch = sessionEpochs.get(key) ?? 0;
+    await runInGroupQueue(
+      groupId,
+      async (ahead) => {
+        await sendText(
+          `⏳ 本群共享工作区正在使用，任务已排队（前面 ${ahead} 个）`,
+          groupId,
+          phone,
+          sessionCallbackUrls.get(key) ?? callbackUrl,
+          { traffic: "status" }
+        ).catch((error) =>
+          log.error(`任务排队回执失败 - 用户: ${phone}, 错误: ${String(error)}`)
+        );
+      },
+      async () => {
+        if (!acceptingRequests) return;
+        if ((sessionEpochs.get(key) ?? 0) !== epoch) {
+          log.info(`跳过 /reset 前排队的旧任务 - 用户: ${phone}, 群: ${groupId}`);
+          return;
+        }
+        const current = await getOrCreateSession(
+          phone,
+          groupId,
+          sessionCallbackUrls.get(key) ?? callbackUrl
+        );
+        if (!current || !acceptingRequests) return;
+        await runPrompt(current, phone, groupId, content, callbackUrl);
       }
-      const current = await getOrCreateSession(
-        phone,
-        groupId,
-        sessionCallbackUrls.get(key) ?? callbackUrl
-      );
-      if (!current || !acceptingRequests) return;
-      await runPrompt(current, phone, groupId, content, callbackUrl);
-    }
-  );
+    );
+  } finally {
+    releaseFullTurn(key);
+  }
 }
 
 /** 应用关闭时释放所有 session。 */
 export async function disposeAllSessions(): Promise<void> {
   acceptingRequests = false;
+  abortOutboundRequests();
   await Promise.allSettled(sessionCreations.values());
   const runningSessions = [...activeRuns.keys()];
-  for (const session of runningSessions) abortingSessions.add(session);
+  for (const session of runningSessions) {
+    abortingSessions.add(session);
+    runOutboundControllers.get(session)?.abort();
+  }
   await Promise.allSettled(runningSessions.map((session) => session.abort()));
   await Promise.allSettled(activeRuns.values());
   await Promise.allSettled(sessionResets.values());
@@ -618,6 +691,7 @@ export async function disposeAllSessions(): Promise<void> {
   sessionLastUsed.clear();
   sessionCallbackUrls.clear();
   sessionEpochs.clear();
+  pendingFullTurns.clear();
   sessionResets.clear();
   activeRuns.clear();
   await Promise.allSettled(sessionDisposals.values());

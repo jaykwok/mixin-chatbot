@@ -5,7 +5,6 @@
 import { Hono, type Context } from "hono";
 import { readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
-import { timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import { log } from "../core/log.ts";
 import {
@@ -16,38 +15,44 @@ import {
   RATE_LIMIT_CLEANUP_INTERVAL,
 } from "../core/config.ts";
 import { WEBHOOK_SECRET_FILE } from "../core/storage.ts";
-import { observeCallbackRoute } from "../integrations/callback-route.ts";
-import { getClientIp, HttpError } from "./http.ts";
+import {
+  cleanupCallbackRoutes,
+  observeCallbackRoute,
+} from "../integrations/callback-route.ts";
+import {
+  constantTimeEqual,
+  getClientIp,
+  HttpError,
+  isJsonContentType,
+} from "./http.ts";
 import {
   cleanupRateLimits,
+  drainUserRequests,
   enqueueUserRequest,
+  enqueueUserNotice,
+  hasUserRequestCapacity,
   isDuplicate,
   isRateLimited,
+  rememberRequest,
   validateWebhookData,
 } from "./webhook.ts";
-import { cleanupIdleSessions, disposeAllSessions } from "../agent/runtime.ts";
+import {
+  cleanupIdleSessions,
+  disposeAllSessions,
+  initializeAgentRuntime,
+} from "../agent/runtime.ts";
 
 const app = new Hono();
+let shuttingDown = false;
 
 /** 读取 webhook 随机密钥；文件不存在/格式无效返回 null，由启动逻辑决定是否拒绝。 */
 function readWebhookSecret(): string | null {
   try {
     const raw = readFileSync(WEBHOOK_SECRET_FILE, "utf8").trim();
-    return /^[0-9a-f]{32,64}$/i.test(raw) ? raw : null;
+    return /^[0-9a-f]{64}$/i.test(raw) ? raw : null;
   } catch {
     return null;
   }
-}
-
-/** 恒定时长字符串比较（密钥比对，避免逐字节定时侧信道）。 */
-function safeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a, "utf8");
-  const bb = Buffer.from(b, "utf8");
-  if (ab.length !== bb.length) {
-    timingSafeEqual(ab, ab); // 抹平耗时，仍返回 false
-    return false;
-  }
-  return timingSafeEqual(ab, bb);
 }
 
 /** 限量读取 JSON，避免在进入字段校验前接收无限大的请求体。 */
@@ -99,9 +104,11 @@ async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
 
 /** webhook 业务处理：解析 + 校验 + 去重 + 限流 + 后台异步。 */
 const webhookHandler = async (c: Context) => {
-  // Content-Type 宽松校验：声明了类型则须含 json（挡表单/异常类型）
-  const ct = (c.req.header("content-type") ?? "").toLowerCase();
-  if (ct && !ct.includes("json")) {
+  if (shuttingDown) throw new HttpError(503, "服务正在关闭，请稍后重试");
+
+  // 声明了 Content-Type 时只接受标准 JSON 或 +json 媒体类型。
+  const ct = c.req.header("content-type") ?? "";
+  if (ct && !isJsonContentType(ct)) {
     throw new HttpError(415, "Content-Type 必须是 application/json");
   }
 
@@ -115,6 +122,10 @@ const webhookHandler = async (c: Context) => {
   );
 
   if (!callbackRoute.safe) {
+    if (callbackRoute.reason === "capacity") {
+      log.error(`callback 路由保护容量已满，拒绝未知 key ${callbackRoute.fingerprint}`);
+      throw new HttpError(503, "回调路由保护暂时无法接收新的机器人 key");
+    }
     log.error(
       `阻止跨群广播：回复 key ${callbackRoute.fingerprint} 同时对应多个群 (${callbackRoute.groups.join(", ")})；请为每个群重新创建独立的会话机器人`
     );
@@ -124,17 +135,47 @@ const webhookHandler = async (c: Context) => {
     );
   }
 
-  if (isRateLimited(phone)) {
-    log.warn(`速率限制触发 - 用户: ${phone}`);
-    throw new HttpError(429, "请求过于频繁，请稍后再试");
-  }
   if (isDuplicate(phone, groupId, content)) {
     log.info(`跳过重复请求 - 用户: ${phone}`);
     return c.json({ status: "success" });
   }
-
+  if (!hasUserRequestCapacity()) {
+    log.warn(`后台请求容量已满 - 用户: ${phone}, 群: ${groupId}`);
+    enqueueUserNotice(
+      "capacity",
+      "⚠️ 当前机器人任务已满，这条请求没有进入处理队列，请稍后重新发送。",
+      phone,
+      groupId,
+      callbackUrl
+    );
+    return c.json({ status: "success" });
+  }
+  if (isRateLimited(phone, groupId)) {
+    log.warn(`速率限制触发 - 用户: ${phone}, 群: ${groupId}`);
+    enqueueUserNotice(
+      "rate-limit",
+      "⚠️ 你发送得太频繁，这条请求没有进入处理队列，请稍后重新发送。",
+      phone,
+      groupId,
+      callbackUrl
+    );
+    return c.json({ status: "success" });
+  }
+  // readJsonBody 等 await 期间可能收到关闭信号；不再接收无法被关机流程追踪的新任务。
+  if (shuttingDown) throw new HttpError(503, "服务正在关闭，请稍后重试");
   // ack 200，后台异步处理；同一会话忙碌时由 agent 层 steer/指令路由协调。
-  enqueueUserRequest(content, phone, groupId, callbackUrl, clientIp);
+  if (!enqueueUserRequest(content, phone, groupId, callbackUrl, clientIp)) {
+    // 单线程内无 await，正常不会在容量预检后命中；仍按不可重投平台处理。
+    enqueueUserNotice(
+      "capacity",
+      "⚠️ 当前机器人任务已满，这条请求没有进入处理队列，请稍后重新发送。",
+      phone,
+      groupId,
+      callbackUrl
+    );
+    return c.json({ status: "success" });
+  }
+  rememberRequest(phone, groupId, content);
   return c.json({ status: "success" });
 };
 
@@ -144,7 +185,7 @@ if (webhookSecret) {
   log.info("Webhook 已启用随机密钥路径鉴权（/webhook/<secret>）");
   app.post("/webhook/:secret", async (c) => {
     const got = c.req.param("secret");
-    if (!got || !safeEqual(got, webhookSecret)) {
+    if (!got || !constantTimeEqual(got, webhookSecret)) {
       return c.json({ status: "error", message: "Not Found" }, 404);
     }
     return webhookHandler(c);
@@ -182,11 +223,15 @@ app.onError((err, c) => {
 });
 app.notFound((c) => c.json({ status: "error", message: "Not Found" }, 404));
 
+// 在开放端口前验证 Pi 的 models.json 与目标模型，避免健康检查已通但首条消息才失败。
+await initializeAgentRuntime();
+
 const rateLimitTimer = setInterval(() => {
   try {
     cleanupRateLimits();
+    cleanupCallbackRoutes();
   } catch (e) {
-    log.error(`速率限制清理出错: ${String(e)}`);
+    log.error(`运行期缓存清理出错: ${String(e)}`);
   }
   void cleanupIdleSessions().catch((e) =>
     log.error(`空闲会话清理出错: ${String(e)}`)
@@ -196,14 +241,31 @@ const rateLimitTimer = setInterval(() => {
 const server = Bun.serve({ hostname: HOST, port: PORT, fetch: app.fetch });
 log.info(`服务启动完成，监听地址: ${HOST}:${PORT}`);
 
-let shuttingDown = false;
-async function shutdown() {
+async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   clearInterval(rateLimitTimer);
-  server.stop();
-  await disposeAllSessions();
-  process.exit(0);
+  let exitCode = 0;
+  try {
+    await server.stop();
+  } catch (error) {
+    exitCode = 1;
+    log.error(`停止 HTTP 服务失败 - 错误: ${String(error)}`);
+  }
+  try {
+    await disposeAllSessions();
+  } catch (error) {
+    exitCode = 1;
+    log.error(`释放 Pi 会话失败 - 错误: ${String(error)}`);
+  }
+  try {
+    await drainUserRequests();
+  } catch (error) {
+    exitCode = 1;
+    log.error(`排空后台请求失败 - 错误: ${String(error)}`);
+  }
+  log.info(`收到 ${signal}，服务关闭完成`);
+  process.exit(exitCode);
 }
-process.once("SIGINT", shutdown);
-process.once("SIGTERM", shutdown);
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));

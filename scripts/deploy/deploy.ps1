@@ -22,6 +22,7 @@ $PortFile = Join-Path $StateDir "bot-port"
 $ModeFile = Join-Path $StateDir "deploy-mode"
 $DomainFile = Join-Path $StateDir "bot-domain"
 $GroupRootFile = Join-Path $StateDir "group-data-root"
+$TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
 $LauncherFile = Join-Path $RuntimeDir "bot-launcher.ps1"
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsPowerShell = "powershell.exe" }
@@ -90,6 +91,19 @@ function Get-ServiceStateLabel($State) {
         "StopPending" { return "正在停止" }
         default { return [string]$State }
     }
+}
+
+$BotDebug = if ([string]::IsNullOrWhiteSpace($env:BOT_DEBUG)) { "0" } else { $env:BOT_DEBUG.Trim() }
+if ($BotDebug -notin @("0", "1")) {
+    Write-Host "BOT_DEBUG 只能是 0 或 1。" -ForegroundColor Red
+    exit 1
+}
+$BotMaxActiveRequests = if ([string]::IsNullOrWhiteSpace($env:BOT_MAX_ACTIVE_REQUESTS)) { "32" } else { $env:BOT_MAX_ACTIVE_REQUESTS.Trim() }
+$parsedMaxActiveRequests = 0
+if (-not [int]::TryParse($BotMaxActiveRequests, [ref]$parsedMaxActiveRequests) -or
+    $parsedMaxActiveRequests -lt 1 -or $parsedMaxActiveRequests -gt 1000) {
+    Write-Host "BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数。" -ForegroundColor Red
+    exit 1
 }
 function Register-BotTask($Action, $Settings, [string]$UserId, [bool]$UseS4U) {
     $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -296,8 +310,8 @@ if (-not (Test-Path -LiteralPath $WebhookSecretFile -PathType Leaf)) {
     Done "webhook 密钥已生成"
 } else {
     $secret = (Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim()
-    if ($secret -notmatch "^[0-9a-fA-F]{32,64}$") {
-        Write-Host "data\config\webhook-secret 格式无效（应为 32–64 位十六进制字符）。" -ForegroundColor Red
+    if ($secret -notmatch "^[0-9a-fA-F]{64}$") {
+        Write-Host "data\config\webhook-secret 格式无效（应为 64 位十六进制字符）。" -ForegroundColor Red
         Write-Host "删除该文件后重新运行 scripts\deploy\deploy.ps1 可生成新密钥。" -ForegroundColor Red
         exit 1
     }
@@ -499,6 +513,9 @@ $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin = ([Security.Principal.WindowsPrincipal]$currentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $currentUser = $currentIdentity.Name
 $platformIp = if ($env:PLATFORM_IP) { $env:PLATFORM_IP } else { "223.244.14.237" }
+$allowUnmanagedFirewall = $env:ALLOW_UNMANAGED_FIREWALL -eq "1"
+$cleanupFirewallAfterHealth = $false
+$currentFirewallRuleName = $null
 if ($mode -eq "direct") {
     $parsedIp = $null
     if (-not [System.Net.IPAddress]::TryParse($platformIp, [ref]$parsedIp)) {
@@ -508,20 +525,61 @@ if ($mode -eq "direct") {
 }
 if ($isAdmin) {
     if ($mode -eq "direct") {
-        # 先写入新规则，再删除旧规则；这样更新失败时不会让当前 webhook 入口中断。
-        $currentFirewallRule = New-NetFirewallRule -DisplayName "mixin-chatbot TCP $Port" -Group "mixin-chatbot" `
-            -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
-            -RemoteAddress $platformIp
-        Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne $currentFirewallRule.Name } |
-            Remove-NetFirewallRule -ErrorAction SilentlyContinue
-        Done "Windows 防火墙已设置为仅允许 $platformIp 访问 TCP $Port"
+        try {
+            $firewallProfiles = @(Get-NetFirewallProfile -ErrorAction Stop)
+            if ($firewallProfiles.Count -eq 0) { throw "未找到 Windows 防火墙配置文件" }
+            $disabledProfiles = @($firewallProfiles | Where-Object { -not $_.Enabled })
+            if ($disabledProfiles.Count -gt 0) {
+                throw "Windows 防火墙配置文件未全部启用：$($disabledProfiles.Name -join ', ')"
+            }
+            # 先写入新规则，再删除旧规则；这样更新失败时不会让当前 webhook 入口中断。
+            $currentFirewallRule = New-NetFirewallRule -DisplayName "mixin-chatbot TCP $Port" -Group "mixin-chatbot" `
+                -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
+                -RemoteAddress $platformIp -ErrorAction Stop
+            $currentFirewallRuleName = $currentFirewallRule.Name
+            $cleanupFirewallAfterHealth = $true
+            Done "Windows 防火墙已写入限定回调来源的 TCP $Port 规则"
+        } catch {
+            if (-not $allowUnmanagedFirewall) {
+                Write-Host "Windows 防火墙安全基线无法生效，直连模式拒绝在 0.0.0.0 上启动：$($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "修复 Windows 防火墙，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。" -ForegroundColor Red
+                exit 1
+            }
+            Warn "ALLOW_UNMANAGED_FIREWALL=1：未使用 Windows 防火墙基线，依赖你已配置的外部防火墙。原因：$($_.Exception.Message)"
+        }
     } else {
-        Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        # 旧直连入口保留到新机器人和隧道健康，部署中途失败时仍可恢复旧服务。
+        $cleanupFirewallAfterHealth = $true
     }
 } elseif ($mode -eq "direct") {
-    Warn "当前不是管理员，未修改 Windows 防火墙；直连模式前请只允许平台 IP 访问 TCP $Port"
+    if (-not $allowUnmanagedFirewall) {
+        Write-Host "当前不是管理员，无法设置 Windows 防火墙；直连模式拒绝在 0.0.0.0 上启动。" -ForegroundColor Red
+        Write-Host "请用管理员 PowerShell 重跑，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。" -ForegroundColor Red
+        exit 1
+    }
+    Warn "ALLOW_UNMANAGED_FIREWALL=1：当前不是管理员，依赖你已配置的外部防火墙。"
+}
+
+# 在停止现有机器人前确认未托管 Cloudflared 服务的归属，取消部署时不产生停机。
+$unmanagedTunnelConfirmed = $false
+$preflightTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+$preflightTunnelManaged = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
+if ($preflightTunnelService -and $preflightTunnelManaged -and $mode -eq "direct" -and -not $isAdmin) {
+    Write-Host "直连模式需要停止并禁用本项目 Cloudflared 服务；请使用管理员 PowerShell 重跑。" -ForegroundColor Red
+    exit 1
+}
+if ($preflightTunnelService -and -not $preflightTunnelManaged) {
+    Warn "系统存在没有本项目归属标记的 Cloudflared 服务，部署脚本不会自动修改它。"
+    $tunnelQuestion = if ($mode -eq "cloudflare") {
+        "确认该服务正在服务本项目，继续沿用？[y/N]"
+    } else {
+        "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]"
+    }
+    if (-not (Read-YesNo $tunnelQuestion $false)) {
+        Write-Host "未确认未托管 Cloudflared 的安全边界；尚未停止现有机器人。" -ForegroundColor Red
+        exit 1
+    }
+    $unmanagedTunnelConfirmed = $true
 }
 
 # ---- 6. 停止旧机器人（避免重新部署时端口冲突）----
@@ -540,11 +598,23 @@ Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyCont
 
 # 为写入生成的 launcher，对路径执行单引号转义
 function Sq($s) { return "'" + ($s -replace "'", "''") + "'" }
+function Save-DeploymentState {
+    Set-Content -LiteralPath $PortFile -Value $Port -NoNewline -Encoding ASCII
+    Set-Content -LiteralPath $ModeFile -Value $mode -NoNewline -Encoding ASCII
+    Set-Content -LiteralPath $GroupRootFile -Value $GroupDataRoot -NoNewline -Encoding UTF8
+    if ($persistDomain) {
+        Set-Content -LiteralPath $DomainFile -Value $publicDomain -NoNewline -Encoding ASCII
+    } elseif ($clearPersistedDomain) {
+        Remove-Item -LiteralPath $DomainFile -Force -ErrorAction SilentlyContinue
+    }
+}
 $launcherBody = @"
 `$ErrorActionPreference = 'Stop'
 `$env:GROUP_DATA_ROOT = $(Sq $GroupDataRoot)
 `$env:BOT_PORT = $(Sq $Port)
 `$env:BOT_HOST = $(Sq $BotHost)
+`$env:BOT_DEBUG = $(Sq $BotDebug)
+`$env:BOT_MAX_ACTIVE_REQUESTS = $(Sq $BotMaxActiveRequests)
 `$env:PATH = $(Sq ($BashDir + ";")) + `$env:PATH
 Set-Location $(Sq $Project)
 `$ErrorActionPreference = 'Continue'
@@ -621,13 +691,31 @@ if ($isAdmin) {
         Write-Host "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请查看 logs\mixin-chatbot.log，并运行 scripts\ops\ops.ps1 doctor。" -ForegroundColor Red
         exit 1
     }
-    Set-Content -LiteralPath $PortFile -Value $Port -NoNewline -Encoding ASCII
-    Set-Content -LiteralPath $ModeFile -Value $mode -NoNewline -Encoding ASCII
-    Set-Content -LiteralPath $GroupRootFile -Value $GroupDataRoot -NoNewline -Encoding UTF8
-    if ($persistDomain) {
-        Set-Content -LiteralPath $DomainFile -Value $publicDomain -NoNewline -Encoding ASCII
-    } elseif ($clearPersistedDomain) {
-        Remove-Item -LiteralPath $DomainFile -Force -ErrorAction SilentlyContinue
+    if ($mode -eq "direct") {
+        $existingTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+        if ($existingTunnelService) {
+            if (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf) {
+                Step "直连模式：停止并禁用本项目管理的 Cloudflared 服务..."
+                try {
+                    if ($existingTunnelService.Status -ne "Stopped") {
+                        Stop-Service -Name "Cloudflared" -Force -ErrorAction Stop
+                    }
+                    Set-Service -Name "Cloudflared" -StartupType Disabled -ErrorAction Stop
+                    Done "本项目 Cloudflared 已停止并禁用，重启后也不会恢复旧隧道入口"
+                } catch {
+                    Write-Host "无法停止或禁用本项目 Cloudflared 服务：$($_.Exception.Message)" -ForegroundColor Red
+                    exit 1
+                }
+            } else {
+                if (-not $unmanagedTunnelConfirmed) {
+                    Warn "部署期间出现未标记为本项目所有的 Cloudflared 服务；不会自动修改。"
+                }
+                if (-not $unmanagedTunnelConfirmed -and -not (Read-YesNo "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]" $false)) {
+                    Write-Host "未确认遗留隧道的安全边界；直连模式部署已停止。" -ForegroundColor Red
+                    exit 1
+                }
+            }
+        }
     }
     Done "机器人健康（群数据总根=$GroupDataRoot）。管理：Get-ScheduledTask $TaskName | Stop-ScheduledTask；日志：logs\mixin-chatbot.log"
     Warn "任务启动方式：$taskStartDescription。"
@@ -636,17 +724,12 @@ if ($isAdmin) {
     if ($mode -eq "cloudflare") {
         Warn "请在另一个 PowerShell 窗口运行 scripts\tunnel\start-tunnel.ps1；当前窗口将被前台机器人占用。"
     }
-    Set-Content -LiteralPath $PortFile -Value $Port -NoNewline -Encoding ASCII
-    Set-Content -LiteralPath $ModeFile -Value $mode -NoNewline -Encoding ASCII
-    Set-Content -LiteralPath $GroupRootFile -Value $GroupDataRoot -NoNewline -Encoding UTF8
-    if ($persistDomain) {
-        Set-Content -LiteralPath $DomainFile -Value $publicDomain -NoNewline -Encoding ASCII
-    } elseif ($clearPersistedDomain) {
-        Remove-Item -LiteralPath $DomainFile -Force -ErrorAction SilentlyContinue
-    }
+    Save-DeploymentState
     $env:GROUP_DATA_ROOT = $GroupDataRoot
     $env:BOT_PORT = $Port
     $env:BOT_HOST = $BotHost
+    $env:BOT_DEBUG = $BotDebug
+    $env:BOT_MAX_ACTIVE_REQUESTS = $BotMaxActiveRequests
     # 非管理员前台模式也必须继承已探测到的 Git Bash，避免 bash 不在系统 PATH 时工具启动失败。
     $env:PATH = $BashDir + ";" + $env:PATH
     Set-Location $Project
@@ -667,6 +750,18 @@ if ($mode -eq "cloudflare") {
     Step "Cloudflare 模式：确保 cloudflared 隧道在线..."
     $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if ($svc) {
+        $managedTunnelService = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
+        if (-not $managedTunnelService) {
+            if (-not $unmanagedTunnelConfirmed) {
+                Warn "部署期间出现没有本项目归属标记的 Cloudflared 服务，无法自动确认它连接的是当前隧道。"
+            }
+            if (-not $unmanagedTunnelConfirmed -and -not (Read-YesNo "确认该服务正在服务本项目，继续沿用？[y/N]" $false)) {
+                Write-Host "未确认未托管的 Cloudflared 服务归属；Cloudflare 模式部署已停止。" -ForegroundColor Red
+                exit 1
+            }
+        } else {
+            Set-Service -Name "Cloudflared" -StartupType Automatic -ErrorAction Stop
+        }
         if ($svc.Status -ne "Running") {
             try { Start-Service "Cloudflared"; Done "Cloudflared 服务已启动（原状态：$(Get-ServiceStateLabel $svc.Status)）。" }
             catch { Warn "启动 Cloudflared 服务失败：$($_.Exception.Message)。请运行 scripts\ops\ops.ps1 doctor -Repair，并查看事件查看器（eventvwr）。" }
@@ -679,6 +774,7 @@ if ($mode -eq "cloudflare") {
     } else {
         Warn "未安装 Cloudflared 服务，将通过 scripts\tunnel\start-tunnel.ps1 安装..."
         $stPath = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
+        $env:BOT_PORT = $Port
         while ($true) {
             $tokIn = Read-Host "隧道 token 文件 [直接回车按 TUNNEL_TOKEN_FILE / TUNNEL_TOKEN / data\config\tunnel-token 的顺序查找]"
             $previousErrorActionPreference = $ErrorActionPreference
@@ -711,4 +807,22 @@ if ($mode -eq "cloudflare") {
         }
         Done "Cloudflared 隧道服务正在运行。"
     }
+}
+
+if ($isAdmin) {
+    if ($cleanupFirewallAfterHealth) {
+        if ($mode -eq "direct") {
+            Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne $currentFirewallRuleName } |
+                Remove-NetFirewallRule -ErrorAction Stop
+            Done "Windows 防火墙已只保留当前机器人入口"
+        } else {
+            Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
+                Remove-NetFirewallRule -ErrorAction Stop
+            Done "Cloudflare 模式已清理本项目旧直连防火墙规则"
+        }
+    }
+    # 机器人健康且隧道/直连切换成功后再提交，避免 doctor 读取半完成配置。
+    Save-DeploymentState
+    Done "部署状态已写入 data\state。"
 }

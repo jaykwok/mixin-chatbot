@@ -11,6 +11,8 @@ import {
   MAX_CONTENT_LENGTH,
   MAX_DEDUP_SIZE,
   MAX_GROUP_ID_LENGTH,
+  MAX_ACTIVE_REQUESTS,
+  MAX_RATE_LIMIT_KEYS,
   PHONE_PATTERN,
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW,
@@ -19,13 +21,18 @@ import {
   VALID_HOSTNAMES,
 } from "../core/config.ts";
 import { HttpError } from "./http.ts";
-import { sendReplyWithMention } from "../integrations/im.ts";
-import { handleUserMessage } from "../agent/runtime.ts";
+import { sendReplyWithMention, sendText } from "../integrations/im.ts";
+import {
+  handleUserMessage,
+  resolveSessionCallbackUrl,
+} from "../agent/runtime.ts";
 
-// 请求去重（Map 保持插入顺序，按序清过期）
+// 已接收请求去重（Map 保持插入顺序，按序清过期）
 const recentRequests = new Map<string, number>();
-// 速率限制（每用户在窗口内的时间戳列表）
+// 速率限制（每个群内用户在窗口内的时间戳列表）
 const rateLimits = new Map<string, number[]>();
+const activeRequests = new Set<Promise<void>>();
+const activeNotices = new Map<string, Promise<void>>();
 
 export type WebhookData = Record<string, unknown>;
 
@@ -43,15 +50,24 @@ export function validateWebhookData(data: WebhookData): ValidatedRequest {
 
   if (data.type !== "text") throw new HttpError(400, `不支持的消息类型: ${String(data.type)}`);
 
-  const phone = String(data.phone ?? "").trim();
-  const groupId = String(data.groupId ?? "").trim();
-  const callbackUrl = String(data.callBackUrl ?? "").trim();
-  const textMsg =
-    data.textMsg && typeof data.textMsg === "object" && !Array.isArray(data.textMsg)
-      ? (data.textMsg as Record<string, unknown>)
-      : {};
-  const content =
-    String(textMsg.content ?? "").trim();
+  if (
+    typeof data.phone !== "string" ||
+    typeof data.groupId !== "string" ||
+    typeof data.callBackUrl !== "string" ||
+    !data.textMsg ||
+    typeof data.textMsg !== "object" ||
+    Array.isArray(data.textMsg)
+  ) {
+    throw new HttpError(400, "phone、groupId、callBackUrl 和 textMsg 必须使用正确类型");
+  }
+  const textMsg = data.textMsg as Record<string, unknown>;
+  if (typeof textMsg.content !== "string") {
+    throw new HttpError(400, "textMsg.content 必须是字符串");
+  }
+  const phone = data.phone.trim();
+  const groupId = data.groupId.trim();
+  const callbackUrl = data.callBackUrl.trim();
+  const content = textMsg.content.trim();
 
   if (!phone || !groupId || !content) {
     throw new HttpError(400, "phone、groupId 或 content 不能为空");
@@ -93,55 +109,75 @@ export function validateWebhookData(data: WebhookData): ValidatedRequest {
   if (parsed.pathname !== CALLBACK_PATH_PREFIX) {
     throw new HttpError(403, "无效的回调URL路径");
   }
-  const callbackKey = parsed.searchParams.get("key")?.trim();
-  if (!callbackKey) {
-    throw new HttpError(403, "回调URL缺少 key 参数");
+  const callbackKeys = parsed.searchParams.getAll("key");
+  if (callbackKeys.length !== 1 || !callbackKeys[0]?.trim()) {
+    throw new HttpError(403, "回调URL必须且只能包含一个非空 key 参数");
+  }
+  if (parsed.hash) {
+    throw new HttpError(403, "回调URL不允许包含片段");
   }
   return { phone, groupId, content, callbackUrl };
 }
 
-/** 请求去重（DEDUP_TTL 内相同 phone+群+content 跳过）。 */
-export function isDuplicate(phone: string, groupId: string, content: string): boolean {
-  const now = Date.now();
+function requestDedupKey(phone: string, groupId: string, content: string): string {
   const hash = createHash("sha256").update(content, "utf8").digest("hex");
-  const key = `${phone}:${groupId}:${hash}`;
-  // 从头部清过期（Map 按插入顺序）
-  for (const [k, t] of recentRequests) {
-    if (now - t > DEDUP_TTL) recentRequests.delete(k);
+  return JSON.stringify([groupId, phone, hash]);
+}
+
+function pruneRecentRequests(now: number): void {
+  // 从头部清过期（Map 按插入顺序）。
+  for (const [key, timestamp] of recentRequests) {
+    if (now - timestamp > DEDUP_TTL) recentRequests.delete(key);
     else break;
   }
-  if (recentRequests.has(key)) return true;
-  recentRequests.set(key, now);
+}
+
+/** 查询已成功接收的重复请求；限流拒绝的请求不会被记入。 */
+export function isDuplicate(phone: string, groupId: string, content: string): boolean {
+  const now = Date.now();
+  pruneRecentRequests(now);
+  return recentRequests.has(requestDedupKey(phone, groupId, content));
+}
+
+/** 在请求成功入队后记录，供重复请求直接确认。 */
+export function rememberRequest(phone: string, groupId: string, content: string): void {
+  const now = Date.now();
+  pruneRecentRequests(now);
+  recentRequests.set(requestDedupKey(phone, groupId, content), now);
   while (recentRequests.size > MAX_DEDUP_SIZE) {
     const firstKey = recentRequests.keys().next().value;
     if (firstKey === undefined) break;
     recentRequests.delete(firstKey);
   }
-  return false;
 }
 
-/** 速率限制检查（窗口内超过 RATE_LIMIT_MAX_REQUESTS 则限流）。 */
-export function isRateLimited(phone: string): boolean {
+/** 速率限制检查；同一手机号在不同群使用互相独立的窗口。 */
+export function isRateLimited(phone: string, groupId: string): boolean {
   const now = Date.now();
   const windowStart = now - RATE_LIMIT_WINDOW;
-  const timestamps = (rateLimits.get(phone) ?? []).filter((t) => t > windowStart);
+  const key = JSON.stringify([groupId, phone]);
+  if (!rateLimits.has(key) && rateLimits.size >= MAX_RATE_LIMIT_KEYS) {
+    cleanupRateLimits(now);
+    if (rateLimits.size >= MAX_RATE_LIMIT_KEYS) return true;
+  }
+  const timestamps = (rateLimits.get(key) ?? []).filter((t) => t > windowStart);
   if (timestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
-    rateLimits.set(phone, timestamps);
+    rateLimits.set(key, timestamps);
     return true;
   }
   timestamps.push(now);
-  rateLimits.set(phone, timestamps);
+  rateLimits.set(key, timestamps);
   return false;
 }
 
 /** 清理限流字典中窗口外已无时间戳的用户，防止内存无限增长。 */
-export function cleanupRateLimits(): void {
+export function cleanupRateLimits(now = Date.now()): void {
   if (rateLimits.size === 0) return;
-  const windowStart = Date.now() - RATE_LIMIT_WINDOW;
-  for (const [phone, ts] of rateLimits) {
+  const windowStart = now - RATE_LIMIT_WINDOW;
+  for (const [key, ts] of rateLimits) {
     const fresh = ts.filter((t) => t > windowStart);
-    if (fresh.length === 0) rateLimits.delete(phone);
-    else rateLimits.set(phone, fresh);
+    if (fresh.length === 0) rateLimits.delete(key);
+    else rateLimits.set(key, fresh);
   }
 }
 
@@ -167,7 +203,7 @@ async function processRequest(
         "⚠️ 抱歉，处理您的请求时出现了问题，请稍后再试。",
         groupId,
         phone,
-        callbackUrl
+        resolveSessionCallbackUrl(phone, groupId, callbackUrl)
       );
       if (!sent) log.error(`错误回复未送达 - 用户: ${phone}`);
     } catch (sendErr) {
@@ -184,8 +220,58 @@ export function enqueueUserRequest(
   groupId: string,
   callbackUrl: string,
   clientIp: string
-): void {
-  void processRequest(content, phone, groupId, callbackUrl, clientIp).catch((e) =>
-    log.error(`后台处理异常 - 用户: ${phone}, 错误: ${String(e)}`)
+): boolean {
+  if (activeRequests.size >= MAX_ACTIVE_REQUESTS) return false;
+  const request = processRequest(content, phone, groupId, callbackUrl, clientIp);
+  activeRequests.add(request);
+  void request.then(
+    () => activeRequests.delete(request),
+    (error) => {
+      activeRequests.delete(request);
+      log.error(`后台处理异常 - 用户: ${phone}, 错误: ${String(error)}`);
+    }
   );
+  return true;
+}
+
+export function hasUserRequestCapacity(): boolean {
+  return activeRequests.size < MAX_ACTIVE_REQUESTS;
+}
+
+/**
+ * 平台不会重投业务拒绝，因此容量/入站限流不能只返回 429/503。
+ * 同一群用户的同类通知在发送完成前合并，避免压力状态下继续堆积相同回执。
+ */
+export function enqueueUserNotice(
+  kind: "capacity" | "rate-limit",
+  message: string,
+  phone: string,
+  groupId: string,
+  callbackUrl: string
+): void {
+  const key = JSON.stringify([kind, groupId, phone, callbackUrl]);
+  if (activeNotices.has(key)) return;
+  const notice = (async () => {
+    try {
+      const sent = await sendText(message, groupId, phone, callbackUrl);
+      if (!sent) log.error(`系统回执未送达 - 类型: ${kind}, 用户: ${phone}`);
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") return;
+      log.error(`系统回执发送失败 - 类型: ${kind}, 用户: ${phone}, 错误: ${String(error)}`);
+    }
+  })();
+  activeNotices.set(key, notice);
+  void notice.finally(() => {
+    if (activeNotices.get(key) === notice) activeNotices.delete(key);
+  });
+}
+
+/** 停止接收新请求后，等待所有已确认的后台请求完成清理。 */
+export async function drainUserRequests(): Promise<void> {
+  while (activeRequests.size > 0 || activeNotices.size > 0) {
+    await Promise.allSettled([
+      ...activeRequests,
+      ...activeNotices.values(),
+    ]);
+  }
 }

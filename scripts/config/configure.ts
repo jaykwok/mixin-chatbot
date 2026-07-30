@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // AI 配置 TUI：交互生成 data/config/models.json（provider + key + model，Pi 原生读取）。
 // 通常在容器内运行：
-//   docker run --rm -it -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure
+//   docker run --rm -it --user "$(stat -c '%u:%g' data)" -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure
 // 也可本地 bun run configure。
 import {
   cancel,
@@ -87,6 +87,7 @@ async function fetchLitellm(): Promise<Record<string, LiteLLMEntry> | null> {
       signal: AbortSignal.timeout(15_000),
     });
     if (!r.ok) {
+      await r.body?.cancel().catch(() => {});
       log.warn(`LiteLLM 抓取返回 ${r.status}，将手动填写元数据`);
       return null;
     }
@@ -98,6 +99,11 @@ async function fetchLitellm(): Promise<Record<string, LiteLLMEntry> | null> {
 }
 
 const norm = (s: string): string => s.toLowerCase().replace(/[\s._\-/]/g, "");
+
+function isPositiveSafeInteger(value: string | undefined): boolean {
+  if (!value || !/^[1-9]\d*$/.test(value)) return false;
+  return Number.isSafeInteger(Number(value));
+}
 
 function matchLitellm(
   catalog: Record<string, LiteLLMEntry>,
@@ -142,6 +148,18 @@ function defaultModel(modelId: string): JsonObject {
     reasoning: false,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   };
+}
+
+/** 只有模型 id 未改变时才沿用旧元数据，避免换模型后继承错误的价格/能力。 */
+export function modelDefaultsForSelection(
+  modelId: string,
+  existing?: JsonObject,
+  sameProvider = true
+): JsonObject {
+  if (sameProvider && existing?.id === modelId) {
+    return { ...existing, id: modelId, name: modelId };
+  }
+  return defaultModel(modelId);
 }
 
 async function main(): Promise<void> {
@@ -244,9 +262,13 @@ async function main(): Promise<void> {
     ).trim();
 
     // 从 LiteLLM 抓元数据（自定义 provider 的模型不在 Pi 内置目录）。
-    let model: JsonObject = firstModel ? { ...firstModel } : defaultModel(modelId);
-    model.id = modelId;
-    model.name = modelId;
+    // 只有仍在编辑原 provider 时才考虑复用旧模型元数据；同名模型在不同端点
+    // 可能有不同上下文、能力和价格，不能跨 provider 继承。
+    let model = modelDefaultsForSelection(
+      modelId,
+      firstModel,
+      providerId === firstId
+    );
     const catalog = await fetchLitellm();
     if (catalog) {
       const m = matchLitellm(catalog, modelId);
@@ -269,7 +291,8 @@ async function main(): Promise<void> {
         message: "contextWindow",
         defaultValue: String(model.contextWindow ?? 131072),
         initialValue: String(model.contextWindow ?? 131072),
-        validate: (v) => (v && /^[1-9]\d*$/.test(v) ? undefined : "需为正整数"),
+        validate: (v) =>
+          isPositiveSafeInteger(v) ? undefined : "需为正安全整数",
       })
     );
     const mt = bail<string>(
@@ -277,7 +300,12 @@ async function main(): Promise<void> {
         message: "maxTokens",
         defaultValue: String(model.maxTokens ?? 8192),
         initialValue: String(model.maxTokens ?? 8192),
-        validate: (v) => (v && /^[1-9]\d*$/.test(v) ? undefined : "需为正整数"),
+        validate: (v) => {
+          if (!isPositiveSafeInteger(v)) return "需为正安全整数";
+          return Number(v) <= Number(cw)
+            ? undefined
+            : "不能大于 contextWindow";
+        },
       })
     );
     model.contextWindow = Number(cw);

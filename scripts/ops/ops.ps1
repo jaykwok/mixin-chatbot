@@ -40,6 +40,7 @@ $ModelsFile = Join-Path $ConfigDir "models.json"
 $WebhookSecretFile = Join-Path $ConfigDir "webhook-secret"
 $DefaultTunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
 $LocalCloudflared = Join-Path $Project "cloudflared.exe"
+$TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsPowerShell = "powershell.exe" }
 
@@ -505,12 +506,18 @@ function Show-Doctor {
         $rows += New-DoctorRow "隧道 token 来源" $(if ($tokenSource.Available) { "pass" } else { "warn" }) $tokenDetail $(if ($tokenSource.Available) { "" } else { "将 token（裸值或 TUNNEL_TOKEN=...）放入 data\config\tunnel-token，然后执行 ops.ps1 repair-tunnel。" })
 
         $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+        $managedTunnel = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
         if (-not $svc) {
             $rows += New-DoctorRow "Cloudflared 服务" "fail" "未安装" "请在管理员 PowerShell 中执行 ops.ps1 repair-tunnel。"
         } elseif ($svc.Status -eq "Running") {
-            $rows += New-DoctorRow "Cloudflared 服务" "pass" "运行中"
+            if ($managedTunnel) {
+                $rows += New-DoctorRow "Cloudflared 服务" "pass" "运行中（本项目管理）"
+            } else {
+                $rows += New-DoctorRow "Cloudflared 服务" "warn" "运行中，但没有本项目归属标记" "确认该服务连接的是当前隧道；需纳入本项目管理时执行 ops.ps1 repair-tunnel。"
+            }
         } else {
-            $rows += New-DoctorRow "Cloudflared 服务" "fail" (Get-ServiceStateLabel $svc.Status) "执行 ops.ps1 doctor -Repair；如果 token 已变化，再执行 ops.ps1 repair-tunnel。"
+            $ownership = if ($managedTunnel) { "本项目管理" } else { "未记录归属" }
+            $rows += New-DoctorRow "Cloudflared 服务" "fail" "$(Get-ServiceStateLabel $svc.Status)（$ownership）" "执行 ops.ps1 doctor -Repair；如果 token 已变化或服务未记录归属，再执行 ops.ps1 repair-tunnel。"
         }
 
         if ($Domain) {
@@ -542,7 +549,7 @@ function Show-Doctor {
     }
     $rows += New-DoctorRow "data/config/models.json" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } else { "执行 bun run configure。" })
 
-    $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ((Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim() -match "^[0-9a-fA-F]{32,64}$")
+    $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ((Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim() -match "^[0-9a-fA-F]{64}$")
     $rows += New-DoctorRow "data/config/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "执行 scripts\deploy\deploy.ps1；密钥变化后还必须更新 IM webhook URL。" })
 
     foreach ($r in $rows) {
@@ -598,14 +605,23 @@ function Invoke-DoctorRepair {
             $tokenSource = Get-TunnelTokenSource
             if ($tokenSource.Available) {
                 if (-not (Invoke-TunnelRepair)) { $ok = $false }
-            } elseif ($svc -and (IsAdmin)) {
+            } elseif ($svc -and (IsAdmin) -and (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
                 try {
-                    if ($svc.Status -eq "Running") { Restart-Service Cloudflared } else { Start-Service Cloudflared }
+                    Set-Service -Name "Cloudflared" -StartupType Automatic -ErrorAction Stop
+                    if ($svc.Status -eq "Running") {
+                        Restart-Service Cloudflared -ErrorAction Stop
+                    } else {
+                        Start-Service Cloudflared -ErrorAction Stop
+                    }
                     Done "Cloudflared 服务已用当前已安装的 token 重启"
                 } catch {
                     Err "重启 Cloudflared 失败：$($_.Exception.Message)"
                     $ok = $false
                 }
+            } elseif ($svc -and -not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
+                Err "Cloudflared 服务没有本项目归属标记，doctor 不会自动重启它"
+                Warn "确认 token 后以管理员身份执行 ops.ps1 repair-tunnel，将服务重新安装并纳入本项目管理"
+                $ok = $false
             } else {
                 Err "Cloudflared 需要修复，但没有可用的 token 来源"
                 Warn "请将 token 放入 data\config\tunnel-token，然后以管理员身份执行 ops.ps1 repair-tunnel"
@@ -729,6 +745,7 @@ function Uninstall-TunnelService([switch]$Confirmed) {
         Err "Cloudflared 服务仍然存在；可能正在等待系统完成删除，请稍后重试"
         return $false
     }
+    Remove-Item -LiteralPath $TunnelManagedFile -Force -ErrorAction SilentlyContinue
     Done "Cloudflared 服务已清理"
 
     if (Test-Path -LiteralPath $LocalCloudflared -PathType Leaf) {
@@ -754,6 +771,11 @@ function Uninstall-Bot {
     $resolvedGroupDataRoot = try { Resolve-ProjectPath $DeployedGroupDataRoot } catch { $null }
     if (-not (IsAdmin)) { Warn "当前不是管理员，任务/服务删除可能失败；如失败请以管理员身份重跑。" }
     Stop-Bot
+    $remainingBotPids = @(Get-BotPids)
+    if ($remainingBotPids.Count -gt 0) {
+        Err "机器人进程仍在运行（pid $($remainingBotPids -join ', ')）；为避免删除仍在使用的数据，卸载已停止。"
+        return $false
+    }
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($t -and -not (IsAdmin)) {
         Err "检测到计划任务，但当前权限无法可靠注销；为避免留下指向已删除文件的孤立任务，卸载已停止。"
@@ -785,7 +807,10 @@ function Uninstall-Bot {
     $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if ($svc) {
         if (Read-YesNo "是否同时停止并卸载 Cloudflared 隧道服务？[y/N]" $false) {
-            [void](Uninstall-TunnelService -Confirmed)
+            if (-not (Uninstall-TunnelService -Confirmed)) {
+                Err "Cloudflared 服务未能完整卸载；已停止后续数据清理。"
+                return $false
+            }
         }
     } elseif (Test-Path -LiteralPath $LocalCloudflared -PathType Leaf) {
         if (Read-YesNo "Cloudflared 服务不存在；是否清理项目内 cloudflared.exe？[y/N]" $false) {
@@ -801,9 +826,27 @@ function Uninstall-Bot {
         Remove-Item -Force -ErrorAction SilentlyContinue
 
     if (Read-YesNo "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N]" $false) {
-        Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath (Join-Path $Project "logs") -Recurse -Force -ErrorAction SilentlyContinue
-        Done "data/ 和 logs/ 已删除"
+        $remainingTunnel = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+        if ($remainingTunnel -and (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
+            Err "本项目管理的 Cloudflared 服务仍然存在；为避免删除其归属/token 状态，已保留 data/ 和 logs/。"
+            return $false
+        }
+        $logsDir = Join-Path $Project "logs"
+        try {
+            if (Test-Path -LiteralPath $DataDir) {
+                Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $logsDir) {
+                Remove-Item -LiteralPath $logsDir -Recurse -Force -ErrorAction Stop
+            }
+            if ((Test-Path -LiteralPath $DataDir) -or (Test-Path -LiteralPath $logsDir)) {
+                throw "目录仍然存在"
+            }
+            Done "data/ 和 logs/ 已删除"
+        } catch {
+            Err "data/ 或 logs/ 删除不完整：$($_.Exception.Message)"
+            return $false
+        }
     } else {
         Done "已保留 data/ 和 logs/（配置、状态与默认群数据保留）"
     }
