@@ -23,11 +23,11 @@
 
 **一群一个机器人实例**：官方出站接口会向 Webhook key 关联的全部未解散群组推送；消息体里的可选 `groupId` 只描述 @ 上下文，并未定义为目标群选择器，因此回复目标仍由入站 `callBackUrl` 中的机器人 key 决定。多个群可以填写同一个本项目 webhook 接收地址，但必须分别在每个群里“新建”独立的自定义会话机器人，不能把同一个机器人实例添加到多个群。服务会记录不含明文密钥的 key 短指纹；运行期间一旦发现同一 key 对应多个 `groupId`，立即停止相关请求并返回 409，避免继续广播串群。冲突记录保留到进程重启；无冲突且闲置 24 小时的观察会回收，最多保存 1000 个 key，容量耗尽时对未知 key 失败关闭。
 
-**群共享工作区 + 用户临时区**：每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace`，只存长期成果；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip 缓存指向用户临时区；Pi 因输出截断产生的完整日志也会迁入这里。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
+**群共享工作区 + 用户临时区**：每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace`，只存长期成果及该群共用的 `.venv`；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip/uv 缓存指向用户临时区，同时把 `VIRTUAL_ENV` / `UV_PROJECT_ENVIRONMENT` 固定到群 workspace 的 `.venv`，把 `PYTHONIOENCODING` 固定为 UTF-8；Pi 因输出截断产生的完整日志也会迁入这里。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
 
 **phone 与 Pi sessionId**：`(groupId, phone)` 唯一定位一份会话文件，Pi 的 sessionId 保存在该 JSONL 头部；`/reset` 删除文件后生成新 sessionId。Pi 向 bash 注入 `PI_SESSION_ID`、`PI_SESSION_FILE`、`PI_PROVIDER`、`PI_MODEL`、`PI_REASONING_LEVEL`，适配层再注入 `PI_GROUP_ID`、`PI_CALLER_PHONE`、`PI_USER_TMP`。`/status` 和创建日志都会显示这层绑定。
 
-**共享工作区串行化**：不同用户仍使用各自会话，但同一群的完整 agent 轮次按 FIFO 串行，避免两个 session 同时改同一 workspace；不同群可并行。当前用户正在执行时发普通消息仍直接走 `session.steer`，指令也不会被队列阻塞。排队请求会收到状态回执，`/reset` 会让该用户尚未执行的旧请求失效。
+**共享工作区文件级并发**：同一群的不同用户可以同时运行完整 agent 轮次。`read` 不加锁；`edit` / `write` 按规范化后的目标路径共用 FIFO，同一文件串行、不同文件并行，两个任务同时创建同名新文件也会串行。`bash` 必须通过 `mutates` 声明可能创建、修改、重命名或删除的 workspace 路径，并与 `edit` / `write` 共用路径锁；纯读取传 `[]`，目标无法列清或属于批量修改时传 `["."]`，临时退化为整个 workspace 独占。锁在工具完成或抛错后由 `finally` 自动释放；等待锁时收到 `/stop`、`/reset` 或进程关闭信号会撤销自己的排队位置，活动工具则在真正停止后再释放，避免后续任务越过仍在执行的写操作。禁止启动会在工具返回后继续修改 workspace 的后台进程。当前用户正在执行时发普通消息仍直接走 `session.steer`，指令不受文件锁阻塞。
 
 **安静执行**：任务开始时只发送一条 `🤔 正在思考...` 作为接单确认；工具调用和长任务过程不发送周期心跳，只在任务完成、失败、收到指令或确实需要排队时再发消息，避免刷屏。
 
@@ -43,7 +43,7 @@
 |---|---|
 | `/help` | 列出指令 |
 | `/stop` | **硬中断**当前任务（`session.abort`，连在跑的工具和附件/回复发送一并取消） |
-| `/status` | 查看忙/闲、Pi sessionId、群工作区队列、待消化干预、最近工具及共享 RPM 窗口 |
+| `/status` | 查看忙/闲、Pi sessionId、群工作区文件协调、待消化干预、最近工具及共享 RPM 窗口 |
 | `/cancel` | 撤销尚未被消化的干预消息 |
 | `/reset` | 清空当前用户在本群的会话历史，重新开始 |
 
@@ -93,7 +93,7 @@ Pi 依赖声明保持 `latest`，当前 `bun.lock` 锁定 Pi `0.83.0`；部署�
 
 ## Pi 官方实现取舍
 
-- 当前核心直接复用 [Pi SDK](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) 的 `AgentSession`、`SessionManager`、`ModelRuntime`、默认资源加载器、compaction/steer/abort，以及 read/bash/edit/write 工具工厂；本项目只保留量子密信回调、群/用户目录策略、工作区队列和发送附件工具。bash 会话与调用者临时环境已启用，工具 schema 只使用当前 TypeBox 支持的 API，并通过 Pi `0.83` 的官方 `defineTool` 助手接入；所有工具以 `prefer` 使用 constrained JSON Schema sampling（模型不支持时自动回退）。
+- 当前核心直接复用 [Pi SDK](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) 的 `AgentSession`、`SessionManager`、`ModelRuntime`、默认资源加载器、compaction/steer/abort，以及 read/bash/edit/write 工具工厂；本项目只保留量子密信回调、群/用户目录策略、工作区文件协调和发送附件工具。bash 会话与调用者临时环境已启用，工具 schema 只使用当前 TypeBox 支持的 API，并通过 Pi `0.83` 的官方 `defineTool` 助手接入；所有工具以 `prefer` 使用 constrained JSON Schema sampling（模型不支持时自动回退）。
 - 官方 [pi-chat](https://github.com/earendil-works/pi-chat) 提供 Discord/Telegram 与 Gondolin 微型虚拟机隔离，证明“一频道一个 workspace/runner”的方向合理；但它依赖 QEMU、tmux、Gondolin，并仍面向旧包名的 peer API，不适合直接嵌入现有 Windows/Linux/Docker 部署。
 
 ## 部署模式：直连 / Cloudflare
@@ -216,7 +216,7 @@ mixin-chatbot/
 ├── src/
 │   ├── agent/                  # Pi 运行时、目录策略与工具适配
 │   │   ├── runtime.ts          # 模型加载 + 会话 + 对话入口
-│   │   ├── group-queue.ts      # 同群共享 workspace 的 FIFO 执行队列
+│   │   ├── workspace-coordinator.ts # 同文件 FIFO、多文件并发与 bash 声明式路径锁
 │   │   ├── local-tools.ts      # Pi 官方工具工厂 + 路径/临时环境适配
 │   │   ├── paths.ts            # 群优先的数据目录布局与安全目录名
 │   │   └── send-tools.ts       # 发送工具 send_image / send_file

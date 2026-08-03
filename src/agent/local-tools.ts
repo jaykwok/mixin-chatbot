@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
+import { Type } from "@earendil-works/pi-ai";
 import {
   createBashToolDefinition,
   createEditToolDefinition,
@@ -23,8 +24,22 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { log } from "../core/log.ts";
 import { isPathInside } from "./paths.ts";
+import {
+  runFileMutation,
+  runFileMutations,
+  runOpaqueWorkspaceOperation,
+} from "./workspace-coordinator.ts";
 
-type BashToolDefinition = ReturnType<typeof createBashToolDefinition>;
+const coordinatedBashSchema = Type.Object({
+  command: Type.String({ description: "Bash command to execute" }),
+  timeout: Type.Optional(
+    Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })
+  ),
+  mutates: Type.Array(Type.String(), {
+    description:
+      "Workspace file paths this command may create, modify, rename, or delete. Use [] only for a read-only command; use ['.'] when the affected files cannot be enumerated.",
+  }),
+});
 
 /** 使用 Pi 0.83 的官方类型收窄助手，使独立工具可安全放入 customTools。 */
 function asSdkTool<T extends ToolDefinition<any, any, any>>(tool: T) {
@@ -137,7 +152,7 @@ function createBashTool(
   tempDir: string,
   phone: string,
   groupId: string
-): BashToolDefinition {
+): ToolDefinition<typeof coordinatedBashSchema> {
   const callerEnvironment = {
     TMPDIR: tempDir,
     TMP: tempDir,
@@ -146,6 +161,10 @@ function createBashTool(
     npm_config_cache: join(tempDir, ".npm"),
     BUN_INSTALL_CACHE_DIR: join(tempDir, ".bun-install-cache"),
     PIP_CACHE_DIR: join(tempDir, ".cache", "pip"),
+    UV_CACHE_DIR: join(tempDir, ".cache", "uv"),
+    UV_PROJECT_ENVIRONMENT: join(cwd, ".venv"),
+    VIRTUAL_ENV: join(cwd, ".venv"),
+    PYTHONIOENCODING: "utf-8",
     PI_CALLER_PHONE: phone,
     PI_GROUP_ID: groupId,
     PI_USER_TMP: tempDir,
@@ -167,7 +186,7 @@ function createBashTool(
     }),
   });
 
-  const execute: typeof official.execute = async (...args) => {
+  const executeOfficial: typeof official.execute = async (...args) => {
     try {
       const result = await official.execute(...args);
       const details = result.details as Record<string, unknown> | undefined;
@@ -211,7 +230,64 @@ function createBashTool(
     }
   };
 
-  return { ...official, execute };
+  const execute: ToolDefinition<typeof coordinatedBashSchema>["execute"] = (
+    toolCallId,
+    { mutates, ...input },
+    signal,
+    onUpdate,
+    context
+  ) => {
+    if (
+      !Array.isArray(mutates) ||
+      mutates.some((path) => typeof path !== "string")
+    ) {
+      throw new Error("bash 的 mutates 必须是字符串路径数组；纯读取请显式传 []");
+    }
+    const task = () =>
+      executeOfficial(toolCallId, input, signal, onUpdate, context);
+    const targets = mutates.map((path) => resolve(cwd, path));
+    if (targets.some((path) => path === resolve(cwd))) {
+      return runOpaqueWorkspaceOperation(cwd, task, signal);
+    }
+    return runFileMutations(cwd, targets, task, signal);
+  };
+
+  return {
+    ...official,
+    parameters: coordinatedBashSchema,
+    prepareArguments: (args: unknown) => {
+      const raw = args as Record<string, unknown>;
+      if (
+        !Array.isArray(raw?.mutates) ||
+        raw.mutates.some((path) => typeof path !== "string")
+      ) {
+        throw new Error("bash 的 mutates 必须是字符串路径数组；纯读取请显式传 []");
+      }
+      const prepared = official.prepareArguments
+        ? official.prepareArguments(args)
+        : (raw as { command: string; timeout?: number });
+      return { ...prepared, mutates: raw.mutates as string[] };
+    },
+    description: `${official.description} Before execution, declare every workspace path the command may create, modify, rename, or delete in mutates. Use an empty list only for read-only commands and ["."] for unknown or workspace-wide changes. Declared paths share FIFO locks with edit/write. Do not start background workspace writers.`,
+    execute,
+  } as unknown as ToolDefinition<typeof coordinatedBashSchema>;
+}
+
+function coordinateFileTool<T extends ToolDefinition<any, any, any>>(
+  tool: T,
+  cwd: string
+): T {
+  const execute: typeof tool.execute = (...args) => {
+    const input = args[1] as { path?: unknown };
+    if (typeof input?.path !== "string") return tool.execute(...args);
+    return runFileMutation(
+      cwd,
+      resolve(cwd, input.path),
+      () => tool.execute(...args),
+      args[2]
+    );
+  };
+  return { ...tool, execute };
 }
 
 /** Pi 官方工具工厂 + 本项目的 workspace/tmp 边界和调用者环境。 */
@@ -248,10 +324,16 @@ export async function buildLocalTools(
     },
   };
 
-  return [
-    asSdkTool(createReadToolDefinition(cwd, { operations: readOperations })),
-    asSdkTool(createBashTool(cwd, tempDir, phone, groupId)),
-    asSdkTool(createEditToolDefinition(cwd, { operations: editOperations })),
-    asSdkTool(createWriteToolDefinition(cwd, { operations: writeOperations })),
-  ];
+  const readTool = createReadToolDefinition(cwd, { operations: readOperations });
+  const bashTool = createBashTool(cwd, tempDir, phone, groupId);
+  const editTool = coordinateFileTool(
+    createEditToolDefinition(cwd, { operations: editOperations }),
+    cwd
+  );
+  const writeTool = coordinateFileTool(
+    createWriteToolDefinition(cwd, { operations: writeOperations }),
+    cwd
+  );
+
+  return [readTool, bashTool, editTool, writeTool].map(asSdkTool);
 }

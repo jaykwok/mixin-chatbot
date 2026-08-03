@@ -10,7 +10,7 @@
 // 中途干预（Pi 官方 API）：
 //   - agent 正忙时，普通消息 → session.steer()（等当前这批工具调用完、下次调 LLM 前注入，软干预）
 //   - /stop → session.abort()（硬中断，经 AbortSignal 连带取消在跑的工具）
-//   - /status /cancel /reset /help → 队列查询/清空、清会话、帮助
+//   - /status /cancel /reset /help → 状态查询、干预清空、清会话、帮助
 import { readFileSync } from "node:fs";
 import { mkdir, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -40,9 +40,9 @@ import {
   sessionFilePath,
   userTempDir,
 } from "./paths.ts";
-import { getGroupQueueStatus, runInGroupQueue } from "./group-queue.ts";
 import { buildLocalTools } from "./local-tools.ts";
 import { buildSendTools } from "./send-tools.ts";
+import { getWorkspaceCoordinationStatus } from "./workspace-coordinator.ts";
 
 // ModelRuntime 单例 + 解析出的单模型。从 data/config/models.json 加载（Pi 原生）。
 let modelRuntime: ModelRuntime | null = null;
@@ -96,7 +96,7 @@ async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> 
 type AgentSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 type ResetResult = { ok: true } | { ok: false; message: string };
 
-// 每 (群, phone) 一个 AgentSession；共享 workspace 的完整轮次另按群串行。
+// 每 (群, phone) 一个 AgentSession；不同用户可并发，workspace 写入由工具层按文件协调。
 const sessions = new Map<string, AgentSession>();
 // 避免同一群/用户的并发首条消息重复创建两个 session 并同时写一个 jsonl。
 const sessionCreations = new Map<string, Promise<AgentSession>>();
@@ -107,10 +107,6 @@ const sessionResets = new Map<string, Promise<ResetResult>>();
 const sessionLastUsed = new Map<string, number>();
 // 平台可能轮换 callback key；发送工具在每次执行时读取当前会话最新 URL。
 const sessionCallbackUrls = new Map<string, string>();
-// /reset 递增代次，使同一用户尚在群工作区队列里的旧请求失效。
-const sessionEpochs = new Map<string, number>();
-// 尚未完成群工作区队列阶段的完整轮次，用于安全回收 /reset 代次。
-const pendingFullTurns = new Map<string, number>();
 // 正在跑 prompt 的 session（中途来的消息走 steer；同一 session 同时只允许一个 prompt）。
 const busySessions = new WeakSet<AgentSession>();
 // 被指令（/stop /reset）主动中断的 session——其 in-flight prompt 不再发回复/错误（指令已自己回执）。
@@ -128,9 +124,13 @@ function buildChatContext(tempDir: string): string {
   return `## 运行环境
 你在「量子密信」群聊机器人里。用户用中文 @你 提问，请用中文简洁回复；需要标题、强调、列表、链接、表格或代码时使用 Markdown，普通段落不必添加格式。回复会自动发到群里。
 当前工作目录是本群共享的 workspace，只放需要让群成员长期复用的成果。先检查已有文件，不要覆盖或删除无关内容。
+不同用户的任务可以同时运行。read 可直接并行；edit/write 会自动按目标文件协调。同一个文件的写入按 FIFO 执行，不同文件可并行。
+调用 bash 时，mutates 必须列出命令可能创建、修改、重命名或删除的每个 workspace 路径；纯读取命令填空数组，无法列清或会批量修改时填 ["."]。禁止启动退出工具后仍会继续改 workspace 的后台进程。
 当前调用用户的专属临时目录是：${resolve(tempDir)}
 下载、缓存、解压、转换产物、草稿和其他中间文件必须放进上述临时目录；不要放进 workspace、系统临时目录、其他用户目录或上级目录。
 bash 工具已自动把 TMPDIR、TMP、TEMP 和常见包管理器缓存指向上述临时目录；PI_USER_TMP 可直接读取该路径。命令若有独立的缓存或输出参数，也要显式指向该目录。
+需要 Python 时，只使用 uv 和本群 workspace/.venv；环境不存在时用 uv venv 创建，创建环境或变更依赖时把 .venv 列入 bash.mutates，依赖变更使用 uv pip。脚本使用 uv run --active --no-sync，不使用全局 Python 或 conda。PYTHONIOENCODING 已固定为 utf-8。
+安全、量子产品及项目知识以共享 workspace 中的项目资料为优先依据；观点冲突时先核对项目资料，需要外部最新事实且具备检索能力时再查询。
 Pi 还会向 bash 注入 PI_SESSION_ID、PI_SESSION_FILE、PI_PROVIDER、PI_MODEL；本适配层另提供 PI_CALLER_PHONE 和 PI_GROUP_ID，用于定位当前调用者与会话。
 只有用户明确要保留或共享的最终成果才写入当前 workspace。
 干活途中用户可能插话干预（ steer ），请把后续用户消息当作对当前任务的补充/纠正，及时调整。`;
@@ -152,29 +152,6 @@ const HELP_TEXT = `可用指令（在群里直接发送，必须以 / 开头）�
 
 function sessionKey(phone: string, groupId: string): string {
   return JSON.stringify([groupId, phone]);
-}
-
-function retainFullTurn(key: string): void {
-  pendingFullTurns.set(key, (pendingFullTurns.get(key) ?? 0) + 1);
-}
-
-function maybeCleanupSessionEpoch(key: string): void {
-  if (
-    (pendingFullTurns.get(key) ?? 0) === 0 &&
-    !sessions.has(key) &&
-    !sessionCreations.has(key) &&
-    !sessionDisposals.has(key) &&
-    !sessionResets.has(key)
-  ) {
-    sessionEpochs.delete(key);
-  }
-}
-
-function releaseFullTurn(key: string): void {
-  const remaining = (pendingFullTurns.get(key) ?? 1) - 1;
-  if (remaining > 0) pendingFullTurns.set(key, remaining);
-  else pendingFullTurns.delete(key);
-  maybeCleanupSessionEpoch(key);
 }
 
 /** 后台错误回执也使用会话最近一次收到的 callback URL。 */
@@ -214,7 +191,6 @@ export async function cleanupIdleSessions(now = Date.now()): Promise<void> {
     sessionCallbackUrls.delete(key);
     lastTool.delete(session);
     await disposeSession(key, session);
-    maybeCleanupSessionEpoch(key);
     log.info(`已释放空闲会话缓存 - 会话: ${key}`);
   }
 }
@@ -348,7 +324,6 @@ async function resetUserSession(
       }
     }
 
-    sessionEpochs.set(key, (sessionEpochs.get(key) ?? 0) + 1);
     if (sessions.get(key) === session) sessions.delete(key);
     sessionLastUsed.delete(key);
     sessionCallbackUrls.delete(key);
@@ -384,7 +359,6 @@ async function resetUserSession(
     return await reset;
   } finally {
     if (sessionResets.get(key) === reset) sessionResets.delete(key);
-    maybeCleanupSessionEpoch(key);
   }
 }
 
@@ -486,7 +460,14 @@ async function handleCommand(
       const pending = typeof session.pendingMessageCount === "number" ? session.pendingMessageCount : 0;
       const last = lastTool.get(session) ?? "无";
       const rate = getOutboundRateStatus(callbackUrl);
-      const workspaceQueue = getGroupQueueStatus(groupId);
+      const workspace = getWorkspaceCoordinationStatus(
+        resolve(groupWorkspaceDir(GROUP_DATA_ROOT, groupId))
+      );
+      const workspaceMode = workspace.opaqueActive
+        ? "bash 独占操作中"
+        : workspace.fileMutations > 0
+          ? `${workspace.fileMutations} 个文件写操作进行中`
+          : "空闲";
       const rateMode = {
         normal: "正常",
         reduced: "状态消息已降频",
@@ -494,7 +475,7 @@ async function handleCommand(
         cooldown: "平台限流冷却中",
       }[rate.mode];
       await reply(
-        `状态：${busy ? "忙碌中" : "空闲"}\nPi 会话：${session.sessionManager.getSessionId()}\n待消化的干预：${pending} 条\n群工作区队列：${workspaceQueue.active ? `执行中，另有 ${workspaceQueue.waiting} 个任务等待` : "空闲"}\n最近工具：🔧 ${last}\n机器人发送窗口：${rate.used}/${rate.limit}（${rateMode}${rate.pending ? `，排队 ${rate.pending}` : ""}）`
+        `状态：${busy ? "忙碌中" : "空闲"}\nPi 会话：${session.sessionManager.getSessionId()}\n待消化的干预：${pending} 条\n群工作区协调：${workspaceMode}${workspace.waiting ? `，另有 ${workspace.waiting} 个操作等待` : ""}\n最近工具：🔧 ${last}\n机器人发送窗口：${rate.used}/${rate.limit}（${rateMode}${rate.pending ? `，排队 ${rate.pending}` : ""}）`
       );
       return;
     }
@@ -603,7 +584,7 @@ async function runPrompt(
   }
 }
 
-/** /指令立即处理；当前用户忙时 steer；新的完整轮次按群串行使用共享 workspace。 */
+/** /指令立即处理；当前用户忙时 steer；不同用户并发，文件写入由工具层协调。 */
 export async function handleUserMessage(
   phone: string,
   groupId: string,
@@ -611,8 +592,15 @@ export async function handleUserMessage(
   callbackUrl: string
 ): Promise<void> {
   if (!acceptingRequests) return;
-  const session = await getOrCreateSession(phone, groupId, callbackUrl);
+  let session = await getOrCreateSession(phone, groupId, callbackUrl);
   if (!session || !acceptingRequests) return;
+  const key = sessionKey(phone, groupId);
+  // A concurrent /reset can replace the session while getOrCreateSession is
+  // yielding. Refresh once before routing commands, steer, or a new prompt.
+  if (sessions.get(key) !== session) {
+    session = await getOrCreateSession(phone, groupId, callbackUrl);
+    if (!session || !acceptingRequests) return;
+  }
   const trimmed = content.trim();
 
   if (trimmed.startsWith("/")) {
@@ -634,41 +622,10 @@ export async function handleUserMessage(
     return;
   }
 
-  const key = sessionKey(phone, groupId);
-  retainFullTurn(key);
-  try {
-    const epoch = sessionEpochs.get(key) ?? 0;
-    await runInGroupQueue(
-      groupId,
-      async (ahead) => {
-        await sendText(
-          `⏳ 本群共享工作区正在使用，任务已排队（前面 ${ahead} 个）`,
-          groupId,
-          phone,
-          sessionCallbackUrls.get(key) ?? callbackUrl,
-          { traffic: "status" }
-        ).catch((error) =>
-          log.error(`任务排队回执失败 - 用户: ${phone}, 错误: ${String(error)}`)
-        );
-      },
-      async () => {
-        if (!acceptingRequests) return;
-        if ((sessionEpochs.get(key) ?? 0) !== epoch) {
-          log.info(`跳过 /reset 前排队的旧任务 - 用户: ${phone}, 群: ${groupId}`);
-          return;
-        }
-        const current = await getOrCreateSession(
-          phone,
-          groupId,
-          sessionCallbackUrls.get(key) ?? callbackUrl
-        );
-        if (!current || !acceptingRequests) return;
-        await runPrompt(current, phone, groupId, content, callbackUrl);
-      }
-    );
-  } finally {
-    releaseFullTurn(key);
-  }
+  // There is intentionally no await between the busy check above and
+  // runPrompt marking this session busy, preventing concurrent prompts on one
+  // AgentSession while still allowing different users to run together.
+  await runPrompt(session, phone, groupId, content, callbackUrl);
 }
 
 /** 应用关闭时释放所有 session。 */
@@ -690,8 +647,6 @@ export async function disposeAllSessions(): Promise<void> {
   sessions.clear();
   sessionLastUsed.clear();
   sessionCallbackUrls.clear();
-  sessionEpochs.clear();
-  pendingFullTurns.clear();
   sessionResets.clear();
   activeRuns.clear();
   await Promise.allSettled(sessionDisposals.values());
