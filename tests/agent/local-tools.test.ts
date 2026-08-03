@@ -96,7 +96,8 @@ describe("local Pi tool boundaries", () => {
         "bash-env",
         {
           command:
-            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR"',
+            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR|$VIRTUAL_ENV|$UV_PROJECT_ENVIRONMENT|$PYTHONIOENCODING"',
+          mutates: [],
         },
         undefined,
         undefined,
@@ -104,7 +105,7 @@ describe("local Pi tool boundaries", () => {
       );
       expect(envResult.content[0]).toMatchObject({
         type: "text",
-        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}`,
+        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${join(workspace, ".venv")}|${join(workspace, ".venv")}|utf-8`,
       });
 
       const outputResult = await bash.execute(
@@ -112,6 +113,7 @@ describe("local Pi tool boundaries", () => {
         {
           command:
             'i=0; while [ "$i" -lt 2105 ]; do echo "line-$i"; i=$((i+1)); done',
+          mutates: [],
         },
         undefined,
         undefined,
@@ -125,6 +127,86 @@ describe("local Pi tool boundaries", () => {
       expect((await readFile(fullOutputPath!, "utf8")).includes("line-2104")).toBe(
         true
       );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bash mutates shares the same file FIFO with write", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-bash-lock-"));
+    const workspace = join(root, "workspace");
+    const userTemp = join(root, "user-tmp");
+    await Promise.all([mkdir(workspace), mkdir(userTemp)]);
+    await writeFile(join(workspace, "shared.txt"), "initial", "utf8");
+
+    try {
+      const tools = await buildLocalTools(
+        workspace,
+        userTemp,
+        "+8613800000000",
+        "group-a"
+      );
+      const bash = tools.find((tool) => tool.name === "bash")!;
+      const write = tools.find((tool) => tool.name === "write")!;
+      const context = {
+        sessionManager: {
+          getSessionId: () => "session-test",
+          getSessionFile: () => join(root, "session.jsonl"),
+        },
+        model: { provider: "provider-test", id: "model-test" },
+        thinkingLevel: "off",
+      } as never;
+
+      const bashRun = bash.execute(
+        "bash-locked-write",
+        {
+          command:
+            'printf "started" > marker.txt; sleep 0.2; printf "from-bash" > shared.txt',
+          mutates: ["marker.txt", "shared.txt"],
+        },
+        undefined,
+        undefined,
+        context
+      );
+
+      for (let attempt = 0; attempt < 100; attempt++) {
+        try {
+          if (
+            (await readFile(join(workspace, "marker.txt"), "utf8")) ===
+            "started"
+          ) {
+            break;
+          }
+        } catch {
+          // Bash has not started yet.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(await readFile(join(workspace, "marker.txt"), "utf8")).toBe(
+        "started"
+      );
+
+      const writeRun = write.execute(
+        "write-after-bash",
+        { path: "shared.txt", content: "from-write" },
+        undefined,
+        undefined,
+        {} as never
+      );
+      await Promise.all([bashRun, writeRun]);
+      expect(await readFile(join(workspace, "shared.txt"), "utf8")).toBe(
+        "from-write"
+      );
+
+      expect(() =>
+        bash.execute(
+          "bash-missing-mutates",
+          { command: "pwd" } as never,
+          undefined,
+          undefined,
+          context
+        )
+      ).toThrow("mutates");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
