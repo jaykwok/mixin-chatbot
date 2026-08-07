@@ -41,7 +41,7 @@ const coordinatedBashSchema = Type.Object({
   }),
 });
 
-/** 使用 Pi 0.83 的官方类型收窄助手，使独立工具可安全放入 customTools。 */
+/** 使用 Pi 官方类型收窄助手，使独立工具可安全放入 customTools。 */
 function asSdkTool<T extends ToolDefinition<any, any, any>>(tool: T) {
   return defineTool({
     ...tool,
@@ -168,6 +168,7 @@ function createBashTool(
     PI_CALLER_PHONE: phone,
     PI_GROUP_ID: groupId,
     PI_USER_TMP: tempDir,
+    AI_AGENT: "pi",
   };
   const shellExports = Object.entries(callerEnvironment)
     .map(([name, value]) => `export ${name}=${shellQuote(value)}`)

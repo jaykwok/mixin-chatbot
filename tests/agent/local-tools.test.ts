@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { buildLocalTools } from "../../src/agent/local-tools.ts";
+import { isPathInside } from "../../src/agent/paths.ts";
 
 describe("local Pi tool boundaries", () => {
   test("file tools allow workspace and caller tmp but reject other paths", async () => {
@@ -96,7 +97,7 @@ describe("local Pi tool boundaries", () => {
         "bash-env",
         {
           command:
-            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR|$VIRTUAL_ENV|$UV_PROJECT_ENVIRONMENT|$PYTHONIOENCODING"',
+            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR|$VIRTUAL_ENV|$UV_PROJECT_ENVIRONMENT|$PYTHONIOENCODING|$AI_AGENT"',
           mutates: [],
         },
         undefined,
@@ -105,7 +106,7 @@ describe("local Pi tool boundaries", () => {
       );
       expect(envResult.content[0]).toMatchObject({
         type: "text",
-        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${join(workspace, ".venv")}|${join(workspace, ".venv")}|utf-8`,
+        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${join(workspace, ".venv")}|${join(workspace, ".venv")}|utf-8|pi`,
       });
 
       const outputResult = await bash.execute(
@@ -123,7 +124,7 @@ describe("local Pi tool boundaries", () => {
         .fullOutputPath;
       expect(fullOutputPath).toBeString();
       expect(isAbsolute(fullOutputPath!)).toBe(true);
-      expect(fullOutputPath!.startsWith(userTemp)).toBe(true);
+      expect(isPathInside(fullOutputPath!, await realpath(userTemp))).toBe(true);
       expect((await readFile(fullOutputPath!, "utf8")).includes("line-2104")).toBe(
         true
       );

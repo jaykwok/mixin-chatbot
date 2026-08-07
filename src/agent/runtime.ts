@@ -10,7 +10,7 @@
 // 中途干预（Pi 官方 API）：
 //   - agent 正忙时，普通消息 → session.steer()（等当前这批工具调用完、下次调 LLM 前注入，软干预）
 //   - /stop → session.abort()（硬中断，经 AbortSignal 连带取消在跑的工具）
-//   - /status /cancel /reset /help → 状态查询、干预清空、清会话、帮助
+//   - /status /clear /help → 状态查询、清会话、帮助
 import { readFileSync } from "node:fs";
 import { mkdir, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -40,6 +40,7 @@ import {
   sessionFilePath,
   userTempDir,
 } from "./paths.ts";
+import { canonicalCommand, HELP_TEXT } from "./commands.ts";
 import { buildLocalTools } from "./local-tools.ts";
 import { buildSendTools } from "./send-tools.ts";
 import { getWorkspaceCoordinationStatus } from "./workspace-coordinator.ts";
@@ -94,7 +95,7 @@ async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> 
 }
 
 type AgentSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
-type ResetResult = { ok: true } | { ok: false; message: string };
+type ClearResult = { ok: true } | { ok: false; message: string };
 
 // 每 (群, phone) 一个 AgentSession；不同用户可并发，workspace 写入由工具层按文件协调。
 const sessions = new Map<string, AgentSession>();
@@ -102,18 +103,18 @@ const sessions = new Map<string, AgentSession>();
 const sessionCreations = new Map<string, Promise<AgentSession>>();
 // dispose 期间阻止同一会话立刻重开并与旧实例同时操作同一个 jsonl。
 const sessionDisposals = new Map<string, Promise<void>>();
-// /reset 的 abort、dispose、删除历史必须整体完成后，才能为同一用户重建 session。
-const sessionResets = new Map<string, Promise<ResetResult>>();
+// /clear 的 abort、dispose、删除历史必须整体完成后，才能为同一用户重建 session。
+const sessionClears = new Map<string, Promise<ClearResult>>();
 const sessionLastUsed = new Map<string, number>();
 // 平台可能轮换 callback key；发送工具在每次执行时读取当前会话最新 URL。
 const sessionCallbackUrls = new Map<string, string>();
 // 正在跑 prompt 的 session（中途来的消息走 steer；同一 session 同时只允许一个 prompt）。
 const busySessions = new WeakSet<AgentSession>();
-// 被指令（/stop /reset）主动中断的 session——其 in-flight prompt 不再发回复/错误（指令已自己回执）。
+// 被指令（/stop /clear）主动中断的 session——其 in-flight prompt 不再发回复/错误（指令已自己回执）。
 const abortingSessions = new WeakSet<AgentSession>();
-// 让 /reset 与进程关闭能等 runPrompt 的外围发送/清理逻辑真正结束。
+// 让 /clear 与进程关闭能等 runPrompt 的外围发送/清理逻辑真正结束。
 const activeRuns = new Map<AgentSession, Promise<void>>();
-// /stop 与 /reset 同时取消适配层自己的状态/最终回复发送，不只中断 Pi prompt。
+// /stop 与 /clear 同时取消适配层自己的状态/最终回复发送，不只中断 Pi prompt。
 const runOutboundControllers = new WeakMap<AgentSession, AbortController>();
 // 每个session最近一次工具调用摘要，供 /status 展示。
 const lastTool = new WeakMap<AgentSession, string>();
@@ -140,15 +141,6 @@ Pi 还会向 bash 注入 PI_SESSION_ID、PI_SESSION_FILE、PI_PROVIDER、PI_MODE
 export async function initializeAgentRuntime(): Promise<void> {
   await getRuntime();
 }
-
-const HELP_TEXT = `可用指令（在群里直接发送，必须以 / 开头）：
-/help   查看本帮助
-/stop   强制停止当前任务（硬中断）
-/status 查看状态（忙/闲、待消化的干预、最近工具）
-/cancel 撤销尚未被消化的干预消息
-/reset  清空你在本群的会话历史，重新开始
-
-提示：agent 干活途中发普通消息 = 插入干预（下一步纳入）；发 /stop = 立即硬停。`;
 
 function sessionKey(phone: string, groupId: string): string {
   return JSON.stringify([groupId, phone]);
@@ -261,8 +253,8 @@ async function getOrCreateSession(
 ): Promise<AgentSession | null> {
   const key = sessionKey(phone, groupId);
   if (!acceptingRequests) return null;
-  const resetting = sessionResets.get(key);
-  if (resetting) await resetting;
+  const clearing = sessionClears.get(key);
+  if (clearing) await clearing;
   if (!acceptingRequests) return null;
   const disposing = sessionDisposals.get(key);
   if (disposing) await disposing;
@@ -294,20 +286,20 @@ async function getOrCreateSession(
 }
 
 /**
- * Reset is one per-user transaction: stop the active turn, wait for runPrompt's
+ * Clear is one per-user transaction: stop the active turn, wait for runPrompt's
  * outer work, dispose the SDK session, then remove its JSONL before allowing a
  * new session for the same (group, phone).
  */
-async function resetUserSession(
+async function clearUserSession(
   session: AgentSession,
   phone: string,
   groupId: string
-): Promise<ResetResult> {
+): Promise<ClearResult> {
   const key = sessionKey(phone, groupId);
-  const existing = sessionResets.get(key);
+  const existing = sessionClears.get(key);
   if (existing) return existing;
 
-  const reset = (async (): Promise<ResetResult> => {
+  const clear = (async (): Promise<ClearResult> => {
     if (busySessions.has(session)) {
       abortingSessions.add(session);
       runOutboundControllers.get(session)?.abort();
@@ -315,11 +307,11 @@ async function resetUserSession(
         await session.abort();
         await activeRuns.get(session);
       } catch (error) {
-        log.error(`reset abort 失败 - 用户: ${phone}, 错误: ${String(error)}`);
+        log.error(`clear abort 失败 - 用户: ${phone}, 错误: ${String(error)}`);
         abortingSessions.delete(session);
         return {
           ok: false,
-          message: "⚠️ 当前任务未能停止，会话历史没有删除；请稍后重试 /reset",
+          message: "⚠️ 当前任务未能停止，会话历史没有删除；请稍后重试 /clear",
         };
       }
     }
@@ -349,16 +341,16 @@ async function resetUserSession(
       );
       return {
         ok: false,
-        message: "⚠️ 会话已关闭，但历史文件删除失败；请检查目录权限后重试 /reset",
+        message: "⚠️ 会话已关闭，但历史文件删除失败；请检查目录权限后重试 /clear",
       };
     }
   })();
 
-  sessionResets.set(key, reset);
+  sessionClears.set(key, clear);
   try {
-    return await reset;
+    return await clear;
   } finally {
-    if (sessionResets.get(key) === reset) sessionResets.delete(key);
+    if (sessionClears.get(key) === clear) sessionClears.delete(key);
   }
 }
 
@@ -419,7 +411,7 @@ async function handleCommand(
   callbackUrl: string
 ): Promise<void> {
   const parts = content.trim().split(/\s+/);
-  const cmd = (parts[0] || "").toLowerCase();
+  const cmd = canonicalCommand(content);
   const reply = async (msg: string): Promise<boolean> => {
     try {
       const sent = await sendText(msg, groupId, phone, callbackUrl);
@@ -480,23 +472,11 @@ async function handleCommand(
       return;
     }
 
-    case "/cancel": {
-      let n = 0;
-      try {
-        const q = session.clearQueue();
-        n = q.steering.length + q.followUp.length;
-      } catch (e) {
-        log.error(`clearQueue 失败 - 用户: ${phone}, 错误: ${String(e)}`);
-      }
-      await reply(n > 0 ? `🗑 已撤销 ${n} 条待消化的干预` : "ℹ️ 没有待消化的干预");
-      return;
-    }
-
-    case "/reset": {
-      const result = await resetUserSession(session, phone, groupId);
+    case "/clear": {
+      const result = await clearUserSession(session, phone, groupId);
       await reply(
         result.ok
-          ? "🗑 已清空你在本群的会话历史，重新开始"
+          ? "🗑 已清空你在本群的会话历史；下一条消息将开启新会话"
           : result.message
       );
       return;
@@ -535,13 +515,13 @@ async function runPrompt(
       traffic: "status",
       signal: outboundController.signal,
     });
-    // /stop 或 /reset 可能发生在状态消息发送期间。
+    // /stop 或 /clear 可能发生在状态消息发送期间。
     if (abortingSessions.has(session)) {
       abortingSessions.delete(session);
       return;
     }
     await session.prompt(content);
-    // 被 /stop /reset 中断 → 不发回复（指令已自己回执）
+    // 被 /stop /clear 中断 → 不发回复（指令已自己回执）
     if (abortingSessions.has(session)) {
       abortingSessions.delete(session);
       log.info(`任务被指令中断，跳过回复 - 用户: ${phone}`);
@@ -595,7 +575,7 @@ export async function handleUserMessage(
   let session = await getOrCreateSession(phone, groupId, callbackUrl);
   if (!session || !acceptingRequests) return;
   const key = sessionKey(phone, groupId);
-  // A concurrent /reset can replace the session while getOrCreateSession is
+  // A concurrent /clear can replace the session while getOrCreateSession is
   // yielding. Refresh once before routing commands, steer, or a new prompt.
   if (sessions.get(key) !== session) {
     session = await getOrCreateSession(phone, groupId, callbackUrl);
@@ -640,14 +620,14 @@ export async function disposeAllSessions(): Promise<void> {
   }
   await Promise.allSettled(runningSessions.map((session) => session.abort()));
   await Promise.allSettled(activeRuns.values());
-  await Promise.allSettled(sessionResets.values());
+  await Promise.allSettled(sessionClears.values());
   for (const [key, session] of sessions) {
     await disposeSession(key, session);
   }
   sessions.clear();
   sessionLastUsed.clear();
   sessionCallbackUrls.clear();
-  sessionResets.clear();
+  sessionClears.clear();
   activeRuns.clear();
   await Promise.allSettled(sessionDisposals.values());
 }
