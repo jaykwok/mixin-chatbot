@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
+  BUILTIN_WHITELIST,
   entryToModel,
   modelDefaultsForSelection,
 } from "../../scripts/config/configure.ts";
 
 describe("configure model metadata", () => {
+  test("offers the Qwen Token Plan Individual provider", () => {
+    expect(BUILTIN_WHITELIST).toContain("qwen-token-plan-individual");
+  });
+
   test("converts LiteLLM per-token prices to Pi per-million-token prices", () => {
     const model = entryToModel("example-model", {
       input_cost_per_token: 0.000001,
