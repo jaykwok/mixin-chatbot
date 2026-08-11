@@ -43,6 +43,11 @@ import {
 import { canonicalCommand, HELP_TEXT } from "./commands.ts";
 import { buildLocalTools } from "./local-tools.ts";
 import { buildSendTools } from "./send-tools.ts";
+import {
+  consumeTerminalToolBlockReply,
+  createToolPolicyExtension,
+  type TerminalToolBlockState,
+} from "./tool-policy.ts";
 import { getWorkspaceCoordinationStatus } from "./workspace-coordinator.ts";
 
 // ModelRuntime 单例 + 解析出的单模型。从 data/config/models.json 加载（Pi 原生）。
@@ -79,6 +84,12 @@ async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> 
     const model = runtime.getModel(providerId, modelId);
     if (!model) {
       throw new Error(`${MODELS_JSON_PATH} 中未找到 ${providerId}/${modelId}，请检查配置。`);
+    }
+    const auth = await runtime.checkAuth(providerId);
+    if (!auth) {
+      throw new Error(
+        `${MODELS_JSON_PATH} 中的 provider ${providerId} 未配置可用凭证，请重新运行 configure 工具。`
+      );
     }
     modelRuntime = runtime;
     resolvedModel = model;
@@ -118,6 +129,11 @@ const activeRuns = new Map<AgentSession, Promise<void>>();
 const runOutboundControllers = new WeakMap<AgentSession, AbortController>();
 // 每个session最近一次工具调用摘要，供 /status 展示。
 const lastTool = new WeakMap<AgentSession, string>();
+// 0.84.1：全终止 tool_call 批次不会再调用模型，直接把策略原因回复给用户。
+const terminalToolBlockStates = new WeakMap<
+  AgentSession,
+  TerminalToolBlockState
+>();
 let acceptingRequests = true;
 
 /** 追加到 Pi 默认 system prompt 的群聊、共享工作区与当前用户临时目录上下文。 */
@@ -132,7 +148,7 @@ function buildChatContext(tempDir: string): string {
 bash 工具已自动把 TMPDIR、TMP、TEMP 和常见包管理器缓存指向上述临时目录；PI_USER_TMP 可直接读取该路径。命令若有独立的缓存或输出参数，也要显式指向该目录。
 需要 Python 时，只使用 uv 和本群 workspace/.venv；环境不存在时用 uv venv 创建，创建环境或变更依赖时把 .venv 列入 bash.mutates，依赖变更使用 uv pip。脚本使用 uv run --active --no-sync，不使用全局 Python 或 conda。PYTHONIOENCODING 已固定为 utf-8。
 安全、量子产品及项目知识以共享 workspace 中的项目资料为优先依据；观点冲突时先核对项目资料，需要外部最新事实且具备检索能力时再查询。
-Pi 还会向 bash 注入 PI_SESSION_ID、PI_SESSION_FILE、PI_PROVIDER、PI_MODEL；本适配层另提供 PI_CALLER_PHONE 和 PI_GROUP_ID，用于定位当前调用者与会话。
+仅当任务确实需要定位会话或调用者时，才使用 bash 中的 PI_* 环境变量，不要主动枚举或检查它们。本适配层提供 PI_CALLER_PHONE、PI_GROUP_ID 和 PI_USER_TMP。
 只有用户明确要保留或共享的最终成果才写入当前 workspace。
 干活途中用户可能插话干预（ steer ），请把后续用户消息当作对当前任务的补充/纠正，及时调整。`;
 }
@@ -204,6 +220,7 @@ async function createSession(
   await mkdir(piAgentDir, { recursive: true });
   const sessionManager = SessionManager.open(historyPath);
   const settingsManager = SettingsManager.inMemory();
+  const toolPolicy = createToolPolicyExtension({ workspaceDir: cwd, tempDir });
   const resourceLoader = new DefaultResourceLoader({
     cwd, // 群共享工作目录（<group>/workspace/）
     agentDir: piAgentDir, // 可重建的共享 Pi 内部目录，避免污染仓库根目录或用户 tmp。
@@ -213,6 +230,8 @@ async function createSession(
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
+    // noExtensions 只禁用磁盘发现；这一个受信任的内联策略仍由代码显式加载。
+    extensionFactories: [toolPolicy.extension],
     appendSystemPromptOverride: (base) => [...base, buildChatContext(tempDir)],
   });
   await resourceLoader.reload();
@@ -238,6 +257,7 @@ async function createSession(
     ],
     thinkingLevel: "off",
   });
+  terminalToolBlockStates.set(session, toolPolicy.state);
   sessions.set(key, session);
   sessionLastUsed.set(key, Date.now());
   log.info(
@@ -527,7 +547,9 @@ async function runPrompt(
       log.info(`任务被指令中断，跳过回复 - 用户: ${phone}`);
       return;
     }
-    const replyText = session.getLastAssistantText();
+    const replyText =
+      consumeTerminalToolBlockReply(terminalToolBlockStates.get(session)) ??
+      session.getLastAssistantText();
     if (!replyText) throw new Error("Pi 未返回回复");
     log.info(
       `Pi 回复完成 - 用户: ${phone}, 耗时: ${((Date.now() - start) / 1000).toFixed(2)}秒, 长度: ${replyText.length}`

@@ -31,8 +31,9 @@ const CHROME_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 // 内置 provider 中面向国内的常用项（其余走「自定义」）。
-const BUILTIN_WHITELIST = [
+export const BUILTIN_WHITELIST = [
   "qwen-token-plan",
+  "qwen-token-plan-individual",
   "qwen-token-plan-cn",
   "deepseek",
   "zai",
@@ -178,7 +179,7 @@ async function main(): Promise<void> {
       options: [
         {
           value: "builtin",
-          label: "内置 provider（qwen-token-plan/deepseek/zai/moonshotai…，元数据 Pi 自带）",
+          label: "内置 provider（含 Qwen Token Plan Individual、DeepSeek、ZAI 等，元数据 Pi 自带）",
         },
         {
           value: "custom",
