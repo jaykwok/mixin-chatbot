@@ -7,12 +7,14 @@ export const SUPPORTED_COMMANDS: ReadonlyMap<string, string> = new Map([
 ]);
 
 /**
- * Remove the IM platform's generic leading bot mention: @, a non-whitespace
- * name, then at least one whitespace character. Only the first leading mention
- * is removed so mentions that are part of the user's actual prompt are kept.
+ * Remove the IM platform's leading bot mention: @, the displayed bot name,
+ * then U+FFA0 HALFWIDTH HANGUL FILLER. U+FFA0 is the platform's actual mention
+ * separator even though it is rendered like a space. Normal whitespace is not
+ * accepted. Only the first leading mention is removed so mentions that are
+ * part of the user's actual prompt are kept.
  */
 export function stripLeadingMention(content: string): string {
-  return content.trim().replace(/^@\S+\s+/u, "");
+  return content.trim().replace(/^@[^\uFFA0]+\uFFA0/u, "");
 }
 
 /** Extract a case-insensitive slash command token from normalized IM text. */
