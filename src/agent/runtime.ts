@@ -40,7 +40,7 @@ import {
   sessionFilePath,
   userTempDir,
 } from "./paths.ts";
-import { canonicalCommand, HELP_TEXT } from "./commands.ts";
+import { canonicalCommand, HELP_TEXT, isCommandMessage } from "./commands.ts";
 import { buildLocalTools } from "./local-tools.ts";
 import { buildSendTools } from "./send-tools.ts";
 import {
@@ -531,10 +531,14 @@ async function runPrompt(
   const key = sessionKey(phone, groupId);
   const getCallbackUrl = () => sessionCallbackUrls.get(key) ?? callbackUrl;
   try {
-    await sendText("🤔 正在思考...", groupId, phone, getCallbackUrl(), {
-      traffic: "status",
-      signal: outboundController.signal,
-    });
+    // Only ordinary prompt text gets an acknowledgement. Slash commands have
+    // their own immediate response and must never emit a misleading thinking status.
+    if (!isCommandMessage(content)) {
+      await sendText("🤔 正在思考...", groupId, phone, getCallbackUrl(), {
+        traffic: "status",
+        signal: outboundController.signal,
+      });
+    }
     // /stop 或 /clear 可能发生在状态消息发送期间。
     if (abortingSessions.has(session)) {
       abortingSessions.delete(session);
@@ -605,7 +609,7 @@ export async function handleUserMessage(
   }
   const trimmed = content.trim();
 
-  if (trimmed.startsWith("/")) {
+  if (isCommandMessage(trimmed)) {
     await handleCommand(session, trimmed, phone, groupId, callbackUrl);
     return;
   }
