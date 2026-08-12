@@ -40,7 +40,12 @@ import {
   sessionFilePath,
   userTempDir,
 } from "./paths.ts";
-import { canonicalCommand, HELP_TEXT, isCommandMessage } from "./commands.ts";
+import {
+  canonicalCommand,
+  HELP_TEXT,
+  isCommandMessage,
+  stripLeadingMention,
+} from "./commands.ts";
 import { buildLocalTools } from "./local-tools.ts";
 import { buildSendTools } from "./send-tools.ts";
 import {
@@ -531,14 +536,12 @@ async function runPrompt(
   const key = sessionKey(phone, groupId);
   const getCallbackUrl = () => sessionCallbackUrls.get(key) ?? callbackUrl;
   try {
-    // Only ordinary prompt text gets an acknowledgement. Slash commands have
-    // their own immediate response and must never emit a misleading thinking status.
-    if (!isCommandMessage(content)) {
-      await sendText("🤔 正在思考...", groupId, phone, getCallbackUrl(), {
-        traffic: "status",
-        signal: outboundController.signal,
-      });
-    }
+    // Slash commands return from handleUserMessage before runPrompt, so only
+    // normalized ordinary prompt text reaches this acknowledgement.
+    await sendText("🤔 正在思考...", groupId, phone, getCallbackUrl(), {
+      traffic: "status",
+      signal: outboundController.signal,
+    });
     // /stop 或 /clear 可能发生在状态消息发送期间。
     if (abortingSessions.has(session)) {
       abortingSessions.delete(session);
@@ -614,12 +617,17 @@ export async function handleUserMessage(
     return;
   }
 
+  // The platform includes the leading @bot mention in textMsg.content. It is
+  // transport syntax rather than part of the user's prompt, so remove it once
+  // before prompt/steer while preserving later mentions in the actual message.
+  const promptContent = stripLeadingMention(trimmed);
+
   if (busySessions.has(session) && abortingSessions.has(session)) {
     await activeRuns.get(session);
     if (!acceptingRequests) return;
   } else if (busySessions.has(session)) {
     try {
-      await session.steer(content);
+      await session.steer(promptContent);
       await sendText("↩️ 已插入干预，agent 将在下一步纳入", groupId, phone, callbackUrl);
     } catch (e) {
       log.error(`steer 失败 - 用户: ${phone}, 错误: ${String(e)}`);
@@ -631,7 +639,7 @@ export async function handleUserMessage(
   // There is intentionally no await between the busy check above and
   // runPrompt marking this session busy, preventing concurrent prompts on one
   // AgentSession while still allowing different users to run together.
-  await runPrompt(session, phone, groupId, content, callbackUrl);
+  await runPrompt(session, phone, groupId, promptContent, callbackUrl);
 }
 
 /** 应用关闭时释放所有 session。 */
