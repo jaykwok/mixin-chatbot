@@ -43,8 +43,9 @@ import {
 import {
   canonicalCommand,
   HELP_TEXT,
-  isCommandMessage,
+  isSlashCommandMessage,
   stripLeadingMention,
+  unknownCommandText,
 } from "./commands.ts";
 import { buildLocalTools } from "./local-tools.ts";
 import { buildSendTools } from "./send-tools.ts";
@@ -435,7 +436,6 @@ async function handleCommand(
   groupId: string,
   callbackUrl: string
 ): Promise<void> {
-  const parts = content.trim().split(/\s+/);
   const cmd = canonicalCommand(content);
   const reply = async (msg: string): Promise<boolean> => {
     try {
@@ -508,7 +508,7 @@ async function handleCommand(
     }
 
     default:
-      await reply(`未知指令「${parts[0]}」。发送 /help 查看可用指令`);
+      await reply(unknownCommandText(content));
   }
 }
 
@@ -612,7 +612,7 @@ export async function handleUserMessage(
   }
   const trimmed = content.trim();
 
-  if (isCommandMessage(trimmed)) {
+  if (isSlashCommandMessage(trimmed)) {
     await handleCommand(session, trimmed, phone, groupId, callbackUrl);
     return;
   }

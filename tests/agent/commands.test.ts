@@ -3,8 +3,10 @@ import {
   canonicalCommand,
   HELP_TEXT,
   isCommandMessage,
+  isSlashCommandMessage,
   stripLeadingMention,
   SUPPORTED_COMMANDS,
+  unknownCommandText,
 } from "../../src/agent/commands.ts";
 
 describe("agent slash commands", () => {
@@ -27,6 +29,16 @@ describe("agent slash commands", () => {
     expect(isCommandMessage("@BOT 请解释 /clear")).toBe(false);
     expect(isCommandMessage("请解释 /clear")).toBe(false);
     expect(isCommandMessage("请帮我分析这段文字")).toBe(false);
+  });
+
+  test("routes unsupported slash syntax to command help instead of the agent", () => {
+    expect(isSlashCommandMessage("/unknown")).toBe(true);
+    expect(isSlashCommandMessage("@BOT\uFFA0/UNKNOWN option")).toBe(true);
+    expect(isSlashCommandMessage("请解释 /unknown")).toBe(false);
+
+    const reply = unknownCommandText("@BOT\uFFA0/UNKNOWN option");
+    expect(reply).toContain("未知指令「/unknown」");
+    expect(reply).toContain(HELP_TEXT);
   });
 
   test("removes only the transport-level leading mention from prompts", () => {
