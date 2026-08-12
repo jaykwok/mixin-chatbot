@@ -6,9 +6,18 @@ export const SUPPORTED_COMMANDS: ReadonlyMap<string, string> = new Map([
   ["/status", "查看状态（忙/闲、待消化的干预、最近工具）"],
 ]);
 
-/** Extract a case-insensitive slash command token. */
+/**
+ * Remove the IM platform's generic leading bot mention: @, a non-whitespace
+ * name, then at least one whitespace character. Only the first leading mention
+ * is removed so mentions that are part of the user's actual prompt are kept.
+ */
+export function stripLeadingMention(content: string): string {
+  return content.trim().replace(/^@\S+\s+/u, "");
+}
+
+/** Extract a case-insensitive slash command token from normalized IM text. */
 export function canonicalCommand(content: string): string {
-  const [token = ""] = content.trim().split(/\s+/, 1);
+  const [token = ""] = stripLeadingMention(content).split(/\s+/, 1);
   return token.toLowerCase();
 }
 
@@ -21,7 +30,7 @@ const commandHelp = [...SUPPORTED_COMMANDS]
   .map(([command, description]) => `${command.padEnd(7)} ${description}`)
   .join("\n");
 
-export const HELP_TEXT = `可用指令（在群里直接发送，必须以 / 开头，大小写不敏感）：
+export const HELP_TEXT = `可用指令（可前置 @机器人名，指令必须以 / 开头，大小写不敏感）：
 ${commandHelp}
 
 提示：agent 干活途中发普通消息 = 插入干预（下一步纳入）；发 /stop = 立即硬停。`;
