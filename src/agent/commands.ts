@@ -28,6 +28,11 @@ export function isCommandMessage(content: string): boolean {
   return SUPPORTED_COMMANDS.has(canonicalCommand(content));
 }
 
+/** Any normalized message whose first token starts with / is command syntax. */
+export function isSlashCommandMessage(content: string): boolean {
+  return canonicalCommand(content).startsWith("/");
+}
+
 const commandHelp = [...SUPPORTED_COMMANDS]
   .map(([command, description]) => `${command.padEnd(7)} ${description}`)
   .join("\n");
@@ -35,4 +40,8 @@ const commandHelp = [...SUPPORTED_COMMANDS]
 export const HELP_TEXT = `可用指令（可前置 @机器人名，指令必须以 / 开头，大小写不敏感）：
 ${commandHelp}
 
-提示：agent 干活途中发普通消息 = 插入干预（下一步纳入）；发 /stop = 立即硬停。`;
+提示：AI 干活途中发普通消息 = 插入干预（下一步纳入）；发 /stop = 立即硬停。`;
+
+export function unknownCommandText(content: string): string {
+  return `⚠️ 未知指令「${canonicalCommand(content)}」\n\n${HELP_TEXT}`;
+}
