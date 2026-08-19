@@ -97,7 +97,7 @@ describe("local Pi tool boundaries", () => {
         "bash-env",
         {
           command:
-            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR|$VIRTUAL_ENV|$UV_PROJECT_ENVIRONMENT|$PYTHONIOENCODING|$AI_AGENT"',
+            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR|$VIRTUAL_ENV|$UV_PROJECT_ENVIRONMENT|$PYTHONIOENCODING|$AI_AGENT|$PI_CODING_AGENT"',
           mutates: [],
         },
         undefined,
@@ -106,7 +106,7 @@ describe("local Pi tool boundaries", () => {
       );
       expect(envResult.content[0]).toMatchObject({
         type: "text",
-        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${join(workspace, ".venv")}|${join(workspace, ".venv")}|utf-8|pi`,
+        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${join(workspace, ".venv")}|${join(workspace, ".venv")}|utf-8|pi|true`,
       });
 
       const outputResult = await bash.execute(
@@ -199,15 +199,64 @@ describe("local Pi tool boundaries", () => {
         "from-write"
       );
 
-      expect(() =>
-        bash.execute(
-          "bash-missing-mutates",
-          { command: "pwd" } as never,
-          undefined,
-          undefined,
-          context
-        )
-      ).toThrow("mutates");
+      // A missing or malformed declaration must fall back to the workspace-wide
+      // lock rather than throwing away the tool call.
+      const missing = await bash.execute(
+        "bash-missing-mutates",
+        { command: "pwd" } as never,
+        undefined,
+        undefined,
+        context
+      );
+      expect(missing.content[0]).toMatchObject({ type: "text" });
+      expect(bash.prepareArguments?.({ command: "pwd" })).toMatchObject({
+        mutates: ["."],
+      });
+      expect(
+        bash.prepareArguments?.({ command: "pwd", mutates: "output.txt" })
+      ).toMatchObject({ mutates: ["."] });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bash may declare mutations in the caller tmp without being blocked", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-bash-tmp-"));
+    const workspace = join(root, "workspace");
+    const userTemp = join(root, "user-tmp");
+    await Promise.all([mkdir(workspace), mkdir(userTemp)]);
+
+    try {
+      const tools = await buildLocalTools(
+        workspace,
+        userTemp,
+        "+8613800000000",
+        "group-a"
+      );
+      const bash = tools.find((tool) => tool.name === "bash")!;
+      const context = {
+        sessionManager: {
+          getSessionId: () => "session-test",
+          getSessionFile: () => join(root, "session.jsonl"),
+        },
+        model: { provider: "provider-test", id: "model-test" },
+        thinkingLevel: "off",
+      } as never;
+
+      // The regression: intermediates belong in the caller's tmp, and declaring
+      // them there used to terminate the whole turn.
+      const scratch = join(userTemp, "extracted.txt");
+      await bash.execute(
+        "bash-temp-mutation",
+        {
+          command: 'printf "extracted" > "$PI_USER_TMP/extracted.txt"',
+          mutates: [scratch],
+        },
+        undefined,
+        undefined,
+        context
+      );
+      expect(await readFile(scratch, "utf8")).toBe("extracted");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

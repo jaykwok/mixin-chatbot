@@ -148,7 +148,7 @@ function buildChatContext(tempDir: string): string {
 你在「量子密信」群聊机器人里。用户用中文 @你 提问，请用中文简洁回复；需要标题、强调、列表、链接、表格或代码时使用 Markdown，普通段落不必添加格式。回复会自动发到群里。
 当前工作目录是本群共享的 workspace，只放需要让群成员长期复用的成果。先检查已有文件，不要覆盖或删除无关内容。
 不同用户的任务可以同时运行。read 可直接并行；edit/write 会自动按目标文件协调。同一个文件的写入按 FIFO 执行，不同文件可并行。
-调用 bash 时，mutates 必须列出命令可能创建、修改、重命名或删除的每个 workspace 路径；纯读取命令填空数组，无法列清或会批量修改时填 ["."]。禁止启动退出工具后仍会继续改 workspace 的后台进程。
+调用 bash 时，mutates 用于排队协调，请列出命令可能创建、修改、重命名或删除的每个路径；纯读取命令填空数组，无法列清或会批量修改时填 ["."]。临时目录内的路径不需要协调，列进去也会被忽略，不必为此改写命令。禁止启动退出工具后仍会继续改 workspace 的后台进程。
 当前调用用户的专属临时目录是：${resolve(tempDir)}
 下载、缓存、解压、转换产物、草稿和其他中间文件必须放进上述临时目录；不要放进 workspace、系统临时目录、其他用户目录或上级目录。
 bash 工具已自动把 TMPDIR、TMP、TEMP 和常见包管理器缓存指向上述临时目录；PI_USER_TMP 可直接读取该路径。命令若有独立的缓存或输出参数，也要显式指向该目录。
@@ -226,7 +226,7 @@ async function createSession(
   await mkdir(piAgentDir, { recursive: true });
   const sessionManager = SessionManager.open(historyPath);
   const settingsManager = SettingsManager.inMemory();
-  const toolPolicy = createToolPolicyExtension({ workspaceDir: cwd, tempDir });
+  const toolPolicy = createToolPolicyExtension();
   const resourceLoader = new DefaultResourceLoader({
     cwd, // 群共享工作目录（<group>/workspace/）
     agentDir: piAgentDir, // 可重建的共享 Pi 内部目录，避免污染仓库根目录或用户 tmp。
