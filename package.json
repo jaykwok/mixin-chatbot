@@ -14,8 +14,8 @@
   },
   "dependencies": {
     "@clack/prompts": "latest",
-    "@earendil-works/pi-ai": "latest",
-    "@earendil-works/pi-coding-agent": "latest",
+    "@earendil-works/pi-ai": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
     "hono": "^4.12.32"
   },
   "devDependencies": {
