@@ -1,17 +1,10 @@
-import { resolve } from "node:path";
 import type {
   InlineExtension,
   ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { isPathInside } from "./paths.ts";
 
 export interface TerminalToolBlockState {
-  reasons: string[];
-}
-
-export interface ToolPolicyOptions {
-  workspaceDir: string;
-  tempDir: string;
+  reason?: string;
 }
 
 interface ToolCallLike {
@@ -19,15 +12,8 @@ interface ToolCallLike {
   input: Record<string, unknown>;
 }
 
-const PATH_TOOLS = new Set(["read", "edit", "write"]);
-
-function terminatingBlock(reason: string): ToolCallEventResult {
-  return { block: true, reason, terminate: true };
-}
-
-function isHttpUrl(value: string): boolean {
-  return /^https?:\/\//i.test(value);
-}
+const DETACHED_PROCESS_REASON =
+  "禁止启动在 bash 工具返回后仍继续运行的后台进程";
 
 /**
  * Detect commands deliberately detached from the bash tool lifecycle. This is
@@ -52,72 +38,36 @@ export function startsDetachedProcess(command: string): boolean {
 }
 
 /**
- * Cheap, pre-execution checks for policy violations that should not be repaired
- * by another model turn. Canonical/symlink validation remains in each tool's
- * execute implementation as the authoritative boundary.
+ * The only pre-execution policy that remains, and the only one that should.
+ *
+ * Path containment is not checked here: every tool that takes a path already
+ * enforces it canonically in its own execute — AllowedPathGuard for
+ * read/edit/write, loadBytes for send_image/send_file — and a violation there
+ * surfaces as an ordinary tool error the model can recover from inside the same
+ * turn. Duplicating those checks here only added `terminate`, which turns a
+ * one-turn self-correction into a dead task.
+ *
+ * A detached background process is genuinely different. It outlives the tool's
+ * AbortSignal, so the damage is in the intent rather than in the arguments, and
+ * another model turn just invites a different spawn syntax. That one ends the
+ * turn and reports straight back to the user.
  */
 export function evaluateToolCallPolicy(
-  event: ToolCallLike,
-  options: ToolPolicyOptions
+  event: ToolCallLike
 ): ToolCallEventResult | undefined {
-  const workspaceDir = resolve(options.workspaceDir);
-  const tempDir = resolve(options.tempDir);
-
-  if (PATH_TOOLS.has(event.toolName)) {
-    const path = event.input.path;
-    if (typeof path !== "string") return undefined;
-    const target = resolve(workspaceDir, path);
-    if (!isPathInside(target, workspaceDir) && !isPathInside(target, tempDir)) {
-      return terminatingBlock(
-        `${event.toolName} 只能访问本群 workspace 或当前用户 tmp`
-      );
-    }
+  if (event.toolName !== "bash") return undefined;
+  const command = event.input.command;
+  if (typeof command !== "string" || !startsDetachedProcess(command)) {
     return undefined;
   }
-
-  if (event.toolName === "send_image" || event.toolName === "send_file") {
-    const source = event.input.source;
-    if (typeof source !== "string" || isHttpUrl(source)) return undefined;
-    const target = resolve(workspaceDir, source);
-    if (!isPathInside(target, workspaceDir) && !isPathInside(target, tempDir)) {
-      return terminatingBlock(
-        `${event.toolName} 只能发送本群 workspace 或当前用户 tmp 内的文件`
-      );
-    }
-    return undefined;
-  }
-
-  if (event.toolName === "bash") {
-    const mutates = event.input.mutates;
-    if (Array.isArray(mutates)) {
-      const outsideWorkspace = mutates.some(
-        (path) =>
-          typeof path === "string" &&
-          !isPathInside(resolve(workspaceDir, path), workspaceDir)
-      );
-      if (outsideWorkspace) {
-        return terminatingBlock(
-          "bash.mutates 只能声明本群 workspace 内的路径"
-        );
-      }
-    }
-
-    const command = event.input.command;
-    if (typeof command === "string" && startsDetachedProcess(command)) {
-      return terminatingBlock(
-        "禁止启动在 bash 工具返回后仍继续运行的后台进程"
-      );
-    }
-  }
-
-  return undefined;
+  return { block: true, reason: DETACHED_PROCESS_REASON, terminate: true };
 }
 
-export function createToolPolicyExtension(options: ToolPolicyOptions): {
+export function createToolPolicyExtension(): {
   extension: InlineExtension;
   state: TerminalToolBlockState;
 } {
-  const state: TerminalToolBlockState = { reasons: [] };
+  const state: TerminalToolBlockState = {};
   const extension: InlineExtension = {
     name: "mixin-tool-policy",
     hidden: true,
@@ -125,13 +75,11 @@ export function createToolPolicyExtension(options: ToolPolicyOptions): {
       // A subsequent turn means the batch was not all-terminating; let the
       // model consume the blocked result and produce the normal final reply.
       pi.on("turn_start", () => {
-        state.reasons.length = 0;
+        state.reason = undefined;
       });
       pi.on("tool_call", (event) => {
-        const decision = evaluateToolCallPolicy(event, options);
-        if (decision?.terminate && decision.reason) {
-          state.reasons.push(decision.reason);
-        }
+        const decision = evaluateToolCallPolicy(event);
+        if (decision?.terminate && decision.reason) state.reason = decision.reason;
         return decision;
       });
     },
@@ -143,10 +91,8 @@ export function createToolPolicyExtension(options: ToolPolicyOptions): {
 export function consumeTerminalToolBlockReply(
   state: TerminalToolBlockState | undefined
 ): string | undefined {
-  if (!state || state.reasons.length === 0) return undefined;
-  const reasons = [...new Set(state.reasons)];
-  state.reasons.length = 0;
-  return reasons.length === 1
-    ? `⛔ 已阻止工具调用：${reasons[0]}`
-    : `⛔ 已阻止以下工具调用：\n${reasons.map((reason) => `- ${reason}`).join("\n")}`;
+  const reason = state?.reason;
+  if (!reason) return undefined;
+  state.reason = undefined;
+  return `⛔ 已阻止工具调用：${reason}`;
 }

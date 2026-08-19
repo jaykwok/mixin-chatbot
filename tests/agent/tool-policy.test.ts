@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { resolve } from "node:path";
 import {
   consumeTerminalToolBlockReply,
   createToolPolicyExtension,
@@ -7,74 +6,55 @@ import {
   startsDetachedProcess,
 } from "../../src/agent/tool-policy.ts";
 
-const workspaceDir = resolve("data/groups/group/workspace");
-const tempDir = resolve("data/groups/group/users/user/tmp");
-const options = { workspaceDir, tempDir };
+const DETACHED_REASON = "禁止启动在 bash 工具返回后仍继续运行的后台进程";
 
 describe("tool call policy", () => {
-  test("allows file operations inside the workspace or caller temp directory", () => {
+  test("leaves path containment to each tool's own canonical guard", () => {
+    // read/edit/write go through AllowedPathGuard and send_* through loadBytes,
+    // both of which reject canonically. Re-checking here would only add
+    // `terminate`, ending a turn the model could have repaired by itself.
+    const events = [
+      { toolName: "read", input: { path: "../../../config/models.json" } },
+      { toolName: "edit", input: { path: "/etc/hosts" } },
+      { toolName: "write", input: { path: "../escape.txt" } },
+      { toolName: "send_file", input: { source: "/etc/passwd" } },
+      { toolName: "send_image", input: { source: "https://example.com/a.png" } },
+    ];
+    for (const event of events) {
+      expect(evaluateToolCallPolicy(event)).toBeUndefined();
+    }
+  });
+
+  test("accepts bash mutation declarations wherever they point", () => {
+    // Declaring a private tmp path is honest and useful; it must never cost the
+    // user a turn. Out-of-workspace paths are dropped at lock time instead.
     expect(
-      evaluateToolCallPolicy(
-        { toolName: "read", input: { path: "report.md" } },
-        options
-      )
+      evaluateToolCallPolicy({
+        toolName: "bash",
+        input: {
+          command: 'unzip data.zip -d "$PI_USER_TMP"',
+          mutates: ["/data/groups/g/users/u/tmp/data"],
+        },
+      })
     ).toBeUndefined();
     expect(
-      evaluateToolCallPolicy(
-        { toolName: "write", input: { path: resolve(tempDir, "draft.md") } },
-        options
-      )
+      evaluateToolCallPolicy({
+        toolName: "bash",
+        input: { command: "touch output.txt", mutates: ["output.txt"] },
+      })
+    ).toBeUndefined();
+    expect(
+      evaluateToolCallPolicy({ toolName: "bash", input: { command: "pwd" } })
     ).toBeUndefined();
   });
 
-  test("terminates file and attachment calls that are lexically outside allowed roots", () => {
+  test("terminates only genuinely unrepairable intent", () => {
     expect(
-      evaluateToolCallPolicy(
-        { toolName: "read", input: { path: "../../../config/models.json" } },
-        options
-      )
-    ).toEqual({
-      block: true,
-      reason: "read 只能访问本群 workspace 或当前用户 tmp",
-      terminate: true,
-    });
-    expect(
-      evaluateToolCallPolicy(
-        { toolName: "send_file", input: { source: resolve("secrets.txt") } },
-        options
-      )
-    ).toMatchObject({ block: true, terminate: true });
-    expect(
-      evaluateToolCallPolicy(
-        { toolName: "send_image", input: { source: "https://example.com/a.png" } },
-        options
-      )
-    ).toBeUndefined();
-  });
-
-  test("terminates bash calls that declare mutations outside the group workspace", () => {
-    expect(
-      evaluateToolCallPolicy(
-        {
-          toolName: "bash",
-          input: { command: "touch ../other.txt", mutates: ["../other.txt"] },
-        },
-        options
-      )
-    ).toEqual({
-      block: true,
-      reason: "bash.mutates 只能声明本群 workspace 内的路径",
-      terminate: true,
-    });
-    expect(
-      evaluateToolCallPolicy(
-        {
-          toolName: "bash",
-          input: { command: "touch output.txt", mutates: ["output.txt"] },
-        },
-        options
-      )
-    ).toBeUndefined();
+      evaluateToolCallPolicy({
+        toolName: "bash",
+        input: { command: "nohup bun run worker &", mutates: ["."] },
+      })
+    ).toEqual({ block: true, reason: DETACHED_REASON, terminate: true });
   });
 
   test("detects detached processes without confusing normal shell operators", () => {
@@ -85,7 +65,7 @@ describe("tool call policy", () => {
   });
 
   test("keeps terminal reasons only when no subsequent model turn starts", async () => {
-    const { extension, state } = createToolPolicyExtension(options);
+    const { extension, state } = createToolPolicyExtension();
     if (typeof extension === "function") throw new Error("expected named inline extension");
 
     const handlers = new Map<string, (event: any) => unknown>();
@@ -95,25 +75,24 @@ describe("tool call policy", () => {
       },
     } as never);
 
-    handlers.get("turn_start")?.({ type: "turn_start" });
-    const decision = handlers.get("tool_call")?.({
+    const detachedCall = {
       type: "tool_call",
       toolCallId: "call-1",
-      toolName: "read",
-      input: { path: "../../../config/models.json" },
+      toolName: "bash",
+      input: { command: "setsid ./writer.sh", mutates: ["."] },
+    };
+
+    handlers.get("turn_start")?.({ type: "turn_start" });
+    expect(handlers.get("tool_call")?.(detachedCall)).toMatchObject({
+      block: true,
+      terminate: true,
     });
-    expect(decision).toMatchObject({ block: true, terminate: true });
     expect(consumeTerminalToolBlockReply(state)).toBe(
-      "⛔ 已阻止工具调用：read 只能访问本群 workspace 或当前用户 tmp"
+      `⛔ 已阻止工具调用：${DETACHED_REASON}`
     );
     expect(consumeTerminalToolBlockReply(state)).toBeUndefined();
 
-    handlers.get("tool_call")?.({
-      type: "tool_call",
-      toolCallId: "call-2",
-      toolName: "read",
-      input: { path: "../../../config/models.json" },
-    });
+    handlers.get("tool_call")?.({ ...detachedCall, toolCallId: "call-2" });
     handlers.get("turn_start")?.({ type: "turn_start" });
     expect(consumeTerminalToolBlockReply(state)).toBeUndefined();
   });

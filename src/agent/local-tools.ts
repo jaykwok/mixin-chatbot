@@ -37,7 +37,7 @@ const coordinatedBashSchema = Type.Object({
   ),
   mutates: Type.Array(Type.String(), {
     description:
-      "Workspace file paths this command may create, modify, rename, or delete. Use [] only for a read-only command; use ['.'] when the affected files cannot be enumerated.",
+      "Workspace file paths this command may create, modify, rename, or delete. Use [] only for a read-only command; use ['.'] when the affected files cannot be enumerated. Paths outside the group workspace, such as your own temp directory, need no coordination and are ignored rather than rejected.",
   }),
 });
 
@@ -168,7 +168,10 @@ function createBashTool(
     PI_CALLER_PHONE: phone,
     PI_GROUP_ID: groupId,
     PI_USER_TMP: tempDir,
+    // Pi sets both markers itself, but only in its own CLI/RPC entrypoints. This
+    // process embeds the SDK, so child commands need them exported explicitly.
     AI_AGENT: "pi",
+    PI_CODING_AGENT: "true",
   };
   const shellExports = Object.entries(callerEnvironment)
     .map(([name, value]) => `export ${name}=${shellQuote(value)}`)
@@ -231,6 +234,29 @@ function createBashTool(
     }
   };
 
+  const workspaceRoot = resolve(cwd);
+
+  /**
+   * `mutates` is scheduling metadata, never a boundary: the bash tool spawns a
+   * real shell, so no declaration can contain where a command actually writes.
+   * Its only job is taking FIFO locks on the shared group workspace. Paths
+   * outside it — the caller's private tmp, most often — need no lock at all, so
+   * they are dropped instead of rejected; declaring them honestly must not cost
+   * the user a turn. A missing or malformed declaration falls back to the
+   * workspace-wide lock, which is conservative and always safe.
+   */
+  const workspaceLockTargets = (mutates: unknown): string[] | "opaque" => {
+    if (
+      !Array.isArray(mutates) ||
+      mutates.some((path) => typeof path !== "string")
+    ) {
+      return "opaque";
+    }
+    const targets = mutates.map((path) => resolve(workspaceRoot, path));
+    if (targets.some((path) => path === workspaceRoot)) return "opaque";
+    return targets.filter((path) => isPathInside(path, workspaceRoot));
+  };
+
   const execute: ToolDefinition<typeof coordinatedBashSchema>["execute"] = (
     toolCallId,
     { mutates, ...input },
@@ -238,16 +264,10 @@ function createBashTool(
     onUpdate,
     context
   ) => {
-    if (
-      !Array.isArray(mutates) ||
-      mutates.some((path) => typeof path !== "string")
-    ) {
-      throw new Error("bash 的 mutates 必须是字符串路径数组；纯读取请显式传 []");
-    }
     const task = () =>
       executeOfficial(toolCallId, input, signal, onUpdate, context);
-    const targets = mutates.map((path) => resolve(cwd, path));
-    if (targets.some((path) => path === resolve(cwd))) {
+    const targets = workspaceLockTargets(mutates);
+    if (targets === "opaque") {
       return runOpaqueWorkspaceOperation(cwd, task, signal);
     }
     return runFileMutations(cwd, targets, task, signal);
@@ -258,22 +278,31 @@ function createBashTool(
     parameters: coordinatedBashSchema,
     prepareArguments: (args: unknown) => {
       const raw = args as Record<string, unknown>;
-      if (
-        !Array.isArray(raw?.mutates) ||
-        raw.mutates.some((path) => typeof path !== "string")
-      ) {
-        throw new Error("bash 的 mutates 必须是字符串路径数组；纯读取请显式传 []");
-      }
       const prepared = official.prepareArguments
         ? official.prepareArguments(args)
         : (raw as { command: string; timeout?: number });
-      return { ...prepared, mutates: raw.mutates as string[] };
+      // Fail safe rather than loud: an omitted or malformed declaration becomes
+      // the workspace-wide lock instead of throwing away the whole tool call.
+      const declared = raw?.mutates;
+      const mutates =
+        Array.isArray(declared) && declared.every((path) => typeof path === "string")
+          ? (declared as string[])
+          : ["."];
+      return { ...prepared, mutates };
     },
-    description: `${official.description} Before execution, declare every workspace path the command may create, modify, rename, or delete in mutates. Use an empty list only for read-only commands and ["."] for unknown or workspace-wide changes. Declared paths share FIFO locks with edit/write. Do not start background workspace writers.`,
+    description: `${official.description} Before execution, declare every workspace path the command may create, modify, rename, or delete in mutates. Use an empty list only for read-only commands and ["."] for unknown or workspace-wide changes. Declared paths share FIFO locks with edit/write; paths outside the group workspace need no lock and are ignored. Do not start background workspace writers.`,
     execute,
   } as unknown as ToolDefinition<typeof coordinatedBashSchema>;
 }
 
+/**
+ * Pi's own edit/write already wrap their mutation in withFileMutationQueue, so
+ * this looks redundant — it is not. That queue only serializes edit against
+ * write; this one shares its FIFO with the paths bash declares in `mutates`,
+ * which is the only thing keeping a file edit from overlapping a bash command
+ * that touches the same file, and it adds the workspace-level gate that keeps
+ * both away from a workspace-wide (opaque) bash operation.
+ */
 function coordinateFileTool<T extends ToolDefinition<any, any, any>>(
   tool: T,
   cwd: string
