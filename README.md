@@ -46,7 +46,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1
 | 运行时 | Bun（原生 TS） |
 | Web 框架 | Hono（跑在 Bun.serve） |
 | Agent 大脑 | `@earendil-works/pi-coding-agent`（版本由 `bun.lock` 锁定） |
-| 模型接入 | Pi 原生读 `data/config/models.json`，支持 DashScope / DeepSeek / 智谱等 openai 兼容端点 |
+| 模型接入 | Pi 原生读 `data/config/models.json`，配置器仅生成 OpenAI Responses API 配置 |
 | 部署 | Docker（Debian，oven/bun 镜像）/ Windows 原生 Bun（`scripts/deploy/deploy.ps1`） |
 
 ## 群聊使用
@@ -114,7 +114,7 @@ data/
             └── session.jsonl
 ```
 
-- **AI 配置**（provider / key / model / 元数据）：全部在 `data/config/models.json`，由 `bun run configure` 调用 `scripts/config/configure.ts` 生成，Pi 原生读取；内置列表包含 `qwen-token-plan-individual`。服务启动时还会对所选 provider 做只读凭证就绪检查。
+- **AI 配置**（Responses provider / base URL / key / model / 元数据 / thinkingLevel）：全部在 `data/config/models.json`，由 `bun run configure` 调用 `scripts/config/configure.ts` 生成，Pi 原生读取 provider/model，本项目读取 thinkingLevel。配置器固定写入 `api: "openai-responses"`；模型支持思考模式时选择 `off/minimal/low/medium/high`（默认 `low`），不支持时固定为 `off`。服务启动时对所选 provider 做只读凭证就绪检查。
 - **监听端口与部署状态**：Linux/Windows 部署脚本每次都会询问；端口默认优先沿用 `BOT_PORT` 或 `data/state/bot-port`，否则为 `1011`，部署模式默认优先沿用 `DEPLOY_MODE` 或 `data/state/deploy-mode`。机器人健康且隧道/直连切换成功后，模式、公网域名和主机侧群数据根才统一提交到 `data/state/`。
 - **监听地址**：部署脚本自动设置；直连模式为 `0.0.0.0`，Cloudflare 模式为 `127.0.0.1`。手动启动时可用 `BOT_HOST` 覆盖。
 - **群数据总根**（可选）：首次默认 `./data/groups`，部署时可改（`deploy.ps1`/`deploy.sh` 会问），或直接设环境变量 `GROUP_DATA_ROOT`（相对仓库或绝对路径均可）。部署成功后主机路径写入 `data/state/group-data-root`，下次部署自动沿用，避免群数据被切到另一目录；配置、部署状态和 runtime 始终保留在项目 `data/` 的分类目录中。
@@ -189,7 +189,7 @@ sudo usermod -aG docker $USER && newgrp docker
 
 1. 询问监听端口（默认沿用已有值，否则 `1011`）、部署模式、群数据总根和 Cloudflare 公网域名；无效输入会原地重试
 2. 构建 Docker 镜像（Bun）
-3. **AI 配置**：若 `data/config/models.json` 不存在，在容器内运行 TUI（选 provider、填 key、选模型，元数据从 LiteLLM 抓取）；已存在则询问是否重配
+3. **AI 配置**：若 `data/config/models.json` 不存在，在容器内运行 TUI（填写 Responses provider、base URL、key 和模型，元数据从 LiteLLM 抓取；支持思考时选择 thinkingLevel）；已存在则询问是否重配
 4. 验证 bind mount 对容器身份可读写，再启动容器（普通用户部署沿用当前非 root UID/GID；root 部署固定降权到 UID/GID 1001；host 网络、只读根文件系统、最小权限）
 5. 等待健康检查并完成隧道/直连切换；失败、超时或中途取消会移除未提交的新容器并恢复旧容器，旧 UFW 入口到成功提交后才清理
 

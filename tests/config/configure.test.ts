@@ -1,13 +1,20 @@
 import { describe, expect, test } from "bun:test";
 import {
-  BUILTIN_WHITELIST,
+  defaultThinkingLevel,
   entryToModel,
+  MODEL_API,
   modelDefaultsForSelection,
 } from "../../scripts/config/configure.ts";
 
 describe("configure model metadata", () => {
-  test("offers the Qwen Token Plan Individual provider", () => {
-    expect(BUILTIN_WHITELIST).toContain("qwen-token-plan-individual");
+  test("writes the OpenAI Responses API type", () => {
+    expect(MODEL_API).toBe("openai-responses");
+  });
+
+  test("defaults reasoning models to low and non-reasoning models to off", () => {
+    expect(defaultThinkingLevel(true)).toBe("low");
+    expect(defaultThinkingLevel(true, "high")).toBe("high");
+    expect(defaultThinkingLevel(false, "high")).toBe("off");
   });
 
   test("converts LiteLLM per-token prices to Pi per-million-token prices", () => {

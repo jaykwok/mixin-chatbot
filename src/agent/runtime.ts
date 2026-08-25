@@ -14,7 +14,12 @@
 import { readFileSync } from "node:fs";
 import { mkdir, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import {
+  clampThinkingLevel,
+  type Api,
+  type Model,
+  type ModelThinkingLevel,
+} from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -59,11 +64,21 @@ import { getWorkspaceCoordinationStatus } from "./workspace-coordinator.ts";
 // ModelRuntime 单例 + 解析出的单模型。从 data/config/models.json 加载（Pi 原生）。
 let modelRuntime: ModelRuntime | null = null;
 let resolvedModel: Model<Api> | null = null;
-let runtimePromise: Promise<{ runtime: ModelRuntime; model: Model<Api> }> | null = null;
+let resolvedThinkingLevel: ModelThinkingLevel = "off";
+type RuntimeSelection = {
+  runtime: ModelRuntime;
+  model: Model<Api>;
+  thinkingLevel: ModelThinkingLevel;
+};
+let runtimePromise: Promise<RuntimeSelection> | null = null;
 
-async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> }> {
+async function getRuntime(): Promise<RuntimeSelection> {
   if (modelRuntime && resolvedModel) {
-    return { runtime: modelRuntime, model: resolvedModel };
+    return {
+      runtime: modelRuntime,
+      model: resolvedModel,
+      thinkingLevel: resolvedThinkingLevel,
+    };
   }
   if (runtimePromise) return runtimePromise;
 
@@ -71,12 +86,15 @@ async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> 
     // 显式读 models.json 拿声明的 provider/model id（getProviders() 会混入内置 provider）。
     let providerId: string | undefined;
     let modelId: string | undefined;
+    let configuredThinkingLevel: ModelThinkingLevel = "off";
     try {
       const raw = JSON.parse(readFileSync(MODELS_JSON_PATH, "utf8")) as {
+        thinkingLevel?: ModelThinkingLevel;
         providers?: Record<string, { models?: { id?: string }[] }>;
       };
       providerId = Object.keys(raw.providers ?? {})[0];
       modelId = raw.providers?.[providerId]?.models?.[0]?.id;
+      configuredThinkingLevel = raw.thinkingLevel ?? "off";
     } catch {
       throw new Error(
         `无法读取 ${MODELS_JSON_PATH}。请先生成 AI 配置：运行 bun run configure（部署脚本会自动调用）`
@@ -97,10 +115,14 @@ async function getRuntime(): Promise<{ runtime: ModelRuntime; model: Model<Api> 
         `${MODELS_JSON_PATH} 中的 provider ${providerId} 未配置可用凭证，请重新运行 configure 工具。`
       );
     }
+    const thinkingLevel = clampThinkingLevel(model, configuredThinkingLevel);
     modelRuntime = runtime;
     resolvedModel = model;
-    log.info(`Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}, 群数据总根=${GROUP_DATA_ROOT}）`);
-    return { runtime, model };
+    resolvedThinkingLevel = thinkingLevel;
+    log.info(
+      `Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}, thinkingLevel=${thinkingLevel}, 群数据总根=${GROUP_DATA_ROOT}）`
+    );
+    return { runtime, model, thinkingLevel };
   })();
 
   try {
@@ -215,7 +237,7 @@ async function createSession(
   callbackUrl: string
 ): Promise<AgentSession> {
   const key = sessionKey(phone, groupId);
-  const { runtime, model } = await getRuntime();
+  const { runtime, model, thinkingLevel } = await getRuntime();
   const cwd = resolve(groupWorkspaceDir(GROUP_DATA_ROOT, groupId));
   const tempDir = resolve(userTempDir(GROUP_DATA_ROOT, groupId, phone));
   const historyPath = resolve(sessionFilePath(GROUP_DATA_ROOT, groupId, phone));
@@ -261,7 +283,7 @@ async function createSession(
         tempDir
       ),
     ],
-    thinkingLevel: "off",
+    thinkingLevel,
   });
   terminalToolBlockStates.set(session, toolPolicy.state);
   sessions.set(key, session);

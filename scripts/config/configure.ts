@@ -18,10 +18,7 @@ import {
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
-import {
-  getBuiltinModels,
-  getBuiltinProviders,
-} from "@earendil-works/pi-ai/providers/all";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { MODELS_JSON_PATH } from "../../src/core/storage.ts";
 
 const LITELLM_URL =
@@ -30,18 +27,7 @@ const LITELLM_URL =
 const CHROME_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-// 内置 provider 中面向国内的常用项（其余走「自定义」）。
-export const BUILTIN_WHITELIST = [
-  "qwen-token-plan",
-  "qwen-token-plan-individual",
-  "qwen-token-plan-cn",
-  "deepseek",
-  "zai",
-  "zai-coding-cn",
-  "moonshotai",
-  "moonshotai-cn",
-  "kimi-coding",
-];
+export const MODEL_API = "openai-responses" as const;
 
 // @clack/prompts 取消即退出。
 function bail<T>(v: T | symbol): T {
@@ -53,6 +39,7 @@ function bail<T>(v: T | symbol): T {
 }
 
 interface ExistingDoc {
+  thinkingLevel?: ModelThinkingLevel;
   providers?: Record<string, Record<string, unknown>>;
 }
 type JsonObject = Record<string, unknown>;
@@ -163,6 +150,13 @@ export function modelDefaultsForSelection(
   return defaultModel(modelId);
 }
 
+export function defaultThinkingLevel(
+  supportsReasoning: boolean,
+  existing?: ModelThinkingLevel
+): ModelThinkingLevel {
+  return supportsReasoning ? (existing ?? "low") : "off";
+}
+
 async function main(): Promise<void> {
   intro(`🤖 AI 配置（生成 ${MODELS_JSON_PATH}）`);
 
@@ -172,150 +166,134 @@ async function main(): Promise<void> {
   const firstEntry = firstId ? (existingProviders[firstId] as JsonObject) : null;
   const firstModel = (firstEntry?.models as JsonObject[] | undefined)?.[0];
 
-  const kind = bail<string>(
-    await select({
-      message: "选择 provider 类型",
-      initialValue: "custom",
-      options: [
-        {
-          value: "builtin",
-          label: "内置 provider（含 Qwen Token Plan Individual、DeepSeek、ZAI 等，元数据 Pi 自带）",
-        },
-        {
-          value: "custom",
-          label: "自定义（任意 openai 兼容端点，如 DeepSeek 直连；元数据从 LiteLLM 抓）",
-        },
-      ],
+  const providerId = bail<string>(
+    await text({
+      message: "Responses provider id（自洽即可，如 openai）",
+      defaultValue: firstId ?? "openai",
+      initialValue: firstId ?? "openai",
+      validate: (v) => (v?.trim() ? undefined : "不能为空"),
     })
-  );
-
-  let providerId: string;
-  let entry: JsonObject;
-
-  if (kind === "builtin") {
-    const providers = getBuiltinProviders().filter((p) => BUILTIN_WHITELIST.includes(p));
-    if (providers.length === 0) throw new Error("Pi 未返回可用的内置 provider");
-    providerId = bail<string>(
-      await select({
-        message: "选择内置 provider",
-        initialValue: "qwen-token-plan",
-        options: providers.map((p) => ({ value: p, label: p })),
-      })
-    );
-    const modelIds = getBuiltinModels(providerId as never).map((m) => m.id);
-    if (modelIds.length === 0) throw new Error(`provider ${providerId} 没有可用模型`);
-    const modelId = bail<string>(
-      await select({
-        message: `选择模型（${providerId} 目录）`,
-        initialValue: modelIds[0],
-        options: modelIds.map((m) => ({ value: m, label: m })),
-      })
-    );
-    const apiKey = bail<string>(
-      await password({
-        message: `输入 ${providerId} 的 API Key`,
-        validate: (v) => (v?.trim() ? undefined : "不能为空"),
-      })
-    ).trim();
-    // 内置 provider：baseUrl/元数据 Pi 目录自带，models.json 只需 key + 模型 id。
-    entry = { apiKey, models: [{ id: modelId }] };
-  } else {
-    providerId = bail<string>(
-      await text({
-        message: "provider id（自洽即可，如 deepseek）",
-        defaultValue: firstId ?? "deepseek",
-        initialValue: firstId ?? "deepseek",
-        validate: (v) => (v?.trim() ? undefined : "不能为空"),
-      })
-    ).trim();
-    const baseUrl = bail<string>(
-      await text({
-        message: "baseUrl（openai 兼容端点）",
-        defaultValue:
-          (firstEntry?.baseUrl as string) ?? "https://api.deepseek.com",
-        initialValue:
-          (firstEntry?.baseUrl as string) ?? "https://api.deepseek.com",
-        validate: (v) => {
-          try {
-            const protocol = new URL(v ?? "").protocol;
-            return protocol === "http:" || protocol === "https:"
-              ? undefined
-              : "仅支持 http:// 或 https://";
-          } catch {
-            return "请输入有效 URL";
-          }
-        },
-      })
-    ).trim();
-    const apiKey = bail<string>(
-      await password({
-        message: "API Key",
-        validate: (v) => (v?.trim() ? undefined : "不能为空"),
-      })
-    ).trim();
-    const modelId = bail<string>(
-      await text({
-        message: "模型 id",
-        defaultValue: (firstModel?.id as string) ?? "deepseek-v4-flash",
-        initialValue: (firstModel?.id as string) ?? "deepseek-v4-flash",
-        validate: (v) => (v?.trim() ? undefined : "不能为空"),
-      })
-    ).trim();
-
-    // 从 LiteLLM 抓元数据（自定义 provider 的模型不在 Pi 内置目录）。
-    // 只有仍在编辑原 provider 时才考虑复用旧模型元数据；同名模型在不同端点
-    // 可能有不同上下文、能力和价格，不能跨 provider 继承。
-    let model = modelDefaultsForSelection(
-      modelId,
-      firstModel,
-      providerId === firstId
-    );
-    const catalog = await fetchLitellm();
-    if (catalog) {
-      const m = matchLitellm(catalog, modelId);
-      if (m) {
-        log.info(
-          `LiteLLM 命中 "${m[0]}": context=${m[1].max_input_tokens ?? "?"}, maxOut=${m[1].max_output_tokens ?? "?"}, $in/tok=${m[1].input_cost_per_token ?? "?"}`
-        );
-        const use = bail<boolean>(
-          await confirm({ message: "采用 LiteLLM 元数据？", initialValue: true })
-        );
-        if (use) model = entryToModel(modelId, m[1]);
-      } else {
-        log.warn(`LiteLLM 未命中 "${modelId}"，手动填写元数据`);
-      }
-    }
-
-    // 允许手动覆盖 contextWindow / maxTokens。
-    const cw = bail<string>(
-      await text({
-        message: "contextWindow",
-        defaultValue: String(model.contextWindow ?? 131072),
-        initialValue: String(model.contextWindow ?? 131072),
-        validate: (v) =>
-          isPositiveSafeInteger(v) ? undefined : "需为正安全整数",
-      })
-    );
-    const mt = bail<string>(
-      await text({
-        message: "maxTokens",
-        defaultValue: String(model.maxTokens ?? 8192),
-        initialValue: String(model.maxTokens ?? 8192),
-        validate: (v) => {
-          if (!isPositiveSafeInteger(v)) return "需为正安全整数";
-          return Number(v) <= Number(cw)
+  ).trim();
+  const baseUrl = bail<string>(
+    await text({
+      message: "baseUrl（必须实现 OpenAI Responses API）",
+      defaultValue:
+        (firstEntry?.baseUrl as string) ?? "https://api.openai.com/v1",
+      initialValue:
+        (firstEntry?.baseUrl as string) ?? "https://api.openai.com/v1",
+      validate: (v) => {
+        try {
+          const protocol = new URL(v ?? "").protocol;
+          return protocol === "http:" || protocol === "https:"
             ? undefined
-            : "不能大于 contextWindow";
-        },
-      })
-    );
-    model.contextWindow = Number(cw);
-    model.maxTokens = Number(mt);
+            : "仅支持 http:// 或 https://";
+        } catch {
+          return "请输入有效 URL";
+        }
+      },
+    })
+  ).trim();
+  const apiKey = bail<string>(
+    await password({
+      message: "API Key",
+      validate: (v) => (v?.trim() ? undefined : "不能为空"),
+    })
+  ).trim();
+  const modelId = bail<string>(
+    await text({
+      message: "模型 id",
+      defaultValue: (firstModel?.id as string) ?? "gpt-5.2",
+      initialValue: (firstModel?.id as string) ?? "gpt-5.2",
+      validate: (v) => (v?.trim() ? undefined : "不能为空"),
+    })
+  ).trim();
 
-    entry = { name: providerId, baseUrl, apiKey, api: "openai-completions", models: [model] };
+  // 从 LiteLLM 抓元数据（自定义 provider 的模型不在 Pi 内置目录）。
+  // 只有仍在编辑原 provider 时才考虑复用旧模型元数据；同名模型在不同端点
+  // 可能有不同上下文、能力和价格，不能跨 provider 继承。
+  let model = modelDefaultsForSelection(
+    modelId,
+    firstModel,
+    providerId === firstId
+  );
+  const catalog = await fetchLitellm();
+  if (catalog) {
+    const m = matchLitellm(catalog, modelId);
+    if (m) {
+      log.info(
+        `LiteLLM 命中 "${m[0]}": context=${m[1].max_input_tokens ?? "?"}, maxOut=${m[1].max_output_tokens ?? "?"}, $in/tok=${m[1].input_cost_per_token ?? "?"}`
+      );
+      const use = bail<boolean>(
+        await confirm({ message: "采用 LiteLLM 元数据？", initialValue: true })
+      );
+      if (use) model = entryToModel(modelId, m[1]);
+    } else {
+      log.warn(`LiteLLM 未命中 "${modelId}"，手动填写元数据`);
+    }
   }
 
-  const doc = { providers: { [providerId]: entry } };
+  // 允许手动覆盖 contextWindow / maxTokens。
+  const cw = bail<string>(
+    await text({
+      message: "contextWindow",
+      defaultValue: String(model.contextWindow ?? 131072),
+      initialValue: String(model.contextWindow ?? 131072),
+      validate: (v) =>
+        isPositiveSafeInteger(v) ? undefined : "需为正安全整数",
+    })
+  );
+  const mt = bail<string>(
+    await text({
+      message: "maxTokens",
+      defaultValue: String(model.maxTokens ?? 8192),
+      initialValue: String(model.maxTokens ?? 8192),
+      validate: (v) => {
+        if (!isPositiveSafeInteger(v)) return "需为正安全整数";
+        return Number(v) <= Number(cw)
+          ? undefined
+          : "不能大于 contextWindow";
+      },
+    })
+  );
+  model.contextWindow = Number(cw);
+  model.maxTokens = Number(mt);
+
+  const supportsReasoning = bail<boolean>(
+    await confirm({
+      message: "模型支持思考模式？",
+      initialValue: model.reasoning === true,
+    })
+  );
+  model.reasoning = supportsReasoning;
+  let thinkingLevel = defaultThinkingLevel(
+    supportsReasoning,
+    existing.thinkingLevel
+  );
+  if (supportsReasoning) {
+    thinkingLevel = bail<ModelThinkingLevel>(
+      await select({
+        message: "thinkingLevel",
+        initialValue: thinkingLevel,
+        options: [
+          { value: "off", label: "off（关闭）" },
+          { value: "minimal", label: "minimal（最低）" },
+          { value: "low", label: "low（低）" },
+          { value: "medium", label: "medium（中）" },
+          { value: "high", label: "high（高）" },
+        ],
+      })
+    );
+  }
+
+  const entry: JsonObject = {
+    name: providerId,
+    baseUrl,
+    apiKey,
+    api: MODEL_API,
+    models: [model],
+  };
+
+  const doc = { thinkingLevel, providers: { [providerId]: entry } };
   await mkdir(dirname(MODELS_JSON_PATH), { recursive: true });
   const tempPath = `${MODELS_JSON_PATH}.tmp-${process.pid}-${randomUUID()}`;
   try {
@@ -331,7 +309,10 @@ async function main(): Promise<void> {
     await unlink(tempPath).catch(() => {});
   }
 
-  note(`已写入 ${MODELS_JSON_PATH}\nprovider=${providerId}`, "完成");
+  note(
+    `已写入 ${MODELS_JSON_PATH}\nprovider=${providerId}\nthinkingLevel=${thinkingLevel}`,
+    "完成"
+  );
   outro("✅ AI 配置完成。");
 }
 
