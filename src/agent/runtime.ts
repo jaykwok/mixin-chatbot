@@ -10,6 +10,7 @@
 // 中途干预（Pi 官方 API）：
 //   - agent 正忙时，普通消息 → session.steer()（等当前这批工具调用完、下次调 LLM 前注入，软干预）
 //   - /stop → session.abort()（硬中断，经 AbortSignal 连带取消在跑的工具）
+//     + session.clearQueue()（abort 只结束这一轮，排队中的干预要一起丢）
 //   - /status /clear /help → 状态查询、清会话、帮助
 import { readFileSync } from "node:fs";
 import { mkdir, unlink } from "node:fs/promises";
@@ -450,6 +451,22 @@ function recordToolProgress(event: AgentSessionEvent, session: AgentSession): vo
   }
 }
 
+/**
+ * Drop steering/follow-up messages that were queued for a turn which no longer
+ * exists. Pi's abort() only cancels the active run; the agent loop reads its
+ * steering queue at the start of the *next* run, so anything left over would be
+ * injected into an unrelated later task. Returns how many were discarded.
+ */
+function discardQueuedInterventions(session: AgentSession): number {
+  try {
+    const { steering, followUp } = session.clearQueue();
+    return steering.length + followUp.length;
+  } catch (e) {
+    log.error(`清空干预队列失败: ${String(e)}`);
+    return 0;
+  }
+}
+
 /** /指令 路由：立即处理，不进 prompt/steer。 */
 async function handleCommand(
   session: AgentSession,
@@ -475,7 +492,7 @@ async function handleCommand(
       await reply(HELP_TEXT);
       return;
 
-    case "/stop":
+    case "/stop": {
       if (!busySessions.has(session)) {
         await reply("ℹ️ 当前没有正在执行的任务");
         return;
@@ -491,8 +508,16 @@ async function handleCommand(
         await reply("⚠️ 停止任务失败，请稍后重试");
         return;
       }
-      await reply("⏹ 已强制停止当前任务");
+      // abort() 只取消在跑的这一轮，排队中的 steer 会留到下次 prompt 开头注入。
+      // 这个 session 会继续服务下一个任务，所以丢弃属于已停任务的干预。
+      const dropped = discardQueuedInterventions(session);
+      await reply(
+        dropped > 0
+          ? `⏹ 已强制停止当前任务，并丢弃 ${dropped} 条未消化的干预`
+          : "⏹ 已强制停止当前任务"
+      );
       return;
+    }
 
     case "/status": {
       const busy = busySessions.has(session);
