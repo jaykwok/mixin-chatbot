@@ -131,7 +131,9 @@ describe("local Pi tool boundaries", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+    // Producing 2105 lines through a real shell runs past bun's 5s default on
+    // Windows/Git Bash; the loop is what makes the output truncate at all.
+  }, 20_000);
 
   test("bash mutates shares the same file FIFO with write", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-bash-lock-"));
@@ -257,6 +259,65 @@ describe("local Pi tool boundaries", () => {
         context
       );
       expect(await readFile(scratch, "utf8")).toBe("extracted");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("read detects images with Pi's sniffer, still behind the path guard", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-image-"));
+    const workspace = join(root, "workspace");
+    const userTemp = join(root, "user-tmp");
+    const outside = join(root, "outside");
+    await Promise.all([mkdir(workspace), mkdir(userTemp), mkdir(outside)]);
+
+    // 1x1 transparent PNG: real signature plus a valid IHDR/IDAT/IEND chain.
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+      "base64"
+    );
+    // Signature only: our old 12-byte sniffer called this image/png, which then
+    // reached the model as a broken image block. Pi's validates the IHDR chunk.
+    const fakePng = Buffer.concat([
+      png.subarray(0, 8),
+      Buffer.from("not really a png", "utf8"),
+    ]);
+
+    try {
+      const tools = await buildLocalTools(
+        workspace,
+        userTemp,
+        "+8613800000000",
+        "group-a"
+      );
+      const read = tools.find((tool) => tool.name === "read")!;
+      const readText = async (path: string): Promise<string> => {
+        const result = await read.execute(
+          `read-${path}`,
+          { path },
+          undefined,
+          undefined,
+          {} as never
+        );
+        return result.content
+          .filter((item) => item.type === "text")
+          .map((item) => item.text)
+          .join("\n");
+      };
+
+      await writeFile(join(workspace, "chart.png"), png);
+      await writeFile(join(workspace, "fake.png"), fakePng);
+      await writeFile(join(outside, "secret.png"), png);
+
+      expect(await readText(join(workspace, "chart.png"))).toContain(
+        "Read image file [image/png]"
+      );
+      expect(await readText(join(workspace, "fake.png"))).not.toContain(
+        "Read image file"
+      );
+      await expect(readText(join(outside, "secret.png"))).rejects.toThrow(
+        "只能访问"
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }

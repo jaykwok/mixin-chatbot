@@ -331,7 +331,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理
 <details>
 <summary><b>工具调用策略</b></summary>
 
-保持 Pi 的磁盘扩展发现关闭，只加载本进程显式注册的内联策略。该策略只剩一条：阻止脱离工具生命周期的后台进程——它活得比工具的 AbortSignal 长，问题出在意图而非参数上，再来一轮只会换个 spawn 写法，因此使用 Pi 0.84.1 的 `{ block: true, terminate: true }`，同批调用全部终止时直接向用户返回原因，不再额外调用一次模型。路径边界不在这里重复判断：`read` / `edit` / `write` 由 `AllowedPathGuard`、`send_image` / `send_file` 由 `loadBytes` 在执行阶段做 canonical path/符号链接校验，越界会变成一次普通的工具报错，模型可以在同一轮里自行改正。
+保持 Pi 的磁盘扩展发现关闭，只加载本进程显式注册的内联策略。该策略只剩一条：阻止脱离工具生命周期的后台进程——它活得比工具的 AbortSignal 长，问题出在意图而非参数上，再来一轮只会换个 spawn 写法，因此使用 Pi 0.84.1 的 `{ block: true, terminate: true }`，同批调用全部终止时直接向用户返回原因，不再额外调用一次模型。路径边界不在这里重复判断：`read` / `edit` / `write` 由 `AllowedPathGuard`、`send_image` / `send_file` 由 `loadBytes` 在执行阶段做 canonical path/符号链接校验，越界会变成一次普通的工具报错，模型可以在同一轮里自行改正。`read` 的 `operations` 覆盖只负责套这层边界，图片类型判断本身直接调 Pi 0.84.4 公开导出的 `detectSupportedImageMimeTypeFromFile`，与官方 `read` 的默认行为保持一致（校验 IHDR、拒绝 APNG 等）。
 
 </details>
 

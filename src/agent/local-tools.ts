@@ -5,7 +5,6 @@ import {
   copyFile,
   lstat,
   mkdir,
-  open,
   readFile,
   realpath,
   unlink,
@@ -20,6 +19,7 @@ import {
   createReadToolDefinition,
   createWriteToolDefinition,
   defineTool,
+  detectSupportedImageMimeTypeFromFile,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { log } from "../core/log.ts";
@@ -96,33 +96,6 @@ class AllowedPathGuard {
         cursor = parent;
       }
     }
-  }
-}
-
-async function detectImageMimeType(path: string): Promise<string | null> {
-  const handle = await open(path, "r");
-  try {
-    const header = Buffer.alloc(12);
-    const { bytesRead } = await handle.read(header, 0, header.length, 0);
-    const bytes = header.subarray(0, bytesRead);
-    if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) {
-      return "image/png";
-    }
-    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-      return "image/jpeg";
-    }
-    if (bytes.length >= 6 && (bytes.toString("ascii", 0, 6) === "GIF87a" || bytes.toString("ascii", 0, 6) === "GIF89a")) {
-      return "image/gif";
-    }
-    if (bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") {
-      return "image/webp";
-    }
-    if (bytes.length >= 2 && bytes.toString("ascii", 0, 2) === "BM") {
-      return "image/bmp";
-    }
-    return null;
-  } finally {
-    await handle.close();
   }
 }
 
@@ -333,8 +306,9 @@ export async function buildLocalTools(
     access: async (path: string) => {
       await access(await guard.existing(path), constants.R_OK);
     },
+    // Pi 的 read 工具默认就用这个嗅探器；同名覆盖只是为了先过路径边界。
     detectImageMimeType: async (path: string) =>
-      detectImageMimeType(await guard.existing(path)),
+      detectSupportedImageMimeTypeFromFile(await guard.existing(path)),
   };
   const writeOperations = {
     writeFile: async (path: string, content: string) =>
