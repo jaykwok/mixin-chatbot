@@ -125,7 +125,7 @@ data/
 <details>
 <summary><b>依赖与出站适配的维护约定</b></summary>
 
-Pi 依赖声明为 `^0.84.2`，当前 `bun.lock` 锁定 Pi `0.84.2`；部署使用 `bun install --frozen-lockfile`，避免未经审计的自动升级。更新 Pi 依赖时运行 `bun update @earendil-works/pi-ai @earendil-works/pi-coding-agent && bun run check`，确认通过后一起提交锁文件。
+Pi 依赖声明为 `^0.84.4`，当前 `bun.lock` 锁定 Pi `0.84.4`；部署使用 `bun install --frozen-lockfile`，避免未经审计的自动升级。更新 Pi 依赖时运行 `bun update @earendil-works/pi-ai @earendil-works/pi-coding-agent && bun run check`，确认通过后一起提交锁文件。
 
 `package.json` 将 Pi 间接使用的 `brace-expansion` 统一约束为已修复的 `5.0.8`，避免依赖树重新解析到受已知内存耗尽漏洞影响的 `5.0.7` 及更早版本。
 
