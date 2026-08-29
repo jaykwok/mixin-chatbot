@@ -41,6 +41,7 @@ import {
   sendReplyWithMention,
   sendText,
 } from "../integrations/im.ts";
+import { getRelayConfig } from "../integrations/relay.ts";
 import {
   groupWorkspaceDir,
   sessionFilePath,
@@ -277,12 +278,14 @@ async function createSession(
     tools: ["read", "bash", "edit", "write", "send_image", "send_file"],
     customTools: [
       ...localTools,
-      ...buildSendTools(
-        () => sessionCallbackUrls.get(key) ?? callbackUrl,
+      ...buildSendTools({
+        getCallbackUrl: () => sessionCallbackUrls.get(key) ?? callbackUrl,
         groupId,
-        cwd,
-        tempDir
-      ),
+        phone,
+        workspaceDir: cwd,
+        tempDir,
+        relay: getRelayConfig(),
+      }),
     ],
     thinkingLevel,
   });

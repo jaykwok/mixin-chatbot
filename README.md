@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1
 机器人只接收**文字**消息（群聊 webhook）。Pi agent 拿到后可调用工具：
 
 - 官方工厂：`read` / `bash` / `edit` / `write`（cwd 为本群共享的 `<GROUP_DATA_ROOT>/<group>/workspace`；文件工具只允许访问该 workspace 与当前用户 tmp）
-- 自定义：`send_image` / `send_file`（往群里发送图片或文件）
+- 自定义：`send_image` / `send_file`（往群里发送图片或文件；配置了[大文件外链分发](#大文件外链分发可选)后，超过 25MB 的文件自动改发下载链接）
 
 规范化后的普通文字任务开始时只发送一条 `🤔 正在思考...` 作为接单确认；工具调用和长任务过程不发送周期心跳，只在任务完成、失败、收到指令或确实需要排队时再发消息，避免刷屏。
 
@@ -95,7 +95,8 @@ data/
 ├── config/                         # 用户配置与密钥
 │   ├── models.json
 │   ├── webhook-secret
-│   └── tunnel-token
+│   ├── tunnel-token
+│   └── relay.json                  # 可选：大文件外链分发后端
 ├── state/                          # 部署脚本生成的状态
 │   ├── bot-port
 │   ├── deploy-mode
@@ -105,7 +106,8 @@ data/
 ├── runtime/                        # 可删除、可重建的运行文件
 │   ├── bot-launcher.ps1
 │   ├── home/                       # Linux 容器任意非 root UID 的可写 HOME
-│   └── pi/
+│   ├── pi/
+│   └── relay-index.jsonl           # 外链去重索引（丢失只会导致重传一次）
 └── groups/                         # 默认 GROUP_DATA_ROOT
     └── <group>/
         ├── workspace/
@@ -121,6 +123,29 @@ data/
 - **访问控制**：随机密钥路径（`data/config/webhook-secret`，应用层）+ 网络层 IP 闸门（直连=系统防火墙 / Cloudflare=WAF），见[部署模式](#部署模式)与[安全](#安全)。
 - **开发开关**：生产环境缺少有效 `data/config/webhook-secret` 时服务拒绝启动；只有隔离的本地调试可显式设置 `ALLOW_INSECURE_WEBHOOK=1`。`BOT_DEBUG=1` 会记录用户消息正文，默认关闭。
 - **负载上限**：`BOT_MAX_ACTIVE_REQUESTS` 控制已确认但尚未完成的 Pi 后台任务数，默认 `32`，有效范围 `1–1000`；达到上限的新请求不启动模型，而是通过 callback 明确通知当前用户稍后重发。
+
+### 大文件外链分发（可选）
+
+量子密信单条附件上限是 25MB。`data/config/relay.json` 存在时，超过该上限的**本地**文件（本群 workspace 或当前用户 tmp 内）会改为流式 PUT 到一个 WebDAV 后端，并在群里发送对应的公开下载链接；该文件不存在时行为与不带这个特性时完全一致——直接报文件过大。
+
+```jsonc
+{
+  "webdavUrl": "http://127.0.0.1:5244/dav/relay/",      // 上传目标，目录需事先存在
+  "publicBaseUrl": "https://files.example.com/d/relay/", // 指向同一目录的公开下载基址
+  "username": "bot",
+  "password": "...",
+  "maxBytes": 2147483648                                 // 可选，默认 2GB
+}
+```
+
+代码只认识 WebDAV，不认识任何具体网盘：后端挂 alist、Nextcloud 还是别的东西，只体现在这个文件里。配置存在但内容有问题时服务**拒绝启动**，避免等到某个用户发了个大文件才发现配置写错。
+
+几个有意为之的取舍：
+
+- **只处理本地文件。** 让机器人把任意 http(s) 地址镜像成公开链接等于把它变成开放转载器，而且远程响应不一定给 `Content-Length`。超限的远程文件仍按原样报错，模型可以先用 `bash` 下载到自己的 tmp 再发。
+- **图片不走这条路。** 群聊里图片的价值在于内联显示，换成链接就没有意义了。
+- **去重按「内容哈希 + 文件名」。** 上传前流式算一遍 SHA-256，命中 `data/runtime/relay-index.jsonl` 就直接复用旧链接，不重复上传；复用前会 HEAD 探测一次（不跟随重定向），远端已被清理时丢弃记录并重传——给用户一条死链比多传一次糟得多。同一内容的并发发送会串行化，后来者等前一个落地后直接命中索引，且不共享前一个的 AbortSignal，前一个被 `/stop` 掉不会连累后一个。相同字节但文件名不同时会重新上传一份，否则用户下到的文件名对不上。
+- **不做过期回收。** 对象名形如 `20260829-<uuid>-<原文件名>`：uuid 让链接不可枚举（公开基址上任何人拿到链接都能下载，猜不到就是唯一的保护），日期前缀让运维可以按天批量清理。清理后索引会在下次命中时自愈。
 
 <details>
 <summary><b>依赖与出站适配的维护约定</b></summary>
@@ -367,7 +392,7 @@ mixin-chatbot/
 │   │   ├── workspace-coordinator.ts # 同文件 FIFO、多文件并发与 bash 声明式路径锁
 │   │   ├── local-tools.ts      # Pi 官方工具工厂 + 路径/临时环境适配
 │   │   ├── paths.ts            # 群优先的数据目录布局与安全目录名
-│   │   └── send-tools.ts       # 发送工具 send_image / send_file
+│   │   └── send-tools.ts       # 发送工具 send_image / send_file（含外链分流）
 │   ├── core/                   # 共享基础设施
 │   │   ├── config.ts           # 参数读取与常量（端口 / 限流 / 日志等）
 │   │   ├── storage.ts          # data/config、state、runtime、groups 路径定义
@@ -375,7 +400,9 @@ mixin-chatbot/
 │   ├── integrations/
 │   │   ├── callback-route.ts   # callback key 与群关系保护
 │   │   ├── markdown.ts         # Markdown 检测与纯文本降级
-│   │   └── im.ts               # 量子密信消息/附件与共享 RPM 窗口
+│   │   ├── im.ts               # 量子密信消息/附件与共享 RPM 窗口
+│   │   ├── relay.ts            # 可选：大文件 WebDAV 外链分发
+│   │   └── relay-index.ts      # 外链去重索引（内容哈希 -> 已上传地址）
 │   └── server/                 # HTTP 层
 │       ├── index.ts            # 入口：Hono + Bun.serve + /webhook 路由
 │       ├── webhook.ts          # 字段校验、去重、入站限流、后台并发派发

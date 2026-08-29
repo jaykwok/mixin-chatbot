@@ -19,6 +19,7 @@ import {
   cleanupCallbackRoutes,
   observeCallbackRoute,
 } from "../integrations/callback-route.ts";
+import { initializeRelay } from "../integrations/relay.ts";
 import {
   constantTimeEqual,
   getClientIp,
@@ -225,6 +226,8 @@ app.notFound((c) => c.json({ status: "error", message: "Not Found" }, 404));
 
 // 在开放端口前验证 Pi 的 models.json 与目标模型，避免健康检查已通但首条消息才失败。
 await initializeAgentRuntime();
+// 同理校验可选的外链分发配置：写错了要现在就报，而不是等某个用户发了个大文件。
+initializeRelay();
 
 const rateLimitTimer = setInterval(() => {
   try {

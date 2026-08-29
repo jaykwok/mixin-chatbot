@@ -43,6 +43,11 @@ export const IM_HTTP_TIMEOUT = 15_000; // 单次 webhook 发送超时
 export const IM_TEXT_MAX_LENGTH = 5000;
 export const ATTACHMENT_HTTP_TIMEOUT = 60_000;
 export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+/** 外链分发单次 PUT 的上限耗时。文件可以很大，这里只兜住真正挂死的连接，
+ *  正常的中途取消由 Pi 工具的 AbortSignal（/stop）负责。 */
+export const RELAY_HTTP_TIMEOUT = 30 * 60_000;
+/** 复用去重索引里的地址前，探测它是否还活着的超时。 */
+export const RELAY_PROBE_TIMEOUT = 15_000;
 /** 机器人出站发送滑动窗口（按 callback key 全局统计，多用户共享）。 */
 export const IM_RATE_LIMIT_WINDOW = 60_000; // ms
 export const IM_RATE_LIMIT_MAX_MESSAGES = 20;
