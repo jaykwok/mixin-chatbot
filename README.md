@@ -136,7 +136,7 @@ data/
   "username": "bot",
   "password": "...",
   "maxBytes": 2147483648,                                // 可选，默认 2GB
-  "expireHours": 8                                       // 可选，缺省表示永不过期
+  "expireHours": 8                                       // 可选，单位小时，缺省表示永不过期
 }
 ```
 
