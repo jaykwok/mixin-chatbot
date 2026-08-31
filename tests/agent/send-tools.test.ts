@@ -196,7 +196,9 @@ describe("attachment send tools", () => {
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-      if (init?.method === "PUT") return new Response(null, { status: 201 });
+      if (init?.method === "PUT" || init?.method === "MKCOL") {
+        return new Response(null, { status: 201 });
+      }
       return new Response(null, { status: 302 });
     }) as unknown as typeof fetch;
 

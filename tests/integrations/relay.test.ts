@@ -67,11 +67,19 @@ async function withFixture<T>(
 }
 
 function mockFetch(
-  handler: (input: Parameters<typeof fetch>[0], init?: RequestInit) => Response
+  handler: (input: Parameters<typeof fetch>[0], init?: RequestInit) => Response,
+  /** 让 handler 也看见建目录请求。只有专门验建目录的用例需要。 */
+  options?: { handleMkcol?: boolean }
 ): () => void {
   const original = globalThis.fetch;
-  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
-    handler(input, init)) as unknown as typeof fetch;
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    // 每次上传前都要建一次 uuid 目录，对绝大多数用例是同样的背景噪音，默认答成功，
+    // 免得每个 mock 都写一遍。建目录本身的行为见 "relay object layout"。
+    if (init?.method === "MKCOL" && !options?.handleMkcol) {
+      return new Response(null, { status: 201 });
+    }
+    return handler(input, init);
+  }) as unknown as typeof fetch;
   return () => {
     globalThis.fetch = original;
   };
@@ -185,7 +193,7 @@ describe("relay upload", () => {
         // 上传对象名与下载对象名必须是同一个，否则链接指向不存在的文件。
         const object = putUrl.slice(CONFIG.webdavUrl.length);
         expect(url).toBe(`${CONFIG.publicBaseUrl}${object}`);
-        expect(decodeURIComponent(object).endsWith("-note.txt")).toBe(true);
+        expect(decodeURIComponent(object).endsWith("/note.txt")).toBe(true);
         expect(contentType).toBe("application/octet-stream");
         expect(auth).toBe(`Basic ${Buffer.from("bot:secret").toString("base64")}`);
       } finally {
@@ -706,6 +714,155 @@ describe("relay expiry", () => {
         // 死链不能靠刷新时间戳续命，必须真的重传。
         expect(puts).toBe(1);
         expect(url).not.toContain("stale-object.txt");
+      } finally {
+        restore();
+      }
+    });
+  });
+});
+
+describe("relay object layout", () => {
+  test("keeps the original filename as the last path segment", async () => {
+    await withFixture(async ({ file, index }) => {
+      const restore = mockFetch(() => new Response(null, { status: 201 }));
+      try {
+        const url = await relayFile({
+          config: CONFIG,
+          localPath: file,
+          size: 5,
+          filename: "电信安全产品手册-2025.pdf",
+          index,
+        });
+        // 后端把对象名原样写进 Content-Disposition，所以最后一段必须就是原文件名——
+        // uuid 拌进文件名里的话，每个人下到的都是 20260831-<uuid>-电信安全产品手册-2025.pdf。
+        const segments = new URL(url).pathname.split("/");
+        expect(decodeURIComponent(segments.at(-1)!)).toBe("电信安全产品手册-2025.pdf");
+        // 不可枚举性挪到了目录段上，要猜的还是那个 uuid。
+        expect(segments.at(-2)).toMatch(/^\d{8}-[0-9a-f-]{36}$/);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("creates the directory before putting the file into it", async () => {
+    await withFixture(async ({ file, index }) => {
+      const calls: string[] = [];
+      const restore = mockFetch(
+        (input, init) => {
+          calls.push(`${init?.method} ${String(input)}`);
+          return new Response(null, { status: 201 });
+        },
+        { handleMkcol: true }
+      );
+      try {
+        await relayFile({ config: CONFIG, localPath: file, size: 5, filename: "note.txt", index });
+        // WebDAV 的 PUT 不会自动建父目录，顺序反了就是 409。
+        expect(calls[0].startsWith("MKCOL")).toBe(true);
+        expect(calls[1].startsWith("PUT")).toBe(true);
+        expect(calls[0]).toMatch(/\/\d{8}-[0-9a-f-]+\/$/);
+        expect(calls[1].endsWith("/note.txt")).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("reports a failed directory creation like any other backend failure", async () => {
+    await withFixture(async ({ file, index }) => {
+      const restore = mockFetch(
+        (_input, init) =>
+          init?.method === "MKCOL"
+            ? new Response("insufficient storage", { status: 507 })
+            : new Response(null, { status: 201 }),
+        { handleMkcol: true }
+      );
+      try {
+        await expect(
+          relayFile({ config: CONFIG, localPath: file, size: 5, filename: "note.txt", index })
+        ).rejects.toThrow("存储空间不足");
+        // 目录都没建起来就别往索引里记一条指向空气的地址。
+        expect(index.size()).toBe(0);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("deletes the whole directory, not just the file inside it", async () => {
+    await withFixture(async ({ index }) => {
+      const key = relayCacheKey("deadbeef", "note.txt");
+      const directory = "20260831-11111111-2222-3333-4444-555555555555";
+      await index.remember({
+        key,
+        url: `${CONFIG.publicBaseUrl}${directory}/${encodeURIComponent("note.txt")}`,
+        name: "note.txt",
+        size: 5,
+        at: new Date(Date.now() - 100 * 60 * 60_000).toISOString(),
+      });
+      const deleted: string[] = [];
+      const restore = mockFetch((input, init) => {
+        if (init?.method === "DELETE") deleted.push(String(input));
+        return new Response(null, { status: 204 });
+      });
+      try {
+        await sweepExpiredRelayObjects({ config: { ...CONFIG, expireHours: 8 }, index });
+        // 只删文件会在后端留下一地空目录。
+        expect(deleted).toEqual([`${CONFIG.webdavUrl}${directory}`]);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("still deletes objects uploaded under the old flat layout", async () => {
+    await withFixture(async ({ index }) => {
+      const key = relayCacheKey("deadbeef", "old.txt");
+      const flat = "20260101-uuid-old.txt";
+      await index.remember({
+        key,
+        url: `${CONFIG.publicBaseUrl}${encodeURIComponent(flat)}`,
+        name: "old.txt",
+        size: 5,
+        at: new Date(Date.now() - 100 * 60 * 60_000).toISOString(),
+      });
+      const deleted: string[] = [];
+      const restore = mockFetch((input, init) => {
+        if (init?.method === "DELETE") deleted.push(String(input));
+        return new Response(null, { status: 204 });
+      });
+      try {
+        await sweepExpiredRelayObjects({ config: { ...CONFIG, expireHours: 8 }, index });
+        // 换布局之前发出去的对象没有目录段，仍然要能被清掉。
+        expect(deleted).toEqual([`${CONFIG.webdavUrl}${encodeURIComponent(flat)}`]);
+        expect(index.size()).toBe(0);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("refuses to delete anything it cannot parse back to an object", async () => {
+    await withFixture(async ({ index }) => {
+      const key = relayCacheKey("deadbeef", "deep.txt");
+      await index.remember({
+        key,
+        // 比「目录/文件名」更深一层的地址不是我们传上去的。
+        url: `${CONFIG.publicBaseUrl}a/b/c.txt`,
+        name: "deep.txt",
+        size: 5,
+        at: new Date(Date.now() - 100 * 60 * 60_000).toISOString(),
+      });
+      let called = false;
+      const restore = mockFetch(() => {
+        called = true;
+        return new Response(null, { status: 204 });
+      });
+      try {
+        const result = await purgeRelayObjects({ config: CONFIG, index });
+        // 宁可报成孤儿让人工处理，也不要往猜出来的路径上发 DELETE。
+        expect(called).toBe(false);
+        expect(result.orphaned).toBe(1);
       } finally {
         restore();
       }

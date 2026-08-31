@@ -241,20 +241,39 @@ export function getRelayConfig(): RelayConfig | null {
 }
 
 /**
- * 拼接对象名。uuid 让链接不可枚举——公开基址上任何人拿到链接都能下载，猜不到就是唯一
- * 的保护；日期前缀让人工排查时能按天定位（到期回收走索引，见
- * sweepExpiredRelayObjects）。
- * filename 由调用方清洗过（不含分隔符），再叠一层 encodeURIComponent，路径穿越在结构上
- * 不可能：对象名永远以日期数字开头。
+ * 拼出对象路径 `<日期>-<uuid>/<原文件名>`。
+ *
+ * uuid 之所以在目录段而不是文件名里：后端把对象名原样写进下载响应的
+ * `Content-Disposition`，uuid 混在文件名里的话每个人下到的都是
+ * `20260829-<uuid>-报告.pdf` 而不是 `报告.pdf`。挪到目录段之后不可枚举性一点没少——公开
+ * 基址上任何人拿到链接都能下载，猜不到就是唯一的保护，而要猜的东西还是那个 uuid。
+ * 日期前缀让人工排查时能按天定位（到期回收走索引，见 sweepExpiredRelayObjects）。
+ *
+ * filename 由调用方清洗过（不含路径分隔符），目录段永远是「日期数字-uuid」的形状，
+ * 所以路径穿越在结构上不可能。
  */
 function buildObjectName(filename: string): string {
   const day = new Date().toISOString().slice(0, 10).replaceAll("-", "");
-  return `${day}-${randomUUID()}-${filename}`;
+  return `${day}-${randomUUID()}/${filename}`;
 }
 
-function joinUrl(base: string, segment: string): string {
+/**
+ * 对象路径的目录段。新布局有，2026-08 之前上传的旧对象（uuid 拼在文件名里）没有，
+ * 返回 null——那批对象仍然要能被正常探测和删除。
+ */
+function directoryOf(objectName: string): string | null {
+  const slash = objectName.indexOf("/");
+  return slash < 0 ? null : objectName.slice(0, slash);
+}
+
+/** 逐段编码后拼到基址上。对象路径含目录段，整体 encodeURIComponent 会把分隔符也编掉。 */
+function joinUrl(base: string, objectName: string): string {
   const normalized = base.endsWith("/") ? base : `${base}/`;
-  return `${normalized}${encodeURIComponent(segment)}`;
+  const encoded = objectName
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return `${normalized}${encoded}`;
 }
 
 function buildAuthHeaders(config: RelayConfig): Record<string, string> {
@@ -290,6 +309,30 @@ function describeBackendFailure(status: number, detail: string): string {
   return `外链上传失败 HTTP ${status}${suffix}。请管理员检查外链后端状态。`;
 }
 
+/**
+ * 建目录。WebDAV 的 PUT 不会自动创建父目录，所以每次上传都要先 MKCOL 一次。
+ * 405 是「集合已存在」，按成功处理——uuid 目录理论上不会撞，但重试时会撞到自己。
+ */
+async function makeCollection(
+  config: RelayConfig,
+  directory: string,
+  filename: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const timeout = AbortSignal.timeout(RELAY_HTTP_TIMEOUT);
+  const response = await fetch(`${joinUrl(config.webdavUrl, directory)}/`, {
+    method: "MKCOL",
+    headers: buildAuthHeaders(config),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
+  if (response.ok || response.status === 405) {
+    await response.body?.cancel().catch(() => {});
+    return;
+  }
+  const detail = (await response.text().catch(() => "")).trim().slice(0, 200);
+  throw new Error(`${filename} 未能分发：${describeBackendFailure(response.status, detail)}`);
+}
+
 /** 真正把文件 PUT 上去，返回公开下载地址。 */
 async function putObject(
   config: RelayConfig,
@@ -299,6 +342,8 @@ async function putObject(
   signal?: AbortSignal
 ): Promise<string> {
   const objectName = buildObjectName(filename);
+  const directory = directoryOf(objectName);
+  if (directory) await makeCollection(config, directory, filename, signal);
   const headers: Record<string, string> = {
     "Content-Type": "application/octet-stream",
     ...buildAuthHeaders(config),
@@ -372,12 +417,26 @@ function objectNameFromPublicUrl(config: RelayConfig, url: string): string | nul
     : `${config.publicBaseUrl}/`;
   if (!url.startsWith(base)) return null;
   const encoded = url.slice(base.length);
-  if (!encoded || encoded.includes("/")) return null;
-  try {
-    return decodeURIComponent(encoded);
-  } catch {
-    return null;
+  if (!encoded) return null;
+
+  // 只可能是两种形状：`<目录>/<文件名>`（当前）或 `<文件名>`（旧对象）。再深一层就不是
+  // 我们传上去的，宁可认不出来也不要往一个猜出来的路径上发 DELETE。
+  const segments = encoded.split("/");
+  if (segments.length > 2) return null;
+  const decoded: string[] = [];
+  for (const segment of segments) {
+    if (!segment) return null;
+    let value: string;
+    try {
+      value = decodeURIComponent(segment);
+    } catch {
+      return null;
+    }
+    // 解码后再出现分隔符或 .. 的话，拼回 WebDAV 地址时能越出目标目录。
+    if (/[/\\]/.test(value) || value === "." || value === "..") return null;
+    decoded.push(value);
   }
+  return decoded.join("/");
 }
 
 /**
@@ -441,8 +500,11 @@ async function deleteObject(
   objectName: string,
   signal?: AbortSignal
 ): Promise<void> {
+  // 删的是整个 uuid 目录，不是里面那个文件：只删文件会在后端留下一地空目录。目录归这次
+  // 分发独有，删它不会波及别的对象。旧对象没有目录段，直接删文件本身。
+  const target = directoryOf(objectName) ?? objectName;
   const timeout = AbortSignal.timeout(RELAY_PROBE_TIMEOUT);
-  const response = await fetch(joinUrl(config.webdavUrl, objectName), {
+  const response = await fetch(joinUrl(config.webdavUrl, target), {
     method: "DELETE",
     headers: buildAuthHeaders(config),
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
