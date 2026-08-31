@@ -40,6 +40,7 @@ $LogPath  = Join-Path $Project "logs\mixin-chatbot.log"
 $TunnelScript = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
 $ModelsFile = Join-Path $ConfigDir "models.json"
 $WebhookSecretFile = Join-Path $ConfigDir "webhook-secret"
+$RelayConfigFile = Join-Path $ConfigDir "relay.json"
 $DefaultTunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
 $LocalCloudflared = Join-Path $Project "cloudflared.exe"
 $TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
@@ -329,6 +330,111 @@ function Get-TunnelTokenSource {
         }
     }
     return Get-TunnelTokenFileInfo $DefaultTunnelTokenFile "data\config\tunnel-token"
+}
+
+# 通用 HTTP 探测，返回状态码；连不上返回 $null。
+#
+# 用 HttpWebRequest 而不是 Invoke-WebRequest 或 curl，三个理由：
+#   - Invoke-WebRequest 会套用系统代理设置，在云桌面上访问本机会一路挂到超时
+#     （Test-Local 就栽在这上面）；这里 Proxy = $null 从根上绕开。
+#   - curl 8.21 拒绝 -K/--config 从文件或 stdin 读配置（"unsupported trailing garbage"），
+#     只剩把凭证写进命令行一条路；而 Windows 上任何用户都能用 WMI 读到别人进程的完整
+#     命令行，WebDAV 密码不该出现在那里。走 .NET 则凭证既不进 argv 也不落盘。
+#   - HttpWebRequest 在 Windows PowerShell 5.1 和 PowerShell 7 上都内置，无需额外依赖。
+function Invoke-HttpProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [string]$Method = "HEAD",
+        [int]$TimeoutSec = 8,
+        [string]$Username,
+        [string]$Password,
+        [hashtable]$Headers
+    )
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($Url)
+        $request.Method = $Method
+        $request.Proxy = $null
+        $request.Timeout = $TimeoutSec * 1000
+        $request.ReadWriteTimeout = $TimeoutSec * 1000
+        $request.AllowAutoRedirect = $false
+        # 必须先判空：$null.Keys 会得到 $null，@($null) 是含一个 $null 元素的数组，
+        # 于是 Headers.Add($null, ...) 抛异常，被下面的 catch 吞成「连不上」——
+        # 不带自定义头的探测会因此永远误报失败。
+        if ($Headers) {
+            foreach ($name in @($Headers.Keys)) { $request.Headers.Add($name, $Headers[$name]) }
+        }
+        if ($Username) {
+            $raw = "{0}:{1}" -f $Username, $Password
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($raw))
+            $request.Headers.Add("Authorization", "Basic $encoded")
+        }
+        $response = $request.GetResponse()
+        $status = [int]$response.StatusCode
+        $response.Close()
+        return $status
+    } catch [System.Net.WebException] {
+        # 4xx/5xx 也走这里，但带着 Response；没有 Response 才是真的没连上。
+        if ($_.Exception.Response) { return [int]$_.Exception.Response.StatusCode }
+        return $null
+    } catch {
+        return $null
+    }
+}
+
+# 大文件外链分发的体检。relay.json 不存在时该特性关闭，一行都不占——它是可选的，
+# 没配置不是问题。配置了就要验到底：写错会让服务拒绝启动，后端不通会让大文件发送失败，
+# 公开基址不通会让群成员拿到死链，三种都不该等到有人真发了个大文件才发现。
+function Get-RelayDoctorRows {
+    if (-not (Test-Path -LiteralPath $RelayConfigFile -PathType Leaf)) { return @() }
+
+    $config = $null
+    try {
+        $config = Get-Content -LiteralPath $RelayConfigFile -Raw | ConvertFrom-Json
+    } catch {
+        return @(New-DoctorRow "data/config/relay.json" "fail" "不是有效 JSON（服务拒绝启动）" `
+            "修正 JSON 语法，或删除该文件以关闭大文件外链分发。")
+    }
+
+    $webdavUrl = "$($config.webdavUrl)".Trim()
+    $publicBaseUrl = "$($config.publicBaseUrl)".Trim()
+    if (-not $webdavUrl -or -not $publicBaseUrl) {
+        return @(New-DoctorRow "data/config/relay.json" "fail" "缺少 webdavUrl 或 publicBaseUrl（服务拒绝启动）" `
+            "补齐这两个字段，或删除该文件以关闭大文件外链分发。")
+    }
+
+    $rows = @(New-DoctorRow "data/config/relay.json" "pass" "已启用 -> $publicBaseUrl")
+
+    $davCode = Invoke-HttpProbe -Url $webdavUrl -Method "PROPFIND" -TimeoutSec 8 `
+        -Username $config.username -Password $config.password `
+        -Headers @{ "Depth" = "0" }
+
+    if ($null -eq $davCode) {
+        $rows += New-DoctorRow "外链 WebDAV 上传端点" "fail" "无法连接 $webdavUrl" `
+            "确认后端服务正在运行且监听该地址；回环地址要求它与机器人在同一台机器。"
+    } elseif ($davCode -in @(200, 204, 207)) {
+        $rows += New-DoctorRow "外链 WebDAV 上传端点" "pass" "HTTP $davCode（可达且凭证有效）"
+    } elseif ($davCode -in @(401, 403)) {
+        $rows += New-DoctorRow "外链 WebDAV 上传端点" "fail" "HTTP $davCode（认证失败）" `
+            "核对 relay.json 的 username/password，以及该账号对目标目录的写权限。"
+    } elseif ($davCode -eq 404) {
+        $rows += New-DoctorRow "外链 WebDAV 上传端点" "fail" "HTTP 404（目录不存在）" `
+            "在后端创建 webdavUrl 指向的目录，或修正 relay.json 里的路径。"
+    } else {
+        $rows += New-DoctorRow "外链 WebDAV 上传端点" "warn" "HTTP $davCode（未预期的状态）" `
+            "手动执行一次 PROPFIND 确认后端行为。"
+    }
+
+    # 公开基址只判断「服务是否在应答」。这类文件服务惯于用 HTTP 200 + JSON 业务码表达
+    # 错误，对目录请求返回 200 属于正常行为，所以除了连不上，任何状态码都算通。
+    $publicCode = Invoke-HttpProbe -Url $publicBaseUrl -Method "HEAD" -TimeoutSec 10
+    if ($null -eq $publicCode) {
+        $rows += New-DoctorRow "外链公开下载基址" "fail" "无法连接 $publicBaseUrl" `
+            "检查该域名的 DNS、隧道与 WAF；群成员拿到的下载链接都指向这个基址。"
+    } else {
+        $rows += New-DoctorRow "外链公开下载基址" "pass" "HTTP $publicCode（服务有应答）"
+    }
+
+    return $rows
 }
 
 function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]$Fix = "") {
@@ -672,6 +778,8 @@ function Show-Doctor {
 
     $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ((Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim() -match "^[0-9a-fA-F]{64}$")
     $rows += New-DoctorRow "data/config/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "执行 scripts\deploy\deploy.ps1；密钥变化后还必须更新 IM webhook URL。" })
+
+    $rows += Get-RelayDoctorRows
 
     foreach ($r in $rows) {
         $tag = switch ($r.Status) { "pass" { "[+]" }; "warn" { "[!]" }; default { "[x]" } }

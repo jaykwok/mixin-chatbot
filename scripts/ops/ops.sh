@@ -15,6 +15,7 @@ STATE_DIR="${DATA_DIR}/state"
 DEFAULT_GROUP_DATA_ROOT="${DATA_DIR}/groups"
 MODELS_FILE="${CONFIG_DIR}/models.json"
 WEBHOOK_SECRET_FILE="${CONFIG_DIR}/webhook-secret"
+RELAY_CONFIG_FILE="${CONFIG_DIR}/relay.json"
 BOT_PORT_FILE="${STATE_DIR}/bot-port"
 DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
 BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
@@ -176,6 +177,68 @@ has_rollback_container() {
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${ROLLBACK_CONTAINER}$"
 }
 
+# 大文件外链分发的体检。relay.json 不存在时该特性关闭，一行都不占——它是可选的，没配
+# 不是问题。配置了就要验到底：写错会让服务拒绝启动，后端不通会让大文件发送失败，公开
+# 基址不通会让群成员拿到死链，三种都不该等到有人真发了个大文件才发现。
+check_relay() {
+    [ -f "$RELAY_CONFIG_FILE" ] || return 0
+
+    if ! command -v jq >/dev/null 2>&1; then
+        check "data/config/relay.json" "1" "已启用（缺少 jq，跳过连通性探测）"
+        return 0
+    fi
+    if ! jq -e . "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
+        check "data/config/relay.json" "0" "不是有效 JSON（服务拒绝启动）"
+        return 0
+    fi
+
+    local dav_url public_url user pass
+    dav_url="$(jq -r '.webdavUrl // empty' "$RELAY_CONFIG_FILE")"
+    public_url="$(jq -r '.publicBaseUrl // empty' "$RELAY_CONFIG_FILE")"
+    if [ -z "$dav_url" ] || [ -z "$public_url" ]; then
+        check "data/config/relay.json" "0" "缺少 webdavUrl 或 publicBaseUrl（服务拒绝启动）"
+        return 0
+    fi
+    check "data/config/relay.json" "1" "已启用 -> $public_url"
+
+    user="$(jq -r '.username // empty' "$RELAY_CONFIG_FILE")"
+    pass="$(jq -r '.password // empty' "$RELAY_CONFIG_FILE")"
+
+    # 凭证经 --netrc-file 传入而不是 -u：同机其他用户能从 /proc/<pid>/cmdline 读到完整
+    # 命令行，WebDAV 密码不该出现在那里。netrc 用 mktemp 建在仅本人可读的目录里，用完即删。
+    local dav_code="000" netrc="" host
+    if [ -n "$user" ]; then
+        netrc="$(mktemp)"
+        chmod 600 "$netrc"
+        host="$(printf '%s' "$dav_url" | sed -e 's#^[a-zA-Z]*://##' -e 's#[:/].*##')"
+        printf 'machine %s login %s password %s\n' "$host" "$user" "$pass" > "$netrc"
+        dav_code="$(curl -s -o /dev/null -w '%{http_code}' -m 8 --noproxy '*' \
+            -X PROPFIND -H 'Depth: 0' --netrc-file "$netrc" "$dav_url" 2>/dev/null || true)"
+        rm -f -- "$netrc"
+    else
+        dav_code="$(curl -s -o /dev/null -w '%{http_code}' -m 8 --noproxy '*' \
+            -X PROPFIND -H 'Depth: 0' "$dav_url" 2>/dev/null || true)"
+    fi
+
+    case "$dav_code" in
+        200|204|207) check "外链 WebDAV 上传端点" "1" "HTTP $dav_code（可达且凭证有效）" ;;
+        401|403)     check "外链 WebDAV 上传端点" "0" "HTTP $dav_code（认证失败，核对 username/password）" ;;
+        404)         check "外链 WebDAV 上传端点" "0" "HTTP 404（webdavUrl 指向的目录不存在）" ;;
+        000|"")      check "外链 WebDAV 上传端点" "0" "无法连接 $dav_url" ;;
+        *)           check "外链 WebDAV 上传端点" "0" "HTTP $dav_code（未预期的状态）" ;;
+    esac
+
+    # 公开基址只判断「服务是否在应答」：这类文件服务惯于用 HTTP 200 + JSON 业务码表达
+    # 错误，对目录请求返回 200 属于正常行为，所以除了连不上，任何状态码都算通。
+    local public_code
+    public_code="$(code_of "$public_url")"
+    if [ -z "$public_code" ] || [ "$public_code" = "000" ]; then
+        check "外链公开下载基址" "0" "无法连接 $public_url"
+    else
+        check "外链公开下载基址" "1" "HTTP $public_code（服务有应答）"
+    fi
+}
+
 doctor() {
     local mode_label="直连"
     [ "$DEPLOY_MODE" = "cloudflare" ] && mode_label="Cloudflare"
@@ -239,6 +302,8 @@ doctor() {
         grep -Eq '^[0-9a-fA-F]{64}$' "$WEBHOOK_SECRET_FILE" &&
         secret_ok="1"
     check "data/config/webhook-secret" "$secret_ok" "$([ "$secret_ok" = "1" ] && echo 有效 || echo '缺少或无效（生产服务拒绝启动）')"
+
+    check_relay
 
     echo ""
     echo -e "结果：${GREEN}${PASS} 项通过${NC}，${RED}${FAIL} 项失败${NC}"
