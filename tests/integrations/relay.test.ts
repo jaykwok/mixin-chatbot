@@ -197,11 +197,94 @@ describe("relay upload", () => {
     });
   });
 
+  test("reuses a proxied URL when the probe reports the stored size", async () => {
+    await withFixture(async ({ file, index }) => {
+      let puts = 0;
+      const restore = mockFetch((_input, init) => {
+        // 后端不做 302 而是自己代理时，HEAD 是 200 + 真实长度。
+        if (init?.method === "HEAD") {
+          return new Response(null, {
+            status: 200,
+            headers: { "Content-Length": "5" },
+          });
+        }
+        puts++;
+        return new Response(null, { status: 201 });
+      });
+
+      try {
+        const first = await relayFile({
+          config: CONFIG,
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        });
+        const second = await relayFile({
+          config: CONFIG,
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        });
+        expect(second).toBe(first);
+        expect(puts).toBe(1);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  // alist 之类的文件服务把业务错误塞进 HTTP 200 的 JSON 里（"sign invalid"、
+  // "object not found" 都是 200）。只看状态码会把错误信封当成文件还在，然后
+  // 把一条死链交给用户。
+  test("does not mistake a 200 error envelope for a live object", async () => {
+    await withFixture(async ({ file, index }) => {
+      let puts = 0;
+      const envelope = JSON.stringify({ code: 401, message: "sign invalid" });
+      const restore = mockFetch((_input, init) => {
+        if (init?.method === "HEAD") {
+          return new Response(null, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "Content-Length": String(envelope.length),
+            },
+          });
+        }
+        puts++;
+        return new Response(null, { status: 201 });
+      });
+
+      try {
+        const first = await relayFile({
+          config: CONFIG,
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        });
+        const second = await relayFile({
+          config: CONFIG,
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        });
+        // 错误信封的长度对不上存下的大小，判为已失效并重传。
+        expect(second).not.toBe(first);
+        expect(puts).toBe(2);
+      } finally {
+        restore();
+      }
+    });
+  });
+
   test("survives a restart by reloading the index from disk", async () => {
     await withFixture(async ({ file, index, indexPath }) => {
       let puts = 0;
       const restore = mockFetch((_input, init) => {
-        if (init?.method === "HEAD") return new Response(null, { status: 200 });
+        if (init?.method === "HEAD") return new Response(null, { status: 302 });
         puts++;
         return new Response(null, { status: 201 });
       });
@@ -271,7 +354,7 @@ describe("relay upload", () => {
     await withFixture(async ({ file, index }) => {
       let puts = 0;
       const restore = mockFetch((_input, init) => {
-        if (init?.method === "HEAD") return new Response(null, { status: 200 });
+        if (init?.method === "HEAD") return new Response(null, { status: 302 });
         puts++;
         return new Response(null, { status: 201 });
       });
@@ -295,7 +378,7 @@ describe("relay upload", () => {
     await withFixture(async ({ file, index }) => {
       let puts = 0;
       const restore = mockFetch((_input, init) => {
-        if (init?.method === "HEAD") return new Response(null, { status: 200 });
+        if (init?.method === "HEAD") return new Response(null, { status: 302 });
         puts++;
         return new Response(null, { status: 201 });
       });

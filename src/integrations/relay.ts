@@ -195,9 +195,19 @@ async function putObject(
 /**
  * 探测缓存里的地址是否还活着。运维按天清理、云盘侧删除都会让索引指向一个 404，
  * 而给用户一条死链比重传一次糟得多。公开基址通常是 302 到网盘直链，所以不跟随
- * 重定向、只看状态码。
+ * 重定向。
+ *
+ * 状态码不够用：这类文件服务常把业务错误塞进 HTTP 200 的 JSON 里（"未授权"、
+ * "对象不存在" 都是 200），只看 `status < 400` 会把错误信封当成文件还在。
+ * 所以 2xx 还要求 Content-Length 与当初存下的大小一致——错误信封只有几十字节，
+ * 对不上；重定向则说明服务端确实解析到了这个对象。
+ * 服务端不给 Content-Length 时按「不存在」处理，代价是重传一次。
  */
-async function remoteStillExists(url: string, signal?: AbortSignal): Promise<boolean> {
+async function remoteStillExists(
+  url: string,
+  size: number,
+  signal?: AbortSignal
+): Promise<boolean> {
   const timeout = AbortSignal.timeout(RELAY_PROBE_TIMEOUT);
   try {
     const response = await fetch(url, {
@@ -206,7 +216,9 @@ async function remoteStillExists(url: string, signal?: AbortSignal): Promise<boo
       signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     });
     await response.body?.cancel().catch(() => {});
-    return response.status < 400;
+    if (response.status >= 300 && response.status < 400) return true;
+    if (response.status >= 400) return false;
+    return Number(response.headers.get("content-length")) === size;
   } catch {
     // 探测失败时按「不存在」处理：重传浪费一次带宽，发死链浪费的是用户的时间。
     return false;
@@ -272,7 +284,7 @@ export async function relayFile(request: RelayRequest): Promise<string> {
     signal?.throwIfAborted();
     const cached = index.get(key);
     if (cached) {
-      if (await remoteStillExists(cached.url, signal)) {
+      if (await remoteStillExists(cached.url, cached.size, signal)) {
         log.info(`外链命中去重索引，跳过上传: ${filename} -> ${cached.url}`);
         return cached.url;
       }

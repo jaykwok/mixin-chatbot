@@ -79,7 +79,7 @@ describe("attachment send tools", () => {
       });
       // WebDAV PUT / 去重探测
       if (init?.method === "PUT") return new Response(null, { status: 201 });
-      if (init?.method === "HEAD") return new Response(null, { status: 200 });
+      if (init?.method === "HEAD") return new Response(null, { status: 302 });
       // IM 出站发送
       const body = init?.body;
       if (typeof body === "string") {
