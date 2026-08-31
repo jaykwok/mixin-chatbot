@@ -4,13 +4,15 @@
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <命令>
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor -Repair
-#   命令：doctor、repair-tunnel、uninstall-tunnel、restart、stop、start、foreground、logs、uninstall（无参数显示菜单）
+#   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update
+#   命令：doctor、update、repair-tunnel、uninstall-tunnel、restart、stop、start、foreground、logs、uninstall（无参数显示菜单）
 #
 # repair-tunnel/uninstall-tunnel/restart/stop/start/uninstall 可能需要管理员权限。
 param(
     [Parameter(Position = 0)]
     [string]$Command = "",
-    [switch]$Repair
+    [switch]$Repair,
+    [switch]$RestartTunnel
 )
 
 $ErrorActionPreference = "Stop"
@@ -161,6 +163,78 @@ function Get-CloudflaredPath {
     if ($env:LOCALAPPDATA) { $additional += (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\cloudflared.exe") }
     if ($env:ProgramFiles) { $additional += (Join-Path $env:ProgramFiles "cloudflared\cloudflared.exe") }
     return Find-VersionedApplication "cloudflared" '(?i)cloudflared\s+version' $additional
+}
+$script:GitPath = $null
+$script:GitPathResolved = $false
+function Get-GitPath {
+    if (-not $script:GitPathResolved) {
+        $additional = @()
+        foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
+            if (-not $root) { continue }
+            $additional += (Join-Path $root "Git\cmd\git.exe")
+            $additional += (Join-Path $root "Git\bin\git.exe")
+        }
+        $script:GitPath = Find-VersionedApplication "git" '(?i)^git version\b' $additional
+        $script:GitPathResolved = $true
+    }
+    return $script:GitPath
+}
+$script:BunPath = $null
+$script:BunPathResolved = $false
+function Get-BunPath {
+    if (-not $script:BunPathResolved) {
+        $additional = @()
+        if ($env:USERPROFILE) { $additional += (Join-Path $env:USERPROFILE ".bun\bin\bun.exe") }
+        if ($env:LOCALAPPDATA) { $additional += (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\bun.exe") }
+        $script:BunPath = Find-VersionedApplication "bun" '^\d+(?:\.\d+)+' $additional
+        $script:BunPathResolved = $true
+    }
+    return $script:BunPath
+}
+
+# git 的返回码才是判据，但 $ErrorActionPreference="Stop" 下原生命令写 stderr 会直接抛异常，
+# 所以这里临时放宽再取真实退出码。GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在
+# 一个无人应答的交互提示上——这个脚本可能跑在计划任务或无人值守的会话里。
+function Invoke-GitCapture([string[]]$GitArgs) {
+    $gitPath = Get-GitPath
+    $hadPromptEnv = Test-Path Env:GIT_TERMINAL_PROMPT
+    $previousPromptEnv = $env:GIT_TERMINAL_PROMPT
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $env:GIT_TERMINAL_PROMPT = "0"
+        $ErrorActionPreference = "Continue"
+        $output = & $gitPath -C $Project @GitArgs 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($hadPromptEnv) { $env:GIT_TERMINAL_PROMPT = $previousPromptEnv }
+        else { Remove-Item Env:GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue }
+    }
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        # 只去尾部空白：git status --porcelain 的首列状态位本身就是空格，整体 Trim 会把
+        # 第一行的缩进吃掉，输出对不齐。需要比较的那几个命令（rev-parse 等）不带前导空白。
+        Text     = (@($output | ForEach-Object { "$_" }) -join "`n").TrimEnd()
+    }
+}
+
+function Invoke-BunInstall {
+    $bunPath = Get-BunPath
+    Step "安装依赖（bun install --frozen-lockfile）..."
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $bunPath install --frozen-lockfile
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
+        Err "bun install 失败（退出码 $exitCode）"
+        return $false
+    }
+    Done "依赖已就绪"
+    return $true
 }
 function Test-Hostname([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Length -gt 253) { return $false }
@@ -645,6 +719,244 @@ function Restart-Bot {
     return $false
 }
 
+function Restart-TunnelService {
+    # 只重启，不重装。隧道服务与仓库代码无关（它只是把公网流量转发到 localhost:$Port），
+    # 例行升级没有理由重装它；token 变化这类需要重装的场景交给 repair-tunnel。
+    $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Err "Cloudflared 服务未安装"
+        Warn "请在管理员 PowerShell 中执行 ops.ps1 repair-tunnel"
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
+        Err "Cloudflared 服务没有本项目归属标记，update 不会自动重启它"
+        Warn "确认该服务属于本项目后，以管理员身份执行 ops.ps1 repair-tunnel"
+        return $false
+    }
+    if (-not (IsAdmin)) {
+        Err "重启 Cloudflared 服务需要管理员 PowerShell"
+        Warn "请在提升权限的窗口中执行 ops.ps1 update 或 ops.ps1 repair-tunnel"
+        return $false
+    }
+    Step "重启 Cloudflared 服务..."
+    try {
+        if ($svc.Status -eq "Running") { Restart-Service Cloudflared -ErrorAction Stop }
+        else { Start-Service Cloudflared -ErrorAction Stop }
+    } catch {
+        Err "重启 Cloudflared 失败：$($_.Exception.Message)"
+        return $false
+    }
+    Done "Cloudflared 服务已重启"
+    return $true
+}
+
+function Restore-Checkout([string]$Branch, [string]$Sha) {
+    if ($Branch -and $Branch -ne "HEAD") {
+        $checkout = Invoke-GitCapture @("checkout", $Branch)
+        if ($checkout.ExitCode -ne 0) {
+            Err "切回分支 $Branch 失败：$($checkout.Text)"
+            return $false
+        }
+    }
+    $reset = Invoke-GitCapture @("reset", "--hard", $Sha)
+    if ($reset.ExitCode -ne 0) {
+        Err "回滚到 $Sha 失败：$($reset.Text)"
+        return $false
+    }
+    return $true
+}
+
+# 升级失败后把代码退回升级前那次提交并重新拉起。进入升级前已确认工作区干净，
+# 所以 reset --hard 不会毁掉任何本地内容。
+function Invoke-UpdateRollback([string]$Branch, [string]$Sha) {
+    Write-Host ""
+    Warn "升级后机器人未能恢复，正在回滚到 $($Sha.Substring(0, [Math]::Min(7, $Sha.Length)))..."
+    if (-not (Restore-Checkout $Branch $Sha)) {
+        Err "自动回滚失败；请手动执行：git checkout $Branch; git reset --hard $Sha"
+        return $false
+    }
+    Done "代码已回滚"
+    if (-not (Invoke-BunInstall)) {
+        Err "回滚后依赖安装失败；机器人可能仍处于停止状态"
+        return $false
+    }
+    if (-not (Restart-Bot)) {
+        Err "回滚后机器人仍未恢复；请执行 ops.ps1 logs 查看日志"
+        return $false
+    }
+    Warn "已回滚到升级前的版本，机器人恢复运行。请排查新版本的问题后再重试 update。"
+    return $true
+}
+
+function Invoke-Update {
+    Step "同步到 origin/main 并重启"
+
+    if (-not (Get-GitPath)) {
+        Err "找不到可用的 git；请安装 Git for Windows：https://git-scm.com/download/win"
+        return $false
+    }
+    if (-not (Get-BunPath)) {
+        Err "找不到可用的 bun；请先安装：powershell -c ""irm bun.sh/install.ps1 | iex"""
+        return $false
+    }
+
+    $insideRepo = Invoke-GitCapture @("rev-parse", "--is-inside-work-tree")
+    if ($insideRepo.ExitCode -ne 0 -or $insideRepo.Text -ne "true") {
+        Err "$Project 不是 git 仓库，无法自动更新"
+        Warn "这份部署可能是解压缩得到的；请改用 git clone 重新部署后再使用 update"
+        return $false
+    }
+
+    # 已跟踪文件的改动会被后面的 checkout/reset 冲掉，必须先拦下来。
+    # 只看已跟踪文件：未跟踪文件（部署机上常有的安装包、临时产物）不会被这些操作动到，
+    # 拿它们挡住升级只会让这条命令永远跑不起来。真撞上同名新文件时，下面的
+    # merge --ff-only 会自己带着明确原因失败。
+    # data/ 和 logs/ 都在 .gitignore 里，配置与群数据本来就不算改动。
+    $dirty = Invoke-GitCapture @("status", "--porcelain", "--untracked-files=no")
+    if ($dirty.ExitCode -ne 0) {
+        Err "读取 git 状态失败：$($dirty.Text)"
+        return $false
+    }
+    if ($dirty.Text) {
+        Err "已跟踪文件有未提交的改动，已停止升级："
+        foreach ($line in ($dirty.Text -split "`n")) { Write-Host "      $line" -ForegroundColor Yellow }
+        Warn "请先提交、撤销（git restore <文件>）或备份这些改动，然后重试"
+        return $false
+    }
+
+    $originalBranch = (Invoke-GitCapture @("rev-parse", "--abbrev-ref", "HEAD")).Text
+    $originalSha = (Invoke-GitCapture @("rev-parse", "HEAD")).Text
+    if (-not $originalSha) {
+        Err "无法读取当前提交"
+        return $false
+    }
+
+    Step "拉取 origin/main..."
+    $fetch = Invoke-GitCapture @("fetch", "--prune", "origin", "main")
+    if ($fetch.ExitCode -ne 0) {
+        Err "git fetch 失败：$($fetch.Text)"
+        return $false
+    }
+
+    if ($originalBranch -ne "main") {
+        Warn "当前在分支 $originalBranch，不是 main"
+        if (-not (Read-YesNo "切换到 main 并继续升级？[y/N]" $false)) {
+            Warn "已取消升级"
+            return $false
+        }
+        $checkout = Invoke-GitCapture @("checkout", "main")
+        if ($checkout.ExitCode -ne 0) {
+            Err "切换到 main 失败：$($checkout.Text)"
+            return $false
+        }
+        Done "已切换到 main"
+    }
+
+    $currentSha = (Invoke-GitCapture @("rev-parse", "HEAD")).Text
+    $targetSha = (Invoke-GitCapture @("rev-parse", "origin/main")).Text
+    if (-not $targetSha) {
+        Err "无法解析 origin/main；请确认远端存在 main 分支"
+        return $false
+    }
+
+    if ($currentSha -eq $targetSha) {
+        Done "已经是 origin/main 最新版本（$($targetSha.Substring(0, 7))）"
+        if (-not (Read-YesNo "代码没有变化；仍然重启机器人？[y/N]" $false)) {
+            Write-Host ""
+            return (Show-Doctor)
+        }
+        if (-not (Restart-Bot)) { return $false }
+        Write-Host ""
+        return (Show-Doctor)
+    }
+
+    # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
+    $ancestor = Invoke-GitCapture @("merge-base", "--is-ancestor", "HEAD", "origin/main")
+    if ($ancestor.ExitCode -ne 0) {
+        Err "本地 main 与 origin/main 已分叉，无法快进升级"
+        $ahead = Invoke-GitCapture @("log", "--oneline", "origin/main..HEAD")
+        if ($ahead.Text) {
+            Warn "本地独有的提交："
+            foreach ($line in ($ahead.Text -split "`n")) { Write-Host "      $line" -ForegroundColor Yellow }
+        }
+        Warn "请先推送或丢弃这些提交后重试"
+        return $false
+    }
+
+    $incoming = Invoke-GitCapture @("log", "--oneline", "HEAD..origin/main")
+    $incomingCount = if ($incoming.Text) { @($incoming.Text -split "`n").Count } else { 0 }
+    Write-Host ""
+    Write-Host "将要应用 $incomingCount 个提交：" -ForegroundColor Cyan
+    foreach ($line in ($incoming.Text -split "`n")) { Write-Host "      $line" -ForegroundColor Gray }
+    Write-Host ""
+
+    Step "停止机器人后更新代码..."
+    Stop-Bot
+    Start-Sleep -Seconds 1
+
+    $merge = Invoke-GitCapture @("merge", "--ff-only", "origin/main")
+    if ($merge.ExitCode -ne 0) {
+        Err "git merge --ff-only 失败：$($merge.Text)"
+        Warn "代码未改变，正在重新启动机器人..."
+        [void](Restart-Bot)
+        return $false
+    }
+    Done "代码已更新到 $($targetSha.Substring(0, 7))"
+
+    if (-not (Invoke-BunInstall)) {
+        [void](Invoke-UpdateRollback $originalBranch $originalSha)
+        return $false
+    }
+
+    if (-not (Restart-Bot)) {
+        [void](Invoke-UpdateRollback $originalBranch $originalSha)
+        return $false
+    }
+
+    $ok = $true
+    if ($DeployMode -eq "cloudflare") {
+        $needsTunnelRestart = [bool]$RestartTunnel
+        if ($needsTunnelRestart) {
+            Warn "已指定 -RestartTunnel，强制重启隧道"
+        } elseif ($Domain) {
+            Step "检查公网链路 https://$Domain ..."
+            $publicStatus = Wait-Public
+            if ($publicStatus -eq "200") {
+                Done "公网链路正常（HTTP 200），隧道无需重启"
+            } else {
+                Warn "公网返回 $(if ($publicStatus) { "HTTP $publicStatus" } else { "无法连接" })，尝试重启隧道"
+                $needsTunnelRestart = $true
+            }
+        } else {
+            Warn "缺少 data\state\bot-domain，跳过公网检查；如需强制重启隧道请加 -RestartTunnel"
+        }
+
+        if ($needsTunnelRestart) {
+            if (Restart-TunnelService) {
+                if ($Domain) {
+                    Step "等待公网链路恢复..."
+                    $publicStatus = Wait-Public
+                    if ($publicStatus -eq "200") {
+                        Done "公网链路已恢复（HTTP 200）"
+                    } else {
+                        Warn "隧道已重启，但公网仍为 $(if ($publicStatus) { "HTTP $publicStatus" } else { "无法连接" })"
+                        Warn "请以管理员身份执行 ops.ps1 repair-tunnel，并检查 Cloudflare DNS/WAF"
+                        $ok = $false
+                    }
+                }
+            } else {
+                $ok = $false
+            }
+        }
+    }
+
+    Write-Host ""
+    Done "升级完成：$($originalSha.Substring(0, 7)) -> $($targetSha.Substring(0, 7))"
+    Write-Host ""
+    $healthy = Show-Doctor
+    return ($ok -and $healthy)
+}
+
 function Show-Logs {
     Step "持续查看 $LogPath（Ctrl+C 退出）"
     Get-Content $LogPath -Tail 50 -Wait
@@ -872,6 +1184,8 @@ switch ($Command) {
         }
     }
     "status"    { if (-not (Show-Doctor)) { exit 1 } }
+    "update"    { if (-not (Invoke-Update)) { exit 1 } }
+    "upgrade"   { if (-not (Invoke-Update)) { exit 1 } }
     "repair-tunnel" {
         if (-not (Invoke-TunnelRepair)) { exit 1 }
         Write-Host ""
@@ -895,9 +1209,11 @@ switch ($Command) {
     "uninstall" { if (-not (Uninstall-Bot)) { exit 1 } }
     default {
         Write-Host "mixin-chatbot 运维工具（Windows Server）" -ForegroundColor Cyan
-        Write-Host "用法：powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <命令> [-Repair]"
+        Write-Host "用法：powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <命令> [-Repair] [-RestartTunnel]"
         Write-Host ""
         Write-Host "  doctor          只读诊断；加 -Repair 自动修复可安全判断的问题"
+        Write-Host "  update          同步 origin/main、装依赖、重启并体检；失败自动回滚"
+        Write-Host "                  隧道默认只在公网检查失败时重启，加 -RestartTunnel 可强制"
         Write-Host "  repair-tunnel   按当前 token 来源强制重装 Cloudflared 服务"
         Write-Host "  uninstall-tunnel 停止并卸载 Cloudflared 服务，可选删除本地程序"
         Write-Host "  restart         停止并重新启动机器人"

@@ -278,6 +278,7 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 
 ```bash
 ./scripts/ops/ops.sh doctor     # 健康检查（群数据根/容器/本地/配置；仅 Cloudflare 模式检查隧道和公网）
+./scripts/ops/ops.sh update     # 一键升级：同步 origin/main → deploy.sh 重建切换容器 → 体检
 ./scripts/ops/ops.sh restart    # 重启（docker restart）
 ./scripts/ops/ops.sh logs       # 实时日志（docker logs -f --tail 50）
 ./scripts/ops/ops.sh stop       # 停止
@@ -293,6 +294,8 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor     # 健康检查（task/端口/配置；隧道检查按部署模式启用）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor -Repair # 诊断后自动修复可安全处理的本地故障
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update     # 一键升级：同步 origin/main → 装依赖 → 重启 → 体检
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update -RestartTunnel # 同上，并强制重启 Cloudflared
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 repair-tunnel  # 按当前 token 来源重装 Cloudflared 服务
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 restart    # 重启
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 foreground # 前台运行（Ctrl+C 停止）
@@ -301,6 +304,23 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 stop       # 停止
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall-tunnel # 停止并卸载 Cloudflared 服务
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理 task/进程/防火墙/launcher，可选清隧道/data/logs
 ```
+
+<details>
+<summary><b>一键升级（<code>update</code>）的边界</b></summary>
+
+两个平台的实现不同——Windows 直接管进程和依赖，Linux 交给 `deploy.sh` 重建镜像、切换容器（复用它已有的旧容器回滚机制）——但结果一致：同步到 `origin/main`、依赖就绪、服务重启、隧道健康、最后跑一次 `doctor`。
+
+升级前会拒绝执行的情况：
+
+- **已跟踪文件有未提交的改动。** 后续的 `checkout`/`reset` 会冲掉它们，所以停下来让人先处理。未跟踪文件不拦——它们不会被这些操作动到，拿它们挡住升级只会让这条命令永远跑不起来。`data/` 和 `logs/` 都在 `.gitignore` 里，配置和群数据从不参与。
+- **本地与 `origin/main` 已分叉。** 只接受快进（`merge --ff-only`），有未推送的本地提交时列出来并停止，不替使用者决定怎么合并。
+- **不是 git 仓库。** 解压得到的部署没有升级路径，提示改用 `git clone`。
+
+升级失败会自动回滚：Windows 上依赖安装或重启失败时，代码退回升级前那次提交、重装依赖、重新拉起；Linux 上 `deploy.sh` 自己会换回旧容器，`update` 负责把工作区一并退回，避免「跑着旧容器、留着新代码」的错位。进入升级前已确认工作区干净，所以 `reset --hard` 不会毁掉任何本地内容。
+
+隧道默认**不**重启：它与仓库代码无关（只是把公网流量转发到 `localhost:<port>`），例行升级重装它既要管理员权限又是无谓抖动。只有升级后公网健康检查不过时才自动重启，或显式加 `-RestartTunnel`。Windows 上若 Cloudflared 服务缺少本项目归属标记，`update` 不会碰它——与 `doctor -Repair` 的规则一致。
+
+</details>
 
 `doctor` 会检查群数据总根、计划任务及上次结果、端口占用进程、本地 HTTP、token 来源、Cloudflared 服务、`data/state/bot-domain` 和公网链路，并为失败项打印对应修复命令。它只确认 token 来源是否可用，无法从 Cloudflared 服务中反查并比较已安装 token；token 有变化时应显式执行 `repair-tunnel`。
 

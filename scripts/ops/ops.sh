@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # mixin-chatbot 运维工具（Linux / Docker）。
-# 一站式运维：doctor / restart / stop / start / logs / uninstall。
+# 一站式运维：doctor / update / restart / stop / start / logs / uninstall。
 #
 # 用法：./scripts/ops/ops.sh <命令>
-#   命令：doctor、restart、stop、start、logs、uninstall（不带参数显示帮助）
+#   命令：doctor、update、restart、stop、start、logs、uninstall（不带参数显示帮助）
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -279,6 +279,135 @@ start_bot() {
     else WA "机器人未通过健康检查（HTTP $lc）；请尝试 scripts/ops/ops.sh logs"; return 1; fi
 }
 
+# git 只在这里用；GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。
+git_here() {
+    GIT_TERMINAL_PROMPT=0 git -C "$PROJECT_DIR" "$@"
+}
+
+restore_checkout() {
+    local branch="$1" sha="$2"
+    if [ -n "$branch" ] && [ "$branch" != "HEAD" ]; then
+        git_here checkout "$branch" >/dev/null 2>&1 || { ER "切回分支 ${branch} 失败"; return 1; }
+    fi
+    git_here reset --hard "$sha" >/dev/null 2>&1 || { ER "回滚到 ${sha} 失败"; return 1; }
+}
+
+update() {
+    local deploy_script="${PROJECT_DIR}/scripts/deploy/deploy.sh"
+    P "同步到 origin/main 并重新部署"
+
+    if ! command -v git >/dev/null 2>&1; then
+        ER "找不到 git；无法自动更新"
+        return 1
+    fi
+    if ! git_here rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        ER "${PROJECT_DIR} 不是 git 仓库，无法自动更新"
+        WA "这份部署可能是解压得到的；请改用 git clone 重新部署后再使用 update"
+        return 1
+    fi
+    if [ ! -f "$deploy_script" ]; then
+        ER "找不到部署脚本：$deploy_script"
+        return 1
+    fi
+
+    # 已跟踪文件的改动会被后面的 checkout/reset 冲掉，必须先拦下来。只看已跟踪文件：
+    # 未跟踪文件不会被这些操作动到，拿它们挡住升级只会让这条命令永远跑不起来。
+    # data/ 和 logs/ 都在 .gitignore 里，配置与群数据本来就不算改动。
+    local dirty
+    dirty="$(git_here status --porcelain --untracked-files=no 2>&1)"
+    if [ -n "$dirty" ]; then
+        ER "已跟踪文件有未提交的改动，已停止升级："
+        printf '%s\n' "$dirty" | sed 's/^/      /'
+        WA "请先提交、撤销（git restore <文件>）或备份这些改动，然后重试"
+        return 1
+    fi
+
+    local original_branch original_sha
+    original_branch="$(git_here rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    original_sha="$(git_here rev-parse HEAD 2>/dev/null)"
+    if [ -z "$original_sha" ]; then ER "无法读取当前提交"; return 1; fi
+
+    P "拉取 origin/main..."
+    if ! git_here fetch --prune origin main; then
+        ER "git fetch 失败"
+        return 1
+    fi
+
+    if [ "$original_branch" != "main" ]; then
+        WA "当前在分支 ${original_branch}，不是 main"
+        if ! ask_yes_no "切换到 main 并继续升级？[y/N] "; then
+            WA "已取消升级"
+            return 1
+        fi
+        if ! git_here checkout main; then
+            ER "切换到 main 失败"
+            return 1
+        fi
+    fi
+
+    local current_sha target_sha
+    current_sha="$(git_here rev-parse HEAD)"
+    target_sha="$(git_here rev-parse origin/main 2>/dev/null)"
+    if [ -z "$target_sha" ]; then
+        ER "无法解析 origin/main；请确认远端存在 main 分支"
+        return 1
+    fi
+
+    if [ "$current_sha" = "$target_sha" ]; then
+        OK "已经是 origin/main 最新版本（${target_sha:0:7}）"
+        if ask_yes_no "代码没有变化；仍然重启容器？[y/N] "; then
+            restart_bot || return 1
+        fi
+        echo ""
+        doctor
+        return $?
+    fi
+
+    # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
+    if ! git_here merge-base --is-ancestor HEAD origin/main; then
+        ER "本地 main 与 origin/main 已分叉，无法快进升级"
+        WA "本地独有的提交："
+        git_here log --oneline origin/main..HEAD | sed 's/^/      /'
+        WA "请先推送或丢弃这些提交后重试"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${CYAN}将要应用的提交：${NC}"
+    git_here log --oneline HEAD..origin/main | sed 's/^/      /'
+    echo ""
+
+    if ! git_here merge --ff-only origin/main; then
+        ER "git merge --ff-only 失败；代码未改变"
+        return 1
+    fi
+    OK "代码已更新到 ${target_sha:0:7}"
+
+    # Docker 部署升级必须重建镜像，而「重建 + 换容器 + 失败自动换回旧容器」这套逻辑已经
+    # 完整存在于 deploy.sh 里。在这里再写一遍等于把最关键的安全逻辑维护成两份，所以直接
+    # 交给它；端口、模式、域名、群数据根这些提示都默认沿用当前值，回车即可。
+    # 隧道也由 deploy.sh 一并处理，不需要在这里单独重启 cloudflared。
+    P "交给 deploy.sh 重建镜像并切换容器（各项提示直接回车即沿用当前配置）..."
+    echo ""
+    if bash "$deploy_script"; then
+        echo ""
+        OK "升级完成：${original_sha:0:7} -> ${target_sha:0:7}"
+        echo ""
+        doctor
+        return $?
+    fi
+
+    echo ""
+    ER "部署失败，正在把代码回滚到 ${original_sha:0:7}..."
+    if restore_checkout "$original_branch" "$original_sha"; then
+        OK "代码已回滚到升级前的版本"
+        WA "deploy.sh 失败时会恢复升级前的容器，机器人多半仍在运行；请执行 ops.sh doctor 确认"
+    else
+        ER "自动回滚失败；请手动执行：git checkout ${original_branch} && git reset --hard ${original_sha}"
+    fi
+    return 1
+}
+
 show_logs() {
     if ! has_container; then ER "找不到容器 '$CONTAINER'"; return 1; fi
     P "持续查看 Docker 日志（Ctrl+C 退出）"
@@ -350,6 +479,7 @@ uninstall() {
 
 case "${1:-}" in
     doctor|status) doctor ;;
+    update|upgrade) update ;;
     restart)   restart_bot ;;
     stop)      stop_bot ;;
     start)     start_bot ;;
@@ -360,6 +490,7 @@ case "${1:-}" in
         echo "用法：./scripts/ops/ops.sh <命令>"
         echo ""
         echo "  doctor     健康检查：群数据根、容器、:$PORT、配置；隧道模式额外检查 Cloudflare"
+        echo "  update     同步 origin/main，再交给 deploy.sh 重建并切换容器；失败自动回滚代码"
         echo "  restart    重启 Docker 容器"
         echo "  stop       停止 Docker 容器"
         echo "  start      启动 Docker 容器"
