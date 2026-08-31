@@ -1,8 +1,18 @@
 ﻿__pycache__/
 .vscode/
+.venv/
+
+# AI 编码工具的本地约定文件与工作目录。这些是各人机器上的用法约定，不是项目的一部分；
+# 公开仓库里也不该出现某个人的目录结构和习惯。
+AGENTS.md
+CLAUDE.md
+GEMINI.md
 .claude/
 .pi/
-.venv/
+.cursor/
+.cursorrules
+.aider*
+agents/
 logs/
 data/
 cloudflared.exe
