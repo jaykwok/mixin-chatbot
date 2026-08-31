@@ -910,13 +910,26 @@ function Restart-TunnelService {
     return $true
 }
 
+# 把工作区退回升级前那个提交。
+#
+# 升级前是 detached HEAD 时（rev-parse --abbrev-ref 返回字面量 "HEAD"）绝不能用 reset：
+# 升级过程中已经 checkout 到 main 了，reset --hard 会把 main 这个分支指针拖回那个游离
+# 提交，等于用一次回滚顺手毁掉 main。这种情况直接 checkout 回那个提交，恢复原本的
+# detached 状态，分支指针一个都不动。
 function Restore-Checkout([string]$Branch, [string]$Sha) {
-    if ($Branch -and $Branch -ne "HEAD") {
-        $checkout = Invoke-GitCapture @("checkout", $Branch)
-        if ($checkout.ExitCode -ne 0) {
-            Err "切回分支 $Branch 失败：$($checkout.Text)"
+    if (-not $Branch -or $Branch -eq "HEAD") {
+        $detached = Invoke-GitCapture @("checkout", "--force", $Sha)
+        if ($detached.ExitCode -ne 0) {
+            Err "回滚到游离提交 $Sha 失败：$($detached.Text)"
             return $false
         }
+        Warn "已恢复到升级前的游离 HEAD（$($Sha.Substring(0, [Math]::Min(7, $Sha.Length)))）；分支指针未改动"
+        return $true
+    }
+    $checkout = Invoke-GitCapture @("checkout", $Branch)
+    if ($checkout.ExitCode -ne 0) {
+        Err "切回分支 $Branch 失败：$($checkout.Text)"
+        return $false
     }
     $reset = Invoke-GitCapture @("reset", "--hard", $Sha)
     if ($reset.ExitCode -ne 0) {
@@ -932,7 +945,11 @@ function Invoke-UpdateRollback([string]$Branch, [string]$Sha) {
     Write-Host ""
     Warn "升级后机器人未能恢复，正在回滚到 $($Sha.Substring(0, [Math]::Min(7, $Sha.Length)))..."
     if (-not (Restore-Checkout $Branch $Sha)) {
-        Err "自动回滚失败；请手动执行：git checkout $Branch; git reset --hard $Sha"
+        if (-not $Branch -or $Branch -eq "HEAD") {
+            Err "自动回滚失败；请手动执行：git checkout --force $Sha"
+        } else {
+            Err "自动回滚失败；请手动执行：git checkout $Branch; git reset --hard $Sha"
+        }
         return $false
     }
     Done "代码已回滚"
@@ -999,7 +1016,11 @@ function Invoke-Update {
     }
 
     if ($originalBranch -ne "main") {
-        Warn "当前在分支 $originalBranch，不是 main"
+        if ($originalBranch -eq "HEAD") {
+            Warn "当前是游离 HEAD（$($originalSha.Substring(0, [Math]::Min(7, $originalSha.Length)))），不在任何分支上"
+        } else {
+            Warn "当前在分支 $originalBranch，不是 main"
+        }
         if (-not (Read-YesNo "切换到 main 并继续升级？[y/N]" $false)) {
             Warn "已取消升级"
             return $false

@@ -349,11 +349,20 @@ git_here() {
     GIT_TERMINAL_PROMPT=0 git -C "$PROJECT_DIR" "$@"
 }
 
+# 把工作区退回升级前那个提交。
+#
+# 升级前是 detached HEAD 时（rev-parse --abbrev-ref 返回字面量 "HEAD"）绝不能用 reset：
+# 升级过程中已经 checkout 到 main 了，reset --hard 会把 main 这个分支指针拖回那个游离
+# 提交，等于用一次回滚顺手毁掉 main。这种情况直接 checkout 回那个提交，恢复原本的
+# detached 状态，分支指针一个都不动。
 restore_checkout() {
     local branch="$1" sha="$2"
-    if [ -n "$branch" ] && [ "$branch" != "HEAD" ]; then
-        git_here checkout "$branch" >/dev/null 2>&1 || { ER "切回分支 ${branch} 失败"; return 1; }
+    if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+        git_here checkout --force "$sha" >/dev/null 2>&1 || { ER "回滚到游离提交 ${sha} 失败"; return 1; }
+        WA "已恢复到升级前的游离 HEAD（${sha:0:7}）；分支指针未改动"
+        return 0
     fi
+    git_here checkout "$branch" >/dev/null 2>&1 || { ER "切回分支 ${branch} 失败"; return 1; }
     git_here reset --hard "$sha" >/dev/null 2>&1 || { ER "回滚到 ${sha} 失败"; return 1; }
 }
 
@@ -399,7 +408,11 @@ update() {
     fi
 
     if [ "$original_branch" != "main" ]; then
-        WA "当前在分支 ${original_branch}，不是 main"
+        if [ "$original_branch" = "HEAD" ]; then
+            WA "当前是游离 HEAD（${original_sha:0:7}），不在任何分支上"
+        else
+            WA "当前在分支 ${original_branch}，不是 main"
+        fi
         if ! ask_yes_no "切换到 main 并继续升级？[y/N] "; then
             WA "已取消升级"
             return 1
@@ -468,7 +481,11 @@ update() {
         OK "代码已回滚到升级前的版本"
         WA "deploy.sh 失败时会恢复升级前的容器，机器人多半仍在运行；请执行 ops.sh doctor 确认"
     else
-        ER "自动回滚失败；请手动执行：git checkout ${original_branch} && git reset --hard ${original_sha}"
+        if [ -z "$original_branch" ] || [ "$original_branch" = "HEAD" ]; then
+            ER "自动回滚失败；请手动执行：git checkout --force ${original_sha}"
+        else
+            ER "自动回滚失败；请手动执行：git checkout ${original_branch} && git reset --hard ${original_sha}"
+        fi
     fi
     return 1
 }
@@ -556,6 +573,7 @@ case "${1:-}" in
         echo ""
         echo "  doctor     健康检查：群数据根、容器、:$PORT、配置；隧道模式额外检查 Cloudflare"
         echo "  update     同步 origin/main，再交给 deploy.sh 重建并切换容器；失败自动回滚代码"
+        echo "             deploy.sh 的各项提示直接回车即沿用现有配置"
         echo "  restart    重启 Docker 容器"
         echo "  stop       停止 Docker 容器"
         echo "  start      启动 Docker 容器"
