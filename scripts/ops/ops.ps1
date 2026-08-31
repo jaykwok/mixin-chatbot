@@ -195,7 +195,10 @@ function Invoke-RelayAdmin([string[]]$RelayArgs) {
         try {
             # Out-Host 而不是直接写管道：调用点是 if (-not (Invoke-RelayAdmin ...))，
             # 那对括号会把函数的全部输出当成返回值收走，bun 打印的清单也就一起被吞了。
-            & $bunPath run "scripts\ops\relay-admin.ts" @RelayArgs 2>&1 | Out-Host
+            # 外链清单里全是中文文件名，不切 UTF-8 就是一屏乱码，见 Invoke-WithUtf8Output。
+            Invoke-WithUtf8Output {
+                & $bunPath run "scripts\ops\relay-admin.ts" @RelayArgs 2>&1 | Out-Host
+            }
             return ($LASTEXITCODE -eq 0)
         } finally {
             $ErrorActionPreference = $previous
@@ -1140,7 +1143,9 @@ function Invoke-Update {
 
 function Show-Logs {
     Step "持续查看 $LogPath（Ctrl+C 退出）"
-    Get-Content $LogPath -Tail 50 -Wait
+    # 日志是 UTF-8 且不带 BOM，而 Windows PowerShell 5.1 的 Get-Content 默认按系统 ANSI
+    # 代码页解码，中文日志会整片变成乱码。显式指定就两个版本都对。
+    Get-Content $LogPath -Tail 50 -Wait -Encoding UTF8
 }
 
 function Run-Foreground {

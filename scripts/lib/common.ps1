@@ -64,6 +64,35 @@ function ConvertTo-Hostname([string]$Value) {
     return $null
 }
 
+# 在 UTF-8 控制台下跑一段命令，跑完恢复原样。
+#
+# bun 往 stdout 写的是 UTF-8，而 PowerShell 按控制台代码页解码原生命令的输出；中文系统上
+# 那是 cp936，于是「正在清理」会变成「姝ｅ湪娓呯悊」。脚本自己的 Write-Host 不受影响，
+# 所以现象是同一屏里一半正常一半乱码。
+#
+# 不在脚本开头一次性切成 UTF-8：同一批脚本里还调用了 sc.exe 这类系统程序，它们在中文系统
+# 上输出的就是 GBK，全局切过去只是把乱码从一处挪到另一处。所以只包住确定输出 UTF-8 的
+# bun 调用，并在 finally 里还原——这个设置是控制台级的，泄漏出去会影响用户后续的命令。
+#
+# 没有控制台时（输出被重定向、宿主不是终端）读写 OutputEncoding 会抛异常，此时静默跳过：
+# 编码本来就不该成为命令跑不跑得起来的前提。
+function Invoke-WithUtf8Output([Parameter(Mandatory = $true)][scriptblock]$Command) {
+    $previous = $null
+    try {
+        $previous = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    } catch {
+        $previous = $null
+    }
+    try {
+        & $Command
+    } finally {
+        if ($null -ne $previous) {
+            try { [Console]::OutputEncoding = $previous } catch { }
+        }
+    }
+}
+
 # 提示不复用调用方的 Warn：start-tunnel.ps1 没有定义它，共用文件不该对宿主脚本
 # 有隐式要求。输出与 deploy.ps1 / ops.ps1 原来的 Warn 完全一致。
 function Read-YesNo([string]$Prompt, [bool]$Default = $false) {

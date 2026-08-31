@@ -222,7 +222,8 @@ if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
     $configureExitCode = 1
     try {
         $ErrorActionPreference = "Continue"
-        & $bunPath run configure
+        # 向导全程是中文提示，不切 UTF-8 就没法读，见 Invoke-WithUtf8Output。
+        Invoke-WithUtf8Output { & $bunPath run configure }
         $configureExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
@@ -236,7 +237,7 @@ if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
         $configureExitCode = 1
         try {
             $ErrorActionPreference = "Continue"
-            & $bunPath run configure
+            Invoke-WithUtf8Output { & $bunPath run configure }
             $configureExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
@@ -800,7 +801,8 @@ if ($isAdmin) {
     $foregroundExitCode = 1
     try {
         $ErrorActionPreference = "Continue"
-        & $bunPath run $Entry
+        # 机器人的日志是中文，前台模式直接打在这个控制台上。
+        Invoke-WithUtf8Output { & $bunPath run $Entry }
         $foregroundExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
