@@ -32,10 +32,17 @@ export interface RelayConfig {
   username?: string;
   password?: string;
   maxBytes: number;
+  /**
+   * 链接有效期（小时）。缺省表示永不过期，行为与未引入该字段时一致。
+   * 到期后对象会被 DELETE 掉——不是让链接失效而已，文件真的从后端消失。
+   */
+  expireHours?: number;
 }
 
 /** 默认外链上限；再大的文件多半是误发，也会长时间占住一次工具调用。 */
 const DEFAULT_RELAY_MAX_BYTES = 2 * 1024 ** 3;
+/** expireHours 的上限，够用且能拦住把毫秒当小时填进来的手误。 */
+const MAX_RELAY_EXPIRE_HOURS = 24 * 365;
 
 function requireHttpUrl(value: unknown, field: string, path: string): string {
   if (typeof value !== "string" || !value.trim()) {
@@ -109,11 +116,27 @@ export function loadRelayConfig(path: string = RELAY_CONFIG_PATH): RelayConfig |
     );
   }
 
+  let expireHours: number | undefined;
+  if (fields.expireHours !== undefined && fields.expireHours !== null) {
+    if (
+      typeof fields.expireHours !== "number" ||
+      !Number.isFinite(fields.expireHours) ||
+      fields.expireHours <= 0 ||
+      fields.expireHours > MAX_RELAY_EXPIRE_HOURS
+    ) {
+      throw new Error(
+        `${path} 的 expireHours 必须是 0 到 ${MAX_RELAY_EXPIRE_HOURS} 之间的正数（小时）`
+      );
+    }
+    expireHours = fields.expireHours;
+  }
+
   return {
     webdavUrl: requireHttpUrl(fields.webdavUrl, "webdavUrl", path),
     publicBaseUrl: requireHttpUrl(fields.publicBaseUrl, "publicBaseUrl", path),
     ...(username === undefined ? {} : { username, password }),
     maxBytes,
+    ...(expireHours === undefined ? {} : { expireHours }),
   };
 }
 
@@ -138,7 +161,8 @@ export function getRelayConfig(): RelayConfig | null {
 
 /**
  * 拼接对象名。uuid 让链接不可枚举——公开基址上任何人拿到链接都能下载，猜不到就是唯一
- * 的保护；日期前缀让运维可以按天批量清理（本模块不做过期回收）。
+ * 的保护；日期前缀让人工排查时能按天定位（到期回收走索引，见
+ * sweepExpiredRelayObjects）。
  * filename 由调用方清洗过（不含分隔符），再叠一层 encodeURIComponent，路径穿越在结构上
  * 不可能：对象名永远以日期数字开头。
  */
@@ -152,6 +176,39 @@ function joinUrl(base: string, segment: string): string {
   return `${normalized}${encodeURIComponent(segment)}`;
 }
 
+function buildAuthHeaders(config: RelayConfig): Record<string, string> {
+  if (config.username === undefined) return {};
+  const credentials = `${config.username}:${config.password ?? ""}`;
+  return {
+    Authorization: `Basic ${Buffer.from(credentials, "utf8").toString("base64")}`,
+  };
+}
+
+/**
+ * 把后端的失败翻成管理员能照着动手的一句话。
+ *
+ * 这条消息会经模型转述进群里，而群成员对「HTTP 500」无能为力——真正需要被叫醒的是
+ * 管理员。最常见的情况恰恰不是本项目的问题：网盘挂载在后端侧的授权（token/cookie）
+ * 过期了，WebDAV 这层凭据完全正常，表现为 5xx。所以按状态码分类给出具体去哪儿修，
+ * 并附上后端自己的原文，管理员据此能直接定位。
+ */
+function describeBackendFailure(status: number, detail: string): string {
+  const suffix = detail ? `（后端返回：${detail}）` : "";
+  if (status === 401 || status === 403) {
+    return `外链后端拒绝了上传凭据 HTTP ${status}${suffix}。请管理员检查 data/config/relay.json 中的账号密码，以及该账号对上传目录的写权限。`;
+  }
+  if (status === 404) {
+    return `外链后端找不到上传目录 HTTP 404${suffix}。请管理员确认 relay.json 的 webdavUrl 指向的目录确实存在。`;
+  }
+  if (status === 507) {
+    return `外链后端存储空间不足 HTTP 507${suffix}。请管理员清理后端空间后重试。`;
+  }
+  if (status >= 500) {
+    return `外链后端故障 HTTP ${status}${suffix}。最常见的原因是后端挂载的网盘授权（token / cookie）已过期，需要管理员登录后端重新授权；本项目的 WebDAV 凭据正常与否与此无关。`;
+  }
+  return `外链上传失败 HTTP ${status}${suffix}。请管理员检查外链后端状态。`;
+}
+
 /** 真正把文件 PUT 上去，返回公开下载地址。 */
 async function putObject(
   config: RelayConfig,
@@ -163,11 +220,8 @@ async function putObject(
   const objectName = buildObjectName(filename);
   const headers: Record<string, string> = {
     "Content-Type": "application/octet-stream",
+    ...buildAuthHeaders(config),
   };
-  if (config.username !== undefined) {
-    const credentials = `${config.username}:${config.password ?? ""}`;
-    headers.Authorization = `Basic ${Buffer.from(credentials, "utf8").toString("base64")}`;
-  }
 
   const timeout = AbortSignal.timeout(RELAY_HTTP_TIMEOUT);
   const response = await fetch(joinUrl(config.webdavUrl, objectName), {
@@ -181,9 +235,7 @@ async function putObject(
 
   if (!response.ok) {
     const detail = (await response.text().catch(() => "")).trim().slice(0, 200);
-    throw new Error(
-      `外链上传失败 HTTP ${response.status}: ${filename}${detail ? ` - ${detail}` : ""}`
-    );
+    throw new Error(`${filename} 未能分发：${describeBackendFailure(response.status, detail)}`);
   }
   await response.body?.cancel().catch(() => {});
 
@@ -223,6 +275,95 @@ async function remoteStillExists(
     // 探测失败时按「不存在」处理：重传浪费一次带宽，发死链浪费的是用户的时间。
     return false;
   }
+}
+
+/**
+ * 从存下来的公开地址反推对象名。上传时公开地址就是
+ * `publicBaseUrl + encodeURIComponent(objectName)`，这里原样倒推回去。
+ *
+ * 配置改过（换了后端或换了目录）之后，旧记录的前缀对不上，我们就没有能力再管理那个
+ * 对象了，返回 null 让调用方丢弃索引记录并明确告警——留着一条永远删不掉的记录，只会
+ * 让过期清理看起来在工作而实际没有。
+ */
+function objectNameFromPublicUrl(config: RelayConfig, url: string): string | null {
+  const base = config.publicBaseUrl.endsWith("/")
+    ? config.publicBaseUrl
+    : `${config.publicBaseUrl}/`;
+  if (!url.startsWith(base)) return null;
+  const encoded = url.slice(base.length);
+  if (!encoded || encoded.includes("/")) return null;
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return null;
+  }
+}
+
+/** DELETE 一个对象。已经不存在（404/410）按成功处理——目标状态就是「它没了」。 */
+async function deleteObject(
+  config: RelayConfig,
+  objectName: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const timeout = AbortSignal.timeout(RELAY_PROBE_TIMEOUT);
+  const response = await fetch(joinUrl(config.webdavUrl, objectName), {
+    method: "DELETE",
+    headers: buildAuthHeaders(config),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
+  await response.body?.cancel().catch(() => {});
+  if (response.ok || response.status === 404 || response.status === 410) return;
+  throw new Error(`HTTP ${response.status}`);
+}
+
+/**
+ * 删除已过期的对象。有效期是滑动的：命中去重会刷新 at，所以「最后一次分享后 N 小时」
+ * 才算过期。
+ *
+ * 删除失败时保留索引记录，下一轮重试——后端临时不可达就把记录丢掉的话，那个对象就
+ * 再也没人管了，变成网盘上永久的孤儿。
+ */
+export async function sweepExpiredRelayObjects(
+  /** 覆盖默认的进程级配置与索引，供测试注入。 */
+  overrides?: { config?: RelayConfig | null; index?: RelayIndex }
+): Promise<void> {
+  const config = overrides?.config ?? getRelayConfig();
+  if (!config?.expireHours) return;
+  const ttl = config.expireHours * 60 * 60_000;
+  const index = overrides?.index ?? (await getRelayIndex());
+
+  let removed = 0;
+  for (const entry of index.entries()) {
+    const at = Date.parse(entry.at);
+    // 时间戳读不出来的记录无法参与「多久没被分享」的判断。留着它等于让这份内容永不
+    // 过期，与配置了有效期的初衷相悖，所以按过期处理。
+    if (!Number.isNaN(at) && Date.now() - at < ttl) continue;
+
+    await withUploadLock(entry.key, async () => {
+      // 双重检查：排队等锁期间这份内容可能刚被人分享过并刷新了时间戳。
+      const current = index.get(entry.key);
+      if (!current) return;
+      const currentAt = Date.parse(current.at);
+      if (!Number.isNaN(currentAt) && Date.now() - currentAt < ttl) return;
+
+      const objectName = objectNameFromPublicUrl(config, current.url);
+      if (!objectName) {
+        log.warn(
+          `外链索引记录与当前 publicBaseUrl 对不上，已丢弃记录但无法删除远端对象（需人工清理）: ${current.url}`
+        );
+        await index.forget(current.key);
+        return;
+      }
+      try {
+        await deleteObject(config, objectName);
+        await index.forget(current.key);
+        removed++;
+      } catch (error) {
+        log.warn(`外链过期对象删除失败，将在下一轮重试: ${current.url} (${String(error)})`);
+      }
+    });
+  }
+  if (removed > 0) log.info(`外链过期清理完成，已删除 ${removed} 个对象`);
 }
 
 /**
@@ -285,6 +426,9 @@ export async function relayFile(request: RelayRequest): Promise<string> {
     const cached = index.get(key);
     if (cached) {
       if (await remoteStillExists(cached.url, cached.size, signal)) {
+        // 探测确认对象还在，才刷新时间戳：这样过期计时是「最后一次分享后 N 小时」，
+        // 第二个人拿到的链接也有完整寿命，而且一个字节都不用重传。
+        await index.remember({ ...cached, at: new Date().toISOString() });
         log.info(`外链命中去重索引，跳过上传: ${filename} -> ${cached.url}`);
         return cached.url;
       }

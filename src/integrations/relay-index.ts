@@ -20,6 +20,10 @@ interface RelayIndexEntry {
   url: string;
   name: string;
   size: number;
+  /**
+   * 最后一次分发这份内容的时间（ISO）。命中去重时会刷新，所以过期是「最后一次分享后
+   * N 小时」而不是「首次上传后 N 小时」——还在被分享说明还有人需要它。
+   */
   at: string;
 }
 
@@ -27,6 +31,8 @@ type IndexLine = RelayIndexEntry | { key: string; deleted: true; at: string };
 
 export interface RelayIndex {
   get(key: string): RelayIndexEntry | undefined;
+  /** 快照，供过期清理遍历；遍历期间的增删不会影响已取到的这份列表。 */
+  entries(): RelayIndexEntry[];
   remember(entry: RelayIndexEntry): Promise<void>;
   forget(key: string): Promise<void>;
   size(): number;
@@ -139,6 +145,7 @@ export async function openRelayIndex(path: string): Promise<RelayIndex> {
 
   return {
     get: (key) => entries.get(key),
+    entries: () => [...entries.values()],
     size: () => entries.size,
     async remember(entry) {
       entries.set(entry.key, entry);

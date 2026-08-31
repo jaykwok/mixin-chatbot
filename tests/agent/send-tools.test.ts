@@ -129,6 +129,58 @@ describe("attachment send tools", () => {
       expect(sentText).toContain(details.url);
       // 附件上传端点不该被碰过——大文件根本没进 IM 的通道。
       expect(requests.some((r) => r.url.includes("upload"))).toBe(false);
+      // 没配有效期就不该凭空承诺一个期限。
+      expect(sentText).not.toContain("失效");
+    } finally {
+      globalThis.fetch = originalFetch;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("tells the group when the link expires", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-relay-ttl-"));
+    const workspace = join(root, "workspace");
+    const userTemp = join(root, "user-tmp");
+    await Promise.all([mkdir(workspace), mkdir(userTemp)]);
+
+    const originalFetch = globalThis.fetch;
+    let sentText = "";
+    globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (init?.method === "PUT") return new Response(null, { status: 201 });
+      if (init?.method === "HEAD") return new Response(null, { status: 302 });
+      const body = init?.body;
+      if (typeof body === "string") {
+        sentText = (JSON.parse(body).textMsg?.content as string) ?? "";
+      }
+      return new Response(JSON.stringify({ ok: true, code: 200 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      await writeOversizedFile(workspace, "report.bin");
+      const fileTool = buildSendTools({
+        getCallbackUrl: () => CALLBACK_URL,
+        groupId: "group-a",
+        phone: "+8613800000000",
+        workspaceDir: workspace,
+        tempDir: userTemp,
+        relay: { ...RELAY, expireHours: 8 },
+        relayIndex: await openRelayIndex(join(root, "relay-index.jsonl")),
+      }).find((tool) => tool.name === "send_file")!;
+
+      await fileTool.execute(
+        "send-large-file-ttl",
+        { source: "report.bin" },
+        undefined,
+        undefined,
+        {} as never
+      );
+
+      // 到期时文件会被删掉，事后没有补救途径；群里必须当场看到期限。
+      expect(sentText).toContain("8 小时后失效");
+      expect(sentText).toContain("删除");
     } finally {
       globalThis.fetch = originalFetch;
       await rm(root, { recursive: true, force: true });

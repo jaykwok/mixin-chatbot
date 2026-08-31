@@ -257,9 +257,14 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
           signal,
           index: relayIndex,
         });
+        // 有效期必须写进群消息本身：链接失效时文件已从后端删除，事后没有任何补救途径，
+        // 群成员只有提前知道期限才会及时下载。
+        const expiry = relay.expireHours
+          ? `\n⏳ 链接 ${relay.expireHours} 小时后失效，届时文件会被删除，请及时下载。`
+          : "";
         // 关键消息：链接就是这次发送的全部产出，被出站限流丢掉等于文件没发出去。
         const sent = await sendText(
-          `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发：\n${url}`,
+          `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发：\n${url}${expiry}`,
           groupId,
           phone,
           getCallbackUrl(),

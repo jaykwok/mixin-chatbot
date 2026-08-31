@@ -6,6 +6,7 @@ import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import {
   loadRelayConfig,
   relayFile,
+  sweepExpiredRelayObjects,
   type RelayConfig,
 } from "../../src/integrations/relay.ts";
 import {
@@ -120,6 +121,36 @@ describe("relay config", () => {
       (path) => loadRelayConfig(path)
     );
     expect(config?.username).toBeUndefined();
+  });
+
+  test("expireHours is optional and defaults to never expiring", async () => {
+    const config = await withConfigFile(JSON.stringify(VALID), (path) => loadRelayConfig(path));
+    expect(config?.expireHours).toBeUndefined();
+  });
+
+  test("accepts a fractional expireHours", async () => {
+    const config = await withConfigFile(
+      JSON.stringify({ ...VALID, expireHours: 0.5 }),
+      (path) => loadRelayConfig(path)
+    );
+    expect(config?.expireHours).toBe(0.5);
+  });
+
+  test("rejects an unusable expireHours", async () => {
+    // NaN/Infinity 过不了 JSON（都会变成 null），所以这里只列真正写得出来的错法。
+    for (const bad of [0, -1, "8", true, 24 * 365 + 1]) {
+      await withConfigFile(JSON.stringify({ ...VALID, expireHours: bad }), (path) => {
+        expect(() => loadRelayConfig(path)).toThrow("expireHours");
+      });
+    }
+  });
+
+  test("treats an explicit null expireHours as absent", async () => {
+    const config = await withConfigFile(
+      JSON.stringify({ ...VALID, expireHours: null }),
+      (path) => loadRelayConfig(path)
+    );
+    expect(config?.expireHours).toBeUndefined();
   });
 });
 
@@ -433,6 +464,244 @@ describe("relay upload", () => {
           })
         ).rejects.toThrow("超过外链分发上限");
         expect(fetched).toBe(false);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("names the likely cause when the backend fails with a 5xx", async () => {
+    await withFixture(async ({ file, index }) => {
+      const restore = mockFetch((_input, init) =>
+        init?.method === "PUT"
+          ? new Response('{"code":500,"message":"refresh token expired"}', { status: 500 })
+          : new Response(null, { status: 404 })
+      );
+      try {
+        const error = await relayFile({
+          config: CONFIG,
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        }).then(
+          () => null,
+          (e: unknown) => e as Error
+        );
+        expect(error).toBeInstanceOf(Error);
+        // 群成员对「HTTP 500」无能为力；这句话要指向真正能修的人和真正的原因。
+        expect(error!.message).toContain("授权");
+        expect(error!.message).toContain("管理员");
+        // 后端原文要带上，管理员据此才能定位。
+        expect(error!.message).toContain("refresh token expired");
+      } finally {
+        restore();
+      }
+    });
+  });
+});
+
+describe("relay expiry", () => {
+  const EXPIRING: RelayConfig = { ...CONFIG, expireHours: 8 };
+
+  /** 直接往索引里塞一条指定年龄的记录，避免测试真的等 8 小时。 */
+  async function seed(index: RelayIndex, ageHours: number, name = "note.txt") {
+    const key = relayCacheKey("deadbeef", name);
+    await index.remember({
+      key,
+      url: `${EXPIRING.publicBaseUrl}${encodeURIComponent(`20260831-uuid-${name}`)}`,
+      name,
+      size: 5,
+      at: new Date(Date.now() - ageHours * 60 * 60_000).toISOString(),
+    });
+    return key;
+  }
+
+  test("deletes an object whose link has expired and drops its index entry", async () => {
+    await withFixture(async ({ index }) => {
+      const key = await seed(index, 9);
+      const deleted: string[] = [];
+      const restore = mockFetch((input, init) => {
+        if (init?.method === "DELETE") deleted.push(String(input));
+        return new Response(null, { status: 204 });
+      });
+      try {
+        await sweepExpiredRelayObjects({ config: EXPIRING, index });
+        expect(deleted).toHaveLength(1);
+        // 删的必须是 WebDAV 地址，不是公开下载地址。
+        expect(deleted[0].startsWith(EXPIRING.webdavUrl)).toBe(true);
+        expect(deleted[0]).toContain("note.txt");
+        expect(index.get(key)).toBeUndefined();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("leaves a still-live object alone", async () => {
+    await withFixture(async ({ index }) => {
+      const key = await seed(index, 7);
+      let called = false;
+      const restore = mockFetch(() => {
+        called = true;
+        return new Response(null, { status: 204 });
+      });
+      try {
+        await sweepExpiredRelayObjects({ config: EXPIRING, index });
+        expect(called).toBe(false);
+        expect(index.get(key)).toBeDefined();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("does nothing at all when no expiry is configured", async () => {
+    await withFixture(async ({ index }) => {
+      const key = await seed(index, 10_000);
+      let called = false;
+      const restore = mockFetch(() => {
+        called = true;
+        return new Response(null, { status: 204 });
+      });
+      try {
+        await sweepExpiredRelayObjects({ config: CONFIG, index });
+        expect(called).toBe(false);
+        expect(index.get(key)).toBeDefined();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("keeps the entry for a retry when the delete fails", async () => {
+    await withFixture(async ({ index }) => {
+      const key = await seed(index, 9);
+      const restore = mockFetch(() => new Response("backend down", { status: 503 }));
+      try {
+        await sweepExpiredRelayObjects({ config: EXPIRING, index });
+        // 后端临时不可达就丢掉记录的话，那个对象再没人管，会变成网盘上的永久孤儿。
+        expect(index.get(key)).toBeDefined();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("treats an already-absent object as successfully deleted", async () => {
+    await withFixture(async ({ index }) => {
+      const key = await seed(index, 9);
+      const restore = mockFetch(() => new Response(null, { status: 404 }));
+      try {
+        await sweepExpiredRelayObjects({ config: EXPIRING, index });
+        expect(index.get(key)).toBeUndefined();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("drops but does not delete an entry left over from another publicBaseUrl", async () => {
+    await withFixture(async ({ index }) => {
+      const key = relayCacheKey("deadbeef", "old.txt");
+      await index.remember({
+        key,
+        url: "https://previous-backend.example.com/d/relay/20260101-uuid-old.txt",
+        name: "old.txt",
+        size: 5,
+        at: new Date(Date.now() - 9 * 60 * 60_000).toISOString(),
+      });
+      let called = false;
+      const restore = mockFetch(() => {
+        called = true;
+        return new Response(null, { status: 204 });
+      });
+      try {
+        await sweepExpiredRelayObjects({ config: EXPIRING, index });
+        // 换过后端之后我们没有能力再删旧对象，但也不该把请求发给新后端。
+        expect(called).toBe(false);
+        expect(index.get(key)).toBeUndefined();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("a cache hit refreshes the deadline instead of re-uploading", async () => {
+    await withFixture(async ({ file, index }) => {
+      let puts = 0;
+      const restore = mockFetch((_input, init) => {
+        if (init?.method === "PUT") {
+          puts++;
+          return new Response(null, { status: 201 });
+        }
+        return new Response(null, { status: 302 });
+      });
+      try {
+        const first = await relayFile({
+          config: EXPIRING,
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        });
+        const key = relayCacheKey(await hashFile(file), "note.txt");
+        // 把记录改老，模拟这份内容已经躺了 7 小时。
+        const aged = new Date(Date.now() - 7 * 60 * 60_000).toISOString();
+        await index.remember({ ...index.get(key)!, at: aged });
+
+        const second = await relayFile({
+          config: EXPIRING,
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        });
+
+        expect(second).toBe(first);
+        expect(puts).toBe(1);
+        // 时间戳被刷新了，所以第二个人拿到的链接有完整寿命，而不是只剩一小时。
+        expect(index.get(key)!.at > aged).toBe(true);
+        // 而且刷新之后不会被随后的清理误删。
+        await sweepExpiredRelayObjects({ config: EXPIRING, index });
+        expect(index.get(key)).toBeDefined();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("does not refresh the deadline when the object is already gone", async () => {
+    await withFixture(async ({ file, index }) => {
+      const key = relayCacheKey(await hashFile(file), "note.txt");
+      const aged = new Date(Date.now() - 7 * 60 * 60_000).toISOString();
+      await index.remember({
+        key,
+        url: `${EXPIRING.publicBaseUrl}stale-object.txt`,
+        name: "note.txt",
+        size: 5,
+        at: aged,
+      });
+      let puts = 0;
+      const restore = mockFetch((_input, init) => {
+        if (init?.method === "PUT") {
+          puts++;
+          return new Response(null, { status: 201 });
+        }
+        // 探测报告对象已不存在。
+        return new Response(null, { status: 404 });
+      });
+      try {
+        const url = await relayFile({
+          config: EXPIRING,
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        });
+        // 死链不能靠刷新时间戳续命，必须真的重传。
+        expect(puts).toBe(1);
+        expect(url).not.toContain("stale-object.txt");
       } finally {
         restore();
       }

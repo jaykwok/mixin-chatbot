@@ -19,7 +19,7 @@ import {
   cleanupCallbackRoutes,
   observeCallbackRoute,
 } from "../integrations/callback-route.ts";
-import { initializeRelay } from "../integrations/relay.ts";
+import { initializeRelay, sweepExpiredRelayObjects } from "../integrations/relay.ts";
 import {
   constantTimeEqual,
   getClientIp,
@@ -228,6 +228,11 @@ app.notFound((c) => c.json({ status: "error", message: "Not Found" }, 404));
 await initializeAgentRuntime();
 // 同理校验可选的外链分发配置：写错了要现在就报，而不是等某个用户发了个大文件。
 initializeRelay();
+// 启动时先补一次过期清理。定时器只在进程活着时走，而重启（部署、Windows 更新、崩溃后
+// 被拉起）期间到期的对象没人管；不在这里补扫，那批文件会一直留在网盘上。
+void sweepExpiredRelayObjects().catch((e) =>
+  log.error(`外链过期清理出错: ${String(e)}`)
+);
 
 const rateLimitTimer = setInterval(() => {
   try {
@@ -238,6 +243,9 @@ const rateLimitTimer = setInterval(() => {
   }
   void cleanupIdleSessions().catch((e) =>
     log.error(`空闲会话清理出错: ${String(e)}`)
+  );
+  void sweepExpiredRelayObjects().catch((e) =>
+    log.error(`外链过期清理出错: ${String(e)}`)
   );
 }, RATE_LIMIT_CLEANUP_INTERVAL);
 
