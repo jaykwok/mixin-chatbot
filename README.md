@@ -167,7 +167,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-purge --all
 
 `--all` 必须显式给出，不带参数的 `relay-purge` 会被拒绝——手滑一次就清空所有人的下载链接，代价太大。清理可以在机器人运行时执行：删掉后端对象才是决定性的动作，索引会自愈（机器人内存里那条记录下次命中时 HEAD 探测会 404，于是丢弃并重传）。
 
-两个平台都只是把 `scripts/ops/relay-admin.ts` 跑起来（Linux 在容器里 `docker exec`，以复用它的 host 网络和挂载）。删一个对象要先从公开地址反推对象名、再拼 WebDAV 地址并带上 Basic 凭据，这些知识只存在于 `src/integrations/relay.ts`；在两个 shell 里各抄一遍会把它维护成三份，而且凭据会进到命令行参数里——Windows 上任何用户都能用 WMI 读到别人进程的完整命令行，Linux 上是 `/proc/<pid>/cmdline`。
+两个平台都只是把 `scripts/ops/relay-admin.ts` 跑起来（Linux 在容器里 `docker exec`，以复用它的 host 网络和挂载），也可以直接 `bun run relay list` / `bun run relay purge <关键字>`。删一个对象要先从公开地址反推对象名、再拼 WebDAV 地址并带上 Basic 凭据，这些知识只存在于 `src/integrations/relay.ts`；在两个 shell 里各抄一遍会把它维护成三份，而且凭据会进到命令行参数里——Windows 上任何用户都能用 WMI 读到别人进程的完整命令行，Linux 上是 `/proc/<pid>/cmdline`。
 
 > 索引只记录**机器人发出去的**链接，你手动传进那个目录的文件不在册。要整个重置就先在后端删对象、再删 `relay-index.jsonl`——顺序反过来的话机器人就不知道那些对象叫什么了，它们会变成网盘上没人管的孤儿。索引本身可以随便删，它在 `data/runtime`（可重建），丢了只是下次多传一遍。
 
