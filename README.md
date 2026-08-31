@@ -104,6 +104,7 @@ data/
 │   └── cloudflared.pid / cloudflared-managed  # Linux PID / Windows 服务归属标记
 ├── runtime/                        # 可删除、可重建的运行文件
 │   ├── bot-launcher.ps1
+│   ├── models-store.json           # Pi 的远程模型目录缓存（非配置）
 │   ├── home/                       # Linux 容器任意非 root UID 的可写 HOME
 │   └── pi/
 └── groups/                         # 默认 GROUP_DATA_ROOT
@@ -114,7 +115,7 @@ data/
             └── session.jsonl
 ```
 
-- **AI 配置**（Responses provider / base URL / key / model / 元数据 / thinkingLevel）：全部在 `data/config/models.json`，由 `bun run configure` 调用 `scripts/config/configure.ts` 生成，Pi 原生读取 provider/model，本项目读取 thinkingLevel。配置器固定写入 `api: "openai-responses"`；模型支持思考模式时选择 `off/minimal/low/medium/high`（默认 `low`），不支持时固定为 `off`。服务启动时对所选 provider 做只读凭证就绪检查。
+- **AI 配置**（Responses provider / base URL / key / model / 元数据 / thinkingLevel）：全部在 `data/config/models.json`，由 `bun run configure` 调用 `scripts/config/configure.ts` 生成，Pi 原生读取 provider/model，本项目读取 thinkingLevel。配置器固定写入 `api: "openai-responses"`；模型支持思考模式时选择 `off/minimal/low/medium/high`（默认 `low`），不支持时固定为 `off`。服务启动时对所选 provider 做只读凭证就绪检查。Pi 默认把远程模型目录缓存 `models-store.json` 写在 `models.json` 旁边；本项目用 `modelsStorePath` 显式指向 `data/runtime/`，让 `data/config/` 只留需要人工维护的内容。
 - **监听端口与部署状态**：Linux/Windows 部署脚本每次都会询问；端口默认优先沿用 `BOT_PORT` 或 `data/state/bot-port`，否则为 `1011`，部署模式默认优先沿用 `DEPLOY_MODE` 或 `data/state/deploy-mode`。机器人健康且隧道/直连切换成功后，模式、公网域名和主机侧群数据根才统一提交到 `data/state/`。
 - **监听地址**：部署脚本自动设置；直连模式为 `0.0.0.0`，Cloudflare 模式为 `127.0.0.1`。手动启动时可用 `BOT_HOST` 覆盖。
 - **群数据总根**（可选）：首次默认 `./data/groups`，部署时可改（`deploy.ps1`/`deploy.sh` 会问），或直接设环境变量 `GROUP_DATA_ROOT`（相对仓库或绝对路径均可）。部署成功后主机路径写入 `data/state/group-data-root`，下次部署自动沿用，避免群数据被切到另一目录；配置、部署状态和 runtime 始终保留在项目 `data/` 的分类目录中。
