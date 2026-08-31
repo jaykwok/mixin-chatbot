@@ -367,10 +367,44 @@ function Get-BotPids {
         Select-Object -ExpandProperty ProcessId
 }
 
+# 返回机器人是否真的停下来了。以前这里把所有失败都静默吞掉，于是「计划任务以
+# Administrator 运行、当前窗口没有管理员权限」时停不掉进程也照样返回，Restart-Bot 会
+# 当成已经重启继续往下走，最后只表现为一句莫名其妙的健康检查失败。
 function Stop-Bot {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($t) { try { Stop-ScheduledTask -TaskName $TaskName } catch {} }
-    foreach ($p in Get-BotPids) { try { Stop-Process -Id $p -Force } catch {} }
+    if ($t) {
+        try {
+            Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        } catch {
+            Warn "停止计划任务失败：$($_.Exception.Message)"
+        }
+    }
+    foreach ($p in Get-BotPids) {
+        try {
+            Stop-Process -Id $p -Force -ErrorAction Stop
+        } catch {
+            Warn "结束进程 $p 失败：$($_.Exception.Message)"
+        }
+    }
+    # 进程和任务状态都要落地。Start-ScheduledTask 对仍处于 Running 的任务是静默空操作，
+    # 只等进程消失就放行的话，随后的启动可能什么都没做，却一路显示成功。
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        $current = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $taskBusy = $current -and $current.State -eq "Running"
+        if (@(Get-BotPids).Count -eq 0 -and -not $taskBusy) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+
+    $remaining = @(Get-BotPids)
+    if ($remaining.Count -gt 0) {
+        Err "机器人进程仍在运行（pid $($remaining -join ', ')）"
+    } else {
+        Err "计划任务 '$TaskName' 仍处于运行状态，无法重新启动它"
+    }
+    if (-not (IsAdmin)) {
+        Warn "当前不是管理员；计划任务以其他账户运行时，需要管理员 PowerShell 才能停止它"
+    }
+    return $false
 }
 
 function Start-Bot {
@@ -387,8 +421,21 @@ function Start-Bot {
 }
 
 function Test-Local {
-    try { return (Invoke-WebRequest -Uri "http://localhost:$Port/favicon.svg" -UseBasicParsing -TimeoutSec 2).StatusCode }
-    catch {
+    # 与 Test-Public 一致优先用 curl.exe。Invoke-WebRequest 走 .NET HttpClient，会套用系统
+    # 代理设置，实测在云桌面上访问本机会一路挂到超时（TaskCanceledException），把健康的
+    # 机器人误判成没响应；curl 同一地址立刻返回 200。
+    # 地址固定 127.0.0.1 而不是 localhost：Cloudflare 模式下机器人只绑 IPv4 回环，
+    # localhost 在 Windows 上可能先解析到 ::1。
+    $curlPath = Get-CurlPath
+    if ($curlPath) {
+        $code = & $curlPath --noproxy "*" -s -o NUL -m 3 -w "%{http_code}" "http://127.0.0.1:$Port/favicon.svg" 2>$null
+        $parsed = 0
+        if ([int]::TryParse("$code".Trim(), [ref]$parsed) -and $parsed -gt 0) { return $parsed }
+        return $null
+    }
+    try {
+        return (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/favicon.svg" -UseBasicParsing -TimeoutSec 3).StatusCode
+    } catch {
         $response = $_.Exception.Response
         if ($response -and $response.StatusCode) { return [int]$response.StatusCode }
         return $null
@@ -710,7 +757,12 @@ function Invoke-DoctorRepair {
 
 function Restart-Bot {
     Step "重新启动机器人..."
-    Stop-Bot
+    # 没停下来就别假装重启了：旧进程还占着端口，新实例起不来，健康检查却会因为旧进程
+    # 仍在应答而显示正常，得到一个「看起来成功、其实没换版本」的结果。
+    if (-not (Stop-Bot)) {
+        Err "机器人未能停止，已放弃重启"
+        return $false
+    }
     Start-Sleep -Seconds 1
     if (-not (Start-Bot)) { return $false }
     $lc = Wait-Local
@@ -890,8 +942,13 @@ function Invoke-Update {
     foreach ($line in ($incoming.Text -split "`n")) { Write-Host "      $line" -ForegroundColor Gray }
     Write-Host ""
 
+    # 先停再改：bun install 会动 node_modules，让它在机器人跑着的时候换依赖不是好主意。
+    # 停不下来就在动 git 之前退出，磁盘上的东西一点没变，重试成本为零。
     Step "停止机器人后更新代码..."
-    Stop-Bot
+    if (-not (Stop-Bot)) {
+        Err "机器人未能停止，已放弃升级（代码未改变）"
+        return $false
+    }
     Start-Sleep -Seconds 1
 
     $merge = Invoke-GitCapture @("merge", "--ff-only", "origin/main")
@@ -1082,7 +1139,8 @@ function Uninstall-Bot {
     Step "卸载 mixin-chatbot"
     $resolvedGroupDataRoot = try { Resolve-ProjectPath $DeployedGroupDataRoot } catch { $null }
     if (-not (IsAdmin)) { Warn "当前不是管理员，任务/服务删除可能失败；如失败请以管理员身份重跑。" }
-    Stop-Bot
+    # 返回值丢弃：下面按实际残留进程判断，比信任停止操作的返回值更严格。
+    [void](Stop-Bot)
     $remainingBotPids = @(Get-BotPids)
     if ($remainingBotPids.Count -gt 0) {
         Err "机器人进程仍在运行（pid $($remainingBotPids -join ', ')）；为避免删除仍在使用的数据，卸载已停止。"
@@ -1193,7 +1251,11 @@ switch ($Command) {
     }
     "uninstall-tunnel" { if (-not (Uninstall-TunnelService)) { exit 1 } }
     "restart"   { if (-not (Restart-Bot)) { exit 1 } }
-    "stop"      { Step "停止机器人..."; Stop-Bot; Done "机器人已停止" }
+    "stop"      {
+        Step "停止机器人..."
+        if (-not (Stop-Bot)) { exit 1 }
+        Done "机器人已停止"
+    }
     "foreground" { if (-not (Run-Foreground)) { exit 1 } }
     "run-foreground" { if (-not (Run-Foreground)) { exit 1 } }
     "start"     {
