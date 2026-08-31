@@ -583,8 +583,36 @@ if ($preflightTunnelService -and -not $preflightTunnelManaged) {
 }
 
 # ---- 6. 停止旧机器人（避免重新部署时端口冲突）----
+#
+# 从这里往下就开始破坏现有部署了：停进程、覆盖 launcher、注销并重建计划任务。Linux 侧
+# 是「起新容器、失败就换回旧容器」，旧部署全程没被动过；Windows 是原地改，一旦后面的
+# 健康检查不过，机器人就停在「旧的已经拆了、新的起不来」的状态。所以先把能复原的三样
+# 东西留个快照：任务定义、launcher 内容、旧端口（$PortFile 要到部署成功才会被覆盖）。
+$previousTaskXml = $null
+$previousTaskWasRunning = $false
+$previousLauncherBody = $null
+$previousPort = $null
 if ($isAdmin) {
     $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        $previousTaskWasRunning = ($existingTask.State -eq "Running")
+        try {
+            $previousTaskXml = Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        } catch {
+            Warn "无法导出现有计划任务定义：$($_.Exception.Message)；本次部署失败时将无法自动恢复旧部署。"
+        }
+    }
+    if (Test-Path -LiteralPath $LauncherFile -PathType Leaf) {
+        try {
+            $previousLauncherBody = [System.IO.File]::ReadAllText($LauncherFile)
+        } catch {
+            Warn "无法读取现有 launcher：$($_.Exception.Message)"
+        }
+    }
+    if (Test-Path -LiteralPath $PortFile -PathType Leaf) {
+        $previousPort = (Get-Content -LiteralPath $PortFile -Raw -ErrorAction SilentlyContinue)
+        if ($previousPort) { $previousPort = $previousPort.Trim() }
+    }
     if ($existingTask -and $existingTask.State -eq "Running") {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     }
@@ -598,6 +626,81 @@ Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyCont
 
 # 为写入生成的 launcher，对路径执行单引号转义
 function Sq($s) { return "'" + ($s -replace "'", "''") + "'" }
+
+# 健康检查不过时，把第 6 步拆掉的旧部署装回去：launcher 内容、计划任务定义，以及（原本
+# 就在跑的话）重新拉起并等它在旧端口上应答。
+#
+# 只能复原「部署脚本自己改动过的东西」。代码本身不在其中——通过 ops.ps1 update 升级时，
+# 仓库已经是新版本了，退代码是那边 Invoke-UpdateRollback 的职责。真正被这条路径救回来的
+# 是「改配置（换端口、换模式、换群数据根）把自己配挂了」这类情况：旧 launcher 里存着上
+# 一次可用的那套设置。
+# 返回 "restored"（旧部署已装回）、"none"（本机根本没有旧部署可装）、"failed"（试了但没成）。
+# 首次部署失败和恢复失败对人来说是两回事，不能都报成一句红字。
+function Restore-PreviousDeployment {
+    if (-not $previousTaskXml -and -not $previousLauncherBody) {
+        return "none"
+    }
+    Write-Host ""
+    Step "正在恢复升级前的部署..."
+
+    # 先让新的那份彻底停下，否则它会占着端口，旧的照样起不来。
+    try {
+        $failedTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($failedTask -and $failedTask.State -eq "Running") {
+            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*$escapedEntry*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+    $restored = $true
+    if ($previousLauncherBody) {
+        try {
+            [System.IO.File]::WriteAllText($LauncherFile, $previousLauncherBody, (New-Object System.Text.UTF8Encoding($true)))
+            Done "已还原上一版 launcher。"
+        } catch {
+            Write-Host "还原 launcher 失败：$($_.Exception.Message)" -ForegroundColor Red
+            $restored = $false
+        }
+    }
+    if ($previousTaskXml) {
+        try {
+            Register-ScheduledTask -TaskName $TaskName -Xml $previousTaskXml -Force -ErrorAction Stop | Out-Null
+            Done "已还原上一版计划任务定义。"
+        } catch {
+            # S4U 主体从 XML 注册时部分策略要求显式带上账户，退一步再试一次。
+            try {
+                Register-ScheduledTask -TaskName $TaskName -Xml $previousTaskXml -User $currentUser -Force -ErrorAction Stop | Out-Null
+                Done "已还原上一版计划任务定义。"
+            } catch {
+                Write-Host "还原计划任务失败：$($_.Exception.Message)" -ForegroundColor Red
+                $restored = $false
+            }
+        }
+    }
+
+    if (-not $previousTaskWasRunning) {
+        Warn "旧部署在本次部署前本就没有运行，因此只还原定义、不再拉起。"
+        return $(if ($restored) { "restored" } else { "failed" })
+    }
+    if (-not $restored) { return "failed" }
+
+    try {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    } catch {
+        Write-Host "重新拉起旧部署失败：$($_.Exception.Message)" -ForegroundColor Red
+        return "failed"
+    }
+    # 端口可能正是这次要改的东西；旧部署要用旧端口探测（$PortFile 此刻还没被覆盖）。
+    $probePort = if ($previousPort) { $previousPort } else { $Port }
+    if (Wait-BotHealth $probePort) {
+        Done "旧部署已恢复运行（:$probePort）。"
+        return "restored"
+    }
+    Write-Host "旧部署已重新拉起，但 :$probePort 仍未通过健康检查。" -ForegroundColor Red
+    return "failed"
+}
 function Save-DeploymentState {
     Set-Content -LiteralPath $PortFile -Value $Port -NoNewline -Encoding ASCII
     Set-Content -LiteralPath $ModeFile -Value $mode -NoNewline -Encoding ASCII
@@ -689,6 +792,18 @@ if ($isAdmin) {
         $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
         $lastResult = if ($taskInfo) { "$(Get-ResultCodeHex $taskInfo.LastTaskResult) / $($taskInfo.LastTaskResult)" } else { "未知" }
         Write-Host "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请查看 logs\mixin-chatbot.log，并运行 scripts\ops\ops.ps1 doctor。" -ForegroundColor Red
+        # 恢复的结果不能盖掉上面那条失败原因；两边都要说清楚，人才知道现在到底是什么状态。
+        switch (Restore-PreviousDeployment) {
+            "restored" {
+                Warn "本次部署未生效，已退回上一版部署。data\state 未被改写，配置仍是这次部署前那一套。"
+            }
+            "none" {
+                Warn "本机此前没有可用部署，没有可回退的目标；请修正问题后重跑部署。"
+            }
+            default {
+                Write-Host "旧部署未能自动恢复；机器人当前处于停止状态。请运行 scripts\ops\ops.ps1 doctor 确认，必要时修正配置后重跑部署。" -ForegroundColor Red
+            }
+        }
         exit 1
     }
     if ($mode -eq "direct") {
