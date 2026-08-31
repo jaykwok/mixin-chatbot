@@ -45,10 +45,16 @@ async function list(): Promise<number> {
   }
   console.log("");
   console.log(`共 ${objects.length} 条。`);
-  if (config?.expireHours) {
-    console.log(`有效期 ${config.expireHours} 小时，从上面的时间起算；到期后对象会被自动删除。`);
+  if (!config?.expireHours) {
+    console.log("未配置 expireHours，链接永不失效，对象也不会被自动回收。");
+  } else if (config.signSecret) {
+    // 上面打印的地址是刚签出来的，跟当初发进群里那条不是同一个 sign，别让人以为链接变了。
+    console.log(
+      `链接有效期 ${config.expireHours} 小时（上面列出的地址是刚签发的，从现在起算）；` +
+        "到期只是签名失效，文件仍留在后端，不会被自动回收——要腾空间用 purge。"
+    );
   } else {
-    console.log("未配置 expireHours，这些对象不会被自动回收。");
+    console.log(`有效期 ${config.expireHours} 小时，从上面的时间起算；到期后对象会被自动删除。`);
   }
   return 0;
 }

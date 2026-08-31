@@ -386,7 +386,18 @@ function Get-RelayDoctorRows {
             "补齐这两个字段，或删除该文件以关闭大文件外链分发。")
     }
 
-    $rows = @(New-DoctorRow "data/config/relay.json" "pass" "已启用 -> $publicBaseUrl")
+    # 到期是删文件还是只让链接失效，是这个特性最容易被记错的一件事，写进体检结果里。
+    $expireHours = "$($config.expireHours)".Trim()
+    $signSecret = "$($config.signSecret)".Trim()
+    if (-not $expireHours) {
+        $expiryLabel = "永不过期"
+    } elseif ($signSecret) {
+        $expiryLabel = "签名 ${expireHours}h 后失效，文件保留"
+    } else {
+        $expiryLabel = "${expireHours}h 后删除文件"
+    }
+
+    $rows = @(New-DoctorRow "data/config/relay.json" "pass" "已启用 -> $publicBaseUrl（$expiryLabel）")
 
     $davCode = Invoke-HttpProbe -Url $webdavUrl -Method "PROPFIND" -TimeoutSec 8 `
         -Username $config.username -Password $config.password `

@@ -7,7 +7,7 @@
 // 有意只支持本地文件：让机器人把任意 http(s) 地址镜像成一条公开链接，等于把它变成
 // 一个开放的转载器；而且远程响应不一定给 Content-Length，拿不到可靠的大小。超限的
 // 远程文件仍按原样报错，模型可以先用 bash 下载到自己的 tmp 再发。
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import {
@@ -34,9 +34,26 @@ export interface RelayConfig {
   maxBytes: number;
   /**
    * 链接有效期（小时）。缺省表示永不过期，行为与未引入该字段时一致。
-   * 到期后对象会被 DELETE 掉——不是让链接失效而已，文件真的从后端消失。
+   *
+   * 到期后发生什么取决于有没有配 signSecret：
+   * - 没配：对象被 DELETE 掉，文件真的从后端消失，事后无法补救。
+   * - 配了：只是签名失效，文件留在后端，再发一次即可拿到新链接且无需重传。
    */
   expireHours?: number;
+  /**
+   * 签名密钥。配了它，公开地址会带上一个有时效的 `?sign=`，到期后后端自己拒绝下载，
+   * 于是「链接失效」和「文件保留」可以同时成立。
+   *
+   * 这是本模块唯一一处对后端实现有假设的地方：签名格式是
+   * `base64(HMAC-SHA256(secret, "<虚拟路径>:<到期秒时间戳>")) + ":" + <到期秒时间戳>`。
+   * 后端不认这套格式就别配它——链接会带上一个被忽略的参数，等于没配。
+   */
+  signSecret?: string;
+  /**
+   * 参与签名的虚拟路径前缀（以 / 开头和结尾），缺省从 publicBaseUrl 推导。
+   * 只在推导不出来时才需要手写，见 deriveSignPathPrefix。
+   */
+  signPathPrefix?: string;
 }
 
 /** 默认外链上限；再大的文件多半是误发，也会长时间占住一次工具调用。 */
@@ -66,6 +83,44 @@ function optionalString(value: unknown, field: string, path: string): string | u
     throw new Error(`${path} 的 ${field} 必须是字符串`);
   }
   return value;
+}
+
+/** 前后都补上 /，签名串里路径的形状必须是稳定的。 */
+function normalizeSignPathPrefix(value: string): string {
+  const trimmed = value.trim();
+  const withLead = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLead.endsWith("/") ? withLead : `${withLead}/`;
+}
+
+/**
+ * 从公开下载基址推出参与签名的虚拟路径前缀。
+ *
+ * 签名覆盖的是后端里的虚拟路径（/relay/xxx.pdf），而公开地址在它前面还多一段下载路由
+ * （惯例是 /d 或 /p）。这里取从左往右第一个 d/p 段，其后即为虚拟路径——
+ * `https://files.example.com/d/relay/` 推出 `/relay/`，绝大多数部署就是这个形状。
+ *
+ * 反向代理把后端挂在子路径下（`/store/d/relay/`）之类的情形推不对，也推不出来时返回
+ * null，由配置校验要求显式写 signPathPrefix：宁可拒绝启动，也不要签出一批必然 403 的
+ * 链接——那种失败要等到群里有人点开才会暴露。
+ */
+function deriveSignPathPrefix(publicBaseUrl: string): string | null {
+  let segments: string[];
+  try {
+    segments = new URL(publicBaseUrl).pathname.split("/").filter(Boolean);
+  } catch {
+    return null;
+  }
+  const route = segments.findIndex((segment) => segment === "d" || segment === "p");
+  if (route < 0) return null;
+  // 后端按解码后的路径验签，所以这里也要解码。
+  const rest = segments.slice(route + 1).map((segment) => {
+    try {
+      return decodeURIComponent(segment);
+    } catch {
+      return segment;
+    }
+  });
+  return rest.length === 0 ? "/" : `/${rest.join("/")}/`;
 }
 
 /**
@@ -131,12 +186,32 @@ export function loadRelayConfig(path: string = RELAY_CONFIG_PATH): RelayConfig |
     expireHours = fields.expireHours;
   }
 
+  const publicBaseUrl = requireHttpUrl(fields.publicBaseUrl, "publicBaseUrl", path);
+
+  const signSecret = optionalString(fields.signSecret, "signSecret", path)?.trim() || undefined;
+  let signPathPrefix: string | undefined;
+  if (signSecret !== undefined) {
+    const explicit = optionalString(fields.signPathPrefix, "signPathPrefix", path)?.trim();
+    const derived = explicit ? normalizeSignPathPrefix(explicit) : deriveSignPathPrefix(publicBaseUrl);
+    if (!derived) {
+      throw new Error(
+        `${path} 配了 signSecret，但无法从 publicBaseUrl（${publicBaseUrl}）推出参与签名的路径前缀，` +
+          "请显式填写 signPathPrefix，例如 \"/relay/\""
+      );
+    }
+    signPathPrefix = derived;
+  } else if (fields.signPathPrefix !== undefined && fields.signPathPrefix !== null) {
+    // 单独一个 signPathPrefix 什么也做不了。静默忽略只会让人以为签名已经生效。
+    throw new Error(`${path} 的 signPathPrefix 只在同时配置 signSecret 时有意义`);
+  }
+
   return {
     webdavUrl: requireHttpUrl(fields.webdavUrl, "webdavUrl", path),
-    publicBaseUrl: requireHttpUrl(fields.publicBaseUrl, "publicBaseUrl", path),
+    publicBaseUrl,
     ...(username === undefined ? {} : { username, password }),
     maxBytes,
     ...(expireHours === undefined ? {} : { expireHours }),
+    ...(signSecret === undefined ? {} : { signSecret, signPathPrefix }),
   };
 }
 
@@ -146,8 +221,14 @@ let cachedConfig: RelayConfig | null | undefined;
 export function initializeRelay(): void {
   cachedConfig = loadRelayConfig();
   if (cachedConfig) {
+    // 到期是删文件还是只让链接失效，是运维最需要一眼看清的一件事，写进启动日志。
+    const expiry = !cachedConfig.expireHours
+      ? "永不过期"
+      : cachedConfig.signSecret
+        ? `签名 ${cachedConfig.expireHours} 小时后失效，文件保留`
+        : `${cachedConfig.expireHours} 小时后删除文件`;
     log.info(
-      `大文件外链分发已启用（上限 ${formatSize(cachedConfig.maxBytes)}，下载基址 ${cachedConfig.publicBaseUrl}）`
+      `大文件外链分发已启用（上限 ${formatSize(cachedConfig.maxBytes)}，下载基址 ${cachedConfig.publicBaseUrl}，${expiry}）`
     );
   } else {
     log.info(`未配置 ${RELAY_CONFIG_PATH}，超过附件上限的文件仍按报错处理`);
@@ -299,6 +380,61 @@ function objectNameFromPublicUrl(config: RelayConfig, url: string): string | nul
   }
 }
 
+/**
+ * 后端用的是 Go 的 `base64.URLEncoding`：URL 字母表 **且带 `=` 填充**。Node 的
+ * `digest("base64url")` 不带填充，直接拿来用会让每一条链接都验签失败，而且失败要等到
+ * 群里有人点开才会暴露。所以在标准 base64 上换字母表，把填充留着。
+ */
+function paddedBase64Url(buffer: Buffer): string {
+  return buffer.toString("base64").replaceAll("+", "-").replaceAll("/", "_");
+}
+
+/**
+ * 为一个对象签一个到期时间。expiresAt 传 0 表示永不过期（后端约定），用于配了
+ * signSecret 但没配 expireHours 的情况——那时签名的作用只是通过后端的强制验签。
+ */
+function signObjectName(config: RelayConfig, objectName: string, expiresAt: number): string {
+  const data = `${config.signPathPrefix ?? "/"}${objectName}`;
+  const expire = String(expiresAt);
+  const mac = createHmac("sha256", config.signSecret ?? "").update(`${data}:${expire}`).digest();
+  return `${paddedBase64Url(mac)}:${expire}`;
+}
+
+/**
+ * 把索引里存的裸地址变成这一刻可用的公开地址。
+ *
+ * 索引存的始终是不带签名的地址：签名有时效，存进去第二天就是一条死链，而裸地址是这个
+ * 对象的恒定身份，`objectNameFromPublicUrl` 也要靠它反推对象名。每次要给出去的时候现签
+ * 一个，于是命中去重时不用重传就能拿到一条寿命完整的新链接。
+ */
+export function publicUrlFor(config: RelayConfig, storedUrl: string): string {
+  if (!config.signSecret) return storedUrl;
+  const objectName = objectNameFromPublicUrl(config, storedUrl);
+  // 前缀对不上（换过后端或目录）时签了也是错的，原样返回，让调用方那边的探测去发现问题。
+  if (!objectName) return storedUrl;
+  const expiresAt = config.expireHours
+    ? Math.floor(Date.now() / 1000) + Math.round(config.expireHours * 3600)
+    : 0;
+  const url = new URL(storedUrl);
+  url.searchParams.set("sign", signObjectName(config, objectName, expiresAt));
+  return url.toString();
+}
+
+/**
+ * 群消息里那句有效期提示。
+ *
+ * 只说链接的有效期——文件在后端是留着还是被删了属于运维细节，群成员该做的事在两种模式下
+ * 都一样，就是在期限内下载。唯一的区别是删文件那种模式过期后真的没有补救途径，所以那句
+ * 多一层提醒。
+ */
+export function describeRelayExpiry(config: RelayConfig): string {
+  if (!config.expireHours) return "";
+  if (config.signSecret) {
+    return `\n⏳ 链接 ${config.expireHours} 小时后失效，请及时下载。`;
+  }
+  return `\n⏳ 链接 ${config.expireHours} 小时后失效，届时文件会被删除，请及时下载。`;
+}
+
 /** DELETE 一个对象。已经不存在（404/410）按成功处理——目标状态就是「它没了」。 */
 async function deleteObject(
   config: RelayConfig,
@@ -361,6 +497,10 @@ export async function sweepExpiredRelayObjects(
   // 「没传」再去读进程级配置，那样签名里的 `| null` 就是句空话。
   const config = overrides?.config === undefined ? getRelayConfig() : overrides.config;
   if (!config?.expireHours) return;
+  // 配了签名就不再删文件：到期靠签名自己失效，对象留在后端。下次再发同一份内容会命中
+  // 去重、现签一条新链接，一个字节都不用重传——删掉它只会逼着下一次重新上传一遍。
+  // 代价是后端占用只增不减，清理走 relay-purge。
+  if (config.signSecret) return;
   const ttl = config.expireHours * 60 * 60_000;
   const index = overrides?.index ?? (await getRelayIndex());
 
@@ -394,11 +534,22 @@ export interface RelayObject {
 }
 
 /** 列出索引里仍在册的外链，按最后分发时间从旧到新——最该被清掉的排在最前面。 */
-export async function listRelayObjects(index?: RelayIndex): Promise<RelayObject[]> {
-  const target = index ?? (await getRelayIndex());
+export async function listRelayObjects(options?: {
+  config?: RelayConfig | null;
+  index?: RelayIndex;
+}): Promise<RelayObject[]> {
+  // 同 sweep/purge：显式传 null 表示「就当没配置」，用 === undefined 区分「没传」。
+  const config = options?.config === undefined ? getRelayConfig() : options.config;
+  const target = options?.index ?? (await getRelayIndex());
+  // 配了签名的话列出来的地址得是现签的，否则管理员照着复制一条只会得到 403。
   return target
     .entries()
-    .map(({ url, name, size, at }) => ({ url, name, size, at }))
+    .map(({ url, name, size, at }) => ({
+      url: config ? publicUrlFor(config, url) : url,
+      name,
+      size,
+      at,
+    }))
     .sort((a, b) => a.at.localeCompare(b.at));
 }
 
@@ -509,12 +660,16 @@ export async function relayFile(request: RelayRequest): Promise<string> {
     signal?.throwIfAborted();
     const cached = index.get(key);
     if (cached) {
-      if (await remoteStillExists(cached.url, cached.size, signal)) {
+      // 探测也要带签名：后端开了强制验签时，不带签名的 HEAD 一律 401，会被当成「对象没了」
+      // 而每次都重传，去重就彻底失效了。
+      const probeUrl = publicUrlFor(config, cached.url);
+      if (await remoteStillExists(probeUrl, cached.size, signal)) {
         // 探测确认对象还在，才刷新时间戳：这样过期计时是「最后一次分享后 N 小时」，
         // 第二个人拿到的链接也有完整寿命，而且一个字节都不用重传。
         await index.remember({ ...cached, at: new Date().toISOString() });
         log.info(`外链命中去重索引，跳过上传: ${filename} -> ${cached.url}`);
-        return cached.url;
+        // 现签一条：命中缓存复用的是后端那个对象，不是当初那条已经在倒计时的链接。
+        return publicUrlFor(config, cached.url);
       }
       log.warn(`外链索引记录的地址已不可访问，重新上传: ${filename} (${cached.url})`);
       await index.forget(key);
@@ -522,6 +677,7 @@ export async function relayFile(request: RelayRequest): Promise<string> {
 
     signal?.throwIfAborted();
     const url = await putObject(config, localPath, size, filename, signal);
+    // 索引存裸地址，签名是给出去的那一刻才现签的，见 publicUrlFor。
     await index.remember({
       key,
       url,
@@ -529,6 +685,6 @@ export async function relayFile(request: RelayRequest): Promise<string> {
       size,
       at: new Date().toISOString(),
     });
-    return url;
+    return publicUrlFor(config, url);
   });
 }

@@ -188,6 +188,44 @@ describe("attachment send tools", () => {
     }
   }, 20_000);
 
+  test("promises a signed link instead of a deadline when signing is on", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-relay-sign-"));
+    const workspace = join(root, "workspace");
+    const userTemp = join(root, "user-tmp");
+    await Promise.all([mkdir(workspace), mkdir(userTemp)]);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (init?.method === "PUT") return new Response(null, { status: 201 });
+      return new Response(null, { status: 302 });
+    }) as unknown as typeof fetch;
+
+    try {
+      await writeOversizedFile(workspace, "report.bin");
+      const notes = createOutboundNotes();
+      const fileTool = buildSendTools({
+        getCallbackUrl: () => CALLBACK_URL,
+        groupId: "group-a",
+        notes,
+        workspaceDir: workspace,
+        tempDir: userTemp,
+        relay: { ...RELAY, expireHours: 8, signSecret: "s", signPathPrefix: "/relay/" },
+        relayIndex: await openRelayIndex(join(root, "relay-index.jsonl")),
+      }).find((tool) => tool.name === "send_file")!;
+
+      await fileTool.execute("send-signed", { source: "report.bin" }, undefined, undefined, {} as never);
+
+      const announcement = notes.drain()[0]!;
+      expect(announcement).toContain("sign=");
+      expect(announcement).toContain("8 小时后失效");
+      // 文件还在就不该吓唬用户「过期就没了」，也不必解释后端留没留——群里只需要知道期限。
+      expect(announcement).not.toContain("删除");
+    } finally {
+      globalThis.fetch = originalFetch;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   test("rejects an oversized local file when no relay is configured", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-norelay-"));
     const workspace = join(root, "workspace");

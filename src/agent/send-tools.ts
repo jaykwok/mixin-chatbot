@@ -16,7 +16,7 @@ import {
   MAX_ATTACHMENT_BYTES,
 } from "../core/config.ts";
 import { sendFile, sendImage, uploadAttachment } from "../integrations/im.ts";
-import { relayFile, type RelayConfig } from "../integrations/relay.ts";
+import { describeRelayExpiry, relayFile, type RelayConfig } from "../integrations/relay.ts";
 import type { RelayIndex } from "../integrations/relay-index.ts";
 import { isPathInside } from "./paths.ts";
 
@@ -286,11 +286,9 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
           signal,
           index: relayIndex,
         });
-        // 有效期必须写进群消息本身：链接失效时文件已从后端删除，事后没有任何补救途径，
-        // 群成员只有提前知道期限才会及时下载。
-        const expiry = relay.expireHours
-          ? `\n⏳ 链接 ${relay.expireHours} 小时后失效，届时文件会被删除，请及时下载。`
-          : "";
+        // 有效期必须写进群消息本身：群成员只有提前知道期限才会及时下载。措辞随后端机制
+        // 变化（删文件 / 只失效签名），交给 relay 层拼，见 describeRelayExpiry。
+        const expiry = describeRelayExpiry(relay);
         // 交给运行时并入本轮回复，而不是在这里单独发一条：URL 必须逐字正确，所以不能让
         // 模型复述；但也不值得为它多花一条出站配额。
         notes.add(

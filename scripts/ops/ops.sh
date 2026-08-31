@@ -179,7 +179,18 @@ check_relay() {
         check "data/config/relay.json" "0" "缺少 webdavUrl 或 publicBaseUrl（服务拒绝启动）"
         return 0
     fi
-    check "data/config/relay.json" "1" "已启用 -> $public_url"
+    # 到期是删文件还是只让链接失效，是这个特性最容易被记错的一件事，写进体检结果里。
+    local expire_hours sign_secret expiry_label
+    expire_hours="$(jq -r '.expireHours // empty' "$RELAY_CONFIG_FILE")"
+    sign_secret="$(jq -r '.signSecret // empty' "$RELAY_CONFIG_FILE")"
+    if [ -z "$expire_hours" ]; then
+        expiry_label="永不过期"
+    elif [ -n "$sign_secret" ]; then
+        expiry_label="签名 ${expire_hours}h 后失效，文件保留"
+    else
+        expiry_label="${expire_hours}h 后删除文件"
+    fi
+    check "data/config/relay.json" "1" "已启用 -> $public_url（$expiry_label）"
 
     user="$(jq -r '.username // empty' "$RELAY_CONFIG_FILE")"
     pass="$(jq -r '.password // empty' "$RELAY_CONFIG_FILE")"

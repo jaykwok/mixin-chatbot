@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import {
+  describeRelayExpiry,
   listRelayObjects,
   loadRelayConfig,
+  publicUrlFor,
   purgeRelayObjects,
   relayFile,
   sweepExpiredRelayObjects,
@@ -711,6 +713,181 @@ describe("relay expiry", () => {
   });
 });
 
+describe("relay signing", () => {
+  const SIGNED: RelayConfig = {
+    ...CONFIG,
+    signSecret: "super-secret-token",
+    signPathPrefix: "/relay/",
+  };
+
+  function signOf(url: string): string {
+    return new URL(url).searchParams.get("sign")!;
+  }
+
+  test("matches the backend's signature byte for byte", () => {
+    // 固定向量，用一份独立的 HMAC-SHA256 实现算出来的（Python 的 urlsafe_b64encode 与后端
+    // 用的 Go base64.URLEncoding 是同一套：URL 字母表 + 保留 = 填充）。签名算法一旦漂移，
+    // 所有链接都会 403，而那种失败只有群里有人点开才会暴露——所以要钉死在这里。
+    const name = "20260831-abc-报告.pdf";
+    const stored = `${SIGNED.publicBaseUrl}${encodeURIComponent(name)}`;
+    expect(signOf(publicUrlFor(SIGNED, stored))).toBe(
+      "19wdmNkxaxaFQcwPI4o0u6aLo_l1h0zoXvs5odZSXvI=:0"
+    );
+  });
+
+  test("keeps the base64 padding the backend expects", () => {
+    // Node 的 digest("base64url") 会去掉这个 =，用错就是全盘验签失败。
+    const signature = signOf(publicUrlFor(SIGNED, `${SIGNED.publicBaseUrl}x.bin`));
+    expect(signature.split(":")[0].endsWith("=")).toBe(true);
+    expect(signature).not.toContain("+");
+  });
+
+  test("expires the signature instead of the file", () => {
+    const url = publicUrlFor({ ...SIGNED, expireHours: 8 }, `${SIGNED.publicBaseUrl}x.bin`);
+    const expire = Number(signOf(url).split(":")[1]);
+    expect(expire - Math.floor(Date.now() / 1000)).toBeCloseTo(8 * 3600, -1);
+  });
+
+  test("signs nothing when no secret is configured", () => {
+    const stored = `${CONFIG.publicBaseUrl}x.bin`;
+    expect(publicUrlFor(CONFIG, stored)).toBe(stored);
+  });
+
+  test("derives the signing path prefix from the public base url", async () => {
+    const cases: [string, string][] = [
+      ["https://files.example.com/d/relay/", "/relay/"],
+      ["https://files.example.com/d/", "/"],
+      ["https://files.example.com/p/a/b/", "/a/b/"],
+    ];
+    for (const [publicBaseUrl, expected] of cases) {
+      const config = await withConfigFile(
+        JSON.stringify({ ...VALID, publicBaseUrl, signSecret: "s" }),
+        (path) => loadRelayConfig(path)
+      );
+      expect(config?.signPathPrefix).toBe(expected);
+    }
+  });
+
+  test("refuses to guess a signing path it cannot derive", async () => {
+    // 反代挂在子路径下之类的形状推不出来。宁可拒绝启动，也不要签出一批必然 403 的链接。
+    await withConfigFile(
+      JSON.stringify({ ...VALID, publicBaseUrl: "https://files.example.com/store/", signSecret: "s" }),
+      (path) => {
+        expect(() => loadRelayConfig(path)).toThrow("signPathPrefix");
+      }
+    );
+  });
+
+  test("normalizes an explicit signing path prefix", async () => {
+    const config = await withConfigFile(
+      JSON.stringify({ ...VALID, signSecret: "s", signPathPrefix: "store/relay" }),
+      (path) => loadRelayConfig(path)
+    );
+    expect(config?.signPathPrefix).toBe("/store/relay/");
+  });
+
+  test("rejects a signing path prefix with no secret to use it", async () => {
+    // 静默忽略只会让人以为签名已经生效。
+    await withConfigFile(JSON.stringify({ ...VALID, signPathPrefix: "/relay/" }), (path) => {
+      expect(() => loadRelayConfig(path)).toThrow("signSecret");
+    });
+  });
+
+  test("stores the bare url but hands out a signed one", async () => {
+    await withFixture(async ({ file, index }) => {
+      const restore = mockFetch(() => new Response(null, { status: 201 }));
+      try {
+        const url = await relayFile({
+          config: SIGNED,
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        });
+        expect(url).toContain("sign=");
+        // 索引里存的必须是裸地址：签名有时效，存进去第二天就是一条死链，而反推对象名
+        // （删除、清理都靠它）也只认裸地址。
+        const stored = index.entries()[0].url;
+        expect(stored).not.toContain("sign");
+        expect(url.startsWith(stored)).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("re-signs a cache hit instead of replaying the old link", async () => {
+    await withFixture(async ({ file, index }) => {
+      const digest = await hashFile(file);
+      const key = relayCacheKey(digest, "note.txt");
+      const stored = `${SIGNED.publicBaseUrl}${encodeURIComponent("20260831-uuid-note.txt")}`;
+      await index.remember({ key, url: stored, name: "note.txt", size: 5, at: new Date().toISOString() });
+
+      const probes: string[] = [];
+      let puts = 0;
+      const restore = mockFetch((input, init) => {
+        if (init?.method === "PUT") puts++;
+        if (init?.method === "HEAD") probes.push(String(input));
+        return new Response(null, { status: 302 });
+      });
+      try {
+        const url = await relayFile({
+          config: { ...SIGNED, expireHours: 8 },
+          localPath: file,
+          size: 5,
+          filename: "note.txt",
+          index,
+        });
+        // 命中去重就不该重传，但拿到的链接得是新签的、寿命完整的。
+        expect(puts).toBe(0);
+        expect(url.startsWith(stored)).toBe(true);
+        expect(Number(signOf(url).split(":")[1])).toBeGreaterThan(Math.floor(Date.now() / 1000));
+        // 探测也必须带签名：后端开了强制验签时不带签名一律 401，会被当成对象没了而每次重传。
+        expect(probes).toHaveLength(1);
+        expect(probes[0]).toContain("sign=");
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("keeps the file on disk when the signature carries the expiry", async () => {
+    await withFixture(async ({ index }) => {
+      const key = relayCacheKey("deadbeef", "note.txt");
+      await index.remember({
+        key,
+        url: `${SIGNED.publicBaseUrl}${encodeURIComponent("20260831-uuid-note.txt")}`,
+        name: "note.txt",
+        size: 5,
+        at: new Date(Date.now() - 100 * 60 * 60_000).toISOString(),
+      });
+      let called = false;
+      const restore = mockFetch(() => {
+        called = true;
+        return new Response(null, { status: 204 });
+      });
+      try {
+        await sweepExpiredRelayObjects({ config: { ...SIGNED, expireHours: 8 }, index });
+        // 签名到期就够了，删文件只会逼着下次重传一遍。
+        expect(called).toBe(false);
+        expect(index.get(key)).toBeDefined();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("tells the group the deadline and nothing about the backend", () => {
+    expect(describeRelayExpiry(CONFIG)).toBe("");
+    // 删文件那种模式过期后没有补救途径，多一层提醒；签名模式只说期限——文件在后端留没留
+    // 是运维细节，群成员该做的事一样，就是在期限内下载。
+    expect(describeRelayExpiry({ ...CONFIG, expireHours: 8 })).toContain("文件会被删除");
+    const signed = describeRelayExpiry({ ...SIGNED, expireHours: 8 });
+    expect(signed).toContain("8 小时后失效");
+    expect(signed).not.toContain("文件");
+  });
+});
+
 describe("relay admin", () => {
   /** 直接往索引里塞几条记录，避免每个用例都真的跑一遍上传。 */
   async function seedThree(index: RelayIndex) {
@@ -735,7 +912,7 @@ describe("relay admin", () => {
       await seedThree(index);
       await index.forget(relayCacheKey("mid.zip", "mid.zip"));
 
-      const objects = await listRelayObjects(index);
+      const objects = await listRelayObjects({ config: CONFIG, index });
       // 墓碑掉的那条不该出现；最该被清掉的排在最前面。
       expect(objects.map((o) => o.name)).toEqual(["old.pdf", "new.iso"]);
       expect(objects[0].size).toBe(5);
