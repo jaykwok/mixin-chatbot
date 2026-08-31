@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import {
+  listRelayObjects,
   loadRelayConfig,
+  purgeRelayObjects,
   relayFile,
   sweepExpiredRelayObjects,
   type RelayConfig,
@@ -705,6 +707,131 @@ describe("relay expiry", () => {
       } finally {
         restore();
       }
+    });
+  });
+});
+
+describe("relay admin", () => {
+  /** 直接往索引里塞几条记录，避免每个用例都真的跑一遍上传。 */
+  async function seedThree(index: RelayIndex) {
+    const rows = [
+      { name: "old.pdf", hours: 72 },
+      { name: "mid.zip", hours: 9 },
+      { name: "new.iso", hours: 1 },
+    ];
+    for (const row of rows) {
+      await index.remember({
+        key: relayCacheKey(row.name, row.name),
+        url: `${CONFIG.publicBaseUrl}${encodeURIComponent(`20260831-uuid-${row.name}`)}`,
+        name: row.name,
+        size: 5,
+        at: new Date(Date.now() - row.hours * 60 * 60_000).toISOString(),
+      });
+    }
+  }
+
+  test("lists live entries oldest first", async () => {
+    await withFixture(async ({ index }) => {
+      await seedThree(index);
+      await index.forget(relayCacheKey("mid.zip", "mid.zip"));
+
+      const objects = await listRelayObjects(index);
+      // 墓碑掉的那条不该出现；最该被清掉的排在最前面。
+      expect(objects.map((o) => o.name)).toEqual(["old.pdf", "new.iso"]);
+      expect(objects[0].size).toBe(5);
+    });
+  });
+
+  test("purges everything when no filter is given", async () => {
+    await withFixture(async ({ index }) => {
+      await seedThree(index);
+      const deleted: string[] = [];
+      const restore = mockFetch((input, init) => {
+        if (init?.method === "DELETE") deleted.push(String(input));
+        return new Response(null, { status: 204 });
+      });
+      try {
+        const result = await purgeRelayObjects({ config: CONFIG, index });
+        expect(result).toEqual({ matched: 3, deleted: 3, failed: 0, orphaned: 0 });
+        expect(deleted).toHaveLength(3);
+        expect(deleted.every((url) => url.startsWith(CONFIG.webdavUrl))).toBe(true);
+        expect(index.size()).toBe(0);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("purges only what the filter matches", async () => {
+    await withFixture(async ({ index }) => {
+      await seedThree(index);
+      const deleted: string[] = [];
+      const restore = mockFetch((input, init) => {
+        if (init?.method === "DELETE") deleted.push(String(input));
+        return new Response(null, { status: 204 });
+      });
+      try {
+        const result = await purgeRelayObjects({ config: CONFIG, index, match: ".zip" });
+        expect(result.matched).toBe(1);
+        expect(result.deleted).toBe(1);
+        expect(deleted[0]).toContain("mid.zip");
+        // 另外两条必须原样留着——手滑打错关键字不该清掉别人的链接。
+        expect(index.size()).toBe(2);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("keeps the entry and reports the failure when the backend rejects a delete", async () => {
+    await withFixture(async ({ index }) => {
+      await seedThree(index);
+      const restore = mockFetch(() => new Response("backend down", { status: 503 }));
+      try {
+        const result = await purgeRelayObjects({ config: CONFIG, index });
+        expect(result.deleted).toBe(0);
+        expect(result.failed).toBe(3);
+        expect(index.size()).toBe(3);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("reports entries it can no longer delete separately from failures", async () => {
+    await withFixture(async ({ index }) => {
+      await index.remember({
+        key: relayCacheKey("deadbeef", "old.txt"),
+        url: "https://previous-backend.example.com/d/relay/20260101-uuid-old.txt",
+        name: "old.txt",
+        size: 5,
+        at: new Date().toISOString(),
+      });
+      let called = false;
+      const restore = mockFetch(() => {
+        called = true;
+        return new Response(null, { status: 204 });
+      });
+      try {
+        const result = await purgeRelayObjects({ config: CONFIG, index });
+        // 换过后端之后我们删不掉旧对象，但也绝不能把请求发给新后端。
+        expect(called).toBe(false);
+        expect(result).toEqual({ matched: 1, deleted: 0, failed: 0, orphaned: 1 });
+        expect(index.size()).toBe(0);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test("refuses to purge when the feature is not configured", async () => {
+    await withFixture(async ({ index }) => {
+      const error = await purgeRelayObjects({ config: null, index }).then(
+        () => null,
+        (e: unknown) => e as Error
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect(error!.message).toContain("relay.json");
     });
   });
 });

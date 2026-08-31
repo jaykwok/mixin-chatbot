@@ -316,18 +316,50 @@ async function deleteObject(
   throw new Error(`HTTP ${response.status}`);
 }
 
+/** 删一条索引记录背后的对象。调用方必须已持有该 key 的上传锁。 */
+type PurgeOutcome = "deleted" | "orphaned" | "failed";
+
+async function deleteIndexedObject(
+  config: RelayConfig,
+  index: RelayIndex,
+  key: string
+): Promise<PurgeOutcome> {
+  const current = index.get(key);
+  if (!current) return "deleted";
+
+  const objectName = objectNameFromPublicUrl(config, current.url);
+  if (!objectName) {
+    // 换过后端或换过目录之后，我们已经没有能力再删那个对象了。留着一条永远删不掉的
+    // 记录只会让清理看起来在工作，所以丢掉记录并明确说需要人工处理。
+    log.warn(
+      `外链索引记录与当前 publicBaseUrl 对不上，已丢弃记录但无法删除远端对象（需人工清理）: ${current.url}`
+    );
+    await index.forget(key);
+    return "orphaned";
+  }
+  try {
+    await deleteObject(config, objectName);
+    await index.forget(key);
+    return "deleted";
+  } catch (error) {
+    // 保留记录，留给下一轮重试——后端临时不可达就把记录丢掉的话，那个对象就再也没人
+    // 管了，变成网盘上永久的孤儿。
+    log.warn(`外链对象删除失败，索引记录已保留以便重试: ${current.url} (${String(error)})`);
+    return "failed";
+  }
+}
+
 /**
  * 删除已过期的对象。有效期是滑动的：命中去重会刷新 at，所以「最后一次分享后 N 小时」
  * 才算过期。
- *
- * 删除失败时保留索引记录，下一轮重试——后端临时不可达就把记录丢掉的话，那个对象就
- * 再也没人管了，变成网盘上永久的孤儿。
  */
 export async function sweepExpiredRelayObjects(
   /** 覆盖默认的进程级配置与索引，供测试注入。 */
   overrides?: { config?: RelayConfig | null; index?: RelayIndex }
 ): Promise<void> {
-  const config = overrides?.config ?? getRelayConfig();
+  // 用 === undefined 而不是 ??：显式传 null 的意思是「就当没配置」，`??` 会把它当成
+  // 「没传」再去读进程级配置，那样签名里的 `| null` 就是句空话。
+  const config = overrides?.config === undefined ? getRelayConfig() : overrides.config;
   if (!config?.expireHours) return;
   const ttl = config.expireHours * 60 * 60_000;
   const index = overrides?.index ?? (await getRelayIndex());
@@ -346,24 +378,76 @@ export async function sweepExpiredRelayObjects(
       const currentAt = Date.parse(current.at);
       if (!Number.isNaN(currentAt) && Date.now() - currentAt < ttl) return;
 
-      const objectName = objectNameFromPublicUrl(config, current.url);
-      if (!objectName) {
-        log.warn(
-          `外链索引记录与当前 publicBaseUrl 对不上，已丢弃记录但无法删除远端对象（需人工清理）: ${current.url}`
-        );
-        await index.forget(current.key);
-        return;
-      }
-      try {
-        await deleteObject(config, objectName);
-        await index.forget(current.key);
-        removed++;
-      } catch (error) {
-        log.warn(`外链过期对象删除失败，将在下一轮重试: ${current.url} (${String(error)})`);
-      }
+      if ((await deleteIndexedObject(config, index, entry.key)) === "deleted") removed++;
     });
   }
   if (removed > 0) log.info(`外链过期清理完成，已删除 ${removed} 个对象`);
+}
+
+/** 索引里一条外链的只读视图，供运维命令展示。 */
+export interface RelayObject {
+  url: string;
+  name: string;
+  size: number;
+  /** 最后一次分发这份内容的时间（ISO）。过期计时从这里开始算。 */
+  at: string;
+}
+
+/** 列出索引里仍在册的外链，按最后分发时间从旧到新——最该被清掉的排在最前面。 */
+export async function listRelayObjects(index?: RelayIndex): Promise<RelayObject[]> {
+  const target = index ?? (await getRelayIndex());
+  return target
+    .entries()
+    .map(({ url, name, size, at }) => ({ url, name, size, at }))
+    .sort((a, b) => a.at.localeCompare(b.at));
+}
+
+export interface RelayPurgeResult {
+  matched: number;
+  deleted: number;
+  /** 后端删除失败，索引记录已保留，可以重试。 */
+  failed: number;
+  /** 地址与当前 publicBaseUrl 对不上，记录已丢弃但远端对象需要人工清理。 */
+  orphaned: number;
+}
+
+/**
+ * 手动清理：删除匹配的对象并丢弃对应的索引记录。
+ *
+ * 与过期清理共用同一条删除路径，区别只是不看时间。允许在机器人运行时执行：删除后端对象
+ * 才是决定性的动作，索引本身会自愈——机器人那份内存副本即使还留着记录，下次命中时的
+ * HEAD 探测会 404，于是丢弃记录并重传。
+ */
+export async function purgeRelayObjects(options?: {
+  /** 只清理文件名或地址包含该子串的条目；缺省表示全部。 */
+  match?: string;
+  config?: RelayConfig | null;
+  index?: RelayIndex;
+}): Promise<RelayPurgeResult> {
+  const config = options?.config === undefined ? getRelayConfig() : options.config;
+  if (!config) throw new Error("未配置外链分发（data/config/relay.json 不存在），没有可清理的对象");
+  const index = options?.index ?? (await getRelayIndex());
+  const match = options?.match?.trim();
+
+  const result: RelayPurgeResult = { matched: 0, deleted: 0, failed: 0, orphaned: 0 };
+  for (const entry of index.entries()) {
+    if (match && !entry.name.includes(match) && !entry.url.includes(match)) continue;
+    result.matched++;
+    // 与上传、过期清理共用同一把锁：正在被上传或清理的条目不会被并发删两次。
+    await withUploadLock(entry.key, async () => {
+      switch (await deleteIndexedObject(config, index, entry.key)) {
+        case "deleted":
+          result.deleted++;
+          break;
+        case "orphaned":
+          result.orphaned++;
+          break;
+        default:
+          result.failed++;
+      }
+    });
+  }
+  return result;
 }
 
 /**
