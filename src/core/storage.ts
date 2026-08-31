@@ -22,5 +22,10 @@ export const GROUP_DATA_ROOT_FILE = join(STATE_DIR, "group-data-root");
 
 /** Rebuildable process-local Pi resources; conversation history lives under GROUP_DATA_ROOT. */
 export const PI_AGENT_DIR = join(RUNTIME_DIR, "pi");
+/**
+ * Pi 的远程模型目录缓存（每 4 小时刷新，供离线复用）。默认放在 models.json 旁边，
+ * 但它是可重建的缓存而不是用户配置——留在 data/config 只会让配置目录看起来比实际更满。
+ */
+export const MODELS_STORE_PATH = join(RUNTIME_DIR, "models-store.json");
 /** 外链去重索引（内容哈希 -> 已上传地址）。丢失只会导致重传一次，因此归在 runtime。 */
 export const RELAY_INDEX_PATH = join(RUNTIME_DIR, "relay-index.jsonl");

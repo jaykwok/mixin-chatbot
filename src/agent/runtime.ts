@@ -34,7 +34,12 @@ import {
   SESSION_IDLE_TTL,
 } from "../core/config.ts";
 import { log } from "../core/log.ts";
-import { MODELS_JSON_PATH, PI_AGENT_DIR } from "../core/storage.ts";
+import {
+  MODELS_JSON_PATH,
+  MODELS_STORE_PATH,
+  PI_AGENT_DIR,
+  RUNTIME_DIR,
+} from "../core/storage.ts";
 import {
   abortOutboundRequests,
   getOutboundRateStatus,
@@ -106,7 +111,13 @@ async function getRuntime(): Promise<RuntimeSelection> {
       throw new Error(`${MODELS_JSON_PATH} 未声明 provider/model，请重新运行 configure 工具。`);
     }
 
-    const runtime = await ModelRuntime.create({ modelsPath: MODELS_JSON_PATH });
+    // Pi 默认把模型目录缓存写在 models.json 旁边；显式指向 data/runtime，让
+    // data/config 里只剩用户真正要维护的东西。首次写入前目录必须存在。
+    await mkdir(RUNTIME_DIR, { recursive: true });
+    const runtime = await ModelRuntime.create({
+      modelsPath: MODELS_JSON_PATH,
+      modelsStorePath: MODELS_STORE_PATH,
+    });
     const model = runtime.getModel(providerId, modelId);
     if (!model) {
       throw new Error(`${MODELS_JSON_PATH} 中未找到 ${providerId}/${modelId}，请检查配置。`);

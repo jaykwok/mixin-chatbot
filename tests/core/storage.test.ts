@@ -9,6 +9,7 @@ import {
   DEPLOY_MODE_FILE,
   GROUP_DATA_ROOT_FILE,
   MODELS_JSON_PATH,
+  MODELS_STORE_PATH,
   PI_AGENT_DIR,
   RUNTIME_DIR,
   STATE_DIR,
@@ -31,5 +32,8 @@ describe("persistent storage layout", () => {
     expect(BOT_DOMAIN_FILE).toBe(join(STATE_DIR, "bot-domain"));
     expect(GROUP_DATA_ROOT_FILE).toBe(join(STATE_DIR, "group-data-root"));
     expect(PI_AGENT_DIR).toBe(join(RUNTIME_DIR, "pi"));
+    // Pi 的模型目录缓存是可重建产物，必须留在 runtime 而不是配置目录里。
+    expect(MODELS_STORE_PATH).toBe(join(RUNTIME_DIR, "models-store.json"));
+    expect(MODELS_STORE_PATH.startsWith(CONFIG_DIR)).toBe(false);
   });
 });
