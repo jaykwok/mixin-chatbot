@@ -152,6 +152,25 @@ data/
 - **有效期是滑动的，到期即删文件。** 对象名形如 `20260829-<uuid>-<原文件名>`：uuid 让链接不可枚举（公开基址上任何人拿到链接都能下载，猜不到就是唯一的保护），日期前缀方便按天人工排查。配了 `expireHours` 后，机器人每 5 分钟扫一遍索引，把「最后一次分享后超过 N 小时」的对象 `DELETE` 掉——不是让链接失效而已，文件真的从后端消失；因此群消息里会同时写明期限，提醒及时下载。计时之所以是滑动的：命中去重时会刷新时间戳，还在被分享说明还有人需要它，第二个人拿到的链接也就有完整寿命，而不是只剩前一个人用剩的那点时间。启动时也会补扫一次，重启期间到期的对象不会被漏掉。删除失败（后端临时不可达）时保留索引记录，下一轮重试——丢掉记录那个对象就再没人管，会变成网盘上的永久孤儿。缺省不填 `expireHours` 则完全不回收，行为与该字段引入前一致。
 - **后端故障按「谁能修」来措辞。** 上传失败时给出的不是裸的 `HTTP 500`，而是分类后的一句话：401/403 指向 `relay.json` 的账号密码与目录写权限，404 指向 `webdavUrl` 的目录是否存在，507 指向后端空间，5xx 则明确提示最常见的原因是**后端挂载的网盘授权（token / cookie）过期，需要管理员登录后端重新授权**，与本项目的 WebDAV 凭据无关。后端返回的原文会一并带上。这条消息经模型转述进群，而群成员对状态码无能为力——真正需要被叫醒的是管理员。
 
+**查看和手动清理**（发出去的链接全部记在 `data/runtime/relay-index.jsonl`）：
+
+```bash
+# Linux
+./scripts/ops/ops.sh relay-ls               # 列出仍在册的外链（旧的排在前面）
+./scripts/ops/ops.sh relay-purge report     # 只删文件名或地址包含 report 的
+./scripts/ops/ops.sh relay-purge --all      # 全删
+
+# Windows Server
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-ls
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-purge --all
+```
+
+`--all` 必须显式给出，不带参数的 `relay-purge` 会被拒绝——手滑一次就清空所有人的下载链接，代价太大。清理可以在机器人运行时执行：删掉后端对象才是决定性的动作，索引会自愈（机器人内存里那条记录下次命中时 HEAD 探测会 404，于是丢弃并重传）。
+
+两个平台都只是把 `scripts/ops/relay-admin.ts` 跑起来（Linux 在容器里 `docker exec`，以复用它的 host 网络和挂载）。删一个对象要先从公开地址反推对象名、再拼 WebDAV 地址并带上 Basic 凭据，这些知识只存在于 `src/integrations/relay.ts`；在两个 shell 里各抄一遍会把它维护成三份，而且凭据会进到命令行参数里——Windows 上任何用户都能用 WMI 读到别人进程的完整命令行，Linux 上是 `/proc/<pid>/cmdline`。
+
+> 索引只记录**机器人发出去的**链接，你手动传进那个目录的文件不在册。要整个重置就先在后端删对象、再删 `relay-index.jsonl`——顺序反过来的话机器人就不知道那些对象叫什么了，它们会变成网盘上没人管的孤儿。索引本身可以随便删，它在 `data/runtime`（可重建），丢了只是下次多传一遍。
+
 <details>
 <summary><b>依赖与出站适配的维护约定</b></summary>
 
@@ -292,6 +311,8 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 ./scripts/ops/ops.sh restart    # 重启（docker restart）
 ./scripts/ops/ops.sh start      # 启动
 ./scripts/ops/ops.sh logs       # 实时日志（docker logs -f --tail 50）
+./scripts/ops/ops.sh relay-ls   # 列出已发出、仍在册的大文件外链
+./scripts/ops/ops.sh relay-purge <关键字>|--all  # 删除匹配的外链对象并清掉索引记录
 ./scripts/ops/ops.sh stop       # 停止
 ./scripts/ops/ops.sh uninstall  # 卸载（容器，可选清 image/cloudflared/data）
 ```
@@ -314,6 +335,8 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 restart    # 重启
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 start      # 启动计划任务
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 foreground # 前台运行（Ctrl+C 停止）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 logs       # 实时日志
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-ls   # 列出已发出、仍在册的大文件外链
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-purge <关键字>|--all # 删除匹配的外链对象并清掉索引记录
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 stop       # 停止
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall-tunnel # 停止并卸载 Cloudflared 服务
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理 task/进程/防火墙/launcher，可选清隧道/data/logs
@@ -450,7 +473,9 @@ mixin-chatbot/
 ├── scripts/
 │   ├── config/          # AI 配置 TUI
 │   ├── deploy/          # Linux/Windows 部署 + 服务器初始化
-│   ├── ops/             # doctor/update/restart/start/stop/logs/uninstall
+│   ├── lib/             # 同平台脚本共用的纯辅助函数（主机名校验、可执行文件发现、提示）
+│   ├── ops/             # doctor/update/restart/start/stop/logs/relay-ls/relay-purge/uninstall
+│   │   └── relay-admin.ts   #   外链列出与清理；ops 脚本调它，避免凭据进命令行
 │   │                    #   Windows 另有 foreground、repair-tunnel、uninstall-tunnel
 │   └── tunnel/          # Linux/Windows cloudflared connector
 ├── tests/               # 按 agent/config/core/integrations/server 分类的 Bun 测试

@@ -5,12 +5,16 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <命令>
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor -Repair
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update
-#   命令：doctor、update、repair-tunnel、uninstall-tunnel、restart、stop、start、foreground、logs、uninstall（无参数显示菜单）
+#   命令：doctor、update、repair-tunnel、uninstall-tunnel、restart、stop、start、foreground、logs、
+#         relay-ls、relay-purge、uninstall（无参数显示菜单）
 #
 # repair-tunnel/uninstall-tunnel/restart/stop/start/uninstall 可能需要管理员权限。
 param(
     [Parameter(Position = 0)]
     [string]$Command = "",
+    # relay-purge 的过滤关键字，或 --all。其余命令用不到。
+    [Parameter(Position = 1)]
+    [string]$Target = "",
     [switch]$Repair,
     [switch]$RestartTunnel
 )
@@ -18,6 +22,13 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+# 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、主机名校验、交互提示）。
+$CommonLib = Join-Path $PSScriptRoot "..\lib\common.ps1"
+if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
+    Write-Host "缺少 $CommonLib；请从仓库完整获取脚本目录后重试。" -ForegroundColor Red
+    exit 1
+}
+. $CommonLib
 $TaskName = "mixin-chatbot"
 $DataDir = Join-Path $Project "data"
 $ConfigDir = Join-Path $DataDir "config"
@@ -52,28 +63,6 @@ function Done($m) { Write-Host "[+] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
 function Err($m)  { Write-Host "[x] $m" -ForegroundColor Red }
 function IsAdmin  { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
-function Read-YesNo([string]$Prompt, [bool]$Default = $false) {
-    while ($true) {
-        $rawAnswer = Read-Host $Prompt
-        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim().ToLowerInvariant() }
-        if (-not $answer) { return $Default }
-        if ($answer -in @("y", "yes", "是")) { return $true }
-        if ($answer -in @("n", "no", "否")) { return $false }
-        Warn "请输入 y 或 n（也可直接回车采用默认值）"
-    }
-}
-function Get-ApplicationPaths([string]$Name) {
-    $paths = @()
-    foreach ($command in @(Get-Command $Name -All -CommandType Application -ErrorAction SilentlyContinue)) {
-        foreach ($rawCandidate in @($command.Path)) {
-            $candidate = [string]$rawCandidate
-            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
-            if ($paths -notcontains $candidate) { $paths += $candidate }
-        }
-    }
-    return $paths
-}
 function Find-VersionedApplication([string]$Name, [string]$Pattern, [string[]]$AdditionalPaths = @()) {
     $candidates = @(Get-ApplicationPaths $Name)
     foreach ($extra in $AdditionalPaths) {
@@ -116,15 +105,6 @@ function Get-TaskStateLabel($State) {
 function Get-DeployModeLabel([string]$Mode) {
     if ($Mode -eq "cloudflare") { return "Cloudflare" }
     return "直连"
-}
-function Get-ServiceStateLabel($State) {
-    switch ([string]$State) {
-        "Running" { return "运行中" }
-        "Stopped" { return "已停止" }
-        "StartPending" { return "正在启动" }
-        "StopPending" { return "正在停止" }
-        default { return [string]$State }
-    }
 }
 function Wait-ServiceGone([string]$Name, [int]$Attempts = 10) {
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
@@ -193,6 +173,38 @@ function Get-BunPath {
     return $script:BunPath
 }
 
+# 外链运维交给 scripts\ops\relay-admin.ts 执行，这边只负责把 bun 跑起来。
+#
+# 删一个对象要先从公开地址反推对象名、再拼 WebDAV 地址并带上 Basic 凭据，这些知识全在
+# src\integrations\relay.ts；在 PowerShell 里抄一遍等于把它维护成两份，而且凭据会出现在
+# 命令行参数里，同机器上任何用户都能用 WMI 读到别人进程的完整命令行。
+function Invoke-RelayAdmin([string[]]$RelayArgs) {
+    if (-not (Test-Path -LiteralPath $RelayConfigFile -PathType Leaf)) {
+        Err "未配置 data\config\relay.json，外链分发未启用"
+        return $false
+    }
+    $bunPath = Get-BunPath
+    if (-not $bunPath) {
+        Err "找不到可用的 bun；请安装 Bun：https://bun.sh"
+        return $false
+    }
+    Push-Location $Project
+    try {
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            # Out-Host 而不是直接写管道：调用点是 if (-not (Invoke-RelayAdmin ...))，
+            # 那对括号会把函数的全部输出当成返回值收走，bun 打印的清单也就一起被吞了。
+            & $bunPath run "scripts\ops\relay-admin.ts" @RelayArgs 2>&1 | Out-Host
+            return ($LASTEXITCODE -eq 0)
+        } finally {
+            $ErrorActionPreference = $previous
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
 # git 的返回码才是判据，但 $ErrorActionPreference="Stop" 下原生命令写 stderr 会直接抛异常，
 # 所以这里临时放宽再取真实退出码。GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在
 # 一个无人应答的交互提示上——这个脚本可能跑在计划任务或无人值守的会话里。
@@ -236,34 +248,6 @@ function Invoke-BunInstall {
     }
     Done "依赖已就绪"
     return $true
-}
-function Test-Hostname([string]$Value) {
-    if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Length -gt 253) { return $false }
-    foreach ($label in $Value.Split('.')) {
-        if ($label.Length -lt 1 -or $label.Length -gt 63 -or
-            $label -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$') {
-            return $false
-        }
-    }
-    return $true
-}
-function ConvertTo-Hostname([string]$Value) {
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $candidate = $Value.Trim()
-    if (Test-Hostname $candidate) { return $candidate.ToLowerInvariant() }
-
-    $uri = $null
-    if ([Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -and
-        $uri.Scheme -in @("http", "https") -and
-        $uri.IsDefaultPort -and
-        [string]::IsNullOrEmpty($uri.UserInfo) -and
-        $uri.AbsolutePath -eq "/" -and
-        [string]::IsNullOrEmpty($uri.Query) -and
-        [string]::IsNullOrEmpty($uri.Fragment) -and
-        (Test-Hostname $uri.DnsSafeHost)) {
-        return $uri.DnsSafeHost.ToLowerInvariant()
-    }
-    return $null
 }
 
 function Resolve-ProjectPath([string]$Value) {
@@ -1397,6 +1381,14 @@ switch ($Command) {
         if (-not (Test-Path $LogPath)) { Warn "找不到日志文件 $LogPath（机器人可能从未启动）"; exit 1 }
         Show-Logs
     }
+    "relay-ls" { if (-not (Invoke-RelayAdmin @("list"))) { exit 1 } }
+    "relay-purge" {
+        if (-not $Target) {
+            Err "relay-purge 需要一个关键字，或用 --all 表示清理全部"
+            exit 1
+        }
+        if (-not (Invoke-RelayAdmin @("purge", $Target))) { exit 1 }
+    }
     "uninstall" { if (-not (Uninstall-Bot)) { exit 1 } }
     default {
         Write-Host "mixin-chatbot 运维工具（Windows Server）" -ForegroundColor Cyan
@@ -1412,6 +1404,9 @@ switch ($Command) {
         Write-Host "  start           启动机器人计划任务"
         Write-Host "  foreground      以前台方式运行 launcher（Ctrl+C 停止）"
         Write-Host "  logs            持续查看 logs\mixin-chatbot.log"
+        Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
+        Write-Host "  relay-purge <关键字>|--all"
+        Write-Host "                  删除匹配的外链对象并清掉索引记录"
         Write-Host "  uninstall       清理任务/进程/防火墙/launcher，可选清理隧道、data 和 logs"
     }
 }

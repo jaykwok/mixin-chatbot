@@ -15,6 +15,13 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\tunnel\start-tunnel.ps1 [token文件]
 $ErrorActionPreference = "Stop"
 $Project = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+# 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、主机名校验、交互提示）。
+$CommonLib = Join-Path $PSScriptRoot "..\lib\common.ps1"
+if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
+    Write-Host "缺少 $CommonLib；请从仓库完整获取脚本目录后重试。" -ForegroundColor Red
+    exit 1
+}
+. $CommonLib
 Set-Location $Project
 $DataDir = Join-Path $Project "data"
 $ConfigDir = Join-Path $DataDir "config"
@@ -23,18 +30,6 @@ $PersistedPortFile = Join-Path $StateDir "bot-port"
 $DefaultTunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
 $TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
 
-function Get-ApplicationPaths([string]$Name) {
-    $paths = @()
-    foreach ($command in @(Get-Command $Name -All -CommandType Application -ErrorAction SilentlyContinue)) {
-        foreach ($rawCandidate in @($command.Path)) {
-            $candidate = [string]$rawCandidate
-            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
-            if ($paths -notcontains $candidate) { $paths += $candidate }
-        }
-    }
-    return $paths
-}
 
 function Test-CloudflaredApplication([string]$Path) {
     try {
@@ -56,15 +51,6 @@ function Test-TunnelTokenValue([string]$Value) {
     return (($Value -replace '[^A-Za-z0-9+/=_-]', '').Length -ge 20)
 }
 
-function Get-ServiceStateLabel($State) {
-    switch ([string]$State) {
-        "Running" { return "运行中" }
-        "Stopped" { return "已停止" }
-        "StartPending" { return "正在启动" }
-        "StopPending" { return "正在停止" }
-        default { return [string]$State }
-    }
-}
 
 $BotPort = if ($env:BOT_PORT) {
     $env:BOT_PORT

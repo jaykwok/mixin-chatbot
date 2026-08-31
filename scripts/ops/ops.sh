@@ -7,6 +7,14 @@
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# 与 deploy.sh / ops.sh 共用的纯辅助函数（主机名校验与规范化）。
+COMMON_LIB="${PROJECT_DIR}/scripts/lib/common.sh"
+if [ ! -f "$COMMON_LIB" ]; then
+    echo "缺少 ${COMMON_LIB}；请从仓库完整获取脚本目录后重试。" >&2
+    exit 1
+fi
+# shellcheck source=../lib/common.sh
+. "$COMMON_LIB"
 CONTAINER="mixin-chatbot"
 ROLLBACK_CONTAINER="${CONTAINER}-rollback"
 DATA_DIR="${PROJECT_DIR}/data"
@@ -51,34 +59,6 @@ resolve_group_data_root() {
         /*) realpath -m -- "$value" ;;
         *) realpath -m -- "${PROJECT_DIR}/${value}" ;;
     esac
-}
-is_valid_hostname() {
-    local hostname="$1"
-    [ -n "$hostname" ] && [ "${#hostname}" -le 253 ] || return 1
-    [[ "$hostname" != .* && "$hostname" != *. && "$hostname" != *..* ]] || return 1
-    local labels=()
-    IFS='.' read -r -a labels <<< "$hostname"
-    local label
-    for label in "${labels[@]}"; do
-        [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
-        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
-    done
-}
-normalize_hostname_input() {
-    local value host
-    value="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    if is_valid_hostname "$value"; then
-        printf '%s' "${value,,}"
-        return 0
-    fi
-    if [[ "$value" =~ ^[Hh][Tt][Tt][Pp][Ss]?://([^/:?#]+)(/)?$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        if is_valid_hostname "$host"; then
-            printf '%s' "${host,,}"
-            return 0
-        fi
-    fi
-    return 1
 }
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
     echo "BOT_PORT/data/state/bot-port 中的端口无效：$PORT" >&2
@@ -344,6 +324,35 @@ start_bot() {
     else WA "机器人未通过健康检查（HTTP $lc）；请尝试 scripts/ops/ops.sh logs"; return 1; fi
 }
 
+# 外链运维交给容器里的 bun 脚本执行，shell 这边只负责把它跑起来。
+#
+# 删一个对象要先从公开地址反推对象名、再拼 WebDAV 地址并带上 Basic 凭据，这些知识全在
+# src/integrations/relay.ts；在 shell 里抄一遍等于把它维护成两份，而且凭据会出现在命令行
+# 参数里，同机器上任何用户都能从 /proc/<pid>/cmdline 读到。
+#
+# 优先 exec 进正在运行的容器：网络命名空间、挂载和运行身份都与机器人自己完全一致，
+# webdavUrl 里的 127.0.0.1 才能指向宿主机上的后端（容器用的是 --network host）。
+relay_admin() {
+    if [ ! -f "$RELAY_CONFIG_FILE" ]; then
+        ER "未配置 ${RELAY_CONFIG_FILE}，外链分发未启用"
+        return 1
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+        ER "找不到 docker"
+        return 1
+    fi
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
+        docker exec "$CONTAINER" bun run scripts/ops/relay-admin.ts "$@"
+        return $?
+    fi
+    WA "容器未在运行，改用一次性容器执行"
+    docker run --rm --network host \
+        --user "$(stat -c '%u:%g' "$DATA_DIR")" \
+        -e HOME=/app/data/runtime/home \
+        -v "${PROJECT_DIR}/data:/app/data" \
+        mixin-chatbot bun run scripts/ops/relay-admin.ts "$@"
+}
+
 # git 只在这里用；GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。
 git_here() {
     GIT_TERMINAL_PROMPT=0 git -C "$PROJECT_DIR" "$@"
@@ -566,6 +575,8 @@ case "${1:-}" in
     stop)      stop_bot ;;
     start)     start_bot ;;
     logs)      show_logs ;;
+    relay-ls)    relay_admin list ;;
+    relay-purge) shift; relay_admin purge "$@" ;;
     uninstall) uninstall ;;
     *)
         echo -e "${CYAN}mixin-chatbot 运维工具（Linux/Docker）${NC}"
@@ -578,6 +589,9 @@ case "${1:-}" in
         echo "  stop       停止 Docker 容器"
         echo "  start      启动 Docker 容器"
         echo "  logs       持续查看最近 50 行 Docker 日志"
+        echo "  relay-ls   列出已发出、仍在册的大文件外链"
+        echo "  relay-purge <关键字>|--all"
+        echo "             删除匹配的外链对象并清掉索引记录"
         echo "  uninstall  删除容器（可选镜像、cloudflared、data/、logs/）"
         ;;
 esac

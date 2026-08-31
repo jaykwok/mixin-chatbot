@@ -8,6 +8,13 @@
 $ErrorActionPreference = "Stop"
 $Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $Project
+# 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、主机名校验、交互提示）。
+$CommonLib = Join-Path $PSScriptRoot "..\lib\common.ps1"
+if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
+    Write-Host "缺少 $CommonLib；请从仓库完整获取脚本目录后重试。" -ForegroundColor Red
+    exit 1
+}
+. $CommonLib
 $Entry    = Join-Path $Project "src\server\index.ts"
 $TaskName = "mixin-chatbot"
 $DataDir = Join-Path $Project "data"
@@ -30,28 +37,6 @@ if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsP
 function Step($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Done($m) { Write-Host "[+] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
-function Read-YesNo([string]$Prompt, [bool]$Default = $false) {
-    while ($true) {
-        $rawAnswer = Read-Host $Prompt
-        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim().ToLowerInvariant() }
-        if (-not $answer) { return $Default }
-        if ($answer -in @("y", "yes", "是")) { return $true }
-        if ($answer -in @("n", "no", "否")) { return $false }
-        Warn "请输入 y 或 n（也可直接回车采用默认值）"
-    }
-}
-function Get-ApplicationPaths([string]$Name) {
-    $paths = @()
-    foreach ($command in @(Get-Command $Name -All -CommandType Application -ErrorAction SilentlyContinue)) {
-        foreach ($rawCandidate in @($command.Path)) {
-            $candidate = [string]$rawCandidate
-            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
-            if ($paths -notcontains $candidate) { $paths += $candidate }
-        }
-    }
-    return $paths
-}
 function Test-VersionedApplication([string]$Path, [string]$RequiredPattern = "") {
     try {
         $output = @(& $Path --version 2>$null)
@@ -83,15 +68,6 @@ function Test-S4ULogonFailure($Value) {
     # ERROR_LOGON_FAILURE / ERROR_LOGON_TYPE_NOT_GRANTED
     return (Get-ResultCodeHex $Value) -in @("0x8007052E", "0x80070569")
 }
-function Get-ServiceStateLabel($State) {
-    switch ([string]$State) {
-        "Running" { return "运行中" }
-        "Stopped" { return "已停止" }
-        "StartPending" { return "正在启动" }
-        "StopPending" { return "正在停止" }
-        default { return [string]$State }
-    }
-}
 
 $BotDebug = if ([string]::IsNullOrWhiteSpace($env:BOT_DEBUG)) { "0" } else { $env:BOT_DEBUG.Trim() }
 if ($BotDebug -notin @("0", "1")) {
@@ -121,34 +97,6 @@ function Register-BotTask($Action, $Settings, [string]$UserId, [bool]$UseS4U) {
         $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
     }
     Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $trigger -Settings $Settings -Principal $principal -Force | Out-Null
-}
-function Test-Hostname([string]$Value) {
-    if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Length -gt 253) { return $false }
-    foreach ($label in $Value.Split('.')) {
-        if ($label.Length -lt 1 -or $label.Length -gt 63 -or
-            $label -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$') {
-            return $false
-        }
-    }
-    return $true
-}
-function ConvertTo-Hostname([string]$Value) {
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $candidate = $Value.Trim()
-    if (Test-Hostname $candidate) { return $candidate.ToLowerInvariant() }
-
-    $uri = $null
-    if ([Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -and
-        $uri.Scheme -in @("http", "https") -and
-        $uri.IsDefaultPort -and
-        [string]::IsNullOrEmpty($uri.UserInfo) -and
-        $uri.AbsolutePath -eq "/" -and
-        [string]::IsNullOrEmpty($uri.Query) -and
-        [string]::IsNullOrEmpty($uri.Fragment) -and
-        (Test-Hostname $uri.DnsSafeHost)) {
-        return $uri.DnsSafeHost.ToLowerInvariant()
-    }
-    return $null
 }
 
 # ---- 1. 前置检查 ----

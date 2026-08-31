@@ -7,6 +7,14 @@
 
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# 与 deploy.sh / ops.sh 共用的纯辅助函数（主机名校验与规范化）。
+COMMON_LIB="${PROJECT_DIR}/scripts/lib/common.sh"
+if [ ! -f "$COMMON_LIB" ]; then
+    echo "缺少 ${COMMON_LIB}；请从仓库完整获取脚本目录后重试。" >&2
+    exit 1
+fi
+# shellcheck source=../lib/common.sh
+. "$COMMON_LIB"
 cd "$PROJECT_DIR"
 DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
@@ -75,34 +83,6 @@ read_input() {
     printf -v "$output_name" '%s' "$input_value"
 }
 
-is_valid_hostname() {
-    local hostname="$1"
-    [ -n "$hostname" ] && [ "${#hostname}" -le 253 ] || return 1
-    [[ "$hostname" != .* && "$hostname" != *. && "$hostname" != *..* ]] || return 1
-    local labels=()
-    IFS='.' read -r -a labels <<< "$hostname"
-    local label
-    for label in "${labels[@]}"; do
-        [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
-        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
-    done
-}
-normalize_hostname_input() {
-    local value host
-    value="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    if is_valid_hostname "$value"; then
-        printf '%s' "${value,,}"
-        return 0
-    fi
-    if [[ "$value" =~ ^[Hh][Tt][Tt][Pp][Ss]?://([^/:?#]+)(/)?$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        if is_valid_hostname "$host"; then
-            printf '%s' "${host,,}"
-            return 0
-        fi
-    fi
-    return 1
-}
 ask_yes_no() {
     local prompt="$1" default_answer="${2:-n}" answer
     while true; do
