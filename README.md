@@ -297,6 +297,10 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update
    - **Windows Server**：管理员 PowerShell `powershell -ExecutionPolicy Bypass -File scripts\tunnel\start-tunnel.ps1 [token-file]`（装 cloudflared + 注册为 Windows 服务，开机自启）
 
    token 解析优先级：位置参数文件 → `$TUNNEL_TOKEN_FILE` → `$TUNNEL_TOKEN`（裸值）→ `data/config/tunnel-token`。token 文件可以是裸 token，也可以是 `.env` 形式（含 `TUNNEL_TOKEN=...`）。
+
+   > **本机没有机器人在监听时，两个脚本都会拒绝启动隧道**（`TUNNEL_ALLOW_NO_BOT=1` 可显式放行）。连接器一连上，Cloudflare 就会把生产流量分给这台机器，而它无处可转发，分到它手上的请求只能是 502；隧道里若还有正常的连接器，表现就是「一半请求好、一半 502」，极难定位。启动前还会从 token 里解出**目标隧道 ID 和账号**打印出来（token 是 base64 的 JSON，secret 一个字符都不输出），好在连上去之前确认是不是自己以为的那条隧道。
+   >
+   > 这条防呆是真踩过才加的：一次脚本冒烟测试在开发机上跑到这里，读到了 `data/config/tunnel-token` 里的**生产** token，把一台什么都没跑的开发机接进了生产隧道。所以**任何一台留有 token 副本的机器都随时可能误接生产流量**——不用于部署的机器不要留 `data/config/`。
 5. IM 平台回调填：`https://<你的域名>/webhook/<secret>`（secret 来自 deploy 输出）。部署交互或 `BOT_DOMAIN` 可填写纯 hostname（如 `bot.example.com`），也可填写仅含根域名的 URL（如 `https://bot.example.com`）；脚本会规范化后写入 `data/state/bot-domain`，后续运维脚本自动检查该域名。
 
 Windows 上的 `data/config/tunnel-token` 只是安装/修复时的 token 来源；Cloudflared 服务会保存安装时使用的 token，单独修改该文件不会自动更新已安装服务。轮换 token 后运行：
@@ -395,6 +399,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理
 | Windows 计划任务存在但机器人未启动 | S4U 被服务器策略拒绝 / task 上次结果异常 | 重跑最新版 `scripts\deploy\deploy.ps1`（会自动回退登录时启动），再执行 `scripts\ops\ops.ps1 doctor` 查看十六进制任务结果 |
 | IM 收不到回复 | 回调地址不可达 / 防火墙 / Cloudflare 源站端口不一致 | 直连检查 `ufw status`；Tunnel 检查 Published application 是否指向 `http://localhost:<data/state/bot-port>` |
 | Cloudflare 公网返回 502 | 隧道在线，但本地机器人未启动或源站端口不一致 | 先运行 `ops.ps1 doctor -Repair`，再确认 Published application 指向 `http://localhost:<data/state/bot-port>` |
+| 502 时好时坏，或某个 hostname 恒 502 而其他正常 | **另一台机器也在用同一 token 跑 connector**，流量被分给了它，而它上面没有对应服务 | 在 Cloudflare 面板看隧道的 connector 列表：多于一个、且 `run_at` 对不上你这台机器的启动时间，就是它。停掉那台的 cloudflared，并清掉它的 `data/config/tunnel-token` |
 | Cloudflare 公网返回 530/1033 或连接失败 | connector 未运行、服务安装 token 已失效、hostname/DNS 异常 | 将最新 token 放到 `data/config/tunnel-token`，以管理员运行 `ops.ps1 repair-tunnel`，再检查 Cloudflare hostname/DNS |
 | 修改 `data/config/tunnel-token` 后仍连不上 | 已安装服务仍使用旧 token | 运行 `ops.ps1 repair-tunnel`；修改文件本身不会更新服务 |
 | 日志显示“发送成功”但群里只收到前 20 条 | 平台对超限请求返回 HTTP 200 后静默丢弃 | 当前版本用本地 60 秒滑动窗口保护，不依赖 429；确认所有实例都已更新且没有另一份 bot 共用同一 callback key |

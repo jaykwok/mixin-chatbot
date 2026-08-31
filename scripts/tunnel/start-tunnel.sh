@@ -159,11 +159,47 @@ if ! command -v cloudflared >/dev/null 2>&1; then
     fi
 fi
 
-# ---- 3. 探测本机机器人 ----
+# ---- 3. 连接前的确认：连到哪条隧道、本机有没有东西可转发 ----
+#
+# token 是 base64 过的 JSON：{"a":"<账号>","t":"<隧道 id>","s":"<密钥>"}。打印前两个字段
+# 让人看清将要接入哪条隧道，secret 一个字符都不输出。解不开就跳过，这只是给人看的信息。
+if command -v base64 >/dev/null 2>&1; then
+    tunnel_identity="$(
+        printf '%s' "$TUNNEL_TOKEN" | tr '_-' '/+' \
+            | { padded="$(cat)"; case $(( ${#padded} % 4 )) in
+                    2) printf '%s==' "$padded" ;;
+                    3) printf '%s=' "$padded" ;;
+                    *) printf '%s' "$padded" ;;
+                esac; } \
+            | base64 -d 2>/dev/null \
+            | sed -n 's/.*"t"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+    )" || tunnel_identity=""
+    [ -n "$tunnel_identity" ] && echo "▸ 目标隧道：${tunnel_identity}"
+fi
+
+# 机器人不在线时拒绝连接。这不是保守，是这个脚本唯一真正危险的失败模式：
+#
+# 连接器一连上，Cloudflare 就会开始把生产流量分给这台机器，而它没有可转发的目标，分到它
+# 手上的请求只能是 502。隧道通常还有别的连接器在正常服务，于是现象是「一半请求好、一半
+# 502」——极难定位。本项目就这么被坑过一次：一次脚本冒烟测试在开发机上跑到这里，读到了
+# data/config/tunnel-token 里的真实 token，把一台什么都没跑的开发机接进了生产隧道。
+#
+# 原来这里只打一行警告然后照连不误。警告不是门槛。
 if curl -fsS "http://localhost:${BOT_PORT}/favicon.svg" >/dev/null 2>&1; then
     echo "✓ 本机 :${BOT_PORT} 机器人在线"
+elif [ "${TUNNEL_ALLOW_NO_BOT:-}" = "1" ]; then
+    echo "⚠ 本机 :${BOT_PORT} 无响应，但 TUNNEL_ALLOW_NO_BOT=1，继续连接" >&2
 else
-    echo "⚠ 本机 :${BOT_PORT} 无响应——先 ./scripts/deploy/deploy.sh 把机器人起来（Cloudflare 模式）" >&2
+    {
+        echo "✗ 已中止：本机 :${BOT_PORT} 上没有机器人在监听，不能把这台机器接进隧道"
+        echo "  连上之后 Cloudflare 会把流量分给它，而它无处可转发，只会返回 502；"
+        echo "  如果隧道里还有正常的连接器，表现就是时好时坏，非常难查。"
+        echo
+        echo "  · 要在这台机器上部署：先 ./scripts/deploy/deploy.sh（Cloudflare 模式）再回来"
+        echo "  · 只是想测试本脚本：别用生产 token，用 TUNNEL_TOKEN 指向一条测试隧道"
+        echo "  · 确认就是要这么连：TUNNEL_ALLOW_NO_BOT=1 后重跑"
+    } >&2
+    exit 1
 fi
 
 # ---- 4. 起隧道（前台）----

@@ -70,15 +70,38 @@ function Test-LocalBot {
     try {
         Invoke-WebRequest -Uri "http://localhost:$BotPort/favicon.svg" -UseBasicParsing -TimeoutSec 3 | Out-Null
         Write-Host "正常：机器人已在 :$BotPort 在线。" -ForegroundColor Green
+        return $true
     } catch {
         Write-Host "警告：:$BotPort 无响应；请先通过 scripts\deploy\deploy.ps1 启动机器人（Cloudflare 模式）。" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+# 从 token 里读出它属于哪条隧道，好让人在连上去之前看清目标。
+#
+# token 是 base64 过的 JSON：{"a":"<账号>","t":"<隧道 id>","s":"<密钥>"}。这里只取前两个
+# 字段，secret 一个字符都不打印。解不开就返回 null——这只是给人看的信息，不该成为启动
+# 的前提条件。
+function Get-TunnelTokenIdentity([string]$Value) {
+    try {
+        $padded = $Value.Replace('-', '+').Replace('_', '/')
+        switch ($padded.Length % 4) {
+            2 { $padded += '==' }
+            3 { $padded += '=' }
+        }
+        $doc = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($padded)) | ConvertFrom-Json
+        if (-not $doc.t) { return $null }
+        return @{ Account = [string]$doc.a; Tunnel = [string]$doc.t }
+    } catch {
+        return $null
     }
 }
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $existingService = if ($isAdmin) { Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue } else { $null }
 if ($existingService -and $env:CLOUDFLARED_REINSTALL -ne "1") {
-    Test-LocalBot
+    # 这条分支不新增连接器，只是把已有服务拉起来，所以机器人不在线只提示、不拦。
+    $null = Test-LocalBot
     Write-Host "Cloudflared 服务已存在（状态：$(Get-ServiceStateLabel $existingService.Status)）。" -ForegroundColor Yellow
     if ($existingService.Status -ne "Running") {
         try { Start-Service "Cloudflared" }
@@ -197,8 +220,34 @@ if (-not $cfPath) {
 }
 Write-Host "[*] cloudflared 程序：$cfPath" -ForegroundColor Cyan
 
-# ---- 3. 探测本地机器人 ----
-Test-LocalBot
+# ---- 3. 连接前的确认：连到哪条隧道、本机有没有东西可转发 ----
+$identity = Get-TunnelTokenIdentity $token
+if ($identity) {
+    Write-Host "[*] 目标隧道：$($identity.Tunnel)" -ForegroundColor Cyan
+    Write-Host "[*] 所属账号：$($identity.Account)" -ForegroundColor Cyan
+}
+$botOnline = Test-LocalBot
+
+# 机器人不在线时拒绝连接。这不是保守，是这个脚本唯一真正危险的失败模式：
+#
+# 连接器一连上，Cloudflare 就会开始把生产流量分给这台机器，而它没有可转发的目标，分到它
+# 手上的请求只能是 502。隧道通常还有别的连接器在正常服务，于是现象是「一半请求好、一半
+# 502」——极难定位。本项目就这么被坑过一次：一次脚本冒烟测试在开发机上跑到这里，读到了
+# data/config/tunnel-token 里的真实 token，把一台什么都没跑的开发机接进了生产隧道，
+# 之后一小时的排查全花在了 Cloudflare 配置上，而配置从头到尾都是对的。
+#
+# 原来这里只打一行警告然后照连不误。警告不是门槛。
+if (-not $botOnline -and $env:TUNNEL_ALLOW_NO_BOT -ne "1") {
+    Write-Host ""
+    Write-Host "已中止：本机 :$BotPort 上没有机器人在监听，不能把这台机器接进隧道。" -ForegroundColor Red
+    Write-Host "连上之后 Cloudflare 会把流量分给它，而它无处可转发，只会返回 502；" -ForegroundColor Red
+    Write-Host "如果隧道里还有正常的连接器，表现就是时好时坏，非常难查。" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  · 要在这台机器上部署：先跑 scripts\deploy\deploy.ps1（Cloudflare 模式）再回来。" -ForegroundColor Yellow
+    Write-Host "  · 只是想测试本脚本：别用生产 token，用 `$env:TUNNEL_TOKEN 指向一条测试隧道。" -ForegroundColor Yellow
+    Write-Host "  · 确认就是要这么连：设置 `$env:TUNNEL_ALLOW_NO_BOT='1' 后重跑。" -ForegroundColor Yellow
+    exit 1
+}
 
 # ---- 4. 启动隧道 ----
 Write-Host "cloudflared 连接器：请在控制台将 Published application 服务地址设为 http://localhost:$BotPort"
