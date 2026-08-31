@@ -233,8 +233,14 @@ docker restart mixin-chatbot
 ### 更新
 
 ```bash
-git pull && ./scripts/deploy/deploy.sh
+# Linux
+./scripts/ops/ops.sh update
+
+# Windows Server
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update
 ```
+
+`update` 负责同步到 `origin/main`、装依赖、重启服务并跑一次体检，失败自动回滚；工作区不干净或与远端分叉时会先停下来。Linux 侧会把重建交给 `deploy.sh`，途中的端口、模式、域名、群数据根等提示**直接回车即沿用现有配置**。边界与回滚范围见[日常运维](#日常运维)一节。
 
 默认配置下，群共享成果保存在 `data/groups/<group>/workspace/`；当前用户的临时文件和会话历史分别保存在 `data/groups/<group>/users/<phone>/tmp/` 与 `data/groups/<group>/users/<phone>/session.jsonl`，更新不丢失。
 
@@ -282,12 +288,15 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 
 ```bash
 ./scripts/ops/ops.sh doctor     # 健康检查（群数据根/容器/本地/配置；仅 Cloudflare 模式检查隧道和公网）
-./scripts/ops/ops.sh update     # 一键升级：同步 origin/main → deploy.sh 重建切换容器 → 体检
+./scripts/ops/ops.sh update     # 安全升级：同步 origin/main → deploy.sh 重建切换容器 → 体检（各项提示回车即沿用现有配置）
 ./scripts/ops/ops.sh restart    # 重启（docker restart）
+./scripts/ops/ops.sh start      # 启动
 ./scripts/ops/ops.sh logs       # 实时日志（docker logs -f --tail 50）
 ./scripts/ops/ops.sh stop       # 停止
 ./scripts/ops/ops.sh uninstall  # 卸载（容器，可选清 image/cloudflared/data）
 ```
+
+日常运维走 `ops.sh` 即可：它带健康检查、部署模式判断和失败回滚。底下的 `docker logs` / `docker restart` 仍然可用，留作 `ops.sh` 帮不上忙时的排障手段。
 
 应用日志：`logs/mixin-chatbot.log`（当前 5MB + 3 份轮转备份）；容器层日志 `docker logs mixin-chatbot`。
 
@@ -298,10 +307,11 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor     # 健康检查（task/端口/配置；隧道检查按部署模式启用）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor -Repair # 诊断后自动修复可安全处理的本地故障
-powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update     # 一键升级：同步 origin/main → 装依赖 → 重启 → 体检
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update     # 一键升级：同步 origin/main → 装依赖 → 重启 → 体检（无需交互）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update -RestartTunnel # 同上，并强制重启 Cloudflared
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 repair-tunnel  # 按当前 token 来源重装 Cloudflared 服务
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 restart    # 重启
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 start      # 启动计划任务
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 foreground # 前台运行（Ctrl+C 停止）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 logs       # 实时日志
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 stop       # 停止
@@ -310,9 +320,9 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理
 ```
 
 <details>
-<summary><b>一键升级（<code>update</code>）的边界</b></summary>
+<summary><b>升级（<code>update</code>）的边界</b></summary>
 
-两个平台的实现不同——Windows 直接管进程和依赖，Linux 交给 `deploy.sh` 重建镜像、切换容器（复用它已有的旧容器回滚机制）——但结果一致：同步到 `origin/main`、依赖就绪、服务重启、隧道健康、最后跑一次 `doctor`。
+两个平台的实现不同——Windows 直接管进程和依赖，全程无需交互；Linux 交给 `deploy.sh` 重建镜像、切换容器（复用它已有的旧容器回滚机制），因此会经过 `deploy.sh` 的那串提示，**回车即沿用现有端口、模式、域名和群数据根**——但结果一致：同步到 `origin/main`、依赖就绪、服务重启、隧道健康、最后跑一次 `doctor`。
 
 升级前会拒绝执行的情况：
 
@@ -320,9 +330,14 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理
 - **本地与 `origin/main` 已分叉。** 只接受快进（`merge --ff-only`），有未推送的本地提交时列出来并停止，不替使用者决定怎么合并。
 - **不是 git 仓库。** 解压得到的部署没有升级路径，提示改用 `git clone`。
 
-升级失败会自动回滚：Windows 上依赖安装或重启失败时，代码退回升级前那次提交、重装依赖、重新拉起；Linux 上 `deploy.sh` 自己会换回旧容器，`update` 负责把工作区一并退回，避免「跑着旧容器、留着新代码」的错位。进入升级前已确认工作区干净，所以 `reset --hard` 不会毁掉任何本地内容。
+升级失败会自动回滚：Windows 上依赖安装或重启失败时，代码退回升级前那次提交、重装依赖、重新拉起；Linux 上 `deploy.sh` 自己会换回旧容器，`update` 负责把工作区一并退回，避免「跑着旧容器、留着新代码」的错位。进入升级前已确认工作区干净，所以 `reset --hard` 不会毁掉任何本地内容。升级前处于游离 HEAD（detached）时不会用 `reset` 回退——那样会把升级途中切过去的 `main` 指针一起拖回那个游离提交；这种情况直接 `checkout` 回原提交，分支指针一个都不动。
 
-隧道默认**不**重启：它与仓库代码无关（只是把公网流量转发到 `localhost:<port>`），例行升级重装它既要管理员权限又是无谓抖动。只有升级后公网健康检查不过时才自动重启，或显式加 `-RestartTunnel`。Windows 上若 Cloudflared 服务缺少本项目归属标记，`update` 不会碰它——与 `doctor -Repair` 的规则一致。
+`deploy.ps1` 自身也有一层回滚：它在停旧进程、覆盖 launcher、重建计划任务之前先把旧的任务定义、launcher 内容和旧端口存下来，健康检查不过时装回去并重新拉起（旧部署本来就没在跑的话只还原定义）。这一层救的是「改配置把自己配挂了」——代码不在它的职责范围内，那是 `update` 的回滚负责的。
+
+隧道默认**不**重启：它与仓库代码无关（只是把公网流量转发到 `localhost:<port>`），例行升级重装它既要管理员权限又是无谓抖动。
+
+- **Windows**：升级后公网健康检查不过时自动重启 Cloudflared 服务，也可显式加 `-RestartTunnel` 强制重启。若该服务缺少本项目归属标记，`update` 不会碰它——与 `doctor -Repair` 的规则一致。
+- **Linux**：没有这两个行为，也没有对应开关。隧道由 `deploy.sh` 在重建容器时一并处理（没跑就后台拉起），`ops.sh update` 不单独干预 cloudflared。
 
 </details>
 
@@ -435,7 +450,8 @@ mixin-chatbot/
 ├── scripts/
 │   ├── config/          # AI 配置 TUI
 │   ├── deploy/          # Linux/Windows 部署 + 服务器初始化
-│   ├── ops/             # doctor/restart/stop/start/logs/uninstall
+│   ├── ops/             # doctor/update/restart/start/stop/logs/uninstall
+│   │                    #   Windows 另有 foreground、repair-tunnel、uninstall-tunnel
 │   └── tunnel/          # Linux/Windows cloudflared connector
 ├── tests/               # 按 agent/config/core/integrations/server 分类的 Bun 测试
 ├── public/favicon.svg
