@@ -155,7 +155,11 @@ function sanitizeFilename(filename: string): string {
  */
 export interface OutboundNotes {
   add(note: string): void;
-  /** 取走并清空。运行时在拼回复时调用；异常路径上兜底再调一次，避免链接随失败一起消失。 */
+  /** 只读快照。拼回复时用它，但在确认送达前不清空。 */
+  peek(): string[];
+  /** 确认已送达后才清空。 */
+  clear(): void;
+  /** 取走并清空，用于异常路径兜底补发。 */
   drain(): string[];
 }
 
@@ -164,6 +168,10 @@ export function createOutboundNotes(): OutboundNotes {
   return {
     add: (note) => {
       notes.push(note);
+    },
+    peek: () => [...notes],
+    clear: () => {
+      notes = [];
     },
     drain: () => {
       const drained = notes;

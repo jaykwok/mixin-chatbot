@@ -595,3 +595,115 @@ describe("IM outbound group routing", () => {
     ]);
   });
 });
+
+describe("must-deliver appendix", () => {
+  // 对象名里的文件名原样保留，所以 `报告_2025_最终.pdf` 编码进 URL 后仍带下划线，
+  // 而 markdownToPlainText 会把 `_x_` 当强调标记去掉。附加文本必须绕开那个转换，
+  // 否则链接被改写一次就再也打不开。
+  const LINK =
+    "https://files.example.com/d/relay/20260831-3fe1b8f7-e45d-40d5-87c7-5e846b5b3868-%E6%8A%A5%E5%91%8A_2025_%E6%9C%80%E7%BB%88.pdf";
+  const APPENDIX = `📎 报告_2025_最终.pdf（36.1MB）超过群聊 25.0MB 附件上限，已改为链接分发：\n${LINK}\n⏳ 链接 8 小时后失效，届时文件会被删除，请及时下载。`;
+
+  function capture(handler?: (payload: Record<string, unknown>) => Response) {
+    const payloads: Record<string, unknown>[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input, init) => {
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      payloads.push(payload);
+      return handler?.(payload) ?? webhookResponse();
+    }) as typeof fetch;
+    return { payloads, restore: () => { globalThis.fetch = originalFetch; } };
+  }
+
+  test("rides along inside the single text message for a plain reply", async () => {
+    const { payloads, restore } = capture();
+    const callbackUrl =
+      `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=ap-${crypto.randomUUID()}`;
+    try {
+      const ok = await sendReplyWithMention(
+        "文件已发送，来源：产品资料/官方资料/",
+        "group-a",
+        "+8613800000000",
+        callbackUrl,
+        undefined,
+        APPENDIX
+      );
+      expect(ok).toBe(true);
+    } finally {
+      restore();
+    }
+    // 一条消息，不是两条——平台按条限流。
+    expect(payloads).toHaveLength(1);
+    const content = (payloads[0] as { textMsg: { content: string } }).textMsg.content;
+    expect(content).toContain("文件已发送");
+    expect(content).toContain(LINK);
+  });
+
+  test("rides along on the completion notice a markdown reply already sends", async () => {
+    const { payloads, restore } = capture();
+    const callbackUrl =
+      `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=ap-${crypto.randomUUID()}`;
+    try {
+      const ok = await sendReplyWithMention(
+        "## 已发送\n- 报告_2025_最终.pdf",
+        "group-a",
+        "+8613800000000",
+        callbackUrl,
+        undefined,
+        APPENDIX
+      );
+      expect(ok).toBe(true);
+    } finally {
+      restore();
+    }
+    // markdown 回复本来就要发一条完成提醒，链接搭它的车，总数不变。
+    expect(payloads).toHaveLength(2);
+    expect(payloads[0]).toMatchObject({ type: "markdown" });
+    const notice = (payloads[1] as { textMsg: { content: string } }).textMsg.content;
+    expect(notice).toContain("任务已完成");
+    expect(notice).toContain(LINK);
+  });
+
+  test("reports failure when the notice carrying the link does not go out", async () => {
+    // markdown 送达但完成提醒失败：没有附加文本时这只是少一句提醒，可以照常返回成功；
+    // 载着唯一下载地址时就必须如实报错，否则调用方以为已送达、不再补发。
+    const { payloads, restore } = capture((payload) =>
+      payload.type === "text" ? new Response("nope", { status: 500 }) : webhookResponse()
+    );
+    const callbackUrl =
+      `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=ap-${crypto.randomUUID()}`;
+    try {
+      const ok = await sendReplyWithMention(
+        "## 已发送",
+        "group-a",
+        "+8613800000000",
+        callbackUrl,
+        undefined,
+        APPENDIX
+      );
+      expect(ok).toBe(false);
+    } finally {
+      restore();
+    }
+    expect(payloads.some((p) => p.type === "markdown")).toBe(true);
+  });
+
+  test("keeps returning success for a missing notice when nothing rides on it", async () => {
+    const { restore } = capture((payload) =>
+      payload.type === "text" ? new Response("nope", { status: 500 }) : webhookResponse()
+    );
+    const callbackUrl =
+      `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=ap-${crypto.randomUUID()}`;
+    try {
+      const ok = await sendReplyWithMention(
+        "## 已发送",
+        "group-a",
+        "+8613800000000",
+        callbackUrl
+      );
+      expect(ok).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+});

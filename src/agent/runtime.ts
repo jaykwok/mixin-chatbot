@@ -627,12 +627,17 @@ async function runPrompt(
     const replyText =
       consumeTerminalToolBlockReply(terminalToolBlockStates.get(session)) ??
       session.getLastAssistantText();
-    // 工具留下的必送文本（大文件外链）并进这一条回复，而不是各发各的：平台按条限流，
-    // 「工具发链接 + 模型发说明」会让一次发送吃掉两条配额。
-    const pending = sessionOutboundNotes.get(session)?.drain() ?? [];
+    // 工具留下的必送文本（大文件外链）随这一条回复一起走，而不是各发各的：平台按条
+    // 限流，「工具发链接 + 模型发说明」会让一次发送吃掉两条配额。
+    //
+    // 这里只 peek 不清空：送达之前先清掉的话，一旦发送失败，链接就既没进群也不在
+    // 兜底队列里了，而文件已经在外链后端上躺着。
+    const notes = sessionOutboundNotes.get(session);
+    const pending = notes?.peek() ?? [];
+    const appendix = pending.length > 0 ? pending.join("\n\n") : undefined;
     // 模型什么都没说但文件确实发出去了时，链接本身就是完整的回复。
-    if (!replyText && pending.length === 0) throw new Error("Pi 未返回回复");
-    const body = [replyText, ...pending].filter(Boolean).join("\n\n");
+    if (!replyText && !appendix) throw new Error("Pi 未返回回复");
+    const body = replyText || "文件已发送。";
     log.info(
       `Pi 回复完成 - 用户: ${phone}, 耗时: ${((Date.now() - start) / 1000).toFixed(2)}秒, 长度: ${body.length}`
     );
@@ -641,9 +646,11 @@ async function runPrompt(
       groupId,
       phone,
       getCallbackUrl(),
-      outboundController.signal
+      outboundController.signal,
+      appendix
     );
     if (!sent) throw new Error("Pi 回复生成成功，但群聊消息发送失败");
+    notes?.clear();
   } catch (e) {
     // 中断（AbortError 或 abortingSessions）→ 静默；其余异常上抛由 processRequest 兜底回错误提示
     if (abortingSessions.has(session) || isAbortError(e)) {

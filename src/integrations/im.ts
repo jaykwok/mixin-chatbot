@@ -679,6 +679,8 @@ export async function sendText(
   return ok;
 }
 
+const COMPLETION_NOTICE = "✅ 任务已完成，请查看上方回复";
+
 /** 群聊回复只产生一条成功消息：
  *  - 普通文本直接发送一条 text@，它本身就是完成通知；
  *  - 带格式的回复先发 Markdown，再发一条简短 text@ 完成提醒；
@@ -688,9 +690,21 @@ export async function sendReplyWithMention(
   groupId: string,
   phone: string,
   callbackUrl: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  /**
+   * 必须逐字进群的附加文本（目前是大文件外链）。
+   *
+   * 它全程不经过 markdownToPlainText，也不参与 Markdown 判定——那个转换会把 `_x_`
+   * 当成强调标记去掉，而对象名里带下划线的文件名（`报告_2025_最终.pdf`）编码进 URL
+   * 后正好长这样，被改写一次链接就废了。
+   *
+   * 落点跟着回复形态走，两种都不额外多发消息：Markdown 回复挂在那条本来就要发的完成
+   * 提醒后面，纯文本回复直接并进正文。
+   */
+  appendix?: string
 ): Promise<boolean> {
   const warning = buildPressureWarning(phone);
+  const notice = appendix ? `${COMPLETION_NOTICE}\n\n${appendix}` : COMPLETION_NOTICE;
   return enqueueOutboundTransaction(
     callbackUrl,
     "required",
@@ -706,7 +720,7 @@ export async function sendReplyWithMention(
         );
         if (markdownOk) {
           const notified = await sendTextChunksAtQueueFront(
-            "✅ 任务已完成，请查看上方回复",
+            notice,
             phone,
             callbackUrl,
             "required",
@@ -719,11 +733,14 @@ export async function sendReplyWithMention(
           log.info(
             `回复发送完成（markdown + text@${notified ? "" : "失败"}），群: ${groupId}, 用户: ${phone}`
           );
-          return true;
+          // 带 appendix 时完成提醒不再是可有可无的提醒，它载着这次唯一的下载地址；
+          // 发失败就必须如实报错，让调用方走补发。
+          return appendix ? notified : true;
         }
         log.warn(`markdown 发送失败，降级为 text@ - 群: ${groupId}, 用户: ${phone}`);
       }
-      const plainText = markdownToPlainText(content) || "（回复内容无法以纯文本显示）";
+      const converted = markdownToPlainText(content) || "（回复内容无法以纯文本显示）";
+      const plainText = appendix ? `${converted}\n\n${appendix}` : converted;
       const ok = await sendTextChunksAtQueueFront(
         plainText,
         phone,
