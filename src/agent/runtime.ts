@@ -60,7 +60,11 @@ import {
   unknownCommandText,
 } from "./commands.ts";
 import { buildLocalTools } from "./local-tools.ts";
-import { buildSendTools } from "./send-tools.ts";
+import {
+  buildSendTools,
+  createOutboundNotes,
+  type OutboundNotes,
+} from "./send-tools.ts";
 import {
   consumeTerminalToolBlockReply,
   createToolPolicyExtension,
@@ -175,6 +179,9 @@ const terminalToolBlockStates = new WeakMap<
   AgentSession,
   TerminalToolBlockState
 >();
+// 工具产出的、必须原样进群的文本（目前只有大文件外链）。每个 session 一份；同一 session
+// 的 run 是串行的（busySessions 保证），所以不会串台。
+const sessionOutboundNotes = new WeakMap<AgentSession, OutboundNotes>();
 let acceptingRequests = true;
 
 /** 追加到 Pi 默认 system prompt 的群聊、共享工作区与当前用户临时目录上下文。 */
@@ -277,6 +284,7 @@ async function createSession(
   });
   await resourceLoader.reload();
   const localTools = await buildLocalTools(cwd, tempDir, phone, groupId);
+  const outboundNotes = createOutboundNotes();
 
   const { session } = await createAgentSession({
     cwd, // Pi session 与工具的默认目录都是群共享 <group>/workspace/。
@@ -292,15 +300,16 @@ async function createSession(
       ...buildSendTools({
         getCallbackUrl: () => sessionCallbackUrls.get(key) ?? callbackUrl,
         groupId,
-        phone,
         workspaceDir: cwd,
         tempDir,
         relay: getRelayConfig(),
+        notes: outboundNotes,
       }),
     ],
     thinkingLevel,
   });
   terminalToolBlockStates.set(session, toolPolicy.state);
+  sessionOutboundNotes.set(session, outboundNotes);
   sessions.set(key, session);
   sessionLastUsed.set(key, Date.now());
   log.info(
@@ -618,12 +627,17 @@ async function runPrompt(
     const replyText =
       consumeTerminalToolBlockReply(terminalToolBlockStates.get(session)) ??
       session.getLastAssistantText();
-    if (!replyText) throw new Error("Pi 未返回回复");
+    // 工具留下的必送文本（大文件外链）并进这一条回复，而不是各发各的：平台按条限流，
+    // 「工具发链接 + 模型发说明」会让一次发送吃掉两条配额。
+    const pending = sessionOutboundNotes.get(session)?.drain() ?? [];
+    // 模型什么都没说但文件确实发出去了时，链接本身就是完整的回复。
+    if (!replyText && pending.length === 0) throw new Error("Pi 未返回回复");
+    const body = [replyText, ...pending].filter(Boolean).join("\n\n");
     log.info(
-      `Pi 回复完成 - 用户: ${phone}, 耗时: ${((Date.now() - start) / 1000).toFixed(2)}秒, 长度: ${replyText.length}`
+      `Pi 回复完成 - 用户: ${phone}, 耗时: ${((Date.now() - start) / 1000).toFixed(2)}秒, 长度: ${body.length}`
     );
     const sent = await sendReplyWithMention(
-      replyText,
+      body,
       groupId,
       phone,
       getCallbackUrl(),
@@ -639,6 +653,17 @@ async function runPrompt(
     }
     throw e;
   } finally {
+    // 兜底：正常路径上 drain 已经清空了，这里拿到东西只可能是回复没发出去（模型报错、
+    // /stop、发送失败）。文件此时已经躺在外链后端上了，链接跟着失败一起消失的话，谁都
+    // 拿不到它，而且它还会一直占着网盘直到过期。所以单独补发一条，且不带本轮的
+    // AbortSignal——那个信号多半正是导致走到这里的原因。
+    const orphaned = sessionOutboundNotes.get(session)?.drain() ?? [];
+    if (orphaned.length > 0) {
+      log.warn(`本轮回复未送达，单独补发外链消息 - 用户: ${phone}, 群: ${groupId}`);
+      await sendText(orphaned.join("\n\n"), groupId, phone, getCallbackUrl()).catch((e) =>
+        log.error(`外链消息补发失败 - 用户: ${phone}, 错误: ${String(e)}`)
+      );
+    }
     try {
       unsub?.();
     } catch {

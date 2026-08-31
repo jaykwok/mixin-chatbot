@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
-import { buildSendTools } from "../../src/agent/send-tools.ts";
+import { buildSendTools, createOutboundNotes } from "../../src/agent/send-tools.ts";
 import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import type { RelayConfig } from "../../src/integrations/relay.ts";
 import { openRelayIndex } from "../../src/integrations/relay-index.ts";
@@ -41,9 +41,9 @@ describe("attachment send tools", () => {
     const imageTool = buildSendTools({
       getCallbackUrl: () => CALLBACK_URL,
       groupId: "group-a",
-      phone: "+8613800000000",
       workspaceDir: ".",
       tempDir: ".",
+      notes: createOutboundNotes(),
     }).find((tool) => tool.name === "send_image")!;
 
     try {
@@ -70,7 +70,6 @@ describe("attachment send tools", () => {
 
     const originalFetch = globalThis.fetch;
     const requests: { url: string; method?: string; auth?: string }[] = [];
-    let sentText = "";
     globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const url = String(input);
       const headers = new Headers(init?.headers);
@@ -82,11 +81,6 @@ describe("attachment send tools", () => {
       // WebDAV PUT / 去重探测
       if (init?.method === "PUT") return new Response(null, { status: 201 });
       if (init?.method === "HEAD") return new Response(null, { status: 302 });
-      // IM 出站发送
-      const body = init?.body;
-      if (typeof body === "string") {
-        sentText = (JSON.parse(body).textMsg?.content as string) ?? "";
-      }
       return new Response(JSON.stringify({ ok: true, code: 200 }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -95,10 +89,11 @@ describe("attachment send tools", () => {
 
     try {
       await writeOversizedFile(workspace, "report.bin");
+      const notes = createOutboundNotes();
       const fileTool = buildSendTools({
         getCallbackUrl: () => CALLBACK_URL,
         groupId: "group-a",
-        phone: "+8613800000000",
+        notes,
         workspaceDir: workspace,
         tempDir: userTemp,
         relay: RELAY,
@@ -125,12 +120,21 @@ describe("attachment send tools", () => {
       const details = result.details as { url: string; mode: string };
       expect(details.mode).toBe("relay");
       expect(details.url.startsWith(RELAY.publicBaseUrl)).toBe(true);
-      // 链接必须真的发进群里，不能只留在工具结果里让模型转述。
-      expect(sentText).toContain(details.url);
+
+      // 链接交给运行时并入那条唯一的回复，工具自己不再单独发一条消息——否则一次发送
+      // 要吃掉两条出站配额。
+      const drained = notes.drain();
+      expect(drained).toHaveLength(1);
+      expect(drained[0]).toContain(details.url);
+      expect(requests.some((r) => r.method === "POST" || r.url.includes("webhook"))).toBe(false);
       // 附件上传端点不该被碰过——大文件根本没进 IM 的通道。
       expect(requests.some((r) => r.url.includes("upload"))).toBe(false);
       // 没配有效期就不该凭空承诺一个期限。
-      expect(sentText).not.toContain("失效");
+      expect(drained[0]).not.toContain("失效");
+      // 工具结果里不再重复给出 URL，免得模型照抄一遍、同一条消息出现两个地址。
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).not.toContain(details.url);
+      expect(text).toContain("不要重复粘贴");
     } finally {
       globalThis.fetch = originalFetch;
       await rm(root, { recursive: true, force: true });
@@ -144,14 +148,9 @@ describe("attachment send tools", () => {
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
     const originalFetch = globalThis.fetch;
-    let sentText = "";
     globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       if (init?.method === "PUT") return new Response(null, { status: 201 });
       if (init?.method === "HEAD") return new Response(null, { status: 302 });
-      const body = init?.body;
-      if (typeof body === "string") {
-        sentText = (JSON.parse(body).textMsg?.content as string) ?? "";
-      }
       return new Response(JSON.stringify({ ok: true, code: 200 }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -160,10 +159,11 @@ describe("attachment send tools", () => {
 
     try {
       await writeOversizedFile(workspace, "report.bin");
+      const notes = createOutboundNotes();
       const fileTool = buildSendTools({
         getCallbackUrl: () => CALLBACK_URL,
         groupId: "group-a",
-        phone: "+8613800000000",
+        notes,
         workspaceDir: workspace,
         tempDir: userTemp,
         relay: { ...RELAY, expireHours: 8 },
@@ -179,8 +179,9 @@ describe("attachment send tools", () => {
       );
 
       // 到期时文件会被删掉，事后没有补救途径；群里必须当场看到期限。
-      expect(sentText).toContain("8 小时后失效");
-      expect(sentText).toContain("删除");
+      const announcement = notes.drain()[0]!;
+      expect(announcement).toContain("8 小时后失效");
+      expect(announcement).toContain("删除");
     } finally {
       globalThis.fetch = originalFetch;
       await rm(root, { recursive: true, force: true });
@@ -205,7 +206,7 @@ describe("attachment send tools", () => {
       const fileTool = buildSendTools({
         getCallbackUrl: () => CALLBACK_URL,
         groupId: "group-a",
-        phone: "+8613800000000",
+        notes: createOutboundNotes(),
         workspaceDir: workspace,
         tempDir: userTemp,
       }).find((tool) => tool.name === "send_file")!;
@@ -258,7 +259,7 @@ describe("attachment send tools", () => {
       const fileTool = buildSendTools({
         getCallbackUrl: () => CALLBACK_URL,
         groupId: "group-a",
-        phone: "+8613800000000",
+        notes: createOutboundNotes(),
         workspaceDir: workspace,
         tempDir: userTemp,
         relay: RELAY,
@@ -280,4 +281,17 @@ describe("attachment send tools", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+describe("outbound notes", () => {
+  test("drains once and stays empty afterwards", () => {
+    const notes = createOutboundNotes();
+    expect(notes.drain()).toEqual([]);
+    notes.add("a");
+    notes.add("b");
+    expect(notes.drain()).toEqual(["a", "b"]);
+    // 运行时在异常路径上会再 drain 一次兜底补发；第二次必须是空的，
+    // 否则同一条外链会在正常回复之后被重复发一遍。
+    expect(notes.drain()).toEqual([]);
+  });
 });

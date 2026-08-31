@@ -15,12 +15,7 @@ import {
   ATTACHMENT_HTTP_TIMEOUT,
   MAX_ATTACHMENT_BYTES,
 } from "../core/config.ts";
-import {
-  sendFile,
-  sendImage,
-  sendText,
-  uploadAttachment,
-} from "../integrations/im.ts";
+import { sendFile, sendImage, uploadAttachment } from "../integrations/im.ts";
 import { relayFile, type RelayConfig } from "../integrations/relay.ts";
 import type { RelayIndex } from "../integrations/relay-index.ts";
 import { isPathInside } from "./paths.ts";
@@ -151,24 +146,50 @@ function sanitizeFilename(filename: string): string {
   return clean || "file";
 }
 
+/**
+ * 工具产出的、必须原样进群的文本。
+ *
+ * 外链是这次 send_file 的全部产出——URL 一个字符都不能错，所以不能指望模型在回复里
+ * 复述它。但工具自己发一条、模型的回复再发一条，一次发送就吃掉两条出站配额，而平台的
+ * 限流是按条算的。所以工具把这段话交给运行时，由运行时拼进那条唯一的回复里。
+ */
+export interface OutboundNotes {
+  add(note: string): void;
+  /** 取走并清空。运行时在拼回复时调用；异常路径上兜底再调一次，避免链接随失败一起消失。 */
+  drain(): string[];
+}
+
+export function createOutboundNotes(): OutboundNotes {
+  let notes: string[] = [];
+  return {
+    add: (note) => {
+      notes.push(note);
+    },
+    drain: () => {
+      const drained = notes;
+      notes = [];
+      return drained;
+    },
+  };
+}
+
 export interface SendToolsOptions {
   /** callback URL 用 getter 读取，以支持平台轮换机器人 key。 */
   getCallbackUrl: () => string;
   /** 固定为创建当前用户会话时所属的群，不能从模型参数中获取。 */
   groupId: string;
-  /** 同上，用于外链消息 @ 到发起人。 */
-  phone: string;
   workspaceDir: string;
   tempDir: string;
   /** 缺省或 null 表示未配置外链后端，超限文件按原样报错。 */
   relay?: RelayConfig | null;
   /** 覆盖默认的进程级外链去重索引。 */
   relayIndex?: RelayIndex;
+  /** 外链地址交给它，由运行时并入本轮唯一的那条回复。 */
+  notes: OutboundNotes;
 }
 
 export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
-  const { getCallbackUrl, groupId, phone, workspaceDir, tempDir, relay, relayIndex } =
-    options;
+  const { getCallbackUrl, groupId, workspaceDir, tempDir, relay, relayIndex, notes } = options;
 
   const imageParams = Type.Object({
     source: Type.String({
@@ -262,20 +283,20 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
         const expiry = relay.expireHours
           ? `\n⏳ 链接 ${relay.expireHours} 小时后失效，届时文件会被删除，请及时下载。`
           : "";
-        // 关键消息：链接就是这次发送的全部产出，被出站限流丢掉等于文件没发出去。
-        const sent = await sendText(
-          `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发：\n${url}${expiry}`,
-          groupId,
-          phone,
-          getCallbackUrl(),
-          { signal }
+        // 交给运行时并入本轮回复，而不是在这里单独发一条：URL 必须逐字正确，所以不能让
+        // 模型复述；但也不值得为它多花一条出站配额。
+        notes.add(
+          `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发：\n${url}${expiry}`
         );
-        if (!sent) throw new Error(`外链已生成但群聊消息发送失败: ${url}`);
         return {
           content: [
             {
               type: "text",
-              text: `文件超过 ${formatSize(MAX_ATTACHMENT_BYTES)}，已改为在群里发送下载链接: ${url}`,
+              // 明确告诉模型别再贴一遍：链接会由代码原样附在回复末尾，模型复述一遍只会
+              // 让同一条消息里出现两个 URL。
+              text:
+                `文件超过 ${formatSize(MAX_ATTACHMENT_BYTES)}，已改为链接分发，下载链接会由系统自动附在你本轮回复的末尾。` +
+                `请正常回复用户（说明文件已通过链接发送即可），不要重复粘贴链接地址。`,
             },
           ],
           details: { name, url, size: resolved.size, mode: "relay" },
