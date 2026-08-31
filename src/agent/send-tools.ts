@@ -57,6 +57,16 @@ async function resolveSource(
   return { kind: "local", path, size: info.size };
 }
 
+/**
+ * 超限报错。这条消息会经模型转述进群里，未配置外链后端时它就是用户能得到的全部解释，
+ * 所以给人看的单位和实际大小都要带上——原始字节数对着群成员没有意义。
+ */
+function oversizeError(kind: string, size: number): Error {
+  return new Error(
+    `${kind}（${formatSize(size)}）超过群聊单条附件上限 ${formatSize(MAX_ATTACHMENT_BYTES)}`
+  );
+}
+
 /** 下载远程内容，边收边卡上限，避免声明的 content-length 说谎。 */
 async function fetchRemoteBytes(
   url: string,
@@ -74,7 +84,7 @@ async function fetchRemoteBytes(
   const declared = Number(r.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > MAX_ATTACHMENT_BYTES) {
     await r.body?.cancel().catch(() => {});
-    throw new Error(`远程文件超过 ${MAX_ATTACHMENT_BYTES} 字节上限`);
+    throw oversizeError("远程文件", declared);
   }
   if (!r.body) throw new Error(`下载响应没有内容: ${url}`);
 
@@ -88,7 +98,7 @@ async function fetchRemoteBytes(
     total += value.byteLength;
     if (total > MAX_ATTACHMENT_BYTES) {
       await reader.cancel();
-      throw new Error(`远程文件超过 ${MAX_ATTACHMENT_BYTES} 字节上限`);
+      throw oversizeError("远程文件", total);
     }
     chunks.push(value);
   }
@@ -111,11 +121,11 @@ async function readBytes(
     return fetchRemoteBytes(resolved.url, signal);
   }
   if (resolved.size > MAX_ATTACHMENT_BYTES) {
-    throw new Error(`本地文件超过 ${MAX_ATTACHMENT_BYTES} 字节上限`);
+    throw oversizeError("本地文件", resolved.size);
   }
   const data = new Uint8Array(await readFile(resolved.path));
   if (data.byteLength > MAX_ATTACHMENT_BYTES) {
-    throw new Error(`本地文件超过 ${MAX_ATTACHMENT_BYTES} 字节上限`);
+    throw oversizeError("本地文件", data.byteLength);
   }
   signal?.throwIfAborted();
   return data;

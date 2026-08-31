@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { formatSize } from "@earendil-works/pi-coding-agent";
 import { buildSendTools } from "../../src/agent/send-tools.ts";
 import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import type { RelayConfig } from "../../src/integrations/relay.ts";
@@ -156,15 +158,28 @@ describe("attachment send tools", () => {
         tempDir: userTemp,
       }).find((tool) => tool.name === "send_file")!;
 
-      await expect(
-        fileTool.execute(
+      // 未配置外链时的完整契约：报错、说人话、不发任何网络请求、不承诺做不到的事。
+      const error = await fileTool
+        .execute(
           "send-large-file-no-relay",
           { source: "report.bin" },
           undefined,
           undefined,
           {} as never
         )
-      ).rejects.toThrow("超过");
+        .then(
+          () => null,
+          (e: unknown) => e as Error
+        );
+      expect(error).toBeInstanceOf(Error);
+      // 这句话会被模型转述进群里：要有人能读的单位，不能是原始字节数。
+      expect(error!.message).toContain(formatSize(MAX_ATTACHMENT_BYTES));
+      expect(error!.message).not.toContain(String(MAX_ATTACHMENT_BYTES));
+      // 工具描述不能提外链，否则模型会向用户承诺一个不存在的能力。
+      expect(fileTool.description).not.toContain("外链");
+      expect(fileTool.description).not.toContain("链接");
+      // 特性关闭时不该留下任何痕迹。
+      expect(existsSync(join(root, "relay-index.jsonl"))).toBe(false);
       expect(fetched).toBe(false);
     } finally {
       globalThis.fetch = originalFetch;
