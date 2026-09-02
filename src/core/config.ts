@@ -98,6 +98,15 @@ export const MAX_ACTIVE_REQUESTS = integerEnv(
   1000
 );
 
+// ===== Agent 工具 =====
+/**
+ * 模型没有显式声明 timeout 时，注入给 bash 工具的默认上限（秒）。
+ * Pi 官方 bash 默认不限时，而一次挂死的命令会永久占住这一轮 prompt：用户只会收到
+ * 「正在思考」，之后的消息都变成 steer，会话槽位也不再释放。宁可让超长命令报错、
+ * 让模型自己重试或显式声明更大的 timeout，也不能让整轮对话无声卡死。
+ */
+export const BASH_DEFAULT_TIMEOUT = integerEnv("BOT_BASH_TIMEOUT", 600, 10, 3600);
+
 // ===== Session 缓存 =====
 /** 空闲会话从内存释放；历史仍保留在 jsonl，下次自动重开。 */
 export const SESSION_IDLE_TTL = 30 * 60_000;

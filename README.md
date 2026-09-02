@@ -124,6 +124,7 @@ data/
 - **访问控制**：随机密钥路径（`data/config/webhook-secret`，应用层）+ 网络层 IP 闸门（直连=系统防火墙 / Cloudflare=WAF），见[部署模式](#部署模式)与[安全](#安全)。
 - **开发开关**：生产环境缺少有效 `data/config/webhook-secret` 时服务拒绝启动；只有隔离的本地调试可显式设置 `ALLOW_INSECURE_WEBHOOK=1`。`BOT_DEBUG=1` 会记录用户消息正文，默认关闭。
 - **负载上限**：`BOT_MAX_ACTIVE_REQUESTS` 控制已确认但尚未完成的 Pi 后台任务数，默认 `32`，有效范围 `1–1000`；达到上限的新请求不启动模型，而是通过 callback 明确通知当前用户稍后重发。
+- **bash 默认时限**：`BOT_BASH_TIMEOUT` 控制模型未显式声明 `timeout` 时 bash 命令的上限秒数，默认 `600`，有效范围 `10–3600`。Pi 官方 bash 默认不限时，而群聊里没人盯着终端：一条挂死的命令会永久占住这一轮 prompt，用户只收到「正在思考」，后续消息全部退化成 steer，任务槽位也不再释放。模型显式声明的 `timeout` 始终优先。
 
 ### 大文件外链分发（可选）
 
@@ -420,7 +421,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理
 <details>
 <summary><b>群共享工作区 + 用户临时区</b></summary>
 
-每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace`，只存长期成果及该群共用的 `.venv`；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip/uv 缓存指向用户临时区，同时把 `VIRTUAL_ENV` / `UV_PROJECT_ENVIRONMENT` 固定到群 workspace 的 `.venv`，把 `PYTHONIOENCODING` 固定为 UTF-8，并按 Pi 通用约定注入 `AI_AGENT=pi` 与 `PI_CODING_AGENT=true`（Pi 只在自己的 CLI/RPC 入口设这两个标记，内嵌 SDK 时需要显式导出）；Pi 因输出截断产生的完整日志也会迁入这里。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
+每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace`，只存长期成果及该群共用的 `.venv`；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip/uv 缓存指向用户临时区，同时把 `VIRTUAL_ENV` / `UV_PROJECT_ENVIRONMENT` 固定到群 workspace 的 `.venv`，把 `PYTHONIOENCODING` 固定为 UTF-8，用 `PYTHON_BASIC_REPL=1` 关掉 Python 3.13+ 的新版 REPL（Windows 上空 heredoc 会被 Git Bash 优化成 `< /dev/null`，即 NUL 字符设备，`isatty` 为真使 `python -` 误判为交互式，新版 REPL 随即在 NUL 句柄上取控制台尺寸失败并无限刷 traceback，命令永不退出），并按 Pi 通用约定注入 `AI_AGENT=pi` 与 `PI_CODING_AGENT=true`（Pi 只在自己的 CLI/RPC 入口设这两个标记，内嵌 SDK 时需要显式导出）；Pi 因输出截断产生的完整日志也会迁入这里。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
 
 </details>
 
@@ -562,4 +563,5 @@ mixin-chatbot/
 | 去重字典 | 1000 条 / 30s |
 | 入站限流字典 | 10000 个 `(群, phone)`；容量满时新键按限流处理，ACK 后 callback 通知重发 |
 | 后台在途任务 | 默认 32；可用 `BOT_MAX_ACTIVE_REQUESTS` 设为 1–1000 |
+| bash 单命令时限 | 未声明 `timeout` 时默认 600s；可用 `BOT_BASH_TIMEOUT` 设为 10–3600 |
 | callback 路由观察 | 1000 个 key；无冲突项闲置 24h 回收 |

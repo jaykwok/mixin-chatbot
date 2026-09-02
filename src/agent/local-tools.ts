@@ -22,6 +22,7 @@ import {
   detectSupportedImageMimeTypeFromFile,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
 import { log } from "../core/log.ts";
 import { isPathInside } from "./paths.ts";
 import {
@@ -33,7 +34,9 @@ import {
 const coordinatedBashSchema = Type.Object({
   command: Type.String({ description: "Bash command to execute" }),
   timeout: Type.Optional(
-    Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })
+    Type.Number({
+      description: `Timeout in seconds (optional, defaults to ${BASH_DEFAULT_TIMEOUT})`,
+    })
   ),
   mutates: Type.Array(Type.String(), {
     description:
@@ -138,6 +141,14 @@ function createBashTool(
     UV_PROJECT_ENVIRONMENT: join(cwd, ".venv"),
     VIRTUAL_ENV: join(cwd, ".venv"),
     PYTHONIOENCODING: "utf-8",
+    // Git Bash turns an empty heredoc into `< /dev/null`, which on Windows is the
+    // NUL character device, and the CRT reports isatty(NUL) as true. `python -`
+    // therefore believes it is interactive and starts the 3.13+ _pyrepl, whose
+    // console-size probe on that handle fails (WinError 6 or 123 depending on what
+    // stdin ended up being); the REPL swallows the error and loops, spewing
+    // tracebacks at megabytes per second and never exiting — one such command wrote
+    // 3.26GB before it was killed. The basic REPL just reads EOF and quits.
+    PYTHON_BASIC_REPL: "1",
     PI_CALLER_PHONE: phone,
     PI_GROUP_ID: groupId,
     PI_USER_TMP: tempDir,
@@ -237,8 +248,18 @@ function createBashTool(
     onUpdate,
     context
   ) => {
+    // Pi leaves bash unbounded unless the model declares a timeout. Nobody is
+    // watching a terminal here: a command that never exits (a stray REPL, a
+    // prompt waiting on stdin, a wedged download) silently eats the whole turn —
+    // the user keeps the "正在思考" ack and never gets an answer, later messages
+    // only queue as steering, and the session slot never comes back. A declared
+    // timeout always wins; this only fills the gap when there is none.
+    const bounded =
+      typeof input.timeout === "number" && Number.isFinite(input.timeout)
+        ? input
+        : { ...input, timeout: BASH_DEFAULT_TIMEOUT };
     const task = () =>
-      executeOfficial(toolCallId, input, signal, onUpdate, context);
+      executeOfficial(toolCallId, bounded, signal, onUpdate, context);
     const targets = workspaceLockTargets(mutates);
     if (targets === "opaque") {
       return runOpaqueWorkspaceOperation(cwd, task, signal);
@@ -263,7 +284,7 @@ function createBashTool(
           : ["."];
       return { ...prepared, mutates };
     },
-    description: `${official.description} Before execution, declare every workspace path the command may create, modify, rename, or delete in mutates. Use an empty list only for read-only commands and ["."] for unknown or workspace-wide changes. Declared paths share FIFO locks with edit/write; paths outside the group workspace need no lock and are ignored. Do not start background workspace writers.`,
+    description: `${official.description} Commands without an explicit timeout are stopped after ${BASH_DEFAULT_TIMEOUT} seconds; pass a larger timeout when a command legitimately needs longer. Before execution, declare every workspace path the command may create, modify, rename, or delete in mutates. Use an empty list only for read-only commands and ["."] for unknown or workspace-wide changes. Declared paths share FIFO locks with edit/write; paths outside the group workspace need no lock and are ignored. Do not start background workspace writers.`,
     execute,
   } as unknown as ToolDefinition<typeof coordinatedBashSchema>;
 }
