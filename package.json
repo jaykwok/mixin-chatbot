@@ -8,6 +8,7 @@
     "dev": "bun --watch run src/server/index.ts",
     "configure": "bun run scripts/config/configure.ts",
     "relay": "bun run scripts/ops/relay-admin.ts",
+    "tmp": "bun run scripts/ops/tmp-admin.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "deadcode": "knip",

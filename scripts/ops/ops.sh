@@ -3,7 +3,8 @@
 # 一站式运维：doctor / update / restart / stop / start / logs / uninstall。
 #
 # 用法：./scripts/ops/ops.sh <命令>
-#   命令：doctor、update、restart、stop、start、logs、uninstall（不带参数显示帮助）
+#   命令：doctor、update、restart、stop、start、logs、relay-ls、relay-purge、
+#         tmp-ls、tmp-purge、uninstall（不带参数显示帮助）
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -364,6 +365,41 @@ relay_admin() {
         mixin-chatbot bun run scripts/ops/relay-admin.ts "$@"
 }
 
+# 用户临时目录的清理同样交给 bun 脚本：目录布局与「什么不能删」的边界定义在 src/ 里，
+# 在 shell 里抄一遍 rm -rf 是把最危险的一段逻辑维护成两份。
+#
+# 与 relay 不同的是这里要显式喂 GROUP_DATA_ROOT：exec 进正在运行的容器时它已经在容器
+# 环境里，用一次性容器时则要按 deploy.sh 的同一套规则把主机目录映射进去，否则脚本会去
+# 扫容器内那个空的 /app/data/groups。
+tmp_admin() {
+    if ! command -v docker >/dev/null 2>&1; then
+        ER "找不到 docker"
+        return 1
+    fi
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
+        docker exec "$CONTAINER" bun run scripts/ops/tmp-admin.ts "$@"
+        return $?
+    fi
+    WA "容器未在运行，改用一次性容器执行"
+    local resolved_root="" group_root_env="/app/data/groups"
+    local group_root_args=()
+    if ! resolved_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null)"; then
+        ER "群数据总根路径无效：$DEPLOYED_GROUP_DATA_ROOT"
+        return 1
+    fi
+    if [ "$resolved_root" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
+        group_root_args+=(-v "$resolved_root:/app/group-data")
+        group_root_env="/app/group-data"
+    fi
+    docker run --rm \
+        --user "$(stat -c '%u:%g' "$DATA_DIR")" \
+        -e HOME=/app/data/runtime/home \
+        -e GROUP_DATA_ROOT="$group_root_env" \
+        "${group_root_args[@]}" \
+        -v "${PROJECT_DIR}/data:/app/data" \
+        mixin-chatbot bun run scripts/ops/tmp-admin.ts "$@"
+}
+
 # git 只在这里用；GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。
 git_here() {
     GIT_TERMINAL_PROMPT=0 git -C "$PROJECT_DIR" "$@"
@@ -588,6 +624,8 @@ case "${1:-}" in
     logs)      show_logs ;;
     relay-ls)    relay_admin list ;;
     relay-purge) shift; relay_admin purge "$@" ;;
+    tmp-ls)      shift; tmp_admin list "$@" ;;
+    tmp-purge)   shift; tmp_admin purge "$@" ;;
     uninstall) uninstall ;;
     *)
         echo -e "${CYAN}mixin-chatbot 运维工具（Linux/Docker）${NC}"
@@ -603,6 +641,9 @@ case "${1:-}" in
         echo "  relay-ls   列出已发出、仍在册的大文件外链"
         echo "  relay-purge <关键字>|--all"
         echo "             删除匹配的外链对象并清掉索引记录"
+        echo "  tmp-ls     列出各用户临时目录的占用（缓存、中间产物、截断日志）"
+        echo "  tmp-purge --days <天数>|--all [--user <手机号>]"
+        echo "             清理用户临时目录；--days 只删这些天没改动过的条目"
         echo "  uninstall  删除容器（可选镜像、cloudflared、data/、logs/）"
         ;;
 esac

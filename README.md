@@ -335,6 +335,8 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 ./scripts/ops/ops.sh logs       # 实时日志（docker logs -f --tail 50）
 ./scripts/ops/ops.sh relay-ls   # 列出已发出、仍在册的大文件外链
 ./scripts/ops/ops.sh relay-purge <关键字>|--all  # 删除匹配的外链对象并清掉索引记录
+./scripts/ops/ops.sh tmp-ls     # 列出各用户临时目录的占用
+./scripts/ops/ops.sh tmp-purge --days 7          # 清理 7 天没改动过的临时文件（--all 全清，--user 限定单人）
 ./scripts/ops/ops.sh stop       # 停止
 ./scripts/ops/ops.sh uninstall  # 卸载（容器，可选清 image/cloudflared/data）
 ```
@@ -359,6 +361,8 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 foreground # 前台
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 logs       # 实时日志
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-ls   # 列出已发出、仍在册的大文件外链
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-purge <关键字>|--all # 删除匹配的外链对象并清掉索引记录
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 tmp-ls     # 列出各用户临时目录的占用
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 tmp-purge -Days 7 # 清理 7 天没改动过的临时文件（-All 全清，-User 限定单人）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 stop       # 停止
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall-tunnel # 停止并卸载 Cloudflared 服务
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理 task/进程/防火墙/launcher，可选清隧道/data/logs
@@ -421,7 +425,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理
 <details>
 <summary><b>群共享工作区 + 用户临时区</b></summary>
 
-每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace`，只存长期成果及该群共用的 `.venv`；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip/uv 缓存指向用户临时区，同时把 `VIRTUAL_ENV` / `UV_PROJECT_ENVIRONMENT` 固定到群 workspace 的 `.venv`，把 `PYTHONIOENCODING` 固定为 UTF-8，用 `PYTHON_BASIC_REPL=1` 关掉 Python 3.13+ 的新版 REPL（Windows 上空 heredoc 会被 Git Bash 优化成 `< /dev/null`，即 NUL 字符设备，`isatty` 为真使 `python -` 误判为交互式，新版 REPL 随即在 NUL 句柄上取控制台尺寸失败并无限刷 traceback，命令永不退出），并按 Pi 通用约定注入 `AI_AGENT=pi` 与 `PI_CODING_AGENT=true`（Pi 只在自己的 CLI/RPC 入口设这两个标记，内嵌 SDK 时需要显式导出）；Pi 因输出截断产生的完整日志也会迁入这里。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
+每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace`，只存长期成果及该群共用的 `.venv`；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip/uv 缓存指向用户临时区，同时把 `VIRTUAL_ENV` / `UV_PROJECT_ENVIRONMENT` 固定到群 workspace 的 `.venv`，把 `PYTHONIOENCODING` 固定为 UTF-8，用 `PYTHON_BASIC_REPL=1` 关掉 Python 3.13+ 的新版 REPL（Windows 上空 heredoc 会被 Git Bash 优化成 `< /dev/null`，即 NUL 字符设备，`isatty` 为真使 `python -` 误判为交互式，新版 REPL 随即在 NUL 句柄上取控制台尺寸失败并无限刷 traceback，命令永不退出），并按 Pi 通用约定注入 `AI_AGENT=pi` 与 `PI_CODING_AGENT=true`（Pi 只在自己的 CLI/RPC 入口设这两个标记，内嵌 SDK 时需要显式导出）；Pi 因输出截断产生的完整日志也会迁入这里。这些中间产物不会自动回收（缓存、解压产物、被截断的完整输出日志会一直堆积），用 `ops.sh tmp-ls` / `tmp-purge` 查看和清理，删掉只影响下次的速度。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
 
 </details>
 
@@ -497,7 +501,7 @@ mixin-chatbot/
 │   ├── config/          # AI 配置 TUI
 │   ├── deploy/          # Linux/Windows 部署 + 服务器初始化
 │   ├── lib/             # 同平台脚本共用的纯辅助函数（主机名校验、可执行文件发现、提示）
-│   ├── ops/             # doctor/update/restart/start/stop/logs/relay-ls/relay-purge/uninstall
+│   ├── ops/             # doctor/update/restart/start/stop/logs/relay-*/tmp-*/uninstall
 │   │   └── relay-admin.ts   #   外链列出与清理；ops 脚本调它，避免凭据进命令行
 │   │                    #   Windows 另有 foreground、repair-tunnel、uninstall-tunnel
 │   └── tunnel/          # Linux/Windows cloudflared connector

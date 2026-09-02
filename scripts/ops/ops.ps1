@@ -6,7 +6,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor -Repair
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update
 #   命令：doctor、update、repair-tunnel、uninstall-tunnel、restart、stop、start、foreground、logs、
-#         relay-ls、relay-purge、uninstall（无参数显示菜单）
+#         relay-ls、relay-purge、tmp-ls、tmp-purge、uninstall（无参数显示菜单）
 #
 # repair-tunnel/uninstall-tunnel/restart/stop/start/uninstall 可能需要管理员权限。
 param(
@@ -16,7 +16,12 @@ param(
     [Parameter(Position = 1)]
     [string]$Target = "",
     [switch]$Repair,
-    [switch]$RestartTunnel
+    [switch]$RestartTunnel,
+    # tmp-purge 的范围。PowerShell 会把 --days 这种 token 当参数名去绑定，所以这里用原生
+    # 开关，由脚本翻译成 tmp-admin.ts 的 --days/--all/--user。
+    [int]$Days = -1,
+    [switch]$All,
+    [string]$User = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -204,6 +209,47 @@ function Invoke-RelayAdmin([string[]]$RelayArgs) {
             $ErrorActionPreference = $previous
         }
     } finally {
+        Pop-Location
+    }
+}
+
+# 用户临时目录的清理同样交给 scripts\ops\tmp-admin.ts。目录布局与「什么不能删」的边界
+# 定义在 src\ 里，在 PowerShell 里抄一遍 Remove-Item -Recurse 是把最危险的一段逻辑维护
+# 成两份——workspace 和 session.jsonl 就在 tmp 的隔壁。
+#
+# GROUP_DATA_ROOT 必须显式传：Windows 上机器人由计划任务启动，这个 PowerShell 会话里
+# 没有它，脚本会退回默认的 data\groups，自定义群数据根就扫不到。
+function Invoke-TmpAdmin([string[]]$TmpArgs) {
+    $bunPath = Get-BunPath
+    if (-not $bunPath) {
+        Err "找不到可用的 bun；请安装 Bun：https://bun.sh"
+        return $false
+    }
+    $groupRoot = try { Resolve-ProjectPath $DeployedGroupDataRoot } catch { $null }
+    if (-not $groupRoot) {
+        Err "群数据总根路径无效：$DeployedGroupDataRoot"
+        return $false
+    }
+    Push-Location $Project
+    $hadGroupRoot = Test-Path Env:GROUP_DATA_ROOT
+    $previousGroupRoot = if ($hadGroupRoot) { $env:GROUP_DATA_ROOT } else { $null }
+    try {
+        $env:GROUP_DATA_ROOT = $groupRoot
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            # 与 Invoke-RelayAdmin 同理：调用点用 if (-not (...)) 收返回值，bun 的输出必须
+            # 走 Out-Host 才不会被一起吞掉；路径和文件名有中文，不切 UTF-8 就是一屏乱码。
+            Invoke-WithUtf8Output {
+                & $bunPath run "scripts\ops\tmp-admin.ts" @TmpArgs 2>&1 | Out-Host
+            }
+            return ($LASTEXITCODE -eq 0)
+        } finally {
+            $ErrorActionPreference = $previous
+        }
+    } finally {
+        if ($hadGroupRoot) { $env:GROUP_DATA_ROOT = $previousGroupRoot }
+        else { Remove-Item Env:GROUP_DATA_ROOT -ErrorAction SilentlyContinue }
         Pop-Location
     }
 }
@@ -1405,6 +1451,21 @@ switch ($Command) {
         }
         if (-not (Invoke-RelayAdmin @("purge", $Target))) { exit 1 }
     }
+    "tmp-ls" {
+        $tmpArgs = @("list")
+        if ($User) { $tmpArgs += @("--user", $User) }
+        if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
+    }
+    "tmp-purge" {
+        if (-not $All -and $Days -lt 0) {
+            Err "tmp-purge 需要 -Days <天数>，或用 -All 表示不看时间全部清理"
+            exit 1
+        }
+        $tmpArgs = @("purge")
+        if ($All) { $tmpArgs += "--all" } else { $tmpArgs += @("--days", "$Days") }
+        if ($User) { $tmpArgs += @("--user", $User) }
+        if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
+    }
     "uninstall" { if (-not (Uninstall-Bot)) { exit 1 } }
     default {
         Write-Host "mixin-chatbot 运维工具（Windows Server）" -ForegroundColor Cyan
@@ -1423,6 +1484,9 @@ switch ($Command) {
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
         Write-Host "  relay-purge <关键字>|--all"
         Write-Host "                  删除匹配的外链对象并清掉索引记录"
+        Write-Host "  tmp-ls          列出各用户临时目录的占用（缓存、中间产物、截断日志）"
+        Write-Host "  tmp-purge -Days <天数> | -All [-User <手机号>]"
+        Write-Host "                  清理用户临时目录；-Days 只删这些天没改动过的条目"
         Write-Host "  uninstall       清理任务/进程/防火墙/launcher，可选清理隧道、data 和 logs"
     }
 }
