@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   describeRequestFailure,
   extractHttpStatus,
+  extractResetMoment,
   redactSecrets,
 } from "../../src/agent/failure.ts";
 
@@ -18,6 +19,28 @@ describe("请求失败回执", () => {
     expect(reply).toContain("insufficient_quota");
     // 额度耗尽也是 429，但「稍后再试」对它没有意义。
     expect(reply).not.toContain("正在限流");
+  });
+
+  test("套餐时间窗口用尽不当成限流，并把重置时刻提到结论里", () => {
+    // 生产实例的原话：原文带 rate_limit_exceeded，但要等三小时，「稍等片刻」是误导。
+    const reply = describeRequestFailure(
+      new Error(
+        "模型未返回回复：rate_limit_exceeded: 已达到 5 小时的使用上限。您的限额将在 2026-09-03 14:23:08 重置。[202609031203293d294c5d19c24baa]"
+      )
+    );
+    expect(reply).toContain("用量已达套餐上限");
+    expect(reply).toContain("额度将在 2026-09-03 14:23:08 重置。");
+    expect(reply).not.toContain("稍等片刻");
+    // 排查用的请求 id 留在原文里。
+    expect(reply).toContain("[202609031203293d294c5d19c24baa]");
+  });
+
+  test("英文 usage limit 同样归到窗口用尽，时刻不带 JSON 尾巴", () => {
+    const reply = describeRequestFailure(
+      new Error('429: {"error":{"message":"Usage limit reached, resets at 2026-09-03T06:23:08Z"}}')
+    );
+    expect(reply).toContain("用量已达套餐上限");
+    expect(reply).toContain("额度将在 2026-09-03T06:23:08Z 重置。");
   });
 
   test("纯限流与额度耗尽区分开", () => {
@@ -111,6 +134,20 @@ describe("状态码识别", () => {
     expect(extractHttpStatus("no status here")).toBeUndefined();
     // 正文里的普通数字不能被当成状态码。
     expect(extractHttpStatus("used 429000 tokens")).toBeUndefined();
+  });
+});
+
+describe("重置时刻识别", () => {
+  test("认出中英文写法，相对时长补「后」", () => {
+    expect(extractResetMoment("您的限额将在 2026-09-03 14:23:08 重置。")).toBe(
+      "2026-09-03 14:23:08"
+    );
+    expect(extractResetMoment('resets at 2026-09-03T06:23:08Z"}}')).toBe("2026-09-03T06:23:08Z");
+    expect(extractResetMoment("Your limit resets in 2 hours.")).toBe("2 hours 后");
+  });
+
+  test("没写重置时刻就不编", () => {
+    expect(extractResetMoment("Rate limit exceeded, retry later")).toBeUndefined();
   });
 });
 

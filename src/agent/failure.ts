@@ -51,8 +51,9 @@ interface FailureRule {
   hint: string;
 }
 
-// 顺序即优先级：特征更具体的排前面。额度必须排在限流之前——额度耗尽的响应通常也是 429，
-// 但「稍后再试」对它毫无意义；空回复排最后，它只是「没别的线索」时的兜底描述。
+// 顺序即优先级：特征更具体的排前面。窗口用尽和额度耗尽都必须排在限流之前——它们的响应
+// 同样是 429、原文里同样带 rate_limit_exceeded，但「稍等片刻再发一次」对要等几小时才重置
+// 的窗口纯属误导；空回复排最后，它只是「没别的线索」时的兜底描述。
 const FAILURE_RULES: readonly FailureRule[] = [
   {
     pattern: /群聊消息发送失败/,
@@ -61,6 +62,12 @@ const FAILURE_RULES: readonly FailureRule[] = [
   {
     pattern: /models\.json|configure|未配置可用凭证/i,
     hint: "机器人这边的模型配置有问题，请联系管理员。",
+  },
+  {
+    // 按时间窗口滚动的套餐上限（如「已达到 5 小时的使用上限」），要等到重置时刻才恢复。
+    pattern:
+      /(?:使用|用量|使用量)上限|已达到?[^。\n]{0,12}上限|usage limit|limit reached|(?:限额|额度|配额)[^。\n]{0,12}重置|will reset/i,
+    hint: "模型服务的用量已达套餐上限，额度重置前无法继续回答，请联系管理员。",
   },
   {
     pattern:
@@ -106,6 +113,25 @@ const FAILURE_RULES: readonly FailureRule[] = [
 
 const FALLBACK_HINT = "这个失败没能自动归类，请把本条消息连同下面的原始错误转给管理员。";
 
+// 报错原文里的重置时刻。有它才知道是「等一分钟」还是「等三小时」，可它埋在原文中段，
+// 而群里真正会被读的只有结论那一行，所以单独拎出来。
+// 时刻往往紧贴着 JSON 的引号和括号，字符类必须把它们排除掉，否则会把 `"}}` 一起念出来。
+const RESET_PATTERNS: readonly { pattern: RegExp; relative?: boolean }[] = [
+  { pattern: /(?:限额|额度|配额|用量)[^。\n"'{}]{0,8}将?在\s*([^。\n"'{}]{4,40}?)\s*(?:才|后)?重置/ },
+  { pattern: /\breset(?:s|ting)?\s+(?:at|on)\s+([^\n"'{},]{4,40})/i },
+  // 「resets in 2 hours」给的是时长而非时刻，补个「后」才通顺。
+  { pattern: /\breset(?:s|ting)?\s+in\s+([^\n"'{},]{2,20})/i, relative: true },
+];
+
+/** 报错原文里写明的额度重置时刻；没写返回 undefined。 */
+export function extractResetMoment(raw: string): string | undefined {
+  for (const { pattern, relative } of RESET_PATTERNS) {
+    const moment = raw.match(pattern)?.[1]?.trim().replace(/[.。;；]+$/u, "");
+    if (moment) return relative ? `${moment} 后` : moment;
+  }
+  return undefined;
+}
+
 function classifyFailure(raw: string, status: number | undefined): string {
   for (const rule of FAILURE_RULES) {
     if (rule.pattern?.test(raw)) return rule.hint;
@@ -133,7 +159,10 @@ function formatDetail(raw: string): string {
 export function describeRequestFailure(error: unknown): string {
   const raw = errorText(error);
   const hint = classifyFailure(raw, extractHttpStatus(raw));
+  const reset = extractResetMoment(raw);
   const detail = formatDetail(raw);
-  const head = `⚠️ 抱歉，处理您的请求时出错了。\n${hint}`;
-  return detail ? `${head}\n原始错误：${detail}` : head;
+  const lines = ["⚠️ 抱歉，处理您的请求时出错了。", hint];
+  if (reset) lines.push(`额度将在 ${reset} 重置。`);
+  if (detail) lines.push(`原始错误：${detail}`);
+  return lines.join("\n");
 }
