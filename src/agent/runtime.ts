@@ -466,11 +466,50 @@ function isAbortError(e: unknown): boolean {
   return false;
 }
 
-/** 订阅 Pi 工具事件并记录最近工具；不向群里发送工具消息。 */
-function recordToolProgress(event: AgentSessionEvent, session: AgentSession): void {
+/**
+ * 这一轮模型侧的真实失败原因。
+ *
+ * provider 的报错不会从 prompt() 抛出来：Pi 把它写成一条 stopReason 为 "error"、正文为空
+ * 的 assistant 消息，并记在 state.errorMessage 上（每轮开始时清空，所以读到的必属本轮）。
+ * 不读这里就只剩「没有回复」这种没法排查的结论——额度耗尽、key 失效、限流全长这样。
+ */
+function readTurnFailure(session: AgentSession): string | undefined {
+  try {
+    const state = session.state;
+    if (state.errorMessage) return state.errorMessage;
+    const last = state.messages[state.messages.length - 1];
+    if (!last || last.role !== "assistant") return undefined;
+    if (last.stopReason !== "error" && last.stopReason !== "aborted") return undefined;
+    return last.errorMessage || `模型请求 ${last.stopReason}`;
+  } catch (e) {
+    log.error(`读取模型失败原因出错: ${String(e)}`);
+    return undefined;
+  }
+}
+
+/** 订阅 Pi 会话事件：记录最近工具供 /status 查询，并把自动重试写进日志。
+ *  工具消息不发群里，重试也不发——它们只在排查时有用。 */
+function recordSessionProgress(
+  event: AgentSessionEvent,
+  session: AgentSession,
+  phone: string
+): void {
   if (event?.type === "tool_execution_start" && event.toolName) {
     const summary = summarizeToolCall(event.toolName, event.args);
     lastTool.set(session, summary);
+    return;
+  }
+  // 重试是「慢」和「最终失败」的原因；只有最后一次的报错会留在 state 上。
+  if (event?.type === "auto_retry_start") {
+    log.warn(
+      `模型请求失败，自动重试 ${event.attempt}/${event.maxAttempts}（${event.delayMs}ms 后）- 用户: ${phone}, 原因: ${event.errorMessage}`
+    );
+    return;
+  }
+  if (event?.type === "auto_retry_end" && !event.success) {
+    log.error(
+      `模型请求重试 ${event.attempt} 次后仍失败 - 用户: ${phone}, 原因: ${event.finalError ?? "未知"}`
+    );
   }
 }
 
@@ -599,7 +638,9 @@ async function runPrompt(
   busySessions.add(session);
   const unsub: (() => void) | undefined =
     typeof session.subscribe === "function"
-      ? session.subscribe((event: AgentSessionEvent) => recordToolProgress(event, session))
+      ? session.subscribe((event: AgentSessionEvent) =>
+          recordSessionProgress(event, session, phone)
+        )
       : undefined;
 
   const start = Date.now();
@@ -636,7 +677,14 @@ async function runPrompt(
     const pending = notes?.peek() ?? [];
     const appendix = pending.length > 0 ? pending.join("\n\n") : undefined;
     // 模型什么都没说但文件确实发出去了时，链接本身就是完整的回复。
-    if (!replyText && !appendix) throw new Error("Pi 未返回回复");
+    const failure = readTurnFailure(session);
+    if (!replyText && !appendix) {
+      throw new Error(failure ? `模型未返回回复：${failure}` : "Pi 未返回回复");
+    }
+    // 有内容就照发（流到一半才出错的轮次仍有话可说），但失败本身不能只烂在内存里。
+    if (failure) {
+      log.warn(`模型本轮报错但仍有内容可发 - 用户: ${phone}, 错误: ${failure}`);
+    }
     const body = replyText || "文件已发送。";
     log.info(
       `Pi 回复完成 - 用户: ${phone}, 耗时: ${((Date.now() - start) / 1000).toFixed(2)}秒, 长度: ${body.length}`

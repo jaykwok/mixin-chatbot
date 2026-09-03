@@ -58,6 +58,8 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1
 
 规范化后的普通文字任务开始时只发送一条 `🤔 正在思考...` 作为接单确认；工具调用和长任务过程不发送周期心跳，只在任务完成、失败、收到指令或确实需要排队时再发消息，避免刷屏。
 
+任务失败时的回执写明具体原因（额度用尽、限流、凭证失效、上下文超限、网络不通等），并附上模型服务返回的报错原文（已抹去凭据），可以直接截图转给管理员排查，详见[失败回执](#设计与实现)。
+
 **中途干预**（agent 干活时无需等做完）：
 
 - 发**普通消息** → 作为引导插入（`session.steer`），agent 在下一步纳入；收到回执 `↩️ 已插入干预`。
@@ -409,6 +411,8 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理
 | 修改 `data/config/tunnel-token` 后仍连不上 | 已安装服务仍使用旧 token | 运行 `ops.ps1 repair-tunnel`；修改文件本身不会更新服务 |
 | 日志显示“发送成功”但群里只收到前 20 条 | 平台对超限请求返回 HTTP 200 后静默丢弃 | 当前版本用本地 60 秒滑动窗口保护，不依赖 429；确认所有实例都已更新且没有另一份 bot 共用同一 callback key |
 | AI 回复报错 | models.json 的 key / 模型有误 | 重跑 configure TUI |
+| 群里回复「模型服务的额度或余额已经用完」 | 模型套餐（token plan）额度跑完 | 在模型服务商侧续费或换套餐；急用时重跑 configure 换一个仍有额度的 provider / 模型 |
+| 群里回复「这个失败没能自动归类」 | 出现了未覆盖的错误类型 | 按回执里的原始错误查服务器日志同一时刻的 `ERROR` 行，必要时在 `src/agent/failure.ts` 补一条规则 |
 | 云电脑迁移后偶发不通 | 前半段（平台→边缘）不稳 | 见 cloudflared 隧道方案（另文） |
 
 ## 设计与实现
@@ -465,6 +469,13 @@ payload 字段必须使用官方 JSON 类型，`callBackUrl` 只能包含一个�
 </details>
 
 <details>
+<summary><b>失败回执</b></summary>
+
+任务失败时群里发的是一条 `text@`（不是 Markdown，也不带「任务已完成」提醒），内容为「一句分类结论 + 报错原文」：额度/余额用尽、限流、凭证失效、模型 id 不存在、上下文超限、网络不通、模型服务 5xx、异常空回复各归一类，只说出了什么事以及用户自己能不能补救（重发、`/clear`），其余一律「请联系管理员」——修复步骤不写进群，管理员看原文即可，无法归类时如实说明并请求转给管理员。原文来自模型服务本身——Pi 不会让 provider 的报错从 `session.prompt()` 抛出，而是写成一条 `stopReason: "error"`、正文为空的 assistant 消息并记在 `state.errorMessage` 上，因此适配层在这一轮结束时读取它；不读就只剩「没有回复」这种无法排查的结论。原文进群前会抹掉 key / `Bearer` / URL 凭据参数，压成一行并截断到 300 字。自动重试（Pi 的 auto retry）不进群，只按 `WARN` / `ERROR` 记进日志，用于区分「一次抖动」和「持续失败」。
+
+</details>
+
+<details>
 <summary><b>Pi 官方实现取舍</b></summary>
 
 - 当前核心直接复用 [Pi SDK](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) 的 `AgentSession`、`SessionManager`、`ModelRuntime`、默认资源加载器、compaction/steer/abort、内联 `tool_call` 策略，以及 read/bash/edit/write 工具工厂；本项目只保留量子密信回调、群/用户目录策略、工作区文件协调和发送附件工具。bash 会话与调用者临时环境已启用，工具 schema 只使用当前 TypeBox 支持的 API，并通过 Pi 官方 `defineTool` 助手接入；所有工具以 `prefer` 使用 constrained JSON Schema sampling（模型不支持时自动回退）。
@@ -479,6 +490,7 @@ mixin-chatbot/
 ├── src/
 │   ├── agent/                  # Pi 运行时、目录策略与工具适配
 │   │   ├── runtime.ts          # 模型加载 + 会话 + 对话入口
+│   │   ├── failure.ts          # 失败回执：分类结论 + 脱敏后的报错原文
 │   │   ├── workspace-coordinator.ts # 同文件 FIFO、多文件并发与 bash 声明式路径锁
 │   │   ├── local-tools.ts      # Pi 官方工具工厂 + 路径/临时环境适配
 │   │   ├── paths.ts            # 群优先的数据目录布局与安全目录名

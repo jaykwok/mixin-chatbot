@@ -21,7 +21,8 @@ import {
   VALID_HOSTNAMES,
 } from "../core/config.ts";
 import { HttpError } from "./http.ts";
-import { sendReplyWithMention, sendText } from "../integrations/im.ts";
+import { sendText } from "../integrations/im.ts";
+import { describeRequestFailure } from "../agent/failure.ts";
 import {
   handleUserMessage,
   resolveSessionCallbackUrl,
@@ -199,8 +200,10 @@ async function processRequest(
     const elapsed = ((Date.now() - start) / 1000).toFixed(2);
     log.error(`请求处理失败 - 用户: ${phone}, 耗时: ${elapsed}秒, 错误: ${String(e)}`);
     try {
-      const sent = await sendReplyWithMention(
-        "⚠️ 抱歉，处理您的请求时出现了问题，请稍后再试。",
+      // 失败回执走 text：不能带「✅ 任务已完成」，报错原文里的 JSON 也不该被
+      // Markdown 判定挑中再被转换改写。
+      const sent = await sendText(
+        describeRequestFailure(e),
         groupId,
         phone,
         resolveSessionCallbackUrl(phone, groupId, callbackUrl)
