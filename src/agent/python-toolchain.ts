@@ -84,7 +84,11 @@ async function provision(venvDir: string): Promise<boolean> {
   const started = Date.now();
   log.info(`开始准备文档解析环境 - ${target}`);
   try {
-    await run("uv", ["venv", target]);
+    // --allow-existing：uv 对已存在的 venv 直接报错退出，没有这个标志，包清单一变
+    // 就再也装不进已部署的群——provision 会卡在第一步，环境永远停在旧清单上。
+    // 用它而不是 --clear：清单变化只需要把新包补进去，重建会连带抹掉模型或运维
+    // 临时装的东西；解释器被删时它也会补回来，坏掉的环境照样能自愈。
+    await run("uv", ["venv", "--allow-existing", target]);
     await run("uv", [
       "pip",
       "install",
