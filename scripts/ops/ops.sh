@@ -4,7 +4,7 @@
 #
 # 用法：./scripts/ops/ops.sh <命令>
 #   命令：doctor、update、restart、stop、start、logs、relay-ls、relay-purge、
-#         tmp-ls、tmp-purge、uninstall（不带参数显示帮助）
+#         tmp-ls、tmp-purge、history-ls、history-clear、uninstall（不带参数显示帮助）
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -371,13 +371,14 @@ relay_admin() {
 # 与 relay 不同的是这里要显式喂 GROUP_DATA_ROOT：exec 进正在运行的容器时它已经在容器
 # 环境里，用一次性容器时则要按 deploy.sh 的同一套规则把主机目录映射进去，否则脚本会去
 # 扫容器内那个空的 /app/data/groups。
-tmp_admin() {
+group_data_admin() {
+    local script="$1"; shift
     if ! command -v docker >/dev/null 2>&1; then
         ER "找不到 docker"
         return 1
     fi
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
-        docker exec "$CONTAINER" bun run scripts/ops/tmp-admin.ts "$@"
+        docker exec "$CONTAINER" bun run "$script" "$@"
         return $?
     fi
     WA "容器未在运行，改用一次性容器执行"
@@ -397,7 +398,34 @@ tmp_admin() {
         -e GROUP_DATA_ROOT="$group_root_env" \
         "${group_root_args[@]}" \
         -v "${PROJECT_DIR}/data:/app/data" \
-        mixin-chatbot bun run scripts/ops/tmp-admin.ts "$@"
+        mixin-chatbot bun run "$script" "$@"
+}
+
+tmp_admin() {
+    group_data_admin scripts/ops/tmp-admin.ts "$@"
+}
+
+# 清历史必须先把机器人停下来，不能只删文件：内存里已经建立的会话仍握着完整的消息列表，
+# 接着聊就把旧内容重新写回去，等于白清一次。所以这里固定走「停 → 清 → 起」，而不是把
+# --force 甩给运维自己判断——那个开关存在只是为了兜住脚本被单独调用的场合。
+history_clear() {
+    if [ -z "${1:-}" ]; then
+        ER "history-clear 需要群号：./scripts/ops/ops.sh history-clear <群号>"
+        return 1
+    fi
+    local was_running=0
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
+        was_running=1
+        OK "先停止机器人，确保内存中的会话不会把历史写回去"
+        stop_bot || return 1
+    fi
+    local code=0
+    group_data_admin scripts/ops/history-admin.ts clear "$@" || code=$?
+    if [ "$was_running" = "1" ]; then
+        OK "重新启动机器人"
+        start_bot || return 1
+    fi
+    return "$code"
 }
 
 # git 只在这里用；GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。
@@ -626,6 +654,8 @@ case "${1:-}" in
     relay-purge) shift; relay_admin purge "$@" ;;
     tmp-ls)      shift; tmp_admin list "$@" ;;
     tmp-purge)   shift; tmp_admin purge "$@" ;;
+    history-ls)    shift; group_data_admin scripts/ops/history-admin.ts list "$@" ;;
+    history-clear) shift; history_clear "$@" ;;
     uninstall) uninstall ;;
     *)
         echo -e "${CYAN}mixin-chatbot 运维工具（Linux/Docker）${NC}"
@@ -644,6 +674,9 @@ case "${1:-}" in
         echo "  tmp-ls     列出各用户临时目录的占用（缓存、中间产物、截断日志）"
         echo "  tmp-purge --days <天数>|--all [--user <手机号>]"
         echo "             清理用户临时目录；--days 只删这些天没改动过的条目"
+        echo "  history-ls 列出各群的会话历史（成员数、占用、最后活动）"
+        echo "  history-clear <群号>"
+        echo "             清空该群全部成员的会话历史；自动停机、清理、再启动"
         echo "  uninstall  删除容器（可选镜像、cloudflared、data/、logs/）"
         ;;
 esac

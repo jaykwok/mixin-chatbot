@@ -6,7 +6,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor -Repair
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update
 #   命令：doctor、update、repair-tunnel、uninstall-tunnel、restart、stop、start、foreground、logs、
-#         relay-ls、relay-purge、tmp-ls、tmp-purge、uninstall（无参数显示菜单）
+#         relay-ls、relay-purge、tmp-ls、tmp-purge、history-ls、history-clear、uninstall（无参数显示菜单）
 #
 # repair-tunnel/uninstall-tunnel/restart/stop/start/uninstall 可能需要管理员权限。
 param(
@@ -219,7 +219,7 @@ function Invoke-RelayAdmin([string[]]$RelayArgs) {
 #
 # GROUP_DATA_ROOT 必须显式传：Windows 上机器人由计划任务启动，这个 PowerShell 会话里
 # 没有它，脚本会退回默认的 data\groups，自定义群数据根就扫不到。
-function Invoke-TmpAdmin([string[]]$TmpArgs) {
+function Invoke-GroupDataAdmin([string]$Script, [string[]]$TmpArgs) {
     $bunPath = Get-BunPath
     if (-not $bunPath) {
         Err "找不到可用的 bun；请安装 Bun：https://bun.sh"
@@ -241,7 +241,7 @@ function Invoke-TmpAdmin([string[]]$TmpArgs) {
             # 与 Invoke-RelayAdmin 同理：调用点用 if (-not (...)) 收返回值，bun 的输出必须
             # 走 Out-Host 才不会被一起吞掉；路径和文件名有中文，不切 UTF-8 就是一屏乱码。
             Invoke-WithUtf8Output {
-                & $bunPath run "scripts\ops\tmp-admin.ts" @TmpArgs 2>&1 | Out-Host
+                & $bunPath run $Script @TmpArgs 2>&1 | Out-Host
             }
             return ($LASTEXITCODE -eq 0)
         } finally {
@@ -252,6 +252,25 @@ function Invoke-TmpAdmin([string[]]$TmpArgs) {
         else { Remove-Item Env:GROUP_DATA_ROOT -ErrorAction SilentlyContinue }
         Pop-Location
     }
+}
+
+function Invoke-TmpAdmin([string[]]$TmpArgs) {
+    return (Invoke-GroupDataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs)
+}
+
+# 清历史必须先把机器人停下来，不能只删文件：内存里已经建立的会话仍握着完整的消息列表，
+# 接着聊就会把旧内容重新写回去，等于白清一次。所以这里固定走「停 → 清 → 起」。
+function Clear-GroupHistory([string]$GroupId) {
+    if (-not $GroupId) {
+        Err "history-clear 需要群号：ops.ps1 history-clear <群号>"
+        return $false
+    }
+    Step "先停止机器人，确保内存中的会话不会把历史写回去"
+    $null = Stop-Bot
+    $cleared = Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" @("clear", $GroupId, "--force")
+    Step "重新启动机器人"
+    $started = Start-Bot
+    return ($cleared -and $started)
 }
 
 # git 的返回码才是判据，但 $ErrorActionPreference="Stop" 下原生命令写 stderr 会直接抛异常，
@@ -1466,6 +1485,12 @@ switch ($Command) {
         if ($User) { $tmpArgs += @("--user", $User) }
         if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
     }
+    "history-ls" {
+        if (-not (Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" @("list"))) { exit 1 }
+    }
+    "history-clear" {
+        if (-not (Clear-GroupHistory $Target)) { exit 1 }
+    }
     "uninstall" { if (-not (Uninstall-Bot)) { exit 1 } }
     default {
         Write-Host "mixin-chatbot 运维工具（Windows Server）" -ForegroundColor Cyan
@@ -1487,6 +1512,9 @@ switch ($Command) {
         Write-Host "  tmp-ls          列出各用户临时目录的占用（缓存、中间产物、截断日志）"
         Write-Host "  tmp-purge -Days <天数> | -All [-User <手机号>]"
         Write-Host "                  清理用户临时目录；-Days 只删这些天没改动过的条目"
+        Write-Host "  history-ls      列出各群的会话历史（成员数、占用、最后活动）"
+        Write-Host "  history-clear <群号>"
+        Write-Host "                  清空该群全部成员的会话历史；自动停机、清理、再启动"
         Write-Host "  uninstall       清理任务/进程/防火墙/launcher，可选清理隧道、data 和 logs"
     }
 }
