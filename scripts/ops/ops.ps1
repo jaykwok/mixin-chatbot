@@ -6,7 +6,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor -Repair
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update
 #   命令：doctor、update、repair-tunnel、uninstall-tunnel、restart、stop、start、foreground、logs、
-#         relay-ls、relay-purge、tmp-ls、tmp-purge、history-ls、history-clear、uninstall（无参数显示菜单）
+#         relay-ls、relay-purge、tmp-ls、tmp-purge、stat、history-ls、history-clear、uninstall（无参数显示菜单）
 #
 # repair-tunnel/uninstall-tunnel/restart/stop/start/uninstall 可能需要管理员权限。
 param(
@@ -21,7 +21,10 @@ param(
     # 开关，由脚本翻译成 tmp-admin.ts 的 --days/--all/--user。
     [int]$Days = -1,
     [switch]$All,
-    [string]$User = ""
+    [string]$User = "",
+    # stat 的统计区间（YYYY-MM-DD），同样翻译成脚本的 --since/--until。
+    [string]$Since = "",
+    [string]$Until = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -1485,6 +1488,13 @@ switch ($Command) {
         if ($User) { $tmpArgs += @("--user", $User) }
         if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
     }
+    "stat" {
+        $statArgs = @()
+        if ($Target) { $statArgs += $Target }
+        if ($Since)  { $statArgs += @("--since", $Since) }
+        if ($Until)  { $statArgs += @("--until", $Until) }
+        if (-not (Invoke-GroupDataAdmin "scripts\ops\stats-admin.ts" $statArgs)) { exit 1 }
+    }
     "history-ls" {
         if (-not (Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" @("list"))) { exit 1 }
     }
@@ -1512,6 +1522,8 @@ switch ($Command) {
         Write-Host "  tmp-ls          列出各用户临时目录的占用（缓存、中间产物、截断日志）"
         Write-Host "  tmp-purge -Days <天数> | -All [-User <手机号>]"
         Write-Host "                  清理用户临时目录；-Days 只删这些天没改动过的条目"
+        Write-Host "  stat [群号] [-Since <日期>] [-Until <日期>]"
+        Write-Host "                  使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
         Write-Host "  history-ls      列出各群的会话历史（成员数、占用、最后活动）"
         Write-Host "  history-clear <群号>"
         Write-Host "                  清空该群全部成员的会话历史；自动停机、清理、再启动"

@@ -4,7 +4,7 @@
 #
 # 用法：./scripts/ops/ops.sh <命令>
 #   命令：doctor、update、restart、stop、start、logs、relay-ls、relay-purge、
-#         tmp-ls、tmp-purge、history-ls、history-clear、uninstall（不带参数显示帮助）
+#         tmp-ls、tmp-purge、stat、history-ls、history-clear、uninstall（不带参数显示帮助）
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -654,6 +654,7 @@ case "${1:-}" in
     relay-purge) shift; relay_admin purge "$@" ;;
     tmp-ls)      shift; tmp_admin list "$@" ;;
     tmp-purge)   shift; tmp_admin purge "$@" ;;
+    stat)          shift; group_data_admin scripts/ops/stats-admin.ts "$@" ;;
     history-ls)    shift; group_data_admin scripts/ops/history-admin.ts list "$@" ;;
     history-clear) shift; history_clear "$@" ;;
     uninstall) uninstall ;;
@@ -674,6 +675,8 @@ case "${1:-}" in
         echo "  tmp-ls     列出各用户临时目录的占用（缓存、中间产物、截断日志）"
         echo "  tmp-purge --days <天数>|--all [--user <手机号>]"
         echo "             清理用户临时目录；--days 只删这些天没改动过的条目"
+        echo "  stat [群号] [--since <日期>] [--until <日期>]"
+        echo "             使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
         echo "  history-ls 列出各群的会话历史（成员数、占用、最后活动）"
         echo "  history-clear <群号>"
         echo "             清空该群全部成员的会话历史；自动停机、清理、再启动"

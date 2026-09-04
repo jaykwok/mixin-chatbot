@@ -10,6 +10,7 @@
     "relay": "bun run scripts/ops/relay-admin.ts",
     "tmp": "bun run scripts/ops/tmp-admin.ts",
     "history": "bun run scripts/ops/history-admin.ts",
+    "stat": "bun run scripts/ops/stats-admin.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "deadcode": "knip",

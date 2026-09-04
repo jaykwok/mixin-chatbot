@@ -142,7 +142,8 @@ data/
   重建是「一次阻塞、之后后台刷新」：进程内首次拿不到缓存时等待扫描完成，之后过期只在后台刷新并立刻返回上一版摘要——会话创建发生在 `🤔 正在思考` 回执之前，不能让用户对着空白等一次全量扫描。扫描跳过点目录（`.git`、`.venv` 等）、`node_modules` 与符号链接。
   同步盘常见的回收站、历史归档目录写进可选的 `<group>/index/ignore.txt`，每行一个 workspace 相对路径前缀，`#` 开头为注释；否则上千个已删除文件会顶掉真正的资料。
 - **历史不会自己变新**：群成员不会主动 `/clear`，会话历史只增不减，里面沉着几个月前提取的旧价格和旧文件名。所以提示词里明确要求「不要引用历史里的检索结果和提取内容，回答价格、参数、版本前重新查一遍」；需要整体重来时用 `ops.sh history-clear <群号>`（见[日常运维](#日常运维)）。该命令只删 `session.jsonl`，并且会先停机再清理——内存里已建立的会话仍持有完整消息列表，开着机删文件只清掉磁盘那一份，聊下去又会写回来。
-- **文档解析环境** `<group>/venv/`：资料以 `.pptx` / `.docx` / `.xlsx` / `.pdf` 为主，而 `read` 对二进制文件只会返回乱码，必须用 Python 提取。启动时按群预建该环境并安装 `python-pptx`、`python-docx`、`openpyxl`、`pypdf`，解释器路径导出为 `$PI_PYTHON`。建环境要联网装包，因此**从不阻塞**会话创建：提示词按当前是否就绪切换措辞——就绪时告诉模型「已装好、直接用」，未就绪时退回「自己用 uv 创建」，绝不对模型宣称不存在的东西已经装好。机器上没有 `uv` 时整体降级，不影响服务启动。
+  `session.jsonl` 同时是 `ops.sh stat` 的唯一数据源，清空后那段使用记录就找不回来了；要留数据的话先跑一次 `stat` 把数字抄走。
+- **文档解析环境** `<group>/venv/`：资料以 `.pptx` / `.docx` / `.xlsx` / `.pdf` 为主，而 `read` 对二进制文件只会返回乱码，必须用 Python 提取。启动时按群预建该环境，装 `python-pptx`、`python-docx`、`openpyxl`、`pypdf` 用于提取文本，再装 `pandas`、`numpy`、`python-dateutil`、`xlsxwriter`、`pillow` 用于按资料生成交付物；解释器路径导出为 `$PI_PYTHON`。清单变化时会就地补装（`uv venv --allow-existing`），不重建、不影响手动加装的包。建环境要联网装包，因此**从不阻塞**会话创建：提示词按当前是否就绪切换措辞——就绪时告诉模型「已装好、直接用」，未就绪时退回「自己用 uv 创建」，绝不对模型宣称不存在的东西已经装好。机器上没有 `uv` 时整体降级，不影响服务启动。
 
 ### 系统提示词
 
@@ -365,6 +366,7 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 ./scripts/ops/ops.sh relay-purge <关键字>|--all  # 删除匹配的外链对象并清掉索引记录
 ./scripts/ops/ops.sh tmp-ls     # 列出各用户临时目录的占用
 ./scripts/ops/ops.sh tmp-purge --days 7          # 清理 7 天没改动过的临时文件（--all 全清，--user 限定单人）
+./scripts/ops/ops.sh stat       # 各群使用概览；带群号看明细，--since/--until 限定统计区间
 ./scripts/ops/ops.sh history-ls # 列出各群的会话历史（成员数、占用、最后活动）
 ./scripts/ops/ops.sh history-clear <群号>        # 清空该群全部成员的会话历史（自动停机→清理→启动）
 ./scripts/ops/ops.sh stop       # 停止
@@ -393,6 +395,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-ls   # 列出
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-purge <关键字>|--all # 删除匹配的外链对象并清掉索引记录
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 tmp-ls     # 列出各用户临时目录的占用
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 tmp-purge -Days 7 # 清理 7 天没改动过的临时文件（-All 全清，-User 限定单人）
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 stat [群号] -Since 2026-09-01 # 使用统计（人数、提问数、发出的资料数）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 history-ls  # 列出各群的会话历史（成员数、占用、最后活动）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 history-clear <群号> # 清空该群全部成员的会话历史（自动停机→清理→启动）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 stop       # 停止
