@@ -37,7 +37,9 @@ function expectedMarker(): string {
 export async function documentToolchainReady(venvDir: string): Promise<boolean> {
   try {
     const marker = await readFile(markerPath(venvDir), "utf8");
-    return marker.trim() === expectedMarker();
+    // 换行归一化：运维在 Windows 上手写这个文件会写成 CRLF，逐字比对就会失配，
+    // 于是每次启动都重建一遍 venv——无声，只是慢，而且会抹掉手动加装的包。
+    return marker.replace(/\r\n?/g, "\n").trim() === expectedMarker();
   } catch {
     return false;
   }
