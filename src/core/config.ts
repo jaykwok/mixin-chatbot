@@ -132,14 +132,24 @@ export const MATERIALS_INDEX_MAX_DEPTH = integerEnv("BOT_INDEX_MAX_DEPTH", 12, 1
 
 // ===== 文档解析环境 =====
 /**
- * 提取 pptx/docx/xlsx/pdf 文本所需的 Python 包。装在 <group>/venv，与 workspace 平级：
+ * 群共享 Python 环境预装的包：前四个用于提取 pptx/docx/xlsx/pdf 的文本，其余用于按资料
+ * 生成交付物（算表、出 Excel、处理图片）。装在 <group>/venv，与 workspace 平级：
  * workspace 是同步盘镜像，往里写 .venv 会被下一次同步删掉，也污染同步源。
+ *
+ * 这份清单同时是就绪标记的内容和提示词里那句「均已安装」的来源，改动它会让所有群在
+ * 下次启动时重建 venv——因此临时需要的冷门包不要加进来，提示词已经告诉模型自行 uv pip
+ * install 到同一个解释器。
  */
 export const DOCUMENT_TOOLCHAIN_PACKAGES = [
   "python-pptx",
   "python-docx",
   "openpyxl",
   "pypdf",
+  "pandas",
+  "numpy",
+  "python-dateutil",
+  "xlsxwriter",
+  "pillow",
 ] as const;
 /** 建环境 + 装包的总时限（ms）。超时视为不可用，提示词自动降级。 */
 export const DOCUMENT_TOOLCHAIN_TIMEOUT = 10 * 60_000;
