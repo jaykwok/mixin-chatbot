@@ -4,6 +4,27 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { buildLocalTools } from "../../src/agent/local-tools.ts";
 import { isPathInside } from "../../src/agent/paths.ts";
+import { venvPythonPath } from "../../src/agent/python-toolchain.ts";
+
+/** venv 与资料索引都住在 workspace 外面，和线上 <group>/ 下的布局保持一致。 */
+const venvDirFor = (root: string) => join(root, "venv");
+const indexPathFor = (root: string) => join(root, "index", "materials.md");
+
+function toolsFor(
+  root: string,
+  workspace: string,
+  userTemp: string,
+  groupId = "group-a"
+) {
+  return buildLocalTools({
+    workspaceDir: workspace,
+    tempDir: userTemp,
+    phone: "+8613800000000",
+    groupId,
+    venvDir: venvDirFor(root),
+    materialsIndexPath: indexPathFor(root),
+  });
+}
 
 describe("local Pi tool boundaries", () => {
   test("file tools allow workspace and caller tmp but reject other paths", async () => {
@@ -18,12 +39,7 @@ describe("local Pi tool boundaries", () => {
     ]);
 
     try {
-      const tools = await buildLocalTools(
-        workspace,
-        userTemp,
-        "+8613800000000",
-        "group-a"
-      );
+      const tools = await toolsFor(root, workspace, userTemp);
       const read = tools.find((tool) => tool.name === "read")!;
       const write = tools.find((tool) => tool.name === "write")!;
 
@@ -77,12 +93,7 @@ describe("local Pi tool boundaries", () => {
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
     try {
-      const tools = await buildLocalTools(
-        workspace,
-        userTemp,
-        "+8613800000000",
-        groupId
-      );
+      const tools = await toolsFor(root, workspace, userTemp, groupId);
       const bash = tools.find((tool) => tool.name === "bash")!;
       const context = {
         sessionManager: {
@@ -97,17 +108,20 @@ describe("local Pi tool boundaries", () => {
         "bash-env",
         {
           command:
-            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR|$VIRTUAL_ENV|$UV_PROJECT_ENVIRONMENT|$PYTHONIOENCODING|$PYTHON_BASIC_REPL|$AI_AGENT|$PI_CODING_AGENT"',
+            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR|$VIRTUAL_ENV|$UV_PROJECT_ENVIRONMENT|$PI_PYTHON|$PI_MATERIALS_INDEX|$PYTHONIOENCODING|$PYTHONUTF8|$LANG|$PYTHON_BASIC_REPL|$AI_AGENT|$PI_CODING_AGENT"',
           mutates: [],
         },
         undefined,
         undefined,
         context
       );
+      // venv 与索引都在 workspace 外：workspace 是同步盘镜像，写进去会被同步删掉。
       expect(envResult.content[0]).toMatchObject({
         type: "text",
-        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${join(workspace, ".venv")}|${join(workspace, ".venv")}|utf-8|1|pi|true`,
+        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${venvDirFor(root)}|${venvDirFor(root)}|${venvPythonPath(venvDirFor(root))}|${indexPathFor(root)}|utf-8|1|C.UTF-8|1|pi|true`,
       });
+      expect(isPathInside(venvDirFor(root), workspace)).toBe(false);
+      expect(isPathInside(indexPathFor(root), workspace)).toBe(false);
 
       const outputResult = await bash.execute(
         "bash-output",
@@ -143,12 +157,7 @@ describe("local Pi tool boundaries", () => {
     await writeFile(join(workspace, "shared.txt"), "initial", "utf8");
 
     try {
-      const tools = await buildLocalTools(
-        workspace,
-        userTemp,
-        "+8613800000000",
-        "group-a"
-      );
+      const tools = await toolsFor(root, workspace, userTemp);
       const bash = tools.find((tool) => tool.name === "bash")!;
       const write = tools.find((tool) => tool.name === "write")!;
       const context = {
@@ -229,12 +238,7 @@ describe("local Pi tool boundaries", () => {
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
     try {
-      const tools = await buildLocalTools(
-        workspace,
-        userTemp,
-        "+8613800000000",
-        "group-a"
-      );
+      const tools = await toolsFor(root, workspace, userTemp);
       const bash = tools.find((tool) => tool.name === "bash")!;
       const context = {
         sessionManager: {
@@ -264,6 +268,67 @@ describe("local Pi tool boundaries", () => {
     }
   });
 
+  test("read reaches the material index outside the workspace but cannot write there", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-index-"));
+    const workspace = join(root, "workspace");
+    const userTemp = join(root, "user-tmp");
+    await Promise.all([
+      mkdir(workspace),
+      mkdir(userTemp),
+      mkdir(join(root, "index")),
+    ]);
+    await writeFile(indexPathFor(root), "产品资料/手册.pptx | 2.0 MB | 2026-01-01", "utf8");
+
+    try {
+      const tools = await toolsFor(root, workspace, userTemp);
+      const read = tools.find((tool) => tool.name === "read")!;
+      const write = tools.find((tool) => tool.name === "write")!;
+
+      // 索引不能放进 workspace（同步盘镜像），但模型必须读得到它，否则每次查清单
+      // 都要先吃一次「只能访问」的拒绝，白白浪费一轮。
+      const result = await read.execute(
+        "read-index",
+        { path: indexPathFor(root) },
+        undefined,
+        undefined,
+        {} as never
+      );
+      expect(
+        result.content
+          .filter((item) => item.type === "text")
+          .map((item) => item.text)
+          .join("\n")
+      ).toContain("产品资料/手册.pptx");
+
+      // 只读放行到此为止：索引由适配层生成，模型不该改写它。edit 走的是另一条
+      // operations 分支（access 而非 readFile），必须一起挡住。
+      await expect(
+        write.execute(
+          "write-index",
+          { path: indexPathFor(root), content: "tampered" },
+          undefined,
+          undefined,
+          {} as never
+        )
+      ).rejects.toThrow("只能访问");
+      const edit = tools.find((tool) => tool.name === "edit")!;
+      await expect(
+        edit.execute(
+          "edit-index",
+          {
+            path: indexPathFor(root),
+            edits: [{ oldText: "产品资料/手册.pptx", newText: "伪造.pptx" }],
+          } as never,
+          undefined,
+          undefined,
+          {} as never
+        )
+      ).rejects.toThrow("只能访问");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("read detects images with Pi's sniffer, still behind the path guard", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-image-"));
     const workspace = join(root, "workspace");
@@ -284,12 +349,7 @@ describe("local Pi tool boundaries", () => {
     ]);
 
     try {
-      const tools = await buildLocalTools(
-        workspace,
-        userTemp,
-        "+8613800000000",
-        "group-a"
-      );
+      const tools = await toolsFor(root, workspace, userTemp);
       const read = tools.find((tool) => tool.name === "read")!;
       const readText = async (path: string): Promise<string> => {
         const result = await read.execute(

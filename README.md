@@ -53,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1
 
 机器人只接收**文字**消息（群聊 webhook）。Pi agent 拿到后可调用工具：
 
-- 官方工厂：`read` / `bash` / `edit` / `write`（cwd 为本群共享的 `<GROUP_DATA_ROOT>/<group>/workspace`；文件工具只允许访问该 workspace 与当前用户 tmp）
+- 官方工厂：`read` / `bash` / `edit` / `write`（cwd 为本群共享的 `<GROUP_DATA_ROOT>/<group>/workspace`；文件工具只允许访问该 workspace 与当前用户 tmp，另对 `<group>/index/` 只读放行）
 - 自定义：`send_image` / `send_file`（往群里发送图片或文件；配置了[大文件外链分发](#大文件外链分发可选)后，超过 25MB 的文件自动改发下载链接）
 
 规范化后的普通文字任务开始时只发送一条 `🤔 正在思考...` 作为接单确认；工具调用和长任务过程不发送周期心跳，只在任务完成、失败、收到指令或确实需要排队时再发消息，避免刷屏。
@@ -113,7 +113,11 @@ data/
 │   └── relay-index.jsonl           # 外链去重索引 + 过期回收清单（丢失会导致重传一次，且已发出的对象无人回收）
 └── groups/                         # 默认 GROUP_DATA_ROOT
     └── <group>/
-        ├── workspace/
+        ├── workspace/              # 资料库（外部同步盘镜像，只放资料）
+        ├── index/
+        │   ├── materials.md        # 自动生成的资料清单，供模型 grep
+        │   └── ignore.txt          # 可选：人工维护的排除前缀，每行一个
+        ├── venv/                   # 文档解析用的共享 Python 环境
         └── users/<phone>/
             ├── tmp/
             └── session.jsonl
@@ -127,6 +131,28 @@ data/
 - **开发开关**：生产环境缺少有效 `data/config/webhook-secret` 时服务拒绝启动；只有隔离的本地调试可显式设置 `ALLOW_INSECURE_WEBHOOK=1`。`BOT_DEBUG=1` 会记录用户消息正文，默认关闭。
 - **负载上限**：`BOT_MAX_ACTIVE_REQUESTS` 控制已确认但尚未完成的 Pi 后台任务数，默认 `32`，有效范围 `1–1000`；达到上限的新请求不启动模型，而是通过 callback 明确通知当前用户稍后重发。
 - **bash 默认时限**：`BOT_BASH_TIMEOUT` 控制模型未显式声明 `timeout` 时 bash 命令的上限秒数，默认 `600`，有效范围 `10–3600`。Pi 官方 bash 默认不限时，而群聊里没人盯着终端：一条挂死的命令会永久占住这一轮 prompt，用户只收到「正在思考」，后续消息全部退化成 steer，任务槽位也不再释放。模型显式声明的 `timeout` 始终优先。
+- **资料索引**：`BOT_INDEX_TTL_MINUTES` 控制清单重建间隔，默认 `5`，有效范围 `1–1440`（实测 1250 个文件的全量扫描约 60ms，且除进程内第一次外都在后台刷新，没有理由让新同步进来的资料等更久）；`BOT_INDEX_MAX_FILES`（默认 `50000`）与 `BOT_INDEX_MAX_DEPTH`（默认 `12`）是防止异常目录树吃光内存的兜底上限。详见[资料索引与文档解析](#资料索引与文档解析)。
+
+### 资料索引与文档解析
+
+群 `workspace` 的定位是**资料库**：内容来自外部同步盘，按约定只存放资料。因此机器人自己需要的两样东西都放在 workspace 外面、与它平级——写进去既污染同步源，也会被下一次同步删掉。
+
+- **资料清单** `<group>/index/materials.md`：启动时和会话创建时按 TTL 重建，每行一个文件、格式为 `相对路径 | 大小 | 修改日期`，按路径排序。提示词只注入清单路径（也导出为 `$PI_MATERIALS_INDEX`）和顶层目录**名**，正文交给模型 `grep`，避免上千行清单挤占每一轮的上下文。文件工具对 `<group>/index/` **只读**放行：模型读得到清单，但改不了它。
+  提示词里刻意不写文件总数和每个目录的文件数，尽管手里就有——见[系统提示词](#系统提示词)里的缓存约束。
+  重建是「一次阻塞、之后后台刷新」：进程内首次拿不到缓存时等待扫描完成，之后过期只在后台刷新并立刻返回上一版摘要——会话创建发生在 `🤔 正在思考` 回执之前，不能让用户对着空白等一次全量扫描。扫描跳过点目录（`.git`、`.venv` 等）、`node_modules` 与符号链接。
+  同步盘常见的回收站、历史归档目录写进可选的 `<group>/index/ignore.txt`，每行一个 workspace 相对路径前缀，`#` 开头为注释；否则上千个已删除文件会顶掉真正的资料。
+- **历史不会自己变新**：群成员不会主动 `/clear`，会话历史只增不减，里面沉着几个月前提取的旧价格和旧文件名。所以提示词里明确要求「不要引用历史里的检索结果和提取内容，回答价格、参数、版本前重新查一遍」；需要整体重来时用 `ops.sh history-clear <群号>`（见[日常运维](#日常运维)）。该命令只删 `session.jsonl`，并且会先停机再清理——内存里已建立的会话仍持有完整消息列表，开着机删文件只清掉磁盘那一份，聊下去又会写回来。
+- **文档解析环境** `<group>/venv/`：资料以 `.pptx` / `.docx` / `.xlsx` / `.pdf` 为主，而 `read` 对二进制文件只会返回乱码，必须用 Python 提取。启动时按群预建该环境并安装 `python-pptx`、`python-docx`、`openpyxl`、`pypdf`，解释器路径导出为 `$PI_PYTHON`。建环境要联网装包，因此**从不阻塞**会话创建：提示词按当前是否就绪切换措辞——就绪时告诉模型「已装好、直接用」，未就绪时退回「自己用 uv 创建」，绝不对模型宣称不存在的东西已经装好。机器上没有 `uv` 时整体降级，不影响服务启动。
+
+### 系统提示词
+
+岗位上下文经 `appendSystemPromptOverride` 追加在 Pi 默认基座之后（保留基座是为了让工具清单和 Pi 随工具版本演进的 guidelines 继续跟着上游走）。追加内容按「角色 → 资料库 → 读文档 → 发文件 → 并发 → 临时目录」排列，其中资料索引段与 Python 段按当前就绪状态生成——不对模型宣称不存在的东西已经装好。
+
+基座里唯一被剪掉的是「pi 自身文档导航」那一段（`src/agent/system-prompt-trim.ts`）：它告诉模型 pi 的 README/docs/examples 在哪、问到 extensions/themes/skills/TUI 时读哪个 `.md`，而本项目 `noExtensions`/`noSkills`/`noPromptTemplates`/`noThemes` 全为 true，这些能力一个都没开；它给的路径又在 `node_modules` 下，文件工具只放行 workspace 与调用者 tmp，模型真去 `read` 只会先撞一次边界错误。实测它占基座 2719 字符中的 1244 字符（46%）。
+
+**提示词必须逐字稳定**，这是这一段最硬的约束。请求的结构是 `[system prompt][历史消息…]`，前缀缓存按最长公共前缀匹配：system prompt 变一个字符，后面整段历史就要按全价重新计费。而这段上下文是**建会话时算一次**的，会话空闲 30 分钟即释放，群聊又是突发式的——同一个人隔天回来就是一次重建。所以提示词里不写任何会随时间变化的值：资料清单只给路径和顶层目录**名**，不给文件总数、不给每个目录的文件数（这些数字模型用不上，清单文件头部本来就有）。实测缓存承担了 92% 的提示 token，护住它远比省几百 token 重要。同理，全段里唯一按用户变化的「临时目录」排在最末，前面的内容对全群逐字相同。这两条都有测试锁着。
+
+剪裁走 Pi 的 `before_agent_start` 扩展事件（`event.systemPrompt` 是组装完成的完整 prompt），而不是 `systemPromptOverride` 整体替换基座——后者会把工具清单和 guidelines 一起丢掉，等于冻结在今天的版本。段落结尾靠「连续的 `- ` 列表项到此为止」判断，不能用 `Current working directory:` 之类的尾部锚点：Pi 的组装顺序是 基座 + 追加内容 + cwd 行，用尾部锚点会把整段岗位上下文一起切掉，而 prompt 看上去仍是完整的一份。定位不到时原样放行并记一条 warn，退化成不剪裁的行为。
 
 ### 大文件外链分发（可选）
 
@@ -281,7 +307,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update
 
 `update` 负责同步到 `origin/main`、装依赖、重启服务并跑一次体检，失败自动回滚；工作区不干净或与远端分叉时会先停下来。Linux 侧会把重建交给 `deploy.sh`，途中的端口、模式、域名、群数据根等提示**直接回车即沿用现有配置**。边界与回滚范围见[日常运维](#日常运维)一节。
 
-默认配置下，群共享成果保存在 `data/groups/<group>/workspace/`；当前用户的临时文件和会话历史分别保存在 `data/groups/<group>/users/<phone>/tmp/` 与 `data/groups/<group>/users/<phone>/session.jsonl`，更新不丢失。
+默认配置下，群资料库在 `data/groups/<group>/workspace/`，机器人生成的资料清单与文档解析环境在同级的 `index/`、`venv/`；当前用户的临时文件和会话历史分别保存在 `data/groups/<group>/users/<phone>/tmp/` 与 `data/groups/<group>/users/<phone>/session.jsonl`，更新不丢失。
 
 ### Cloudflare 模式（云电脑）部署
 
@@ -339,6 +365,8 @@ Windows 管理员部署会优先创建“开机启动、无需用户登录”的
 ./scripts/ops/ops.sh relay-purge <关键字>|--all  # 删除匹配的外链对象并清掉索引记录
 ./scripts/ops/ops.sh tmp-ls     # 列出各用户临时目录的占用
 ./scripts/ops/ops.sh tmp-purge --days 7          # 清理 7 天没改动过的临时文件（--all 全清，--user 限定单人）
+./scripts/ops/ops.sh history-ls # 列出各群的会话历史（成员数、占用、最后活动）
+./scripts/ops/ops.sh history-clear <群号>        # 清空该群全部成员的会话历史（自动停机→清理→启动）
 ./scripts/ops/ops.sh stop       # 停止
 ./scripts/ops/ops.sh uninstall  # 卸载（容器，可选清 image/cloudflared/data）
 ```
@@ -365,6 +393,8 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-ls   # 列出
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-purge <关键字>|--all # 删除匹配的外链对象并清掉索引记录
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 tmp-ls     # 列出各用户临时目录的占用
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 tmp-purge -Days 7 # 清理 7 天没改动过的临时文件（-All 全清，-User 限定单人）
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 history-ls  # 列出各群的会话历史（成员数、占用、最后活动）
+powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 history-clear <群号> # 清空该群全部成员的会话历史（自动停机→清理→启动）
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 stop       # 停止
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall-tunnel # 停止并卸载 Cloudflared 服务
 powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理 task/进程/防火墙/launcher，可选清隧道/data/logs
@@ -430,7 +460,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 uninstall  # 清理
 <details>
 <summary><b>群共享工作区 + 用户临时区</b></summary>
 
-每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace`，只存长期成果及该群共用的 `.venv`；每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip/uv 缓存指向用户临时区，同时把 `VIRTUAL_ENV` / `UV_PROJECT_ENVIRONMENT` 固定到群 workspace 的 `.venv`，把 `PYTHONIOENCODING` 固定为 UTF-8，用 `PYTHON_BASIC_REPL=1` 关掉 Python 3.13+ 的新版 REPL（Windows 上空 heredoc 会被 Git Bash 优化成 `< /dev/null`，即 NUL 字符设备，`isatty` 为真使 `python -` 误判为交互式，新版 REPL 随即在 NUL 句柄上取控制台尺寸失败并无限刷 traceback，命令永不退出），并按 Pi 通用约定注入 `AI_AGENT=pi` 与 `PI_CODING_AGENT=true`（Pi 只在自己的 CLI/RPC 入口设这两个标记，内嵌 SDK 时需要显式导出）；Pi 因输出截断产生的完整日志也会迁入这里。这些中间产物不会自动回收（缓存、解压产物、被截断的完整输出日志会一直堆积），用 `ops.sh tmp-ls` / `tmp-purge` 查看和清理，删掉只影响下次的速度。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
+每个群共用 `<GROUP_DATA_ROOT>/<group>/workspace` 作为资料库（外部同步盘镜像，只放资料）；机器人自己生成的资料清单与文档解析环境放在与之平级的 `<group>/index/`、`<group>/venv/`，见[资料索引与文档解析](#资料索引与文档解析)。每次任务的下载、缓存、草稿和转换中间产物放在当前调用用户的 `<GROUP_DATA_ROOT>/<group>/users/<phone>/tmp`。bash 使用 Pi 官方 `createBashToolDefinition` 的 `spawnHook`，自动把该会话的 `TMPDIR`、`TMP`、`TEMP` 以及常见 npm/Bun/pip/uv 缓存指向用户临时区，同时把 `VIRTUAL_ENV` / `UV_PROJECT_ENVIRONMENT` 指向 `<group>/venv` 并以 `PI_PYTHON` 导出其解释器路径，把 `PYTHONIOENCODING` 与 `PYTHONUTF8` 固定为 UTF-8（前者只管住 stdout/stderr，`open()` 的默认编码仍随系统 ANSI 代码页走，在中文 Windows 上就是 GBK），把 `LANG` / `LC_ALL` 设为 `C.UTF-8`（Git Bash 默认 locale 为 C，coreutils 会把中文文件名转义成八进制打印，而资料文件名几乎全是中文），用 `PYTHON_BASIC_REPL=1` 关掉 Python 3.13+ 的新版 REPL（Windows 上空 heredoc 会被 Git Bash 优化成 `< /dev/null`，即 NUL 字符设备，`isatty` 为真使 `python -` 误判为交互式，新版 REPL 随即在 NUL 句柄上取控制台尺寸失败并无限刷 traceback，命令永不退出），并按 Pi 通用约定注入 `AI_AGENT=pi` 与 `PI_CODING_AGENT=true`（Pi 只在自己的 CLI/RPC 入口设这两个标记，内嵌 SDK 时需要显式导出）；Pi 因输出截断产生的完整日志也会迁入这里。这些中间产物不会自动回收（缓存、解压产物、被截断的完整输出日志会一直堆积），用 `ops.sh tmp-ls` / `tmp-purge` 查看和清理，删掉只影响下次的速度。会话按 **(群, phone)** 分开，保存在 `<GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl`，避免不同成员的话题历史分散模型注意力。`groupId` 不适合作为跨平台目录名时改用带 `sha256-` 前缀的完整摘要，防路径穿越和命名碰撞。
 
 </details>
 
@@ -494,6 +524,9 @@ mixin-chatbot/
 │   │   ├── failure.ts          # 失败回执：分类结论 + 脱敏后的报错原文
 │   │   ├── workspace-coordinator.ts # 同文件 FIFO、多文件并发与 bash 声明式路径锁
 │   │   ├── local-tools.ts      # Pi 官方工具工厂 + 路径/临时环境适配
+│   │   ├── materials-index.ts  # 资料清单生成（写在 workspace 外，供模型 grep）
+│   │   ├── python-toolchain.ts # 群共享文档解析环境的预建与就绪判定
+│   │   ├── system-prompt-trim.ts # 剪掉 Pi 基座里的 pi 自身文档导航段
 │   │   ├── paths.ts            # 群优先的数据目录布局与安全目录名
 │   │   └── send-tools.ts       # 发送工具 send_image / send_file（含外链分流）
 │   ├── core/                   # 共享基础设施
@@ -524,7 +557,7 @@ mixin-chatbot/
 │   ├── config/          # models.json、webhook-secret、tunnel-token
 │   ├── state/           # 部署状态及 cloudflared PID/归属标记
 │   ├── runtime/         # Windows launcher、Pi 可重建运行目录
-│   └── groups/          # <group>/workspace + users/<phone>/{tmp,session.jsonl}
+│   └── groups/          # <group>/{workspace,index,venv} + users/<phone>/{tmp,session.jsonl}
 ├── logs/                # 应用日志
 ├── Dockerfile           # oven/bun:1-debian
 └── package.json
@@ -559,7 +592,7 @@ mixin-chatbot/
 - 请求去重（30 秒内相同请求跳过）及按 `(群, phone)` 隔离的 10 RPM 入站窗口
 - Pi 后台在途任务默认最多 32 个（`BOT_MAX_ACTIVE_REQUESTS`）；超限请求 ACK 后通过 callback 通知用户重发
 - 错误信息脱敏（仅记日志，不回传用户）
-- read/write/edit 文件工具会解析真实路径，只允许本群 workspace 与当前用户 tmp，阻止 `..` 和符号链接越界。
+- read/write/edit 文件工具会解析真实路径，只允许本群 workspace 与当前用户 tmp，阻止 `..` 和符号链接越界；`<group>/index/`（资料清单）额外只读放行，写入仍被拒绝。
 - ⚠️ `bash` 仍是**非 cwd 沙箱**，可执行任意命令，权限=bot 进程用户；cwd 和临时环境不是 OS 级隔离。仅可信群成员可触发，生产优先使用只读、非 root、丢弃 capabilities 的 Docker 部署。若以后要求对不可信用户开放，应整体接入 Gondolin/容器级沙箱，而不是依赖 shell 字符串过滤。
 
 ### 系统层（`scripts/deploy/setup-server.sh`）

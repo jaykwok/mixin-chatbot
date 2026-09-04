@@ -107,6 +107,43 @@ export const MAX_ACTIVE_REQUESTS = integerEnv(
  */
 export const BASH_DEFAULT_TIMEOUT = integerEnv("BOT_BASH_TIMEOUT", 600, 10, 3600);
 
+// ===== 资料索引 =====
+/**
+ * 索引重建间隔（ms）。workspace 由外部同步盘镜像，新资料随时可能出现。
+ *
+ * 默认值定得短，是因为实测一次全量扫描（1250 个文件）只要 60ms，而且除进程内第一次
+ * 之外都在后台刷新、不阻塞任何人——没有理由让新同步进来的资料等上十几分钟。
+ */
+export const MATERIALS_INDEX_TTL = integerEnv(
+  "BOT_INDEX_TTL_MINUTES",
+  5,
+  1,
+  1440
+) * 60_000;
+/** 单次扫描收录的文件数上限，防止异常巨大的目录树吃光内存与磁盘。 */
+export const MATERIALS_INDEX_MAX_FILES = integerEnv(
+  "BOT_INDEX_MAX_FILES",
+  50_000,
+  100,
+  1_000_000
+);
+/** 目录递归深度上限；同步盘里的深层归档超过此深度只统计不逐条列出。 */
+export const MATERIALS_INDEX_MAX_DEPTH = integerEnv("BOT_INDEX_MAX_DEPTH", 12, 1, 64);
+
+// ===== 文档解析环境 =====
+/**
+ * 提取 pptx/docx/xlsx/pdf 文本所需的 Python 包。装在 <group>/venv，与 workspace 平级：
+ * workspace 是同步盘镜像，往里写 .venv 会被下一次同步删掉，也污染同步源。
+ */
+export const DOCUMENT_TOOLCHAIN_PACKAGES = [
+  "python-pptx",
+  "python-docx",
+  "openpyxl",
+  "pypdf",
+] as const;
+/** 建环境 + 装包的总时限（ms）。超时视为不可用，提示词自动降级。 */
+export const DOCUMENT_TOOLCHAIN_TIMEOUT = 10 * 60_000;
+
 // ===== Session 缓存 =====
 /** 空闲会话从内存释放；历史仍保留在 jsonl，下次自动重开。 */
 export const SESSION_IDLE_TTL = 30 * 60_000;

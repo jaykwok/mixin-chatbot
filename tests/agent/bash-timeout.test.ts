@@ -21,12 +21,14 @@ describe("bash default timeout", () => {
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
     try {
-      const tools = await buildLocalTools(
-        workspace,
-        userTemp,
-        "+8613800000000",
-        "group-a"
-      );
+      const tools = await buildLocalTools({
+        workspaceDir: workspace,
+        tempDir: userTemp,
+        phone: "+8613800000000",
+        groupId: "group-a",
+        venvDir: join(root, "venv"),
+        materialsIndexPath: join(root, "index", "materials.md"),
+      });
       const bash = tools.find((tool) => tool.name === "bash")!;
       const context = {
         sessionManager: {

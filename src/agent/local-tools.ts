@@ -25,6 +25,7 @@ import {
 import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
 import { log } from "../core/log.ts";
 import { isPathInside } from "./paths.ts";
+import { venvPythonPath } from "./python-toolchain.ts";
 import {
   runFileMutation,
   runFileMutations,
@@ -57,18 +58,47 @@ function shellQuote(value: string): string {
 }
 
 class AllowedPathGuard {
-  private constructor(private readonly roots: string[]) {}
+  private constructor(
+    private readonly roots: string[],
+    /**
+     * 可读但不可写的目录。资料索引住在 workspace 外面（workspace 是同步盘镜像，只放
+     * 资料），模型仍然需要能 read 它——否则每次查索引都要先吃一次「只能访问」的拒绝。
+     */
+    private readonly readOnlyRoots: string[]
+  ) {}
 
-  static async create(roots: string[]): Promise<AllowedPathGuard> {
-    return new AllowedPathGuard(
-      await Promise.all(roots.map((root) => realpath(resolve(root))))
+  static async create(
+    roots: string[],
+    readOnlyRoots: string[] = []
+  ): Promise<AllowedPathGuard> {
+    const canonical = await Promise.all(
+      roots.map((root) => realpath(resolve(root)))
     );
+    // 只读根是可选能力，目录还没建出来时安静跳过，不能因此让整套工具建不起来。
+    const canonicalReadOnly = (
+      await Promise.all(
+        readOnlyRoots.map((root) => realpath(resolve(root)).catch(() => null))
+      )
+    ).filter((root): root is string => root !== null);
+    return new AllowedPathGuard(canonical, canonicalReadOnly);
   }
 
   private assertInside(path: string): void {
     if (!this.roots.some((root) => isPathInside(path, root))) {
       throw new Error("文件工具只能访问本群 workspace 或当前调用用户 tmp");
     }
+  }
+
+  private assertReadable(path: string): void {
+    if (this.readOnlyRoots.some((root) => isPathInside(path, root))) return;
+    this.assertInside(path);
+  }
+
+  /** 读取路径：可写根 + 只读根。 */
+  async readable(path: string): Promise<string> {
+    const canonical = await realpath(resolve(path));
+    this.assertReadable(canonical);
+    return canonical;
   }
 
   async existing(path: string): Promise<string> {
@@ -127,7 +157,9 @@ function createBashTool(
   cwd: string,
   tempDir: string,
   phone: string,
-  groupId: string
+  groupId: string,
+  venvDir: string,
+  materialsIndexPath: string
 ): ToolDefinition<typeof coordinatedBashSchema> {
   const callerEnvironment = {
     TMPDIR: tempDir,
@@ -138,9 +170,19 @@ function createBashTool(
     BUN_INSTALL_CACHE_DIR: join(tempDir, ".bun-install-cache"),
     PIP_CACHE_DIR: join(tempDir, ".cache", "pip"),
     UV_CACHE_DIR: join(tempDir, ".cache", "uv"),
-    UV_PROJECT_ENVIRONMENT: join(cwd, ".venv"),
-    VIRTUAL_ENV: join(cwd, ".venv"),
+    // 文档解析环境在 workspace 外：workspace 是同步盘镜像，往里建 .venv 会污染同步源，
+    // 并被下一次同步删掉。
+    UV_PROJECT_ENVIRONMENT: venvDir,
+    VIRTUAL_ENV: venvDir,
     PYTHONIOENCODING: "utf-8",
+    // PYTHONIOENCODING 只管住 stdout/stderr；open() 的默认编码仍随系统 ANSI 代码页走，
+    // 在中文 Windows 上就是 GBK，读写 UTF-8 中间文件会直接乱码或抛 UnicodeDecodeError。
+    // PYTHONUTF8 等价于每条命令都加 -X utf8，模型不必再自己想起来加。
+    PYTHONUTF8: "1",
+    // Git Bash 默认 locale 为 C，coreutils 会把中文文件名转义成八进制打印，模型据此
+    // 拼出的路径打不开文件。资料文件名几乎全是中文，这里必须显式声明 UTF-8。
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
     // Git Bash turns an empty heredoc into `< /dev/null`, which on Windows is the
     // NUL character device, and the CRT reports isatty(NUL) as true. `python -`
     // therefore believes it is interactive and starts the 3.13+ _pyrepl, whose
@@ -152,6 +194,10 @@ function createBashTool(
     PI_CALLER_PHONE: phone,
     PI_GROUP_ID: groupId,
     PI_USER_TMP: tempDir,
+    // 解释器路径与索引位置都随群/平台变化，写死在提示词里迟早会过期；导出成变量后
+    // 模型只要 "$PI_PYTHON"、"$PI_MATERIALS_INDEX" 即可，也不用再去探测 Scripts/ 还是 bin/。
+    PI_PYTHON: venvPythonPath(venvDir),
+    PI_MATERIALS_INDEX: materialsIndexPath,
     // Pi sets both markers itself, but only in its own CLI/RPC entrypoints. This
     // process embeds the SDK, so child commands need them exported explicitly.
     AI_AGENT: "pi",
@@ -314,22 +360,37 @@ function coordinateFileTool<T extends ToolDefinition<any, any, any>>(
   return { ...tool, execute };
 }
 
+export interface LocalToolsOptions {
+  /** 群共享 workspace，同时是 agent 的 cwd。 */
+  workspaceDir: string;
+  /** 当前调用用户的临时目录。 */
+  tempDir: string;
+  phone: string;
+  groupId: string;
+  /** 文档解析用的群共享 venv，位于 workspace 之外。 */
+  venvDir: string;
+  /** 资料索引文件路径；所在目录对 read 只读放行。 */
+  materialsIndexPath: string;
+}
+
 /** Pi 官方工具工厂 + 本项目的 workspace/tmp 边界和调用者环境。 */
 export async function buildLocalTools(
-  cwd: string,
-  tempDir: string,
-  phone: string,
-  groupId: string
+  options: LocalToolsOptions
 ): Promise<ToolDefinition[]> {
-  const guard = await AllowedPathGuard.create([cwd, tempDir]);
+  const { workspaceDir: cwd, tempDir, phone, groupId, venvDir } = options;
+  const indexPath = resolve(options.materialsIndexPath);
+  const guard = await AllowedPathGuard.create(
+    [cwd, tempDir],
+    [dirname(indexPath)]
+  );
   const readOperations = {
-    readFile: async (path: string) => readFile(await guard.existing(path)),
+    readFile: async (path: string) => readFile(await guard.readable(path)),
     access: async (path: string) => {
-      await access(await guard.existing(path), constants.R_OK);
+      await access(await guard.readable(path), constants.R_OK);
     },
     // Pi 的 read 工具默认就用这个嗅探器；同名覆盖只是为了先过路径边界。
     detectImageMimeType: async (path: string) =>
-      detectSupportedImageMimeTypeFromFile(await guard.existing(path)),
+      detectSupportedImageMimeTypeFromFile(await guard.readable(path)),
   };
   const writeOperations = {
     writeFile: async (path: string, content: string) =>
@@ -350,7 +411,7 @@ export async function buildLocalTools(
   };
 
   const readTool = createReadToolDefinition(cwd, { operations: readOperations });
-  const bashTool = createBashTool(cwd, tempDir, phone, groupId);
+  const bashTool = createBashTool(cwd, tempDir, phone, groupId, venvDir, indexPath);
   const editTool = coordinateFileTool(
     createEditToolDefinition(cwd, { operations: editOperations }),
     cwd
