@@ -14,7 +14,7 @@ test.each(["first", "existing", "manual"])("configure %s flow writes reviewed me
     if (mode === "existing") {
       await mkdir(join(files.root, "data/config"), { recursive: true });
       await writeFile(modelsPath, JSON.stringify({ providers: { openai: {
-        baseUrl: "https://example.test/v1", compat: { supportsMaxOutputTokens: false },
+        baseUrl: "https://example.com/v1", compat: { supportsMaxOutputTokens: false },
         models: [{ id: source.id, input: ["text", "image"], contextWindow: 12345, maxTokens: 2345,
           reasoning: false, cost: { input: 7, output: 8, cacheRead: 9, cacheWrite: 10 } }],
       } } }));
