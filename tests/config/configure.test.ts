@@ -23,7 +23,7 @@ describe("configure model metadata", () => {
   });
 
   test("writes compatibility settings only on the model, with the selected value winning", () => {
-    const entry = responsesProvider("openai", "https://example.test/v1", "test-only", {
+    const entry = responsesProvider("openai", "https://example.com/v1", "test-only", {
       id: "test", compat: { supportsMaxOutputTokens: false, supportsStrictMode: true },
     }, { supportsMaxOutputTokens: false, supportsDeveloperRole: false }, true);
     expect(entry).not.toHaveProperty("compat");
