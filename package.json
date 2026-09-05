@@ -11,15 +11,16 @@
     "tmp": "bun run scripts/ops/tmp-admin.ts",
     "history": "bun run scripts/ops/history-admin.ts",
     "stat": "bun run scripts/ops/stats-admin.ts",
-    "test": "bun test",
+    "test": "bun test ./tests",
     "typecheck": "tsc --noEmit",
     "deadcode": "knip",
-    "check": "bun run typecheck && bun test && bun run deadcode"
+    "check": "bun run typecheck && bun run test && bun run deadcode"
   },
   "dependencies": {
     "@clack/prompts": "latest",
-    "@earendil-works/pi-ai": "^0.84.4",
-    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@earendil-works/pi-ai": "0.85.0",
+    "@earendil-works/pi-coding-agent": "0.85.0",
+    "@earendil-works/pi-server": "0.85.0",
     "hono": "^4.12.32"
   },
   "devDependencies": {

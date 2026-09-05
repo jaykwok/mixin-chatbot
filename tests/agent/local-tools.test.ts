@@ -5,6 +5,9 @@ import { isAbsolute, join } from "node:path";
 import { buildLocalTools } from "../../src/agent/local-tools.ts";
 import { isPathInside } from "../../src/agent/paths.ts";
 import { venvPythonPath } from "../../src/agent/python-toolchain.ts";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { getWorkspaceCoordinationStatus, runFileMutation } from "../../src/agent/workspace-coordinator.ts";
+import { tempFixture } from "../helpers/temp.ts";
 
 /** venv 与资料索引都住在 workspace 外面，和线上 <group>/ 下的布局保持一致。 */
 const venvDirFor = (root: string) => join(root, "venv");
@@ -27,6 +30,67 @@ function toolsFor(
 }
 
 describe("local Pi tool boundaries", () => {
+  test.each([
+    ["write", "shared.txt"], ["edit", "shared.txt"], ["bash", "shared.txt"],
+    ["write", "@shared.txt"], ["edit", "@shared.txt"], ["bash", "@shared.txt"],
+    ["write", "unicode"], ["edit", "unicode"], ["bash", "unicode"],
+    ["bash", "."], ["bash", "./"], ["bash", ""], ["bash", "sub/.."],
+    ...(process.platform === "win32" ? [["write", "msys"], ["edit", "msys"], ["bash", "msys"]] : []),
+    ["bash", "outside-cwd"],
+  ])("%s coordinates the actual ctx.cwd path (%s)", async (name, spelling) => {
+    const files = await tempFixture("pi-cwd-");
+    const { root } = files;
+    const workspace = join(root, "workspace");
+    const executionCwd = join(root, spelling === "outside-cwd" ? "outside" : "workspace/nested");
+    const userTemp = join(root, "user-tmp");
+    await Promise.all([mkdir(executionCwd, { recursive: true }), mkdir(workspace, { recursive: true }), mkdir(userTemp)]);
+    const fileName = spelling === "unicode" ? "shared file.txt" : "shared.txt";
+    const target = join(spelling === "outside-cwd" ? workspace : executionCwd, fileName);
+    const path = spelling === "unicode" ? "shared\u00a0file.txt"
+      : spelling === "msys" ? target.replaceAll("\\", "/").replace(/^([a-z]):/i, (_, drive: string) => `/${drive.toLowerCase()}`)
+      : spelling === "outside-cwd" ? "outside.txt" : spelling;
+    await writeFile(target, "before");
+    let release!: () => void;
+    const gate = new Promise<void>((done) => { release = done; });
+    let started!: () => void;
+    const ready = new Promise<void>((done) => { started = done; });
+    const holder = runFileMutation(workspace, target, async () => { started(); await gate; });
+    let run: Promise<unknown> | undefined;
+    try {
+      await ready;
+      const tool = (await toolsFor(root, workspace, userTemp)).find((tool) => tool.name === name)!;
+      const input = name === "bash"
+        ? { command: spelling === "outside-cwd" ? 'printf "after"' : `printf "after" > '${fileName}'`, mutates: [path] }
+        : name === "edit"
+          ? { path, edits: [{ oldText: "before", newText: "after" }] }
+          : { path, content: "after" };
+      let settled = false;
+      run = tool.execute("cwd-lock", input, undefined, undefined, {
+        cwd: executionCwd,
+        sessionManager: SessionManager.inMemory(executionCwd),
+        thinkingLevel: "off",
+      } as never);
+      void run.then(() => { settled = true; }, () => { settled = true; });
+      // 成功条件是实际路径队列/整群闸门阻塞。错锁会先执行完成，必定失败；
+      // 超时仅作为死锁兜底，不把“等了一小会仍没执行”当成成功证据。
+      const deadline = Date.now() + 5000;
+      while (!settled && getWorkspaceCoordinationStatus(workspace).waiting !== 1) {
+        if (Date.now() > deadline) throw new Error("tool neither queued nor settled");
+        await Bun.sleep(1);
+      }
+      expect(settled).toBe(false);
+      expect(getWorkspaceCoordinationStatus(workspace).waiting).toBe(1);
+      expect(await readFile(target, "utf8")).toBe("before");
+      release();
+      await Promise.all([holder, run]);
+      expect(await readFile(target, "utf8")).toBe(spelling === "outside-cwd" ? "before" : "after");
+    } finally {
+      release();
+      await Promise.allSettled([holder, ...(run ? [run] : [])]);
+      await files.cleanup();
+    }
+  });
+
   test("file tools allow workspace and caller tmp but reject other paths", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-tools-"));
     const workspace = join(root, "workspace");
@@ -108,7 +172,7 @@ describe("local Pi tool boundaries", () => {
         "bash-env",
         {
           command:
-            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR|$VIRTUAL_ENV|$UV_PROJECT_ENVIRONMENT|$PI_PYTHON|$PI_MATERIALS_INDEX|$PYTHONIOENCODING|$PYTHONUTF8|$LANG|$PYTHON_BASIC_REPL|$AI_AGENT|$PI_CODING_AGENT"',
+            'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_SESSION_ID|$PI_SESSION_FILE|$PI_PROVIDER|$PI_MODEL|$PI_REASONING_LEVEL|$PI_USER_TMP|$TMPDIR|$VIRTUAL_ENV|$UV_PROJECT_ENVIRONMENT|$PI_PYTHON|$PI_MATERIALS_INDEX|$PYTHONIOENCODING|$PYTHONUTF8|$LANG|$PYTHON_BASIC_REPL|$AI_AGENT|$PI_CODING_AGENT" > "$PI_USER_TMP/caller-env.txt"',
           mutates: [],
         },
         undefined,
@@ -116,10 +180,11 @@ describe("local Pi tool boundaries", () => {
         context
       );
       // venv 与索引都在 workspace 外：workspace 是同步盘镜像，写进去会被同步删掉。
-      expect(envResult.content[0]).toMatchObject({
-        type: "text",
-        text: `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${venvDirFor(root)}|${venvDirFor(root)}|${venvPythonPath(venvDirFor(root))}|${indexPathFor(root)}|utf-8|1|C.UTF-8|1|pi|true`,
-      });
+      expect(envResult.content[0]).toMatchObject({ type: "text" });
+      // 验证子进程实际收到的值，避免 Git Bash 启动时的 stderr 提示混入断言。
+      expect(await readFile(join(userTemp, "caller-env.txt"), "utf8")).toBe(
+        `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${venvDirFor(root)}|${venvDirFor(root)}|${venvPythonPath(venvDirFor(root))}|${indexPathFor(root)}|utf-8|1|C.UTF-8|1|pi|true`
+      );
       expect(isPathInside(venvDirFor(root), workspace)).toBe(false);
       expect(isPathInside(indexPathFor(root), workspace)).toBe(false);
 
@@ -139,6 +204,10 @@ describe("local Pi tool boundaries", () => {
       expect(fullOutputPath).toBeString();
       expect(isAbsolute(fullOutputPath!)).toBe(true);
       expect(isPathInside(fullOutputPath!, await realpath(userTemp))).toBe(true);
+      const text = outputResult.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+      expect(text).toContain(`Full output: ${fullOutputPath}`);
+      expect(text).toContain("line-2104");
+      expect(text).toContain("Showing");
       expect((await readFile(fullOutputPath!, "utf8")).includes("line-2104")).toBe(
         true
       );

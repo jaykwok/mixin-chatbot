@@ -1,12 +1,37 @@
 import { describe, expect, test } from "bun:test";
 import {
   defaultThinkingLevel,
-  entryToModel,
+  catalogMatches,
+  catalogModelMetadata,
   MODEL_API,
   modelDefaultsForSelection,
+  defaultCatalogSource,
+  responsesProvider,
 } from "../../scripts/config/configure.ts";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 
 describe("configure model metadata", () => {
+  test("first configuration adopts a catalog model; reconfiguration preserves existing metadata", () => {
+    const model = getBuiltinModels("openai")[0]!;
+    const matches = [{ ...model, provider: "other" }, model];
+    expect(defaultCatalogSource(matches, "openai", false)).toBe(1);
+    expect(defaultCatalogSource([model], "custom-gateway", false)).toBe(0);
+    expect(defaultCatalogSource(matches, "openai", true)).toBe(-1);
+    expect(defaultCatalogSource([], "openai", false)).toBe(-1);
+    const selected = matches[defaultCatalogSource(matches, "openai", false)]!;
+    expect(catalogModelMetadata(model.id, selected)).toMatchObject({ input: model.input, cost: model.cost });
+  });
+
+  test("writes compatibility settings only on the model, with the selected value winning", () => {
+    const entry = responsesProvider("openai", "https://example.test/v1", "test-only", {
+      id: "test", compat: { supportsMaxOutputTokens: false, supportsStrictMode: true },
+    }, { supportsMaxOutputTokens: false, supportsDeveloperRole: false }, true);
+    expect(entry).not.toHaveProperty("compat");
+    expect(entry.models).toEqual([{ id: "test", compat: {
+      supportsMaxOutputTokens: true, supportsStrictMode: true, supportsDeveloperRole: false,
+    } }]);
+  });
+
   test("writes the OpenAI Responses API type", () => {
     expect(MODEL_API).toBe("openai-responses");
   });
@@ -17,22 +42,31 @@ describe("configure model metadata", () => {
     expect(defaultThinkingLevel(false, "high")).toBe("off");
   });
 
-  test("converts LiteLLM per-token prices to Pi per-million-token prices", () => {
-    const model = entryToModel("example-model", {
-      input_cost_per_token: 0.000001,
-      output_cost_per_token: 0.000002,
-      cache_read_input_token_cost: 0.000000125,
-      cache_creation_input_token_cost: 0.00000125,
-      supports_reasoning: true,
-    });
+  test("uses the official catalog without guessing similar model ids", () => {
+    const source = getBuiltinModels("openai")[0]!;
+    expect(catalogMatches(source.id)).toContainEqual(source);
+    expect(catalogMatches(`${source.id}-unknown-alias`)).toEqual([]);
+    expect(catalogMatches("")).toEqual([]);
+  });
 
-    expect(model.cost).toEqual({
-      input: 1,
-      output: 2,
-      cacheRead: 0.125,
-      cacheWrite: 1.25,
+  test("copies native metadata without leaking provider transport settings", () => {
+    const source = getBuiltinModels("openai")[0]!;
+    const model = catalogModelMetadata("gateway-alias", {
+      ...source,
+      headers: { "provider-specific": "value" },
+      compat: { supportsMaxOutputTokens: false },
     });
-    expect(model.reasoning).toBe(true);
+    expect(model).toEqual({
+      id: "gateway-alias",
+      name: "gateway-alias",
+      contextWindow: source.contextWindow,
+      maxTokens: source.maxTokens,
+      input: source.input,
+      reasoning: source.reasoning,
+      cost: source.cost,
+    });
+    expect(model.cost).not.toBe(source.cost);
+    expect(model.input).not.toBe(source.input);
   });
 
   test("does not carry capability and price metadata across model ids", () => {

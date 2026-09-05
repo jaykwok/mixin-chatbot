@@ -221,7 +221,9 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 relay-purge --all
 <details>
 <summary><b>依赖与出站适配的维护约定</b></summary>
 
-Pi 依赖声明为 `^0.84.4`，当前 `bun.lock` 锁定 Pi `0.84.4`；部署使用 `bun install --frozen-lockfile`，避免未经审计的自动升级。更新 Pi 依赖时运行 `bun update @earendil-works/pi-ai @earendil-works/pi-coding-agent && bun run check`，确认通过后一起提交锁文件。
+Pi 仅适配 `0.85.0`，直接依赖使用精确版本并由 `bun.lock` 锁定整个依赖树；部署使用 `bun install --frozen-lockfile`。升级时显式指定目标版本，例如 `bun add --exact @earendil-works/pi-ai@0.85.0 @earendil-works/pi-coding-agent@0.85.0 @earendil-works/pi-server@0.85.0`，再运行 `bun run check`，一起提交依赖声明和锁文件。
+
+`0.85.0` 发布包存在依赖声明遗漏：SDK 根入口经实验性 server 模块导入 `@earendil-works/pi-server`，但没有将它列入 dependencies。因此本项目显式安装同版本官方 `pi-server`，否则仅导入 SDK 就报缺包；这不启动 Pi server。本项也登记在 `knip.json` 的 `ignoreDependencies` 中。后续升级需先验证上游是否修复，不能只因业务代码未直接 import 就移除它。
 
 `package.json` 将 Pi 间接使用的 `brace-expansion` 统一约束为已修复的 `5.0.8`，避免依赖树重新解析到受已知内存耗尽漏洞影响的 `5.0.7` 及更早版本。
 
@@ -285,7 +287,7 @@ sudo usermod -aG docker $USER && newgrp docker
 
 1. 询问监听端口（默认沿用已有值，否则 `1011`）、部署模式、群数据总根和 Cloudflare 公网域名；无效输入会原地重试
 2. 构建 Docker 镜像（Bun）
-3. **AI 配置**：若 `data/config/models.json` 不存在，在容器内运行 TUI（填写 Responses provider、base URL、key 和模型，元数据从 LiteLLM 抓取；支持思考时选择 thinkingLevel）；已存在则询问是否重配
+3. **AI 配置**：若 `data/config/models.json` 不存在，在容器内运行 TUI（填写 Responses provider、base URL、key 和模型，从 Pi 官方内置目录选择元数据来源或手动填写；支持思考时选择 thinkingLevel）；已存在则询问是否重配
 4. 验证 bind mount 对容器身份可读写，再启动容器（普通用户部署沿用当前非 root UID/GID；root 部署固定降权到 UID/GID 1001；host 网络、只读根文件系统、最小权限）
 5. 等待健康检查并完成隧道/直连切换；失败、超时或中途取消会移除未提交的新容器并恢复旧容器，旧 UFW 入口到成功提交后才清理
 
@@ -512,6 +514,19 @@ payload 字段必须使用官方 JSON 类型，`callBackUrl` 只能包含一个�
 <details>
 <summary><b>Pi 官方实现取舍</b></summary>
 
+- 本轮 [Pi 0.85.0 发布说明](https://pi.dev/news/releases/0.85.0) 的评估结果如下；实现仅面向该版本，不提供旧 Pi 双轨或 LiteLLM 回退。
+
+| 能力 | 本项目的采用方式 |
+|---|---|
+| 官方模型目录 | 配置器改用 `pi-ai/providers/all` 的 `getBuiltinProviders` / `getBuiltinModels`，移除 LiteLLM 网络抓取、UA 绕行、模糊匹配和价格单位转换。精确匹配模型 id；首次配置默认采用匹配目录（优先同 provider，其次 Responses 来源），重配同端点同模型则默认保留现有资料。仅复制上下文、输出上限、输入能力、思考能力和价格，不复制来源服务商的 API、地址、headers 或 compat。图片输入与输入/输出/缓存读/缓存写价格都可编辑；未匹配或全零价格会提醒核对。目录随 Pi 版本更新，自定义别名手填。 |
+| `supportsMaxOutputTokens` | 配置器将已有 provider/model compat 合并后只写在模型一级，避免同时留下相反的值；选择结果写入官方 `models[].compat.supportsMaxOutputTokens`。默认为支持，只在中转站明确拒绝 `max_output_tokens` 时关闭。Pi 自己决定是否发送该参数，本项目不拦截或重写请求。关闭后服务自行决定输出限制，`maxTokens` 仍保留为模型元数据。 |
+| 工具优先使用 `ctx.cwd` | 文件工具与 bash 声明共享 `tool-path.ts`，对齐 Pi 的 `@`、`~`、Unicode 空格、file URL、Windows shell 路径归一化，锁跟随真实执行目录。声明解析为群根或执行目录时（含 `.`、`./`、空字符串、`sub/..`）均整群独占；传入群外 cwd 时也保守取整群锁。会话打开时使用官方 `cwdOverride` 绑定当前群目录。 |
+| `SessionManager.inMemory(..., entries)` | 不引入外置存储。当前已直接使用官方 `SessionManager.open` 持久化；内存恢复适合数据库托管，改用它需要自建落盘与并发持久化机制，对本项目没有减码收益。 |
+| `AgentSessionRuntime` / 实验性 server | 前者用于替换当前会话及重建 cwd 服务，不负责群成员并发、出站取消和容量控制；后者引入 worker/协调器及 POSIX socket 目录要求。继续用官方 `createAgentSession` 内嵌模式适配 Windows/Linux。 |
+| Claude effort、vLLM 调度、TUI 改进 | 随依赖获得对应上游实现，但当前配置器只接 Responses、界面是群聊，没有为未使用的服务和终端增加配置项。 |
+
+- 升级回归直接使用 Pi 官方 `fauxProvider` 验证 SDK 创建会话、保存/恢复 JSONL 和真实基座的提示词剪裁；另外截获官方 Responses 适配器发出前的 payload，验证 provider 继承与模型覆盖的输出参数行为。`bun run check` 只发现 `tests/` 下的测试，避免临时审计目录或依赖缓存中的第三方测试混入。
+- 路径测试通过官方工具的 operations 接口比对最终路径；锁回归等待实际同文件队列登记，不用短延时推断成功。`/status` 的等待数包含路径 FIFO 和整群闸门。新增测试夹具使用系统临时目录，受 `TEMP`/`TMPDIR` 控制；默认自动清理，可设置 `TEST_TRASH_DIR` 改为移入指定回收目录。共享清理函数重试 Windows 文件占用，失败时记录现场路径，不覆盖原始断言。
 - 当前核心直接复用 [Pi SDK](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) 的 `AgentSession`、`SessionManager`、`ModelRuntime`、默认资源加载器、compaction/steer/abort、内联 `tool_call` 策略，以及 read/bash/edit/write 工具工厂；本项目只保留量子密信回调、群/用户目录策略、工作区文件协调和发送附件工具。bash 会话与调用者临时环境已启用，工具 schema 只使用当前 TypeBox 支持的 API，并通过 Pi 官方 `defineTool` 助手接入；所有工具以 `prefer` 使用 constrained JSON Schema sampling（模型不支持时自动回退）。
 - 官方 [pi-chat](https://github.com/earendil-works/pi-chat) 提供 Discord/Telegram 与 Gondolin 微型虚拟机隔离，证明“一频道一个 workspace/runner”的方向合理；但它依赖 QEMU、tmux、Gondolin，并仍面向旧包名的 peer API，不适合直接嵌入现有 Windows/Linux/Docker 部署。
 

@@ -423,7 +423,8 @@ async function createSession(
     indexPath,
     ignorePath: resolve(materialsIgnorePath(GROUP_DATA_ROOT, groupId)),
   });
-  const sessionManager = SessionManager.open(historyPath);
+  // 新历史和跨主机恢复都以当前群目录为准，不沿用进程 cwd 或历史中的旧绝对路径。
+  const sessionManager = SessionManager.open(historyPath, undefined, cwd);
   const settingsManager = SettingsManager.inMemory();
   const toolPolicy = createToolPolicyExtension();
   const resourceLoader = new DefaultResourceLoader({
@@ -759,7 +760,7 @@ async function handleCommand(
       const workspaceMode = workspace.opaqueActive
         ? "bash 独占操作中"
         : workspace.fileMutations > 0
-          ? `${workspace.fileMutations} 个文件写操作进行中`
+          ? `${workspace.fileMutations} 个文件写操作已登记`
           : "空闲";
       const rateMode = {
         normal: "正常",
@@ -768,7 +769,7 @@ async function handleCommand(
         cooldown: "平台限流冷却中",
       }[rate.mode];
       await reply(
-        `状态：${busy ? "忙碌中" : "空闲"}\nPi 会话：${session.sessionManager.getSessionId()}\n待消化的干预：${pending} 条\n群工作区协调：${workspaceMode}${workspace.waiting ? `，另有 ${workspace.waiting} 个操作等待` : ""}\n最近工具：🔧 ${last}\n机器人发送窗口：${rate.used}/${rate.limit}（${rateMode}${rate.pending ? `，排队 ${rate.pending}` : ""}）`
+        `状态：${busy ? "忙碌中" : "空闲"}\nPi 会话：${session.sessionManager.getSessionId()}\n待消化的干预：${pending} 条\n群工作区协调：${workspaceMode}${workspace.waiting ? `，${workspace.waiting} 个操作等待` : ""}\n最近工具：🔧 ${last}\n机器人发送窗口：${rate.used}/${rate.limit}（${rateMode}${rate.pending ? `，排队 ${rate.pending}` : ""}）`
       );
       return;
     }

@@ -1,5 +1,6 @@
 {
   "$schema": "https://unpkg.com/knip@latest/schema.json",
   "entry": ["tests/**/*.test.ts"],
-  "project": ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"]
+  "project": ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"],
+  "ignoreDependencies": ["@earendil-works/pi-server"]
 }

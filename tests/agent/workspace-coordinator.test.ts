@@ -133,13 +133,14 @@ describe("workspace operation coordination", () => {
       thirdStarted = true;
     });
     await waitFor(
-      () => getWorkspaceCoordinationStatus(workspace).fileMutations === 3
+      () => getWorkspaceCoordinationStatus(workspace).waiting === 2
     );
 
     controller.abort();
     expect(await secondSettled).toBe("AbortError");
     expect(secondStarted).toBe(false);
     expect(thirdStarted).toBe(false);
+    expect(getWorkspaceCoordinationStatus(workspace).waiting).toBe(1);
 
     releaseFirst();
     await Promise.all([first, third]);
