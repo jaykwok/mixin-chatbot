@@ -10,6 +10,7 @@ interface AccessWaiter {
 
 interface WorkspaceState {
   activeFiles: number;
+  pathWaiters: number;
   opaqueActive: boolean;
   waiters: AccessWaiter[];
 }
@@ -48,7 +49,7 @@ function getWorkspaceState(workspace: string): WorkspaceState {
   const key = workspaceKey(workspace);
   let state = workspaces.get(key);
   if (!state) {
-    state = { activeFiles: 0, opaqueActive: false, waiters: [] };
+    state = { activeFiles: 0, pathWaiters: 0, opaqueActive: false, waiters: [] };
     workspaces.set(key, state);
   }
   return state;
@@ -153,6 +154,7 @@ async function mutationKey(filePath: string): Promise<string> {
 }
 
 async function acquirePaths(
+  workspace: WorkspaceState,
   filePaths: string[],
   signal?: AbortSignal
 ): Promise<() => void> {
@@ -170,13 +172,14 @@ async function acquirePaths(
       }
 
       const previous = state.tail;
+      const blocked = state.depth > 0;
       let release!: () => void;
       const gate = new Promise<void>((resolveGate) => {
         release = resolveGate;
       });
       state.tail = previous.then(() => gate);
       state.depth++;
-      return { key, state, previous, release };
+      return { key, state, previous, release, blocked };
     });
   });
   pathRegistrationQueue = registration.then(
@@ -198,32 +201,38 @@ async function acquirePaths(
     }
   };
 
-  if (!signal) {
-    await Promise.all(entries.map(({ previous }) => previous));
-    return release;
-  }
-  if (signal.aborted) {
-    release();
-    throw abortError(signal);
-  }
-
-  await new Promise<void>((resolveReady, rejectReady) => {
-    let settled = false;
-    const onAbort = () => {
-      if (settled) return;
-      settled = true;
+  const blocked = entries.some((entry) => entry.blocked);
+  if (blocked) workspace.pathWaiters++;
+  try {
+    if (!signal) {
+      await Promise.all(entries.map(({ previous }) => previous));
+      return release;
+    }
+    if (signal.aborted) {
       release();
-      rejectReady(abortError(signal));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    void Promise.all(entries.map(({ previous }) => previous)).then(() => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener("abort", onAbort);
-      resolveReady();
+      throw abortError(signal);
+    }
+
+    await new Promise<void>((resolveReady, rejectReady) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        release();
+        rejectReady(abortError(signal));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      void Promise.all(entries.map(({ previous }) => previous)).then(() => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolveReady();
+      });
     });
-  });
-  return release;
+    return release;
+  } finally {
+    if (blocked) workspace.pathWaiters--;
+  }
 }
 
 /**
@@ -251,7 +260,7 @@ export async function runFileMutations<T>(
   if (filePaths.length === 0) return task();
   const releaseWorkspace = await acquireWorkspace(workspace, "file", signal);
   try {
-    const releasePaths = await acquirePaths(filePaths, signal);
+    const releasePaths = await acquirePaths(getWorkspaceState(workspace), filePaths, signal);
     try {
       throwIfAborted(signal);
       return await task();
@@ -287,6 +296,7 @@ export function getWorkspaceCoordinationStatus(
   return {
     fileMutations: state.activeFiles,
     opaqueActive: state.opaqueActive,
-    waiting: state.waiters.length,
+    // 包含已登记实际路径、正在等同文件 FIFO 的请求，不只统计整群闸门。
+    waiting: state.waiters.length + state.pathWaiters,
   };
 }

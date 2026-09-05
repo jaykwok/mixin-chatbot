@@ -25,6 +25,7 @@ import {
 import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
 import { log } from "../core/log.ts";
 import { isPathInside } from "./paths.ts";
+import { resolveToolPath } from "./tool-path.ts";
 import { venvPythonPath } from "./python-toolchain.ts";
 import {
   runFileMutation,
@@ -275,15 +276,20 @@ function createBashTool(
    * the user a turn. A missing or malformed declaration falls back to the
    * workspace-wide lock, which is conservative and always safe.
    */
-  const workspaceLockTargets = (mutates: unknown): string[] | "opaque" => {
+  const workspaceLockTargets = (mutates: unknown, executionCwd: string): string[] | "opaque" => {
     if (
       !Array.isArray(mutates) ||
       mutates.some((path) => typeof path !== "string")
     ) {
       return "opaque";
     }
-    const targets = mutates.map((path) => resolve(workspaceRoot, path));
-    if (targets.some((path) => path === workspaceRoot)) return "opaque";
+    const executionRoot = resolveToolPath(".", executionCwd);
+    // cwd 来自会话；若宿主意外传入群目录之外，不能把全部声明过滤成免锁执行。
+    if (!isPathInside(executionRoot, workspaceRoot)) return "opaque";
+    // 0.85.0 官方工具优先使用 ctx.cwd；锁仍归本群，但路径必须与实际执行目录一致。
+    const targets = mutates.map((path) => resolveToolPath(path, executionCwd));
+    // 语义覆盖 .、./、空字符串、sub/..，子目录 cwd 也按整群独占处理。
+    if (targets.some((path) => path === workspaceRoot || path === executionRoot)) return "opaque";
     return targets.filter((path) => isPathInside(path, workspaceRoot));
   };
 
@@ -306,7 +312,7 @@ function createBashTool(
         : { ...input, timeout: BASH_DEFAULT_TIMEOUT };
     const task = () =>
       executeOfficial(toolCallId, bounded, signal, onUpdate, context);
-    const targets = workspaceLockTargets(mutates);
+    const targets = workspaceLockTargets(mutates, context?.cwd || cwd);
     if (targets === "opaque") {
       return runOpaqueWorkspaceOperation(cwd, task, signal);
     }
@@ -352,7 +358,7 @@ function coordinateFileTool<T extends ToolDefinition<any, any, any>>(
     if (typeof input?.path !== "string") return tool.execute(...args);
     return runFileMutation(
       cwd,
-      resolve(cwd, input.path),
+      resolveToolPath(input.path, args[4]?.cwd || cwd),
       () => tool.execute(...args),
       args[2]
     );

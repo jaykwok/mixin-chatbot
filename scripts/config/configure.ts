@@ -18,14 +18,9 @@ import {
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
-import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODELS_JSON_PATH } from "../../src/core/storage.ts";
-
-const LITELLM_URL =
-  "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
-// raw GitHub 对默认 fetch UA 指纹拦截，必须带浏览器 UA。
-const CHROME_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 export const MODEL_API = "openai-responses" as const;
 
@@ -55,74 +50,49 @@ async function loadExisting(): Promise<ExistingDoc> {
   }
 }
 
-interface LiteLLMEntry {
-  max_input_tokens?: number;
-  max_output_tokens?: number;
-  max_tokens?: number;
-  input_cost_per_token?: number;
-  output_cost_per_token?: number;
-  cache_read_input_token_cost?: number;
-  cache_creation_input_token_cost?: number;
-  supports_vision?: boolean;
-  supports_reasoning?: boolean;
-  mode?: string;
-}
-
-async function fetchLitellm(): Promise<Record<string, LiteLLMEntry> | null> {
-  try {
-    const r = await fetch(LITELLM_URL, {
-      headers: { "User-Agent": CHROME_UA },
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!r.ok) {
-      await r.body?.cancel().catch(() => {});
-      log.warn(`LiteLLM 抓取返回 ${r.status}，将手动填写元数据`);
-      return null;
-    }
-    return (await r.json()) as Record<string, LiteLLMEntry>;
-  } catch (e) {
-    log.warn(`LiteLLM 抓取失败（${String(e)}），将手动填写元数据`);
-    return null;
-  }
-}
-
-const norm = (s: string): string => s.toLowerCase().replace(/[\s._\-/]/g, "");
-
 function isPositiveSafeInteger(value: string | undefined): boolean {
   if (!value || !/^[1-9]\d*$/.test(value)) return false;
   return Number.isSafeInteger(Number(value));
 }
 
-function matchLitellm(
-  catalog: Record<string, LiteLLMEntry>,
-  modelId: string
-): [string, LiteLLMEntry] | null {
-  const nid = norm(modelId);
-  for (const k of Object.keys(catalog)) if (norm(k) === nid) return [k, catalog[k]];
-  for (const k of Object.keys(catalog))
-    if (norm(k).includes(nid) || nid.includes(norm(k))) return [k, catalog[k]];
-  return null;
+/** 只接受精确 id；同名模型由管理员选择来源，不能靠子串猜价格和上下文。 */
+export function catalogMatches(modelId: string): Model<Api>[] {
+  return getBuiltinProviders().flatMap((provider) =>
+    getBuiltinModels(provider).filter((model) => model.id === modelId)
+  );
 }
 
-export function entryToModel(modelId: string, e: LiteLLMEntry): JsonObject {
-  // LiteLLM 是美元/token，Pi 的 Model.cost 是美元/百万 token。
-  const perMillion = (value: number | undefined): number =>
-    typeof value === "number" && Number.isFinite(value)
-      ? value * 1_000_000
-      : 0;
+export function defaultCatalogSource(matches: Model<Api>[], providerId: string, reuseExisting: boolean): number {
+  if (reuseExisting || matches.length === 0) return -1;
+  const providerMatch = matches.findIndex((model) => model.provider === providerId);
+  if (providerMatch !== -1) return providerMatch;
+  const responsesMatch = matches.findIndex((model) => model.api === MODEL_API);
+  return responsesMatch === -1 ? 0 : responsesMatch;
+}
+
+/** 配置器只生成一个模型；compat 合并到模型一级，避免两个层级保存相反值。 */
+export function responsesProvider(
+  providerId: string, baseUrl: string, apiKey: string, model: JsonObject,
+  providerCompat: JsonObject, supportsMaxOutputTokens: boolean
+): JsonObject {
+  return {
+    name: providerId, baseUrl, apiKey, api: MODEL_API,
+    models: [{ ...model, compat: {
+      ...providerCompat, ...(model.compat as JsonObject | undefined), supportsMaxOutputTokens,
+    } }],
+  };
+}
+
+export function catalogModelMetadata(modelId: string, model: Model<Api>): JsonObject {
+  // 只复制模型资料。provider/api/baseUrl/headers/compat 属于原服务商，不能带到中转站。
   return {
     id: modelId,
     name: modelId,
-    contextWindow: e.max_input_tokens ?? e.max_tokens ?? 131072,
-    maxTokens: e.max_output_tokens ?? e.max_tokens ?? 8192,
-    input: e.supports_vision ? ["text", "image"] : ["text"],
-    reasoning: e.supports_reasoning ?? false,
-    cost: {
-      input: perMillion(e.input_cost_per_token),
-      output: perMillion(e.output_cost_per_token),
-      cacheRead: perMillion(e.cache_read_input_token_cost),
-      cacheWrite: perMillion(e.cache_creation_input_token_cost),
-    },
+    contextWindow: model.contextWindow,
+    maxTokens: model.maxTokens,
+    input: [...model.input],
+    reasoning: model.reasoning,
+    cost: { ...model.cost }, // Pi 原生单位：美元/百万 token。
   };
 }
 
@@ -208,28 +178,33 @@ async function main(): Promise<void> {
     })
   ).trim();
 
-  // 从 LiteLLM 抓元数据（自定义 provider 的模型不在 Pi 内置目录）。
+  // 同步读取 Pi 随包提供的目录，无需联网、认证或另一套元数据格式。
   // 只有仍在编辑原 provider 时才考虑复用旧模型元数据；同名模型在不同端点
   // 可能有不同上下文、能力和价格，不能跨 provider 继承。
+  const sameProvider = providerId === firstId && baseUrl === firstEntry?.baseUrl;
+  const reuseExisting = sameProvider && firstModel?.id === modelId;
   let model = modelDefaultsForSelection(
     modelId,
     firstModel,
-    providerId === firstId
+    sameProvider
   );
-  const catalog = await fetchLitellm();
-  if (catalog) {
-    const m = matchLitellm(catalog, modelId);
-    if (m) {
-      log.info(
-        `LiteLLM 命中 "${m[0]}": context=${m[1].max_input_tokens ?? "?"}, maxOut=${m[1].max_output_tokens ?? "?"}, $in/tok=${m[1].input_cost_per_token ?? "?"}`
-      );
-      const use = bail<boolean>(
-        await confirm({ message: "采用 LiteLLM 元数据？", initialValue: true })
-      );
-      if (use) model = entryToModel(modelId, m[1]);
-    } else {
-      log.warn(`LiteLLM 未命中 "${modelId}"，手动填写元数据`);
-    }
+  const matches = catalogMatches(modelId);
+  if (matches.length > 0) {
+    const source = bail<number>(await select({
+      message: "模型资料来源（中转站的价格和能力可能不同，请核对）",
+      initialValue: defaultCatalogSource(matches, providerId, reuseExisting),
+      options: [
+        { value: -1, label: reuseExisting ? "保留已有资料（下方可编辑）" : "手动填写全部模型资料" },
+        ...matches.map((match, index) => ({
+          value: index,
+          label: `Pi: ${match.provider}/${match.id}（context=${match.contextWindow}, maxOut=${match.maxTokens}, $in/M=${match.cost.input}, $out/M=${match.cost.output}）`,
+        })),
+      ],
+    }));
+    if (source !== -1) model = { ...model, ...catalogModelMetadata(modelId, matches[source]!) };
+    else if (!reuseExisting) log.warn("尚未采用模型目录资料，请填写实际上下文、输入能力和价格；默认值仅供占位。");
+  } else {
+    log.warn(`Pi 目录未精确匹配 "${modelId}"，请核对并填写全部模型资料`);
   }
 
   // 允许手动覆盖 contextWindow / maxTokens。
@@ -258,6 +233,39 @@ async function main(): Promise<void> {
   model.contextWindow = Number(cw);
   model.maxTokens = Number(mt);
 
+  const vision = bail<boolean>(await confirm({
+    message: "模型支持图片输入？",
+    initialValue: Array.isArray(model.input) && model.input.includes("image"),
+  }));
+  model.input = vision ? ["text", "image"] : ["text"];
+  const previousCost = (model.cost ?? {}) as JsonObject;
+  const cost: JsonObject = {};
+  for (const [key, label] of [
+    ["input", "输入"], ["output", "输出"], ["cacheRead", "缓存读取"], ["cacheWrite", "缓存写入"],
+  ] as const) {
+    const value = String(previousCost[key] ?? 0);
+    cost[key] = Number(bail<string>(await text({
+      message: `${label}价格（美元/百万 token，0 表示免费或尚未填写）`,
+      initialValue: value, defaultValue: value,
+      validate: (raw) => raw?.trim() && Number.isFinite(Number(raw)) && Number(raw) >= 0
+        ? undefined : "需为非负有限数",
+    })));
+  }
+  const ratesChanged = Object.keys(cost).some((key) => cost[key] !== previousCost[key]);
+  if (!ratesChanged && previousCost.tiers) cost.tiers = previousCost.tiers;
+  else if (ratesChanged && previousCost.tiers) log.warn("基础价格已修改，已移除原目录的阶梯价格；需要时请在 models.json 中填写实际 tiers。");
+  model.cost = cost;
+  if (Object.values(cost).every((value) => value === 0)) log.warn("价格全部为 0，费用估算将为零；请确认这是实际价格。");
+
+  const compat = (model.compat ?? {}) as JsonObject;
+  const providerCompat = sameProvider
+    ? (firstEntry?.compat ?? {}) as JsonObject
+    : {};
+  const supportsMaxOutputTokens = bail<boolean>(await confirm({
+    message: "服务支持 max_output_tokens 参数？（仅在服务明确拒绝该参数时选否）",
+    initialValue: (compat.supportsMaxOutputTokens ?? providerCompat.supportsMaxOutputTokens) !== false,
+  }));
+
   const supportsReasoning = bail<boolean>(
     await confirm({
       message: "模型支持思考模式？",
@@ -285,13 +293,7 @@ async function main(): Promise<void> {
     );
   }
 
-  const entry: JsonObject = {
-    name: providerId,
-    baseUrl,
-    apiKey,
-    api: MODEL_API,
-    models: [model],
-  };
+  const entry = responsesProvider(providerId, baseUrl, apiKey, model, providerCompat, supportsMaxOutputTokens);
 
   const doc = { thinkingLevel, providers: { [providerId]: entry } };
   await mkdir(dirname(MODELS_JSON_PATH), { recursive: true });
