@@ -42,8 +42,9 @@ describe("supervised real subprocesses", () => {
     const childFile = join(fixture.root, "child.cjs");
     const parentFile = join(fixture.root, "parent.cjs");
     const pidFile = join(fixture.root, "child.pid");
-    await writeFile(childFile, `require('fs').writeFileSync(process.argv[2],String(process.pid)); process.stdout.write('READY:'+process.pid+'\\n'); const tick=setInterval(()=>process.stdout.write('alive\\n'),30); setTimeout(()=>{clearInterval(tick);process.exit(0)},8000);`);
-    await writeFile(parentFile, `const {spawn}=require('child_process'); const fs=require('fs'); spawn(process.execPath,[process.argv[2],process.argv[3]],{detached:true,stdio:['ignore','inherit','inherit'],windowsHide:true}).unref(); const tick=setInterval(()=>{if(process.argv[4]==='exit'&&fs.existsSync(process.argv[3]))process.exit(0)},25);setTimeout(()=>process.exit(0),10000);`);
+    await writeFile(childFile, `require('fs').writeFileSync(process.argv[2],String(process.pid)); process.stdout.write('READY:'+process.pid+'\\n',()=>process.send?.('ready')); const tick=setInterval(()=>process.stdout.write('alive\\n'),30); setTimeout(()=>{clearInterval(tick);process.exit(0)},8000);`);
+    // Exit only after READY is flushed; observing the PID file races buffered stdout.
+    await writeFile(parentFile, `const {spawn}=require('child_process'); const child=spawn(process.execPath,[process.argv[2],process.argv[3]],{detached:true,stdio:['ignore','inherit','inherit','ipc'],windowsHide:true}); child.on('message',message=>{if(message==='ready'&&process.argv[4]==='exit')process.exit(0)}); child.unref(); setTimeout(()=>process.exit(0),10000);`);
     const controller = new AbortController();
     let pid = 0;
     let readyAt = 0;

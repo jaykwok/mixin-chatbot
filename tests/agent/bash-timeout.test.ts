@@ -1,20 +1,29 @@
 import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 // Pi 的 bash 工具默认不限时，挂死的命令会永久占住一轮 prompt：用户只收到「正在思考」，
 // 之后的消息全部退化成 steer，会话槽位也不再释放。这里验证适配层注入的默认上限确实生效。
-// 配置在模块加载时读环境变量，因此必须先设置再动态导入。bun test 的模块注册表在同一次
-// 运行里是共用的，所以这只在本文件先于其他导入 config 的测试执行时生效——下面第一条断言
-// 就是为此而写：万一将来顺序变了，它会立刻报错，而不是让测试挂在一分钟的 sleep 上。
+// 配置在模块加载时读取：用独立测试进程设置环境，不能依赖各平台的文件发现顺序。
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir } from "node:fs/promises";
 
 import { join } from "node:path";
-
-process.env.BOT_BASH_TIMEOUT = "10";
-const { BASH_DEFAULT_TIMEOUT } = await import("../../src/core/config.ts");
-const { buildLocalTools } = await import("../../src/agent/local-tools.ts");
+import { fileURLToPath } from "node:url";
 
 describe("bash default timeout", () => {
   test("a command with no declared timeout is stopped instead of hanging the turn", async () => {
+    if (process.env.BASH_TIMEOUT_TEST_CHILD !== "1") {
+      const child = Bun.spawn([process.execPath, "test", fileURLToPath(import.meta.url)], {
+        cwd: process.cwd(), env: { ...process.env, BOT_BASH_TIMEOUT: "10", BASH_TIMEOUT_TEST_CHILD: "1" },
+        stdout: "pipe", stderr: "pipe", windowsHide: true,
+      });
+      const timer = setTimeout(() => child.kill(), 35000);
+      try {
+        const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+        expect(code, stdout + "\n" + stderr).toBe(0);
+      } finally { clearTimeout(timer); child.kill(); await child.exited; }
+      return;
+    }
+    const { BASH_DEFAULT_TIMEOUT } = await import("../../src/core/config.ts");
+    const { buildLocalTools } = await import("../../src/agent/local-tools.ts");
     expect(BASH_DEFAULT_TIMEOUT).toBe(10);
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-bash-timeout-"));
     const workspace = join(root, "workspace");

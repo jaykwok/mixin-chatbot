@@ -39,14 +39,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - run: docker build -t mixin-chatbot-check .
-      - name: Test parsers and supervised processes in the restricted image
+      - name: Test parsers in the restricted image
         run: |
           mkdir -p agents/temp agents/rm
           docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges \
             --user "$(id -u):$(id -g)" \
-            -e PYTHONIOENCODING=utf-8 -e UV_CACHE_DIR=/app/agents/temp/uv-cache \
+            -e PYTHONIOENCODING=utf-8 -e UV_CACHE_DIR=/app/agents/temp/uv-cache -e TMPDIR=/app/agents/temp \
             -v "$PWD/agents:/app/agents" mixin-chatbot-check \
             uv run --no-project --no-python-downloads --python /app/.venv/bin/python scripts/runtime/verify_documents.py
+      - name: Test supervised processes in the restricted image
+        run: |
+          mkdir -p agents/temp agents/rm
           docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
             --user "$(id -u):$(id -g)" -v "$PWD/agents:/app/agents" -v "$PWD/tests:/app/tests:ro" \
             mixin-chatbot-check bun run test tests/core/process.test.ts

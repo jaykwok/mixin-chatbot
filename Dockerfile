@@ -16,7 +16,7 @@ WORKDIR /app
 
 # 先装依赖（利用层缓存；.dockerignore 排除本地 node_modules，容器内重装）
 COPY package.json bun.lock ./
-COPY patches ./patches
+COPY scripts/patches ./scripts/patches
 RUN bun install --frozen-lockfile --production
 
 # Explicit build inputs prevent local credentials and tool workspaces entering image layers.
@@ -27,7 +27,6 @@ COPY --chown=appuser:appgroup scripts/ops/*.ts ./scripts/ops/
 COPY --chown=appuser:appgroup scripts/lib/*.ts ./scripts/lib/
 COPY --chown=appuser:appgroup scripts/runtime ./scripts/runtime
 COPY --chown=appuser:appgroup scripts/test.ts ./scripts/test.ts
-COPY THIRD_PARTY_NOTICES.md ./
 
 RUN mkdir -p \
       /app/data/config \

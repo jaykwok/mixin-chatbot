@@ -1,9 +1,9 @@
 // Private helper process. Windows jobs include descendants even after detached spawn;
 // Linux subreaping lets us collect descendants which create their own process groups.
 // Never import this module into the HTTP process: supervision must have its own lifetime.
-import { dlopen, FFIType, ptr } from "bun:ffi";
+import { dlopen, FFIType, ptr, read as ffiRead } from "bun:ffi";
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 
 if (!import.meta.main) throw new Error("process-supervisor must run as a separate process");
 
@@ -29,6 +29,7 @@ if (process.platform === "win32") {
   const { symbols: libc } = dlopen("libc.so.6", {
     prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 },
     waitpid: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    __errno_location: { args: [], returns: FFIType.ptr },
   });
   if (libc.prctl(36, 1, 0, 0, 0) !== 0 || libc.prctl(1, 15, 0, 0, 0) !== 0) {
     throw new Error("无法启用 Linux 子进程回收监督");
@@ -36,12 +37,22 @@ if (process.platform === "win32") {
   terminate = async (code) => {
     // Kill direct children repeatedly: grandchildren are adopted here as their parents exit.
     for (let round = 0; round < 100; round++) {
-      const children = (await readFile(`/proc/self/task/${process.pid}/children`, "utf8")).trim();
-      if (!children) process.exit(code);
-      for (const value of children.split(/\s+/)) {
+      // Bun may spawn from a worker thread. Each /proc task lists only its own
+      // children, so reading the main thread alone can miss live descendants.
+      const tids = await readdir("/proc/self/task");
+      const lists = await Promise.all(tids.map(async (tid) => {
+        try { return await readFile(`/proc/self/task/${tid}/children`, "utf8"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return ""; throw error; }
+      }));
+      const children = new Set(lists.flatMap((list) => list.trim().split(/\s+/).filter(Boolean)));
+      for (const value of children) {
         try { process.kill(Number(value), "SIGKILL"); } catch {}
       }
-      while (libc.waitpid(-1, null, 1) > 0) { /* reap adopted children */ }
+      let waiting: number;
+      do { waiting = libc.waitpid(-1, null, 1); } while (waiting > 0);
+      // A /proc snapshot can omit children during exit/adoption. Only ECHILD
+      // proves there is nothing left; 0 means a child is still running.
+      if (waiting === -1 && ffiRead.i32(libc.__errno_location()!) === 10) process.exit(code);
       await Bun.sleep(10);
     }
     process.stderr.write("子进程回收超过 1 秒，监督进程失败退出\n");

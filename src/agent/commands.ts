@@ -4,7 +4,7 @@ export const SUPPORTED_COMMANDS: ReadonlyMap<string, string> = new Map([
   ["/clear", "归档你在本群的历史，开启新会话"],
   ["/stop", "取消当前任务和排队消息"],
   ["/status", "查看任务状态、排队消息和未送达记录"],
-  ["/deliver", "重试交付已保存的未送达内容"],
+  ["/deliver", "补发已生成但没发到群里的回复"],
 ]);
 
 /**

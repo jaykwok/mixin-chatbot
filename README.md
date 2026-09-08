@@ -49,7 +49,7 @@ flowchart TD
 | 普通消息 | 同一会话顺序执行，最多 8 条等待消息 |
 | `/stop` | 立即取消当前任务并清空等待消息，回执发送不阻塞停止 |
 | `/clear` | 取消并等待收尾，归档本人在本群的会话；后续消息在清理完成后执行 |
-| `/deliver` | 顺序补发已持久化的未送达文本和外链，成功一条确认一条 |
+| `/deliver` | 补发已生成但没发到群里的回复 |
 | `/status` | 查看任务阶段、队列、最近工具、未送达数量与出站窗口 |
 | `/help` | 查看指令说明 |
 
@@ -395,7 +395,7 @@ bun run check
 
 `bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。测试和诊断产物放在 `agents/temp`。
 
-`patches/knip@6.29.0.patch` 修复 Knip 对 Bun 脚本 production 入口标记的传递，仅影响开发检查。`package.json`、`bun.lock` 和 Docker 构建都引用它，不能单独删除目录；上游修复后需同步移除引用并通过两种 Knip 检查。
+`scripts/patches/knip@6.29.0.patch` 修复 Knip 对 Bun 脚本 production 入口标记的传递，仅影响开发检查。补丁随检查脚本维护；移除前需同步更新安装引用并通过普通和 production 两种 Knip 检查。
 
 Pi 两个包精确固定为 0.85.1，使用官方本地 SDK，无需实验性 `pi-server`。依赖升级通过改版本、更新锁文件和回归检查完成。当前外链存储只支持 SQLite 账本与现行对象布局。
 
@@ -410,4 +410,4 @@ Pi 两个包精确固定为 0.85.1，使用官方本地 SDK，无需实验性 `p
 
 CI 配置了 Windows/Linux 检查及受限 Linux 镜像中的解析器与进程回收验证。本机已验证 Windows 流程；Linux/Docker 尚未实机验收，模拟测试不代表实际部署。
 
-设计取舍、完整问题清单和验证证据见[整体审计与整改报告](docs/CODE_AUDIT_2026-09-08.md)；第三方组件、许可与保留补丁见[第三方声明](THIRD_PARTY_NOTICES.md)。
+设计取舍、完整问题清单和验证证据见[整体审计与整改报告](docs/CODE_AUDIT_2026-09-08.md)。Pi 路径适配代码的许可保留在对应源码中，开发检查补丁位于 `scripts/patches`。

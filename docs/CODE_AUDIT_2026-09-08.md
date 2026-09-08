@@ -141,7 +141,7 @@ flowchart LR
 | A25 | `src/core/runtime-config.ts`、`scripts/config/runtime-settings.ts` | 环境变量 > runtime.json > 默认值；支持项原子保存、未传值沿用、未知/越界值拒绝。默认 bash 600 秒、索引 5 分钟/50000 文件/12 层。 |
 | A26 | `scripts/ops/stats-admin.ts` | 从成功工具结果统计，区分上传/链接生成与平台送达；只覆盖仍保留的 Pi 历史，不把模型调用意图算成交付。 |
 | A27 | `scripts/ops/tmp-admin.ts`、`history-admin.ts`、`scripts/lib/group-data.ts` | 操作前复核根与每层祖先，拒绝 junction/symlink；服务互斥，移入回收区。覆盖 root/group/users/user 多层目录链接与 tmp 叶子链接。 |
-| A28–A29 | `knip.json`、README、源码/CLI 帮助、`THIRD_PARTY_NOTICES.md` | 普通和 production Knip 无未使用项或配置提示；清掉废弃导出/三套模块及对应旧测试。纠正 tmp 可重建、唯一消息、账本丢弃、索引默认值和旧命令说明。 |
+| A28–A29 | `knip.json`、README、源码/CLI 帮助、源码许可注释 | 普通和 production Knip 无未使用项或配置提示；清掉废弃导出/三套模块及对应旧测试。纠正 tmp 可重建、唯一消息、账本丢弃、索引默认值和旧命令说明。 |
 | A30 | `runtime.ts`、`src/core/maintenance.ts`、`Dockerfile`、`.dockerignore` | 官方 SDK 设置显式化，单 provider/model 校验、关闭隐式资源发现及目录联网刷新；单实例/维护租约，固定构建依赖，镜像 COPY 白名单。 |
 | A31 | README、两平台部署和 tunnel 脚本 | `setup-server.sh` 和 cloudflared 自下载逻辑已归档；使用官方安装渠道及 Windows 服务安装器，移除不可达的非管理员部署分支。 |
 

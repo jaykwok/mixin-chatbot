@@ -10,6 +10,24 @@ const quotePS = (text: string) => "'" + text.replaceAll("'", "''") + "'";
 const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
 const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 
+test("Docker COPY inputs and dependency patch paths exist in the checkout", async () => {
+  const dockerfile = await readFile(join(project, "Dockerfile"), "utf8");
+  const manifest = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
+  const lock = JSON.parse((await readFile(join(project, "bun.lock"), "utf8")).replace(/,\s*([}\]])/g, "$1"));
+  expect(lock.patchedDependencies).toEqual(manifest.patchedDependencies);
+  for (const path of Object.values(manifest.patchedDependencies) as string[]) {
+    expect(existsSync(join(project, path)), `Missing dependency patch: ${path}`).toBe(true);
+  }
+  // This Dockerfile uses one-line COPY instructions with unquoted source paths.
+  for (const line of dockerfile.split(/\r?\n/).filter(line => /^COPY\s/.test(line) && !line.includes("--from="))) {
+    const sources = line.split(/\s+/).slice(1, -1).filter(part => !part.startsWith("--"));
+    for (const source of sources) {
+      const matches = source.includes("*") ? [...new Bun.Glob(source).scanSync({ cwd: project })] : existsSync(join(project, source)) ? [source] : [];
+      expect(matches.length, `Missing Docker COPY input: ${source}`).toBeGreaterThan(0);
+    }
+  }
+});
+
 async function execute(args: string[], cwd: string, env = process.env) {
   const child = Bun.spawn(args, { cwd, env, stdout: "pipe", stderr: "pipe", windowsHide: true });
   const timeout = setTimeout(() => child.kill(), 45000);

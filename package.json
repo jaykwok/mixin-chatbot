@@ -38,6 +38,6 @@
     "brace-expansion": "5.0.8"
   },
   "patchedDependencies": {
-    "knip@6.29.0": "patches/knip@6.29.0.patch"
+    "knip@6.29.0": "scripts/patches/knip@6.29.0.patch"
   }
 }
