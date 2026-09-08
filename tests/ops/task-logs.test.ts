@@ -119,6 +119,34 @@ for (const platform of ["powershell", "bash"] as const) {
       } finally { await f.cleanup(); }
     }, 30_000);
 
+    test("summarizes model inactivity and stream finish metadata for the selected task", async () => {
+      const f = await fixture(platform);
+      try {
+        const stats = { response: 1, lastEvent: "toolcall_delta", events: { toolcall_delta: 180 },
+          emptyDeltas: 179, whitespaceDeltas: 0, effectiveChars: 21, idleSeconds: 180, lastEventSecondsAgo: 0,
+          responseId: "test-response-id", stopReason: "pending", rawStopReason: null };
+        const idle = progress("模型无有效进展超时", "接收模型输出", 184, 180) +
+          ", 模型流: " + JSON.stringify(stats) + ", 取消原因: model_idle";
+        const ended = progress("模型流结束", "等待取消清理", 184, 0) +
+          ", 模型流: " + JSON.stringify({ ...stats, lastEvent: "message_end", stopReason: "aborted" });
+        await writeFile(join(f.logs, "mixin-chatbot.log"), [
+          progress("任务开始", "准备会话", 0, 0), idle, ended,
+          progress("模型流结束", "模型响应结束", 1, 0, "abcdef12") + ", responseId: other-task-response",
+          progress("任务取消清理完成", "等待取消清理", 184, 0),
+        ].join("\n"));
+        const result = await execute(platform, f.script, ["555d838a"], f.cwd);
+        expect(result.code, result.output).toBe(0);
+        const report = await readReport(f.root);
+        const summary = report["summary.txt"]!;
+        expect(summary).toContain(idle);
+        expect(summary).toContain(ended);
+        expect(summary).toContain('"emptyDeltas":179');
+        expect(summary).toContain('"rawStopReason":null');
+        expect(summary).not.toContain("other-task-response");
+        expect(report["task.log"]!.trim().split("\n")).toHaveLength(4);
+      } finally { await f.cleanup(); }
+    }, 30_000);
+
     test("accepts an alternate log directory and zero context; repeated runs preserve earlier output", async () => {
       const f = await fixture(platform);
       try {

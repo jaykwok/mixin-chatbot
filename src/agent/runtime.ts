@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { clampThinkingLevel, Type, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { GROUP_DATA_ROOT, SESSION_IDLE_TTL, RUN_TIMEOUT_MS } from "../core/config.ts";
+import { GROUP_DATA_ROOT, SESSION_IDLE_TTL, RUN_TIMEOUT_MS, MODEL_IDLE_TIMEOUT_MS } from "../core/config.ts";
 import { log } from "../core/log.ts";
 import { MODELS_JSON_PATH, MODELS_STORE_PATH, PI_AGENT_DIR, RUNTIME_DIR } from "../core/storage.ts";
 import { application, waitFor } from "../core/lifecycle.ts";
@@ -24,6 +24,7 @@ import { SessionQueue } from "./session-queue.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { ensureStorageIdentity } from "./storage-identity.ts";
 import { redactSecrets } from "./failure.ts";
+import { ModelProgress } from "./model-progress.ts";
 
 // ModelRuntime 单例 + 解析出的单模型。从 data/config/models.json 加载（Pi 原生）。
 let modelRuntime: ModelRuntime | null = null;
@@ -121,7 +122,11 @@ interface SessionRecord {
   key: string; phone: string; groupId: string; callbackUrl: string;
   queue: SessionQueue; session?: AgentSession; lastUsed: number; lastTool?: string;
   notes: OutboundNotes; deliveryId?: string; unsubscribe?: () => void;
-  progress?: { id: string; started: number; updated: number; stage: string };
+  progress?: {
+    id: string; started: number; updated: number; stage: string;
+    model: ModelProgress; signal: AbortSignal; checkModelIdle: () => void;
+    abortReason?: "model_idle" | "task_timeout" | "user_cancel" | "shutdown";
+  };
 }
 const records = new Map<string, SessionRecord>();
 const controlReceipts = new Map<string, Promise<unknown>>();
@@ -132,16 +137,19 @@ const sessionKey = (phone: string, groupId: string) => JSON.stringify([groupId, 
 function progressText(record: SessionRecord): string {
   const p = record.progress;
   if (!p) return "";
+  const stream = p.model.snapshot();
   return `任务: ${p.id}, 群: ${record.groupId}, 用户: ${record.phone}, 阶段: ${p.stage}, ` +
-    `耗时: ${Math.floor((Date.now() - p.started) / 1000)}秒, 最近进展距今: ${Math.floor((Date.now() - p.updated) / 1000)}秒`;
+    `耗时: ${Math.floor((Date.now() - p.started) / 1000)}秒, 最近进展距今: ${Math.floor((Date.now() - p.updated) / 1000)}秒` +
+    (stream ? ", 模型流: " + JSON.stringify(stream) : "") +
+    (p.abortReason ? ", 取消原因: " + p.abortReason : "");
 }
 
-function setStage(record: SessionRecord, stage: string): void {
+function setStage(record: SessionRecord, stage: string, advanced = true): void {
   const p = record.progress;
-  if (!p) return;
+  if (!p || (p.signal.aborted && stage !== "等待取消清理")) return;
   const changed = p.stage !== stage;
   p.stage = stage;
-  p.updated = Date.now();
+  if (advanced) p.updated = Date.now();
   if (changed) log.info("任务进展 - " + progressText(record));
 }
 
@@ -229,8 +237,31 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
   record.session = session;
   record.unsubscribe = session.subscribe((event) => {
     // Only record metadata; never log model text, reasoning or tool arguments/results.
-    if (event.type === "turn_start") setStage(record, "等待模型响应");
-    if (event.type === "message_update") setStage(record, "接收模型输出");
+    const p = record.progress;
+    if (!p) return;
+    // Cancellation can still yield a terminal assistant message; keep its finish reason.
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      p.model.finish(event.message);
+      log.info("模型流结束 - " + progressText(record));
+      setStage(record, "模型响应结束");
+      return;
+    }
+    // Late SDK events must not rearm the watchdog or hide the cancellation cleanup stage.
+    if (p.signal.aborted) return;
+    if (event.type === "turn_start") {
+      p.model.begin();
+      setStage(record, "等待模型响应");
+    }
+    if (event.type === "message_start" && event.message.role === "assistant") p.model.start(event.message);
+    if (event.type === "message_update") {
+      setStage(record, "接收模型输出", p.model.update(event.assistantMessageEvent));
+      // Also check on events so a flood of empty deltas cannot conceal a stalled stream.
+      p.checkModelIdle();
+    }
+    if (event.type === "tool_execution_start" || event.type === "tool_execution_update" ||
+        event.type === "tool_execution_end" || event.type === "turn_end" ||
+        event.type === "compaction_start" || event.type === "auto_retry_start" ||
+        event.type === "summarization_retry_scheduled" || event.type === "summarization_retry_attempt_start") p.model.pause();
     if (event.type === "tool_execution_start") {
       record.lastTool = event.toolName;
       setStage(record, "执行工具 " + event.toolName);
@@ -258,23 +289,38 @@ export async function initializeAgentRuntime(): Promise<void> { await getRuntime
 
 async function run(record: SessionRecord, content: string, cancellation: AbortSignal): Promise<void> {
   const deadline = AbortSignal.timeout(RUN_TIMEOUT_MS);
-  const signal = AbortSignal.any([application.signal, cancellation, deadline]);
-  record.progress = { id: randomUUID().slice(0, 8), started: Date.now(), updated: Date.now(), stage: "准备会话" };
+  const modelIdle = new AbortController();
+  const signal = AbortSignal.any([application.signal, cancellation, deadline, modelIdle.signal]);
+  const p: NonNullable<SessionRecord["progress"]> = record.progress = {
+    id: randomUUID().slice(0, 8), started: Date.now(), updated: Date.now(), stage: "准备会话",
+    model: new ModelProgress(), signal,
+    checkModelIdle: () => {
+      if (signal.aborted || !p.model.isIdle(MODEL_IDLE_TIMEOUT_MS)) return;
+      modelIdle.abort(new Error(`模型连续 ${MODEL_IDLE_TIMEOUT_MS / 1000} 秒无有效进展（阶段：${p.stage}；任务：${p.id}）`));
+    },
+  };
   record.lastTool = undefined;
-  log.info(`任务开始 - ${progressText(record)}, 总时限: ${RUN_TIMEOUT_MS / 1000}秒`);
+  log.info(`任务开始 - ${progressText(record)}, 总时限: ${RUN_TIMEOUT_MS / 1000}秒, 模型无进展时限: ${MODEL_IDLE_TIMEOUT_MS / 1000}秒`);
   const heartbeat = setInterval(() => log.info("任务仍在运行 - " + progressText(record)), 60_000);
   heartbeat.unref();
+  const watchdog = setInterval(p.checkModelIdle, 1000);
+  watchdog.unref();
   record.notes.clear();
   record.deliveryId = undefined;
   let session: AgentSession | undefined;
   let abortTask: Promise<void> | undefined;
   let timeoutStage: string | undefined;
   const onAbort = () => {
-    if (deadline.aborted && !cancellation.aborted && !application.signal.aborted) {
-      timeoutStage ??= record.progress?.stage;
-      log.warn("任务总时限到达 - " + progressText(record));
+    if (!p.abortReason) {
+      timeoutStage = p.stage;
+      p.abortReason = application.signal.aborted ? "shutdown" : cancellation.aborted ? "user_cancel" :
+        modelIdle.signal.aborted ? "model_idle" : "task_timeout";
+      const reason = p.abortReason === "model_idle" ? "模型无有效进展超时" :
+        p.abortReason === "task_timeout" ? "任务总时限到达" : "任务取消";
+      log.warn(reason + " - " + progressText(record));
+      p.model.pause();
+      setStage(record, "等待取消清理");
     }
-    setStage(record, "等待取消清理");
     if (session) abortTask ??= session.abort().catch((error) => log.warn("Pi abort: " + String(error)));
   };
   signal.addEventListener("abort", onAbort, { once: true });
@@ -293,6 +339,7 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
     log.info(`模型调用开始 - ${progressText(record)}, 历史消息数: ${session.state.messages.length}`);
     await session.prompt(content);
     signal.throwIfAborted();
+    p.model.pause();
     setStage(record, "模型调用结束");
     const failure = session.state.errorMessage;
     const text = session.getLastAssistantText();
@@ -311,14 +358,21 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
     log.info("任务完成 - " + progressText(record));
   } catch (error) {
     if (cancellation.aborted || application.signal.aborted) return;
-    if (deadline.aborted) {
+    if (p.abortReason === "model_idle") throw modelIdle.signal.reason;
+    if (p.abortReason === "task_timeout") {
       throw new Error(`任务总时限 ${RUN_TIMEOUT_MS / 1000} 秒已到（阶段：${timeoutStage ?? record.progress?.stage}；任务：${record.progress?.id}）`);
     }
     log.warn("任务失败 - " + progressText(record) + ", 错误: " + redactSecrets(String(error)));
     throw error;
   } finally {
     signal.removeEventListener("abort", onAbort);
-    try { await abortTask; } finally { clearInterval(heartbeat); record.progress = undefined; }
+    clearInterval(watchdog);
+    p.model.pause();
+    try { await abortTask; } finally {
+      if (signal.aborted) log.info("任务取消清理完成 - " + progressText(record));
+      clearInterval(heartbeat);
+      record.progress = undefined;
+    }
     record.lastUsed = Date.now();
   }
 }
@@ -361,7 +415,8 @@ export async function handleUserMessage(phone: string, groupId: string, content:
     if (record.progress) {
       const p = record.progress;
       reply += `\n任务编号：${p.id}\n当前阶段：${p.stage}\n已用时间：${Math.floor((Date.now() - p.started) / 1000)} 秒` +
-        `\n距上次进度更新：${Math.floor((Date.now() - p.updated) / 1000)} 秒\n最长处理时间：${RUN_TIMEOUT_MS / 1000} 秒`;
+        `\n距上次进度更新：${Math.floor((Date.now() - p.updated) / 1000)} 秒\n最长处理时间：${RUN_TIMEOUT_MS / 1000} 秒` +
+        `\n模型无进展时限：${MODEL_IDLE_TIMEOUT_MS / 1000} 秒`;
     }
   } else reply = command === "/help" ? HELP_TEXT : unknownCommandText(content);
   const receiptKey = record.key + command;

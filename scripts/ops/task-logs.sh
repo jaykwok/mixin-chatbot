@@ -93,6 +93,8 @@ FNR == 1 {
         if (index($0, "任务开始 -")) starts++
         if (index($0, "任务仍在运行 -")) last_heartbeat = text
         if (index($0, "任务总时限到达 -")) timeout_record = text
+        if (index($0, "模型无有效进展超时 -")) model_idle_record = text
+        if (index($0, "模型流结束 -")) last_stream_end = text
         print text > task_file
         first = NR - context
         if (first < 1) first = 1
@@ -123,12 +125,18 @@ END {
     report("总时限到达记录（取消清理前）:")
     report(record(timeout_record))
     report("")
+    report("模型无有效进展超时记录（取消清理前）:")
+    report(record(model_idle_record))
+    report("")
+    report("最后一条模型流结束记录（含流统计和结束原因）:")
+    report(record(last_stream_end))
+    report("")
     report("最后一条任务记录:")
     report(record(last_match))
     report("")
     report("task.log: 仅任务匹配行；context.log: 匹配行及前后文，重叠行只保留一次。")
     report("每行带原日志文件名和行号；-- 表示省略了不相关的日志。")
-    report("接收模型输出阶段要结合最近进展距今判断；本报告不直接断言超时原因。")
+    report("接收模型输出阶段要结合有效内容增长和流事件统计判断；旧版本可能未记录这些字段，本报告不直接断言超时原因。")
     report("这是已写入日志的一次读取，运行中的任务可能继续产生日志。")
     if (!hits) {
         report("未找到任务。请确认任务 ID、生产实例及日志目录；较早日志可能已轮转覆盖。")

@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { mkdir, writeFile, access } from "node:fs/promises";
 import { mock } from "bun:test";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { waitFor, application } from "../../src/core/lifecycle.ts";
 const sdk = await import("@earendil-works/pi-coding-agent");
 const completed: string[] = [];
@@ -11,14 +12,15 @@ function gate() {
   const promise = new Promise<void>((resolve) => { release = resolve; });
   return { promise, release };
 }
-async function until(check: () => boolean) {
-  const end = Date.now() + 3000;
+async function until(check: () => boolean, timeoutMs = 3000) {
+  const end = Date.now() + timeoutMs;
   while (!check()) { assert.ok(Date.now() < end, "lifecycle condition timed out"); await delay(); }
 }
 type Fake = { cwd: string; history: string; state: { errorMessage?: string; messages: unknown[] }; prompt: (text: string) => Promise<void>;
   abort: () => Promise<void>; dispose: () => Promise<void>; subscribe: () => () => void; getLastAssistantText: () => string;
   active: boolean; disposed: boolean; controller?: AbortController; disposeGate?: ReturnType<typeof gate>; disposeError?: Error;
-  emit?: (event: { type: string; toolName?: string }) => void };
+  promptGate?: ReturnType<typeof gate>; abortGate?: ReturnType<typeof gate>;
+  emit?: (event: { type: string; [key: string]: unknown }) => void };
 const sessions: Fake[] = [];
 const prompts: string[] = [];
 let creating = false;
@@ -53,11 +55,11 @@ mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
         prompts.push(text); session.active = true; active++; peak = Math.max(peak, active);
         session.controller = new AbortController();
         try {
-          if (text.startsWith("block")) await waitFor(gate().promise, session.controller.signal);
+          if (text.startsWith("block")) { session.promptGate = gate(); await waitFor(session.promptGate.promise, session.controller.signal); }
           if (text === "link") link?.();
         } finally { session.active = false; active--; }
       },
-      async abort() { session.controller?.abort(new DOMException("cancel", "AbortError")); await abortGate?.promise; },
+      async abort() { session.controller?.abort(new DOMException("cancel", "AbortError")); await session.abortGate?.promise; await abortGate?.promise; },
       async dispose() { assert.equal(session.active, false); await session.disposeGate?.promise; if (session.disposeError) throw session.disposeError; session.disposed = true; },
       subscribe: (listener?: Fake["emit"]) => { session.emit = listener; return () => { session.emit = undefined; }; },
       getLastAssistantText: () => "answer:" + prompts.at(-1),
@@ -93,6 +95,132 @@ const { stateDatabase } = await import("../../src/core/state.ts");
 const store = new DeliveryStore();
 const callback = (key: string) => "https://im.zdxlz.com/im-external/v1/webhook/send?key=" + key;
 const request = (user: string, content: string) => runtime.handleUserMessage(user, "group", content, callback(user));
+
+// A separate process selects this mode with a 10s model idle budget and a 45s task budget.
+if (process.argv.includes("--model-idle")) {
+  const partial = (responseId: string): AssistantMessage => ({
+    role: "assistant", content: [], api: "openai-completions", provider: "fake", model: "fake", responseId,
+    stopReason: "pending", timestamp: Date.now(),
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  });
+  async function blocked(user: string) {
+    const result = request(user, "block-" + user).then(() => undefined, error => error as Error);
+    await until(() => prompts.includes("block-" + user));
+    return { session: sessions.at(-1)!, result };
+  }
+  function begin(session: Fake, message: AssistantMessage) {
+    session.emit?.({ type: "turn_start" });
+    session.emit?.({ type: "message_start", message });
+  }
+  function delta(session: Fake, message: AssistantMessage, value: string, type = "toolcall_delta") {
+    session.emit?.({ type: "message_update", message,
+      assistantMessageEvent: { type, contentIndex: 0, delta: value, partial: message } });
+  }
+  function finish(session: Fake, message: AssistantMessage) {
+    message.stopReason = "stop"; message.rawStopReason = "stop";
+    session.emit?.({ type: "message_end", message });
+    session.promptGate!.release();
+  }
+
+  const silent = await blocked("idle-silent");
+  silent.session.emit?.({ type: "turn_start" });
+  const empty = await blocked("idle-empty");
+  const emptyMessage = partial("idle-empty-response");
+  empty.session.abortGate = gate();
+  begin(empty.session, emptyMessage);
+  delta(empty.session, emptyMessage, '{"path": "private-tool-argument"}');
+  const emptyTimer = setInterval(() => {
+    delta(empty.session, emptyMessage, "");
+    delta(empty.session, emptyMessage, " \n");
+  }, 50);
+  const next = request("idle-empty", "after-idle-cancellation");
+
+  const growing = await blocked("idle-growing");
+  const growingMessage = partial("idle-growing-response");
+  begin(growing.session, growingMessage);
+  const growingTimer = setInterval(() => {
+    delta(growing.session, growingMessage, "private-thinking", "thinking_delta");
+    delta(growing.session, growingMessage, "private-answer", "text_delta");
+    delta(growing.session, growingMessage, "private-argument");
+  }, 1_000);
+
+  const tool = await blocked("idle-tool");
+  const toolMessage = partial("idle-tool-response");
+  begin(tool.session, toolMessage);
+  delta(tool.session, toolMessage, '{"path":"file"}');
+  toolMessage.stopReason = "toolUse"; toolMessage.rawStopReason = "tool_calls";
+  tool.session.emit?.({ type: "message_end", message: toolMessage });
+  tool.session.emit?.({ type: "tool_execution_start", toolName: "read" });
+
+  const compaction = await blocked("idle-compaction");
+  compaction.session.emit?.({ type: "compaction_start" });
+  const retry = await blocked("idle-retry");
+  const retryMessage = partial("idle-retry-first");
+  begin(retry.session, retryMessage);
+  retryMessage.stopReason = "error";
+  retry.session.emit?.({ type: "message_end", message: retryMessage });
+  retry.session.emit?.({ type: "auto_retry_start", attempt: 1, maxAttempts: 1, delayMs: 12_000, errorMessage: "503: fake retry" });
+
+  finalGate = gate();
+  const delivery = await blocked("idle-delivery");
+  const deliveryMessage = partial("idle-delivery-response");
+  begin(delivery.session, deliveryMessage);
+  delta(delivery.session, deliveryMessage, "private-final-answer", "text_delta");
+  finish(delivery.session, deliveryMessage);
+  await until(() => finalCalls === 1);
+  let delivered = false;
+  void delivery.result.then(() => { delivered = true; });
+
+  await until(() => !!silent.session.controller?.signal.aborted && !!empty.session.controller?.signal.aborted, 15_000);
+  clearInterval(emptyTimer);
+  assert.match(String(await silent.result), /模型连续 10 秒无有效进展.*阶段：等待模型响应/);
+  assert.equal(prompts.includes("after-idle-cancellation"), false, "next prompt escaped the abort cleanup barrier");
+  emptyMessage.stopReason = "aborted";
+  empty.session.emit?.({ type: "message_end", message: emptyMessage });
+  // Late updates must not revive a cancelled run or hide its cleanup phase.
+  empty.session.emit?.({ type: "turn_start" });
+  delta(empty.session, emptyMessage, "late-output-must-be-ignored");
+  empty.session.emit?.({ type: "tool_execution_start", toolName: "late-tool" });
+  await request("idle-empty", "/status");
+  assert.match(sent.at(-1)!, /当前阶段：等待取消清理/);
+  assert.match(sent.at(-1)!, /模型无进展时限：10 秒/);
+  assert.equal(store.pending(JSON.stringify(["group", "idle-empty"])).length, 0, "partial output was persisted as a deliverable");
+  empty.session.abortGate!.release();
+  assert.match(String(await empty.result), /模型连续 10 秒无有效进展.*阶段：接收模型输出/);
+  await until(() => prompts.includes("after-idle-cancellation"));
+  completed.push("silent-and-empty-streams-stop-with-cleanup-barrier");
+
+  // These phases have lasted longer than the idle budget and must still be running.
+  for (const item of [growing, tool, compaction, retry]) {
+    assert.equal(item.session.active, true);
+    assert.equal(item.session.controller?.signal.aborted, false);
+  }
+  assert.equal(delivered, false);
+  assert.equal(delivery.session.controller?.signal.aborted, false);
+  clearInterval(growingTimer);
+  finish(growing.session, growingMessage);
+  for (const [item, id] of [[tool, "idle-tool-next"], [compaction, "idle-compaction-next"], [retry, "idle-retry-next"]] as const) {
+    const message = partial(id);
+    begin(item.session, message);
+    delta(item.session, message, "reply-after-pause", "text_delta");
+    finish(item.session, message);
+  }
+  finalGate.release();
+  for (const item of [growing, tool, compaction, retry, delivery]) assert.equal(await item.result, undefined);
+  await next;
+  finalGate = undefined;
+  completed.push("growth-tools-compaction-retry-and-delivery-survive");
+
+  await request("idle-empty", "/status");
+  assert.match(sent.at(-1)!, /状态：空闲/);
+  assert.doesNotMatch(sent.at(-1)!, /任务编号：/);
+  await runtime.disposeAllSessions();
+  await application.drain();
+  stateDatabase().close();
+  console.log("HARNESS_RESULT=" + JSON.stringify(completed));
+  process.exit(0);
+}
 
 // Diagnose a silent stream and compaction separately; stale tool state must not leak into the next run.
 const observed = request("progress", "block-progress");

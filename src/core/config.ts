@@ -37,6 +37,8 @@ export const ALLOW_INSECURE_WEBHOOK = process.env.ALLOW_INSECURE_WEBHOOK === "1"
 /** 详细日志会记录用户消息正文，默认关闭。 */
 export const DEBUG = runtimeSetting("BOT_DEBUG") === "1";
 export const RUN_TIMEOUT_MS = integerEnv("BOT_RUN_TIMEOUT_SECONDS", 1200, 10, 7200) * 1000;
+/** Only model waiting/streaming; empty or whitespace-only deltas do not renew this budget. */
+export const MODEL_IDLE_TIMEOUT_MS = integerEnv("BOT_MODEL_IDLE_TIMEOUT_SECONDS", 180, 10, 7200) * 1000;
 export const SHUTDOWN_TIMEOUT_MS = integerEnv("BOT_SHUTDOWN_TIMEOUT_SECONDS", 20, 5, 25) * 1000;
 export const DELIVERY_TIMEOUT_MS = integerEnv("BOT_DELIVERY_TIMEOUT_SECONDS", 180, 1, 600) * 1000;
 export const MAX_WEBHOOK_BODY_BYTES = 64 * 1024;

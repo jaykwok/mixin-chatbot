@@ -89,6 +89,15 @@ describe("请求失败回执", () => {
     expect(deadline).not.toContain("连不上模型服务");
   });
 
+  test("model inactivity explains the early stop and retains the task ID", () => {
+    const reply = describeRequestFailure(new Error("模型连续 180 秒无有效进展（阶段：接收模型输出；任务：555d838a）"));
+    expect(reply).toContain("模型长时间没有产生新的有效内容");
+    expect(reply).toContain("本次处理已停止");
+    expect(reply).toContain("任务：555d838a");
+    expect(reply).not.toContain("连不上模型服务");
+    expect(reply).not.toContain("超过了最长等待时间");
+  });
+
   test("上下文超限提示用户自己 /clear", () => {
     const reply = describeRequestFailure(
       new Error("模型未返回回复：400: This model's maximum context length is 128000 tokens")
