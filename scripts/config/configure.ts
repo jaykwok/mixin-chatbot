@@ -16,12 +16,12 @@ import {
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
-import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
+import { clampThinkingLevel, getSupportedThinkingLevels, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { builtinProviders, getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODELS_JSON_PATH } from "../../src/core/storage.ts";
 import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
 
-export const MODEL_API = "openai-responses" as const;
+export const CUSTOM_APIS = ["openai-completions", "openai-responses", "anthropic-messages"] as const;
 
 // @clack/prompts 取消即退出。
 function bail<T>(v: T | symbol): T {
@@ -33,10 +33,19 @@ function bail<T>(v: T | symbol): T {
 }
 
 interface ExistingDoc {
+  modelId?: string;
   thinkingLevel?: ModelThinkingLevel;
   providers?: Record<string, Record<string, unknown>>;
 }
 type JsonObject = Record<string, unknown>;
+
+/** Keep the native provider intact: only supply credentials; Pi owns transport and metadata. */
+export function builtinConfiguration(providerId: string, modelId: string, apiKey: string, thinkingLevel: ModelThinkingLevel): ExistingDoc {
+  const provider = builtinProviders().find((item) => item.id === providerId && item.auth.apiKey);
+  const model = provider?.getModels().find((item) => item.id === modelId);
+  if (!model) throw new Error(`Pi 内置 API Key 服务商中未找到 ${providerId}/${modelId}`);
+  return { modelId, thinkingLevel: clampThinkingLevel(model, thinkingLevel), providers: { [providerId]: { apiKey } } };
+}
 
 async function loadExisting(): Promise<ExistingDoc> {
   try {
@@ -61,23 +70,24 @@ export function catalogMatches(modelId: string): Model<Api>[] {
   );
 }
 
-export function defaultCatalogSource(matches: Model<Api>[], providerId: string, reuseExisting: boolean): number {
+export function defaultCatalogSource(matches: Model<Api>[], providerId: string, reuseExisting: boolean, api: Api = "openai-responses"): number {
   if (reuseExisting || matches.length === 0) return -1;
   const providerMatch = matches.findIndex((model) => model.provider === providerId);
   if (providerMatch !== -1) return providerMatch;
-  const responsesMatch = matches.findIndex((model) => model.api === MODEL_API);
-  return responsesMatch === -1 ? 0 : responsesMatch;
+  const apiMatch = matches.findIndex((model) => model.api === api);
+  return apiMatch === -1 ? 0 : apiMatch;
 }
 
 /** 配置器只生成一个模型；compat 合并到模型一级，避免两个层级保存相反值。 */
-export function responsesProvider(
+export function customProvider(
   providerId: string, baseUrl: string, apiKey: string, model: JsonObject,
-  providerCompat: JsonObject, supportsMaxOutputTokens: boolean
+  providerCompat: JsonObject, supportsMaxOutputTokens: boolean, api: Api = "openai-responses"
 ): JsonObject {
   return {
-    name: providerId, baseUrl, apiKey, api: MODEL_API,
+    name: providerId, baseUrl, apiKey, api,
     models: [{ ...model, compat: {
-      ...providerCompat, ...(model.compat as JsonObject | undefined), supportsMaxOutputTokens,
+      ...providerCompat, ...(model.compat as JsonObject | undefined),
+      ...(api === "openai-responses" ? { supportsMaxOutputTokens } : {}),
     } }],
   };
 }
@@ -135,21 +145,62 @@ async function main(): Promise<void> {
   const firstEntry = firstId ? (existingProviders[firstId] as JsonObject) : null;
   const firstModel = (firstEntry?.models as JsonObject[] | undefined)?.[0];
 
+  const mode = bail<string>(await select({
+    message: "模型接入方式",
+    initialValue: firstEntry?.models ? "custom" : "builtin",
+    options: [
+      { value: "builtin", label: "Pi 内置服务商（选择模型、填写 API Key）" },
+      { value: "custom", label: "自定义服务商（Pi models.json）" },
+    ],
+  }));
+  if (mode === "builtin") {
+    const providers = builtinProviders().filter((item) => item.auth.apiKey && item.getModels().length > 0);
+    const providerId = bail<string>(await select({
+      message: "Pi 内置服务商",
+      initialValue: providers.some((item) => item.id === firstId) ? firstId : "openai",
+      options: providers.map((item) => ({ value: item.id, label: `${item.name} (${item.id})` })),
+    }));
+    const models = providers.find((item) => item.id === providerId)!.getModels();
+    const previousId = existing.modelId ?? firstModel?.id;
+    const modelId = bail<string>(await select({
+      message: "Pi 内置模型",
+      initialValue: models.find((item) => item.id === previousId)?.id ?? models[0]!.id,
+      options: models.map((item) => ({ value: item.id, label: `${item.name} (${item.id})` })),
+    }));
+    const model = models.find((item) => item.id === modelId)!;
+    note(`地址：${model.baseUrl}\n协议：${model.api}\n上下文：${model.contextWindow}\n输出上限：${model.maxTokens}`, "Pi 内置配置");
+    const apiKey = bail<string>(await password({ message: "API Key", validate: (v) => v?.trim() ? undefined : "不能为空" })).trim();
+    const levels = getSupportedThinkingLevels(model);
+    const initial = clampThinkingLevel(model, defaultThinkingLevel(model.reasoning, existing.thinkingLevel));
+    const thinkingLevel = levels.length > 1 ? bail<ModelThinkingLevel>(await select({
+      message: "thinkingLevel", initialValue: initial,
+      options: levels.map((value) => ({ value, label: value })),
+    })) : initial;
+    await saveConfiguration(builtinConfiguration(providerId, modelId, apiKey, thinkingLevel), providerId, thinkingLevel);
+    return;
+  }
+
   const providerId = bail<string>(
     await text({
-      message: "Responses provider id（自洽即可，如 openai）",
+      message: "自定义 provider id（如 custom-gateway）",
       defaultValue: firstId ?? "openai",
       initialValue: firstId ?? "openai",
       validate: (v) => (v?.trim() ? undefined : "不能为空"),
     })
   ).trim();
+  const api = bail<(typeof CUSTOM_APIS)[number]>(await select({
+    message: "自定义服务协议",
+    initialValue: CUSTOM_APIS.find((value) => value === firstEntry?.api) ?? "openai-completions",
+    options: CUSTOM_APIS.map((value) => ({ value, label: value })),
+  }));
+  const defaultBaseUrl = api === "anthropic-messages" ? "https://api.anthropic.com" : "https://api.openai.com/v1";
   const baseUrl = bail<string>(
     await text({
-      message: "baseUrl（必须实现 OpenAI Responses API）",
+      message: "baseUrl（对应所选协议的服务地址）",
       defaultValue:
-        (firstEntry?.baseUrl as string) ?? "https://api.openai.com/v1",
+        (firstEntry?.baseUrl as string) ?? defaultBaseUrl,
       initialValue:
-        (firstEntry?.baseUrl as string) ?? "https://api.openai.com/v1",
+        (firstEntry?.baseUrl as string) ?? defaultBaseUrl,
       validate: (v) => {
         try {
           const protocol = new URL(v ?? "").protocol;
@@ -180,7 +231,7 @@ async function main(): Promise<void> {
   // 同步读取 Pi 随包提供的目录，无需联网、认证或另一套元数据格式。
   // 只有仍在编辑原 provider 时才考虑复用旧模型元数据；同名模型在不同端点
   // 可能有不同上下文、能力和价格，不能跨 provider 继承。
-  const sameProvider = providerId === firstId && baseUrl === firstEntry?.baseUrl;
+  const sameProvider = providerId === firstId && baseUrl === firstEntry?.baseUrl && api === firstEntry?.api;
   const reuseExisting = sameProvider && firstModel?.id === modelId;
   let model = modelDefaultsForSelection(
     modelId,
@@ -191,7 +242,7 @@ async function main(): Promise<void> {
   if (matches.length > 0) {
     const source = bail<number>(await select({
       message: "模型资料来源（中转站的价格和能力可能不同，请核对）",
-      initialValue: defaultCatalogSource(matches, providerId, reuseExisting),
+      initialValue: defaultCatalogSource(matches, providerId, reuseExisting, api),
       options: [
         { value: -1, label: reuseExisting ? "保留已有资料（下方可编辑）" : "手动填写全部模型资料" },
         ...matches.map((match, index) => ({
@@ -260,10 +311,10 @@ async function main(): Promise<void> {
   const providerCompat = sameProvider
     ? (firstEntry?.compat ?? {}) as JsonObject
     : {};
-  const supportsMaxOutputTokens = bail<boolean>(await confirm({
+  const supportsMaxOutputTokens = api === "openai-responses" ? bail<boolean>(await confirm({
     message: "服务支持 max_output_tokens 参数？（仅在服务明确拒绝该参数时选否）",
     initialValue: (compat.supportsMaxOutputTokens ?? providerCompat.supportsMaxOutputTokens) !== false,
-  }));
+  })) : true;
 
   const supportsReasoning = bail<boolean>(
     await confirm({
@@ -292,9 +343,13 @@ async function main(): Promise<void> {
     );
   }
 
-  const entry = responsesProvider(providerId, baseUrl, apiKey, model, providerCompat, supportsMaxOutputTokens);
+  const entry = customProvider(providerId, baseUrl, apiKey, model, providerCompat, supportsMaxOutputTokens, api);
 
-  const doc = { thinkingLevel, providers: { [providerId]: entry } };
+  const doc = { modelId, thinkingLevel, providers: { [providerId]: entry } };
+  await saveConfiguration(doc, providerId, thinkingLevel);
+}
+
+async function saveConfiguration(doc: ExistingDoc, providerId: string, thinkingLevel: ModelThinkingLevel): Promise<void> {
   await mkdir(dirname(MODELS_JSON_PATH), { recursive: true });
   await mkdir("agents/temp", { recursive: true });
   const tempPath = join("agents/temp", `models-${randomUUID()}.json`);

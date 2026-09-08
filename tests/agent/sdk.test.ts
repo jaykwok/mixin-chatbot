@@ -5,9 +5,36 @@ import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryMo
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { buildChatContext } from "../../src/agent/prompt.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import { responsesProvider } from "../../scripts/config/configure.ts";
+import { builtinConfiguration, customProvider } from "../../scripts/config/configure.ts";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 
 describe("installed Pi SDK integration", () => {
+  test("native key-only configuration preserves Pi ZAI transport, tools and thinking metadata", async () => {
+    const files = await tempFixture("pi-native-");
+    try {
+      const modelsPath = join(files.root, "models.json");
+      await writeFile(modelsPath, JSON.stringify(builtinConfiguration("zai-coding-cn", "glm-5.3-flash", "test-only", "low")));
+      const runtime = await ModelRuntime.create({ modelsPath, credentials: new InMemoryCredentialStore(),
+        modelsStore: new InMemoryModelsStore(), refreshOnCreate: false });
+      expect(runtime.getError()).toBeUndefined();
+      const model = runtime.getModel("zai-coding-cn", "glm-5.3-flash")!;
+      const builtin = getBuiltinModels("zai-coding-cn").find((item) => item.id === model.id)!;
+      expect(model).toMatchObject({ api: builtin.api, baseUrl: builtin.baseUrl, compat: builtin.compat,
+        thinkingLevelMap: builtin.thinkingLevelMap, contextWindow: builtin.contextWindow, maxTokens: builtin.maxTokens });
+      expect(await runtime.checkAuth("zai-coding-cn")).toBeDefined();
+      let payload: Record<string, unknown> | undefined;
+      const result = await runtime.completeSimple(model, { messages: [{ role: "user", content: "test", timestamp: 0 }],
+        tools: [{ name: "lookup", description: "test", parameters: { type: "object", properties: {} } }] }, {
+        reasoning: "low", maxTokens: 128,
+        onPayload(body) { payload = body as Record<string, unknown>; throw new Error("captured native payload before network"); },
+      });
+      expect(result.errorMessage).toContain("captured native payload before network");
+      expect(payload?.model).toBe("glm-5.3-flash");
+      expect(payload?.tools).toBeDefined();
+      expect(payload?.max_tokens).toBe(128);
+      expect(payload).not.toHaveProperty("max_output_tokens");
+    } finally { await files.cleanup(); }
+  });
   test.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"])("Pi 0.85.1 builds the real long-cache payload for %s", async (id) => {
     const runtime = await ModelRuntime.create({ modelsPath: null, credentials: new InMemoryCredentialStore(),
       modelsStore: new InMemoryModelsStore(), refreshOnCreate: false });
@@ -28,7 +55,7 @@ describe("installed Pi SDK integration", () => {
     try {
       const modelsPath = join(files.root, "models.json");
       await writeFile(modelsPath, JSON.stringify({ providers: {
-        [provider]: responsesProvider(provider, "http://127.0.0.1:1/v1", "test-only", {
+        [provider]: customProvider(provider, "http://127.0.0.1:1/v1", "test-only", {
           id: "gpt-5.2", contextWindow: 8192, maxTokens: 512, reasoning: false,
           compat: { supportsMaxOutputTokens: false },
         }, { supportsMaxOutputTokens: false }, true),

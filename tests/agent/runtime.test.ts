@@ -5,7 +5,7 @@ import { tempFixture } from "../helpers/temp.ts";
 test("real runtime and HTTP scheduling survive lifecycle races", async () => {
   const fixture = await tempFixture("mixin-runtime-");
   const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../helpers/runtime-harness.ts", import.meta.url))], {
-    cwd: fixture.root, env: { ...process.env, GROUP_DATA_ROOT: "data/groups", BOT_MAX_ACTIVE_REQUESTS: "1" },
+    cwd: fixture.root, env: { ...process.env, GROUP_DATA_ROOT: "data/groups", BOT_MAX_ACTIVE_REQUESTS: "1", BOT_RUN_TIMEOUT_SECONDS: "10" },
     stdout: "pipe", stderr: "pipe", windowsHide: true,
   });
   const timer = setTimeout(() => child.kill(), 25000);
@@ -14,6 +14,6 @@ test("real runtime and HTTP scheduling survive lifecycle races", async () => {
     expect(code, stdout + "\n" + stderr).toBe(0);
     const line = stdout.split("\n").find(line => line.startsWith("HARNESS_RESULT="));
     expect(line, stderr).toBeDefined();
-    expect(JSON.parse(line!.slice("HARNESS_RESULT=".length))).toHaveLength(9);
+    expect(JSON.parse(line!.slice("HARNESS_RESULT=".length))).toHaveLength(10);
   } finally { clearTimeout(timer); child.kill(); await child.exited; await fixture.cleanup(); }
 }, 30000);

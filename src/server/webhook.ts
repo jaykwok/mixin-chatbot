@@ -195,14 +195,14 @@ async function processRequest(
   clientIp: string
 ): Promise<void> {
   const start = Date.now();
-  log.info(`请求处理开始 - 用户: ${phone}, IP: ${clientIp}`);
+  log.info(`请求处理开始 - 群: ${groupId}, 用户: ${phone}, IP: ${clientIp}`);
   try {
     if (DEBUG) log.info(`[DEBUG] webhook 内容 - 用户: ${phone}, 内容: ${content}`);
     await handleUserMessage(phone, groupId, content, callbackUrl);
   } catch (e) {
     if (application.signal.aborted || (e instanceof Error && e.name === "AbortError")) return;
     const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-    log.error(`请求处理失败 - 用户: ${phone}, 耗时: ${elapsed}秒, 错误: ${String(e)}`);
+    log.error(`请求处理失败 - 群: ${groupId}, 用户: ${phone}, 耗时: ${elapsed}秒, 错误: ${String(e)}`);
     try {
       // 失败回执走 text：不能带「✅ 任务已完成」，报错原文里的 JSON 也不该被
       // Markdown 判定挑中再被转换改写。

@@ -3,10 +3,10 @@ import {
   defaultThinkingLevel,
   catalogMatches,
   catalogModelMetadata,
-  MODEL_API,
+  CUSTOM_APIS,
   modelDefaultsForSelection,
   defaultCatalogSource,
-  responsesProvider,
+  customProvider,
 } from "../../scripts/config/configure.ts";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 
@@ -23,7 +23,7 @@ describe("configure model metadata", () => {
   });
 
   test("writes compatibility settings only on the model, with the selected value winning", () => {
-    const entry = responsesProvider("openai", "https://example.com/v1", "test-only", {
+    const entry = customProvider("openai", "https://example.com/v1", "test-only", {
       id: "test", compat: { supportsMaxOutputTokens: false, supportsStrictMode: true },
     }, { supportsMaxOutputTokens: false, supportsDeveloperRole: false }, true);
     expect(entry).not.toHaveProperty("compat");
@@ -32,8 +32,13 @@ describe("configure model metadata", () => {
     } }]);
   });
 
-  test("writes the OpenAI Responses API type", () => {
-    expect(MODEL_API).toBe("openai-responses");
+  test("offers Pi custom protocols without forcing Responses compatibility", () => {
+    expect(CUSTOM_APIS).toEqual(["openai-completions", "openai-responses", "anthropic-messages"]);
+    for (const api of CUSTOM_APIS) {
+      const entry = customProvider("custom", "https://example.com/v1", "test-only", { id: "test" }, {}, true, api);
+      expect(entry.api).toBe(api);
+      expect((entry.models as { compat: object }[])[0]!.compat).toEqual(api === "openai-responses" ? { supportsMaxOutputTokens: true } : {});
+    }
   });
 
   test("defaults reasoning models to low and non-reasoning models to off", () => {

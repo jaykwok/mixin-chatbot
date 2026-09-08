@@ -15,9 +15,10 @@ async function until(check: () => boolean) {
   const end = Date.now() + 3000;
   while (!check()) { assert.ok(Date.now() < end, "lifecycle condition timed out"); await delay(); }
 }
-type Fake = { cwd: string; history: string; state: { errorMessage?: string }; prompt: (text: string) => Promise<void>;
+type Fake = { cwd: string; history: string; state: { errorMessage?: string; messages: unknown[] }; prompt: (text: string) => Promise<void>;
   abort: () => Promise<void>; dispose: () => Promise<void>; subscribe: () => () => void; getLastAssistantText: () => string;
-  active: boolean; disposed: boolean; controller?: AbortController; disposeGate?: ReturnType<typeof gate>; disposeError?: Error };
+  active: boolean; disposed: boolean; controller?: AbortController; disposeGate?: ReturnType<typeof gate>; disposeError?: Error;
+  emit?: (event: { type: string; toolName?: string }) => void };
 const sessions: Fake[] = [];
 const prompts: string[] = [];
 let creating = false;
@@ -34,7 +35,7 @@ let link: (() => void) | undefined;
 const sent: string[] = [];
 
 mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
-  ModelRuntime: { create: async () => ({ getModel: () => ({ id: "fake", provider: "fake", api: "openai-responses" }), checkAuth: async () => true }) },
+  ModelRuntime: { create: async () => ({ getError: () => undefined, getModel: () => ({ id: "fake", provider: "fake", api: "openai-responses" }), checkAuth: async () => true }) },
   DefaultResourceLoader: class { async reload() {} },
   SessionManager: { open: (filename: string) => ({ filename }) },
   SettingsManager: { inMemory: () => ({}) },
@@ -45,7 +46,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
     const history = options.sessionManager.filename;
     await writeFile(history, '{"type":"session","version":3}\n');
     const session: Fake = {
-      cwd: options.cwd, history, state: {}, active: false, disposed: false,
+      cwd: options.cwd, history, state: { messages: [] }, active: false, disposed: false,
       async prompt(text) {
         assert.equal(session.active, false, "overlapping prompt on one session");
         assert.equal(session.disposed, false, "prompt started after disposal");
@@ -58,7 +59,8 @@ mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
       },
       async abort() { session.controller?.abort(new DOMException("cancel", "AbortError")); await abortGate?.promise; },
       async dispose() { assert.equal(session.active, false); await session.disposeGate?.promise; if (session.disposeError) throw session.disposeError; session.disposed = true; },
-      subscribe: () => () => {}, getLastAssistantText: () => "answer:" + prompts.at(-1),
+      subscribe: (listener?: Fake["emit"]) => { session.emit = listener; return () => { session.emit = undefined; }; },
+      getLastAssistantText: () => "answer:" + prompts.at(-1),
     };
     sessions.push(session);
     return { session };
@@ -84,13 +86,39 @@ mock.module("../../src/integrations/im.ts", () => ({
   },
 }));
 await mkdir("data/config", { recursive: true });
-await writeFile("data/config/models.json", JSON.stringify({ providers: { fake: { models: [{ id: "fake" }] } } }));
+await writeFile("data/config/models.json", JSON.stringify({ modelId: "fake", providers: { fake: { apiKey: "test-only" } } }));
 const runtime = await import("../../src/agent/runtime.ts");
 const { DeliveryStore } = await import("../../src/agent/delivery-store.ts");
 const { stateDatabase } = await import("../../src/core/state.ts");
 const store = new DeliveryStore();
 const callback = (key: string) => "https://im.zdxlz.com/im-external/v1/webhook/send?key=" + key;
 const request = (user: string, content: string) => runtime.handleUserMessage(user, "group", content, callback(user));
+
+// Diagnose a silent stream and compaction separately; stale tool state must not leak into the next run.
+const observed = request("progress", "block-progress");
+await until(() => prompts.includes("block-progress"));
+const observedSession = sessions.at(-1)!;
+observedSession.emit?.({ type: "turn_start" });
+await request("progress", "/status");
+assert.match(sent.at(-1)!, /当前阶段：等待模型响应/);
+assert.match(sent.at(-1)!, /任务编号：/);
+await delay(); // Control receipts coalesce until their asynchronous send finishes.
+observedSession.emit?.({ type: "tool_execution_start", toolName: "read" });
+observedSession.emit?.({ type: "compaction_start" });
+await request("progress", "/status");
+assert.match(sent.at(-1)!, /当前阶段：压缩会话历史/);
+await delay();
+await request("progress", "/stop"); await observed;
+const timed = assert.rejects(request("progress", "block-timeout"), /任务总时限 10 秒已到.*阶段：等待模型响应/);
+await until(() => prompts.includes("block-timeout"));
+observedSession.emit?.({ type: "turn_start" });
+await request("progress", "/status");
+assert.match(sent.at(-1)!, /最近工具：无/);
+await timed;
+await request("progress", "/status");
+assert.match(sent.at(-1)!, /状态：空闲/);
+assert.doesNotMatch(sent.at(-1)!, /任务编号：/);
+completed.push("progress-and-task-deadline");
 
 // A final reply waiting on the platform still owns the session queue.
 finalGate = gate();

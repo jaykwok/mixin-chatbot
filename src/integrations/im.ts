@@ -685,7 +685,7 @@ export async function sendText(
     options?.traffic ?? "required",
     signal
   );
-  if (ok) log.info(`消息发送成功，群: ${groupId}, 用户: ${phone}`);
+  if (ok) log.info(`消息发送成功（${options?.traffic === "status" ? "处理中提示" : "文本回执"}），群: ${groupId}, 用户: ${phone}`);
   return ok;
 }
 

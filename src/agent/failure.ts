@@ -56,6 +56,10 @@ interface FailureRule {
 // 的窗口纯属误导；空回复排最后，它只是「没别的线索」时的兜底描述。
 const FAILURE_RULES: readonly FailureRule[] = [
   {
+    pattern: /任务总时限/,
+    hint: "任务超过了总时间限制，已取消。本群可发送 /clear 归档会话历史后重试；持续出现请联系管理员按任务编号查看阶段日志。",
+  },
+  {
     pattern: /群聊消息发送失败/,
     hint: "模型已经生成了回复，但发到群里失败了。多为平台限流或 callback key 失效，请管理员查看服务器日志里的发送状态码。",
   },
@@ -98,8 +102,12 @@ const FAILURE_RULES: readonly FailureRule[] = [
   },
   {
     pattern:
-      /etimedout|econnreset|econnrefused|enotfound|eai_again|socket hang up|fetch failed|network error|timed?\s?out|超时|连接失败/i,
+      /etimedout|econnreset|econnrefused|enotfound|eai_again|socket hang up|fetch failed|network error|连接失败/i,
     hint: "机器人连不上模型服务（网络不通或超时），请联系管理员。",
+  },
+  {
+    pattern: /timed?\s?out|timeout|超时/i,
+    hint: "处理请求超时，当前错误不足以判断是模型等待、网络还是其他处理阶段，请联系管理员查看阶段日志。",
   },
   {
     statuses: [500, 502, 503, 504, 529],

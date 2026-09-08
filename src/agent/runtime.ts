@@ -2,6 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { clampThinkingLevel, Type, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { GROUP_DATA_ROOT, SESSION_IDLE_TTL, RUN_TIMEOUT_MS } from "../core/config.ts";
@@ -22,6 +23,7 @@ import { DeliveryStore } from "./delivery-store.ts";
 import { SessionQueue } from "./session-queue.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { ensureStorageIdentity } from "./storage-identity.ts";
+import { redactSecrets } from "./failure.ts";
 
 // ModelRuntime 单例 + 解析出的单模型。从 data/config/models.json 加载（Pi 原生）。
 let modelRuntime: ModelRuntime | null = null;
@@ -51,13 +53,20 @@ async function getRuntime(): Promise<RuntimeSelection> {
     let configuredThinkingLevel: ModelThinkingLevel = "off";
     try {
       const raw = JSON.parse(readFileSync(MODELS_JSON_PATH, "utf8")) as {
+        modelId?: string;
         thinkingLevel?: ModelThinkingLevel;
         providers?: Record<string, { models?: { id?: string }[] }>;
       };
       if (Object.keys(raw.providers ?? {}).length !== 1) throw new Error("只允许配置一个 provider");
       providerId = Object.keys(raw.providers ?? {})[0];
-      if (raw.providers?.[providerId]?.models?.length !== 1) throw new Error("只允许配置一个模型");
-      modelId = raw.providers?.[providerId]?.models?.[0]?.id;
+      const models = raw.providers?.[providerId]?.models;
+      if (typeof raw.modelId !== "string" || !raw.modelId.trim()) {
+        throw new Error("需指定 modelId；旧配置请运行 bun run configure 重新配置");
+      }
+      modelId = raw.modelId;
+      if (models !== undefined && (models.length !== 1 || models[0]?.id !== modelId)) {
+        throw new Error("自定义 models 必须只声明 modelId 指定的一个模型");
+      }
       configuredThinkingLevel = raw.thinkingLevel ?? "off";
     } catch (error) {
       throw new Error(
@@ -77,6 +86,7 @@ async function getRuntime(): Promise<RuntimeSelection> {
       signal: application.signal,
       allowModelNetwork: false,
     });
+    if (runtime.getError()) throw new Error(`${MODELS_JSON_PATH}: ${runtime.getError()}`);
     const model = runtime.getModel(providerId, modelId);
     if (!model) {
       throw new Error(`${MODELS_JSON_PATH} 中未找到 ${providerId}/${modelId}，请检查配置。`);
@@ -92,7 +102,7 @@ async function getRuntime(): Promise<RuntimeSelection> {
     resolvedModel = model;
     resolvedThinkingLevel = thinkingLevel;
     log.info(
-      `Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}, thinkingLevel=${thinkingLevel}, 群数据总根=${GROUP_DATA_ROOT}）`
+      `Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}, api=${model.api}, thinkingLevel=${thinkingLevel}, 群数据总根=${GROUP_DATA_ROOT}）`
     );
     return { runtime, model, thinkingLevel };
   })();
@@ -111,12 +121,29 @@ interface SessionRecord {
   key: string; phone: string; groupId: string; callbackUrl: string;
   queue: SessionQueue; session?: AgentSession; lastUsed: number; lastTool?: string;
   notes: OutboundNotes; deliveryId?: string; unsubscribe?: () => void;
+  progress?: { id: string; started: number; updated: number; stage: string };
 }
 const records = new Map<string, SessionRecord>();
 const controlReceipts = new Map<string, Promise<unknown>>();
 let deliveries: DeliveryStore | undefined;
 const store = () => deliveries ??= new DeliveryStore();
 const sessionKey = (phone: string, groupId: string) => JSON.stringify([groupId, phone]);
+
+function progressText(record: SessionRecord): string {
+  const p = record.progress;
+  if (!p) return "";
+  return `任务: ${p.id}, 群: ${record.groupId}, 用户: ${record.phone}, 阶段: ${p.stage}, ` +
+    `耗时: ${Math.floor((Date.now() - p.started) / 1000)}秒, 最近进展距今: ${Math.floor((Date.now() - p.updated) / 1000)}秒`;
+}
+
+function setStage(record: SessionRecord, stage: string): void {
+  const p = record.progress;
+  if (!p) return;
+  const changed = p.stage !== stage;
+  p.stage = stage;
+  p.updated = Date.now();
+  if (changed) log.info("任务进展 - " + progressText(record));
+}
 
 export function resolveSessionCallbackUrl(phone: string, groupId: string, fallback: string): string {
   return records.get(sessionKey(phone, groupId))?.callbackUrl ?? fallback;
@@ -201,8 +228,27 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
   });
   record.session = session;
   record.unsubscribe = session.subscribe((event) => {
-    if (event.type === "tool_execution_start") record.lastTool = event.toolName;
-    if (event.type === "auto_retry_start") log.warn("模型自动重试: " + event.errorMessage);
+    // Only record metadata; never log model text, reasoning or tool arguments/results.
+    if (event.type === "turn_start") setStage(record, "等待模型响应");
+    if (event.type === "message_update") setStage(record, "接收模型输出");
+    if (event.type === "tool_execution_start") {
+      record.lastTool = event.toolName;
+      setStage(record, "执行工具 " + event.toolName);
+    }
+    if (event.type === "tool_execution_update") setStage(record, "执行工具 " + event.toolName);
+    if (event.type === "tool_execution_end") setStage(record, "工具结束 " + event.toolName);
+    if (event.type === "compaction_start") setStage(record, "压缩会话历史");
+    if (event.type === "compaction_end") {
+      setStage(record, "会话历史压缩结束");
+      if (event.errorMessage) log.warn("历史压缩异常 - " + progressText(record) + ", 错误: " + redactSecrets(event.errorMessage));
+    }
+    if (event.type === "auto_retry_start" || event.type === "summarization_retry_scheduled") {
+      setStage(record, event.type === "auto_retry_start" ? "等待模型重试" : "等待历史压缩重试");
+      log.warn(`模型自动重试 - ${progressText(record)}, 次数: ${event.attempt}/${event.maxAttempts}, ` +
+        `延迟: ${event.delayMs}ms, 错误: ${redactSecrets(event.errorMessage)}`);
+    }
+    if (event.type === "auto_retry_end") setStage(record, "模型重试结束");
+    if (event.type === "summarization_retry_attempt_start") setStage(record, "重试会话历史压缩");
   });
   signal.throwIfAborted();
   return session;
@@ -211,12 +257,24 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
 export async function initializeAgentRuntime(): Promise<void> { await getRuntime(); }
 
 async function run(record: SessionRecord, content: string, cancellation: AbortSignal): Promise<void> {
-  const signal = AbortSignal.any([application.signal, cancellation, AbortSignal.timeout(RUN_TIMEOUT_MS)]);
+  const deadline = AbortSignal.timeout(RUN_TIMEOUT_MS);
+  const signal = AbortSignal.any([application.signal, cancellation, deadline]);
+  record.progress = { id: randomUUID().slice(0, 8), started: Date.now(), updated: Date.now(), stage: "准备会话" };
+  record.lastTool = undefined;
+  log.info(`任务开始 - ${progressText(record)}, 总时限: ${RUN_TIMEOUT_MS / 1000}秒`);
+  const heartbeat = setInterval(() => log.info("任务仍在运行 - " + progressText(record)), 60_000);
+  heartbeat.unref();
   record.notes.clear();
   record.deliveryId = undefined;
   let session: AgentSession | undefined;
   let abortTask: Promise<void> | undefined;
+  let timeoutStage: string | undefined;
   const onAbort = () => {
+    if (deadline.aborted && !cancellation.aborted && !application.signal.aborted) {
+      timeoutStage ??= record.progress?.stage;
+      log.warn("任务总时限到达 - " + progressText(record));
+    }
+    setStage(record, "等待取消清理");
     if (session) abortTask ??= session.abort().catch((error) => log.warn("Pi abort: " + String(error)));
   };
   signal.addEventListener("abort", onAbort, { once: true });
@@ -224,14 +282,18 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
     store().assertCapacity(record.key);
     session = record.session ?? await createSession(record, signal);
     if (signal.aborted) { onAbort(); signal.throwIfAborted(); }
+    setStage(record, "刷新资料索引");
     await refreshIndex(record, signal);
     record.queue.phase = "执行中";
     // A status message is disposable and cannot delay model execution.
     const status = sendText("🤔 正在处理...", record.groupId, record.phone, record.callbackUrl,
       { traffic: "status", signal }).catch(() => false);
     application.track(status);
+    setStage(record, "模型调用准备（含历史检查）");
+    log.info(`模型调用开始 - ${progressText(record)}, 历史消息数: ${session.state.messages.length}`);
     await session.prompt(content);
     signal.throwIfAborted();
+    setStage(record, "模型调用结束");
     const failure = session.state.errorMessage;
     const text = session.getLastAssistantText();
     const appendix = record.notes.peek().join("\n\n");
@@ -241,16 +303,22 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
     // Persist before entering the network queue; /deliver can recover after stop/restart.
     record.deliveryId = store().save(record.key, [body, appendix].filter(Boolean).join("\n\n"), record.deliveryId);
     record.queue.phase = "交付中";
+    setStage(record, "发送最终回复");
     const sent = await sendReplyWithMention(body, record.groupId, record.phone, record.callbackUrl, signal, appendix || undefined);
     if (!sent) throw new Error("回复未送达，内容已保存，可使用 /deliver 重试");
     store().acknowledge([record.deliveryId]);
     record.notes.clear();
+    log.info("任务完成 - " + progressText(record));
   } catch (error) {
     if (cancellation.aborted || application.signal.aborted) return;
+    if (deadline.aborted) {
+      throw new Error(`任务总时限 ${RUN_TIMEOUT_MS / 1000} 秒已到（阶段：${timeoutStage ?? record.progress?.stage}；任务：${record.progress?.id}）`);
+    }
+    log.warn("任务失败 - " + progressText(record) + ", 错误: " + redactSecrets(String(error)));
     throw error;
   } finally {
     signal.removeEventListener("abort", onAbort);
-    await abortTask;
+    try { await abortTask; } finally { clearInterval(heartbeat); record.progress = undefined; }
     record.lastUsed = Date.now();
   }
 }
@@ -288,6 +356,11 @@ export async function handleUserMessage(phone: string, groupId: string, content:
     reply = "状态：" + record.queue.phase + "\n排队消息：" + record.queue.waiting +
       "\n最近工具：" + (record.lastTool ?? "无") + "\n未送达记录：" + store().pending(record.key).length +
       "\n机器人发送窗口：" + rate.used + "/" + rate.limit;
+    if (record.progress) {
+      const p = record.progress;
+      reply += `\n任务编号：${p.id}\n当前阶段：${p.stage}\n已用时间：${Math.floor((Date.now() - p.started) / 1000)} 秒` +
+        `\n最近进展距今：${Math.floor((Date.now() - p.updated) / 1000)} 秒\n总时限：${RUN_TIMEOUT_MS / 1000} 秒`;
+    }
   } else reply = command === "/help" ? HELP_TEXT : unknownCommandText(content);
   const receiptKey = record.key + command;
   if (controlReceipts.has(receiptKey) || controlReceipts.size >= 128) return;

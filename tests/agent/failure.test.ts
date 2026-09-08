@@ -73,6 +73,16 @@ describe("请求失败回执", () => {
     expect(reply).toContain("连不上模型服务");
   });
 
+  test("generic and whole-task timeouts do not claim the model is unreachable", () => {
+    const generic = describeRequestFailure(new Error("The operation timed out."));
+    expect(generic).toContain("当前错误不足以判断");
+    expect(generic).not.toContain("连不上模型服务");
+    const deadline = describeRequestFailure(new Error("任务总时限 1200 秒已到（阶段：压缩会话历史；任务：abcd1234）"));
+    expect(deadline).toContain("超过了总时间限制");
+    expect(deadline).toContain("abcd1234");
+    expect(deadline).not.toContain("连不上模型服务");
+  });
+
   test("上下文超限提示用户自己 /clear", () => {
     const reply = describeRequestFailure(
       new Error("模型未返回回复：400: This model's maximum context length is 128000 tokens")

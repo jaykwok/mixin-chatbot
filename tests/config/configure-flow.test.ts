@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { tempFixture } from "../helpers/temp.ts";
 
-test.each(["first", "existing", "manual"])("configure %s flow writes reviewed metadata", async (mode) => {
+test.each(["first", "existing", "manual", "builtin", "completions", "anthropic"])("configure %s flow writes reviewed metadata", async (mode) => {
   const files = await tempFixture("pi-configure-");
   try {
     const source = getBuiltinModels("openai").find((model) => model.id === "gpt-5.2")!;
@@ -14,7 +14,7 @@ test.each(["first", "existing", "manual"])("configure %s flow writes reviewed me
     if (mode === "existing") {
       await mkdir(join(files.root, "data/config"), { recursive: true });
       await writeFile(modelsPath, JSON.stringify({ providers: { openai: {
-        baseUrl: "https://example.com/v1", compat: { supportsMaxOutputTokens: false },
+        baseUrl: "https://example.com/v1", api: "openai-responses", compat: { supportsMaxOutputTokens: false },
         models: [{ id: source.id, input: ["text", "image"], contextWindow: 12345, maxTokens: 2345,
           reasoning: false, cost: { input: 7, output: 8, cacheRead: 9, cacheWrite: 10 } }],
       } } }));
@@ -30,7 +30,13 @@ test.each(["first", "existing", "manual"])("configure %s flow writes reviewed me
         cancel: noop, intro: noop, note: noop, outro: noop, isCancel: () => false,
         log: { info: noop, warn: (message) => console.log(message) },
         password: async () => "test-only",
-        select: async (options) => options.initialValue,
+        select: async (options) => {
+          if (options.message === "模型接入方式") return mode === "builtin" ? "builtin" : "custom";
+          if (options.message === "自定义服务协议") return mode === "completions" ? "openai-completions" : mode === "anthropic" ? "anthropic-messages" : "openai-responses";
+          if (options.message === "Pi 内置服务商") return "zai-coding-cn";
+          if (options.message === "Pi 内置模型") return "glm-5.3-flash";
+          return options.initialValue;
+        },
         confirm: async (options) => {
           if (options.message.startsWith("服务支持")) return true;
           if (mode === "manual" && options.message === "模型支持图片输入？") return true;
@@ -52,9 +58,19 @@ test.each(["first", "existing", "manual"])("configure %s flow writes reviewed me
     ]);
     expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
     const doc = JSON.parse(await readFile(modelsPath, "utf8"));
+    if (mode === "builtin") {
+      expect(doc).toEqual({ modelId: "glm-5.3-flash", thinkingLevel: "low", providers: { "zai-coding-cn": { apiKey: "test-only" } } });
+      return;
+    }
     const provider = doc.providers.openai;
     const model = provider.models[0];
+    expect(doc.modelId).toBe(model.id);
     expect(provider).not.toHaveProperty("compat");
+    if (mode === "completions" || mode === "anthropic") {
+      expect(provider.api).toBe(mode === "completions" ? "openai-completions" : "anthropic-messages");
+      expect(model.compat).not.toHaveProperty("supportsMaxOutputTokens");
+      return;
+    }
     expect(model.compat.supportsMaxOutputTokens).toBe(true);
     if (mode === "first") {
       expect(model).toMatchObject({ input: source.input, cost: source.cost, contextWindow: source.contextWindow, maxTokens: source.maxTokens });

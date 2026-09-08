@@ -4,7 +4,7 @@
 
 **群用户**：[使用示例](#使用示例) · [使用流程](#使用流程) · [群聊指令](#群聊指令) · [文件交付](#文件交付)
 
-**部署与维护**：[快速开始](#快速开始) · [已有实例升级](docs/UPGRADE_0.85.1.md) · [配置与数据](#配置与数据) · [运维](#运维) · [工作原理](#工作原理) · [提示词与工具](#提示词与工具) · [开发与检查](#开发与检查)
+**部署与维护**：[快速开始](#快速开始) · [配置与数据](#配置与数据) · [运维](#运维) · [工作原理](#工作原理) · [提示词与工具](#提示词与工具) · [开发与检查](#开发与检查)
 
 ## 使用示例
 
@@ -94,8 +94,6 @@ Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。L
 
 ### 执行部署
 
-> **已部署旧版的 Windows 实例**，先按[升级手册](docs/UPGRADE_0.85.1.md)停机备份、核对旧环境变量，再执行部署。手册适用于旧远端外链已清空的情况；群资料与会话保持原路径，旧 JSONL 不能直接改名成 SQLite。
-
 在项目根目录选择对应入口。脚本会引导模型与入口配置、生成 webhook 密钥、保存运行设置并检查新实例。
 
 Windows，在管理员 PowerShell 中执行：
@@ -112,7 +110,24 @@ bash scripts/deploy/deploy.sh
 bash scripts/ops/ops.sh doctor
 ```
 
-模型配置保存在 `data/config/models.json`，支持一个 OpenAI Responses 兼容 provider 和一个模型。向导可设置上游地址、密钥、上下文窗口、输出上限、推理级别及兼容选项；升级 Pi 不会自动更换所选模型。
+模型配置保存在 `data/config/models.json`，使用 Pi 原生 provider，每个实例选择一个服务商和一个模型。`bun run configure` 提供两种方式：
+
+- **Pi 内置服务商**：选择服务商、模型并填写 API Key，地址、协议、工具兼容和模型能力由 Pi 提供。国内智谱 Coding Plan 在当前 Pi 目录中为 `zai-coding-cn`，国际站为 `zai`，请按实际账号选择。
+- **自定义服务商**：填写地址、Key 和模型资料，向导支持 `openai-completions`、`openai-responses`、`anthropic-messages`；高级参数遵循 Pi 的 `models.json` 格式。
+
+**本次配置格式不兼容旧版。更新后先停机并重新运行 `bun run configure`，再启动服务。** 顶层 `modelId` 和 `thinkingLevel` 用于本项目选定模型与推理级别，`providers` 交给 Pi 原生加载。内置模式只写凭证，不复制或覆盖目录中的模型定义：
+
+```json
+{
+  "modelId": "glm-5.3-flash",
+  "thinkingLevel": "low",
+  "providers": {
+    "zai-coding-cn": { "apiKey": "YOUR_API_KEY" }
+  }
+}
+```
+
+自定义模式同样需要顶层 `modelId`，并在对应 provider 的 `models` 中声明这个模型。升级 Pi 不会自动更换所选模型，但内置模型资料会跟随所安装的 Pi 版本更新。
 
 首次部署直接创建当前存储结构。后续重复部署时，脚本先暂停已有实例并保存配置、启动定义、依赖或镜像及原运行状态；部署失败会尝试回滚，恢复失败则保留现场并报错。Windows 计划任务优先使用 S4U 开机启动，受系统限制时回退到登录启动，并显示实际方式。
 
@@ -182,7 +197,7 @@ logs/                          应用日志
 
 群和用户标识会编码为安全目录段；映射到已有目录的大小写别名会被拒绝，避免 Windows 串会话。将资料同步到对应群的 `workspace`，生成物写入各用户的 `tmp`。
 
-建议正常停机后备份整个 `data/`，并单独备份外置的 `GROUP_DATA_ROOT`；`data/runtime` 含运行资源和启动文件，旧版还在此保存外链 JSONL。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。具体路径及回滚步骤见[升级手册](docs/UPGRADE_0.85.1.md)。
+建议正常停机后备份整个 `data/`，并单独备份外置的 `GROUP_DATA_ROOT`；`data/runtime` 含运行资源和启动文件，旧版还在此保存外链 JSONL。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
 
 ### 大文件外链配置
 
@@ -239,6 +254,17 @@ bash scripts/ops/ops.sh doctor
 `update` 要求已跟踪文件没有本地改动，失败时尝试恢复原提交和部署状态。Windows 在改工作树与依赖之前停止实例，Linux 已运行容器与主机源码隔离。
 
 关闭服务使用 `stop`：Windows 验证实例身份后先请求优雅关闭，超时再复核归属并终止进程树；Linux 使用 Docker 停止期限。
+
+### 长时间没有回复
+
+“消息发送成功（处理中提示）”只表示发送了“正在处理”，最终回答需要看到“回复发送完成”或“任务完成”。`/status` 显示任务编号、当前阶段、已用时间、最近进展距今和总时限；服务器每 60 秒输出一次仍在运行的任务摘要，不记录模型输出、思考正文或工具参数。
+
+1. 在异常群发送 `/status`，记下任务编号。用上述 `logs` 入口查看日志，或在 PowerShell 执行 `Get-Content logs/mixin-chatbot.log -Tail 200`，按任务编号、群号定位。
+2. “模型调用准备”涵盖 Pi 的校验与历史检查；“等待模型响应”表示进入模型轮次；“接收模型输出”表示 SDK 正在收到流事件；“压缩会话历史”表示正在压缩该群该用户的历史。工具执行和最终发送也分别记录。
+3. 只有某个群异常时，发送 `/stop`，等待 `/status` 变为空闲，再发 `/clear`。收到归档确认后，用“只回复 OK”测试。`/clear` 归档当前用户在本群的会话，不清除群资料。若恢复，旧会话上下文是重要线索；若仍失败，保留这一轮阶段日志继续检查 Pi 请求与模型服务。
+4. 普通 HTTP 流探测成功只验证该次请求，不能验证机器人的完整历史、工具定义、思考模式和压缩请求。`doctor`/健康检查也不能证明模型回答正常。
+
+默认整轮时限为 1200 秒，覆盖准备、模型、工具和交付。新版会明确报告“任务总时限”与到期阶段；上游只返回 `The operation timed out.` 时不再直接断言网络不通。若日志已到“等待取消清理”却长期不结束，先保存日志，再用运维 `restart` 恢复实例。
 
 ### 数据维护
 
@@ -368,6 +394,8 @@ bun run check
 配置向导和配置变更需要先停止服务。已有模型配置与 webhook 密钥时，用 `bun run start` 前台运行、`bun run dev` 监听代码变化。仅隔离开发可显式设置 `ALLOW_INSECURE_WEBHOOK=1` 使用无密钥的 `/webhook`。
 
 `bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。测试和诊断产物放在 `agents/temp`。
+
+`patches/knip@6.29.0.patch` 修复 Knip 对 Bun 脚本 production 入口标记的传递，仅影响开发检查。`package.json`、`bun.lock` 和 Docker 构建都引用它，不能单独删除目录；上游修复后需同步移除引用并通过两种 Knip 检查。
 
 Pi 两个包精确固定为 0.85.1，使用官方本地 SDK，无需实验性 `pi-server`。依赖升级通过改版本、更新锁文件和回归检查完成。当前外链存储只支持 SQLite 账本与现行对象布局。
 
