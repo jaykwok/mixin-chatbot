@@ -230,7 +230,7 @@ foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$
   } finally { await fixture.cleanup(); }
 }, 60000);
 
-test.skipIf(process.platform !== "win32")("Windows successful backup cleanup removes its transaction and preserves unrelated recovery files", async () => {
+test.skipIf(process.platform !== "win32")("Windows successful backup cleanup empties all recycled files and preserves other tmp snapshots", async () => {
   const fixture = await tempFixture("backup-cleanup-windows-");
   const script = join(fixture.root, "cleanup.ps1");
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
@@ -245,10 +245,14 @@ $env:BOT_DEPLOY_BACKUP_ID='deploy-current'
 Set-Content (Join-Path $root 'old-file') 'old'
 Move-ToProjectArchive (Join-Path $root 'old-file') $root
 if(-not (Test-Path (Join-Path $root 'backup/rm/deploy-current'))){throw 'wrong archive directory'}
+New-Item -ItemType Directory -Force -Path (Join-Path $root 'backup/rm/deploy-previous') | Out-Null
+Set-Content (Join-Path $root 'backup/rm/deploy-previous/old-config') 'historical'
+Set-Content (Join-Path $root 'backup/rm/loose-file') 'unscoped'
+Set-Content (Join-Path $root 'backup/rm/.hidden-file') 'hidden'
 $lock=[IO.File]::Open((Join-Path $root 'data/state/deploy.lock'),'OpenOrCreate','ReadWrite','None')
 try {
     Remove-CompletedBackup $snapshot $root
-    if((Test-Path $snapshot) -or (Test-Path (Join-Path $root 'backup/rm/deploy-current'))){throw 'completed backup retained'}
+    if((Test-Path $snapshot) -or (Test-Path (Join-Path $root 'backup/rm'))){throw 'completed backup or recycled files retained'}
     if((Get-Content (Join-Path $failed 'recovery')) -ne 'preserve'){throw 'unrelated backup lost'}
     $rejected=$false
     try { Remove-CompletedBackup (Join-Path $root 'data') $root } catch { $rejected=$true }
@@ -265,7 +269,7 @@ try {
   } finally { await fixture.cleanup(); }
 }, 60000);
 
-test.skipIf(!bash || !existsSync(bash))("Linux successful backup cleanup is scoped and removes empty backup directories", async () => {
+test.skipIf(!bash || !existsSync(bash))("Linux successful backup cleanup empties all recycled files and preserves other tmp snapshots", async () => {
   const fixture = await tempFixture("backup-cleanup-linux-");
   const script = join(fixture.root, "cleanup.sh");
   await writeFile(script, `#!/usr/bin/env bash
@@ -281,8 +285,12 @@ export BOT_DEPLOY_BACKUP_ID=deploy-current
 printf old > "$PROJECT_DIR/old-file"
 archive_project_path "$PROJECT_DIR/old-file"
 [ -d "$PROJECT_DIR/backup/rm/deploy-current" ]
+mkdir -p "$PROJECT_DIR/backup/rm/deploy-previous"
+printf historical > "$PROJECT_DIR/backup/rm/deploy-previous/old-config"
+printf unscoped > "$PROJECT_DIR/backup/rm/loose-file"
+printf hidden > "$PROJECT_DIR/backup/rm/.hidden-file"
 cleanup_completed_backup "$snapshot"
-[ ! -e "$snapshot" ] && [ ! -e "$PROJECT_DIR/backup/rm/deploy-current" ]
+[ ! -e "$snapshot" ] && [ ! -e "$PROJECT_DIR/backup/rm" ]
 [ "$(cat "$failed/recovery")" = preserve ]
 if cleanup_completed_backup "$PROJECT_DIR/backup"; then exit 41; fi
 mv -- "$failed" "$PROJECT_DIR/saved-failure"

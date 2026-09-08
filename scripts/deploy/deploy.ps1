@@ -739,7 +739,7 @@ $deploymentCommitted = $true
         catch { Write-Host ("自动回滚未完成，保留快照 " + $snapshot.Path + "：" + $_.Exception.Message) -ForegroundColor Red }
     } elseif ($deploymentCommitted) {
         try { Remove-CompletedBackup $snapshot.Path $Project }
-        catch { Warn ("部署已完成，旧快照仍保留在 " + $snapshot.Path) }
+        catch { Warn ('部署已完成，但备份清理未完成，请检查 backup/tmp 和 backup/rm：' + $_.Exception.Message) }
     }
     $snapshot.Lock.Dispose()
     $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId

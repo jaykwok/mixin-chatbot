@@ -125,7 +125,7 @@ const webhookHandler = async (c: Context) => {
     log.warn(`后台请求容量已满 - 用户: ${phone}, 群: ${groupId}`);
     enqueueUserNotice(
       "capacity",
-      "⚠️ 当前机器人任务已满，这条请求没有进入处理队列，请稍后重新发送。",
+      "⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。",
       phone,
       groupId,
       callbackUrl
@@ -136,7 +136,7 @@ const webhookHandler = async (c: Context) => {
     log.warn(`速率限制触发 - 用户: ${phone}, 群: ${groupId}`);
     enqueueUserNotice(
       "rate-limit",
-      "⚠️ 你发送得太频繁，这条请求没有进入处理队列，请稍后重新发送。",
+      "⚠️ 短时间内收到的消息较多，这条消息未加入队列，不会自动处理，请稍后重新发送。",
       phone,
       groupId,
       callbackUrl
@@ -150,7 +150,7 @@ const webhookHandler = async (c: Context) => {
     // 单线程内无 await，正常不会在容量预检后命中；仍按不可重投平台处理。
     enqueueUserNotice(
       "capacity",
-      "⚠️ 当前机器人任务已满，这条请求没有进入处理队列，请稍后重新发送。",
+      "⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。",
       phone,
       groupId,
       callbackUrl

@@ -7,6 +7,12 @@ import {
 } from "../../src/agent/failure.ts";
 
 describe("请求失败回执", () => {
+  test("排队已满时说明本条消息不会自动处理", () => {
+    const reply = describeRequestFailure(new Error("本会话已有 8 条消息排队，请稍后重发"));
+    expect(reply).toContain("这条消息没有加入队列");
+    expect(reply).toContain("再重新发送");
+    expect(reply).not.toContain("暂时无法确定原因");
+  });
   test("额度用尽给出续费/换模型的结论，并附带 provider 原文", () => {
     const reply = describeRequestFailure(
       new Error(
@@ -57,7 +63,7 @@ describe("请求失败回执", () => {
         '401: {"error":{"message":"Incorrect API key provided: sk-abcdef1234567890"}} (api_key=sk-abcdef1234567890)'
       )
     );
-    expect(reply).toContain("拒绝了当前凭证");
+    expect(reply).toContain("密钥无效");
     expect(reply).not.toContain("abcdef1234567890");
   });
 
@@ -75,10 +81,10 @@ describe("请求失败回执", () => {
 
   test("generic and whole-task timeouts do not claim the model is unreachable", () => {
     const generic = describeRequestFailure(new Error("The operation timed out."));
-    expect(generic).toContain("当前错误不足以判断");
+    expect(generic).toContain("暂时无法确定原因");
     expect(generic).not.toContain("连不上模型服务");
     const deadline = describeRequestFailure(new Error("任务总时限 1200 秒已到（阶段：压缩会话历史；任务：abcd1234）"));
-    expect(deadline).toContain("超过了总时间限制");
+    expect(deadline).toContain("超过了最长等待时间");
     expect(deadline).toContain("abcd1234");
     expect(deadline).not.toContain("连不上模型服务");
   });
@@ -94,7 +100,7 @@ describe("请求失败回执", () => {
     const reply = describeRequestFailure(
       new Error('模型未返回回复：404: {"error":{"message":"The model `glm-x` does not exist"}}')
     );
-    expect(reply).toContain("找不到配置的模型 id");
+    expect(reply).toContain("当前配置的模型不可用");
   });
 
   test("配置缺失优先于状态码分类", () => {
@@ -109,15 +115,33 @@ describe("请求失败回执", () => {
     expect(reply).toContain("发到群里失败");
   });
 
+  test("已保存的回复发送失败时引导补发，不误报模型故障", () => {
+    for (const raw of [
+      "回复未能完整发到群里，已保存的内容可用 /deliver 补发",
+      "补发失败，尚未发完的回复仍已保存，可稍后再发送 /deliver",
+    ]) {
+      const reply = describeRequestFailure(new Error(raw));
+      expect(reply).toContain("请稍后发送 /deliver");
+      expect(reply).toContain("可能包含你已经收到的部分");
+      expect(reply).not.toContain("暂时无法确定原因");
+    }
+  });
+
+  test("待补发内容过多时提示先补发再提问", () => {
+    const reply = describeRequestFailure(new Error("待补发回复已达 64 条，请先发送 /deliver 补发，再发送新的问题"));
+    expect(reply).toContain("暂时无法处理新问题");
+    expect(reply).toContain("请先发送 /deliver");
+  });
+
   test("没有任何线索的空回复单独描述，可直接重发", () => {
     const reply = describeRequestFailure(new Error("Pi 未返回回复"));
-    expect(reply).toContain("异常空回复");
+    expect(reply).toContain("模型没有返回回复");
     expect(reply).toContain("原始错误：Pi 未返回回复");
   });
 
   test("认不出的失败保留原文并要求转给管理员", () => {
     const reply = describeRequestFailure(new Error("something went sideways"));
-    expect(reply).toContain("没能自动归类");
+    expect(reply).toContain("暂时无法确定原因");
     expect(reply).toContain("原始错误：something went sideways");
   });
 

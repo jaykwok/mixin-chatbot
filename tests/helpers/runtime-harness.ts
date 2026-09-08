@@ -113,7 +113,7 @@ const timed = assert.rejects(request("progress", "block-timeout"), /任务总时
 await until(() => prompts.includes("block-timeout"));
 observedSession.emit?.({ type: "turn_start" });
 await request("progress", "/status");
-assert.match(sent.at(-1)!, /最近工具：无/);
+assert.match(sent.at(-1)!, /最近使用的工具：暂无/);
 await timed;
 await request("progress", "/status");
 assert.match(sent.at(-1)!, /状态：空闲/);
@@ -190,14 +190,18 @@ assert.equal(broken.disposed, true, "failed disposal remains retryable");
 completed.push("idle-disposal-failure-isolation");
 
 failFinal = true;
-await assert.rejects(request("delivery", "link"), /未送达/);
+await assert.rejects(request("delivery", "link"), /未能完整发到群里/);
 const key = JSON.stringify(["group", "delivery"]);
 assert.equal(store.pending(key).length, 1); assert.match(store.pending(key)[0]!.text, /a_b\?sign=x_y/);
 failFinal = false;
 await request("delivery", "/clear"); assert.equal(store.pending(key).length, 1);
+assert.match(sent.at(-1)!, /你在本群的聊天记录已归档/);
+assert.match(sent.at(-1)!, /之前已生成但尚未发完/);
 failText = true; await assert.rejects(request("delivery", "/deliver"), /补发失败/);
 assert.equal(store.pending(key).length, 1);
 failText = false; await request("delivery", "/deliver"); assert.equal(store.pending(key).length, 0);
+await request("delivery", "/deliver"); assert.equal(sent.at(-1), "你在本群没有待补发的回复。");
+await request("delivery", "/stop"); assert.doesNotMatch(sent.at(-1)!, /已保留/);
 completed.push("durable-delivery-after-clear");
 
 const { createApp } = await import("../../src/server/app.ts");

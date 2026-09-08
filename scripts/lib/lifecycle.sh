@@ -21,12 +21,13 @@ cleanup_completed_backup() {
     name="$(basename -- "$snapshot")"
     [[ "$name" =~ ^(deploy|tunnel)-[a-zA-Z0-9-]+$ ]] || return 1
     [ "$(dirname -- "$snapshot")" = "$backup/tmp" ] || return 1
-    for target in "$snapshot" "$backup/rm/$name"; do
+    # Include loose files and historical transaction directories in the recycle area.
+    for target in "$snapshot" "$backup/rm"; do
         # Refuse redirected paths; rm unlinks any symlinks inside the snapshot.
         [ "$(realpath -m -- "$target")" = "$target" ] || return 1
         rm -rf -- "$target" || return 1
     done
-    # Remove empty parents only, retaining other transactions and failed snapshots.
+    # Remove empty parents only, retaining other snapshots still present under tmp.
     rmdir -- "$backup/tmp" "$backup/rm" 2>/dev/null || true
     # A running container still holds this bind mount. Removing its host inode
     # would prevent subsequent archives from reaching the recreated host path.

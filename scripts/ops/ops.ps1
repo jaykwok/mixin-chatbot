@@ -1018,7 +1018,7 @@ function Invoke-Update {
             } catch { Err ('自动回滚未完成，快照保留在 ' + $snapshot.Path + '：' + $_.Exception.Message) }
         } elseif ($committed) {
             try { Remove-CompletedBackup $snapshot.Path $Project }
-            catch { Warn ('升级已完成，旧快照仍在 ' + $snapshot.Path) }
+            catch { Warn ('升级已完成，但备份清理未完成，请检查 backup/tmp 和 backup/rm：' + $_.Exception.Message) }
         }
         $snapshot.Lock.Dispose()
         $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId

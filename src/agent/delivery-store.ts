@@ -12,7 +12,7 @@ export class DeliveryStore {
   }
   assertCapacity(session: string): void {
     const { count } = this.db.query("SELECT count(*) AS count FROM deliveries WHERE session = ?").get(session) as { count: number };
-    if (count >= 64) throw new Error("未送达记录已达 64 条，请先使用 /deliver 处理");
+    if (count >= 64) throw new Error("待补发回复已达 64 条，请先发送 /deliver 补发，再发送新的问题");
   }
   /** One row per run: early links survive a crash, and the final answer updates that row. */
   save(session: string, text: string, id?: string): string {

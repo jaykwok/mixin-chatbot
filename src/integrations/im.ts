@@ -616,7 +616,7 @@ function splitTextContent(content: string): string[] {
 
 function buildPressureWarning(phone: string) {
   return buildText(
-    "⚠️ 当前机器人消息较多，已自动减少非关键状态消息并排队保护最终回复；任务仍在继续。",
+    "⚠️ 当前需要发送的消息较多，回复会稍晚发出。任务仍在继续，请耐心等待。",
     phone
   );
 }

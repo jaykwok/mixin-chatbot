@@ -56,16 +56,28 @@ interface FailureRule {
 // 的窗口纯属误导；空回复排最后，它只是「没别的线索」时的兜底描述。
 const FAILURE_RULES: readonly FailureRule[] = [
   {
+    pattern: /本会话已有 8 条消息排队/,
+    hint: "你在本群已有 8 条消息等待处理，这条消息没有加入队列。请等前面的消息处理完，再重新发送。",
+  },
+  {
     pattern: /任务总时限/,
-    hint: "任务超过了总时间限制，已取消。本群可发送 /clear 归档会话历史后重试；持续出现请联系管理员按任务编号查看阶段日志。",
+    hint: "这次处理超过了最长等待时间，已停止。请联系管理员，并提供下方的任务编号以便排查。",
+  },
+  {
+    pattern: /回复未能完整发到群里|回复未送达|补发失败/,
+    hint: "回复没能完整发到群里，已保存的内容可以补发。请稍后发送 /deliver；如果再次失败，请联系管理员。补发可能包含你已经收到的部分。",
+  },
+  {
+    pattern: /待补发回复已达|未送达记录已达/,
+    hint: "你在本群积累了较多待补发回复，暂时无法处理新问题。请先发送 /deliver 补发，再发送新的问题。",
   },
   {
     pattern: /群聊消息发送失败/,
-    hint: "模型已经生成了回复，但发到群里失败了。多为平台限流或 callback key 失效，请管理员查看服务器日志里的发送状态码。",
+    hint: "回复已经生成，但发到群里失败了。请联系管理员检查消息发送是否正常。",
   },
   {
     pattern: /models\.json|configure|未配置可用凭证/i,
-    hint: "机器人这边的模型配置有问题，请联系管理员。",
+    hint: "机器人的模型配置有问题，暂时无法回答，请联系管理员。",
   },
   {
     // 按时间窗口滚动的套餐上限（如「已达到 5 小时的使用上限」），要等到重置时刻才恢复。
@@ -88,17 +100,17 @@ const FAILURE_RULES: readonly FailureRule[] = [
     pattern:
       /invalid[_ ]?api[_ ]?key|incorrect api key|invalid token|unauthorized|authentication|permission denied|forbidden|鉴权失败/i,
     statuses: [401, 403],
-    hint: "模型服务拒绝了当前凭证（key 无效、过期或没有该模型的权限），请联系管理员。",
+    hint: "机器人连接模型服务的密钥无效、已过期或权限不足，请联系管理员。",
   },
   {
     pattern: /model[^\n]{0,24}(?:not found|does not exist|不存在|未找到)|unknown model|no such model/i,
     statuses: [404],
-    hint: "模型服务里找不到配置的模型 id，请联系管理员。",
+    hint: "机器人当前配置的模型不可用，请联系管理员。",
   },
   {
     pattern:
       /context[_ ]?length|maximum context|context window|too many tokens|prompt is too long|上下文(?:过长|超限)/i,
-    hint: "这轮对话的上下文超出了模型上限。发送 /clear 清空你在本群的会话历史后重试。",
+    hint: "这次对话的内容太多，超出了模型能处理的长度。发送 /clear 开启新会话后，再发送你的问题。",
   },
   {
     pattern:
@@ -107,19 +119,19 @@ const FAILURE_RULES: readonly FailureRule[] = [
   },
   {
     pattern: /timed?\s?out|timeout|超时/i,
-    hint: "处理请求超时，当前错误不足以判断是模型等待、网络还是其他处理阶段，请联系管理员查看阶段日志。",
+    hint: "这次处理超时了，暂时无法确定原因。请把这条提示发给管理员排查。",
   },
   {
     statuses: [500, 502, 503, 504, 529],
-    hint: "模型服务自身故障或过载，通常过几分钟自行恢复；持续出现请联系管理员。",
+    hint: "模型服务暂时故障或过载，请过几分钟再发送一次问题；持续出现请联系管理员。",
   },
   {
     pattern: /未返回回复/,
-    hint: "模型这一轮既没有输出文本也没有报错，属于异常空回复。可以重发一次；持续出现请联系管理员。",
+    hint: "模型没有返回回复。请重新发送一次问题；如果仍然没有回复，请联系管理员。",
   },
 ];
 
-const FALLBACK_HINT = "这个失败没能自动归类，请把本条消息连同下面的原始错误转给管理员。";
+const FALLBACK_HINT = "暂时无法确定原因，请把这条提示连同下方的错误信息发给管理员排查。";
 
 // 报错原文里的重置时刻。有它才知道是「等一分钟」还是「等三小时」，可它埋在原文中段，
 // 而群里真正会被读的只有结论那一行，所以单独拎出来。

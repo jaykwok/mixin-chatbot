@@ -16,7 +16,7 @@ function Move-ToProjectArchive([string]$Path, [string]$ProjectRoot, [string]$All
     Move-Item -LiteralPath $source -Destination $destination -ErrorAction Stop
 }
 
-# Successful deployment explicitly discards only this transaction's backups.
+# A successful deployment discards its snapshot and empties the entire recycle area.
 function Remove-CompletedBackup([string]$SnapshotPath, [string]$ProjectRoot) {
     $root = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\', '/')
     $backup = Join-Path $root 'backup'
@@ -25,7 +25,7 @@ function Remove-CompletedBackup([string]$SnapshotPath, [string]$ProjectRoot) {
     if ((Split-Path $snapshot -Parent) -ne (Join-Path $backup 'tmp') -or $name -notmatch '^(deploy|tunnel)-[a-zA-Z0-9-]+$') {
         throw '备份清理路径无效'
     }
-    $targets = @($snapshot, (Join-Path (Join-Path $backup 'rm') $name))
+    $targets = @($snapshot, (Join-Path $backup 'rm'))
     foreach ($target in $targets) {
         # Reject redirected ancestors before recursive removal; never follow a junction out of backup.
         for ($ancestor = $target; $ancestor -ne $root; $ancestor = Split-Path $ancestor -Parent) {
@@ -37,7 +37,7 @@ function Remove-CompletedBackup([string]$SnapshotPath, [string]$ProjectRoot) {
     }
     foreach ($directory in @((Join-Path $backup 'tmp'), (Join-Path $backup 'rm'), $backup)) {
         if ((Test-Path -LiteralPath $directory -PathType Container) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) {
-            [IO.Directory]::Delete($directory) # Empty only; preserve other operations and retained failures.
+            [IO.Directory]::Delete($directory) # Keep other snapshots still present under tmp.
         }
     }
 }

@@ -287,7 +287,7 @@ if ($isAdmin) {
         if (-not $connectorCommitted) { Restore-CloudflaredSnapshot $connectorSnapshot }
         else {
             try { Remove-CompletedBackup $connectorSnapshot.Path $Project }
-            catch { Write-Warning ('连接器已启动，旧快照保留在 ' + $connectorSnapshot.Path) }
+            catch { Write-Warning ('连接器已启动，但备份清理未完成，请检查 backup/tmp 和 backup/rm：' + $_.Exception.Message) }
         }
         } finally { $env:BOT_DEPLOY_BACKUP_ID = $connectorSnapshot.PreviousBackupId }
     }

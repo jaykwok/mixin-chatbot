@@ -757,7 +757,7 @@ if [ "${DEPLOY_PRESERVE_STOPPED:-0}" = 1 ] && [ "$PREVIOUS_RUNNING" = 0 ]; then
 fi
 DEPLOYMENT_COMMITTED=1
 trap - EXIT INT TERM
-cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，旧快照仍在 $DEPLOY_SNAPSHOT"
+cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，但备份清理未完成，请检查 $DEPLOY_SNAPSHOT 和 $PROJECT_DIR/backup/rm"
 flock -u 9
 exec 9>&-
 if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ]; then

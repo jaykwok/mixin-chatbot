@@ -302,10 +302,10 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
     const body = text || "文件链接已生成。";
     // Persist before entering the network queue; /deliver can recover after stop/restart.
     record.deliveryId = store().save(record.key, [body, appendix].filter(Boolean).join("\n\n"), record.deliveryId);
-    record.queue.phase = "交付中";
+    record.queue.phase = "正在发送回复";
     setStage(record, "发送最终回复");
     const sent = await sendReplyWithMention(body, record.groupId, record.phone, record.callbackUrl, signal, appendix || undefined);
-    if (!sent) throw new Error("回复未送达，内容已保存，可使用 /deliver 重试");
+    if (!sent) throw new Error("回复未能完整发到群里，已保存的内容可用 /deliver 补发");
     store().acknowledge([record.deliveryId]);
     record.notes.clear();
     log.info("任务完成 - " + progressText(record));
@@ -332,7 +332,8 @@ export async function handleUserMessage(phone: string, groupId: string, content:
   let reply: string;
   if (command === "/stop") {
     await record.queue.cancel();
-    reply = "⏹ 当前任务及排队消息已停止。未送达内容已保留，可用 /deliver 重试。";
+    reply = "⏹ 已停止你在本群的当前任务，并取消排队中的消息。已发出的内容不会撤回。";
+    if (store().pending(record.key).length) reply += "\n已生成但尚未发完的回复已保留，发送 /deliver 可补发。";
   } else if (command === "/clear") {
     record.queue.cancel();
     await record.queue.enqueue(async () => {
@@ -340,26 +341,27 @@ export async function handleUserMessage(phone: string, groupId: string, content:
       await disposeSession(record);
       await archiveFile(sessionFilePath(GROUP_DATA_ROOT, groupId, phone));
     });
-    reply = "🧹 本群会话历史已归档，下条消息将开启新会话。未送达内容仍可用 /deliver 查看。";
+    reply = "🧹 你在本群的聊天记录已归档，下条消息将开启新会话。其他人的聊天记录不受影响。";
+    if (store().pending(record.key).length) reply += "\n之前已生成但尚未发完的回复仍保留，发送 /deliver 可补发。";
   } else if (command === "/deliver") {
     return record.queue.enqueue(async (cancel) => {
       const signal = AbortSignal.any([application.signal, cancel]);
       const pending = store().pending(record.key);
-      if (!pending.length) { await sendText("没有未送达内容。", groupId, phone, callbackUrl, { signal }); return; }
+      if (!pending.length) { await sendText("你在本群没有待补发的回复。", groupId, phone, callbackUrl, { signal }); return; }
       for (const item of pending) {
-        if (!await sendText(item.text, groupId, phone, record.callbackUrl, { signal })) throw new Error("补发失败，未送达内容继续保留");
+        if (!await sendText(item.text, groupId, phone, record.callbackUrl, { signal })) throw new Error("补发失败，尚未发完的回复仍已保存，可稍后再发送 /deliver");
         store().acknowledge([item.id]);
       }
     });
   } else if (command === "/status") {
     const rate = getOutboundRateStatus(callbackUrl);
-    reply = "状态：" + record.queue.phase + "\n排队消息：" + record.queue.waiting +
-      "\n最近工具：" + (record.lastTool ?? "无") + "\n未送达记录：" + store().pending(record.key).length +
-      "\n机器人发送窗口：" + rate.used + "/" + rate.limit;
+    reply = "状态：" + record.queue.phase + "\n等待处理的消息：" + record.queue.waiting +
+      "\n最近使用的工具：" + (record.lastTool ?? "暂无") + "\n待补发回复：" + store().pending(record.key).length +
+      "\n机器人近1分钟发送额度用量：" + rate.used + "/" + rate.limit;
     if (record.progress) {
       const p = record.progress;
       reply += `\n任务编号：${p.id}\n当前阶段：${p.stage}\n已用时间：${Math.floor((Date.now() - p.started) / 1000)} 秒` +
-        `\n最近进展距今：${Math.floor((Date.now() - p.updated) / 1000)} 秒\n总时限：${RUN_TIMEOUT_MS / 1000} 秒`;
+        `\n距上次进度更新：${Math.floor((Date.now() - p.updated) / 1000)} 秒\n最长处理时间：${RUN_TIMEOUT_MS / 1000} 秒`;
     }
   } else reply = command === "/help" ? HELP_TEXT : unknownCommandText(content);
   const receiptKey = record.key + command;
