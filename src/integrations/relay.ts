@@ -692,7 +692,7 @@ export async function relayFile(request: RelayRequest): Promise<string> {
   const signal = AbortSignal.any([application.signal, AbortSignal.timeout(RELAY_HTTP_TIMEOUT), ...(request.signal ? [request.signal] : [])]);
   signal.throwIfAborted();
   if (request.size > config.maxBytes) throw new Error(filename + " 超过外链分发上限 " + formatSize(config.maxBytes));
-  const tempDir = resolve(request.tempDir ?? "agents/temp/relay");
+  const tempDir = resolve(request.tempDir ?? "data/runtime/tmp/relay");
   await mkdir(tempDir, { recursive: true });
   const snapshot = join(tempDir, ".relay-" + randomUUID());
   let size = 0;

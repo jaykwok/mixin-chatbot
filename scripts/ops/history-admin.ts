@@ -1,4 +1,4 @@
-// 查看各群会话占用，停机后将指定群的 session.jsonl 归档到 agents/rm。
+// 查看各群会话占用，停机后将指定群的 session.jsonl 归档到 backup/rm。
 // 未交付记录独立保留；目录遍历使用实际存储段并拒绝链接。
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -30,7 +30,7 @@ function usage(): void {
   console.log("  list                 列出各群的会话历史（成员数、占用、最后活动）");
   console.log("  clear <群号>         清空该群全部成员的会话历史");
   console.log("");
-  console.log("  停机后执行；session.jsonl 移入 agents/rm，未交付消息另行保留。");
+  console.log("  停机后执行；session.jsonl 移入 backup/rm，未交付消息另行保留。");
   console.log("  清空后每位成员的下一条消息都会开启全新会话。");
 }
 
@@ -116,7 +116,7 @@ export async function clearGroup(
   }
 
   console.log("");
-  console.log(`已清空 ${removed} 位成员的会话历史，归档 ${formatSize(freed)} 到 agents/rm。`);
+  console.log(`已清空 ${removed} 位成员的会话历史，归档 ${formatSize(freed)} 到 backup/rm。`);
   console.log("每位成员的下一条消息都会开启全新会话；workspace、tmp、资料索引均未改动。");
   if (failed > 0) {
     console.log(`${failed} 位成员清空失败，常见原因是机器人仍在占用该文件——停下来再试一次。`);

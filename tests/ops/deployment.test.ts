@@ -37,6 +37,62 @@ async function execute(args: string[], cwd: string, env = process.env) {
   } finally { clearTimeout(timeout); child.kill(); await child.exited; }
 }
 
+test.skipIf(process.platform !== "win32")("Windows update reuses matching dependencies and reinstalls changed or incomplete installs", async () => {
+  const fixture = await tempFixture("update-dependencies-");
+  const script = join(fixture.root, "reuse.ps1");
+  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+. ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+$root=Join-Path $PSScriptRoot 'repo'
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+Set-Location $root
+$git=(Get-Command git.exe).Source
+function Git-Ok { & $git @args | Out-Null; if($LASTEXITCODE -ne 0){throw 'fixture Git operation failed'} }
+function Commit-Fixture { Git-Ok add .; Git-Ok -c user.name=Test -c user.email=test@example.invalid commit -qm fixture; return (& $git rev-parse HEAD).Trim() }
+function Check-Reuse([bool]$expected,[string]$label) {
+    $actual=Test-DeploymentDependenciesReusable $root $git $script:original $script:target
+    if($actual -ne $expected){throw ($label+': expected '+$expected+', got '+$actual)}
+    Write-Output ('VERIFIED '+$label)
+}
+Git-Ok init -q
+New-Item -ItemType Directory -Force -Path 'scripts/patches','node_modules/demo' | Out-Null
+Set-Content .gitignore 'node_modules/'
+Set-Content package.json '{"dependencies":{"demo":"1.2.3"},"patchedDependencies":{"demo@1.2.3":"scripts/patches/demo.patch"}}'
+Set-Content bun.lock 'fixture-lock'
+Set-Content scripts/patches/demo.patch 'fixture-patch'
+Set-Content node_modules/demo/package.json '{"name":"demo","version":"1.2.3","bin":"cli.js"}'
+Set-Content node_modules/demo/cli.js 'fixture-cli'
+$script:original=Commit-Fixture; $script:target=$script:original
+Check-Reuse $true 'unchanged'
+Set-Content app.ts 'new application code'
+$script:target=Commit-Fixture
+Check-Reuse $true 'code-only'
+foreach($version in @('1.2.2','1.2.4')) {
+    Set-Content node_modules/demo/package.json ('{"name":"demo","version":"'+$version+'"}')
+    Check-Reuse $false ('version-'+$version)
+}
+Set-Content node_modules/demo/package.json '{"name":"demo","version":"1.2.3","bin":"cli.js"}'
+# Move fixture files rather than delete them.
+Move-Item -LiteralPath (Join-Path $root 'node_modules/demo/cli.js') -Destination (Join-Path $PSScriptRoot 'saved-cli.js')
+Check-Reuse $false 'missing-cli'
+Move-Item -LiteralPath (Join-Path $PSScriptRoot 'saved-cli.js') -Destination (Join-Path $root 'node_modules/demo/cli.js')
+Set-Content bun.lock 'changed-transitive-lock'
+$script:target=Commit-Fixture
+Check-Reuse $false 'lock-changed'
+$script:original=$script:target
+Set-Content scripts/patches/demo.patch 'changed-patch'
+$script:target=Commit-Fixture
+Check-Reuse $false 'patch-changed'
+$script:original=$script:target
+Move-Item -LiteralPath (Join-Path $root 'node_modules') -Destination (Join-Path $PSScriptRoot 'saved-node-modules')
+Check-Reuse $false 'missing-install'
+`);
+  try {
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output.match(/VERIFIED /g)).toHaveLength(8);
+  } finally { await fixture.cleanup(); }
+}, 60000);
+
 test.skipIf(process.platform !== "win32")("Windows deployment rollback restores files, dependencies, task and connector across failure stages", async () => {
   const fixture = await tempFixture("deployment-windows-");
   const script = join(fixture.root, "rollback.ps1");
@@ -115,6 +171,129 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
     expect(result.output.match(/VERIFIED /g)).toHaveLength(16);
+  } finally { await fixture.cleanup(); }
+}, 60000);
+
+test.skipIf(process.platform !== "win32")("Windows update reports hashes, skips matching installs and preserves rollback on failure", async () => {
+  const fixture = await tempFixture("update-flow-");
+  const script = join(fixture.root, "update.ps1");
+  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+# Extract only the update function; never execute the operations CLI or host controls.
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/ops/ops.ps1"))},[ref]$tokens,[ref]$errors)
+if($errors.Count){throw ($errors | Out-String)}
+$definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Update'},$true)
+Invoke-Expression $definition.Extent.Text
+$Project=$PSScriptRoot; $TaskName='fixture'; $RestartTunnel=$false
+$env:BOT_DEPLOY_BACKUP_ID='deploy-previous'
+$old='1111111111111111111111111111111111111111'; $new='2222222222222222222222222222222222222222'
+function Step($text){ Write-Host $text }; function Done($text){ Write-Host $text }; function Err($text){ Write-Host $text }; function Warn($text){ Write-Host $text }
+function IsAdmin { $true }; function Get-GitPath { 'fixture-git' }; function Get-BunPath { 'fixture-bun' }
+function Invoke-GitCapture($arguments) {
+    $text=''
+    if($arguments[0] -eq 'rev-parse') {
+        if($arguments[1] -eq '--abbrev-ref'){$text='main'}
+        elseif($arguments[1] -eq 'origin/main' -or $script:merged){$text=$new}else{$text=$old}
+    }
+    if($arguments[0] -eq 'merge') { if($arguments[2] -ne $new){throw 'merge did not use displayed target'}; $script:merged=$true }
+    @{ExitCode=0;Text=$text}
+}
+function New-DeploymentSnapshot { $previous=$env:BOT_DEPLOY_BACKUP_ID; $env:BOT_DEPLOY_BACKUP_ID='deploy-current'; [pscustomobject]@{WasRunning=$script:running;TaskXml='<Task/>';Path=$PSScriptRoot;Lock=(New-Object IO.MemoryStream);DependenciesAttempted=$false;PreviousBackupId=$previous} }
+function Stop-ProjectBot { $true }; function Get-ScheduledTask { $null }
+function Test-DeploymentDependenciesReusable { $script:reuse }
+function Save-DeploymentDependencies($snapshot) { $snapshot.DependenciesAttempted=$true; $script:backups++ }
+function Invoke-BunInstall { $script:installs++; return $script:failure -ne 'install' }
+function Start-Bot { $script:starts++; $true }; function Wait-Local { if($script:failure -eq 'health'){503}else{200} }
+function Register-ScheduledTask { $script:restoredStopped++ }
+function Stop-Bot { $true }; function Restore-Checkout { $true }
+function Restore-DeploymentSnapshot($snapshot) { $script:rollbacks++; if($snapshot.DependenciesAttempted -eq $script:reuse){throw 'wrong dependency rollback flag'} }
+function Remove-CompletedBackup { $script:archived++ }
+foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','install','health')) {
+    if(($script:failure -eq 'install' -and $script:reuse) -or ($script:failure -eq 'health' -and -not $script:running)){continue}
+    $script:merged=$false; $script:backups=0; $script:installs=0; $script:starts=0; $script:restoredStopped=0; $script:rollbacks=0; $script:archived=0
+    $result=Invoke-Update
+    if($env:BOT_DEPLOY_BACKUP_ID -ne 'deploy-previous'){throw 'temporary backup environment leaked'}
+    $success=$script:failure -eq 'none'
+    if($result -ne $success){throw 'wrong update result'}
+    $expectedInstalls=[int](-not $script:reuse)
+    if($script:installs -ne $expectedInstalls -or $script:backups -ne $expectedInstalls){throw 'unexpected install/backup'}
+    if($script:rollbacks -ne [int](-not $success) -or $script:archived -ne [int]$success){throw 'wrong transaction outcome'}
+    if($success -and ($script:starts -ne [int]$script:running -or $script:restoredStopped -ne [int](-not $script:running))){throw 'run state not preserved'}
+    Write-Output 'VERIFIED'
+} } }
+`);
+  try {
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output.match(/VERIFIED/g)).toHaveLength(8);
+    expect(result.output).toContain("1111111 -> 2222222");
+  } finally { await fixture.cleanup(); }
+}, 60000);
+
+test.skipIf(process.platform !== "win32")("Windows successful backup cleanup removes its transaction and preserves unrelated recovery files", async () => {
+  const fixture = await tempFixture("backup-cleanup-windows-");
+  const script = join(fixture.root, "cleanup.ps1");
+  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+. ${quotePS(join(project, "scripts/lib/lifecycle.ps1"))}
+$root=Join-Path $PSScriptRoot 'project'
+$snapshot=Join-Path $root 'backup/tmp/deploy-current'
+$failed=Join-Path $root 'backup/tmp/deploy-failed'
+New-Item -ItemType Directory -Force -Path $snapshot,$failed,(Join-Path $root 'data/state') | Out-Null
+Set-Content (Join-Path $snapshot 'old-config') 'old'
+Set-Content (Join-Path $failed 'recovery') 'preserve'
+$env:BOT_DEPLOY_BACKUP_ID='deploy-current'
+Set-Content (Join-Path $root 'old-file') 'old'
+Move-ToProjectArchive (Join-Path $root 'old-file') $root
+if(-not (Test-Path (Join-Path $root 'backup/rm/deploy-current'))){throw 'wrong archive directory'}
+$lock=[IO.File]::Open((Join-Path $root 'data/state/deploy.lock'),'OpenOrCreate','ReadWrite','None')
+try {
+    Remove-CompletedBackup $snapshot $root
+    if((Test-Path $snapshot) -or (Test-Path (Join-Path $root 'backup/rm/deploy-current'))){throw 'completed backup retained'}
+    if((Get-Content (Join-Path $failed 'recovery')) -ne 'preserve'){throw 'unrelated backup lost'}
+    $rejected=$false
+    try { Remove-CompletedBackup (Join-Path $root 'data') $root } catch { $rejected=$true }
+    if(-not $rejected){throw 'out-of-scope cleanup accepted'}
+    Move-Item -LiteralPath $failed -Destination (Join-Path $PSScriptRoot 'saved-failure')
+    Remove-CompletedBackup $snapshot $root
+    if(Test-Path (Join-Path $root 'backup')){throw 'empty backup directory retained'}
+    if(-not (Test-Path (Join-Path $root 'data/state/deploy.lock'))){throw 'active lock removed'}
+} finally { $lock.Dispose() }
+`);
+  try {
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+    expect(result.code, result.output).toBe(0);
+  } finally { await fixture.cleanup(); }
+}, 60000);
+
+test.skipIf(!bash || !existsSync(bash))("Linux successful backup cleanup is scoped and removes empty backup directories", async () => {
+  const fixture = await tempFixture("backup-cleanup-linux-");
+  const script = join(fixture.root, "cleanup.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_DIR="$(realpath "$1")"
+. '${posixPath(join(project, "scripts/lib/lifecycle.sh"))}'
+snapshot="$PROJECT_DIR/backup/tmp/deploy-current"
+failed="$PROJECT_DIR/backup/tmp/deploy-failed"
+mkdir -p "$snapshot" "$failed"
+printf old > "$snapshot/old-config"
+printf preserve > "$failed/recovery"
+export BOT_DEPLOY_BACKUP_ID=deploy-current
+printf old > "$PROJECT_DIR/old-file"
+archive_project_path "$PROJECT_DIR/old-file"
+[ -d "$PROJECT_DIR/backup/rm/deploy-current" ]
+cleanup_completed_backup "$snapshot"
+[ ! -e "$snapshot" ] && [ ! -e "$PROJECT_DIR/backup/rm/deploy-current" ]
+[ "$(cat "$failed/recovery")" = preserve ]
+if cleanup_completed_backup "$PROJECT_DIR/backup"; then exit 41; fi
+mv -- "$failed" "$PROJECT_DIR/saved-failure"
+cleanup_completed_backup "$snapshot" keep-root
+[ -d "$PROJECT_DIR/backup" ] && [ -z "$(ls -A "$PROJECT_DIR/backup")" ]
+cleanup_completed_backup "$snapshot"
+[ ! -e "$PROJECT_DIR/backup" ]
+`);
+  try {
+    const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
+    expect(result.code, result.output).toBe(0);
   } finally { await fixture.cleanup(); }
 }, 60000);
 

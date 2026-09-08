@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { lstat, mkdir } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { STATE_DIR } from "./storage.ts";
 import { lock } from "proper-lockfile";
@@ -8,7 +8,10 @@ import { move } from "fs-extra";
 /** Preserve recoverability, including group data on a different drive or bind mount. */
 export async function archiveFile(path: string): Promise<string | null> {
   const source = resolve(path);
-  const trash = resolve("agents", "rm");
+  try { await lstat(source); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+  const backupId = process.env.BOT_DEPLOY_BACKUP_ID;
+  const trash = resolve("backup", "rm", backupId && /^(deploy|tunnel)-[a-zA-Z0-9-]+$/.test(backupId) ? backupId : ".");
   if (source === trash || source.startsWith(trash + "/") || source.startsWith(trash + "\\")) {
     throw new Error("不能归档回收区本身");
   }

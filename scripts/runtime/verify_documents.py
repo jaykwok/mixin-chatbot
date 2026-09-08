@@ -1,4 +1,4 @@
-"""Offline parser smoke test. Outputs remain under agents/temp for inspection."""
+"""Offline parser smoke test. Outputs remain under backup/tmp for inspection."""
 from pathlib import Path
 from tempfile import mkdtemp
 import json
@@ -9,7 +9,7 @@ from PIL import Image
 from pptx import Presentation
 from pypdf import PdfReader, PdfWriter
 
-temporary = Path("agents/temp")
+temporary = Path("backup/tmp")
 temporary.mkdir(parents=True, exist_ok=True)
 root = Path(mkdtemp(prefix="document-check-", dir=temporary))
 text = "量子产品资料回归"

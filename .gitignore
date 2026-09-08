@@ -13,6 +13,7 @@ GEMINI.md
 .cursorrules
 .aider*
 agents/
+backup/
 logs/
 data/
 cloudflared.exe

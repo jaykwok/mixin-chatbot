@@ -974,6 +974,10 @@ function Invoke-Update {
     if ($originalSha -notmatch '^[0-9a-f]{40}$') { Err '无法识别原提交'; return $false }
     $fetch = Invoke-GitCapture @('fetch', 'origin', 'main')
     if ($fetch.ExitCode -ne 0) { Err $fetch.Text; return $false }
+    $target = Invoke-GitCapture @('rev-parse', 'origin/main')
+    if ($target.ExitCode -ne 0 -or $target.Text -notmatch '^[0-9a-f]{40}$') { Err '无法识别 origin/main 提交'; return $false }
+    $targetSha = $target.Text
+    Step ("提交：{0} -> {1}" -f $originalSha.Substring(0, 7), $targetSha.Substring(0, 7))
     $snapshot = New-DeploymentSnapshot $Project $TaskName
     $committed = $false
     $mutated = $false
@@ -983,10 +987,16 @@ function Invoke-Update {
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
         $checkout = Invoke-GitCapture @('checkout', 'main')
         if ($checkout.ExitCode -ne 0) { throw $checkout.Text }
-        $merge = Invoke-GitCapture @('merge', '--ff-only', 'origin/main')
+        $merge = Invoke-GitCapture @('merge', '--ff-only', $targetSha)
         if ($merge.ExitCode -ne 0) { throw $merge.Text }
-        Save-DeploymentDependencies $snapshot
-        if (-not (Invoke-BunInstall)) { throw '新依赖安装失败' }
+        $current = Invoke-GitCapture @('rev-parse', 'HEAD')
+        if ($current.ExitCode -ne 0 -or $current.Text -ne $targetSha) { throw '同步后 HEAD 与 origin/main 目标提交不一致' }
+        if (Test-DeploymentDependenciesReusable $Project (Get-GitPath) $originalSha $targetSha) {
+            Done '依赖清单、锁文件和补丁未变，已安装版本匹配；跳过依赖安装。'
+        } else {
+            Save-DeploymentDependencies $snapshot
+            if (-not (Invoke-BunInstall)) { throw '新依赖安装失败' }
+        }
         if ($snapshot.WasRunning) {
             if (-not (Start-Bot) -or (Wait-Local) -ne 200) { throw '新实例健康检查失败' }
         } elseif ($snapshot.TaskXml) {
@@ -994,7 +1004,7 @@ function Invoke-Update {
         }
         if ($RestartTunnel -and -not (Restart-TunnelService)) { throw '隧道重启失败' }
         $committed = $true
-        Done '升级完成，原来的运行或停止状态已保留。'
+        Done ("升级完成：{0} -> {1}；原来的运行或停止状态已保留。" -f $originalSha.Substring(0, 7), $targetSha.Substring(0, 7))
         return $true
     } catch {
         Err ('升级未完成：' + $_.Exception.Message)
@@ -1007,10 +1017,11 @@ function Invoke-Update {
                 Restore-DeploymentSnapshot $snapshot
             } catch { Err ('自动回滚未完成，快照保留在 ' + $snapshot.Path + '：' + $_.Exception.Message) }
         } elseif ($committed) {
-            try { Move-ToProjectArchive $snapshot.Path $Project }
+            try { Remove-CompletedBackup $snapshot.Path $Project }
             catch { Warn ('升级已完成，旧快照仍在 ' + $snapshot.Path) }
         }
         $snapshot.Lock.Dispose()
+        $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId
     }
 }
 

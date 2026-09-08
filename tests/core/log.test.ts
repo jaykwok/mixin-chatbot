@@ -36,6 +36,6 @@ test("log rotation retains only the configured backups without accumulating an a
     for (const name of names) bytes += (await stat(join(fixture.root, "logs", name))).size;
     expect(bytes).toBeLessThanOrEqual(LOG_MAX_BYTES * (LOG_BACKUP_COUNT + 1));
     expect(await readFile(join(fixture.root, "logs", LOG_FILE), "utf8")).toContain(`rotation ${LOG_BACKUP_COUNT + 2}`);
-    expect(existsSync(join(fixture.root, "agents/rm"))).toBe(false);
+    expect(existsSync(join(fixture.root, "backup/rm"))).toBe(false);
   } finally { clearTimeout(timer); child.kill(); await child.exited; await fixture.cleanup(); }
 }, 20000);

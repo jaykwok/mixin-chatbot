@@ -5,15 +5,16 @@ DEPLOY_FILES=(data/config data/state/bot-port data/state/deploy-mode data/state/
 # archive_project_path is shared with ops and tunnel scripts.
 
 begin_deployment() {
-    mkdir -p "$PROJECT_DIR/agents/temp" "$PROJECT_DIR/agents/rm"
+    mkdir -p "$PROJECT_DIR/backup/tmp" "$PROJECT_DIR/backup/rm" "$PROJECT_DIR/data/state"
     # util-linux flock owns the deployment lock; children launched as daemons close descriptor 9.
-    exec 9>"$PROJECT_DIR/agents/temp/deploy.lock"
+    exec 9>"$PROJECT_DIR/data/state/deploy.lock"
     flock -n 9 || { print_error "另一个部署正在进行"; return 1; }
     ROLLBACK_CONTAINER="mixin-chatbot-rollback"
     if docker ps -a --format '{{.Names}}' | grep -qx "$ROLLBACK_CONTAINER"; then
         print_error "发现旧回滚容器，请先确认其状态"; return 1
     fi
-    DEPLOY_SNAPSHOT="$(mktemp -d "$PROJECT_DIR/agents/temp/deploy-XXXXXXXX")"
+    DEPLOY_SNAPSHOT="$(mktemp -d "$PROJECT_DIR/backup/tmp/deploy-XXXXXXXX")"
+    export BOT_DEPLOY_BACKUP_ID="$(basename -- "$DEPLOY_SNAPSHOT")"
     chmod 700 "$DEPLOY_SNAPSHOT"
     local relative
     for relative in "${DEPLOY_FILES[@]}"; do

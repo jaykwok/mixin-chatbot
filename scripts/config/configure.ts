@@ -351,8 +351,8 @@ async function main(): Promise<void> {
 
 async function saveConfiguration(doc: ExistingDoc, providerId: string, thinkingLevel: ModelThinkingLevel): Promise<void> {
   await mkdir(dirname(MODELS_JSON_PATH), { recursive: true });
-  await mkdir("agents/temp", { recursive: true });
-  const tempPath = join("agents/temp", `models-${randomUUID()}.json`);
+  // Stage beside the destination so rename remains atomic across Docker bind mounts.
+  const tempPath = join(dirname(MODELS_JSON_PATH), `.models-${randomUUID()}.tmp`);
   try {
     await writeFile(tempPath, JSON.stringify(doc, null, 2) + "\n", {
       encoding: "utf8",

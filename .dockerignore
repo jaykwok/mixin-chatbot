@@ -3,6 +3,7 @@
 .venv
 .claude
 agents
+backup
 AGENTS.md
 CLAUDE.md
 GEMINI.md

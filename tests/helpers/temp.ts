@@ -6,8 +6,8 @@ import { move } from "fs-extra";
 import { isPathInside } from "../../src/agent/paths.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
-const fixtures = resolve(process.env.TEST_TEMP_ROOT ?? join(project, "agents/temp/test-fixtures"));
-const archive = resolve(process.env.TEST_TRASH_DIR ?? join(project, "agents/rm"));
+const fixtures = resolve(process.env.TEST_TEMP_ROOT ?? join(project, "backup/tmp/test-fixtures"));
+const archive = resolve(process.env.TEST_TRASH_DIR ?? join(project, "backup/rm"));
 mkdirSync(fixtures, { recursive: true });
 export function testTempDir(): string { return fixtures; }
 
@@ -21,7 +21,7 @@ export async function archiveFixture(path: string, options?: { force?: boolean; 
   } catch (error) { if (options?.force && (error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
 }
 
-/** Tests use only agents/temp and archive fixtures under agents/rm. */
+/** Tests use only backup/tmp and archive fixtures under backup/rm. */
 export async function tempFixture(prefix: string) {
   const root = await mkdtemp(join(fixtures, prefix));
   return {

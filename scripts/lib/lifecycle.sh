@@ -3,14 +3,34 @@
 archive_project_path() {
     local source archive parent
     source="$(realpath -ms -- "$1")" || return 1
-    archive="$PROJECT_DIR/agents/rm"
+    archive="$PROJECT_DIR/backup/rm"
+    if [[ "${BOT_DEPLOY_BACKUP_ID:-}" =~ ^(deploy|tunnel)-[a-zA-Z0-9-]+$ ]]; then archive="$archive/$BOT_DEPLOY_BACKUP_ID"; fi
     [ -e "$source" ] || [ -L "$source" ] || return 0
     case "$source" in "$PROJECT_DIR"/*) ;; *) echo "归档路径越界: $source" >&2; return 1 ;; esac
-    case "$source" in "$archive"|"$archive"/*|"$PROJECT_DIR/agents") return 1 ;; esac
+    case "$source" in "$archive"|"$archive"/*|"$PROJECT_DIR/backup") return 1 ;; esac
     parent="$(realpath -- "$(dirname "$source")")" || return 1
     case "$parent/" in "$PROJECT_DIR/"*) ;; *) echo '归档父目录越界' >&2; return 1 ;; esac
     mkdir -p "$archive"
     mv -- "$source" "$archive/$(date +%s)-${RANDOM}-${RANDOM}-$(basename "$source")"
+}
+
+cleanup_completed_backup() {
+    local backup snapshot name target
+    backup="$PROJECT_DIR/backup"
+    snapshot="$(realpath -ms -- "$1")" || return 1
+    name="$(basename -- "$snapshot")"
+    [[ "$name" =~ ^(deploy|tunnel)-[a-zA-Z0-9-]+$ ]] || return 1
+    [ "$(dirname -- "$snapshot")" = "$backup/tmp" ] || return 1
+    for target in "$snapshot" "$backup/rm/$name"; do
+        # Refuse redirected paths; rm unlinks any symlinks inside the snapshot.
+        [ "$(realpath -m -- "$target")" = "$target" ] || return 1
+        rm -rf -- "$target" || return 1
+    done
+    # Remove empty parents only, retaining other transactions and failed snapshots.
+    rmdir -- "$backup/tmp" "$backup/rm" 2>/dev/null || true
+    # A running container still holds this bind mount. Removing its host inode
+    # would prevent subsequent archives from reaching the recreated host path.
+    if [ "${2:-}" != keep-root ]; then rmdir -- "$backup" 2>/dev/null || true; fi
 }
 
 process_start_identity() {

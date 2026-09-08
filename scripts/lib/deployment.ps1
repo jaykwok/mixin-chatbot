@@ -1,10 +1,14 @@
 ﻿# A deployment snapshot excludes live SQLite databases and conversation data.
 function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
-    $temporaryRoot = Join-Path $ProjectRoot 'agents\temp'
+    $previousBackupId = $env:BOT_DEPLOY_BACKUP_ID
+    $temporaryRoot = Join-Path $ProjectRoot 'backup\tmp'
     New-Item -ItemType Directory -Force -Path $temporaryRoot | Out-Null
-    $deploymentLock = [IO.File]::Open((Join-Path $temporaryRoot 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $lockRoot = Join-Path $ProjectRoot 'data\state'
+    New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null
+    $deploymentLock = [IO.File]::Open((Join-Path $lockRoot 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     try {
-    $snapshot = Join-Path $ProjectRoot ('agents\temp\deploy-' + [Guid]::NewGuid().ToString('N'))
+    $snapshot = Join-Path $ProjectRoot ('backup\tmp\deploy-' + [Guid]::NewGuid().ToString('N'))
+    $env:BOT_DEPLOY_BACKUP_ID = Split-Path $snapshot -Leaf
     $paths = Save-DeploymentFiles $ProjectRoot $snapshot
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $task -and @(Get-ProjectBotPids $ProjectRoot).Count -gt 0) {
@@ -31,15 +35,48 @@ function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
         Firewall = $firewall; Tunnel = $tunnel;
         TunnelManaged = (Test-Path -LiteralPath (Join-Path $ProjectRoot 'data\state\cloudflared-managed'));
         DependenciesMoved = $false; DependenciesAttempted = $false;
-        Lock = $deploymentLock; CloudConfigPath = $cloudConfigPath
+        Lock = $deploymentLock; CloudConfigPath = $cloudConfigPath; PreviousBackupId = $previousBackupId
     }
     Save-DeploymentSnapshot $state
     return $state
-    } catch { $deploymentLock.Dispose(); throw }
+    } catch { $env:BOT_DEPLOY_BACKUP_ID = $previousBackupId; $deploymentLock.Dispose(); throw }
 }
 
 function Save-DeploymentSnapshot($Snapshot) {
     $Snapshot | Select-Object * -ExcludeProperty Lock | Export-Clixml -LiteralPath (Join-Path $Snapshot.Path 'deployment.xml')
+}
+
+function Test-DeploymentDependenciesReusable([string]$ProjectRoot, [string]$GitPath, [string]$OldRevision, [string]$NewRevision) {
+    try {
+        if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot 'node_modules') -PathType Container)) { return $false }
+        $manifest = Get-Content -LiteralPath (Join-Path $ProjectRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        # Compare lockfiles and install inputs as well as versions: a patch or transitive
+        # dependency change also requires installation. Unknown layouts fail closed.
+        $inputs = @('package.json', 'bun.lock', 'bun.lockb', 'bunfig.toml', '.npmrc', 'scripts/patches', 'patches')
+        foreach ($patch in @($manifest.patchedDependencies.PSObject.Properties)) {
+            if ($patch) { $inputs += [string]$patch.Value }
+        }
+        & $GitPath -C $ProjectRoot diff --quiet $OldRevision $NewRevision -- @inputs
+        if ($LASTEXITCODE -ne 0 -or $manifest.workspaces) { return $false }
+        foreach ($section in @('dependencies', 'devDependencies', 'optionalDependencies')) {
+            foreach ($entry in @($manifest.$section.PSObject.Properties)) {
+                if (-not $entry) { continue }
+                # This project pins exact versions; ranges/aliases need Bun's resolver.
+                if ([string]$entry.Value -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') { return $false }
+                $installedPath = Join-Path $ProjectRoot ('node_modules/' + $entry.Name + '/package.json')
+                if (-not (Test-Path -LiteralPath $installedPath -PathType Leaf)) { return $false }
+                $installed = Get-Content -LiteralPath $installedPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($installed.name -cne $entry.Name -or $installed.version -cne [string]$entry.Value) { return $false }
+                foreach ($bin in @($installed.bin.PSObject.Properties)) {
+                    if ($installed.bin -is [string]) { $binPath = $installed.bin }
+                    elseif ($bin) { $binPath = [string]$bin.Value }
+                    else { continue }
+                    if (-not (Test-Path -LiteralPath (Join-Path (Split-Path $installedPath -Parent) $binPath) -PathType Leaf)) { return $false }
+                }
+            }
+        }
+        return $true
+    } catch { return $false }
 }
 
 function Save-DeploymentDependencies($Snapshot) {
@@ -84,12 +121,17 @@ function Restore-DeploymentSnapshot($Snapshot) {
     }
     if ($Snapshot.Tunnel -and $Snapshot.Tunnel.Started) { Start-Service Cloudflared -ErrorAction Stop }
     if ($Snapshot.WasRunning) { Start-ScheduledTask -TaskName $Snapshot.TaskName -ErrorAction Stop }
-    Write-Warning '已恢复配置、启动定义、依赖、网络入口和原运行状态；回滚快照保留在 agents/temp。'
+    Write-Warning '已恢复配置、启动定义、依赖、网络入口和原运行状态；回滚快照保留在 backup/tmp。'
 }
 
 # The official Windows installer stores its token under ProgramData. Snapshot that directory too.
 function New-CloudflaredSnapshot([string]$ProjectRoot, [string]$Directory = '') {
-    if (-not $Directory) { $Directory = Join-Path $ProjectRoot ('agents\temp\tunnel-' + [Guid]::NewGuid().ToString('N')) }
+    $previousBackupId = $env:BOT_DEPLOY_BACKUP_ID
+    try {
+    if (-not $Directory) {
+        $Directory = Join-Path $ProjectRoot ('backup\tmp\tunnel-' + [Guid]::NewGuid().ToString('N'))
+        $env:BOT_DEPLOY_BACKUP_ID = Split-Path $Directory -Leaf
+    }
     New-Item -ItemType Directory -Force -Path $Directory | Out-Null
     Protect-ProjectSecretPath $Directory
     $tunnel = Get-CimInstance Win32_Service -Filter "Name='Cloudflared'" -ErrorAction SilentlyContinue
@@ -101,9 +143,10 @@ function New-CloudflaredSnapshot([string]$ProjectRoot, [string]$Directory = '') 
         Copy-Item -LiteralPath $configPath -Destination (Join-Path $Directory 'cloudflared-config') -Recurse -ErrorAction Stop
         Get-Acl -LiteralPath $configPath | Export-Clixml -LiteralPath (Join-Path $Directory 'cloudflared-acl.xml')
     }
-    $state = [pscustomobject]@{ Project = $ProjectRoot; Path = $Directory; Tunnel = $tunnel; TunnelManaged = $managed; CloudConfigPath = $configPath }
+    $state = [pscustomobject]@{ Project = $ProjectRoot; Path = $Directory; Tunnel = $tunnel; TunnelManaged = $managed; CloudConfigPath = $configPath; PreviousBackupId = $previousBackupId }
     $state | Export-Clixml -LiteralPath (Join-Path $Directory 'tunnel.xml')
     return $state
+    } catch { $env:BOT_DEPLOY_BACKUP_ID = $previousBackupId; throw }
 }
 
 function Restore-CloudflaredSnapshot($Snapshot, [switch]$DeferStart) {

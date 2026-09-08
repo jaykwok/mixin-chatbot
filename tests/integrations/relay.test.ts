@@ -91,7 +91,7 @@ describe("relay lifecycle regressions", () => {
   test.each(["success", "failure", "cancel"])("deletes the disposable upload snapshot after %s", async mode => {
     await withFixture(async ({ file, index }) => {
       const tempDir = join(dirname(file), "snapshots");
-      const archives = () => readdir("agents/rm").catch(() => []);
+      const archives = () => readdir("backup/rm").catch(() => []);
       const before = await archives();
       const controller = new AbortController();
       const restore = mockFetch(async (_input, init) => {

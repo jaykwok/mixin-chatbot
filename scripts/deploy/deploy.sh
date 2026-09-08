@@ -305,7 +305,7 @@ echo ""
 print_status "设置目录权限..."
 # root 部署固定降权到 appuser(1001)；普通 Docker 用户则由容器沿用当前 UID/GID。
 if [ "$(id -u)" -eq 0 ]; then
-    chown -R "$CONTAINER_UID:$CONTAINER_GID" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$PROJECT_DIR/agents"
+    chown -R "$CONTAINER_UID:$CONTAINER_GID" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup"
     chown "$CONTAINER_UID:$CONTAINER_GID" "$HOST_GROUP_DATA_ROOT"
 fi
 chmod 755 "$DATA_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
@@ -328,7 +328,7 @@ verify_container_storage() {
       -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
       "${GROUP_ROOT_ARGS[@]}" \
       -v "$(pwd)/logs:/app/logs" \
-      -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" \
+      -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" \
       --entrypoint sh \
       mixin-chatbot \
       -c 'for directory in /app/data/config /app/data/state /app/data/runtime /app/data/runtime/home /app/logs "$GROUP_DATA_ROOT"; do
@@ -352,7 +352,7 @@ print_success "持久化目录权限正常"
 
 if [ ! -f "$MODELS_FILE" ]; then
     print_status "首次配置 AI（provider/key/model）..."
-    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" mixin-chatbot bun run configure; then
+    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" mixin-chatbot bun run configure; then
         print_error "AI 配置命令执行失败"
         exit 1
     fi
@@ -363,7 +363,7 @@ if [ ! -f "$MODELS_FILE" ]; then
 else
     print_status "检测到已有 data/config/models.json"
     if ask_yes_no "是否重新配置 AI（provider/key/model）？[y/N]：" "n"; then
-        if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" mixin-chatbot bun run configure; then
+        if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" mixin-chatbot bun run configure; then
             print_error "AI 配置命令执行失败"
             exit 1
         fi
@@ -393,7 +393,7 @@ if [ ! -f "$WEBHOOK_SECRET_FILE" ]; then
 else
     SECRET="$(tr -d '[:space:]' < "$WEBHOOK_SECRET_FILE")"
     if ! [[ "$SECRET" =~ ^[0-9a-fA-F]{64}$ ]]; then
-        print_error "data/config/webhook-secret 格式无效（应为 64 位十六进制）；请停机并将该文件移入 agents/rm 后重新部署"
+        print_error "data/config/webhook-secret 格式无效（应为 64 位十六进制）；请停机并将该文件移入 backup/rm 后重新部署"
         exit 1
     fi
     SHOW_SECRET=0
@@ -491,7 +491,7 @@ else
     print_warning "WAF 应只限制 /webhook/ 前缀：平台 IP + POST 放行，其他 webhook 请求 Block；可保留 /favicon.svg 供健康检查"
 fi
 if [ "$SHOW_SECRET" = "1" ]; then
-    print_warning "密钥仅本次显示、不进容器日志；轮换时停机并将 data/config/webhook-secret 移入 agents/rm 后重新部署"
+    print_warning "密钥仅本次显示、不进容器日志；轮换时停机并将 data/config/webhook-secret 移入 backup/rm 后重新部署"
 fi
 echo ""
 
@@ -568,7 +568,7 @@ for runtime_key in BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_
 done
 docker run --rm --user "$CONTAINER_UID:$CONTAINER_GID" \
   -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" -e BOT_PORT="$BOT_PORT" -e BOT_HOST="$BOT_HOST" \
-  "${runtime_env_args[@]}" -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" \
+  -e BOT_DEPLOY_BACKUP_ID "${runtime_env_args[@]}" -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" \
   mixin-chatbot bun run scripts/config/runtime-settings.ts
 
 # ---- 启动容器 ----
@@ -585,7 +585,7 @@ if docker run -d \
   -e BOT_HOST="$BOT_HOST" \
   "${GROUP_ROOT_ARGS[@]}" \
   -v "$(pwd)/logs:/app/logs" \
-  -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" \
+  -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" \
   --restart unless-stopped \
   --stop-timeout 30 \
   --name mixin-chatbot \
@@ -757,7 +757,7 @@ if [ "${DEPLOY_PRESERVE_STOPPED:-0}" = 1 ] && [ "$PREVIOUS_RUNNING" = 0 ]; then
 fi
 DEPLOYMENT_COMMITTED=1
 trap - EXIT INT TERM
-archive_project_path "$DEPLOY_SNAPSHOT" || print_warning "部署已完成，旧快照仍在 $DEPLOY_SNAPSHOT"
+cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，旧快照仍在 $DEPLOY_SNAPSHOT"
 flock -u 9
 exec 9>&-
 if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ]; then

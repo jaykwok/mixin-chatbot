@@ -189,9 +189,9 @@ data/
     └── users/<user>/
         ├── session.jsonl      Pi 原生会话
         └── tmp/               生成文件、缓存与完整工具输出
-agents/
-├── temp/                      测试、诊断与部署现场
-└── rm/                        会话、tmp、部署快照等归档
+backup/
+├── tmp/                       部署备份、测试与诊断现场
+└── rm/                        被移除的旧文件、会话与用户 tmp
 logs/                          应用日志
 ```
 
@@ -253,6 +253,10 @@ bash scripts/ops/ops.sh doctor
 
 `update` 要求已跟踪文件没有本地改动，失败时尝试恢复原提交和部署状态。Windows 在改工作树与依赖之前停止实例，Linux 已运行容器与主机源码隔离。
 
+Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件、安装配置和补丁未变，且已安装的直接依赖版本匹配时，会保留 `node_modules` 并跳过安装；缺包、版本不匹配或依赖输入发生变化时，才备份旧依赖并按锁文件安装。版本更高也不视为匹配，避免偏离经过验证的依赖组合。
+
+部署、升级和连接器安装的备份放在 `backup/tmp`，被替换的旧文件放在 `backup/rm`。成功后删除本次操作的备份，失败时保留回滚现场；其他操作留下的备份和手动清理的会话归档不会被顺带删除。Windows 会移除空的 `backup` 目录；Linux 保留空的容器挂载目录，避免运行中的容器丢失后续归档。部署锁保存在 `data/state/deploy.lock`。
+
 关闭服务使用 `stop`：Windows 验证实例身份后先请求优雅关闭，超时再复核归属并终止进程树；Linux 使用 Docker 停止期限。
 
 ### 长时间没有回复
@@ -307,7 +311,7 @@ Linux 主机没有 Bun 时，停机后用已构建镜像执行同一个 CLI。�
 docker run --rm --network none \
   --user "$(stat -c '%u:%g' data)" \
   -e HOME=/app/data/runtime/home \
-  -v "$PWD/data:/app/data" -v "$PWD/agents:/app/agents" \
+  -v "$PWD/data:/app/data" -v "$PWD/backup:/app/backup" \
   mixin-chatbot bun run routes list
 ```
 
@@ -316,8 +320,9 @@ docker run --rm --network none \
 | 内容 | 保留策略 |
 |---|---|
 | 配置、SQLite 状态库、群资料 | 持久保存，纳入停机备份 |
-| 会话、用户 tmp、部署快照 | 清理时归档到 `agents/rm`，按保留策略离线处置 |
-| 测试与诊断现场 | 放在 `agents/temp`，按需离线清理 |
+| 会话、用户 tmp | 清理时归档到 `backup/rm`，按保留策略离线处置 |
+| 部署备份 | `backup/tmp` 和 `backup/rm` 下按操作隔离；成功后清理，失败时保留 |
+| 测试与诊断现场 | 放在 `backup/tmp`，按需离线清理 |
 | 上传快照 | 完成、失败或取消后直接删除 |
 | 应用日志 | 约 5 MiB 轮转，当前文件加 3 份备份，最旧备份直接删除 |
 
@@ -393,7 +398,7 @@ bun run check
 
 配置向导和配置变更需要先停止服务。已有模型配置与 webhook 密钥时，用 `bun run start` 前台运行、`bun run dev` 监听代码变化。仅隔离开发可显式设置 `ALLOW_INSECURE_WEBHOOK=1` 使用无密钥的 `/webhook`。
 
-`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。测试和诊断产物放在 `agents/temp`。
+`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。测试和诊断产物放在 `backup/tmp`。
 
 `scripts/patches/knip@6.29.0.patch` 修复 Knip 对 Bun 脚本 production 入口标记的传递，仅影响开发检查。补丁随检查脚本维护；移除前需同步更新安装引用并通过普通和 production 两种 Knip 检查。
 

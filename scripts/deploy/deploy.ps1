@@ -283,7 +283,7 @@ if (-not (Test-Path -LiteralPath $WebhookSecretFile -PathType Leaf)) {
     $secret = (Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim()
     if ($secret -notmatch "^[0-9a-fA-F]{64}$") {
         Write-Host "data\config\webhook-secret 格式无效（应为 64 位十六进制字符）。" -ForegroundColor Red
-        Write-Host "停机并将该文件移入 agents\rm 后，重新部署可生成新密钥。" -ForegroundColor Red
+        Write-Host "停机并将该文件移入 backup\rm 后，重新部署可生成新密钥。" -ForegroundColor Red
         exit 1
     }
     Done "沿用已有 webhook-secret"
@@ -570,7 +570,7 @@ Write-Host ""
 Write-Host "==== 回调 URL（填入 IM 平台）====" -ForegroundColor Cyan
 if ($showSecret) {
     Write-Host ("  " + ($url -replace "<SECRET>", $secret)) -ForegroundColor White
-    Warn "密钥仅显示一次；轮换时停机并将 data\config\webhook-secret 移入 agents\rm，再重新部署。"
+    Warn "密钥仅显示一次；轮换时停机并将 data\config\webhook-secret 移入 backup\rm，再重新部署。"
 } else {
     Write-Host "  $url" -ForegroundColor White
     Warn "密钥未变化；查看命令：Get-Content data\config\webhook-secret"
@@ -738,8 +738,9 @@ $deploymentCommitted = $true
         try { Restore-DeploymentSnapshot $snapshot }
         catch { Write-Host ("自动回滚未完成，保留快照 " + $snapshot.Path + "：" + $_.Exception.Message) -ForegroundColor Red }
     } elseif ($deploymentCommitted) {
-        try { Move-ToProjectArchive $snapshot.Path $Project }
+        try { Remove-CompletedBackup $snapshot.Path $Project }
         catch { Warn ("部署已完成，旧快照仍保留在 " + $snapshot.Path) }
     }
     $snapshot.Lock.Dispose()
+    $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId
 }

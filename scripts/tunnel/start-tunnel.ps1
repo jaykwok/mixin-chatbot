@@ -283,11 +283,13 @@ if ($isAdmin) {
     Write-Host "完成。检查命令：Get-Service Cloudflared；日志：事件查看器（eventvwr）。" -ForegroundColor Green
     $connectorCommitted = $true
     } finally {
+        try {
         if (-not $connectorCommitted) { Restore-CloudflaredSnapshot $connectorSnapshot }
         else {
-            try { Move-ToProjectArchive $connectorSnapshot.Path $Project }
+            try { Remove-CompletedBackup $connectorSnapshot.Path $Project }
             catch { Write-Warning ('连接器已启动，旧快照保留在 ' + $connectorSnapshot.Path) }
         }
+        } finally { $env:BOT_DEPLOY_BACKUP_ID = $connectorSnapshot.PreviousBackupId }
     }
 } else {
     Write-Host "（当前不是管理员：以前台方式运行；请以管理员身份重跑以安装服务。）" -ForegroundColor Yellow

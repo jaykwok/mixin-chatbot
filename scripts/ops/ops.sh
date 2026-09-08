@@ -180,8 +180,8 @@ check_relay() {
     # 命令行，WebDAV 密码不该出现在那里。netrc 用 mktemp 建在仅本人可读的目录里，用完即删。
     local dav_code="000" netrc="" host
     if [ -n "$user" ]; then
-        mkdir -p "$PROJECT_DIR/agents/temp"
-        netrc="$(mktemp "$PROJECT_DIR/agents/temp/relay-auth-XXXXXXXX")"
+        mkdir -p "$PROJECT_DIR/backup/tmp"
+        netrc="$(mktemp "$PROJECT_DIR/backup/tmp/relay-auth-XXXXXXXX")"
         chmod 600 "$netrc"
         host="$(printf '%s' "$dav_url" | sed -e 's#^[a-zA-Z]*://##' -e 's#[:/].*##')"
         printf 'machine %s login %s password %s\n' "$host" "$user" "$pass" > "$netrc"
@@ -342,7 +342,7 @@ relay_admin() {
     docker run --rm --network host \
         --user "$(stat -c '%u:%g' "$DATA_DIR")" \
         -e HOME=/app/data/runtime/home \
-        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/agents:/app/agents" \
+        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
         mixin-chatbot bun run scripts/ops/relay-admin.ts "$@"
 }
 
@@ -378,7 +378,7 @@ group_data_admin() {
         -e HOME=/app/data/runtime/home \
         -e GROUP_DATA_ROOT="$group_root_env" \
         "${group_root_args[@]}" \
-        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/agents:/app/agents" \
+        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
         mixin-chatbot bun run "$script" "$@"
 }
 
@@ -611,7 +611,7 @@ uninstall() {
         fi
         if archive_project_path "${PROJECT_DIR}/data" && archive_project_path "${PROJECT_DIR}/logs" &&
             [ ! -e "${PROJECT_DIR}/data" ] && [ ! -e "${PROJECT_DIR}/logs" ]; then
-            OK "data/ 和 logs/ 已移入 agents/rm"
+            OK "data/ 和 logs/ 已移入 backup/rm"
         else
             ER "data/ 或 logs/ 归档不完整；请检查权限后重试"
             return 1

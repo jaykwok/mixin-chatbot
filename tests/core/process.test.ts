@@ -10,6 +10,47 @@ function alive(pid: number): boolean {
 }
 
 describe("supervised real subprocesses", () => {
+  test.skipIf(process.platform !== "linux")("finishes reaping a detached process tree despite repeated termination signals", async () => {
+    const fixture = await tempFixture("supervised-signals-");
+    const command = join(fixture.root, "tree.cjs");
+    const supervisor = fileURLToPath(new URL("../../src/core/process-supervisor.ts", import.meta.url));
+    // Several generations require repeated adoption/reaping rounds, so later
+    // signals arrive while cleanup is in progress, rather than after it exits.
+    await writeFile(command, `const {spawn}=require('child_process'); const ids=[...JSON.parse(process.argv[2]),process.pid]; if(ids.length<8){spawn(process.execPath,[__filename,JSON.stringify(ids)],{detached:true,stdio:['ignore','inherit','inherit']}).unref()}else{console.log('READY:'+JSON.stringify(ids))} setTimeout(()=>process.exit(0),8000);`);
+    const child = Bun.spawn([process.execPath, supervisor], { cwd: fixture.root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    child.stdin.write(JSON.stringify({ command: process.execPath, args: [command, "[]"], cwd: fixture.root, env: process.env }) + "\n");
+    await child.stdin.flush();
+    const stderr = new Response(child.stderr).text();
+    const watchdog = setTimeout(() => child.kill("SIGKILL"), 15000);
+    let signals: ReturnType<typeof setInterval> | undefined;
+    let ids: number[] = [];
+    try {
+      let output = "";
+      for await (const data of child.stdout) {
+        output += Buffer.from(data).toString();
+        const match = output.match(/READY:(\[[\d,]+\])/);
+        if (!match) continue;
+        ids = JSON.parse(match[1]);
+        child.kill("SIGTERM");
+        signals = setInterval(() => child.kill("SIGTERM"), 2);
+        break;
+      }
+      const code = await child.exited;
+      if (signals) clearInterval(signals);
+      expect(ids).toHaveLength(8);
+      expect(code).toBe(143);
+      expect(ids.filter(alive)).toEqual([]);
+      await stderr;
+    } finally {
+      if (signals) clearInterval(signals);
+      clearTimeout(watchdog);
+      child.kill("SIGKILL");
+      await child.exited;
+      for (const pid of ids) { try { process.kill(pid, "SIGKILL"); } catch {} }
+      await fixture.cleanup();
+    }
+  }, 20000);
+
   test("reaps detached descendants when the bot parent is forcibly killed", async () => {
     const fixture = await tempFixture("supervised-force-");
     const command = join(fixture.root, "command.cjs");

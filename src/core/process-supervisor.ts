@@ -68,8 +68,10 @@ function finish(code: number): void {
   finishing = true;
   void terminate(code).catch((error) => { console.error(String(error)); process.exit(125); });
 }
-process.once("SIGTERM", () => finish(143));
-process.once("SIGINT", () => finish(130));
+// Keep handlers installed throughout asynchronous reaping. A second signal must
+// not restore the default termination action and strand the remaining descendants.
+process.on("SIGTERM", () => finish(143));
+process.on("SIGINT", () => finish(130));
 process.stdin.once("end", () => finish(143)); // Parent died or cancelled, including forced parent exit.
 process.stdin.once("error", () => finish(143));
 

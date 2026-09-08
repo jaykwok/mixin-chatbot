@@ -1,4 +1,4 @@
-// 查看用户 tmp 占用，停机后将选中的内容归档到 agents/rm。
+// 查看用户 tmp 占用，停机后将选中的内容归档到 backup/rm。
 // tmp 包含缓存、完整工具输出及生成的交付物，不能假设全部可以重建。
 // 目录边界由共享解析器验证；扫描和归档均不跟随目录链接。
 import { lstat, readdir } from "node:fs/promises";
@@ -38,7 +38,7 @@ function usage(): void {
   console.log("  purge --all              清空全部用户临时目录（等价于 --days 0）");
   console.log("");
   console.log("  两条 purge 都可加 --user <手机号> 只处理一个用户。");
-  console.log("  停机后将选中内容移入 agents/rm；tmp 目录、workspace 和 session.jsonl 保留。");
+  console.log("  停机后将选中内容移入 backup/rm；tmp 目录、workspace 和 session.jsonl 保留。");
 }
 
 function describeAge(at: number): string {
@@ -150,7 +150,7 @@ async function list(userFilter?: string): Promise<number> {
   }
   console.log("");
   console.log(`共 ${users.length} 个用户，合计 ${formatSize(bytes)}。`);
-  console.log("包含缓存、完整工具输出和用户生成的交付物；清理会移入 agents/rm，可按原路径恢复。");
+  console.log("包含缓存、完整工具输出和用户生成的交付物；清理会移入 backup/rm，可按原路径恢复。");
   return 0;
 }
 
@@ -185,7 +185,7 @@ export async function purge(
         await archiveFile(entry.path);
         freed += entry.bytes;
         removed++;
-        console.log(`已移入 agents/rm：${entry.path}（${formatSize(entry.bytes)}）`);
+        console.log(`已移入 backup/rm：${entry.path}（${formatSize(entry.bytes)}）`);
       } catch (error) {
         failed++;
         console.error(`归档失败 ${entry.path}：${String(error)}`);
@@ -197,7 +197,7 @@ export async function purge(
   if (removed === 0 && failed === 0) {
     console.log(`没有符合条件的条目（${days} 天内改动过的都保留了）。`);
   } else {
-    console.log(`已归档 ${removed} 个条目、${formatSize(freed)} 到 agents/rm（尚未释放磁盘空间）。`);
+    console.log(`已归档 ${removed} 个条目、${formatSize(freed)} 到 backup/rm（尚未释放磁盘空间）。`);
   }
   if (keptEntries > 0) {
     console.log(`保留 ${keptEntries} 个条目（${formatSize(keptBytes)}）：它们在 ${days} 天内有改动。`);

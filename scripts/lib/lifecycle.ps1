@@ -6,13 +6,40 @@ function Move-ToProjectArchive([string]$Path, [string]$ProjectRoot, [string]$All
     if ($source -ne $root -and -not $source.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw "归档路径不在指定目录内：$source"
     }
-    $archive = [IO.Path]::GetFullPath((Join-Path $ProjectRoot 'agents\rm'))
+    $archive = [IO.Path]::GetFullPath((Join-Path $ProjectRoot 'backup\rm'))
+    if ($env:BOT_DEPLOY_BACKUP_ID -match '^(deploy|tunnel)-[a-zA-Z0-9-]+$') { $archive = Join-Path $archive $env:BOT_DEPLOY_BACKUP_ID }
     if ($source -eq $archive -or $archive.StartsWith($source.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw "不能将项目根目录或回收区移入其自身"
     }
     New-Item -ItemType Directory -Force -Path $archive | Out-Null
     $destination = Join-Path $archive (([Guid]::NewGuid().ToString('N')) + '-' + (Split-Path $source -Leaf))
     Move-Item -LiteralPath $source -Destination $destination -ErrorAction Stop
+}
+
+# Successful deployment explicitly discards only this transaction's backups.
+function Remove-CompletedBackup([string]$SnapshotPath, [string]$ProjectRoot) {
+    $root = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\', '/')
+    $backup = Join-Path $root 'backup'
+    $snapshot = [IO.Path]::GetFullPath($SnapshotPath)
+    $name = Split-Path $snapshot -Leaf
+    if ((Split-Path $snapshot -Parent) -ne (Join-Path $backup 'tmp') -or $name -notmatch '^(deploy|tunnel)-[a-zA-Z0-9-]+$') {
+        throw '备份清理路径无效'
+    }
+    $targets = @($snapshot, (Join-Path (Join-Path $backup 'rm') $name))
+    foreach ($target in $targets) {
+        # Reject redirected ancestors before recursive removal; never follow a junction out of backup.
+        for ($ancestor = $target; $ancestor -ne $root; $ancestor = Split-Path $ancestor -Parent) {
+            if (Test-Path -LiteralPath $ancestor) {
+                if ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '备份清理路径包含链接' }
+            }
+        }
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop }
+    }
+    foreach ($directory in @((Join-Path $backup 'tmp'), (Join-Path $backup 'rm'), $backup)) {
+        if ((Test-Path -LiteralPath $directory -PathType Container) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) {
+            [IO.Directory]::Delete($directory) # Empty only; preserve other operations and retained failures.
+        }
+    }
 }
 
 function Get-ProjectBotInstance([string]$ProjectRoot) {

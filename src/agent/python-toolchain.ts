@@ -13,7 +13,7 @@ const requirements = fileURLToPath(new URL("../../scripts/runtime/requirements.t
 const provisioning = new KeyedQueue();
 
 async function toolchainEnv() {
-  const temporary = resolve("agents/temp/document-toolchain");
+  const temporary = resolve("data/runtime/tmp/document-toolchain");
   await mkdir(temporary, { recursive: true });
   return { ...process.env, TMPDIR: temporary, TEMP: temporary, TMP: temporary,
     UV_CACHE_DIR: join(temporary, "uv-cache"), UV_PYTHON_INSTALL_DIR: process.env.UV_PYTHON_INSTALL_DIR || join(temporary, "python"),
