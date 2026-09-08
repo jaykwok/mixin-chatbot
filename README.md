@@ -279,7 +279,7 @@ Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件�
 | `emptyDeltas` / `whitespaceDeltas` | 空字符串 / 仅空白的增量数量 |
 | `textChars` / `thinkingChars` / `toolArgsChars` | 已收到的正文 / 思考 / 工具参数增量字符量，包含空白，按 UTF-16 计数 |
 | `effectiveChars` | 上述增量中非空白字符的累计量；比较两条摘要可得到期间增长量 |
-| `active` / `idleSeconds` / `lastEventSecondsAgo` | 检测是否启用 / 距有效增长或轮次开始的秒数 / 距流事件的秒数；暂停后时长冻结 |
+| `active` / `elapsedSeconds` / `idleSeconds` / `lastEventSecondsAgo` | 检测是否启用 / 本轮次开始至今的秒数 / 距有效增长或轮次开始的秒数 / 距流事件的秒数；暂停后时长冻结 |
 | `responseId` / `stopReason` / `rawStopReason` | 上游响应标识 / SDK 结束原因 / 上游原始结束原因；未提供时为 `null` |
 
 事件持续增加但 `effectiveChars` 不增长时，说明仍收到事件却没有新内容。`rawStopReason=null` 只表示未观察到上游结束原因；取消后 `stopReason=aborted` 是本地取消结果，需结合取消前记录判断。日志另记 `取消原因`，区分 `model_idle`、`task_timeout`、`user_cancel`、`shutdown`。这些信息本身不能确定故障在上游服务还是 SDK。
