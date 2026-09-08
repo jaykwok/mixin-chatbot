@@ -270,6 +270,39 @@ Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件�
 
 默认整轮时限为 1200 秒，覆盖准备、模型、工具和交付。新版会明确报告“任务总时限”与到期阶段；上游只返回 `The operation timed out.` 时不再直接断言网络不通。若日志已到“等待取消清理”却长期不结束，先保存日志，再用运维 `restart` 恢复实例。
 
+### 按任务编号提取日志
+
+将群内报错或 `/status` 中的任务编号传给脚本即可。在项目根目录运行：
+
+Windows PowerShell：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/task-logs.ps1 555d838a
+```
+
+Linux（在部署主机上运行，支持 Docker 部署，无需主机安装 Bun）：
+
+```sh
+bash scripts/ops/task-logs.sh 555d838a
+```
+
+脚本读取项目 `logs/mixin-chatbot.log` 及数字后缀的轮转日志，按旧到新提取完整的 8 位任务编号。
+默认附带前后各 3 行，跨轮转文件保留上下文，重叠行只输出一次。每次运行在
+`backup/tmp/task-logs-<任务ID>-<时间>-<随机后缀>/` 下新建：
+
+- `task.log`：仅任务匹配行，附原文件名和行号。
+- `context.log`：任务行及前后文；`--` 表示中间省略了其他日志。
+- `summary.txt`：扫描范围、匹配数量、首次匹配前最近的模型就绪信息、首末记录、最后运行心跳及超时到达记录。
+
+可选参数：Windows 用 `-Context 5 -LogDir "D:\saved-logs"`；Linux 用
+`--context 5 --log-dir /path/to/saved-logs`。上下文范围为 0–100 行，日志目录默认相对脚本定位项目，
+显式指定的相对日志目录则相对当前工作目录。从其他目录调用脚本时，结果仍保存到脚本所属项目的 `backup/tmp`。
+
+脚本可在服务运行或停止时执行，保留源日志和之前的提取结果，不读取模型凭据配置。
+Linux 使用 Bash、awk 和 GNU coreutils；Windows 支持 PowerShell 5.1+。
+退出码 `0` 表示找到任务，`2` 表示没有匹配日志，`1` 表示参数或读写失败。正在运行的任务可能继续写日志，
+已轮转覆盖的历史无法从当前日志恢复。日志保留原文，前后文可能包含其他任务，分享前请脱敏。
+
 ### 数据维护
 
 以下命令在安装了 Bun 的项目根目录运行；将尖括号占位内容替换为实际值。
