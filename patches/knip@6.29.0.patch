@@ -1,0 +1,13 @@
+diff --git a/dist/WorkspaceWorker.js b/dist/WorkspaceWorker.js
+index 1d5a9e1a6b5e437b261f19d815d5d3c3ed712e43..477d45dad9c740338191a3ff31182a32b5e82c16 100644
+--- a/dist/WorkspaceWorker.js
++++ b/dist/WorkspaceWorker.js
+@@ -261,7 +261,7 @@ export class WorkspaceWorker {
+                 storeConfigFilePath(input.pluginName, { ...input, containingFilePath });
+             }
+             else if (!isProduction || (isProduction && (input.production || hasProductionInput(input)))) {
+-                inputs.push({ ...input, containingFilePath });
++                inputs.push({ ...input, production: input.production || !!hasProductionInput(input), containingFilePath });
+             }
+         }
+         const runPlugin = async (pluginName, patterns, isResolvedConfigFiles = false) => {

@@ -1,13 +1,10 @@
-﻿# Windows 脚本共用的纯辅助函数。deploy.ps1 / ops.ps1 / start-tunnel.ps1 都 dot-source 它。
-#
-# 这里只放「不依赖调用方任何变量、也不碰部署状态」的东西：主机名校验、可执行文件发现、
-# 服务状态翻译、交互提示。Docker、计划任务、隧道这些核心流程各脚本继续各自维护——它们
-# 的差异是本质的，硬抽出来只会做出一个到处是 if 的四不像。
-#
+﻿# Windows 脚本共用入口：加载实例控制、部署事务和交互/路径辅助函数。
 # 用法：. (Join-Path $PSScriptRoot "..\lib\common.ps1")
 
-# 列出 PATH 上某个命令的全部真实可执行文件。Get-Command 会把 .cmd shim 和无扩展名的
-# 同名文件一并报出来，逐个验证过再交给调用方，避免把一个 shim 当成真程序。
+. (Join-Path $PSScriptRoot 'lifecycle.ps1')
+. (Join-Path $PSScriptRoot 'deployment.ps1')
+
+# 列出 PATH 上的真实可执行文件，调用方再验证版本并排除 shim。
 function Get-ApplicationPaths([string]$Name) {
     $paths = @()
     foreach ($command in @(Get-Command $Name -All -CommandType Application -ErrorAction SilentlyContinue)) {

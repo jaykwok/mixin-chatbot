@@ -1,8 +1,9 @@
+import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 // 这个命令会递归删除文件，而它要删的目录就紧挨着 workspace 和 session.jsonl，
 // 所以边界必须有测试盯着：删对了什么、更重要的是没碰什么。
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, stat, utimes, writeFile } from "node:fs/promises";
+
 import { join } from "node:path";
 import { collect, purge } from "../../scripts/ops/tmp-admin.ts";
 

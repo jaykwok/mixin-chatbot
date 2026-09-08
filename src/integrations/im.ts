@@ -1,6 +1,8 @@
 // 发送层：量子密信群聊 webhook 消息、附件上传和出站限流。
 import { createHash } from "node:crypto";
 import { log } from "../core/log.ts";
+import { callbackDeliverySignal } from "./callback-route.ts";
+import { DELIVERY_TIMEOUT_MS } from "../core/config.ts";
 import {
   markdownToPlainText,
   shouldRenderMarkdown,
@@ -37,6 +39,10 @@ function throwIfDeliveryAborted(signal?: AbortSignal): void {
   if (!abortedSignal) return;
   if (abortedSignal.reason instanceof Error) throw abortedSignal.reason;
   throw abortError();
+}
+
+function deliverySignal(url: string, group: string | undefined, signal?: AbortSignal): AbortSignal {
+  return AbortSignal.any([outboundAbortController.signal, callbackDeliverySignal(url, group), AbortSignal.timeout(DELIVERY_TIMEOUT_MS), ...(signal ? [signal] : [])]);
 }
 
 function requestSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
@@ -253,6 +259,7 @@ async function enqueueOutbound<T>(
 ): Promise<T> {
   throwIfDeliveryAborted(signal);
   const state = getRateState(callbackUrl);
+  if (state.pending >= 64) throw new Error("机器人交付队列已满，内容保留待补发");
   const previous = state.tail;
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -354,7 +361,7 @@ function noteServerRateLimit(
     }
   }
   // 本地已把窗口写成 20/20；即使 Retry-After 更短，也必须等最早时间戳滚出窗口。
-  delayMs = Math.max(delayMs, IM_RATE_LIMIT_WINDOW);
+  delayMs = Math.min(Math.max(delayMs, IM_RATE_LIMIT_WINDOW), DELIVERY_TIMEOUT_MS);
   state.timestamps = Array<number>(IM_RATE_LIMIT_MAX_MESSAGES).fill(now);
   state.blockedUntil = Math.max(state.blockedUntil, now + delayMs);
   state.lastActivity = now;
@@ -409,6 +416,7 @@ async function postAtQueueFront(
   signal?: AbortSignal
 ): Promise<boolean> {
   let attempt = 0;
+  let rateLimitRetries = 0;
   while (attempt < IM_RETRY_COUNT) {
     throwIfDeliveryAborted(signal);
     const reservation = await reserveOutboundSlot(
@@ -450,14 +458,14 @@ async function postAtQueueFront(
         log.error(
           `${label}发送业务失败: code=${result?.code ?? "?"}, message=${result?.message ?? "无有效 JSON 响应"}`
         );
-        if (rateLimited && traffic === "required") continue;
+        if (rateLimited && traffic === "required" && ++rateLimitRetries <= 2) continue;
         return false;
       }
       if (resp.status === 429) {
         noteServerRateLimit(url, resp);
         await resp.body?.cancel().catch(() => {});
         log.error(`${label}发送失败，状态码: 429`);
-        if (traffic === "required") continue;
+        if (traffic === "required" && ++rateLimitRetries <= 2) continue;
         return false;
       }
       await resp.body?.cancel().catch(() => {});
@@ -483,6 +491,7 @@ async function enqueueOutboundTransaction(
 ): Promise<boolean> {
   throwIfDeliveryAborted(signal);
   const state = getRateState(url);
+  if (traffic !== "required" && state.pending > 0) return false;
   const rejected = rejectDroppableTraffic(
     state,
     traffic,
@@ -668,12 +677,13 @@ export async function sendText(
   callbackUrl: string,
   options?: { traffic?: OutboundTraffic; signal?: AbortSignal }
 ): Promise<boolean> {
+  const signal = deliverySignal(callbackUrl, groupId, options?.signal);
   const ok = await sendTextChunks(
     content,
     phone,
     callbackUrl,
     options?.traffic ?? "required",
-    options?.signal
+    signal
   );
   if (ok) log.info(`消息发送成功，群: ${groupId}, 用户: ${phone}`);
   return ok;
@@ -703,6 +713,7 @@ export async function sendReplyWithMention(
    */
   appendix?: string
 ): Promise<boolean> {
+  signal = deliverySignal(callbackUrl, groupId, signal);
   const warning = buildPressureWarning(phone);
   const notice = appendix ? `${COMPLETION_NOTICE}\n\n${appendix}` : COMPLETION_NOTICE;
   return enqueueOutboundTransaction(
@@ -733,13 +744,12 @@ export async function sendReplyWithMention(
           log.info(
             `回复发送完成（markdown + text@${notified ? "" : "失败"}），群: ${groupId}, 用户: ${phone}`
           );
-          // 带 appendix 时完成提醒不再是可有可无的提醒，它载着这次唯一的下载地址；
-          // 发失败就必须如实报错，让调用方走补发。
+          // appendix 含必须交付的外链；失败需保留待交付记录，供 /deliver 补发。
           return appendix ? notified : true;
         }
         log.warn(`markdown 发送失败，降级为 text@ - 群: ${groupId}, 用户: ${phone}`);
       }
-      const converted = markdownToPlainText(content) || "（回复内容无法以纯文本显示）";
+      const converted = (shouldRenderMarkdown(content) ? markdownToPlainText(content) : content) || "（回复内容无法以纯文本显示）";
       const plainText = appendix ? `${converted}\n\n${appendix}` : converted;
       const ok = await sendTextChunksAtQueueFront(
         plainText,
@@ -766,6 +776,7 @@ export async function sendImage(
   height?: number,
   signal?: AbortSignal
 ): Promise<boolean> {
+  signal = deliverySignal(callbackUrl, groupId, signal);
   const ok = await postWithRetry(
     callbackUrl,
     buildImage(fileId, phone, width, height),
@@ -785,6 +796,7 @@ export async function sendFile(
   phone?: string,
   signal?: AbortSignal
 ): Promise<boolean> {
+  signal = deliverySignal(callbackUrl, groupId, signal);
   const ok = await postWithRetry(
     callbackUrl,
     buildFile(fileId, phone),
@@ -805,8 +817,10 @@ export async function uploadAttachment(
   data: Uint8Array,
   filename: string,
   fileType: "image" | "file",
+  groupId: string,
   signal?: AbortSignal
 ): Promise<string | null> {
+  signal = deliverySignal(callbackUrl, groupId, signal);
   if (data.byteLength > MAX_ATTACHMENT_BYTES) {
     log.error(
       `附件过大: ${filename} (${data.byteLength} > ${MAX_ATTACHMENT_BYTES})`

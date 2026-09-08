@@ -269,10 +269,13 @@ function Clear-GroupHistory([string]$GroupId) {
         return $false
     }
     Step "先停止机器人，确保内存中的会话不会把历史写回去"
-    $null = Stop-Bot
-    $cleared = Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" @("clear", $GroupId, "--force")
-    Step "重新启动机器人"
-    $started = Start-Bot
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $wasRunning = $task -and $task.State -eq 'Running'
+    if (-not (Stop-Bot)) { return $false }
+    try { $cleared = Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" @("clear", $GroupId) }
+    finally {
+        if ($wasRunning) { $started = Start-Bot } else { $started = $true }
+    }
     return ($cleared -and $started)
 }
 
@@ -528,56 +531,9 @@ if ($Domain) {
     $Domain = $normalizedDomain
 }
 
-# 识别正在运行 src/server/index.ts 的 bun.exe 进程
-function Get-BotPids {
-    $escapedProject = [WildcardPattern]::Escape($Project)
-    Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.CommandLine -like "*$escapedProject*" -and
-            ($_.CommandLine -like "*server\index.ts*" -or $_.CommandLine -like "*server/index.ts*")
-        } |
-        Select-Object -ExpandProperty ProcessId
-}
-
-# 返回机器人是否真的停下来了。以前这里把所有失败都静默吞掉，于是「计划任务以
-# Administrator 运行、当前窗口没有管理员权限」时停不掉进程也照样返回，Restart-Bot 会
-# 当成已经重启继续往下走，最后只表现为一句莫名其妙的健康检查失败。
-function Stop-Bot {
-    $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($t) {
-        try {
-            Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-        } catch {
-            Warn "停止计划任务失败：$($_.Exception.Message)"
-        }
-    }
-    foreach ($p in Get-BotPids) {
-        try {
-            Stop-Process -Id $p -Force -ErrorAction Stop
-        } catch {
-            Warn "结束进程 $p 失败：$($_.Exception.Message)"
-        }
-    }
-    # 进程和任务状态都要落地。Start-ScheduledTask 对仍处于 Running 的任务是静默空操作，
-    # 只等进程消失就放行的话，随后的启动可能什么都没做，却一路显示成功。
-    for ($attempt = 1; $attempt -le 10; $attempt++) {
-        $current = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        $taskBusy = $current -and $current.State -eq "Running"
-        if (@(Get-BotPids).Count -eq 0 -and -not $taskBusy) { return $true }
-        Start-Sleep -Milliseconds 500
-    }
-
-    $remaining = @(Get-BotPids)
-    if ($remaining.Count -gt 0) {
-        Err "机器人进程仍在运行（pid $($remaining -join ', ')）"
-    } else {
-        Err "计划任务 '$TaskName' 仍处于运行状态，无法重新启动它"
-    }
-    if (-not (IsAdmin)) {
-        Warn "当前不是管理员；计划任务以其他账户运行时，需要管理员 PowerShell 才能停止它"
-    }
-    return $false
-}
+# 使用启动时间和本地实例记录识别相对路径启动的机器人。
+function Get-BotPids { Get-ProjectBotPids $Project }
+function Stop-Bot { return (Stop-ProjectBot $Project $TaskName) }
 
 function Start-Bot {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -1007,206 +963,55 @@ function Restore-Checkout([string]$Branch, [string]$Sha) {
 
 # 升级失败后把代码退回升级前那次提交并重新拉起。进入升级前已确认工作区干净，
 # 所以 reset --hard 不会毁掉任何本地内容。
-function Invoke-UpdateRollback([string]$Branch, [string]$Sha) {
-    Write-Host ""
-    Warn "升级后机器人未能恢复，正在回滚到 $($Sha.Substring(0, [Math]::Min(7, $Sha.Length)))..."
-    if (-not (Restore-Checkout $Branch $Sha)) {
-        if (-not $Branch -or $Branch -eq "HEAD") {
-            Err "自动回滚失败；请手动执行：git checkout --force $Sha"
-        } else {
-            Err "自动回滚失败；请手动执行：git checkout $Branch; git reset --hard $Sha"
-        }
-        return $false
-    }
-    Done "代码已回滚"
-    if (-not (Invoke-BunInstall)) {
-        Err "回滚后依赖安装失败；机器人可能仍处于停止状态"
-        return $false
-    }
-    if (-not (Restart-Bot)) {
-        Err "回滚后机器人仍未恢复；请执行 ops.ps1 logs 查看日志"
-        return $false
-    }
-    Warn "已回滚到升级前的版本，机器人恢复运行。请排查新版本的问题后再重试 update。"
-    return $true
-}
-
 function Invoke-Update {
-    Step "同步到 origin/main 并重启"
-
-    if (-not (Get-GitPath)) {
-        Err "找不到可用的 git；请安装 Git for Windows：https://git-scm.com/download/win"
-        return $false
-    }
-    if (-not (Get-BunPath)) {
-        Err "找不到可用的 bun；请先安装：powershell -c ""irm bun.sh/install.ps1 | iex"""
-        return $false
-    }
-
-    $insideRepo = Invoke-GitCapture @("rev-parse", "--is-inside-work-tree")
-    if ($insideRepo.ExitCode -ne 0 -or $insideRepo.Text -ne "true") {
-        Err "$Project 不是 git 仓库，无法自动更新"
-        Warn "这份部署可能是解压缩得到的；请改用 git clone 重新部署后再使用 update"
-        return $false
-    }
-
-    # 已跟踪文件的改动会被后面的 checkout/reset 冲掉，必须先拦下来。
-    # 只看已跟踪文件：未跟踪文件（部署机上常有的安装包、临时产物）不会被这些操作动到，
-    # 拿它们挡住升级只会让这条命令永远跑不起来。真撞上同名新文件时，下面的
-    # merge --ff-only 会自己带着明确原因失败。
-    # data/ 和 logs/ 都在 .gitignore 里，配置与群数据本来就不算改动。
-    $dirty = Invoke-GitCapture @("status", "--porcelain", "--untracked-files=no")
-    if ($dirty.ExitCode -ne 0) {
-        Err "读取 git 状态失败：$($dirty.Text)"
-        return $false
-    }
-    if ($dirty.Text) {
-        Err "已跟踪文件有未提交的改动，已停止升级："
-        foreach ($line in ($dirty.Text -split "`n")) { Write-Host "      $line" -ForegroundColor Yellow }
-        Warn "请先提交、撤销（git restore <文件>）或备份这些改动，然后重试"
-        return $false
-    }
-
-    $originalBranch = (Invoke-GitCapture @("rev-parse", "--abbrev-ref", "HEAD")).Text
-    $originalSha = (Invoke-GitCapture @("rev-parse", "HEAD")).Text
-    if (-not $originalSha) {
-        Err "无法读取当前提交"
-        return $false
-    }
-
-    Step "拉取 origin/main..."
-    $fetch = Invoke-GitCapture @("fetch", "--prune", "origin", "main")
-    if ($fetch.ExitCode -ne 0) {
-        Err "git fetch 失败：$($fetch.Text)"
-        return $false
-    }
-
-    if ($originalBranch -ne "main") {
-        if ($originalBranch -eq "HEAD") {
-            Warn "当前是游离 HEAD（$($originalSha.Substring(0, [Math]::Min(7, $originalSha.Length)))），不在任何分支上"
-        } else {
-            Warn "当前在分支 $originalBranch，不是 main"
+    Step '同步到 origin/main；停止旧实例后才变更工作树和依赖'
+    if (-not (IsAdmin)) { Err 'update 需要管理员 PowerShell，以保证失败时能还原计划任务。'; return $false }
+    if (-not (Get-GitPath) -or -not (Get-BunPath)) { Err '需要 Git 和 Bun'; return $false }
+    $dirty = Invoke-GitCapture @('status', '--porcelain', '--untracked-files=no')
+    if ($dirty.ExitCode -ne 0 -or $dirty.Text) { Err '已跟踪文件有改动或无法读取 Git 状态；请先处理后更新。'; return $false }
+    $originalBranch = (Invoke-GitCapture @('rev-parse', '--abbrev-ref', 'HEAD')).Text
+    $originalSha = (Invoke-GitCapture @('rev-parse', 'HEAD')).Text
+    if ($originalSha -notmatch '^[0-9a-f]{40}$') { Err '无法识别原提交'; return $false }
+    $fetch = Invoke-GitCapture @('fetch', 'origin', 'main')
+    if ($fetch.ExitCode -ne 0) { Err $fetch.Text; return $false }
+    $snapshot = New-DeploymentSnapshot $Project $TaskName
+    $committed = $false
+    $mutated = $false
+    try {
+        if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '旧实例未停止，未变更代码' }
+        $mutated = $true
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
+        $checkout = Invoke-GitCapture @('checkout', 'main')
+        if ($checkout.ExitCode -ne 0) { throw $checkout.Text }
+        $merge = Invoke-GitCapture @('merge', '--ff-only', 'origin/main')
+        if ($merge.ExitCode -ne 0) { throw $merge.Text }
+        Save-DeploymentDependencies $snapshot
+        if (-not (Invoke-BunInstall)) { throw '新依赖安装失败' }
+        if ($snapshot.WasRunning) {
+            if (-not (Start-Bot) -or (Wait-Local) -ne 200) { throw '新实例健康检查失败' }
+        } elseif ($snapshot.TaskXml) {
+            Register-ScheduledTask -TaskName $TaskName -Xml $snapshot.TaskXml -Force | Out-Null
         }
-        if (-not (Read-YesNo "切换到 main 并继续升级？[y/N]" $false)) {
-            Warn "已取消升级"
-            return $false
-        }
-        $checkout = Invoke-GitCapture @("checkout", "main")
-        if ($checkout.ExitCode -ne 0) {
-            Err "切换到 main 失败：$($checkout.Text)"
-            return $false
-        }
-        Done "已切换到 main"
-    }
-
-    $currentSha = (Invoke-GitCapture @("rev-parse", "HEAD")).Text
-    $targetSha = (Invoke-GitCapture @("rev-parse", "origin/main")).Text
-    if (-not $targetSha) {
-        Err "无法解析 origin/main；请确认远端存在 main 分支"
+        if ($RestartTunnel -and -not (Restart-TunnelService)) { throw '隧道重启失败' }
+        $committed = $true
+        Done '升级完成，原来的运行或停止状态已保留。'
+        return $true
+    } catch {
+        Err ('升级未完成：' + $_.Exception.Message)
         return $false
-    }
-
-    if ($currentSha -eq $targetSha) {
-        Done "已经是 origin/main 最新版本（$($targetSha.Substring(0, 7))）"
-        if (-not (Read-YesNo "代码没有变化；仍然重启机器人？[y/N]" $false)) {
-            Write-Host ""
-            return (Show-Doctor)
+    } finally {
+        if (-not $committed -and $mutated) {
+            try {
+                if (-not (Stop-Bot)) { throw '新实例未停止' }
+                if (-not (Restore-Checkout $originalBranch $originalSha)) { throw '原工作树恢复失败' }
+                Restore-DeploymentSnapshot $snapshot
+            } catch { Err ('自动回滚未完成，快照保留在 ' + $snapshot.Path + '：' + $_.Exception.Message) }
+        } elseif ($committed) {
+            try { Move-ToProjectArchive $snapshot.Path $Project }
+            catch { Warn ('升级已完成，旧快照仍在 ' + $snapshot.Path) }
         }
-        if (-not (Restart-Bot)) { return $false }
-        Write-Host ""
-        return (Show-Doctor)
+        $snapshot.Lock.Dispose()
     }
-
-    # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
-    $ancestor = Invoke-GitCapture @("merge-base", "--is-ancestor", "HEAD", "origin/main")
-    if ($ancestor.ExitCode -ne 0) {
-        Err "本地 main 与 origin/main 已分叉，无法快进升级"
-        $ahead = Invoke-GitCapture @("log", "--oneline", "origin/main..HEAD")
-        if ($ahead.Text) {
-            Warn "本地独有的提交："
-            foreach ($line in ($ahead.Text -split "`n")) { Write-Host "      $line" -ForegroundColor Yellow }
-        }
-        Warn "请先推送或丢弃这些提交后重试"
-        return $false
-    }
-
-    $incoming = Invoke-GitCapture @("log", "--oneline", "HEAD..origin/main")
-    $incomingCount = if ($incoming.Text) { @($incoming.Text -split "`n").Count } else { 0 }
-    Write-Host ""
-    Write-Host "将要应用 $incomingCount 个提交：" -ForegroundColor Cyan
-    foreach ($line in ($incoming.Text -split "`n")) { Write-Host "      $line" -ForegroundColor Gray }
-    Write-Host ""
-
-    # 先停再改：bun install 会动 node_modules，让它在机器人跑着的时候换依赖不是好主意。
-    # 停不下来就在动 git 之前退出，磁盘上的东西一点没变，重试成本为零。
-    Step "停止机器人后更新代码..."
-    if (-not (Stop-Bot)) {
-        Err "机器人未能停止，已放弃升级（代码未改变）"
-        return $false
-    }
-    Start-Sleep -Seconds 1
-
-    $merge = Invoke-GitCapture @("merge", "--ff-only", "origin/main")
-    if ($merge.ExitCode -ne 0) {
-        Err "git merge --ff-only 失败：$($merge.Text)"
-        Warn "代码未改变，正在重新启动机器人..."
-        [void](Restart-Bot)
-        return $false
-    }
-    Done "代码已更新到 $($targetSha.Substring(0, 7))"
-
-    if (-not (Invoke-BunInstall)) {
-        [void](Invoke-UpdateRollback $originalBranch $originalSha)
-        return $false
-    }
-
-    if (-not (Restart-Bot)) {
-        [void](Invoke-UpdateRollback $originalBranch $originalSha)
-        return $false
-    }
-
-    $ok = $true
-    if ($DeployMode -eq "cloudflare") {
-        $needsTunnelRestart = [bool]$RestartTunnel
-        if ($needsTunnelRestart) {
-            Warn "已指定 -RestartTunnel，强制重启隧道"
-        } elseif ($Domain) {
-            Step "检查公网链路 https://$Domain ..."
-            $publicStatus = Wait-Public
-            if ($publicStatus -eq "200") {
-                Done "公网链路正常（HTTP 200），隧道无需重启"
-            } else {
-                Warn "公网返回 $(if ($publicStatus) { "HTTP $publicStatus" } else { "无法连接" })，尝试重启隧道"
-                $needsTunnelRestart = $true
-            }
-        } else {
-            Warn "缺少 data\state\bot-domain，跳过公网检查；如需强制重启隧道请加 -RestartTunnel"
-        }
-
-        if ($needsTunnelRestart) {
-            if (Restart-TunnelService) {
-                if ($Domain) {
-                    Step "等待公网链路恢复..."
-                    $publicStatus = Wait-Public
-                    if ($publicStatus -eq "200") {
-                        Done "公网链路已恢复（HTTP 200）"
-                    } else {
-                        Warn "隧道已重启，但公网仍为 $(if ($publicStatus) { "HTTP $publicStatus" } else { "无法连接" })"
-                        Warn "请以管理员身份执行 ops.ps1 repair-tunnel，并检查 Cloudflare DNS/WAF"
-                        $ok = $false
-                    }
-                }
-            } else {
-                $ok = $false
-            }
-        }
-    }
-
-    Write-Host ""
-    Done "升级完成：$($originalSha.Substring(0, 7)) -> $($targetSha.Substring(0, 7))"
-    Write-Host ""
-    $healthy = Show-Doctor
-    return ($ok -and $healthy)
 }
 
 function Show-Logs {
@@ -1311,13 +1116,13 @@ function Uninstall-TunnelService([switch]$Confirmed) {
         Err "Cloudflared 服务仍然存在；可能正在等待系统完成删除，请稍后重试"
         return $false
     }
-    Remove-Item -LiteralPath $TunnelManagedFile -Force -ErrorAction SilentlyContinue
+    Move-ToProjectArchive $TunnelManagedFile $Project
     Done "Cloudflared 服务已清理"
 
     if (Test-Path -LiteralPath $LocalCloudflared -PathType Leaf) {
         if (Read-YesNo "是否删除项目内下载的 cloudflared.exe？[y/N]" $false) {
             try {
-                Remove-Item -LiteralPath $LocalCloudflared -Force
+                Move-ToProjectArchive $LocalCloudflared $Project
                 Done "项目内 cloudflared.exe 已删除"
             } catch {
                 Warn "删除 cloudflared.exe 失败：$($_.Exception.Message)"
@@ -1328,7 +1133,7 @@ function Uninstall-TunnelService([switch]$Confirmed) {
         }
     }
     Get-ChildItem -LiteralPath $Project -Filter "cloudflared.exe.download-*" -File -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+        ForEach-Object { Move-ToProjectArchive $_.FullName $Project }
     return $true
 }
 
@@ -1336,8 +1141,7 @@ function Uninstall-Bot {
     Step "卸载 mixin-chatbot"
     $resolvedGroupDataRoot = try { Resolve-ProjectPath $DeployedGroupDataRoot } catch { $null }
     if (-not (IsAdmin)) { Warn "当前不是管理员，任务/服务删除可能失败；如失败请以管理员身份重跑。" }
-    # 返回值丢弃：下面按实际残留进程判断，比信任停止操作的返回值更严格。
-    [void](Stop-Bot)
+    if (-not (Stop-Bot)) { Err '停止机器人失败，卸载已停止。'; return $false }
     $remainingBotPids = @(Get-BotPids)
     if ($remainingBotPids.Count -gt 0) {
         Err "机器人进程仍在运行（pid $($remainingBotPids -join ', ')）；为避免删除仍在使用的数据，卸载已停止。"
@@ -1363,10 +1167,10 @@ function Uninstall-Bot {
         }
     } else { Warn "没有可删除的计划任务" }
     $launcher = Join-Path $RuntimeDir "bot-launcher.ps1"
-    if (Test-Path -LiteralPath $launcher -PathType Leaf) { Remove-Item -LiteralPath $launcher -Force; Done "机器人 launcher 已删除" }
+    if (Test-Path -LiteralPath $launcher -PathType Leaf) { Move-ToProjectArchive $launcher $Project; Done "机器人 launcher 已删除" }
     if ((Test-Path -LiteralPath $RuntimeDir -PathType Container) -and
         @(Get-ChildItem -LiteralPath $RuntimeDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
-        Remove-Item -LiteralPath $RuntimeDir -Force
+        Move-ToProjectArchive $RuntimeDir $Project
         Done "空的 data\runtime 目录已删除"
     }
     [void](Remove-ManagedFirewallRules)
@@ -1382,7 +1186,7 @@ function Uninstall-Bot {
     } elseif (Test-Path -LiteralPath $LocalCloudflared -PathType Leaf) {
         if (Read-YesNo "Cloudflared 服务不存在；是否清理项目内 cloudflared.exe？[y/N]" $false) {
             try {
-                Remove-Item -LiteralPath $LocalCloudflared -Force
+                Move-ToProjectArchive $LocalCloudflared $Project
                 Done "项目内 cloudflared.exe 已删除"
             } catch {
                 Warn "删除 cloudflared.exe 失败：$($_.Exception.Message)"
@@ -1390,7 +1194,7 @@ function Uninstall-Bot {
         }
     }
     Get-ChildItem -LiteralPath $Project -Filter "cloudflared.exe.download-*" -File -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+        ForEach-Object { Move-ToProjectArchive $_.FullName $Project }
 
     if (Read-YesNo "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N]" $false) {
         $remainingTunnel = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
@@ -1401,10 +1205,10 @@ function Uninstall-Bot {
         $logsDir = Join-Path $Project "logs"
         try {
             if (Test-Path -LiteralPath $DataDir) {
-                Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction Stop
+                Move-ToProjectArchive $DataDir $Project
             }
             if (Test-Path -LiteralPath $logsDir) {
-                Remove-Item -LiteralPath $logsDir -Recurse -Force -ErrorAction Stop
+                Move-ToProjectArchive $logsDir $Project
             }
             if ((Test-Path -LiteralPath $DataDir) -or (Test-Path -LiteralPath $logsDir)) {
                 throw "目录仍然存在"

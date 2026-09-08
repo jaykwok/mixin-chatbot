@@ -1,9 +1,10 @@
 /** Single source of truth for command recognition and /help output. */
 export const SUPPORTED_COMMANDS: ReadonlyMap<string, string> = new Map([
   ["/help", "查看本帮助"],
-  ["/clear", "清空你在本群的会话历史，开启新会话"],
-  ["/stop", "强制停止当前任务（硬中断）"],
-  ["/status", "查看状态（忙/闲、待消化的干预、最近工具）"],
+  ["/clear", "归档你在本群的历史，开启新会话"],
+  ["/stop", "取消当前任务和排队消息"],
+  ["/status", "查看任务状态、排队消息和未送达记录"],
+  ["/deliver", "重试交付已保存的未送达内容"],
 ]);
 
 /**
@@ -23,11 +24,6 @@ export function canonicalCommand(content: string): string {
   return token.toLowerCase();
 }
 
-/** Commands are matched case-insensitively and may be followed by arguments. */
-export function isCommandMessage(content: string): boolean {
-  return SUPPORTED_COMMANDS.has(canonicalCommand(content));
-}
-
 /** Any normalized message whose first token starts with / is command syntax. */
 export function isSlashCommandMessage(content: string): boolean {
   return canonicalCommand(content).startsWith("/");
@@ -40,7 +36,7 @@ const commandHelp = [...SUPPORTED_COMMANDS]
 export const HELP_TEXT = `可用指令（可前置 @机器人名，指令必须以 / 开头，大小写不敏感）：
 ${commandHelp}
 
-提示：AI 干活途中发普通消息 = 插入干预（下一步纳入）；发 /stop = 立即硬停。`;
+提示：普通消息按收到顺序排队；/stop 取消当前任务和等待消息，已发出的内容无法撤回。`;
 
 export function unknownCommandText(content: string): string {
   return `⚠️ 未知指令「${canonicalCommand(content)}」\n\n${HELP_TEXT}`;

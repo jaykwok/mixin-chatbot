@@ -1,21 +1,36 @@
-import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { mkdir, mkdtemp, realpath } from "node:fs/promises";
+import { mkdirSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { move } from "fs-extra";
+import { isPathInside } from "../../src/agent/paths.ts";
 
-/** 默认使用系统临时目录；本机约定通过 TEMP/TMPDIR 和 TEST_TRASH_DIR 注入。 */
+const project = fileURLToPath(new URL("../../", import.meta.url));
+const fixtures = resolve(process.env.TEST_TEMP_ROOT ?? join(project, "agents/temp/test-fixtures"));
+const archive = resolve(process.env.TEST_TRASH_DIR ?? join(project, "agents/rm"));
+mkdirSync(fixtures, { recursive: true });
+export function testTempDir(): string { return fixtures; }
+
+export async function archiveFixture(path: string, options?: { force?: boolean; recursive?: boolean }): Promise<void> {
+  const source = resolve(path);
+  if (source === fixtures || !isPathInside(source, fixtures)) throw new Error("Fixture archive outside test root: " + source);
+  try {
+    if (!isPathInside(await realpath(dirname(source)), await realpath(fixtures))) throw new Error("Fixture parent escapes test root");
+    await mkdir(archive, { recursive: true });
+    await move(source, join(archive, `${basename(source)}-${crypto.randomUUID()}`), { overwrite: false });
+  } catch (error) { if (options?.force && (error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+}
+
+/** Tests use only agents/temp and archive fixtures under agents/rm. */
 export async function tempFixture(prefix: string) {
-  const root = await mkdtemp(join(tmpdir(), prefix));
+  const root = await mkdtemp(join(fixtures, prefix));
   return {
     root,
     async cleanup() {
-      const trash = process.env.TEST_TRASH_DIR;
-      const destination = trash ? join(resolve(trash), `${basename(root)}-${crypto.randomUUID()}`) : undefined;
       try {
-        if (trash) await mkdir(resolve(trash), { recursive: true });
         for (let attempt = 0; ; attempt++) {
           try {
-            if (destination) await rename(root, destination);
-            else await rm(root, { recursive: true, force: true, maxRetries: 4, retryDelay: 50 });
+            await archiveFixture(root, { force: true });
             return;
           } catch (error) {
             if (!["EPERM", "EBUSY", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "") || attempt === 4) throw error;

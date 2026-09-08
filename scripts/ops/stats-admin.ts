@@ -1,14 +1,6 @@
-// 使用统计：从 <群数据总根>/<群>/users/<用户>/session.jsonl 里数出「谁用过、用了多少」。
-//
-// 用途是写汇报材料，所以口径必须说得清、经得起问：
-//   - 「提问」= 一条真正发给模型的用户消息。斜杠指令不进会话（handleCommand 直接回执），
-//     历史里偶尔留有的几条是早期版本的残留，这里按同一套 commands.ts 规则再筛一次。
-//   - 干活途中插话的干预（steer）也会落成用户消息，同样计入：对提问的人来说那就是又问
-//     了一次，把它排除反而不符合直觉。
-//   - 统计只读文件，不需要停机；正在写入的最后一行可能是半条 JSON，跳过并在结尾报数。
-//
-// 唯一要当心的是数据来源：统计建立在 session.jsonl 之上，而 /clear 和 history-clear 会
-// 把它删掉。清过的那部分永远找不回来，输出里因此固定带一句说明。
+// 只读统计仍在 session.jsonl 中的用户消息、模型轮次及成功资料工具结果。
+// 斜杠指令按 commands.ts 排除；未完成的尾行跳过并报告。
+// /clear 与 history-clear 会归档会话，已归档部分不纳入本次统计。
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -34,6 +26,7 @@ interface GroupStats {
   asks: number;
   replies: number;
   tools: Map<string, number>;
+  delivered: Map<string, number>;
   tokens: { input: number; output: number; cacheRead: number };
   months: Map<string, { asks: number; users: Set<string> }>;
   days: Set<string>;
@@ -103,6 +96,7 @@ function emptyGroup(group: string): GroupStats {
     asks: 0,
     replies: 0,
     tools: new Map(),
+    delivered: new Map(),
     tokens: { input: 0, output: 0, cacheRead: 0 },
     months: new Map(),
     days: new Set(),
@@ -151,7 +145,7 @@ async function readUser(
     let record: {
       type?: string;
       timestamp?: string;
-      message?: { role?: string; content?: unknown; usage?: Record<string, unknown> };
+      message?: { role?: string; content?: unknown; usage?: Record<string, unknown>; toolName?: string; isError?: boolean; details?: { fileId?: string } };
     };
     try {
       record = JSON.parse(line);
@@ -194,8 +188,15 @@ async function readUser(
           const { type, name } = part as { type?: string; name?: string };
           if (type !== "toolCall" || !name) continue;
           group.tools.set(name, (group.tools.get(name) ?? 0) + 1);
-          if (name === "send_file") stats.files++;
+
         }
+      }
+    } else if (role === "toolResult") {
+      const message = record.message;
+      if (!message.isError && message.details?.fileId && ["send_file", "send_image"].includes(message.toolName ?? "")) {
+        const name = message.toolName!;
+        group.delivered.set(name, (group.delivered.get(name) ?? 0) + 1);
+        if (name === "send_file") stats.files++;
       }
     } else {
       continue;
@@ -252,7 +253,7 @@ function printFootnote(): void {
     "统计口径：一条发给机器人的消息算一次提问（含干活途中的插话），/help /clear 等指令不计入。"
   );
   console.log(
-    "数据来自各成员的 session.jsonl，被 /clear 或 history-clear 清空过的部分无法计入。"
+    "数据来自保留的 session.jsonl；归档历史未计入。附件数只计有 fileId 的成功工具结果，链接生成不等于送达。"
   );
 }
 
@@ -270,9 +271,9 @@ function printGroup(stats: GroupStats, window: Window): void {
   console.log(`  活跃天数    ${stats.days.size} 天`);
   console.log(`  AI 处理轮次 ${stats.replies} 次`);
 
-  const sentFiles = stats.tools.get("send_file") ?? 0;
-  const sentImages = stats.tools.get("send_image") ?? 0;
-  console.log(`  发送资料    ${sentFiles} 份文件` + (sentImages > 0 ? `、${sentImages} 张图片` : ""));
+  const sentFiles = stats.delivered.get("send_file") ?? 0;
+  const sentImages = stats.delivered.get("send_image") ?? 0;
+  console.log(`  成功发送附件    ${sentFiles} 份文件` + (sentImages > 0 ? `、${sentImages} 张图片` : ""));
 
   const toolTotal = [...stats.tools.values()].reduce((sum, n) => sum + n, 0);
   const topTools = [...stats.tools]
@@ -302,7 +303,7 @@ function printGroup(stats: GroupStats, window: Window): void {
       rank++;
       console.log(
         `    ${String(rank).padStart(2)}. ${user.user.padEnd(14)}` +
-          `${String(user.asks).padStart(4)} 次提问  ${String(user.files).padStart(3)} 份资料  ` +
+          `${String(user.asks).padStart(4)} 次提问  ${String(user.files).padStart(3)} 份已确认附件  ` +
           `${formatDay(user.firstAt)} ~ ${formatDay(user.lastAt)}  ${user.days.size} 天`
       );
     }
@@ -341,10 +342,10 @@ async function overview(root: string, window: Window): Promise<number> {
   console.log(`共 ${groups.length} 个群、${people} 位成员、${asks} 次提问${describeWindow(window)}`);
   console.log("");
   for (const group of groups) {
-    const files = group.tools.get("send_file") ?? 0;
+    const files = group.delivered.get("send_file") ?? 0;
     console.log(
       `  ${group.group}    ${String(group.users.length).padStart(3)} 人  ` +
-        `${String(group.asks).padStart(4)} 次提问  ${String(files).padStart(3)} 份资料  ` +
+        `${String(group.asks).padStart(4)} 次提问  ${String(files).padStart(3)} 份已确认附件  ` +
         `${formatDay(group.firstAt)} ~ ${formatDay(group.lastAt)}`
     );
   }

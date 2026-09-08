@@ -1,13 +1,14 @@
+import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+
 import { join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { buildSendTools, createOutboundNotes } from "../../src/agent/send-tools.ts";
 import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import type { RelayConfig } from "../../src/integrations/relay.ts";
-import { openRelayIndex } from "../../src/integrations/relay-index.ts";
+import { openRelayIndex, type RelayIndex } from "../../src/integrations/relay-index.ts";
 
 const CALLBACK_URL =
   "https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=send-tools-test";
@@ -27,8 +28,11 @@ async function writeOversizedFile(dir: string, name: string): Promise<string> {
   return path;
 }
 
+async function indexFor(root: string, opened: RelayIndex[]) { const index = await openRelayIndex(join(root, "relay.sqlite")); opened.push(index); return index; }
+
 describe("attachment send tools", () => {
   test("honors the Pi tool abort signal before downloading", async () => {
+    const opened: RelayIndex[] = [];
     const originalFetch = globalThis.fetch;
     let fetched = false;
     globalThis.fetch = (async () => {
@@ -58,6 +62,7 @@ describe("attachment send tools", () => {
       ).rejects.toThrow();
       expect(fetched).toBe(false);
     } finally {
+      for (const index of opened) index.close();
       globalThis.fetch = originalFetch;
     }
   });
@@ -68,6 +73,7 @@ describe("attachment send tools", () => {
     const userTemp = join(root, "user-tmp");
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
+    const opened: RelayIndex[] = [];
     const originalFetch = globalThis.fetch;
     const requests: { url: string; method?: string; auth?: string }[] = [];
     globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -98,7 +104,7 @@ describe("attachment send tools", () => {
         tempDir: userTemp,
         relay: RELAY,
         // 用临时索引，别把测试产物写进仓库的 data/runtime。
-        relayIndex: await openRelayIndex(join(root, "relay-index.jsonl")),
+        relayIndex: await indexFor(root, opened),
       }).find((tool) => tool.name === "send_file")!;
 
       const result = await fileTool.execute(
@@ -123,7 +129,7 @@ describe("attachment send tools", () => {
 
       // 链接交给运行时并入那条唯一的回复，工具自己不再单独发一条消息——否则一次发送
       // 要吃掉两条出站配额。
-      const drained = notes.drain();
+      const drained = notes.peek();
       expect(drained).toHaveLength(1);
       expect(drained[0]).toContain(details.url);
       expect(requests.some((r) => r.method === "POST" || r.url.includes("webhook"))).toBe(false);
@@ -134,8 +140,9 @@ describe("attachment send tools", () => {
       // 工具结果里不再重复给出 URL，免得模型照抄一遍、同一条消息出现两个地址。
       const text = (result.content[0] as { text: string }).text;
       expect(text).not.toContain(details.url);
-      expect(text).toContain("不要重复粘贴");
+      expect(text).toContain("重复粘贴");
     } finally {
+      for (const index of opened) index.close();
       globalThis.fetch = originalFetch;
       await rm(root, { recursive: true, force: true });
     }
@@ -147,6 +154,7 @@ describe("attachment send tools", () => {
     const userTemp = join(root, "user-tmp");
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
+    const opened: RelayIndex[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       if (init?.method === "PUT") return new Response(null, { status: 201 });
@@ -167,7 +175,7 @@ describe("attachment send tools", () => {
         workspaceDir: workspace,
         tempDir: userTemp,
         relay: { ...RELAY, expireHours: 8 },
-        relayIndex: await openRelayIndex(join(root, "relay-index.jsonl")),
+        relayIndex: await indexFor(root, opened),
       }).find((tool) => tool.name === "send_file")!;
 
       await fileTool.execute(
@@ -179,10 +187,11 @@ describe("attachment send tools", () => {
       );
 
       // 到期时文件会被删掉，事后没有补救途径；群里必须当场看到期限。
-      const announcement = notes.drain()[0]!;
+      const announcement = notes.peek()[0]!;
       expect(announcement).toContain("8 小时后失效");
       expect(announcement).toContain("删除");
     } finally {
+      for (const index of opened) index.close();
       globalThis.fetch = originalFetch;
       await rm(root, { recursive: true, force: true });
     }
@@ -194,6 +203,7 @@ describe("attachment send tools", () => {
     const userTemp = join(root, "user-tmp");
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
+    const opened: RelayIndex[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       if (init?.method === "PUT" || init?.method === "MKCOL") {
@@ -212,17 +222,18 @@ describe("attachment send tools", () => {
         workspaceDir: workspace,
         tempDir: userTemp,
         relay: { ...RELAY, expireHours: 8, signSecret: "s", signPathPrefix: "/relay/" },
-        relayIndex: await openRelayIndex(join(root, "relay-index.jsonl")),
+        relayIndex: await indexFor(root, opened),
       }).find((tool) => tool.name === "send_file")!;
 
       await fileTool.execute("send-signed", { source: "report.bin" }, undefined, undefined, {} as never);
 
-      const announcement = notes.drain()[0]!;
+      const announcement = notes.peek()[0]!;
       expect(announcement).toContain("sign=");
       expect(announcement).toContain("8 小时后失效");
       // 文件还在就不该吓唬用户「过期就没了」，也不必解释后端留没留——群里只需要知道期限。
       expect(announcement).not.toContain("删除");
     } finally {
+      for (const index of opened) index.close();
       globalThis.fetch = originalFetch;
       await rm(root, { recursive: true, force: true });
     }
@@ -234,6 +245,7 @@ describe("attachment send tools", () => {
     const userTemp = join(root, "user-tmp");
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
+    const opened: RelayIndex[] = [];
     const originalFetch = globalThis.fetch;
     let fetched = false;
     globalThis.fetch = (async () => {
@@ -275,6 +287,7 @@ describe("attachment send tools", () => {
       expect(existsSync(join(root, "relay-index.jsonl"))).toBe(false);
       expect(fetched).toBe(false);
     } finally {
+      for (const index of opened) index.close();
       globalThis.fetch = originalFetch;
       await rm(root, { recursive: true, force: true });
     }
@@ -287,6 +300,7 @@ describe("attachment send tools", () => {
     const outside = join(root, "outside");
     await Promise.all([mkdir(workspace), mkdir(userTemp), mkdir(outside)]);
 
+    const opened: RelayIndex[] = [];
     const originalFetch = globalThis.fetch;
     let fetched = false;
     globalThis.fetch = (async () => {
@@ -303,7 +317,7 @@ describe("attachment send tools", () => {
         workspaceDir: workspace,
         tempDir: userTemp,
         relay: RELAY,
-        relayIndex: await openRelayIndex(join(root, "relay-index.jsonl")),
+        relayIndex: await indexFor(root, opened),
       }).find((tool) => tool.name === "send_file")!;
 
       await expect(
@@ -317,6 +331,7 @@ describe("attachment send tools", () => {
       ).rejects.toThrow("只能发送");
       expect(fetched).toBe(false);
     } finally {
+      for (const index of opened) index.close();
       globalThis.fetch = originalFetch;
       await rm(root, { recursive: true, force: true });
     }
@@ -324,14 +339,14 @@ describe("attachment send tools", () => {
 });
 
 describe("outbound notes", () => {
-  test("drains once and stays empty afterwards", () => {
-    const notes = createOutboundNotes();
-    expect(notes.drain()).toEqual([]);
-    notes.add("a");
-    notes.add("b");
-    expect(notes.drain()).toEqual(["a", "b"]);
-    // 运行时在异常路径上会再 drain 一次兜底补发；第二次必须是空的，
-    // 否则同一条外链会在正常回复之后被重复发一遍。
-    expect(notes.drain()).toEqual([]);
+  test("retains delivery notes until explicit acknowledgement", () => {
+    const saved: string[] = [];
+    const notes = createOutboundNotes((note) => saved.push(note));
+    notes.add("a"); notes.add("b");
+    expect(notes.peek()).toEqual(["a", "b"]);
+    expect(notes.peek()).toEqual(saved);
+    notes.clear();
+    expect(notes.peek()).toEqual([]);
+    expect(saved).toEqual(["a", "b"]);
   });
 });

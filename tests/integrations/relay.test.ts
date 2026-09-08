@@ -1,7 +1,8 @@
+import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+
+import { dirname, join } from "node:path";
 import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import {
   describeRelayExpiry,
@@ -56,18 +57,19 @@ async function withFixture<T>(
 ): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-relay-"));
   const file = join(root, "note.txt");
-  const indexPath = join(root, "relay-index.jsonl");
+  const indexPath = join(root, "relay.sqlite");
   await writeFile(file, contents, "utf8");
   const index = await openRelayIndex(indexPath);
   try {
     return await run({ file, index, indexPath });
   } finally {
+    index.close();
     await rm(root, { recursive: true, force: true });
   }
 }
 
 function mockFetch(
-  handler: (input: Parameters<typeof fetch>[0], init?: RequestInit) => Response,
+  handler: (input: Parameters<typeof fetch>[0], init?: RequestInit) => Response | Promise<Response>,
   /** 让 handler 也看见建目录请求。只有专门验建目录的用例需要。 */
   options?: { handleMkcol?: boolean }
 ): () => void {
@@ -84,6 +86,168 @@ function mockFetch(
     globalThis.fetch = original;
   };
 }
+
+describe("relay lifecycle regressions", () => {
+  test.each(["success", "failure", "cancel"])("deletes the disposable upload snapshot after %s", async mode => {
+    await withFixture(async ({ file, index }) => {
+      const tempDir = join(dirname(file), "snapshots");
+      const archives = () => readdir("agents/rm").catch(() => []);
+      const before = await archives();
+      const controller = new AbortController();
+      const restore = mockFetch(async (_input, init) => {
+        expect(init?.method).toBe("PUT");
+        expect((await readdir(tempDir)).filter(name => name.startsWith(".relay-"))).toHaveLength(1);
+        if (mode === "cancel") { controller.abort(new Error("cancel snapshot test")); throw controller.signal.reason; }
+        return new Response(null, { status: mode === "failure" ? 503 : 201 });
+      });
+      try {
+        const task = relayFile({ config: CONFIG, localPath: file, size: 5, filename: "note.txt", tempDir, index, signal: controller.signal });
+        if (mode === "success") await task; else await expect(task).rejects.toThrow();
+        expect(await readdir(tempDir)).toEqual([]);
+        expect(await archives()).toEqual(before);
+        expect(await readFile(file, "utf8")).toBe("hello");
+      } finally { restore(); }
+    });
+  });
+
+  test.each([500, 401, "network"])("recovers from an unconfirmed HEAD (%s) by PUT to the same object", async failure => {
+    await withFixture(async ({ file, index }) => {
+      const puts: string[] = [];
+      const restore = mockFetch((input, init) => {
+        if (init?.method === "HEAD") {
+          if (failure === "network") throw new TypeError("temporary probe failure");
+          return new Response(null, { status: Number(failure) });
+        }
+        puts.push(String(input));
+        return new Response(null, { status: 201 });
+      });
+      try {
+        const request = { config: CONFIG, localPath: file, size: 5, filename: "note.txt", index };
+        const first = await relayFile(request);
+        expect(await relayFile(request)).toBe(first);
+        expect(puts).toHaveLength(2);
+        expect(puts[1]).toBe(puts[0]);
+        expect(index.entries()).toHaveLength(1);
+        expect(index.entries()[0]!.state).toBe("uploaded");
+      } finally { restore(); }
+    });
+  });
+
+  test("a cancelled HEAD does not start another PUT", async () => {
+    await withFixture(async ({ file, index }) => {
+      const controller = new AbortController();
+      let puts = 0;
+      const restore = mockFetch((_input, init) => {
+        if (init?.method === "HEAD") { controller.abort(new Error("stop probe")); throw controller.signal.reason; }
+        puts++;
+        return new Response(null, { status: 201 });
+      });
+      try {
+        const request = { config: CONFIG, localPath: file, size: 5, filename: "note.txt", index };
+        await relayFile(request);
+        const before = index.entries();
+        await expect(relayFile({ ...request, signal: controller.signal })).rejects.toThrow("stop probe");
+        expect(puts).toBe(1);
+        expect(index.entries()).toEqual(before);
+      } finally { restore(); }
+    });
+  });
+
+  test("a failed retry after an ambiguous HEAD cannot expire an existing nonexpiring object", async () => {
+    await withFixture(async ({ file, index }) => {
+      let puts = 0;
+      let deletes = 0;
+      const restore = mockFetch((_input, init) => {
+        if (init?.method === "HEAD") return new Response(null, { status: 500 });
+        if (init?.method === "DELETE") { deletes++; return new Response(null, { status: 204 }); }
+        return new Response(null, { status: ++puts === 1 ? 201 : 503 });
+      });
+      try {
+        const request = { config: CONFIG, localPath: file, size: 5, filename: "note.txt", index };
+        const url = await relayFile(request);
+        await expect(relayFile(request)).rejects.toThrow();
+        const record = index.entries()[0]!;
+        expect(record.url).toBe(url);
+        await index.remember({ ...record, at: new Date(Date.now() - 32 * 60000).toISOString() });
+        await sweepExpiredRelayObjects({ config: CONFIG, index });
+        expect(deletes).toBe(0);
+        expect(index.get(record.key)?.state).toBe("uploaded");
+        expect(puts).toBe(2);
+      } finally { restore(); }
+    });
+  });
+
+  test("keeps separate object records when the configured backend changes", async () => {
+    await withFixture(async ({ file, index }) => {
+      const otherConfig = { ...CONFIG, publicBaseUrl: "https://new.example.com/files/", webdavUrl: "https://new.example.com/dav/" };
+      const calls: string[] = [];
+      const restore = mockFetch((_input, init) => { calls.push(init!.method!); return new Response(null, { status: 201 }); });
+      try {
+        const request = { localPath: file, size: 5, filename: "note.txt", index };
+        const first = await relayFile({ ...request, config: CONFIG });
+        const second = await relayFile({ ...request, config: otherConfig });
+        const digest = await hashFile(file);
+        expect(first.startsWith(CONFIG.publicBaseUrl)).toBe(true);
+        expect(second.startsWith(otherConfig.publicBaseUrl)).toBe(true);
+        expect(calls).toEqual(["PUT", "PUT"]);
+        expect(index.size()).toBe(2);
+        expect(index.get(relayCacheKey(digest, "note.txt", CONFIG.publicBaseUrl))?.url).toBe(first);
+        expect(index.get(relayCacheKey(digest, "note.txt", otherConfig.publicBaseUrl))?.url).toBe(second);
+      } finally { restore(); }
+    });
+  });
+
+  test.each([false, true])("cleans an interrupted planned upload even with nonexpiring or signed links (%s)", async (signed) => {
+    await withFixture(async ({ index }) => {
+      const config = { ...CONFIG, ...(signed ? { signSecret: "fake-signing", expireHours: 24 } : {}) };
+      await index.remember({ key: "planned", url: CONFIG.publicBaseUrl + "pending/note.txt", name: "note.txt", size: 5,
+        state: "planned", at: new Date(Date.now() - 32 * 60000).toISOString() });
+      const calls: string[] = [];
+      const restore = mockFetch((_input, init) => { calls.push(init!.method!); return new Response(null, { status: 204 }); });
+      try { await sweepExpiredRelayObjects({ config, index }); expect(calls).toEqual(["DELETE"]); expect(index.size()).toBe(0); }
+      finally { restore(); }
+    });
+  });
+
+  test("a cancelled upload lock waiter returns while the first upload is still in progress", async () => {
+    await withFixture(async ({ file, index }) => {
+      let ready!: () => void; const started = new Promise<void>(resolve => { ready = resolve; });
+      let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+      const restore = mockFetch(async (_input, init) => {
+        if (init?.method === "PUT") { ready(); await held; }
+        return new Response(null, { status: 201 });
+      });
+      const first = relayFile({ config: CONFIG, localPath: file, size: 5, filename: "note.txt", index });
+      try {
+        await started;
+        const abort = new AbortController();
+        const second = relayFile({ config: CONFIG, localPath: file, size: 5, filename: "note.txt", index, signal: abort.signal });
+        const result = second.catch(error => error);
+        await Bun.sleep(40); abort.abort(new Error("cancelled waiter"));
+        const before = Date.now();
+        expect(await result).toBeInstanceOf(Error);
+        expect(Date.now() - before).toBeLessThan(1000);
+      } finally { release(); await first; restore(); }
+    });
+  });
+
+  test("the uploaded bytes still match their digest if the source is replaced after snapshotting", async () => {
+    await withFixture(async ({ file, index }) => {
+      const digest = await hashFile(file);
+      let content = "";
+      const restore = mockFetch(async (_input, init) => {
+        if (init?.method === "MKCOL") await writeFile(file, "replaced source");
+        if (init?.method === "PUT") content = await new Response(init.body).text();
+        return new Response(null, { status: 201 });
+      }, { handleMkcol: true });
+      try {
+        await relayFile({ config: CONFIG, localPath: file, size: 5, filename: "note.txt", index });
+        expect(content).toBe("hello");
+        expect(index.get(relayCacheKey(digest, "note.txt", CONFIG.publicBaseUrl))?.state).toBe("uploaded");
+      } finally { restore(); }
+    });
+  });
+});
 
 describe("relay config", () => {
   test("a missing file disables the feature instead of failing", () => {
@@ -307,15 +471,14 @@ describe("relay upload", () => {
           filename: "note.txt",
           index,
         });
-        const second = await relayFile({
+        expect(await relayFile({
           config: CONFIG,
           localPath: file,
           size: 5,
           filename: "note.txt",
           index,
-        });
-        // 错误信封的长度对不上存下的大小，判为已失效并重传。
-        expect(second).not.toBe(first);
+        })).toBe(first);
+        expect(index.entries()[0]!.url).toBe(first);
         expect(puts).toBe(2);
       } finally {
         restore();
@@ -340,7 +503,7 @@ describe("relay upload", () => {
           filename: "note.txt",
           index,
         });
-        // 换一个从同一份 JSONL 重新加载的索引，模拟进程重启。
+        // 独立 SQLite 连接读到已提交记录。
         const reloaded = await openRelayIndex(indexPath);
         const second = await relayFile({
           config: CONFIG,
@@ -348,7 +511,7 @@ describe("relay upload", () => {
           size: 5,
           filename: "note.txt",
           index: reloaded,
-        });
+        }).finally(() => reloaded.close());
         expect(second).toBe(first);
         expect(puts).toBe(1);
       } finally {
@@ -357,7 +520,7 @@ describe("relay upload", () => {
     });
   });
 
-  test("re-uploads and drops the entry when the stored URL is gone", async () => {
+  test("re-uploads a missing object at its recorded URL", async () => {
     await withFixture(async ({ file, index }) => {
       let puts = 0;
       const restore = mockFetch((_input, init) => {
@@ -382,9 +545,9 @@ describe("relay upload", () => {
           filename: "note.txt",
           index,
         });
-        expect(second).not.toBe(first);
+        expect(second).toBe(first);
         expect(puts).toBe(2);
-        expect(index.get(relayCacheKey(await hashFile(file), "note.txt"))?.url).toBe(
+        expect(index.get(relayCacheKey(await hashFile(file), "note.txt", CONFIG.publicBaseUrl))?.url).toBe(
           second
         );
       } finally {
@@ -450,8 +613,9 @@ describe("relay upload", () => {
             index,
           })
         ).rejects.toThrow("wrong password");
-        // 失败的上传不能留在索引里，否则下次会复用一个不存在的地址。
-        expect(index.size()).toBe(0);
+        // 保留未完成计划；下次按同一对象名重试，不当作已上传对象复用。
+        expect(index.size()).toBe(1);
+        expect(index.entries()[0]!.state).toBe("planned");
       } finally {
         restore();
       }
@@ -518,12 +682,13 @@ describe("relay expiry", () => {
 
   /** 直接往索引里塞一条指定年龄的记录，避免测试真的等 8 小时。 */
   async function seed(index: RelayIndex, ageHours: number, name = "note.txt") {
-    const key = relayCacheKey("deadbeef", name);
+    const key = relayCacheKey("deadbeef", name, EXPIRING.publicBaseUrl);
     await index.remember({
       key,
-      url: `${EXPIRING.publicBaseUrl}${encodeURIComponent(`20260831-uuid-${name}`)}`,
+      url: `${EXPIRING.publicBaseUrl}20260831-uuid-${encodeURIComponent(name)}/${encodeURIComponent(name)}`,
       name,
       size: 5,
+      state: "uploaded",
       at: new Date(Date.now() - ageHours * 60 * 60_000).toISOString(),
     });
     return key;
@@ -613,14 +778,15 @@ describe("relay expiry", () => {
     });
   });
 
-  test("drops but does not delete an entry left over from another publicBaseUrl", async () => {
+  test("retains and does not delete an entry left over from another publicBaseUrl", async () => {
     await withFixture(async ({ index }) => {
-      const key = relayCacheKey("deadbeef", "old.txt");
+      const key = relayCacheKey("deadbeef", "old.txt", "https://previous-backend.example.com/d/relay/");
       await index.remember({
         key,
-        url: "https://previous-backend.example.com/d/relay/20260101-uuid-old.txt",
+        url: "https://previous-backend.example.com/d/relay/20260101-uuid/old.txt",
         name: "old.txt",
         size: 5,
+        state: "uploaded",
         at: new Date(Date.now() - 9 * 60 * 60_000).toISOString(),
       });
       let called = false;
@@ -632,7 +798,7 @@ describe("relay expiry", () => {
         await sweepExpiredRelayObjects({ config: EXPIRING, index });
         // 换过后端之后我们没有能力再删旧对象，但也不该把请求发给新后端。
         expect(called).toBe(false);
-        expect(index.get(key)).toBeUndefined();
+        expect(index.get(key)).toBeDefined();
       } finally {
         restore();
       }
@@ -657,7 +823,7 @@ describe("relay expiry", () => {
           filename: "note.txt",
           index,
         });
-        const key = relayCacheKey(await hashFile(file), "note.txt");
+        const key = relayCacheKey(await hashFile(file), "note.txt", CONFIG.publicBaseUrl);
         // 把记录改老，模拟这份内容已经躺了 7 小时。
         const aged = new Date(Date.now() - 7 * 60 * 60_000).toISOString();
         await index.remember({ ...index.get(key)!, at: aged });
@@ -683,15 +849,16 @@ describe("relay expiry", () => {
     });
   });
 
-  test("does not refresh the deadline when the object is already gone", async () => {
+  test("re-uploads a missing object before refreshing its deadline", async () => {
     await withFixture(async ({ file, index }) => {
-      const key = relayCacheKey(await hashFile(file), "note.txt");
+      const key = relayCacheKey(await hashFile(file), "note.txt", CONFIG.publicBaseUrl);
       const aged = new Date(Date.now() - 7 * 60 * 60_000).toISOString();
       await index.remember({
         key,
-        url: `${EXPIRING.publicBaseUrl}stale-object.txt`,
+        url: `${EXPIRING.publicBaseUrl}stale-object/note.txt`,
         name: "note.txt",
         size: 5,
+        state: "uploaded",
         at: aged,
       });
       let puts = 0;
@@ -713,7 +880,8 @@ describe("relay expiry", () => {
         });
         // 死链不能靠刷新时间戳续命，必须真的重传。
         expect(puts).toBe(1);
-        expect(url).not.toContain("stale-object.txt");
+        expect(url).toContain("stale-object/note.txt");
+        expect(index.get(key)!.at).not.toBe(aged);
       } finally {
         restore();
       }
@@ -781,8 +949,9 @@ describe("relay object layout", () => {
         await expect(
           relayFile({ config: CONFIG, localPath: file, size: 5, filename: "note.txt", index })
         ).rejects.toThrow("存储空间不足");
-        // 目录都没建起来就别往索引里记一条指向空气的地址。
-        expect(index.size()).toBe(0);
+        // 建目录失败也保留计划，后续重试与过期清理都有持久依据。
+        expect(index.size()).toBe(1);
+        expect(index.entries()[0]!.state).toBe("planned");
       } finally {
         restore();
       }
@@ -791,13 +960,14 @@ describe("relay object layout", () => {
 
   test("deletes the whole directory, not just the file inside it", async () => {
     await withFixture(async ({ index }) => {
-      const key = relayCacheKey("deadbeef", "note.txt");
+      const key = relayCacheKey("deadbeef", "note.txt", CONFIG.publicBaseUrl);
       const directory = "20260831-11111111-2222-3333-4444-555555555555";
       await index.remember({
         key,
         url: `${CONFIG.publicBaseUrl}${directory}/${encodeURIComponent("note.txt")}`,
         name: "note.txt",
         size: 5,
+        state: "uploaded",
         at: new Date(Date.now() - 100 * 60 * 60_000).toISOString(),
       });
       const deleted: string[] = [];
@@ -815,15 +985,16 @@ describe("relay object layout", () => {
     });
   });
 
-  test("still deletes objects uploaded under the old flat layout", async () => {
+  test("refuses to delete an object without its dedicated directory", async () => {
     await withFixture(async ({ index }) => {
-      const key = relayCacheKey("deadbeef", "old.txt");
+      const key = relayCacheKey("deadbeef", "old.txt", CONFIG.publicBaseUrl);
       const flat = "20260101-uuid-old.txt";
       await index.remember({
         key,
         url: `${CONFIG.publicBaseUrl}${encodeURIComponent(flat)}`,
         name: "old.txt",
         size: 5,
+        state: "uploaded",
         at: new Date(Date.now() - 100 * 60 * 60_000).toISOString(),
       });
       const deleted: string[] = [];
@@ -832,10 +1003,10 @@ describe("relay object layout", () => {
         return new Response(null, { status: 204 });
       });
       try {
-        await sweepExpiredRelayObjects({ config: { ...CONFIG, expireHours: 8 }, index });
-        // 换布局之前发出去的对象没有目录段，仍然要能被清掉。
-        expect(deleted).toEqual([`${CONFIG.webdavUrl}${encodeURIComponent(flat)}`]);
-        expect(index.size()).toBe(0);
+        const result = await purgeRelayObjects({ config: CONFIG, index });
+        expect(deleted).toEqual([]);
+        expect(result.orphaned).toBe(1);
+        expect(index.size()).toBe(1);
       } finally {
         restore();
       }
@@ -844,13 +1015,14 @@ describe("relay object layout", () => {
 
   test("refuses to delete anything it cannot parse back to an object", async () => {
     await withFixture(async ({ index }) => {
-      const key = relayCacheKey("deadbeef", "deep.txt");
+      const key = relayCacheKey("deadbeef", "deep.txt", CONFIG.publicBaseUrl);
       await index.remember({
         key,
         // 比「目录/文件名」更深一层的地址不是我们传上去的。
         url: `${CONFIG.publicBaseUrl}a/b/c.txt`,
         name: "deep.txt",
         size: 5,
+        state: "uploaded",
         at: new Date(Date.now() - 100 * 60 * 60_000).toISOString(),
       });
       let called = false;
@@ -882,31 +1054,28 @@ describe("relay signing", () => {
   }
 
   test("matches the backend's signature byte for byte", () => {
-    // 固定向量，用一份独立的 HMAC-SHA256 实现算出来的（Python 的 urlsafe_b64encode 与后端
-    // 用的 Go base64.URLEncoding 是同一套：URL 字母表 + 保留 = 填充）。签名算法一旦漂移，
-    // 所有链接都会 403，而那种失败只有群里有人点开才会暴露——所以要钉死在这里。
-    const name = "20260831-abc-报告.pdf";
-    const stored = `${SIGNED.publicBaseUrl}${encodeURIComponent(name)}`;
+    // 固定向量由 .NET HMACSHA256 独立计算；采用后端要求的 URL 字母表并保留 = 填充。
+    const stored = `${SIGNED.publicBaseUrl}20260831-abc/${encodeURIComponent("报告.pdf")}`;
     expect(signOf(publicUrlFor(SIGNED, stored))).toBe(
-      "19wdmNkxaxaFQcwPI4o0u6aLo_l1h0zoXvs5odZSXvI=:0"
+      "VC74DqvWFtn9w6X_YBKIMeWYQhVRIuDgplI_WEjuVJo=:0"
     );
   });
 
   test("keeps the base64 padding the backend expects", () => {
     // Node 的 digest("base64url") 会去掉这个 =，用错就是全盘验签失败。
-    const signature = signOf(publicUrlFor(SIGNED, `${SIGNED.publicBaseUrl}x.bin`));
+    const signature = signOf(publicUrlFor(SIGNED, `${SIGNED.publicBaseUrl}20260831-abc/x.bin`));
     expect(signature.split(":")[0].endsWith("=")).toBe(true);
     expect(signature).not.toContain("+");
   });
 
   test("expires the signature instead of the file", () => {
-    const url = publicUrlFor({ ...SIGNED, expireHours: 8 }, `${SIGNED.publicBaseUrl}x.bin`);
+    const url = publicUrlFor({ ...SIGNED, expireHours: 8 }, `${SIGNED.publicBaseUrl}20260831-abc/x.bin`);
     const expire = Number(signOf(url).split(":")[1]);
     expect(expire - Math.floor(Date.now() / 1000)).toBeCloseTo(8 * 3600, -1);
   });
 
   test("signs nothing when no secret is configured", () => {
-    const stored = `${CONFIG.publicBaseUrl}x.bin`;
+    const stored = `${CONFIG.publicBaseUrl}20260831-abc/x.bin`;
     expect(publicUrlFor(CONFIG, stored)).toBe(stored);
   });
 
@@ -976,9 +1145,9 @@ describe("relay signing", () => {
   test("re-signs a cache hit instead of replaying the old link", async () => {
     await withFixture(async ({ file, index }) => {
       const digest = await hashFile(file);
-      const key = relayCacheKey(digest, "note.txt");
-      const stored = `${SIGNED.publicBaseUrl}${encodeURIComponent("20260831-uuid-note.txt")}`;
-      await index.remember({ key, url: stored, name: "note.txt", size: 5, at: new Date().toISOString() });
+      const key = relayCacheKey(digest, "note.txt", CONFIG.publicBaseUrl);
+      const stored = `${SIGNED.publicBaseUrl}20260831-uuid/note.txt`;
+      await index.remember({ key, url: stored, name: "note.txt", size: 5, state: "uploaded", at: new Date().toISOString() });
 
       const probes: string[] = [];
       let puts = 0;
@@ -1010,12 +1179,13 @@ describe("relay signing", () => {
 
   test("keeps the file on disk when the signature carries the expiry", async () => {
     await withFixture(async ({ index }) => {
-      const key = relayCacheKey("deadbeef", "note.txt");
+      const key = relayCacheKey("deadbeef", "note.txt", CONFIG.publicBaseUrl);
       await index.remember({
         key,
-        url: `${SIGNED.publicBaseUrl}${encodeURIComponent("20260831-uuid-note.txt")}`,
+        url: `${SIGNED.publicBaseUrl}20260831-uuid/note.txt`,
         name: "note.txt",
         size: 5,
+        state: "uploaded",
         at: new Date(Date.now() - 100 * 60 * 60_000).toISOString(),
       });
       let called = false;
@@ -1055,10 +1225,11 @@ describe("relay admin", () => {
     ];
     for (const row of rows) {
       await index.remember({
-        key: relayCacheKey(row.name, row.name),
-        url: `${CONFIG.publicBaseUrl}${encodeURIComponent(`20260831-uuid-${row.name}`)}`,
+        key: relayCacheKey(row.name, row.name, CONFIG.publicBaseUrl),
+        url: `${CONFIG.publicBaseUrl}20260831-uuid-${encodeURIComponent(row.name)}/${encodeURIComponent(row.name)}`,
         name: row.name,
         size: 5,
+        state: "uploaded",
         at: new Date(Date.now() - row.hours * 60 * 60_000).toISOString(),
       });
     }
@@ -1067,10 +1238,10 @@ describe("relay admin", () => {
   test("lists live entries oldest first", async () => {
     await withFixture(async ({ index }) => {
       await seedThree(index);
-      await index.forget(relayCacheKey("mid.zip", "mid.zip"));
+      await index.forget(relayCacheKey("mid.zip", "mid.zip", CONFIG.publicBaseUrl));
 
       const objects = await listRelayObjects({ config: CONFIG, index });
-      // 墓碑掉的那条不该出现；最该被清掉的排在最前面。
+      // 已删除的记录不再出现；最久未使用的对象排在最前面。
       expect(objects.map((o) => o.name)).toEqual(["old.pdf", "new.iso"]);
       expect(objects[0].size).toBe(5);
     });
@@ -1135,10 +1306,11 @@ describe("relay admin", () => {
   test("reports entries it can no longer delete separately from failures", async () => {
     await withFixture(async ({ index }) => {
       await index.remember({
-        key: relayCacheKey("deadbeef", "old.txt"),
-        url: "https://previous-backend.example.com/d/relay/20260101-uuid-old.txt",
+        key: relayCacheKey("deadbeef", "old.txt", "https://previous-backend.example.com/d/relay/"),
+        url: "https://previous-backend.example.com/d/relay/20260101-uuid/old.txt",
         name: "old.txt",
         size: 5,
+        state: "uploaded",
         at: new Date().toISOString(),
       });
       let called = false;
@@ -1151,7 +1323,7 @@ describe("relay admin", () => {
         // 换过后端之后我们删不掉旧对象，但也绝不能把请求发给新后端。
         expect(called).toBe(false);
         expect(result).toEqual({ matched: 1, deleted: 0, failed: 0, orphaned: 1 });
-        expect(index.size()).toBe(0);
+        expect(index.size()).toBe(1);
       } finally {
         restore();
       }

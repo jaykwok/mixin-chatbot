@@ -1,68 +1,51 @@
-/**
- * Markdown 纯文本转换核心改编自 wong2/weixin-agent-sdk：
- * https://github.com/wong2/weixin-agent-sdk/blob/main/packages/sdk/src/messaging/send.ts
- * 原实现采用 MIT License，Copyright (c) 2026 wong2；完整许可见
- * THIRD_PARTY_NOTICES.md。
- *
- * 本项目额外处理了波浪线代码围栏、标题和引用，并负责判断回复是否
- * 确实包含可渲染的 Markdown 标记。
- */
+// Use the same maintained Markdown parser as Pi; never strip URL/code characters by regex.
+import { Lexer, type Token, type Tokens } from "marked";
 
-const TABLE_PATTERN =
-  /(^|\n)\s*\|?.+\|.+\r?\n\s*\|?\s*:?-{3,}:?\s*\|\s*:?-{3,}:?(?:\s*\|\s*:?-{3,}:?)*\s*\|?/;
-const BLOCK_PATTERN =
-  /```|~~~|(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s|(?:[-*_]\s*){3,}$)/m;
-const INLINE_PATTERN =
-  /\*\*[^*\n]+\*\*|__[^_\n]+__|(?<!\*)\*[^*\n]+\*(?!\*)|(?<!_)_[^_\n]+_(?!_)|~~[^~\n]+~~|`[^`\n]+`|\[[^\]\n]+\]\([^\s)]+\)/;
-
-/** 普通段落走 text；确实带标题、强调、列表、链接、表格或代码时才渲染 Markdown。 */
-export function shouldRenderMarkdown(text: string): boolean {
-  return (
-    TABLE_PATTERN.test(text) ||
-    BLOCK_PATTERN.test(text) ||
-    INLINE_PATTERN.test(text)
-  );
+function inline(tokens: Token[]): string { return tokens.map(plain).join(""); }
+function plain(token: Token): string {
+  switch (token.type) {
+    case "space": return token.raw;
+    case "code": return (token as Tokens.Code).text + "\n";
+    case "codespan": return (token as Tokens.Codespan).text;
+    case "br": return "\n";
+    case "hr": return "\n";
+    case "image": {
+      const image = token as Tokens.Image;
+      return `${image.text || "图片"} (${image.href})`;
+    }
+    case "link": {
+      const link = token as Tokens.Link;
+      const label = inline(link.tokens);
+      return label === link.href ? link.href : label + " (" + link.href + ")";
+    }
+    case "list": {
+      const list = token as Tokens.List;
+      return list.items.map((item, i) => (list.ordered ? String(Number(list.start) + i) + ". " : "- ") + inline(item.tokens).trim()).join("\n") + "\n";
+    }
+    case "table": {
+      const table = token as Tokens.Table;
+      const row = (cells: Tokens.TableCell[]) => cells.map((cell) => inline(cell.tokens)).join(" ");
+      return row(table.header) + "\n\n" + table.rows.map(row).join("\n") + "\n";
+    }
+    case "html": return token.raw.replace(/<[^>]*>/g, "");
+    default: {
+      const value = token as Token & { tokens?: Token[]; text?: string };
+      const text = value.tokens ? inline(value.tokens) : value.text ?? value.raw;
+      return text + (["paragraph", "heading", "blockquote"].includes(token.type) ? "\n" : "");
+    }
+  }
 }
 
-/**
- * 把模型常见 Markdown 输出转成适合 text 消息的可读纯文本。
- * 保留换行和列表结构，只移除不影响语义的展示标记。
- */
 export function markdownToPlainText(text: string): string {
-  let result = text;
+  return inline(Lexer.lex(text)).replace(/\n{3,}/g, "\n\n").trim();
+}
 
-  // 代码块：去掉围栏，保留代码内容。
-  result = result.replace(
-    /```[^\n]*\n?([\s\S]*?)```/g,
-    (_, code: string) => code.trim()
-  );
-  result = result.replace(
-    /~~~[^\n]*\n?([\s\S]*?)~~~/g,
-    (_, code: string) => code.trim()
-  );
-  // 图片不能通过 text 展示，直接移除；链接保留显示文字。
-  result = result.replace(/!\[[^\]]*\]\([^)]*\)/g, "");
-  result = result.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
-  // Markdown 发送失败时，表格降级为逐行、空格分隔的文本。
-  result = result.replace(/^\|[\s:|-]+\|$/gm, "");
-  result = result.replace(/^\|(.+)\|$/gm, (_, inner: string) =>
-    inner
-      .split("|")
-      .map((cell) => cell.trim())
-      .join(" ")
-  );
-  // 标题和引用保留正文；列表符号保留，避免破坏层次。
-  result = result
-    .replace(/^\s{0,3}#{1,6}[ \t]+/gm, "")
-    .replace(/^\s{0,3}>[ \t]?/gm, "");
-  // 行内格式只影响展示，移除标记。
-  result = result
-    .replace(/\*\*(.+?)\*\*/g, "$1")
-    .replace(/\*(.+?)\*/g, "$1")
-    .replace(/__(.+?)__/g, "$1")
-    .replace(/_(.+?)_/g, "$1")
-    .replace(/~~(.+?)~~/g, "$1")
-    .replace(/`(.+?)`/g, "$1");
-
-  return result.replace(/\n{3,}/g, "\n\n").trim();
+export function shouldRenderMarkdown(text: string): boolean {
+  const formatted = (token: Token): boolean => {
+    if (["heading", "blockquote", "list", "table", "code", "codespan", "strong", "em", "del", "image", "hr"].includes(token.type)) return true;
+    if (token.type === "link" && token.raw.startsWith("[")) return true;
+    const nested = (token as Token & { tokens?: Token[] }).tokens;
+    return !!nested?.some(formatted);
+  };
+  return Lexer.lex(text).some(formatted);
 }

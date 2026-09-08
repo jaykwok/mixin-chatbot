@@ -1,8 +1,9 @@
+import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 // 这些数字会被抄进汇报材料，所以口径必须钉死：指令不算提问、干预算提问、区间按自然日
 // 闭区间、半行 JSON 不能让整份统计失败。测试用真实的 session.jsonl 记录形状。
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+
 import { join } from "node:path";
 import { collectAll, collectGroup } from "../../scripts/ops/stats-admin.ts";
 
@@ -38,9 +39,11 @@ async function makeRoot(): Promise<string> {
     JSON.stringify({ type: "model_change", timestamp: "2026-08-10T01:00:00.100Z" }),
     userMsg("2026-08-10T01:00:01.000Z", "发一份安全大脑的介绍材料"),
     assistantMsg("2026-08-10T01:00:05.000Z", ["bash", "send_file"]),
+    JSON.stringify({type:"message", timestamp:"2026-08-10T01:00:06.000Z", message:{role:"toolResult", toolName:"send_file", isError:false, details:{fileId:"confirmed-file"}}}),
     // 干活途中的插话：对提问的人来说这就是又问了一次。
     userMsg("2026-08-10T01:00:09.000Z", "顺便把报价也发一下"),
     assistantMsg("2026-08-10T01:00:12.000Z", ["send_file"]),
+    JSON.stringify({type:"message", timestamp:"2026-08-10T01:00:13.000Z", message:{role:"toolResult", toolName:"send_file", isError:true, details:{fileId:"failed-file"}}}),
     // 指令不进模型，早期版本残留在历史里的也要排除。
     userMsg("2026-08-10T01:00:20.000Z", "/stop"),
     userMsg("2026-08-10T01:00:25.000Z", "@机器人ﾠ/clear"),
@@ -81,7 +84,7 @@ describe("usage stats", () => {
       const stats = await collectGroup("group-a", root);
       expect(stats.tools.get("send_file")).toBe(2);
       expect(stats.tools.get("bash")).toBe(3);
-      expect(stats.users[0]!.files).toBe(2);
+      expect(stats.users[0]!.files).toBe(1);
       expect(stats.replies).toBe(4);
       expect(stats.tokens.input).toBe(400);
       expect(stats.tokens.cacheRead).toBe(3600);

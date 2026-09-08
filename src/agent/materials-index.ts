@@ -1,12 +1,5 @@
-// 资料索引：把群 workspace 里的资料列成一份可 grep 的清单，写到 <group>/index/materials.md。
-//
-// 为什么放在 workspace 外面：workspace 是外部同步盘的镜像，按约定只放资料。任何多出来的
-// 文件都会污染同步源，并可能被下一次同步当作外来内容删除。用户 tmp 也不行——那是每个
-// 用户各自的草稿区，还会被 tmp 清理命令删掉，而索引是全群共用、需要长期存在的。
-//
-// 为什么要有它：模型每次找材料都在重复遍历同一棵目录树。清单一次生成、多轮复用，模型
-// grep 一次就能定位到路径、大小和版本日期。清单本身可能上百 KB，所以不进 system prompt，
-// 只把目录概览和清单路径注入提示词，正文交给模型按需检索。
+// 群共享资料清单写在 workspace 之外，避免被外部同步覆盖。
+// 提示词只提供清单路径；概览和正文按需检索，不随扫描结果改变缓存前缀。
 import { readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
@@ -16,6 +9,7 @@ import {
   MATERIALS_INDEX_TTL,
 } from "../core/config.ts";
 import { log } from "../core/log.ts";
+import { application } from "../core/lifecycle.ts";
 
 /** 与具体群无关的噪声目录；点开头的目录（.git/.venv/.cache）一律跳过。 */
 const ALWAYS_SKIPPED = new Set(["node_modules", "__pycache__", "$RECYCLE.BIN"]);
@@ -26,9 +20,9 @@ export interface MaterialsIndexSummary {
   totalFiles: number;
   totalBytes: number;
   generatedAt: number;
-  /** 顶层目录概览，注入提示词让模型先缩小范围再检索。 */
+  /** 顶层目录概览，同时写入清单正文。 */
   topLevel: { name: string; files: number; bytes: number }[];
-  /** 触碰文件数或深度上限时为 true，提示词里会说明清单不完整。 */
+  /** 触碰扫描上限或存在不可读条目时为 true，清单正文会说明不完整。 */
   truncated: boolean;
 }
 
@@ -63,8 +57,9 @@ export async function loadIgnorePrefixes(ignorePath: string): Promise<string[]> 
   let raw: string;
   try {
     raw = await readFile(ignorePath, "utf8");
-  } catch {
-    return []; // 可选文件，缺失是正常状态。
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
   }
   return raw
     .split(/\r?\n/)
@@ -94,7 +89,8 @@ export async function scanWorkspace(
   let truncated = false;
 
   const walk = async (dir: string, rel: string, depth: number): Promise<void> => {
-    if (truncated) return;
+    application.signal.throwIfAborted();
+    if (entries.length >= MATERIALS_INDEX_MAX_FILES) { truncated = true; return; }
     if (depth > MATERIALS_INDEX_MAX_DEPTH) {
       truncated = true;
       return;
@@ -104,10 +100,12 @@ export async function scanWorkspace(
       children = await readdir(dir, { withFileTypes: true });
     } catch (e) {
       log.warn(`资料索引跳过无法读取的目录: ${dir} (${String(e)})`);
+      truncated = true;
       return;
     }
     for (const child of children) {
-      if (truncated) return;
+      application.signal.throwIfAborted();
+      if (entries.length >= MATERIALS_INDEX_MAX_FILES) { truncated = true; return; }
       if (child.isSymbolicLink()) continue;
       if (child.name.startsWith(".") || ALWAYS_SKIPPED.has(child.name)) continue;
       const childRel = rel ? `${rel}/${child.name}` : child.name;
@@ -127,6 +125,7 @@ export async function scanWorkspace(
         entries.push({ path: childRel, size: info.size, mtime: info.mtimeMs });
       } catch (e) {
         log.warn(`资料索引跳过无法统计的文件: ${childPath} (${String(e)})`);
+        truncated = true;
       }
     }
   };
@@ -148,7 +147,7 @@ function summarizeTopLevel(entries: FileEntry[]): MaterialsIndexSummary["topLeve
   }
   return [...byTop]
     .map(([name, bucket]) => ({ name, ...bucket }))
-    .sort((a, b) => b.files - a.files);
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** 渲染清单正文。每行一个文件，供模型用 grep 检索，不要求可读性优先。 */
@@ -170,7 +169,7 @@ export function renderMaterialsIndex(
   ];
   if (scan.truncated) {
     lines.push(
-      "- ⚠️ 已达扫描上限，清单不完整；未收录的部分需要用 find 自行定位。"
+      "- ⚠️ 扫描受限或有无法读取的条目，清单不完整；未收录的部分需要定向遍历定位。"
     );
   }
   lines.push("", "## 目录概览", "");
@@ -223,18 +222,21 @@ export interface EnsureOptions {
 
 interface CacheEntry {
   summary: MaterialsIndexSummary;
-  refreshing?: Promise<unknown>;
 }
 
 const cache = new Map<string, CacheEntry>();
 const building = new Map<string, Promise<MaterialsIndexSummary | null>>();
+function rememberSummary(key: string, summary: MaterialsIndexSummary): void {
+  cache.delete(key);
+  if (cache.size >= 128) cache.delete(cache.keys().next().value!);
+  cache.set(key, { summary });
+}
 
 /**
  * 返回可用的索引摘要，没有则重建。
  *
- * 进程内每个群只会阻塞扫描一次：首次（缓存为空）等待结果，之后过期只在后台刷新并立刻
- * 返回旧摘要。会话创建发生在「🤔 正在思考」回执之前，让用户对着空白等一次全量扫描是
- * 不可接受的；索引晚十几分钟更新，代价只是模型可能查不到刚同步进来的新文件。
+ * 无缓存时等待扫描；TTL 到期后返回旧摘要并在后台刷新。同一路径的所有扫描共用
+ * building，缓存被淘汰后也不会与尚未完成的刷新重复写文件。
  */
 export async function ensureMaterialsIndex(
   options: EnsureOptions,
@@ -242,27 +244,14 @@ export async function ensureMaterialsIndex(
 ): Promise<MaterialsIndexSummary | null> {
   const key = resolve(options.indexPath);
   const cached = cache.get(key);
-  if (cached) {
-    if (
-      now - cached.summary.generatedAt >= MATERIALS_INDEX_TTL &&
-      !cached.refreshing
-    ) {
-      cached.refreshing = rebuild(options)
-        .then((summary) => cache.set(key, { summary }))
-        .catch((e) => {
-          log.error(`资料索引后台刷新失败 - ${String(e)}`);
-          cached.refreshing = undefined;
-        });
-    }
-    return cached.summary;
-  }
+  if (cached && now - cached.summary.generatedAt < MATERIALS_INDEX_TTL) return cached.summary;
 
   const inFlight = building.get(key);
-  if (inFlight) return inFlight;
+  if (inFlight) return cached?.summary ?? inFlight;
 
-  const build = rebuild(options)
+  const build = application.track(rebuild(options))
     .then((summary) => {
-      cache.set(key, { summary });
+      rememberSummary(key, summary);
       return summary;
     })
     .catch((e) => {
@@ -274,11 +263,5 @@ export async function ensureMaterialsIndex(
       building.delete(key);
     });
   building.set(key, build);
-  return build;
-}
-
-/** 测试用：清空进程内缓存。 */
-export function resetMaterialsIndexCache(): void {
-  cache.clear();
-  building.clear();
+  return cached?.summary ?? build;
 }

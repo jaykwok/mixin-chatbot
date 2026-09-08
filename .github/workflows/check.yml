@@ -1,0 +1,52 @@
+name: Agent checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - name: PowerShell syntax and UTF-8 BOM
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-ChildItem scripts -Recurse -Filter *.ps1 | ForEach-Object {
+            $bytes = [IO.File]::ReadAllBytes($_.FullName)
+            if ($bytes[0] -ne 239 -or $bytes[1] -ne 187 -or $bytes[2] -ne 191) { throw "Missing UTF-8 BOM: $_" }
+            $tokens = $null; $errors = $null
+            [Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+      - name: Bash syntax
+        if: runner.os == 'Linux'
+        run: find scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: docker build -t mixin-chatbot-check .
+      - name: Test parsers and supervised processes in the restricted image
+        run: |
+          mkdir -p agents/temp agents/rm
+          docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --user "$(id -u):$(id -g)" \
+            -e PYTHONIOENCODING=utf-8 -e UV_CACHE_DIR=/app/agents/temp/uv-cache \
+            -v "$PWD/agents:/app/agents" mixin-chatbot-check \
+            uv run --no-project --no-python-downloads --python /app/.venv/bin/python scripts/runtime/verify_documents.py
+          docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --user "$(id -u):$(id -g)" -v "$PWD/agents:/app/agents" -v "$PWD/tests:/app/tests:ro" \
+            mixin-chatbot-check bun run test tests/core/process.test.ts

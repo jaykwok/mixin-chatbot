@@ -1,18 +1,29 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
+import { describe, expect, test } from "bun:test";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+
 import { join } from "node:path";
 import {
   ensureMaterialsIndex,
   loadIgnorePrefixes,
   renderMaterialsIndex,
-  resetMaterialsIndexCache,
   scanWorkspace,
 } from "../../src/agent/materials-index.ts";
+import { MATERIALS_INDEX_MAX_DEPTH } from "../../src/core/config.ts";
 
-afterEach(() => {
-  resetMaterialsIndexCache();
+test("a deep branch cannot hide a shallow sibling", async () => {
+  const { root, workspace } = await makeWorkspace();
+  try {
+    const deep = join(workspace, "a-deep", ...Array(MATERIALS_INDEX_MAX_DEPTH + 1).fill("nested"));
+    await mkdir(deep, { recursive: true });
+    await writeFile(join(deep, "hidden.txt"), "deep");
+    await writeFile(join(workspace, "z-visible.txt"), "shallow");
+    const scan = await scanWorkspace(workspace);
+    expect(scan.truncated).toBe(true);
+    expect(scan.entries.some(entry => entry.path === "z-visible.txt")).toBe(true);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
+
 
 async function makeWorkspace(): Promise<{ root: string; workspace: string }> {
   const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-index-"));
@@ -112,10 +123,17 @@ describe("materials index", () => {
       expect(second?.generatedAt).toBe(first!.generatedAt);
 
       // TTL 到期后后台刷新，摘要在下一次调用时更新。
-      await ensureMaterialsIndex(options, Date.now() + 3600_000);
-      await Bun.sleep(50);
-      const refreshed = await ensureMaterialsIndex(options);
+      const snapshots = await Promise.all(Array.from({ length: 16 }, () =>
+        ensureMaterialsIndex(options, Date.now() + 3600_000)));
+      expect(snapshots.every(snapshot => snapshot === first)).toBe(true);
+      const deadline = Date.now() + 2000;
+      let refreshed = await ensureMaterialsIndex(options);
+      while (refreshed?.totalFiles !== 5 && Date.now() < deadline) {
+        await Bun.sleep(10);
+        refreshed = await ensureMaterialsIndex(options);
+      }
       expect(refreshed?.totalFiles).toBe(5);
+      expect(await readFile(indexPath, "utf8")).toContain("案例/新项目.docx");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -133,5 +151,18 @@ describe("materials index", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("an unreadable workspace is not advertised as a complete empty index", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-index-incomplete-"));
+    try {
+      const summary = await ensureMaterialsIndex({
+        workspaceDir: join(root, "missing"),
+        indexPath: join(root, "materials.md"),
+        ignorePath: join(root, "ignore.txt"),
+      });
+      expect(summary?.truncated).toBe(true);
+      expect(await readFile(join(root, "materials.md"), "utf8")).toContain("无法读取");
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

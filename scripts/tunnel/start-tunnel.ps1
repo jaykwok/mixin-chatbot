@@ -1,4 +1,4 @@
-﻿# 云电脑（Windows Server）连接器：安装 cloudflared 并注册为 Windows 服务。
+﻿# Windows Server 连接器：使用已安装的官方 cloudflared 注册 Windows 服务。
 #   Cloudflare Tunnel  <==>  localhost:BOT_PORT（默认 1011）
 #
 # 前置条件：
@@ -15,7 +15,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\tunnel\start-tunnel.ps1 [token文件]
 $ErrorActionPreference = "Stop"
 $Project = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-# 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、主机名校验、交互提示）。
+# 加载共享实例控制、部署事务和辅助函数。
 $CommonLib = Join-Path $PSScriptRoot "..\lib\common.ps1"
 if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
     Write-Host "缺少 $CommonLib；请从仓库完整获取脚本目录后重试。" -ForegroundColor Red
@@ -68,7 +68,7 @@ $BotPort = "$portNumber"
 
 function Test-LocalBot {
     try {
-        Invoke-WebRequest -Uri "http://localhost:$BotPort/favicon.svg" -UseBasicParsing -TimeoutSec 3 | Out-Null
+        Invoke-WebRequest -Uri "http://localhost:$BotPort/health" -UseBasicParsing -TimeoutSec 3 | Out-Null
         Write-Host "正常：机器人已在 :$BotPort 在线。" -ForegroundColor Green
         return $true
     } catch {
@@ -173,7 +173,7 @@ if (-not (Test-TunnelTokenValue $token)) {
 }
 Write-Host "[*] token 来源：$source" -ForegroundColor Cyan
 
-# ---- 2. 查找或下载 cloudflared.exe ----
+# ---- 2. 查找官方安装的 cloudflared.exe ----
 $exe = Join-Path $Project "cloudflared.exe"
 $cfCandidates = @(Get-ApplicationPaths "cloudflared")
 $knownCloudflaredPaths = @()
@@ -193,30 +193,7 @@ foreach ($candidate in $cfCandidates) {
     }
 }
 if (-not $cfPath) {
-    if (Test-Path -LiteralPath $exe -PathType Leaf) {
-        Write-Host "警告：项目内的 cloudflared.exe 不可用，将下载最新版替换。" -ForegroundColor Yellow
-    } else {
-        Write-Host "未找到可用的 cloudflared，正在下载最新版..."
-    }
-    $asset = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
-        "X64"   { "cloudflared-windows-amd64.exe" }
-        "Arm64" { "cloudflared-windows-arm64.exe" }
-        default { throw "不支持的 Windows 架构：$($_)" }
-    }
-    $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/$asset"
-    $download = "$exe.download-$PID.exe"
-    try {
-        try {
-            Invoke-WebRequest -Uri $url -OutFile $download -UseBasicParsing
-        } catch {
-            throw "下载 cloudflared 失败：$($_.Exception.Message)"
-        }
-        if (-not (Test-CloudflaredApplication $download)) { throw "下载的 cloudflared 版本探测失败" }
-        Move-Item -LiteralPath $download -Destination $exe -Force
-    } finally {
-        Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
-    }
-    $cfPath = $exe
+    throw '请先通过官方渠道安装 cloudflared：winget install --id Cloudflare.cloudflared；然后重新运行。'
 }
 Write-Host "[*] cloudflared 程序：$cfPath" -ForegroundColor Cyan
 
@@ -228,15 +205,7 @@ if ($identity) {
 }
 $botOnline = Test-LocalBot
 
-# 机器人不在线时拒绝连接。这不是保守，是这个脚本唯一真正危险的失败模式：
-#
-# 连接器一连上，Cloudflare 就会开始把生产流量分给这台机器，而它没有可转发的目标，分到它
-# 手上的请求只能是 502。隧道通常还有别的连接器在正常服务，于是现象是「一半请求好、一半
-# 502」——极难定位。本项目就这么被坑过一次：一次脚本冒烟测试在开发机上跑到这里，读到了
-# data/config/tunnel-token 里的真实 token，把一台什么都没跑的开发机接进了生产隧道，
-# 之后一小时的排查全花在了 Cloudflare 配置上，而配置从头到尾都是对的。
-#
-# 原来这里只打一行警告然后照连不误。警告不是门槛。
+# 连接器注册后会参与分流；默认要求本地服务健康，避免向无服务实例导入生产流量。
 if (-not $botOnline -and $env:TUNNEL_ALLOW_NO_BOT -ne "1") {
     Write-Host ""
     Write-Host "已中止：本机 :$BotPort 上没有机器人在监听，不能把这台机器接进隧道。" -ForegroundColor Red
@@ -252,6 +221,16 @@ if (-not $botOnline -and $env:TUNNEL_ALLOW_NO_BOT -ne "1") {
 # ---- 4. 启动隧道 ----
 Write-Host "cloudflared 连接器：请在控制台将 Published application 服务地址设为 http://localhost:$BotPort"
 if ($isAdmin) {
+    if ($existingService -and -not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
+        throw '现有 Cloudflared 服务没有本项目归属记录；请通过其原管理方式维护，不能自动重装。'
+    }
+    $serviceHelp = @(& $cfPath service install --help) -join "`n"
+    if ($serviceHelp -notmatch '--token-file') { throw '请更新官方 cloudflared，当前 service install 不支持 token 文件。' }
+    $connectorSnapshot = New-CloudflaredSnapshot $Project
+    $connectorCommitted = $false
+    try {
+    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    Set-Content -LiteralPath $TunnelManagedFile -Value "Cloudflared" -NoNewline -Encoding ASCII
     $svc = $existingService
     if ($svc) {
         Write-Host "Cloudflared 服务已存在（状态：$(Get-ServiceStateLabel $svc.Status)）。" -ForegroundColor Yellow
@@ -302,13 +281,25 @@ if ($isAdmin) {
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     Set-Content -LiteralPath $TunnelManagedFile -Value "Cloudflared" -NoNewline -Encoding ASCII
     Write-Host "完成。检查命令：Get-Service Cloudflared；日志：事件查看器（eventvwr）。" -ForegroundColor Green
+    $connectorCommitted = $true
+    } finally {
+        if (-not $connectorCommitted) { Restore-CloudflaredSnapshot $connectorSnapshot }
+        else {
+            try { Move-ToProjectArchive $connectorSnapshot.Path $Project }
+            catch { Write-Warning ('连接器已启动，旧快照保留在 ' + $connectorSnapshot.Path) }
+        }
+    }
 } else {
     Write-Host "（当前不是管理员：以前台方式运行；请以管理员身份重跑以安装服务。）" -ForegroundColor Yellow
     $previousErrorActionPreference = $ErrorActionPreference
     $foregroundExitCode = 1
     try {
         $ErrorActionPreference = "Continue"
-        & $cfPath tunnel --no-autoupdate run --token $token
+        $foregroundTokenFile = Join-Path $ConfigDir 'cloudflared-token'
+        New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+        [IO.File]::WriteAllText($foregroundTokenFile, $token, (New-Object Text.UTF8Encoding($false)))
+        Protect-ProjectSecretPath $foregroundTokenFile
+        & $cfPath tunnel --no-autoupdate run --token-file $foregroundTokenFile
         $foregroundExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference

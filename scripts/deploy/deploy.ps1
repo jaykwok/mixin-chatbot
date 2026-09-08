@@ -8,7 +8,7 @@
 $ErrorActionPreference = "Stop"
 $Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $Project
-# 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、主机名校验、交互提示）。
+# 加载共享实例控制、部署事务和辅助函数。
 $CommonLib = Join-Path $PSScriptRoot "..\lib\common.ps1"
 if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
     Write-Host "缺少 $CommonLib；请从仓库完整获取脚本目录后重试。" -ForegroundColor Red
@@ -53,7 +53,7 @@ function Test-VersionedApplication([string]$Path, [string]$RequiredPattern = "")
 function Wait-BotHealth([string]$ListenPort, [int]$Attempts = 18) {
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            $status = (Invoke-WebRequest -Uri "http://localhost:$ListenPort/favicon.svg" -UseBasicParsing -TimeoutSec 2).StatusCode
+            $status = (Invoke-WebRequest -Uri "http://127.0.0.1:$ListenPort/health" -UseBasicParsing -TimeoutSec 2).StatusCode
             if ($status -eq 200) { return $true }
         } catch {}
         if ($attempt -lt $Attempts) { Start-Sleep -Seconds 3 }
@@ -69,12 +69,16 @@ function Test-S4ULogonFailure($Value) {
     return (Get-ResultCodeHex $Value) -in @("0x8007052E", "0x80070569")
 }
 
-$BotDebug = if ([string]::IsNullOrWhiteSpace($env:BOT_DEBUG)) { "0" } else { $env:BOT_DEBUG.Trim() }
+$savedRuntime = @{}
+$runtimeFile = Join-Path $ConfigDir 'runtime.json'
+if (Test-Path -LiteralPath $runtimeFile) { $savedRuntime = Get-Content -LiteralPath $runtimeFile -Raw -Encoding UTF8 | ConvertFrom-Json }
+$BotDebug = if ($env:BOT_DEBUG) { $env:BOT_DEBUG.Trim() } elseif ($savedRuntime.BOT_DEBUG) { [string]$savedRuntime.BOT_DEBUG } else { '0' }
 if ($BotDebug -notin @("0", "1")) {
     Write-Host "BOT_DEBUG 只能是 0 或 1。" -ForegroundColor Red
     exit 1
 }
-$BotMaxActiveRequests = if ([string]::IsNullOrWhiteSpace($env:BOT_MAX_ACTIVE_REQUESTS)) { "32" } else { $env:BOT_MAX_ACTIVE_REQUESTS.Trim() }
+$BotMaxActiveRequests = if ($env:BOT_MAX_ACTIVE_REQUESTS) { $env:BOT_MAX_ACTIVE_REQUESTS.Trim() }
+    elseif ($savedRuntime.BOT_MAX_ACTIVE_REQUESTS) { [string]$savedRuntime.BOT_MAX_ACTIVE_REQUESTS } else { '32' }
 $parsedMaxActiveRequests = 0
 if (-not [int]::TryParse($BotMaxActiveRequests, [ref]$parsedMaxActiveRequests) -or
     $parsedMaxActiveRequests -lt 1 -or $parsedMaxActiveRequests -gt 1000) {
@@ -201,6 +205,22 @@ foreach ($bunPathCandidate in $bunPaths) {
 if (-not $bunPath) { Write-Host "bun --version 执行失败；找到的 bun 命令都不可用。" -ForegroundColor Red; exit 1 }
 Done "bun 版本：$bunVersion"
 
+# 从此处开始才允许修改持久配置、依赖、服务和网络入口。
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) { throw '部署需要管理员 PowerShell；本地前台运行请使用 bun run start。' }
+if ([Version]($bunVersion -replace '-.*$', '') -lt [Version]'1.4.0') { throw '需要 Bun 1.4.0 或更高版本（Windows FFI 进程监督）。' }
+$UvPath = @(Get-ApplicationPaths 'uv.exe' | Where-Object { Test-VersionedApplication $_ '^uv ' } | Select-Object -First 1)
+if ($UvPath.Count -ne 1) { throw '缺少原生 uv.exe，请先安装 uv 并加入 PATH。' }
+$UvDir = Split-Path $UvPath[0] -Parent
+$env:PATH = $UvDir + ';' + $BashDir + ';' + $env:PATH
+$snapshot = New-DeploymentSnapshot $Project $TaskName
+$deploymentCommitted = $false
+$deploymentMutated = $false
+try {
+    if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '旧服务未停止，部署取消。' }
+    $deploymentMutated = $true
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
+    Save-DeploymentDependencies $snapshot
 # ---- 2. 依赖 ----
 Step "安装依赖（bun install --frozen-lockfile）..."
 $previousErrorActionPreference = $ErrorActionPreference
@@ -216,6 +236,8 @@ if ($bunInstallExitCode -ne 0) { Write-Host "bun install 执行失败（退出�
 
 # ---- 3. 持久化目录 + AI 配置 ----
 New-Item -ItemType Directory -Force -Path $ConfigDir, $StateDir, $RuntimeDir, (Join-Path $Project "logs") | Out-Null
+Protect-ProjectSecretPath $ConfigDir
+Protect-ProjectSecretPath $StateDir
 if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
     Step "首次配置 AI（provider/key/model）..."
     $previousErrorActionPreference = $ErrorActionPreference
@@ -261,7 +283,7 @@ if (-not (Test-Path -LiteralPath $WebhookSecretFile -PathType Leaf)) {
     $secret = (Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim()
     if ($secret -notmatch "^[0-9a-fA-F]{64}$") {
         Write-Host "data\config\webhook-secret 格式无效（应为 64 位十六进制字符）。" -ForegroundColor Red
-        Write-Host "删除该文件后重新运行 scripts\deploy\deploy.ps1 可生成新密钥。" -ForegroundColor Red
+        Write-Host "停机并将该文件移入 agents\rm 后，重新部署可生成新密钥。" -ForegroundColor Red
         exit 1
     }
     Done "沿用已有 webhook-secret"
@@ -344,15 +366,6 @@ while ($true) {
         }
     }
     $GroupDataRoot = (Resolve-Path -LiteralPath $GroupDataRoot).Path
-    $writeProbe = Join-Path $GroupDataRoot (".mixin-chatbot-write-test-" + [Guid]::NewGuid().ToString("N"))
-    try {
-        [System.IO.File]::WriteAllText($writeProbe, "")
-    } catch {
-        Warn "群数据总根不可写：$GroupDataRoot（$($_.Exception.Message)）"
-        continue
-    } finally {
-        Remove-Item -LiteralPath $writeProbe -Force -ErrorAction SilentlyContinue
-    }
     break
 }
 Done "群数据总根：$GroupDataRoot"
@@ -458,9 +471,7 @@ if ($mode -eq "cloudflare") {
 
 # 让直连模式防火墙规则始终跟随所选端口。Cloudflare 模式只监听 loopback，
 # 并删除本脚本遗留的直连规则。
-$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$isAdmin = ([Security.Principal.WindowsPrincipal]$currentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$currentUser = $currentIdentity.Name
+$currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $platformIp = if ($env:PLATFORM_IP) { $env:PLATFORM_IP } else { "223.244.14.237" }
 $allowUnmanagedFirewall = $env:ALLOW_UNMANAGED_FIREWALL -eq "1"
 $cleanupFirewallAfterHealth = $false
@@ -472,51 +483,38 @@ if ($mode -eq "direct") {
         exit 1
     }
 }
-if ($isAdmin) {
-    if ($mode -eq "direct") {
-        try {
-            $firewallProfiles = @(Get-NetFirewallProfile -ErrorAction Stop)
-            if ($firewallProfiles.Count -eq 0) { throw "未找到 Windows 防火墙配置文件" }
-            $disabledProfiles = @($firewallProfiles | Where-Object { -not $_.Enabled })
-            if ($disabledProfiles.Count -gt 0) {
-                throw "Windows 防火墙配置文件未全部启用：$($disabledProfiles.Name -join ', ')"
-            }
-            # 先写入新规则，再删除旧规则；这样更新失败时不会让当前 webhook 入口中断。
-            $currentFirewallRule = New-NetFirewallRule -DisplayName "mixin-chatbot TCP $Port" -Group "mixin-chatbot" `
-                -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
-                -RemoteAddress $platformIp -ErrorAction Stop
-            $currentFirewallRuleName = $currentFirewallRule.Name
-            $cleanupFirewallAfterHealth = $true
-            Done "Windows 防火墙已写入限定回调来源的 TCP $Port 规则"
-        } catch {
-            if (-not $allowUnmanagedFirewall) {
-                Write-Host "Windows 防火墙安全基线无法生效，直连模式拒绝在 0.0.0.0 上启动：$($_.Exception.Message)" -ForegroundColor Red
-                Write-Host "修复 Windows 防火墙，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。" -ForegroundColor Red
-                exit 1
-            }
-            Warn "ALLOW_UNMANAGED_FIREWALL=1：未使用 Windows 防火墙基线，依赖你已配置的外部防火墙。原因：$($_.Exception.Message)"
+if ($mode -eq "direct") {
+    try {
+        $firewallProfiles = @(Get-NetFirewallProfile -ErrorAction Stop)
+        if ($firewallProfiles.Count -eq 0) { throw "未找到 Windows 防火墙配置文件" }
+        $disabledProfiles = @($firewallProfiles | Where-Object { -not $_.Enabled })
+        if ($disabledProfiles.Count -gt 0) {
+            throw "Windows 防火墙配置文件未全部启用：$($disabledProfiles.Name -join ', ')"
         }
-    } else {
-        # 旧直连入口保留到新机器人和隧道健康，部署中途失败时仍可恢复旧服务。
+        # 先写入新规则，再删除旧规则；这样更新失败时不会让当前 webhook 入口中断。
+        $currentFirewallRule = New-NetFirewallRule -DisplayName "mixin-chatbot TCP $Port" -Group "mixin-chatbot" `
+            -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
+            -RemoteAddress $platformIp -ErrorAction Stop
+        $currentFirewallRuleName = $currentFirewallRule.Name
         $cleanupFirewallAfterHealth = $true
+        Done "Windows 防火墙已写入限定回调来源的 TCP $Port 规则"
+    } catch {
+        if (-not $allowUnmanagedFirewall) {
+            Write-Host "Windows 防火墙安全基线无法生效，直连模式拒绝在 0.0.0.0 上启动：$($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "修复 Windows 防火墙，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。" -ForegroundColor Red
+            exit 1
+        }
+        Warn "ALLOW_UNMANAGED_FIREWALL=1：未使用 Windows 防火墙基线，依赖你已配置的外部防火墙。原因：$($_.Exception.Message)"
     }
-} elseif ($mode -eq "direct") {
-    if (-not $allowUnmanagedFirewall) {
-        Write-Host "当前不是管理员，无法设置 Windows 防火墙；直连模式拒绝在 0.0.0.0 上启动。" -ForegroundColor Red
-        Write-Host "请用管理员 PowerShell 重跑，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。" -ForegroundColor Red
-        exit 1
-    }
-    Warn "ALLOW_UNMANAGED_FIREWALL=1：当前不是管理员，依赖你已配置的外部防火墙。"
+} else {
+    # 旧直连入口保留到新机器人和隧道健康，部署中途失败时仍可恢复旧服务。
+    $cleanupFirewallAfterHealth = $true
 }
 
-# 在停止现有机器人前确认未托管 Cloudflared 服务的归属，取消部署时不产生停机。
+# 外部连接器不能仅凭服务名认领；取消时由部署事务恢复旧状态。
 $unmanagedTunnelConfirmed = $false
 $preflightTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
 $preflightTunnelManaged = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
-if ($preflightTunnelService -and $preflightTunnelManaged -and $mode -eq "direct" -and -not $isAdmin) {
-    Write-Host "直连模式需要停止并禁用本项目 Cloudflared 服务；请使用管理员 PowerShell 重跑。" -ForegroundColor Red
-    exit 1
-}
 if ($preflightTunnelService -and -not $preflightTunnelManaged) {
     Warn "系统存在没有本项目归属标记的 Cloudflared 服务，部署脚本不会自动修改它。"
     $tunnelQuestion = if ($mode -eq "cloudflare") {
@@ -525,131 +523,14 @@ if ($preflightTunnelService -and -not $preflightTunnelManaged) {
         "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]"
     }
     if (-not (Read-YesNo $tunnelQuestion $false)) {
-        Write-Host "未确认未托管 Cloudflared 的安全边界；尚未停止现有机器人。" -ForegroundColor Red
+        Write-Host "未确认未托管 Cloudflared 的归属，部署取消并恢复原状态。" -ForegroundColor Red
         exit 1
     }
     $unmanagedTunnelConfirmed = $true
 }
 
-# ---- 6. 停止旧机器人（避免重新部署时端口冲突）----
-#
-# 从这里往下就开始破坏现有部署了：停进程、覆盖 launcher、注销并重建计划任务。Linux 侧
-# 是「起新容器、失败就换回旧容器」，旧部署全程没被动过；Windows 是原地改，一旦后面的
-# 健康检查不过，机器人就停在「旧的已经拆了、新的起不来」的状态。所以先把能复原的三样
-# 东西留个快照：任务定义、launcher 内容、旧端口（$PortFile 要到部署成功才会被覆盖）。
-$previousTaskXml = $null
-$previousTaskWasRunning = $false
-$previousLauncherBody = $null
-$previousPort = $null
-if ($isAdmin) {
-    $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($existingTask) {
-        $previousTaskWasRunning = ($existingTask.State -eq "Running")
-        try {
-            $previousTaskXml = Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-        } catch {
-            Warn "无法导出现有计划任务定义：$($_.Exception.Message)；本次部署失败时将无法自动恢复旧部署。"
-        }
-    }
-    if (Test-Path -LiteralPath $LauncherFile -PathType Leaf) {
-        try {
-            $previousLauncherBody = [System.IO.File]::ReadAllText($LauncherFile)
-        } catch {
-            Warn "无法读取现有 launcher：$($_.Exception.Message)"
-        }
-    }
-    if (Test-Path -LiteralPath $PortFile -PathType Leaf) {
-        $previousPort = (Get-Content -LiteralPath $PortFile -Raw -ErrorAction SilentlyContinue)
-        if ($previousPort) { $previousPort = $previousPort.Trim() }
-    }
-    if ($existingTask -and $existingTask.State -eq "Running") {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-    }
-}
-$escapedEntry = [WildcardPattern]::Escape($Entry)
-Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like "*$escapedEntry*" } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-
-# ---- 7. launcher（把部署设置写入命令；计划任务不会重新读取当前 shell）+ 启动 ----
-
-# 为写入生成的 launcher，对路径执行单引号转义
+# 旧服务已在依赖和配置变更之前停止，所有后续失败统一进入 finally 回滚。
 function Sq($s) { return "'" + ($s -replace "'", "''") + "'" }
-
-# 健康检查不过时，把第 6 步拆掉的旧部署装回去：launcher 内容、计划任务定义，以及（原本
-# 就在跑的话）重新拉起并等它在旧端口上应答。
-#
-# 只能复原「部署脚本自己改动过的东西」。代码本身不在其中——通过 ops.ps1 update 升级时，
-# 仓库已经是新版本了，退代码是那边 Invoke-UpdateRollback 的职责。真正被这条路径救回来的
-# 是「改配置（换端口、换模式、换群数据根）把自己配挂了」这类情况：旧 launcher 里存着上
-# 一次可用的那套设置。
-# 返回 "restored"（旧部署已装回）、"none"（本机根本没有旧部署可装）、"failed"（试了但没成）。
-# 首次部署失败和恢复失败对人来说是两回事，不能都报成一句红字。
-function Restore-PreviousDeployment {
-    if (-not $previousTaskXml -and -not $previousLauncherBody) {
-        return "none"
-    }
-    Write-Host ""
-    Step "正在恢复升级前的部署..."
-
-    # 先让新的那份彻底停下，否则它会占着端口，旧的照样起不来。
-    try {
-        $failedTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        if ($failedTask -and $failedTask.State -eq "Running") {
-            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        }
-    } catch {}
-    Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*$escapedEntry*" } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-
-    $restored = $true
-    if ($previousLauncherBody) {
-        try {
-            [System.IO.File]::WriteAllText($LauncherFile, $previousLauncherBody, (New-Object System.Text.UTF8Encoding($true)))
-            Done "已还原上一版 launcher。"
-        } catch {
-            Write-Host "还原 launcher 失败：$($_.Exception.Message)" -ForegroundColor Red
-            $restored = $false
-        }
-    }
-    if ($previousTaskXml) {
-        try {
-            Register-ScheduledTask -TaskName $TaskName -Xml $previousTaskXml -Force -ErrorAction Stop | Out-Null
-            Done "已还原上一版计划任务定义。"
-        } catch {
-            # S4U 主体从 XML 注册时部分策略要求显式带上账户，退一步再试一次。
-            try {
-                Register-ScheduledTask -TaskName $TaskName -Xml $previousTaskXml -User $currentUser -Force -ErrorAction Stop | Out-Null
-                Done "已还原上一版计划任务定义。"
-            } catch {
-                Write-Host "还原计划任务失败：$($_.Exception.Message)" -ForegroundColor Red
-                $restored = $false
-            }
-        }
-    }
-
-    if (-not $previousTaskWasRunning) {
-        Warn "旧部署在本次部署前本就没有运行，因此只还原定义、不再拉起。"
-        return $(if ($restored) { "restored" } else { "failed" })
-    }
-    if (-not $restored) { return "failed" }
-
-    try {
-        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-    } catch {
-        Write-Host "重新拉起旧部署失败：$($_.Exception.Message)" -ForegroundColor Red
-        return "failed"
-    }
-    # 端口可能正是这次要改的东西；旧部署要用旧端口探测（$PortFile 此刻还没被覆盖）。
-    $probePort = if ($previousPort) { $previousPort } else { $Port }
-    if (Wait-BotHealth $probePort) {
-        Done "旧部署已恢复运行（:$probePort）。"
-        return "restored"
-    }
-    Write-Host "旧部署已重新拉起，但 :$probePort 仍未通过健康检查。" -ForegroundColor Red
-    return "failed"
-}
 function Save-DeploymentState {
     Set-Content -LiteralPath $PortFile -Value $Port -NoNewline -Encoding ASCII
     Set-Content -LiteralPath $ModeFile -Value $mode -NoNewline -Encoding ASCII
@@ -657,17 +538,19 @@ function Save-DeploymentState {
     if ($persistDomain) {
         Set-Content -LiteralPath $DomainFile -Value $publicDomain -NoNewline -Encoding ASCII
     } elseif ($clearPersistedDomain) {
-        Remove-Item -LiteralPath $DomainFile -Force -ErrorAction SilentlyContinue
+        Move-ToProjectArchive $DomainFile $Project
     }
 }
+$env:GROUP_DATA_ROOT = $GroupDataRoot
+$env:BOT_PORT = $Port
+$env:BOT_HOST = $BotHost
+$env:BOT_DEBUG = $BotDebug
+$env:BOT_MAX_ACTIVE_REQUESTS = $BotMaxActiveRequests
+Invoke-WithUtf8Output { & $bunPath run scripts/config/runtime-settings.ts }
+if ($LASTEXITCODE -ne 0) { throw '运行配置持久化失败' }
 $launcherBody = @"
 `$ErrorActionPreference = 'Stop'
-`$env:GROUP_DATA_ROOT = $(Sq $GroupDataRoot)
-`$env:BOT_PORT = $(Sq $Port)
-`$env:BOT_HOST = $(Sq $BotHost)
-`$env:BOT_DEBUG = $(Sq $BotDebug)
-`$env:BOT_MAX_ACTIVE_REQUESTS = $(Sq $BotMaxActiveRequests)
-`$env:PATH = $(Sq ($BashDir + ";")) + `$env:PATH
+`$env:PATH = $(Sq ($UvDir + ";" + $BashDir + ";")) + `$env:PATH
 Set-Location $(Sq $Project)
 `$ErrorActionPreference = 'Continue'
 & $(Sq $bunPath) run $(Sq $Entry)
@@ -687,128 +570,89 @@ Write-Host ""
 Write-Host "==== 回调 URL（填入 IM 平台）====" -ForegroundColor Cyan
 if ($showSecret) {
     Write-Host ("  " + ($url -replace "<SECRET>", $secret)) -ForegroundColor White
-    Warn "密钥仅显示一次；如需轮换，删除 data\config\webhook-secret 后重新运行部署。"
+    Warn "密钥仅显示一次；轮换时停机并将 data\config\webhook-secret 移入 agents\rm，再重新部署。"
 } else {
     Write-Host "  $url" -ForegroundColor White
     Warn "密钥未变化；查看命令：Get-Content data\config\webhook-secret"
 }
 
-if ($isAdmin) {
-    Step "安装 Windows 计划任务 '$TaskName'（优先开机启动，失败自动重试）..."
-    $fileArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $LauncherFile + '"'
-    $action    = New-ScheduledTaskAction -Execute $WindowsPowerShell -Argument $fileArg -WorkingDirectory $Project
-    $settings  = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-    # RunLevel Limited：bot 只需监听所选端口并写入 data/ 与 logs/，无需管理员；
-    # 降权可缩小 agent bash 工具（非 cwd 沙箱）的影响范围。
-    $taskStartDescription = "开机启动（无需用户登录）"
-    $taskUsesS4U = $true
-    try {
-        Register-BotTask $action $settings $currentUser $true
-    } catch {
-        # 某些服务器安全策略禁止 S4U；回退到兼容性更好的交互式登录任务。
-        Warn "无法注册无需登录的开机任务：$($_.Exception.Message)"
-        Warn "回退为 $currentUser 登录时启动；如需无人值守，请授予该账户“作为批处理作业登录”权限后重新部署。"
-        Register-BotTask $action $settings $currentUser $false
-        $taskUsesS4U = $false
-        $taskStartDescription = "$currentUser 登录时启动"
-    }
-    try {
-        Start-ScheduledTask -TaskName $TaskName
-    } catch {
-        if (-not $taskUsesS4U) { throw }
-        Warn "无需登录的开机任务无法启动：$($_.Exception.Message)"
-        Warn "自动回退为 $currentUser 登录时启动。"
-        Register-BotTask $action $settings $currentUser $false
-        $taskUsesS4U = $false
-        $taskStartDescription = "$currentUser 登录时启动"
-        Start-ScheduledTask -TaskName $TaskName
-    }
-    if ($taskUsesS4U) {
-        Start-Sleep -Seconds 2
-        $probeTaskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
-        if ($probeTaskInfo -and (Test-S4ULogonFailure $probeTaskInfo.LastTaskResult)) {
-            $probeCode = Get-ResultCodeHex $probeTaskInfo.LastTaskResult
-            Warn "系统拒绝 S4U 任务登录（$probeCode），自动回退为 $currentUser 登录时启动。"
-            Register-BotTask $action $settings $currentUser $false
-            $taskUsesS4U = $false
-            $taskStartDescription = "$currentUser 登录时启动"
-            Start-ScheduledTask -TaskName $TaskName
-        }
-    }
-    Step "等待机器人健康检查通过..."
-    $healthy = Wait-BotHealth $Port
-    if (-not $healthy) {
-        $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
-        $lastResult = if ($taskInfo) { "$(Get-ResultCodeHex $taskInfo.LastTaskResult) / $($taskInfo.LastTaskResult)" } else { "未知" }
-        Write-Host "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请查看 logs\mixin-chatbot.log，并运行 scripts\ops\ops.ps1 doctor。" -ForegroundColor Red
-        # 恢复的结果不能盖掉上面那条失败原因；两边都要说清楚，人才知道现在到底是什么状态。
-        switch (Restore-PreviousDeployment) {
-            "restored" {
-                Warn "本次部署未生效，已退回上一版部署。data\state 未被改写，配置仍是这次部署前那一套。"
-            }
-            "none" {
-                Warn "本机此前没有可用部署，没有可回退的目标；请修正问题后重跑部署。"
-            }
-            default {
-                Write-Host "旧部署未能自动恢复；机器人当前处于停止状态。请运行 scripts\ops\ops.ps1 doctor 确认，必要时修正配置后重跑部署。" -ForegroundColor Red
-            }
-        }
-        exit 1
-    }
-    if ($mode -eq "direct") {
-        $existingTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-        if ($existingTunnelService) {
-            if (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf) {
-                Step "直连模式：停止并禁用本项目管理的 Cloudflared 服务..."
-                try {
-                    if ($existingTunnelService.Status -ne "Stopped") {
-                        Stop-Service -Name "Cloudflared" -Force -ErrorAction Stop
-                    }
-                    Set-Service -Name "Cloudflared" -StartupType Disabled -ErrorAction Stop
-                    Done "本项目 Cloudflared 已停止并禁用，重启后也不会恢复旧隧道入口"
-                } catch {
-                    Write-Host "无法停止或禁用本项目 Cloudflared 服务：$($_.Exception.Message)" -ForegroundColor Red
-                    exit 1
-                }
-            } else {
-                if (-not $unmanagedTunnelConfirmed) {
-                    Warn "部署期间出现未标记为本项目所有的 Cloudflared 服务；不会自动修改。"
-                }
-                if (-not $unmanagedTunnelConfirmed -and -not (Read-YesNo "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]" $false)) {
-                    Write-Host "未确认遗留隧道的安全边界；直连模式部署已停止。" -ForegroundColor Red
-                    exit 1
-                }
-            }
-        }
-    }
-    Done "机器人健康（群数据总根=$GroupDataRoot）。管理：Get-ScheduledTask $TaskName | Stop-ScheduledTask；日志：logs\mixin-chatbot.log"
-    Warn "任务启动方式：$taskStartDescription。"
-} else {
-    Warn "当前不是管理员，将以前台方式运行（Ctrl+C 停止）；请以管理员身份重跑以安装计划任务。"
-    if ($mode -eq "cloudflare") {
-        Warn "请在另一个 PowerShell 窗口运行 scripts\tunnel\start-tunnel.ps1；当前窗口将被前台机器人占用。"
-    }
-    Save-DeploymentState
-    $env:GROUP_DATA_ROOT = $GroupDataRoot
-    $env:BOT_PORT = $Port
-    $env:BOT_HOST = $BotHost
-    $env:BOT_DEBUG = $BotDebug
-    $env:BOT_MAX_ACTIVE_REQUESTS = $BotMaxActiveRequests
-    # 非管理员前台模式也必须继承已探测到的 Git Bash，避免 bash 不在系统 PATH 时工具启动失败。
-    $env:PATH = $BashDir + ";" + $env:PATH
-    Set-Location $Project
-    $previousErrorActionPreference = $ErrorActionPreference
-    $foregroundExitCode = 1
-    try {
-        $ErrorActionPreference = "Continue"
-        # 机器人的日志是中文，前台模式直接打在这个控制台上。
-        Invoke-WithUtf8Output { & $bunPath run $Entry }
-        $foregroundExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    exit $foregroundExitCode
+Step "安装 Windows 计划任务 '$TaskName'（优先开机启动，失败自动重试）..."
+$fileArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $LauncherFile + '"'
+$action    = New-ScheduledTaskAction -Execute $WindowsPowerShell -Argument $fileArg -WorkingDirectory $Project
+$settings  = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+# RunLevel Limited：bot 只需监听所选端口并写入 data/ 与 logs/，无需管理员；
+# 降权可缩小 agent bash 工具（非 cwd 沙箱）的影响范围。
+$taskStartDescription = "开机启动（无需用户登录）"
+$taskUsesS4U = $true
+try {
+    Register-BotTask $action $settings $currentUser $true
+} catch {
+    # 某些服务器安全策略禁止 S4U；回退到兼容性更好的交互式登录任务。
+    Warn "无法注册无需登录的开机任务：$($_.Exception.Message)"
+    Warn "回退为 $currentUser 登录时启动；如需无人值守，请授予该账户“作为批处理作业登录”权限后重新部署。"
+    Register-BotTask $action $settings $currentUser $false
+    $taskUsesS4U = $false
+    $taskStartDescription = "$currentUser 登录时启动"
 }
+try {
+    Start-ScheduledTask -TaskName $TaskName
+} catch {
+    if (-not $taskUsesS4U) { throw }
+    Warn "无需登录的开机任务无法启动：$($_.Exception.Message)"
+    Warn "自动回退为 $currentUser 登录时启动。"
+    Register-BotTask $action $settings $currentUser $false
+    $taskUsesS4U = $false
+    $taskStartDescription = "$currentUser 登录时启动"
+    Start-ScheduledTask -TaskName $TaskName
+}
+if ($taskUsesS4U) {
+    Start-Sleep -Seconds 2
+    $probeTaskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($probeTaskInfo -and (Test-S4ULogonFailure $probeTaskInfo.LastTaskResult)) {
+        $probeCode = Get-ResultCodeHex $probeTaskInfo.LastTaskResult
+        Warn "系统拒绝 S4U 任务登录（$probeCode），自动回退为 $currentUser 登录时启动。"
+        Register-BotTask $action $settings $currentUser $false
+        $taskUsesS4U = $false
+        $taskStartDescription = "$currentUser 登录时启动"
+        Start-ScheduledTask -TaskName $TaskName
+    }
+}
+Step "等待机器人健康检查通过..."
+$healthy = Wait-BotHealth $Port
+if (-not $healthy) {
+    $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    $lastResult = if ($taskInfo) { "$(Get-ResultCodeHex $taskInfo.LastTaskResult) / $($taskInfo.LastTaskResult)" } else { "未知" }
+    Write-Host "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请查看 logs\mixin-chatbot.log，并运行 scripts\ops\ops.ps1 doctor。" -ForegroundColor Red
+    throw "新部署未通过健康检查"
+}
+if ($mode -eq "direct") {
+    $existingTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+    if ($existingTunnelService) {
+        if (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf) {
+            Step "直连模式：停止并禁用本项目管理的 Cloudflared 服务..."
+            try {
+                if ($existingTunnelService.Status -ne "Stopped") {
+                    Stop-Service -Name "Cloudflared" -Force -ErrorAction Stop
+                }
+                Set-Service -Name "Cloudflared" -StartupType Disabled -ErrorAction Stop
+                Done "本项目 Cloudflared 已停止并禁用，重启后也不会恢复旧隧道入口"
+            } catch {
+                Write-Host "无法停止或禁用本项目 Cloudflared 服务：$($_.Exception.Message)" -ForegroundColor Red
+                exit 1
+            }
+        } else {
+            if (-not $unmanagedTunnelConfirmed) {
+                Warn "部署期间出现未标记为本项目所有的 Cloudflared 服务；不会自动修改。"
+            }
+            if (-not $unmanagedTunnelConfirmed -and -not (Read-YesNo "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]" $false)) {
+                Write-Host "未确认遗留隧道的安全边界；直连模式部署已停止。" -ForegroundColor Red
+                exit 1
+            }
+        }
+    }
+}
+Done "机器人健康（群数据总根=$GroupDataRoot）。停止请用 scripts\ops\ops.ps1 stop；日志：logs\mixin-chatbot.log"
+Warn "任务启动方式：$taskStartDescription。"
 
 # ---- 7b. Cloudflare 模式：确保隧道在线（已有服务则启动，否则调用安装脚本）----
 if ($mode -eq "cloudflare") {
@@ -864,30 +708,38 @@ if ($mode -eq "cloudflare") {
             Warn "Cloudflared 未安装成功或尚未运行，请检查上方提示后重新输入 token 来源。按 Ctrl+C 可取消部署。"
         }
     }
-    if ($isAdmin) {
-        $finalTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-        if (-not $finalTunnelService -or $finalTunnelService.Status -ne "Running") {
-            Write-Host "Cloudflare 模式部署未完成：Cloudflared 服务没有运行。请执行 scripts\ops\ops.ps1 doctor -Repair。" -ForegroundColor Red
-            exit 1
-        }
-        Done "Cloudflared 隧道服务正在运行。"
+    $finalTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+    if (-not $finalTunnelService -or $finalTunnelService.Status -ne "Running") {
+        Write-Host "Cloudflare 模式部署未完成：Cloudflared 服务没有运行。请执行 scripts\ops\ops.ps1 doctor -Repair。" -ForegroundColor Red
+        exit 1
     }
+    Done "Cloudflared 隧道服务正在运行。"
 }
 
-if ($isAdmin) {
-    if ($cleanupFirewallAfterHealth) {
-        if ($mode -eq "direct") {
-            Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -ne $currentFirewallRuleName } |
-                Remove-NetFirewallRule -ErrorAction Stop
-            Done "Windows 防火墙已只保留当前机器人入口"
-        } else {
-            Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
-                Remove-NetFirewallRule -ErrorAction Stop
-            Done "Cloudflare 模式已清理本项目旧直连防火墙规则"
-        }
+if ($cleanupFirewallAfterHealth) {
+    if ($mode -eq "direct") {
+        Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne $currentFirewallRuleName } |
+            Remove-NetFirewallRule -ErrorAction Stop
+        Done "Windows 防火墙已只保留当前机器人入口"
+    } else {
+        Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction Stop
+        Done "Cloudflare 模式已清理本项目旧直连防火墙规则"
     }
-    # 机器人健康且隧道/直连切换成功后再提交，避免 doctor 读取半完成配置。
-    Save-DeploymentState
-    Done "部署状态已写入 data\state。"
+}
+# 机器人健康且隧道/直连切换成功后再提交，避免 doctor 读取半完成配置。
+Save-DeploymentState
+Done "部署状态已写入 data\state。"
+$deploymentCommitted = $true
+
+} finally {
+    if (-not $deploymentCommitted -and $deploymentMutated) {
+        try { Restore-DeploymentSnapshot $snapshot }
+        catch { Write-Host ("自动回滚未完成，保留快照 " + $snapshot.Path + "：" + $_.Exception.Message) -ForegroundColor Red }
+    } elseif ($deploymentCommitted) {
+        try { Move-ToProjectArchive $snapshot.Path $Project }
+        catch { Warn ("部署已完成，旧快照仍保留在 " + $snapshot.Path) }
+    }
+    $snapshot.Lock.Dispose()
 }

@@ -4,8 +4,8 @@ import {
   existsSync,
   mkdirSync,
   renameSync,
+  rmSync,
   statSync,
-  unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
 import {
@@ -40,13 +40,12 @@ export function sanitizeLogMessage(message: string): string {
   );
 }
 
-/** 当前日志文件超限时滚动：删除最旧的 .backupCount，依次上移，当前重命名为 .1。 */
+/** 仅保留当前文件和固定份数的备份；过期日志直接删除，不进入业务归档。 */
 function rotateIfNeeded(): void {
   try {
     if (!existsSync(LOG_PATH) || statSync(LOG_PATH).size < LOG_MAX_BYTES) return;
-    // 删除最旧的备份
     const oldest = `${LOG_PATH}.${LOG_BACKUP_COUNT}`;
-    if (existsSync(oldest)) unlinkSync(oldest);
+    rmSync(oldest, { force: true });
     // .(n-1) -> .n，从大到小依次上移
     for (let i = LOG_BACKUP_COUNT - 1; i >= 1; i--) {
       const from = `${LOG_PATH}.${i}`;

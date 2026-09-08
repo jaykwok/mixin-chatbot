@@ -23,9 +23,12 @@ import {
 import { HttpError } from "./http.ts";
 import { sendText } from "../integrations/im.ts";
 import { describeRequestFailure } from "../agent/failure.ts";
+import { canonicalCommand, isSlashCommandMessage } from "../agent/commands.ts";
+import { application } from "../core/lifecycle.ts";
 import {
   handleUserMessage,
   resolveSessionCallbackUrl,
+  stopUserTask,
 } from "../agent/runtime.ts";
 
 // 已接收请求去重（Map 保持插入顺序，按序清过期）
@@ -33,6 +36,7 @@ const recentRequests = new Map<string, number>();
 // 速率限制（每个群内用户在窗口内的时间戳列表）
 const rateLimits = new Map<string, number[]>();
 const activeRequests = new Set<Promise<void>>();
+const activeControls = new Map<string, Promise<void>>();
 const activeNotices = new Map<string, Promise<void>>();
 
 export type WebhookData = Record<string, unknown>;
@@ -182,8 +186,7 @@ export function cleanupRateLimits(now = Date.now()): void {
   }
 }
 
-/** 后台异步处理：调 Pi agent 生成回复并发送。失败则发错误提示。
- *  agent 干活途中的新消息/指令由 agent.ts 内部 steer/abort 处理，故此处不再串行化。 */
+/** 后台派发由 runtime 的用户会话 FIFO 接管；失败回执有独立交付期限。 */
 async function processRequest(
   content: string,
   phone: string,
@@ -197,6 +200,7 @@ async function processRequest(
     if (DEBUG) log.info(`[DEBUG] webhook 内容 - 用户: ${phone}, 内容: ${content}`);
     await handleUserMessage(phone, groupId, content, callbackUrl);
   } catch (e) {
+    if (application.signal.aborted || (e instanceof Error && e.name === "AbortError")) return;
     const elapsed = ((Date.now() - start) / 1000).toFixed(2);
     log.error(`请求处理失败 - 用户: ${phone}, 耗时: ${elapsed}秒, 错误: ${String(e)}`);
     try {
@@ -215,8 +219,7 @@ async function processRequest(
   }
 }
 
-/** 后台 fire-and-forget 派发（webhook 已 ack 200）。agent 正忙时新消息走
- *  steer、指令立即处理；新的完整轮次由 agent 层按群共享 workspace 串行。 */
+/** 普通消息进入有界 FIFO；控制操作独立计数，重复 stop 仍立即生效。 */
 export function enqueueUserRequest(
   content: string,
   phone: string,
@@ -224,6 +227,18 @@ export function enqueueUserRequest(
   callbackUrl: string,
   clientIp: string
 ): boolean {
+  if (isSlashCommandMessage(content)) {
+    const command = canonicalCommand(content);
+    if (command === "/stop") stopUserTask(phone, groupId);
+    const key = JSON.stringify([groupId, phone, command]);
+    if (activeControls.has(key)) return true;
+    if (activeControls.size >= 128) return command === "/stop";
+    if (command === "/clear") stopUserTask(phone, groupId);
+    const action = processRequest(content, phone, groupId, callbackUrl, clientIp);
+    activeControls.set(key, action);
+    void action.finally(() => activeControls.delete(key));
+    return true;
+  }
   if (activeRequests.size >= MAX_ACTIVE_REQUESTS) return false;
   const request = processRequest(content, phone, groupId, callbackUrl, clientIp);
   activeRequests.add(request);
@@ -253,7 +268,7 @@ export function enqueueUserNotice(
   callbackUrl: string
 ): void {
   const key = JSON.stringify([kind, groupId, phone, callbackUrl]);
-  if (activeNotices.has(key)) return;
+  if (activeNotices.has(key) || activeNotices.size >= 128 || application.signal.aborted) return;
   const notice = (async () => {
     try {
       const sent = await sendText(message, groupId, phone, callbackUrl);
@@ -271,10 +286,11 @@ export function enqueueUserNotice(
 
 /** 停止接收新请求后，等待所有已确认的后台请求完成清理。 */
 export async function drainUserRequests(): Promise<void> {
-  while (activeRequests.size > 0 || activeNotices.size > 0) {
+  while (activeRequests.size > 0 || activeNotices.size > 0 || activeControls.size > 0) {
     await Promise.allSettled([
       ...activeRequests,
       ...activeNotices.values(),
+      ...activeControls.values(),
     ]);
   }
 }

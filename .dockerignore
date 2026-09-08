@@ -2,6 +2,13 @@
 .vscode
 .venv
 .claude
+agents
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.codex
+.cursor
+docs
 .pi
 .codefree
 __pycache__
@@ -11,6 +18,8 @@ data
 *.pyc
 *.pyo
 .env
+.env.*
+.github
 scripts/**/*.sh
 scripts/**/*.ps1
 README.md

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Linux 脚本共用的纯辅助函数。deploy.sh / ops.sh 都 source 它。
+# Linux 脚本共用的主机名校验、归档与连接器身份操作。
 #
-# 这里只放「不依赖调用方任何变量、也不碰部署状态」的东西。Docker、UFW、隧道这些核心流程
-# 各脚本继续各自维护——它们的差异是本质的，硬抽出来只会做出一个到处是 if 的四不像。
+# lifecycle 函数在调用时读取 PROJECT_DIR 与 TUNNEL_PID_FILE；导入不操作外部状态。
 #
 # 用法：. "${PROJECT_DIR}/scripts/lib/common.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/lifecycle.sh"
 
 is_valid_hostname() {
     local hostname="$1"

@@ -10,22 +10,16 @@ export const DEFAULT_GROUP_DATA_ROOT = join(DATA_DIR, "groups");
 /** User-managed configuration and secrets. */
 export const MODELS_JSON_PATH = join(CONFIG_DIR, "models.json");
 export const WEBHOOK_SECRET_FILE = join(CONFIG_DIR, "webhook-secret");
-export const TUNNEL_TOKEN_FILE = join(CONFIG_DIR, "tunnel-token");
 /** 可选：大文件外链分发的 WebDAV 后端；缺失即关闭该特性。 */
 export const RELAY_CONFIG_PATH = join(CONFIG_DIR, "relay.json");
-
-/** Deployment-generated state shared by deploy, ops and tunnel scripts. */
-export const BOT_PORT_FILE = join(STATE_DIR, "bot-port");
-export const DEPLOY_MODE_FILE = join(STATE_DIR, "deploy-mode");
-export const BOT_DOMAIN_FILE = join(STATE_DIR, "bot-domain");
-export const GROUP_DATA_ROOT_FILE = join(STATE_DIR, "group-data-root");
+export const RUNTIME_CONFIG_PATH = join(CONFIG_DIR, "runtime.json");
+export const STATE_DATABASE_PATH = join(STATE_DIR, "agent.sqlite");
 
 /** Rebuildable process-local Pi resources; conversation history lives under GROUP_DATA_ROOT. */
 export const PI_AGENT_DIR = join(RUNTIME_DIR, "pi");
 /**
- * Pi 的远程模型目录缓存（每 4 小时刷新，供离线复用）。默认放在 models.json 旁边，
- * 但它是可重建的缓存而不是用户配置——留在 data/config 只会让配置目录看起来比实际更满。
+ * Pi 模型目录缓存与用户配置分开保存。当前应用显式禁用模型目录联网刷新。
  */
 export const MODELS_STORE_PATH = join(RUNTIME_DIR, "models-store.json");
-/** 外链去重索引（内容哈希 -> 已上传地址）。丢失只会导致重传一次，因此归在 runtime。 */
-export const RELAY_INDEX_PATH = join(RUNTIME_DIR, "relay-index.jsonl");
+/** 远端对象清理账本；需要备份，不能作为缓存删除。 */
+export const RELAY_INDEX_PATH = join(STATE_DIR, "relay.sqlite");

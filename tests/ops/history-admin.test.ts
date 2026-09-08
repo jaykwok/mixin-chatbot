@@ -1,8 +1,9 @@
+import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 // 这条命令删的是长期资产，所以测试的重点不是「删掉了」，而是「只删掉了该删的」：
 // workspace、用户 tmp、资料索引和 venv 就在 session.jsonl 的隔壁，一个写歪的路径代价太大。
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, mkdir, readFile, writeFile, symlink } from "node:fs/promises";
+
 import { join } from "node:path";
 import { clearGroup, collect } from "../../scripts/ops/history-admin.ts";
 
@@ -28,6 +29,22 @@ async function makeRoot(): Promise<string> {
 }
 
 describe("history admin", () => {
+  test.each(["root", "group", "users", "user"])("does not traverse a linked %s directory", async (part) => {
+    const root = await mkdtemp(join(tmpdir(), "history-links-"));
+    const scanned = join(root, "groups");
+    const outside = join(root, "outside");
+    const path = { root: scanned, group: join(scanned, "g"), users: join(scanned, "g/users"), user: join(scanned, "g/users/u") }[part]!;
+    const tail = { root: "g/users/u", group: "users/u", users: "u", user: "." }[part]!;
+    await mkdir(join(outside, tail), { recursive: true });
+    await writeFile(join(outside, tail, "session.jsonl"), "keep");
+    await mkdir(join(path, ".."), { recursive: true });
+    await symlink(outside, path, process.platform === "win32" ? "junction" : "dir");
+    try {
+      expect(await collect(scanned)).toEqual([]);
+      await clearGroup("g", scanned);
+      expect(await readFile(join(outside, tail, "session.jsonl"), "utf8")).toBe("keep");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
   test("lists every group that has history", async () => {
     const root = await makeRoot();
     try {
@@ -42,7 +59,7 @@ describe("history admin", () => {
   test("clears every member of one group and leaves everything else alone", async () => {
     const root = await makeRoot();
     try {
-      const code = await clearGroup("group-a", { skipRunningCheck: true }, root);
+      const code = await clearGroup("group-a", root);
       expect(code).toBe(0);
 
       // 目标群的历史全部消失。
@@ -77,7 +94,7 @@ describe("history admin", () => {
   test("refuses an unknown group instead of doing nothing quietly", async () => {
     const root = await makeRoot();
     try {
-      expect(await clearGroup("group-zzz", { skipRunningCheck: true }, root)).toBe(1);
+      expect(await clearGroup("group-zzz", root)).toBe(1);
       expect(await collect(root)).toHaveLength(2);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -93,7 +110,7 @@ describe("history admin", () => {
     try {
       // 群号里的 .. 会先被 groupSegment 换成 sha256（目录不存在），再走目录名兜底，
       // 而兜底必须重新校验边界，否则这一条就能清掉群数据根之外的文件。
-      expect(await clearGroup("../escape-target", { skipRunningCheck: true }, root)).toBe(1);
+      expect(await clearGroup("../escape-target", root)).toBe(1);
       expect(
         await readFile(join(outside, "users", "13800000000", "session.jsonl"), "utf8")
       ).toBe("outside");
@@ -107,7 +124,7 @@ describe("history admin", () => {
     const root = await makeRoot();
     await rm(join(root, "group-b", "users", "13700000000", "session.jsonl"));
     try {
-      expect(await clearGroup("group-b", { skipRunningCheck: true }, root)).toBe(0);
+      expect(await clearGroup("group-b", root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

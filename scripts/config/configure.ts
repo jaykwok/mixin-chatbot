@@ -1,8 +1,6 @@
 #!/usr/bin/env bun
 // AI 配置 TUI：交互生成 data/config/models.json（provider + key + model，Pi 原生读取）。
-// 通常在容器内运行：
-//   docker run --rm -it --user "$(stat -c '%u:%g' data)" -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure
-// 也可本地 bun run configure。
+// 部署脚本在停止旧实例后调用；本地停机时也可运行 bun run configure。
 import {
   cancel,
   confirm,
@@ -15,12 +13,13 @@ import {
   text,
   isCancel,
 } from "@clack/prompts";
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODELS_JSON_PATH } from "../../src/core/storage.ts";
+import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
 
 export const MODEL_API = "openai-responses" as const;
 
@@ -28,7 +27,7 @@ export const MODEL_API = "openai-responses" as const;
 function bail<T>(v: T | symbol): T {
   if (isCancel(v)) {
     cancel("已取消");
-    process.exit(0);
+    throw new DOMException("配置已取消", "AbortError");
   }
   return v as T;
 }
@@ -297,7 +296,8 @@ async function main(): Promise<void> {
 
   const doc = { thinkingLevel, providers: { [providerId]: entry } };
   await mkdir(dirname(MODELS_JSON_PATH), { recursive: true });
-  const tempPath = `${MODELS_JSON_PATH}.tmp-${process.pid}-${randomUUID()}`;
+  await mkdir("agents/temp", { recursive: true });
+  const tempPath = join("agents/temp", `models-${randomUUID()}.json`);
   try {
     await writeFile(tempPath, JSON.stringify(doc, null, 2) + "\n", {
       encoding: "utf8",
@@ -308,7 +308,7 @@ async function main(): Promise<void> {
     });
     await rename(tempPath, MODELS_JSON_PATH);
   } finally {
-    await unlink(tempPath).catch(() => {});
+    await archiveFile(tempPath);
   }
 
   note(
@@ -319,8 +319,9 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch((e) => {
+  withMaintenance(main).catch((e) => {
+    if (e instanceof Error && e.name === "AbortError") return;
     console.error(e);
-    process.exit(1);
+    process.exitCode = 1;
   });
 }

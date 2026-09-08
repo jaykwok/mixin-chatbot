@@ -1,6 +1,6 @@
 {
   "$schema": "https://unpkg.com/knip@latest/schema.json",
-  "entry": ["tests/**/*.test.ts"],
-  "project": ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"],
-  "ignoreDependencies": ["@earendil-works/pi-server"]
+  "ignoreExportsUsedInFile": true,
+  "entry": ["src/core/process-supervisor.ts!", "scripts/config/*.ts!", "scripts/ops/*.ts!", "scripts/runtime/*.ts!", "tests/**/*.test.ts"],
+  "project": ["src/**/*.ts!", "scripts/{config,ops,lib,runtime}/**/*.ts!", "tests/**/*.ts"]
 }

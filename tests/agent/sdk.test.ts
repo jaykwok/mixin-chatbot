@@ -3,11 +3,26 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { createSystemPromptTrimExtension } from "../../src/agent/system-prompt-trim.ts";
+import { buildChatContext } from "../../src/agent/prompt.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { responsesProvider } from "../../scripts/config/configure.ts";
 
 describe("installed Pi SDK integration", () => {
+  test.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"])("Pi 0.85.1 builds the real long-cache payload for %s", async (id) => {
+    const runtime = await ModelRuntime.create({ modelsPath: null, credentials: new InMemoryCredentialStore(),
+      modelsStore: new InMemoryModelsStore(), refreshOnCreate: false });
+    const model = runtime.getModel("openai", id)!;
+    expect(model).toBeDefined();
+    let payload: Record<string, unknown> | undefined;
+    const result = await runtime.completeSimple(model, { messages: [{ role: "user", content: "cache regression", timestamp: 0 }] }, {
+      apiKey: "test-only", cacheRetention: "long", sessionId: "offline-test",
+      onPayload(body) { payload = body as Record<string, unknown>; throw new Error("captured before network"); },
+    });
+    expect(result.errorMessage).toContain("captured before network");
+    expect(payload).toHaveProperty("prompt_cache_options", { ttl: "30m" });
+    expect(payload?.prompt_cache_retention).toBeUndefined();
+  });
+
   test.each(["openai", "test-gateway"])("configured %s has no conflicting provider compat", async (provider) => {
     const files = await tempFixture("pi-compat-");
     try {
@@ -48,14 +63,14 @@ describe("installed Pi SDK integration", () => {
     const faux = fauxProvider({ tokensPerSecond: 0 });
     runtime.registerNativeProvider(faux.provider);
     const history = join(files.root, "session.jsonl");
-    const appended = "## 群聊岗位\n按群资料回答，交付文件放当前用户 tmp。";
+    const appended = buildChatContext({ tempDir: cwd, relayEnabled: false });
     const create = async () => {
       const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
       const resourceLoader = new DefaultResourceLoader({
         cwd, agentDir, settingsManager,
         noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-        extensionFactories: [createSystemPromptTrimExtension()],
-        appendSystemPromptOverride: () => [appended],
+        systemPromptOverride: () => appended,
+        appendSystemPromptOverride: () => [],
       });
       await resourceLoader.reload();
       return (await createAgentSession({
@@ -73,7 +88,8 @@ describe("installed Pi SDK integration", () => {
       await session.prompt("记住项目编号 Q-85");
       expect(session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
       expect(prompt).toContain(appended);
-      expect(prompt).toContain("Guidelines:");
+      expect(prompt).not.toContain("Guidelines:");
+      expect(prompt).not.toContain("expert coding assistant");
       expect(prompt).not.toContain("Pi documentation (read only when");
       expect(JSON.parse((await readFile(history, "utf8")).split("\n")[0]!)).toMatchObject({ cwd });
       await session.dispose();

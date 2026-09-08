@@ -1,10 +1,5 @@
-// 外链运维命令：列出已发出的链接、手动清理对象。
-//
-// 之所以是一个 bun 脚本而不是写在 ops.sh / ops.ps1 里：删除一个对象要先从公开地址反推
-// 对象名、再拼出 WebDAV 地址并带上 Basic 凭据，这些知识全在 src/integrations/relay.ts。
-// 在两个 shell 里各抄一遍等于把它维护成三份，而且凭据会进到命令行参数里——Windows 上
-// 任何用户都能用 WMI 读到别人进程的完整命令行，Linux 上是 /proc/<pid>/cmdline。走 bun
-// 则凭据只存在于进程内存中。
+import { withMaintenance } from "../../src/core/maintenance.ts";
+// 外链账本只读展示与停机清理；复用 relay 的后端协议，凭据不传入 shell 参数。
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import {
   getRelayConfig,
@@ -16,7 +11,7 @@ function usage(): void {
   console.log("用法：bun run relay <命令>");
   console.log("");
   console.log("  list                列出索引里仍在册的外链（旧的排在前面）");
-  console.log("  purge --all         删除全部外链对象并清空索引");
+  console.log("  purge --all         停机后删除当前后端的全部在册对象，失败或不匹配记录保留");
   console.log("  purge <关键字>      只删除文件名或地址包含该关键字的对象");
 }
 
@@ -40,13 +35,16 @@ async function list(): Promise<number> {
   }
   // 不排成表格：文件名和「3 天前」都可能是中文，按字符数对齐在终端里反而会错位。
   for (const object of objects) {
-    console.log(`${object.name}（${formatSize(object.size)}，最后分发于 ${describeAge(object.at)}）`);
+    const status = object.state === "planned" ? "上传未确认" : "已上传";
+    console.log(`${object.name}（${formatSize(object.size)}，${status}，最后更新于 ${describeAge(object.at)}）`);
     console.log(`  ${object.url}`);
   }
   console.log("");
   console.log(`共 ${objects.length} 条。`);
-  if (!config?.expireHours) {
-    console.log("未配置 expireHours，链接永不失效，对象也不会被自动回收。");
+  if (!config) {
+    console.log("未配置外链后端；仅展示账本原始地址，无法验证下载或执行清理。");
+  } else if (!config.expireHours) {
+    console.log("未配置 expireHours，本项目不主动过期已上传对象或链接。");
   } else if (config.signSecret) {
     // 上面打印的地址是刚签出来的，跟当初发进群里那条不是同一个 sign，别让人以为链接变了。
     console.log(
@@ -56,6 +54,7 @@ async function list(): Promise<number> {
   } else {
     console.log(`有效期 ${config.expireHours} 小时，从上面的时间起算；到期后对象会被自动删除。`);
   }
+  if (config) console.log("未完成的上传计划超过 31 分钟后可被回收；以上规则仅适用于当前后端。");
   return 0;
 }
 
@@ -72,7 +71,7 @@ async function purge(match: string | undefined): Promise<number> {
   if (result.orphaned > 0) {
     console.log(
       `${result.orphaned} 条记录的地址与当前 publicBaseUrl 对不上（换过后端或目录），` +
-        "记录已丢弃，但远端对象需要你自己去后端删除。"
+        "记录已保留；请使用原后端配置处理这些对象。"
     );
   }
   if (result.failed > 0) {
@@ -82,7 +81,7 @@ async function purge(match: string | undefined): Promise<number> {
     );
     return 1;
   }
-  return 0;
+  return result.orphaned > 0 ? 1 : 0;
 }
 
 const [command, argument] = process.argv.slice(2);
@@ -96,9 +95,9 @@ switch (command) {
   case "purge":
     // --all 必须显式给出：一条不带参数的 purge 太容易在手滑时清空所有人的下载链接。
     if (argument === "--all") {
-      exitCode = await purge(undefined);
+      exitCode = await withMaintenance(() => purge(undefined));
     } else if (argument) {
-      exitCode = await purge(argument);
+      exitCode = await withMaintenance(() => purge(argument));
     } else {
       console.error("purge 需要一个关键字，或用 --all 表示清理全部。");
       exitCode = 1;

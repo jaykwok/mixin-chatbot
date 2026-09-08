@@ -19,17 +19,9 @@ BOT_PORT_FILE="${PROJECT_DIR}/data/state/bot-port"
 DEFAULT_TUNNEL_TOKEN_FILE="${PROJECT_DIR}/data/config/tunnel-token"
 TUNNEL_PID_FILE="${PROJECT_DIR}/data/state/cloudflared.pid"
 
-managed_tunnel_pid() {
-    local pid="" process_name=""
-    [ -f "$TUNNEL_PID_FILE" ] || return 1
-    pid="$(tr -d '[:space:]' < "$TUNNEL_PID_FILE")"
-    [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
-    process_name="$(ps -p "$pid" -o comm= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    [ "${process_name##*/}" = "cloudflared" ] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
-    printf '%s' "$pid"
-}
+. "$PROJECT_DIR/scripts/lib/lifecycle.sh"
 
-if existing_pid="$(managed_tunnel_pid)"; then
+if existing_pid="$(managed_cloudflared_pid)"; then
     echo "✓ 本项目 cloudflared 已在运行（pid ${existing_pid}）"
     exit 0
 fi
@@ -112,51 +104,10 @@ if [ "${#TUNNEL_TOKEN}" -lt 20 ]; then
     exit 1
 fi
 
-# ---- 2. 确保 cloudflared ----
+# ---- 2. Use the official package; do not maintain a latest-binary downloader. ----
 if ! command -v cloudflared >/dev/null 2>&1; then
-    echo "cloudflared 未安装，尝试安装（Linux）..."
-    if [ "$(uname -s)" = "Linux" ] && command -v curl >/dev/null 2>&1; then
-        ARCH=$(uname -m)
-        case "$ARCH" in
-            x86_64)       BIN=cloudflared-linux-amd64;;
-            aarch64|arm64) BIN=cloudflared-linux-arm64;;
-            *) echo "✗ 不支持的架构 $ARCH，请手动安装 cloudflared" >&2; exit 1;;
-        esac
-        CF_TMP="$(mktemp)"
-        trap 'rm -f "$CF_TMP"' EXIT
-        if ! curl -fsSL -o "$CF_TMP" \
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/$BIN"; then
-            echo "✗ 下载 cloudflared 失败，请检查网络后重试" >&2
-            exit 1
-        fi
-        chmod +x "$CF_TMP"
-        if ! "$CF_TMP" --version >/dev/null 2>&1; then
-            echo "✗ 下载的 cloudflared 无法运行" >&2
-            exit 1
-        fi
-        if [ "$(id -u)" -eq 0 ]; then
-            install -m 0755 "$CF_TMP" /usr/local/bin/cloudflared || {
-                echo "✗ 安装 cloudflared 失败" >&2
-                exit 1
-            }
-        elif command -v sudo >/dev/null 2>&1; then
-            sudo install -m 0755 "$CF_TMP" /usr/local/bin/cloudflared || {
-                echo "✗ 通过 sudo 安装 cloudflared 失败" >&2
-                exit 1
-            }
-        else
-            echo "✗ 安装到 /usr/local/bin 需要 root 或 sudo" >&2
-            exit 1
-        fi
-        rm -f "$CF_TMP"
-        trap - EXIT
-    else
-        echo "✗ 请先安装 cloudflared：" >&2
-        echo "  Linux:   https://pkg.cloudflare.com/cloudflared 或下载二进制到 /usr/local/bin" >&2
-        echo "  macOS:   brew install cloudflared" >&2
-        echo "  Windows: https://github.com/cloudflare/cloudflared/releases (cloudflared-windows-amd64.exe)" >&2
-        exit 1
-    fi
+    echo '请先通过官方渠道安装 cloudflared：https://pkg.cloudflare.com/' >&2
+    exit 1
 fi
 
 # ---- 3. 连接前的确认：连到哪条隧道、本机有没有东西可转发 ----
@@ -177,15 +128,8 @@ if command -v base64 >/dev/null 2>&1; then
     [ -n "$tunnel_identity" ] && echo "▸ 目标隧道：${tunnel_identity}"
 fi
 
-# 机器人不在线时拒绝连接。这不是保守，是这个脚本唯一真正危险的失败模式：
-#
-# 连接器一连上，Cloudflare 就会开始把生产流量分给这台机器，而它没有可转发的目标，分到它
-# 手上的请求只能是 502。隧道通常还有别的连接器在正常服务，于是现象是「一半请求好、一半
-# 502」——极难定位。本项目就这么被坑过一次：一次脚本冒烟测试在开发机上跑到这里，读到了
-# data/config/tunnel-token 里的真实 token，把一台什么都没跑的开发机接进了生产隧道。
-#
-# 原来这里只打一行警告然后照连不误。警告不是门槛。
-if curl -fsS "http://localhost:${BOT_PORT}/favicon.svg" >/dev/null 2>&1; then
+# 连接器注册后会参与分流；默认要求本地服务健康，避免向无服务实例导入生产流量。
+if curl --noproxy '*' --max-time 3 -fsS "http://127.0.0.1:${BOT_PORT}/health" >/dev/null 2>&1; then
     echo "✓ 本机 :${BOT_PORT} 机器人在线"
 elif [ "${TUNNEL_ALLOW_NO_BOT:-}" = "1" ]; then
     echo "⚠ 本机 :${BOT_PORT} 无响应，但 TUNNEL_ALLOW_NO_BOT=1，继续连接" >&2
@@ -205,6 +149,10 @@ fi
 # ---- 4. 起隧道（前台）----
 echo "▶ 启动 cloudflared connector（控制台 Published application 应配置为 http://localhost:${BOT_PORT}）"
 echo "  （前台运行，Ctrl+C 停止。常驻开机自启可用 systemd/tmux 包一层）"
-mkdir -p "$(dirname "$TUNNEL_PID_FILE")"
-(umask 077 && printf '%s' "$$" > "$TUNNEL_PID_FILE")
-exec cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN"
+mkdir -p "$PROJECT_DIR/data/config"
+token_path="$PROJECT_DIR/data/config/cloudflared-token"
+(umask 077 && printf '%s' "$TUNNEL_TOKEN" > "$token_path")
+chmod 600 "$token_path"
+unset TUNNEL_TOKEN
+record_cloudflared_pid "$"
+exec cloudflared tunnel --no-autoupdate run --token-file "$token_path"

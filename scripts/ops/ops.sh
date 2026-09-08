@@ -128,27 +128,7 @@ wait_for_local() {
     return 1
 }
 
-managed_cloudflared_pid() {
-    local pid="" process_name=""
-    [ -f "$TUNNEL_PID_FILE" ] || return 1
-    pid="$(tr -d '[:space:]' < "$TUNNEL_PID_FILE")"
-    [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
-    process_name="$(ps -p "$pid" -o comm= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    [ "${process_name##*/}" = "cloudflared" ] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
-    printf '%s' "$pid"
-}
-
-stop_managed_cloudflared() {
-    local pid="" attempt
-    pid="$(managed_cloudflared_pid)" || return 1
-    kill "$pid" || return 1
-    for attempt in $(seq 1 10); do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 1
-    done
-    kill -0 "$pid" 2>/dev/null && return 1
-    rm -f -- "$TUNNEL_PID_FILE"
-}
+# Connector identity and bounded stop are shared in scripts/lib/lifecycle.sh.
 
 has_container() {
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"
@@ -200,13 +180,14 @@ check_relay() {
     # 命令行，WebDAV 密码不该出现在那里。netrc 用 mktemp 建在仅本人可读的目录里，用完即删。
     local dav_code="000" netrc="" host
     if [ -n "$user" ]; then
-        netrc="$(mktemp)"
+        mkdir -p "$PROJECT_DIR/agents/temp"
+        netrc="$(mktemp "$PROJECT_DIR/agents/temp/relay-auth-XXXXXXXX")"
         chmod 600 "$netrc"
         host="$(printf '%s' "$dav_url" | sed -e 's#^[a-zA-Z]*://##' -e 's#[:/].*##')"
         printf 'machine %s login %s password %s\n' "$host" "$user" "$pass" > "$netrc"
         dav_code="$(curl -s -o /dev/null -w '%{http_code}' -m 8 --noproxy '*' \
             -X PROPFIND -H 'Depth: 0' --netrc-file "$netrc" "$dav_url" 2>/dev/null || true)"
-        rm -f -- "$netrc"
+        archive_project_path "$netrc"
     else
         dav_code="$(curl -s -o /dev/null -w '%{http_code}' -m 8 --noproxy '*' \
             -X PROPFIND -H 'Depth: 0' "$dav_url" 2>/dev/null || true)"
@@ -361,7 +342,7 @@ relay_admin() {
     docker run --rm --network host \
         --user "$(stat -c '%u:%g' "$DATA_DIR")" \
         -e HOME=/app/data/runtime/home \
-        -v "${PROJECT_DIR}/data:/app/data" \
+        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/agents:/app/agents" \
         mixin-chatbot bun run scripts/ops/relay-admin.ts "$@"
 }
 
@@ -397,7 +378,7 @@ group_data_admin() {
         -e HOME=/app/data/runtime/home \
         -e GROUP_DATA_ROOT="$group_root_env" \
         "${group_root_args[@]}" \
-        -v "${PROJECT_DIR}/data:/app/data" \
+        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/agents:/app/agents" \
         mixin-chatbot bun run "$script" "$@"
 }
 
@@ -405,9 +386,7 @@ tmp_admin() {
     group_data_admin scripts/ops/tmp-admin.ts "$@"
 }
 
-# 清历史必须先把机器人停下来，不能只删文件：内存里已经建立的会话仍握着完整的消息列表，
-# 接着聊就把旧内容重新写回去，等于白清一次。所以这里固定走「停 → 清 → 起」，而不是把
-# --force 甩给运维自己判断——那个开关存在只是为了兜住脚本被单独调用的场合。
+# 清历史先停服务，防止内存会话写回；归档后恢复调用前的运行或停止状态。
 history_clear() {
     if [ -z "${1:-}" ]; then
         ER "history-clear 需要群号：./scripts/ops/ops.sh history-clear <群号>"
@@ -551,12 +530,15 @@ update() {
     # 隧道也由 deploy.sh 一并处理，不需要在这里单独重启 cloudflared。
     P "交给 deploy.sh 重建镜像并切换容器（各项提示直接回车即沿用当前配置）..."
     echo ""
-    if bash "$deploy_script"; then
+    local was_running
+    was_running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
+    if DEPLOY_PRESERVE_STOPPED=1 bash "$deploy_script"; then
         echo ""
         OK "升级完成：${original_sha:0:7} -> ${target_sha:0:7}"
         echo ""
-        doctor
-        return $?
+        if [ "$was_running" = true ]; then doctor; return $?; fi
+        OK "保留原停止状态，使用 start 可启动新版本"
+        return 0
     fi
 
     echo ""
@@ -627,11 +609,11 @@ uninstall() {
             ER "本项目 cloudflared（pid ${managed_pid}）仍在运行；为避免删除其归属/token 状态，已保留 data/ 和 logs/"
             return 1
         fi
-        if rm -rf -- "${PROJECT_DIR}/data" "${PROJECT_DIR}/logs" &&
+        if archive_project_path "${PROJECT_DIR}/data" && archive_project_path "${PROJECT_DIR}/logs" &&
             [ ! -e "${PROJECT_DIR}/data" ] && [ ! -e "${PROJECT_DIR}/logs" ]; then
-            OK "data/ 和 logs/ 已删除"
+            OK "data/ 和 logs/ 已移入 agents/rm"
         else
-            ER "data/ 或 logs/ 删除不完整；请检查权限后重试"
+            ER "data/ 或 logs/ 归档不完整；请检查权限后重试"
             return 1
         fi
     else

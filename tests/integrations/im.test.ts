@@ -263,7 +263,8 @@ describe("IM outbound group routing", () => {
         callbackUrl,
         new Uint8Array([1, 2, 3]),
         "report.png",
-        "image"
+        "image",
+        "upload-group"
       );
     } finally {
       globalThis.fetch = originalFetch;

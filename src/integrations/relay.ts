@@ -8,7 +8,12 @@
 // 一个开放的转载器；而且远程响应不一定给 Content-Length，拿不到可靠的大小。超限的
 // 远程文件仍按原样报错，模型可以先用 bash 下载到自己的 tmp 再发。
 import { createHmac, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, createReadStream, createWriteStream } from "node:fs";
+import { mkdir, rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
+import { application, KeyedQueue } from "../core/lifecycle.ts";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import {
   MAX_ATTACHMENT_BYTES,
@@ -22,6 +27,7 @@ import {
   openRelayIndex,
   relayCacheKey,
   type RelayIndex,
+  type RelayIndexEntry,
 } from "./relay-index.ts";
 
 export interface RelayConfig {
@@ -33,7 +39,7 @@ export interface RelayConfig {
   password?: string;
   maxBytes: number;
   /**
-   * 链接有效期（小时）。缺省表示永不过期，行为与未引入该字段时一致。
+   * 链接有效期（小时）。缺省表示永不过期。
    *
    * 到期后发生什么取决于有没有配 signSecret：
    * - 没配：对象被 DELETE 掉，文件真的从后端消失，事后无法补救。
@@ -257,13 +263,9 @@ function buildObjectName(filename: string): string {
   return `${day}-${randomUUID()}/${filename}`;
 }
 
-/**
- * 对象路径的目录段。新布局有，2026-08 之前上传的旧对象（uuid 拼在文件名里）没有，
- * 返回 null——那批对象仍然要能被正常探测和删除。
- */
-function directoryOf(objectName: string): string | null {
-  const slash = objectName.indexOf("/");
-  return slash < 0 ? null : objectName.slice(0, slash);
+/** 对象只采用 `<日期>-<uuid>/<文件名>` 布局，每次上传独占一个目录。 */
+function directoryOf(objectName: string): string {
+  return objectName.slice(0, objectName.indexOf("/"));
 }
 
 /** 逐段编码后拼到基址上。对象路径含目录段，整体 encodeURIComponent 会把分隔符也编掉。 */
@@ -339,11 +341,11 @@ async function putObject(
   localPath: string,
   size: number,
   filename: string,
+  objectName: string,
   signal?: AbortSignal
 ): Promise<string> {
-  const objectName = buildObjectName(filename);
   const directory = directoryOf(objectName);
-  if (directory) await makeCollection(config, directory, filename, signal);
+  await makeCollection(config, directory, filename, signal);
   const headers: Record<string, string> = {
     "Content-Type": "application/octet-stream",
     ...buildAuthHeaders(config),
@@ -379,7 +381,7 @@ async function putObject(
  * "对象不存在" 都是 200），只看 `status < 400` 会把错误信封当成文件还在。
  * 所以 2xx 还要求 Content-Length 与当初存下的大小一致——错误信封只有几十字节，
  * 对不上；重定向则说明服务端确实解析到了这个对象。
- * 服务端不给 Content-Length 时按「不存在」处理，代价是重传一次。
+ * 未知状态不等同于不存在；调用方保留账本，并在同一对象名上尝试一次幂等重传。
  */
 async function remoteStillExists(
   url: string,
@@ -387,29 +389,23 @@ async function remoteStillExists(
   signal?: AbortSignal
 ): Promise<boolean> {
   const timeout = AbortSignal.timeout(RELAY_PROBE_TIMEOUT);
-  try {
-    const response = await fetch(url, {
-      method: "HEAD",
-      redirect: "manual",
-      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-    });
-    await response.body?.cancel().catch(() => {});
-    if (response.status >= 300 && response.status < 400) return true;
-    if (response.status >= 400) return false;
-    return Number(response.headers.get("content-length")) === size;
-  } catch {
-    // 探测失败时按「不存在」处理：重传浪费一次带宽，发死链浪费的是用户的时间。
-    return false;
-  }
+  const response = await fetch(url, {
+    method: "HEAD",
+    redirect: "manual",
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
+  await response.body?.cancel().catch(() => {});
+  if (response.status >= 300 && response.status < 400) return true;
+  if (response.status === 404 || response.status === 410) return false;
+  const length = response.headers.get("content-length");
+  if (response.ok && length !== null && Number(length) === size) return true;
+  throw new Error("外链探测无法确认对象状态 (HTTP " + response.status + ")");
 }
 
 /**
- * 从存下来的公开地址反推对象名。上传时公开地址就是
- * `publicBaseUrl + encodeURIComponent(objectName)`，这里原样倒推回去。
+ * 从公开地址反推对象名；对应 joinUrl 对目录和文件名逐段编码的规则。
  *
- * 配置改过（换了后端或换了目录）之后，旧记录的前缀对不上，我们就没有能力再管理那个
- * 对象了，返回 null 让调用方丢弃索引记录并明确告警——留着一条永远删不掉的记录，只会
- * 让过期清理看起来在工作而实际没有。
+ * 前缀不属于当前后端时返回 null；调用方保留账本并报告，供运维用原后端处理。
  */
 function objectNameFromPublicUrl(config: RelayConfig, url: string): string | null {
   const base = config.publicBaseUrl.endsWith("/")
@@ -419,10 +415,9 @@ function objectNameFromPublicUrl(config: RelayConfig, url: string): string | nul
   const encoded = url.slice(base.length);
   if (!encoded) return null;
 
-  // 只可能是两种形状：`<目录>/<文件名>`（当前）或 `<文件名>`（旧对象）。再深一层就不是
-  // 我们传上去的，宁可认不出来也不要往一个猜出来的路径上发 DELETE。
+  // 只接受本项目的两段对象路径，不对无法识别的布局推测 DELETE 目标。
   const segments = encoded.split("/");
-  if (segments.length > 2) return null;
+  if (segments.length !== 2) return null;
   const decoded: string[] = [];
   for (const segment of segments) {
     if (!segment) return null;
@@ -500,9 +495,8 @@ async function deleteObject(
   objectName: string,
   signal?: AbortSignal
 ): Promise<void> {
-  // 删的是整个 uuid 目录，不是里面那个文件：只删文件会在后端留下一地空目录。目录归这次
-  // 分发独有，删它不会波及别的对象。旧对象没有目录段，直接删文件本身。
-  const target = directoryOf(objectName) ?? objectName;
+  // 目录由本次分发独占，删除整个目录以免留下空目录。
+  const target = directoryOf(objectName);
   const timeout = AbortSignal.timeout(RELAY_PROBE_TIMEOUT);
   const response = await fetch(joinUrl(config.webdavUrl, target), {
     method: "DELETE",
@@ -520,23 +514,22 @@ type PurgeOutcome = "deleted" | "orphaned" | "failed";
 async function deleteIndexedObject(
   config: RelayConfig,
   index: RelayIndex,
-  key: string
+  key: string,
+  signal?: AbortSignal
 ): Promise<PurgeOutcome> {
   const current = index.get(key);
   if (!current) return "deleted";
 
   const objectName = objectNameFromPublicUrl(config, current.url);
   if (!objectName) {
-    // 换过后端或换过目录之后，我们已经没有能力再删那个对象了。留着一条永远删不掉的
-    // 记录只会让清理看起来在工作，所以丢掉记录并明确说需要人工处理。
+    // 不把旧对象交给新后端删除，也不丢失其清理依据。
     log.warn(
-      `外链索引记录与当前 publicBaseUrl 对不上，已丢弃记录但无法删除远端对象（需人工清理）: ${current.url}`
+      `外链索引记录与当前 publicBaseUrl 对不上，保留记录且未删除远端对象（需人工清理）: ${current.url}`
     );
-    await index.forget(key);
     return "orphaned";
   }
   try {
-    await deleteObject(config, objectName);
+    await deleteObject(config, objectName, signal);
     await index.forget(key);
     return "deleted";
   } catch (error) {
@@ -548,8 +541,8 @@ async function deleteIndexedObject(
 }
 
 /**
- * 删除已过期的对象。有效期是滑动的：命中去重会刷新 at，所以「最后一次分享后 N 小时」
- * 才算过期。
+ * 已上传对象按最后复用时间计算闲置期限；签名模式保留已上传对象。
+ * 未完成的上传计划按上传预算回收，两种模式都适用。
  */
 export async function sweepExpiredRelayObjects(
   /** 覆盖默认的进程级配置与索引，供测试注入。 */
@@ -558,29 +551,28 @@ export async function sweepExpiredRelayObjects(
   // 用 === undefined 而不是 ??：显式传 null 的意思是「就当没配置」，`??` 会把它当成
   // 「没传」再去读进程级配置，那样签名里的 `| null` 就是句空话。
   const config = overrides?.config === undefined ? getRelayConfig() : overrides.config;
-  if (!config?.expireHours) return;
-  // 配了签名就不再删文件：到期靠签名自己失效，对象留在后端。下次再发同一份内容会命中
-  // 去重、现签一条新链接，一个字节都不用重传——删掉它只会逼着下一次重新上传一遍。
-  // 代价是后端占用只增不减，清理走 relay-purge。
-  if (config.signSecret) return;
-  const ttl = config.expireHours * 60 * 60_000;
+  if (!config) return;
+  // Failed/interrupted uploads are reclaimable even when published objects never expire.
+  const expired = (entry: RelayIndexEntry) => {
+    const ttl = entry.state === "planned" ? RELAY_HTTP_TIMEOUT + 60_000
+      : config.expireHours && !config.signSecret ? config.expireHours * 3600_000 : Infinity;
+    const at = Date.parse(entry.at);
+    return ttl !== Infinity && (Number.isNaN(at) || Date.now() - at >= ttl);
+  };
   const index = overrides?.index ?? (await getRelayIndex());
 
   let removed = 0;
   for (const entry of index.entries()) {
-    const at = Date.parse(entry.at);
-    // 时间戳读不出来的记录无法参与「多久没被分享」的判断。留着它等于让这份内容永不
-    // 过期，与配置了有效期的初衷相悖，所以按过期处理。
-    if (!Number.isNaN(at) && Date.now() - at < ttl) continue;
+    application.signal.throwIfAborted();
+    if (!expired(entry)) continue;
 
     await withUploadLock(entry.key, async () => {
       // 双重检查：排队等锁期间这份内容可能刚被人分享过并刷新了时间戳。
       const current = index.get(entry.key);
       if (!current) return;
-      const currentAt = Date.parse(current.at);
-      if (!Number.isNaN(currentAt) && Date.now() - currentAt < ttl) return;
+      if (!expired(current)) return;
 
-      if ((await deleteIndexedObject(config, index, entry.key)) === "deleted") removed++;
+      if ((await deleteIndexedObject(config, index, entry.key, application.signal)) === "deleted") removed++;
     });
   }
   if (removed > 0) log.info(`外链过期清理完成，已删除 ${removed} 个对象`);
@@ -591,7 +583,8 @@ export interface RelayObject {
   url: string;
   name: string;
   size: number;
-  /** 最后一次分发这份内容的时间（ISO）。过期计时从这里开始算。 */
+  state: "planned" | "uploaded";
+  /** 最后一次计划、上传或复用的时间（ISO），不代表平台确认交付。 */
   at: string;
 }
 
@@ -606,11 +599,12 @@ export async function listRelayObjects(options?: {
   // 配了签名的话列出来的地址得是现签的，否则管理员照着复制一条只会得到 403。
   return target
     .entries()
-    .map(({ url, name, size, at }) => ({
+    .map(({ url, name, size, at, state }) => ({
       url: config ? publicUrlFor(config, url) : url,
       name,
       size,
       at,
+      state: state ?? "uploaded",
     }))
     .sort((a, b) => a.at.localeCompare(b.at));
 }
@@ -620,16 +614,13 @@ export interface RelayPurgeResult {
   deleted: number;
   /** 后端删除失败，索引记录已保留，可以重试。 */
   failed: number;
-  /** 地址与当前 publicBaseUrl 对不上，记录已丢弃但远端对象需要人工清理。 */
+  /** 地址与当前 publicBaseUrl 对不上，记录保留供人工处理。 */
   orphaned: number;
 }
 
 /**
- * 手动清理：删除匹配的对象并丢弃对应的索引记录。
- *
- * 与过期清理共用同一条删除路径，区别只是不看时间。允许在机器人运行时执行：删除后端对象
- * 才是决定性的动作，索引本身会自愈——机器人那份内存副本即使还留着记录，下次命中时的
- * HEAD 探测会 404，于是丢弃记录并重传。
+ * 手动清理与过期清理共用删除路径；远端确认删除后才移除账本记录。
+ * CLI 须先取得维护租约，与服务互斥；进程内上传锁不提供跨进程保护。
  */
 export async function purgeRelayObjects(options?: {
   /** 只清理文件名或地址包含该子串的条目；缺省表示全部。 */
@@ -644,11 +635,12 @@ export async function purgeRelayObjects(options?: {
 
   const result: RelayPurgeResult = { matched: 0, deleted: 0, failed: 0, orphaned: 0 };
   for (const entry of index.entries()) {
+    application.signal.throwIfAborted();
     if (match && !entry.name.includes(match) && !entry.url.includes(match)) continue;
     result.matched++;
     // 与上传、过期清理共用同一把锁：正在被上传或清理的条目不会被并发删两次。
     await withUploadLock(entry.key, async () => {
-      switch (await deleteIndexedObject(config, index, entry.key)) {
+      switch (await deleteIndexedObject(config, index, entry.key, application.signal)) {
         case "deleted":
           result.deleted++;
           break;
@@ -667,21 +659,10 @@ export async function purgeRelayObjects(options?: {
  * 同一个内容同时只上传一次。第二个调用者排在后面，等前一个落地后直接命中索引；
  * 它不共享前一个的 AbortSignal，所以前一个被 /stop 掉不会连累后一个。
  */
-const uploadLocks = new Map<string, Promise<void>>();
+const uploadLocks = new KeyedQueue();
 
-async function withUploadLock<T>(key: string, task: () => Promise<T>): Promise<T> {
-  const previous = uploadLocks.get(key) ?? Promise.resolve();
-  const run = previous.then(task, task);
-  const settled = run.then(
-    () => {},
-    () => {}
-  );
-  uploadLocks.set(key, settled);
-  try {
-    return await run;
-  } finally {
-    if (uploadLocks.get(key) === settled) uploadLocks.delete(key);
-  }
+async function withUploadLock<T>(key: string, task: () => Promise<T>, signal: AbortSignal = application.signal): Promise<T> {
+  return uploadLocks.run(key, task, signal);
 }
 
 let indexPromise: Promise<RelayIndex> | undefined;
@@ -692,61 +673,69 @@ function getRelayIndex(): Promise<RelayIndex> {
 }
 
 export interface RelayRequest {
+  tempDir?: string;
   config: RelayConfig;
   localPath: string;
   size: number;
   filename: string;
   signal?: AbortSignal;
-  /** 覆盖默认的进程级去重索引（data/runtime 下那份）。 */
+  /** 覆盖默认的持久账本（data/state/relay.sqlite）。 */
   index?: RelayIndex;
 }
 
 /**
- * 把一个本地文件分发成公开链接。相同内容 + 相同文件名只会真正上传一次：先算内容
- * 哈希查索引，命中且远端仍在就直接复用旧地址。
+ * 相同后端、内容和文件名复用同一对象。探测确认后复用链接，否则在原对象名重传；
+ * 快照、哈希、等锁、探测和上传共享取消信号与总期限。
  */
 export async function relayFile(request: RelayRequest): Promise<string> {
-  const { config, localPath, size, filename, signal } = request;
-  signal?.throwIfAborted();
-  if (size > config.maxBytes) {
-    throw new Error(
-      `${filename}（${formatSize(size)}）超过外链分发上限 ${formatSize(config.maxBytes)}`
-    );
-  }
-
-  const index = request.index ?? (await getRelayIndex());
-  // 哈希要读一遍整个文件，但这远比把它再传一遍便宜。
-  const key = relayCacheKey(await hashFile(localPath, signal), filename);
-
-  return withUploadLock(key, async () => {
-    signal?.throwIfAborted();
-    const cached = index.get(key);
-    if (cached) {
-      // 探测也要带签名：后端开了强制验签时，不带签名的 HEAD 一律 401，会被当成「对象没了」
-      // 而每次都重传，去重就彻底失效了。
-      const probeUrl = publicUrlFor(config, cached.url);
-      if (await remoteStillExists(probeUrl, cached.size, signal)) {
-        // 探测确认对象还在，才刷新时间戳：这样过期计时是「最后一次分享后 N 小时」，
-        // 第二个人拿到的链接也有完整寿命，而且一个字节都不用重传。
-        await index.remember({ ...cached, at: new Date().toISOString() });
-        log.info(`外链命中去重索引，跳过上传: ${filename} -> ${cached.url}`);
-        // 现签一条：命中缓存复用的是后端那个对象，不是当初那条已经在倒计时的链接。
-        return publicUrlFor(config, cached.url);
+  const { config, localPath, filename } = request;
+  const signal = AbortSignal.any([application.signal, AbortSignal.timeout(RELAY_HTTP_TIMEOUT), ...(request.signal ? [request.signal] : [])]);
+  signal.throwIfAborted();
+  if (request.size > config.maxBytes) throw new Error(filename + " 超过外链分发上限 " + formatSize(config.maxBytes));
+  const tempDir = resolve(request.tempDir ?? "agents/temp/relay");
+  await mkdir(tempDir, { recursive: true });
+  const snapshot = join(tempDir, ".relay-" + randomUUID());
+  let size = 0;
+  try {
+    // Hash and PUT the same immutable bytes, even if the sync client replaces the source later.
+    await pipeline(createReadStream(localPath), new Transform({ transform(chunk: Buffer, _encoding, next) {
+      size += chunk.length;
+      if (size > config.maxBytes) next(new Error("源文件增长超过外链上限"));
+      else next(null, chunk);
+    } }), createWriteStream(snapshot, { flags: "wx" }), { signal });
+    const index = request.index ?? await getRelayIndex();
+    const digest = await hashFile(snapshot, signal);
+    const key = relayCacheKey(digest, filename, config.publicBaseUrl);
+    return await withUploadLock(key, async () => {
+      signal.throwIfAborted();
+      let cached = index.get(key);
+      let preserveUploaded = false;
+      if (cached && cached.state !== "planned") {
+        let exists = false;
+        try { exists = await remoteStillExists(publicUrlFor(config, cached.url), cached.size, signal); }
+        catch (error) {
+          signal.throwIfAborted(); // Cancellation and the total deadline never trigger another upload.
+          preserveUploaded = true;
+          log.warn(`外链探测失败，保留账本并按原对象名重传: ${String(error)}`);
+        }
+        if (exists) {
+          await index.remember({ ...cached, at: new Date().toISOString() });
+          return publicUrlFor(config, cached.url);
+        }
+        // Missing or unconfirmed: reuse the recorded location without dropping its cleanup ledger.
       }
-      log.warn(`外链索引记录的地址已不可访问，重新上传: ${filename} (${cached.url})`);
-      await index.forget(key);
-    }
-
-    signal?.throwIfAborted();
-    const url = await putObject(config, localPath, size, filename, signal);
-    // 索引存裸地址，签名是给出去的那一刻才现签的，见 publicUrlFor。
-    await index.remember({
-      key,
-      url,
-      name: filename,
-      size,
-      at: new Date().toISOString(),
-    });
-    return publicUrlFor(config, url);
-  });
+      const objectName = cached ? objectNameFromPublicUrl(config, cached.url) : buildObjectName(filename);
+      if (!objectName) throw new Error("外链账本与配置不匹配，记录已保留，请联系管理员");
+      cached = { key, url: joinUrl(config.publicBaseUrl, objectName), name: filename, size,
+        // An ambiguous probe must not turn a previously uploaded object into an expiring partial upload.
+        at: new Date().toISOString(), state: preserveUploaded ? "uploaded" : "planned" };
+      await index.remember(cached); // Before MKCOL/PUT: a crash can always be reconciled.
+      const url = await putObject(config, snapshot, size, filename, objectName, signal);
+      await index.remember({ ...cached, state: "uploaded" });
+      return publicUrlFor(config, url);
+    }, signal);
+  } finally {
+    // Disposable copy of the source; retaining it after every upload would grow storage without bound.
+    await rm(snapshot, { force: true });
+  }
 }

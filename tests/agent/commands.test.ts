@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import {
   canonicalCommand,
   HELP_TEXT,
-  isCommandMessage,
   isSlashCommandMessage,
   stripLeadingMention,
   SUPPORTED_COMMANDS,
@@ -17,18 +16,18 @@ describe("agent slash commands", () => {
   });
 
   test("separates slash commands from ordinary prompt text", () => {
-    expect(isCommandMessage("/status")).toBe(true);
-    expect(isCommandMessage("  /HELP")).toBe(true);
-    expect(isCommandMessage("/StOp now")).toBe(true);
-    expect(isCommandMessage("@BOT\uFFA0/clear")).toBe(true);
-    expect(isCommandMessage("@BOT /clear")).toBe(false);
-    expect(isCommandMessage("@任意机器人名称    /clear")).toBe(false);
-    expect(isCommandMessage("@张三 @BOT /STATUS")).toBe(false);
-    expect(isCommandMessage("@BOT/clear")).toBe(false);
-    expect(isCommandMessage("/unknown")).toBe(false);
-    expect(isCommandMessage("@BOT 请解释 /clear")).toBe(false);
-    expect(isCommandMessage("请解释 /clear")).toBe(false);
-    expect(isCommandMessage("请帮我分析这段文字")).toBe(false);
+    expect(isSlashCommandMessage("/status")).toBe(true);
+    expect(isSlashCommandMessage("  /HELP")).toBe(true);
+    expect(isSlashCommandMessage("/StOp now")).toBe(true);
+    expect(isSlashCommandMessage("@BOT\uFFA0/clear")).toBe(true);
+    expect(isSlashCommandMessage("@BOT /clear")).toBe(false);
+    expect(isSlashCommandMessage("@任意机器人名称    /clear")).toBe(false);
+    expect(isSlashCommandMessage("@张三 @BOT /STATUS")).toBe(false);
+    expect(isSlashCommandMessage("@BOT/clear")).toBe(false);
+    expect(isSlashCommandMessage("/unknown")).toBe(true);
+    expect(isSlashCommandMessage("@BOT 请解释 /clear")).toBe(false);
+    expect(isSlashCommandMessage("请解释 /clear")).toBe(false);
+    expect(isSlashCommandMessage("请帮我分析这段文字")).toBe(false);
   });
 
   test("routes unsupported slash syntax to command help instead of the agent", () => {
@@ -51,7 +50,7 @@ describe("agent slash commands", () => {
   });
 
   test("advertises every supported command in help", () => {
-    expect([...SUPPORTED_COMMANDS.keys()]).toEqual(["/help", "/clear", "/stop", "/status"]);
+    expect([...SUPPORTED_COMMANDS.keys()]).toEqual(["/help", "/clear", "/stop", "/status", "/deliver"]);
     for (const command of SUPPORTED_COMMANDS.keys()) {
       expect(HELP_TEXT).toContain(command);
     }

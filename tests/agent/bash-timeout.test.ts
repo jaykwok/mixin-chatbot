@@ -1,11 +1,12 @@
+import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 // Pi 的 bash 工具默认不限时，挂死的命令会永久占住一轮 prompt：用户只收到「正在思考」，
 // 之后的消息全部退化成 steer，会话槽位也不再释放。这里验证适配层注入的默认上限确实生效。
 // 配置在模块加载时读环境变量，因此必须先设置再动态导入。bun test 的模块注册表在同一次
 // 运行里是共用的，所以这只在本文件先于其他导入 config 的测试执行时生效——下面第一条断言
 // 就是为此而写：万一将来顺序变了，它会立刻报错，而不是让测试挂在一分钟的 sleep 上。
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, mkdir } from "node:fs/promises";
+
 import { join } from "node:path";
 
 process.env.BOT_BASH_TIMEOUT = "10";

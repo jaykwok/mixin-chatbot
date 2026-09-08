@@ -15,6 +15,7 @@ if [ ! -f "$COMMON_LIB" ]; then
 fi
 # shellcheck source=../lib/common.sh
 . "$COMMON_LIB"
+. "${PROJECT_DIR}/scripts/lib/deployment.sh"
 cd "$PROJECT_DIR"
 DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
@@ -136,30 +137,7 @@ remove_managed_ufw_rules() {
     done
 }
 
-managed_cloudflared_pid() {
-    local pid="" process_name=""
-    [ -f "$TUNNEL_PID_FILE" ] || return 1
-    pid="$(tr -d '[:space:]' < "$TUNNEL_PID_FILE")"
-    [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
-    process_name="$(ps -p "$pid" -o comm= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    [ "${process_name##*/}" = "cloudflared" ] || { rm -f -- "$TUNNEL_PID_FILE"; return 1; }
-    printf '%s' "$pid"
-}
-
-stop_managed_cloudflared() {
-    local pid="" attempt
-    pid="$(managed_cloudflared_pid)" || return 1
-    # 归属记录可能来自由 root/systemd 启动的 connector；无权限停止时必须失败关闭，
-    # 不能把 kill -0 的 EPERM 误判为“进程已退出”并删除 PID 记录。
-    kill "$pid" || return 1
-    for attempt in $(seq 1 10); do
-        if ! managed_cloudflared_pid >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
-}
+# Connector identity and bounded stop are shared in scripts/lib/lifecycle.sh.
 
 # ---- 前置检查 ----
 
@@ -183,6 +161,9 @@ print_success "环境检查通过"
 
 # ---- 目录 + 监听端口 ----
 
+command -v flock >/dev/null || { print_error "需要 util-linux flock"; exit 1; }
+print_warning "开始部署事务：旧容器在配置期间保持停止；任一步失败都会恢复原配置和运行状态。"
+begin_deployment
 mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 if [ -n "${BOT_PORT:-}" ]; then
     PORT_DEFAULT_SOURCE="BOT_PORT"
@@ -302,15 +283,7 @@ while true; do
         print_warning "无法设置群数据总根权限：$HOST_GROUP_DATA_ROOT"
         continue
     fi
-    write_probe="${HOST_GROUP_DATA_ROOT}/.mixin-chatbot-write-test-$$"
-    if ! (umask 077 && : > "$write_probe") 2>/dev/null; then
-        print_warning "群数据总根不可写：$HOST_GROUP_DATA_ROOT"
-        continue
-    fi
-    if ! rm -f -- "$write_probe"; then
-        print_warning "无法清理群数据总根写入测试文件：$write_probe"
-        continue
-    fi
+    [ -w "$HOST_GROUP_DATA_ROOT" ] || { print_warning '群数据根不可写'; continue; }
     break
 done
 GROUP_ROOT_ARGS=()
@@ -332,7 +305,8 @@ echo ""
 print_status "设置目录权限..."
 # root 部署固定降权到 appuser(1001)；普通 Docker 用户则由容器沿用当前 UID/GID。
 if [ "$(id -u)" -eq 0 ]; then
-    chown -R "$CONTAINER_UID:$CONTAINER_GID" "$DATA_DIR" "$LOG_DIR" "$HOST_GROUP_DATA_ROOT"
+    chown -R "$CONTAINER_UID:$CONTAINER_GID" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$PROJECT_DIR/agents"
+    chown "$CONTAINER_UID:$CONTAINER_GID" "$HOST_GROUP_DATA_ROOT"
 fi
 chmod 755 "$DATA_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 print_success "目录就绪"
@@ -354,7 +328,7 @@ verify_container_storage() {
       -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
       "${GROUP_ROOT_ARGS[@]}" \
       -v "$(pwd)/logs:/app/logs" \
-      -v "$(pwd)/data:/app/data" \
+      -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" \
       --entrypoint sh \
       mixin-chatbot \
       -c 'for directory in /app/data/config /app/data/state /app/data/runtime /app/data/runtime/home /app/logs "$GROUP_DATA_ROOT"; do
@@ -378,7 +352,7 @@ print_success "持久化目录权限正常"
 
 if [ ! -f "$MODELS_FILE" ]; then
     print_status "首次配置 AI（provider/key/model）..."
-    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
+    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" mixin-chatbot bun run configure; then
         print_error "AI 配置命令执行失败"
         exit 1
     fi
@@ -389,7 +363,7 @@ if [ ! -f "$MODELS_FILE" ]; then
 else
     print_status "检测到已有 data/config/models.json"
     if ask_yes_no "是否重新配置 AI（provider/key/model）？[y/N]：" "n"; then
-        if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -v "$(pwd)/data:/app/data" mixin-chatbot bun run configure; then
+        if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" mixin-chatbot bun run configure; then
             print_error "AI 配置命令执行失败"
             exit 1
         fi
@@ -419,7 +393,7 @@ if [ ! -f "$WEBHOOK_SECRET_FILE" ]; then
 else
     SECRET="$(tr -d '[:space:]' < "$WEBHOOK_SECRET_FILE")"
     if ! [[ "$SECRET" =~ ^[0-9a-fA-F]{64}$ ]]; then
-        print_error "data/config/webhook-secret 格式无效（应为 64 位十六进制）；请删除该文件后重新部署以生成新密钥"
+        print_error "data/config/webhook-secret 格式无效（应为 64 位十六进制）；请停机并将该文件移入 agents/rm 后重新部署"
         exit 1
     fi
     SHOW_SECRET=0
@@ -517,12 +491,12 @@ else
     print_warning "WAF 应只限制 /webhook/ 前缀：平台 IP + POST 放行，其他 webhook 请求 Block；可保留 /favicon.svg 供健康检查"
 fi
 if [ "$SHOW_SECRET" = "1" ]; then
-    print_warning "密钥仅本次显示、不进容器日志；泄露时删 data/config/webhook-secret 重新部署即重新生成"
+    print_warning "密钥仅本次显示、不进容器日志；轮换时停机并将 data/config/webhook-secret 移入 agents/rm 后重新部署"
 fi
 echo ""
 
-# ---- 停止旧容器 ----
-# 镜像、配置和密钥全部准备成功后才产生服务停机窗口。
+# ---- 切换网络入口 ----
+# 旧容器已在修改配置之前停止并备份，后续失败由部署事务恢复。
 if [ "$DEPLOY_MODE" = "direct" ]; then
     if command -v ufw >/dev/null 2>&1 && can_manage_ufw; then
         print_status "同步 UFW 规则到端口 ${BOT_PORT}..."
@@ -548,7 +522,7 @@ if [ "$DEPLOY_MODE" = "direct" ]; then
             print_warning "ALLOW_UNMANAGED_FIREWALL=1：UFW 未启用，依赖你已配置的外部防火墙"
         else
             print_error "UFW 未启用；直连模式拒绝在 0.0.0.0 上启动"
-            echo "  运行 scripts/deploy/setup-server.sh / sudo ufw enable，或确认已有等效云防火墙后设置 ALLOW_UNMANAGED_FIREWALL=1。"
+            echo "  请按主机运维策略配置防火墙，或确认已有等效云防火墙后设置 ALLOW_UNMANAGED_FIREWALL=1。"
             exit 1
         fi
     elif [ "${ALLOW_UNMANAGED_FIREWALL:-0}" = "1" ]; then
@@ -585,61 +559,17 @@ if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 
     UNMANAGED_TUNNEL_CONFIRMED=1
 fi
 
-ROLLBACK_CONTAINER="mixin-chatbot-rollback"
-PREVIOUS_CONTAINER_SAVED=0
-NEW_CONTAINER_ATTEMPTED=0
-TUNNEL_STARTED_BY_DEPLOY=0
-DEPLOYMENT_COMMITTED=0
+# 旧容器和配置已在 begin_deployment 中保存。
 
-rollback_deployment() {
-    local exit_status=$?
-    trap - EXIT
-    if [ "$DEPLOYMENT_COMMITTED" = "1" ]; then
-        exit "$exit_status"
-    fi
-    set +e
-    if [ "$TUNNEL_STARTED_BY_DEPLOY" = "1" ]; then
-        stop_managed_cloudflared >/dev/null 2>&1
-    fi
-    if [ "$NEW_CONTAINER_ATTEMPTED" = "1" ] &&
-       docker ps -a --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
-        docker rm -f mixin-chatbot >/dev/null 2>&1
-    fi
-    if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ] &&
-       docker ps -a --format '{{.Names}}' | grep -q "^${ROLLBACK_CONTAINER}$"; then
-        if docker rename "$ROLLBACK_CONTAINER" mixin-chatbot >/dev/null 2>&1 &&
-           docker start mixin-chatbot >/dev/null 2>&1; then
-            print_warning "新部署未完成，已恢复并启动旧容器"
-        else
-            print_error "新部署未完成，旧容器自动恢复失败；请检查 docker ps -a"
-        fi
-    fi
-    exit "$exit_status"
-}
-
-if docker ps -a --format '{{.Names}}' | grep -q "^${ROLLBACK_CONTAINER}$"; then
-    print_error "发现上次遗留的 ${ROLLBACK_CONTAINER}；请先确认容器状态，避免覆盖可恢复版本"
-    exit 1
-fi
-trap rollback_deployment EXIT
-
-print_status "停止现有容器..."
-if docker ps -a --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
-    if ! docker stop mixin-chatbot >/dev/null 2>&1; then
-        print_error "旧容器停止失败；未继续覆盖部署"
-        docker start mixin-chatbot >/dev/null 2>&1 || true
-        exit 1
-    fi
-    if ! docker rename mixin-chatbot "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
-        print_error "旧容器保存为回滚版本失败；未继续覆盖部署"
-        docker start mixin-chatbot >/dev/null 2>&1 || true
-        exit 1
-    fi
-    PREVIOUS_CONTAINER_SAVED=1
-    print_success "旧容器已保存为临时回滚版本"
-else
-    print_success "没有发现旧容器"
-fi
+# 持久化受支持的显式环境配置；容器路径由部署计算，其他值沿用 runtime.json。
+runtime_env_args=()
+for runtime_key in BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_TTL_MINUTES BOT_INDEX_MAX_FILES BOT_INDEX_MAX_DEPTH BOT_RUN_TIMEOUT_SECONDS BOT_SHUTDOWN_TIMEOUT_SECONDS BOT_DELIVERY_TIMEOUT_SECONDS BOT_DOCUMENT_ENV; do
+    if [ -n "${!runtime_key:-}" ]; then runtime_env_args+=(-e "$runtime_key"); fi
+done
+docker run --rm --user "$CONTAINER_UID:$CONTAINER_GID" \
+  -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" -e BOT_PORT="$BOT_PORT" -e BOT_HOST="$BOT_HOST" \
+  "${runtime_env_args[@]}" -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" \
+  mixin-chatbot bun run scripts/config/runtime-settings.ts
 
 # ---- 启动容器 ----
 
@@ -653,11 +583,9 @@ if docker run -d \
   -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
   -e BOT_PORT="$BOT_PORT" \
   -e BOT_HOST="$BOT_HOST" \
-  -e BOT_DEBUG="$BOT_DEBUG_VALUE" \
-  -e BOT_MAX_ACTIVE_REQUESTS="$BOT_MAX_ACTIVE_REQUESTS_VALUE" \
   "${GROUP_ROOT_ARGS[@]}" \
   -v "$(pwd)/logs:/app/logs" \
-  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/data:/app/data" -v "$(pwd)/agents:/app/agents" \
   --restart unless-stopped \
   --stop-timeout 30 \
   --name mixin-chatbot \
@@ -753,8 +681,10 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
             fi
 
             print_warning "cloudflared 未运行，后台启动 scripts/tunnel/start-tunnel.sh..."
-            BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh "${tunnel_token_args[@]}" >>"$LOG_DIR/cloudflared.log" 2>&1 &
+            BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh "${tunnel_token_args[@]}" >>"$LOG_DIR/cloudflared.log" 2>&1 9>&- &
             tunnel_launcher_pid=$!
+            tunnel_launcher_start="$(process_start_identity "$tunnel_launcher_pid")"
+            TUNNEL_STARTED_BY_DEPLOY=1
             for attempt in $(seq 1 30); do
                 managed_cloudflared_pid >/dev/null 2>&1 && break
                 kill -0 "$tunnel_launcher_pid" 2>/dev/null || break
@@ -766,6 +696,8 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
                 print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
                 break
             fi
+            stop_tunnel_launcher || { print_error "无法结束连接器启动进程"; exit 1; }
+            tunnel_launcher_pid=""
             print_warning "cloudflared 未能启动，最近日志："
             tail -n 10 "$LOG_DIR/cloudflared.log" 2>/dev/null || true
             print_warning "请修正 token 来源后重试；按 Ctrl+C 可取消部署。"
@@ -816,11 +748,18 @@ printf '%s' "$HOST_GROUP_DATA_ROOT" > "$GROUP_DATA_ROOT_FILE"
 if [ "$PERSIST_BOT_DOMAIN" = "1" ]; then
     printf '%s' "$PUBLIC_DOMAIN" > "$BOT_DOMAIN_FILE"
 elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = "1" ]; then
-    rm -f -- "$BOT_DOMAIN_FILE"
+    archive_project_path "$BOT_DOMAIN_FILE"
 fi
 
+# update preserves an existing stopped deployment after checking the new instance.
+if [ "${DEPLOY_PRESERVE_STOPPED:-0}" = 1 ] && [ "$PREVIOUS_RUNNING" = 0 ]; then
+    docker stop --time 30 mixin-chatbot >/dev/null
+fi
 DEPLOYMENT_COMMITTED=1
-trap - EXIT
+trap - EXIT INT TERM
+archive_project_path "$DEPLOY_SNAPSHOT" || print_warning "部署已完成，旧快照仍在 $DEPLOY_SNAPSHOT"
+flock -u 9
+exec 9>&-
 if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ]; then
     if docker rm "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
         print_success "部署已提交，旧容器回滚版本已清理"
@@ -831,7 +770,9 @@ fi
 
 # ---- 输出信息 ----
 
-if docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
+if [ "${DEPLOY_PRESERVE_STOPPED:-0}" = 1 ] && [ "$PREVIOUS_RUNNING" = 0 ]; then
+    print_success '升级完成，已恢复原停止状态。'
+elif docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     print_success "服务启动成功"
 
     echo ""
@@ -863,7 +804,7 @@ if docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo "  底层命令（ops.sh 不适用时排障用）:"
     echo "    docker logs -f mixin-chatbot                         # 容器层日志"
     echo "    docker restart mixin-chatbot                         # 直接重启容器"
-    echo "    docker run --rm -it --user \"\$(stat -c '%u:%g' data)\" -e HOME=/app/data/runtime/home -v \"\$(pwd)/data:/app/data\" mixin-chatbot bun run configure && docker restart mixin-chatbot   # 重配 AI"
+    echo "    bash scripts/deploy/deploy.sh                        # 重配 AI 并验证新实例，失败回滚"
     echo ""
 
     print_status "最近日志:"

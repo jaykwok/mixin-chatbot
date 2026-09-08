@@ -4,8 +4,8 @@
 // 大小分两条路：不超过 IM 单条附件上限的走原来的「读进内存 + 上传 + 发附件消息」；
 // 超过上限的本地文件在配置了外链后端时改为流式 PUT 到外部存储，在群里发一条下载链接
 // （见 ../integrations/relay.ts）。未配置外链时行为与之前完全一致——直接报文件过大。
-import { readFile, realpath, stat } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { open, realpath, stat } from "node:fs/promises";
+import { resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import {
   formatSize,
@@ -19,6 +19,7 @@ import { sendFile, sendImage, uploadAttachment } from "../integrations/im.ts";
 import { describeRelayExpiry, relayFile, type RelayConfig } from "../integrations/relay.ts";
 import type { RelayIndex } from "../integrations/relay-index.ts";
 import { isPathInside } from "./paths.ts";
+import { resolveToolPath } from "./tool-path.ts";
 
 /**
  * 定位来源但不读取内容。本地路径在这里就做完 canonical path/符号链接边界校验并拿到
@@ -42,7 +43,7 @@ async function resolveSource(
     realpath(resolve(workspaceDir)),
     realpath(resolve(tempDir)),
   ]);
-  const requestedPath = isAbsolute(source) ? resolve(source) : resolve(roots[0], source);
+  const requestedPath = resolveToolPath(source, roots[0]!);
   const path = await realpath(requestedPath);
   if (!roots.some((root) => isPathInside(path, root))) {
     throw new Error("只能发送本群 workspace 或当前调用用户 tmp 目录内的文件");
@@ -118,12 +119,25 @@ async function readBytes(
   if (resolved.size > MAX_ATTACHMENT_BYTES) {
     throw oversizeError("本地文件", resolved.size);
   }
-  const data = new Uint8Array(await readFile(resolved.path));
-  if (data.byteLength > MAX_ATTACHMENT_BYTES) {
-    throw oversizeError("本地文件", data.byteLength);
-  }
-  signal?.throwIfAborted();
-  return data;
+  const handle = await open(resolved.path, "r");
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error("来源不再是普通文件");
+    if (info.size > MAX_ATTACHMENT_BYTES) throw oversizeError("本地文件", info.size);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      signal?.throwIfAborted();
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_ATTACHMENT_BYTES + 1 - total));
+      const { bytesRead } = await handle.read(buffer);
+      if (!bytesRead) break;
+      total += bytesRead;
+      if (total > MAX_ATTACHMENT_BYTES) throw oversizeError("本地文件", total);
+      chunks.push(buffer.subarray(0, bytesRead));
+    }
+    signal?.throwIfAborted();
+    return Buffer.concat(chunks, total);
+  } finally { await handle.close(); }
 }
 
 function filenameFromSource(source: string): string {
@@ -149,9 +163,8 @@ function sanitizeFilename(filename: string): string {
 /**
  * 工具产出的、必须原样进群的文本。
  *
- * 外链是这次 send_file 的全部产出——URL 一个字符都不能错，所以不能指望模型在回复里
- * 复述它。但工具自己发一条、模型的回复再发一条，一次发送就吃掉两条出站配额，而平台的
- * 限流是按条算的。所以工具把这段话交给运行时，由运行时拼进那条唯一的回复里。
+ * 外链由运行时原样保存并并入最终交付，避免模型复述 URL 引入错误。
+ * 交付可能拆成多条平台消息；失败或取消后可通过 /deliver 补发。
  */
 export interface OutboundNotes {
   add(note: string): void;
@@ -159,24 +172,18 @@ export interface OutboundNotes {
   peek(): string[];
   /** 确认已送达后才清空。 */
   clear(): void;
-  /** 取走并清空，用于异常路径兜底补发。 */
-  drain(): string[];
 }
 
-export function createOutboundNotes(): OutboundNotes {
+export function createOutboundNotes(onAdd?: (note: string) => void): OutboundNotes {
   let notes: string[] = [];
   return {
     add: (note) => {
+      onAdd?.(note);
       notes.push(note);
     },
     peek: () => [...notes],
     clear: () => {
       notes = [];
-    },
-    drain: () => {
-      const drained = notes;
-      notes = [];
-      return drained;
     },
   };
 }
@@ -192,7 +199,7 @@ export interface SendToolsOptions {
   relay?: RelayConfig | null;
   /** 覆盖默认的进程级外链去重索引。 */
   relayIndex?: RelayIndex;
-  /** 外链地址交给它，由运行时并入本轮唯一的那条回复。 */
+  /** 外链地址交给运行时持久化并并入最终交付。 */
   notes: OutboundNotes;
 }
 
@@ -238,6 +245,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
         data,
         filenameFromSource(params.source),
         "image",
+        groupId,
         signal
       );
       if (!fileId) throw new Error(`图片上传失败: ${params.source}`);
@@ -261,7 +269,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
   };
 
   const relayNote = relay
-    ? ` 超过 ${formatSize(MAX_ATTACHMENT_BYTES)} 的本地文件会自动改为上传外部存储、在群里发送下载链接，你不需要为此做任何额外处理，照常调用即可。`
+    ? ` 超过 ${formatSize(MAX_ATTACHMENT_BYTES)} 的本地文件会上传外部存储，下载链接由系统保存并附在本轮回复末尾；工具生成链接不代表平台已确认送达。`
     : "";
 
   const sendFileTool: ToolDefinition<typeof fileParams> = {
@@ -285,6 +293,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
           filename: name,
           signal,
           index: relayIndex,
+          tempDir,
         });
         // 有效期必须写进群消息本身：群成员只有提前知道期限才会及时下载。措辞随后端机制
         // 变化（删文件 / 只失效签名），交给 relay 层拼，见 describeRelayExpiry。
@@ -302,7 +311,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
               // 让同一条消息里出现两个 URL。
               text:
                 `文件超过 ${formatSize(MAX_ATTACHMENT_BYTES)}，已改为链接分发，下载链接会由系统自动附在你本轮回复的末尾。` +
-                `请正常回复用户（说明文件已通过链接发送即可），不要重复粘贴链接地址。`,
+                `请说明文件链接已生成，不要声称已送达或重复粘贴链接地址。`,
             },
           ],
           details: { name, url, size: resolved.size, mode: "relay" },
@@ -311,7 +320,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
 
       const data = await readBytes(resolved, signal);
       const callbackUrl = getCallbackUrl();
-      const fileId = await uploadAttachment(callbackUrl, data, name, "file", signal);
+      const fileId = await uploadAttachment(callbackUrl, data, name, "file", groupId, signal);
       if (!fileId) throw new Error(`文件上传失败: ${params.source}`);
       const ok = await sendFile(fileId, groupId, callbackUrl, undefined, signal);
       if (!ok) throw new Error(`文件发送失败: ${params.source}`);

@@ -2,19 +2,18 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
   access,
-  copyFile,
   lstat,
   mkdir,
   readFile,
   realpath,
-  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { move } from "fs-extra";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import { Type } from "@earendil-works/pi-ai";
 import {
   createBashToolDefinition,
+  getShellConfig,
   createEditToolDefinition,
   createReadToolDefinition,
   createWriteToolDefinition,
@@ -25,26 +24,8 @@ import {
 import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
 import { log } from "../core/log.ts";
 import { isPathInside } from "./paths.ts";
-import { resolveToolPath } from "./tool-path.ts";
 import { venvPythonPath } from "./python-toolchain.ts";
-import {
-  runFileMutation,
-  runFileMutations,
-  runOpaqueWorkspaceOperation,
-} from "./workspace-coordinator.ts";
-
-const coordinatedBashSchema = Type.Object({
-  command: Type.String({ description: "Bash command to execute" }),
-  timeout: Type.Optional(
-    Type.Number({
-      description: `Timeout in seconds (optional, defaults to ${BASH_DEFAULT_TIMEOUT})`,
-    })
-  ),
-  mutates: Type.Array(Type.String(), {
-    description:
-      "Workspace file paths this command may create, modify, rename, or delete. Use [] only for a read-only command; use ['.'] when the affected files cannot be enumerated. Paths outside the group workspace, such as your own temp directory, need no coordination and are ignored rather than rejected.",
-  }),
-});
+import { runProcess } from "../core/process.ts";
 
 /** 使用 Pi 官方类型收窄助手，使独立工具可安全放入 customTools。 */
 function asSdkTool<T extends ToolDefinition<any, any, any>>(tool: T) {
@@ -86,7 +67,7 @@ class AllowedPathGuard {
 
   private assertInside(path: string): void {
     if (!this.roots.some((root) => isPathInside(path, root))) {
-      throw new Error("文件工具只能访问本群 workspace 或当前调用用户 tmp");
+      throw new Error("写入仅允许当前用户 tmp；本群 workspace 和 index 只读");
     }
   }
 
@@ -149,8 +130,7 @@ async function moveOfficialBashOutput(
 
   const stem = basename(source, ".log");
   const destination = join(canonicalUserTemp, `${stem}-${randomUUID()}.log`);
-  await copyFile(canonicalSource, destination, constants.COPYFILE_EXCL);
-  await unlink(canonicalSource);
+  await move(canonicalSource, destination, { overwrite: false });
   return destination;
 }
 
@@ -161,7 +141,7 @@ function createBashTool(
   groupId: string,
   venvDir: string,
   materialsIndexPath: string
-): ToolDefinition<typeof coordinatedBashSchema> {
+) {
   const callerEnvironment = {
     TMPDIR: tempDir,
     TMP: tempDir,
@@ -184,13 +164,8 @@ function createBashTool(
     // 拼出的路径打不开文件。资料文件名几乎全是中文，这里必须显式声明 UTF-8。
     LANG: "C.UTF-8",
     LC_ALL: "C.UTF-8",
-    // Git Bash turns an empty heredoc into `< /dev/null`, which on Windows is the
-    // NUL character device, and the CRT reports isatty(NUL) as true. `python -`
-    // therefore believes it is interactive and starts the 3.13+ _pyrepl, whose
-    // console-size probe on that handle fails (WinError 6 or 123 depending on what
-    // stdin ended up being); the REPL swallows the error and loops, spewing
-    // tracebacks at megabytes per second and never exiting — one such command wrote
-    // 3.26GB before it was killed. The basic REPL just reads EOF and quits.
+    // Windows NUL may be reported as a TTY after an empty Git Bash heredoc.
+    // The basic REPL handles that EOF without starting the console-only _pyrepl.
     PYTHON_BASIC_REPL: "1",
     PI_CALLER_PHONE: phone,
     PI_GROUP_ID: groupId,
@@ -208,6 +183,17 @@ function createBashTool(
     .map(([name, value]) => `export ${name}=${shellQuote(value)}`)
     .join("\n");
   const official = createBashToolDefinition(cwd, {
+    operations: {
+      exec: async (command, executionCwd, { onData, signal, timeout, env }) => {
+        const shell = getShellConfig();
+        const seconds = timeout ?? BASH_DEFAULT_TIMEOUT;
+        if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 3600) {
+          throw new Error("bash timeout 必须大于 0 且不超过 3600 秒");
+        }
+        return runProcess({ command: shell.shell, args: [...shell.args, command],
+          cwd: executionCwd, env, signal, timeoutMs: seconds * 1000, onData });
+      },
+    },
     exposeSessionEnvironment: true,
     spawnHook: (context) => ({
       ...context,
@@ -265,105 +251,12 @@ function createBashTool(
     }
   };
 
-  const workspaceRoot = resolve(cwd);
-
-  /**
-   * `mutates` is scheduling metadata, never a boundary: the bash tool spawns a
-   * real shell, so no declaration can contain where a command actually writes.
-   * Its only job is taking FIFO locks on the shared group workspace. Paths
-   * outside it — the caller's private tmp, most often — need no lock at all, so
-   * they are dropped instead of rejected; declaring them honestly must not cost
-   * the user a turn. A missing or malformed declaration falls back to the
-   * workspace-wide lock, which is conservative and always safe.
-   */
-  const workspaceLockTargets = (mutates: unknown, executionCwd: string): string[] | "opaque" => {
-    if (
-      !Array.isArray(mutates) ||
-      mutates.some((path) => typeof path !== "string")
-    ) {
-      return "opaque";
-    }
-    const executionRoot = resolveToolPath(".", executionCwd);
-    // cwd 来自会话；若宿主意外传入群目录之外，不能把全部声明过滤成免锁执行。
-    if (!isPathInside(executionRoot, workspaceRoot)) return "opaque";
-    // 0.85.0 官方工具优先使用 ctx.cwd；锁仍归本群，但路径必须与实际执行目录一致。
-    const targets = mutates.map((path) => resolveToolPath(path, executionCwd));
-    // 语义覆盖 .、./、空字符串、sub/..，子目录 cwd 也按整群独占处理。
-    if (targets.some((path) => path === workspaceRoot || path === executionRoot)) return "opaque";
-    return targets.filter((path) => isPathInside(path, workspaceRoot));
-  };
-
-  const execute: ToolDefinition<typeof coordinatedBashSchema>["execute"] = (
-    toolCallId,
-    { mutates, ...input },
-    signal,
-    onUpdate,
-    context
-  ) => {
-    // Pi leaves bash unbounded unless the model declares a timeout. Nobody is
-    // watching a terminal here: a command that never exits (a stray REPL, a
-    // prompt waiting on stdin, a wedged download) silently eats the whole turn —
-    // the user keeps the "正在思考" ack and never gets an answer, later messages
-    // only queue as steering, and the session slot never comes back. A declared
-    // timeout always wins; this only fills the gap when there is none.
-    const bounded =
-      typeof input.timeout === "number" && Number.isFinite(input.timeout)
-        ? input
-        : { ...input, timeout: BASH_DEFAULT_TIMEOUT };
-    const task = () =>
-      executeOfficial(toolCallId, bounded, signal, onUpdate, context);
-    const targets = workspaceLockTargets(mutates, context?.cwd || cwd);
-    if (targets === "opaque") {
-      return runOpaqueWorkspaceOperation(cwd, task, signal);
-    }
-    return runFileMutations(cwd, targets, task, signal);
-  };
-
-  return {
+  return defineTool({
     ...official,
-    parameters: coordinatedBashSchema,
-    prepareArguments: (args: unknown) => {
-      const raw = args as Record<string, unknown>;
-      const prepared = official.prepareArguments
-        ? official.prepareArguments(args)
-        : (raw as { command: string; timeout?: number });
-      // Fail safe rather than loud: an omitted or malformed declaration becomes
-      // the workspace-wide lock instead of throwing away the whole tool call.
-      const declared = raw?.mutates;
-      const mutates =
-        Array.isArray(declared) && declared.every((path) => typeof path === "string")
-          ? (declared as string[])
-          : ["."];
-      return { ...prepared, mutates };
-    },
-    description: `${official.description} Commands without an explicit timeout are stopped after ${BASH_DEFAULT_TIMEOUT} seconds; pass a larger timeout when a command legitimately needs longer. Before execution, declare every workspace path the command may create, modify, rename, or delete in mutates. Use an empty list only for read-only commands and ["."] for unknown or workspace-wide changes. Declared paths share FIFO locks with edit/write; paths outside the group workspace need no lock and are ignored. Do not start background workspace writers.`,
-    execute,
-  } as unknown as ToolDefinition<typeof coordinatedBashSchema>;
-}
-
-/**
- * Pi's own edit/write already wrap their mutation in withFileMutationQueue, so
- * this looks redundant — it is not. That queue only serializes edit against
- * write; this one shares its FIFO with the paths bash declares in `mutates`,
- * which is the only thing keeping a file edit from overlapping a bash command
- * that touches the same file, and it adds the workspace-level gate that keeps
- * both away from a workspace-wide (opaque) bash operation.
- */
-function coordinateFileTool<T extends ToolDefinition<any, any, any>>(
-  tool: T,
-  cwd: string
-): T {
-  const execute: typeof tool.execute = (...args) => {
-    const input = args[1] as { path?: unknown };
-    if (typeof input?.path !== "string") return tool.execute(...args);
-    return runFileMutation(
-      cwd,
-      resolveToolPath(input.path, args[4]?.cwd || cwd),
-      () => tool.execute(...args),
-      args[2]
-    );
-  };
-  return { ...tool, execute };
+    description: official.description + " Default timeout is " + BASH_DEFAULT_TIMEOUT +
+      " seconds, maximum 3600. The workspace is reference material: only write to your own temp directory. All child processes are stopped when this command completes or is cancelled.",
+    execute: executeOfficial,
+  });
 }
 
 export interface LocalToolsOptions {
@@ -386,8 +279,8 @@ export async function buildLocalTools(
   const { workspaceDir: cwd, tempDir, phone, groupId, venvDir } = options;
   const indexPath = resolve(options.materialsIndexPath);
   const guard = await AllowedPathGuard.create(
-    [cwd, tempDir],
-    [dirname(indexPath)]
+    [tempDir],
+    [cwd, dirname(indexPath)]
   );
   const readOperations = {
     readFile: async (path: string) => readFile(await guard.readable(path)),
@@ -418,14 +311,8 @@ export async function buildLocalTools(
 
   const readTool = createReadToolDefinition(cwd, { operations: readOperations });
   const bashTool = createBashTool(cwd, tempDir, phone, groupId, venvDir, indexPath);
-  const editTool = coordinateFileTool(
-    createEditToolDefinition(cwd, { operations: editOperations }),
-    cwd
-  );
-  const writeTool = coordinateFileTool(
-    createWriteToolDefinition(cwd, { operations: writeOperations }),
-    cwd
-  );
+  const editTool = createEditToolDefinition(cwd, { operations: editOperations });
+  const writeTool = createWriteToolDefinition(cwd, { operations: writeOperations });
 
   return [readTool, bashTool, editTool, writeTool].map(asSdkTool);
 }

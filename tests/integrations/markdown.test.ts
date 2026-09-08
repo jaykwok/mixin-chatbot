@@ -23,9 +23,9 @@ describe("Markdown reply adaptation", () => {
       markdownToPlainText(
         "## 标题\n> 说明\n\n这是 **重点**、*斜体*、`代码` 和 [链接](https://example.com)。"
       )
-    ).toBe("标题\n说明\n\n这是 重点、斜体、代码 和 链接。");
+    ).toBe("标题\n说明\n\n这是 重点、斜体、代码 和 链接 (https://example.com)。");
 
-    expect(markdownToPlainText("![图片](https://example.com/a.png)")).toBe("");
+    expect(markdownToPlainText("![图片](https://example.com/a.png)")).toBe("图片 (https://example.com/a.png)");
     expect(markdownToPlainText("```ts\nconst ok = true;\n```")).toBe(
       "const ok = true;"
     );
@@ -35,5 +35,11 @@ describe("Markdown reply adaptation", () => {
     expect(
       markdownToPlainText("| 项目 | 状态 |\n| --- | --- |\n| 路由 | 正常 |")
     ).toBe("项目 状态\n\n路由 正常");
+  });
+  test("preserves literal URLs, signed query values and code", () => {
+    const url = "https://files.example/中文/a_b_(c).pdf?sign=x_y&version=1";
+    expect(shouldRenderMarkdown(url)).toBe(false);
+    expect(markdownToPlainText(`**下载** [材料](<${url}>)`)).toContain(url);
+    expect(markdownToPlainText("`a_b_*c*` ")).toBe("a_b_*c*");
   });
 });

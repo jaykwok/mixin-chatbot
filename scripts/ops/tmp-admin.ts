@@ -1,16 +1,13 @@
-// 用户临时目录运维命令：查看与清理 <群数据总根>/<群>/users/<用户>/tmp。
-//
-// 之所以是一个 bun 脚本而不是写在 ops.sh / ops.ps1 里：目录布局、群/用户目录段的 sha256
-// 兜底规则、GROUP_DATA_ROOT 的解析全在 src/ 里，在两个 shell 里各抄一遍等于维护三份。
-// 更要紧的是「什么不能删」这条边界只能有一个定义——workspace 和 session.jsonl 是长期
-// 资产，它们就在 tmp 的隔壁，一个写歪的 rm -rf 代价太大。
-//
-// tmp 里堆积的主要是：Pi 输出被截断时迁过来的完整日志 pi-bash-*.log、uv/pip/npm 缓存、
-// 解压和格式转换的中间产物。全都可以重建，删了只是下次慢一点。
-import { lstat, readdir, rm } from "node:fs/promises";
+// 查看用户 tmp 占用，停机后将选中的内容归档到 agents/rm。
+// tmp 包含缓存、完整工具输出及生成的交付物，不能假设全部可以重建。
+// 目录边界由共享解析器验证；扫描和归档均不跟随目录链接。
+import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
+import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
+import { userSegment } from "../../src/agent/paths.ts";
+import { assertDataDirectory, dataDirectoryNames } from "../lib/group-data.ts";
 
 const DAY = 24 * 60 * 60_000;
 
@@ -41,7 +38,7 @@ function usage(): void {
   console.log("  purge --all              清空全部用户临时目录（等价于 --days 0）");
   console.log("");
   console.log("  两条 purge 都可加 --user <手机号> 只处理一个用户。");
-  console.log("  只删除 tmp 里面的内容，tmp 目录本身、workspace 和 session.jsonl 都不动。");
+  console.log("  停机后将选中内容移入 agents/rm；tmp 目录、workspace 和 session.jsonl 保留。");
 }
 
 function describeAge(at: number): string {
@@ -54,7 +51,7 @@ function describeAge(at: number): string {
 
 /**
  * 用 lstat 而不是 stat：符号链接按它自己算，不跟进去。tmp 里出现一条指向 workspace 的
- * 链接时，既不该把 workspace 的体积算进来，更不该让它进入删除范围——rm 删的是链接本身。
+ * 链接时，统计和归档只处理链接本身，不遍历目标。
  */
 async function measure(path: string): Promise<Usage> {
   let info;
@@ -84,15 +81,6 @@ async function measure(path: string): Promise<Usage> {
   return total;
 }
 
-async function readDirNames(path: string): Promise<string[]> {
-  try {
-    const entries = await readdir(path, { withFileTypes: true });
-    return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
-  } catch {
-    return [];
-  }
-}
-
 /**
  * 扫描所有群下所有用户的 tmp。找不到目录就是还没人在这个群里用过工具，不是错误。
  *
@@ -104,14 +92,17 @@ export async function collect(
   root: string = GROUP_DATA_ROOT
 ): Promise<UserTmp[]> {
   const found: UserTmp[] = [];
-  for (const group of await readDirNames(root)) {
+  for (const group of await dataDirectoryNames(root, root)) {
     const usersDir = join(root, group, "users");
-    for (const user of await readDirNames(usersDir)) {
-      if (userFilter && user !== userFilter) continue;
+    for (const user of await dataDirectoryNames(usersDir, root)) {
+      if (userFilter && user !== userSegment(userFilter)) continue;
       const dir = join(usersDir, user, "tmp");
       // 这里不能只看目录：tmp 里的散落文件（迁过来的 pi-bash-*.log 就是）也要算进来。
       let names: string[];
       try {
+        await assertDataDirectory(dir, root);
+        const info = await lstat(dir);
+        if (!info.isDirectory() || info.isSymbolicLink()) continue;
         names = (await readdir(dir, { withFileTypes: true })).map((entry) => entry.name);
       } catch {
         continue; // 这个用户还没触发过任何工具，tmp 尚未建立。
@@ -159,7 +150,7 @@ async function list(userFilter?: string): Promise<number> {
   }
   console.log("");
   console.log(`共 ${users.length} 个用户，合计 ${formatSize(bytes)}。`);
-  console.log("这些内容都可以重建（缓存、中间产物、被截断的完整输出日志），删除只影响下次的速度。");
+  console.log("包含缓存、完整工具输出和用户生成的交付物；清理会移入 agents/rm，可按原路径恢复。");
   return 0;
 }
 
@@ -190,13 +181,14 @@ export async function purge(
         continue;
       }
       try {
-        await rm(entry.path, { recursive: true, force: true });
+        await assertDataDirectory(user.dir, root);
+        await archiveFile(entry.path);
         freed += entry.bytes;
         removed++;
-        console.log(`已删除 ${entry.path}（${formatSize(entry.bytes)}）`);
+        console.log(`已移入 agents/rm：${entry.path}（${formatSize(entry.bytes)}）`);
       } catch (error) {
         failed++;
-        console.error(`删除失败 ${entry.path}：${String(error)}`);
+        console.error(`归档失败 ${entry.path}：${String(error)}`);
       }
     }
   }
@@ -205,13 +197,13 @@ export async function purge(
   if (removed === 0 && failed === 0) {
     console.log(`没有符合条件的条目（${days} 天内改动过的都保留了）。`);
   } else {
-    console.log(`已删除 ${removed} 个条目，释放 ${formatSize(freed)}。`);
+    console.log(`已归档 ${removed} 个条目、${formatSize(freed)} 到 agents/rm（尚未释放磁盘空间）。`);
   }
   if (keptEntries > 0) {
     console.log(`保留 ${keptEntries} 个条目（${formatSize(keptBytes)}）：它们在 ${days} 天内有改动。`);
   }
   if (failed > 0) {
-    console.log(`${failed} 个条目删除失败，常见原因是有进程正占用其中的文件——机器人停下来再试一次。`);
+    console.log(`${failed} 个条目归档失败；检查文件占用及目录权限后重试。`);
     return 1;
   }
   return 0;
@@ -256,9 +248,9 @@ async function main(args: string[]): Promise<number> {
         return 1;
       }
       if (days === 0) {
-        console.log("正在清空全部用户临时目录；正在执行中的任务会丢失中间产物。");
+        console.log("准备将全部用户临时内容移入回收区；运行中的机器人会阻止本操作。");
       }
-      return purge(days, userFilter);
+      return withMaintenance(() => purge(days, userFilter));
     default:
       usage();
       return command ? 1 : 0;

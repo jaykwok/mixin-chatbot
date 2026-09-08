@@ -1,13 +1,16 @@
 // 全局参数与默认值。持久化目录统一由 src/core/storage.ts 定义：
-// data/config 放配置与密钥，data/state 放部署状态，data/runtime 放可重建运行文件，
+// data/config 放配置与密钥，data/state 放持久账本与部署状态，data/runtime 放 SDK 运行资源，
 // data/groups 放群共享工作区、用户临时文件与会话。
 // 无必需 .env/config.json；可选环境变量覆盖部署参数。访问控制由 webhook secret + 防火墙/WAF 共同承担。
 // 所有时间常量统一毫秒（Date.now()/setTimeout 均为 ms）。
 
 import { DEFAULT_GROUP_DATA_ROOT } from "./storage.ts";
+import { readFileSync } from "node:fs";
+import { runtimeSetting } from "./runtime-config.ts";
+import { documentPackages } from "../../scripts/runtime/document-manifest.ts";
 
 function integerEnv(name: string, fallback: number, min: number, max: number): number {
-  const raw = process.env[name]?.trim();
+  const raw = runtimeSetting(name);
   if (!raw) return fallback;
   const value = Number(raw);
   if (!Number.isInteger(value) || value < min || value > max) {
@@ -24,15 +27,18 @@ function integerEnv(name: string, fallback: number, min: number, max: number): n
  * 仍固定在项目 data/ 的分类子目录中，避免运维脚本失去统一入口。
  */
 export const GROUP_DATA_ROOT =
-  process.env.GROUP_DATA_ROOT?.trim() || DEFAULT_GROUP_DATA_ROOT;
+  runtimeSetting("GROUP_DATA_ROOT") || DEFAULT_GROUP_DATA_ROOT;
 
 // ===== 服务 =====
 export const PORT = integerEnv("BOT_PORT", 1011, 1, 65_535);
-export const HOST = process.env.BOT_HOST?.trim() || "0.0.0.0";
+export const HOST = runtimeSetting("BOT_HOST") || "0.0.0.0";
 /** 仅本地开发可显式开启无 secret 的 /webhook；生产默认失败关闭。 */
 export const ALLOW_INSECURE_WEBHOOK = process.env.ALLOW_INSECURE_WEBHOOK === "1";
 /** 详细日志会记录用户消息正文，默认关闭。 */
-export const DEBUG = process.env.BOT_DEBUG === "1";
+export const DEBUG = runtimeSetting("BOT_DEBUG") === "1";
+export const RUN_TIMEOUT_MS = integerEnv("BOT_RUN_TIMEOUT_SECONDS", 1200, 10, 7200) * 1000;
+export const SHUTDOWN_TIMEOUT_MS = integerEnv("BOT_SHUTDOWN_TIMEOUT_SECONDS", 20, 5, 25) * 1000;
+export const DELIVERY_TIMEOUT_MS = integerEnv("BOT_DELIVERY_TIMEOUT_SECONDS", 180, 1, 600) * 1000;
 export const MAX_WEBHOOK_BODY_BYTES = 64 * 1024;
 
 // ===== IM 服务 =====
@@ -43,8 +49,7 @@ export const IM_HTTP_TIMEOUT = 15_000; // 单次 webhook 发送超时
 export const IM_TEXT_MAX_LENGTH = 5000;
 export const ATTACHMENT_HTTP_TIMEOUT = 60_000;
 export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
-/** 外链分发单次 PUT 的上限耗时。文件可以很大，这里只兜住真正挂死的连接，
- *  正常的中途取消由 Pi 工具的 AbortSignal（/stop）负责。 */
+/** 外链分发总预算，包含快照、等锁、探测和 PUT；同时受整轮任务和 /stop 取消约束。 */
 export const RELAY_HTTP_TIMEOUT = 30 * 60_000;
 /** 复用去重索引里的地址前，探测它是否还活着的超时。 */
 export const RELAY_PROBE_TIMEOUT = 15_000;
@@ -101,18 +106,13 @@ export const MAX_ACTIVE_REQUESTS = integerEnv(
 // ===== Agent 工具 =====
 /**
  * 模型没有显式声明 timeout 时，注入给 bash 工具的默认上限（秒）。
- * Pi 官方 bash 默认不限时，而一次挂死的命令会永久占住这一轮 prompt：用户只会收到
- * 「正在思考」，之后的消息都变成 steer，会话槽位也不再释放。宁可让超长命令报错、
- * 让模型自己重试或显式声明更大的 timeout，也不能让整轮对话无声卡死。
+ * 同时受整轮期限和取消信号约束；模型声明的 timeout 最大为 3600 秒。
  */
 export const BASH_DEFAULT_TIMEOUT = integerEnv("BOT_BASH_TIMEOUT", 600, 10, 3600);
 
 // ===== 资料索引 =====
 /**
- * 索引重建间隔（ms）。workspace 由外部同步盘镜像，新资料随时可能出现。
- *
- * 默认值定得短，是因为实测一次全量扫描（1250 个文件）只要 60ms，而且除进程内第一次
- * 之外都在后台刷新、不阻塞任何人——没有理由让新同步进来的资料等上十几分钟。
+ * 每轮检查索引是否过期；首次等待构建，之后返回旧索引并在后台刷新。
  */
 export const MATERIALS_INDEX_TTL = integerEnv(
   "BOT_INDEX_TTL_MINUTES",
@@ -127,31 +127,19 @@ export const MATERIALS_INDEX_MAX_FILES = integerEnv(
   100,
   1_000_000
 );
-/** 目录递归深度上限；同步盘里的深层归档超过此深度只统计不逐条列出。 */
+/** 目录递归深度上限；跳过更深分支并将索引标为不完整。 */
 export const MATERIALS_INDEX_MAX_DEPTH = integerEnv("BOT_INDEX_MAX_DEPTH", 12, 1, 64);
 
 // ===== 文档解析环境 =====
 /**
- * 群共享 Python 环境预装的包：前四个用于提取 pptx/docx/xlsx/pdf 的文本，其余用于按资料
- * 生成交付物（算表、出 Excel、处理图片）。装在 <group>/venv，与 workspace 平级：
- * workspace 是同步盘镜像，往里写 .venv 会被下一次同步删掉，也污染同步源。
- *
- * 这份清单同时是就绪标记的内容和提示词里那句「均已安装」的来源，改动它会让所有群在
- * 下次启动时重建 venv——因此临时需要的冷门包不要加进来，提示词已经告诉模型自行 uv pip
- * install 到同一个解释器。
+ * 解析和生成文档的直接依赖，完整依赖锁为 requirements.txt。
+ * 能力工具检查解释器、包版本及导入结果；标记只用于识别配置，不作为就绪依据。
+ * 使用指定环境、预装项目 .venv 或按需准备的群 venv；模型不能修改共享环境。
  */
-export const DOCUMENT_TOOLCHAIN_PACKAGES = [
-  "python-pptx",
-  "python-docx",
-  "openpyxl",
-  "pypdf",
-  "pandas",
-  "numpy",
-  "python-dateutil",
-  "xlsxwriter",
-  "pillow",
-] as const;
-/** 建环境 + 装包的总时限（ms）。超时视为不可用，提示词自动降级。 */
+export const DOCUMENT_TOOLCHAIN_PACKAGES: readonly string[] = documentPackages(readFileSync(
+  new URL("../../scripts/runtime/requirements.in", import.meta.url), "utf8"
+));
+/** 建环境、装包与验证的总时限（ms）；失败由能力工具明确返回。 */
 export const DOCUMENT_TOOLCHAIN_TIMEOUT = 10 * 60_000;
 
 // ===== Session 缓存 =====
