@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { clampThinkingLevel, Type, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { GROUP_DATA_ROOT, SESSION_IDLE_TTL, RUN_TIMEOUT_MS, MODEL_IDLE_TIMEOUT_MS } from "../core/config.ts";
+import { GROUP_DATA_ROOT, SESSION_IDLE_TTL, RUN_TIMEOUT_MS, MODEL_IDLE_TIMEOUT_MS, MODEL_RESPONSE_TIMEOUT_MS } from "../core/config.ts";
 import { log } from "../core/log.ts";
 import { MODELS_JSON_PATH, MODELS_STORE_PATH, PI_AGENT_DIR, RUNTIME_DIR } from "../core/storage.ts";
 import { application, waitFor } from "../core/lifecycle.ts";
@@ -124,8 +124,8 @@ interface SessionRecord {
   notes: OutboundNotes; deliveryId?: string; unsubscribe?: () => void;
   progress?: {
     id: string; started: number; updated: number; stage: string;
-    model: ModelProgress; signal: AbortSignal; checkModelIdle: () => void;
-    abortReason?: "model_idle" | "task_timeout" | "user_cancel" | "shutdown";
+    model: ModelProgress; signal: AbortSignal; checkModelLimits: () => void;
+    abortReason?: "model_idle" | "model_response_timeout" | "task_timeout" | "user_cancel" | "shutdown";
   };
 }
 const records = new Map<string, SessionRecord>();
@@ -256,7 +256,7 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
     if (event.type === "message_update") {
       setStage(record, "接收模型输出", p.model.update(event.assistantMessageEvent));
       // Also check on events so a flood of empty deltas cannot conceal a stalled stream.
-      p.checkModelIdle();
+      p.checkModelLimits();
     }
     if (event.type === "tool_execution_start" || event.type === "tool_execution_update" ||
         event.type === "tool_execution_end" || event.type === "turn_end" ||
@@ -290,20 +290,27 @@ export async function initializeAgentRuntime(): Promise<void> { await getRuntime
 async function run(record: SessionRecord, content: string, cancellation: AbortSignal): Promise<void> {
   const deadline = AbortSignal.timeout(RUN_TIMEOUT_MS);
   const modelIdle = new AbortController();
-  const signal = AbortSignal.any([application.signal, cancellation, deadline, modelIdle.signal]);
+  const modelResponse = new AbortController();
+  const signal = AbortSignal.any([application.signal, cancellation, deadline, modelIdle.signal, modelResponse.signal]);
   const p: NonNullable<SessionRecord["progress"]> = record.progress = {
     id: randomUUID().slice(0, 8), started: Date.now(), updated: Date.now(), stage: "准备会话",
     model: new ModelProgress(), signal,
-    checkModelIdle: () => {
-      if (signal.aborted || !p.model.isIdle(MODEL_IDLE_TIMEOUT_MS)) return;
-      modelIdle.abort(new Error(`模型连续 ${MODEL_IDLE_TIMEOUT_MS / 1000} 秒无有效进展（阶段：${p.stage}；任务：${p.id}）`));
+    checkModelLimits: () => {
+      if (signal.aborted) return;
+      // Sample before cancelling so a recent parsed change cannot be missed by throttling.
+      if (p.model.sampleToolArguments(p.model.isIdle(MODEL_IDLE_TIMEOUT_MS))) p.updated = Date.now();
+      if (p.model.isExpired(MODEL_RESPONSE_TIMEOUT_MS)) {
+        modelResponse.abort(new Error(`单次模型响应时限 ${MODEL_RESPONSE_TIMEOUT_MS / 1000} 秒已到（阶段：${p.stage}；任务：${p.id}）`));
+      } else if (p.model.isIdle(MODEL_IDLE_TIMEOUT_MS)) {
+        modelIdle.abort(new Error(`模型连续 ${MODEL_IDLE_TIMEOUT_MS / 1000} 秒无有效进展（阶段：${p.stage}；任务：${p.id}）`));
+      }
     },
   };
   record.lastTool = undefined;
-  log.info(`任务开始 - ${progressText(record)}, 总时限: ${RUN_TIMEOUT_MS / 1000}秒, 模型无进展时限: ${MODEL_IDLE_TIMEOUT_MS / 1000}秒`);
+  log.info(`任务开始 - ${progressText(record)}, 总时限: ${RUN_TIMEOUT_MS / 1000}秒, 模型无进展时限: ${MODEL_IDLE_TIMEOUT_MS / 1000}秒, 单次模型响应时限: ${MODEL_RESPONSE_TIMEOUT_MS / 1000}秒`);
   const heartbeat = setInterval(() => log.info("任务仍在运行 - " + progressText(record)), 60_000);
   heartbeat.unref();
-  const watchdog = setInterval(p.checkModelIdle, 1000);
+  const watchdog = setInterval(p.checkModelLimits, 1000);
   watchdog.unref();
   record.notes.clear();
   record.deliveryId = undefined;
@@ -314,8 +321,9 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
     if (!p.abortReason) {
       timeoutStage = p.stage;
       p.abortReason = application.signal.aborted ? "shutdown" : cancellation.aborted ? "user_cancel" :
-        modelIdle.signal.aborted ? "model_idle" : "task_timeout";
+        modelIdle.signal.aborted ? "model_idle" : modelResponse.signal.aborted ? "model_response_timeout" : "task_timeout";
       const reason = p.abortReason === "model_idle" ? "模型无有效进展超时" :
+        p.abortReason === "model_response_timeout" ? "单次模型响应超时" :
         p.abortReason === "task_timeout" ? "任务总时限到达" : "任务取消";
       log.warn(reason + " - " + progressText(record));
       p.model.pause();
@@ -359,6 +367,7 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
   } catch (error) {
     if (cancellation.aborted || application.signal.aborted) return;
     if (p.abortReason === "model_idle") throw modelIdle.signal.reason;
+    if (p.abortReason === "model_response_timeout") throw modelResponse.signal.reason;
     if (p.abortReason === "task_timeout") {
       throw new Error(`任务总时限 ${RUN_TIMEOUT_MS / 1000} 秒已到（阶段：${timeoutStage ?? record.progress?.stage}；任务：${record.progress?.id}）`);
     }
@@ -416,7 +425,8 @@ export async function handleUserMessage(phone: string, groupId: string, content:
       const p = record.progress;
       reply += `\n任务编号：${p.id}\n当前阶段：${p.stage}\n已用时间：${Math.floor((Date.now() - p.started) / 1000)} 秒` +
         `\n距上次进度更新：${Math.floor((Date.now() - p.updated) / 1000)} 秒\n最长处理时间：${RUN_TIMEOUT_MS / 1000} 秒` +
-        `\n模型无进展时限：${MODEL_IDLE_TIMEOUT_MS / 1000} 秒`;
+        `\n模型无进展时限：${MODEL_IDLE_TIMEOUT_MS / 1000} 秒` +
+        `\n单次模型响应时限：${MODEL_RESPONSE_TIMEOUT_MS / 1000} 秒`;
     }
   } else reply = command === "/help" ? HELP_TEXT : unknownCommandText(content);
   const receiptKey = record.key + command;

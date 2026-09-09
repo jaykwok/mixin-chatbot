@@ -86,6 +86,7 @@ try {
     $lastHeartbeat = ''
     $timeoutRecord = ''
     $modelIdleRecord = ''
+    $modelResponseRecord = ''
     $lastStreamEnd = ''
 
     # Scan oldest rotation first; the context buffer spans rotation boundaries.
@@ -115,6 +116,7 @@ try {
                     if ($line.Contains('任务仍在运行 -')) { $lastHeartbeat = $text }
                     if ($line.Contains('任务总时限到达 -')) { $timeoutRecord = $text }
                     if ($line.Contains('模型无有效进展超时 -')) { $modelIdleRecord = $text }
+                    if ($line.Contains('单次模型响应超时 -')) { $modelResponseRecord = $text }
                     if ($line.Contains('模型流结束 -')) { $lastStreamEnd = $text }
                     $taskWriter.WriteLine($text)
                     foreach ($previous in $recent) { Write-ContextEntry $previous }
@@ -152,6 +154,9 @@ try {
         '模型无有效进展超时记录（取消清理前）:',
         (Show-Record $modelIdleRecord),
         '',
+        '单次模型响应超时记录（取消清理前）:',
+        (Show-Record $modelResponseRecord),
+        '',
         '最后一条模型流结束记录（含流统计和结束原因）:',
         (Show-Record $lastStreamEnd),
         '',
@@ -160,7 +165,7 @@ try {
         '',
         'task.log: 仅任务匹配行；context.log: 匹配行及前后文，重叠行只保留一次。',
         '每行带原日志文件名和行号；-- 表示省略了不相关的日志。',
-        '接收模型输出阶段要结合有效内容增长和流事件统计判断；旧版本可能未记录这些字段，本报告不直接断言超时原因。',
+        '接收模型输出阶段要结合解析参数变化、无进展时间和流事件统计判断；原始增量增长不等于有效进展，旧版本可能未记录这些字段，本报告不直接断言超时原因。',
         '这是已写入日志的一次读取，运行中的任务可能继续产生日志。'
     )
     if ($count -eq 0) {

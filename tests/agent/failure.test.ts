@@ -98,6 +98,15 @@ describe("请求失败回执", () => {
     expect(reply).not.toContain("超过了最长等待时间");
   });
 
+  test("model response deadline is distinct from inactivity and whole-task timeout", () => {
+    const reply = describeRequestFailure(new Error("单次模型响应时限 600 秒已到（阶段：接收模型输出；任务：e78cd520）"));
+    expect(reply).toContain("模型未能在规定时间内完成本次响应");
+    expect(reply).toContain("任务：e78cd520");
+    expect(reply).not.toContain("连不上模型服务");
+    expect(reply).not.toContain("没有产生新的有效内容");
+    expect(reply).not.toContain("超过了最长等待时间");
+  });
+
   test("上下文超限提示用户自己 /clear", () => {
     const reply = describeRequestFailure(
       new Error("模型未返回回复：400: This model's maximum context length is 128000 tokens")

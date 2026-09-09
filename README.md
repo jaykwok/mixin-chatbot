@@ -112,17 +112,17 @@ bash scripts/ops/ops.sh doctor
 
 模型配置保存在 `data/config/models.json`，使用 Pi 原生 provider，每个实例选择一个服务商和一个模型。`bun run configure` 提供两种方式：
 
-- **Pi 内置服务商**：选择服务商、模型并填写 API Key，地址、协议、工具兼容和模型能力由 Pi 提供。国内智谱 Coding Plan 在当前 Pi 目录中为 `zai-coding-cn`，国际站为 `zai`，请按实际账号选择。
+- **Pi 内置服务商**：选择服务商、模型并填写 API Key，地址、协议、工具兼容和模型能力由 Pi 提供。可选项来自所安装 Pi 版本的服务商目录，向导只列出使用 API Key 且有可用模型的条目。同一家厂商的不同站点、区域或套餐在目录中可能是彼此独立的服务商 ID，请按实际账号选择；ID 和模型清单会随 Pi 版本变化，以向导当前列出的为准。
 - **自定义服务商**：填写地址、Key 和模型资料，向导支持 `openai-completions`、`openai-responses`、`anthropic-messages`；高级参数遵循 Pi 的 `models.json` 格式。
 
 **本次配置格式不兼容旧版。更新后先停机并重新运行 `bun run configure`，再启动服务。** 顶层 `modelId` 和 `thinkingLevel` 用于本项目选定模型与推理级别，`providers` 交给 Pi 原生加载。内置模式只写凭证，不复制或覆盖目录中的模型定义：
 
 ```json
 {
-  "modelId": "glm-5.3-flash",
+  "modelId": "YOUR_MODEL_ID",
   "thinkingLevel": "low",
   "providers": {
-    "zai-coding-cn": { "apiKey": "YOUR_API_KEY" }
+    "YOUR_PROVIDER_ID": { "apiKey": "YOUR_API_KEY" }
   }
 }
 ```
@@ -159,7 +159,8 @@ bash scripts/ops/ops.sh doctor
 | `BOT_MAX_ACTIVE_REQUESTS` | 32 | 1–1000，普通请求总量 |
 | `BOT_BASH_TIMEOUT` | 600 秒 | 10–3600 秒；工具可声明其他时限，最高 3600 秒 |
 | `BOT_RUN_TIMEOUT_SECONDS` | 1200 秒 | 10–7200 秒，覆盖准备、模型、工具与最终交付 |
-| `BOT_MODEL_IDLE_TIMEOUT_SECONDS` | 180 秒 | 10–7200 秒；模型等待或输出期间连续无有效内容增长的上限 |
+| `BOT_MODEL_IDLE_TIMEOUT_SECONDS` | 180 秒 | 10–7200 秒；模型等待或输出期间连续无有效进展的上限 |
+| `BOT_MODEL_RESPONSE_TIMEOUT_SECONDS` | 600 秒 | 10–7200 秒；单次模型响应的上限，持续输出也不续期 |
 | `BOT_DELIVERY_TIMEOUT_SECONDS` | 180 秒 | 1–600 秒，包含出站排队和重试 |
 | `BOT_SHUTDOWN_TIMEOUT_SECONDS` | 20 秒 | 5–25 秒，覆盖 HTTP、任务、进程与租约收尾 |
 | `BOT_INDEX_TTL_MINUTES` | 5 分钟 | 1–1440 分钟，活跃会话每轮检查 |
@@ -269,7 +270,11 @@ Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件�
 3. 只有某个群异常时，发送 `/stop`，等待 `/status` 变为空闲，再发 `/clear`。收到归档确认后，用“只回复 OK”测试。`/clear` 归档当前用户在本群的会话，不清除群资料。若恢复，旧会话上下文是重要线索；若仍失败，保留这一轮阶段日志继续检查 Pi 请求与模型服务。
 4. 普通 HTTP 流探测成功只验证该次请求，不能验证机器人的完整历史、工具定义、思考模式和压缩请求。`doctor`/健康检查也不能证明模型回答正常。
 
-模型等待或输出期间，默认连续 180 秒无有效内容增长就主动取消；计时从每个模型轮次开始，包含首个内容到达前的等待。正文、思考和工具参数增量中的非空白字符算作有效增长，空增量、纯空白、块开始/结束等元数据事件不续期。“最近进展距今”在接收模型输出时只随有效增长刷新。工具执行、历史压缩、重试等待和最终发送期间暂停模型无进展检测，下个模型轮次重新计时。这是流活跃度检测，不能判断非空内容是否重复或有用。
+模型等待或输出期间，默认连续 180 秒无有效进展就主动取消；计时从每个模型轮次开始，包含首个内容到达前的等待。正文、思考增量中的非空白字符会刷新进展时间；工具参数则比较 SDK 解析后的参数 JSON，仅在参数发生变化时刷新。原始工具参数增量再多，只要解析结果不变，就不算进展。空增量、纯空白正文/思考、块开始/结束、工具名称/调用 ID 和初始空参数对象也不续期。“最近进展距今”在接收模型输出时随上述进展刷新。
+
+解析参数最多每秒采样一次，模型响应结束或准备因无进展取消时补查尚未采样的变化；只保留摘要用于比较，不把参数内容写入运行日志，也不提前执行尚未结束的工具调用。每个工具分别比较，再合并为本次响应的进展。采样比较不等于判断语义有用性：反复改写参数或重复输出正文仍可能续期，因此另设**单次模型响应 600 秒上限**，持续有进展也不能延长。
+
+这两种模型时限都只在等待模型或接收输出时生效；工具执行、历史压缩、重试等待和最终发送期间暂停，下个模型轮次重新计时。检测随流事件及每秒定时检查触发。
 
 任务摘要中的 `模型流` 按当前模型响应累计，`response` 标识本任务的第几个模型响应：
 
@@ -278,13 +283,16 @@ Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件�
 | `events` / `lastEvent` | SDK 流事件类型与数量（含 assistant 的 `message_start`、`message_end`），不是原始网络包 |
 | `emptyDeltas` / `whitespaceDeltas` | 空字符串 / 仅空白的增量数量 |
 | `textChars` / `thinkingChars` / `toolArgsChars` | 已收到的正文 / 思考 / 工具参数增量字符量，包含空白，按 UTF-16 计数 |
-| `effectiveChars` | 上述增量中非空白字符的累计量；比较两条摘要可得到期间增长量 |
-| `active` / `elapsedSeconds` / `idleSeconds` / `lastEventSecondsAgo` | 检测是否启用 / 本轮次开始至今的秒数 / 距有效增长或轮次开始的秒数 / 距流事件的秒数；暂停后时长冻结 |
+| `effectiveChars` | 上述原始增量中非空白字符的累计量，保留用于诊断；工具参数部分的增长不再用于刷新无进展时限 |
+| `parsedToolArgsChars` | 最近采样的所有工具参数 JSON 长度之和（UTF-16，含 JSON 语法字符），可增可减，与原始增量累计量不同 |
+| `toolArgsChanges` / `toolArgsLastChangeSecondsAgo` | 所有工具的已观察参数变化次数之和 / 距最后一次参数变化的秒数；从未观察到变化时为 `null` |
+| `toolCalls` / `tools` | 已观察工具调用数 / 前 8 个工具的名称、内容块序号、解析参数长度、变化次数及距变化的时间；进展检测覆盖全部调用 |
+| `active` / `elapsedSeconds` / `idleSeconds` / `lastEventSecondsAgo` | 检测是否启用 / 本轮次开始至今的秒数 / 距上述有效进展或轮次开始的秒数 / 距流事件的秒数；暂停后时长冻结 |
 | `responseId` / `stopReason` / `rawStopReason` | 上游响应标识 / SDK 结束原因 / 上游原始结束原因；未提供时为 `null` |
 
-事件持续增加但 `effectiveChars` 不增长时，说明仍收到事件却没有新内容。`rawStopReason=null` 只表示未观察到上游结束原因；取消后 `stopReason=aborted` 是本地取消结果，需结合取消前记录判断。日志另记 `取消原因`，区分 `model_idle`、`task_timeout`、`user_cancel`、`shutdown`。这些信息本身不能确定故障在上游服务还是 SDK。
+事件持续增加但 `effectiveChars` 不增长时，说明仍收到事件却没有新的非空白增量。若 `toolArgsChars` 持续增长，而 `parsedToolArgsChars` 很小、`toolArgsChanges` 不再增加、`toolArgsLastChangeSecondsAgo` 持续变大，则原始工具参数流没有推动可观察的解析结果变化。只看参数长度不能判断内容是否改变，需结合变化次数。`rawStopReason=null` 只表示未观察到上游结束原因；取消后 `stopReason=aborted` 是本地取消结果，需结合取消前记录判断。日志另记 `取消原因`，区分 `model_idle`、`model_response_timeout`、`task_timeout`、`user_cancel`、`shutdown`。这些信息本身不能确定故障在上游服务还是 SDK。
 
-整轮时限仍为 1200 秒，覆盖准备、模型、工具和交付，两种时限以先到者为准。可通过 `data/config/runtime.json` 或环境变量设置 `BOT_MODEL_IDLE_TIMEOUT_SECONDS`，重启生效；无可见增量的长思考模型可按实测调整。取消会等待 SDK 清理完毕再执行同一用户的下一条消息。上游只返回 `The operation timed out.` 时不直接断言网络不通。若日志已到“等待取消清理”却长期不结束，先保存日志，再用运维 `restart` 恢复实例。
+整轮时限仍为 1200 秒，覆盖准备、模型、工具和交付，三种时限以先到者为准。可通过 `data/config/runtime.json` 或环境变量设置 `BOT_MODEL_IDLE_TIMEOUT_SECONDS` 和 `BOT_MODEL_RESPONSE_TIMEOUT_SECONDS`，重启生效；无可见增量的长思考模型、耗时较长的正常生成可按实测调整。超时后仍需等待 SDK 取消清理完毕，再执行同一用户的下一条消息，因此最终报错耗时可能超过阈值。上游只返回 `The operation timed out.` 时不直接断言网络不通。若日志已到“等待取消清理”却长期不结束，先保存日志，再用运维 `restart` 恢复实例。
 
 ### 按任务编号提取日志
 
@@ -308,7 +316,7 @@ bash scripts/ops/task-logs.sh 555d838a
 
 - `task.log`：仅任务匹配行，附原文件名和行号。
 - `context.log`：任务行及前后文；`--` 表示中间省略了其他日志。
-- `summary.txt`：扫描范围、匹配数量、首次匹配前最近的模型就绪信息、首末记录、最后运行心跳、两种超时记录及最后的模型流结束统计。
+- `summary.txt`：扫描范围、匹配数量、首次匹配前最近的模型就绪信息、首末记录、最后运行心跳、三种超时记录及最后的模型流结束统计。
 
 可选参数：Windows 用 `-Context 5 -LogDir "D:\saved-logs"`；Linux 用
 `--context 5 --log-dir /path/to/saved-logs`。上下文范围为 0–100 行，日志目录默认相对脚本定位项目，

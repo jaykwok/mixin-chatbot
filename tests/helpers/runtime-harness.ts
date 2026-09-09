@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { mkdir, writeFile, access } from "node:fs/promises";
 import { mock } from "bun:test";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ToolCall } from "@earendil-works/pi-ai";
 import { waitFor, application } from "../../src/core/lifecycle.ts";
 const sdk = await import("@earendil-works/pi-coding-agent");
 const completed: string[] = [];
@@ -96,8 +96,8 @@ const store = new DeliveryStore();
 const callback = (key: string) => "https://im.zdxlz.com/im-external/v1/webhook/send?key=" + key;
 const request = (user: string, content: string) => runtime.handleUserMessage(user, "group", content, callback(user));
 
-// A separate process selects this mode with a 10s model idle budget and a 45s task budget.
-if (process.argv.includes("--model-idle")) {
+// Separate processes exercise each model limit before the 45s whole-task budget.
+if (process.argv.includes("--model-idle") || process.argv.includes("--model-response")) {
   const partial = (responseId: string): AssistantMessage => ({
     role: "assistant", content: [], api: "openai-completions", provider: "fake", model: "fake", responseId,
     stopReason: "pending", timestamp: Date.now(),
@@ -122,11 +122,113 @@ if (process.argv.includes("--model-idle")) {
     session.emit?.({ type: "message_end", message });
     session.promptGate!.release();
   }
+  function toolCall(message: AssistantMessage, args: ToolCall["arguments"]): ToolCall {
+    const block: ToolCall = { type: "toolCall", id: "call-" + message.responseId, name: "bash", arguments: args };
+    message.content[0] = block;
+    return block;
+  }
+  async function complete() {
+    await runtime.disposeAllSessions();
+    await application.drain();
+    stateDatabase().close();
+    console.log("HARNESS_RESULT=" + JSON.stringify(completed));
+    process.exit(0);
+  }
+
+  if (process.argv.includes("--model-response")) {
+    const silent = await blocked("response-silent");
+    begin(silent.session, partial("response-silent-id"));
+    const growing = await blocked("response-growing");
+    const growingMessage = partial("response-growing-id");
+    const growingTool = toolCall(growingMessage, { command: "private-command-0" });
+    growing.session.abortGate = gate();
+    begin(growing.session, growingMessage);
+    let sequence = 0;
+    const growingTimer = setInterval(() => {
+      growingTool.arguments.command = "private-command-" + ++sequence;
+      delta(growing.session, growingMessage, "private-raw-delta");
+    }, 200);
+    const next = request("response-growing", "after-response-timeout");
+
+    const reset = await blocked("response-reset");
+    let resetMessage = partial("response-reset-first");
+    begin(reset.session, resetMessage);
+    const resetAt = Date.now() + 6000;
+    let restarted = false;
+    const resetTimer = setInterval(() => {
+      if (!restarted && Date.now() >= resetAt) {
+        resetMessage.stopReason = "toolUse";
+        reset.session.emit?.({ type: "message_end", message: resetMessage });
+        reset.session.emit?.({ type: "tool_execution_start", toolName: "read" });
+        reset.session.emit?.({ type: "tool_execution_end", toolName: "read" });
+        resetMessage = partial("response-reset-second");
+        begin(reset.session, resetMessage);
+        restarted = true;
+      }
+      delta(reset.session, resetMessage, "private-answer", "text_delta");
+    }, 200);
+
+    const paused = [];
+    for (const stage of ["tool", "compaction", "retry"] as const) {
+      const item = await blocked("response-" + stage);
+      const message = partial("response-" + stage + "-first");
+      begin(item.session, message);
+      item.session.emit?.(stage === "tool" ? { type: "tool_execution_start", toolName: "read" } :
+        stage === "compaction" ? { type: "compaction_start" } :
+          { type: "auto_retry_start", attempt: 1, maxAttempts: 1, delayMs: 12_000, errorMessage: "503: fake retry" });
+      paused.push(item);
+    }
+    finalGate = gate();
+    const delivery = await blocked("response-delivery");
+    const deliveryMessage = partial("response-delivery-id");
+    begin(delivery.session, deliveryMessage);
+    finish(delivery.session, deliveryMessage);
+    await until(() => finalCalls === 1);
+
+    await until(() => !!silent.session.controller?.signal.aborted && !!growing.session.controller?.signal.aborted, 14_000);
+    clearInterval(growingTimer);
+    assert.match(String(await silent.result), /单次模型响应时限 10 秒已到.*阶段：等待模型响应/);
+    assert.equal(prompts.includes("after-response-timeout"), false, "response deadline bypassed abort cleanup");
+    growingMessage.stopReason = "aborted";
+    growing.session.emit?.({ type: "message_end", message: growingMessage });
+    begin(growing.session, partial("late-response-must-be-ignored"));
+    delta(growing.session, growingMessage, "late-output-must-be-ignored");
+    growing.session.emit?.({ type: "tool_execution_start", toolName: "late-tool" });
+    await request("response-growing", "/status");
+    assert.match(sent.at(-1)!, /当前阶段：等待取消清理/);
+    assert.match(sent.at(-1)!, /单次模型响应时限：10 秒/);
+    assert.equal(store.pending(JSON.stringify(["group", "response-growing"])).length, 0);
+    growing.session.abortGate!.release();
+    assert.match(String(await growing.result), /单次模型响应时限 10 秒已到.*阶段：接收模型输出/);
+    await until(() => prompts.includes("after-response-timeout"));
+    completed.push("silent-and-growing-responses-hit-hard-deadline-with-cleanup");
+
+    // Exceed the first response's deadline while the second response and other phases continue.
+    await Bun.sleep(1200);
+    assert.equal(restarted, true);
+    for (const item of [reset, ...paused, delivery]) assert.equal(item.session.controller?.signal.aborted, false);
+    for (const item of [reset, ...paused]) assert.equal(item.session.active, true);
+    clearInterval(resetTimer);
+    finish(reset.session, resetMessage);
+    for (const item of paused) {
+      const message = partial("response-after-pause");
+      begin(item.session, message);
+      delta(item.session, message, "private-final-answer", "text_delta");
+      finish(item.session, message);
+    }
+    finalGate.release();
+    for (const item of [reset, ...paused, delivery]) assert.equal(await item.result, undefined);
+    await next;
+    finalGate = undefined;
+    completed.push("response-deadline-resets-and-excludes-tools-compaction-retry-delivery");
+    await complete();
+  }
 
   const silent = await blocked("idle-silent");
   silent.session.emit?.({ type: "turn_start" });
   const empty = await blocked("idle-empty");
   const emptyMessage = partial("idle-empty-response");
+  toolCall(emptyMessage, { path: "private-tool-argument" });
   empty.session.abortGate = gate();
   begin(empty.session, emptyMessage);
   delta(empty.session, emptyMessage, '{"path": "private-tool-argument"}');
@@ -135,6 +237,26 @@ if (process.argv.includes("--model-idle")) {
     delta(empty.session, emptyMessage, " \n");
   }, 50);
   const next = request("idle-empty", "after-idle-cancellation");
+
+  const stable = await blocked("idle-stable-args");
+  const stableMessage = partial("idle-stable-response");
+  const stableTool = toolCall(stableMessage, { command: "private-stable-command", timeout: 60 });
+  begin(stable.session, stableMessage);
+  delta(stable.session, stableMessage, "private-raw-delta");
+  const stableTimer = setInterval(() => {
+    stableTool.arguments = { command: "private-stable-command", timeout: 60 };
+    delta(stable.session, stableMessage, "private-raw-delta");
+  }, 50);
+
+  const parsed = await blocked("idle-parsed-growth");
+  const parsedMessage = partial("idle-parsed-response");
+  const parsedTool = toolCall(parsedMessage, { command: "private-command-0" });
+  begin(parsed.session, parsedMessage);
+  let changes = 0;
+  const parsedTimer = setInterval(() => {
+    parsedTool.arguments.command = "private-command-" + ++changes;
+    delta(parsed.session, parsedMessage, "private-raw-delta");
+  }, 500);
 
   const growing = await blocked("idle-growing");
   const growingMessage = partial("idle-growing-response");
@@ -147,6 +269,7 @@ if (process.argv.includes("--model-idle")) {
 
   const tool = await blocked("idle-tool");
   const toolMessage = partial("idle-tool-response");
+  toolCall(toolMessage, { path: "file" });
   begin(tool.session, toolMessage);
   delta(tool.session, toolMessage, '{"path":"file"}');
   toolMessage.stopReason = "toolUse"; toolMessage.rawStopReason = "tool_calls";
@@ -172,8 +295,12 @@ if (process.argv.includes("--model-idle")) {
   let delivered = false;
   void delivery.result.then(() => { delivered = true; });
 
-  await until(() => !!silent.session.controller?.signal.aborted && !!empty.session.controller?.signal.aborted, 15_000);
+  await until(() => !!silent.session.controller?.signal.aborted && !!empty.session.controller?.signal.aborted &&
+    !!stable.session.controller?.signal.aborted, 16_000);
   clearInterval(emptyTimer);
+  clearInterval(stableTimer);
+  assert.match(String(await stable.result), /模型连续 10 秒无有效进展.*阶段：接收模型输出/);
+  completed.push("nonempty-raw-deltas-with-stable-parsed-arguments-stop");
   assert.match(String(await silent.result), /模型连续 10 秒无有效进展.*阶段：等待模型响应/);
   assert.equal(prompts.includes("after-idle-cancellation"), false, "next prompt escaped the abort cleanup barrier");
   emptyMessage.stopReason = "aborted";
@@ -192,14 +319,16 @@ if (process.argv.includes("--model-idle")) {
   completed.push("silent-and-empty-streams-stop-with-cleanup-barrier");
 
   // These phases have lasted longer than the idle budget and must still be running.
-  for (const item of [growing, tool, compaction, retry]) {
+  for (const item of [growing, parsed, tool, compaction, retry]) {
     assert.equal(item.session.active, true);
     assert.equal(item.session.controller?.signal.aborted, false);
   }
   assert.equal(delivered, false);
   assert.equal(delivery.session.controller?.signal.aborted, false);
   clearInterval(growingTimer);
+  clearInterval(parsedTimer);
   finish(growing.session, growingMessage);
+  finish(parsed.session, parsedMessage);
   for (const [item, id] of [[tool, "idle-tool-next"], [compaction, "idle-compaction-next"], [retry, "idle-retry-next"]] as const) {
     const message = partial(id);
     begin(item.session, message);
@@ -207,7 +336,7 @@ if (process.argv.includes("--model-idle")) {
     finish(item.session, message);
   }
   finalGate.release();
-  for (const item of [growing, tool, compaction, retry, delivery]) assert.equal(await item.result, undefined);
+  for (const item of [growing, parsed, tool, compaction, retry, delivery]) assert.equal(await item.result, undefined);
   await next;
   finalGate = undefined;
   completed.push("growth-tools-compaction-retry-and-delivery-survive");
@@ -215,11 +344,7 @@ if (process.argv.includes("--model-idle")) {
   await request("idle-empty", "/status");
   assert.match(sent.at(-1)!, /状态：空闲/);
   assert.doesNotMatch(sent.at(-1)!, /任务编号：/);
-  await runtime.disposeAllSessions();
-  await application.drain();
-  stateDatabase().close();
-  console.log("HARNESS_RESULT=" + JSON.stringify(completed));
-  process.exit(0);
+  await complete();
 }
 
 // Diagnose a silent stream and compaction separately; stale tool state must not leak into the next run.
