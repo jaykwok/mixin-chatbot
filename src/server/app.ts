@@ -24,6 +24,14 @@ export interface AppOptions {
 export function createApp(options: AppOptions): Hono {
 const app = new Hono();
 
+/** 拒绝日志不包含查询参数、请求体或 webhook 密钥，外部字段限制长度。 */
+function logRejectedRequest(c: Context, status: number, reason: string): void {
+  const path = c.req.path.startsWith("/webhook/") ? "/webhook/<redacted>" : c.req.path;
+  log.warn(
+    `拒绝请求 - IP: ${getClientIp(c).slice(0, 128)}, 方法: ${c.req.method}, 路径: ${path.slice(0, 256)}, 状态码: ${status}, 原因: ${reason}`
+  );
+}
+
 
 /** 限量读取 JSON，避免在进入字段校验前接收无限大的请求体。 */
 async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
@@ -168,12 +176,16 @@ if (webhookSecret) {
   app.post("/webhook/:secret", async (c) => {
     const got = c.req.param("secret");
     if (!got || !constantTimeEqual(got, webhookSecret)) {
+      logRejectedRequest(c, 404, "webhook_secret_mismatch");
       return c.json({ status: "error", message: "Not Found" }, 404);
     }
     return webhookHandler(c);
   });
   // 无密钥路径直接 404，强制走密钥路径
-  app.post("/webhook", (c) => c.json({ status: "error", message: "Not Found" }, 404));
+  app.post("/webhook", (c) => {
+    logRejectedRequest(c, 404, "webhook_secret_missing");
+    return c.json({ status: "error", message: "Not Found" }, 404);
+  });
 } else {
   if (!options.allowInsecure) {
     throw new Error(
@@ -195,6 +207,8 @@ app.get("/favicon.ico", async () =>
 
 app.onError((err, c) => {
   if (err instanceof HttpError) {
+    // err.message 可能包含来自请求体的字段值，日志只记录稳定的原因标签。
+    logRejectedRequest(c, err.status, "http_error");
     return new Response(JSON.stringify({ status: "error", message: err.message }), {
       status: err.status,
       headers: { "Content-Type": "application/json" },
@@ -203,7 +217,10 @@ app.onError((err, c) => {
   log.error(`未处理异常 - IP: ${getClientIp(c)}, 错误: ${String(err)}`);
   return c.json({ status: "error", message: "内部服务器错误" }, 500);
 });
-app.notFound((c) => c.json({ status: "error", message: "Not Found" }, 404));
+app.notFound((c) => {
+  logRejectedRequest(c, 404, "route_not_found");
+  return c.json({ status: "error", message: "Not Found" }, 404);
+});
 
 
 app.get("/health", (c) => c.json({ status: options.isStopping() ? "stopping" : "ready", pid: process.pid }));
