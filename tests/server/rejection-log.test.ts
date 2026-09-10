@@ -11,6 +11,21 @@ function context(path = "/webhook/private-secret", ip = "203.0.113.5") {
 }
 
 describe("bounded rejection summaries", () => {
+  test("shares the detail limit across changing IPs and paths", () => {
+    const lines: string[] = [];
+    const logger = new RejectionLogger(line => lines.push(line), 60_000, 2);
+    try {
+      for (let i = 0; i < 20; i++) {
+        logger.record(context(`/scan-${i}`, `203.0.113.${i + 1}`), 404, "route_not_found");
+      }
+      expect(lines).toHaveLength(2);
+      logger.flush();
+      expect(lines).toHaveLength(3);
+      expect(lines[2]).toContain("总数: 20, 已记录: 2, 已抑制: 18");
+      expect(lines[2]).toContain('"route_not_found":20');
+    } finally { logger.flush(); }
+  });
+
   test("summarizes once when traffic stops, then renews the detail budget", async () => {
     const lines: string[] = [];
     let done!: () => void;
@@ -45,8 +60,8 @@ describe("bounded rejection summaries", () => {
     [new HttpError(403, "private-body"), "request_validation", "forbidden_request"],
     [new HttpError(408, "private-body"), "request_validation", "request_timeout"],
     [new HttpError(408, "private-body", "service_stopping"), "runtime_protection", "service_stopping"],
-    [new HttpError(409, "private-body"), "runtime_protection", "runtime_protection"],
-    [new HttpError(503, "private-body"), "runtime_protection", "runtime_protection"],
+    [new HttpError(409, "private-body"), "runtime_protection", "runtime_rejected"],
+    [new HttpError(503, "private-body"), "runtime_protection", "runtime_rejected"],
     [new HttpError(503, "private-body", "callback_route_capacity"), "runtime_protection", "callback_route_capacity"],
   ])("classifies %o without leaking the error message", (error, category, reason) => {
     const lines: string[] = [];

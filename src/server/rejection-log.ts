@@ -17,7 +17,7 @@ const categories = {
   callback_route_capacity: "runtime_protection",
   callback_route_conflict: "runtime_protection",
   request_capacity: "runtime_protection",
-  runtime_protection: "runtime_protection",
+  runtime_rejected: "runtime_protection",
 } as const;
 type Reason = keyof typeof categories;
 type Category = (typeof categories)[Reason];
@@ -67,7 +67,7 @@ export class RejectionLogger {
       413: "payload_too_large", 415: "unsupported_media_type",
     };
     this.record(c, error.status, error.reason ??
-      (error.status === 409 || error.status >= 500 ? "runtime_protection" :
+      (error.status === 409 || error.status >= 500 ? "runtime_rejected" :
         reasons[error.status] ?? "request_rejected"));
   }
 
