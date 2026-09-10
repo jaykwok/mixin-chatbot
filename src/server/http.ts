@@ -4,7 +4,8 @@ import type { Context } from "hono";
 
 /** 可抛出的 HTTP 错误，webhook 层捕获后返回对应状态码。 */
 export class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(public status: number, message: string,
+    public reason?: "service_stopping" | "callback_route_capacity" | "callback_route_conflict") {
     super(message);
   }
 }

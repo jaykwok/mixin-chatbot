@@ -8,6 +8,7 @@ import { WEBHOOK_SECRET_FILE } from "../core/storage.ts";
 import { log } from "../core/log.ts";
 import { observeCallbackRoute } from "../integrations/callback-route.ts";
 import { constantTimeEqual, getClientIp, HttpError, isJsonContentType } from "./http.ts";
+import { RejectionLogger } from "./rejection-log.ts";
 import { enqueueUserRequest, enqueueUserNotice, hasUserRequestCapacity, isDuplicate,
   isRateLimited, rememberRequest, validateWebhookData } from "./webhook.ts";
 
@@ -24,13 +25,8 @@ export interface AppOptions {
 export function createApp(options: AppOptions): Hono {
 const app = new Hono();
 
-/** 拒绝日志不包含查询参数、请求体或 webhook 密钥，外部字段限制长度。 */
-function logRejectedRequest(c: Context, status: number, reason: string): void {
-  const path = c.req.path.startsWith("/webhook/") ? "/webhook/<redacted>" : c.req.path;
-  log.warn(
-    `拒绝请求 - IP: ${getClientIp(c).slice(0, 128)}, 方法: ${c.req.method}, 路径: ${path.slice(0, 256)}, 状态码: ${status}, 原因: ${reason}`
-  );
-}
+const rejectionLog = new RejectionLogger();
+options.signal.addEventListener("abort", () => rejectionLog.flush(), { once: true });
 
 
 /** 限量读取 JSON，避免在进入字段校验前接收无限大的请求体。 */
@@ -64,7 +60,8 @@ async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
   }
   } catch (error) {
     void reader.cancel().catch(() => {});
-    if (signal.aborted) throw new HttpError(408, "请求体读取超时或服务关闭");
+    if (signal.aborted) throw new HttpError(408, "请求体读取超时或服务关闭",
+      options.signal.aborted ? "service_stopping" : undefined);
     throw error;
   } finally { reader.releaseLock(); }
 
@@ -89,7 +86,7 @@ async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
 
 /** webhook 业务处理：解析 + 校验 + 去重 + 限流 + 后台异步。 */
 const webhookHandler = async (c: Context) => {
-  if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试");
+  if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试", "service_stopping");
 
   // 声明了 Content-Type 时只接受标准 JSON 或 +json 媒体类型。
   const ct = c.req.header("content-type") ?? "";
@@ -109,20 +106,22 @@ const webhookHandler = async (c: Context) => {
   if (!callbackRoute.safe) {
     if (callbackRoute.reason === "capacity") {
       log.error(`callback 路由保护容量已满，拒绝未知 key ${callbackRoute.fingerprint}`);
-      throw new HttpError(503, "回调路由保护暂时无法接收新的机器人 key");
+      throw new HttpError(503, "回调路由保护暂时无法接收新的机器人 key", "callback_route_capacity");
     }
     log.error(
       `阻止跨群广播：回复 key ${callbackRoute.fingerprint} 同时对应多个群 (${callbackRoute.groups.join(", ")})；请为每个群重新创建独立的会话机器人`
     );
     throw new HttpError(
       409,
-      "同一个机器人回复 key 被多个群共用；为防止消息串群，本次请求已停止"
+      "同一个机器人回复 key 被多个群共用；为防止消息串群，本次请求已停止",
+      "callback_route_conflict"
     );
   }
 
   if (isSlashCommandMessage(content)) {
-    if (options.isStopping()) throw new HttpError(503, "服务正在关闭");
+    if (options.isStopping()) throw new HttpError(503, "服务正在关闭", "service_stopping");
     const accepted = enqueueUserRequest(content, phone, groupId, callbackUrl, clientIp);
+    if (!accepted) rejectionLog.record(c, 503, "request_capacity");
     return c.json({ status: accepted ? "success" : "busy" }, accepted ? 200 : 503);
   }
   if (isDuplicate(phone, groupId, content)) {
@@ -152,7 +151,7 @@ const webhookHandler = async (c: Context) => {
     return c.json({ status: "success" });
   }
   // readJsonBody 等 await 期间可能收到关闭信号；不再接收无法被关机流程追踪的新任务。
-  if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试");
+  if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试", "service_stopping");
   // ack 200，后台异步处理；同一会话由 agent 层 FIFO 和控制屏障协调。
   if (!enqueueUserRequest(content, phone, groupId, callbackUrl, clientIp)) {
     // 单线程内无 await，正常不会在容量预检后命中；仍按不可重投平台处理。
@@ -176,14 +175,14 @@ if (webhookSecret) {
   app.post("/webhook/:secret", async (c) => {
     const got = c.req.param("secret");
     if (!got || !constantTimeEqual(got, webhookSecret)) {
-      logRejectedRequest(c, 404, "webhook_secret_mismatch");
+      rejectionLog.record(c, 404, "webhook_secret_mismatch");
       return c.json({ status: "error", message: "Not Found" }, 404);
     }
     return webhookHandler(c);
   });
   // 无密钥路径直接 404，强制走密钥路径
   app.post("/webhook", (c) => {
-    logRejectedRequest(c, 404, "webhook_secret_missing");
+    rejectionLog.record(c, 404, "webhook_secret_missing");
     return c.json({ status: "error", message: "Not Found" }, 404);
   });
 } else {
@@ -208,7 +207,7 @@ app.get("/favicon.ico", async () =>
 app.onError((err, c) => {
   if (err instanceof HttpError) {
     // err.message 可能包含来自请求体的字段值，日志只记录稳定的原因标签。
-    logRejectedRequest(c, err.status, "http_error");
+    rejectionLog.httpError(c, err);
     return new Response(JSON.stringify({ status: "error", message: err.message }), {
       status: err.status,
       headers: { "Content-Type": "application/json" },
@@ -218,7 +217,7 @@ app.onError((err, c) => {
   return c.json({ status: "error", message: "内部服务器错误" }, 500);
 });
 app.notFound((c) => {
-  logRejectedRequest(c, 404, "route_not_found");
+  rejectionLog.record(c, 404, "route_not_found");
   return c.json({ status: "error", message: "Not Found" }, 404);
 });
 

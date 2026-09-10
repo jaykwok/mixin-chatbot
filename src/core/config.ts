@@ -155,3 +155,6 @@ export const LOG_DIR = "logs";
 export const LOG_FILE = "mixin-chatbot.log";
 export const LOG_MAX_BYTES = 5 * 1024 ** 2; // 5MB
 export const LOG_BACKUP_COUNT = 3;
+/** 拒绝日志按类别分别限量，防止扫描流量耗尽所有日志保留空间。 */
+export const REJECTION_LOG_WINDOW_MS = 60_000;
+export const REJECTION_LOG_DETAIL_LIMIT = 10;
