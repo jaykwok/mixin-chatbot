@@ -1,13 +1,13 @@
 ﻿# A deployment snapshot excludes live SQLite databases and conversation data.
 function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
     $previousBackupId = $env:BOT_DEPLOY_BACKUP_ID
-    $temporaryRoot = Join-Path $ProjectRoot 'backup\tmp'
+    $temporaryRoot = Join-Path $ProjectRoot 'backup\snapshots'
     New-Item -ItemType Directory -Force -Path $temporaryRoot | Out-Null
     $lockRoot = Join-Path $ProjectRoot 'data\state'
     New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null
     $deploymentLock = [IO.File]::Open((Join-Path $lockRoot 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     try {
-    $snapshot = Join-Path $ProjectRoot ('backup\tmp\deploy-' + [Guid]::NewGuid().ToString('N'))
+    $snapshot = Join-Path $ProjectRoot ('backup\snapshots\deploy-' + [Guid]::NewGuid().ToString('N'))
     $env:BOT_DEPLOY_BACKUP_ID = Split-Path $snapshot -Leaf
     $paths = Save-DeploymentFiles $ProjectRoot $snapshot
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -121,7 +121,7 @@ function Restore-DeploymentSnapshot($Snapshot) {
     }
     if ($Snapshot.Tunnel -and $Snapshot.Tunnel.Started) { Start-Service Cloudflared -ErrorAction Stop }
     if ($Snapshot.WasRunning) { Start-ScheduledTask -TaskName $Snapshot.TaskName -ErrorAction Stop }
-    Write-Warning '已恢复配置、启动定义、依赖、网络入口和原运行状态；回滚快照保留在 backup/tmp。'
+    Write-Warning '已恢复配置、启动定义、依赖、网络入口和原运行状态；回滚快照保留在 backup/snapshots。'
 }
 
 # Snapshot the service, project token and any ProgramData configuration for rollback.
@@ -129,7 +129,7 @@ function New-CloudflaredSnapshot([string]$ProjectRoot, [string]$Directory = '') 
     $previousBackupId = $env:BOT_DEPLOY_BACKUP_ID
     try {
     if (-not $Directory) {
-        $Directory = Join-Path $ProjectRoot ('backup\tmp\tunnel-' + [Guid]::NewGuid().ToString('N'))
+        $Directory = Join-Path $ProjectRoot ('backup\snapshots\tunnel-' + [Guid]::NewGuid().ToString('N'))
         $env:BOT_DEPLOY_BACKUP_ID = Split-Path $Directory -Leaf
     }
     New-Item -ItemType Directory -Force -Path $Directory | Out-Null

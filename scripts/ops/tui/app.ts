@@ -5,16 +5,17 @@
 
 import { Screen, type Key, MIN_COLUMNS, MIN_ROWS } from "./render/screen.ts";
 import { createTheme, STATUS, type StatusName, type Theme } from "./render/theme.ts";
-import { box, wrap } from "./render/widgets.ts";
+import { box, table, wrap } from "./render/widgets.ts";
 import { pad, width } from "./render/width.ts";
 import { Viewport } from "./render/viewport.ts";
 import { createInterface } from "node:readline";
 import * as fmt from "./render/format.ts";
-import { footer, header, navbar } from "./frame.ts";
+import { footer, header, navbar, subnav } from "./frame.ts";
 import { loadGit, probeService, type GitState, type Service } from "./data.ts";
 import { PROJECT_DIR, loadDeployment, opsCommand, type Deployment } from "./platform.ts";
 import { openLocalFile, stream, trackMaintenance } from "./exec.ts";
-import type { AppApi, ConfirmSpec, View, ViewContext } from "./view.ts";
+import type { AppApi, Choice, ConfirmSpec, Section, SelectSpec, View, ViewContext } from "./view.ts";
+import { moveSelection, windowStart } from "./views/common.ts";
 
 /** 转圈动画，只在操作进行时显示。 */
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
@@ -22,8 +23,9 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 const TOAST_MS = 6000;
 
 interface Modal {
-  kind: "confirm" | "ask" | "help";
+  kind: "confirm" | "ask" | "help" | "select";
   spec?: ConfirmSpec;
+  selection?: SelectSpec;
   label?: string;
   /** typeToConfirm 或 ask 的当前输入。 */
   input: string;
@@ -50,6 +52,9 @@ export class App implements AppApi {
   private readonly screen: Screen;
   private readonly readDeployment: () => Deployment;
   private readonly views: View[];
+  private readonly sections: Section[];
+  private readonly lastView = new Map<string, string>();
+  private readonly refreshes = new Map<View, { promise: Promise<void>; again: boolean }>();
   private active: string;
   private toastState: { status: StatusName; text: string; at: number } | null = null;
   private modal: Modal | null = null;
@@ -61,14 +66,17 @@ export class App implements AppApi {
   private dirty = true;
   private paintQueued = false;
   private viewBusy = false;
+  private refreshing = false;
 
-  constructor(views: View[], options: { screen?: Screen; deployment?: Deployment; theme?: Theme } = {}) {
+  constructor(sections: (Section | View)[], options: { screen?: Screen; deployment?: Deployment; theme?: Theme } = {}) {
     this.readDeployment = options.deployment ? () => options.deployment! : loadDeployment;
     this.deployment = this.readDeployment();
     this.theme = options.theme ?? createTheme();
     this.screen = options.screen ?? new Screen();
-    this.views = views;
-    this.active = views[0]!.id;
+    this.sections = sections.map(section => "views" in section ? section : { id: section.id, label: section.label, views: [section] });
+    if (!this.sections.length || this.sections.some(section => !section.views.length)) throw new Error("每个主分区至少需要一个页面");
+    this.views = this.sections.flatMap(section => section.views);
+    this.active = this.views[0]!.id;
   }
 
   // ===== 生命周期 =====
@@ -88,8 +96,9 @@ export class App implements AppApi {
 
     this.paint();
     try {
-      await Promise.all([this.refreshChrome(), this.current.refresh?.(this)]);
-      this.redraw();
+      void Promise.all([this.refreshChrome(), this.refreshView(this.current)])
+        .then(() => this.redraw())
+        .catch(error => { if (!this.quit) this.toast("danger", String(error)); });
       while (!this.quit) await new Promise((resolve) => setTimeout(resolve, 50));
     } finally {
       this.current.onLeave?.();
@@ -100,6 +109,29 @@ export class App implements AppApi {
 
   private get current(): View {
     return this.views.find((view) => view.id === this.active) ?? this.views[0]!;
+  }
+
+  private get section(): Section {
+    return this.sections.find(section => section.views.some(view => view.id === this.active))!;
+  }
+
+  /** 按住方向键来回切换时，同一页面最多运行一次加载；重入请求合并为一次后续刷新。 */
+  private refreshView(view: View, again = false): Promise<void> {
+    if (!view.refresh) return Promise.resolve();
+    const pending = this.refreshes.get(view);
+    if (pending) {
+      pending.again ||= again;
+      return pending.promise;
+    }
+    const job = { promise: Promise.resolve(), again: false };
+    job.promise = (async () => {
+      do {
+        job.again = false;
+        await view.refresh!(this);
+      } while (job.again && this.current === view && !this.quit);
+    })().finally(() => this.refreshes.delete(view));
+    this.refreshes.set(view, job);
+    return job.promise;
   }
 
   /** 页眉要的那几样：服务是否在应答、代码版本。两者都可能慢，所以并行。 */
@@ -128,11 +160,17 @@ export class App implements AppApi {
   }
 
   go(view: string): void {
-    if (!this.views.some((entry) => entry.id === view)) return;
-    if (view !== this.active) this.current.onLeave?.();
+    const section = this.sections.find(section => section.id === view);
+    if (section) view = this.lastView.get(section.id) ?? section.views[0]!.id;
+    if (view === this.active || !this.views.some((entry) => entry.id === view)) return;
+    this.current.onLeave?.();
     this.active = view;
+    this.lastView.set(this.section.id, view);
     this.redraw();
-    void this.current.refresh?.(this).catch(error => this.toast("danger", String(error)));
+    const current = this.current;
+    void this.refreshView(current, true).catch(error => {
+      if (this.current === current) this.toast("danger", String(error));
+    });
   }
 
   /**
@@ -161,7 +199,7 @@ export class App implements AppApi {
       } finally { input.close(); process.stdin.pause(); }
     });
     await this.refreshChrome();
-    await this.current.refresh?.(this);
+    await this.refreshView(this.current, true);
     this.redraw();
     this.paint();
     return code;
@@ -198,6 +236,18 @@ export class App implements AppApi {
         choice: 1,
         scroll: new Viewport(),
         resolve: resolve as (value: unknown) => void,
+      };
+      this.redraw();
+      this.paint();
+    });
+  }
+
+  choose(spec: SelectSpec): Promise<string | null> {
+    return new Promise(resolve => {
+      this.modal = {
+        kind: "select", selection: spec, input: "",
+        choice: Math.max(0, spec.choices.findIndex(choice => spec.initial === undefined ? !choice.disabled : choice.value === spec.initial)),
+        scroll: new Viewport(), resolve: resolve as (value: unknown) => void,
       };
       this.redraw();
       this.paint();
@@ -244,50 +294,99 @@ export class App implements AppApi {
 
     // 命令跑完后状态多半变了：重新探一次服务和版本，页眉不要停留在旧结论上。
     await this.refreshChrome();
-    await this.current.refresh?.(this);
+    await this.refreshView(this.current, true);
     this.paint();
     return code;
   }
 
   // ===== 按键 =====
 
+  private showHelp(): void {
+    this.modal = { kind: "help", input: "", choice: 0, scroll: new Viewport(), resolve: () => {} };
+    this.redraw();
+    this.paint();
+  }
+
+  private async refreshCurrent(): Promise<void> {
+    if (this.refreshing) return;
+    const view = this.current;
+    this.refreshing = true;
+    this.toast("busy", `正在刷新${view.label}…`);
+    try {
+      await Promise.all([this.refreshChrome(), this.refreshView(view, true)]);
+      if (this.current === view) this.toast("ok", `${view.label}已刷新 · ${fmt.clock()}`);
+    } finally {
+      this.refreshing = false;
+      this.redraw();
+    }
+  }
+
+  private async showActions(): Promise<void> {
+    const view = this.current;
+    const choices: Choice[] = [
+      ...(view.actions?.() ?? []),
+      ...this.section.views.filter(page => page.id !== view.id).map(page => ({
+        value: "@view/" + page.id, label: "切换到" + page.label, description: this.section.label + "分区内的其他功能（也可按 Tab 切换）",
+      })),
+      { value: "@refresh", label: "刷新本页", description: "重新读取当前页面和服务状态" },
+      ...(view.id === this.views[0]?.id ? [] : [{ value: "@overview", label: "返回总览", description: "查看今日用量与待处理事项" }]),
+      { value: "@help", label: "键位帮助", description: "查看导航、筛选、操作与返回方式" },
+    ];
+    const value = await this.choose({
+      title: (this.section.views.length > 1 ? this.section.label + " / " : "") + view.label + " · 操作",
+      description: "选择要做的事；清理、停止等操作会继续展示范围与确认步骤。", choices,
+    });
+    if (value === null) return;
+    if (value === "@refresh") await this.refreshCurrent();
+    else if (value === "@overview") this.go(this.views[0]!.id);
+    else if (value === "@help") this.showHelp();
+    else if (value.startsWith("@view/")) this.go(value.slice(6));
+    else await view.onKey?.({ name: value, raw: value, ctrl: false, shift: false }, this);
+    this.redraw();
+  }
+
   private async handleKey(key: Key): Promise<void> {
     if (!this.screen.isActive) return;
     if (this.action) return this.handleActionKey(key);
     if (this.modal) return this.handleModalKey(key);
 
-    if (key.ctrl && key.name === "c") {
+    if ((key.ctrl && key.name === "c") || (!key.ctrl && key.name === "q")) {
       this.quit = true;
       return;
     }
+    if (this.viewBusy || key.ctrl) return;
     switch (key.name) {
-      case "q":
-        this.quit = true;
-        return;
       case "?":
-        this.modal = { kind: "help", input: "", choice: 0, scroll: new Viewport(), resolve: () => {} };
-        this.redraw();
-        this.paint();
+      case "f1":
+        this.showHelp();
         return;
       case "r":
-        this.toast("busy", "正在刷新…");
-        await this.refreshChrome();
-        await this.current.refresh?.(this);
-        this.toast("ok", "已刷新");
+        await this.refreshCurrent();
+        return;
+      case "space":
+      case "f2":
+        this.viewBusy = true;
+        try { await this.showActions(); }
+        finally { this.viewBusy = false; }
+        return;
+      case "left":
+      case "right": {
+        const index = this.sections.indexOf(this.section);
+        const next = (index + (key.name === "left" ? -1 : 1) + this.sections.length) % this.sections.length;
+        this.go(this.sections[next]!.id);
         this.paint();
         return;
+      }
       case "tab": {
-        const index = this.views.findIndex((view) => view.id === this.active);
-        const next = key.shift
-          ? (index - 1 + this.views.length) % this.views.length
-          : (index + 1) % this.views.length;
-        this.go(this.views[next]!.id);
+        const pages = this.section.views;
+        const index = pages.indexOf(this.current);
+        this.go(pages[(index + (key.shift ? -1 : 1) + pages.length) % pages.length]!.id);
         this.paint();
         return;
       }
     }
     if (/^[1-9]$/.test(key.name)) {
-      const target = this.views[Number(key.name) - 1];
+      const target = this.sections[Number(key.name) - 1];
       if (target) {
         this.go(target.id);
         this.paint();
@@ -295,7 +394,6 @@ export class App implements AppApi {
       return;
     }
 
-    if (this.viewBusy) return;
     this.viewBusy = true;
     try {
       const consumed = await this.current.onKey?.(key, this);
@@ -322,12 +420,13 @@ export class App implements AppApi {
 
   private handleModalKey(key: Key): void {
     const modal = this.modal!;
+    if (modal.kind === "select") return this.handleSelectKey(key, modal);
     if (["up", "down", "pageup", "pagedown", "home", "end"].includes(key.name) && modal.scroll.onKey(key.name)) {
       this.redraw();
       return;
     }
     if (modal.kind === "help") {
-      if (!["escape", "enter", "q", "?"].includes(key.name)) return;
+      if (!["escape", "enter", "q", "?"].includes(key.name) && !(key.ctrl && key.name === "c")) return;
       this.modal = null;
       this.redraw();
       this.paint();
@@ -394,6 +493,40 @@ export class App implements AppApi {
     this.paint();
   }
 
+  private filteredChoices(modal: Modal): Choice[] {
+    const query = modal.input.trim().toLocaleLowerCase();
+    return modal.selection!.choices.filter(choice =>
+      !query || [choice.label, choice.description ?? "", choice.value].some(text => text.toLocaleLowerCase().includes(query))
+    );
+  }
+
+  private handleSelectKey(key: Key, modal: Modal): void {
+    if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+      this.modal = null;
+      modal.resolve(null);
+    } else {
+      const choices = this.filteredChoices(modal);
+      const moved = !key.ctrl && ["up", "down", "pageup", "pagedown", "home", "end"].includes(key.name)
+        ? moveSelection(key.name, modal.choice, choices.length) : null;
+      if (moved !== null) modal.choice = moved;
+      else if (key.name === "enter") {
+        const choice = choices[modal.choice];
+        if (choice && !choice.disabled) {
+          this.modal = null;
+          modal.resolve(choice.value);
+        }
+      } else {
+        const before = modal.input;
+        if (key.name === "backspace") modal.input = [...modal.input].slice(0, -1).join("");
+        else if (key.ctrl && key.name === "u") modal.input = "";
+        else if (!key.ctrl) modal.input += key.text ?? (key.name === "space" ? " " : [...key.name].length === 1 ? key.name : "");
+        if (modal.input !== before) modal.choice = 0;
+      }
+    }
+    this.redraw();
+    this.paint();
+  }
+
   // ===== 渲染 =====
 
   private paint(): void {
@@ -410,6 +543,7 @@ export class App implements AppApi {
       return;
     }
 
+    const navigation = navbar(this.theme, columns, this.sections, this.section.id, this.git);
     const chrome = [
       ...header({
         theme: this.theme,
@@ -419,15 +553,20 @@ export class App implements AppApi {
         git: this.git,
         uptime: this.service?.state === "ready" && this.service.startedAt ? Date.now() - this.service.startedAt : undefined,
       }),
-      ...navbar(this.theme, columns, this.views, this.active, this.git),
+      navigation[0]!,
+      this.section.views.length > 1
+        ? subnav(this.theme, columns, this.section.views, this.active)
+        : navigation[1]!,
     ];
     const keys: [string, string][] = [
-      ...this.current.hints(),
+      ["←→", "分区"],
+      ...(this.section.views.length > 1 ? [["Tab", "子页"]] as [string, string][] : []),
+      ["Space", "操作"],
       ["r", "刷新"],
       ["?", "帮助"],
       ["q", "退出"],
     ];
-    const tail = footer(this.theme, columns, this.toastState, keys);
+    const tail = footer(this.theme, columns, this.toastState, this.current.hints(), keys);
     const bodyHeight = Math.max(0, rows - chrome.length - tail.length);
 
     const ctx: ViewContext = {
@@ -491,6 +630,7 @@ export class App implements AppApi {
 
   private renderModal(columns: number, height: number): string[] {
     const modal = this.modal!;
+    if (modal.kind === "select") return this.renderSelect(columns, height, modal);
     const size = Math.min(columns - 6, 72);
     const inner = size - 4;
     const inputLine = () => {
@@ -510,12 +650,21 @@ export class App implements AppApi {
     const controls: string[] = [];
     if (modal.kind === "help") {
       content.push(
-        "1–9 / Tab / Shift+Tab  切换页面", "↑↓ / j k              选择或滚动",
+        "← →                   切换主分区（首尾循环）",
+        "Tab / Shift+Tab       切换当前分区内的子页",
+        "↑↓ / j k              选择条目或滚动详情",
+        "Space / F2            当前页操作菜单",
+        "/                     筛选群、成员或日志",
         "PgUp / PgDn           翻页", "Home / End            首尾",
         "Enter                 进入或执行", "Esc                   返回上一层",
-        "r                     刷新", "q / Ctrl+C            退出", "",
-        "统计：e 导出，o 打开最近报表，m 临时显号。",
-        "存储：p 清理当前成员，a 清理全部成员，←→ 选择天数。",
+        "r                     刷新", "q / Ctrl+C            退出",
+        "1–5                   直接进入主分区", "",
+        "总览 · 监控（体检 / 日志）· 统计",
+        "数据（会话 / 临时文件 / 外链）· 系统（服务部署 / 回调路由）", "",
+        "菜单：↑↓ 选择，Enter 确认；直接输入文字可筛选菜单。",
+        "统计：w 选择常用日期，d 自定义区间，e 导出，o 打开报表。",
+        "临时文件：d 选择天数，Enter 看文件，p 清当前成员，a 清全部。",
+        "详情先按 Esc 返回列表，再按 Esc 清除筛选。",
         "历史和临时目录清理会移入 backup/rm；外链对象删除不可恢复。"
       );
       controls.push(this.theme.c("muted", "Enter / Esc 关闭"));
@@ -543,6 +692,36 @@ export class App implements AppApi {
     return box(this.theme, {
       width: size, title, accent: modal.spec?.danger ? "danger" : "accent",
       body: [...visible, this.theme.c("muted", modal.scroll.label ? modal.scroll.label + " · ↑↓ / PgUp PgDn" : ""), ...controls],
+    });
+  }
+
+  private renderSelect(columns: number, height: number, modal: Modal): string[] {
+    const size = Math.min(columns - 6, 80);
+    const inner = size - 4;
+    const spec = modal.selection!;
+    const choices = this.filteredChoices(modal);
+    const choice = choices[modal.choice];
+    const head = [
+      ...wrap(spec.description ?? "用方向键选择，按 Enter 确认。", inner).slice(0, 2),
+      this.theme.c("accent", "筛选 › " + (wrap(modal.input, inner - 9).at(-1) ?? "") + "▁"),
+      "",
+    ];
+    const details = wrap(choice?.description ?? (choices.length ? "按 Enter 选择此项" : "没有匹配项；退格修改，Ctrl+U 清空。"), inner).slice(0, 3);
+    const tail = ["", ...details.map(line => this.theme.c(choice?.danger ? "warn" : "muted", line)),
+      this.theme.c("muted", "↑↓ 选择 · Enter 确认 · Esc 取消 · 输入文字筛选")];
+    const room = Math.max(1, height - 4 - head.length - tail.length);
+    const start = windowStart(modal.choice, choices.length, room);
+    const rows = table(this.theme, {
+      width: inner, rows: choices.slice(start, start + room), selected: modal.choice - start,
+      columns: [
+        { header: "", flex: 1, render: item => item.disabled ? this.theme.c("muted", item.label) : item.danger ? this.theme.c("warn", item.label) : item.label },
+        { header: "", size: 8, align: "right", render: item => item.disabled ? "不可用" : item.danger ? "需确认" : "" },
+      ],
+    });
+    if (!rows.length) rows.push(this.theme.c("muted", "  没有匹配项"));
+    return box(this.theme, {
+      width: size, title: spec.title, note: choices.length ? `${modal.choice + 1} / ${choices.length}` : "0 项",
+      accent: "accent", body: [...head, ...rows, ...tail],
     });
   }
 }

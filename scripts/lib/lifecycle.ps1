@@ -22,7 +22,7 @@ function Remove-CompletedBackup([string]$SnapshotPath, [string]$ProjectRoot) {
     $backup = Join-Path $root 'backup'
     $snapshot = [IO.Path]::GetFullPath($SnapshotPath)
     $name = Split-Path $snapshot -Leaf
-    if ((Split-Path $snapshot -Parent) -ne (Join-Path $backup 'tmp') -or $name -notmatch '^(deploy|tunnel)-[a-zA-Z0-9-]+$') {
+    if ((Split-Path $snapshot -Parent) -ne (Join-Path $backup 'snapshots') -or $name -notmatch '^(deploy|tunnel)-[a-zA-Z0-9-]+$') {
         throw '备份清理路径无效'
     }
     $targets = @($snapshot, (Join-Path $backup 'rm'))
@@ -35,9 +35,9 @@ function Remove-CompletedBackup([string]$SnapshotPath, [string]$ProjectRoot) {
         }
         if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop }
     }
-    foreach ($directory in @((Join-Path $backup 'tmp'), (Join-Path $backup 'rm'), $backup)) {
+    foreach ($directory in @((Join-Path $backup 'snapshots'), (Join-Path $backup 'rm'), $backup)) {
         if ((Test-Path -LiteralPath $directory -PathType Container) -and @(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) {
-            [IO.Directory]::Delete($directory) # Keep other snapshots still present under tmp.
+            [IO.Directory]::Delete($directory) # Keep other snapshots still present under snapshots/.
         }
     }
 }

@@ -1,10 +1,10 @@
 // 展示 ops.sh doctor --json / ops.ps1 doctor -Json 的结果，并转交平台对应的修复操作。
 
-import { box, mark, table, wrap } from "../render/widgets.ts";
+import { box, mark, rule, table, wrap } from "../render/widgets.ts";
 import { pad } from "../render/width.ts";
 import { Viewport } from "../render/viewport.ts";
 import { loadHealth, type Health, type HealthCheck } from "../data.ts";
-import type { AppApi, Loading, View, ViewContext } from "../view.ts";
+import type { AppApi, Loading, View, ViewAction, ViewContext } from "../view.ts";
 import { gap, moveSelection, pending, windowStart } from "./common.ts";
 
 function statusOf(check: HealthCheck): "ok" | "warn" | "danger" {
@@ -14,10 +14,12 @@ function statusOf(check: HealthCheck): "ok" | "warn" | "danger" {
 
 export class HealthView implements View {
   readonly id = "health";
-  readonly label = "健康";
+  readonly label = "体检";
   private state: Loading<Health> = { kind: "idle" };
   private selected = 0;
   private expanded = false;
+  /** 用户是否自己移动过光标；移动过就不再替他跳到失败项上。 */
+  private moved = false;
   private scroll = new Viewport();
   private platform: "windows" | "linux" = "linux";
 
@@ -29,6 +31,15 @@ export class HealthView implements View {
     return keys;
   }
 
+  actions(): ViewAction[] {
+    return [
+      ...(this.expanded ? [{ value: "escape", label: "返回检查列表" }]
+        : [{ value: "enter", label: "展开选中检查项", description: "查看完整诊断内容与处理建议", disabled: this.state.kind !== "ready" }]),
+      { value: "f", label: this.platform === "windows" ? "自动修复部署" : "进入重建修复向导",
+        description: "查看修复步骤并确认后执行", danger: true, disabled: this.state.kind !== "ready" },
+    ];
+  }
+
   async refresh(app: AppApi): Promise<void> {
     this.platform = app.deployment.platform;
     this.state = { kind: "loading" };
@@ -36,6 +47,12 @@ export class HealthView implements View {
     try {
       this.state = { kind: "ready", value: await loadHealth(app.deployment) };
       this.selected = Math.min(this.selected, Math.max(0, this.state.value.checks.length - 1));
+      // 用户还没自己选过时，光标落在第一条不通过的检查上。doctor 的输出是按依赖顺序排的，
+      // 不该重排，但一条失败排在八条通过后面时，停在第一行等于把这一页的重点藏了起来。
+      if (!this.moved) {
+        const attention = this.state.value.checks.findIndex(check => check.status !== "pass");
+        this.selected = Math.max(0, attention);
+      }
       if (!this.state.value.checks.length) this.expanded = false;
     } catch (error) {
       this.state = { kind: "error", message: String(error instanceof Error ? error.message : error) };
@@ -57,6 +74,7 @@ export class HealthView implements View {
     const moved = this.expanded ? null : moveSelection(key.name, this.selected, checks.length);
     if (moved !== null) {
       this.selected = moved;
+      this.moved = true;
       return true;
     }
     if (key.name === "f") {
@@ -110,13 +128,17 @@ export class HealthView implements View {
       });
     }
 
-    // 表格留给检查项，摘要单独一行：摘要是唯一需要一眼看到的东西。
-    const room = Math.max(1, height - 6);
+    // 修复建议固定占用最后两行，表格拿走中间全部高度——检查项越多越该多显示几条，
+    // 而不是让表格停在半空、底下空着一片。
+    const advice = wrap(current?.fix || "按 Enter 查看完整检查结果", total - 2).slice(0, 2);
+    const room = Math.max(1, height - 2 - advice.length - 1);
     const start = windowStart(this.selected, health.checks.length, room);
     const visible = health.checks.slice(start, start + room);
 
-    const rows = table(theme, {
-      width: total - 4,
+    out.push(rule(theme, total, "体检", summary,
+      health.fail > 0 ? "danger" : health.warn > 0 ? "warn" : "ok"));
+    out.push(...table(theme, {
+      width: total,
       rows: visible,
       selected: this.selected - start,
       gap: 1,
@@ -125,24 +147,13 @@ export class HealthView implements View {
         { header: "检查项", size: Math.min(26, Math.floor(total * 0.32)), render: (check) => check.name },
         { header: "结果", flex: 1, render: (check) => check.detail },
       ],
-    });
-
-    out.push(
-      ...box(theme, {
-        width: total,
-        title: "体检",
-        note: summary,
-        accent: health.fail > 0 ? "danger" : health.warn > 0 ? "warn" : "ok",
-        body: rows,
-      })
-    );
+    }));
+    while (out.length < height - advice.length - 1) out.push(gap(total));
 
     // 选中项的修复建议单独展开：把它塞进表格里会把「结果」列挤到没法读。
-    out.push(gap(total));
-    out.push(pad(` ${theme.c("muted", "建议")}  ${current?.fix || "按 Enter 查看完整检查结果"}`, total));
-    if (health.checks.length > room) {
-      out.push(pad(` ${theme.c("muted", `显示 ${start + 1}-${start + visible.length} / ${health.checks.length}`)}`, total));
-    }
+    out.push(rule(theme, total, "建议",
+      health.checks.length > room ? `${start + 1}-${start + visible.length} / ${health.checks.length}` : undefined));
+    out.push(...advice.map(line => pad(` ${line}`, total)));
     return out;
   }
 }

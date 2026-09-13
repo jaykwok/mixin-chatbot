@@ -46,7 +46,7 @@ async function execute(platform: Platform, script: string, args: string[], cwd: 
 }
 
 async function readReport(root: string): Promise<Record<string, string>> {
-  const parent = join(root, "backup/tmp");
+  const parent = join(root, "tmp");
   const dirs = await readdir(parent);
   expect(dirs).toHaveLength(1);
   const output = join(parent, dirs[0]!);
@@ -172,7 +172,7 @@ for (const platform of ["powershell", "bash"] as const) {
         expect(report["context.log"]).not.toContain("unrelated");
         const repeated = await execute(platform, f.script, ["555d838a", ...options], f.cwd);
         expect(repeated.code, repeated.output).toBe(0);
-        expect(await readdir(join(f.root, "backup/tmp"))).toHaveLength(2);
+        expect(await readdir(join(f.root, "tmp"))).toHaveLength(2);
         expect(existsSync(join(f.root, "agents"))).toBe(false);
       } finally { await f.cleanup(); }
     }, 45_000);
@@ -182,7 +182,7 @@ for (const platform of ["powershell", "bash"] as const) {
       try {
         const empty = await execute(platform, f.script, ["555d838a"], f.cwd);
         expect(empty.code, empty.output).toBe(2);
-        expect(existsSync(join(f.root, "backup/tmp"))).toBe(false);
+        expect(existsSync(join(f.root, "tmp"))).toBe(false);
         await writeFile(join(f.logs, "mixin-chatbot.log"), progress("任务开始", "准备会话", 0, 0, "abcdef12"));
         const result = await execute(platform, f.script, ["555d838a"], f.cwd);
         expect(result.code, result.output).toBe(2);
@@ -203,7 +203,7 @@ for (const platform of ["powershell", "bash"] as const) {
         const help = await execute(platform, f.script, [platform === "powershell" ? "-Help" : "--help"], f.cwd);
         expect(help.code, help.output).toBe(0);
         expect(help.output).toContain("用法");
-        expect(existsSync(join(f.root, "backup/tmp"))).toBe(false);
+        expect(existsSync(join(f.root, "tmp"))).toBe(false);
       } finally { await f.cleanup(); }
     }, 60_000);
   });

@@ -205,8 +205,8 @@ check_relay() {
     # 命令行，WebDAV 密码不该出现在那里。netrc 用 mktemp 建在仅本人可读的目录里，用完即删。
     local dav_code="000" netrc="" host
     if [ -n "$user" ]; then
-        mkdir -p "$PROJECT_DIR/backup/tmp"
-        netrc="$(mktemp "$PROJECT_DIR/backup/tmp/relay-auth-XXXXXXXX")"
+        mkdir -p "$PROJECT_DIR/tmp"
+        netrc="$(mktemp "$PROJECT_DIR/tmp/relay-auth-XXXXXXXX")"
         chmod 600 "$netrc"
         host="$(printf '%s' "$dav_url" | sed -e 's#^[a-zA-Z]*://##' -e 's#[:/].*##')"
         printf 'machine %s login %s password %s\n' "$host" "$user" "$pass" > "$netrc"
@@ -584,8 +584,8 @@ update() (
     echo ""
     local was_running
     was_running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
-    mkdir -p "$PROJECT_DIR/backup/tmp" || return 1
-    commit_file="$(mktemp "$PROJECT_DIR/backup/tmp/update-commit-XXXXXXXX")" || return 1
+    mkdir -p "$PROJECT_DIR/tmp" || return 1
+    commit_file="$(mktemp "$PROJECT_DIR/tmp/update-commit-XXXXXXXX")" || return 1
     BOT_UPDATE_COMMIT_FILE="$commit_file" DEPLOY_PRESERVE_STOPPED=1 bash "$deploy_script" <&0 &
     deploy_pid=$!
     if wait "$deploy_pid"; then

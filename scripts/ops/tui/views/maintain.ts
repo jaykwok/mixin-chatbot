@@ -1,13 +1,11 @@
 // 部署、升级、启停、修复和卸载入口；执行前展示各自的范围与恢复方式。
 // 提交列表来自本地远端引用，实际升级时由运维脚本重新 fetch。
 
-import { box, mark, table } from "../render/widgets.ts";
-import { pad } from "../render/width.ts";
 import type { StatusName } from "../render/theme.ts";
 import * as fmt from "../render/format.ts";
 import { loadGit, type GitState } from "../data.ts";
-import type { AppApi, ConfirmSpec, Loading, View, ViewContext } from "../view.ts";
-import { gap, moveSelection, pending, windowStart } from "./common.ts";
+import type { AppApi, ConfirmSpec, Loading, View, ViewAction, ViewContext } from "../view.ts";
+import { actionWorkbench, moveSelection, pending } from "./common.ts";
 
 interface Action {
   key: string;
@@ -18,7 +16,7 @@ interface Action {
   status: StatusName;
   /** 该命令会向用户提问，必须拿到真正的 TTY（update 转调的 deploy.sh 全程交互）。 */
   interactive?: boolean | ((app: AppApi) => boolean);
-  confirm(app: AppApi, git: GitState | null): ConfirmSpec | null;
+  confirm(app: Pick<AppApi, "deployment">, git: GitState | null): ConfirmSpec | null;
   args(app: AppApi): string[];
 }
 
@@ -178,22 +176,35 @@ const ACTIONS: Action[] = [
   },
 ];
 
+const ACTION_ORDER = ["start", "restart", "stop", "update", "deploy", "repair", "repair-tunnel", "uninstall"];
+
 export class MaintainView implements View {
   readonly id = "maintain";
-  readonly label = "维护";
+  readonly label = "服务部署";
   private state: Loading<GitState | null> = { kind: "idle" };
   private selected = 0;
   private platform: "windows" | "linux" = "linux";
 
-  private get actions(): Action[] {
-    return ACTIONS.filter((action) => !action.only || action.only === this.platform);
+  private get availableActions(): Action[] {
+    return ACTIONS.filter((action) => !action.only || action.only === this.platform)
+      .sort((a, b) => ACTION_ORDER.indexOf(a.key) - ACTION_ORDER.indexOf(b.key))
+      .map(action => action.key === "repair" ? { ...action, summary: this.platform === "windows"
+        ? "检查并修复计划任务、防火墙与隧道" : "通过部署向导重建当前版本" } : action);
   }
 
   hints(): [string, string][] {
     return [
       ["↑↓", "选择"],
-      ["⏎", "执行"],
+      ["Enter", "执行所选操作"],
     ];
+  }
+
+  actions(): ViewAction[] {
+    return this.availableActions.map(action => ({
+      value: action.key, label: action.label, description: action.summary,
+      danger: action.status === "danger" || action.key === "stop" || action.key === "repair-tunnel",
+      disabled: this.state.kind === "loading",
+    }));
   }
 
   async refresh(app: AppApi): Promise<void> {
@@ -205,14 +216,15 @@ export class MaintainView implements View {
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
-    const actions = this.actions;
+    const actions = this.availableActions;
     const moved = moveSelection(key.name, this.selected, actions.length);
     if (moved !== null) {
       this.selected = moved;
       return true;
     }
-    if (key.name === "enter") {
-      const action = actions[this.selected];
+    if (key.name === "enter" || actions.some(action => action.key === key.name)) {
+      if (this.state.kind === "loading") return true;
+      const action = key.name === "enter" ? actions[this.selected] : actions.find(action => action.key === key.name);
       if (!action) return true;
       const git = this.state.kind === "ready" ? this.state.value : null;
       const spec = action.confirm(app, git);
@@ -241,55 +253,24 @@ export class MaintainView implements View {
     const waiting = pending(theme, total, this.state, "");
     if (waiting && this.state.kind === "loading") return waiting;
     const git = this.state.kind === "ready" ? this.state.value : null;
-    const actions = this.actions;
-    const roomForActions = Math.max(1, ctx.height - 8);
-    const start = windowStart(this.selected, actions.length, roomForActions);
-    const visible = actions.slice(start, start + roomForActions);
-
-    const out = box(theme, {
-      width: total,
-      title: "维护",
-      note: ctx.deployment.runtime === "docker" ? "Docker 部署" : "计划任务部署",
-      accent: "accent",
-      body: table(theme, {
-        width: total - 4,
-        rows: visible,
-        selected: this.selected - start,
-        columns: [
-          { header: "", size: 2, render: (action) => mark(theme, action.status) },
-          { header: "", size: Math.max(10, Math.floor(total * 0.16)), render: (action) => action.label },
-          { header: "", flex: 1, render: (action) => theme.c("muted", action.summary) },
-        ],
-      }).slice(1),
-    });
-
-    // 待应用的提交：升级前最该看清楚的东西，不该等到执行日志里才滚过去。
-    if (git && git.behind > 0) {
-      const room = Math.max(1, ctx.height - out.length - 3);
-      out.push(gap(total));
-      out.push(
-        ...box(theme, {
-          width: total,
-          title: `待应用的提交（${git.behind}）`,
-          note: git.incoming.length > room ? `显示前 ${room} 条` : undefined,
-          accent: "warn",
-          body: git.incoming
-            .slice(0, room)
-            .map((commit) => `${theme.c("muted", commit.sha)}  ${commit.subject}`),
-        })
-      );
-    } else if (git) {
-      out.push(gap(total));
-      out.push(
-        pad(
-          ` ${mark(theme, git.behind === 0 && git.ahead === 0 ? "ok" : "warn")} ${theme.c("muted", git.behind < 0
-            ? "尚未获得 origin/main 对照；升级时拉取远端"
-            : git.ahead > 0 ? "存在本地领先提交；升级时会核对是否可快进"
-            : `与上次同步的 origin/main 一致（${fmt.shortSha(git.sha)}）`)}`,
-          total
-        )
-      );
-    }
-    return out;
+    const actions = this.availableActions;
+    const action = actions[this.selected]!;
+    const spec = action.confirm(ctx, git);
+    const blocked = action.key === "update" && (!git || git.dirty);
+    const details = [
+      theme.bold(blocked ? spec!.subject : action.summary),
+      theme.c(spec?.danger || blocked ? "warn" : "accent", spec ? "影响：" + spec.steps[0] : "启动完成后检查服务是否就绪"),
+      "",
+      ...(spec ? [theme.bold("执行步骤"), ...spec.steps.map((step, i) => `${i + 1}. ${step}`),
+        ...(spec.recovery ? ["", "恢复说明：" + spec.recovery] : [])] : ["启动机器人，等待健康检查通过。"]),
+      ...(action.key === "update" && git && git.behind > 0 ? [
+        "", theme.bold(`待应用的提交（${git.behind}，上次同步）`),
+        ...git.incoming.map(commit => `${commit.sha}  ${commit.subject}`),
+      ] : []),
+    ];
+    const version = git?.dirty ? "工作区有改动，升级会被拒绝"
+      : git ? `${fmt.shortSha(git.sha)} · ${git.behind > 0 ? `待更新 ${git.behind} 个提交（上次同步）` : git.ahead > 0 ? "本地有领先提交" : git.behind < 0 ? "尚无远端对照" : "与上次同步一致"}`
+        : "非 git 部署，升级不可用";
+    return actionWorkbench(ctx, { title: "服务与部署", items: actions, selected: this.selected, details, note: version });
   }
 }

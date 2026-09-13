@@ -16,7 +16,7 @@ export class DeliveryStore {
         const version = versionTable ? (db.query("SELECT version FROM delivery_schema WHERE id = 1").get() as { version: number } | null)?.version : undefined;
         const columns = new Set((db.query("PRAGMA table_info(deliveries)").all() as { name: string }[]).map(column => column.name));
         if (version !== 2 || !columns.has("attachments") || !columns.has("blocked_reason")) {
-          throw new Error("待补发账本格式需要迁移；请先停止机器人，运行 backup/tmp/migrate-audit-2026-09-13.ts --apply 后再启动");
+          throw new Error("待补发账本格式需要迁移；请先停止机器人，运行 tmp/migrate-audit-2026-09-13.ts --apply 后再启动");
         }
       } else {
         db.exec("CREATE TABLE deliveries (id TEXT PRIMARY KEY, session TEXT NOT NULL, text TEXT NOT NULL, at TEXT NOT NULL, attachments TEXT NOT NULL DEFAULT '[]', blocked_reason TEXT)");

@@ -21,8 +21,11 @@ test("每日提问按消息当天计数，9 次和 1 次不会被平均成 5 次
         message: { role: "toolResult", toolName: "send_file", isError: false, details: { fileId: "fixture" } } }),
     ].join("\n") + "\n");
     const recent = await loadRecentStats(fixture.root, 3, new Date(2026, 8, 12, 23).getTime());
+    // 成员和附件也按天留档：总览的指标块要用昨天的值算环比，只攒提问数的话算不出来。
     expect(recent.trend).toEqual([
-      { day: "2026-09-10", asks: 0 }, { day: "2026-09-11", asks: 9 }, { day: "2026-09-12", asks: 1 },
+      { day: "2026-09-10", asks: 0, people: 0, files: 0 },
+      { day: "2026-09-11", asks: 9, people: 1, files: 0 },
+      { day: "2026-09-12", asks: 1, people: 1, files: 1 },
     ]);
     expect(recent.today).toEqual({ asks: 1, people: 1, files: 1, images: 0, groups: 1 });
     // 跨午夜才送达的附件仍计入送达当天，即使当天没有新提问。

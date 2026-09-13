@@ -17,7 +17,7 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 
 function Show-Usage {
     Write-Output '用法：powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/task-logs.ps1 <任务ID> [-Context 3] [-LogDir <日志目录>]'
-    Write-Output '任务 ID 为 8 位十六进制，例如 555d838a。扫描当前及轮转日志，结果写入项目 backup/tmp。'
+    Write-Output '任务 ID 为 8 位十六进制，例如 555d838a。扫描当前及轮转日志，结果写入项目 tmp/。'
     Write-Output '退出码：0=找到任务；2=没有匹配日志；1=参数或读取/写入失败。'
 }
 
@@ -65,7 +65,7 @@ try {
     }
 
     $name = 'task-logs-' + $TaskId + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
-    $outputDir = Join-Path (Join-Path $project 'backup/tmp') $name
+    $outputDir = Join-Path (Join-Path $project 'tmp') $name
     [IO.Directory]::CreateDirectory($outputDir) | Out-Null
     $taskWriter = New-Object IO.StreamWriter((Join-Path $outputDir 'task.log'), $false, $utf8)
     $contextWriter = New-Object IO.StreamWriter((Join-Path $outputDir 'context.log'), $false, $utf8)

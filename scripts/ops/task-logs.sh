@@ -6,7 +6,7 @@ umask 077
 usage() {
     cat <<'USAGE'
 用法：bash scripts/ops/task-logs.sh <任务ID> [--context 3] [--log-dir <日志目录>]
-任务 ID 为 8 位十六进制，例如 555d838a。扫描当前及轮转日志，结果写入项目 backup/tmp。
+任务 ID 为 8 位十六进制，例如 555d838a。扫描当前及轮转日志，结果写入项目 tmp/。
 退出码：0=找到任务；2=没有匹配日志；1=参数或读取/写入失败。
 USAGE
 }
@@ -51,8 +51,8 @@ if [ "${#files[@]}" -eq 0 ]; then
 fi
 # Numeric/version sort handles .10 before .2; NUL separators preserve spaces in paths.
 mapfile -d '' -t files < <(printf '%s\0' "${files[@]}" | LC_ALL=C sort -zrV)
-(cd -- "$project" && mkdir -p -- backup/tmp)
-output="$(mktemp -d "$project/backup/tmp/task-logs-$task_id-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+(cd -- "$project" && mkdir -p -- tmp)
+output="$(mktemp -d "$project/tmp/task-logs-$task_id-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
 : > "$output/task.log"
 : > "$output/context.log"
 

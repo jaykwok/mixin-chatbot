@@ -153,27 +153,46 @@ export async function loadStatsOverview(root: string, window: Window = {}): Prom
   return collectAll(root, window);
 }
 
-export interface RecentStats {
-  today: { asks: number; people: number; files: number; images: number; groups: number };
-  trend: { day: string; asks: number }[];
+/** 每日一格的指标；成员按「人次」计，同一个人在两个群里活跃算两次，与今日口径一致。 */
+export interface DailyPoint {
+  day: string;
+  asks: number;
+  people: number;
+  files: number;
 }
 
-/** 一次历史扫描同时得到今日指标和每日趋势，数字直接来自消息发生的自然日。 */
+export interface RecentStats {
+  today: { asks: number; people: number; files: number; images: number; groups: number };
+  /** 从最早到今天，长度恒等于请求的天数；没有记录的那天补 0，趋势线不会因为缺天而变短。 */
+  trend: DailyPoint[];
+}
+
+/**
+ * 一次历史扫描同时得到今日指标和每日趋势，数字直接来自消息发生的自然日。
+ *
+ * 三个指标都按天留档而不是只留提问数：总览上的指标块要显示环比和趋势线，那需要昨天的值，
+ * 只攒一个当日总数的话，界面就只能摆四个孤零零的数字，看不出是在涨还是在跌。
+ */
 export async function loadRecentStats(root: string, days: number, now = Date.now()): Promise<RecentStats> {
   const since = new Date(now);
   since.setHours(0, 0, 0, 0);
   since.setDate(since.getDate() - (days - 1));
   const groups = await collectAll(root, { since: since.getTime(), until: now });
-  const byDay = new Map<string, number>();
+  const byDay = new Map<string, DailyPoint>();
   for (let offset = 0; offset < days; offset++) {
     const date = new Date(since);
     date.setDate(date.getDate() + offset);
-    byDay.set(day(date.getTime()), 0);
+    byDay.set(day(date.getTime()), { day: day(date.getTime()), asks: 0, people: 0, files: 0 });
   }
   const today = { asks: 0, people: 0, files: 0, images: 0, groups: 0 };
   for (const group of groups) {
     for (const [date, daily] of group.daily) {
-      if (byDay.has(date)) byDay.set(date, byDay.get(date)! + daily.asks);
+      const point = byDay.get(date);
+      if (point) {
+        point.asks += daily.asks;
+        point.people += daily.users.size;
+        point.files += daily.files;
+      }
       if (date === day(now)) {
         today.asks += daily.asks;
         today.people += daily.users.size;
@@ -183,7 +202,7 @@ export async function loadRecentStats(root: string, days: number, now = Date.now
       }
     }
   }
-  return { today, trend: [...byDay].map(([day, asks]) => ({ day, asks })) };
+  return { today, trend: [...byDay.values()] };
 }
 
 // ===== 会话历史与临时目录 =====

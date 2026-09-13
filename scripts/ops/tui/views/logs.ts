@@ -4,14 +4,14 @@
 // 文件里捞一遍，再对齐模型就绪记录、心跳和流结束记录——scripts/ops/task-logs.sh 已经把这套
 // awk 写好了，这里只负责问一句 ID 然后把它跑起来。
 
-import { box } from "../render/widgets.ts";
+import { rule } from "../render/widgets.ts";
 import { pad, truncate } from "../render/width.ts";
 import type { ColorName } from "../render/theme.ts";
 import { loadLogTail, type LogLine } from "../data.ts";
 import { PROJECT_DIR } from "../platform.ts";
 import { capture } from "../exec.ts";
-import type { AppApi, Loading, View, ViewContext } from "../view.ts";
-import { gap, pending } from "./common.ts";
+import type { AppApi, Loading, View, ViewAction, ViewContext } from "../view.ts";
+import { ListFilter, pending } from "./common.ts";
 import { join } from "node:path";
 
 const LEVELS = ["全部", "warn", "error"] as const;
@@ -31,20 +31,42 @@ export class LogsView implements View {
   private follow = true;
   private offset = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private revision = 0;
+  private polling = false;
+  private pageSize = 10;
+  private filter = new ListFilter();
 
   hints(): [string, string][] {
     return [
-      ["f", this.follow ? "跟随中" : "已暂停"],
-      ["l", `级别 ${LEVELS[this.levelIndex]}`],
+      ["↑↓", "回看"],
+      ["End", "跟随"],
+      ["/", "搜索"],
+      ["l", "级别"],
       ["t", "查任务"],
     ];
   }
 
+  actions(): ViewAction[] {
+    return [
+      { value: "f", label: this.follow ? "暂停跟随" : "恢复跟随", description: "暂停后可用方向键回看，End 恢复最新输出" },
+      { value: "/", label: "搜索日志内容", description: "按任务编号、错误内容或任意关键字筛选" },
+      { value: "l", label: "筛选日志级别", description: "全部、警告及错误、仅错误" },
+      { value: "t", label: "提取任务排查记录", description: "输入 8 位任务编号，从当前与轮转日志中提取上下文" },
+      { value: "home", label: "跳到最早的可见记录" },
+      { value: "end", label: "回到最新记录并跟随" },
+    ];
+  }
+
   async refresh(app: AppApi): Promise<void> {
+    this.onLeave();
+    const revision = this.revision;
     if (this.state.kind === "idle") this.state = { kind: "loading" };
     try {
-      this.state = { kind: "ready", value: await loadLogTail(400) };
+      const lines = await loadLogTail(400);
+      if (revision !== this.revision) return;
+      this.state = { kind: "ready", value: lines };
     } catch (error) {
+      if (revision !== this.revision) return;
       this.state = { kind: "error", message: `读不到日志：${String(error)}` };
     }
     app.redraw();
@@ -53,19 +75,24 @@ export class LogsView implements View {
     // 一个已经被改名的旧文件，而轮询每次都重新按路径读，轮转后自动跟到新文件上。
     if (!this.timer) {
       this.timer = setInterval(() => {
-        if (!this.follow) return;
+        if (!this.follow || this.polling) return;
+        this.polling = true;
         void loadLogTail(400)
           .then((lines) => {
+            if (revision !== this.revision || !this.follow) return;
             this.state = { kind: "ready", value: lines };
             app.redraw();
           })
-          .catch(() => {});
+          .catch(() => {})
+          .finally(() => { if (revision === this.revision) this.polling = false; });
       }, 2000);
     }
   }
 
   /** 离开本页就停掉轮询：没人看的时候每两秒读一次日志纯属浪费，还会引起无谓的重绘。 */
   onLeave(): void {
+    this.revision++;
+    this.polling = false;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -74,12 +101,16 @@ export class LogsView implements View {
 
   private filtered(lines: LogLine[]): LogLine[] {
     const level = LEVELS[this.levelIndex];
-    if (level === "全部") return lines;
-    if (level === "warn") return lines.filter((line) => line.level === "warn" || line.level === "error");
-    return lines.filter((line) => line.level === "error");
+    return lines.filter(line => this.filter.matches(line.text) &&
+      (level === "全部" || line.level === "error" || (level === "warn" && line.level === "warn")));
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
+    if (key.name === "escape" && this.filter.clear()) { this.offset = 0; return true; }
+    if (key.name === "/") {
+      if (await this.filter.edit(app, "搜索日志内容")) this.offset = 0;
+      return true;
+    }
     if (key.name === "f") {
       this.follow = !this.follow;
       if (this.follow) this.offset = 0;
@@ -87,12 +118,19 @@ export class LogsView implements View {
       return true;
     }
     if (key.name === "l") {
-      this.levelIndex = (this.levelIndex + 1) % LEVELS.length;
+      const value = await app.choose({
+        title: "日志级别", initial: String(this.levelIndex),
+        choices: [{ value: "0", label: "全部级别" }, { value: "1", label: "警告与错误" }, { value: "2", label: "仅错误" }],
+      });
+      if (value !== null && ["0", "1", "2"].includes(value)) { this.levelIndex = Number(value); this.offset = 0; }
       return true;
     }
+    const maximum = this.state.kind === "ready" ? Math.max(0, this.filtered(this.state.value).length - this.pageSize) : 0;
+    if (key.name === "home") { this.follow = false; this.offset = maximum; return true; }
+    if (key.name === "end") { this.follow = true; this.offset = 0; return true; }
     if (key.name === "up" || key.name === "k") {
       this.follow = false;
-      this.offset += 1;
+      this.offset = Math.min(maximum, this.offset + 1);
       return true;
     }
     if (key.name === "down" || key.name === "j") {
@@ -101,11 +139,11 @@ export class LogsView implements View {
     }
     if (key.name === "pageup") {
       this.follow = false;
-      this.offset += 10;
+      this.offset = Math.min(maximum, this.offset + this.pageSize);
       return true;
     }
     if (key.name === "pagedown") {
-      this.offset = Math.max(0, this.offset - 10);
+      this.offset = Math.max(0, this.offset - this.pageSize);
       return true;
     }
     if (key.name === "t") {
@@ -153,24 +191,27 @@ export class LogsView implements View {
     if (waiting) return waiting;
     const all = this.filtered((this.state as { value: LogLine[] }).value);
 
-    const room = Math.max(3, height - 2);
+    // 不套框：日志行是这一页唯一的内容，而边框要拿走四列宽度——那四列正是一行日志末尾
+    // 被截掉的部分。状态并进分隔线，正文拿到整个终端宽度和除标题行外的全部高度。
+    const room = Math.max(1, height - 1);
+    this.pageSize = room;
+    this.offset = this.follow ? 0 : Math.min(this.offset, Math.max(0, all.length - room));
     // offset 从尾部往回数；跟随时恒为 0。
     const end = Math.max(room, all.length - this.offset);
     const visible = all.slice(Math.max(0, end - room), end);
 
-    const note = this.follow
+    const state = this.follow
       ? `跟随中 · ${LEVELS[this.levelIndex]}`
       : `已暂停 · 距末尾 ${this.offset} 行 · ${LEVELS[this.levelIndex]}`;
 
-    return box(theme, {
-      width: total,
-      title: "日志",
-      note,
-      accent: this.follow ? "accent" : "muted",
-      body: [
-        ...visible.map((line) => theme.c(LEVEL_COLOR[line.level], truncate(line.text, total - 4))),
-        ...(visible.length === 0 ? [theme.c("muted", "该级别下没有记录")] : []),
-      ],
-    }).concat(all.length === 0 ? [gap(total), pad(`  ${theme.c("muted", "日志为空")}`, total)] : []);
+    return [
+      rule(theme, total, `日志 · ${state}`, this.filter.value
+        ? `搜索「${this.filter.value}」 · ${all.length} 条 · Esc 清除`
+        : `${all.length} 条 · / 搜索 · Home 最早 · End 跟随`,
+        this.follow ? "accent" : "muted"),
+      ...(visible.length
+        ? visible.map((line) => pad(" " + theme.c(LEVEL_COLOR[line.level], truncate(line.text, total - 1)), total))
+        : [pad(`  ${theme.c("muted", "该级别下没有记录")}`, total)]),
+    ];
   }
 }

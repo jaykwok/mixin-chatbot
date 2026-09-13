@@ -6,13 +6,16 @@ import { App } from "../../scripts/ops/tui/app.ts";
 import { Screen, type Key } from "../../scripts/ops/tui/render/screen.ts";
 import { createTheme } from "../../scripts/ops/tui/render/theme.ts";
 import { Viewport } from "../../scripts/ops/tui/render/viewport.ts";
-import type { AppApi, ConfirmSpec, ViewContext } from "../../scripts/ops/tui/view.ts";
+import type { AppApi, ConfirmSpec, SelectSpec, View, ViewContext } from "../../scripts/ops/tui/view.ts";
 import type { Deployment } from "../../scripts/ops/tui/platform.ts";
 import { HealthView } from "../../scripts/ops/tui/views/health.ts";
 import { OverviewView } from "../../scripts/ops/tui/views/overview.ts";
 import { StatsView } from "../../scripts/ops/tui/views/stats.ts";
 import { StorageView } from "../../scripts/ops/tui/views/storage.ts";
+import { HistoryView } from "../../scripts/ops/tui/views/history.ts";
+import { LogsView } from "../../scripts/ops/tui/views/logs.ts";
 import { MaintainView } from "../../scripts/ops/tui/views/maintain.ts";
+import * as tuiData from "../../scripts/ops/tui/data.ts";
 import { createRelayView, createRoutesView } from "../../scripts/ops/tui/views/passthrough.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -29,11 +32,13 @@ function fakeApp(root = "unused") {
     answers: [] as (string | null)[], prompts: [] as string[], confirms: [] as ConfirmSpec[],
     commands: [] as { title: string; args: string[] }[], toasts: [] as string[],
     opened: [] as string[], destinations: [] as string[],
+    choices: [] as (string | null)[], menus: [] as SelectSpec[],
   };
   const app: AppApi = {
     deployment: { ...deployment, groupDataRoot: root }, theme: createTheme("truecolor"),
     redraw() {}, go(id) { calls.destinations.push(id); }, toast(_status, text) { calls.toasts.push(text); },
     async ask(label) { calls.prompts.push(label); return calls.answers.shift() ?? null; },
+    async choose(spec) { calls.menus.push(spec); return calls.choices.shift() ?? null; },
     async confirm(spec) { calls.confirms.push(spec); return true; },
     async run(title, args) { calls.commands.push({ title, args }); return 0; },
     async runInteractive() { throw new Error("测试不得执行真实运维命令"); },
@@ -62,6 +67,183 @@ function terminal() {
   const screen = new Screen(output as unknown as NodeJS.WriteStream, input as unknown as NodeJS.ReadStream);
   return { input, output, screen, text: () => written, close() { screen.stop(); input.destroy(); output.destroy(); } };
 }
+
+test("左右切换主分区、Tab 切换子页并记住位置，待办可以跨分区直达", async () => {
+  const tty = terminal();
+  const received: string[] = [];
+  const left: string[] = [];
+  const page = (id: string, label: string): View => ({
+    id, label, render: () => [], hints: () => [],
+    onLeave() { left.push(id); },
+    onKey(key) { received.push(id + ":" + key.name); return true; },
+  });
+  const app = new App([
+    { id: "overview", label: "总览", views: [page("overview", "总览")] },
+    { id: "monitor", label: "监控", views: [page("health", "体检"), page("logs", "日志")] },
+    { id: "stats", label: "统计", views: [page("stats", "统计")] },
+    { id: "data", label: "数据", views: [page("history", "会话"), page("storage", "临时文件"), page("relay", "外链")] },
+    { id: "system", label: "系统", views: [page("maintain", "服务部署"), page("routes", "回调路由")] },
+  ], { screen: tty.screen, deployment });
+  tty.screen.start(event => { void app["handleKey"](event); }, () => {});
+  try {
+    tty.input.write("\u001b[C");
+    await tick();
+    expect(app["current"].id).toBe("health");
+    await app["handleKey"](key("tab"));
+    expect(app["current"].id).toBe("logs");
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("stats");
+    await app["handleKey"](key("left"));
+    expect(app["current"].id).toBe("logs");
+    await app["handleKey"]({ ...key("tab"), shift: true });
+    expect(app["current"].id).toBe("health");
+    await app["handleKey"]({ ...key("tab"), shift: true });
+    expect(app["current"].id).toBe("logs");
+    await app["handleKey"](key("down"));
+    expect(received).toEqual(["logs:down"]);
+    app.go("storage");
+    expect(app["section"].id).toBe("data");
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("maintain");
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("overview");
+    await app["handleKey"](key("left"));
+    expect(app["current"].id).toBe("maintain");
+    await app["handleKey"](key("4"));
+    expect(app["current"].id).toBe("storage");
+    await app["handleKey"](key("tab"));
+    expect(app["current"].id).toBe("relay");
+    await app["handleKey"](key("tab"));
+    expect(app["current"].id).toBe("history");
+    expect(left).toContain("logs");
+    expect(plain([tty.text()])).toContain("Tab");
+  } finally { tty.close(); }
+});
+
+test("空格操作菜单共用原确认通道，方向键在弹窗内选择而不会切换分区", async () => {
+  const tty = terminal();
+  let executions = 0;
+  const view: View = {
+    id: "one", label: "数据", render: () => [], hints: () => [],
+    actions: () => [{ value: "c", label: "清理当前成员", danger: true }],
+    async onKey(key, app) {
+      if (key.name !== "c") return false;
+      if (await app.confirm({ title: "清理", subject: "当前群 / 当前成员", steps: ["归档选中范围"], danger: true })) executions++;
+      return true;
+    },
+  };
+  const app = new App([view, { id: "two", label: "其他", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
+  tty.screen.start(() => {}, () => {});
+  try {
+    for (const accept of [false, true]) {
+      const menu = app["handleKey"](key(accept ? "f2" : "space"));
+      expect(app["modal"]?.kind).toBe("select");
+      await app["handleKey"](key("right"));
+      expect(app["current"].id).toBe("one");
+      await app["handleKey"](key("enter"));
+      await tick();
+      expect(app["modal"]?.kind).toBe("confirm");
+      if (accept) await app["handleKey"](key("right"));
+      await app["handleKey"](key("enter"));
+      await menu;
+      expect(executions).toBe(accept ? 1 : 0);
+      expect(app["current"].id).toBe("one");
+    }
+  } finally { tty.close(); }
+});
+
+test("连续切换不会并发启动多次体检，回到加载中的页面只追加一次刷新", async () => {
+  const tty = terminal();
+  const finishes: (() => void)[] = [];
+  let reads = 0;
+  const slow: View = {
+    id: "slow", label: "体检", render: () => [], hints: () => [],
+    refresh: () => { reads++; return new Promise(resolve => { finishes.push(resolve); }); },
+  };
+  const app = new App([{ id: "home", label: "总览", render: () => [], hints: () => [] }, slow], { screen: tty.screen, deployment });
+  tty.screen.start(() => {}, () => {});
+  try {
+    for (let i = 0; i < 10; i++) {
+      app.go("home");
+      app.go("slow");
+    }
+    expect(reads).toBe(1);
+    finishes.shift()!();
+    await tick();
+    expect(reads).toBe(2);
+    finishes.shift()!();
+    await tick();
+    expect(app["refreshes"].size).toBe(0);
+  } finally { finishes.forEach(finish => finish()); tty.close(); }
+});
+
+test("初次读取尚未完成也可以退出，终端立即恢复", async () => {
+  const tty = terminal();
+  let finish!: () => void;
+  const app = new App([{
+    id: "slow", label: "总览", render: () => [], hints: () => [],
+    refresh: () => new Promise(resolve => { finish = resolve; }),
+  }], { screen: tty.screen, deployment });
+  app["refreshChrome"] = async () => {};
+  const running = app.start();
+  try {
+    await app["handleKey"](key("q"));
+    await running;
+    expect(tty.screen.isActive).toBe(false);
+    expect(tty.input.isRaw).toBe(false);
+  } finally { finish(); tty.close(); }
+});
+
+test("后台查询未完成时 q 仍可退出", async () => {
+  const tty = terminal();
+  let finish!: (handled: boolean) => void;
+  const app = new App([{
+    id: "query", label: "日志", render: () => [], hints: () => [],
+    onKey: () => new Promise(resolve => { finish = resolve; }),
+  }], { screen: tty.screen, deployment });
+  tty.screen.start(() => {}, () => {});
+  try {
+    const query = app["handleKey"](key("t"));
+    await app["handleKey"](key("q"));
+    expect(app["quit"]).toBe(true);
+    finish(true);
+    await query;
+  } finally { finish(true); tty.close(); }
+});
+
+test("选择菜单支持中文筛选、取消和长列表，禁用项不会被执行", async () => {
+  const tty = terminal();
+  const app = new App([{ id: "fixture", label: "测试", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
+  tty.screen.start(() => {}, () => {});
+  try {
+    const selection = app.choose({ title: "操作", choices: [
+      { value: "restart", label: "重启服务" },
+      { value: "stop", label: "停止服务", disabled: true, description: "正在刷新，请稍后" },
+    ] });
+    for (const text of "停止") await app["handleKey"](key(text, text));
+    await app["handleKey"](key("enter"));
+    expect(app["modal"]?.kind).toBe("select");
+    expect(plain(app["renderModal"](72, 20))).toContain("不可用");
+    await app["handleKey"]({ ...key("u"), ctrl: true });
+    for (const text of "重启") await app["handleKey"](key(text, text));
+    await app["handleKey"](key("enter"));
+    expect(await selection).toBe("restart");
+
+    const long = app.choose({ title: "长列表", description: "范围说明".repeat(60),
+      choices: Array.from({ length: 60 }, (_, index) => ({
+        value: String(index), label: "选项 " + index, description: "选项说明".repeat(80),
+      })),
+    });
+    await app["handleKey"](key("end"));
+    const frame = app["renderModal"](72, 20);
+    expect(frame.length).toBeLessThanOrEqual(20);
+    for (const line of frame) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(72);
+    expect(plain(frame)).toContain("选项 59");
+    expect(plain(frame)).toContain("Esc 取消");
+    await app["handleKey"](key("escape"));
+    expect(await long).toBeNull();
+  } finally { tty.close(); }
+});
 
 test("终端交接期间不吃键或重绘，成功与异常退出都恢复原始模式和键盘", async () => {
   const tty = terminal();
@@ -153,7 +335,7 @@ test("完成的执行面板按方向键回看而不关闭，长输出首尾可�
   } finally { tty.close(); }
 });
 
-test("总览的待办可选择并跳转到维护、存储、健康", () => {
+test("总览的待办与常用入口可直接进入具体功能", () => {
   const view = new OverviewView();
   const { app, calls } = fakeApp();
   Object.assign(view, { state: { kind: "ready", value: {
@@ -162,15 +344,22 @@ test("总览的待办可选择并跳转到维护、存储、健康", () => {
     tmp: [{ bytes: 10, entries: [{ newest: 0, bytes: 10 }] }],
   } } });
   for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
+  // 告警在前（未提交改动 danger 排在陈旧 tmp warn 前面），常用入口固定在后，回车都是「去处理」。
   view.onKey(key("enter"), app);
   view.onKey(key("down"), app);
   view.onKey(key("enter"), app);
   view.onKey(key("end"), app);
   view.onKey(key("enter"), app);
-  expect(calls.destinations).toEqual(["maintain", "storage", "health"]);
+  expect(calls.destinations).toEqual(["maintain", "storage", "maintain"]);
+  const shown = plain(view.render(context()));
+  expect(shown).toContain("查看运行日志");
+  // 分隔线右端只数需要关注的条数，不把四个常驻入口算进去。
+  expect(shown).toContain("2 项待关注");
+  view.onKey(key("health"), app);
+  expect(calls.destinations.at(-1)).toBe("health");
   const maintain = new MaintainView();
   Object.assign(maintain, { platform: "windows", state: { kind: "ready", value: {
-    behind: 24, incoming: Array.from({ length: 24 }, (_, i) => ({ sha: String(i), subject: "待应用更新" })),
+    sha: "123456789", behind: 24, incoming: Array.from({ length: 24 }, (_, i) => ({ sha: String(i), subject: "待应用更新" })),
   } } });
   fits(maintain.render(context(72, 20)), context(72, 20));
 });
@@ -202,15 +391,15 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
     app.runInteractive = async (title, args) => { interactive.push(args); calls.commands.push({ title, args }); return 0; };
     const view = new MaintainView();
     Object.assign(view, { platform, state: { kind: "ready", value: { sha: "123456789", behind: 1, dirty: false, incoming: [{ sha: "987654321", subject: "fixture" }] } } });
-    const expected = [["deploy"], ["update"], ["restart"], platform === "windows" ? ["doctor", "-Repair"] : ["deploy"],
-      ["stop"], ["start"], ...(platform === "windows" ? [["repair-tunnel"]] : []), ["uninstall"]];
+    const expected = [["start"], ["restart"], ["stop"], ["update"], ["deploy"],
+      platform === "windows" ? ["doctor", "-Repair"] : ["deploy"], ...(platform === "windows" ? [["repair-tunnel"]] : []), ["uninstall"]];
     for (let i = 0; i < expected.length; i++) {
       fits(view.render(context(72, 20)), context(72, 20));
       await view.onKey(key("enter"), app);
       await view.onKey(key("down"), app);
     }
     expect(calls.commands.map(call => call.args)).toEqual(expected);
-    expect(interactive).toEqual([["deploy"], ["update"], ...(platform === "linux" ? [["deploy"]] : []), ["uninstall"]]);
+    expect(interactive).toEqual([["update"], ["deploy"], ...(platform === "linux" ? [["deploy"]] : []), ["uninstall"]]);
     expect(calls.confirms.at(-1)?.typeToConfirm).toBe("卸载");
     const health = new HealthView();
     Object.assign(health, { platform, state: { kind: "ready", value: { pass: 0, warn: 0, fail: 1, checks: [{ name: "fixture", status: "fail", detail: "fixture" }] } } });
@@ -317,10 +506,13 @@ test("存储清当前会同时传群与成员，清所有则明确显示范围",
     const view = new StorageView();
     const { app, calls } = fakeApp(fixture.root);
     await view.refresh(app);
-    for (let i = 0; i < 4; i++) await view.onKey(key("right"), app);
+    calls.choices.push("0");
+    await view.onKey(key("d"), app);
     fits(view.render(context(72, 20)), context(72, 20));
+    // 两行清理预览各自说清范围：一行是选中成员，一行是全部，且明说忽略筛选。
     expect(plain(view.render(context()))).toContain("p 当前");
-    expect(plain(view.render(context()))).toContain("a 所有群与成员");
+    expect(plain(view.render(context()))).toContain("a 全部");
+    expect(plain(view.render(context()))).toContain("所有群与成员，忽略筛选");
     await view.onKey(key("p"), app);
     expect(calls.commands[0]!.args).toEqual(["tmp-purge", "--all", "--group", "g1", "--user", "13812345678", "--storage-segment"]);
     expect(calls.confirms[0]!.subject).toContain("群 g1");
@@ -328,6 +520,152 @@ test("存储清当前会同时传群与成员，清所有则明确显示范围",
     expect(calls.commands[1]!.args).toEqual(["tmp-purge", "--all"]);
     expect(calls.confirms[1]!.subject).toContain("所有群的所有成员");
   } finally { await fixture.cleanup(); }
+});
+
+test("筛选临时文件后只清选中成员，全量清理仍明确覆盖所有群，详情可滚到最后一个文件", async () => {
+  const fixture = await tempFixture("tui-storage-filter-");
+  try {
+    for (const [group, count] of [["支持 一群", 3], ["支持 二群", 32]] as const) {
+      const dir = join(fixture.root, group, "users", "13812345678", "tmp");
+      await mkdir(dir, { recursive: true });
+      for (let i = 0; i < count; i++) await writeFile(join(dir, `file-${String(i).padStart(2, "0")}.txt`), "fixture");
+    }
+    const view = new StorageView();
+    const { app, calls } = fakeApp(fixture.root);
+    await view.refresh(app);
+    calls.choices.push(null, "0");
+    await view.onKey(key("d"), app);
+    expect(plain(view.render(context()))).toContain("30 天未改动");
+    await view.onKey(key("d"), app);
+    calls.answers.push("支持 二群", null);
+    await view.onKey(key("/"), app);
+    await view.onKey(key("/"), app);
+    expect(plain(view.render(context()))).toContain("1 / 2");
+    expect(plain(view.render(context()))).not.toContain("支持 一群");
+    await view.onKey(key("p"), app);
+    expect(calls.commands[0]!.args).toEqual(["tmp-purge", "--all", "--group", "支持 二群", "--user", "13812345678", "--storage-segment"]);
+    await view.onKey(key("a"), app);
+    expect(calls.commands[1]!.args).toEqual(["tmp-purge", "--all"]);
+    expect(calls.confirms[1]!.subject).toContain("不受列表筛选影响");
+    expect(calls.confirms[1]!.subject).toContain("35 个条目");
+    await view.onKey(key("enter"), app);
+    view.render(context());
+    await view.onKey(key("end"), app);
+    expect(plain(view.render(context()))).toContain("file-31.txt");
+    for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
+    await view.onKey(key("escape"), app);
+    expect(plain(view.render(context()))).toContain("1 / 2");
+    await view.onKey(key("escape"), app);
+    expect(plain(view.render(context()))).toContain("支持 一群");
+    calls.answers.push("没有这个群");
+    await view.onKey(key("/"), app);
+    await view.onKey(key("p"), app);
+    expect(calls.commands).toHaveLength(2);
+    expect(plain(view.render(context()))).toContain("没有匹配");
+  } finally { await fixture.cleanup(); }
+});
+
+test("群筛选控制统计导出范围，常用日期可选，会话全部成员可达且清理目标正确", async () => {
+  const fixture = await tempFixture("tui-groups-filter-");
+  try {
+    await history(fixture.root, "other-group", "13912345678");
+    for (let i = 0; i < 24; i++) await history(fixture.root, "support-group", String(13812345678 + i));
+    const { app, calls } = fakeApp(fixture.root);
+    const stats = new StatsView(join(fixture.root, "reports"));
+    await stats.refresh(app);
+    calls.answers.push("support-group", null);
+    await stats.onKey(key("/"), app);
+    await stats.onKey(key("/"), app);
+    expect(plain(stats.render(context()))).not.toContain("other-group");
+    await stats.onKey(key("e"), app);
+    await stats.onKey(key("o"), app);
+    const report = await Bun.file(calls.opened[0]!).text();
+    expect(report).toContain("support-group");
+    expect(report).not.toContain("other-group");
+    calls.choices.push("7");
+    await stats.onKey(key("w"), app);
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - 6);
+    expect(stats["window"].since).toBe(start.getTime());
+    const selectedWindow = { ...stats["window"] };
+    calls.choices.push(null);
+    await stats.onKey(key("w"), app);
+    expect(stats["window"]).toEqual(selectedWindow);
+
+    const sessions = new HistoryView();
+    await sessions.refresh(app);
+    calls.answers.push("support-group");
+    await sessions.onKey(key("/"), app);
+    await sessions.onKey(key("enter"), app);
+    sessions.render(context());
+    await sessions.onKey(key("end"), app);
+    expect(plain(sessions.render(context()))).toContain("138****5701");
+    for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(sessions.render(context(width, rows)), context(width, rows));
+    await sessions.onKey(key("c"), app);
+    expect(calls.commands.at(-1)?.args).toEqual(["history-clear", "support-group", "--storage-segment"]);
+    await sessions.onKey(key("escape"), app);
+    expect(plain(sessions.render(context()))).not.toContain("other-group");
+    await sessions.onKey(key("escape"), app);
+    expect(plain(sessions.render(context()))).toContain("other-group");
+  } finally { await fixture.cleanup(); }
+});
+
+test("日志搜索与级别筛选可叠加，Home/End 首尾可达并恢复跟随", async () => {
+  const view = new LogsView();
+  const { app, calls } = fakeApp();
+  Object.assign(view, { state: { kind: "ready", value: Array.from({ length: 200 }, (_, index) => ({
+    level: index % 2 === 0 ? "error" : "info", text: `record-${index} ${index % 2 === 0 ? "a1b2c3d4" : "other-task"}`,
+  })) } });
+  view.render(context());
+  await view.onKey(key("home"), app);
+  expect(plain(view.render(context()))).toContain("record-0 ");
+  expect(plain(view.render(context()))).toContain("已暂停");
+  calls.answers.push("a1b2c3d4");
+  await view.onKey(key("/"), app);
+  calls.choices.push("2");
+  await view.onKey(key("l"), app);
+  await view.onKey(key("end"), app);
+  const output = plain(view.render(context()));
+  expect(output).toContain("record-198 ");
+  expect(output).not.toContain("other-task");
+  expect(output).toContain("跟随中");
+  expect(output).toContain("100 条");
+  for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
+  calls.answers.push("missing-task");
+  await view.onKey(key("/"), app);
+  fits(view.render(context(72, 20)), context(72, 20));
+  expect(plain(view.render(context()))).toContain("没有记录");
+});
+
+test("快速离开日志页后，未完成的加载不会重新启动后台轮询", async () => {
+  const view = new LogsView();
+  const { app } = fakeApp();
+  let finish!: (lines: tuiData.LogLine[]) => void;
+  const load = spyOn(tuiData, "loadLogTail").mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  try {
+    const refresh = view.refresh(app);
+    view.onLeave();
+    finish([{ text: "late result", level: "info" }]);
+    await refresh;
+    expect(view["timer"]).toBeNull();
+    expect(view["state"].kind).not.toBe("ready");
+  } finally { view.onLeave(); load.mockRestore(); }
+});
+
+test("操作预览在宽窄窗口及无色终端都完整容纳菜单，最后一项始终可达", async () => {
+  const { app } = fakeApp();
+  for (const view of [new MaintainView(), createRelayView(), createRoutesView()]) {
+    await view.onKey!(key("end"), app);
+    for (const [width, rows] of [[72, 20], [80, 24], [96, 20], [100, 24], [120, 35]]) {
+      for (const depth of ["truecolor", "ansi256", "none"] as const) {
+        const ctx = { ...context(width, rows), theme: createTheme(depth) };
+        const frame = view.render(ctx);
+        fits(frame, ctx);
+        expect(plain(frame)).toContain(view.id === "maintain" ? "卸载" : view.id === "relay" ? "清理全部外链" : "移除废弃绑定");
+      }
+    }
+  }
 });
 
 test("必填输入为空会停止，路由群名中的空格完整传递", async () => {

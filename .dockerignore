@@ -4,6 +4,7 @@
 .claude
 agents
 backup
+tmp
 AGENTS.md
 CLAUDE.md
 GEMINI.md

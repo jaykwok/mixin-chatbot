@@ -7,11 +7,11 @@
 import { describe, expect, test } from "bun:test";
 import { pad, truncate, width } from "../../scripts/ops/tui/render/width.ts";
 import { createTheme, STATUS } from "../../scripts/ops/tui/render/theme.ts";
-import { bar, box, columns, fields, mark, sparkline, status, table, wrap } from "../../scripts/ops/tui/render/widgets.ts";
+import { bar, box, columnChart, columns, fields, mark, meter, rule, sparkline, status, table, tile, wrap } from "../../scripts/ops/tui/render/widgets.ts";
 import * as fmt from "../../scripts/ops/tui/render/format.ts";
 import { listenKeys, type Key } from "../../scripts/ops/tui/render/screen.ts";
 import { PassThrough } from "node:stream";
-import { navbar } from "../../scripts/ops/tui/frame.ts";
+import { footer, navbar, subnav } from "../../scripts/ops/tui/frame.ts";
 
 const CSI = String.fromCharCode(27) + "[";
 /** 界面里真实会遇到的几类文本：中文、全角标点、摘要目录名、带色文本、emoji。 */
@@ -112,6 +112,7 @@ describe("组件宽度不变量", () => {
             ...fields(current, [["群数据根", "/srv/mixin/groups"], ["占用", "5.8 GB"]], size - 4, 10),
             status(current, "warn", "cloudflared 未记录归属"),
             sparkline(current, [1, 5, 9, 2, 0, 7]),
+            meter(current, [{ value: 3, color: "warn" }, { value: 5, color: "accent" }], 10, 12),
             ...table(current, {
               width: size - 4,
               rows,
@@ -127,9 +128,54 @@ describe("组件宽度不变量", () => {
           ],
         });
         for (const line of built) expect(width(line)).toBe(size);
+
+        // 无边框的那几个组件走各自的宽度约定，同样要精确等宽。
+        for (const line of [
+          rule(current, size, "近 14 天提问", "峰值 128 · 今日 5 群"),
+          rule(current, size),
+          ...tile(current, { width: size, label: "今日提问", value: "126 次", delta: { text: "↑7" }, trend: [3, 9, 4, 8] }),
+          ...tile(current, { width: size, label: "数据占用", value: "14.8 GB", foot: "tmp 10.0 GB",
+            meter: { total: 100, segments: [{ value: 62, color: "accent" }] } }),
+          ...columnChart(current, { width: size, height: 4, values: [62, 0, 128, 33, 96], labels: ["09-01", "09-02", "09-03", "09-04", "09-05"] }),
+        ]) expect(width(line)).toBe(size);
       }
     });
   }
+
+  test("指标块窄到放不下图形时，仪表让位给说明文字，趋势线不让", () => {
+    // 没有说明的彩色进度条等于让颜色单独承载语义；趋势线砍成半截则会谎报趋势。
+    const narrow = tile(theme, { width: 16, label: "数据占用", value: "14.8 GB", foot: "tmp 10.0 GB",
+      meter: { total: 100, segments: [{ value: 62, color: "accent" }] } });
+    expect(Bun.stripANSI(narrow[2]!)).toContain("tmp 10.0 GB");
+    expect(narrow[2]).not.toContain("█");
+
+    const trend = tile(theme, { width: 16, label: "今日提问", value: "126 次", foot: "峰值 128", trend: [1, 4, 2, 9, 5, 7] });
+    expect(Bun.stripANSI(trend[2]!).trim()).not.toContain("峰值");
+    expect(Bun.stripANSI(trend[2]!).trim().length).toBeGreaterThan(0);
+  });
+
+  test("仪表在无色终端下靠字符密度区分，不是只靠颜色", () => {
+    const plainMeter = Bun.stripANSI(meter(plain, [{ value: 3, color: "accent" }], 10, 10));
+    expect(plainMeter).toBe("███░░░░░░░");
+    // 满和空必须长得不一样，否则 NO_COLOR 下每条仪表读起来都是「满的」。
+    expect(Bun.stripANSI(meter(plain, [{ value: 10, color: "accent" }], 10, 10)))
+      .not.toBe(Bun.stripANSI(meter(plain, [{ value: 0, color: "accent" }], 10, 10)));
+  });
+
+  test("柱状图的零值留白、极小值仍可见，峰值与零刻度分列两端", () => {
+    const plot = (line: string): string => Bun.stripANSI(line).split(/[│└]/)[1] ?? "";
+    const lines = columnChart(plain, { width: 40, height: 4, values: [0, 50, 100] });
+    expect(lines[0]).toContain("100");
+    expect(lines.at(-1)).toContain("0");
+    // 零值那一列整列留白，有值的列画出来。
+    expect(plot(lines[3]!).startsWith(" ")).toBe(true);
+    expect(plot(lines[3]!)).toContain("█");
+
+    // 小到不够一格的值也要顶出一格：否则「那天没人用」和「那天用得少」看起来一样。
+    const tiny = columnChart(plain, { width: 40, height: 4, values: [1, 1000] });
+    expect(plot(tiny[3]!).trimEnd().length).toBeGreaterThan(0);
+    expect(plot(tiny[3]!).startsWith(" ")).toBe(false);
+  });
 
   test("并排放置的两块加上间隔正好填满整行", () => {
     const left = box(theme, { width: 38, title: "部署", body: ["a"] });
@@ -146,14 +192,43 @@ describe("组件宽度不变量", () => {
     }
   });
 
-  test("72 列能看见全部九页，无色模式也保留当前页标记", () => {
-    const labels = ["总览", "健康", "统计", "历史", "存储", "外链", "路由", "日志", "维护"].map(label => ({ id: label, label }));
+  test("标点不落行首，避头点回退后仍然不超宽也不丢字", () => {
+    const text = "未配置 data/config/relay.json 时该特性关闭，这里的命令会直接报「未启用」。清理只删后端对象。";
+    for (const size of [12, 20, 24, 33, 60]) {
+      const lines = wrap(text, size);
+      for (const line of lines) expect(width(line)).toBeLessThanOrEqual(size);
+      for (const line of lines.slice(1)) {
+        expect("。，、；：？！）」』】".includes(Bun.stripANSI(line).trimStart()[0] ?? "")).toBe(false);
+      }
+      // 回退不能把字吃掉：拼回来必须和原文逐字相同。
+      expect(lines.map(line => Bun.stripANSI(line)).join("")).toBe(text);
+    }
+  });
+
+  test("72 列能看见五个主分区和全部子页，无色模式也保留当前标记", () => {
+    const labels = ["总览", "监控", "统计", "数据", "系统"].map(label => ({ id: label, label }));
     for (const depth of ["truecolor", "none"] as const) {
       const lines = navbar(createTheme(depth), 72, labels, "统计", null);
       const text = Bun.stripANSI(lines[0]!);
       for (const { label } of labels) expect(text).toContain(label);
       if (depth === "none") expect(text).toContain("[统计]");
       for (const line of lines) expect(Bun.stringWidth(line)).toBe(72);
+      const children = subnav(createTheme(depth), 72, ["会话", "临时文件", "外链"].map(label => ({ id: label, label })), "临时文件");
+      expect(Bun.stripANSI(children)).toContain("[临时文件]");
+      expect(Bun.stripANSI(children)).toContain("Tab / Shift+Tab");
+      expect(Bun.stringWidth(children)).toBe(72);
+    }
+  });
+
+  test("窄窗口下操作提示再多也不会挤掉主导航、菜单、刷新和退出提示", () => {
+    const common: [string, string][] = [["←→", "分区"], ["Tab", "子页"], ["Space", "操作"], ["r", "刷新"], ["?", "帮助"], ["q", "退出"]];
+    for (const depth of ["truecolor", "ansi256", "none"] as const) {
+      for (const toast of [null, { status: "ok" as const, text: "操作已完成".repeat(40) }]) {
+        const lines = footer(createTheme(depth), 72, toast, Array.from({ length: 30 }, () => ["x", "上下文操作"]), common);
+        expect(lines).toHaveLength(2);
+        for (const line of lines) expect(Bun.stringWidth(line)).toBe(72);
+        for (const [key, label] of common) expect(Bun.stripANSI(lines[1]!)).toContain(key + " " + label);
+      }
     }
   });
 });

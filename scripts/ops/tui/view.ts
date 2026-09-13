@@ -33,6 +33,25 @@ export interface ConfirmSpec {
   danger?: boolean;
 }
 
+/** 选择菜单只返回选择，不直接执行操作；调用方继续走原有确认与执行通道。 */
+export interface Choice {
+  value: string;
+  label: string;
+  description?: string;
+  danger?: boolean;
+  disabled?: boolean;
+}
+
+export interface SelectSpec {
+  title: string;
+  description?: string;
+  choices: Choice[];
+  initial?: string;
+}
+
+/** value 对应本页 onKey 的键名，菜单与快捷键共用同一份操作逻辑。 */
+export type ViewAction = Choice;
+
 export interface AppApi {
   theme: Theme;
   deployment: Deployment;
@@ -42,6 +61,8 @@ export interface AppApi {
   confirm(spec: ConfirmSpec): Promise<boolean>;
   /** 要一行输入。空字符串表示留空，null 表示取消。 */
   ask(label: string, initial?: string): Promise<string | null>;
+  /** 支持方向键与文字筛选的选择菜单，Esc 返回 null。 */
+  choose(spec: SelectSpec): Promise<string | null>;
   /** 跑一条运维命令，实时显示每一行输出；返回退出码。仅用于不会向用户提问的命令。 */
   run(title: string, args: string[]): Promise<number>;
   /**
@@ -60,17 +81,26 @@ export interface AppApi {
 
 export interface View {
   id: string;
-  /** 导航栏上的两字标签。 */
+  /** 导航栏上的标签。 */
   label: string;
   render(ctx: ViewContext): string[];
   /** 本页特有的按键提示；通用键由 app 补。 */
   hints(): [string, string][];
+  /** 空格操作菜单；只列出当前上下文可用的动作。 */
+  actions?(): ViewAction[];
   /** 进入本页或按 r 时调用。 */
   refresh?(app: AppApi): Promise<void>;
   /** 离开本页时调用，用来停掉本页自己起的轮询。 */
   onLeave?(): void;
   /** 返回 true 表示按键已被消费，app 不再继续处理。 */
   onKey?(key: Key, app: AppApi): boolean | Promise<boolean>;
+}
+
+/** 按管理员任务组织主分区；App 记住每个分区最后查看的子页。 */
+export interface Section {
+  id: string;
+  label: string;
+  views: View[];
 }
 
 /** 数据加载的三种状态。界面要能区分「还在读」和「读到了但是空的」。 */

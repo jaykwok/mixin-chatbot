@@ -1,8 +1,4 @@
-// 页眉、导航、页脚。三行页眉两行页脚，剩下全给正文。
-//
-// 终端高度是这个界面最稀缺的资源：80×24 下每多一行装饰就少一条记录。所以状态、模式、端口、
-// 域名和版本全部压在同一条页眉里，导航用横向标签而不是左侧栏（左栏在 72 列下要吃掉五分之一
-// 的宽度，而这些标签只有两个字）。
+// 三行页眉、两行页脚。方向键导航常驻，页面动作与提示共用另一行，正文保留完整宽度。
 
 import { pad, width } from "./render/width.ts";
 import { hints, status } from "./render/widgets.ts";
@@ -40,22 +36,17 @@ export function header(input: HeaderInput): string[] {
   const { theme, width: total, deployment, service } = input;
   const { name, label } = serviceStatus(service);
 
-  const left = ` ${theme.bold("mixin-chatbot")}  ${status(theme, name, label)}`;
+  const left = ` ${theme.bold("mixin-chatbot")} ${theme.c("muted", "/ 管理台")}  ${status(theme, name, label)}`;
   const uptime = input.uptime ? theme.c("muted", ` · ${fmt.duration(input.uptime)}`) : "";
-  const right = ` ${theme.c("muted", describeMode(deployment))} ${theme.c("muted", `· :${deployment.port}`)} `;
+  const mode = ` ${theme.c("muted", describeMode(deployment))} ${theme.c("muted", `· :${deployment.port}`)} `;
 
   const head = left + uptime;
-  const fill = Math.max(0, total - 2 - width(head) - width(right));
-  const line =
-    theme.c("faint", "╭") + head + theme.c("faint", "─".repeat(fill)) + right + theme.c("faint", "╮");
-  return [pad(line, total)];
+  const right = width(head) + width(mode) + 2 <= total ? mode : theme.c("muted", ` :${deployment.port} `);
+  return [pad(head + " ".repeat(Math.max(1, total - width(head) - width(right))) + right, total)];
 }
 
 /**
- * 导航：横向标签 + 一条下划线，当前页那一段染成主色。
- *
- * 用下划线标记当前页而不是给标签整体反色：反色在窄终端里会变成一块很重的色块，而下划线
- * 只占已经必须存在的那条分隔线，等于零额外高度。
+ * 主分区取消数字前缀，当前分区使用等宽选中标记。
  */
 export function navbar(
   theme: Theme,
@@ -64,16 +55,18 @@ export function navbar(
   activeId: string,
   git: GitState | null
 ): string[] {
-  const gap = total < 80 ? 1 : 2;
-  let line = " ";
+  const gap = total < 100 ? 1 : 2;
+  let line = theme.c("accent", "← ");
   const spans: { start: number; size: number; active: boolean }[] = [];
-  labels.forEach((entry, index) => {
+  labels.forEach((entry) => {
     const active = entry.id === activeId;
-    const label = active && theme.depth === "none" ? `[${entry.label}]` : entry.label;
-    const text = `${theme.c("muted", String(index + 1))} ${active ? theme.bold(theme.c("accent", label)) : theme.c("muted", label)}`;
+    const text = active
+      ? theme.depth === "none" ? `[${entry.label}]` : theme.invert(theme.bold(` ${entry.label} `))
+      : theme.c("muted", ` ${entry.label} `);
     spans.push({ start: width(line), size: width(text), active });
     line += text + " ".repeat(gap);
   });
+  line += theme.c("accent", "→");
 
   // 版本信息贴右：落后提交数是「该不该升级」唯一需要天天看到的数字。
   let tail = "";
@@ -102,6 +95,16 @@ export function navbar(
   return [pad(line, total), pad(underline, total)];
 }
 
+/** 子页单独占用原分隔线的位置，保持正文高度；Tab 只在当前分区内循环。 */
+export function subnav(theme: Theme, total: number, pages: { id: string; label: string }[], activeId: string): string {
+  const entries = pages.map(page => page.id === activeId
+    ? theme.bold(theme.c("accent", "[" + page.label + "]"))
+    : theme.c("muted", " " + page.label + " "));
+  const tabs = "  " + entries.join("  ");
+  const hint = theme.c("muted", "Tab / Shift+Tab 切换 ");
+  return pad(tabs + " ".repeat(Math.max(2, total - width(tabs) - width(hint))) + hint, total);
+}
+
 /**
  * 页脚：提示消息一行 + 按键提示一行。
  *
@@ -112,8 +115,9 @@ export function footer(
   theme: Theme,
   total: number,
   toast: { status: keyof typeof STATUS; text: string } | null,
-  keys: [string, string][]
+  keys: [string, string][],
+  commonKeys: [string, string][]
 ): string[] {
-  const message = toast ? ` ${status(theme, toast.status, toast.text)}` : "";
-  return [pad(message, total), hints(theme, keys, total)];
+  const context = toast ? pad(` ${status(theme, toast.status, toast.text)}`, total) : hints(theme, keys, total);
+  return [context, hints(theme, commonKeys, total)];
 }

@@ -237,8 +237,8 @@ test.skipIf(process.platform !== "win32")("Windows successful backup cleanup emp
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/lifecycle.ps1"))}
 $root=Join-Path $PSScriptRoot 'project'
-$snapshot=Join-Path $root 'backup/tmp/deploy-current'
-$failed=Join-Path $root 'backup/tmp/deploy-failed'
+$snapshot=Join-Path $root 'backup/snapshots/deploy-current'
+$failed=Join-Path $root 'backup/snapshots/deploy-failed'
 New-Item -ItemType Directory -Force -Path $snapshot,$failed,(Join-Path $root 'data/state') | Out-Null
 Set-Content (Join-Path $snapshot 'old-config') 'old'
 Set-Content (Join-Path $failed 'recovery') 'preserve'
@@ -277,8 +277,8 @@ test.skipIf(!bash || !existsSync(bash))("Linux successful backup cleanup empties
 set -euo pipefail
 PROJECT_DIR="$(realpath "$1")"
 . '${posixPath(join(project, "scripts/lib/lifecycle.sh"))}'
-snapshot="$PROJECT_DIR/backup/tmp/deploy-current"
-failed="$PROJECT_DIR/backup/tmp/deploy-failed"
+snapshot="$PROJECT_DIR/backup/snapshots/deploy-current"
+failed="$PROJECT_DIR/backup/snapshots/deploy-failed"
 mkdir -p "$snapshot" "$failed"
 printf old > "$snapshot/old-config"
 printf preserve > "$failed/recovery"

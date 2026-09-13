@@ -34,8 +34,9 @@ RUN mkdir -p \
       /app/data/runtime/pi \
       /app/data/groups \
       /app/data/runtime/tmp \
-      /app/backup/tmp \
+      /app/backup/snapshots \
       /app/backup/rm \
+      /app/tmp \
       /app/logs && \
     chown -R appuser:appgroup /app
 

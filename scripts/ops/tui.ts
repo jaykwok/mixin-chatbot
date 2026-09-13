@@ -20,13 +20,16 @@ import { StorageView } from "./tui/views/storage.ts";
 import { createRelayView, createRoutesView } from "./tui/views/passthrough.ts";
 import { LogsView } from "./tui/views/logs.ts";
 import { MaintainView } from "./tui/views/maintain.ts";
-import type { View } from "./tui/view.ts";
+import type { Section } from "./tui/view.ts";
 
 function usage(): void {
   console.log("mixin-chatbot 运维界面");
   console.log("");
   console.log("  bun run tui                 启动全屏界面（Windows / Linux）");
   console.log("  bun run tui --help          查看帮助");
+  console.log("");
+  console.log("←→ 切换主分区，Tab 切换子页，↑↓ 选择，Enter 进入，空格打开操作菜单。");
+  console.log("总览 · 监控（体检/日志）· 统计 · 数据（会话/临时文件/外链）· 系统（服务部署/路由）");
   console.log("");
   console.log("界面需要交互式终端。脚本和 CI 里请直接用 ops.sh / ops.ps1 的子命令。");
 }
@@ -47,19 +50,15 @@ async function main(args: string[]): Promise<number> {
     return 1;
   }
 
-  const views: View[] = [
-    new OverviewView(),
-    new HealthView(),
-    new StatsView(),
-    new HistoryView(),
-    new StorageView(),
-    createRelayView(),
-    createRoutesView(),
-    new LogsView(),
-    new MaintainView(),
+  const sections: Section[] = [
+    { id: "overview", label: "总览", views: [new OverviewView()] },
+    { id: "monitor", label: "监控", views: [new HealthView(), new LogsView()] },
+    { id: "stats", label: "统计", views: [new StatsView()] },
+    { id: "data", label: "数据", views: [new HistoryView(), new StorageView(), createRelayView()] },
+    { id: "system", label: "系统", views: [new MaintainView(), createRoutesView()] },
   ];
 
-  const app = new App(views);
+  const app = new App(sections);
   await app.start();
   return 0;
 }

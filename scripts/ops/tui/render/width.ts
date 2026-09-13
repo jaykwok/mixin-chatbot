@@ -58,29 +58,51 @@ export function pad(text: string, size: number, align: Align = "left"): string {
   return clipped + " ".repeat(gap);
 }
 
+/**
+ * 不能落在行首的字符（避头点）。
+ *
+ * 界面通篇中文，一行以「。」或「」」开头，看着就和英文段落以句点开头一样刺眼。
+ * 碰上这种断点就把上一个字一起带下去，标点跟着它该跟的那个字走。
+ */
+const NO_LINE_START = new Set([
+  ..."。，、；：？！）］｝〕〉》」』】",
+  ..."”’…·～%",
+  ...",.;:?!)]}",
+]);
+
 /** 按显示列折行；每行独立闭合样式，下一行恢复样式，适用于滚动输出。 */
 export function wrap(text: string, size: number): string[] {
   if (size <= 0) return [];
   const lines: string[] = [];
   let style = "";
+  const visibleWidth = (parts: string[]): number =>
+    parts.reduce((sum, part) => sum + (SGR.test(part) ? 0 : width(part)), 0);
   for (const paragraph of text.split(/\r?\n/)) {
-    let line = style;
+    // 按 token 攒行而不是直接拼字符串：避头点要能把上一个字「退」回来，
+    // 而那个字前面可能还粘着样式序列，拼成字符串以后就切不干净了。
+    let parts: string[] = [];
     let used = 0;
     for (const part of tokens(paragraph)) {
       if (SGR.test(part)) {
         style = part === RESET || part === "\u001b[m" ? "" : style + part;
-        line += part;
+        parts.push(part);
         continue;
       }
       const columns = width(part);
       if (used + columns > size && used > 0) {
-        lines.push(line + (style ? RESET : ""));
-        line = style;
-        used = 0;
+        // 避头点：把上一个可见字符一起挪到下一行，标点就不会单独落在行首。
+        // 整行只剩一个可见字符时不退，否则那个字会被一路往下推，永远断不了行。
+        const last = parts.findLastIndex(item => !SGR.test(item));
+        const carry = last >= 0 && NO_LINE_START.has(part) && visibleWidth(parts) > width(parts[last]!)
+          ? parts.splice(last)
+          : [];
+        lines.push(style + parts.join("") + (style ? RESET : ""));
+        parts = carry;
+        used = visibleWidth(carry);
       }
-      if (columns <= size) { line += part; used += columns; }
+      if (columns <= size) { parts.push(part); used += columns; }
     }
-    lines.push(line + (style ? RESET : ""));
+    lines.push(style + parts.join("") + (style ? RESET : ""));
   }
   return lines;
 }

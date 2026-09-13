@@ -6,12 +6,9 @@
 //
 // 界面在这里提供的是「不用记参数」：每条命令要什么参数、危险在哪，列成菜单并在执行前问清楚。
 
-import { box, mark, table } from "../render/widgets.ts";
-import { pad } from "../render/width.ts";
 import type { StatusName } from "../render/theme.ts";
-import { wrap } from "../render/widgets.ts";
-import type { AppApi, View, ViewContext } from "../view.ts";
-import { gap, moveSelection } from "./common.ts";
+import type { AppApi, View, ViewAction, ViewContext } from "../view.ts";
+import { actionWorkbench, moveSelection } from "./common.ts";
 
 interface Command {
   label: string;
@@ -44,8 +41,14 @@ class CommandMenu implements View {
   hints(): [string, string][] {
     return [
       ["↑↓", "选择"],
-      ["⏎", "执行"],
+      ["Enter", "执行所选操作"],
     ];
+  }
+
+  actions(): ViewAction[] {
+    return this.commands.map((command, index) => ({
+      value: `command:${index}`, label: command.label, description: command.summary, danger: !!command.danger,
+    }));
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
@@ -54,10 +57,9 @@ class CommandMenu implements View {
       this.selected = moved;
       return true;
     }
-    if (key.name !== "enter") return false;
-
-    const command = this.commands[this.selected];
-    if (!command) return true;
+    const command = key.name === "enter" ? this.commands[this.selected]
+      : this.commands.find((_, index) => key.name === `command:${index}`);
+    if (!command) return false;
 
     const values: string[] = [];
     for (const label of command.ask ?? []) {
@@ -93,25 +95,18 @@ class CommandMenu implements View {
   }
 
   render(ctx: ViewContext): string[] {
-    const { theme, width: total } = ctx;
-    const out = box(theme, {
-      width: total,
-      title: this.title,
-      accent: "accent",
-      body: table(theme, {
-        width: total - 4,
-        rows: this.commands,
-        selected: this.selected,
-        columns: [
-          { header: "", size: 2, render: (command) => mark(theme, command.status) },
-          { header: "", size: Math.max(12, Math.floor(total * 0.2)), render: (command) => command.label },
-          { header: "", flex: 1, render: (command) => theme.c("muted", command.summary) },
-        ],
-      }).slice(1),
+    const command = this.commands[this.selected]!;
+    return actionWorkbench(ctx, {
+      title: this.title, items: this.commands, selected: this.selected,
+      details: [
+        ctx.theme.bold(command.summary),
+        ctx.theme.c(command.danger ? "warn" : "ok", command.danger ? "修改操作 · 执行前需确认" : "只读查看"),
+        "",
+        ...(command.ask?.length ? ["需要提供：" + command.ask.join("、"), ""] : []),
+        this.intro,
+      ],
+      note: command.danger ? "Enter 填写范围并查看确认步骤" : "Enter 查看结果 · 支持滚动回看完整输出",
     });
-    out.push(gap(total));
-    out.push(...wrap(this.intro, total - 2).map((line) => pad(` ${theme.c("muted", line)}`, total)));
-    return out;
   }
 }
 
@@ -170,7 +165,7 @@ export function createRelayView(): View {
 export function createRoutesView(): View {
   return new CommandMenu(
     "routes",
-    "路由",
+    "回调路由",
     "回调路由",
     "一个 callback key 同时对应多个群就是冲突，机器人会拒绝跨群广播。" +
       "reset 前必须先在平台侧把配置改对，否则下一条入站消息会把冲突重新建起来。",
