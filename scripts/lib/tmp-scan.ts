@@ -3,7 +3,7 @@
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { userSegment } from "../../src/agent/paths.ts";
-import { assertDataDirectory, dataDirectoryNames, resolveGroupName, type GroupSelection } from "./group-data.ts";
+import { assertDataDirectory, byName, dataDirectoryNames, resolveGroupName, type GroupSelection } from "./group-data.ts";
 
 export interface Usage {
   bytes: number;
@@ -92,9 +92,9 @@ export async function scanTmp(root: string, userFilter?: string, groupFilter?: s
         total.files += measured.files;
         total.newest = Math.max(total.newest, measured.newest);
       }
-      entries.sort((a, b) => b.bytes - a.bytes);
+      entries.sort((a, b) => b.bytes - a.bytes || byName(a.name, b.name));
       found.push(total);
     }
   }
-  return found.sort((a, b) => b.bytes - a.bytes);
+  return found.sort((a, b) => b.bytes - a.bytes || byName(a.group, b.group) || byName(a.user, b.user));
 }

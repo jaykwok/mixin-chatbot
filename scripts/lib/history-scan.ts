@@ -3,7 +3,7 @@
 
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { assertDataDirectory, dataDirectoryNames } from "./group-data.ts";
+import { assertDataDirectory, byName, dataDirectoryNames } from "./group-data.ts";
 
 export const HISTORY_FILE = "session.jsonl";
 
@@ -41,8 +41,8 @@ export async function scanHistory(root: string): Promise<GroupHistory[]> {
       }
     }
     if (users.length === 0) continue;
-    users.sort((a, b) => b.bytes - a.bytes);
+    users.sort((a, b) => b.bytes - a.bytes || byName(a.user, b.user));
     groups.push({ group, dir, users, bytes });
   }
-  return groups.sort((a, b) => b.bytes - a.bytes);
+  return groups.sort((a, b) => b.bytes - a.bytes || byName(a.group, b.group));
 }

@@ -4,6 +4,17 @@ import { groupSegment, isPathInside } from "../../src/agent/paths.ts";
 
 export type GroupSelection = "auto" | "id" | "segment";
 
+/**
+ * 扫描结果排序时的并列打破依据：按名字定序。
+ *
+ * 缺了这一步，占用或提问数相同的条目谁先谁后就是 readdir 的返回次序：NTFS 按名字给，
+ * ext4 按哈希给，同一批数据在两个平台上排出来不一样，同一台机器刷新一次选中行也会跳。
+ * 用码位比较而不是 localeCompare——后者的结果取决于运行环境的 ICU 版本，同样不稳。
+ */
+export function byName(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 /** A scanned storage name and an external ID are different namespaces. */
 export async function resolveGroupName(value: string, root: string, kind: GroupSelection = "auto"): Promise<string | null> {
   const names = await dataDirectoryNames(root, root);

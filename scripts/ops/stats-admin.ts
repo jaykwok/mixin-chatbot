@@ -1,4 +1,4 @@
-import { assertDataDirectory, dataDirectoryNames, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
+import { assertDataDirectory, byName, dataDirectoryNames, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
 import { readSessionStats } from "../lib/session-stats-cache.ts";
 import { addUsage, emptyUsageBreakdown, formatCacheRate, type UsageBreakdown, type UsageTotals } from "../lib/usage.ts";
 // 只读统计仍在 session.jsonl 中的用户消息、模型轮次及成功资料工具结果。
@@ -207,7 +207,7 @@ export async function collectGroup(
     stats.firstAt = Math.min(stats.firstAt, entry.firstAt);
     stats.lastAt = Math.max(stats.lastAt, entry.lastAt);
   }
-  stats.users.sort((a, b) => b.asks - a.asks || b.lastAt - a.lastAt);
+  stats.users.sort((a, b) => b.asks - a.asks || b.lastAt - a.lastAt || byName(a.user, b.user));
   return stats;
 }
 
@@ -220,7 +220,7 @@ export async function collectAll(
     const stats = await collectGroup(group, root, window);
     if (stats.users.length > 0 || stats.usage.total.requests > 0) groups.push(stats);
   }
-  return groups.sort((a, b) => b.asks - a.asks);
+  return groups.sort((a, b) => b.asks - a.asks || byName(a.group, b.group));
 }
 
 function describeWindow(window: Window): string {
