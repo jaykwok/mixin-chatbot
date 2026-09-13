@@ -1,11 +1,10 @@
+import { assertDataDirectory, dataDirectoryNames, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
+import { readSessionStats } from "../lib/session-stats-cache.ts";
+import { addUsage, emptyUsageBreakdown, formatCacheRate, type UsageBreakdown, type UsageTotals } from "../lib/usage.ts";
 // 只读统计仍在 session.jsonl 中的用户消息、模型轮次及成功资料工具结果。
 // 斜杠指令按 commands.ts 排除；未完成的尾行跳过并报告。
 // /clear 与 history-clear 会归档会话，已归档部分不纳入本次统计。
-import { existsSync } from "node:fs";
-import { readdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import { isSlashCommandMessage } from "../../src/agent/commands.ts";
-import { groupSegment, isPathInside } from "../../src/agent/paths.ts";
+import { join } from "node:path";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
 
 const HISTORY_FILE = "session.jsonl";
@@ -27,7 +26,8 @@ export interface GroupStats {
   replies: number;
   tools: Map<string, number>;
   delivered: Map<string, number>;
-  tokens: { input: number; output: number; cacheRead: number };
+  tokens: UsageTotals;
+  usage: UsageBreakdown;
   months: Map<string, { asks: number; users: Set<string> }>;
   daily: Map<string, { asks: number; users: Set<string>; files: number; images: number }>;
   days: Set<string>;
@@ -48,6 +48,7 @@ function usage(): void {
   console.log("  <群号>            该群的详细统计（按月、按成员）");
   console.log("  --since <日期>    只统计该日期当天及之后（YYYY-MM-DD）");
   console.log("  --until <日期>    只统计该日期当天及之前（YYYY-MM-DD）");
+  console.log("  --group-id / --storage-segment  明确使用原始群号或存储目录段，两者互斥");
   console.log("");
   console.log("  只读取 session.jsonl，不修改任何文件，机器人运行中也可以执行。");
 }
@@ -83,16 +84,8 @@ export function parseDate(raw: string, endOfDay: boolean): number {
   return at.getTime();
 }
 
-async function readDirNames(path: string): Promise<string[]> {
-  try {
-    const entries = await readdir(path, { withFileTypes: true });
-    return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
-  } catch {
-    return [];
-  }
-}
-
 function emptyGroup(group: string): GroupStats {
+  const usage = emptyUsageBreakdown();
   return {
     group,
     users: [],
@@ -100,7 +93,8 @@ function emptyGroup(group: string): GroupStats {
     replies: 0,
     tools: new Map(),
     delivered: new Map(),
-    tokens: { input: 0, output: 0, cacheRead: 0 },
+    tokens: usage.total,
+    usage,
     months: new Map(),
     daily: new Map(),
     days: new Set(),
@@ -110,29 +104,16 @@ function emptyGroup(group: string): GroupStats {
   };
 }
 
-function firstText(content: unknown): string {
-  if (!Array.isArray(content)) return "";
-  for (const part of content) {
-    if (part && typeof part === "object" && (part as { type?: string }).type === "text") {
-      const text = (part as { text?: unknown }).text;
-      if (typeof text === "string") return text;
-    }
-  }
-  return "";
-}
-
 async function readUser(
   path: string,
   user: string,
   group: GroupStats,
   window: Window
 ): Promise<UserStats | null> {
-  let text: string;
-  try {
-    text = await Bun.file(path).text();
-  } catch {
-    return null;
-  }
+  let source: Awaited<ReturnType<typeof readSessionStats>>;
+  try { source = await readSessionStats(path); } catch { return null; }
+  group.skipped += source.skipped;
+  let provider = "unknown", model = "unknown";
 
   const stats: UserStats = {
     user,
@@ -144,33 +125,28 @@ async function readUser(
     days: new Set(),
   };
 
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    let record: {
-      type?: string;
-      timestamp?: string;
-      message?: { role?: string; content?: unknown; usage?: Record<string, unknown>; toolName?: string; isError?: boolean; details?: { fileId?: string } };
-    };
-    try {
-      record = JSON.parse(line);
-    } catch {
-      // 机器人正在追写时，最后一行可能只写了一半。跳过并计数，不让统计整体失败。
-      group.skipped++;
-      continue;
+  for (const record of source.records) {
+    if (record.type === "model_change") { provider = record.provider ?? "unknown"; model = record.modelId ?? "unknown"; continue; }
+    if (record.type === "message" && record.message?.role === "assistant") {
+      provider = record.message.provider ?? provider; model = record.message.model ?? model;
     }
-    if (record.type !== "message" || !record.message) continue;
-
     const at = Date.parse(record.timestamp ?? "");
     if (!Number.isFinite(at)) continue;
     if (window.since !== undefined && at < window.since) continue;
     if (window.until !== undefined && at > window.until) continue;
 
+    if (record.type === "compaction" || record.type === "branch_summary") {
+      addUsage(group.usage, record.type, provider, model, dayKey(at), record.usage);
+      group.firstAt = Math.min(group.firstAt, at); group.lastAt = Math.max(group.lastAt, at);
+      continue;
+    }
+    if (record.type !== "message" || !record.message) continue;
     const role = record.message.role;
     const day = dayKey(at);
     const daily = group.daily.get(day) ?? { asks: 0, users: new Set<string>(), files: 0, images: 0 };
     if (role === "user") {
       // 指令不算提问：它没有进过模型，只是让机器人停一下或清个历史。
-      if (isSlashCommandMessage(firstText(record.message.content))) continue;
+      if (record.message.command) continue;
       stats.asks++;
       daily.asks++;
       stats.days.add(day);
@@ -182,12 +158,7 @@ async function readUser(
       group.months.set(monthKey, month);
     } else if (role === "assistant") {
       stats.replies++;
-      const usage = record.message.usage;
-      if (usage) {
-        group.tokens.input += Number(usage.input) || 0;
-        group.tokens.output += Number(usage.output) || 0;
-        group.tokens.cacheRead += Number(usage.cacheRead) || 0;
-      }
+      addUsage(group.usage, "assistant", provider, model, day, record.message.usage);
       if (Array.isArray(record.message.content)) {
         for (const part of record.message.content) {
           if (!part || typeof part !== "object") continue;
@@ -226,7 +197,8 @@ export async function collectGroup(
 ): Promise<GroupStats> {
   const stats = emptyGroup(group);
   const usersDir = join(root, group, "users");
-  for (const user of await readDirNames(usersDir)) {
+  await assertDataDirectory(join(root, group), root);
+  for (const user of await dataDirectoryNames(usersDir, root)) {
     const entry = await readUser(join(usersDir, user, HISTORY_FILE), user, stats, window);
     if (!entry) continue;
     stats.users.push(entry);
@@ -244,9 +216,9 @@ export async function collectAll(
   window: Window = {}
 ): Promise<GroupStats[]> {
   const groups: GroupStats[] = [];
-  for (const group of await readDirNames(root)) {
+  for (const group of await dataDirectoryNames(root, root)) {
     const stats = await collectGroup(group, root, window);
-    if (stats.users.length > 0) groups.push(stats);
+    if (stats.users.length > 0 || stats.usage.total.requests > 0) groups.push(stats);
   }
   return groups.sort((a, b) => b.asks - a.asks);
 }
@@ -327,19 +299,6 @@ function printGroup(stats: GroupStats, window: Window): void {
   printFootnote();
 }
 
-/**
- * 群号 → 目录。与 history-admin 同一套规则：外部群号不适合做目录名时会落成 sha256
- * 摘要，所以先按规则换算；换算不出来再把参数当目录名本身试一次，方便直接从概览里复制。
- * 后一条路径必须重新校验边界，否则 `..` 这类输入会走出群数据根。
- */
-function resolveGroupName(groupId: string, root: string): string | null {
-  const segment = groupSegment(groupId);
-  if (existsSync(join(root, segment))) return segment;
-  const raw = join(root, groupId);
-  if (existsSync(raw) && isPathInside(resolve(raw), resolve(root))) return groupId;
-  return null;
-}
-
 async function overview(root: string, window: Window): Promise<number> {
   const groups = await collectAll(root, window);
   if (groups.length === 0) {
@@ -367,6 +326,7 @@ async function overview(root: string, window: Window): Promise<number> {
 
 async function main(args: string[]): Promise<number> {
   const window: Window = {};
+  let selection: GroupSelection = "auto";
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
@@ -389,6 +349,11 @@ async function main(args: string[]): Promise<number> {
       }
       continue;
     }
+    if (arg === "--storage-segment" || arg === "--group-id") {
+      if (selection !== "auto") throw new Error("群目录选择参数不能重复");
+      selection = arg === "--storage-segment" ? "segment" : "id";
+      continue;
+    }
     if (arg.startsWith("-")) {
       console.error(`无法识别的参数：${arg}`);
       return 1;
@@ -409,17 +374,23 @@ async function main(args: string[]): Promise<number> {
   const groupId = positional[0];
   if (!groupId) return overview(root, window);
 
-  const group = resolveGroupName(groupId, root);
+  const group = await resolveGroupName(groupId, root, selection);
   if (!group) {
     console.error(`在 ${root} 下找不到群 ${groupId}。不带参数运行可以列出现有的群。`);
     return 1;
   }
   const stats = await collectGroup(group, root, window);
-  if (stats.users.length === 0) {
+  if (stats.users.length === 0 && stats.usage.total.requests === 0) {
     console.log(`群 ${group} 在该区间内没有使用记录 ${describeWindow(window)}。`);
     return 0;
   }
   printGroup(stats, window);
+  console.log("缓存写入: " + stats.tokens.cacheWrite + "；加权缓存读率: " + formatCacheRate(stats.tokens));
+  console.log("已知估算费用: $" + stats.tokens.cost.toFixed(6) + "；费用未知记录: " + stats.tokens.unknownCost + "；用量不完整记录: " + stats.tokens.missingUsage);
+  console.log("费用按 SDK 配置价格估算，不代表 Coding Plan 的实际账单或套餐配额。");
+  for (const [kind, usage] of Object.entries(stats.usage.kinds)) console.log(kind + ": " + JSON.stringify(usage));
+  for (const [model, usage] of stats.usage.models) console.log("模型 " + model + ": " + JSON.stringify(usage));
+  for (const [day, usage] of stats.usage.days) console.log("日期 " + day + ": " + JSON.stringify(usage));
   return 0;
 }
 

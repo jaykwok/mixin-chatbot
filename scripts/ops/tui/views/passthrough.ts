@@ -144,7 +144,7 @@ export function createRelayView(): View {
           untouched: ["不匹配的对象", "群里已发出的消息本身"],
           recovery: "不可恢复：对象从后端删除后无法找回",
         }),
-        args: ([value]) => ["relay-purge", value!],
+        args: ([value]) => ["relay-purge", "--keyword", value!],
       },
       {
         label: "清理全部外链",

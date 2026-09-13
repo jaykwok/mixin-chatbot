@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { opsCommand, PROJECT_DIR } from "../../scripts/ops/tui/platform.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -25,11 +25,16 @@ foreach ($name in @('Show-Doctor', 'Step', 'New-DoctorRow', 'Get-DeployModeLabel
 }
 $parts += @'
 $DeployMode = 'direct'
+$Project = $PSScriptRoot
 $Port = 1011
 $Domain = ''
 $TaskName = 'fixture'
 $DeployedGroupDataRoot = $PSScriptRoot
 $ModelsFile = Join-Path $PSScriptRoot 'models.json'
+function Test-ModelConfiguration($project, $path) {
+    & $env:TUI_TEST_BUN $env:TUI_TEST_VALIDATOR $path
+    return $LASTEXITCODE -eq 0
+}
 $WebhookSecretFile = Join-Path $PSScriptRoot 'webhook-secret'
 function Resolve-ProjectPath($value) { return $value }
 function Test-Local { if ($env:TUI_TEST_HEALTH -eq 'fail') { return 0 }; return 200 }
@@ -49,6 +54,7 @@ function Invoke-TmpAdmin([string[]]$CliArgs) { Write-Captured 'tmp' $CliArgs; re
 function Invoke-GroupDataAdmin([string]$Script, [string[]]$CliArgs) { Write-Captured $Script $CliArgs; return $true }
 '@
 $jsonEntry = @($ast.EndBlock.Statements | Where-Object { $_.Extent.Text.StartsWith('if ($Json -and $Command -in') })
+$parts += ($ast.EndBlock.Statements | Where-Object { $_.Extent.Text.StartsWith('if ($RequestBase64)') }).Extent.Text
 $switchEntry = @($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.SwitchStatementAst] -and $_.Condition.Extent.Text -eq '$Command' })
 if ($jsonEntry.Count -ne 1 -or $switchEntry.Count -ne 1) { throw 'missing real dispatcher' }
 $parts += $jsonEntry[0].Extent.Text
@@ -61,7 +67,7 @@ async function fixtureWrapper() {
   const wrapper = join(fixture.root, "ops-fixture.ps1");
   const builder = join(fixture.root, "build.ps1");
   await writeFile(builder, "\ufeff" + BUILD);
-  await writeFile(join(fixture.root, "models.json"), '{"providers":{"fixture":{}}}');
+  await writeFile(join(fixture.root, "models.json"), '{"modelId":"fixture","providers":{"fixture":{}}}');
   await writeFile(join(fixture.root, "webhook-secret"), "a".repeat(64));
   const child = Bun.spawn(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", builder], {
     stdout: "pipe", stderr: "pipe", windowsHide: true,
@@ -75,7 +81,7 @@ async function fixtureWrapper() {
     command.args[4] = wrapper;
     const child = Bun.spawn([command.command, ...command.args], {
       stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
-      env: { ...process.env, TUI_TEST_HEALTH: health },
+      env: { ...process.env, TUI_TEST_HEALTH: health, TUI_TEST_BUN: process.execPath, TUI_TEST_VALIDATOR: join(PROJECT_DIR, "scripts/config/validate-models.ts") },
     });
     const [stdout, stderr, code] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -86,9 +92,10 @@ async function fixtureWrapper() {
 
 test("Windows 规范化参数保留路径和群名中的空格，Linux 保持原参数", () => {
   const route = ["routes", "reset", "abcdef123456", "--group", "技术 支持群"];
-  expect(opsCommand("windows", route).args.slice(5)).toEqual([
-    "routes", "-Target", "reset", "-Fingerprint", "abcdef123456", "-Group", "技术 支持群",
-  ]);
+  expect(opsCommand("windows", route).args[5]).toBe("-RequestBase64");
+  expect(JSON.parse(Buffer.from(opsCommand("windows", route).args[6]!, "base64").toString())).toEqual({
+    Command: "routes", Target: "reset", Fingerprint: "abcdef123456", Group: "技术 支持群",
+  });
   expect(opsCommand("linux", route).args.slice(1)).toEqual(route);
 });
 
@@ -113,6 +120,18 @@ windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非�
   } finally { await fixture.cleanup(); }
 }, 30000);
 
+windowsTest("Windows TUI 部署入口调用部署脚本并保留失败退出码", async () => {
+  const fixture = await fixtureWrapper();
+  try {
+    await mkdir(join(fixture.root, "scripts/deploy"), { recursive: true });
+    for (const code of [0, 17]) {
+      await writeFile(join(fixture.root, "scripts/deploy/deploy.ps1"), '\ufeffWrite-Output "DEPLOY_FIXTURE"\nexit ' + code + '\n');
+      const result = await fixture.run(["deploy"]);
+      expect(result.stdout).toContain("DEPLOY_FIXTURE"); expect(result.code, result.stderr).toBe(code);
+    }
+  } finally { await fixture.cleanup(); }
+}, 15000);
+
 windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 CLI", async () => {
   const fixture = await fixtureWrapper();
   try {
@@ -121,6 +140,9 @@ windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 C
       { input: ["routes", "reset", "abcdef123456", "--group", "技术 支持群"], argv: ["reset", "abcdef123456", "--group", "技术 支持群"], script: "scripts\\ops\\route-admin.ts" },
       { input: ["routes", "forget", "abcdef123456"], argv: ["forget", "abcdef123456"], script: "scripts\\ops\\route-admin.ts" },
       { input: ["relay-purge", "--all"], argv: ["purge", "--all"], script: "relay" },
+      ...["-All", "-all", "-A", "--all", "--group", "含 空格与'引号"].map(keyword => ({
+        input: ["relay-purge", "--keyword", keyword], argv: ["purge", "--keyword", keyword], script: "relay",
+      })),
       { input: ["tmp-purge", "--all", "--group", "g1", "--user", "13812345678"], argv: ["purge", "--all", "--user", "13812345678", "--group", "g1"], script: "tmp" },
       { input: ["tmp-ls", "--group", "g1"], argv: ["list", "--group", "g1"], script: "tmp" },
     ];

@@ -61,18 +61,8 @@ function ConvertTo-Hostname([string]$Value) {
     return $null
 }
 
-# 在 UTF-8 控制台下跑一段命令，跑完恢复原样。
-#
-# bun 往 stdout 写的是 UTF-8，而 PowerShell 按控制台代码页解码原生命令的输出；中文系统上
-# 那是 cp936，于是「正在清理」会变成「姝ｅ湪娓呯悊」。脚本自己的 Write-Host 不受影响，
-# 所以现象是同一屏里一半正常一半乱码。
-#
-# 不在脚本开头一次性切成 UTF-8：同一批脚本里还调用了 sc.exe 这类系统程序，它们在中文系统
-# 上输出的就是 GBK，全局切过去只是把乱码从一处挪到另一处。所以只包住确定输出 UTF-8 的
-# bun 调用，并在 finally 里还原——这个设置是控制台级的，泄漏出去会影响用户后续的命令。
-#
-# 没有控制台时（输出被重定向、宿主不是终端）读写 OutputEncoding 会抛异常，此时静默跳过：
-# 编码本来就不该成为命令跑不跑得起来的前提。
+# 临时按 UTF-8 解码 Bun 等原生命令的输出，finally 恢复控制台原编码。
+# Windows 系统工具可能使用本地代码页，因此不全局切换；没有控制台时跳过编码设置。
 function Invoke-WithUtf8Output([Parameter(Mandatory = $true)][scriptblock]$Command) {
     $previous = $null
     try {
@@ -101,4 +91,32 @@ function Read-YesNo([string]$Prompt, [bool]$Default = $false) {
         if ($answer -in @("n", "no", "否")) { return $false }
         Write-Host "[!] 请输入 y 或 n（也可直接回车采用默认值）" -ForegroundColor Yellow
     }
+}
+function Test-ProjectBotHealth([string]$ProjectRoot, [int]$ListenPort) {
+    try {
+        $expected = Get-Content -LiteralPath (Join-Path $ProjectRoot 'data\state\instance.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$ListenPort/health")
+        $request.Proxy = $null
+        $request.Timeout = 3000
+        $request.AllowAutoRedirect = $false
+        $response = $request.GetResponse()
+        try {
+            if ([int]$response.StatusCode -ne 200) { return $false }
+            $reader = New-Object IO.StreamReader($response.GetResponseStream())
+            try { $body = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+            return ($body.service -ceq 'mixin-chatbot' -and $body.version -eq 1 -and $body.status -ceq 'ready' -and
+                $body.instanceId -cmatch '^[a-f0-9-]{36}$' -and $body.instanceId -ceq $expected.instanceId -and
+                $body.pid -gt 0 -and $body.pid -eq $expected.pid -and $expected.port -eq $ListenPort -and
+                $body.startedAt -gt 0 -and $body.startedAt -eq $expected.startedAt)
+        } finally { $response.Close() }
+    } catch { return $false }
+}
+
+function Test-ModelConfiguration([string]$ProjectRoot, [string]$ModelPath) {
+    try {
+        $bun = @(Get-ApplicationPaths 'bun' | Select-Object -First 1)
+        if ($bun.Count -ne 1) { return $false }
+        & $bun[0] run (Join-Path $ProjectRoot 'scripts\config\validate-models.ts') $ModelPath 2>$null | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch { return $false }
 }

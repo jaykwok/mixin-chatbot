@@ -20,7 +20,8 @@ export function redactSecrets(text: string): string {
       /(["']?(?:api[_-]?key|apikey|access[_-]?token|token|secret|password|passwd)["']?\s*[:=]\s*["']?)[^"'\s,;}&]+/gi,
       "$1***"
     )
-    .replace(/([?&](?:key|token|secret|sig|signature|password)=)[^&\s"']+/gi, "$1***");
+    .replace(/([?&](?:key|token|secret|sig|sign|signature|password)=)[^&\s"']+/gi, "$1***")
+    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1***@");
 }
 
 // pi-ai 的 formatProviderError 会把状态码拼成 `429: <body>` 或 `<provider> (429): <body>`；

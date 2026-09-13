@@ -1,6 +1,8 @@
 import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, stat } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { application } from "../../src/core/lifecycle.ts";
 
 import { join } from "node:path";
 import {
@@ -44,6 +46,33 @@ async function makeWorkspace(): Promise<{ root: string; workspace: string }> {
 }
 
 describe("materials index", () => {
+  test("persists a reusable manifest, leaves unchanged indexes alone and invalidates ignore changes", async () => {
+    const { root, workspace } = await makeWorkspace();
+    const options = { workspaceDir: workspace, indexPath: join(root, "index", "materials.md"), ignorePath: join(root, "index", "ignore.txt") };
+    try {
+      const first = await ensureMaterialsIndex(options);
+      const modified = (await stat(options.indexPath)).mtimeMs;
+      await ensureMaterialsIndex(options, Date.now() + 3600000);
+      await application.drain();
+      expect((await stat(options.indexPath)).mtimeMs).toBe(modified);
+      expect((await ensureMaterialsIndex(options))?.generatedAt).toBe(first!.generatedAt);
+      await writeFile(join(workspace, "new.docx"), "new");
+      const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../helpers/index-cache-harness.ts", import.meta.url)), JSON.stringify(options)],
+        { stdout: "pipe", stderr: "pipe", windowsHide: true });
+      const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(code, err).toBe(0);
+      const persisted = JSON.parse(out.split("\n").find(line => line.startsWith("INDEX_RESULT="))!.slice(13));
+      expect(persisted.totalFiles).toBe(4);
+      expect((await stat(options.indexPath)).mtimeMs).toBe(modified);
+      await writeFile(options.ignorePath, "案例\n");
+      const refreshed = await ensureMaterialsIndex(options);
+      expect(refreshed?.totalFiles).toBe(4);
+      expect(await readFile(options.indexPath, "utf8")).not.toContain("案例/某项目.docx");
+      expect(await readFile(options.indexPath, "utf8")).toContain("new.docx");
+      await mkdir(join(root, "bad-ignore"));
+      expect(await ensureMaterialsIndex({ ...options, ignorePath: join(root, "bad-ignore") })).toBeNull();
+    } finally { await application.drain(); await rm(root, { recursive: true, force: true }); }
+  });
   test("collects material files and skips dot directories", async () => {
     const { root, workspace } = await makeWorkspace();
     try {

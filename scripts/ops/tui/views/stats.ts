@@ -1,3 +1,4 @@
+import { formatCacheRate } from "../../../lib/usage.ts";
 // 统计概览与可滚动明细；导出路径保留到下一次导出，显号只在当前明细内有效。
 import { relative } from "node:path";
 import { bar, box, table, wrap } from "../render/widgets.ts";
@@ -170,6 +171,8 @@ export class StatsView implements View {
         stats.asks + " 次提问 · " + stats.users.length + " 人 · " + stats.days.size + " 天活跃 · " + stats.replies + " 轮处理",
         "附件 " + (stats.delivered.get("send_file") ?? 0) + " 份 · 图片 " + (stats.delivered.get("send_image") ?? 0) + " 张",
         "模型用量：输入 " + fmt.count(stats.tokens.input) + " · 输出 " + fmt.count(stats.tokens.output) + " · 缓存 " + fmt.count(stats.tokens.cacheRead),
+        "缓存写入 " + fmt.count(stats.tokens.cacheWrite) + " · 加权读率 " + formatCacheRate(stats.tokens),
+        "已知估算 $" + stats.tokens.cost.toFixed(4) + " · 费用未知 " + stats.tokens.unknownCost + " 条 · 用量不完整 " + stats.tokens.missingUsage + " 条",
       ],
     });
     const months = [...stats.months].sort((a, b) => a[0].localeCompare(b[0]));

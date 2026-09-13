@@ -1,6 +1,7 @@
 // 替换缓冲区、原始输入和差量重绘。按键序列由 Node readline 处理，支持分块到达的方向键。
 import { emitKeypressEvents, type Key as ReadlineKey } from "node:readline";
 import { truncate } from "./width.ts";
+import { drainMaintenance } from "../exec.ts";
 
 const CSI = "\u001b[";
 const ALT_ON = CSI + "?1049h";
@@ -56,6 +57,7 @@ export class Screen {
   start(onKey: (key: Key) => void, onResize: () => void): void {
     if (this.restore) return;
     const input = this.input;
+    let exiting = false;
     if (!input.isTTY) throw new Error("需要交互式终端（stdin 不是 TTY）");
 
     this.attachKeys = () => { this.detachKeys = listenKeys(input, onKey); };
@@ -71,14 +73,18 @@ export class Screen {
       input.pause();
       this.out.write(CSI + "0m" + CURSOR_SHOW + ALT_OFF);
       process.off("exit", restore);
-      process.off("SIGTERM", onSignal);
-      process.off("SIGHUP", onSignal);
-      process.off("uncaughtException", onFatal);
+      if (!exiting) {
+        process.off("SIGINT", onSignal);
+        process.off("SIGTERM", onSignal);
+        process.off("SIGHUP", onSignal);
+        process.off("uncaughtException", onFatal);
+      }
     };
-    const onSignal = (): void => { restore(); process.exit(130); };
-    const onFatal = (error: unknown): void => { restore(); console.error(error); process.exit(1); };
+    const onSignal = (): void => { if (exiting) return; exiting = true; restore(); void drainMaintenance().then(() => process.exit(130)); };
+    const onFatal = (error: unknown): void => { if (exiting) return; exiting = true; restore(); console.error(error); void drainMaintenance().then(() => process.exit(1)); };
     this.restore = restore;
     process.on("exit", restore);
+    process.on("SIGINT", onSignal);
     process.on("SIGTERM", onSignal);
     process.on("SIGHUP", onSignal);
     process.on("uncaughtException", onFatal);

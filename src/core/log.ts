@@ -8,6 +8,7 @@ import {
   statSync,
 } from "node:fs";
 import { join } from "node:path";
+import { redactSecrets } from "../agent/failure.ts";
 import {
   LOG_BACKUP_COUNT,
   LOG_DIR,
@@ -59,7 +60,7 @@ function rotateIfNeeded(): void {
 }
 
 function write(level: string, msg: string): void {
-  const line = `${timestamp()} - ${level} - ${sanitizeLogMessage(msg)}`;
+  const line = `${timestamp()} - ${level} - ${sanitizeLogMessage(redactSecrets(msg))}`;
   console.log(line);
   try {
     rotateIfNeeded();

@@ -84,7 +84,7 @@ async function purge(match: string | undefined): Promise<number> {
   return result.orphaned > 0 ? 1 : 0;
 }
 
-const [command, argument] = process.argv.slice(2);
+const [command, argument, keyword, ...extra] = process.argv.slice(2);
 
 let exitCode = 0;
 switch (command) {
@@ -93,9 +93,16 @@ switch (command) {
     exitCode = await list();
     break;
   case "purge":
+    if (extra.length || (keyword !== undefined && argument !== "--keyword") || (argument === "--keyword" && !keyword)) {
+      console.error("用法：purge --all 或 purge --keyword <关键字>");
+      exitCode = 1;
+      break;
+    }
     // --all 必须显式给出：一条不带参数的 purge 太容易在手滑时清空所有人的下载链接。
     if (argument === "--all") {
       exitCode = await withMaintenance(() => purge(undefined));
+    } else if (argument === "--keyword") {
+      exitCode = await withMaintenance(() => purge(keyword));
     } else if (argument) {
       exitCode = await withMaintenance(() => purge(argument));
     } else {

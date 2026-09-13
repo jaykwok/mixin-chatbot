@@ -88,6 +88,27 @@ function mockFetch(
 }
 
 describe("relay lifecycle regressions", () => {
+  test.each(["file", "login", "missing", "loop"])("verifies the final HEAD after a %s redirect", async kind => {
+    await withFixture(async ({ file, index }) => {
+      let puts = 0;
+      const restore = mockFetch((input, init) => {
+        if (init?.method === "PUT") { puts++; return new Response(null, { status: 201 }); }
+        if (String(input).startsWith(CONFIG.publicBaseUrl) || kind === "loop") {
+          return new Response(null, { status: 302, headers: { location: "https://cdn.invalid/object" } });
+        }
+        if (kind === "missing") return new Response(null, { status: 404 });
+        return new Response(null, { status: 200, headers: { "content-length": kind === "file" ? "5" : "123" } });
+      });
+      try {
+        const options = { config: CONFIG, localPath: file, size: 5, filename: "note.txt", index };
+        const first = await relayFile(options);
+        await relayFile(options);
+        expect(puts).toBe(kind === "file" ? 1 : 2);
+        expect(index.entries()).toHaveLength(1);
+        if (kind !== "missing") expect(index.entries()[0]!.url).toBe(first);
+      } finally { restore(); }
+    });
+  });
   test.each(["success", "failure", "cancel"])("deletes the disposable upload snapshot after %s", async mode => {
     await withFixture(async ({ file, index }) => {
       const tempDir = join(dirname(file), "snapshots");
@@ -247,6 +268,17 @@ describe("relay lifecycle regressions", () => {
       } finally { restore(); }
     });
   });
+
+  test("rejects a changed source size before uploading or saving inconsistent delivery references", async () => {
+    await withFixture(async ({ file, index }) => {
+      let calls = 0;
+      const restore = mockFetch(async () => { calls++; return new Response(null, { status: 201 }); }, { handleMkcol: true });
+      try {
+        await expect(relayFile({ config: CONFIG, localPath: file, size: 4, filename: "note.txt", index })).rejects.toThrow("大小发生变化");
+        expect(calls).toBe(0); expect(index.size()).toBe(0);
+      } finally { restore(); }
+    });
+  });
 });
 
 describe("relay config", () => {
@@ -373,7 +405,7 @@ describe("relay upload", () => {
       const restore = mockFetch((_input, init) => {
         if (init?.method === "HEAD") {
           heads++;
-          return new Response(null, { status: 302 });
+          return new Response(null, { status: 200, headers: { "content-length": "5" } });
         }
         puts++;
         return new Response(null, { status: 201 });
@@ -396,7 +428,7 @@ describe("relay upload", () => {
         });
         expect(second).toBe(first);
         expect(puts).toBe(1);
-        // 复用前探测了一次远端，302 也算存在（公开基址通常重定向到网盘直链）。
+        // 复用前探测远端并核对实际文件长度。
         expect(heads).toBe(1);
       } finally {
         restore();
@@ -490,7 +522,7 @@ describe("relay upload", () => {
     await withFixture(async ({ file, index, indexPath }) => {
       let puts = 0;
       const restore = mockFetch((_input, init) => {
-        if (init?.method === "HEAD") return new Response(null, { status: 302 });
+        if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "content-length": "5" } });
         puts++;
         return new Response(null, { status: 201 });
       });
@@ -560,7 +592,7 @@ describe("relay upload", () => {
     await withFixture(async ({ file, index }) => {
       let puts = 0;
       const restore = mockFetch((_input, init) => {
-        if (init?.method === "HEAD") return new Response(null, { status: 302 });
+        if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "content-length": "5" } });
         puts++;
         return new Response(null, { status: 201 });
       });
@@ -584,7 +616,7 @@ describe("relay upload", () => {
     await withFixture(async ({ file, index }) => {
       let puts = 0;
       const restore = mockFetch((_input, init) => {
-        if (init?.method === "HEAD") return new Response(null, { status: 302 });
+        if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "content-length": "5" } });
         puts++;
         return new Response(null, { status: 201 });
       });
@@ -813,7 +845,7 @@ describe("relay expiry", () => {
           puts++;
           return new Response(null, { status: 201 });
         }
-        return new Response(null, { status: 302 });
+        return new Response(null, { status: 200, headers: { "content-length": "5" } });
       });
       try {
         const first = await relayFile({
@@ -1154,7 +1186,7 @@ describe("relay signing", () => {
       const restore = mockFetch((input, init) => {
         if (init?.method === "PUT") puts++;
         if (init?.method === "HEAD") probes.push(String(input));
-        return new Response(null, { status: 302 });
+        return new Response(null, { status: 200, headers: { "content-length": "5" } });
       });
       try {
         const url = await relayFile({

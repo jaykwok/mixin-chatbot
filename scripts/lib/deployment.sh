@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Deployment transaction. Call begin_deployment only after read-only preflight succeeds.
+. "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 DEPLOY_FILES=(data/config data/state/bot-port data/state/deploy-mode data/state/bot-domain data/state/group-data-root)
 
 # archive_project_path is shared with ops and tunnel scripts.
@@ -7,8 +8,7 @@ DEPLOY_FILES=(data/config data/state/bot-port data/state/deploy-mode data/state/
 begin_deployment() {
     mkdir -p "$PROJECT_DIR/backup/tmp" "$PROJECT_DIR/backup/rm" "$PROJECT_DIR/data/state"
     # util-linux flock owns the deployment lock; children launched as daemons close descriptor 9.
-    exec 9>"$PROJECT_DIR/data/state/deploy.lock"
-    flock -n 9 || { print_error "另一个部署正在进行"; return 1; }
+    acquire_deploy_lock || { print_error "另一个部署正在进行"; return 1; }
     ROLLBACK_CONTAINER="mixin-chatbot-rollback"
     if docker ps -a --format '{{.Names}}' | grep -qx "$ROLLBACK_CONTAINER"; then
         print_error "发现旧回滚容器，请先确认其状态"; return 1
@@ -66,10 +66,21 @@ begin_deployment() {
     DEPLOY_FILES_MUTATED=1
 }
 
+commit_deployment() {
+    # The update parent must distinguish a committed deployment from a later diagnostic failure or signal.
+    if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then
+        printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE" || return 1
+    fi
+    DEPLOYMENT_COMMITTED=1
+    trap - EXIT INT TERM
+}
+
 rollback_deployment() {
     local status=$? failed=0
     trap - EXIT INT TERM
     [ "$DEPLOYMENT_COMMITTED" = 0 ] || return "$status"
+    # A signal can arrive after the receipt write and before the local flag is assigned.
+    if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ] && [ "$(cat "$BOT_UPDATE_COMMIT_FILE" 2>/dev/null)" = committed ]; then return "$status"; fi
     set +e
     if [ "$DEPLOY_FILES_MUTATED" = 0 ]; then
         if [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ]; then docker start mixin-chatbot >/dev/null; fi

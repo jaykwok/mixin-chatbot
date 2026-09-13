@@ -9,8 +9,9 @@ import { log } from "../core/log.ts";
 import { observeCallbackRoute } from "../integrations/callback-route.ts";
 import { constantTimeEqual, getClientIp, HttpError, isJsonContentType } from "./http.ts";
 import { RejectionLogger } from "./rejection-log.ts";
+import { randomUUID } from "node:crypto";
 import { enqueueUserRequest, enqueueUserNotice, hasUserRequestCapacity, isDuplicate,
-  isRateLimited, rememberRequest, validateWebhookData } from "./webhook.ts";
+  isRateLimited, validateWebhookData } from "./webhook.ts";
 
 export interface AppOptions {
   signal: AbortSignal;
@@ -19,11 +20,15 @@ export interface AppOptions {
   isStopping: () => boolean;
   adminToken: string;
   shutdown: () => void;
+  instanceId?: string;
+  startedAt?: number;
 }
 
 /** HTTP construction is separate from SDK startup and OS signal ownership. */
 export function createApp(options: AppOptions): Hono {
 const app = new Hono();
+const identity = { service: "mixin-chatbot" as const, version: 1 as const, instanceId: options.instanceId ?? randomUUID(),
+  startedAt: options.startedAt ?? Date.now(), pid: process.pid };
 
 const rejectionLog = new RejectionLogger();
 options.signal.addEventListener("abort", () => rejectionLog.flush(), { once: true });
@@ -164,7 +169,6 @@ const webhookHandler = async (c: Context) => {
     );
     return c.json({ status: "success" });
   }
-  rememberRequest(phone, groupId, content);
   return c.json({ status: "success" });
 };
 
@@ -222,7 +226,7 @@ app.notFound((c) => {
 });
 
 
-app.get("/health", (c) => c.json({ status: options.isStopping() ? "stopping" : "ready", pid: process.pid }));
+app.get("/health", (c) => c.json({ ...identity, status: options.isStopping() ? "stopping" : "ready" }, options.isStopping() ? 503 : 200));
 app.post("/_admin/shutdown", (c) => {
   if (!constantTimeEqual(c.req.header("Authorization") ?? "", "Bearer " + options.adminToken)) return c.notFound();
   setTimeout(options.shutdown, 0);

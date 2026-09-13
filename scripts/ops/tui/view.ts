@@ -47,8 +47,7 @@ export interface AppApi {
   /**
    * 退出全屏、把终端整个交给子进程，结束后回到界面。
    *
-   * update 和 uninstall 都会问问题（update 转调的 deploy.sh 更是逐项确认端口、模式、域名），
-   * 这些命令必须拿到真正的 TTY。塞进执行面板里它们只会在「输入已结束」上失败。
+   * 部署、升级、Linux 重建修复和卸载需要真正的 TTY，不能放进关闭 stdin 的执行面板。
    */
   runInteractive(title: string, args: string[]): Promise<number>;
   /** 用宿主机默认应用打开导出的文件；失败时仍保留路径。 */

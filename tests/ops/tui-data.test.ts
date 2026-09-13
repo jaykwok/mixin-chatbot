@@ -45,13 +45,14 @@ test("日期拒绝不存在的自然日，闰年和当天末尾边界有效", ()
 test("健康探针拒绝 503、未知状态和无 PID，运行时长只来自匹配的实例记录", async () => {
   const fixture = await tempFixture("tui-health-");
   let status = 200;
-  let body: unknown = { status: "ready", pid: 42 };
+  const startedAt = Date.now() - 3_600_000;
+  const identity = { service: "mixin-chatbot", version: 1, instanceId: crypto.randomUUID(), startedAt, pid: 42 };
+  let body: unknown = { ...identity, status: "ready" };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(body, { status }) });
   const port = server.port!;
   const file = join(fixture.root, "instance.json");
   try {
-    const startedAt = Date.now() - 3_600_000;
-    await writeFile(file, JSON.stringify({ pid: 42, port, startedAt }));
+    await writeFile(file, JSON.stringify({ ...identity, port }));
     expect(await probeService(port, file)).toMatchObject({ state: "ready", pid: 42, startedAt });
     status = 503;
     expect((await probeService(port, file)).state).toBe("unreachable");
@@ -60,9 +61,12 @@ test("健康探针拒绝 503、未知状态和无 PID，运行时长只来自匹
       body = invalid;
       expect((await probeService(port, file)).state).toBe("unreachable");
     }
-    body = { status: "stopping", pid: 42 };
+    body = { ...identity, status: "stopping" };
     expect((await probeService(port, file)).state).toBe("stopping");
-    body = { status: "ready", pid: 43 };
+    body = { ...identity, status: "ready", instanceId: crypto.randomUUID() };
+    expect((await probeService(port, file)).state).toBe("unreachable");
+    body = { ...identity, status: "ready", pid: 43 };
+    expect((await probeService(port, file)).state).toBe("unreachable");
     expect((await probeService(port, file)).startedAt).toBeUndefined();
     await writeFile(file, JSON.stringify({ pid: 43, port: port + 1, startedAt }));
     expect((await probeService(port, file)).startedAt).toBeUndefined();

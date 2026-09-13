@@ -1,7 +1,7 @@
 // Own the service lease, SDK startup and the single bounded shutdown sequence.
 import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { createApp } from "./app.ts";
 import { application } from "../core/lifecycle.ts";
@@ -21,6 +21,8 @@ let timer: ReturnType<typeof setInterval> | undefined;
 let maintenance: Promise<unknown> | undefined;
 const instanceFile = join(STATE_DIR, "instance.json");
 const adminToken = randomBytes(32).toString("hex");
+const instanceId = randomUUID();
+const startedAt = Date.now() - process.uptime() * 1000;
 
 async function shutdown(reason: string, code = 0): Promise<void> {
   if (stopping) return;
@@ -62,13 +64,13 @@ try {
     if (/^[0-9a-f]{64}$/i.test(raw)) webhookSecret = raw;
   } catch {}
   const app = createApp({ signal: application.signal, webhookSecret, allowInsecure: ALLOW_INSECURE_WEBHOOK,
-    isStopping: () => stopping, adminToken, shutdown: () => void shutdown("local control") });
+    isStopping: () => stopping, adminToken, instanceId, startedAt, shutdown: () => void shutdown("local control") });
   await initializeAgentRuntime();
   application.signal.throwIfAborted();
   initializeRelay();
   server = Bun.serve({ hostname: HOST, port: PORT, idleTimeout: 15, fetch: app.fetch });
   await application.track(writeFile(instanceFile, JSON.stringify({ pid: process.pid, port: server.port, token: adminToken,
-    host: HOST, cwd: process.cwd(), startedAt: Date.now() - process.uptime() * 1000 }), { mode: 0o600 }));
+    host: HOST, cwd: process.cwd(), instanceId, startedAt }), { mode: 0o600 }));
   application.signal.throwIfAborted();
   const maintain = () => {
     if (maintenance || stopping) return;

@@ -406,7 +406,7 @@ function queuePressureWarning(
   });
 }
 
-/** 已位于 FIFO 队首；限流不消耗普通重试次数，关键消息会持续等待后重发。 */
+/** 已位于 FIFO 队首；限流最多另重试两次，仍受交付总期限和取消约束。 */
 async function postAtQueueFront(
   url: string,
   payload: unknown,
@@ -691,26 +691,15 @@ export async function sendText(
 
 const COMPLETION_NOTICE = "✅ 任务已完成，请查看上方回复";
 
-/** 群聊回复只产生一条成功消息：
- *  - 普通文本直接发送一条 text@，它本身就是完成通知；
- *  - 带格式的回复先发 Markdown，再发一条简短 text@ 完成提醒；
- *  - Markdown HTTP 明确失败时转换并降级为一条 text@，不重复提醒。 */
+/** Markdown 先发正文再发 text@ 提醒；发送失败时降级为纯文本。
+ * 纯文本和附注按平台长度上限分片，可能产生多条消息。 */
 export async function sendReplyWithMention(
   content: string,
   groupId: string,
   phone: string,
   callbackUrl: string,
   signal?: AbortSignal,
-  /**
-   * 必须逐字进群的附加文本（目前是大文件外链）。
-   *
-   * 它全程不经过 markdownToPlainText，也不参与 Markdown 判定——那个转换会把 `_x_`
-   * 当成强调标记去掉，而对象名里带下划线的文件名（`报告_2025_最终.pdf`）编码进 URL
-   * 后正好长这样，被改写一次链接就废了。
-   *
-   * 落点跟着回复形态走，两种都不额外多发消息：Markdown 回复挂在那条本来就要发的完成
-   * 提醒后面，纯文本回复直接并进正文。
-   */
+  /** 原样交付的外链附注：并入 text@ 提醒或纯文本正文，不参与 Markdown 转换。 */
   appendix?: string
 ): Promise<boolean> {
   signal = deliverySignal(callbackUrl, groupId, signal);

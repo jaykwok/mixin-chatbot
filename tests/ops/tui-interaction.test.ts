@@ -183,7 +183,7 @@ test("健康页可展开完整结果和建议，窄窗口不会遮住分页或�
       detail: "完整诊断内容".repeat(200), fix: "修复建议".repeat(100) + "建议末尾" })),
   } } });
   for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
-  expect(view.hints().some(([key]) => key === "f")).toBe(false);
+  expect(view.hints()).toContainEqual(["f", "重建修复"]);
   await view.onKey(key("enter"), app);
   fits(view.render(context()), context());
   expect(plain(view.render(context()))).toContain("完整诊断内容");
@@ -191,6 +191,53 @@ test("健康页可展开完整结果和建议，窄窗口不会遮住分页或�
   expect(plain(view.render(context()))).toContain("建议末尾");
   await view.onKey(key("escape"), app);
   expect(plain(view.render(context()))).toContain("检查项");
+});
+
+test("维护页在两个平台均可完成部署、升级、重启和修复，交互向导使用终端交接", async () => {
+  for (const platform of ["windows", "linux"] as const) {
+    const { app, calls } = fakeApp();
+    app.deployment.platform = platform;
+    app.deployment.runtime = platform === "windows" ? "scheduled-task" : "docker";
+    const interactive: string[][] = [];
+    app.runInteractive = async (title, args) => { interactive.push(args); calls.commands.push({ title, args }); return 0; };
+    const view = new MaintainView();
+    Object.assign(view, { platform, state: { kind: "ready", value: { sha: "123456789", behind: 1, dirty: false, incoming: [{ sha: "987654321", subject: "fixture" }] } } });
+    const expected = [["deploy"], ["update"], ["restart"], platform === "windows" ? ["doctor", "-Repair"] : ["deploy"],
+      ["stop"], ["start"], ...(platform === "windows" ? [["repair-tunnel"]] : []), ["uninstall"]];
+    for (let i = 0; i < expected.length; i++) {
+      fits(view.render(context(72, 20)), context(72, 20));
+      await view.onKey(key("enter"), app);
+      await view.onKey(key("down"), app);
+    }
+    expect(calls.commands.map(call => call.args)).toEqual(expected);
+    expect(interactive).toEqual([["deploy"], ["update"], ...(platform === "linux" ? [["deploy"]] : []), ["uninstall"]]);
+    expect(calls.confirms.at(-1)?.typeToConfirm).toBe("卸载");
+    const health = new HealthView();
+    Object.assign(health, { platform, state: { kind: "ready", value: { pass: 0, warn: 0, fail: 1, checks: [{ name: "fixture", status: "fail", detail: "fixture" }] } } });
+    await health.onKey(key("f"), app);
+    expect(calls.commands.at(-1)?.args).toEqual(platform === "windows" ? ["doctor", "-Repair"] : ["deploy"]);
+  }
+});
+
+test("自动修复的执行面板收到 Esc 后等待维护完成", async () => {
+  const tty = terminal();
+  const app = new App([{ id: "fixture", label: "测试", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
+  app["refreshChrome"] = async () => {};
+  tty.screen.start(() => {}, () => {});
+  let killed = false, finish!: (code: number) => void, output!: ReadableStreamDefaultController<Uint8Array>;
+  const child = { exited: new Promise<number>(resolve => { finish = resolve; }),
+    stdout: new ReadableStream<Uint8Array>({ start(controller) { output = controller; } }),
+    stderr: new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } }),
+    kill() { killed = true; finish(143); } };
+  const spawn = spyOn(Bun, "spawn").mockImplementationOnce(() => child as ReturnType<typeof Bun.spawn>);
+  try {
+    const done = app.run("自动修复", ["doctor", "-Repair"]);
+    await app["handleKey"](key("escape"));
+    expect(killed).toBe(false);
+    output.enqueue(new TextEncoder().encode("MAINTENANCE_DONE\n")); output.close(); finish(0);
+    expect(await done).toBe(0);
+    expect(plain(app["renderAction"](80, 24))).toContain("MAINTENANCE_DONE");
+  } finally { spawn.mockRestore(); finish(0); tty.close(); }
 });
 
 async function history(root: string, group: string, user: string, days = ["2026-09-12"]) {
@@ -275,7 +322,7 @@ test("存储清当前会同时传群与成员，清所有则明确显示范围",
     expect(plain(view.render(context()))).toContain("p 当前");
     expect(plain(view.render(context()))).toContain("a 所有群与成员");
     await view.onKey(key("p"), app);
-    expect(calls.commands[0]!.args).toEqual(["tmp-purge", "--all", "--group", "g1", "--user", "13812345678"]);
+    expect(calls.commands[0]!.args).toEqual(["tmp-purge", "--all", "--group", "g1", "--user", "13812345678", "--storage-segment"]);
     expect(calls.confirms[0]!.subject).toContain("群 g1");
     await view.onKey(key("a"), app);
     expect(calls.commands[1]!.args).toEqual(["tmp-purge", "--all"]);

@@ -5,10 +5,9 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <命令>
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor -Repair
 #   powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 update
-#   命令：doctor、update、repair-tunnel、uninstall-tunnel、restart、stop、start、foreground、logs、
-#         relay-ls、relay-purge、tmp-ls、tmp-purge、stat、history-ls、history-clear、uninstall（无参数显示菜单）
+#   不带参数显示完整帮助。
 #
-# repair-tunnel/uninstall-tunnel/restart/stop/start/uninstall 可能需要管理员权限。
+# 部署、修复和服务控制可能需要管理员权限。
 param(
     [Parameter(Position = 0)]
     [string]$Command = "",
@@ -29,7 +28,10 @@ param(
     [string]$Until = "",
     # routes 的目标；Group 也可用于限定 tmp-ls/tmp-purge 的群。
     [string]$Fingerprint = "",
-    [string]$Group = ""
+    [string]$Group = "",
+    [switch]$StorageSegment,
+    [switch]$GroupId,
+    [string]$RequestBase64 = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -267,17 +269,20 @@ function Invoke-TmpAdmin([string[]]$TmpArgs) {
 }
 
 # 清历史必须先把机器人停下来，不能只删文件：内存里已经建立的会话仍握着完整的消息列表，
-# 接着聊就会把旧内容重新写回去，等于白清一次。所以这里固定走「停 → 清 → 起」。
-function Clear-GroupHistory([string]$GroupId) {
-    if (-not $GroupId) {
+# 所以先停止实例，再归档会话，最后恢复调用前的运行或停止状态。
+function Clear-GroupHistory([string]$GroupValue) {
+    if (-not $GroupValue) {
         Err "history-clear 需要群号：ops.ps1 history-clear <群号>"
         return $false
     }
     Step "先停止机器人，确保内存中的会话不会把历史写回去"
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    $wasRunning = $task -and $task.State -eq 'Running'
+    $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
     if (-not (Stop-Bot)) { return $false }
-    try { $cleared = Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" @("clear", $GroupId) }
+    $historyArgs = @("clear", $GroupValue)
+    if ($StorageSegment) { $historyArgs += "--storage-segment" }
+    elseif ($GroupId) { $historyArgs += "--group-id" }
+    try { $cleared = Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" $historyArgs }
     finally {
         if ($wasRunning) { $started = Start-Bot } else { $started = $true }
     }
@@ -395,15 +400,8 @@ function Get-TunnelTokenSource {
     return Get-TunnelTokenFileInfo $DefaultTunnelTokenFile "data\config\tunnel-token"
 }
 
-# 通用 HTTP 探测，返回状态码；连不上返回 $null。
-#
-# 用 HttpWebRequest 而不是 Invoke-WebRequest 或 curl，三个理由：
-#   - Invoke-WebRequest 会套用系统代理设置，在云桌面上访问本机会一路挂到超时
-#     （Test-Local 就栽在这上面）；这里 Proxy = $null 从根上绕开。
-#   - curl 8.21 拒绝 -K/--config 从文件或 stdin 读配置（"unsupported trailing garbage"），
-#     只剩把凭证写进命令行一条路；而 Windows 上任何用户都能用 WMI 读到别人进程的完整
-#     命令行，WebDAV 密码不该出现在那里。走 .NET 则凭证既不进 argv 也不落盘。
-#   - HttpWebRequest 在 Windows PowerShell 5.1 和 PowerShell 7 上都内置，无需额外依赖。
+# 通用 HTTP 探测，禁用系统代理；凭据通过 .NET 请求设置，不进入命令行或临时文件。
+# 返回 HTTP 状态码；连接失败返回 $null。
 function Invoke-HttpProbe {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -554,25 +552,8 @@ function Start-Bot {
 }
 
 function Test-Local {
-    # 与 Test-Public 一致优先用 curl.exe。Invoke-WebRequest 走 .NET HttpClient，会套用系统
-    # 代理设置，实测在云桌面上访问本机会一路挂到超时（TaskCanceledException），把健康的
-    # 机器人误判成没响应；curl 同一地址立刻返回 200。
-    # 地址固定 127.0.0.1 而不是 localhost：Cloudflare 模式下机器人只绑 IPv4 回环，
-    # localhost 在 Windows 上可能先解析到 ::1。
-    $curlPath = Get-CurlPath
-    if ($curlPath) {
-        $code = & $curlPath --noproxy "*" -s -o NUL -m 3 -w "%{http_code}" "http://127.0.0.1:$Port/favicon.svg" 2>$null
-        $parsed = 0
-        if ([int]::TryParse("$code".Trim(), [ref]$parsed) -and $parsed -gt 0) { return $parsed }
-        return $null
-    }
-    try {
-        return (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/favicon.svg" -UseBasicParsing -TimeoutSec 3).StatusCode
-    } catch {
-        $response = $_.Exception.Response
-        if ($response -and $response.StatusCode) { return [int]$response.StatusCode }
-        return $null
-    }
+    if (Test-ProjectBotHealth $Project ([int]$Port)) { return 200 }
+    return 0
 }
 
 function Wait-Local {
@@ -752,7 +733,7 @@ function Show-Doctor {
         }
     }
 
-    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus) { "HTTP $localStatus" } else { "无响应" }) $(if ($localStatus -eq 200) { "" } else { "执行 ops.ps1 doctor -Repair，然后用 ops.ps1 logs 查看日志。" })
+    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } else { "执行 ops.ps1 doctor -Repair，然后用 ops.ps1 logs 查看日志。" })
 
     if ($DeployMode -eq "cloudflare") {
         $tokenSource = Get-TunnelTokenSource
@@ -794,13 +775,7 @@ function Show-Doctor {
         }
     }
 
-    $modelsOk = $false
-    if (Test-Path -LiteralPath $ModelsFile) {
-        try {
-            $modelsDoc = Get-Content -LiteralPath $ModelsFile -Raw | ConvertFrom-Json
-            $modelsOk = $null -ne $modelsDoc.providers -and @($modelsDoc.providers.PSObject.Properties).Count -gt 0
-        } catch {}
-    }
+    $modelsOk = Test-ModelConfiguration $Project $ModelsFile
     $rows += New-DoctorRow "data/config/models.json" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } else { "执行 bun run configure。" })
 
     $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ((Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim() -match "^[0-9a-fA-F]{64}$")
@@ -920,8 +895,8 @@ function Restart-Bot {
     Start-Sleep -Seconds 1
     if (-not (Start-Bot)) { return $false }
     $lc = Wait-Local
-    if ($lc -eq 200) { Done "机器人已恢复（:$Port 返回 HTTP 200）"; return $true }
-    Warn "机器人仍未响应（HTTP $lc）；请检查 scripts\ops\ops.ps1 logs。"
+    if ($lc -eq 200) { Done "机器人已恢复（:$Port 实例身份与就绪检查通过）"; return $true }
+    Warn "本地实例健康检查未通过；请检查 scripts\ops\ops.ps1 logs。"
     return $false
 }
 
@@ -1001,6 +976,7 @@ function Invoke-Update {
     $target = Invoke-GitCapture @('rev-parse', 'origin/main')
     if ($target.ExitCode -ne 0 -or $target.Text -notmatch '^[0-9a-f]{40}$') { Err '无法识别 origin/main 提交'; return $false }
     $targetSha = $target.Text
+    if (-not (Test-ModelConfiguration $Project $ModelsFile)) { Err '模型配置无效；尚未停止旧服务。'; return $false }
     Step ("提交：{0} -> {1}" -f $originalSha.Substring(0, 7), $targetSha.Substring(0, 7))
     $snapshot = New-DeploymentSnapshot $Project $TaskName
     $committed = $false
@@ -1264,6 +1240,18 @@ function Uninstall-Bot {
     return $true
 }
 
+# Decode data after PowerShell parameter binding; no expression evaluation or token reparsing.
+if ($RequestBase64) {
+    $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
+    foreach ($property in $request.PSObject.Properties) {
+        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId')) {
+            throw "无效的运维请求字段"
+        }
+        Set-Variable -Name $property.Name -Value $property.Value
+    }
+}
+if ($StorageSegment -and $GroupId) { throw "群目录选择参数互斥" }
+
 if ($Json -and $Command -in @("doctor", "status")) {
     if ($Repair) { [Console]::Error.WriteLine("-Json 只用于诊断；修复请单独运行 doctor -Repair。"); exit 2 }
     $result = Show-Doctor
@@ -1273,6 +1261,11 @@ if ($Json -and $Command -in @("doctor", "status")) {
 }
 
 switch ($Command) {
+    "deploy" {
+        $deployHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        Invoke-WithUtf8Output { & $deployHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Project 'scripts\deploy\deploy.ps1') }
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
     "doctor"    {
         $healthy = Show-Doctor
         if ($Repair) {
@@ -1305,8 +1298,8 @@ switch ($Command) {
     "start"     {
         if (-not (Start-Bot)) { exit 1 }
         $lc = Wait-Local
-        if ($lc -eq 200) { Done "机器人已启动（:$Port 返回 HTTP 200）" }
-        else { Warn "机器人未通过健康检查（HTTP $lc）；请检查 scripts\ops\ops.ps1 logs。"; exit 1 }
+        if ($lc -eq 200) { Done "机器人已启动（:$Port 实例身份与就绪检查通过）" }
+        else { Warn "本地实例健康检查未通过；请检查 scripts\ops\ops.ps1 logs。"; exit 1 }
     }
     "logs"      {
         if (-not (Test-Path $LogPath)) { Warn "找不到日志文件 $LogPath（机器人可能从未启动）"; exit 1 }
@@ -1314,12 +1307,12 @@ switch ($Command) {
     }
     "relay-ls" { if (-not (Invoke-RelayAdmin @("list"))) { exit 1 } }
     "relay-purge" {
-        if ($All) { $Target = "--all" }
-        if (-not $Target) {
-            Err "relay-purge 需要一个关键字，或用 --all 表示清理全部"
+        if (-not $All -and -not $Target) {
+            Err "relay-purge 需要一个关键字，或用 -All 表示清理全部"
             exit 1
         }
-        if (-not (Invoke-RelayAdmin @("purge", $Target))) { exit 1 }
+        $relayArgs = if ($All) { @("purge", "--all") } else { @("purge", "--keyword", $Target) }
+        if (-not (Invoke-RelayAdmin $relayArgs)) { exit 1 }
     }
     "routes" {
         $routeArgs = @($Target)
@@ -1341,6 +1334,8 @@ switch ($Command) {
         $tmpArgs = @("list")
         if ($User) { $tmpArgs += @("--user", $User) }
         if ($Group) { $tmpArgs += @("--group", $Group) }
+        if ($StorageSegment) { $tmpArgs += "--storage-segment" }
+        elseif ($GroupId) { $tmpArgs += "--group-id" }
         if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
     }
     "tmp-purge" {
@@ -1352,6 +1347,8 @@ switch ($Command) {
         if ($All) { $tmpArgs += "--all" } else { $tmpArgs += @("--days", "$Days") }
         if ($User) { $tmpArgs += @("--user", $User) }
         if ($Group) { $tmpArgs += @("--group", $Group) }
+        if ($StorageSegment) { $tmpArgs += "--storage-segment" }
+        elseif ($GroupId) { $tmpArgs += "--group-id" }
         if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
     }
     "stat" {
@@ -1359,6 +1356,8 @@ switch ($Command) {
         if ($Target) { $statArgs += $Target }
         if ($Since)  { $statArgs += @("--since", $Since) }
         if ($Until)  { $statArgs += @("--until", $Until) }
+        if ($StorageSegment) { $statArgs += "--storage-segment" }
+        elseif ($GroupId) { $statArgs += "--group-id" }
         if (-not (Invoke-GroupDataAdmin "scripts\ops\stats-admin.ts" $statArgs)) { exit 1 }
     }
     "history-ls" {
@@ -1377,6 +1376,7 @@ switch ($Command) {
         Write-Host "运维界面：在项目根目录运行 bun run tui。"
         Write-Host ""
         Write-Host "  doctor          只读诊断；-Json 输出 JSON；-Repair 自动修复"
+        Write-Host "  deploy          配置并部署当前代码；已有部署可重建，失败自动回滚"
         Write-Host "  update          同步 origin/main、装依赖、重启并体检；失败自动回滚"
         Write-Host "                  隧道默认只在公网检查失败时重启，加 -RestartTunnel 可强制"
         Write-Host "  repair-tunnel   按当前 token 来源强制重装 Cloudflared 服务"
@@ -1387,7 +1387,7 @@ switch ($Command) {
         Write-Host "  foreground      以前台方式运行 launcher（Ctrl+C 停止）"
         Write-Host "  logs            持续查看 logs\mixin-chatbot.log"
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
-        Write-Host "  relay-purge <关键字>|--all"
+        Write-Host "  relay-purge <关键字>|-All"
         Write-Host "                  删除匹配的外链对象并清掉索引记录"
         Write-Host "  routes list | reset -Fingerprint <指纹> -Group <群号> | forget -Fingerprint <指纹>"
         Write-Host "  tmp-ls [-User <手机号>] [-Group <群号>]"
@@ -1398,7 +1398,8 @@ switch ($Command) {
         Write-Host "                  使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
         Write-Host "  history-ls      列出各群的会话历史（成员数、占用、最后活动）"
         Write-Host "  history-clear <群号>"
-        Write-Host "                  清空该群全部成员的会话历史；自动停机、清理、再启动"
+        Write-Host "                  归档该群会话；自动停机、清理，再恢复原运行或停止状态"
+        Write-Host "                  群选择可加 -GroupId（原始群号）或 -StorageSegment（目录段）"
         Write-Host "  uninstall       清理任务/进程/防火墙/launcher，可选清理隧道、data 和 logs"
         if ($unknown) { exit 1 }
     }

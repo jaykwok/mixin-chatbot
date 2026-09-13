@@ -1,12 +1,5 @@
-// 维护。升级、起停、修隧道、卸载。
-//
-// 每一项都先把「会发生什么」摆出来再执行——这些命令的后果差异很大，从「重启一下」到
-// 「删掉容器和数据」都有，而它们在菜单里只差两行。确认框里写的是这一条实际会做的事，
-// 不是一句通用的「确定吗」。
-//
-// 升级那条尤其如此：它会把代码快进到 origin/main 再交给 deploy 重建镜像换容器，失败还会
-// 自动回滚。这些在命令行里是跑起来才知道的，这里在按下去之前就列出来，并且把待应用的提交
-// 一条条显示出来。
+// 部署、升级、启停、修复和卸载入口；执行前展示各自的范围与恢复方式。
+// 提交列表来自本地远端引用，实际升级时由运维脚本重新 fetch。
 
 import { box, mark, table } from "../render/widgets.ts";
 import { pad } from "../render/width.ts";
@@ -14,7 +7,7 @@ import type { StatusName } from "../render/theme.ts";
 import * as fmt from "../render/format.ts";
 import { loadGit, type GitState } from "../data.ts";
 import type { AppApi, ConfirmSpec, Loading, View, ViewContext } from "../view.ts";
-import { gap, moveSelection, pending } from "./common.ts";
+import { gap, moveSelection, pending, windowStart } from "./common.ts";
 
 interface Action {
   key: string;
@@ -24,12 +17,29 @@ interface Action {
   only?: "windows" | "linux";
   status: StatusName;
   /** 该命令会向用户提问，必须拿到真正的 TTY（update 转调的 deploy.sh 全程交互）。 */
-  interactive?: boolean;
+  interactive?: boolean | ((app: AppApi) => boolean);
   confirm(app: AppApi, git: GitState | null): ConfirmSpec | null;
   args(app: AppApi): string[];
 }
 
 const ACTIONS: Action[] = [
+  {
+    key: "deploy",
+    label: "部署 / 重部署",
+    summary: "配置并部署当前代码，失败恢复原部署",
+    status: "busy",
+    interactive: true,
+    confirm: (app) => ({
+      title: "部署 / 重部署",
+      subject: "运行当前版本的部署向导",
+      steps: ["确认模型、端口、群数据目录和访问方式，默认沿用已有配置",
+        app.deployment.runtime === "docker" ? "构建镜像并切换容器" : "安装依赖并注册计划任务",
+        "检查新实例就绪状态，失败时恢复部署前的配置和服务"],
+      untouched: ["会话历史", "群共享资料"],
+      recovery: "替换期间服务会短暂中断；尚未安装 Bun 和项目依赖的机器需先完成环境安装",
+    }),
+    args: () => ["deploy"],
+  },
   {
     key: "update",
     label: "升级",
@@ -61,13 +71,13 @@ const ACTIONS: Action[] = [
               "失败时自动回滚代码，并恢复升级前的容器/服务",
               "完成后自动跑一次体检",
             ]
-          : ["代码已是最新；会询问是否仍然重启", "完成后自动跑一次体检"];
+          : ["先拉取远端并显示实际更新内容", "有更新时重新部署；无更新时询问是否重启", "完成后自动跑一次体检"];
       return {
         title: "升级",
         subject:
           git.behind > 0
             ? `${fmt.shortSha(git.sha)} → origin/main，共 ${git.behind} 个提交`
-            : `已经是最新（${fmt.shortSha(git.sha)}）`,
+            : `当前 ${fmt.shortSha(git.sha)}；远端版本将在执行时确认`,
         steps,
         untouched: ["data/ 下的配置与群数据", "会话历史"],
         recovery: "失败时自动回滚代码并恢复原容器；部署过程中服务会短暂中断",
@@ -83,11 +93,28 @@ const ACTIONS: Action[] = [
     confirm: () => ({
       title: "重启",
       subject: "停止并重新启动机器人",
-      steps: ["停止当前实例（正在处理的任务会被中断）", "重新启动并等待本地健康检查返回 200"],
+      steps: ["停止当前实例（正在处理的任务会被中断）", "重新启动并核对新实例的身份和就绪状态"],
       untouched: ["配置", "会话历史", "群数据"],
       recovery: "无需恢复；重启不改任何数据",
     }),
     args: () => ["restart"],
+  },
+  {
+    key: "repair",
+    label: "修复部署",
+    summary: "Windows 修复任务与规则；Linux 通过部署向导重建",
+    status: "warn",
+    interactive: app => app.deployment.platform === "linux",
+    confirm: app => ({
+      title: "修复部署",
+      subject: app.deployment.platform === "windows" ? "修复可确定的部署问题" : "按当前代码重建部署",
+      steps: app.deployment.platform === "windows"
+        ? ["检查并修复计划任务、防火墙和隧道", "完成后重新体检"]
+        : ["进入部署向导，回车沿用当前配置", "重新构建镜像并切换容器，核对实例健康", "失败时恢复原部署"],
+      untouched: ["会话历史", "群共享资料"],
+      recovery: "可能短暂中断服务；无法自动判断的配置问题会显示具体原因",
+    }),
+    args: app => app.deployment.platform === "windows" ? ["doctor", "-Repair"] : ["deploy"],
   },
   {
     key: "stop",
@@ -199,7 +226,8 @@ export class MaintainView implements View {
           return true;
         }
       }
-      const code = action.interactive
+      const interactive = typeof action.interactive === "function" ? action.interactive(app) : action.interactive;
+      const code = interactive
         ? await app.runInteractive(action.label, action.args(app))
         : await app.run(action.label, action.args(app));
       app.toast(code === 0 ? "ok" : "danger", code === 0 ? `${action.label}完成` : `${action.label}未成功（退出码 ${code}）`);
@@ -214,6 +242,9 @@ export class MaintainView implements View {
     if (waiting && this.state.kind === "loading") return waiting;
     const git = this.state.kind === "ready" ? this.state.value : null;
     const actions = this.actions;
+    const roomForActions = Math.max(1, ctx.height - 8);
+    const start = windowStart(this.selected, actions.length, roomForActions);
+    const visible = actions.slice(start, start + roomForActions);
 
     const out = box(theme, {
       width: total,
@@ -222,8 +253,8 @@ export class MaintainView implements View {
       accent: "accent",
       body: table(theme, {
         width: total - 4,
-        rows: actions,
-        selected: this.selected,
+        rows: visible,
+        selected: this.selected - start,
         columns: [
           { header: "", size: 2, render: (action) => mark(theme, action.status) },
           { header: "", size: Math.max(10, Math.floor(total * 0.16)), render: (action) => action.label },
@@ -251,7 +282,10 @@ export class MaintainView implements View {
       out.push(gap(total));
       out.push(
         pad(
-          ` ${mark(theme, "ok")} ${theme.c("muted", `已是 origin/main 最新版本（${fmt.shortSha(git.sha)}）`)}`,
+          ` ${mark(theme, git.behind === 0 && git.ahead === 0 ? "ok" : "warn")} ${theme.c("muted", git.behind < 0
+            ? "尚未获得 origin/main 对照；升级时拉取远端"
+            : git.ahead > 0 ? "存在本地领先提交；升级时会核对是否可快进"
+            : `与上次同步的 origin/main 一致（${fmt.shortSha(git.sha)}）`)}`,
           total
         )
       );

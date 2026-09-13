@@ -1,9 +1,7 @@
 // 发送工具定义：send_image / send_file（ToolDefinition，Pi agent 经 customTools 调用）。
 // 从 im 层封装：agent 给 source（URL、群 workspace 或当前用户 tmp 内路径），工具负责读取 + 上传 + 发送。
 //
-// 大小分两条路：不超过 IM 单条附件上限的走原来的「读进内存 + 上传 + 发附件消息」；
-// 超过上限的本地文件在配置了外链后端时改为流式 PUT 到外部存储，在群里发一条下载链接
-// （见 ../integrations/relay.ts）。未配置外链时行为与之前完全一致——直接报文件过大。
+// 小附件限量读入内存并直传；超限本地文件由配置的外链后端分发，未配置则报大小限制。
 import { open, realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
@@ -16,10 +14,25 @@ import {
   MAX_ATTACHMENT_BYTES,
 } from "../core/config.ts";
 import { sendFile, sendImage, uploadAttachment } from "../integrations/im.ts";
-import { describeRelayExpiry, relayFile, type RelayConfig } from "../integrations/relay.ts";
+import { describeRelayExpiry, relayFile, relayReference, type RelayConfig } from "../integrations/relay.ts";
+import type { DeliveryAttachment } from "./delivery-store.ts";
 import type { RelayIndex } from "../integrations/relay-index.ts";
 import { isPathInside } from "./paths.ts";
 import { resolveToolPath } from "./tool-path.ts";
+import { AsyncSemaphore } from "../core/async-semaphore.ts";
+import { application } from "../core/lifecycle.ts";
+import { runtimeSetting } from "../core/runtime-config.ts";
+
+const attachmentSlots = new AsyncSemaphore(Number(runtimeSetting("BOT_ATTACHMENT_CONCURRENCY") ?? 2));
+
+async function uploadBuffered(source: ResolvedSource, callbackUrl: string, name: string, type: "image" | "file", group: string, signal?: AbortSignal) {
+  const budget = AbortSignal.any([application.signal, ...(signal ? [signal] : [])]);
+  const release = await attachmentSlots.acquire(budget);
+  try {
+    const data = await readBytes(source, budget);
+    return await uploadAttachment(callbackUrl, data, name, type, group, budget);
+  } finally { release(); }
+}
 
 /**
  * 定位来源但不读取内容。本地路径在这里就做完 canonical path/符号链接边界校验并拿到
@@ -87,17 +100,18 @@ async function fetchRemoteBytes(
   const reader = r.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (true) {
-    signal?.throwIfAborted();
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_ATTACHMENT_BYTES) {
-      await reader.cancel();
-      throw oversizeError("远程文件", total);
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_ATTACHMENT_BYTES) {
+        throw oversizeError("远程文件", total);
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
-  }
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
   const data = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
@@ -167,23 +181,28 @@ function sanitizeFilename(filename: string): string {
  * 交付可能拆成多条平台消息；失败或取消后可通过 /deliver 补发。
  */
 export interface OutboundNotes {
-  add(note: string): void;
+  add(note: string, attachment?: DeliveryAttachment): void;
   /** 只读快照。拼回复时用它，但在确认送达前不清空。 */
   peek(): string[];
-  /** 确认已送达后才清空。 */
+  references(): DeliveryAttachment[];
+  /** 重置本轮内存附注；未交付内容独立保存在 DeliveryStore。 */
   clear(): void;
 }
 
-export function createOutboundNotes(onAdd?: (note: string) => void): OutboundNotes {
+export function createOutboundNotes(onAdd?: (note: string, attachment?: DeliveryAttachment) => void): OutboundNotes {
   let notes: string[] = [];
+  let attachments: DeliveryAttachment[] = [];
   return {
-    add: (note) => {
-      onAdd?.(note);
+    add: (note, attachment) => {
+      onAdd?.(note, attachment);
       notes.push(note);
+      if (attachment) attachments.push(attachment);
     },
     peek: () => [...notes],
+    references: () => [...attachments],
     clear: () => {
       notes = [];
+      attachments = [];
     },
   };
 }
@@ -238,11 +257,10 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
       // 图片不走外链：群聊里图片的价值在于内联显示，换成一条链接就没有意义了，
       // 而且超过 25MB 的图基本都是本该当文件发的东西。
       const resolved = await resolveSource(params.source, workspaceDir, tempDir, signal);
-      const data = await readBytes(resolved, signal);
       const callbackUrl = getCallbackUrl();
-      const fileId = await uploadAttachment(
+      const fileId = await uploadBuffered(
+        resolved,
         callbackUrl,
-        data,
         filenameFromSource(params.source),
         "image",
         groupId,
@@ -300,9 +318,8 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
         const expiry = describeRelayExpiry(relay);
         // 交给运行时并入本轮回复，而不是在这里单独发一条：URL 必须逐字正确，所以不能让
         // 模型复述；但也不值得为它多花一条出站配额。
-        notes.add(
-          `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发：\n${url}${expiry}`
-        );
+        const note = `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发：\n${url}${expiry}`;
+        notes.add(note, { original: note, reference: relayReference(relay, url, name, resolved.size) });
         return {
           content: [
             {
@@ -318,9 +335,8 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
         };
       }
 
-      const data = await readBytes(resolved, signal);
       const callbackUrl = getCallbackUrl();
-      const fileId = await uploadAttachment(callbackUrl, data, name, "file", groupId, signal);
+      const fileId = await uploadBuffered(resolved, callbackUrl, name, "file", groupId, signal);
       if (!fileId) throw new Error(`文件上传失败: ${params.source}`);
       const ok = await sendFile(fileId, groupId, callbackUrl, undefined, signal);
       if (!ok) throw new Error(`文件发送失败: ${params.source}`);

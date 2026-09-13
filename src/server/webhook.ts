@@ -32,7 +32,7 @@ import {
 } from "../agent/runtime.ts";
 
 // 已接收请求去重（Map 保持插入顺序，按序清过期）
-const recentRequests = new Map<string, number>();
+const recentRequests = new Map<string, { at: number }>();
 // 速率限制（每个群内用户在窗口内的时间戳列表）
 const rateLimits = new Map<string, number[]>();
 const activeRequests = new Set<Promise<void>>();
@@ -131,8 +131,8 @@ function requestDedupKey(phone: string, groupId: string, content: string): strin
 
 function pruneRecentRequests(now: number): void {
   // 从头部清过期（Map 按插入顺序）。
-  for (const [key, timestamp] of recentRequests) {
-    if (now - timestamp > DEDUP_TTL) recentRequests.delete(key);
+  for (const [key, entry] of recentRequests) {
+    if (now - entry.at > DEDUP_TTL) recentRequests.delete(key);
     else break;
   }
 }
@@ -144,16 +144,21 @@ export function isDuplicate(phone: string, groupId: string, content: string): bo
   return recentRequests.has(requestDedupKey(phone, groupId, content));
 }
 
-/** 在请求成功入队后记录，供重复请求直接确认。 */
-export function rememberRequest(phone: string, groupId: string, content: string): void {
+/** 入队前预约去重状态；拒绝、失败或取消时只释放本次预约。 */
+export function rememberRequest(phone: string, groupId: string, content: string): () => void {
   const now = Date.now();
   pruneRecentRequests(now);
-  recentRequests.set(requestDedupKey(phone, groupId, content), now);
+  const key = requestDedupKey(phone, groupId, content);
+  const entry = { at: now };
+  recentRequests.delete(key);
+  recentRequests.set(key, entry);
   while (recentRequests.size > MAX_DEDUP_SIZE) {
     const firstKey = recentRequests.keys().next().value;
     if (firstKey === undefined) break;
     recentRequests.delete(firstKey);
   }
+  // An old job finishing must never remove a replacement request's reservation.
+  return () => { if (recentRequests.get(key) === entry) recentRequests.delete(key); };
 }
 
 /** 速率限制检查；同一手机号在不同群使用互相独立的窗口。 */
@@ -192,14 +197,16 @@ async function processRequest(
   phone: string,
   groupId: string,
   callbackUrl: string,
-  clientIp: string
+  clientIp: string,
+  invalidate?: () => void
 ): Promise<void> {
   const start = Date.now();
   log.info(`请求处理开始 - 群: ${groupId}, 用户: ${phone}, IP: ${clientIp}`);
   try {
     if (DEBUG) log.info(`[DEBUG] webhook 内容 - 用户: ${phone}, 内容: ${content}`);
-    await handleUserMessage(phone, groupId, content, callbackUrl);
+    await handleUserMessage(phone, groupId, content, callbackUrl, invalidate);
   } catch (e) {
+    invalidate?.();
     if (application.signal.aborted || (e instanceof Error && e.name === "AbortError")) return;
     const elapsed = ((Date.now() - start) / 1000).toFixed(2);
     log.error(`请求处理失败 - 群: ${groupId}, 用户: ${phone}, 耗时: ${elapsed}秒, 错误: ${String(e)}`);
@@ -240,7 +247,8 @@ export function enqueueUserRequest(
     return true;
   }
   if (activeRequests.size >= MAX_ACTIVE_REQUESTS) return false;
-  const request = processRequest(content, phone, groupId, callbackUrl, clientIp);
+  const invalidate = rememberRequest(phone, groupId, content);
+  const request = processRequest(content, phone, groupId, callbackUrl, clientIp, invalidate);
   activeRequests.add(request);
   void request.then(
     () => activeRequests.delete(request),

@@ -1,6 +1,22 @@
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { isPathInside } from "../../src/agent/paths.ts";
+import { groupSegment, isPathInside } from "../../src/agent/paths.ts";
+
+export type GroupSelection = "auto" | "id" | "segment";
+
+/** A scanned storage name and an external ID are different namespaces. */
+export async function resolveGroupName(value: string, root: string, kind: GroupSelection = "auto"): Promise<string | null> {
+  const names = await dataDirectoryNames(root, root);
+  const encoded = groupSegment(value);
+  const byId = names.includes(encoded) ? encoded : null;
+  const bySegment = names.includes(value) ? value : null;
+  if (kind === "id") return byId;
+  if (kind === "segment") return bySegment;
+  if (byId && bySegment && byId !== bySegment) {
+    throw new Error("群号与存储目录存在歧义；请使用 --group-id 或 --storage-segment 明确选择");
+  }
+  return byId ?? bySegment;
+}
 
 /** Recheck the root and each directory before moving any user data. */
 export async function assertDataDirectory(path: string, root: string): Promise<void> {

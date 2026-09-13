@@ -39,3 +39,22 @@ test("log rotation retains only the configured backups without accumulating an a
     expect(existsSync(join(fixture.root, "backup/rm"))).toBe(false);
   } finally { clearTimeout(timer); child.kill(); await child.exited; await fixture.cleanup(); }
 }, 20000);
+
+test("public log methods redact credentials and signatures in both console and file output", async () => {
+  const fixture = await tempFixture("log-redaction-");
+  const module = fileURLToPath(new URL("../../src/core/log.ts", import.meta.url));
+  const script = join(fixture.root, "redact.ts");
+  await writeFile(script, `import {log} from ${JSON.stringify(module)};
+    for (const level of ['info','warn','error']) log[level]('request=fixture Authorization: Bearer bearerfixture123 apiKey=keyfixture123 https://userfixture:passwordfixture@files.invalid/d/f?sign=signaturefixture123&ok=yes\\nsecond');`);
+  const child = Bun.spawn([process.execPath, script], { cwd: fixture.root, stdout: "pipe", stderr: "pipe", windowsHide: true });
+  const timer = setTimeout(() => child.kill(), 20000);
+  try {
+    const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code, out + err).toBe(0);
+    for (const output of [out, await readFile(join(fixture.root, "logs", LOG_FILE), "utf8")]) {
+      expect(output.trim().split(/\r?\n/u)).toHaveLength(3);
+      for (const secret of ['bearerfixture123', 'keyfixture123', 'userfixture', 'passwordfixture', 'signaturefixture123']) expect(output).not.toContain(secret);
+      expect(output).toContain('request=fixture'); expect(output).toContain('ok=yes'); expect(output).toContain('\\nsecond');
+    }
+  } finally { clearTimeout(timer); child.kill(); await child.exited; await fixture.cleanup(); }
+}, 25000);

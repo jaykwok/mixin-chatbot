@@ -1,9 +1,22 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir } from "node:fs/promises";
+import { lstat, mkdir, rename } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { STATE_DIR } from "./storage.ts";
 import { lock } from "proper-lockfile";
 import { move } from "fs-extra";
+
+/** Atomically publish a staged file; retry brief Windows sharing locks without deleting the destination. */
+export async function replaceFile(temporary: string, destination: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try { await rename(temporary, destination); return; }
+    catch (error) {
+      if (process.platform !== "win32" || attempt >= 6 ||
+          !["EPERM", "EACCES", "EBUSY"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      await sleep(25 * 2 ** attempt);
+    }
+  }
+}
 
 /** Preserve recoverability, including group data on a different drive or bind mount. */
 export async function archiveFile(path: string): Promise<string | null> {

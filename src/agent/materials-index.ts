@@ -1,6 +1,7 @@
 // 群共享资料清单写在 workspace 之外，避免被外部同步覆盖。
 // 提示词只提供清单路径；概览和正文按需检索，不随扫描结果改变缓存前缀。
-import { readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, rename, lstat as stat, writeFile, rm } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import {
@@ -97,21 +98,25 @@ export async function scanWorkspace(
     }
     let children;
     try {
+      const info = await stat(dir);
+      if (!info.isDirectory() || info.isSymbolicLink()) { truncated = true; return; }
       children = await readdir(dir, { withFileTypes: true });
     } catch (e) {
       log.warn(`资料索引跳过无法读取的目录: ${dir} (${String(e)})`);
       truncated = true;
       return;
     }
+    const pending: Promise<void>[] = [];
     for (const child of children) {
       application.signal.throwIfAborted();
-      if (entries.length >= MATERIALS_INDEX_MAX_FILES) { truncated = true; return; }
+      if (entries.length + pending.length >= MATERIALS_INDEX_MAX_FILES) { truncated = true; break; }
       if (child.isSymbolicLink()) continue;
       if (child.name.startsWith(".") || ALWAYS_SKIPPED.has(child.name)) continue;
       const childRel = rel ? `${rel}/${child.name}` : child.name;
       if (isIgnored(childRel, ignorePrefixes)) continue;
       const childPath = join(dir, child.name);
       if (child.isDirectory()) {
+        await Promise.all(pending.splice(0));
         await walk(childPath, childRel, depth + 1);
         continue;
       }
@@ -120,14 +125,17 @@ export async function scanWorkspace(
         truncated = true;
         return;
       }
-      try {
+      pending.push((async () => { try {
         const info = await stat(childPath);
+        if (!info.isFile() || info.isSymbolicLink()) return;
         entries.push({ path: childRel, size: info.size, mtime: info.mtimeMs });
       } catch (e) {
         log.warn(`资料索引跳过无法统计的文件: ${childPath} (${String(e)})`);
         truncated = true;
-      }
+      } })());
+      if (pending.length >= 16) await Promise.all(pending.splice(0));
     }
+    await Promise.all(pending);
   };
 
   await walk(root, "", 1);
@@ -185,21 +193,24 @@ export function renderMaterialsIndex(
 }
 
 async function writeIndexFile(indexPath: string, content: string): Promise<void> {
-  const temp = `${indexPath}.tmp`;
-  await writeFile(temp, content, "utf8");
-  // 模型可能正在 grep 上一版；先写临时文件再原子替换，避免读到半份清单。
-  await rename(temp, indexPath);
+  const temp = `${indexPath}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temp, content, "utf8");
+    // 模型可能正在 grep 上一版；先写临时文件再原子替换，避免读到半份清单。
+    await rename(temp, indexPath);
+  } finally { await rm(temp, { force: true }).catch(() => {}); }
 }
 
 async function rebuild(options: EnsureOptions): Promise<MaterialsIndexSummary> {
   const started = Date.now();
   const ignorePrefixes = await loadIgnorePrefixes(options.ignorePath);
   const scan = await scanWorkspace(options.workspaceDir, ignorePrefixes);
-  const generatedAt = Date.now();
-  await writeIndexFile(
-    options.indexPath,
-    renderMaterialsIndex(options.workspaceDir, scan, generatedAt)
-  );
+  const digest = createHash("sha256").update(JSON.stringify(scan)).digest("hex");
+  const previous = await readManifest(options);
+  const generatedAt = previous?.digest === digest ? previous.summary.generatedAt : Date.now();
+  if (!previous || previous.digest !== digest) {
+    await writeIndexFile(options.indexPath, renderMaterialsIndex(options.workspaceDir, scan, generatedAt));
+  }
   const summary: MaterialsIndexSummary = {
     path: resolve(options.indexPath),
     totalFiles: scan.entries.length,
@@ -208,6 +219,8 @@ async function rebuild(options: EnsureOptions): Promise<MaterialsIndexSummary> {
     topLevel: summarizeTopLevel(scan.entries),
     truncated: scan.truncated,
   };
+  const manifest: Manifest = { version: 1, identity: await identity(options), digest, summary, checkedAt: Date.now(), indexStamp: await fileStamp(options.indexPath) };
+  await writeIndexFile(options.indexPath + ".manifest.json", JSON.stringify(manifest));
   log.info(
     `资料索引已更新 - 文件: ${summary.totalFiles}, 大小: ${formatSize(summary.totalBytes)}, 耗时: ${((Date.now() - started) / 1000).toFixed(2)}秒, 路径: ${summary.path}`
   );
@@ -222,14 +235,39 @@ export interface EnsureOptions {
 
 interface CacheEntry {
   summary: MaterialsIndexSummary;
+  checkedAt: number;
+  identity: string;
+  indexStamp: string;
+}
+
+interface Manifest extends CacheEntry { version: 1; digest: string; }
+async function fileStamp(path: string): Promise<string> {
+  try {
+    const info = await stat(path);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error("索引文件不是普通文件");
+    return JSON.stringify([info.size, info.mtimeMs, info.ctimeMs]);
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing"; throw error; }
+}
+async function identity(options: EnsureOptions): Promise<string> {
+  return JSON.stringify([resolve(options.workspaceDir), resolve(options.ignorePath), await fileStamp(options.ignorePath), MATERIALS_INDEX_MAX_FILES, MATERIALS_INDEX_MAX_DEPTH]);
+}
+async function readManifest(options: EnsureOptions): Promise<Manifest | null> {
+  try {
+    const value = JSON.parse(await readFile(options.indexPath + ".manifest.json", "utf8")) as Manifest;
+    if (value.version !== 1 || !/^[a-f0-9]{64}$/.test(value.digest) || !Number.isFinite(value.summary?.generatedAt) ||
+        !Array.isArray(value.summary.topLevel) || value.identity !== await identity(options) || value.summary.path !== resolve(options.indexPath) ||
+        !Number.isFinite(value.checkedAt) || value.checkedAt > Date.now() || value.indexStamp !== await fileStamp(options.indexPath)) return null;
+    return value;
+  } catch { return null; }
 }
 
 const cache = new Map<string, CacheEntry>();
 const building = new Map<string, Promise<MaterialsIndexSummary | null>>();
-function rememberSummary(key: string, summary: MaterialsIndexSummary): void {
+const retryAt = new Map<string, number>();
+function rememberSummary(key: string, entry: CacheEntry): void {
   cache.delete(key);
   if (cache.size >= 128) cache.delete(cache.keys().next().value!);
-  cache.set(key, { summary });
+  cache.set(key, entry);
 }
 
 /**
@@ -243,20 +281,43 @@ export async function ensureMaterialsIndex(
   now = Date.now()
 ): Promise<MaterialsIndexSummary | null> {
   const key = resolve(options.indexPath);
-  const cached = cache.get(key);
-  if (cached && now - cached.summary.generatedAt < MATERIALS_INDEX_TTL) return cached.summary;
+  let cached = cache.get(key);
+  let stamp: string;
+  try {
+    stamp = await identity(options);
+    const indexStamp = await fileStamp(options.indexPath);
+    if (cached && (cached.identity !== stamp || cached.indexStamp !== indexStamp)) { cache.delete(key); cached = undefined; }
+  } catch (error) {
+    if (Date.now() >= (retryAt.get(key) ?? 0)) log.warn(`资料索引校验失败，本次退回目录遍历 - ${String(error)}`);
+    retryAt.set(key, Date.now() + 30000);
+    if (retryAt.size > 128) retryAt.delete(retryAt.keys().next().value!);
+    return null;
+  }
+  if (cached) rememberSummary(key, cached);
+  if (cached && now - cached.checkedAt < MATERIALS_INDEX_TTL) return cached.summary;
 
   const inFlight = building.get(key);
   if (inFlight) return cached?.summary ?? inFlight;
+  if (Date.now() < (retryAt.get(key) ?? 0)) return cached?.summary ?? null;
 
-  const build = application.track(rebuild(options))
+  const build = application.track((async () => {
+      const persisted = cached ? null : await readManifest(options);
+      if (persisted && now - persisted.checkedAt < MATERIALS_INDEX_TTL) {
+        rememberSummary(key, persisted); return persisted.summary;
+      }
+      const summary = await rebuild(options);
+      rememberSummary(key, { summary, checkedAt: Date.now(), identity: stamp, indexStamp: await fileStamp(options.indexPath) });
+      retryAt.delete(key);
+      return summary;
+    })())
     .then((summary) => {
-      rememberSummary(key, summary);
       return summary;
     })
     .catch((e) => {
       // 索引是加速手段，不是必需品：失败时退回让模型自己 find，不能阻断会话创建。
       log.error(`资料索引生成失败，本次会话退回目录遍历 - ${String(e)}`);
+      retryAt.set(key, Date.now() + 30000);
+      if (retryAt.size > 128) retryAt.delete(retryAt.keys().next().value!);
       return null;
     })
     .finally(() => {

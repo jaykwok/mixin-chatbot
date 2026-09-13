@@ -3,10 +3,9 @@
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
-import { groupSegment } from "../../src/agent/paths.ts";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
 import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
-import { assertDataDirectory, dataDirectoryNames } from "../lib/group-data.ts";
+import { assertDataDirectory, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
 import { scanHistory, type GroupHistory } from "../lib/history-scan.ts";
 
 function usage(): void {
@@ -14,6 +13,7 @@ function usage(): void {
   console.log("");
   console.log("  list                 列出各群的会话历史（成员数、占用、最后活动）");
   console.log("  clear <群号>         清空该群全部成员的会话历史");
+  console.log("  --group-id / --storage-segment  明确使用原始群号或存储目录段，两者互斥");
   console.log("");
   console.log("  停机后执行；session.jsonl 移入 backup/rm，未交付消息另行保留。");
   console.log("  清空后每位成员的下一条消息都会开启全新会话。");
@@ -35,9 +35,8 @@ export async function collect(root: string = GROUP_DATA_ROOT): Promise<GroupHist
 /**
  * 接受外部群号或 list 输出的存储段，但只匹配已经验证的实际目录名。
  */
-async function resolveGroupDir(groupId: string, root: string): Promise<string | null> {
-  const names = await dataDirectoryNames(root, root);
-  const name = names.find(name => name === groupSegment(groupId)) ?? names.find(name => name === groupId);
+async function resolveGroupDir(groupId: string, root: string, kind: GroupSelection): Promise<string | null> {
+  const name = await resolveGroupName(groupId, root, kind);
   return name ? join(root, name) : null;
 }
 
@@ -46,9 +45,10 @@ async function resolveGroupDir(groupId: string, root: string): Promise<string | 
  */
 export async function clearGroup(
   groupId: string,
-  root: string = GROUP_DATA_ROOT
+  root: string = GROUP_DATA_ROOT,
+  kind: GroupSelection = "auto"
 ): Promise<number> {
-  const dir = await resolveGroupDir(groupId, root);
+  const dir = await resolveGroupDir(groupId, root, kind);
   if (!dir) {
     console.error(`在 ${root} 下找不到群 ${groupId}。用 list 查看现有的群。`);
     return 1;
@@ -126,12 +126,14 @@ async function main(args: string[]): Promise<number> {
         console.error("clear 需要群号：bun run history clear <群号>");
         return 1;
       }
-      const unknown = args[2];
+      const selection = args[2];
+      const kind: GroupSelection = selection === "--storage-segment" ? "segment" : selection === "--group-id" ? "id" : "auto";
+      const unknown = kind === "auto" ? selection : args[3];
       if (unknown) {
         console.error(`无法识别的参数：${unknown}`);
         return 1;
       }
-      return withMaintenance(() => clearGroup(groupId));
+      return withMaintenance(() => clearGroup(groupId, GROUP_DATA_ROOT, kind));
     }
     default:
       usage();

@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
 # mixin-chatbot 运维工具（Linux / Docker）。
-# 一站式运维：doctor / update / restart / stop / start / logs / uninstall。
-#
-# 用法：./scripts/ops/ops.sh <命令>
-#   命令：doctor、update、restart、stop、start、logs、relay-ls、relay-purge、
-#         tmp-ls、tmp-purge、stat、history-ls、history-clear、uninstall（不带参数显示帮助）
+# 用法：./scripts/ops/ops.sh <命令>；不带参数显示完整帮助。
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# 与 deploy.sh / ops.sh 共用的纯辅助函数（主机名校验与规范化）。
+# 与部署、隧道脚本共用校验、健康检查和生命周期函数。
 COMMON_LIB="${PROJECT_DIR}/scripts/lib/common.sh"
 if [ ! -f "$COMMON_LIB" ]; then
     echo "缺少 ${COMMON_LIB}；请从仓库完整获取脚本目录后重试。" >&2
@@ -149,16 +145,11 @@ code_of() {
 }
 
 wait_for_local() {
-    local attempt code=""
+    local attempt
     for attempt in $(seq 1 10); do
-        code="$(code_of "http://localhost:${PORT}/favicon.svg" 2)"
-        if [ "$code" = "200" ]; then
-            printf '%s' "$code"
-            return 0
-        fi
+        if bot_local_ready "$PORT" >/dev/null 2>&1; then return 0; fi
         [ "$attempt" -eq 10 ] || sleep 1
     done
-    printf '%s' "$code"
     return 1
 }
 
@@ -272,8 +263,8 @@ doctor() {
     check "部署回滚容器" "$(! has_rollback_container && echo 1 || echo 0)" \
         "$(! has_rollback_container && echo 无 || echo "发现 ${ROLLBACK_CONTAINER}，请确认后恢复或删除")"
 
-    local lc; lc="$(code_of "http://localhost:${PORT}/favicon.svg")"
-    check "本地机器人健康" "$([ "$lc" = "200" ] && echo 1 || echo 0)" "HTTP $lc"
+    if bot_local_ready "$PORT" >/dev/null 2>&1; then check "本地机器人健康" 1 "就绪且实例身份匹配"
+    else check "本地机器人健康" 0 "未就绪或实例身份不匹配"; fi
 
     if [ "$DEPLOY_MODE" = "cloudflare" ]; then
         local crunning="0" cdetail="未运行"
@@ -295,13 +286,7 @@ doctor() {
     fi
 
     local models_ok="0"
-    if [ -s "$MODELS_FILE" ]; then
-        if command -v jq >/dev/null 2>&1; then
-            jq -e '.providers | type == "object" and length > 0' "$MODELS_FILE" >/dev/null 2>&1 && models_ok="1"
-        else
-            grep -q '"providers"' "$MODELS_FILE" && models_ok="1"
-        fi
-    fi
+    if [ -s "$MODELS_FILE" ] && validate_model_configuration >/dev/null 2>&1; then models_ok="1"; fi
     check "data/config/models.json" "$models_ok" "$([ "$models_ok" = "1" ] && echo 有效 || echo '缺少或无效')"
 
     local secret_ok="0"
@@ -339,9 +324,8 @@ restart_bot() {
     P "重新启动容器..."
     if ! has_container; then ER "找不到容器 '$CONTAINER'；请先运行 scripts/deploy/deploy.sh"; return 1; fi
     docker restart "$CONTAINER" >/dev/null 2>&1 || { ER "docker restart 失败"; return 1; }
-    local lc
-    if lc="$(wait_for_local)"; then OK "机器人已恢复（:${PORT} 返回 HTTP 200）"
-    else WA "机器人仍未响应（HTTP $lc）；请尝试 scripts/ops/ops.sh logs"; return 1; fi
+    if wait_for_local; then OK "机器人已恢复（:${PORT} 实例身份与就绪检查通过）"
+    else WA "机器人未通过本地实例健康检查；请尝试 scripts/ops/ops.sh logs"; return 1; fi
 }
 
 stop_bot() {
@@ -353,9 +337,8 @@ stop_bot() {
 start_bot() {
     P "启动容器..."
     docker start "$CONTAINER" >/dev/null 2>&1 || { ER "启动失败；请先运行 scripts/deploy/deploy.sh"; return 1; }
-    local lc
-    if lc="$(wait_for_local)"; then OK "机器人已启动（:${PORT} 返回 HTTP 200）"
-    else WA "机器人未通过健康检查（HTTP $lc）；请尝试 scripts/ops/ops.sh logs"; return 1; fi
+    if wait_for_local; then OK "机器人已启动（:${PORT} 实例身份与就绪检查通过）"
+    else WA "机器人未通过本地实例健康检查；请尝试 scripts/ops/ops.sh logs"; return 1; fi
 }
 
 # 外链运维交给容器里的 bun 脚本执行，shell 这边只负责把它跑起来。
@@ -428,25 +411,28 @@ tmp_admin() {
 }
 
 # 清历史先停服务，防止内存会话写回；归档后恢复调用前的运行或停止状态。
-history_clear() {
-    if [ -z "${1:-}" ]; then
-        ER "history-clear 需要群号：./scripts/ops/ops.sh history-clear <群号>"
-        return 1
-    fi
-    local was_running=0
+history_clear() (
+    if [ -z "${1:-}" ]; then ER 'history-clear 需要群号'; return 1; fi
+    local was_running=0 restored=0
+    restore_history_service() {
+        local code=$?
+        trap - EXIT INT TERM
+        if [ "$was_running" = 1 ] && [ "$restored" = 0 ]; then start_bot || code=1; fi
+        exit "$code"
+    }
+    trap restore_history_service EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
         was_running=1
-        OK "先停止机器人，确保内存中的会话不会把历史写回去"
         stop_bot || return 1
     fi
     local code=0
     group_data_admin scripts/ops/history-admin.ts clear "$@" || code=$?
-    if [ "$was_running" = "1" ]; then
-        OK "重新启动机器人"
-        start_bot || return 1
-    fi
+    if [ "$was_running" = 1 ]; then start_bot || return 1; fi
+    restored=1
     return "$code"
-}
+)
 
 # git 只在这里用；GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。
 git_here() {
@@ -470,7 +456,8 @@ restore_checkout() {
     git_here reset --hard "$sha" >/dev/null 2>&1 || { ER "回滚到 ${sha} 失败"; return 1; }
 }
 
-update() {
+update() (
+    acquire_deploy_lock || { ER "另一个部署或升级正在进行"; return 1; }
     local deploy_script="${PROJECT_DIR}/scripts/deploy/deploy.sh"
     P "同步到 origin/main 并重新部署"
 
@@ -504,6 +491,27 @@ update() {
     original_branch="$(git_here rev-parse --abbrev-ref HEAD 2>/dev/null)"
     original_sha="$(git_here rev-parse HEAD 2>/dev/null)"
     if [ -z "$original_sha" ]; then ER "无法读取当前提交"; return 1; fi
+    local update_changed=0 update_committed=0 deploy_pid='' commit_file=''
+    finish_update() {
+        local status=$?
+        trap - EXIT INT TERM
+        if [ -n "$deploy_pid" ]; then
+            kill -TERM "$deploy_pid" 2>/dev/null || true
+            wait "$deploy_pid" 2>/dev/null || true
+        fi
+        if [ -n "$commit_file" ]; then
+            if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then update_committed=1; fi
+            rm -f -- "$commit_file" || WA "升级回执清理失败：$commit_file"
+        fi
+        if [ "$update_changed" = 1 ] && [ "$update_committed" != 1 ]; then
+            ER "升级未提交，正在恢复升级前的代码..."
+            restore_checkout "$original_branch" "$original_sha" || { ER "代码自动回滚失败，请检查当前 git 状态"; status=1; }
+        fi
+        exit "$status"
+    }
+    trap finish_update EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     P "拉取 origin/main..."
     if ! git_here fetch --prune origin main; then
@@ -521,6 +529,7 @@ update() {
             WA "已取消升级"
             return 1
         fi
+        update_changed=1
         if ! git_here checkout main; then
             ER "切换到 main 失败"
             return 1
@@ -536,6 +545,7 @@ update() {
     fi
 
     if [ "$current_sha" = "$target_sha" ]; then
+        update_committed=1
         OK "已经是 origin/main 最新版本（${target_sha:0:7}）"
         if ask_yes_no "代码没有变化；仍然重启容器？[y/N] "; then
             restart_bot || return 1
@@ -546,7 +556,7 @@ update() {
     fi
 
     # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
-    if ! git_here merge-base --is-ancestor HEAD origin/main; then
+    if ! git_here merge-base --is-ancestor HEAD "$target_sha"; then
         ER "本地 main 与 origin/main 已分叉，无法快进升级"
         WA "本地独有的提交："
         git_here log --oneline origin/main..HEAD | sed 's/^/      /'
@@ -559,8 +569,9 @@ update() {
     git_here log --oneline HEAD..origin/main | sed 's/^/      /'
     echo ""
 
-    if ! git_here merge --ff-only origin/main; then
-        ER "git merge --ff-only 失败；代码未改变"
+    update_changed=1
+    if ! git_here merge --ff-only "$target_sha"; then
+        ER "git merge --ff-only 失败"
         return 1
     fi
     OK "代码已更新到 ${target_sha:0:7}"
@@ -573,7 +584,13 @@ update() {
     echo ""
     local was_running
     was_running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
-    if DEPLOY_PRESERVE_STOPPED=1 bash "$deploy_script"; then
+    mkdir -p "$PROJECT_DIR/backup/tmp" || return 1
+    commit_file="$(mktemp "$PROJECT_DIR/backup/tmp/update-commit-XXXXXXXX")" || return 1
+    BOT_UPDATE_COMMIT_FILE="$commit_file" DEPLOY_PRESERVE_STOPPED=1 bash "$deploy_script" <&0 &
+    deploy_pid=$!
+    if wait "$deploy_pid"; then
+        deploy_pid=''
+        update_committed=1
         echo ""
         OK "升级完成：${original_sha:0:7} -> ${target_sha:0:7}"
         echo ""
@@ -582,20 +599,15 @@ update() {
         return 0
     fi
 
-    echo ""
-    ER "部署失败，正在把代码回滚到 ${original_sha:0:7}..."
-    if restore_checkout "$original_branch" "$original_sha"; then
-        OK "代码已回滚到升级前的版本"
-        WA "deploy.sh 失败时会恢复升级前的容器，机器人多半仍在运行；请执行 ops.sh doctor 确认"
-    else
-        if [ -z "$original_branch" ] || [ "$original_branch" = "HEAD" ]; then
-            ER "自动回滚失败；请手动执行：git checkout --force ${original_sha}"
-        else
-            ER "自动回滚失败；请手动执行：git checkout ${original_branch} && git reset --hard ${original_sha}"
-        fi
+    deploy_pid=''
+    if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then
+        update_committed=1
+        ER "新部署已提交，但后续操作未完成；保留当前代码，请执行 doctor 检查"
+        return 1
     fi
+    ER "部署失败，退出前将恢复升级前的代码"
     return 1
-}
+)
 
 show_logs() {
     if ! has_container; then ER "找不到容器 '$CONTAINER'"; return 1; fi
@@ -667,6 +679,7 @@ uninstall() {
 }
 
 case "${1:-}" in
+    deploy) exec bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" ;;
     doctor|status) doctor ;;
     update|upgrade) update ;;
     restart)   restart_bot ;;
@@ -696,6 +709,7 @@ case "${1:-}" in
         echo ""
         echo "  doctor     健康检查：群数据根、容器、:$PORT、配置；隧道模式额外检查 Cloudflare"
         echo "             加 --json 输出单行 JSON，供运维界面消费"
+        echo "  deploy     配置并部署当前代码；已有部署可用于重建修复，失败自动回滚"
         echo "  update     同步 origin/main，再交给 deploy.sh 重建并切换容器；失败自动回滚代码"
         echo "             deploy.sh 的各项提示直接回车即沿用现有配置"
         echo "  restart    重启 Docker 容器"
@@ -715,7 +729,8 @@ case "${1:-}" in
         echo "  routes     回调路由：list 查看绑定与冲突，reset/forget 需停机"
         echo "  history-ls 列出各群的会话历史（成员数、占用、最后活动）"
         echo "  history-clear <群号>"
-        echo "             清空该群全部成员的会话历史；自动停机、清理、再启动"
+        echo "             归档该群会话；自动停机、清理，再恢复原运行或停止状态"
+        echo "             群选择可加 --group-id（原始群号）或 --storage-segment（目录段）"
         echo "  uninstall  删除容器（可选镜像、cloudflared、data/、logs/）"
         # 显式 exit：case 分支的退出码取决于最后一条命令，靠自然结束会把 [ ] 的结果漏出去。
         [ "$UNKNOWN" = "1" ] && exit 1

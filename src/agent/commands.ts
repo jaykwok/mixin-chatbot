@@ -15,7 +15,7 @@ export const SUPPORTED_COMMANDS: ReadonlyMap<string, string> = new Map([
  * part of the user's actual prompt are kept.
  */
 export function stripLeadingMention(content: string): string {
-  return content.trim().replace(/^@[^\uFFA0]+\uFFA0/u, "");
+  return content.trim().replace(/^@[^\uFFA0]+\uFFA0/u, "").trimStart();
 }
 
 /** Extract a case-insensitive slash command token from normalized IM text. */

@@ -1,8 +1,4 @@
-// 体检。逐项结果来自 ops.sh doctor --json / ops.ps1 doctor -Json。
-//
-// 判断逻辑一行都不在这里：容器状态、计划任务、隧道归属、WebDAV 连通性，那些只有宿主机
-// 脚本做得了，而且已经做对了。这一页的价值在于把结果摆成能扫读的样子，并且让失败项旁边
-// 就有对应的处理入口——原来看完 doctor 还要自己回想该敲哪条命令。
+// 展示 ops.sh doctor --json / ops.ps1 doctor -Json 的结果，并转交平台对应的修复操作。
 
 import { box, mark, table, wrap } from "../render/widgets.ts";
 import { pad } from "../render/width.ts";
@@ -23,14 +19,13 @@ export class HealthView implements View {
   private selected = 0;
   private expanded = false;
   private scroll = new Viewport();
-  /** 在 refresh 里取到真值前先按 linux 算，宁可少显示一个键位也不显示一个按了没用的。 */
   private platform: "windows" | "linux" = "linux";
 
   hints(): [string, string][] {
     const keys: [string, string][] = this.expanded
       ? [["Esc", "返回"], ["↑↓", "滚动"], ["PgUp/Dn", "翻页"]]
       : [["↑↓", "选择"], ["Enter", "完整详情"]];
-    if (this.platform === "windows") keys.push(["f", "自动修复"]);
+    keys.push(["f", this.platform === "windows" ? "自动修复" : "重建修复"]);
     return keys;
   }
 
@@ -64,21 +59,23 @@ export class HealthView implements View {
       this.selected = moved;
       return true;
     }
-    // Windows 侧的体检自带安全自动修复；Linux 侧没有对应入口，不假装有。
-    if (key.name === "f" && app.deployment.platform === "windows") {
+    if (key.name === "f") {
+      const windows = app.deployment.platform === "windows";
       const ok = await app.confirm({
-        title: "自动修复",
-        subject: "对可安全判断的问题执行 doctor -Repair",
-        steps: [
+        title: windows ? "自动修复" : "重建修复",
+        subject: windows ? "修复可确定的部署问题" : "通过部署向导重新构建当前版本",
+        steps: windows ? [
           "重新注册计划任务、修正防火墙规则一类可确定的修复",
           "按当前 token 来源处理隧道（必要时重装 Cloudflared 服务）",
           "修复后再跑一次体检",
-        ],
+        ] : ["确认部署选项，回车默认沿用已有配置", "重建镜像并核对新实例的健康状态", "失败时恢复原部署"],
         untouched: ["data/ 配置与群数据", "已有的会话历史"],
         recovery: "修复只改部署侧设施，不动数据；失败时体检结果会指出剩下的问题",
       });
       if (ok) {
-        await app.run("自动修复", ["doctor", "-Repair"]);
+        const code = windows ? await app.run("自动修复", ["doctor", "-Repair"])
+          : await app.runInteractive("重建修复", ["deploy"]);
+        app.toast(code === 0 ? "ok" : "danger", code === 0 ? "修复完成" : `修复未成功（退出码 ${code}）`);
       }
       return true;
     }

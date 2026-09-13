@@ -118,7 +118,7 @@ export class StorageView implements View {
         return true;
       }
       const args = this.days === 0 ? ["tmp-purge", "--all"] : ["tmp-purge", "--days", String(this.days)];
-      if (!all) args.push("--group", current.group, "--user", current.user);
+      if (!all) args.push("--group", current.group, "--user", current.user, "--storage-segment");
       const code = await app.run(`清理 · ${scope}`, args);
       app.toast(code === 0 ? "ok" : "danger", code === 0 ? "清理完成" : "清理未完成，请看输出");
       return true;

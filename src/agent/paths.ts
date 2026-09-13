@@ -41,7 +41,7 @@ export function groupIndexDir(root: string, groupId: string): string {
   return join(root, groupSegment(groupId), "index");
 }
 
-/** Generated listing of every material file in the group workspace. */
+/** Bounded material listing; ignore rules and scan limits may omit workspace files. */
 export function materialsIndexPath(root: string, groupId: string): string {
   return join(groupIndexDir(root, groupId), "materials.md");
 }

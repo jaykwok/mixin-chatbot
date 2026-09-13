@@ -90,7 +90,7 @@ describe("installed Pi SDK integration", () => {
     const faux = fauxProvider({ tokensPerSecond: 0 });
     runtime.registerNativeProvider(faux.provider);
     const history = join(files.root, "session.jsonl");
-    const appended = buildChatContext({ tempDir: cwd, relayEnabled: false });
+    const appended = buildChatContext({ relayEnabled: false });
     const create = async () => {
       const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
       const resourceLoader = new DefaultResourceLoader({

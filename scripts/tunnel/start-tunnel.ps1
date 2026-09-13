@@ -51,6 +51,26 @@ function Test-TunnelTokenValue([string]$Value) {
     return (($Value -replace '[^A-Za-z0-9+/=_-]', '').Length -ge 20)
 }
 
+function Register-ProjectCloudflared([string]$Executable, [string]$TokenFile) {
+    # Official service install accepts a positional token, not --token-file.
+    # Register the official executable with its supported tunnel run arguments instead.
+    if ($Executable.Contains('"') -or $TokenFile.Contains('"')) { throw '连接器路径无效' }
+    $binaryPath = '"' + $Executable + '" tunnel --no-autoupdate run --token-file "' + $TokenFile + '"'
+    if (-not (Test-Path -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\Cloudflared')) {
+        New-EventLog -LogName Application -Source Cloudflared
+    }
+    $service = Get-Service -Name Cloudflared -ErrorAction SilentlyContinue
+    if ($service) {
+        Stop-Service Cloudflared -ErrorAction Stop
+        Set-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\Cloudflared' -Name ImagePath -Value $binaryPath
+        Set-Service Cloudflared -StartupType Automatic -ErrorAction Stop
+    } else {
+        New-Service -Name Cloudflared -DisplayName 'Cloudflared agent' -BinaryPathName $binaryPath -StartupType Automatic -ErrorAction Stop | Out-Null
+    }
+    $installed = Get-CimInstance Win32_Service -Filter "Name='Cloudflared'" -ErrorAction Stop
+    if (-not $installed -or $installed.PathName -cne $binaryPath) { throw '连接器服务命令行校验失败' }
+}
+
 
 $BotPort = if ($env:BOT_PORT) {
     $env:BOT_PORT
@@ -68,7 +88,7 @@ $BotPort = "$portNumber"
 
 function Test-LocalBot {
     try {
-        Invoke-WebRequest -Uri "http://localhost:$BotPort/health" -UseBasicParsing -TimeoutSec 3 | Out-Null
+        if (-not (Test-ProjectBotHealth $Project ([int]$BotPort))) { throw '实例未就绪或身份不匹配' }
         Write-Host "正常：机器人已在 :$BotPort 在线。" -ForegroundColor Green
         return $true
     } catch {
@@ -224,52 +244,25 @@ if ($isAdmin) {
     if ($existingService -and -not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
         throw '现有 Cloudflared 服务没有本项目归属记录；请通过其原管理方式维护，不能自动重装。'
     }
-    $serviceHelp = @(& $cfPath service install --help) -join "`n"
-    if ($serviceHelp -notmatch '--token-file') { throw '请更新官方 cloudflared，当前 service install 不支持 token 文件。' }
+    $serviceHelp = @(& $cfPath tunnel run --help) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $serviceHelp -notmatch '--token-file') { throw '请更新官方 cloudflared，当前 tunnel run 不支持 token 文件。' }
     $connectorSnapshot = New-CloudflaredSnapshot $Project
     $connectorCommitted = $false
     try {
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     Set-Content -LiteralPath $TunnelManagedFile -Value "Cloudflared" -NoNewline -Encoding ASCII
     $svc = $existingService
-    if ($svc) {
-        Write-Host "Cloudflared 服务已存在（状态：$(Get-ServiceStateLabel $svc.Status)）。" -ForegroundColor Yellow
-        if ($env:CLOUDFLARED_REINSTALL -eq "1") {
-            Stop-Service "Cloudflared" -ErrorAction SilentlyContinue
-            $previousErrorActionPreference = $ErrorActionPreference
-            try {
-                $ErrorActionPreference = "Continue"
-                & $cfPath service uninstall
-                $serviceUninstallExitCode = $LASTEXITCODE
-            } finally {
-                $ErrorActionPreference = $previousErrorActionPreference
-            }
-            if ($serviceUninstallExitCode -ne 0) { throw "Cloudflared 服务卸载失败（退出码 $serviceUninstallExitCode）" }
-            $previousErrorActionPreference = $ErrorActionPreference
-            try {
-                $ErrorActionPreference = "Continue"
-                & $cfPath service install $token
-                $serviceInstallExitCode = $LASTEXITCODE
-            } finally {
-                $ErrorActionPreference = $previousErrorActionPreference
-            }
-            if ($serviceInstallExitCode -ne 0) { throw "Cloudflared 服务安装失败（退出码 $serviceInstallExitCode）" }
-            Write-Host "Cloudflared 服务已使用指定 token 重新安装。" -ForegroundColor Green
-        } else {
-            if ($svc.Status -ne "Running") { Start-Service "Cloudflared" }
-            Write-Host "现有服务会继续使用已安装的 token；如需替换，请设置 CLOUDFLARED_REINSTALL=1。" -ForegroundColor Yellow
-        }
+    if (-not $svc -or $env:CLOUDFLARED_REINSTALL -eq '1') {
+        $serviceTokenFile = Join-Path $ConfigDir 'cloudflared-token'
+        New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+        if ($svc) { Stop-Service Cloudflared -ErrorAction Stop }
+        [IO.File]::WriteAllText($serviceTokenFile, $token, (New-Object Text.UTF8Encoding($false)))
+        Protect-ProjectSecretPath $serviceTokenFile
+        Register-ProjectCloudflared $cfPath $serviceTokenFile
+        Write-Host 'Cloudflared 服务已配置为开机自启，凭据从受保护文件读取。' -ForegroundColor Green
     } else {
-        Write-Host "正在安装 Windows 服务（开机自启）..."
-        $previousErrorActionPreference = $ErrorActionPreference
-        try {
-            $ErrorActionPreference = "Continue"
-            & $cfPath service install $token
-            $serviceInstallExitCode = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previousErrorActionPreference
-        }
-        if ($serviceInstallExitCode -ne 0) { throw "Cloudflared 服务安装失败（退出码 $serviceInstallExitCode）" }
+        if ($svc.Status -ne 'Running') { Start-Service Cloudflared }
+        Write-Host '现有服务继续使用原凭据；如需替换，请设置 CLOUDFLARED_REINSTALL=1。' -ForegroundColor Yellow
     }
     $installedService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if (-not $installedService) { throw "Cloudflared 服务安装命令已完成，但系统中仍找不到该服务" }

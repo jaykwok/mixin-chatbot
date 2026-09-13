@@ -1,0 +1,43 @@
+import assert from "node:assert/strict";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { mock, spyOn } from "bun:test";
+import { application, waitFor } from "../../src/core/lifecycle.ts";
+import { DOCUMENT_TOOLCHAIN_PACKAGES } from "../../src/core/config.ts";
+import { documentMarker, DOCUMENT_TOOLCHAIN_MARKER } from "../../scripts/runtime/document-manifest.ts";
+let runs = 0, success = true, release: (() => void) | undefined, hold = false;
+spyOn(Bun, "which").mockReturnValue("fixture-uv");
+mock.module("../../src/core/process.ts", () => ({ runProcess: async (options: any) => {
+  runs++;
+  assert.ok(options.args.at(-1).includes("lxml=="));
+  if (hold) await waitFor(new Promise<void>(resolve => { release = resolve; }), options.signal);
+  options.signal.throwIfAborted();
+  return { exitCode: success ? 0 : 1, output: "" };
+} }));
+const { documentToolchainReady, venvPythonPath } = await import("../../src/agent/python-toolchain.ts");
+const venv = join(process.cwd(), "venv"), python = venvPythonPath(venv), marker = join(venv, DOCUMENT_TOOLCHAIN_MARKER);
+await mkdir(dirname(python), { recursive: true }); await writeFile(python, "fixture-interpreter");
+const expected = documentMarker(DOCUMENT_TOOLCHAIN_PACKAGES, await readFile(new URL("../../scripts/runtime/requirements.txt", import.meta.url), "utf8"));
+await writeFile(marker, expected);
+assert.deepEqual(await Promise.all(Array.from({ length: 8 }, () => documentToolchainReady(venv))), Array(8).fill(true));
+assert.equal(runs, 1); assert.equal(await documentToolchainReady(venv), true); assert.equal(runs, 1);
+await writeFile(python, "changed-interpreter");
+assert.equal(await documentToolchainReady(venv), true); assert.equal(runs, 2);
+await writeFile(marker, "old-marker"); assert.equal(await documentToolchainReady(venv), false); assert.equal(runs, 2);
+await writeFile(marker, expected);
+success = false; assert.equal(await documentToolchainReady(venv), false); assert.equal(runs, 3);
+success = true; assert.equal(await documentToolchainReady(venv), true); assert.equal(runs, 4);
+const realNow = Date.now;
+Date.now = () => realNow() + 301000;
+try { assert.equal(await documentToolchainReady(venv), true); assert.equal(runs, 5); }
+finally { Date.now = realNow; }
+await writeFile(python, "concurrent-check");
+hold = true;
+const abort = new AbortController();
+const p1 = documentToolchainReady(venv, abort.signal).then(() => false, () => true);
+const p2 = documentToolchainReady(venv);
+while (runs < 6) await Bun.sleep(5);
+await Bun.sleep(30); abort.abort(); assert.equal(await p1, true);
+hold = false; release!(); assert.equal(await p2, true); assert.equal(runs, 6);
+await application.drain();
+console.log("READINESS_CACHE_PASSED");

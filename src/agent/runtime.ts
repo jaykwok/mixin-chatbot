@@ -20,10 +20,14 @@ import { buildLocalTools } from "./local-tools.ts";
 import { buildSendTools, createOutboundNotes, type OutboundNotes } from "./send-tools.ts";
 import { buildChatContext } from "./prompt.ts";
 import { DeliveryStore } from "./delivery-store.ts";
+import { refreshDeliveryText } from "./delivery-links.ts";
 import { SessionQueue } from "./session-queue.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { ensureStorageIdentity } from "./storage-identity.ts";
 import { redactSecrets } from "./failure.ts";
+import { validateModelConfig } from "../core/model-config.ts";
+import { configureModelCache, type CachePolicy } from "./model-cache.ts";
+import { buildDocumentTool } from "./document-extract.ts";
 import { ModelProgress } from "./model-progress.ts";
 
 // ModelRuntime 单例 + 解析出的单模型。从 data/config/models.json 加载（Pi 原生）。
@@ -49,34 +53,7 @@ async function getRuntime(): Promise<RuntimeSelection> {
 
   runtimePromise = (async () => {
     // 显式读 models.json 拿声明的 provider/model id（getProviders() 会混入内置 provider）。
-    let providerId: string | undefined;
-    let modelId: string | undefined;
-    let configuredThinkingLevel: ModelThinkingLevel = "off";
-    try {
-      const raw = JSON.parse(readFileSync(MODELS_JSON_PATH, "utf8")) as {
-        modelId?: string;
-        thinkingLevel?: ModelThinkingLevel;
-        providers?: Record<string, { models?: { id?: string }[] }>;
-      };
-      if (Object.keys(raw.providers ?? {}).length !== 1) throw new Error("只允许配置一个 provider");
-      providerId = Object.keys(raw.providers ?? {})[0];
-      const models = raw.providers?.[providerId]?.models;
-      if (typeof raw.modelId !== "string" || !raw.modelId.trim()) {
-        throw new Error("需指定 modelId；旧配置请运行 bun run configure 重新配置");
-      }
-      modelId = raw.modelId;
-      if (models !== undefined && (models.length !== 1 || models[0]?.id !== modelId)) {
-        throw new Error("自定义 models 必须只声明 modelId 指定的一个模型");
-      }
-      configuredThinkingLevel = raw.thinkingLevel ?? "off";
-    } catch (error) {
-      throw new Error(
-        `无法加载 ${MODELS_JSON_PATH}: ${String(error)}。请运行 bun run configure 检查 AI 配置。`
-      );
-    }
-    if (!providerId || !modelId) {
-      throw new Error(`${MODELS_JSON_PATH} 未声明 provider/model，请重新运行 configure 工具。`);
-    }
+    const { providerId, modelId, thinkingLevel: configuredThinkingLevel } = validateModelConfig(JSON.parse(readFileSync(MODELS_JSON_PATH, "utf8")));
 
     // Pi 默认把模型目录缓存写在 models.json 旁边；显式指向 data/runtime，让
     // data/config 里只剩用户真正要维护的东西。首次写入前目录必须存在。
@@ -99,6 +76,7 @@ async function getRuntime(): Promise<RuntimeSelection> {
       );
     }
     const thinkingLevel = clampThinkingLevel(model, configuredThinkingLevel);
+    configureModelCache(runtime, (runtimeSetting("BOT_MODEL_CACHE_RETENTION") ?? "auto") as CachePolicy);
     modelRuntime = runtime;
     resolvedModel = model;
     resolvedThinkingLevel = thinkingLevel;
@@ -168,8 +146,9 @@ function getRecord(phone: string, groupId: string, callbackUrl: string): Session
   if (!record) {
     if (records.size >= 1000) throw new Error("会话容量已满，请稍后重试");
     record = { key, phone, groupId, callbackUrl, queue: new SessionQueue(), lastUsed: Date.now(),
-      notes: createOutboundNotes((note) => {
-        record!.deliveryId = store().save(key, [...record!.notes.peek(), note].join("\n\n"), record!.deliveryId);
+      notes: createOutboundNotes((note, attachment) => {
+        record!.deliveryId = store().save(key, [...record!.notes.peek(), note].join("\n\n"), record!.deliveryId,
+          [...record!.notes.references(), ...(attachment ? [attachment] : [])]);
       }) };
     records.set(key, record);
   }
@@ -210,7 +189,7 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
   const resourceLoader = new DefaultResourceLoader({
     cwd, agentDir: resolve(PI_AGENT_DIR), settingsManager,
     noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-    systemPromptOverride: () => buildChatContext({ tempDir, relayEnabled: !!getRelayConfig() }),
+    systemPromptOverride: () => buildChatContext({ relayEnabled: !!getRelayConfig() }),
     appendSystemPromptOverride: () => [],
   });
   await resourceLoader.reload();
@@ -220,8 +199,8 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
   const { session } = await createAgentSession({
     cwd, agentDir: resolve(PI_AGENT_DIR), modelRuntime: runtime, model, thinkingLevel, settingsManager, resourceLoader,
     sessionManager: SessionManager.open(history, undefined, cwd),
-    tools: ["read", "bash", "edit", "write", "send_image", "send_file", "document_environment"],
-    customTools: [...localTools, ...buildSendTools({
+    tools: ["read", "bash", "edit", "write", "send_image", "send_file", "document_environment", "document_extract"],
+    customTools: [...localTools, buildDocumentTool({ workspaceDir: cwd, tempDir, indexPath, venvDir }), ...buildSendTools({
       getCallbackUrl: () => record.callbackUrl, groupId: record.groupId, workspaceDir: cwd, tempDir,
       relay: getRelayConfig(), notes: record.notes,
     }), {
@@ -285,7 +264,7 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
   return session;
 }
 
-export async function initializeAgentRuntime(): Promise<void> { await getRuntime(); }
+export async function initializeAgentRuntime(): Promise<void> { store(); await getRuntime(); }
 
 async function run(record: SessionRecord, content: string, cancellation: AbortSignal): Promise<void> {
   const deadline = AbortSignal.timeout(RUN_TIMEOUT_MS);
@@ -351,12 +330,13 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
     setStage(record, "模型调用结束");
     const failure = session.state.errorMessage;
     const text = session.getLastAssistantText();
-    const appendix = record.notes.peek().join("\n\n");
+    const rawAppendix = record.notes.peek().join("\n\n");
     if (failure) throw new Error(failure);
-    if (!text && !appendix) throw new Error("Pi 未返回回复");
+    if (!text && !rawAppendix) throw new Error("Pi 未返回回复");
     const body = text || "文件链接已生成。";
-    // Persist before entering the network queue; /deliver can recover after stop/restart.
-    record.deliveryId = store().save(record.key, [body, appendix].filter(Boolean).join("\n\n"), record.deliveryId);
+    // Persist the complete answer before any network probe or send can fail.
+    record.deliveryId = store().save(record.key, [body, rawAppendix].filter(Boolean).join("\n\n"), record.deliveryId, record.notes.references());
+    const appendix = await refreshDeliveryText({ text: rawAppendix, attachments: record.notes.references() }, signal);
     record.queue.phase = "正在发送回复";
     setStage(record, "发送最终回复");
     const sent = await sendReplyWithMention(body, record.groupId, record.phone, record.callbackUrl, signal, appendix || undefined);
@@ -387,10 +367,10 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
 }
 
 /** Control action is immediate; its network receipt is separately bounded/coalesced. */
-export async function handleUserMessage(phone: string, groupId: string, content: string, callbackUrl: string): Promise<void> {
+export async function handleUserMessage(phone: string, groupId: string, content: string, callbackUrl: string, invalidate?: () => void): Promise<void> {
   application.signal.throwIfAborted();
   const record = getRecord(phone, groupId, callbackUrl);
-  if (!isSlashCommandMessage(content)) return record.queue.enqueue((signal) => run(record, stripLeadingMention(content), signal));
+  if (!isSlashCommandMessage(content)) return record.queue.enqueue((signal) => run(record, stripLeadingMention(content), signal), invalidate);
   const command = canonicalCommand(content);
   let reply: string;
   if (command === "/stop") {
@@ -412,7 +392,8 @@ export async function handleUserMessage(phone: string, groupId: string, content:
       const pending = store().pending(record.key);
       if (!pending.length) { await sendText("你在本群没有待补发的回复。", groupId, phone, callbackUrl, { signal }); return; }
       for (const item of pending) {
-        if (!await sendText(item.text, groupId, phone, record.callbackUrl, { signal })) throw new Error("补发失败，尚未发完的回复仍已保存，可稍后再发送 /deliver");
+        const text = await refreshDeliveryText(item, signal);
+        if (!await sendText(text, groupId, phone, record.callbackUrl, { signal })) throw new Error("补发失败，尚未发完的回复仍已保存，可稍后再发送 /deliver");
         store().acknowledge([item.id]);
       }
     });

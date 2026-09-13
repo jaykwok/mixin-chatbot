@@ -189,6 +189,7 @@ $env:BOT_DEPLOY_BACKUP_ID='deploy-previous'
 $old='1111111111111111111111111111111111111111'; $new='2222222222222222222222222222222222222222'
 function Step($text){ Write-Host $text }; function Done($text){ Write-Host $text }; function Err($text){ Write-Host $text }; function Warn($text){ Write-Host $text }
 function IsAdmin { $true }; function Get-GitPath { 'fixture-git' }; function Get-BunPath { 'fixture-bun' }
+function Test-ModelConfiguration { $true }
 function Invoke-GitCapture($arguments) {
     $text=''
     if($arguments[0] -eq 'rev-parse') {

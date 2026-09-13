@@ -1,8 +1,8 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { RUNTIME_KEYS, validateRuntimeConfig } from "../../src/core/runtime-config.ts";
 import { RUNTIME_CONFIG_PATH } from "../../src/core/storage.ts";
-import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
+import { archiveFile, replaceFile, withMaintenance } from "../../src/core/maintenance.ts";
 
 /** Persist explicit deployment settings, including supported values inherited from the shell. */
 export async function saveRuntimeSettings(path = RUNTIME_CONFIG_PATH, env = process.env): Promise<void> {
@@ -16,7 +16,7 @@ export async function saveRuntimeSettings(path = RUNTIME_CONFIG_PATH, env = proc
   const temporary = join(dirname(path), `.runtime-${crypto.randomUUID()}.tmp`);
   try {
     await writeFile(temporary, JSON.stringify(validated, null, 2) + "\n", { mode: 0o600 });
-    await rename(temporary, path);
+    await replaceFile(temporary, path);
   } finally { await archiveFile(temporary); }
 }
 

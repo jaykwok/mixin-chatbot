@@ -1,10 +1,5 @@
-// 子进程。所有写操作都从这里出去，TUI 自己不碰 docker、git 和计划任务。
-//
-// 分两种用法：
-//   capture —— 要一个结果（体检 JSON、git 状态），等它跑完拿输出。
-//   stream  —— 要过程（升级、重启、清理），边跑边把每一行喂回界面。
-//
-// 一律用参数数组，不拼 shell 字符串：群号和关键字来自用户输入，拼进 shell 就是注入。
+// 非交互子进程：capture 收集结果，stream 逐行显示过程；交互终端交接由 App 处理。
+// 参数通过 argv 传递，维护事务在界面退出前统一等待完成。
 
 import { PROJECT_DIR, type Platform } from "./platform.ts";
 
@@ -16,12 +11,18 @@ export interface RunResult {
   timedOut: boolean;
 }
 
-export interface RunOptions {
-  /** 毫秒；到点发送 SIGTERM。默认 20 秒，够用又不会让界面挂死。 */
+interface CaptureOptions {
+  /** 毫秒；到点终止子进程。默认 20 秒。 */
   timeout?: number;
   env?: Record<string, string>;
   /** 喂给子进程 stdin 的内容；不给则关闭 stdin。 */
   input?: string;
+}
+
+interface StreamOptions {
+  env?: Record<string, string>;
+  /** A maintenance transaction must finish its restoration before the UI exits. */
+  cancelMode?: "terminate" | "finish";
 }
 
 /**
@@ -33,7 +34,7 @@ export interface RunOptions {
 export async function capture(
   command: string,
   args: string[],
-  options: RunOptions = {}
+  options: CaptureOptions = {}
 ): Promise<RunResult> {
   const { timeout = 20_000, env, input } = options;
   const child = Bun.spawn([command, ...args], {
@@ -66,22 +67,30 @@ export async function capture(
 export interface StreamHandle {
   /** 结束后 resolve 为退出码。 */
   done: Promise<number>;
-  /** 提前中止（用户按了 Esc）。 */
+  /** 请求取消；受保护的维护操作只提示等待，不终止子进程。 */
   cancel(): void;
+}
+
+const maintenance = new Set<Promise<number>>();
+export function trackMaintenance(done: Promise<number>): Promise<number> {
+  maintenance.add(done);
+  void done.finally(() => maintenance.delete(done)).catch(() => {});
+  return done;
+}
+export async function drainMaintenance(): Promise<void> {
+  await Promise.allSettled([...maintenance]);
 }
 
 /**
  * 跑一条命令并按行回调。
  *
- * stdout 和 stderr 合到一起按时间顺序回调：运维读的是一条时间线，把警告单独拎出来放在
- * 最后反而看不出它发生在哪一步。行级缓冲自己做，因为管道的分块边界和换行没有关系
- * ——按 chunk 直接输出会把一行劈成两半。
+ * stdout 和 stderr 分别按行缓冲，按读取顺序合并回调；不保证两个管道间的发出顺序。
  */
 export function stream(
   command: string,
   args: string[],
   onLine: (line: string) => void,
-  options: RunOptions = {}
+  options: StreamOptions = {}
 ): StreamHandle {
   const child = Bun.spawn([command, ...args], {
     cwd: PROJECT_DIR,
@@ -105,11 +114,22 @@ export function stream(
   };
 
   const done = (async (): Promise<number> => {
-    await Promise.all([pump(child.stdout), pump(child.stderr)]);
-    return child.exited;
+    const output = await Promise.allSettled([pump(child.stdout), pump(child.stderr)]);
+    const code = await child.exited;
+    const failed = output.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+    return code;
   })();
 
-  return { done, cancel: () => child.kill() };
+  if (options.cancelMode === "finish") {
+    trackMaintenance(done);
+  }
+  let requested = false;
+  return { done, cancel: () => {
+    if (options.cancelMode !== "finish") { child.kill(); return; }
+    if (!requested) onLine("维护已进入受保护流程，正在完成操作并恢复服务；请等待退出结果。");
+    requested = true;
+  } };
 }
 
 /** 解析命令的 JSON 输出。失败时把原始输出带进错误，方便看清它到底打了什么。 */

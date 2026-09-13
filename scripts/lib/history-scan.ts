@@ -1,12 +1,5 @@
-// 会话历史占用的扫描。只读，不依赖 npm 包。
-//
-// 从 history-admin.ts 拆出来，是为了让宿主机上的运维界面能直接调用它。
-// history-admin.ts 还要做归档，因而在模块一级就导入了 proper-lockfile 和 fs-extra；Linux
-// 生产机上宿主机没有 node_modules（依赖只装在镜像里），那些 import 会让整个模块加载失败。
-// 扫描本身一个 npm 包都不需要，所以它属于这里，不属于那边。
-//
-// root 是必填的：调用方各自知道自己的群数据根从哪来（部署状态文件、环境变量、测试目录），
-// 这里不替谁决定，也就不必导入那个按 cwd 解析的配置模块。
+// 只读会话扫描，不加载维护/归档模块；宿主机 TUI 无需安装 npm 依赖。
+// 调用方显式提供群数据根，扫描器不读取部署配置。
 
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";

@@ -1,16 +1,6 @@
-// 数据来源。
-//
-// 读写分两条路，这是整个界面的核心取舍：
-//
-//   读 —— 直接读宿主机上的文件。Linux 上 data/ 本来就是 bind mount 的真实宿主路径，绕一圈
-//         docker run 去读宿主机自己的文件没有意义，而且慢。这条路一个 npm 包都不需要，
-//         宿主机只要有 bun 就能跑。
-//
-//   写 —— 一律转交 ops.sh / ops.ps1。容器编排、维护租约、history-clear 的「停机→清理→
-//         恢复原状态」都已经在那两个脚本里，在这里重写一遍就是把最危险的逻辑维护成两份。
-//
-// 体检也走包装器的 --json：它要判断容器、计划任务、隧道归属，那些判断只有宿主机脚本
-// 做得了，而且已经做对了。
+import { matchesInstance } from "../../../src/core/health.ts";
+// 统计、会话和临时目录直接读取宿主机文件，无需 npm 依赖。
+// 健康诊断复用 ops 的 JSON 接口，容器和服务维护转交对应平台脚本。
 
 import { readdir, lstat } from "node:fs/promises";
 import { join } from "node:path";
@@ -45,8 +35,7 @@ export interface Health {
  * 而超时被当成「体检失败」比真失败更难排查。
  */
 export async function loadHealth(deployment: Deployment): Promise<Health> {
-  const flag = deployment.platform === "windows" ? "-Json" : "--json";
-  const { command, args } = opsCommand(deployment.platform, ["doctor", flag]);
+  const { command, args } = opsCommand(deployment.platform, ["doctor", "--json"]);
   const result = await capture(command, args, { timeout: 90_000 });
   if (result.timedOut) throw new Error("体检超时（90 秒）；隧道或外链后端可能无响应");
   const health = parseJson<Health>(result, "doctor --json");
@@ -59,12 +48,12 @@ export async function loadHealth(deployment: Deployment): Promise<Health> {
 // ===== 服务本身 =====
 
 export interface Service {
-  /** 本地 /health 的结果。unreachable 表示端口上没有东西在应答。 */
+  /** unreachable 表示请求失败、响应无效或实例身份不匹配。 */
   state: "ready" | "stopping" | "unreachable";
   pid?: number;
   /** 往返毫秒；unreachable 时为空。 */
   latency?: number;
-  /** 与健康响应 PID 匹配的实例记录；读不到时不显示运行时长。 */
+  /** 从通过完整身份校验的实例记录取得的启动时刻。 */
   startedAt?: number;
 }
 
@@ -74,17 +63,11 @@ export async function probeService(port: number, instanceFile = join(PROJECT_DIR
     const response = await fetch(`http://127.0.0.1:${port}/health`, {
       signal: AbortSignal.timeout(3000),
     });
-    const body = (await response.json()) as { status?: string; pid?: number };
-    if (!response.ok || !body || !["ready", "stopping"].includes(body.status ?? "") || !Number.isSafeInteger(body.pid) || body.pid! <= 0) {
-      return { state: "unreachable" };
-    }
-    let startedAt: number | undefined;
-    try {
-      const instance = await Bun.file(instanceFile).json();
-      if (instance.pid === body.pid && instance.port === port && Number.isFinite(instance.startedAt) && instance.startedAt > 0 && instance.startedAt <= Date.now()) {
-        startedAt = instance.startedAt;
-      }
-    } catch { /* 没有实例记录时只显示已验证的服务状态。 */ }
+    const body: unknown = await response.json();
+    const instance = await Bun.file(instanceFile).json();
+    if (!matchesInstance(body, instance, port) || (!response.ok && body.status !== "stopping")) return { state: "unreachable" };
+    const startedAt = instance.startedAt;
+
     return {
       state: body.status === "stopping" ? "stopping" : "ready",
       pid: body.pid,

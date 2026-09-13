@@ -1,8 +1,5 @@
-// 平台与部署状态。
-//
-// TUI 跑在宿主机上，读的必须是「这台机器实际部署成了什么样」，而不是仓库里的默认值。
-// 这些事实的唯一来源是 deploy 写下的 data/state/*，与 ops.sh / ops.ps1 读的是同一批文件
-// ——两边看到的端口、模式、域名和群数据根必须是同一个，否则 TUI 会对着另一套配置做体检。
+// TUI 读取宿主机部署状态，与 ops 使用相同的端口、模式、域名和群数据根。
+// BOT_PORT、BOT_DOMAIN 的显式环境变量覆盖对应状态文件。
 
 import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
@@ -87,21 +84,38 @@ export function loadDeployment(): Deployment {
  */
 export function opsCommand(platform: Platform, args: string[]): { command: string; args: string[] } {
   if (platform === "windows") {
-    let native = args;
+    const request: Record<string, string | number | boolean> = { Command: args[0] ?? "" };
+    let i = 1;
     if (args[0] === "routes") {
-      native = ["routes", "-Target", args[1] ?? "list"];
-      if (args[2]) native.push("-Fingerprint", args[2]);
-      if (args[3] === "--group") native.push("-Group", args[4] ?? "");
-    } else {
-      const flags: Record<string, string> = {
-        "--all": "-All", "--days": "-Days", "--user": "-User", "--group": "-Group",
-        "--since": "-Since", "--until": "-Until", "--json": "-Json",
-      };
-      native = args.map(arg => flags[arg] ?? arg);
+      request.Target = args[i++] ?? "list";
+      if (args[i] && args[i] !== "--group") request.Fingerprint = args[i++]!;
+    } else if (args[0] === "relay-purge") {
+      if (args[i] === "--all") { request.All = true; i++; }
+      else {
+        if (args[i] === "--keyword") i++;
+        request.Target = args[i++] ?? "";
+      }
+    } else if (["history-clear", "stat"].includes(args[0] ?? "") && args[i] && !args[i]!.startsWith("--")) {
+      request.Target = args[i++]!;
     }
+    const switches: Record<string, string> = {
+      "--all": "All", "--json": "Json", "-Repair": "Repair", "-RestartTunnel": "RestartTunnel",
+      "--storage-segment": "StorageSegment", "--group-id": "GroupId",
+    };
+    const values: Record<string, string> = { "--days": "Days", "--user": "User", "--group": "Group", "--since": "Since", "--until": "Until" };
+    for (; i < args.length; i++) {
+      const flag = args[i]!;
+      if (switches[flag]) request[switches[flag]!] = true;
+      else if (values[flag] && args[i + 1] !== undefined) {
+        const value = args[++i]!;
+        request[values[flag]!] = flag === "--days" ? Number(value) : value;
+      } else throw new Error(`无法识别的运维参数：${flag}`);
+    }
+    // Only base64 crosses PowerShell's parameter binder. Values are never parsed as switches.
+    const encoded = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
     return {
       command: "powershell",
-      args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(PROJECT_DIR, "scripts", "ops", "ops.ps1"), ...native],
+      args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(PROJECT_DIR, "scripts", "ops", "ops.ps1"), "-RequestBase64", encoded],
     };
   }
   return { command: "bash", args: [join(PROJECT_DIR, "scripts", "ops", "ops.sh"), ...args] };

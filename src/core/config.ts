@@ -2,7 +2,7 @@
 // data/config 放配置与密钥，data/state 放持久账本与部署状态，data/runtime 放 SDK 运行资源，
 // data/groups 放群共享工作区、用户临时文件与会话。
 // 无必需 .env/config.json；可选环境变量覆盖部署参数。访问控制由 webhook secret + 防火墙/WAF 共同承担。
-// 所有时间常量统一毫秒（Date.now()/setTimeout 均为 ms）。
+// 计时和期限常量使用毫秒；bash 工具的 timeout 参数使用秒。
 
 import { DEFAULT_GROUP_DATA_ROOT } from "./storage.ts";
 import { readFileSync } from "node:fs";
@@ -116,7 +116,7 @@ export const BASH_DEFAULT_TIMEOUT = integerEnv("BOT_BASH_TIMEOUT", 600, 10, 3600
 
 // ===== 资料索引 =====
 /**
- * 每轮检查索引是否过期；首次等待构建，之后返回旧索引并在后台刷新。
+ * 每轮检查索引是否过期；有效 manifest 可复用，否则首次等待构建，过期后后台刷新。
  */
 export const MATERIALS_INDEX_TTL = integerEnv(
   "BOT_INDEX_TTL_MINUTES",
@@ -137,7 +137,7 @@ export const MATERIALS_INDEX_MAX_DEPTH = integerEnv("BOT_INDEX_MAX_DEPTH", 12, 1
 // ===== 文档解析环境 =====
 /**
  * 解析和生成文档的直接依赖，完整依赖锁为 requirements.txt。
- * 能力工具检查解释器、包版本及导入结果；标记只用于识别配置，不作为就绪依据。
+ * 就绪校验包含解释器、锁定版本和导入结果；文件状态未变时可短期复用成功结果。
  * 使用指定环境、预装项目 .venv 或按需准备的群 venv；模型不能修改共享环境。
  */
 export const DOCUMENT_TOOLCHAIN_PACKAGES: readonly string[] = documentPackages(readFileSync(

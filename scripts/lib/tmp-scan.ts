@@ -1,12 +1,9 @@
-// 用户临时目录占用的扫描。只读，不依赖 npm 包。
-//
-// 与 history-scan.ts 同一个理由：tmp-admin.ts 要归档，模块一级就带上了 npm 依赖，而宿主机
-// 上没有 node_modules。扫描不需要它们。
+// 只读临时目录扫描，不加载维护/归档模块；宿主机 TUI 无需安装 npm 依赖。
 
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { groupSegment, userSegment } from "../../src/agent/paths.ts";
-import { assertDataDirectory, dataDirectoryNames } from "./group-data.ts";
+import { userSegment } from "../../src/agent/paths.ts";
+import { assertDataDirectory, dataDirectoryNames, resolveGroupName, type GroupSelection } from "./group-data.ts";
 
 export interface Usage {
   bytes: number;
@@ -60,11 +57,11 @@ export async function measure(path: string): Promise<Usage> {
 }
 
 /** 扫描所有群下所有用户的 tmp。找不到目录就是还没人在这个群里用过工具，不是错误。 */
-export async function scanTmp(root: string, userFilter?: string, groupFilter?: string): Promise<UserTmp[]> {
+export async function scanTmp(root: string, userFilter?: string, groupFilter?: string, selection: GroupSelection = "auto"): Promise<UserTmp[]> {
   const found: UserTmp[] = [];
   const groups = await dataDirectoryNames(root, root);
   // TUI 传的是已扫描到的目录名：精确匹配优先，不能同时命中其再次编码后的另一个目录。
-  const selectedGroup = groupFilter ? (groups.includes(groupFilter) ? groupFilter : groupSegment(groupFilter)) : undefined;
+  const selectedGroup = groupFilter ? await resolveGroupName(groupFilter, root, selection) : undefined;
   for (const group of groups) {
     if (selectedGroup !== undefined && group !== selectedGroup) continue;
     const usersDir = join(root, group, "users");

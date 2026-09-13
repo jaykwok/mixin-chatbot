@@ -52,10 +52,7 @@ function Test-VersionedApplication([string]$Path, [string]$RequiredPattern = "")
 }
 function Wait-BotHealth([string]$ListenPort, [int]$Attempts = 18) {
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        try {
-            $status = (Invoke-WebRequest -Uri "http://127.0.0.1:$ListenPort/health" -UseBasicParsing -TimeoutSec 2).StatusCode
-            if ($status -eq 200) { return $true }
-        } catch {}
+        if (Test-ProjectBotHealth $Project ([int]$ListenPort)) { return $true }
         if ($attempt -lt $Attempts) { Start-Sleep -Seconds 3 }
     }
     return $false
@@ -213,6 +210,9 @@ $UvPath = @(Get-ApplicationPaths 'uv.exe' | Where-Object { Test-VersionedApplica
 if ($UvPath.Count -ne 1) { throw '缺少原生 uv.exe，请先安装 uv 并加入 PATH。' }
 $UvDir = Split-Path $UvPath[0] -Parent
 $env:PATH = $UvDir + ';' + $BashDir + ';' + $env:PATH
+if ((Test-Path -LiteralPath $ModelsFile) -and -not (Test-ModelConfiguration $Project $ModelsFile)) {
+    throw '模型配置无效；尚未停止旧服务，请运行 bun run configure。'
+}
 $snapshot = New-DeploymentSnapshot $Project $TaskName
 $deploymentCommitted = $false
 $deploymentMutated = $false
@@ -267,6 +267,8 @@ if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
         if ($configureExitCode -ne 0) { Write-Host "AI 配置失败（退出码 $configureExitCode）。" -ForegroundColor Red; exit 1 }
     }
 }
+
+if (-not (Test-ModelConfiguration $Project $ModelsFile)) { throw '模型配置无效，正在恢复原部署。' }
 
 # ---- 4. webhook 密钥 ----
 $showSecret = $false

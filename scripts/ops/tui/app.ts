@@ -13,7 +13,7 @@ import * as fmt from "./render/format.ts";
 import { footer, header, navbar } from "./frame.ts";
 import { loadGit, probeService, type GitState, type Service } from "./data.ts";
 import { PROJECT_DIR, loadDeployment, opsCommand, type Deployment } from "./platform.ts";
-import { openLocalFile, stream } from "./exec.ts";
+import { openLocalFile, stream, trackMaintenance } from "./exec.ts";
 import type { AppApi, ConfirmSpec, View, ViewContext } from "./view.ts";
 
 /** 转圈动画，只在操作进行时显示。 */
@@ -153,7 +153,7 @@ export class App implements AppApi {
         stdout: "inherit",
         stderr: "inherit",
       });
-      code = await child.exited;
+      code = await trackMaintenance(child.exited);
       process.stdout.write(`\n== ${title} 结束（退出码 ${code}）==\n按回车回到运维界面…`);
       const input = createInterface({ input: process.stdin, terminal: false });
       try {
@@ -230,7 +230,8 @@ export class App implements AppApi {
       const handle = stream(command, full, (line) => {
         pane.lines.push(line);
         this.redraw();
-      });
+      }, { cancelMode: ["logs", "relay-ls", "history-ls", "tmp-ls", "stat", "doctor", "status"].includes(args[0] ?? "") &&
+        !args.includes("-Repair") && !args.includes("-RestartTunnel") ? "terminate" : "finish" });
       pane.cancel = handle.cancel;
       code = await handle.done;
     } catch (error) {
@@ -309,7 +310,7 @@ export class App implements AppApi {
       // 除滚动外，运行中只接受显式中止；回车不会打断命令。
       if (key.name === "escape" || (key.ctrl && key.name === "c")) {
         pane.cancel();
-        this.toast("warn", "已请求中止；子进程可能还要几秒才退出");
+        this.toast("warn", "已请求中止；维护操作会完成恢复后退出，请查看输出");
       }
       return;
     }

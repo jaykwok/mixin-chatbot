@@ -44,6 +44,6 @@ ENV TZ=Asia/Shanghai
 
 # 健康检查（bun fetch，无需额外装 curl）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD bun -e "const {PORT}=await import('./src/core/config.ts'); fetch('http://127.0.0.1:'+PORT+'/health').then(r=>r.json()).then(r=>process.exit(r.status==='ready'?0:1)).catch(()=>process.exit(1))"
+  CMD bun run scripts/ops/health-check.ts
 
 CMD ["bun", "run", "src/server/index.ts"]

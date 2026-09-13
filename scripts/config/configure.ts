@@ -13,13 +13,13 @@ import {
   text,
   isCancel,
 } from "@clack/prompts";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { clampThinkingLevel, getSupportedThinkingLevels, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { builtinProviders, getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODELS_JSON_PATH } from "../../src/core/storage.ts";
-import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
+import { archiveFile, replaceFile, withMaintenance } from "../../src/core/maintenance.ts";
 
 export const CUSTOM_APIS = ["openai-completions", "openai-responses", "anthropic-messages"] as const;
 
@@ -361,7 +361,7 @@ async function saveConfiguration(doc: ExistingDoc, providerId: string, thinkingL
     await chmod(tempPath, 0o600).catch(() => {
       // Windows ACL 不使用 POSIX mode；部署脚本仍限制运行身份。
     });
-    await rename(tempPath, MODELS_JSON_PATH);
+    await replaceFile(tempPath, MODELS_JSON_PATH);
   } finally {
     await archiveFile(tempPath);
   }

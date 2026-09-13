@@ -44,8 +44,9 @@ describe("用户临时目录清理", () => {
         await writeFile(join(path, "keep-unless-selected.txt"), "fixture");
       }
       expect((await collect(user, scoped, group)).map(item => item.dir)).toEqual([chosen]);
-      expect((await collect(userSegment(user), scoped, groupSegment(group))).map(item => item.dir)).toEqual([chosen]);
-      expect(await purge(0, userSegment(user), scoped, groupSegment(group))).toBe(0);
+      await expect(collect(userSegment(user), scoped, groupSegment(group))).rejects.toThrow("歧义");
+      expect((await collect(userSegment(user), scoped, groupSegment(group), "segment")).map(item => item.dir)).toEqual([chosen]);
+      expect(await purge(0, userSegment(user), scoped, groupSegment(group), "segment")).toBe(0);
       expect(await exists(join(chosen, "keep-unless-selected.txt"))).toBe(false);
       expect(await exists(join(otherGroup, "keep-unless-selected.txt"))).toBe(true);
       expect(await exists(join(otherUser, "keep-unless-selected.txt"))).toBe(true);

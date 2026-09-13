@@ -19,7 +19,7 @@ BOT_PORT_FILE="${PROJECT_DIR}/data/state/bot-port"
 DEFAULT_TUNNEL_TOKEN_FILE="${PROJECT_DIR}/data/config/tunnel-token"
 TUNNEL_PID_FILE="${PROJECT_DIR}/data/state/cloudflared.pid"
 
-. "$PROJECT_DIR/scripts/lib/lifecycle.sh"
+. "$PROJECT_DIR/scripts/lib/common.sh"
 
 if existing_pid="$(managed_cloudflared_pid)"; then
     echo "✓ 本项目 cloudflared 已在运行（pid ${existing_pid}）"
@@ -129,7 +129,7 @@ if command -v base64 >/dev/null 2>&1; then
 fi
 
 # 连接器注册后会参与分流；默认要求本地服务健康，避免向无服务实例导入生产流量。
-if curl --noproxy '*' --max-time 3 -fsS "http://127.0.0.1:${BOT_PORT}/health" >/dev/null 2>&1; then
+if bot_local_ready "$BOT_PORT" >/dev/null 2>&1; then
     echo "✓ 本机 :${BOT_PORT} 机器人在线"
 elif [ "${TUNNEL_ALLOW_NO_BOT:-}" = "1" ]; then
     echo "⚠ 本机 :${BOT_PORT} 无响应，但 TUNNEL_ALLOW_NO_BOT=1，继续连接" >&2
@@ -154,5 +154,5 @@ token_path="$PROJECT_DIR/data/config/cloudflared-token"
 (umask 077 && printf '%s' "$TUNNEL_TOKEN" > "$token_path")
 chmod 600 "$token_path"
 unset TUNNEL_TOKEN
-record_cloudflared_pid "$"
+record_cloudflared_pid "$$"
 exec cloudflared tunnel --no-autoupdate run --token-file "$token_path"

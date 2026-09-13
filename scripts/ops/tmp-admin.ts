@@ -4,7 +4,7 @@
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
 import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
-import { assertDataDirectory } from "../lib/group-data.ts";
+import { assertDataDirectory, type GroupSelection } from "../lib/group-data.ts";
 import { scanTmp, type UserTmp } from "../lib/tmp-scan.ts";
 
 const DAY = 24 * 60 * 60_000;
@@ -17,6 +17,7 @@ function usage(): void {
   console.log("  purge --all              清空全部用户临时目录（等价于 --days 0）");
   console.log("");
   console.log("  list/purge 可加 --user <手机号> 和 --group <群号>，限定成员与群。");
+  console.log("  --group-id / --storage-segment 明确群参数是原始群号或存储目录段，两者互斥。");
   console.log("  停机后将选中内容移入 backup/rm；tmp 目录、workspace 和 session.jsonl 保留。");
 }
 
@@ -37,13 +38,14 @@ function describeAge(at: number): string {
 export async function collect(
   userFilter?: string,
   root: string = GROUP_DATA_ROOT,
-  groupFilter?: string
+  groupFilter?: string,
+  selection: GroupSelection = "auto"
 ): Promise<UserTmp[]> {
-  return scanTmp(root, userFilter, groupFilter);
+  return scanTmp(root, userFilter, groupFilter, selection);
 }
 
-async function list(userFilter?: string, groupFilter?: string): Promise<number> {
-  const users = await collect(userFilter, GROUP_DATA_ROOT, groupFilter);
+async function list(userFilter?: string, groupFilter?: string, selection: GroupSelection = "auto"): Promise<number> {
+  const users = await collect(userFilter, GROUP_DATA_ROOT, groupFilter, selection);
   if (users.length === 0) {
     console.log(`没有找到任何用户临时目录（群数据总根：${GROUP_DATA_ROOT}）。`);
     return 0;
@@ -72,10 +74,11 @@ export async function purge(
   days: number,
   userFilter?: string,
   root: string = GROUP_DATA_ROOT,
-  groupFilter?: string
+  groupFilter?: string,
+  selection: GroupSelection = "auto"
 ): Promise<number> {
   const cutoff = Date.now() - days * DAY;
-  const users = await collect(userFilter, root, groupFilter);
+  const users = await collect(userFilter, root, groupFilter, selection);
   if (users.length === 0) {
     console.log(`没有找到任何用户临时目录（群数据总根：${root}）。`);
     return 0;
@@ -129,6 +132,7 @@ async function main(args: string[]): Promise<number> {
   let days: number | undefined;
   let userFilter: string | undefined;
   let groupFilter: string | undefined;
+  let selection: GroupSelection = "auto";
   for (let i = 1; i < args.length; i++) {
     const flag = args[i];
     if (flag === "--all") {
@@ -152,6 +156,9 @@ async function main(args: string[]): Promise<number> {
         console.error("--group 需要一个群号");
         return 1;
       }
+    } else if (flag === "--storage-segment" || flag === "--group-id") {
+      if (selection !== "auto") throw new Error("群目录选择参数不能重复");
+      selection = flag === "--storage-segment" ? "segment" : "id";
     } else {
       console.error(`无法识别的参数：${flag}`);
       return 1;
@@ -161,7 +168,7 @@ async function main(args: string[]): Promise<number> {
   switch (command) {
     case "list":
     case "ls":
-      return list(userFilter, groupFilter);
+      return list(userFilter, groupFilter, selection);
     case "purge":
       // 跟 relay purge 一样，范围必须显式给出：一条不带参数的 purge 太容易在手滑时
       // 把某个正在跑的任务的中间产物一起端掉。
@@ -172,7 +179,7 @@ async function main(args: string[]): Promise<number> {
       if (days === 0) {
         console.log("准备将所选范围的全部临时内容移入回收区；运行中的机器人会阻止本操作。");
       }
-      return withMaintenance(() => purge(days, userFilter, GROUP_DATA_ROOT, groupFilter));
+      return withMaintenance(() => purge(days, userFilter, GROUP_DATA_ROOT, groupFilter, selection));
     default:
       usage();
       return command ? 1 : 0;

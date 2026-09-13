@@ -5,7 +5,10 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { collectAll, collectGroup } from "../../scripts/ops/stats-admin.ts";
+import { cacheReadRate, emptyUsage, formatCacheRate } from "../../scripts/lib/usage.ts";
+import { tempFixture } from "../helpers/temp.ts";
 
 function userMsg(at: string, text: string): string {
   return JSON.stringify({
@@ -64,6 +67,49 @@ async function makeRoot(): Promise<string> {
 }
 
 describe("usage stats", () => {
+  test("the real CLI displays a group whose only usage is history compaction", async () => {
+    const fixture = await tempFixture("stats-compaction-cli-");
+    const user = join(fixture.root, "g/users/u"); await mkdir(user, { recursive: true });
+    await writeFile(join(user, "session.jsonl"), JSON.stringify({ type: "compaction", timestamp: "2026-09-11T12:01:00Z",
+      usage: { input: 321, output: 20, cacheRead: 0, cacheWrite: 9, cost: { total: 0.5 } } }) + "\n");
+    const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../../scripts/ops/stats-admin.ts", import.meta.url)), "g", "--group-id"],
+      { cwd: fixture.root, env: { ...process.env, GROUP_DATA_ROOT: fixture.root }, stdout: "pipe", stderr: "pipe", windowsHide: true });
+    const timer = setTimeout(() => child.kill(), 15000);
+    try {
+      const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(code, out + err).toBe(0); expect(out).not.toContain("没有使用记录");
+      expect(out).toContain("compaction"); expect(out).toContain("321"); expect(out).toContain("0.500000");
+    } finally { clearTimeout(timer); child.kill(); await child.exited; await fixture.cleanup(); }
+  }, 20000);
+  test("counts assistant, compaction and branch usage with token weights and unknown costs", async () => {
+    const fixture = await tempFixture("usage-breakdown-");
+    const user = join(fixture.root, "g", "users", "u");
+    await mkdir(user, { recursive: true });
+    const usage = (input: number, output: number, cacheRead: number, cacheWrite: number, cost: number) => ({ input, output, cacheRead, cacheWrite, cost: { total: cost } });
+    await writeFile(join(user, "session.jsonl"), [
+      { type: "model_change", provider: "zai", modelId: "plan", timestamp: "2026-09-10T12:00:00Z" },
+      { type: "message", timestamp: "2026-09-11T12:00:00Z", message: { role: "assistant", usage: usage(100, 10, 900, 500, 1) } },
+      { type: "compaction", timestamp: "2026-09-11T12:01:00Z", usage: usage(200, 20, 0, 0, 2) },
+      { type: "model_change", provider: "next", modelId: "model", timestamp: "2026-09-12T12:00:00Z" },
+      { type: "branch_summary", timestamp: "2026-09-12T12:01:00Z", usage: usage(50, 5, 100, 10, 3) },
+      { type: "message", timestamp: "2026-09-12T12:02:00Z", message: { role: "assistant" } },
+    ].map(value => JSON.stringify(value)).join("\n"));
+    try {
+      const result = await collectGroup("g", fixture.root);
+      expect(result.tokens).toMatchObject({ input: 350, output: 35, cacheRead: 1000, cacheWrite: 510,
+        cost: 6, requests: 4, missingUsage: 1, unknownCost: 1 });
+      expect(cacheReadRate(result.tokens)).toBeCloseTo(1000 / 1860, 10);
+      expect(result.usage.kinds.compaction.input).toBe(200);
+      expect(result.usage.kinds.branch_summary.cacheWrite).toBe(10);
+      expect(result.usage.models.get(JSON.stringify(["zai", "plan"]))?.requests).toBe(2);
+      expect(result.usage.days.get("2026-09-12")?.requests).toBe(2);
+      const onlyCompaction = await collectAll(fixture.root, { since: Date.parse("2026-09-11T12:00:30Z"), until: Date.parse("2026-09-11T12:01:30Z") });
+      expect(onlyCompaction).toHaveLength(1);
+      expect(onlyCompaction[0]!.tokens.input).toBe(200);
+      expect(onlyCompaction[0]!.usage.models.get(JSON.stringify(["zai", "plan"]))?.requests).toBe(1);
+      expect(formatCacheRate(emptyUsage())).toBe("无样本");
+    } finally { await fixture.cleanup(); }
+  });
   test("counts a message as one ask and leaves slash commands out", async () => {
     const root = await makeRoot();
     try {

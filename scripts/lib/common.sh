@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux 脚本共用的主机名校验、归档与连接器身份操作。
+# Linux 脚本共用的主机名、实例健康、模型校验、部署互斥和生命周期操作。
 #
 # lifecycle 函数在调用时读取 PROJECT_DIR 与 TUNNEL_PID_FILE；导入不操作外部状态。
 #
@@ -37,4 +37,36 @@ normalize_hostname_input() {
         fi
     fi
     return 1
+}
+
+# Host-port response must identify this project's current instance. Docker provides Bun when the host does not.
+bot_local_ready() {
+    local port="$1" body
+    body="$(curl --noproxy '*' --max-time 3 -fsS "http://127.0.0.1:$port/health")" || return 1
+    if command -v bun >/dev/null 2>&1; then
+        (cd "$PROJECT_DIR" && printf '%s' "$body" | BOT_PORT="$port" bun run scripts/ops/health-check.ts --stdin)
+    else
+        printf '%s' "$body" | docker exec -i -e BOT_PORT="$port" mixin-chatbot bun run scripts/ops/health-check.ts --stdin
+    fi
+}
+
+validate_model_configuration() {
+    if command -v bun >/dev/null 2>&1; then
+        bun run "$PROJECT_DIR/scripts/config/validate-models.ts" "$PROJECT_DIR/data/config/models.json"
+    else
+        docker run --rm --network none --entrypoint bun -v "$PROJECT_DIR:/audit:ro" mixin-chatbot run /audit/scripts/config/validate-models.ts /audit/data/config/models.json
+    fi
+}
+
+acquire_deploy_lock() {
+    mkdir -p "$PROJECT_DIR/data/state"
+    local lock_path
+    lock_path="$(realpath "$PROJECT_DIR/data/state")/deploy.lock"
+    if [ "${BOT_DEPLOY_LOCK_HELD:-}" = "$lock_path" ] && [ "$(readlink /proc/self/fd/9 2>/dev/null)" = "$lock_path" ]; then
+        flock -n 9
+        return $?
+    fi
+    exec 9>"$lock_path"
+    flock -n 9 || return 1
+    export BOT_DEPLOY_LOCK_HELD="$lock_path"
 }

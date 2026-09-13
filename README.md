@@ -31,14 +31,14 @@ Windows 和 Linux 均在项目根目录运行。需要交互式终端和宿主�
 | 按键 | 页面 | 可以做什么 |
 |---|---|---|
 | `1` | 总览 | 查看运行状态、今日用量、近期趋势、更新与清理待办 |
-| `2` | 健康 | 检查服务、隧道与配置；`Enter` 展开结果和处理建议，Windows 支持 `f` 自动修复 |
+| `2` | 健康 | 检查服务、隧道与配置；`Enter` 展开详情，`f` 在 Windows 自动修复、在 Linux 进入重建修复向导 |
 | `3` | 统计 | 按日期查看群与成员用量、月度趋势和工具调用，导出 HTML 报表 |
 | `4` | 会话 | 查看群与成员的会话占用，按群清理历史 |
 | `5` | 存储 | 预览临时文件的清理范围与大小，按群和成员清理 |
 | `6` | 外链 | 查看外链账本，清理匹配或全部远端对象 |
 | `7` | 路由 | 查看 callback 绑定与冲突，重绑或移除已废弃的绑定 |
 | `8` | 日志 | 跟随最新日志、筛选级别，按任务编号提取排查上下文 |
-| `9` | 维护 | 升级、启动、停止、重启与卸载；Windows 支持修复隧道 |
+| `9` | 维护 | 部署 / 重部署、升级、启动、停止、重启、修复部署与卸载；Windows 另有修复隧道 |
 
 ### 常用键位
 
@@ -76,7 +76,9 @@ Windows 和 Linux 均在项目根目录运行。需要交互式终端和宿主�
 
 存储页用 `←` `→` 选择清理天数，预览命中的条目和字节数。`p` 只清理选中行对应的群与成员，`a` 处理所有群的所有成员；同一成员在其他群的内容不会被 `p` 清理。文件移入 `backup/rm`，归档后磁盘空间尚未释放。
 
-改动类操作先显示操作范围、步骤和恢复说明，卸载与全量清理还要求手动输入确认词。`update` 与 `uninstall` 全程交互，界面会将终端交给运维脚本，结束后按回车返回。
+改动类操作先显示操作范围、步骤和恢复说明，卸载与全量清理还要求手动输入确认词。部署、升级、Linux 重建修复与卸载需要交互，界面会将终端交给运维脚本，结束后按回车返回。维护执行期间按 Esc 会等待关键操作及恢复完成；日志等只读操作可以直接中止。
+
+部署入口运行当前代码，升级入口先拉取 `origin/main`；菜单里的提交列表来自上次同步结果。新机器需先安装 Bun 及平台部署所需的环境，之后即可从维护页部署。一次性数据迁移使用独立脚本，不会在启动或重启时自动修改旧账本格式。
 
 界面读取宿主机上的部署数据，维护操作复用 `ops.sh` / `ops.ps1`。健康页复用 `doctor --json`（Windows 为 `doctor -Json`）的逐项结果；有失败项时，JSON 接口返回非零退出码。
 
@@ -191,7 +193,7 @@ bash scripts/ops/ops.sh doctor
 - **Pi 内置服务商**：选择服务商、模型并填写 API Key，地址、协议、工具兼容和模型能力由 Pi 提供。可选项来自所安装 Pi 版本的服务商目录，向导只列出使用 API Key 且有可用模型的条目。同一家厂商的不同站点、区域或套餐在目录中可能是彼此独立的服务商 ID，请按实际账号选择；ID 和模型清单会随 Pi 版本变化，以向导当前列出的为准。
 - **自定义服务商**：填写地址、Key 和模型资料，向导支持 `openai-completions`、`openai-responses`、`anthropic-messages`；高级参数遵循 Pi 的 `models.json` 格式。
 
-**本次配置格式不兼容旧版。更新后先停机并重新运行 `bun run configure`，再启动服务。** 顶层 `modelId` 和 `thinkingLevel` 用于本项目选定模型与推理级别，`providers` 交给 Pi 原生加载。内置模式只写凭证，不复制或覆盖目录中的模型定义：
+顶层 `modelId` 和 `thinkingLevel` 用于本项目选定模型与推理级别，`providers` 交给 Pi 原生加载。旧部署先按[一次性迁移](#2026-09-13-版本的一次性迁移)处理；仅在需要重新选择模型或修正无法确定的配置时运行 `bun run configure`。内置模式只写凭证，不复制或覆盖目录中的模型定义：
 
 ```json
 {
@@ -219,13 +221,11 @@ bash scripts/ops/ops.sh doctor
 每个群使用独立的 callback key。部署后结合实际域名运行 `doctor`，并在测试群验证消息、文件和停止操作；本地 `/health` 只能确认应用就绪。
 
 <details>
-<summary>Cloudflare 规则维护与后续 WebSocket 迁移</summary>
+<summary>Cloudflare 规则维护</summary>
 
-**Cloudflare 规则维护约定：** 当前线上入口采用默认拒绝、显式放行的策略；实际规则只在 Cloudflare 控制台维护，尚未纳入仓库版本管理，部署脚本不会同步它们。本段记录维护约定，不是线上规则快照。
+Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在 Cloudflare 控制台维护，部署脚本不会同步；以控制台当前配置为准。
 
 新增或修改 `src/server/app.ts` 的公网路由时，必须同时检查控制台中的放行路径、HTTP 方法和来源条件，并同步所需规则。仅提交路由代码不足以开放公网访问。验收应分别检查本地源站响应和公网请求；如果本地正常而公网失败、源站日志全空，先查 Cloudflare 安全事件及规则命中情况，不要仅凭应用日志判断请求没有发出。
-
-**后续 WebSocket 迁移：** 先确认连接方向和仍需保留的公网入口。若改为机器人主动向平台建立出站长连接，待消息、重连和回滚流程验证完成后，再清理废弃的 webhook 路由、密钥配置、对应拒绝日志逻辑，以及控制台中对应的放行规则；同时核对健康检查、管理操作和文件分发是否仍依赖 HTTP。若仍由平台连入机器人，则仍需维护握手入口的鉴权和 Cloudflare 规则，不能仅因使用 WebSocket 就删除入口防护。迁移前保留现有实现。
 
 </details>
 
@@ -271,6 +271,8 @@ bash scripts/ops/ops.sh doctor
 | `BOT_RUN_TIMEOUT_SECONDS` | 1200 秒 | 10–7200 秒，覆盖准备、模型、工具与最终交付 |
 | `BOT_MODEL_IDLE_TIMEOUT_SECONDS` | 180 秒 | 10–7200 秒；模型等待或输出期间连续无有效进展的上限 |
 | `BOT_MODEL_RESPONSE_TIMEOUT_SECONDS` | 600 秒 | 10–7200 秒；单次模型响应的上限，持续输出也不续期 |
+| `BOT_MODEL_CACHE_RETENTION` | auto | 默认沿用 Pi 官方 SDK；short/long/none 仅作显式覆盖，保留调用方设置 |
+| `BOT_ATTACHMENT_CONCURRENCY` | 2 | 1–8；在小附件读取前预约，覆盖读取与上传，限制内存峰值 |
 | `BOT_DELIVERY_TIMEOUT_SECONDS` | 180 秒 | 1–600 秒，包含出站排队和重试 |
 | `BOT_SHUTDOWN_TIMEOUT_SECONDS` | 20 秒 | 5–25 秒，覆盖 HTTP、任务、进程与租约收尾 |
 | `BOT_INDEX_TTL_MINUTES` | 5 分钟 | 1–1440 分钟，活跃会话每轮检查 |
@@ -287,7 +289,8 @@ data/
 │   ├── runtime.json           持久运行设置
 │   ├── webhook-secret         入站鉴权密钥
 │   ├── relay.json             可选大文件分发配置
-│   └── tunnel-token           可选连接器凭据输入
+│   ├── tunnel-token           可选连接器凭据输入
+│   └── cloudflared-token      部署生成的连接器 token 文件
 ├── state/
 │   ├── agent.sqlite           待交付内容、路由隔离与路径身份
 │   ├── relay.sqlite           远端对象的持久账本
@@ -296,7 +299,7 @@ data/
 ├── runtime/                   Pi 资源、模型缓存与启动脚本
 └── groups/<group>/
     ├── workspace/             外部同步的资料源
-    ├── index/                 materials.md；可选 ignore.txt
+    ├── index/                 materials.md、扫描 manifest；可选 ignore.txt、parsed/ 文档缓存
     ├── venv/                  原生部署按需准备的解析环境
     └── users/<user>/
         ├── session.jsonl      Pi 原生会话
@@ -310,7 +313,9 @@ logs/                          应用日志
 
 群和用户标识会编码为安全目录段；映射到已有目录的大小写别名会被拒绝，避免 Windows 串会话。将资料同步到对应群的 `workspace`，生成物写入各用户的 `tmp`。
 
-建议正常停机后备份整个 `data/`，并单独备份外置的 `GROUP_DATA_ROOT`；`data/runtime` 含运行资源和启动文件，旧版还在此保存外链 JSONL。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
+历史、统计和临时目录命令支持 `--group-id`（原始群号）或 `--storage-segment`（已编码目录段），两者互斥；PowerShell 包装器对应 `-GroupId` / `-StorageSegment`。未指定时自动判断，遇到两个不同群同时匹配则拒绝操作。TUI 会传入明确的目录段。
+
+建议正常停机后备份整个 `data/`，并单独备份外置的 `GROUP_DATA_ROOT`；`data/runtime` 含运行资源和启动文件。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
 
 ### 大文件外链配置
 
@@ -369,6 +374,7 @@ bash scripts/ops/ops.sh doctor
 | `start` / `stop` / `restart` | 启动、正常关闭或重启实例 |
 | `logs` | 持续查看日志 |
 | `update` | 同步 origin/main 并部署，保留原运行或停止状态 |
+| `deploy` | 部署当前代码；可重新配置并重建现有部署，失败恢复原部署 |
 
 `update` 要求已跟踪文件没有本地改动，失败时尝试恢复原提交和部署状态。Windows 在改工作树与依赖之前停止实例，Linux 已运行容器与主机源码隔离。
 
@@ -377,6 +383,21 @@ Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件�
 部署、升级和连接器安装的备份放在 `backup/tmp`，被替换的旧文件放在 `backup/rm`。成功后删除本次操作的快照，并清空整个 `backup/rm`，包括历史目录、散落文件和手动清理的会话归档；其他 `backup/tmp` 快照保留。操作失败时不执行成功清理，保留回滚现场。Windows 会移除空的 `backup` 目录；Linux 保留空的容器挂载目录，避免运行中的容器丢失后续归档。部署锁保存在 `data/state/deploy.lock`。
 
 关闭服务使用 `stop`：Windows 验证实例身份后先请求优雅关闭，超时再复核归属并终止进程树；Linux 使用 Docker 停止期限。
+
+### 2026-09-13 版本的一次性迁移
+
+旧待补发账本需转换为附件引用结构，新版在启动时检查格式。即使待补发为 0 条，也可能需要更新表结构；是否迁移以脚本的预览结论为准。将本次交付的 `migrate-audit-2026-09-13.ts` 复制到生产项目的 `backup/tmp`，在项目根目录用部署账户执行。这个临时脚本不随 Git 更新分发；需要宿主机安装 Bun 和项目依赖。
+
+先在 TUI「维护 → 停止」停机，再执行：
+
+```sh
+bun run backup/tmp/migrate-audit-2026-09-13.ts
+bun run backup/tmp/migrate-audit-2026-09-13.ts --apply
+```
+
+第一条只预览。第二条取得服务锁，先备份，再补齐唯一可确定的顶层 `modelId` 并迁移待补发附件；保留 provider、模型协议、密钥、会话历史和原正文。SQLite 备份包含已提交的 WAL 记录。无法由本地外链账本确认的附件会暂停补发，脚本列出记录 ID，不会发送旧链接或重新上传附件。修复对应后端或账本后可以重新运行脚本；已完成的转换不会重复进行。
+
+脚本先显示迁移计数和备份路径，全部成功后询问是否删除**本次迁移备份**，默认保留。非交互执行默认保留，需要删除时显式加 `--delete-backup`；失败或有挂起记录时始终保留，也不清理历史备份。迁移完成后从 TUI 升级到新版，再启动并查看健康页；停机升级会保留停止状态，需主动启动。
 
 ### 长时间没有回复
 
@@ -511,6 +532,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 | 配置、SQLite 状态库、群资料 | 持久保存，纳入停机备份 |
 | 会话、用户 tmp | 清理时归档到 `backup/rm`，下次部署、升级或连接器安装成功后清空 |
 | 部署备份 | 成功后删除本次 `backup/tmp` 快照并清空整个 `backup/rm`；失败时保留 |
+| 本次审计的数据迁移备份 | 默认保留；全部成功后可选择删除本次备份；失败或附件挂起时保留 |
 | 测试与诊断现场 | 放在 `backup/tmp`，按需离线清理 |
 | TUI 统计报表 | 每次导出独立保存在 `backup/reports`，按需保留或手动清理 |
 | 上传快照 | 完成、失败或取消后直接删除 |
@@ -520,7 +542,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 
 ### 隧道托管
 
-Cloudflared 常驻命令使用 token 文件，Windows 由官方服务安装器托管；安装时 token 会短暂作为安装程序参数传入。Linux 记录 PID、启动时间和系统启动 ID 验证归属，内置 nohup 仅负责当前运行，开机托管需运维配置 systemd 等服务管理方式。
+Cloudflared 常驻命令使用 token 文件。Windows 通过服务控制管理器注册官方可执行文件，命令行只包含受 ACL 保护的 token 文件路径，并核对注册后的命令；token 不作为命令行参数传入。Linux 记录 PID、启动时间和系统启动 ID 验证归属，内置 nohup 仅负责当前运行，开机托管需运维配置 systemd 等服务管理方式。
 
 ## 工作原理
 
@@ -546,7 +568,7 @@ flowchart TD
 
 停止与清理走独立控制路径，不受普通消息容量、入站限流或去重阻挡。相同的在途清理会合并，重复 `/stop` 仍会再次触发取消。图中虚线表示根级取消约束：关机先广播取消，进程和出站请求在统一期限内收尾。
 
-最终文本和必要外链先持久化，平台确认后才移除记录；未送达内容可用 `/deliver` 补发。文件附件由发送工具直接交付。
+最终文本和必要外链先持久化，平台确认后才移除记录；未送达内容可用 `/deliver` 补发。代码生成的外链另存结构化附件引用，交付前重新签名并检查远端对象大小；对象缺失、到删除期限或后端变更时保留待补发记录。部分补发只确认已成功的行。文件附件由发送工具直接交付。
 
 callback key 必须对应一个群。跨群复用会触发持久隔离，并取消关联的在途与排队交付；修正平台配置后按[回调路由恢复](#回调路由恢复)解除隔离。
 
@@ -564,6 +586,7 @@ callback key 必须对应一个群。跨群复用会触发持久隔离，并取�
 | `edit` / `write` | 仅写本用户 tmp，检查规范路径 |
 | `bash` | 执行命令，统一管理超时、取消、输出上限及后代回收 |
 | `document_environment` | 按需准备解析环境，验证实际解释器、版本和库导入 |
+| `document_extract` | 提取 PDF/DOCX/PPTX/XLSX，按内容与解析器版本复用缓存，返回可检索的文本路径 |
 | `send_file` / `send_image` | 发送文件或图片；本地路径复用文件工具的解析规则 |
 
 本地路径支持 Pi 路径约定、file URL 和 Windows Git Bash 路径。Windows 用 Job Object 管理工具进程及后代，Linux 用 subreaper 和父进程死亡通知回收后代；主命令退出、超时、取消或机器人父进程强制结束都会触发收尾。输出总量限制为 16 MiB，并保留错误尾部。
@@ -574,27 +597,39 @@ callback key 必须对应一个群。跨群复用会触发持久隔离，并取�
 
 索引用于定位文件：每轮检查刷新期限，刷新期间可暂时使用旧清单；未命中时仍需定向查找资料。`index/ignore.txt` 每行一个 workspace 相对路径前缀，`#` 表示注释；扫描受文件数和深度限制，无法读取的目录会使清单标记为不完整。
 
-解析二进制文档前调用 `document_environment`，模型不能自行安装包或改写共享环境。支持 PPTX、DOCX、XLSX、PDF、数据表及常用图片，不提供 OCR 或旧版 Office 转换器。
+PDF、DOCX、PPTX、XLSX 文本优先使用 `document_extract`，它会按需检查解析环境并复用缓存。特殊解析或文件生成先调用 `document_environment`；模型不能自行安装包或改写共享环境。解析环境另支持数据表及常用图片处理，不提供 OCR 或旧版 Office 转换器。
 
 解析依赖由 [requirements.in](scripts/runtime/requirements.in) 和完整锁文件 [requirements.txt](scripts/runtime/requirements.txt) 管理。Docker 构建、原生安装和就绪检测共用 [document-manifest.ts](scripts/runtime/document-manifest.ts)，统一处理空行、注释及换行格式。更新解析依赖时用 uv 重新生成锁文件并运行格式回归。
+
+资料索引保存可验证的 manifest，重启后在 TTL 内复用；清单内容不变时不重写正文，目录扫描适度并发、失败后退避。文档环境成功校验缓存 5 分钟，解释器、marker 或锁文件变化立即失效，并合并同一环境的并发检查。
+
+`document_extract` 优先处理重复的二进制资料：群共享资料的结果位于群 `index/parsed`，用户私有文件的结果只放本用户 `tmp/.document-cache`。键包含原件 SHA-256、解析器与依赖锁版本、格式及提取选项；命中时仍核对当前原件和缓存正文摘要。保留页码、幻灯片或 sheet/行号；XLSX 公式输出原文、不计算。单个原件上限 128 MiB，解析全局并发为 2，每个缓存目录最多保留约 128 项，支持取消、期限及自动淘汰。
+
+### 缓存与费用统计
+
+模型缓存默认完全沿用 Pi SDK，不按 provider 是否内置区分。官方 Coding Plan 即使通过自定义 provider 配置，也不会被应用额外降级；智谱的自动缓存无需另外开启。通常只需配置接口、模型与凭据。只有服务商明确支持且需要覆盖时，才设置 `BOT_MODEL_CACHE_RETENTION`；这里的 `long` 是传给 SDK 的偏好，不保证服务端保留期限或套餐配额收益。
+
+提示词使用稳定的 `$PI_USER_TMP` 名称，避免用户绝对路径改变公共前缀；实际目录通过工具环境传入。会话 ID、工具顺序及 schema 保持稳定。资料查找、文档提取缓存和统计扫描缓存改善的是本地工作量，不与服务商的模型缓存命中率混算。
+
+统计包含普通回复、历史压缩和分支摘要的 input/output/cacheRead/cacheWrite，按模型、日期及调用类型分组。缓存读取比例按 `ΣcacheRead / Σ(input + cacheRead + cacheWrite)` 计算，无有效输入样本时显示“无样本”。费用是 SDK 根据配置价格的估算，缺失项单列，**不代表 Coding Plan 实际账单或套餐配额**。CLI、TUI 和 HTML 报表共用同一统计来源；无变更的会话复用内存缓存，追加写入校验旧前缀后只重新解析新行，截断或改写则重建。
 
 ## 开发与检查
 
 ```sh
 bun install --frozen-lockfile
-bun run configure
 bun run check
+bun audit
 ```
 
 配置向导和配置变更需要先停止服务。已有模型配置与 webhook 密钥时，用 `bun run start` 前台运行、`bun run dev` 监听代码变化。仅隔离开发可显式设置 `ALLOW_INSECURE_WEBHOOK=1` 使用无密钥的 `/webhook`。
 
-`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。测试和诊断产物放在 `backup/tmp`。
+`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。TypeScript 拒绝未使用变量、参数、标签及不可达语句；Knip 同时检查入口文件的未使用导出。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。测试和诊断产物放在 `backup/tmp`。
 
 `scripts/patches/knip@6.29.0.patch` 修复 Knip 对 Bun 脚本 production 入口标记的传递，仅影响开发检查。补丁随检查脚本维护；移除前需同步更新安装引用并通过普通和 production 两种 Knip 检查。
 
 命令行入口放在 `scripts/{config,ops,runtime}` 下的直接子文件，由 `knip.json` 的 glob 统一标成生产入口。运维界面入口是 [tui.ts](scripts/ops/tui.ts)，实现放在 `scripts/ops/tui/`；新增命令沿用这一布局，并通过普通和 production 两种 Knip 检查。
 
-Pi 两个包精确固定为 0.85.1，使用官方本地 SDK，无需实验性 `pi-server`。依赖升级通过改版本、更新锁文件和回归检查完成。当前外链存储只支持 SQLite 账本与现行对象布局。
+Pi 两个包精确固定为 0.85.1，使用官方本地 SDK。依赖升级通过改版本、更新锁文件和回归检查完成。当前外链存储使用 SQLite 账本。
 
 | 工程入口 | 职责 |
 |---|---|
@@ -606,6 +641,6 @@ Pi 两个包精确固定为 0.85.1，使用官方本地 SDK，无需实验性 `p
 | [scripts/ops](scripts/ops)、[scripts/deploy](scripts/deploy) | 日常运维与部署事务 |
 | [scripts/ops/tui](scripts/ops/tui) | 全屏运维界面：渲染层、宿主机数据读取与操作转调 |
 
-CI 配置了 Windows/Linux 检查及受限 Linux 镜像中的解析器与进程回收验证。本机已验证 Windows 流程；Linux/Docker 尚未实机验收，模拟测试不代表实际部署。
+CI 配置了 Windows/Linux 检查及受限 Linux 镜像中的解析器与进程回收验证。部署验收还需检查目标机器的服务、入口和真实交付流程。
 
-设计取舍、完整问题清单和验证证据见[整体审计与整改报告](docs/CODE_AUDIT_2026-09-08.md)。Pi 路径适配代码的许可保留在对应源码中，开发检查补丁位于 `scripts/patches`。
+Pi 路径适配代码的许可保留在对应源码中，开发检查补丁位于 `scripts/patches`。

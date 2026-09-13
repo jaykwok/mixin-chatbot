@@ -7,7 +7,7 @@
 // 有意只支持本地文件：让机器人把任意 http(s) 地址镜像成一条公开链接，等于把它变成
 // 一个开放的转载器；而且远程响应不一定给 Content-Length，拿不到可靠的大小。超限的
 // 远程文件仍按原样报错，模型可以先用 bash 下载到自己的 tmp 再发。
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { readFileSync, createReadStream, createWriteStream } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -23,7 +23,6 @@ import {
 import { log } from "../core/log.ts";
 import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../core/storage.ts";
 import {
-  hashFile,
   openRelayIndex,
   relayCacheKey,
   type RelayIndex,
@@ -374,13 +373,13 @@ async function putObject(
 
 /**
  * 探测缓存里的地址是否还活着。运维按天清理、云盘侧删除都会让索引指向一个 404，
- * 而给用户一条死链比重传一次糟得多。公开基址通常是 302 到网盘直链，所以不跟随
- * 重定向。
+ * 而给用户一条死链比重传一次糟得多。公开基址通常是 302 到网盘直链，有限跟随后
+ * 验证最终响应，不能把登录跳转或跳到已删除对象当成可下载。
  *
  * 状态码不够用：这类文件服务常把业务错误塞进 HTTP 200 的 JSON 里（"未授权"、
  * "对象不存在" 都是 200），只看 `status < 400` 会把错误信封当成文件还在。
  * 所以 2xx 还要求 Content-Length 与当初存下的大小一致——错误信封只有几十字节，
- * 对不上；重定向则说明服务端确实解析到了这个对象。
+ * 对不上。
  * 未知状态不等同于不存在；调用方保留账本，并在同一对象名上尝试一次幂等重传。
  */
 async function remoteStillExists(
@@ -389,17 +388,25 @@ async function remoteStillExists(
   signal?: AbortSignal
 ): Promise<boolean> {
   const timeout = AbortSignal.timeout(RELAY_PROBE_TIMEOUT);
-  const response = await fetch(url, {
-    method: "HEAD",
-    redirect: "manual",
-    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-  });
-  await response.body?.cancel().catch(() => {});
-  if (response.status >= 300 && response.status < 400) return true;
-  if (response.status === 404 || response.status === 410) return false;
-  const length = response.headers.get("content-length");
-  if (response.ok && length !== null && Number(length) === size) return true;
-  throw new Error("外链探测无法确认对象状态 (HTTP " + response.status + ")");
+  const probeSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  let target = url;
+  for (let redirects = 0; redirects <= 5; redirects++) {
+    const response = await fetch(target, { method: "HEAD", redirect: "manual", signal: probeSignal });
+    await response.body?.cancel().catch(() => {});
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("location");
+      if (!location || redirects === 5) throw new Error("外链探测重定向无效或过多");
+      const next = new URL(location, target);
+      if (!["http:", "https:"].includes(next.protocol) || next.username || next.password) throw new Error("外链探测重定向地址无效");
+      target = next.toString();
+      continue;
+    }
+    if (response.status === 404 || response.status === 410) return false;
+    const length = response.headers.get("content-length");
+    if (response.ok && length !== null && /^\d+$/.test(length) && Number(length) === size) return true;
+    throw new Error("外链探测无法确认对象状态 (HTTP " + response.status + ")");
+  }
+  return false;
 }
 
 /**
@@ -472,6 +479,31 @@ export function publicUrlFor(config: RelayConfig, storedUrl: string): string {
   const url = new URL(storedUrl);
   url.searchParams.set("sign", signObjectName(config, objectName, expiresAt));
   return url.toString();
+}
+
+/** Durable attachment identity; never persist a signing secret. */
+export interface RelayReference { backend: string; url: string; name: string; size: number; }
+export function relayReference(config: RelayConfig, url: string, name: string, size: number): RelayReference {
+  const stored = new URL(url);
+  stored.searchParams.delete("sign");
+  return { backend: createHash("sha256").update(JSON.stringify([config.webdavUrl, config.publicBaseUrl])).digest("hex"),
+    url: stored.toString(), name, size };
+}
+
+export async function refreshRelayReference(reference: RelayReference, signal?: AbortSignal,
+  config = getRelayConfig(), suppliedIndex?: RelayIndex): Promise<{ url: string; expiry: string }> {
+  if (!config || reference.backend !== relayReference(config, reference.url, reference.name, reference.size).backend ||
+      !objectNameFromPublicUrl(config, reference.url)) throw new Error("附件后端已变更，待补发记录已保留，请联系管理员恢复原后端");
+  const index = suppliedIndex ?? await getRelayIndex();
+  const entry = index.entries().find(item => item.url === reference.url && item.state === "uploaded");
+  if (!entry || (reference.size >= 0 && entry.size !== reference.size)) throw new Error("附件已不在外链账本中，待补发记录已保留，请重新生成文件");
+  const remaining = config.expireHours && !config.signSecret
+    ? (Date.parse(entry.at) + config.expireHours * 3600000 - Date.now()) / 3600000 : undefined;
+  if (remaining !== undefined && !(remaining > 0)) throw new Error("附件已到删除期限，待补发记录已保留，请重新生成文件");
+  const url = publicUrlFor(config, reference.url);
+  if (!await remoteStillExists(url, entry.size, signal)) throw new Error("附件已从后端删除，待补发记录已保留，请重新生成文件");
+  return { url, expiry: remaining === undefined ? describeRelayExpiry(config) :
+    `\n⏳ 文件将在 ${Math.max(1, Math.floor(remaining * 60))} 分钟内到期，请立即下载。` };
 }
 
 /**
@@ -696,15 +728,17 @@ export async function relayFile(request: RelayRequest): Promise<string> {
   await mkdir(tempDir, { recursive: true });
   const snapshot = join(tempDir, ".relay-" + randomUUID());
   let size = 0;
+  const hash = createHash("sha256");
   try {
     // Hash and PUT the same immutable bytes, even if the sync client replaces the source later.
     await pipeline(createReadStream(localPath), new Transform({ transform(chunk: Buffer, _encoding, next) {
       size += chunk.length;
       if (size > config.maxBytes) next(new Error("源文件增长超过外链上限"));
-      else next(null, chunk);
+      else { hash.update(chunk); next(null, chunk); }
     } }), createWriteStream(snapshot, { flags: "wx" }), { signal });
+    if (size !== request.size) throw new Error("源文件在同步时大小发生变化，请重新发送文件");
     const index = request.index ?? await getRelayIndex();
-    const digest = await hashFile(snapshot, signal);
+    const digest = hash.digest("hex");
     const key = relayCacheKey(digest, filename, config.publicBaseUrl);
     return await withUploadLock(key, async () => {
       signal.throwIfAborted();

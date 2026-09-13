@@ -7,7 +7,7 @@ export const RUNTIME_KEYS = [
   "BOT_BASH_TIMEOUT", "BOT_INDEX_TTL_MINUTES", "BOT_INDEX_MAX_FILES", "BOT_INDEX_MAX_DEPTH",
   "BOT_RUN_TIMEOUT_SECONDS", "BOT_MODEL_IDLE_TIMEOUT_SECONDS", "BOT_MODEL_RESPONSE_TIMEOUT_SECONDS",
   "BOT_SHUTDOWN_TIMEOUT_SECONDS", "BOT_DELIVERY_TIMEOUT_SECONDS",
-  "BOT_DOCUMENT_ENV",
+  "BOT_DOCUMENT_ENV", "BOT_MODEL_CACHE_RETENTION", "BOT_ATTACHMENT_CONCURRENCY",
 ] as const;
 type RuntimeKey = typeof RUNTIME_KEYS[number];
 const ranges: Partial<Record<RuntimeKey, [number, number]>> = {
@@ -15,6 +15,7 @@ const ranges: Partial<Record<RuntimeKey, [number, number]>> = {
   BOT_INDEX_TTL_MINUTES: [1, 1440], BOT_INDEX_MAX_FILES: [100, 1000000], BOT_INDEX_MAX_DEPTH: [1, 64],
   BOT_RUN_TIMEOUT_SECONDS: [10, 7200], BOT_SHUTDOWN_TIMEOUT_SECONDS: [5, 25], BOT_DELIVERY_TIMEOUT_SECONDS: [1, 600],
   BOT_MODEL_IDLE_TIMEOUT_SECONDS: [10, 7200], BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: [10, 7200],
+  BOT_ATTACHMENT_CONCURRENCY: [1, 8],
 };
 
 export function validateRuntimeConfig(value: unknown): Partial<Record<RuntimeKey, string>> {
@@ -31,6 +32,7 @@ export function validateRuntimeConfig(value: unknown): Partial<Record<RuntimeKey
       throw new Error(`${key} 必须是 ${range[0]}-${range[1]} 的整数`);
     }
     if (key === "BOT_DEBUG" && !["0", "1"].includes(text)) throw new Error("BOT_DEBUG 只能是 0 或 1");
+    if (key === "BOT_MODEL_CACHE_RETENTION" && !["auto", "short", "long", "none"].includes(text)) throw new Error("BOT_MODEL_CACHE_RETENTION 必须是 auto、short、long 或 none");
     if (key === "BOT_HOST" && text !== "localhost" && !isIP(text)) throw new Error("BOT_HOST 必须是 IP 地址或 localhost");
   }
   return result;

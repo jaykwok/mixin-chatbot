@@ -124,7 +124,7 @@ function Restore-DeploymentSnapshot($Snapshot) {
     Write-Warning '已恢复配置、启动定义、依赖、网络入口和原运行状态；回滚快照保留在 backup/tmp。'
 }
 
-# The official Windows installer stores its token under ProgramData. Snapshot that directory too.
+# Snapshot the service, project token and any ProgramData configuration for rollback.
 function New-CloudflaredSnapshot([string]$ProjectRoot, [string]$Directory = '') {
     $previousBackupId = $env:BOT_DEPLOY_BACKUP_ID
     try {
@@ -138,6 +138,10 @@ function New-CloudflaredSnapshot([string]$ProjectRoot, [string]$Directory = '') 
     $marker = Join-Path $ProjectRoot 'data\state\cloudflared-managed'
     $managed = Test-Path -LiteralPath $marker
     $configPath = Join-Path $env:ProgramData 'cloudflared'
+    $projectToken = Join-Path $ProjectRoot 'data\config\cloudflared-token'
+    if (Test-Path -LiteralPath $projectToken -PathType Leaf) {
+        Copy-Item -LiteralPath $projectToken -Destination (Join-Path $Directory 'project-cloudflared-token') -ErrorAction Stop
+    }
     if ($managed) { Copy-Item -LiteralPath $marker -Destination (Join-Path $Directory 'cloudflared-managed') -ErrorAction Stop }
     if (($managed -or -not $tunnel) -and (Test-Path -LiteralPath $configPath)) {
         Copy-Item -LiteralPath $configPath -Destination (Join-Path $Directory 'cloudflared-config') -Recurse -ErrorAction Stop
@@ -170,6 +174,14 @@ function Restore-CloudflaredSnapshot($Snapshot, [switch]$DeferStart) {
         Stop-Service Cloudflared -ErrorAction Stop
     }
     if ($Snapshot.TunnelManaged -or -not $Snapshot.Tunnel) {
+        $projectToken = Join-Path $root 'data\config\cloudflared-token'
+        Move-ToProjectArchive $projectToken $root
+        $savedProjectToken = Join-Path $Snapshot.Path 'project-cloudflared-token'
+        if (Test-Path -LiteralPath $savedProjectToken -PathType Leaf) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $projectToken -Parent) | Out-Null
+            Copy-Item -LiteralPath $savedProjectToken -Destination $projectToken -ErrorAction Stop
+            Protect-ProjectSecretPath $projectToken
+        }
         Move-ToProjectArchive $Snapshot.CloudConfigPath $root $Snapshot.CloudConfigPath
         $savedCloudConfig = Join-Path $Snapshot.Path 'cloudflared-config'
         if (Test-Path -LiteralPath $savedCloudConfig) {

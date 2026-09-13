@@ -1,19 +1,5 @@
-// 配色与状态符号。
-//
-// 两条约束决定了这里的每一个取值：
-//
-// 1) 只上前景色，不铺整块背景。终端底色是用户自己定的，浅色主题上铺一层深灰面板会变成
-//    一块脏印子，而我们无从知道对方用的是什么底色。细边框 + 前景色在深浅终端上都成立。
-//
-// 2) 色值不是挑出来的，是验过的。原本凭手感选的一套（青主色 + 绿/黄/红）在校验里三项不过：
-//    紫与蓝在红绿色盲下 ΔE 1.3，绿与青在正常视力下 ΔE 9.6（低于 15 的硬底线）——而「绿色
-//    状态点挨着青色边框」正是总览页每一屏都有的组合。现用的是数据可视化规范里那套已验证
-//    的参考色板：分类槽 1（蓝）作主色与序列色，状态色取其固定的 good/warning/serious/
-//    critical 四档。
-//
-// 状态色在红绿色盲下本来就分不开（good 与 critical ΔE 4.1），规范对此的要求是状态必须
-// 同时带符号和文字，不能只靠颜色。所以状态一律走 STATUS 表拿「符号 + 颜色」，视图里没有
-// 只给颜色的入口——这条约束写进类型，比写进注释可靠。
+// 按终端色深输出前景色，不设置面板背景。
+// 状态使用 STATUS 中的符号与颜色，无色终端仍保留符号。
 
 export type ColorDepth = "truecolor" | "ansi256" | "none";
 
@@ -47,21 +33,21 @@ type Rgb = readonly [number, number, number];
 
 /**
  * 语义色板。名字按用途取，不按颜色取——改配色时不必回头找每一处调用。
- * x256 是 256 色终端下最接近的色号，降级时整体观感不会散。
+ * x256 是 256 色终端使用的备用色号。
  */
 const PALETTE = {
-  /** 分类槽 1（蓝）。主色，同时是所有「比大小」图形的单一序列色。 */
+  /** 主色，同时用于图表的数据序列。 */
   accent: { rgb: [57, 135, 229], x256: 68 },
   /** 同一条蓝色梯度的浅步，用于次级强调。 */
   accentSoft: { rgb: [134, 182, 239], x256: 111 },
-  ok: { rgb: [12, 163, 12], x256: 34 }, // status good
-  warn: { rgb: [250, 178, 25], x256: 214 }, // status warning
-  serious: { rgb: [236, 131, 90], x256: 209 }, // status serious
-  danger: { rgb: [208, 59, 59], x256: 167 }, // status critical
+  ok: { rgb: [12, 163, 12], x256: 34 },
+  warn: { rgb: [250, 178, 25], x256: 214 },
+  serious: { rgb: [236, 131, 90], x256: 209 },
+  danger: { rgb: [208, 59, 59], x256: 167 },
   text: { rgb: [255, 255, 255], x256: 231 },
-  /** 轴、标签一类的次要文字；规范里深浅两模式同值。 */
+  /** 轴、标签等次要文字。 */
   muted: { rgb: [137, 135, 129], x256: 245 },
-  /** 边框与分隔线。刻意压暗，但在纯黑终端上仍有 3:1，不会糊成一片。 */
+  /** 边框与分隔线。 */
   faint: { rgb: [107, 106, 102], x256: 242 },
 } as const satisfies Record<string, { rgb: Rgb; x256: number }>;
 
@@ -89,13 +75,7 @@ export interface Theme {
   underline(text: string): string;
 }
 
-/**
- * 套一层样式，并在文本内部每一处 reset 之后把它重新打开。
- *
- * 这是嵌套上色唯一的坑：选中行外面套反色，里面的进度条自己带了颜色，它结束时的 `0m`
- * 会把反色一起关掉——于是选中条从进度条那里断成两截。ANSI 没有「只关闭我这一层」的写法，
- * 所以每遇到一个内部 reset 就把外层重新打开一次。
- */
+/** 内层 RESET 会同时清除外层样式；在每处 RESET 后重新应用外层样式，保持嵌套显示。 */
 function wrapStyle(open: string, text: string): string {
   return `${open}${text.replaceAll(RESET, RESET + open)}${RESET}`;
 }
@@ -114,13 +94,7 @@ export function createTheme(depth: ColorDepth = detectDepth()): Theme {
 
 export type StatusName = "ok" | "running" | "warn" | "serious" | "danger" | "idle" | "busy";
 
-/**
- * 状态 = 符号 + 颜色，绑在一起取。
- *
- * good 与 critical 在红绿色盲下 ΔE 只有 4.1，两个只换颜色的 ● 对相当一部分人是同一个点。
- * 符号选的是形状差异明显的一组，去掉颜色也认得出谁是谁——这同时让 NO_COLOR 和管道输出
- * 不损失信息。符号宽度统一为 1 列，表格不会因为状态不同而错位。
- */
+/** 状态同时使用颜色和单列符号，NO_COLOR 下仍可区分结果且保持表格对齐。 */
 export const STATUS: Record<StatusName, { glyph: string; color: ColorName }> = {
   ok: { glyph: "✓", color: "ok" },
   /** 「正在运行」用实心点而不是对勾：✓ 表示一项检查通过，● 表示一个东西此刻活着。 */

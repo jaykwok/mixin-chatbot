@@ -64,7 +64,7 @@ export class HistoryView implements View {
         app.toast("idle", "已取消");
         return true;
       }
-      const code = await app.run(`清空 ${target.group} 的会话历史`, ["history-clear", target.group]);
+      const code = await app.run(`清空 ${target.group} 的会话历史`, ["history-clear", target.group, "--storage-segment"]);
       app.toast(code === 0 ? "ok" : "danger", code === 0 ? "已清空并恢复运行状态" : "清空未完成，请看输出");
       return true;
     }

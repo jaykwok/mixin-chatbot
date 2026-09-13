@@ -181,13 +181,7 @@ export function sparkline(theme: Theme, values: number[], color: ColorName = "ac
   );
 }
 
-/**
- * 状态符号。界面里每一处状态都从这里取符号和颜色。
- *
- * 没有「只给颜色」的出口是故意的。good 和 critical 在红绿色盲下几乎同色，只换颜色的圆点
- * 对一部分人就是同一个点；符号自带形状差异，去掉颜色也读得出来。表格里它固定占一列，
- * 所以状态变化不会让后面的列跟着错位。
- */
+/** 从统一状态表取得符号和颜色；无色终端保留符号。 */
 export function mark(theme: Theme, name: StatusName): string {
   const { glyph, color } = STATUS[name];
   return theme.c(color, glyph);

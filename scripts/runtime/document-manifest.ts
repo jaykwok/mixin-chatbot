@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 
 export const DOCUMENT_TOOLCHAIN_MARKER = ".mixin-doc-toolchain";
 
@@ -8,8 +9,9 @@ export function documentPackages(contents: string): string[] {
   return contents.split(/\r\n?|\n/).map(line => line.trim()).filter(line => line && !line.startsWith("#"));
 }
 
-export function documentMarker(packages: readonly string[]): string {
-  return [...packages].sort().join("\n");
+export function documentMarker(packages: readonly string[], lock?: string): string {
+  return [...packages].sort().join("\n") + (lock === undefined ? "" :
+    "\n# lock-sha256=" + createHash("sha256").update(lock.replace(/\r\n?/g, "\n")).digest("hex"));
 }
 
 if (import.meta.main) {
@@ -18,5 +20,9 @@ if (import.meta.main) {
     throw new Error("Usage: bun document-manifest.ts <requirements.in> <venv directory>");
   }
   const packages = documentPackages(await readFile(requirements, "utf8"));
-  await writeFile(join(environment, DOCUMENT_TOOLCHAIN_MARKER), documentMarker(packages), "utf8");
+  const lock = await readFile(join(dirname(requirements), "requirements.txt"), "utf8").catch(error => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  });
+  await writeFile(join(environment, DOCUMENT_TOOLCHAIN_MARKER), documentMarker(packages, lock), "utf8");
 }

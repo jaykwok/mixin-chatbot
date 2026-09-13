@@ -157,6 +157,7 @@ for file in "${required_files[@]}"; do
     fi
 done
 
+if [ -f "$MODELS_FILE" ]; then validate_model_configuration || { print_error "模型配置无效；尚未停止旧服务"; exit 1; }; fi
 print_success "环境检查通过"
 
 # ---- 目录 + 监听端口 ----
@@ -369,6 +370,7 @@ else
         fi
     fi
 fi
+validate_model_configuration || { print_error "模型配置无效，正在恢复原部署"; exit 1; }
 if [ "$(id -u)" -eq 0 ]; then
     chown "$CONTAINER_UID:$CONTAINER_GID" "$MODELS_FILE"
 fi
@@ -563,7 +565,7 @@ fi
 
 # 持久化受支持的显式环境配置；容器路径由部署计算，其他值沿用 runtime.json。
 runtime_env_args=()
-for runtime_key in BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_TTL_MINUTES BOT_INDEX_MAX_FILES BOT_INDEX_MAX_DEPTH BOT_RUN_TIMEOUT_SECONDS BOT_MODEL_IDLE_TIMEOUT_SECONDS BOT_MODEL_RESPONSE_TIMEOUT_SECONDS BOT_SHUTDOWN_TIMEOUT_SECONDS BOT_DELIVERY_TIMEOUT_SECONDS BOT_DOCUMENT_ENV; do
+for runtime_key in BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_TTL_MINUTES BOT_INDEX_MAX_FILES BOT_INDEX_MAX_DEPTH BOT_RUN_TIMEOUT_SECONDS BOT_MODEL_IDLE_TIMEOUT_SECONDS BOT_MODEL_RESPONSE_TIMEOUT_SECONDS BOT_SHUTDOWN_TIMEOUT_SECONDS BOT_DELIVERY_TIMEOUT_SECONDS BOT_DOCUMENT_ENV BOT_MODEL_CACHE_RETENTION BOT_ATTACHMENT_CONCURRENCY; do
     if [ -n "${!runtime_key:-}" ]; then runtime_env_args+=(-e "$runtime_key"); fi
 done
 docker run --rm --user "$CONTAINER_UID:$CONTAINER_GID" \
@@ -755,11 +757,9 @@ fi
 if [ "${DEPLOY_PRESERVE_STOPPED:-0}" = 1 ] && [ "$PREVIOUS_RUNNING" = 0 ]; then
     docker stop --time 30 mixin-chatbot >/dev/null
 fi
-DEPLOYMENT_COMMITTED=1
-trap - EXIT INT TERM
+commit_deployment
 cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，但备份清理未完成，请检查 $DEPLOY_SNAPSHOT 和 $PROJECT_DIR/backup/rm"
-flock -u 9
-exec 9>&-
+# Let process exit close descriptor 9. Explicit unlock would also unlock an update parent's inherited descriptor.
 if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ]; then
     if docker rm "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
         print_success "部署已提交，旧容器回滚版本已清理"

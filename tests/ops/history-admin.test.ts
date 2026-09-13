@@ -6,6 +6,7 @@ import { mkdtemp, mkdir, readFile, writeFile, symlink } from "node:fs/promises";
 
 import { join } from "node:path";
 import { clearGroup, collect } from "../../scripts/ops/history-admin.ts";
+import { groupSegment } from "../../src/agent/paths.ts";
 
 async function makeRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-history-"));
@@ -29,6 +30,23 @@ async function makeRoot(): Promise<string> {
 }
 
 describe("history admin", () => {
+  test("rejects ambiguous IDs and clears the explicitly selected storage segment", async () => {
+    const root = await mkdtemp(join(tmpdir(), "history-ambiguous-"));
+    const first = groupSegment("审计群A");
+    const second = groupSegment(first);
+    for (const group of [first, second]) {
+      await mkdir(join(root, group, "users/u"), { recursive: true });
+      await writeFile(join(root, group, "users/u/session.jsonl"), "keep\n");
+    }
+    try {
+      await expect(clearGroup(first, root)).rejects.toThrow("歧义");
+      expect(await collect(root)).toHaveLength(2);
+      expect(await clearGroup(first, root, "segment")).toBe(0);
+      expect((await collect(root)).map(group => group.group)).toEqual([second]);
+      expect(await clearGroup(first, root, "id")).toBe(0);
+      expect(await collect(root)).toHaveLength(0);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
   test.each(["root", "group", "users", "user"])("does not traverse a linked %s directory", async (part) => {
     const root = await mkdtemp(join(tmpdir(), "history-links-"));
     const scanned = join(root, "groups");

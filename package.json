@@ -24,7 +24,7 @@
     "@earendil-works/pi-ai": "0.85.1",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "fs-extra": "11.4.0",
-    "hono": "4.12.32",
+    "hono": "4.13.7",
     "marked": "18.0.5",
     "proper-lockfile": "4.1.2"
   },
@@ -36,7 +36,8 @@
     "typescript": "5.9.3"
   },
   "overrides": {
-    "brace-expansion": "5.0.8"
+    "brace-expansion": "5.0.9",
+    "smol-toml": "1.8.0"
   },
   "patchedDependencies": {
     "knip@6.29.0": "scripts/patches/knip@6.29.0.patch"

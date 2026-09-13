@@ -15,6 +15,12 @@ describe("agent slash commands", () => {
     expect(canonicalCommand("@BOT\uFFA0/ClEaR")).toBe("/clear");
   });
 
+  test.each([" ", "\t", "\n", " \t\n "])("normalizes transport mention followed by %j", (space) => {
+    expect(canonicalCommand(`@BOT\uFFA0${space}/StOp`)).toBe("/stop");
+    expect(isSlashCommandMessage(`@BOT\uFFA0${space}/unknown`)).toBe(true);
+    expect(stripLeadingMention(`@BOT\uFFA0${space}请通知 @成员`)).toBe("请通知 @成员");
+  });
+
   test("separates slash commands from ordinary prompt text", () => {
     expect(isSlashCommandMessage("/status")).toBe(true);
     expect(isSlashCommandMessage("  /HELP")).toBe(true);
