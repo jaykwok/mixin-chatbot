@@ -1,0 +1,279 @@
+// 数据来源。
+//
+// 读写分两条路，这是整个界面的核心取舍：
+//
+//   读 —— 直接读宿主机上的文件。Linux 上 data/ 本来就是 bind mount 的真实宿主路径，绕一圈
+//         docker run 去读宿主机自己的文件没有意义，而且慢。这条路一个 npm 包都不需要，
+//         宿主机只要有 bun 就能跑。
+//
+//   写 —— 一律转交 ops.sh / ops.ps1。容器编排、维护租约、history-clear 的「停机→清理→
+//         恢复原状态」都已经在那两个脚本里，在这里重写一遍就是把最危险的逻辑维护成两份。
+//
+// 体检也走包装器的 --json：它要判断容器、计划任务、隧道归属，那些判断只有宿主机脚本
+// 做得了，而且已经做对了。
+
+import { readdir, lstat } from "node:fs/promises";
+import { join } from "node:path";
+import { collectAll, type GroupStats, type Window } from "../stats-admin.ts";
+import { scanHistory, type GroupHistory } from "../../lib/history-scan.ts";
+import { scanTmp, type UserTmp } from "../../lib/tmp-scan.ts";
+import { capture, parseJson, type RunResult } from "./exec.ts";
+import { LOG_FILE, PROJECT_DIR, opsCommand, type Deployment } from "./platform.ts";
+import { day } from "./render/format.ts";
+
+// ===== 体检 =====
+
+export interface HealthCheck {
+  name: string;
+  status: "pass" | "warn" | "fail";
+  detail: string;
+  /** 修复建议；Windows 侧的体检会给，Linux 侧目前为空。 */
+  fix: string;
+}
+
+export interface Health {
+  pass: number;
+  warn: number;
+  fail: number;
+  checks: HealthCheck[];
+}
+
+/**
+ * 跑一次体检。
+ *
+ * 超时给到 90 秒：隧道模式下这一步要打公网、探 WebDAV，几次 curl 叠起来很容易超过默认值，
+ * 而超时被当成「体检失败」比真失败更难排查。
+ */
+export async function loadHealth(deployment: Deployment): Promise<Health> {
+  const flag = deployment.platform === "windows" ? "-Json" : "--json";
+  const { command, args } = opsCommand(deployment.platform, ["doctor", flag]);
+  const result = await capture(command, args, { timeout: 90_000 });
+  if (result.timedOut) throw new Error("体检超时（90 秒）；隧道或外链后端可能无响应");
+  const health = parseJson<Health>(result, "doctor --json");
+  if (!health || !Array.isArray(health.checks) || !health.checks.every(check =>
+    check && ["pass", "warn", "fail"].includes(check.status) && typeof check.name === "string" && typeof check.detail === "string"
+  )) throw new Error("doctor 返回了不完整的检查结果");
+  return health;
+}
+
+// ===== 服务本身 =====
+
+export interface Service {
+  /** 本地 /health 的结果。unreachable 表示端口上没有东西在应答。 */
+  state: "ready" | "stopping" | "unreachable";
+  pid?: number;
+  /** 往返毫秒；unreachable 时为空。 */
+  latency?: number;
+  /** 与健康响应 PID 匹配的实例记录；读不到时不显示运行时长。 */
+  startedAt?: number;
+}
+
+export async function probeService(port: number, instanceFile = join(PROJECT_DIR, "data", "state", "instance.json")): Promise<Service> {
+  const started = Date.now();
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    const body = (await response.json()) as { status?: string; pid?: number };
+    if (!response.ok || !body || !["ready", "stopping"].includes(body.status ?? "") || !Number.isSafeInteger(body.pid) || body.pid! <= 0) {
+      return { state: "unreachable" };
+    }
+    let startedAt: number | undefined;
+    try {
+      const instance = await Bun.file(instanceFile).json();
+      if (instance.pid === body.pid && instance.port === port && Number.isFinite(instance.startedAt) && instance.startedAt > 0 && instance.startedAt <= Date.now()) {
+        startedAt = instance.startedAt;
+      }
+    } catch { /* 没有实例记录时只显示已验证的服务状态。 */ }
+    return {
+      state: body.status === "stopping" ? "stopping" : "ready",
+      pid: body.pid,
+      latency: Date.now() - started,
+      startedAt,
+    };
+  } catch {
+    return { state: "unreachable" };
+  }
+}
+
+// ===== 代码版本 =====
+
+export interface GitState {
+  branch: string;
+  sha: string;
+  subject: string;
+  /** 已跟踪文件有未提交改动；有的话升级会被拒绝。 */
+  dirty: boolean;
+  /** 落后 origin/main 多少个提交。-1 表示没有可比较的 origin/main。 */
+  behind: number;
+  ahead: number;
+  /** 待应用的提交，新的在前。 */
+  incoming: { sha: string; subject: string }[];
+}
+
+async function git(args: string[]): Promise<RunResult> {
+  // GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在一个没人应答的提示上。
+  return capture("git", args, { env: { GIT_TERMINAL_PROMPT: "0" }, timeout: 15_000 });
+}
+
+/**
+ * 读取版本状态。
+ *
+ * 不 fetch：界面每次刷新都联一次远端既慢又可能卡住，而「落后几个提交」本来就是相对上次
+ * fetch 而言的。真正要升级时由 update 流程自己 fetch，那里等待是有交代的。
+ */
+export async function loadGit(): Promise<GitState | null> {
+  if (!Bun.which("git")) return null;
+  const head = await git(["rev-parse", "HEAD"]);
+  if (head.code !== 0) return null;
+
+  const [branch, subject, status, counts] = await Promise.all([
+    git(["rev-parse", "--abbrev-ref", "HEAD"]),
+    git(["log", "-1", "--pretty=%s"]),
+    git(["status", "--porcelain", "--untracked-files=no"]),
+    git(["rev-list", "--left-right", "--count", "HEAD...origin/main"]),
+  ]);
+
+  let ahead = 0;
+  let behind = -1;
+  if (counts.code === 0) {
+    const [left, right] = counts.stdout.trim().split(/\s+/).map(Number);
+    ahead = left ?? 0;
+    behind = right ?? 0;
+  }
+
+  const incoming: GitState["incoming"] = [];
+  if (behind > 0) {
+    const log = await git(["log", "--pretty=%h %s", "HEAD..origin/main"]);
+    for (const line of log.stdout.split("\n")) {
+      const match = /^(\S+)\s+(.*)$/.exec(line.trim());
+      if (match) incoming.push({ sha: match[1]!, subject: match[2]! });
+    }
+  }
+
+  return {
+    branch: branch.stdout.trim(),
+    sha: head.stdout.trim(),
+    subject: subject.stdout.trim(),
+    dirty: status.stdout.trim().length > 0,
+    behind,
+    ahead,
+    incoming,
+  };
+}
+
+// ===== 统计 =====
+
+export type { GroupStats, Window };
+
+export async function loadStatsOverview(root: string, window: Window = {}): Promise<GroupStats[]> {
+  return collectAll(root, window);
+}
+
+export interface RecentStats {
+  today: { asks: number; people: number; files: number; images: number; groups: number };
+  trend: { day: string; asks: number }[];
+}
+
+/** 一次历史扫描同时得到今日指标和每日趋势，数字直接来自消息发生的自然日。 */
+export async function loadRecentStats(root: string, days: number, now = Date.now()): Promise<RecentStats> {
+  const since = new Date(now);
+  since.setHours(0, 0, 0, 0);
+  since.setDate(since.getDate() - (days - 1));
+  const groups = await collectAll(root, { since: since.getTime(), until: now });
+  const byDay = new Map<string, number>();
+  for (let offset = 0; offset < days; offset++) {
+    const date = new Date(since);
+    date.setDate(date.getDate() + offset);
+    byDay.set(day(date.getTime()), 0);
+  }
+  const today = { asks: 0, people: 0, files: 0, images: 0, groups: 0 };
+  for (const group of groups) {
+    for (const [date, daily] of group.daily) {
+      if (byDay.has(date)) byDay.set(date, byDay.get(date)! + daily.asks);
+      if (date === day(now)) {
+        today.asks += daily.asks;
+        today.people += daily.users.size;
+        today.files += daily.files;
+        today.images += daily.images;
+        if (daily.users.size > 0 || daily.files > 0 || daily.images > 0) today.groups++;
+      }
+    }
+  }
+  return { today, trend: [...byDay].map(([day, asks]) => ({ day, asks })) };
+}
+
+// ===== 会话历史与临时目录 =====
+
+export type { GroupHistory, UserTmp };
+
+export async function loadHistory(root: string): Promise<GroupHistory[]> {
+  return scanHistory(root);
+}
+
+export async function loadTmp(root: string): Promise<UserTmp[]> {
+  return scanTmp(root);
+}
+
+// ===== 磁盘占用 =====
+
+/** data/ 与群数据根的总占用。给总览一个「这台机器被吃掉了多少」的数字。 */
+export async function loadDiskUsage(paths: string[]): Promise<number> {
+  let total = 0;
+  const seen = new Set<string>();
+  const walk = async (path: string): Promise<void> => {
+    if (seen.has(path)) return;
+    seen.add(path);
+    let info;
+    try {
+      info = await lstat(path);
+    } catch {
+      return;
+    }
+    if (!info.isDirectory()) {
+      total += info.size;
+      return;
+    }
+    let names: string[];
+    try {
+      names = await readdir(path);
+    } catch {
+      return;
+    }
+    for (const name of names) await walk(join(path, name));
+  };
+  for (const path of paths) await walk(path);
+  return total;
+}
+
+// ===== 日志 =====
+
+export interface LogLine {
+  text: string;
+  level: "info" | "warn" | "error" | "other";
+}
+
+/**
+ * 读日志尾部。
+ *
+ * 只读文件末尾那一段，不整文件读进内存：日志上限 5MB，轮转前读全量既慢又没必要。
+ */
+export async function loadLogTail(lines: number, bytes = 256 * 1024): Promise<LogLine[]> {
+  const file = Bun.file(LOG_FILE);
+  const size = file.size;
+  if (!size) return [];
+  const slice = await file.slice(Math.max(0, size - bytes)).text();
+  const rows = slice.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  // 第一行多半是从中间截断的，丢掉，避免显示半句话。
+  if (size > bytes && rows.length > 1) rows.shift();
+  return rows.slice(-lines).map((text) => ({
+    text,
+    level: text.includes(" - ERROR - ")
+      ? "error"
+      : text.includes(" - WARNING - ") || text.includes(" - WARN - ")
+        ? "warn"
+        : text.includes(" - INFO - ")
+          ? "info"
+          : "other",
+  }));
+}

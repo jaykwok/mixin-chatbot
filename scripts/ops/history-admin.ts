@@ -7,22 +7,7 @@ import { groupSegment } from "../../src/agent/paths.ts";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
 import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
 import { assertDataDirectory, dataDirectoryNames } from "../lib/group-data.ts";
-
-const HISTORY_FILE = "session.jsonl";
-
-interface UserHistory {
-  user: string;
-  path: string;
-  bytes: number;
-  modified: number;
-}
-
-interface GroupHistory {
-  group: string;
-  dir: string;
-  users: UserHistory[];
-  bytes: number;
-}
+import { scanHistory, type GroupHistory } from "../lib/history-scan.ts";
 
 function usage(): void {
   console.log("用法：bun run history <命令>");
@@ -42,29 +27,9 @@ function describeAge(at: number): string {
   return `${Math.floor(hours / 24)} 天前`;
 }
 
+/** 扫描本身在 scripts/lib/history-scan.ts，宿主机上的运维界面直接调那一份。 */
 export async function collect(root: string = GROUP_DATA_ROOT): Promise<GroupHistory[]> {
-  const groups: GroupHistory[] = [];
-  for (const group of await dataDirectoryNames(root, root)) {
-    const dir = join(root, group);
-    const users: UserHistory[] = [];
-    let bytes = 0;
-    for (const user of await dataDirectoryNames(join(dir, "users"), root)) {
-      const path = join(dir, "users", user, HISTORY_FILE);
-      try {
-        await assertDataDirectory(dirname(path), root);
-        const info = await lstat(path);
-        if (!info.isFile() || info.isSymbolicLink()) continue;
-        users.push({ user, path, bytes: info.size, modified: info.mtimeMs });
-        bytes += info.size;
-      } catch {
-        continue; // 这位成员还没说过话。
-      }
-    }
-    if (users.length === 0) continue;
-    users.sort((a, b) => b.bytes - a.bytes);
-    groups.push({ group, dir, users, bytes });
-  }
-  return groups.sort((a, b) => b.bytes - a.bytes);
+  return scanHistory(root);
 }
 
 /**

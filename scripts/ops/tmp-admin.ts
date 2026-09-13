@@ -1,34 +1,13 @@
 // 查看用户 tmp 占用，停机后将选中的内容归档到 backup/rm。
 // tmp 包含缓存、完整工具输出及生成的交付物，不能假设全部可以重建。
 // 目录边界由共享解析器验证；扫描和归档均不跟随目录链接。
-import { lstat, readdir } from "node:fs/promises";
-import { join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
 import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
-import { userSegment } from "../../src/agent/paths.ts";
-import { assertDataDirectory, dataDirectoryNames } from "../lib/group-data.ts";
+import { assertDataDirectory } from "../lib/group-data.ts";
+import { scanTmp, type UserTmp } from "../lib/tmp-scan.ts";
 
 const DAY = 24 * 60 * 60_000;
-
-interface Usage {
-  bytes: number;
-  files: number;
-  /** 整棵子树里最新的修改时间。 */
-  newest: number;
-}
-
-interface TmpEntry extends Usage {
-  name: string;
-  path: string;
-}
-
-interface UserTmp extends Usage {
-  group: string;
-  user: string;
-  dir: string;
-  entries: TmpEntry[];
-}
 
 function usage(): void {
   console.log("用法：bun run tmp <命令>");
@@ -37,7 +16,7 @@ function usage(): void {
   console.log("  purge --days <天数>      只清理这些天内没有改动过的条目");
   console.log("  purge --all              清空全部用户临时目录（等价于 --days 0）");
   console.log("");
-  console.log("  两条 purge 都可加 --user <手机号> 只处理一个用户。");
+  console.log("  list/purge 可加 --user <手机号> 和 --group <群号>，限定成员与群。");
   console.log("  停机后将选中内容移入 backup/rm；tmp 目录、workspace 和 session.jsonl 保留。");
 }
 
@@ -50,86 +29,21 @@ function describeAge(at: number): string {
 }
 
 /**
- * 用 lstat 而不是 stat：符号链接按它自己算，不跟进去。tmp 里出现一条指向 workspace 的
- * 链接时，统计和归档只处理链接本身，不遍历目标。
- */
-async function measure(path: string): Promise<Usage> {
-  let info;
-  try {
-    info = await lstat(path);
-  } catch {
-    // 正在跑的任务随时可能删掉自己的中间文件，扫描期间消失属于正常。
-    return { bytes: 0, files: 0, newest: 0 };
-  }
-  if (!info.isDirectory() || info.isSymbolicLink()) {
-    return { bytes: info.size, files: 1, newest: info.mtimeMs };
-  }
-
-  let children: string[] = [];
-  try {
-    children = (await readdir(path, { withFileTypes: true })).map((child) => child.name);
-  } catch {
-    return { bytes: 0, files: 0, newest: info.mtimeMs };
-  }
-  const total: Usage = { bytes: 0, files: 0, newest: info.mtimeMs };
-  for (const name of children) {
-    const child = await measure(join(path, name));
-    total.bytes += child.bytes;
-    total.files += child.files;
-    total.newest = Math.max(total.newest, child.newest);
-  }
-  return total;
-}
-
-/**
- * 扫描所有群下所有用户的 tmp。找不到目录就是还没人在这个群里用过工具，不是错误。
+ * 扫描本身在 scripts/lib/tmp-scan.ts，宿主机上的运维界面直接调那一份。
  *
  * root 显式传入而不是直接用 GROUP_DATA_ROOT：那个常量在模块加载时就定死了，测试没法
  * 在导入之后再改环境变量，而这个命令删文件，必须能在真实目录树上测。
  */
 export async function collect(
   userFilter?: string,
-  root: string = GROUP_DATA_ROOT
+  root: string = GROUP_DATA_ROOT,
+  groupFilter?: string
 ): Promise<UserTmp[]> {
-  const found: UserTmp[] = [];
-  for (const group of await dataDirectoryNames(root, root)) {
-    const usersDir = join(root, group, "users");
-    for (const user of await dataDirectoryNames(usersDir, root)) {
-      if (userFilter && user !== userSegment(userFilter)) continue;
-      const dir = join(usersDir, user, "tmp");
-      // 这里不能只看目录：tmp 里的散落文件（迁过来的 pi-bash-*.log 就是）也要算进来。
-      let names: string[];
-      try {
-        await assertDataDirectory(dir, root);
-        const info = await lstat(dir);
-        if (!info.isDirectory() || info.isSymbolicLink()) continue;
-        names = (await readdir(dir, { withFileTypes: true })).map((entry) => entry.name);
-      } catch {
-        continue; // 这个用户还没触发过任何工具，tmp 尚未建立。
-      }
-      if (names.length === 0) continue;
-
-      const entries: TmpEntry[] = [];
-      const total: UserTmp = {
-        group, user, dir, entries, bytes: 0, files: 0, newest: 0,
-      };
-      for (const name of names) {
-        const path = join(dir, name);
-        const measured = await measure(path);
-        entries.push({ name, path, ...measured });
-        total.bytes += measured.bytes;
-        total.files += measured.files;
-        total.newest = Math.max(total.newest, measured.newest);
-      }
-      entries.sort((a, b) => b.bytes - a.bytes);
-      found.push(total);
-    }
-  }
-  return found.sort((a, b) => b.bytes - a.bytes);
+  return scanTmp(root, userFilter, groupFilter);
 }
 
-async function list(userFilter?: string): Promise<number> {
-  const users = await collect(userFilter);
+async function list(userFilter?: string, groupFilter?: string): Promise<number> {
+  const users = await collect(userFilter, GROUP_DATA_ROOT, groupFilter);
   if (users.length === 0) {
     console.log(`没有找到任何用户临时目录（群数据总根：${GROUP_DATA_ROOT}）。`);
     return 0;
@@ -157,10 +71,11 @@ async function list(userFilter?: string): Promise<number> {
 export async function purge(
   days: number,
   userFilter?: string,
-  root: string = GROUP_DATA_ROOT
+  root: string = GROUP_DATA_ROOT,
+  groupFilter?: string
 ): Promise<number> {
   const cutoff = Date.now() - days * DAY;
-  const users = await collect(userFilter, root);
+  const users = await collect(userFilter, root, groupFilter);
   if (users.length === 0) {
     console.log(`没有找到任何用户临时目录（群数据总根：${root}）。`);
     return 0;
@@ -213,6 +128,7 @@ async function main(args: string[]): Promise<number> {
   const command = args[0];
   let days: number | undefined;
   let userFilter: string | undefined;
+  let groupFilter: string | undefined;
   for (let i = 1; i < args.length; i++) {
     const flag = args[i];
     if (flag === "--all") {
@@ -230,6 +146,12 @@ async function main(args: string[]): Promise<number> {
         console.error("--user 需要一个手机号");
         return 1;
       }
+    } else if (flag === "--group") {
+      groupFilter = args[++i];
+      if (!groupFilter) {
+        console.error("--group 需要一个群号");
+        return 1;
+      }
     } else {
       console.error(`无法识别的参数：${flag}`);
       return 1;
@@ -239,7 +161,7 @@ async function main(args: string[]): Promise<number> {
   switch (command) {
     case "list":
     case "ls":
-      return list(userFilter);
+      return list(userFilter, groupFilter);
     case "purge":
       // 跟 relay purge 一样，范围必须显式给出：一条不带参数的 purge 太容易在手滑时
       // 把某个正在跑的任务的中间产物一起端掉。
@@ -248,9 +170,9 @@ async function main(args: string[]): Promise<number> {
         return 1;
       }
       if (days === 0) {
-        console.log("准备将全部用户临时内容移入回收区；运行中的机器人会阻止本操作。");
+        console.log("准备将所选范围的全部临时内容移入回收区；运行中的机器人会阻止本操作。");
       }
-      return withMaintenance(() => purge(days, userFilter));
+      return withMaintenance(() => purge(days, userFilter, GROUP_DATA_ROOT, groupFilter));
     default:
       usage();
       return command ? 1 : 0;

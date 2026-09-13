@@ -6,6 +6,7 @@
   "scripts": {
     "start": "bun run src/server/index.ts",
     "dev": "bun --watch run src/server/index.ts",
+    "tui": "bun run scripts/ops/tui.ts",
     "configure": "bun run scripts/config/configure.ts",
     "configure-runtime": "bun run scripts/config/runtime-settings.ts",
     "relay": "bun run scripts/ops/relay-admin.ts",

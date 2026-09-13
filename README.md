@@ -1,10 +1,86 @@
 # mixin-chatbot
 
-量子密信群聊中的产品资料助手，面向销售与售前。你可以在已接入机器人的群里询问产品问题、索要原始资料，或让它整理方案、对比表和清单。
+面向销售与售前的量子密信群聊资料助手。在群里询问产品问题、索要原始资料，或让机器人根据本群资料整理方案、对比表和清单。
 
-**群用户**：[使用示例](#使用示例) · [使用流程](#使用流程) · [群聊指令](#群聊指令) · [文件交付](#文件交付)
+日常维护通过 **TUI 终端界面**完成：查看状态、检查故障、升级起停、清理数据。使用统计可导出为**离线 HTML 报表**，在浏览器中查看或分享。
 
-**部署与维护**：[快速开始](#快速开始) · [配置与数据](#配置与数据) · [运维](#运维) · [工作原理](#工作原理) · [提示词与工具](#提示词与工具) · [开发与检查](#开发与检查)
+**群聊使用**：[使用示例](#使用示例) · [使用流程](#使用流程) · [群聊指令](#群聊指令) · [文件交付](#文件交付)
+
+**部署与维护**：[快速开始](#快速开始) · [运维界面](#运维界面) · [HTML 报表](#导出-html-报表) · [命令行运维](#运维) · [配置与数据](#配置与数据)
+
+**开发**：[工作原理](#工作原理) · [提示词与工具](#提示词与工具) · [开发与检查](#开发与检查)
+
+## 运维界面
+
+一个终端集中查看服务状态、今日用量、近期趋势和待办。选中待办后按 `Enter`，即可进入对应页面处理。
+
+```sh
+bun run tui
+```
+
+Windows 和 Linux 均在项目根目录运行。需要交互式终端和宿主机上的 [Bun 1.4.0+](https://bun.sh/docs/installation)，TUI 无需额外 npm 依赖。推荐终端尺寸 **80×24 或更大**，最小支持 72×20；支持真彩色、256 色和 `NO_COLOR`。
+
+![TUI 总览：服务状态、部署信息、今日用量、14 天趋势与可跳转的待办](docs/assets/tui-overview.png)
+
+*预览由实际 TUI 渲染生成，使用演示数据；示例为 Windows 部署，100×24 终端。*
+
+> **Docker 部署**：机器人运行和命令行运维无需宿主机安装 Bun；使用 TUI 时，需在宿主机另装 Bun。界面管理的是宿主机上的部署，可在机器人停止时启动。
+
+### 九个页面
+
+| 按键 | 页面 | 可以做什么 |
+|---|---|---|
+| `1` | 总览 | 查看运行状态、今日用量、近期趋势、更新与清理待办 |
+| `2` | 健康 | 检查服务、隧道与配置；`Enter` 展开结果和处理建议，Windows 支持 `f` 自动修复 |
+| `3` | 统计 | 按日期查看群与成员用量、月度趋势和工具调用，导出 HTML 报表 |
+| `4` | 会话 | 查看群与成员的会话占用，按群清理历史 |
+| `5` | 存储 | 预览临时文件的清理范围与大小，按群和成员清理 |
+| `6` | 外链 | 查看外链账本，清理匹配或全部远端对象 |
+| `7` | 路由 | 查看 callback 绑定与冲突，重绑或移除已废弃的绑定 |
+| `8` | 日志 | 跟随最新日志、筛选级别，按任务编号提取排查上下文 |
+| `9` | 维护 | 升级、启动、停止、重启与卸载；Windows 支持修复隧道 |
+
+### 常用键位
+
+底部提示会随当前页面和状态变化，常用操作如下：
+
+| 按键 | 操作 |
+|---|---|
+| `1`–`9` / `Tab` / `Shift+Tab` | 直接跳页 / 下一页 / 上一页 |
+| `↑` `↓` / `j` `k` | 选择条目或滚动内容 |
+| `Enter` / `Esc` | 进入或确认 / 返回或取消 |
+| `PgUp` / `PgDn`、`Home` / `End` | 翻阅长明细、检查结果与执行输出；执行面板按 `End` 恢复跟随 |
+| `r` | 刷新当前状态 |
+| `?` / `q` | 查看帮助 / 退出界面 |
+
+命令行帮助使用 `bun run tui --help`。管道、CI 和非交互环境使用[命令行运维](#运维)。
+
+### 导出 HTML 报表
+
+在终端查看统计，在浏览器里阅读和分享：
+
+1. 按 `3` 进入统计，按 `d` 设置日期区间。留空表示不限，`Esc` 保留原筛选。
+2. 查看各群汇总，或选中一个群按 `Enter` 查看成员、月度趋势和模型用量。
+3. 按 `e` 导出，按 `o` 用默认应用打开最近一份报表。保存路径持续显示在统计页顶部。
+
+![TUI 统计明细：群用量、已打码的成员、月度趋势和工具调用，底部提示 e 导出](docs/assets/tui-stats.png)
+
+*统计页预览同样使用演示数据，成员号码默认打码。*
+
+报表保存到 `backup/reports/`，每次导出生成独立文件。内容包含所选日期区间的各群汇总；从群明细导出时，还会附上该群明细。**单个 HTML 文件即可离线打开或转发**，支持深浅配色，图表配有可展开的数据表，无外部请求。报表保留导出时的统计快照，需要更新时重新导出。
+
+手机号默认打码。仅在群明细按 `m` 临时显号后，导出的报表才包含完整号码；返回列表、切群或离开统计页会恢复打码，已导出的文件保留原内容。统计基于尚未归档的会话历史，每日趋势按消息发生的自然日计数。
+
+<details>
+<summary>清理范围、操作确认与终端交接</summary>
+
+存储页用 `←` `→` 选择清理天数，预览命中的条目和字节数。`p` 只清理选中行对应的群与成员，`a` 处理所有群的所有成员；同一成员在其他群的内容不会被 `p` 清理。文件移入 `backup/rm`，归档后磁盘空间尚未释放。
+
+改动类操作先显示操作范围、步骤和恢复说明，卸载与全量清理还要求手动输入确认词。`update` 与 `uninstall` 全程交互，界面会将终端交给运维脚本，结束后按回车返回。
+
+界面读取宿主机上的部署数据，维护操作复用 `ops.sh` / `ops.ps1`。健康页复用 `doctor --json`（Windows 为 `doctor -Json`）的逐项结果；有失败项时，JSON 接口返回非零退出码。
+
+</details>
 
 ## 使用示例
 
@@ -88,9 +164,9 @@ flowchart LR
 | Windows 原生 | Bun 1.4.0+、Git for Windows 的 GNU Bash、原生 `uv.exe`；管理员 PowerShell 部署 | 首次解析按需准备 |
 | Linux / Docker | glibc Linux、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；直连模式使用 UFW | 镜像预装 Python 3.12.13 和固定版本解析库 |
 
-Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。Linux 生产主机无需额外安装 Bun，配置向导与应用运行在镜像内。
+Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。Docker 的配置向导与应用运行在镜像内，宿主机无需额外安装 Bun；若使用[运维界面](#运维界面)，则需在宿主机安装 Bun 1.4.0+。
 
-基础组件通过官方渠道安装：[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Docker Engine（Debian）](https://docs.docker.com/engine/install/debian/)。使用 Cloudflare 隧道时，预先安装 [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)；Windows 可执行 `winget install --id Cloudflare.cloudflared`。
+基础组件通过官方渠道安装：[Bun](https://bun.sh/docs/installation)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Docker Engine（Debian）](https://docs.docker.com/engine/install/debian/)。使用 Cloudflare 隧道时，预先安装 [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)；Windows 可执行 `winget install --id Cloudflare.cloudflared`。
 
 ### 执行部署
 
@@ -142,15 +218,23 @@ bash scripts/ops/ops.sh doctor
 
 每个群使用独立的 callback key。部署后结合实际域名运行 `doctor`，并在测试群验证消息、文件和停止操作；本地 `/health` 只能确认应用就绪。
 
+<details>
+<summary>Cloudflare 规则维护与后续 WebSocket 迁移</summary>
+
 **Cloudflare 规则维护约定：** 当前线上入口采用默认拒绝、显式放行的策略；实际规则只在 Cloudflare 控制台维护，尚未纳入仓库版本管理，部署脚本不会同步它们。本段记录维护约定，不是线上规则快照。
 
 新增或修改 `src/server/app.ts` 的公网路由时，必须同时检查控制台中的放行路径、HTTP 方法和来源条件，并同步所需规则。仅提交路由代码不足以开放公网访问。验收应分别检查本地源站响应和公网请求；如果本地正常而公网失败、源站日志全空，先查 Cloudflare 安全事件及规则命中情况，不要仅凭应用日志判断请求没有发出。
 
 **后续 WebSocket 迁移：** 先确认连接方向和仍需保留的公网入口。若改为机器人主动向平台建立出站长连接，待消息、重连和回滚流程验证完成后，再清理废弃的 webhook 路由、密钥配置、对应拒绝日志逻辑，以及控制台中对应的放行规则；同时核对健康检查、管理操作和文件分发是否仍依赖 HTTP。若仍由平台连入机器人，则仍需维护握手入口的鉴权和 Cloudflare 规则，不能仅因使用 WebSocket 就删除入口防护。迁移前保留现有实现。
 
+</details>
+
 ### HTTP 拒绝日志
 
 错误或缺失 webhook 密钥、未知路由、管理 token 错误对外保持相同的 `404 / Not Found`。已通过密钥校验的请求保留实际的校验或运行状态码。
+
+<details>
+<summary>日志分类、计数与脱敏规则</summary>
 
 | 日志分类 | 含义 | 原因标签示例 |
 |---|---|---|
@@ -165,6 +249,8 @@ bash scripts/ops/ops.sh doctor
 统计请求量应使用汇总的“总数”（已经包含明细），不要再叠加明细行；实时排查可先看尚未汇总的明细。汇总只保留固定分类与原因的计数，不按 IP 或路径建表，因此换 IP 也不能绕过日志配额。进程强制退出时，尚未汇总的计数可能丢失。已有业务日志仍按原逻辑输出；日志限速不代表请求限流，也不改变响应状态。
 
 明细包含 IP、方法、脱敏路径和状态码；不记录查询参数、请求体、Authorization 或错误消息中的外部字段。`/webhook/` 后的路径全部隐藏。IP 沿用 X-Forwarded-For 第一跳、X-Real-IP 回退的提取规则，仅作为排查线索，不作为可信鉴权依据。代理层直接拦截的请求不会出现在应用日志里。
+
+</details>
 
 ## 配置与数据
 
@@ -217,6 +303,7 @@ data/
         └── tmp/               生成文件、缓存与完整工具输出
 backup/
 ├── tmp/                       部署备份、测试与诊断现场
+├── reports/                   TUI 导出的离线 HTML 报表
 └── rm/                        被移除的旧文件、会话与用户 tmp
 logs/                          应用日志
 ```
@@ -256,13 +343,19 @@ logs/                          应用日志
 
 ## 运维
 
+日常交互操作可从[运维界面](#运维界面)进入。以下保留命令行入口与排查步骤，便于脚本调用和无 Bun 的 Docker 宿主机使用。
+
 ### 日常控制
 
-统一入口，在项目根目录调用：
+在项目根目录选择对应平台的命令行入口。
+
+Windows：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 doctor
 ```
+
+Linux / Docker：
 
 ```sh
 bash scripts/ops/ops.sh doctor
@@ -272,7 +365,7 @@ bash scripts/ops/ops.sh doctor
 
 | 命令 | 用途 |
 |---|---|
-| `doctor` | 检查配置、实例、群数据根及已配置的网络入口 |
+| `doctor` | 检查配置、实例、群数据根及已配置的网络入口；加 `--json`（Windows 为 `-Json`）输出单行 JSON |
 | `start` / `stop` / `restart` | 启动、正常关闭或重启实例 |
 | `logs` | 持续查看日志 |
 | `update` | 同步 origin/main 并部署，保留原运行或停止状态 |
@@ -293,6 +386,9 @@ Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件�
 2. “模型调用准备”涵盖 Pi 的校验与历史检查；“等待模型响应”表示进入模型轮次；“接收模型输出”表示 SDK 正在收到流事件；“压缩会话历史”表示正在压缩该群该用户的历史。工具执行和最终发送也分别记录。
 3. 只有某个群异常时，发送 `/stop`，等待 `/status` 变为空闲，再发 `/clear`。收到归档确认后，用“只回复 OK”测试。`/clear` 归档当前用户在本群的会话，不清除群资料。若恢复，旧会话上下文是重要线索；若仍失败，保留这一轮阶段日志继续检查 Pi 请求与模型服务。
 4. 普通 HTTP 流探测成功只验证该次请求，不能验证机器人的完整历史、工具定义、思考模式和压缩请求。`doctor`/健康检查也不能证明模型回答正常。
+
+<details>
+<summary>深入排查：模型超时、进展判定与日志字段</summary>
 
 模型等待或输出期间，默认连续 180 秒无有效进展就主动取消；计时从每个模型轮次开始，包含首个内容到达前的等待。正文、思考增量中的非空白字符会刷新进展时间；工具参数则比较 SDK 解析后的参数 JSON，仅在参数发生变化时刷新。原始工具参数增量再多，只要解析结果不变，就不算进展。空增量、纯空白正文/思考、块开始/结束、工具名称/调用 ID 和初始空参数对象也不续期。“最近进展距今”在接收模型输出时随上述进展刷新。
 
@@ -317,6 +413,8 @@ Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件�
 事件持续增加但 `effectiveChars` 不增长时，说明仍收到事件却没有新的非空白增量。若 `toolArgsChars` 持续增长，而 `parsedToolArgsChars` 很小、`toolArgsChanges` 不再增加、`toolArgsLastChangeSecondsAgo` 持续变大，则原始工具参数流没有推动可观察的解析结果变化。只看参数长度不能判断内容是否改变，需结合变化次数。`rawStopReason=null` 只表示未观察到上游结束原因；取消后 `stopReason=aborted` 是本地取消结果，需结合取消前记录判断。日志另记 `取消原因`，区分 `model_idle`、`model_response_timeout`、`task_timeout`、`user_cancel`、`shutdown`。这些信息本身不能确定故障在上游服务还是 SDK。
 
 整轮时限仍为 1200 秒，覆盖准备、模型、工具和交付，三种时限以先到者为准。可通过 `data/config/runtime.json` 或环境变量设置 `BOT_MODEL_IDLE_TIMEOUT_SECONDS` 和 `BOT_MODEL_RESPONSE_TIMEOUT_SECONDS`，重启生效；无可见增量的长思考模型、耗时较长的正常生成可按实测调整。超时后仍需等待 SDK 取消清理完毕，再执行同一用户的下一条消息，因此最终报错耗时可能超过阈值。上游只返回 `The operation timed out.` 时不直接断言网络不通。若日志已到“等待取消清理”却长期不结束，先保存日志，再用运维 `restart` 恢复实例。
+
+</details>
 
 ### 按任务编号提取日志
 
@@ -365,6 +463,7 @@ bun run routes list
 # 写操作前先停止服务
 bun run history clear "<群号>"
 bun run tmp purge --days 7
+bun run tmp purge --days 30 --group "<群号>" --user "<手机号>"
 bun run relay purge "<关键字>"
 ```
 
@@ -386,14 +485,23 @@ bun run routes forget "<指纹>"
 
 指纹支持日志中的 12 位前缀；有歧义时使用 `list` 输出的完整值，无需输入 callback 密钥。普通绑定闲置 24 小时后可回收；冲突绑定不会因重启或 TTL 自动解除，仍计入 1000 条总容量。`forget` 后，该 key 再次入站将建立新绑定。
 
-Linux 主机没有 Bun 时，停机后用已构建镜像执行同一个 CLI。将末尾 `list` 替换为 `reset` 或 `forget` 及对应参数：
+Linux 主机没有 Bun 时，用运维包装器执行同一个 CLI：
 
 ```sh
-docker run --rm --network none \
-  --user "$(stat -c '%u:%g' data)" \
-  -e HOME=/app/data/runtime/home \
-  -v "$PWD/data:/app/data" -v "$PWD/backup:/app/backup" \
-  mixin-chatbot bun run routes list
+bash scripts/ops/ops.sh routes list
+bash scripts/ops/ops.sh routes reset "<指纹>" --group "<目标群号>"
+bash scripts/ops/ops.sh routes forget "<指纹>"
+```
+
+容器在运行就 `docker exec` 进去，否则用已构建镜像起一次性容器，以 `data/` 的属主运行并按部署时记录的群数据根挂载。写操作仍受维护租约限制，机器人运行时会被拒绝，因此 `reset`/`forget` 之前照样要先 `stop`。
+
+Windows 包装器使用 PowerShell 原生参数：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 routes list
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 routes reset -Fingerprint "<指纹>" -Group "<目标群号>"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 routes forget -Fingerprint "<指纹>"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purge -Days 30 -Group "<群号>" -User "<手机号>"
 ```
 
 ### 磁盘保留
@@ -404,6 +512,7 @@ docker run --rm --network none \
 | 会话、用户 tmp | 清理时归档到 `backup/rm`，下次部署、升级或连接器安装成功后清空 |
 | 部署备份 | 成功后删除本次 `backup/tmp` 快照并清空整个 `backup/rm`；失败时保留 |
 | 测试与诊断现场 | 放在 `backup/tmp`，按需离线清理 |
+| TUI 统计报表 | 每次导出独立保存在 `backup/reports`，按需保留或手动清理 |
 | 上传快照 | 完成、失败或取消后直接删除 |
 | 应用日志 | 约 5 MiB 轮转，当前文件加 3 份备份，最旧备份直接删除 |
 
@@ -483,6 +592,8 @@ bun run check
 
 `scripts/patches/knip@6.29.0.patch` 修复 Knip 对 Bun 脚本 production 入口标记的传递，仅影响开发检查。补丁随检查脚本维护；移除前需同步更新安装引用并通过普通和 production 两种 Knip 检查。
 
+命令行入口放在 `scripts/{config,ops,runtime}` 下的直接子文件，由 `knip.json` 的 glob 统一标成生产入口。运维界面入口是 [tui.ts](scripts/ops/tui.ts)，实现放在 `scripts/ops/tui/`；新增命令沿用这一布局，并通过普通和 production 两种 Knip 检查。
+
 Pi 两个包精确固定为 0.85.1，使用官方本地 SDK，无需实验性 `pi-server`。依赖升级通过改版本、更新锁文件和回归检查完成。当前外链存储只支持 SQLite 账本与现行对象布局。
 
 | 工程入口 | 职责 |
@@ -493,6 +604,7 @@ Pi 两个包精确固定为 0.85.1，使用官方本地 SDK，无需实验性 `p
 | [process.ts](src/core/process.ts)、[process-supervisor.ts](src/core/process-supervisor.ts) | 工具进程执行与后代回收 |
 | [delivery-store.ts](src/agent/delivery-store.ts)、[im.ts](src/integrations/im.ts)、[relay.ts](src/integrations/relay.ts) | 持久交付、平台发送与外链对象 |
 | [scripts/ops](scripts/ops)、[scripts/deploy](scripts/deploy) | 日常运维与部署事务 |
+| [scripts/ops/tui](scripts/ops/tui) | 全屏运维界面：渲染层、宿主机数据读取与操作转调 |
 
 CI 配置了 Windows/Linux 检查及受限 Linux 镜像中的解析器与进程回收验证。本机已验证 Windows 流程；Linux/Docker 尚未实机验收，模拟测试不代表实际部署。
 

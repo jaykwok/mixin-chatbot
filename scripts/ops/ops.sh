@@ -102,12 +102,46 @@ ask_yes_no() {
     done
 }
 
+# doctor --json 让运维界面复用同一套体检，而不是自己再实现一遍 docker/隧道/配置的判断。
+# 逐项结果在 check() 里顺手攒起来，人类可读的输出一个字不改。
+JSON_OUTPUT=0
+JSON_ROWS=""
+
+# 只处理 JSON 字符串里必须转义的字符：反斜杠、双引号和控制字符。
+# 详情里带的是路径和 URL，出现反斜杠（Windows 路径）和引号都不稀奇。
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
+}
+
 PASS=0; FAIL=0
 check() {
     local name="$1" ok="$2" detail="$3"
-    if [ "$ok" = "1" ]; then OK "$(printf '%-30s %s' "$name" "$detail")"; PASS=$((PASS+1))
-    else ER "$(printf '%-30s %s' "$name" "$detail")"; FAIL=$((FAIL+1)); fi
+    if [ "$JSON_OUTPUT" = "1" ]; then
+        # status 用 pass/warn/fail 三态而不是布尔：Windows 那边的体检本来就分三档，
+        # 两个平台吐同一个 schema，界面才不用写两套解析。这边目前只产生 pass 和 fail。
+        local row status
+        status="$([ "$ok" = "1" ] && echo pass || echo fail)"
+        row="{\"name\":\"$(json_escape "$name")\",\"status\":\"${status}\",\"detail\":\"$(json_escape "$detail")\",\"fix\":\"\"}"
+        JSON_ROWS="${JSON_ROWS:+${JSON_ROWS},}${row}"
+    fi
+    if [ "$ok" = "1" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+    [ "$JSON_OUTPUT" = "1" ] && return 0
+    if [ "$ok" = "1" ]; then OK "$(printf '%-30s %s' "$name" "$detail")"
+    else ER "$(printf '%-30s %s' "$name" "$detail")"; fi
 }
+
+# JSON 模式下把提示类输出静音：stdout 必须是一份干净的 JSON，混进一行中文提示就没法解析了。
+if [ "${1:-}" = "doctor" ] || [ "${1:-}" = "status" ]; then
+    case "${2:-}" in
+        --json)
+            JSON_OUTPUT=1
+            P()  { :; }
+            OK() { :; }
+            WA() { :; }
+            ER() { :; }
+            ;;
+    esac
+fi
 
 # 获取 URL 的 HTTP 状态码（curl 连接失败时输出 "000"）。
 code_of() {
@@ -277,6 +311,13 @@ doctor() {
     check "data/config/webhook-secret" "$secret_ok" "$([ "$secret_ok" = "1" ] && echo 有效 || echo '缺少或无效（生产服务拒绝启动）')"
 
     check_relay
+
+    if [ "$JSON_OUTPUT" = "1" ]; then
+        printf '{"pass":%s,"warn":0,"fail":%s,"mode":"%s","port":%s,"domain":"%s","checks":[%s]}\n' \
+            "$PASS" "$FAIL" "$DEPLOY_MODE" "$PORT" "$(json_escape "$DOMAIN")" "$JSON_ROWS"
+        [ "$FAIL" -gt 0 ] && return 1
+        return 0
+    fi
 
     echo ""
     echo -e "结果：${GREEN}${PASS} 项通过${NC}，${RED}${FAIL} 项失败${NC}"
@@ -636,15 +677,25 @@ case "${1:-}" in
     relay-purge) shift; relay_admin purge "$@" ;;
     tmp-ls)      shift; tmp_admin list "$@" ;;
     tmp-purge)   shift; tmp_admin purge "$@" ;;
+    routes)        shift; group_data_admin scripts/ops/route-admin.ts "$@" ;;
     stat)          shift; group_data_admin scripts/ops/stats-admin.ts "$@" ;;
     history-ls)    shift; group_data_admin scripts/ops/history-admin.ts list "$@" ;;
     history-clear) shift; history_clear "$@" ;;
     uninstall) uninstall ;;
     *)
+        # 空参和显式 help 是「我要看帮助」，退 0；其余都是打错了的命令，必须退非零。
+        # 否则脚本或 CI 里少写一个字母（ops.sh restrat）会被当成执行成功。
+        UNKNOWN=0
+        case "${1:-}" in
+            ""|help|-h|--help) ;;
+            *) UNKNOWN=1; ER "无法识别的命令：$1" ;;
+        esac
         echo -e "${CYAN}mixin-chatbot 运维工具（Linux/Docker）${NC}"
         echo "用法：./scripts/ops/ops.sh <命令>"
+        echo "运维界面：在项目根目录运行 bun run tui；需宿主机安装 Bun（安装指引：https://bun.sh/docs/installation）。"
         echo ""
         echo "  doctor     健康检查：群数据根、容器、:$PORT、配置；隧道模式额外检查 Cloudflare"
+        echo "             加 --json 输出单行 JSON，供运维界面消费"
         echo "  update     同步 origin/main，再交给 deploy.sh 重建并切换容器；失败自动回滚代码"
         echo "             deploy.sh 的各项提示直接回车即沿用现有配置"
         echo "  restart    重启 Docker 容器"
@@ -654,14 +705,20 @@ case "${1:-}" in
         echo "  relay-ls   列出已发出、仍在册的大文件外链"
         echo "  relay-purge <关键字>|--all"
         echo "             删除匹配的外链对象并清掉索引记录"
-        echo "  tmp-ls     列出各用户临时目录的占用（缓存、中间产物、截断日志）"
-        echo "  tmp-purge --days <天数>|--all [--user <手机号>]"
+        echo "  tmp-ls [--user <手机号>] [--group <群号>]"
+        echo "             列出各用户临时目录的占用（缓存、中间产物、截断日志）"
+        echo "  tmp-purge --days <天数>|--all [--user <手机号>] [--group <群号>]"
         echo "             清理用户临时目录；--days 只删这些天没改动过的条目"
+        echo "             --user 与 --group 可组合，把范围限到某个群里的某个成员"
         echo "  stat [群号] [--since <日期>] [--until <日期>]"
         echo "             使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
+        echo "  routes     回调路由：list 查看绑定与冲突，reset/forget 需停机"
         echo "  history-ls 列出各群的会话历史（成员数、占用、最后活动）"
         echo "  history-clear <群号>"
         echo "             清空该群全部成员的会话历史；自动停机、清理、再启动"
         echo "  uninstall  删除容器（可选镜像、cloudflared、data/、logs/）"
+        # 显式 exit：case 分支的退出码取决于最后一条命令，靠自然结束会把 [ ] 的结果漏出去。
+        [ "$UNKNOWN" = "1" ] && exit 1
+        exit 0
         ;;
 esac

@@ -10,7 +10,7 @@ import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
 
 const HISTORY_FILE = "session.jsonl";
 
-interface UserStats {
+export interface UserStats {
   user: string;
   asks: number;
   replies: number;
@@ -20,7 +20,7 @@ interface UserStats {
   days: Set<string>;
 }
 
-interface GroupStats {
+export interface GroupStats {
   group: string;
   users: UserStats[];
   asks: number;
@@ -29,13 +29,14 @@ interface GroupStats {
   delivered: Map<string, number>;
   tokens: { input: number; output: number; cacheRead: number };
   months: Map<string, { asks: number; users: Set<string> }>;
+  daily: Map<string, { asks: number; users: Set<string>; files: number; images: number }>;
   days: Set<string>;
   firstAt: number;
   lastAt: number;
   skipped: number;
 }
 
-interface Window {
+export interface Window {
   since?: number;
   until?: number;
 }
@@ -69,14 +70,16 @@ function formatCount(value: number): string {
 }
 
 /** --since/--until 收的是自然日，转成当天的起止时刻，避免边界少算一天。 */
-function parseDate(raw: string, endOfDay: boolean): number {
+export function parseDate(raw: string, endOfDay: boolean): number {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
   if (!match) throw new Error(`日期格式应为 YYYY-MM-DD，收到「${raw}」`);
   const [, year, month, day] = match;
   const at = endOfDay
     ? new Date(Number(year), Number(month) - 1, Number(day), 23, 59, 59, 999)
     : new Date(Number(year), Number(month) - 1, Number(day));
-  if (Number.isNaN(at.getTime())) throw new Error(`无效日期：${raw}`);
+  if (Number.isNaN(at.getTime()) || at.getFullYear() !== Number(year) || at.getMonth() !== Number(month) - 1 || at.getDate() !== Number(day)) {
+    throw new Error(`无效日期：${raw}`);
+  }
   return at.getTime();
 }
 
@@ -99,6 +102,7 @@ function emptyGroup(group: string): GroupStats {
     delivered: new Map(),
     tokens: { input: 0, output: 0, cacheRead: 0 },
     months: new Map(),
+    daily: new Map(),
     days: new Set(),
     firstAt: Number.POSITIVE_INFINITY,
     lastAt: Number.NEGATIVE_INFINITY,
@@ -162,11 +166,13 @@ async function readUser(
     if (window.until !== undefined && at > window.until) continue;
 
     const role = record.message.role;
+    const day = dayKey(at);
+    const daily = group.daily.get(day) ?? { asks: 0, users: new Set<string>(), files: 0, images: 0 };
     if (role === "user") {
       // 指令不算提问：它没有进过模型，只是让机器人停一下或清个历史。
       if (isSlashCommandMessage(firstText(record.message.content))) continue;
       stats.asks++;
-      const day = dayKey(at);
+      daily.asks++;
       stats.days.add(day);
       group.days.add(day);
       const monthKey = day.slice(0, 7);
@@ -197,10 +203,14 @@ async function readUser(
         const name = message.toolName!;
         group.delivered.set(name, (group.delivered.get(name) ?? 0) + 1);
         if (name === "send_file") stats.files++;
+        if (name === "send_file") daily.files++;
+        else daily.images++;
       }
     } else {
       continue;
     }
+    if (role === "user" || role === "assistant") daily.users.add(user);
+    group.daily.set(day, daily);
     stats.firstAt = Math.min(stats.firstAt, at);
     stats.lastAt = Math.max(stats.lastAt, at);
   }

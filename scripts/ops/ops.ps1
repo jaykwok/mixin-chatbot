@@ -12,19 +12,24 @@
 param(
     [Parameter(Position = 0)]
     [string]$Command = "",
-    # relay-purge 的过滤关键字，或 --all。其余命令用不到。
+    # relay-purge 的过滤关键字、routes 的子命令，或 stat/history-clear 的群号。
     [Parameter(Position = 1)]
     [string]$Target = "",
     [switch]$Repair,
     [switch]$RestartTunnel,
+    # doctor 以单行 JSON 输出逐项结果，供运维界面消费；人类可读的输出保持原样。
+    [switch]$Json,
     # tmp-purge 的范围。PowerShell 会把 --days 这种 token 当参数名去绑定，所以这里用原生
-    # 开关，由脚本翻译成 tmp-admin.ts 的 --days/--all/--user。
+    # 开关，由脚本翻译成 tmp-admin.ts 的 --days/--all/--user/--group。
     [int]$Days = -1,
     [switch]$All,
     [string]$User = "",
     # stat 的统计区间（YYYY-MM-DD），同样翻译成脚本的 --since/--until。
     [string]$Since = "",
-    [string]$Until = ""
+    [string]$Until = "",
+    # routes 的目标；Group 也可用于限定 tmp-ls/tmp-purge 的群。
+    [string]$Fingerprint = "",
+    [string]$Group = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -691,7 +696,7 @@ function Invoke-TunnelRepair {
 }
 
 function Show-Doctor {
-    Step "mixin-chatbot 健康检查（模式=$(Get-DeployModeLabel $DeployMode)，端口=$Port）"
+    if (-not $Json) { Step "mixin-chatbot 健康检查（模式=$(Get-DeployModeLabel $DeployMode)，端口=$Port）" }
     $rows = @()
 
     try {
@@ -802,6 +807,25 @@ function Show-Doctor {
     $rows += New-DoctorRow "data/config/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "执行 scripts\deploy\deploy.ps1；密钥变化后还必须更新 IM webhook URL。" })
 
     $rows += Get-RelayDoctorRows
+
+    # doctor -Json 让运维界面复用这同一套体检，而不是自己再实现一遍计划任务/隧道/配置的判断。
+    # stdout 必须只有 JSON，所以这里直接返回，不走下面的彩色输出。
+    if ($Json) {
+        $payload = [pscustomobject]@{
+            pass   = @($rows | Where-Object { $_.Status -eq "pass" }).Count
+            warn   = @($rows | Where-Object { $_.Status -eq "warn" }).Count
+            fail   = @($rows | Where-Object { $_.Status -eq "fail" }).Count
+            mode   = $DeployMode
+            port    = [int]$Port
+            domain = $Domain
+            # 单行输出：ConvertTo-Json 默认会把数组换行展开，Compress 后一行读完即可。
+            checks = @($rows | ForEach-Object {
+                [pscustomobject]@{ name = $_.Name; status = $_.Status; detail = $_.Detail; fix = $_.Fix }
+            })
+        }
+        # 返回结构化结果；JSON 序列化与退出码由入口处理，不与布尔结果混进同一条管道。
+        return $payload
+    }
 
     foreach ($r in $rows) {
         $tag = switch ($r.Status) { "pass" { "[+]" }; "warn" { "[!]" }; default { "[x]" } }
@@ -1240,6 +1264,14 @@ function Uninstall-Bot {
     return $true
 }
 
+if ($Json -and $Command -in @("doctor", "status")) {
+    if ($Repair) { [Console]::Error.WriteLine("-Json 只用于诊断；修复请单独运行 doctor -Repair。"); exit 2 }
+    $result = Show-Doctor
+    Invoke-WithUtf8Output { [Console]::WriteLine(($result | ConvertTo-Json -Depth 4 -Compress)) }
+    if ($result.fail -gt 0) { exit 1 }
+    exit 0
+}
+
 switch ($Command) {
     "doctor"    {
         $healthy = Show-Doctor
@@ -1282,15 +1314,33 @@ switch ($Command) {
     }
     "relay-ls" { if (-not (Invoke-RelayAdmin @("list"))) { exit 1 } }
     "relay-purge" {
+        if ($All) { $Target = "--all" }
         if (-not $Target) {
             Err "relay-purge 需要一个关键字，或用 --all 表示清理全部"
             exit 1
         }
         if (-not (Invoke-RelayAdmin @("purge", $Target))) { exit 1 }
     }
+    "routes" {
+        $routeArgs = @($Target)
+        switch ($Target) {
+            "list" { }
+            "reset" {
+                if (-not $Fingerprint -or -not $Group) { Err "routes reset 需要 -Fingerprint 和 -Group"; exit 2 }
+                $routeArgs += @($Fingerprint, "--group", $Group)
+            }
+            "forget" {
+                if (-not $Fingerprint) { Err "routes forget 需要 -Fingerprint"; exit 2 }
+                $routeArgs += $Fingerprint
+            }
+            default { Err "routes 需要 list、reset 或 forget"; exit 2 }
+        }
+        if (-not (Invoke-GroupDataAdmin "scripts\ops\route-admin.ts" $routeArgs)) { exit 1 }
+    }
     "tmp-ls" {
         $tmpArgs = @("list")
         if ($User) { $tmpArgs += @("--user", $User) }
+        if ($Group) { $tmpArgs += @("--group", $Group) }
         if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
     }
     "tmp-purge" {
@@ -1301,6 +1351,7 @@ switch ($Command) {
         $tmpArgs = @("purge")
         if ($All) { $tmpArgs += "--all" } else { $tmpArgs += @("--days", "$Days") }
         if ($User) { $tmpArgs += @("--user", $User) }
+        if ($Group) { $tmpArgs += @("--group", $Group) }
         if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
     }
     "stat" {
@@ -1318,10 +1369,14 @@ switch ($Command) {
     }
     "uninstall" { if (-not (Uninstall-Bot)) { exit 1 } }
     default {
+        # 空参和显式 help 是「我要看帮助」，退 0；其余都是打错了的命令，必须退非零。
+        $unknown = $Command -and $Command -ne "help"
+        if ($unknown) { Err "无法识别的命令：$Command" }
         Write-Host "mixin-chatbot 运维工具（Windows Server）" -ForegroundColor Cyan
         Write-Host "用法：powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <命令> [-Repair] [-RestartTunnel]"
+        Write-Host "运维界面：在项目根目录运行 bun run tui。"
         Write-Host ""
-        Write-Host "  doctor          只读诊断；加 -Repair 自动修复可安全判断的问题"
+        Write-Host "  doctor          只读诊断；-Json 输出 JSON；-Repair 自动修复"
         Write-Host "  update          同步 origin/main、装依赖、重启并体检；失败自动回滚"
         Write-Host "                  隧道默认只在公网检查失败时重启，加 -RestartTunnel 可强制"
         Write-Host "  repair-tunnel   按当前 token 来源强制重装 Cloudflared 服务"
@@ -1334,8 +1389,10 @@ switch ($Command) {
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
         Write-Host "  relay-purge <关键字>|--all"
         Write-Host "                  删除匹配的外链对象并清掉索引记录"
-        Write-Host "  tmp-ls          列出各用户临时目录的占用（缓存、中间产物、截断日志）"
-        Write-Host "  tmp-purge -Days <天数> | -All [-User <手机号>]"
+        Write-Host "  routes list | reset -Fingerprint <指纹> -Group <群号> | forget -Fingerprint <指纹>"
+        Write-Host "  tmp-ls [-User <手机号>] [-Group <群号>]"
+        Write-Host "                  列出各用户临时目录的占用（缓存、中间产物、截断日志）"
+        Write-Host "  tmp-purge -Days <天数> | -All [-User <手机号>] [-Group <群号>]"
         Write-Host "                  清理用户临时目录；-Days 只删这些天没改动过的条目"
         Write-Host "  stat [群号] [-Since <日期>] [-Until <日期>]"
         Write-Host "                  使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
@@ -1343,5 +1400,6 @@ switch ($Command) {
         Write-Host "  history-clear <群号>"
         Write-Host "                  清空该群全部成员的会话历史；自动停机、清理、再启动"
         Write-Host "  uninstall       清理任务/进程/防火墙/launcher，可选清理隧道、data 和 logs"
+        if ($unknown) { exit 1 }
     }
 }

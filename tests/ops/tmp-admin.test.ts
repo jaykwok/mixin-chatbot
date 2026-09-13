@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, stat, utimes, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
 import { collect, purge } from "../../scripts/ops/tmp-admin.ts";
+import { groupSegment, userSegment } from "../../src/agent/paths.ts";
 
 const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-tmp-admin-"));
 
@@ -28,6 +29,33 @@ async function exists(path: string): Promise<boolean> {
 }
 
 describe("用户临时目录清理", () => {
+  test("同时限定群和成员，同一手机号在其他群的内容保留，摘要目录可直接选中", async () => {
+    const scoped = await mkdtemp(join(tmpdir(), "tmp-scope-"));
+    try {
+      const group = "带 空格的群";
+      const user = "成员/标识";
+      const chosen = join(scoped, groupSegment(group), "users", userSegment(user), "tmp");
+      const otherGroup = join(scoped, "other", "users", userSegment(user), "tmp");
+      const otherUser = join(scoped, groupSegment(group), "users", "13812345678", "tmp");
+      const encodedGroup = join(scoped, groupSegment(groupSegment(group)), "users", userSegment(user), "tmp");
+      const encodedUser = join(scoped, groupSegment(group), "users", userSegment(userSegment(user)), "tmp");
+      for (const path of [chosen, otherGroup, otherUser, encodedGroup, encodedUser]) {
+        await mkdir(path, { recursive: true });
+        await writeFile(join(path, "keep-unless-selected.txt"), "fixture");
+      }
+      expect((await collect(user, scoped, group)).map(item => item.dir)).toEqual([chosen]);
+      expect((await collect(userSegment(user), scoped, groupSegment(group))).map(item => item.dir)).toEqual([chosen]);
+      expect(await purge(0, userSegment(user), scoped, groupSegment(group))).toBe(0);
+      expect(await exists(join(chosen, "keep-unless-selected.txt"))).toBe(false);
+      expect(await exists(join(otherGroup, "keep-unless-selected.txt"))).toBe(true);
+      expect(await exists(join(otherUser, "keep-unless-selected.txt"))).toBe(true);
+      expect(await exists(join(encodedGroup, "keep-unless-selected.txt"))).toBe(true);
+      expect(await exists(join(encodedUser, "keep-unless-selected.txt"))).toBe(true);
+      expect(await exists(chosen)).toBe(true);
+      expect(await collect("../../outside", scoped, "../outside")).toEqual([]);
+    } finally { await rm(scoped); }
+  });
+
   test("按子树最新改动时间清理，且不碰 workspace 与会话历史", async () => {
     try {
       await mkdir(join(u1Tmp, "cache", "uv"), { recursive: true });
