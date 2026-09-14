@@ -37,6 +37,10 @@ export class LogsView implements View {
   private pageSize = 10;
   private filter = new ListFilter();
 
+  activity(): string | null {
+    return this.lookupController ? "正在扫描任务日志…" : null;
+  }
+
   hints(): [string, string][] {
     return [
       ["↑↓", "回看"],

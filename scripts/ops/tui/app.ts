@@ -5,7 +5,7 @@
 
 import { Screen, type Key, MIN_COLUMNS, MIN_ROWS } from "./render/screen.ts";
 import { createTheme, STATUS, type StatusName, type Theme } from "./render/theme.ts";
-import { box, table, wrap } from "./render/widgets.ts";
+import { box, spinner, SPINNER_INTERVAL_MS, table, wrap } from "./render/widgets.ts";
 import { pad, width } from "./render/width.ts";
 import { Viewport } from "./render/viewport.ts";
 import { createInterface } from "node:readline";
@@ -16,9 +16,6 @@ import { PROJECT_DIR, loadDeployment, opsCommand, type Deployment } from "./plat
 import { openLocalFile, stream, trackMaintenance, startQueries, shutdownTui } from "./exec.ts";
 import type { AppApi, Choice, ConfirmSpec, Section, SelectSpec, View, ViewContext } from "./view.ts";
 import { moveSelection, windowStart } from "./views/common.ts";
-
-/** 转圈动画，只在操作进行时显示。 */
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
 const TOAST_MS = 6000;
 
@@ -38,7 +35,6 @@ interface Modal {
 interface ActionPane {
   title: string;
   lines: string[];
-  frame: number;
   done: boolean;
   code: number | null;
   cancel: () => void;
@@ -66,7 +62,7 @@ export class App implements AppApi {
   private dirty = true;
   private paintQueued = false;
   private viewBusy = false;
-  private readonly refreshing = new Set<View>();
+  private readonly refreshing = new Map<View, object>();
   private chromeRevision = 0;
 
   constructor(sections: (Section | View)[], options: { screen?: Screen; deployment?: Deployment; theme?: Theme } = {}) {
@@ -88,13 +84,20 @@ export class App implements AppApi {
       (key) => void this.handleKey(key).catch(error => this.toast("danger", String(error))),
       () => this.redraw()
     );
-    // 每秒一拍：转圈动画、运行时长、提示条过期都靠它，不需要各自计时器。
+    // 加载动画不依赖查询进度；空闲时只在秒数变化或提示过期时重绘。
+    let second = Math.floor(Date.now() / 1000);
     this.timer = setInterval(() => {
-      if (this.action && !this.action.done) this.action.frame++;
-      if (this.toastState && Date.now() - this.toastState.at > TOAST_MS) this.toastState = null;
-      if (this.action || this.toastState || this.service?.startedAt) this.redraw();
+      const now = Date.now();
+      const nextSecond = Math.floor(now / 1000);
+      if (this.toastState && now - this.toastState.at > TOAST_MS) {
+        this.toastState = null;
+        this.redraw();
+      }
+      if ((this.action && !this.action.done) || !this.service || this.currentActivity() ||
+        (this.service.startedAt && nextSecond !== second)) this.redraw();
+      second = nextSecond;
       this.paint();
-    }, 1000);
+    }, SPINNER_INTERVAL_MS);
 
     this.paint();
     try {
@@ -131,10 +134,22 @@ export class App implements AppApi {
       do {
         job.again = false;
         await view.refresh!(this);
-      } while (job.again && this.current === view && !this.quit);
-    })().finally(() => this.refreshes.delete(view));
+      } while (job.again && this.refreshes.get(view) === job && this.current === view && !this.quit);
+    })().finally(() => {
+      // 操作结束后允许立即发起新查询；旧查询的收尾不能删除它。
+      if (this.refreshes.get(view) === job) {
+        this.refreshes.delete(view);
+        this.redraw();
+      }
+    });
     this.refreshes.set(view, job);
     return job.promise;
+  }
+
+  private currentActivity(): string | null {
+    const view = this.current;
+    return view.activity?.() ?? (this.refreshing.has(view) ? `正在刷新${view.label}…`
+      : this.refreshes.has(view) ? `正在读取${view.label}…` : null);
   }
 
   /** 页眉要的那几样：服务是否在应答、代码版本。两者都可能慢，所以并行。 */
@@ -196,12 +211,13 @@ export class App implements AppApi {
    * 它说了什么，比多按一次回车糟糕得多。
    */
   async runInteractive(title: string, args: string[]): Promise<number> {
-    const { command, args: full } = opsCommand(this.deployment.platform, args);
+    const { command, args: full, env } = opsCommand(this.deployment.platform, args);
     let code = 1;
     await this.screen.suspend(async () => {
       process.stdout.write(`\n== ${title} ==\n\n`);
       const child = Bun.spawn([command, ...full], {
         cwd: PROJECT_DIR,
+        env: { ...process.env, ...env },
         stdin: "inherit",
         stdout: "inherit",
         stderr: "inherit",
@@ -272,11 +288,10 @@ export class App implements AppApi {
    * 完整输出保留到面板关闭，可滚动检查；升级构建仍直接使用终端。
    */
   async run(title: string, args: string[]): Promise<number> {
-    const { command, args: full } = opsCommand(this.deployment.platform, args);
+    const { command, args: full, env } = opsCommand(this.deployment.platform, args);
     const pane: ActionPane = {
       title,
       lines: [],
-      frame: 0,
       done: false,
       code: null,
       cancel: () => {},
@@ -294,7 +309,7 @@ export class App implements AppApi {
       const handle = stream(command, full, (line) => {
         pane.lines.push(line);
         this.redraw();
-      }, { cancelMode: readOnly &&
+      }, { env, cancelMode: readOnly &&
         !args.includes("-Repair") && !args.includes("-RestartTunnel") ? "terminate" : "finish" });
       pane.cancel = handle.cancel;
       code = await handle.done;
@@ -312,6 +327,12 @@ export class App implements AppApi {
 
   /** 操作已结束就释放按键通道；状态读取在后台更新，各页面自行限制依赖这些数据的操作。 */
   private refreshAfterOperation(): void {
+    for (const view of this.views) {
+      if (!view.invalidate) continue;
+      view.invalidate();
+      this.refreshes.delete(view);
+      this.refreshing.delete(view);
+    }
     void Promise.all([this.refreshChrome(), this.refreshView(this.current, true)])
       .catch(error => { if (!this.quit) this.toast("warn", `状态刷新失败：${String(error)}`); });
     this.redraw();
@@ -329,13 +350,21 @@ export class App implements AppApi {
   private refreshCurrent(): void {
     const view = this.current;
     if (this.refreshing.has(view)) return;
-    this.refreshing.add(view);
+    const refresh = {};
+    this.refreshing.set(view, refresh);
     this.toast("busy", `正在刷新${view.label}…`);
     // 菜单和快捷键共用后台刷新；某页的慢体检不占用其他页面的刷新入口。
     void Promise.all([this.refreshChrome(), this.refreshView(view, true)])
-      .then(() => { if (!this.quit && this.current === view) this.toast("ok", `${view.label}已刷新 · ${fmt.clock()}`); })
-      .catch(error => { if (!this.quit && this.current === view) this.toast("warn", `刷新失败：${String(error)}`); })
-      .finally(() => { this.refreshing.delete(view); this.redraw(); });
+      .then(() => {
+        if (this.refreshing.get(view) === refresh && !this.quit && this.current === view) this.toast("ok", `${view.label}已刷新 · ${fmt.clock()}`);
+      })
+      .catch(error => {
+        if (this.refreshing.get(view) === refresh && !this.quit && this.current === view) this.toast("warn", `刷新失败：${String(error)}`);
+      })
+      .finally(() => {
+        if (this.refreshing.get(view) === refresh) this.refreshing.delete(view);
+        this.redraw();
+      });
   }
 
   private async showActions(): Promise<void> {
@@ -555,7 +584,7 @@ export class App implements AppApi {
       this.screen.render([
         "",
         ` 终端太小：当前 ${columns}×${rows}，至少需要 ${MIN_COLUMNS}×${MIN_ROWS}。`,
-        " 请把窗口拉大，或改用 ops.sh / ops.ps1 的命令行子命令。",
+        " 请把窗口拉大，或缩小终端字体后继续使用管理台。",
       ]);
       return;
     }
@@ -583,7 +612,9 @@ export class App implements AppApi {
       ["?", "帮助"],
       ["q", "退出"],
     ];
-    const tail = footer(this.theme, columns, this.toastState, this.current.hints(), keys);
+    const activity = this.currentActivity();
+    const notice = this.toastState?.status === "busy" && !activity ? null : this.toastState;
+    const tail = footer(this.theme, columns, notice ?? (activity ? { status: "busy", text: activity } : null), this.current.hints(), keys);
     const bodyHeight = Math.max(0, rows - chrome.length - tail.length);
 
     const ctx: ViewContext = {
@@ -622,7 +653,7 @@ export class App implements AppApi {
       ? pane.code === 0
         ? `${STATUS.ok.glyph} 完成`
         : `${STATUS.danger.glyph} 退出码 ${pane.code}`
-      : `${SPINNER[pane.frame % SPINNER.length]} 进行中 ${fmt.duration(Date.now() - pane.startedAt)}`;
+      : `${spinner(this.theme)} 进行中 ${fmt.duration(Date.now() - pane.startedAt)}`;
     const color = pane.done ? (pane.code === 0 ? "ok" : "danger") : "accent";
 
     const wrapped = pane.lines.flatMap(line => wrap(line, inner));

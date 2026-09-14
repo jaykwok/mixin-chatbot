@@ -625,12 +625,12 @@ for i in $(seq 1 18); do
         break
     fi
     if [ "$status" = "unhealthy" ]; then
-        print_error "健康检查失败，请检查日志: docker logs mixin-chatbot"
+        print_error "健康检查失败，请查看日志: $(ops_command_hint logs)"
         docker logs --tail 50 mixin-chatbot 2>&1 || true
         exit 1
     fi
     if [ $i -eq 18 ]; then
-        print_error "健康检查超时（90s），请检查日志: docker logs mixin-chatbot"
+        print_error "健康检查超时（90s），请查看日志: $(ops_command_hint logs)"
         docker logs --tail 50 mixin-chatbot 2>&1 || true
         exit 1
     fi
@@ -690,7 +690,7 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
                 fi
             fi
 
-            print_warning "cloudflared 未运行，后台启动 scripts/tunnel/start-tunnel.sh..."
+            print_warning "cloudflared 未运行，正在后台启动隧道连接器..."
             BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh "${tunnel_token_args[@]}" >>"$LOG_DIR/cloudflared.log" 2>&1 9>&- &
             tunnel_launcher_pid=$!
             tunnel_launcher_start="$(process_start_identity "$tunnel_launcher_pid")"
@@ -803,17 +803,19 @@ elif docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo ""
     echo "  内存限制: 512MB | CPU: 1核"
     echo ""
-    echo "  常用命令（推荐走 ops.sh：带健康检查、隧道判断和失败回滚）:"
-    echo "    ./scripts/ops/ops.sh doctor                          # 体检"
-    echo "    ./scripts/ops/ops.sh logs                            # 实时日志"
-    echo "    ./scripts/ops/ops.sh restart                         # 重启"
-    echo "    ./scripts/ops/ops.sh update                          # 升级到 origin/main（提示回车即沿用现有配置）"
+    echo "  常用操作（带健康检查、隧道判断和失败回滚）:"
+    echo "    体检: $(ops_command_hint doctor)"
+    echo "    日志: $(ops_command_hint logs)"
+    echo "    重启: $(ops_command_hint restart)"
+    echo "    升级: $(ops_command_hint update)（提示回车即沿用现有配置）"
     echo ""
-    echo "  底层命令（ops.sh 不适用时排障用）:"
-    echo "    docker logs -f mixin-chatbot                         # 容器层日志"
-    echo "    docker restart mixin-chatbot                         # 直接重启容器"
-    echo "    bash scripts/deploy/deploy.sh                        # 重配 AI 并验证新实例，失败回滚"
-    echo ""
+    if [ "${MIXIN_OPS_TUI:-}" != "1" ]; then
+        echo "  底层命令（ops.sh 不适用时排障用）:"
+        echo "    docker logs -f mixin-chatbot                         # 容器层日志"
+        echo "    docker restart mixin-chatbot                         # 直接重启容器"
+        echo "    bash scripts/deploy/deploy.sh                        # 重配 AI 并验证新实例，失败回滚"
+        echo ""
+    fi
 
     print_status "最近日志:"
     docker logs --tail 10 mixin-chatbot 2>&1

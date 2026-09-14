@@ -82,7 +82,7 @@ function Test-LocalBot {
         Write-Host "正常：机器人已在 :$BotPort 在线。" -ForegroundColor Green
         return $true
     } catch {
-        Write-Host "警告：:$BotPort 无响应；请先通过 scripts\deploy\deploy.ps1 启动机器人（Cloudflare 模式）。" -ForegroundColor Yellow
+        Write-Host "警告：:$BotPort 无响应；请先通过 $(Get-OpsCommandHint 'deploy') 启动机器人（Cloudflare 模式）。" -ForegroundColor Yellow
         return $false
     }
 }
@@ -117,16 +117,15 @@ if ($existingService -and $env:CLOUDFLARED_REINSTALL -ne "1") {
         try { Start-Service "Cloudflared" }
         catch {
             Write-Host "错误：Cloudflared 服务启动失败：$($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "请运行：powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 doctor" -ForegroundColor Yellow
+            Write-Host "请检查：$(Get-OpsCommandHint 'doctor')" -ForegroundColor Yellow
             exit 1
         }
     }
-    Write-Host "现有服务会继续使用已安装的 token；如需替换，请设置 CLOUDFLARED_REINSTALL=1。" -ForegroundColor Yellow
+    Write-Host "现有服务会继续使用已安装的 token；如需替换，请使用 $(Get-OpsCommandHint 'repair-tunnel')。" -ForegroundColor Yellow
     if (-not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
         Write-Host "该服务没有本项目归属标记；切换回直连模式时部署脚本不会自动停止它。" -ForegroundColor Yellow
     }
-    Write-Host "也可以运行：powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 repair-tunnel" -ForegroundColor Yellow
-    Write-Host "完成。检查命令：Get-Service Cloudflared；日志：事件查看器（eventvwr）。" -ForegroundColor Green
+    Write-Host "完成。状态检查：$(Get-OpsCommandHint 'doctor')；隧道日志：Windows 事件查看器。" -ForegroundColor Green
     exit 0
 }
 
@@ -165,11 +164,15 @@ if ($file) {
     if ($null -eq $r) {
         Show-TunnelTokenHelp
         Write-Host "错误：找不到 tunnel token 文件：$file" -ForegroundColor Red
-        Write-Host "  使用优先级：" -ForegroundColor Red
-        Write-Host "    .\scripts\tunnel\start-tunnel.ps1 <token文件>   # 相对或绝对路径" -ForegroundColor Red
-        Write-Host "    `$env:TUNNEL_TOKEN_FILE='<路径>'             # 指定 token 文件" -ForegroundColor Red
-        Write-Host "    `$env:TUNNEL_TOKEN='<裸 token>'             # 直接提供 token 值" -ForegroundColor Red
-        Write-Host "    默认：data\config\tunnel-token          # 裸 token 或 .env 文件" -ForegroundColor Red
+        if ($env:MIXIN_OPS_TUI -eq '1') {
+            Write-Host "  在部署向导的「隧道 token 文件」中填写已有文件路径，或将 token 保存到 data\config\tunnel-token 后直接回车。" -ForegroundColor Red
+        } else {
+            Write-Host "  使用优先级：" -ForegroundColor Red
+            Write-Host "    .\scripts\tunnel\start-tunnel.ps1 <token文件>   # 相对或绝对路径" -ForegroundColor Red
+            Write-Host "    `$env:TUNNEL_TOKEN_FILE='<路径>'             # 指定 token 文件" -ForegroundColor Red
+            Write-Host "    `$env:TUNNEL_TOKEN='<裸 token>'             # 直接提供 token 值" -ForegroundColor Red
+            Write-Host "    默认：data\config\tunnel-token          # 裸 token 或 .env 文件" -ForegroundColor Red
+        }
         Write-Host "  （包含 TUNNEL_TOKEN=<值> 的 .env 文件可直接使用）" -ForegroundColor Red
         exit 1
     }
@@ -203,7 +206,7 @@ if (-not $botOnline -and $env:TUNNEL_ALLOW_NO_BOT -ne "1") {
     Write-Host "连上之后 Cloudflare 会把流量分给它，而它无处可转发，只会返回 502；" -ForegroundColor Red
     Write-Host "如果隧道里还有正常的连接器，表现就是时好时坏，非常难查。" -ForegroundColor Red
     Write-Host ""
-    Write-Host "  · 要在这台机器上部署：先跑 scripts\deploy\deploy.ps1（Cloudflare 模式）再回来。" -ForegroundColor Yellow
+    Write-Host "  · 要在这台机器上部署：先使用 $(Get-OpsCommandHint 'deploy')（Cloudflare 模式）再回来。" -ForegroundColor Yellow
     Write-Host "  · 只是想测试本脚本：别用生产 token，用 `$env:TUNNEL_TOKEN 指向一条测试隧道。" -ForegroundColor Yellow
     Write-Host "  · 确认就是要这么连：设置 `$env:TUNNEL_ALLOW_NO_BOT='1' 后重跑。" -ForegroundColor Yellow
     exit 1
@@ -233,7 +236,7 @@ if ($isAdmin) {
         Write-Host 'Cloudflared 服务已配置为开机自启，凭据从受保护文件读取。' -ForegroundColor Green
     } else {
         if ($svc.Status -ne 'Running') { Start-Service Cloudflared }
-        Write-Host '现有服务继续使用原凭据；如需替换，请设置 CLOUDFLARED_REINSTALL=1。' -ForegroundColor Yellow
+        Write-Host "现有服务继续使用原凭据；如需替换，请使用 $(Get-OpsCommandHint 'repair-tunnel')。" -ForegroundColor Yellow
     }
     $installedService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if (-not $installedService) { throw "Cloudflared 服务安装命令已完成，但系统中仍找不到该服务" }
@@ -244,7 +247,7 @@ if ($isAdmin) {
     if ($installedService.Status -ne "Running") { throw "Cloudflared 服务已安装，但未能进入运行状态" }
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     Set-Content -LiteralPath $TunnelManagedFile -Value "Cloudflared" -NoNewline -Encoding ASCII
-    Write-Host "完成。检查命令：Get-Service Cloudflared；日志：事件查看器（eventvwr）。" -ForegroundColor Green
+    Write-Host "完成。状态检查：$(Get-OpsCommandHint 'doctor')；隧道日志：Windows 事件查看器。" -ForegroundColor Green
     $connectorCommitted = $true
     } finally {
         try {

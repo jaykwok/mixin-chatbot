@@ -90,6 +90,10 @@ export interface View {
   actions?(): ViewAction[];
   /** 进入本页或按 r 时调用。 */
   refresh?(app: AppApi): Promise<void>;
+  /** 运维操作结束后丢弃已失效的快照和在途读取；隐藏页面等重入时再加载。 */
+  invalidate?(): void;
+  /** refresh 之外的后台工作；返回提示文字，由 App 持续显示加载动画。 */
+  activity?(): string | null;
   /** 离开时停止轮询；返回 true 表示当前读取已失效，重入时需要补一次刷新。 */
   onLeave?(): boolean | void;
   /** 返回 true 表示按键已被消费，app 不再继续处理。 */

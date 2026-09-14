@@ -544,7 +544,7 @@ function Stop-Bot { return (Stop-ProjectBot $Project $TaskName) }
 
 function Start-Bot {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $t) { Err "找不到计划任务 '$TaskName'；请先运行 scripts\deploy\deploy.ps1"; return $false }
+    if (-not $t) { Err "找不到计划任务 '$TaskName'；请先使用 $(Get-OpsCommandHint 'deploy')"; return $false }
     try {
         if ($t.State -eq "Disabled") { Enable-ScheduledTask -TaskName $TaskName | Out-Null }
         Start-ScheduledTask -TaskName $TaskName | Out-Null
@@ -689,10 +689,10 @@ function Show-Doctor {
         if (Test-Path -LiteralPath $resolvedGroupDataRoot -PathType Container) {
             $rows += New-DoctorRow "群数据总根" "pass" $resolvedGroupDataRoot
         } else {
-            $rows += New-DoctorRow "群数据总根" "fail" "目录不存在：$resolvedGroupDataRoot" "重新运行 scripts\deploy\deploy.ps1 并确认群数据总根。"
+            $rows += New-DoctorRow "群数据总根" "fail" "目录不存在：$resolvedGroupDataRoot" "通过 $(Get-OpsCommandHint 'deploy') 确认群数据总根。"
         }
     } catch {
-        $rows += New-DoctorRow "群数据总根" "fail" "路径无效：$DeployedGroupDataRoot" "重新运行 scripts\deploy\deploy.ps1 并选择有效目录。"
+        $rows += New-DoctorRow "群数据总根" "fail" "路径无效：$DeployedGroupDataRoot" "通过 $(Get-OpsCommandHint 'deploy') 选择有效目录。"
     }
 
     $localStatus = Test-Local
@@ -702,27 +702,27 @@ function Show-Doctor {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $t) {
         if ($localStatus -eq 200 -and $botPids.Count -gt 0) {
-            $rows += New-DoctorRow "计划任务" "warn" "未安装；机器人当前以前台方式运行" "如需开机自启，请在管理员 PowerShell 中运行 scripts\deploy\deploy.ps1。"
+            $rows += New-DoctorRow "计划任务" "warn" "未安装；机器人当前以前台方式运行" "如需开机自启，请以管理员身份使用 $(Get-OpsCommandHint 'deploy')。"
         } else {
-            $rows += New-DoctorRow "计划任务" "fail" "缺少，且没有健康的前台机器人" "请先运行 ops.ps1 foreground，或在管理员 PowerShell 中运行 scripts\deploy\deploy.ps1。"
+            $rows += New-DoctorRow "计划任务" "fail" "缺少，且没有健康的前台机器人" "请以管理员身份使用 $(Get-OpsCommandHint 'deploy')。"
         }
     } else {
         $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
         $taskLogon = if ($t.Principal) { Get-TaskLogonLabel $t.Principal.LogonType } else { "未知登录方式" }
         $taskDetail = "$(Get-TaskStateLabel $t.State)，$taskLogon" + $(if ($taskInfo) { "，上次结果 $(Get-TaskResultHex $taskInfo.LastTaskResult)" } else { "" })
         if ($t.State -eq "Disabled") {
-            $rows += New-DoctorRow "计划任务" "fail" $taskDetail "运行：Enable-ScheduledTask -TaskName $TaskName；然后执行 ops.ps1 start。"
+            $rows += New-DoctorRow "计划任务" "fail" $taskDetail "使用 $(Get-OpsCommandHint 'start')，会启用计划任务并启动机器人。"
         } elseif ($t.State -eq "Running") {
             $rows += New-DoctorRow "计划任务" "pass" $taskDetail
         } elseif ($localStatus -eq 200) {
-            $rows += New-DoctorRow "计划任务" "warn" "$taskDetail；机器人可能在任务外运行" "停止手动启动的机器人，然后执行 ops.ps1 start。"
+            $rows += New-DoctorRow "计划任务" "warn" "$taskDetail；机器人可能在任务外运行" "先通过 $(Get-OpsCommandHint 'stop') 停止手动启动的机器人，再使用 $(Get-OpsCommandHint 'start')。"
         } else {
-            $rows += New-DoctorRow "计划任务" "fail" $taskDetail "执行 ops.ps1 doctor -Repair，或用 ops.ps1 logs 查看日志。"
+            $rows += New-DoctorRow "计划任务" "fail" $taskDetail "使用 $(Get-OpsCommandHint 'doctor -Repair')，或在 $(Get-OpsCommandHint 'logs') 查看日志。"
         }
     }
 
     if ($listeners.Count -eq 0) {
-        $rows += New-DoctorRow "机器人监听 :$Port" "fail" "没有监听" "执行 ops.ps1 doctor -Repair。"
+        $rows += New-DoctorRow "机器人监听 :$Port" "fail" "没有监听" "使用 $(Get-OpsCommandHint 'doctor -Repair')。"
     } else {
         $ownerPids = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { [int]$_ })
         $botOwnerPid = @($ownerPids | Where-Object { $botPids -contains $_ } | Select-Object -First 1)
@@ -730,33 +730,33 @@ function Show-Doctor {
             $rows += New-DoctorRow "机器人监听 :$Port" "pass" "pid $($botOwnerPid[0])（mixin-chatbot）"
         } elseif ($localStatus -eq 200) {
             $ownerList = $ownerPids -join ", "
-            $rows += New-DoctorRow "机器人监听 :$Port" "warn" "pid $ownerList；健康检查有响应但未识别进程身份" "检查：Get-CimInstance Win32_Process，并核对这些 pid。"
+            $rows += New-DoctorRow "机器人监听 :$Port" "warn" "pid $ownerList；健康检查有响应但未识别进程身份" "在 Windows 任务管理器的「详细信息」中核对这些 PID 与命令行；$(Get-OpsCommandHint 'doctor') 可重新检查。"
         } else {
             $ownerList = $ownerPids -join ", "
-            $rows += New-DoctorRow "机器人监听 :$Port" "fail" "pid $ownerList 不是健康的 mixin-chatbot" "检查或停止这些 pid，或使用其他 BOT_PORT 重新部署。"
+            $rows += New-DoctorRow "机器人监听 :$Port" "fail" "pid $ownerList 不是健康的 mixin-chatbot" "在 Windows 任务管理器中核对占用端口的进程，或通过 $(Get-OpsCommandHint 'deploy') 选择其他端口。"
         }
     }
 
-    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } else { "执行 ops.ps1 doctor -Repair，然后用 ops.ps1 logs 查看日志。" })
+    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')，再到 $(Get-OpsCommandHint 'logs') 查看日志。" })
 
     if ($DeployMode -eq "cloudflare") {
         $tokenSource = Get-TunnelTokenSource
         $tokenDetail = if ($tokenSource.Available) { "$($tokenSource.Detail)；仅表示可用于修复，无法证明服务已安装同一 token" } else { $tokenSource.Detail }
-        $rows += New-DoctorRow "隧道 token 来源" $(if ($tokenSource.Available) { "pass" } else { "warn" }) $tokenDetail $(if ($tokenSource.Available) { "" } else { "将 token（裸值或 TUNNEL_TOKEN=...）放入 data\config\tunnel-token，然后执行 ops.ps1 repair-tunnel。" })
+        $rows += New-DoctorRow "隧道 token 来源" $(if ($tokenSource.Available) { "pass" } else { "warn" }) $tokenDetail $(if ($tokenSource.Available) { "" } else { "将 token（裸值或 TUNNEL_TOKEN=...）放入 data\config\tunnel-token，再使用 $(Get-OpsCommandHint 'repair-tunnel')。" })
 
         $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
         $managedTunnel = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
         if (-not $svc) {
-            $rows += New-DoctorRow "Cloudflared 服务" "fail" "未安装" "请在管理员 PowerShell 中执行 ops.ps1 repair-tunnel。"
+            $rows += New-DoctorRow "Cloudflared 服务" "fail" "未安装" "请以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')。"
         } elseif ($svc.Status -eq "Running") {
             if ($managedTunnel) {
                 $rows += New-DoctorRow "Cloudflared 服务" "pass" "运行中（本项目管理）"
             } else {
-                $rows += New-DoctorRow "Cloudflared 服务" "warn" "运行中，但没有本项目归属标记" "确认该服务连接的是当前隧道；需纳入本项目管理时执行 ops.ps1 repair-tunnel。"
+                $rows += New-DoctorRow "Cloudflared 服务" "warn" "运行中，但没有本项目归属标记" "确认该服务连接的是当前隧道；需纳入本项目管理时使用 $(Get-OpsCommandHint 'repair-tunnel')。"
             }
         } else {
             $ownership = if ($managedTunnel) { "本项目管理" } else { "未记录归属" }
-            $rows += New-DoctorRow "Cloudflared 服务" "fail" "$(Get-ServiceStateLabel $svc.Status)（$ownership）" "执行 ops.ps1 doctor -Repair；如果 token 已变化或服务未记录归属，再执行 ops.ps1 repair-tunnel。"
+            $rows += New-DoctorRow "Cloudflared 服务" "fail" "$(Get-ServiceStateLabel $svc.Status)（$ownership）" "使用 $(Get-OpsCommandHint 'doctor -Repair')；如果 token 已变化或服务未记录归属，再使用 $(Get-OpsCommandHint 'repair-tunnel')。"
         }
 
         if ($Domain) {
@@ -769,22 +769,22 @@ function Show-Doctor {
             } elseif ($publicStatus -eq "403") {
                 $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" "HTTP 403（可能是 WAF 策略）" "允许 /favicon.svg 健康检查；按文档只限制 /webhook/ 路径。"
             } elseif ($publicStatus -eq "530" -or $publicStatus -eq "1033") {
-                $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" "HTTP $publicStatus（连接器不可用）" "执行 ops.ps1 repair-tunnel，然后检查 Cloudflare Tunnel hostname/DNS。"
+                $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" "HTTP $publicStatus（连接器不可用）" "使用 $(Get-OpsCommandHint 'repair-tunnel')，然后检查 Cloudflare 控制台的隧道路由与 DNS。"
             } else {
-                $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" $(if ($publicStatus) { "HTTP $publicStatus" } else { "DNS/TLS/连接失败" }) "执行 ops.ps1 repair-tunnel，然后检查 Cloudflare DNS、WAF 和 Published application。"
+                $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" $(if ($publicStatus) { "HTTP $publicStatus" } else { "DNS/TLS/连接失败" }) "使用 $(Get-OpsCommandHint 'repair-tunnel')，然后检查 Cloudflare DNS、WAF 和 Published application。"
             }
         } else {
-            $rows += New-DoctorRow "data/state/bot-domain" "warn" "缺少；跳过公网健康检查" "运行：Set-Content -LiteralPath .\data\state\bot-domain -Value 'bot.example.com' -NoNewline"
-            $rows += New-DoctorRow "公网 CF→隧道→机器人" "warn" "没有 data/state/bot-domain，未测试" "设置 data\state\bot-domain 后重新执行 ops.ps1 doctor。"
+            $rows += New-DoctorRow "data/state/bot-domain" "warn" "缺少；跳过公网健康检查" "通过 $(Get-OpsCommandHint 'deploy') 填写 Cloudflare 公网域名，并在 Cloudflare 控制台配置对应路由。"
+            $rows += New-DoctorRow "公网 CF→隧道→机器人" "warn" "没有 data/state/bot-domain，未测试" "通过 $(Get-OpsCommandHint 'deploy') 设置域名，再使用 $(Get-OpsCommandHint 'doctor')。"
         }
     }
 
     # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
     $modelsOk = Test-ModelConfiguration $Project
-    $rows += New-DoctorRow "模型配置（models.json + Pi 设置）" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } else { "执行 bun run configure。" })
+    $rows += New-DoctorRow "模型配置（models.json + Pi 设置）" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } elseif (-not (Test-Path -LiteralPath $ModelsFile)) { "通过 $(Get-OpsCommandHint 'deploy') 完成首次模型配置。" } else { "模型配置建议：$(Get-OpsCommandHint 'configure')。" })
 
     $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ((Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim() -match "^[0-9a-fA-F]{64}$")
-    $rows += New-DoctorRow "data/config/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "执行 scripts\deploy\deploy.ps1；密钥变化后还必须更新 IM webhook URL。" })
+    $rows += New-DoctorRow "data/config/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "使用 $(Get-OpsCommandHint 'deploy')；密钥变化后还必须更新 IM webhook URL。" })
 
     $rows += Get-RelayDoctorRows
 
@@ -829,7 +829,7 @@ function Show-Doctor {
     }
 
     if ($fail -gt 0) {
-        Warn "可尝试安全自动修复：powershell -ExecutionPolicy Bypass -File .\scripts\ops\ops.ps1 doctor -Repair"
+        Warn "可尝试修复：$(Get-OpsCommandHint 'doctor -Repair')"
         return $false
     } elseif ($warn -gt 0) {
         Warn "必需检查已通过，但仍有警告"
@@ -875,11 +875,11 @@ function Invoke-DoctorRepair {
                 }
             } elseif ($svc -and -not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
                 Err "Cloudflared 服务没有本项目归属标记，doctor 不会自动重启它"
-                Warn "确认 token 后以管理员身份执行 ops.ps1 repair-tunnel，将服务重新安装并纳入本项目管理"
+                Warn "确认 token 后以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')，将服务重新安装并纳入本项目管理"
                 $ok = $false
             } else {
                 Err "Cloudflared 需要修复，但没有可用的 token 来源"
-                Warn "请将 token 放入 data\config\tunnel-token，然后以管理员身份执行 ops.ps1 repair-tunnel"
+                Warn "请将 token 放入 data\config\tunnel-token，然后以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')"
                 $ok = $false
             }
         }
@@ -901,7 +901,7 @@ function Restart-Bot {
     if (-not (Start-Bot)) { return $false }
     $lc = Wait-Local
     if ($lc -eq 200) { Done "机器人已恢复（:$Port 实例身份与就绪检查通过）"; return $true }
-    Warn "本地实例健康检查未通过；请检查 scripts\ops\ops.ps1 logs。"
+    Warn "本地实例健康检查未通过；请在 $(Get-OpsCommandHint 'logs') 查看日志。"
     return $false
 }
 
@@ -911,17 +911,17 @@ function Restart-TunnelService {
     $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if (-not $svc) {
         Err "Cloudflared 服务未安装"
-        Warn "请在管理员 PowerShell 中执行 ops.ps1 repair-tunnel"
+        Warn "请以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')"
         return $false
     }
     if (-not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
         Err "Cloudflared 服务没有本项目归属标记，update 不会自动重启它"
-        Warn "确认该服务属于本项目后，以管理员身份执行 ops.ps1 repair-tunnel"
+        Warn "确认该服务属于本项目后，以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')"
         return $false
     }
     if (-not (IsAdmin)) {
         Err "重启 Cloudflared 服务需要管理员 PowerShell"
-        Warn "请在提升权限的窗口中执行 ops.ps1 update 或 ops.ps1 repair-tunnel"
+        Warn "请在管理员终端中使用 $(Get-OpsCommandHint 'update') 或 $(Get-OpsCommandHint 'repair-tunnel')"
         return $false
     }
     Step "重启 Cloudflared 服务..."
@@ -1040,17 +1040,17 @@ function Show-Logs {
 function Run-Foreground {
     $launcher = Join-Path $RuntimeDir "bot-launcher.ps1"
     if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
-        Err "找不到前台 launcher；请先运行 scripts\deploy\deploy.ps1"
+        Err "找不到前台 launcher；请先使用 $(Get-OpsCommandHint 'deploy')"
         return $false
     }
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task -and $task.State -eq "Running") {
-        Err "计划任务正在运行；请先执行 ops.ps1 stop，再切换到前台模式"
+        Err "计划任务正在运行；请先使用 $(Get-OpsCommandHint 'stop')，再切换到前台模式"
         return $false
     }
     $running = @(Get-BotPids)
     if ($running.Count -gt 0) {
-        Err "机器人已经在运行（pid $($running -join ', ')）；请先执行 ops.ps1 stop"
+        Err "机器人已经在运行（pid $($running -join ', ')）；请先使用 $(Get-OpsCommandHint 'stop')"
         return $false
     }
     Step "以前台方式运行机器人（Ctrl+C 停止）..."
@@ -1166,7 +1166,7 @@ function Uninstall-Bot {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($t -and -not (IsAdmin)) {
         Err "检测到计划任务，但当前权限无法可靠注销；为避免留下指向已删除文件的孤立任务，卸载已停止。"
-        Warn "请以管理员 PowerShell 重新运行 ops.ps1 uninstall。"
+        Warn "请以管理员身份使用 $(Get-OpsCommandHint 'uninstall')。"
         return $false
     }
     if ($t) {
@@ -1258,7 +1258,7 @@ if ($RequestBase64) {
 if ($StorageSegment -and $GroupId) { throw "群目录选择参数互斥" }
 
 if ($Json -and $Command -in @("doctor", "status")) {
-    if ($Repair) { [Console]::Error.WriteLine("-Json 只用于诊断；修复请单独运行 doctor -Repair。"); exit 2 }
+    if ($Repair) { [Console]::Error.WriteLine("-Json 只用于诊断；修复请使用 $(Get-OpsCommandHint 'doctor -Repair')。"); exit 2 }
     $result = Show-Doctor
     Invoke-WithUtf8Output { [Console]::WriteLine(($result | ConvertTo-Json -Depth 4 -Compress)) }
     if ($result.fail -gt 0) { exit 1 }
@@ -1304,7 +1304,7 @@ switch ($Command) {
         if (-not (Start-Bot)) { exit 1 }
         $lc = Wait-Local
         if ($lc -eq 200) { Done "机器人已启动（:$Port 实例身份与就绪检查通过）" }
-        else { Warn "本地实例健康检查未通过；请检查 scripts\ops\ops.ps1 logs。"; exit 1 }
+        else { Warn "本地实例健康检查未通过；请在 $(Get-OpsCommandHint 'logs') 查看日志。"; exit 1 }
     }
     "logs"      {
         if (-not (Test-Path $LogPath)) { Warn "找不到日志文件 $LogPath（机器人可能从未启动）"; exit 1 }

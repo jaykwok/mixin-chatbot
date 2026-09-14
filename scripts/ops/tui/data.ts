@@ -17,7 +17,7 @@ export interface HealthCheck {
   name: string;
   status: "pass" | "warn" | "fail";
   detail: string;
-  /** 修复建议；Windows 侧的体检会给，Linux 侧目前为空。 */
+  /** 修复建议；通过 TUI 调用时使用对应平台的菜单路径。 */
   fix: string;
 }
 
@@ -34,14 +34,14 @@ export interface Health {
  * 超时给到 90 秒：隧道模式下这一步要打公网、探 WebDAV，几次 curl 叠起来很容易超过默认值，
  * 而超时被当成「体检失败」比真失败更难排查。
  */
-export async function loadHealth(deployment: Deployment): Promise<Health> {
-  const { command, args } = opsCommand(deployment.platform, ["doctor", "--json"]);
-  const result = await capture(command, args, { timeout: 90_000 });
+export async function loadHealth(deployment: Deployment, signal?: AbortSignal): Promise<Health> {
+  const { command, args, env } = opsCommand(deployment.platform, ["doctor", "--json"]);
+  const result = await capture(command, args, { timeout: 90_000, signal, env });
   if (result.timedOut) throw new Error("体检超时（90 秒）；隧道或外链后端可能无响应");
-  const health = parseJson<Health>(result, "doctor --json");
+  const health = parseJson<Health>(result, "体检");
   if (!health || !Array.isArray(health.checks) || !health.checks.every(check =>
     check && ["pass", "warn", "fail"].includes(check.status) && typeof check.name === "string" && typeof check.detail === "string"
-  )) throw new Error("doctor 返回了不完整的检查结果");
+  )) throw new Error("体检返回了不完整的检查结果；请在「监控 → 体检」按 r 重试");
   return health;
 }
 

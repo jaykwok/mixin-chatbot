@@ -82,7 +82,8 @@ export function loadDeployment(): Deployment {
  * 所有写操作都转交给它，而不是在 TUI 里重写一遍：容器编排、维护租约、history-clear 的
  * 「停机→清理→恢复原状态」这些逻辑已经在那两个脚本里，抄一遍就是维护两份。
  */
-export function opsCommand(platform: Platform, args: string[]): { command: string; args: string[] } {
+export function opsCommand(platform: Platform, args: string[]): { command: string; args: string[]; env: Record<string, string> } {
+  const env = { MIXIN_OPS_TUI: "1" };
   if (platform === "windows") {
     const request: Record<string, string | number | boolean> = { Command: args[0] ?? "" };
     let i = 1;
@@ -114,11 +115,12 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
     // Only base64 crosses PowerShell's parameter binder. Values are never parsed as switches.
     const encoded = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
     return {
+      env,
       command: "powershell",
       args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(PROJECT_DIR, "scripts", "ops", "ops.ps1"), "-RequestBase64", encoded],
     };
   }
-  return { command: "bash", args: [join(PROJECT_DIR, "scripts", "ops", "ops.sh"), ...args] };
+  return { command: "bash", args: [join(PROJECT_DIR, "scripts", "ops", "ops.sh"), ...args], env };
 }
 
 /** 人话的模式标签，界面和报表共用。 */

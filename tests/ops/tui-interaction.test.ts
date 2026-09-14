@@ -188,6 +188,140 @@ test("连续切换复用正在运行的体检，只有显式刷新才追加一�
   } finally { finishes.forEach(finish => finish()); tty.close(); }
 });
 
+test.each(["已完成", "新检查期间返回", "新检查之后返回", "新检查之后报错"] as const)("部署或修复返回后丢弃旧体检（%s），重入时懒加载最新结果", async timing => {
+  for (const interactive of [true, false]) {
+    const tty = terminal();
+    const view = new HealthView();
+    const old = Promise.withResolvers<tuiData.Health>();
+    const fresh = Promise.withResolvers<tuiData.Health>();
+    const missing: tuiData.Health = { pass: 0, warn: 0, fail: 1, checks: [
+      { name: "本地机器人健康", status: "fail", detail: "首次部署前实例不存在", fix: "请部署" },
+    ] };
+    const healthy: tuiData.Health = { pass: 1, warn: 0, fail: 0, checks: [
+      { name: "本地机器人健康", status: "pass", detail: "就绪且实例身份匹配", fix: "" },
+    ] };
+    const signals: (AbortSignal | undefined)[] = [];
+    const read = spyOn(tuiData, "loadHealth").mockImplementation((_deployment, signal?: AbortSignal) => {
+      signals.push(signal);
+      return signals.length === 1 ? old.promise : fresh.promise;
+    });
+    const app = new App([
+      { id: "home", label: "总览", render: () => [], hints: () => [] }, view,
+      { id: "system", label: "系统", render: () => [], hints: () => [] },
+    ], { screen: tty.screen, deployment: { ...deployment, platform: "windows" } });
+    app["refreshChrome"] = async () => {};
+    // 只模拟外部操作结束，实际运行返回后的刷新和导航；不执行部署或修复。
+    const suspend = spyOn(tty.screen, "suspend").mockResolvedValue(undefined);
+    const stream = spyOn(tuiExec, "stream").mockReturnValue({ done: Promise.resolve(0), cancel() {} });
+    tty.screen.start(() => {}, () => {});
+    try {
+      app.go("health");
+      const oldJob = app["refreshes"].get(view)!.promise;
+      if (timing === "已完成") {
+        old.resolve(missing);
+        await oldJob;
+        expect(plain(view.render(context()))).toContain("首次部署前实例不存在");
+      } else {
+        app["refreshCurrent"](); // 连先前排队的手动刷新也应失效。
+      }
+      app.go("system");
+      if (interactive) await app.runInteractive("首次部署", ["deploy"]);
+      else {
+        await app.run("修复", ["doctor", "-Repair"]);
+        await app["handleKey"](key("enter"));
+      }
+      expect(read).toHaveBeenCalledTimes(1); // 隐藏的体检页不提前运行 doctor。
+      app.go("health");
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(plain(view.render(context()))).not.toContain("首次部署前实例不存在");
+      expect(plain(view.render(context()))).toContain("正在读取");
+      const freshJob = app["refreshes"].get(view)!;
+      if (timing !== "已完成") expect(signals[0]?.aborted).toBe(true);
+      if (timing === "新检查期间返回") {
+        old.resolve(missing);
+        await oldJob;
+        expect(app["refreshes"].get(view)).toBe(freshJob);
+        expect(plain(view.render(context()))).not.toContain("首次部署前实例不存在");
+        expect(app["toastState"]?.text).not.toContain("已刷新");
+      }
+      app.go("system");
+      app.go("health");
+      expect(read).toHaveBeenCalledTimes(2);
+      fresh.resolve(healthy);
+      await freshJob.promise;
+      if (timing === "新检查之后返回") {
+        old.resolve(missing);
+        await oldJob;
+      } else if (timing === "新检查之后报错") {
+        old.reject(new Error("已过期的体检失败"));
+        await oldJob;
+      }
+      expect(view["state"]).toEqual({ kind: "ready", value: healthy });
+      expect(app["refreshes"].size).toBe(0);
+    } finally {
+      old.resolve(missing); fresh.resolve(healthy); await tick();
+      read.mockRestore(); suspend.mockRestore(); stream.mockRestore(); tty.close();
+    }
+  }
+});
+
+test("没有运行时长或提示消息时，初次加载仍持续动画、可导航，完成后停止快速重绘", async () => {
+  const tty = terminal();
+  const view = new HealthView();
+  const result = Promise.withResolvers<tuiData.Health>();
+  const read = spyOn(tuiData, "loadHealth").mockReturnValue(result.promise);
+  const render = spyOn(tty.screen, "render");
+  const app = new App([view, { id: "other", label: "其他", render: () => [], hints: () => [] }],
+    { screen: tty.screen, deployment });
+  app["refreshChrome"] = async () => { app["service"] = { state: "unreachable" }; };
+  const running = app.start();
+  try {
+    const frames = () => new Set(render.mock.calls.flatMap(([lines]) => lines
+      .filter(line => line.includes("正在读取…")).map(line => Bun.stripANSI(line))));
+    expect(app["toastState"]).toBeNull();
+    await waitFor(() => frames().size >= 3, "加载动画连续更新", 1200);
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("other");
+    await app["handleKey"](key("left"));
+    expect(read).toHaveBeenCalledTimes(1);
+    result.resolve({ pass: 0, warn: 0, fail: 0, checks: [] });
+    await waitFor(() => !plain(render.mock.calls.at(-1)![0]).includes("正在读取"), "体检完成后的界面", 1000);
+    const paints = render.mock.calls.length;
+    await Bun.sleep(350);
+    expect(render.mock.calls.length - paints).toBeLessThanOrEqual(1);
+  } finally {
+    result.resolve({ pass: 0, warn: 0, fail: 0, checks: [] });
+    await app["handleKey"](key("q")); await running;
+    read.mockRestore(); render.mockRestore(); tty.close();
+  }
+});
+
+test("统计日期在后台读取时，提示过期后仍持续显示动画", async () => {
+  const tty = terminal();
+  const view = new StatsView();
+  const result = Promise.withResolvers<tuiData.GroupStats[]>();
+  const read = spyOn(tuiData, "loadStatsOverview").mockResolvedValueOnce([]).mockReturnValue(result.promise);
+  const app = new App([view], { screen: tty.screen, deployment });
+  app["refreshChrome"] = async () => { app["service"] = { state: "unreachable" }; };
+  const choose = spyOn(app, "choose").mockResolvedValue("today");
+  const render = spyOn(tty.screen, "render");
+  const running = app.start();
+  try {
+    await tick();
+    await app["handleKey"](key("w"));
+    expect(app["refreshes"].size).toBe(0); // 日期变化不经过 App 的页面刷新队列。
+    app["toastState"]!.at -= 10_000;
+    const frames = () => new Set(render.mock.calls.flatMap(([lines]) => lines
+      .filter(line => line.includes("正在读取统计…")).map(line => Bun.stripANSI(line))));
+    await waitFor(() => frames().size >= 3, "提示过期后的统计加载动画", 1200);
+    result.resolve([]);
+    await waitFor(() => !plain(render.mock.calls.at(-1)![0]).includes("正在读取"), "统计完成后的界面", 1000);
+  } finally {
+    result.resolve([]); await app["handleKey"](key("q")); await running;
+    read.mockRestore(); choose.mockRestore(); render.mockRestore(); tty.close();
+  }
+});
+
 test("回到已取消初次读取的日志页会恢复加载和跟随", async () => {
   const tty = terminal();
   const logs = new LogsView();
@@ -401,7 +535,7 @@ test("完成的执行面板按方向键回看而不关闭，长输出首尾可�
   try {
     app["action"] = {
       title: "测试输出", lines: Array.from({ length: 800 }, (_, i) => `第 ${i} 行 ` + "完整输出".repeat(18)),
-      frame: 0, done: true, code: 0, cancel() {}, startedAt: Date.now(), scroll: new Viewport(true),
+      done: true, code: 0, cancel() {}, startedAt: Date.now(), scroll: new Viewport(true),
     };
     expect(plain(app["renderAction"](80, 24))).toContain("第 799 行");
     await app["handleKey"](key("home"));
@@ -713,6 +847,9 @@ test("报表写入和打开浏览器不阻止导航，也不重复启动同一�
     expect(view.actions().find(action => action.value === "e")?.disabled).toBe(true);
     await app["handleKey"](key("e"));
     expect(write).toHaveBeenCalledTimes(1);
+    app["toastState"] = null;
+    app.redraw(); await tick();
+    expect(plain([tty.text()])).toContain("正在导出报表…");
     await app["handleKey"](key("right"));
     expect(app["current"].id).toBe("other");
     saved.resolve("fixture-report.html");
@@ -722,6 +859,9 @@ test("报表写入和打开浏览器不阻止导航，也不重复启动同一�
     await tick();
     await app["handleKey"](key("o"));
     expect(open).toHaveBeenCalledTimes(1);
+    app["toastState"] = null;
+    app.redraw(); await tick();
+    expect(plain([tty.text()])).toContain("正在打开报表…");
     await app["handleKey"](key("right"));
     expect(app["current"].id).toBe("other");
     opened.resolve();
@@ -752,6 +892,9 @@ test("日志任务扫描不阻止翻阅或切页，离页会取消查询并忽�
     expect(signal?.aborted).toBe(false);
     await app["handleKey"](key("t"));
     expect(capture).toHaveBeenCalledTimes(1);
+    app["toastState"] = null;
+    app.redraw(); await tick();
+    expect(plain([tty.text()])).toContain("正在扫描任务日志…");
     await app["handleKey"](key("home"));
     expect(view["follow"]).toBe(false);
     await app["handleKey"](key("right"));

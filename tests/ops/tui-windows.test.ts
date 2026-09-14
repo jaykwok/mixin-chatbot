@@ -17,18 +17,21 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($env:TUI_TEST_OPS, [re
 if ($errors.Count) { throw 'ops.ps1 syntax error' }
 $common = [Management.Automation.Language.Parser]::ParseFile($env:TUI_TEST_COMMON, [ref]$tokens, [ref]$errors)
 $parts = @($ast.ParamBlock.Extent.Text, '$ErrorActionPreference = "Stop"', '[Console]::OutputEncoding = [Text.Encoding]::GetEncoding(936)')
-$utf8 = $common.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-WithUtf8Output'}, $true)
-$parts += $utf8.Extent.Text
-foreach ($name in @('Show-Doctor', 'Step', 'Done', 'New-DoctorRow', 'Get-DeployModeLabel')) {
+foreach ($name in @('Invoke-WithUtf8Output', 'Get-OpsCommandHint')) {
+    $definition = $common.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
+    $parts += $definition.Extent.Text
+}
+foreach ($name in @('Show-Doctor', 'Step', 'Done', 'Warn', 'New-DoctorRow', 'Get-DeployModeLabel')) {
     $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     if (-not $definition) { throw "missing function $name" }
     $parts += $definition.Extent.Text
 }
 $parts += @'
-$DeployMode = 'direct'
+$DeployMode = if ($env:TUI_TEST_CLOUDFLARE -eq '1') { 'cloudflare' } else { 'direct' }
 $Project = $PSScriptRoot
 $Port = 1011
-$Domain = ''
+$Domain = 'bot.example.com'
+$TunnelManagedFile = Join-Path $PSScriptRoot 'cloudflared-managed'
 $TaskName = 'fixture'
 $DeployedGroupDataRoot = $PSScriptRoot
 $ModelsFile = Join-Path $PSScriptRoot 'data\config\models.json'
@@ -45,6 +48,9 @@ function Get-NetTCPConnection { param($LocalPort, $State, $ErrorAction)
 }
 function Get-ScheduledTask { param($TaskName, $ErrorAction) }
 function Get-RelayDoctorRows { }
+function Get-TunnelTokenSource { return @{ Available = $false; Detail = '测试 token 缺少' } }
+function Get-Service { param($Name, $ErrorAction) }
+function Test-Public { return '530' }
 function Err($message) { [Console]::Error.WriteLine($message) }
 function Start-Bot { Step $env:TUI_TEST_PROGRESS; [Console]::Error.WriteLine($env:TUI_TEST_DIAGNOSTIC); return $true }
 function Wait-Local { return 200 }
@@ -86,13 +92,13 @@ async function fixtureWrapper() {
   });
   const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
   if (code) { await fixture.cleanup(); throw new Error(error); }
-  return { ...fixture, async run(args: string[], health = "pass") {
+  return { ...fixture, async run(args: string[], health = "pass", env: Record<string, string> = {}) {
     const command = opsCommand("windows", args);
     command.args[4] = wrapper;
     const child = Bun.spawn([command.command, ...command.args], {
       stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
-      env: { ...process.env, TUI_TEST_HEALTH: health, TUI_TEST_BUN: process.execPath, TUI_TEST_VALIDATOR: join(PROJECT_DIR, "scripts/config/validate-models.ts"),
-        TUI_TEST_PROGRESS: "正在启动机器人", TUI_TEST_DIAGNOSTIC: "测试诊断：隧道信息" },
+      env: { ...process.env, ...command.env, TUI_TEST_HEALTH: health, TUI_TEST_BUN: process.execPath, TUI_TEST_VALIDATOR: join(PROJECT_DIR, "scripts/config/validate-models.ts"),
+        TUI_TEST_PROGRESS: "正在启动机器人", TUI_TEST_DIAGNOSTIC: "测试诊断：隧道信息", ...env },
     });
     const [stdout, stderr, code] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -136,12 +142,33 @@ windowsTest("Windows TUI 部署入口调用部署脚本并保留失败退出码"
   try {
     await mkdir(join(fixture.root, "scripts/deploy"), { recursive: true });
     for (const code of [0, 17]) {
-      await writeFile(join(fixture.root, "scripts/deploy/deploy.ps1"), '\ufeffWrite-Output "DEPLOY_FIXTURE"\nexit ' + code + '\n');
+      await writeFile(join(fixture.root, "scripts/deploy/deploy.ps1"), '\ufeffWrite-Output "DEPLOY_FIXTURE"\nWrite-Output "TUI=$env:MIXIN_OPS_TUI"\nexit ' + code + '\n');
       const result = await fixture.run(["deploy"]);
       expect(result.stdout).toContain("DEPLOY_FIXTURE"); expect(result.code, result.stderr).toBe(code);
+      expect(result.stdout).toContain("TUI=1");
     }
   } finally { await fixture.cleanup(); }
 }, 15000);
+
+windowsTest("TUI 体检与修复输出使用菜单路径，直接调用仍给命令行建议", async () => {
+  const fixture = await fixtureWrapper();
+  try {
+    for (const tui of ["1", ""]) {
+      const env = { MIXIN_OPS_TUI: tui, TUI_TEST_CLOUDFLARE: "1" };
+      const result = await fixture.run(["doctor", "--json"], "fail", env);
+      expect(result.code, result.stderr).toBe(1);
+      const health = JSON.parse(result.stdout);
+      const fixes = health.checks.map((check: { fix: string }) => check.fix).join("\n");
+      expect(fixes).toContain(tui ? "系统 → 服务部署 → 修复隧道" : "scripts\\ops\\ops.ps1 repair-tunnel");
+      expect(fixes).toContain(tui ? "系统 → 服务部署 → 部署 / 重部署" : "scripts\\ops\\ops.ps1 deploy");
+      expect(fixes).toContain(tui ? "监控 → 日志" : "scripts\\ops\\ops.ps1 logs");
+      if (tui) expect(fixes).not.toMatch(/ops\.ps1|scripts[\\/]|bun run/);
+      const printed = await fixture.run(["doctor"], "fail", env);
+      expect(printed.stdout).toContain(tui ? "系统 → 服务部署 → 修复部署" : "scripts\\ops\\ops.ps1 doctor -Repair");
+      if (tui) expect(printed.stdout).not.toMatch(/ops\.ps1|scripts[\\/]|bun run/);
+    }
+  } finally { await fixture.cleanup(); }
+}, 30000);
 
 windowsTest("Windows TUI 在中文代码页下通过 UTF-8 输出普通进度、诊断和错误", async () => {
   const fixture = await fixtureWrapper();

@@ -204,14 +204,14 @@ Done "bun 版本：$bunVersion"
 
 # 从此处开始才允许修改持久配置、依赖、服务和网络入口。
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) { throw '部署需要管理员 PowerShell；本地前台运行请使用 bun run start。' }
+if (-not $isAdmin) { throw "部署需要管理员权限；请在管理员终端中使用 $(Get-OpsCommandHint 'deploy')。" }
 if ([Version]($bunVersion -replace '-.*$', '') -lt [Version]'1.4.0') { throw '需要 Bun 1.4.0 或更高版本（Windows FFI 进程监督）。' }
 $UvPath = @(Get-ApplicationPaths 'uv.exe' | Where-Object { Test-VersionedApplication $_ '^uv ' } | Select-Object -First 1)
 if ($UvPath.Count -ne 1) { throw '缺少原生 uv.exe，请先安装 uv 并加入 PATH。' }
 $UvDir = Split-Path $UvPath[0] -Parent
 $env:PATH = $UvDir + ';' + $BashDir + ';' + $env:PATH
 if ((Test-Path -LiteralPath $ModelsFile) -and -not (Test-ModelConfiguration $Project)) {
-    throw '模型配置无效；尚未停止旧服务，请运行 bun run configure。'
+    throw "模型配置无效；尚未停止旧服务。配置建议：$(Get-OpsCommandHint 'configure')。"
 }
 $snapshot = New-DeploymentSnapshot $Project $TaskName
 $deploymentCommitted = $false
@@ -628,7 +628,7 @@ $healthy = Wait-BotHealth $Port
 if (-not $healthy) {
     $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
     $lastResult = if ($taskInfo) { "$(Get-ResultCodeHex $taskInfo.LastTaskResult) / $($taskInfo.LastTaskResult)" } else { "未知" }
-    Write-Host "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请查看 logs\mixin-chatbot.log，并运行 scripts\ops\ops.ps1 doctor。" -ForegroundColor Red
+    Write-Host "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请在 $(Get-OpsCommandHint 'logs') 查看日志，并使用 $(Get-OpsCommandHint 'doctor')。" -ForegroundColor Red
     throw "新部署未通过健康检查"
 }
 if ($mode -eq "direct") {
@@ -657,7 +657,7 @@ if ($mode -eq "direct") {
         }
     }
 }
-Done "机器人健康（群数据总根=$GroupDataRoot）。停止请用 scripts\ops\ops.ps1 stop；日志：logs\mixin-chatbot.log"
+Done "机器人健康（群数据总根=$GroupDataRoot）。停止请用 $(Get-OpsCommandHint 'stop')；日志：$(Get-OpsCommandHint 'logs')"
 Warn "任务启动方式：$taskStartDescription。"
 
 # ---- 7b. Cloudflare 模式：确保隧道在线（已有服务则启动，否则调用安装脚本）----
@@ -679,15 +679,15 @@ if ($mode -eq "cloudflare") {
         }
         if ($svc.Status -ne "Running") {
             try { Start-Service "Cloudflared"; Done "Cloudflared 服务已启动（原状态：$(Get-ServiceStateLabel $svc.Status)）。" }
-            catch { Warn "启动 Cloudflared 服务失败：$($_.Exception.Message)。请运行 scripts\ops\ops.ps1 doctor -Repair，并查看事件查看器（eventvwr）。" }
+            catch { Warn "启动 Cloudflared 服务失败：$($_.Exception.Message)。请使用 $(Get-OpsCommandHint 'doctor -Repair')，并查看 Windows 事件查看器。" }
         } else {
             Done "Cloudflared 服务已经在运行。"
         }
         if (Test-Path -LiteralPath $TunnelTokenFile -PathType Leaf) {
-            Warn "检测到 data\config\tunnel-token；现有服务可能仍使用旧 token。token 更新后请执行 scripts\ops\ops.ps1 repair-tunnel。"
+            Warn "检测到 data\config\tunnel-token；现有服务可能仍使用旧 token。token 更新后请使用 $(Get-OpsCommandHint 'repair-tunnel')。"
         }
     } else {
-        Warn "未安装 Cloudflared 服务，将通过 scripts\tunnel\start-tunnel.ps1 安装..."
+        Warn "未安装 Cloudflared 服务，正在进入隧道安装流程..."
         $stPath = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
         $env:BOT_PORT = $Port
         Show-TunnelTokenHelp
@@ -717,7 +717,7 @@ if ($mode -eq "cloudflare") {
     }
     $finalTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if (-not $finalTunnelService -or $finalTunnelService.Status -ne "Running") {
-        Write-Host "Cloudflare 模式部署未完成：Cloudflared 服务没有运行。请执行 scripts\ops\ops.ps1 doctor -Repair。" -ForegroundColor Red
+        Write-Host "Cloudflare 模式部署未完成：Cloudflared 服务没有运行。请使用 $(Get-OpsCommandHint 'doctor -Repair')。" -ForegroundColor Red
         exit 1
     }
     Done "Cloudflared 隧道服务正在运行。"

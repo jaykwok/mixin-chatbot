@@ -1,7 +1,7 @@
 // 视图共用的小零件。放在这里而不是 app.ts，页面就不必为了拿两个排版函数去依赖整个壳层。
 
 import { pad } from "../render/width.ts";
-import { columns as sideBySide, mark, rule, status, table, wrap } from "../render/widgets.ts";
+import { columns as sideBySide, mark, rule, spinner, status, table, wrap } from "../render/widgets.ts";
 import type { StatusName, Theme } from "../render/theme.ts";
 import type { AppApi, Loading, ViewContext } from "../view.ts";
 
@@ -24,7 +24,7 @@ export function pending<T>(
 ): string[] | null {
   if (state.kind === "ready") return null;
   if (state.kind === "loading") {
-    return [gap(columns), pad(`  ${theme.c("accent", "⠹")} ${theme.c("muted", "正在读取…")}`, columns)];
+    return [gap(columns), pad(`  ${spinner(theme)} ${theme.c("muted", "正在读取…")}`, columns)];
   }
   if (state.kind === "error") {
     return [

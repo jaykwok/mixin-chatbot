@@ -79,7 +79,11 @@ if [ -n "$TOKEN_FILE" ]; then
     if [ ! -f "$TOKEN_FILE" ]; then
         show_tunnel_token_help >&2
         echo "✗ 未找到隧道 token 文件：$TOKEN_FILE" >&2
-        echo "  优先级：位置参数 > TUNNEL_TOKEN_FILE > TUNNEL_TOKEN > data/config/tunnel-token" >&2
+        if [ "${MIXIN_OPS_TUI:-}" = "1" ]; then
+            echo "  请在部署向导中填写 token 文件路径，或将 token 保存到 data/config/tunnel-token 后重新部署。" >&2
+        else
+            echo "  优先级：位置参数 > TUNNEL_TOKEN_FILE > TUNNEL_TOKEN > data/config/tunnel-token" >&2
+        fi
         exit 1
     fi
     extract_rc=0
@@ -137,7 +141,7 @@ else
         echo "  连上之后 Cloudflare 会把流量分给它，而它无处可转发，只会返回 502；"
         echo "  如果隧道里还有正常的连接器，表现就是时好时坏，非常难查。"
         echo
-        echo "  · 要在这台机器上部署：先 ./scripts/deploy/deploy.sh（Cloudflare 模式）再回来"
+        echo "  · 要在这台机器上部署：先使用 $(ops_command_hint deploy)（Cloudflare 模式）再回来"
         echo "  · 只是想测试本脚本：别用生产 token，用 TUNNEL_TOKEN 指向一条测试隧道"
         echo "  · 确认就是要这么连：TUNNEL_ALLOW_NO_BOT=1 后重跑"
     } >&2

@@ -1,4 +1,4 @@
-// 组件库。全部是纯函数：给参数，返回若干行，每行显示宽度恰好等于 width。
+// 组件库：给参数，返回若干行，每行显示宽度恰好等于 width。
 //
 // 「每行宽度恰好等于 width」是硬约束。只要有一个组件少给一列，它右边的所有东西都会错位，
 // 而终端不会报错，只会看起来很廉价。所以组件一律自己补齐，调用方不需要关心。
@@ -33,6 +33,8 @@ const FULL = "█";
 const TRACK = "░";
 /** 迷你折线用的高度档位。 */
 const SPARK = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+export const SPINNER_INTERVAL_MS = 100;
 
 /**
  * 带标题的分区细线：`── 待处理 ───────────────── 2 项待关注 ──`
@@ -394,9 +396,15 @@ export function mark(theme: Theme, name: StatusName): string {
   return theme.c(color, glyph);
 }
 
+/** 页面加载、后台查询和执行面板共用时钟，无需逐页维护帧号。 */
+export function spinner(theme: Theme): string {
+  const frame = Math.floor(Date.now() / SPINNER_INTERVAL_MS) % SPINNER.length;
+  return theme.c(STATUS.busy.color, SPINNER[frame]!);
+}
+
 /** 状态标记：符号 + 同色文字。用于页眉、提示行这类单行状态。 */
 export function status(theme: Theme, name: StatusName, text: string): string {
-  return `${mark(theme, name)} ${theme.c(STATUS[name].color, text)}`;
+  return `${name === "busy" ? spinner(theme) : mark(theme, name)} ${theme.c(STATUS[name].color, text)}`;
 }
 
 /** 键名 + 说明 的底部提示条。 */

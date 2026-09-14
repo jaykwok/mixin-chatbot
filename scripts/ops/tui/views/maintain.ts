@@ -49,14 +49,14 @@ const ACTIONS: Action[] = [
         return {
           title: "升级",
           subject: "这份部署不是 git 仓库，无法自动升级",
-          steps: ["请改用 git clone 重新部署后再使用升级"],
+          steps: ["先通过 Git 获取项目，再进入「系统 → 服务部署 → 部署 / 重部署」；之后即可在此升级"],
         };
       }
       if (git.dirty) {
         return {
           title: "升级",
           subject: "已跟踪文件有未提交改动，升级会被拒绝",
-          steps: ["先提交、撤销（git restore <文件>）或备份这些改动，再回来升级"],
+          steps: ["先提交、撤销或备份本地代码改动，再进入「系统 → 服务部署 → 升级」"],
         };
       }
       const steps =
@@ -64,7 +64,7 @@ const ACTIONS: Action[] = [
           ? [
               `快进到 origin/main（${git.behind} 个提交）`,
               app.deployment.runtime === "docker"
-                ? "交给 deploy.sh 重建镜像并切换容器"
+                ? "通过部署向导重建镜像并切换容器"
                 : "重装依赖并重启计划任务",
               "失败时自动回滚代码，并恢复升级前的容器/服务",
               "完成后自动跑一次体检",

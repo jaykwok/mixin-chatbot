@@ -31,6 +31,12 @@ export class StatsView implements View {
 
   constructor(private readonly reportDir?: string) {}
 
+  activity(): string | null {
+    if (this.overview.kind === "loading") return "正在读取统计…";
+    if (this.exporting) return "正在导出报表…";
+    return this.opening ? "正在打开报表…" : null;
+  }
+
   hints(): [string, string][] {
     const keys: [string, string][] = this.detail
       ? [["Esc", "返回"], ["↑↓", "滚动"], ["m", this.unmasked ? "打码" : "显号"]]
@@ -192,7 +198,7 @@ export class StatsView implements View {
   private async openReport(app: AppApi): Promise<void> {
     if (this.opening || !this.lastReport) return;
     this.opening = true;
-    app.redraw();
+    app.toast("busy", "正在打开报表…");
     try { await app.openFile(this.lastReport.path); }
     catch (error) { app.toast("warn", "打开报表失败：" + String(error)); }
     finally { this.opening = false; app.redraw(); }

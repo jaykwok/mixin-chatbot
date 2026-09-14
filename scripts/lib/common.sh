@@ -6,6 +6,25 @@
 # 用法：. "${PROJECT_DIR}/scripts/lib/common.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/lifecycle.sh"
 
+# TUI 中显示菜单路径；命令行调用仍显示可直接执行的命令。
+ops_command_hint() {
+    local command="$1" path=""
+    if [ "${MIXIN_OPS_TUI:-}" = "1" ]; then
+        case "$command" in
+            deploy) path='系统 → 服务部署 → 部署 / 重部署' ;;
+            update) path='系统 → 服务部署 → 升级' ;;
+            start) path='系统 → 服务部署 → 启动' ;;
+            stop) path='系统 → 服务部署 → 停止' ;;
+            restart) path='系统 → 服务部署 → 重启' ;;
+            uninstall) path='系统 → 服务部署 → 卸载' ;;
+            doctor) path='监控 → 体检（按 r 刷新）' ;;
+            logs) path='监控 → 日志' ;;
+        esac
+        if [ -n "$path" ]; then printf '「%s」' "$path"; return; fi
+    fi
+    printf 'scripts/ops/ops.sh %s' "$command"
+}
+
 is_valid_hostname() {
     local hostname="$1"
     [ -n "$hostname" ] && [ "${#hostname}" -le 253 ] || return 1

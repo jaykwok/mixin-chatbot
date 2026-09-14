@@ -111,13 +111,14 @@ json_escape() {
 
 PASS=0; FAIL=0
 check() {
-    local name="$1" ok="$2" detail="$3"
+    local name="$1" ok="$2" detail="$3" fix="${4:-}"
+    [ "$ok" = "1" ] && fix=""
     if [ "$JSON_OUTPUT" = "1" ]; then
         # status 用 pass/warn/fail 三态而不是布尔：Windows 那边的体检本来就分三档，
         # 两个平台吐同一个 schema，界面才不用写两套解析。这边目前只产生 pass 和 fail。
         local row status
         status="$([ "$ok" = "1" ] && echo pass || echo fail)"
-        row="{\"name\":\"$(json_escape "$name")\",\"status\":\"${status}\",\"detail\":\"$(json_escape "$detail")\",\"fix\":\"\"}"
+        row="{\"name\":\"$(json_escape "$name")\",\"status\":\"${status}\",\"detail\":\"$(json_escape "$detail")\",\"fix\":\"$(json_escape "$fix")\"}"
         JSON_ROWS="${JSON_ROWS:+${JSON_ROWS},}${row}"
     fi
     if [ "$ok" = "1" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
@@ -250,7 +251,7 @@ doctor() {
         group_root_ok="1"
         group_root_detail="$resolved_group_root"
     fi
-    check "群数据总根" "$group_root_ok" "$group_root_detail"
+    check "群数据总根" "$group_root_ok" "$group_root_detail" "通过 $(ops_command_hint deploy) 确认群数据目录。"
 
     local cstate="缺少"
     if has_container; then
@@ -259,12 +260,14 @@ doctor() {
     local cstate_label="$cstate"
     [ "$cstate" = "running" ] && cstate_label="运行中"
     [ "$cstate" = "exited" ] && cstate_label="已退出"
-    check "容器" "$([ "$cstate" = "running" ] && echo 1 || echo 0)" "$cstate_label"
+    check "容器" "$([ "$cstate" = "running" ] && echo 1 || echo 0)" "$cstate_label" \
+        "使用 $(ops_command_hint start)；尚未部署时请使用 $(ops_command_hint deploy)。"
     check "部署回滚容器" "$(! has_rollback_container && echo 1 || echo 0)" \
         "$(! has_rollback_container && echo 无 || echo "发现 ${ROLLBACK_CONTAINER}，请确认后恢复或删除")"
 
     if bot_local_ready "$PORT" >/dev/null 2>&1; then check "本地机器人健康" 1 "就绪且实例身份匹配"
-    else check "本地机器人健康" 0 "未就绪或实例身份不匹配"; fi
+    else check "本地机器人健康" 0 "未就绪或实例身份不匹配" \
+        "使用 $(ops_command_hint restart)，再到 $(ops_command_hint logs) 查看日志。"; fi
 
     if [ "$DEPLOY_MODE" = "cloudflare" ]; then
         local crunning="0" cdetail="未运行"
@@ -275,11 +278,12 @@ doctor() {
             crunning="1"; cdetail="未记录归属的 pid $(pgrep -x cloudflared | head -n1)"
             WA "检测到 cloudflared，但它没有本项目 PID 记录；请确认该进程连接的是当前隧道"
         fi
-        check "cloudflared 运行状态" "$crunning" "$cdetail"
+        check "cloudflared 运行状态" "$crunning" "$cdetail" "通过 $(ops_command_hint deploy) 选择 Cloudflare 模式，确认 token 并重建隧道。"
 
         if [ -n "$DOMAIN" ]; then
             local pc; pc="$(code_of "https://${DOMAIN}/favicon.svg")"
-            check "公网 CF→隧道→机器人" "$([ "$pc" = "200" ] && echo 1 || echo 0)" "HTTP $pc"
+            check "公网 CF→隧道→机器人" "$([ "$pc" = "200" ] && echo 1 || echo 0)" "HTTP $pc" \
+                "先检查本地实例与隧道；部署修复入口为 $(ops_command_hint deploy)。域名、DNS 和公开路由需在 Cloudflare 控制台核对。"
         else
             WA "BOT_DOMAIN/data/state/bot-domain 未设置，跳过公网健康检查"
         fi
@@ -288,13 +292,15 @@ doctor() {
     # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
     local models_ok="0"
     if [ -s "$MODELS_FILE" ] && validate_model_configuration >/dev/null 2>&1; then models_ok="1"; fi
-    check "模型配置（models.json + Pi 设置）" "$models_ok" "$([ "$models_ok" = "1" ] && echo 有效 || echo '缺少或无效')"
+    check "模型配置（models.json + Pi 设置）" "$models_ok" "$([ "$models_ok" = "1" ] && echo 有效 || echo '缺少或无效')" \
+        "首次配置请使用 $(ops_command_hint deploy)；已有文件无效时，先修正 data/config/models.json 与 data/runtime/pi/settings.json。"
 
     local secret_ok="0"
     [ -f "$WEBHOOK_SECRET_FILE" ] &&
         grep -Eq '^[0-9a-fA-F]{64}$' "$WEBHOOK_SECRET_FILE" &&
         secret_ok="1"
-    check "data/config/webhook-secret" "$secret_ok" "$([ "$secret_ok" = "1" ] && echo 有效 || echo '缺少或无效（生产服务拒绝启动）')"
+    check "data/config/webhook-secret" "$secret_ok" "$([ "$secret_ok" = "1" ] && echo 有效 || echo '缺少或无效（生产服务拒绝启动）')" \
+        "使用 $(ops_command_hint deploy)；密钥变化后还必须更新 IM webhook URL。"
 
     check_relay
 
@@ -308,12 +314,12 @@ doctor() {
     echo ""
     echo -e "结果：${GREEN}${PASS} 项通过${NC}，${RED}${FAIL} 项失败${NC}"
     if [ "$FAIL" -gt 0 ]; then
-        [ "$group_root_ok" = "1" ] || WA "       群数据根失败 -> 重新运行 scripts/deploy/deploy.sh 并确认目录；"
+        [ "$group_root_ok" = "1" ] || WA "       群数据根失败 -> 使用 $(ops_command_hint deploy) 并确认目录；"
         if [ "$DEPLOY_MODE" = "cloudflare" ]; then
             WA "提示：公网 530/1033 通常表示隧道断开；公网 502 表示隧道到达但机器人源站不可用。"
         fi
-        WA "       本地失败 -> 容器未运行（scripts/ops/ops.sh restart）；"
-        WA "       secret 缺少 -> 重新运行 scripts/deploy/deploy.sh"
+        WA "       本地失败 -> 使用 $(ops_command_hint restart)；"
+        WA "       secret 缺少 -> 使用 $(ops_command_hint deploy)"
         return 1
     else
         OK "全部检查通过"
@@ -323,10 +329,10 @@ doctor() {
 
 restart_bot() {
     P "重新启动容器..."
-    if ! has_container; then ER "找不到容器 '$CONTAINER'；请先运行 scripts/deploy/deploy.sh"; return 1; fi
+    if ! has_container; then ER "找不到容器 '$CONTAINER'；请先使用 $(ops_command_hint deploy)"; return 1; fi
     docker restart "$CONTAINER" >/dev/null 2>&1 || { ER "docker restart 失败"; return 1; }
     if wait_for_local; then OK "机器人已恢复（:${PORT} 实例身份与就绪检查通过）"
-    else WA "机器人未通过本地实例健康检查；请尝试 scripts/ops/ops.sh logs"; return 1; fi
+    else WA "机器人未通过本地实例健康检查；请在 $(ops_command_hint logs) 查看日志"; return 1; fi
 }
 
 stop_bot() {
@@ -337,9 +343,9 @@ stop_bot() {
 
 start_bot() {
     P "启动容器..."
-    docker start "$CONTAINER" >/dev/null 2>&1 || { ER "启动失败；请先运行 scripts/deploy/deploy.sh"; return 1; }
+    docker start "$CONTAINER" >/dev/null 2>&1 || { ER "启动失败；请先使用 $(ops_command_hint deploy)"; return 1; }
     if wait_for_local; then OK "机器人已启动（:${PORT} 实例身份与就绪检查通过）"
-    else WA "机器人未通过本地实例健康检查；请尝试 scripts/ops/ops.sh logs"; return 1; fi
+    else WA "机器人未通过本地实例健康检查；请在 $(ops_command_hint logs) 查看日志"; return 1; fi
 }
 
 # 外链运维交给容器里的 bun 脚本执行，shell 这边只负责把它跑起来。
@@ -581,7 +587,7 @@ update() (
     # 完整存在于 deploy.sh 里。在这里再写一遍等于把最关键的安全逻辑维护成两份，所以直接
     # 交给它；端口、模式、域名、群数据根这些提示都默认沿用当前值，回车即可。
     # 隧道也由 deploy.sh 一并处理，不需要在这里单独重启 cloudflared。
-    P "交给 deploy.sh 重建镜像并切换容器（各项提示直接回车即沿用当前配置）..."
+    P "通过部署向导重建镜像并切换容器（各项提示直接回车即沿用当前配置）..."
     echo ""
     local was_running
     was_running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"

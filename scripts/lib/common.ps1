@@ -4,6 +4,30 @@
 . (Join-Path $PSScriptRoot 'lifecycle.ps1')
 . (Join-Path $PSScriptRoot 'deployment.ps1')
 
+# 交互界面沿用相同运维命令，但建议指向界面中真实存在的入口。
+function Get-OpsCommandHint([string]$Command) {
+    if ($env:MIXIN_OPS_TUI -eq '1') {
+        $paths = @{
+            'deploy' = '系统 → 服务部署 → 部署 / 重部署'
+            'update' = '系统 → 服务部署 → 升级'
+            'start' = '系统 → 服务部署 → 启动'
+            'stop' = '系统 → 服务部署 → 停止'
+            'restart' = '系统 → 服务部署 → 重启'
+            'doctor -Repair' = '系统 → 服务部署 → 修复部署'
+            'repair-tunnel' = '系统 → 服务部署 → 修复隧道'
+            'uninstall' = '系统 → 服务部署 → 卸载'
+            'doctor' = '监控 → 体检（按 r 刷新）'
+            'logs' = '监控 → 日志'
+        }
+        if ($paths.ContainsKey($Command)) { return "「$($paths[$Command])」" }
+        if ($Command -eq 'configure') {
+            return '先修正 data/config/models.json 和 data/runtime/pi/settings.json；配置有效后，可在「系统 → 服务部署 → 部署 / 重部署」重新选择模型'
+        }
+    }
+    if ($Command -eq 'configure') { return 'bun run configure' }
+    return "scripts\ops\ops.ps1 $Command"
+}
+
 # 列出 PATH 上的真实可执行文件，调用方再验证版本并排除 shim。
 function Get-ApplicationPaths([string]$Name) {
     $paths = @()

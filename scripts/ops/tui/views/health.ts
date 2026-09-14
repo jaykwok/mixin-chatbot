@@ -22,6 +22,7 @@ export class HealthView implements View {
   private moved = false;
   private scroll = new Viewport();
   private platform: "windows" | "linux" = "linux";
+  private controller: AbortController | null = null;
 
   hints(): [string, string][] {
     const keys: [string, string][] = this.expanded
@@ -40,12 +41,27 @@ export class HealthView implements View {
     ];
   }
 
+  invalidate(): void {
+    this.controller?.abort();
+    this.controller = null;
+    this.state = { kind: "idle" };
+    this.expanded = false;
+    this.moved = false;
+    this.selected = 0;
+    this.scroll.reset();
+  }
+
   async refresh(app: AppApi): Promise<void> {
+    this.controller?.abort();
+    const controller = new AbortController();
+    this.controller = controller;
     this.platform = app.deployment.platform;
     if (this.state.kind !== "ready") this.state = { kind: "loading" };
     app.redraw();
     try {
-      this.state = { kind: "ready", value: await loadHealth(app.deployment) };
+      const value = await loadHealth(app.deployment, controller.signal);
+      if (this.controller !== controller) return;
+      this.state = { kind: "ready", value };
       this.selected = Math.min(this.selected, Math.max(0, this.state.value.checks.length - 1));
       // 用户还没自己选过时，光标落在第一条不通过的检查上。doctor 的输出是按依赖顺序排的，
       // 不该重排，但一条失败排在八条通过后面时，停在第一行等于把这一页的重点藏了起来。
@@ -55,9 +71,15 @@ export class HealthView implements View {
       }
       if (!this.state.value.checks.length) this.expanded = false;
     } catch (error) {
-      this.state = { kind: "error", message: String(error instanceof Error ? error.message : error) };
+      if (this.controller === controller) {
+        this.state = { kind: "error", message: String(error instanceof Error ? error.message : error) };
+      }
+    } finally {
+      if (this.controller === controller) {
+        this.controller = null;
+        app.redraw();
+      }
     }
-    app.redraw();
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
