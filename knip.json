@@ -2,6 +2,6 @@
   "$schema": "https://unpkg.com/knip@latest/schema.json",
   "ignoreExportsUsedInFile": true,
   "includeEntryExports": true,
-  "entry": ["src/core/process-supervisor.ts!", "scripts/config/*.ts!", "scripts/ops/{*,tui/preview}.ts!", "scripts/runtime/*.ts!", "tests/**/*.test.ts"],
+  "entry": ["src/core/process-supervisor.ts!", "scripts/config/{configure,runtime-settings,validate-models}.ts!", "scripts/ops/{*,tui/preview}.ts!", "scripts/runtime/*.ts!", "tests/**/*.test.ts"],
   "project": ["src/**/*.ts!", "scripts/{config,ops,lib,runtime}/**/*.ts!", "tests/**/*.ts"]
 }

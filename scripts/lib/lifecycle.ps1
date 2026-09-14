@@ -117,7 +117,9 @@ function Stop-ProjectBot([string]$ProjectRoot, [string]$TaskName = 'mixin-chatbo
 function Save-DeploymentFiles([string]$ProjectRoot, [string]$Snapshot) {
     New-Item -ItemType Directory -Force -Path $Snapshot | Out-Null
     Protect-ProjectSecretPath $Snapshot
-    $paths = @('data\config', 'data\runtime\bot-launcher.ps1', 'data\state\bot-port', 'data\state\deploy-mode',
+    # 服务商、选型和动态目录缓存一起恢复，保证回滚后仍能离线解析出原模型。
+    $paths = @('data\config', 'data\runtime\pi\settings.json', 'data\runtime\models-store.json', 'data\runtime\bot-launcher.ps1',
+        'data\state\bot-port', 'data\state\deploy-mode',
         'data\state\bot-domain', 'data\state\group-data-root', 'data\state\cloudflared-managed')
     foreach ($relative in $paths) {
         $source = Join-Path $ProjectRoot $relative

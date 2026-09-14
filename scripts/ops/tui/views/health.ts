@@ -42,7 +42,7 @@ export class HealthView implements View {
 
   async refresh(app: AppApi): Promise<void> {
     this.platform = app.deployment.platform;
-    this.state = { kind: "loading" };
+    if (this.state.kind !== "ready") this.state = { kind: "loading" };
     app.redraw();
     try {
       this.state = { kind: "ready", value: await loadHealth(app.deployment) };

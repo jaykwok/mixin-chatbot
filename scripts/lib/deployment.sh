@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deployment transaction. Call begin_deployment only after read-only preflight succeeds.
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-DEPLOY_FILES=(data/config data/state/bot-port data/state/deploy-mode data/state/bot-domain data/state/group-data-root)
+# 服务商、选型和动态目录缓存一起恢复，保证回滚后的实例仍能离线解析出原模型。
+DEPLOY_FILES=(data/config data/runtime/pi/settings.json data/runtime/models-store.json data/state/bot-port data/state/deploy-mode data/state/bot-domain data/state/group-data-root)
 
 # archive_project_path is shared with ops and tunnel scripts.
 

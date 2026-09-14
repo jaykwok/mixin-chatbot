@@ -1,5 +1,6 @@
 import { assertDataDirectory, byName, dataDirectoryNames, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
 import { readSessionStats } from "../lib/session-stats-cache.ts";
+import { mapConcurrent } from "../lib/concurrent.ts";
 import { addUsage, emptyUsageBreakdown, formatCacheRate, type UsageBreakdown, type UsageTotals } from "../lib/usage.ts";
 // 只读统计仍在 session.jsonl 中的用户消息、模型轮次及成功资料工具结果。
 // 斜杠指令按 commands.ts 排除；未完成的尾行跳过并报告。
@@ -104,14 +105,12 @@ function emptyGroup(group: string): GroupStats {
   };
 }
 
-async function readUser(
-  path: string,
+function readUser(
+  source: Awaited<ReturnType<typeof readSessionStats>>,
   user: string,
   group: GroupStats,
   window: Window
-): Promise<UserStats | null> {
-  let source: Awaited<ReturnType<typeof readSessionStats>>;
-  try { source = await readSessionStats(path); } catch { return null; }
+): UserStats | null {
   group.skipped += source.skipped;
   let provider = "unknown", model = "unknown";
 
@@ -198,8 +197,14 @@ export async function collectGroup(
   const stats = emptyGroup(group);
   const usersDir = join(root, group, "users");
   await assertDataDirectory(join(root, group), root);
-  for (const user of await dataDirectoryNames(usersDir, root)) {
-    const entry = await readUser(join(usersDir, user, HISTORY_FILE), user, stats, window);
+  const users = (await dataDirectoryNames(usersDir, root)).sort(byName);
+  const sources = await mapConcurrent(users, user =>
+    readSessionStats(join(usersDir, user, HISTORY_FILE)).catch(() => null));
+  // Read concurrently, then fold in directory order so maps and floating-point
+  // usage totals cannot depend on which file finished reading first.
+  for (const [index, source] of sources.entries()) {
+    if (!source) continue;
+    const entry = readUser(source, users[index]!, stats, window);
     if (!entry) continue;
     stats.users.push(entry);
     stats.asks += entry.asks;
@@ -259,7 +264,7 @@ function printGroup(stats: GroupStats, window: Window): void {
 
   const toolTotal = [...stats.tools.values()].reduce((sum, n) => sum + n, 0);
   const topTools = [...stats.tools]
-    .sort((a, b) => b[1] - a[1])
+    .sort((a, b) => b[1] - a[1] || byName(a[0], b[0]))
     .slice(0, 5)
     .map(([name, count]) => `${name} ${count}`)
     .join("、");

@@ -1,7 +1,7 @@
 // 替换缓冲区、原始输入和差量重绘。按键序列由 Node readline 处理，支持分块到达的方向键。
 import { emitKeypressEvents, type Key as ReadlineKey } from "node:readline";
 import { truncate } from "./width.ts";
-import { drainMaintenance } from "../exec.ts";
+import { shutdownTui } from "../exec.ts";
 
 const CSI = "\u001b[";
 const ALT_ON = CSI + "?1049h";
@@ -80,8 +80,8 @@ export class Screen {
         process.off("uncaughtException", onFatal);
       }
     };
-    const onSignal = (): void => { if (exiting) return; exiting = true; restore(); void drainMaintenance().then(() => process.exit(130)); };
-    const onFatal = (error: unknown): void => { if (exiting) return; exiting = true; restore(); console.error(error); void drainMaintenance().then(() => process.exit(1)); };
+    const onSignal = (): void => { if (exiting) return; exiting = true; restore(); void shutdownTui().catch(console.error).then(() => process.exit(130)); };
+    const onFatal = (error: unknown): void => { if (exiting) return; exiting = true; restore(); console.error(error); void shutdownTui().catch(console.error).then(() => process.exit(1)); };
     this.restore = restore;
     process.on("exit", restore);
     process.on("SIGINT", onSignal);

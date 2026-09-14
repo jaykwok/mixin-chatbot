@@ -14,7 +14,7 @@ const DEFAULT_GROUP_DATA_ROOT = join(PROJECT_DIR, "data", "groups");
 export const LOG_FILE = join(PROJECT_DIR, "logs", "mixin-chatbot.log");
 
 export type Platform = "windows" | "linux";
-export type DeployMode = "direct" | "cloudflare";
+type DeployMode = "direct" | "cloudflare";
 
 export interface Deployment {
   platform: Platform;

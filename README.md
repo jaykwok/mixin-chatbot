@@ -118,24 +118,24 @@ bash scripts/deploy/deploy.sh
 bash scripts/ops/ops.sh doctor
 ```
 
-模型配置保存在 `data/config/models.json`，使用 Pi 原生 provider，每个实例选择一个服务商和一个模型。`bun run configure` 提供两种方式：
+模型配置全部落在 Pi 自己的两个文件里，格式和校验都归 Pi：`data/config/models.json` 声明服务商、凭证和模型，`data/runtime/pi/settings.json` 记录选中的服务商、模型和推理级别（Pi 的 `defaultProvider` / `defaultModel` / `defaultThinkingLevel`）。每个实例固定用一个模型，不在运行中切换。`bun run configure` 提供两种方式：
 
-- **Pi 内置服务商**：选择服务商、模型并填写 API Key，地址、协议、工具兼容和模型能力由 Pi 提供。可选项来自所安装 Pi 版本的服务商目录，向导只列出使用 API Key 且有可用模型的条目。同一家厂商的不同站点、区域或套餐在目录中可能是彼此独立的服务商 ID，请按实际账号选择；ID 和模型清单会随 Pi 版本变化，以向导当前列出的为准。
-- **自定义服务商**：填写地址、Key 和模型资料，向导支持 `openai-completions`、`openai-responses`、`anthropic-messages`；高级参数遵循 Pi 的 `models.json` 格式。
+- **Pi 内置服务商**：从支持 API Key 的服务商中选择、填 Key，再从刷新后的目录选模型。地址、协议、工具兼容和模型能力由 Pi 随包目录或服务商动态目录提供，不复制到 `models.json`。同一厂商的不同站点、区域或套餐可能使用不同服务商 ID，请按实际账号选择；可选项以向导当前列出的为准。
+- **自定义服务商**：填 provider id、协议、地址和 Key，向导按端点自己返回的清单（OpenAI 兼容为 `GET {baseUrl}/models`）列出模型供选择；端点列不出来时退回手填 id。选中的 id 若在 Pi 目录里有同名模型，上下文、能力和价格会用它预填，由你核对后落盘——中转站的实际价格和限制可能与原厂不同。协议选项来自 Pi 已注册的 api 实现。
 
-顶层 `modelId` 和 `thinkingLevel` 用于本项目选定模型与推理级别，`providers` 交给 Pi 原生加载。旧部署先按[一次性迁移](docs/operations.md#2026-09-13-版本的一次性迁移)处理；仅在需要重新选择模型或修正无法确定的配置时运行 `bun run configure`。内置模式只写凭证，不复制或覆盖目录中的模型定义：
+内置方式的最小 `models.json` 只需凭证：
 
 ```json
 {
-  "modelId": "YOUR_MODEL_ID",
-  "thinkingLevel": "low",
   "providers": {
     "YOUR_PROVIDER_ID": { "apiKey": "YOUR_API_KEY" }
   }
 }
 ```
 
-自定义模式同样需要顶层 `modelId`，并在对应 provider 的 `models` 中声明这个模型。升级 Pi 不会自动更换所选模型，但内置模型资料会跟随所安装的 Pi 版本更新。
+`apiKey` 也可以写成 `$ENV_VAR`、`${VAR}` 或 `!command`，由 Pi 解析。实例不读取磁盘 `auth.json`，凭证统一从 `models.json` 接入。向导保留服务商的 `headers`、`compat`、`authHeader`、`modelOverrides`，以及同一端点、同一模型上未询问的原生字段（如模型级 `headers`、`thinkingLevelMap`、`samplingParams`）。向导在暂存目录中完成配置和校验，取消时保留当前配置，提交失败会恢复原文件。
+
+旧模型配置直接按[重新配置说明](docs/operations.md#重新配置模型)重建；运行时不维护旧顶层选型字段的迁移逻辑。后续换模型或凭证继续运行 `bun run configure`，所选推理级别会同步清除该模型原有的级别覆盖。
 
 首次部署直接创建当前存储结构。后续重复部署时，脚本先暂停已有实例并保存配置、启动定义、依赖或镜像及原运行状态；部署失败会尝试回滚，恢复失败则保留现场并报错。Windows 计划任务优先使用 S4U 开机启动，受系统限制时回退到登录启动，并显示实际方式。
 
@@ -233,9 +233,9 @@ Windows 和 Linux 均在项目根目录运行。需要交互式终端和宿主�
 
 在“数据 → 临时文件”按 `d` 打开天数选择菜单，预览命中的条目和字节数；`Enter` 查看该成员的全部文件及各项的“待归档 / 保留”状态。左右方向键始终用于切换主分区。`p` 只清理选中行对应的群与成员，`a` 处理所有群的所有成员，**不受列表筛选影响**；同一成员在其他群的内容不会被 `p` 清理。文件移入 `backup/rm`，归档后磁盘空间尚未释放。
 
-改动类操作先显示操作范围、步骤和恢复说明，卸载与全量清理还要求手动输入确认词。部署、升级、Linux 重建修复与卸载需要交互，界面会将终端交给运维脚本，结束后按回车返回。维护执行期间按 Esc 会等待关键操作及恢复完成；日志等只读操作可以直接中止。
+改动类操作先显示操作范围、步骤和恢复说明，卸载与全量清理还要求手动输入确认词。部署、升级、Linux 重建修复与卸载需要交互，界面会将终端交给运维脚本，结束后按回车返回。维护执行期间按 Esc 会等待关键操作及恢复完成；日志等只读操作可以直接中止。退出界面会取消后台查询并回收查询进程，仍在执行的维护操作会完成收尾后退出。
 
-部署入口运行当前代码，升级入口先拉取 `origin/main`；操作预览里的提交列表来自上次同步结果。新机器需先安装 Bun 及平台部署所需的环境，之后即可从“系统 → 服务部署”进入部署。一次性数据迁移使用独立脚本，不会在启动或重启时自动修改旧账本格式。
+部署入口运行当前代码，升级入口先拉取 `origin/main`；操作预览里的提交列表来自上次同步结果。新机器需先安装 Bun 及平台部署所需的环境，之后即可从“系统 → 服务部署”进入部署。旧账本格式需要在升级前完成转换，启动或重启不会自动迁移；模型配置重建见[运维手册](docs/operations.md#重新配置模型)。
 
 界面读取宿主机上的部署数据，维护操作复用 `ops.sh` / `ops.ps1`。“监控 → 体检”复用 `doctor --json`（Windows 为 `doctor -Json`）的逐项结果；有失败项时，JSON 接口返回非零退出码。
 
@@ -312,7 +312,7 @@ Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件�
 ```text
 data/
 ├── config/
-│   ├── models.json            模型与凭据
+│   ├── models.json            Pi 原生服务商、凭据与模型定义
 │   ├── runtime.json           持久运行设置
 │   ├── webhook-secret         入站鉴权密钥
 │   ├── relay.json             可选大文件分发配置
@@ -323,7 +323,10 @@ data/
 │   ├── relay.sqlite           远端对象的持久账本
 │   ├── instance.json          实例 PID、启动时间与关闭令牌
 │   └── ...                    部署状态与维护租约
-├── runtime/                   Pi 资源、模型缓存与启动脚本
+├── runtime/
+│   ├── pi/settings.json       Pi 原生选型：服务商、模型与推理级别（需备份）
+│   ├── models-store.json      模型目录缓存，动态目录服务商离线启动时需要
+│   └── ...                    其余 Pi 资源与启动脚本，可重建
 └── groups/<group>/
     ├── workspace/             外部同步的资料源
     ├── index/                 materials.md、扫描 manifest；可选 ignore.txt、parsed/ 文档缓存
@@ -335,7 +338,7 @@ backup/                        为了能撤销某个操作而留的，别顺手�
 ├── snapshots/                 部署、升级与连接器安装的回滚现场
 ├── reports/                   TUI 导出的离线 HTML 报表
 └── rm/                        被移除的旧文件、会话与用户 tmp
-tmp/                           测试隔离 cwd、诊断产物、一次性脚本；整个删掉也不丢东西
+tmp/                           测试隔离 cwd、诊断产物、一次性脚本；无任务使用时可清理
 logs/                          应用日志
 ```
 
@@ -343,7 +346,7 @@ logs/                          应用日志
 
 历史、统计和临时目录命令支持 `--group-id`（原始群号）或 `--storage-segment`（已编码目录段），两者互斥；PowerShell 包装器对应 `-GroupId` / `-StorageSegment`。未指定时自动判断，遇到两个不同群同时匹配则拒绝操作。TUI 会传入明确的目录段。
 
-建议正常停机后备份整个 `data/`，并单独备份外置的 `GROUP_DATA_ROOT`；`data/runtime` 含运行资源和启动文件。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
+建议正常停机后备份整个 `data/`，并单独备份外置的 `GROUP_DATA_ROOT`。`data/runtime/pi/settings.json` 是必须保留的模型选型；`data/runtime/models-store.json` 也应随配置备份，动态目录服务商依赖它离线启动，移除后需重新运行向导联网刷新。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
 
 ### 大文件外链配置
 
@@ -406,7 +409,7 @@ callback key 必须对应一个群。跨群复用会触发持久隔离，并取�
 
 ## 提示词与工具
 
-完整系统提示词在 [prompt.ts](src/agent/prompt.ts) 中维护，通过 Pi 的 `systemPromptOverride` 注入。关闭自动发现 extensions、skills、prompt templates、themes 和上下文文件，避免资料目录中的文件变成工程指令；变化的文件数量、时间和解析状态不进入固定提示词前缀。
+完整系统提示词在 [prompt.ts](src/agent/prompt.ts) 中维护，通过 Pi 的 `systemPromptOverride` 注入。关闭自动发现 extensions、skills、prompt templates、themes 和上下文文件，也不读取群工作区的 `.pi/settings.json`，避免资料目录中的文件改变指令或运行设置；变化的文件数量、时间和解析状态不进入固定提示词前缀。
 
 回答以本群资料为依据，尽可能标明文件、页码或 sheet。有效版本依据正式发布、生效日期和版本说明判断；历史答案与文件修改时间不能证明当前有效。资料内容作为证据处理，原始资料按用户要求直接发送。
 
@@ -457,7 +460,7 @@ bun audit
 
 `scripts/patches/knip@6.29.0.patch` 修复 Knip 对 Bun 脚本 production 入口标记的传递，仅影响开发检查。补丁随检查脚本维护；移除前需同步更新安装引用并通过普通和 production 两种 Knip 检查。
 
-命令行入口放在 `scripts/{config,ops,runtime}` 下的直接子文件，由 `knip.json` 的 glob 统一标成生产入口。运维界面入口是 [tui.ts](scripts/ops/tui.ts)，实现放在 `scripts/ops/tui/`；新增命令沿用这一布局，并通过普通和 production 两种 Knip 检查。
+命令行入口放在 `scripts/{config,ops,runtime}` 下，由 `package.json` 和 `knip.json` 登记为生产入口。配置目录明确列出三个命令入口，辅助模块通过引用纳入检查。运维界面入口是 [tui.ts](scripts/ops/tui.ts)，实现放在 `scripts/ops/tui/`；新增命令时同步更新入口声明，并通过普通和 production 两种 Knip 检查。
 
 `bun run tui:preview [页面] [列] [行]` 用固定的演示数据把任意页面渲染成文本，不读 `data/`，也不需要 TTY；加 `--plain` 去色，用来核对列宽。改动界面排版后用它比对同一份输入前后的样子，本文档的截图也来自同一条渲染路径。渲染层的硬约束是「每个组件吐出的每一行显示宽度精确等于给它的宽度」——差一列不会报错，只会让右边所有东西错位，`tests/ops/tui-render.test.ts` 用中文、全角标点和带色文本压这条不变量。
 

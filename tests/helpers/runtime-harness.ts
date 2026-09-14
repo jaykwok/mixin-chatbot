@@ -36,11 +36,11 @@ let peak = 0;
 let link: (() => void) | undefined;
 const sent: string[] = [];
 
+// SettingsManager 不替换：选型走真实的 Pi 设置读取，由下面写的 settings.json 驱动。
 mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
-  ModelRuntime: { create: async () => ({ getError: () => undefined, getModel: () => ({ id: "fake", provider: "fake", api: "openai-responses" }), checkAuth: async () => true }) },
+  ModelRuntime: { create: async () => ({ getError: () => undefined, getModel: () => ({ id: "fake", provider: "fake", api: "openai-responses", reasoning: false }), checkAuth: async () => true }) },
   DefaultResourceLoader: class { async reload() {} },
   SessionManager: { open: (filename: string) => ({ filename }) },
-  SettingsManager: { inMemory: () => ({}) },
   createAgentSession: async (options: { cwd: string; sessionManager: { filename: string } }) => {
     creating = true;
     await creationGate?.promise;
@@ -88,7 +88,9 @@ mock.module("../../src/integrations/im.ts", () => ({
   },
 }));
 await mkdir("data/config", { recursive: true });
-await writeFile("data/config/models.json", JSON.stringify({ modelId: "fake", providers: { fake: { apiKey: "test-only" } } }));
+await mkdir("data/runtime/pi", { recursive: true });
+await writeFile("data/config/models.json", JSON.stringify({ providers: { fake: { apiKey: "test-only" } } }));
+await writeFile("data/runtime/pi/settings.json", JSON.stringify({ defaultProvider: "fake", defaultModel: "fake" }));
 const runtime = await import("../../src/agent/runtime.ts");
 const { DeliveryStore } = await import("../../src/agent/delivery-store.ts");
 const { stateDatabase } = await import("../../src/core/state.ts");

@@ -35,10 +35,10 @@ const MIN_CHART_ROWS = 3;
 const COLUMN_GAP = 3;
 
 interface Snapshot {
-  today: RecentStats["today"];
+  today: RecentStats["today"] | null;
   trend: DailyPoint[];
-  tmp: UserTmp[];
-  disk: number;
+  tmp: UserTmp[] | null;
+  disk: number | null;
   git: GitState | null;
 }
 
@@ -54,6 +54,10 @@ export class OverviewView implements View {
   readonly label = "总览";
   private state: Loading<Snapshot> = { kind: "idle" };
   private selected = 0;
+  private root: string | undefined;
+  private revision = 0;
+  private loading = new Set<string>();
+  private errors = new Map<string, Todo>();
 
   hints(): [string, string][] {
     return [["↑↓", "选择事项"], ["Enter", "前往处理"]];
@@ -70,27 +74,51 @@ export class OverviewView implements View {
   }
 
   async refresh(app: AppApi): Promise<void> {
-    this.state = { kind: "loading" };
-    app.redraw();
+    const revision = ++this.revision;
     const root = app.deployment.groupDataRoot;
-    try {
-      const [{ today, trend }, tmp, disk, git] = await Promise.all([
-        loadRecentStats(root, TREND_DAYS),
-        loadTmp(root),
-        loadDiskUsage([join(PROJECT_DIR, "data"), root]),
-        loadGit(),
-      ]);
-      this.state = { kind: "ready", value: { today, trend, tmp, disk, git } };
-      this.selected = Math.max(0, Math.min(this.selected, this.todos(this.state.value).length - 1));
-    } catch (error) {
-      this.state = { kind: "error", message: `读取失败：${String(error)}` };
-    }
+    const snapshot: Snapshot = this.state.kind === "ready" && (this.root === undefined || this.root === root) ? { ...this.state.value }
+      : { today: null, trend: [], tmp: null, disk: null, git: null };
+    this.root = root;
+    // "ready" means the page has a snapshot to render, including placeholders.
+    // Per-source loading/errors below track data readiness; navigation stays usable.
+    this.state = { kind: "ready", value: snapshot };
+    this.loading = new Set(["stats", "tmp", "disk", "git"]);
+    this.errors.clear();
     app.redraw();
+
+    // 今日用量、目录和 Git 独立到达；慢扫描不能挡住已经读到的指标与常用入口。
+    const read = async <T>(id: string, label: string, target: string, load: () => Promise<T>, apply: (value: T) => void) => {
+      let update: () => void;
+      try {
+        const value = await load();
+        update = () => apply(value);
+      } catch (error) {
+        update = () => this.errors.set(id, { status: "warn", text: `${label}读取失败：${String(error)}`,
+          hint: target === "stats" ? "统计" : target === "maintain" ? "系统" : "数据", target });
+      }
+      if (revision !== this.revision) return;
+      const selected = this.todos(snapshot)[this.selected];
+      update();
+      const todos = this.todos(snapshot);
+      const index = todos.findIndex(todo => todo.text === selected?.text && todo.target === selected.target);
+      this.selected = index >= 0 ? index : Math.max(0, Math.min(this.selected, todos.length - 1));
+      this.loading.delete(id);
+      app.redraw();
+    };
+    await Promise.all([
+      read("stats", "统计", "stats", () => loadRecentStats(root, TREND_DAYS), value => {
+        snapshot.today = value.today;
+        snapshot.trend = value.trend;
+      }),
+      read("tmp", "临时目录", "storage", () => loadTmp(root), value => { snapshot.tmp = value; }),
+      read("disk", "磁盘占用", "storage", () => loadDiskUsage([join(PROJECT_DIR, "data"), root]), value => { snapshot.disk = value; }),
+      read("git", "版本", "maintain", loadGit, value => { snapshot.git = value; }),
+    ]);
   }
 
   /** 告警按严重度排序在前，常用入口固定在后；attention 只数前半段。 */
   private todos(snapshot: Snapshot): Todo[] {
-    const list: Todo[] = [];
+    const list: Todo[] = [...this.errors.values()];
     const { git } = snapshot;
 
     if (git?.dirty) {
@@ -147,10 +175,10 @@ export class OverviewView implements View {
   private tmpBytes(snapshot: Snapshot): { total: number; stale: number } {
     const cutoff = Date.now() - STALE_DAYS * 86_400_000;
     let stale = 0;
-    for (const user of snapshot.tmp) {
+    for (const user of snapshot.tmp ?? []) {
       for (const entry of user.entries) if (entry.newest <= cutoff) stale += entry.bytes;
     }
-    return { total: snapshot.tmp.reduce((sum, user) => sum + user.bytes, 0), stale };
+    return { total: (snapshot.tmp ?? []).reduce((sum, user) => sum + user.bytes, 0), stale };
   }
 
   onKey(key: { name: string }, app: AppApi): boolean {
@@ -171,10 +199,11 @@ export class OverviewView implements View {
    */
   private tiles(ctx: ViewContext, snapshot: Snapshot): string[] {
     const { theme, width: total } = ctx;
-    const { asks, people, files } = snapshot.today;
+    const { asks, people, files } = snapshot.today ?? { asks: 0, people: 0, files: 0 };
     const trend = snapshot.trend;
     const yesterday = trend.at(-2);
     const { total: tmp } = this.tmpBytes(snapshot);
+    const placeholder = (id: string) => this.errors.has(id) ? "读取失败" : "读取中";
 
     const change = (now: number, before: number | undefined): { text: string } | undefined => {
       if (before === undefined || (before === 0 && now === 0)) return undefined;
@@ -185,18 +214,19 @@ export class OverviewView implements View {
 
     const specs = [
       // 峰值不在这里标：下面趋势图的标题里已经有一个，同一个数字在一屏上出现两次没有意义。
-      { label: "今日提问", value: `${fmt.count(asks)} 次`, delta: change(asks, yesterday?.asks),
+      { label: "今日提问", value: snapshot.today ? `${fmt.count(asks)} 次` : placeholder("stats"), delta: change(asks, yesterday?.asks),
         trend: trend.map(point => point.asks) },
-      { label: "活跃成员", value: `${fmt.count(people)} 人次`, delta: change(people, yesterday?.people),
+      { label: "活跃成员", value: snapshot.today ? `${fmt.count(people)} 人次` : placeholder("stats"), delta: change(people, yesterday?.people),
         trend: trend.map(point => point.people) },
-      { label: "已送附件", value: `${fmt.count(files)} 份`, delta: change(files, yesterday?.files),
+      { label: "已送附件", value: snapshot.today ? `${fmt.count(files)} 份` : placeholder("stats"), delta: change(files, yesterday?.files),
         trend: trend.map(point => point.files) },
       // 磁盘没有历史值，换个更该问的问题：这些占用里临时目录占了多大一块。
       // 只画一段、配一行文字说明它是什么——两段不同颜色而没有图例，等于让颜色单独承载语义，
       // 何况「其中多少可以清理」在下面的待办里已经用整句话写着了。
-      { label: "数据占用", value: fmt.bytes(snapshot.disk),
-        meter: { total: snapshot.disk, segments: [{ value: tmp, color: "accent" as const }] },
-        foot: `tmp ${fmt.bytes(tmp)}` },
+      { label: "数据占用", value: snapshot.disk === null ? placeholder("disk") : fmt.bytes(snapshot.disk),
+        ...(snapshot.disk !== null && snapshot.tmp !== null
+          ? { meter: { total: snapshot.disk, segments: [{ value: tmp, color: "accent" as const }] } } : {}),
+        foot: snapshot.tmp === null ? `tmp ${placeholder("tmp")}` : `tmp ${fmt.bytes(tmp)}` },
     ];
 
     // 左右各留一列装订线，四块之间留两列——指标块没有边框，块与块之间只剩留白在分隔。
@@ -223,7 +253,7 @@ export class OverviewView implements View {
     const bottom = Math.max(listRows, wide ? 6 : 0) + 1;
     const chartRoom = height - out.length - bottom - 2;
 
-    if (chartRoom >= MIN_CHART_ROWS + 2) {
+    if (snapshot.today && chartRoom >= MIN_CHART_ROWS + 2) {
       const peak = Math.max(0, ...snapshot.trend.map(point => point.asks));
       out.push(rule(theme, total, `近 ${TREND_DAYS} 天提问`,
         `峰值 ${peak} · 今日 ${snapshot.today.groups} 群 / ${snapshot.today.images} 图`));
@@ -256,9 +286,11 @@ export class OverviewView implements View {
       }),
     ];
 
+    const version = snapshot.git ? `${snapshot.git.branch}@${fmt.shortSha(snapshot.git.sha)}`
+      : this.loading.has("git") ? "版本读取中" : this.errors.has("git") ? "版本读取失败" : "非 git 部署";
     if (!wide) {
       out.push(...tasks);
-      out.push(pad(` ${theme.c("muted", describeDeployment(ctx, snapshot))}`, total));
+      out.push(pad(` ${theme.c("muted", describeDeployment(ctx, version))}`, total));
       return out;
     }
 
@@ -268,7 +300,7 @@ export class OverviewView implements View {
         ["运行方式", ctx.deployment.runtime === "docker" ? "Docker" : "计划任务"],
         ["监听端口", String(ctx.deployment.port)],
         ["域名", ctx.deployment.domain || "未设置"],
-        ["版本", snapshot.git ? fmt.shortSha(snapshot.git.sha) : "非 git 部署"],
+        ["版本", snapshot.git ? fmt.shortSha(snapshot.git.sha) : version],
         ["分支", snapshot.git?.branch || "—"],
         ["数据根", ctx.deployment.groupDataRootIsCustom ? ctx.deployment.groupDataRoot : "data/groups"],
       ], sideWidth, 9),
@@ -279,11 +311,11 @@ export class OverviewView implements View {
 }
 
 /** 窄窗口下部署信息压成一行，只留需要核对的几项。 */
-function describeDeployment(ctx: ViewContext, snapshot: Snapshot): string {
+function describeDeployment(ctx: ViewContext, version: string): string {
   return [
     ctx.deployment.runtime === "docker" ? "Docker" : "计划任务",
     `:${ctx.deployment.port}`,
     ctx.deployment.domain || "未设域名",
-    snapshot.git ? `${snapshot.git.branch}@${fmt.shortSha(snapshot.git.sha)}` : "非 git 部署",
+    version,
   ].join(" · ");
 }

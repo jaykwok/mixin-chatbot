@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { copyFile, mkdir, readFile, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { capture, stream, drainMaintenance } from "../../scripts/ops/tui/exec.ts";
+import { capture, stream, shutdownTui, startQueries } from "../../scripts/ops/tui/exec.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
@@ -75,7 +75,8 @@ test.skipIf(process.platform !== "win32")("TUI cancellation waits for real histo
       handle = stream("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps], line => {
         if (line === "CLEAR_STARTED") { cancelled = true; handle.cancel(); handle.cancel(); }
       }, { cancelMode: "finish", env: { FIXTURE_MARKERS: markers, FIXTURE_MODE: mode } });
-      await drainMaintenance();
+      await shutdownTui();
+      startQueries();
       expect(await handle.done).toBe(0); expect(cancelled).toBe(true);
       expect(await Bun.file(join(markers, "stopped")).exists()).toBe(true);
       expect(await Bun.file(join(markers, "restored")).exists()).toBe(mode !== "stopped");

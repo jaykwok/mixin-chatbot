@@ -112,11 +112,11 @@ function Test-ProjectBotHealth([string]$ProjectRoot, [int]$ListenPort) {
     } catch { return $false }
 }
 
-function Test-ModelConfiguration([string]$ProjectRoot, [string]$ModelPath) {
+function Test-ModelConfiguration([string]$ProjectRoot) {
     try {
         $bun = @(Get-ApplicationPaths 'bun' | Select-Object -First 1)
         if ($bun.Count -ne 1) { return $false }
-        & $bun[0] run (Join-Path $ProjectRoot 'scripts\config\validate-models.ts') $ModelPath 2>$null | Out-Null
+        & $bun[0] run (Join-Path $ProjectRoot 'scripts\config\validate-models.ts') $ProjectRoot 2>$null | Out-Null
         return $LASTEXITCODE -eq 0
     } catch { return $false }
 }

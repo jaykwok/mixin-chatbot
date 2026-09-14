@@ -13,7 +13,7 @@ import * as fmt from "./render/format.ts";
 import { footer, header, navbar, subnav } from "./frame.ts";
 import { loadGit, probeService, type GitState, type Service } from "./data.ts";
 import { PROJECT_DIR, loadDeployment, opsCommand, type Deployment } from "./platform.ts";
-import { openLocalFile, stream, trackMaintenance } from "./exec.ts";
+import { openLocalFile, stream, trackMaintenance, startQueries, shutdownTui } from "./exec.ts";
 import type { AppApi, Choice, ConfirmSpec, Section, SelectSpec, View, ViewContext } from "./view.ts";
 import { moveSelection, windowStart } from "./views/common.ts";
 
@@ -67,6 +67,7 @@ export class App implements AppApi {
   private paintQueued = false;
   private viewBusy = false;
   private refreshing = false;
+  private chromeRevision = 0;
 
   constructor(sections: (Section | View)[], options: { screen?: Screen; deployment?: Deployment; theme?: Theme } = {}) {
     this.readDeployment = options.deployment ? () => options.deployment! : loadDeployment;
@@ -82,6 +83,7 @@ export class App implements AppApi {
   // ===== 生命周期 =====
 
   async start(): Promise<void> {
+    startQueries();
     this.screen.start(
       (key) => void this.handleKey(key).catch(error => this.toast("danger", String(error))),
       () => this.redraw()
@@ -104,6 +106,7 @@ export class App implements AppApi {
       this.current.onLeave?.();
       if (this.timer) clearInterval(this.timer);
       this.screen.stop();
+      await shutdownTui();
     }
   }
 
@@ -115,7 +118,7 @@ export class App implements AppApi {
     return this.sections.find(section => section.views.some(view => view.id === this.active))!;
   }
 
-  /** 按住方向键来回切换时，同一页面最多运行一次加载；重入请求合并为一次后续刷新。 */
+  /** 导航复用在途读取；只有显式刷新或已取消的读取才追加一次后续刷新。 */
   private refreshView(view: View, again = false): Promise<void> {
     if (!view.refresh) return Promise.resolve();
     const pending = this.refreshes.get(view);
@@ -136,11 +139,20 @@ export class App implements AppApi {
 
   /** 页眉要的那几样：服务是否在应答、代码版本。两者都可能慢，所以并行。 */
   private async refreshChrome(): Promise<void> {
+    const revision = ++this.chromeRevision;
     this.deployment = this.readDeployment();
-    const [service, git] = await Promise.all([probeService(this.deployment.port), loadGit()]);
-    this.service = service;
-    this.git = git;
-    this.redraw();
+    await Promise.all([
+      probeService(this.deployment.port).then(service => {
+        if (revision !== this.chromeRevision || this.quit) return;
+        this.service = service;
+        this.redraw();
+      }),
+      loadGit().then(git => {
+        if (revision !== this.chromeRevision || this.quit) return;
+        this.git = git;
+        this.redraw();
+      }),
+    ]);
   }
 
   // ===== AppApi =====
@@ -163,12 +175,15 @@ export class App implements AppApi {
     const section = this.sections.find(section => section.id === view);
     if (section) view = this.lastView.get(section.id) ?? section.views[0]!.id;
     if (view === this.active || !this.views.some((entry) => entry.id === view)) return;
-    this.current.onLeave?.();
+    if (this.current.onLeave?.()) {
+      const pending = this.refreshes.get(this.current);
+      if (pending) pending.again = true;
+    }
     this.active = view;
     this.lastView.set(this.section.id, view);
     this.redraw();
     const current = this.current;
-    void this.refreshView(current, true).catch(error => {
+    void this.refreshView(current).catch(error => {
       if (this.current === current) this.toast("danger", String(error));
     });
   }

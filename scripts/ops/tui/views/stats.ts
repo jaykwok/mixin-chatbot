@@ -1,4 +1,5 @@
 import { cacheReadRate, formatCacheRate } from "../../../lib/usage.ts";
+import { byName } from "../../../lib/group-data.ts";
 // 统计概览与可滚动明细；导出路径保留到下一次导出，显号只在当前明细内有效。
 import { relative } from "node:path";
 import { bar, columns as sideBySide, rule, status, table, tile, wrap } from "../render/widgets.ts";
@@ -16,6 +17,7 @@ export class StatsView implements View {
   readonly id = "stats";
   readonly label = "统计";
   private overview: Loading<GroupStats[]> = { kind: "idle" };
+  private root: string | undefined;
   private detail: GroupStats | null = null;
   private selected = 0;
   private window: Window = {};
@@ -57,9 +59,18 @@ export class StatsView implements View {
 
   onLeave(): void { this.unmasked = false; }
 
-  async refresh(app: AppApi): Promise<void> {
+  async refresh(app: AppApi, reset = false): Promise<void> {
     const revision = ++this.revision;
-    this.overview = { kind: "loading" };
+    if (this.root !== undefined && this.root !== app.deployment.groupDataRoot) {
+      reset = true;
+      this.detail = null;
+      this.unmasked = false;
+      this.selected = 0;
+      this.scroll.reset();
+      this.filter.clear();
+    }
+    this.root = app.deployment.groupDataRoot;
+    if (reset || this.overview.kind !== "ready") this.overview = { kind: "loading" };
     app.redraw();
     try {
       const groups = await loadStatsOverview(app.deployment.groupDataRoot, this.window);
@@ -129,7 +140,7 @@ export class StatsView implements View {
       this.window = { since: since.getTime(), until: until.getTime() };
     }
     this.scroll.reset();
-    await this.refresh(app);
+    await this.refresh(app, true);
   }
 
   private async pickWindow(app: AppApi): Promise<void> {
@@ -149,7 +160,7 @@ export class StatsView implements View {
     }
     this.window = { since, until };
     this.scroll.reset();
-    await this.refresh(app);
+    await this.refresh(app, true);
     if (this.overview.kind === "ready") app.toast("ok", this.describeWindow());
   }
 
@@ -265,7 +276,7 @@ export class StatsView implements View {
   }
 
   private toolRows(theme: ViewContext["theme"], stats: GroupStats, size: number): string[] {
-    return [...stats.tools].sort((a, b) => b[1] - a[1]).map(([tool, count]) =>
+    return [...stats.tools].sort((a, b) => b[1] - a[1] || byName(a[0], b[0])).map(([tool, count]) =>
       pad(" " + truncate(tool, Math.max(1, size - 9)) +
         pad(theme.c("muted", count + " 次"), Math.max(0, size - 1 - width(truncate(tool, Math.max(1, size - 9)))), "right"), size)
     );

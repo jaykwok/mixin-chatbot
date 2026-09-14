@@ -1,9 +1,99 @@
-import { expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { loadRecentStats, probeService } from "../../scripts/ops/tui/data.ts";
+import { expect, spyOn, test } from "bun:test";
+import { lstat, mkdir, symlink, writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { loadDiskUsage, loadGit, loadHistory, loadRecentStats, loadStatsOverview, loadTmp, probeService } from "../../scripts/ops/tui/data.ts";
+import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import { parseDate } from "../../scripts/ops/stats-admin.ts";
 import { tempFixture } from "../helpers/temp.ts";
+
+test("Git 并发调用共享一次查询，下一次刷新仍读取最新版本", async () => {
+  let done!: (value: tuiExec.RunResult) => void;
+  let sha = "123456789abcdef";
+  const result = (stdout: string): tuiExec.RunResult => ({ code: 0, stdout, stderr: "", timedOut: false });
+  const capture = spyOn(tuiExec, "capture").mockImplementation(async (_command, args) => {
+    if (args[0] === "status") return new Promise(resolve => { done = resolve; });
+    if (args[0] === "rev-parse") return result("main\n");
+    if (args[0] === "rev-list") return result("2\t1\n");
+    return result(args.includes("-1") ? `${sha}\nfixture subject\n` : "abcdef0 incoming subject\n");
+  });
+  try {
+    const first = loadGit();
+    expect(loadGit()).toBe(first);
+    expect(capture).toHaveBeenCalledTimes(4);
+    done(result(" M tracked.ts\n"));
+    expect(await first).toEqual({ branch: "main", sha, subject: "fixture subject", dirty: true, ahead: 2, behind: 1,
+      incoming: [{ sha: "abcdef0", subject: "incoming subject" }] });
+    expect(capture).toHaveBeenCalledTimes(5);
+    sha = "fedcba987654321";
+    const second = loadGit();
+    expect(second).not.toBe(first);
+    done(result(""));
+    expect(await second).toMatchObject({ sha, dirty: false });
+    capture.mockRejectedValue(new Error("git missing"));
+    expect(await loadGit().catch(error => error)).toBeInstanceOf(Error);
+  } finally { capture.mockRestore(); }
+});
+
+test("Git 超时与执行故障显示读取错误，仅明确的非仓库返回空状态", async () => {
+  const capture = spyOn(tuiExec, "capture");
+  try {
+    capture.mockResolvedValue({ code: 124, stdout: "", stderr: "diagnostic", timedOut: true });
+    expect(String(await loadGit().catch(error => error))).toContain("Git 查询超时");
+    capture.mockResolvedValue({ code: 128, stdout: "", stderr: "permission denied", timedOut: false });
+    expect(String(await loadGit().catch(error => error))).toContain("permission denied");
+    capture.mockResolvedValue({ code: 128, stdout: "", stderr: "fatal: not a git repository", timedOut: false });
+    expect(await loadGit()).toBeNull();
+  } finally { capture.mockRestore(); }
+});
+
+test("并发磁盘扫描不重复计算重叠根目录，也不跟随目录链接", async () => {
+  const fixture = await tempFixture("tui-disk-");
+  const data = join(fixture.root, "data");
+  const group = join(data, "groups", "g1");
+  const outside = join(fixture.root, "outside");
+  try {
+    await mkdir(group, { recursive: true });
+    await mkdir(outside);
+    await writeFile(join(outside, "excluded"), "x".repeat(10000));
+    for (let i = 1; i <= 40; i++) await writeFile(join(group, String(i)), "x".repeat(i));
+    const link = join(data, "linked");
+    await symlink(outside, link, process.platform === "win32" ? "junction" : "dir");
+    const expected = 820 + (await lstat(link)).size;
+    expect(await loadDiskUsage([data, group, relative(process.cwd(), data), ...(process.platform === "win32" ? [data.toUpperCase()] : [])])).toBe(expected);
+    expect(await loadDiskUsage([join(fixture.root, "missing")])).toBe(0);
+  } finally { await fixture.cleanup(); }
+});
+
+test("并发扫描多个群和成员时统计、会话字节及深层临时文件总量一致", async () => {
+  const fixture = await tempFixture("tui-parallel-scan-");
+  const now = new Date(2026, 8, 12, 23).getTime();
+  let historyBytes = 0;
+  try {
+    for (let member = 0; member < 12; member++) {
+      const dir = join(fixture.root, `g${Math.floor(member / 4)}`, "users", `u${member}`);
+      const tmp = join(dir, "tmp", "nested");
+      await mkdir(tmp, { recursive: true });
+      const content = Array.from({ length: member + 1 }, () => JSON.stringify({ type: "message",
+        timestamp: new Date(now - 3600000).toISOString(), message: { role: "user", content: [{ type: "text", text: "并发统计" }] } })).join("\n") + "\n";
+      historyBytes += Buffer.byteLength(content);
+      await writeFile(join(dir, "session.jsonl"), content);
+      await Promise.all(Array.from({ length: 20 }, (_, index) => writeFile(join(tmp, `${index}.txt`), "x".repeat(index + 1))));
+    }
+    const [stats, recent, history, tmp, disk] = await Promise.all([
+      loadStatsOverview(fixture.root), loadRecentStats(fixture.root, 3, now), loadHistory(fixture.root),
+      loadTmp(fixture.root), loadDiskUsage([fixture.root]),
+    ]);
+    expect(stats.map(group => group.group)).toEqual(["g2", "g1", "g0"]);
+    expect(stats.reduce((sum, group) => sum + group.asks, 0)).toBe(78);
+    expect(recent.today.asks).toBe(78);
+    expect(recent.today.people).toBe(12);
+    expect(history.reduce((sum, group) => sum + group.bytes, 0)).toBe(historyBytes);
+    expect(history.flatMap(group => group.users)).toHaveLength(12);
+    expect(tmp.reduce((sum, user) => sum + user.files, 0)).toBe(240);
+    expect(tmp.reduce((sum, user) => sum + user.bytes, 0)).toBe(2520);
+    expect(disk).toBe(historyBytes + 2520);
+  } finally { await fixture.cleanup(); }
+});
 
 test("每日提问按消息当天计数，9 次和 1 次不会被平均成 5 次", async () => {
   const fixture = await tempFixture("tui-daily-");

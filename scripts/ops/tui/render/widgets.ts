@@ -113,7 +113,7 @@ export function columns(blocks: string[][], widths: number[], gap = 1): string[]
   return rows;
 }
 
-export interface Column<T> {
+interface Column<T> {
   header: string;
   /** 固定列宽；不给则按 flex 分配剩余宽度。 */
   size?: number;

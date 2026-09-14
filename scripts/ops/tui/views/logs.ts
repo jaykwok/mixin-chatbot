@@ -90,13 +90,14 @@ export class LogsView implements View {
   }
 
   /** 离开本页就停掉轮询：没人看的时候每两秒读一次日志纯属浪费，还会引起无谓的重绘。 */
-  onLeave(): void {
+  onLeave(): true {
     this.revision++;
     this.polling = false;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
+    return true;
   }
 
   private filtered(lines: LogLine[]): LogLine[] {

@@ -210,7 +210,7 @@ $UvPath = @(Get-ApplicationPaths 'uv.exe' | Where-Object { Test-VersionedApplica
 if ($UvPath.Count -ne 1) { throw '缺少原生 uv.exe，请先安装 uv 并加入 PATH。' }
 $UvDir = Split-Path $UvPath[0] -Parent
 $env:PATH = $UvDir + ';' + $BashDir + ';' + $env:PATH
-if ((Test-Path -LiteralPath $ModelsFile) -and -not (Test-ModelConfiguration $Project $ModelsFile)) {
+if ((Test-Path -LiteralPath $ModelsFile) -and -not (Test-ModelConfiguration $Project)) {
     throw '模型配置无效；尚未停止旧服务，请运行 bun run configure。'
 }
 $snapshot = New-DeploymentSnapshot $Project $TaskName
@@ -268,7 +268,7 @@ if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
     }
 }
 
-if (-not (Test-ModelConfiguration $Project $ModelsFile)) { throw '模型配置无效，正在恢复原部署。' }
+if (-not (Test-ModelConfiguration $Project)) { throw '模型配置无效，正在恢复原部署。' }
 
 # ---- 4. webhook 密钥 ----
 $showSecret = $false

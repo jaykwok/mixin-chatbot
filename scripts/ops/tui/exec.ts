@@ -2,6 +2,7 @@
 // 参数通过 argv 传递，维护事务在界面退出前统一等待完成。
 
 import { PROJECT_DIR, type Platform } from "./platform.ts";
+import { QueryPool } from "./exec-client.ts";
 
 export interface RunResult {
   code: number;
@@ -11,12 +12,23 @@ export interface RunResult {
   timedOut: boolean;
 }
 
-interface CaptureOptions {
+export interface CaptureOptions {
   /** 毫秒；到点终止子进程。默认 20 秒。 */
   timeout?: number;
-  env?: Record<string, string>;
+  env?: NodeJS.ProcessEnv;
   /** 喂给子进程 stdin 的内容；不给则关闭 stdin。 */
   input?: string;
+  signal?: AbortSignal;
+}
+
+let queries = new QueryPool();
+export function startQueries(): void { if (queries.closed) queries = new QueryPool(); }
+
+/** 取消只读查询，同时等待维护事务完成恢复；各自的进程生命周期互不影响。 */
+export async function shutdownTui(): Promise<void> {
+  const results = await Promise.allSettled([queries.stop(), drainMaintenance()]);
+  const failure = results.find(result => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
 }
 
 interface StreamOptions {
@@ -31,11 +43,16 @@ interface StreamOptions {
  * stdin 默认关闭而不是继承：继承的话，一条意外要求确认的命令会安静地吃掉用户在 TUI 里
  * 的按键，界面看上去像卡死了。关掉 stdin 让它立刻失败，我们至少能把错误显示出来。
  */
-export async function capture(
+export function capture(
   command: string,
   args: string[],
   options: CaptureOptions = {}
 ): Promise<RunResult> {
+  return queries.capture(command, args, options);
+}
+
+/** 用户主动打开的浏览器必须能在 TUI 退出后继续运行，不纳入查询进程树。 */
+async function launchOpener(command: string, args: string[], options: CaptureOptions = {}): Promise<RunResult> {
   const { timeout = 20_000, env, input } = options;
   const child = Bun.spawn([command, ...args], {
     cwd: PROJECT_DIR,
@@ -77,7 +94,7 @@ export function trackMaintenance(done: Promise<number>): Promise<number> {
   void done.finally(() => maintenance.delete(done)).catch(() => {});
   return done;
 }
-export async function drainMaintenance(): Promise<void> {
+async function drainMaintenance(): Promise<void> {
   await Promise.allSettled([...maintenance]);
 }
 
@@ -149,7 +166,7 @@ export function parseJson<T>(result: RunResult, what: string): T {
 /** 文件路径作为参数或环境变量传递，不拼进 shell 代码。 */
 export async function openLocalFile(path: string, platform: Platform): Promise<void> {
   const result = platform === "windows"
-    ? await capture("powershell", ["-NoProfile", "-NonInteractive", "-Command", "Start-Process -FilePath $env:MIXIN_OPS_OPEN_FILE"], { env: { MIXIN_OPS_OPEN_FILE: path } })
-    : Bun.which("xdg-open") ? await capture("xdg-open", [path]) : null;
+    ? await launchOpener("powershell", ["-NoProfile", "-NonInteractive", "-Command", "Start-Process -FilePath $env:MIXIN_OPS_OPEN_FILE"], { env: { MIXIN_OPS_OPEN_FILE: path } })
+    : Bun.which("xdg-open") ? await launchOpener("xdg-open", [path]) : null;
   if (!result || result.code !== 0 || result.timedOut) throw new Error("当前主机无法打开浏览器；报表路径已保留，可复制到本地查看");
 }

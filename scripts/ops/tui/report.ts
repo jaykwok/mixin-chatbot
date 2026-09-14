@@ -1,4 +1,5 @@
 import { formatCacheRate } from "../../lib/usage.ts";
+import { byName } from "../../lib/group-data.ts";
 // 统计报表导出：一份自包含的静态 HTML。
 //
 // 为什么是静态文件而不是一个网页面板：这份东西的用途是「发给别人看」和「贴进汇报材料」。
@@ -303,7 +304,7 @@ function detailSection(input: ReportInput, stats: GroupStats): string {
   const memberMax = Math.max(0, ...members.map((user) => user.asks));
   const name = (user: string): string => (input.unmasked ? user : fmt.maskUser(user));
 
-  const tools = [...stats.tools].sort((a, b) => b[1] - a[1]);
+  const tools = [...stats.tools].sort((a, b) => b[1] - a[1] || byName(a[0], b[0]));
   const toolMax = Math.max(0, ...tools.map(([, count]) => count));
 
   return `

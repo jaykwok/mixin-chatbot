@@ -14,7 +14,10 @@ const modelId = kind === "zai" ? "glm-5.3-flash" : kind === "legacy" ? "gpt-5.2"
 const providerConfig = kind === "zai" ? { api: "openai-responses", apiKey: "fixture-only", baseUrl: "https://open.bigmodel.cn/api/v1",
   models: [{ id: modelId, contextWindow: 8192, maxTokens: 512, reasoning: false }] } : { apiKey: "fixture-only" };
 await mkdir("data/config", { recursive: true });
-await writeFile("data/config/models.json", JSON.stringify({ modelId, thinkingLevel: "off", providers: { [provider]: providerConfig } }));
+await mkdir("data/runtime/pi", { recursive: true });
+await writeFile("data/config/models.json", JSON.stringify({ providers: { [provider]: providerConfig } }));
+await writeFile("data/runtime/pi/settings.json",
+  JSON.stringify({ defaultProvider: provider, defaultModel: modelId, defaultThinkingLevel: "off" }));
 const createRuntime = sdk.ModelRuntime.create.bind(sdk.ModelRuntime);
 let liveRuntime: any;
 const payloads: any[] = [], forwarded: any[] = [];

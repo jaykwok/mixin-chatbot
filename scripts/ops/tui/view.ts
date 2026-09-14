@@ -90,8 +90,8 @@ export interface View {
   actions?(): ViewAction[];
   /** 进入本页或按 r 时调用。 */
   refresh?(app: AppApi): Promise<void>;
-  /** 离开本页时调用，用来停掉本页自己起的轮询。 */
-  onLeave?(): void;
+  /** 离开时停止轮询；返回 true 表示当前读取已失效，重入时需要补一次刷新。 */
+  onLeave?(): boolean | void;
   /** 返回 true 表示按键已被消费，app 不再继续处理。 */
   onKey?(key: Key, app: AppApi): boolean | Promise<boolean>;
 }

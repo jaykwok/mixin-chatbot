@@ -30,9 +30,9 @@ $Port = 1011
 $Domain = ''
 $TaskName = 'fixture'
 $DeployedGroupDataRoot = $PSScriptRoot
-$ModelsFile = Join-Path $PSScriptRoot 'models.json'
-function Test-ModelConfiguration($project, $path) {
-    & $env:TUI_TEST_BUN $env:TUI_TEST_VALIDATOR $path
+$ModelsFile = Join-Path $PSScriptRoot 'data\config\models.json'
+function Test-ModelConfiguration($project) {
+    & $env:TUI_TEST_BUN $env:TUI_TEST_VALIDATOR $PSScriptRoot
     return $LASTEXITCODE -eq 0
 }
 $WebhookSecretFile = Join-Path $PSScriptRoot 'webhook-secret'
@@ -67,7 +67,14 @@ async function fixtureWrapper() {
   const wrapper = join(fixture.root, "ops-fixture.ps1");
   const builder = join(fixture.root, "build.ps1");
   await writeFile(builder, "\ufeff" + BUILD);
-  await writeFile(join(fixture.root, "models.json"), '{"modelId":"fixture","providers":{"fixture":{}}}');
+  // doctor 的模型检查走真实的离线校验，所以 fixture 要摆出一份 Pi 真能解析的配置：
+  // models.json 只带凭证，选型在项目私有 agent 目录的 settings.json 里。
+  await mkdir(join(fixture.root, "data", "config"), { recursive: true });
+  await mkdir(join(fixture.root, "data", "runtime", "pi"), { recursive: true });
+  await writeFile(join(fixture.root, "data", "config", "models.json"),
+    '{"providers":{"zai-coding-cn":{"apiKey":"test-only"}}}');
+  await writeFile(join(fixture.root, "data", "runtime", "pi", "settings.json"),
+    '{"defaultProvider":"zai-coding-cn","defaultModel":"glm-5.3-flash"}');
   await writeFile(join(fixture.root, "webhook-secret"), "a".repeat(64));
   const child = Bun.spawn(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", builder], {
     stdout: "pipe", stderr: "pipe", windowsHide: true,

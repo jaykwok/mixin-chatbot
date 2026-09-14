@@ -122,10 +122,14 @@ describe("请求失败回执", () => {
   });
 
   test("配置缺失优先于状态码分类", () => {
-    const reply = describeRequestFailure(
-      new Error("无法读取 data/config/models.json。请先生成 AI 配置：运行 bun run configure")
-    );
-    expect(reply).toContain("模型配置有问题");
+    for (const message of [
+      "无法读取 data/config/models.json。请先生成 AI 配置：运行 bun run configure",
+      // Pi 存选型的文件读坏了，同样是配置问题，不该落到通用提示上。
+      "data/runtime/pi/settings.json: JSON Parse error: Expected '}'",
+      "provider zai 未配置可用凭证，请运行 bun run configure",
+    ]) {
+      expect(describeRequestFailure(new Error(message))).toContain("模型配置有问题");
+    }
   });
 
   test("模型生成成功但发送失败时不怪模型", () => {

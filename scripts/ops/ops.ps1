@@ -775,8 +775,9 @@ function Show-Doctor {
         }
     }
 
-    $modelsOk = Test-ModelConfiguration $Project $ModelsFile
-    $rows += New-DoctorRow "data/config/models.json" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } else { "执行 bun run configure。" })
+    # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
+    $modelsOk = Test-ModelConfiguration $Project
+    $rows += New-DoctorRow "模型配置（models.json + Pi 设置）" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } else { "执行 bun run configure。" })
 
     $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ((Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim() -match "^[0-9a-fA-F]{64}$")
     $rows += New-DoctorRow "data/config/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "执行 scripts\deploy\deploy.ps1；密钥变化后还必须更新 IM webhook URL。" })
@@ -976,7 +977,7 @@ function Invoke-Update {
     $target = Invoke-GitCapture @('rev-parse', 'origin/main')
     if ($target.ExitCode -ne 0 -or $target.Text -notmatch '^[0-9a-f]{40}$') { Err '无法识别 origin/main 提交'; return $false }
     $targetSha = $target.Text
-    if (-not (Test-ModelConfiguration $Project $ModelsFile)) { Err '模型配置无效；尚未停止旧服务。'; return $false }
+    if (-not (Test-ModelConfiguration $Project)) { Err '模型配置无效；尚未停止旧服务。'; return $false }
     Step ("提交：{0} -> {1}" -f $originalSha.Substring(0, 7), $targetSha.Substring(0, 7))
     $snapshot = New-DeploymentSnapshot $Project $TaskName
     $committed = $false

@@ -1,13 +1,13 @@
 // Pi local SDK integration. One SessionQueue owns each user's entire task lifecycle.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { clampThinkingLevel, Type, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { Type, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { GROUP_DATA_ROOT, SESSION_IDLE_TTL, RUN_TIMEOUT_MS, MODEL_IDLE_TIMEOUT_MS, MODEL_RESPONSE_TIMEOUT_MS } from "../core/config.ts";
 import { log } from "../core/log.ts";
-import { MODELS_JSON_PATH, MODELS_STORE_PATH, PI_AGENT_DIR, RUNTIME_DIR } from "../core/storage.ts";
+import { PI_AGENT_DIR, RUNTIME_DIR } from "../core/storage.ts";
 import { application, waitFor } from "../core/lifecycle.ts";
 import { archiveFile } from "../core/maintenance.ts";
 import { abortOutboundRequests, getOutboundRateStatus, sendReplyWithMention, sendText } from "../integrations/im.ts";
@@ -25,65 +25,38 @@ import { SessionQueue } from "./session-queue.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { ensureStorageIdentity } from "./storage-identity.ts";
 import { redactSecrets } from "./failure.ts";
-import { validateModelConfig } from "../core/model-config.ts";
+import { openModelRuntime, openSettings, resolveModelSelection } from "../core/model-config.ts";
 import { configureModelCache, type CachePolicy } from "./model-cache.ts";
 import { buildDocumentTool } from "./document-extract.ts";
 import { ModelProgress } from "./model-progress.ts";
 
-// ModelRuntime 单例 + 解析出的单模型。从 data/config/models.json 加载（Pi 原生）。
-let modelRuntime: ModelRuntime | null = null;
-let resolvedModel: Model<Api> | null = null;
-let resolvedThinkingLevel: ModelThinkingLevel = "off";
+// Pi 运行时单例：目录、原生设置的只读快照和选中的模型，全实例共用一份。
 type RuntimeSelection = {
   runtime: ModelRuntime;
+  settings: SettingsManager;
   model: Model<Api>;
   thinkingLevel: ModelThinkingLevel;
 };
+let resolvedRuntime: RuntimeSelection | null = null;
 let runtimePromise: Promise<RuntimeSelection> | null = null;
 
 async function getRuntime(): Promise<RuntimeSelection> {
-  if (modelRuntime && resolvedModel) {
-    return {
-      runtime: modelRuntime,
-      model: resolvedModel,
-      thinkingLevel: resolvedThinkingLevel,
-    };
-  }
+  if (resolvedRuntime) return resolvedRuntime;
   if (runtimePromise) return runtimePromise;
 
   runtimePromise = (async () => {
-    // 显式读 models.json 拿声明的 provider/model id（getProviders() 会混入内置 provider）。
-    const { providerId, modelId, thinkingLevel: configuredThinkingLevel } = validateModelConfig(JSON.parse(readFileSync(MODELS_JSON_PATH, "utf8")));
-
     // Pi 默认把模型目录缓存写在 models.json 旁边；显式指向 data/runtime，让
     // data/config 里只剩用户真正要维护的东西。首次写入前目录必须存在。
     await mkdir(RUNTIME_DIR, { recursive: true });
-    const runtime = await ModelRuntime.create({
-      modelsPath: MODELS_JSON_PATH,
-      modelsStorePath: MODELS_STORE_PATH,
-      signal: application.signal,
-      allowModelNetwork: false,
-    });
-    if (runtime.getError()) throw new Error(`${MODELS_JSON_PATH}: ${runtime.getError()}`);
-    const model = runtime.getModel(providerId, modelId);
-    if (!model) {
-      throw new Error(`${MODELS_JSON_PATH} 中未找到 ${providerId}/${modelId}，请检查配置。`);
-    }
-    const auth = await runtime.checkAuth(providerId);
-    if (!auth) {
-      throw new Error(
-        `${MODELS_JSON_PATH} 中的 provider ${providerId} 未配置可用凭证，请重新运行 configure 工具。`
-      );
-    }
-    const thinkingLevel = clampThinkingLevel(model, configuredThinkingLevel);
+    const runtime = await openModelRuntime({ signal: application.signal });
+    const settings = openSettings();
+    const { model, thinkingLevel } = await resolveModelSelection(runtime, settings, { signal: application.signal });
     configureModelCache(runtime, (runtimeSetting("BOT_MODEL_CACHE_RETENTION") ?? "auto") as CachePolicy);
-    modelRuntime = runtime;
-    resolvedModel = model;
-    resolvedThinkingLevel = thinkingLevel;
+    resolvedRuntime = { runtime, settings, model, thinkingLevel };
     log.info(
-      `Pi ModelRuntime 就绪（provider=${providerId}, model=${modelId}, api=${model.api}, thinkingLevel=${thinkingLevel}, 群数据总根=${GROUP_DATA_ROOT}）`
+      `Pi ModelRuntime 就绪（provider=${model.provider}, model=${model.id}, api=${model.api}, thinkingLevel=${thinkingLevel}, 群数据总根=${GROUP_DATA_ROOT}）`
     );
-    return { runtime, model, thinkingLevel };
+    return resolvedRuntime;
   })();
 
   try {
@@ -169,7 +142,7 @@ async function refreshIndex(record: SessionRecord, signal: AbortSignal): Promise
 async function createSession(record: SessionRecord, signal: AbortSignal): Promise<AgentSession> {
   await ensureStorageIdentity(GROUP_DATA_ROOT, record.groupId, record.phone);
   signal.throwIfAborted();
-  const { runtime, model, thinkingLevel } = await getRuntime();
+  const { runtime, settings: settingsManager, model, thinkingLevel } = await getRuntime();
   signal.throwIfAborted();
   const cwd = resolve(groupWorkspaceDir(GROUP_DATA_ROOT, record.groupId));
   const tempDir = resolve(userTempDir(GROUP_DATA_ROOT, record.groupId, record.phone));
@@ -180,12 +153,6 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
   for (const dir of [cwd, tempDir, dirname(history), PI_AGENT_DIR, groupIndexDir(GROUP_DATA_ROOT, record.groupId)]) {
     await mkdir(dir, { recursive: true });
   }
-  const settingsManager = SettingsManager.inMemory({
-    retry: { enabled: true, maxRetries: 1, baseDelayMs: 1000,
-      provider: { timeoutMs: 120000, maxRetries: 1, maxRetryDelayMs: 5000 } },
-    compaction: { enabled: true }, enableAnalytics: false, enableInstallTelemetry: false,
-    enableSkillCommands: false,
-  });
   const resourceLoader = new DefaultResourceLoader({
     cwd, agentDir: resolve(PI_AGENT_DIR), settingsManager,
     noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,

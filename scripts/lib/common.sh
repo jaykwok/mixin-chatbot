@@ -52,9 +52,9 @@ bot_local_ready() {
 
 validate_model_configuration() {
     if command -v bun >/dev/null 2>&1; then
-        bun run "$PROJECT_DIR/scripts/config/validate-models.ts" "$PROJECT_DIR/data/config/models.json"
+        bun run "$PROJECT_DIR/scripts/config/validate-models.ts" "$PROJECT_DIR"
     else
-        docker run --rm --network none --entrypoint bun -v "$PROJECT_DIR:/audit:ro" mixin-chatbot run /audit/scripts/config/validate-models.ts /audit/data/config/models.json
+        docker run --rm --network none --entrypoint bun -v "$PROJECT_DIR:/audit:ro" mixin-chatbot run /audit/scripts/config/validate-models.ts /audit
     fi
 }
 

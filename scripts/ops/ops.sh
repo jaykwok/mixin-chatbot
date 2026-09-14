@@ -285,9 +285,10 @@ doctor() {
         fi
     fi
 
+    # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
     local models_ok="0"
     if [ -s "$MODELS_FILE" ] && validate_model_configuration >/dev/null 2>&1; then models_ok="1"; fi
-    check "data/config/models.json" "$models_ok" "$([ "$models_ok" = "1" ] && echo 有效 || echo '缺少或无效')"
+    check "模型配置（models.json + Pi 设置）" "$models_ok" "$([ "$models_ok" = "1" ] && echo 有效 || echo '缺少或无效')"
 
     local secret_ok="0"
     [ -f "$WEBHOOK_SECRET_FILE" ] &&

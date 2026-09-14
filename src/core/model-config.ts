@@ -1,30 +1,144 @@
-import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+// Pi 原生模型接线。服务商和凭证来自 models.json，选型来自 Pi settings.json。
+// 启动和 doctor 只读本地配置；只有向导能刷新并提交模型目录缓存。
+import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import {
+  clampThinkingLevel, InMemoryCredentialStore, InMemoryModelsStore,
+  type Api, type Model, type ModelsStoreEntry, type ModelThinkingLevel,
+} from "@earendil-works/pi-ai";
+import { ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { MODELS_JSON_PATH, MODELS_STORE_PATH, PI_SETTINGS_PATH } from "./storage.ts";
 
-/** Offline structural validation shared by startup, doctor and deployment preflight. */
-export function validateModelConfig(value: unknown): { providerId: string; modelId: string; thinkingLevel: ModelThinkingLevel } {
-  const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
-  if (!object(value) || !object(value.providers) || Object.keys(value.providers).length !== 1) throw new Error("models.json 只允许配置一个 provider");
-  const providerId = Object.keys(value.providers)[0]!;
-  const provider = value.providers[providerId];
-  if (!providerId.trim() || !object(provider)) throw new Error("provider 配置必须为对象");
-  const modelId = value.modelId;
-  if (typeof modelId !== "string" || !modelId.trim() || modelId !== modelId.trim()) throw new Error("需指定顶层 modelId；请运行 bun run configure");
-  const thinkingLevel = value.thinkingLevel ?? "off";
-  if (typeof thinkingLevel !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(thinkingLevel)) throw new Error("thinkingLevel 无效");
-  if (provider.models !== undefined) {
-    if (!Array.isArray(provider.models) || provider.models.length !== 1 || !object(provider.models[0]) || provider.models[0].id !== modelId) {
-      throw new Error("自定义 models 必须只声明 modelId 指定的一个模型");
-    }
-    const model = provider.models[0];
-    for (const field of ["contextWindow", "maxTokens"]) {
-      if (model[field] !== undefined && (!Number.isSafeInteger(model[field]) || Number(model[field]) <= 0)) throw new Error(`模型 ${field} 必须为正整数`);
-    }
+// Pi 没有从包入口导出这两个类型，用它自己的方法签名取，避免抄一份结构定义出来。
+type PiSettings = Parameters<SettingsManager["applyOverrides"]>[0];
+type PiSettingsStorage = Parameters<typeof SettingsManager.fromStorage>[0];
+
+/** 与 Pi 的缺省值一致。服务端要在建会话前就把级别定下来并写进日志，所以显式取一次。 */
+const FALLBACK_THINKING_LEVEL: ModelThinkingLevel = "medium";
+
+/**
+ * 运行策略，不进配置文件：这些值和任务超时、失败回执的行为绑在一起，改一个要连带改
+ * 另一个，交给管理员单独调只会调出不一致的组合。
+ */
+const AGENT_SETTINGS: PiSettings = {
+  retry: {
+    enabled: true, maxRetries: 1, baseDelayMs: 1000,
+    provider: { timeoutMs: 120000, maxRetries: 1, maxRetryDelayMs: 5000 },
+  },
+  compaction: { enabled: true },
+  enableAnalytics: false,
+  enableInstallTelemetry: false,
+  enableSkillCommands: false,
+};
+
+interface OpenModelRuntimeOptions {
+  signal?: AbortSignal;
+  modelsPath?: string;
+  modelsStorePath?: string;
+  /** 只供向导的暂存目录使用；其他调用连读取缓存都不申请磁盘锁。 */
+  writableCatalog?: boolean;
+}
+
+/** Pi 的目录缓存是 provider ID 到 ModelsStoreEntry 的映射；恢复到它自己的内存 store。 */
+async function modelCatalogSnapshot(path: string): Promise<InMemoryModelsStore> {
+  const store = new InMemoryModelsStore();
+  let content: string;
+  try {
+    content = await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return store;
+    throw error;
   }
-  if (provider.baseUrl !== undefined) {
-    if (typeof provider.baseUrl !== "string" || !provider.baseUrl.trim()) throw new Error("模型 baseUrl 无效");
-    let url: URL;
-    try { url = new URL(String(provider.baseUrl)); } catch { throw new Error("模型 baseUrl 无效"); }
-    if (!["https:", "http:"].includes(url.protocol)) throw new Error("模型 baseUrl 必须使用 HTTP(S)");
+  const entries = JSON.parse(content.replace(/^\uFEFF/, "")) as Record<string, ModelsStoreEntry>;
+  for (const [providerId, entry] of Object.entries(entries)) await store.write(providerId, entry);
+  return store;
+}
+
+export async function openModelRuntime(options: OpenModelRuntimeOptions = {}): Promise<ModelRuntime> {
+  const modelsPath = options.modelsPath ?? MODELS_JSON_PATH;
+  const modelsStorePath = options.modelsStorePath ?? MODELS_STORE_PATH;
+  const runtime = await ModelRuntime.create({
+    modelsPath,
+    modelsStorePath,
+    modelsStore: options.writableCatalog ? undefined : await modelCatalogSnapshot(modelsStorePath),
+    // 不接入磁盘 auth.json：Key 和环境/命令引用统一由 Pi 从 models.json 解析。
+    credentials: new InMemoryCredentialStore(),
+    allowModelNetwork: false,
+    signal: options.signal,
+  });
+  // Pi 把 models.json 的读取、JSON 和 schema 错误收在 getError() 里，不抛异常。
+  const error = runtime.getError();
+  if (error) throw new Error(`${modelsPath}: ${error}`);
+  return runtime;
+}
+
+/**
+ * 只读的全局设置后端，不访问群工作区，也不创建 proper-lockfile 锁文件。
+ */
+function readOnlySettingsStorage(readGlobal: () => string | undefined): PiSettingsStorage {
+  return {
+    withLock(scope, read) {
+      // 返回值的含义是「把这段内容写回去」，只读视图直接丢掉。
+      read(scope === "global" ? readGlobal() : undefined);
+    },
+  };
+}
+
+/**
+ * Pi 原生设置管理器，全局作用域读项目私有 agent 目录下的 settings.json。
+ *
+ * 项目作用域必须关掉：agent 的 cwd 是群共享工作区，群成员能往里传文件，也就能放一个
+ * .pi/settings.json 进去改模型和运行策略。
+ */
+export function openSettings(path = PI_SETTINGS_PATH): SettingsManager {
+  const settings = SettingsManager.fromStorage(readOnlySettingsStorage(
+    () => existsSync(path) ? readFileSync(path, "utf8") : undefined
+  ), { projectTrusted: false });
+  const failures = settings.drainErrors();
+  // 设置文件坏了就是选型信息坏了，不能退回默认模型继续跑。
+  if (failures.length) {
+    throw new Error(`${path}: ${failures.map((failure) => failure.error.message).join("; ")}`);
   }
-  return { providerId, modelId, thinkingLevel: thinkingLevel as ModelThinkingLevel };
+  // Pi 先解析原生设置，再固定本进程的全局视图。策略必须进入 storage 的内容：
+  // applyOverrides() 会被 SDK 的 resourceLoader.reload() 清掉，且单例会影响其他会话。
+  const configured = settings.getGlobalSettings();
+  const snapshot = JSON.stringify({
+    ...configured,
+    ...AGENT_SETTINGS,
+    compaction: { ...configured.compaction, ...AGENT_SETTINGS.compaction },
+  });
+  return SettingsManager.fromStorage(readOnlySettingsStorage(() => snapshot), { projectTrusted: false });
+}
+
+interface ModelSelection {
+  model: Model<Api>;
+  thinkingLevel: ModelThinkingLevel;
+}
+
+/**
+ * 解析本实例固定使用的那一个模型。
+ *
+ * 不做「取第一个可用模型」的兜底：配置缺失、模型不存在或凭证缺失都必须在启动时报出
+ * 来，而不是换一个管理员没选过的模型去回群消息。
+ */
+export async function resolveModelSelection(
+  runtime: ModelRuntime, settings: SettingsManager, options: { signal?: AbortSignal } = {}
+): Promise<ModelSelection> {
+  const providerId = settings.getDefaultProvider();
+  const modelId = settings.getDefaultModel();
+  if (!providerId || !modelId) {
+    throw new Error(`${PI_SETTINGS_PATH} 未记录 defaultProvider/defaultModel，请运行 bun run configure`);
+  }
+  const model = runtime.getModel(providerId, modelId);
+  if (!model) {
+    throw new Error(`Pi 未提供 ${providerId}/${modelId}，请运行 bun run configure 重新选择`);
+  }
+  const auth = await runtime.checkAuth(providerId, { signal: options.signal });
+  if (!auth) {
+    throw new Error(`provider ${providerId} 未配置可用凭证，请运行 bun run configure`);
+  }
+  const configured = settings.getModelThinkingLevel(providerId, modelId)
+    ?? settings.getDefaultThinkingLevel()
+    ?? FALLBACK_THINKING_LEVEL;
+  return { model, thinkingLevel: clampThinkingLevel(model, configured) };
 }

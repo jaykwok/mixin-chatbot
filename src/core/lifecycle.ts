@@ -35,7 +35,7 @@ export class KeyedQueue {
   }
 }
 
-export class TaskScope {
+class TaskScope {
   readonly controller = new AbortController();
   private tasks = new Set<Promise<unknown>>();
   get signal(): AbortSignal { return this.controller.signal; }

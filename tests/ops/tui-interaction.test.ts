@@ -152,7 +152,7 @@ test("空格操作菜单共用原确认通道，方向键在弹窗内选择而�
   } finally { tty.close(); }
 });
 
-test("连续切换不会并发启动多次体检，回到加载中的页面只追加一次刷新", async () => {
+test("连续切换复用正在运行的体检，只有显式刷新才追加一次读取", async () => {
   const tty = terminal();
   const finishes: (() => void)[] = [];
   let reads = 0;
@@ -170,11 +170,96 @@ test("连续切换不会并发启动多次体检，回到加载中的页面只�
     expect(reads).toBe(1);
     finishes.shift()!();
     await tick();
+    expect(reads).toBe(1);
+    expect(app["refreshes"].size).toBe(0);
+
+    const refresh = app["refreshView"](slow, true);
+    for (let i = 0; i < 10; i++) void app["refreshView"](slow, true);
     expect(reads).toBe(2);
     finishes.shift()!();
     await tick();
+    expect(reads).toBe(3);
+    finishes.shift()!();
+    await refresh;
     expect(app["refreshes"].size).toBe(0);
   } finally { finishes.forEach(finish => finish()); tty.close(); }
+});
+
+test("回到已取消初次读取的日志页会恢复加载和跟随", async () => {
+  const tty = terminal();
+  const logs = new LogsView();
+  const finishes: ((lines: tuiData.LogLine[]) => void)[] = [];
+  const read = spyOn(tuiData, "loadLogTail").mockImplementation(() => new Promise(resolve => { finishes.push(resolve); }));
+  const app = new App([{ id: "home", label: "总览", render: () => [], hints: () => [] }, logs], { screen: tty.screen, deployment });
+  tty.screen.start(() => {}, () => {});
+  try {
+    app.go("logs");
+    app.go("home");
+    app.go("logs");
+    expect(read).toHaveBeenCalledTimes(1);
+    finishes.shift()!([{ text: "已取消的读取", level: "info" }]);
+    await tick();
+    expect(read).toHaveBeenCalledTimes(2);
+    finishes.shift()!([{ text: "恢复后的日志", level: "info" }]);
+    await tick();
+    expect(plain(logs.render(context()))).toContain("恢复后的日志");
+    expect(logs["timer"]).not.toBeNull();
+    app.go("home");
+    expect(logs["timer"]).toBeNull();
+  } finally { finishes.forEach(finish => finish([])); logs.onLeave(); read.mockRestore(); tty.close(); }
+});
+
+test("页眉的服务状态无需等待 Git 查询完成", async () => {
+  const tty = terminal();
+  const app = new App([{ id: "home", label: "总览", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
+  let finish!: (value: null) => void;
+  const service = spyOn(tuiData, "probeService").mockResolvedValue({ state: "ready", pid: 42, latency: 1 });
+  const git = spyOn(tuiData, "loadGit").mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  try {
+    const refresh = app["refreshChrome"]();
+    await tick();
+    expect(app["service"]?.state).toBe("ready");
+    finish(null);
+    await refresh;
+  } finally { service.mockRestore(); git.mockRestore(); tty.close(); }
+});
+
+test("总览逐项显示指标，慢磁盘和 Git 不挡住统计、导航或选中事项", async () => {
+  const { app, calls } = fakeApp();
+  const view = new OverviewView();
+  let diskDone!: (bytes: number) => void;
+  let gitDone!: (value: tuiData.GitState | null) => void;
+  const recent = spyOn(tuiData, "loadRecentStats").mockResolvedValue({
+    today: { asks: 12, people: 3, files: 2, images: 1, groups: 1 }, trend: [],
+  });
+  const tmp = spyOn(tuiData, "loadTmp").mockResolvedValue([]);
+  const disk = spyOn(tuiData, "loadDiskUsage").mockImplementation(() => new Promise(resolve => { diskDone = resolve; }));
+  const git = spyOn(tuiData, "loadGit").mockImplementation(() => new Promise(resolve => { gitDone = resolve; }));
+  try {
+    const refresh = view.refresh(app);
+    expect(plain(view.render(context()))).toContain("读取中");
+    expect(plain(view.render(context()))).not.toContain("0 次");
+    await tick();
+    for (const [columns, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(columns, rows)), context(columns, rows));
+    expect(plain(view.render(context()))).toContain("12 次");
+    expect(plain(view.render(context()))).toContain("版本读取中");
+    view.onKey(key("down"), app); // 常用入口中的日志。
+    diskDone(4096);
+    gitDone({ branch: "main", sha: "abcdef12345", subject: "fixture", dirty: true, behind: 0, ahead: 0, incoming: [] });
+    await refresh;
+    view.onKey(key("enter"), app);
+    expect(calls.destinations).toEqual(["logs"]);
+    expect(plain(view.render(context()))).toContain("abcdef1");
+
+    recent.mockRejectedValueOnce(new Error("fixture stats failed"));
+    const retry = view.refresh(app);
+    await tick();
+    expect(plain(view.render(context()))).toContain("12 次");
+    expect(plain(view.render(context()))).toContain("统计读取失败");
+    diskDone(8192);
+    gitDone(null);
+    await retry;
+  } finally { recent.mockRestore(); tmp.mockRestore(); disk.mockRestore(); git.mockRestore(); }
 });
 
 test("初次读取尚未完成也可以退出，终端立即恢复", async () => {
@@ -438,6 +523,105 @@ async function history(root: string, group: string, user: string, days = ["2026-
   ]).map(line => JSON.stringify(line)).join("\n") + "\n");
 }
 
+test("统计、会话和临时文件刷新保留列表，切换数据根后清除旧范围", async () => {
+  const fixture = await tempFixture("tui-refresh-scope-");
+  const finishes: (() => void)[] = [];
+  const mocks: { mockRestore(): void }[] = [];
+  try {
+    await history(fixture.root, "old-group", "13812345678");
+    const tmp = join(fixture.root, "old-group", "users", "13812345678", "tmp");
+    await mkdir(tmp);
+    await writeFile(join(tmp, "sample.txt"), "fixture");
+    const { app, calls } = fakeApp(fixture.root);
+    const stats = new StatsView();
+    const views = [stats, new HistoryView(), new StorageView()];
+    for (const view of views) await view.refresh(app);
+    const statsValue = await tuiData.loadStatsOverview(fixture.root);
+    const historyValue = await tuiData.loadHistory(fixture.root);
+    const tmpValue = await tuiData.loadTmp(fixture.root);
+    let empty = false;
+    mocks.push(
+      spyOn(tuiData, "loadStatsOverview").mockImplementation(() => new Promise(resolve => { finishes.push(() => resolve(empty ? [] : statsValue)); })),
+      spyOn(tuiData, "loadHistory").mockImplementation(() => new Promise(resolve => { finishes.push(() => resolve(empty ? [] : historyValue)); })),
+      spyOn(tuiData, "loadTmp").mockImplementation(() => new Promise(resolve => { finishes.push(() => resolve(empty ? [] : tmpValue)); })),
+    );
+    for (const view of views) {
+      const refresh = view.refresh(app);
+      expect(plain(view.render(context()))).toContain("old-group");
+      expect(plain(view.render(context()))).not.toContain("正在读取");
+      finishes.shift()!();
+      await refresh;
+    }
+    calls.choices.push("today");
+    const window = stats.onKey(key("w"), app);
+    await tick();
+    expect(plain(stats.render(context()))).toContain("正在读取");
+    expect(plain(stats.render(context()))).not.toContain("old-group");
+    finishes.shift()!();
+    await window;
+
+    app.deployment.groupDataRoot = join(fixture.root, "new-root");
+    empty = true;
+    for (const view of views) {
+      calls.answers.push("old-group");
+      await view.onKey(key("/"), app);
+      const filter = view instanceof StatsView ? view["filter"] : view instanceof HistoryView ? view["filter"] : view["filter"];
+      expect(filter.value).toBe("old-group");
+      const refresh = view.refresh(app);
+      expect(filter.value).toBe("");
+      expect(plain(view.render(context()))).toContain("正在读取");
+      expect(plain(view.render(context()))).not.toContain("old-group");
+      finishes.shift()!();
+      await refresh;
+    }
+  } finally { finishes.forEach(finish => finish()); mocks.forEach(mock => mock.mockRestore()); await fixture.cleanup(); }
+});
+
+test("维护页保留版本预览，但新版本查询结束前不能执行操作", async () => {
+  const view = new MaintainView();
+  const { app, calls } = fakeApp();
+  const value: tuiData.GitState = { branch: "main", sha: "abcdef1234", subject: "fixture", dirty: false, ahead: 0, behind: 0, incoming: [] };
+  const git = spyOn(tuiData, "loadGit").mockResolvedValue(value);
+  let finish!: (value: tuiData.GitState) => void;
+  try {
+    await view.refresh(app);
+    git.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const refresh = view.refresh(app);
+    expect(plain(view.render(context()))).toContain("abcdef1");
+    expect(view.actions().every(action => action.disabled)).toBe(true);
+    await view.onKey(key("enter"), app);
+    expect(calls.commands).toHaveLength(0);
+    finish(value);
+    await refresh;
+    expect(view.actions().some(action => !action.disabled)).toBe(true);
+  } finally { git.mockRestore(); }
+});
+
+test("维护页首次或再次读取失败时显示错误、禁用执行，并允许刷新恢复", async () => {
+  const { app, calls } = fakeApp();
+  const value: tuiData.GitState = { branch: "main", sha: "abcdef1234", subject: "fixture", dirty: false, ahead: 0, behind: 3, incoming: [] };
+  const git = spyOn(tuiData, "loadGit");
+  try {
+    for (const previous of [false, true]) {
+      const view = new MaintainView();
+      if (previous) { git.mockResolvedValueOnce(value); await view.refresh(app); }
+      git.mockRejectedValueOnce(new Error("fixture worker failed"));
+      await view.refresh(app);
+      expect(plain(view.render(context()))).toContain("版本读取失败");
+      expect(plain(view.render(context()))).not.toContain("abcdef1");
+      expect(plain(view.render(context()))).not.toContain("非 git 部署");
+      expect(view.actions().every(action => action.disabled)).toBe(true);
+      for (const name of ["enter", "update", "start"]) await view.onKey(key(name), app);
+      expect(calls.commands).toHaveLength(0);
+      expect(calls.confirms).toHaveLength(0);
+      git.mockResolvedValueOnce(value);
+      await view.refresh(app);
+      expect(view.actions().some(action => !action.disabled)).toBe(true);
+      expect(plain(view.render(context()))).toContain("abcdef1");
+    }
+  } finally { git.mockRestore(); }
+});
+
 test("统计在 80×24 先显示成员，所有成员与月度、工具均可滚到；报表路径保留且显号离页重置", async () => {
   const fixture = await tempFixture("tui-stats-view-");
   try {
@@ -656,6 +840,7 @@ test("快速离开日志页后，未完成的加载不会重新启动后台轮�
 test("操作预览在宽窄窗口及无色终端都完整容纳菜单，最后一项始终可达", async () => {
   const { app } = fakeApp();
   for (const view of [new MaintainView(), createRelayView(), createRoutesView()]) {
+    if (view instanceof MaintainView) view["state"] = { kind: "ready", value: null };
     await view.onKey!(key("end"), app);
     for (const [width, rows] of [[72, 20], [80, 24], [96, 20], [100, 24], [120, 35]]) {
       for (const depth of ["truecolor", "ansi256", "none"] as const) {

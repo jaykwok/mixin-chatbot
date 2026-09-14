@@ -3,6 +3,8 @@ const ANSI = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)
 const SGR = /^\u001b\[[0-9;:]*m$/;
 const RESET = "\u001b[0m";
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+const UNSAFE = new RegExp(`${ANSI.source}|${CONTROL.source}`, "g");
 
 export function width(text: string): number { return Bun.stringWidth(text); }
 
@@ -23,14 +25,18 @@ function* tokens(text: string): Generator<string> {
 
 export function truncate(text: string, max: number, ellipsis = "…"): string {
   if (max <= 0) return "";
-  const parts = [...tokens(text)];
-  const total = parts.reduce((sum, part) => sum + width(part), 0);
-  const tail = total > max ? ellipsis : "";
-  const limit = Math.max(0, max - width(tail));
+  // pad、组件拼接和最终屏幕裁切会反复经过这里。正常宽度的行无需逐字素分词，
+  // 但必须先过滤光标控制和展开 Tab，不能让快速路径绕过终端输出清理。
+  const clean = CONTROL.test(text)
+    ? text.replace(UNSAFE, part => SGR.test(part) ? part : part === "\t" ? "    " : "")
+    : text;
+  if (width(clean) <= max) return clean + (clean.includes("\u001b[") && !clean.endsWith(RESET) ? RESET : "");
+  const tailWidth = width(ellipsis);
+  const limit = Math.max(0, max - tailWidth);
   let used = 0;
   let out = "";
   let styled = false;
-  for (const part of parts) {
+  for (const part of tokens(clean)) {
     if (SGR.test(part)) {
       out += part;
       styled = true;
@@ -41,7 +47,7 @@ export function truncate(text: string, max: number, ellipsis = "…"): string {
       used += size;
     }
   }
-  return out + (width(tail) <= max ? tail : "") + (styled ? RESET : "");
+  return out + (tailWidth <= max ? ellipsis : "") + (styled ? RESET : "");
 }
 
 export type Align = "left" | "right" | "center";

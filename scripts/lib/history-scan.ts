@@ -4,10 +4,11 @@
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { assertDataDirectory, byName, dataDirectoryNames } from "./group-data.ts";
+import { mapConcurrent } from "./concurrent.ts";
 
-export const HISTORY_FILE = "session.jsonl";
+const HISTORY_FILE = "session.jsonl";
 
-export interface UserHistory {
+interface UserHistory {
   user: string;
   path: string;
   bytes: number;
@@ -26,21 +27,20 @@ export async function scanHistory(root: string): Promise<GroupHistory[]> {
   const groups: GroupHistory[] = [];
   for (const group of await dataDirectoryNames(root, root)) {
     const dir = join(root, group);
-    const users: UserHistory[] = [];
-    let bytes = 0;
-    for (const user of await dataDirectoryNames(join(dir, "users"), root)) {
+    const entries = await mapConcurrent(await dataDirectoryNames(join(dir, "users"), root), async user => {
       const path = join(dir, "users", user, HISTORY_FILE);
       try {
         await assertDataDirectory(dirname(path), root);
         const info = await lstat(path);
-        if (!info.isFile() || info.isSymbolicLink()) continue;
-        users.push({ user, path, bytes: info.size, modified: info.mtimeMs });
-        bytes += info.size;
+        if (!info.isFile() || info.isSymbolicLink()) return null;
+        return { user, path, bytes: info.size, modified: info.mtimeMs };
       } catch {
-        continue; // 这位成员还没说过话。
+        return null; // 这位成员还没说过话。
       }
-    }
+    });
+    const users = entries.filter((entry): entry is UserHistory => entry !== null);
     if (users.length === 0) continue;
+    const bytes = users.reduce((total, user) => total + user.bytes, 0);
     users.sort((a, b) => b.bytes - a.bytes || byName(a.user, b.user));
     groups.push({ group, dir, users, bytes });
   }

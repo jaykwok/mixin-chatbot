@@ -5,15 +5,15 @@ import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryMo
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { buildChatContext } from "../../src/agent/prompt.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import { builtinConfiguration, customProvider } from "../../scripts/config/configure.ts";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 
 describe("installed Pi SDK integration", () => {
   test("native key-only configuration preserves Pi ZAI transport, tools and thinking metadata", async () => {
     const files = await tempFixture("pi-native-");
     try {
+      // 配置向导内置方式的产物：只有凭证，一条模型定义都不写。
       const modelsPath = join(files.root, "models.json");
-      await writeFile(modelsPath, JSON.stringify(builtinConfiguration("zai-coding-cn", "glm-5.3-flash", "test-only", "low")));
+      await writeFile(modelsPath, JSON.stringify({ providers: { "zai-coding-cn": { apiKey: "test-only" } } }));
       const runtime = await ModelRuntime.create({ modelsPath, credentials: new InMemoryCredentialStore(),
         modelsStore: new InMemoryModelsStore(), refreshOnCreate: false });
       expect(runtime.getError()).toBeUndefined();
@@ -50,15 +50,19 @@ describe("installed Pi SDK integration", () => {
     expect(payload?.prompt_cache_retention).toBeUndefined();
   });
 
-  test.each(["openai", "test-gateway"])("configured %s has no conflicting provider compat", async (provider) => {
+  // Pi 自己做 mergeCompat(provider, model)，模型一级的值覆盖 provider 一级；配置向导因此
+  // 不需要也不应该再合并一遍。内置 provider id 和全新 id 走的是同一条合成路径。
+  test.each(["openai", "test-gateway"])("configured %s lets model compat override provider compat", async (provider) => {
     const files = await tempFixture("pi-compat-");
     try {
       const modelsPath = join(files.root, "models.json");
       await writeFile(modelsPath, JSON.stringify({ providers: {
-        [provider]: customProvider(provider, "http://127.0.0.1:1/v1", "test-only", {
-          id: "gpt-5.2", contextWindow: 8192, maxTokens: 512, reasoning: false,
+        [provider]: {
+          api: "openai-responses", baseUrl: "http://127.0.0.1:1/v1", apiKey: "test-only",
           compat: { supportsMaxOutputTokens: false },
-        }, { supportsMaxOutputTokens: false }, true),
+          models: [{ id: "gpt-5.2", contextWindow: 8192, maxTokens: 512, reasoning: false,
+            compat: { supportsMaxOutputTokens: true } }],
+        },
       } }));
       const runtime = await ModelRuntime.create({
         modelsPath, credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(), refreshOnCreate: false,

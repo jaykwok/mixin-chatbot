@@ -15,6 +15,7 @@ export class HistoryView implements View {
   readonly id = "history";
   readonly label = "会话";
   private state: Loading<GroupHistory[]> = { kind: "idle" };
+  private root: string | undefined;
   private selected = 0;
   private filter = new ListFilter();
   private expanded = false;
@@ -41,7 +42,15 @@ export class HistoryView implements View {
   }
 
   async refresh(app: AppApi): Promise<void> {
-    this.state = { kind: "loading" };
+    const rootChanged = this.root !== undefined && this.root !== app.deployment.groupDataRoot;
+    if (rootChanged) {
+      this.filter.clear();
+      this.expanded = false;
+      this.selected = 0;
+      this.scroll.reset();
+    }
+    this.root = app.deployment.groupDataRoot;
+    if (rootChanged || this.state.kind !== "ready") this.state = { kind: "loading" };
     app.redraw();
     try {
       const groups = await loadHistory(app.deployment.groupDataRoot);

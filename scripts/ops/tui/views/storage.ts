@@ -21,6 +21,7 @@ export class StorageView implements View {
   readonly id = "storage";
   readonly label = "临时文件";
   private state: Loading<UserTmp[]> = { kind: "idle" };
+  private root: string | undefined;
   private selected = 0;
   private presetIndex = 2; // 默认 30 天
   private filter = new ListFilter();
@@ -58,7 +59,15 @@ export class StorageView implements View {
   }
 
   async refresh(app: AppApi): Promise<void> {
-    this.state = { kind: "loading" };
+    const rootChanged = this.root !== undefined && this.root !== app.deployment.groupDataRoot;
+    if (rootChanged) {
+      this.filter.clear();
+      this.expanded = false;
+      this.selected = 0;
+      this.scroll.reset();
+    }
+    this.root = app.deployment.groupDataRoot;
+    if (rootChanged || this.state.kind !== "ready") this.state = { kind: "loading" };
     app.redraw();
     try {
       const users = await loadTmp(app.deployment.groupDataRoot);

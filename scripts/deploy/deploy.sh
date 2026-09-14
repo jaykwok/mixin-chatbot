@@ -335,7 +335,7 @@ verify_container_storage() {
       -c 'for directory in /app/data/config /app/data/state /app/data/runtime /app/data/runtime/home /app/logs "$GROUP_DATA_ROOT"; do
               [ -d "$directory" ] && [ -w "$directory" ] || { echo "容器用户不可写: $directory" >&2; exit 1; }
           done
-          for file in /app/data/config/models.json /app/data/config/webhook-secret; do
+          for file in /app/data/config/models.json /app/data/runtime/pi/settings.json /app/data/config/webhook-secret; do
               [ ! -e "$file" ] || { [ -r "$file" ] && [ -w "$file" ]; } || { echo "容器用户不可读写: $file" >&2; exit 1; }
           done'
 }

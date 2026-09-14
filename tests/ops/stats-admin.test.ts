@@ -1,7 +1,7 @@
 import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 // 这些数字会被抄进汇报材料，所以口径必须钉死：指令不算提问、干预算提问、区间按自然日
 // 闭区间、半行 JSON 不能让整份统计失败。测试用真实的 session.jsonl 记录形状。
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
@@ -9,6 +9,39 @@ import { fileURLToPath } from "node:url";
 import { collectAll, collectGroup } from "../../scripts/ops/stats-admin.ts";
 import { cacheReadRate, emptyUsage, formatCacheRate } from "../../scripts/lib/usage.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import * as statsCache from "../../scripts/lib/session-stats-cache.ts";
+import { waitFor } from "../helpers/tui-process.ts";
+
+test("会话逆序读完也按稳定顺序累加工具、模型与每日统计", async () => {
+  const fixture = await tempFixture("stats-read-order-");
+  type Source = Awaited<ReturnType<typeof statsCache.readSessionStats>>;
+  const readers = new Map<string, (value: Source) => void>();
+  const read = spyOn(statsCache, "readSessionStats").mockImplementation(path => new Promise(resolve => { readers.set(path, resolve); }));
+  try {
+    const users = ["a", "b", "c"];
+    for (const user of users) await mkdir(join(fixture.root, "group", "users", user), { recursive: true });
+    const run = async (order: string[]) => {
+      readers.clear();
+      const pending = collectGroup("group", fixture.root);
+      await waitFor(() => readers.size === 3, "并发会话读取");
+      for (const user of order) {
+        readers.get(join(fixture.root, "group", "users", user, "session.jsonl"))!({ skipped: 0, records: [{
+          type: "message", timestamp: `2026-09-0${users.indexOf(user) + 1}T12:00:00Z`,
+          message: { role: "assistant", provider: "fixture", model: user, content: [{ type: "toolCall", name: user }],
+            usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } },
+        }] });
+        await Bun.sleep(0);
+      }
+      return pending;
+    };
+    const reverse = await run(["c", "b", "a"]);
+    const forward = await run(users);
+    const serialize = (value: unknown) => JSON.stringify(value, (_key, part) =>
+      part instanceof Map ? [...part] : part instanceof Set ? [...part] : part);
+    expect([...reverse.tools.keys()]).toEqual(users);
+    expect(serialize(reverse)).toBe(serialize(forward));
+  } finally { read.mockRestore(); await fixture.cleanup(); }
+});
 
 function userMsg(at: string, text: string): string {
   return JSON.stringify({

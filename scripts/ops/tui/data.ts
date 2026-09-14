@@ -3,7 +3,7 @@ import { matchesInstance } from "../../../src/core/health.ts";
 // 健康诊断复用 ops 的 JSON 接口，容器和服务维护转交对应平台脚本。
 
 import { readdir, lstat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { collectAll, type GroupStats, type Window } from "../stats-admin.ts";
 import { scanHistory, type GroupHistory } from "../../lib/history-scan.ts";
 import { scanTmp, type UserTmp } from "../../lib/tmp-scan.ts";
@@ -96,26 +96,35 @@ export interface GitState {
 
 async function git(args: string[]): Promise<RunResult> {
   // GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在一个没人应答的提示上。
-  return capture("git", args, { env: { GIT_TERMINAL_PROMPT: "0" }, timeout: 15_000 });
+  const result = await capture("git", args, { env: { GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" }, timeout: 15_000 });
+  if (result.timedOut) throw new Error(`Git 查询超时（15 秒）：${result.stderr.trim() || args[0]}`);
+  return result;
 }
 
-/**
- * 读取版本状态。
- *
- * 不 fetch：界面每次刷新都联一次远端既慢又可能卡住，而「落后几个提交」本来就是相对上次
- * fetch 而言的。真正要升级时由 update 流程自己 fetch，那里等待是有交代的。
- */
-export async function loadGit(): Promise<GitState | null> {
-  if (!Bun.which("git")) return null;
-  const head = await git(["rev-parse", "HEAD"]);
-  if (head.code !== 0) return null;
+let gitRead: Promise<GitState | null> | null = null;
 
-  const [branch, subject, status, counts] = await Promise.all([
+/**
+ * 页眉、总览和维护页共享在途查询；下次刷新仍读取最新状态。
+ * 不 fetch：落后提交数相对上次 fetch，真正升级时由 update 流程联网。
+ */
+export function loadGit(): Promise<GitState | null> {
+  return gitRead ??= readGit().finally(() => { gitRead = null; });
+}
+
+async function readGit(): Promise<GitState | null> {
+  if (!Bun.which("git")) return null;
+  const [head, branch, status, counts] = await Promise.all([
+    git(["log", "-1", "--format=%H%n%s"]),
     git(["rev-parse", "--abbrev-ref", "HEAD"]),
-    git(["log", "-1", "--pretty=%s"]),
     git(["status", "--porcelain", "--untracked-files=no"]),
     git(["rev-list", "--left-right", "--count", "HEAD...origin/main"]),
   ]);
+  const failed = [head, branch, status].find(result => result.code !== 0);
+  if (failed) {
+    if (/not a git repository|does not have any commits yet/i.test(failed.stderr)) return null;
+    throw new Error(`Git 查询失败：${failed.stderr.trim() || `退出码 ${failed.code}`}`);
+  }
+  const [sha = "", subject = ""] = head.stdout.trim().split(/\r?\n/);
 
   let ahead = 0;
   let behind = -1;
@@ -136,8 +145,8 @@ export async function loadGit(): Promise<GitState | null> {
 
   return {
     branch: branch.stdout.trim(),
-    sha: head.stdout.trim(),
-    subject: subject.stdout.trim(),
+    sha,
+    subject,
     dirty: status.stdout.trim().length > 0,
     behind,
     ahead,
@@ -223,9 +232,11 @@ export async function loadTmp(root: string): Promise<UserTmp[]> {
 export async function loadDiskUsage(paths: string[]): Promise<number> {
   let total = 0;
   const seen = new Set<string>();
+  const queue = paths.map(path => resolve(path));
   const walk = async (path: string): Promise<void> => {
-    if (seen.has(path)) return;
-    seen.add(path);
+    const key = process.platform === "win32" ? path.toLowerCase() : path;
+    if (seen.has(key)) return;
+    seen.add(key);
     let info;
     try {
       info = await lstat(path);
@@ -242,9 +253,10 @@ export async function loadDiskUsage(paths: string[]): Promise<number> {
     } catch {
       return;
     }
-    for (const name of names) await walk(join(path, name));
+    for (const name of names) queue.push(join(path, name));
   };
-  for (const path of paths) await walk(path);
+  // 有限并发，避免每个文件串行等待，也不一次创建成千上万个文件系统请求。
+  while (queue.length) await Promise.all(queue.splice(-16).map(walk));
   return total;
 }
 

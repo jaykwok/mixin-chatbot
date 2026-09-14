@@ -85,7 +85,8 @@ const FAILURE_RULES: readonly FailureRule[] = [
     hint: "回复已经生成，但发到群里失败了。请联系管理员检查消息发送是否正常。",
   },
   {
-    pattern: /models\.json|configure|未配置可用凭证/i,
+    // settings.json 是 Pi 存选型的地方，读坏了和 models.json 坏了一样属于配置问题。
+    pattern: /models\.json|settings\.json|configure|未配置可用凭证/i,
     hint: "机器人的模型配置有问题，暂时无法回答，请联系管理员。",
   },
   {

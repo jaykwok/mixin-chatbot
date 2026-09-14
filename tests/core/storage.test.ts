@@ -7,6 +7,7 @@ import {
   MODELS_JSON_PATH,
   MODELS_STORE_PATH,
   PI_AGENT_DIR,
+  PI_SETTINGS_PATH,
   RUNTIME_DIR,
   STATE_DIR,
   WEBHOOK_SECRET_FILE,
@@ -25,5 +26,7 @@ describe("persistent storage layout", () => {
     // Pi 的模型目录缓存是可重建产物，必须留在 runtime 而不是配置目录里。
     expect(MODELS_STORE_PATH).toBe(join(RUNTIME_DIR, "models-store.json"));
     expect(MODELS_STORE_PATH.startsWith(CONFIG_DIR)).toBe(false);
+    // 选型沿用 Pi 对 agentDir 的默认布局。
+    expect(PI_SETTINGS_PATH).toBe(join(PI_AGENT_DIR, "settings.json"));
   });
 });

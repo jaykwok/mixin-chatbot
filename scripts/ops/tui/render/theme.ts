@@ -12,7 +12,7 @@ const RESET = `${CSI}0m`;
  * FORCE_COLOR 允许在管道里强制上色（截图、录屏用得上）；NO_COLOR 是社区约定的一票否决，
  * 优先级高于一切自动判断。Windows Terminal 不设 COLORTERM，靠 WT_SESSION 认。
  */
-export function detectDepth(stream: { isTTY?: boolean } = process.stdout): ColorDepth {
+function detectDepth(stream: { isTTY?: boolean } = process.stdout): ColorDepth {
   const env = process.env;
   if (env.NO_COLOR !== undefined && env.NO_COLOR !== "") return "none";
   if (env.FORCE_COLOR === "0") return "none";

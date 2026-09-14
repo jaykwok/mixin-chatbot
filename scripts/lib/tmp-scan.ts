@@ -4,15 +4,16 @@ import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { userSegment } from "../../src/agent/paths.ts";
 import { assertDataDirectory, byName, dataDirectoryNames, resolveGroupName, type GroupSelection } from "./group-data.ts";
+import { mapConcurrent } from "./concurrent.ts";
 
-export interface Usage {
+interface Usage {
   bytes: number;
   files: number;
   /** 整棵子树里最新的修改时间。 */
   newest: number;
 }
 
-export interface TmpEntry extends Usage {
+interface TmpEntry extends Usage {
   name: string;
   path: string;
 }
@@ -28,31 +29,24 @@ export interface UserTmp extends Usage {
  * 用 lstat 而不是 stat：符号链接按它自己算，不跟进去。tmp 里出现一条指向 workspace 的
  * 链接时，统计和归档只处理链接本身，不遍历目标。
  */
-export async function measure(path: string): Promise<Usage> {
-  let info;
-  try {
-    info = await lstat(path);
-  } catch {
-    // 正在跑的任务随时可能删掉自己的中间文件，扫描期间消失属于正常。
-    return { bytes: 0, files: 0, newest: 0 };
-  }
-  if (!info.isDirectory() || info.isSymbolicLink()) {
-    return { bytes: info.size, files: 1, newest: info.mtimeMs };
-  }
-
-  let children: string[] = [];
-  try {
-    children = (await readdir(path, { withFileTypes: true })).map((child) => child.name);
-  } catch {
-    return { bytes: 0, files: 0, newest: info.mtimeMs };
-  }
-  const total: Usage = { bytes: 0, files: 0, newest: info.mtimeMs };
-  for (const name of children) {
-    const child = await measure(join(path, name));
-    total.bytes += child.bytes;
-    total.files += child.files;
-    total.newest = Math.max(total.newest, child.newest);
-  }
+async function measure(path: string): Promise<Usage> {
+  const total: Usage = { bytes: 0, files: 0, newest: 0 };
+  const queue = [path];
+  const read = async (entry: string): Promise<void> => {
+    let info;
+    try { info = await lstat(entry); }
+    catch { return; } // 正在运行的任务可能删除自己的中间文件。
+    total.newest = Math.max(total.newest, info.mtimeMs);
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      total.bytes += info.size;
+      total.files++;
+      return;
+    }
+    try { for (const name of await readdir(entry)) queue.push(join(entry, name)); }
+    catch { /* 扫描期间消失或不可读的目录保留自身时间。 */ }
+  };
+  // A single bounded queue avoids serial traversal and unbounded recursive fan-out.
+  while (queue.length) await Promise.all(queue.splice(-16).map(read));
   return total;
 }
 
@@ -67,20 +61,19 @@ export async function scanTmp(root: string, userFilter?: string, groupFilter?: s
     const usersDir = join(root, group, "users");
     const users = await dataDirectoryNames(usersDir, root);
     const selectedUser = userFilter ? (users.includes(userFilter) ? userFilter : userSegment(userFilter)) : undefined;
-    for (const user of users) {
-      if (selectedUser !== undefined && user !== selectedUser) continue;
+    const results = await mapConcurrent(users.filter(user => selectedUser === undefined || user === selectedUser), async user => {
       const dir = join(usersDir, user, "tmp");
       // 这里不能只看目录：tmp 里的散落文件（迁过来的 pi-bash-*.log 就是）也要算进来。
       let names: string[];
       try {
         await assertDataDirectory(dir, root);
         const info = await lstat(dir);
-        if (!info.isDirectory() || info.isSymbolicLink()) continue;
+        if (!info.isDirectory() || info.isSymbolicLink()) return null;
         names = (await readdir(dir, { withFileTypes: true })).map((entry) => entry.name);
       } catch {
-        continue; // 这个用户还没触发过任何工具，tmp 尚未建立。
+        return null; // 这个用户还没触发过任何工具，tmp 尚未建立。
       }
-      if (names.length === 0) continue;
+      if (names.length === 0) return null;
 
       const entries: TmpEntry[] = [];
       const total: UserTmp = { group, user, dir, entries, bytes: 0, files: 0, newest: 0 };
@@ -93,8 +86,9 @@ export async function scanTmp(root: string, userFilter?: string, groupFilter?: s
         total.newest = Math.max(total.newest, measured.newest);
       }
       entries.sort((a, b) => b.bytes - a.bytes || byName(a.name, b.name));
-      found.push(total);
-    }
+      return total;
+    });
+    found.push(...results.filter((entry): entry is UserTmp => entry !== null));
   }
   return found.sort((a, b) => b.bytes - a.bytes || byName(a.group, b.group) || byName(a.user, b.user));
 }

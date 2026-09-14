@@ -182,6 +182,7 @@ export class MaintainView implements View {
   readonly id = "maintain";
   readonly label = "服务部署";
   private state: Loading<GitState | null> = { kind: "idle" };
+  private refreshing = false;
   private selected = 0;
   private platform: "windows" | "linux" = "linux";
 
@@ -203,16 +204,23 @@ export class MaintainView implements View {
     return this.availableActions.map(action => ({
       value: action.key, label: action.label, description: action.summary,
       danger: action.status === "danger" || action.key === "stop" || action.key === "repair-tunnel",
-      disabled: this.state.kind === "loading",
+      disabled: this.refreshing || this.state.kind !== "ready",
     }));
   }
 
   async refresh(app: AppApi): Promise<void> {
     this.platform = app.deployment.platform;
-    this.state = { kind: "loading" };
+    this.refreshing = true;
+    if (this.state.kind !== "ready") this.state = { kind: "loading" };
     app.redraw();
-    this.state = { kind: "ready", value: await loadGit() };
-    app.redraw();
+    try {
+      this.state = { kind: "ready", value: await loadGit() };
+    } catch (error) {
+      this.state = { kind: "error", message: `版本读取失败，请刷新重试：${String(error)}` };
+    } finally {
+      this.refreshing = false;
+      app.redraw();
+    }
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
@@ -223,7 +231,7 @@ export class MaintainView implements View {
       return true;
     }
     if (key.name === "enter" || actions.some(action => action.key === key.name)) {
-      if (this.state.kind === "loading") return true;
+      if (this.refreshing || this.state.kind !== "ready") return true;
       const action = key.name === "enter" ? actions[this.selected] : actions.find(action => action.key === key.name);
       if (!action) return true;
       const git = this.state.kind === "ready" ? this.state.value : null;
@@ -251,7 +259,7 @@ export class MaintainView implements View {
   render(ctx: ViewContext): string[] {
     const { theme, width: total } = ctx;
     const waiting = pending(theme, total, this.state, "");
-    if (waiting && this.state.kind === "loading") return waiting;
+    if (waiting) return waiting;
     const git = this.state.kind === "ready" ? this.state.value : null;
     const actions = this.availableActions;
     const action = actions[this.selected]!;

@@ -27,11 +27,12 @@ mock.module("../../src/integrations/im.ts", () => ({
   },
   uploadAttachment: async () => { throw new Error("Unexpected IM upload"); }, sendFile: async () => false, sendImage: async () => false,
 }));
+// SettingsManager 不替换：选型走真实的 Pi 设置读取，由下面写的 settings.json 驱动。
 mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
   ModelRuntime: { create: async () => ({ getError: () => undefined,
-    getModel: () => ({ id: "fake", provider: "fake", api: "openai-responses" }), checkAuth: async () => true }) },
+    getModel: () => ({ id: "fake", provider: "fake", api: "openai-responses", reasoning: false }), checkAuth: async () => true }) },
   DefaultResourceLoader: class { async reload() {} },
-  SessionManager: { open: (filename: string) => ({ filename }) }, SettingsManager: { inMemory: () => ({}) },
+  SessionManager: { open: (filename: string) => ({ filename }) },
   createAgentSession: async (options: any) => {
     await writeFile(options.sessionManager.filename, '{"type":"session","version":3}\n');
     const session = { state: { messages: [] }, controller: undefined as AbortController | undefined, release: undefined as (() => void) | undefined,
@@ -52,7 +53,9 @@ mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
   },
 }));
 await mkdir("data/config", { recursive: true });
-await writeFile("data/config/models.json", JSON.stringify({ modelId: "fake", providers: { fake: { apiKey: "fixture-only" } } }));
+await mkdir("data/runtime/pi", { recursive: true });
+await writeFile("data/config/models.json", JSON.stringify({ providers: { fake: { apiKey: "fixture-only" } } }));
+await writeFile("data/runtime/pi/settings.json", JSON.stringify({ defaultProvider: "fake", defaultModel: "fake" }));
 const runtime = await import("../../src/agent/runtime.ts");
 const webhook = await import("../../src/server/webhook.ts");
 const { createApp } = await import("../../src/server/app.ts");

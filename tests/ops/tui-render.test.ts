@@ -67,6 +67,16 @@ describe("显示宽度", () => {
     }
   });
 
+  test("无需截断时也清理控制序列、展开 Tab 并闭合颜色，重复填充不累积 reset", () => {
+    const text = `${CSI}2J${CSI}31m群\tA\u0007\u001b]0;改标题\u0007`;
+    expect(truncate(text, 20)).toBe(`${CSI}31m群    A${CSI}0m`);
+    expect(truncate("\u001b]8;;https://example.com\u001b\\链接\u001b]8;;\u001b\\", 20)).toBe("链接");
+    expect(truncate("👩‍💻e\u0301🇨🇳", 20)).toBe("👩‍💻e\u0301🇨🇳");
+    let colored = `${CSI}31m中文${CSI}0m`;
+    for (let i = 0; i < 10; i++) colored = truncate(colored, 10);
+    expect(colored).toBe(`${CSI}31m中文${CSI}0m`);
+  });
+
   test("截断不会切在宽字符中间", () => {
     for (const text of SAMPLES) {
       for (const size of [1, 2, 3, 7, 12, 40]) {
