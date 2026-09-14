@@ -155,10 +155,8 @@ function Get-CurlPath {
     return $script:CurlPath
 }
 function Get-CloudflaredPath {
-    $additional = @($LocalCloudflared)
-    if ($env:LOCALAPPDATA) { $additional += (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\cloudflared.exe") }
-    if ($env:ProgramFiles) { $additional += (Join-Path $env:ProgramFiles "cloudflared\cloudflared.exe") }
-    return Find-VersionedApplication "cloudflared" '(?i)cloudflared\s+version' $additional
+    if (Test-CloudflaredApplication $LocalCloudflared) { return $LocalCloudflared }
+    return $null
 }
 $script:GitPath = $null
 $script:GitPathResolved = $false

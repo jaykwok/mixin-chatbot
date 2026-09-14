@@ -96,7 +96,7 @@ test.skipIf(process.platform !== "win32")("Windows service registration uses onl
     "function Set-ItemProperty { param($LiteralPath,$Name,$Value); $script:command=$Value }",
     "function New-Service { param($Name,$DisplayName,$BinaryPathName,$StartupType,$ErrorAction); $script:command=$BinaryPathName }",
     "function Get-CimInstance { @{PathName=$(if($script:bad){'wrong command'}else{$script:command})} }",
-    "$executable='C:\\Program Files\\cloudflared\\cloudflared.exe'; $tokenFile='C:\\Project With Spaces\\data\\cloudflared-token'",
+    "$executable='C:\\Project With Spaces\\cloudflared.exe'; $tokenFile='C:\\Project With Spaces\\data\\cloudflared-token'",
     "foreach($script:exists in @($true,$false)) { Register-ProjectCloudflared $executable $tokenFile; if($script:command -cne ('\"'+$executable+'\" tunnel --no-autoupdate run --token-file \"'+$tokenFile+'\"')){throw 'wrong command'} }",
     "$script:bad=$true; $rejected=$false; try{Register-ProjectCloudflared $executable $tokenFile}catch{$rejected=$true}; if(-not $rejected){throw 'accepted mismatched service'}",
     "Write-Output 'SERVICE_ARGV_PASSED'",
@@ -113,14 +113,15 @@ test.skipIf(process.platform !== "linux")("original Linux tunnel launcher record
   const identity = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: crypto.randomUUID(), pid: 42, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(identity) });
   try {
-    for (const dir of ["scripts/tunnel", "scripts/lib", "scripts/ops", "src/core", "data/state", "bin"]) await mkdir(join(fixture.root, dir), { recursive: true });
+    for (const dir of ["scripts/tunnel", "scripts/lib", "scripts/ops", "src/core", "data/state"]) await mkdir(join(fixture.root, dir), { recursive: true });
     for (const path of ["scripts/tunnel/start-tunnel.sh", "scripts/lib/common.sh", "scripts/lib/lifecycle.sh", "scripts/ops/health-check.ts", "src/core/health.ts"]) {
       await copyFile(join(project, path), join(fixture.root, path));
     }
     await writeFile(join(fixture.root, "data/state/instance.json"), JSON.stringify({ ...identity, port: server.port }));
-    const executable = join(fixture.root, "bin/cloudflared");
+    const executable = join(fixture.root, "cloudflared");
     await writeFile(executable, [
       "#!/usr/bin/env bash",
+      'if [ "${1:-}" = "--version" ]; then echo "cloudflared version fixture"; exit 0; fi',
       'printf "%s\\n" "$$" > "$FIXTURE_ROOT/exec-pid"',
       'cat "/proc/$$/stat" > "$FIXTURE_ROOT/exec-stat"',
       'printf "%s\\n" "$@" > "$FIXTURE_ROOT/exec-args"',
@@ -128,7 +129,7 @@ test.skipIf(process.platform !== "linux")("original Linux tunnel launcher record
     ].join("\n") + "\n");
     await chmod(executable, 0o755);
     const child = Bun.spawn(["bash", join(fixture.root, "scripts/tunnel/start-tunnel.sh")], {
-      cwd: fixture.root, env: { ...process.env, PATH: join(fixture.root, "bin") + ":" + process.env.PATH,
+      cwd: fixture.root, env: { ...process.env,
         BOT_PORT: String(server.port), TUNNEL_TOKEN: "eyJ0IjoiZml4dHVyZSIsInMiOiJ0ZXN0In0=", TUNNEL_TOKEN_FILE: "", FIXTURE_ROOT: fixture.root },
       stdin: "ignore", stdout: "pipe", stderr: "pipe",
     });

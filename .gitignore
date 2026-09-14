@@ -19,6 +19,8 @@ logs/
 data/
 cloudflared.exe
 cloudflared.exe.download-*
+/cloudflared
+/cloudflared.download-*
 node_modules/
 
 # Chromium/crashpad diagnostics may be emitted beside a previewed document.

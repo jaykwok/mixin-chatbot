@@ -167,7 +167,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 
 ## 隧道托管
 
-Cloudflared 常驻命令使用 token 文件。Windows 通过服务控制管理器注册官方可执行文件，命令行只包含受 ACL 保护的 token 文件路径，并核对注册后的命令；token 不作为命令行参数传入。Linux 记录 PID、启动时间和系统启动 ID 验证归属，内置 nohup 仅负责当前运行，开机托管需运维配置 systemd 等服务管理方式。
+首次使用本项目的 Cloudflare 公网域名模式时，先在控制台准备域名和隧道：
+
+1. 将根域名（如 `example.com`）添加到 Cloudflare，按指引在域名注册商修改 NS，等待状态变为 **Active（已激活）**。域名无需转移注册商，但 DNS 需托管到 Cloudflare。部署交互中填写机器人使用的子域名，如 `bot.example.com`。
+2. 在同一 Cloudflare 账户打开 **Networking → Tunnels**（[控制台入口](https://dash.cloudflare.com/?to=/:account/tunnels)），创建 Cloudflared 隧道；已有隧道则选择它，再打开 **Add a replica（添加副本）**。在安装连接器页面，只复制安装命令中 `eyJ` 开头的完整 token 值，单独保存到项目的 `data/config/tunnel-token`。Windows 注意文件不要带 `.txt` 后缀。部署询问的是文件路径，保存到默认位置后直接回车即可，连接器由项目脚本安装。
+3. 在该隧道的 **Published application** 路由中填写相同子域名，服务地址设为 `http://localhost:<BOT_PORT>`（类型选 HTTP，URL 填 `localhost:<BOT_PORT>`；默认端口为 `1011`）。DNS 接入与公开路由需在控制台完成；部署脚本填写域名不会自动创建它们。域名可在部署时留空、稍后配置，公网回调需这些步骤完成后才能使用。
+
+脚本使用项目根目录的 `cloudflared.exe`（Windows）或 `cloudflared`（Linux）。已有可运行副本会直接复用；缺失或不可用时，从 [Cloudflare 官方 GitHub 发布](https://github.com/cloudflare/cloudflared/releases) 下载对应架构的版本，先校验 SHA-256，再检查可执行性并保存。下载版本与校验值统一记录在 `scripts/tunnel/cloudflared-release.txt`；更新清单只影响后续下载。下载失败或校验失败会保留原文件并清理下载残留，也可提前将官方可执行文件放到项目根目录。
+
+常驻命令使用 token 文件。Windows 通过服务控制管理器注册项目根目录的可执行文件，命令行只包含受 ACL 保护的 token 文件路径，并核对注册后的命令；token 不作为命令行参数传入。Linux 记录 PID、启动时间和系统启动 ID 验证归属，内置 nohup 仅负责当前运行，开机托管需运维配置 systemd 等服务管理方式。
 
 ## 重新配置模型
 

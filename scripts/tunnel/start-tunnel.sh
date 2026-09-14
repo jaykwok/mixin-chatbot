@@ -77,6 +77,7 @@ fi
 
 if [ -n "$TOKEN_FILE" ]; then
     if [ ! -f "$TOKEN_FILE" ]; then
+        show_tunnel_token_help >&2
         echo "✗ 未找到隧道 token 文件：$TOKEN_FILE" >&2
         echo "  优先级：位置参数 > TUNNEL_TOKEN_FILE > TUNNEL_TOKEN > data/config/tunnel-token" >&2
         exit 1
@@ -104,11 +105,8 @@ if [ "${#TUNNEL_TOKEN}" -lt 20 ]; then
     exit 1
 fi
 
-# ---- 2. Use the official package; do not maintain a latest-binary downloader. ----
-if ! command -v cloudflared >/dev/null 2>&1; then
-    echo '请先通过官方渠道安装 cloudflared：https://pkg.cloudflare.com/' >&2
-    exit 1
-fi
+# ---- 2. 只使用项目根目录的 cloudflared；缺失或不可用时下载并校验。 ----
+cloudflared_path="$(ensure_cloudflared "$PROJECT_DIR")"
 
 # ---- 3. 连接前的确认：连到哪条隧道、本机有没有东西可转发 ----
 #
@@ -155,4 +153,4 @@ token_path="$PROJECT_DIR/data/config/cloudflared-token"
 chmod 600 "$token_path"
 unset TUNNEL_TOKEN
 record_cloudflared_pid "$$"
-exec cloudflared tunnel --no-autoupdate run --token-file "$token_path"
+exec "$cloudflared_path" tunnel --no-autoupdate run --token-file "$token_path"

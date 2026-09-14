@@ -29,3 +29,7 @@ knip.json
 tests
 .gitignore
 .dockerignore
+cloudflared
+cloudflared.exe
+cloudflared.download-*
+cloudflared.exe.download-*

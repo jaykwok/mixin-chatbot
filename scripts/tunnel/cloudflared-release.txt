@@ -1,0 +1,7 @@
+# Version, official release asset, SHA-256. Update together from cloudflare/cloudflared releases.
+2026.9.1 cloudflared-linux-386 5d66134cf7646cb98f33aeee7bcc8b97d8feacd76db279f5903f9585226e0922
+2026.9.1 cloudflared-linux-amd64 03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc
+2026.9.1 cloudflared-linux-arm 093ffa3638ab2b636de63c43a8c68f96a69cf71f9699dd8277a91b160b0f4fc0
+2026.9.1 cloudflared-linux-arm64 3d97437c71848bd8df68041e12436b484a661d95073ea1937f01a845ce88faa3
+2026.9.1 cloudflared-windows-386.exe 11b6e4b2d306950bd87e7caa4deee8e80a32d71ffee555a96237a76651eeae4c
+2026.9.1 cloudflared-windows-amd64.exe 2837888cc0f5d58f15b6dc478376de90b4d3ba5241c7947455d1e0a0df429712

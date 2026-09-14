@@ -1,4 +1,4 @@
-﻿# Windows Server 连接器：使用已安装的官方 cloudflared 注册 Windows 服务。
+﻿# Windows Server 连接器：使用项目根目录的 cloudflared.exe 注册服务；缺失时下载官方版本。
 #   Cloudflare Tunnel  <==>  localhost:BOT_PORT（默认 1011）
 #
 # 前置条件：
@@ -30,16 +30,6 @@ $PersistedPortFile = Join-Path $StateDir "bot-port"
 $DefaultTunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
 $TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
 
-
-function Test-CloudflaredApplication([string]$Path) {
-    try {
-        $output = @(& $Path --version 2>$null)
-        $exitCode = $LASTEXITCODE
-    } catch {
-        return $false
-    }
-    return $exitCode -eq 0 -and (($output -join "`n") -match '(?i)cloudflared\s+version')
-}
 
 function Resolve-ProjectPath([string]$Value) {
     if ([System.IO.Path]::IsPathRooted($Value)) { return [System.IO.Path]::GetFullPath($Value) }
@@ -173,6 +163,7 @@ if ($args.Count -ge 1 -and $args[0]) {
 if ($file) {
     $r = Read-TokenFile $file
     if ($null -eq $r) {
+        Show-TunnelTokenHelp
         Write-Host "错误：找不到 tunnel token 文件：$file" -ForegroundColor Red
         Write-Host "  使用优先级：" -ForegroundColor Red
         Write-Host "    .\scripts\tunnel\start-tunnel.ps1 <token文件>   # 相对或绝对路径" -ForegroundColor Red
@@ -193,28 +184,8 @@ if (-not (Test-TunnelTokenValue $token)) {
 }
 Write-Host "[*] token 来源：$source" -ForegroundColor Cyan
 
-# ---- 2. 查找官方安装的 cloudflared.exe ----
-$exe = Join-Path $Project "cloudflared.exe"
-$cfCandidates = @(Get-ApplicationPaths "cloudflared")
-$knownCloudflaredPaths = @()
-if ($env:LOCALAPPDATA) { $knownCloudflaredPaths += (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\cloudflared.exe") }
-if ($env:ProgramFiles) { $knownCloudflaredPaths += (Join-Path $env:ProgramFiles "cloudflared\cloudflared.exe") }
-foreach ($knownCloudflaredPath in $knownCloudflaredPaths) {
-    if ((Test-Path -LiteralPath $knownCloudflaredPath -PathType Leaf) -and $cfCandidates -notcontains $knownCloudflaredPath) {
-        $cfCandidates += $knownCloudflaredPath
-    }
-}
-if ((Test-Path -LiteralPath $exe -PathType Leaf) -and $cfCandidates -notcontains $exe) { $cfCandidates += $exe }
-$cfPath = $null
-foreach ($candidate in $cfCandidates) {
-    if (Test-CloudflaredApplication $candidate) {
-        $cfPath = $candidate
-        break
-    }
-}
-if (-not $cfPath) {
-    throw '请先通过官方渠道安装 cloudflared：winget install --id Cloudflare.cloudflared；然后重新运行。'
-}
+# ---- 2. 只使用项目根目录的 cloudflared.exe；缺失或不可用时下载并校验。 ----
+$cfPath = Ensure-ProjectCloudflared $Project
 Write-Host "[*] cloudflared 程序：$cfPath" -ForegroundColor Cyan
 
 # ---- 3. 连接前的确认：连到哪条隧道、本机有没有东西可转发 ----

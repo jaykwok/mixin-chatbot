@@ -18,6 +18,57 @@ function Get-ApplicationPaths([string]$Name) {
     return $paths
 }
 
+function Test-CloudflaredApplication([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $output = @(& $Path --version 2>$null)
+        return $LASTEXITCODE -eq 0 -and (($output -join "`n") -match '(?i)^cloudflared\s+version')
+    } catch { return $false }
+}
+
+# Only the project copy is used. Validate the download before executing or replacing anything.
+function Ensure-ProjectCloudflared([string]$ProjectRoot) {
+    $executable = Join-Path $ProjectRoot 'cloudflared.exe'
+    if (Test-CloudflaredApplication $executable) { return $executable }
+    if ((Test-Path -LiteralPath $executable) -and -not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+        throw "cloudflared 路径不是文件：$executable"
+    }
+    $asset = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
+        'X64' { 'cloudflared-windows-amd64.exe' }
+        'X86' { 'cloudflared-windows-386.exe' }
+        default { throw '当前 Windows 架构没有自动下载项，请将可用的 cloudflared.exe 放在项目根目录。' }
+    }
+    $release = @(Get-Content -LiteralPath (Join-Path $ProjectRoot 'scripts\tunnel\cloudflared-release.txt') -ErrorAction Stop |
+        ForEach-Object { $fields = $_.Trim() -split '\s+'; if ($fields.Count -eq 3 -and $fields[1] -eq $asset) { ,$fields } })
+    if ($release.Count -ne 1 -or $release[0][0] -notmatch '^\d{4}\.\d+\.\d+$' -or $release[0][2] -notmatch '^[a-fA-F0-9]{64}$') {
+        throw "cloudflared 下载清单无效或缺少 $asset，请获取完整的项目脚本。"
+    }
+    $version = $release[0][0]
+    $checksum = $release[0][2]
+    $url = "https://github.com/cloudflare/cloudflared/releases/download/$version/$asset"
+    $download = "$executable.download-$([Guid]::NewGuid().ToString('N')).exe"
+    Write-Host "[*] 正在从 Cloudflare 官方发布下载 cloudflared $version 到项目根目录..." -ForegroundColor Cyan
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $download -UseBasicParsing -TimeoutSec 180 -ErrorAction Stop
+        # 从 PowerShell 7 调起 5.1 时，避免继承的 PSModulePath 选错内置模块。
+        Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
+        if ((Get-FileHash -LiteralPath $download -Algorithm SHA256 -ErrorAction Stop).Hash -ine $checksum) { throw 'cloudflared 下载文件 SHA-256 校验失败' }
+        if (-not (Test-CloudflaredApplication $download)) { throw '下载的 cloudflared 无法运行或版本检查失败' }
+        Move-ToProjectArchive $executable $ProjectRoot
+        Move-Item -LiteralPath $download -Destination $executable -ErrorAction Stop
+        return $executable
+    } finally {
+        if (Test-Path -LiteralPath $download -PathType Leaf) { Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Show-TunnelTokenHelp {
+    Write-Host 'token 获取：Cloudflare 控制台 → Networking → Tunnels → 创建 Cloudflared 隧道，或选择已有隧道 → Add a replica（添加副本）。'
+    Write-Host '控制台入口：https://dash.cloudflare.com/?to=/:account/tunnels'
+    Write-Host '复制安装命令中 eyJ 开头的完整 token，单独保存到 data\config\tunnel-token（不要带 .txt 后缀）。'
+    Write-Host '部署提示中输入的是 token 文件路径；保存在默认位置后直接回车。连接器安装由本脚本完成。'
+}
+
 function Get-ServiceStateLabel($State) {
     switch ([string]$State) {
         "Running" { return "运行中" }

@@ -58,6 +58,58 @@ validate_model_configuration() {
     fi
 }
 
+# A pinned official release keeps Windows and Linux downloads reproducible without a JSON parser.
+# Run in a subshell so temporary-file cleanup does not replace a deployment's traps.
+ensure_cloudflared() (
+    local PROJECT_DIR="$1" executable="$1/cloudflared" version asset checksum actual download output
+    if [ -x "$executable" ] && output="$("$executable" --version 2>/dev/null)" && [[ "$output" =~ ^cloudflared[[:space:]]+version ]]; then
+        printf '%s\n' "$executable"
+        return 0
+    fi
+    if [ -e "$executable" ] && [ ! -f "$executable" ]; then
+        echo "cloudflared 路径不是文件：$executable" >&2
+        return 1
+    fi
+    case "$(uname -m)" in
+        x86_64|amd64) asset=cloudflared-linux-amd64 ;;
+        aarch64|arm64) asset=cloudflared-linux-arm64 ;;
+        armv6*|armv7*) asset=cloudflared-linux-arm ;;
+        i?86) asset=cloudflared-linux-386 ;;
+        *) echo '当前 Linux 架构没有自动下载项，请将可用的 cloudflared 放在项目根目录。' >&2; return 1 ;;
+    esac
+    read -r version _ checksum < <(awk -v asset="$asset" '$2 == asset { print; exit }' "$PROJECT_DIR/scripts/tunnel/cloudflared-release.txt") || return 1
+    checksum="${checksum%$'\r'}"
+    if ! [[ "$version" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ && "$checksum" =~ ^[a-fA-F0-9]{64}$ ]]; then
+        echo "cloudflared 下载清单无效：$asset" >&2
+        return 1
+    fi
+    download="$(mktemp "$executable.download-XXXXXX")" || return 1
+    trap 'rm -f -- "$download"' EXIT
+    echo "[*] 正在从 Cloudflare 官方发布下载 cloudflared $version 到项目根目录..." >&2
+    curl --proto '=https' --tlsv1.2 --fail --location --show-error --silent --connect-timeout 15 --max-time 180 \
+        --output "$download" "https://github.com/cloudflare/cloudflared/releases/download/$version/$asset" || return 1
+    actual="$(sha256sum < "$download")" || return 1
+    if [ "${actual%% *}" != "${checksum,,}" ]; then
+        echo 'cloudflared 下载文件 SHA-256 校验失败' >&2
+        return 1
+    fi
+    chmod 755 "$download" || return 1
+    if ! output="$("$download" --version 2>/dev/null)" || ! [[ "$output" =~ ^cloudflared[[:space:]]+version ]]; then
+        echo '下载的 cloudflared 无法运行或版本检查失败' >&2
+        return 1
+    fi
+    archive_project_path "$executable" || return 1
+    mv -- "$download" "$executable" || return 1
+    printf '%s\n' "$executable"
+)
+
+show_tunnel_token_help() {
+    echo 'token 获取：Cloudflare 控制台 → Networking → Tunnels → 创建 Cloudflared 隧道，或选择已有隧道 → Add a replica（添加副本）。'
+    echo '控制台入口：https://dash.cloudflare.com/?to=/:account/tunnels'
+    echo '复制安装命令中 eyJ 开头的完整 token，单独保存到 data/config/tunnel-token。'
+    echo '部署提示中输入的是 token 文件路径；保存在默认位置后直接回车。连接器安装由本脚本完成。'
+}
+
 acquire_deploy_lock() {
     mkdir -p "$PROJECT_DIR/data/state"
     local lock_path

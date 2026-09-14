@@ -439,6 +439,11 @@ if [ -n "$INVALID_CONFIGURED_DOMAIN" ]; then
     print_warning "$DOMAIN_SOURCE 中的域名无效，已忽略：$INVALID_CONFIGURED_DOMAIN"
 fi
 if [ "$DEPLOY_MODE" = "cloudflare" ]; then
+    echo "Cloudflare 公网域名准备："
+    echo "  1) 将根域名（如 example.com）添加到 Cloudflare，按指引在域名注册商修改 NS，等待状态变为 Active（已激活）。域名无需转移注册商，但 DNS 需托管到 Cloudflare。"
+    echo "  2) 下面填写机器人使用的子域名，例如 bot.example.com。"
+    echo "  3) 在同一 Cloudflare 账户的 Networking → Tunnels 中创建或选择 Cloudflared 隧道；Published application 路由填相同子域名，服务地址设为 http://localhost:${BOT_PORT}。"
+    echo "DNS 接入和公开路由需在控制台完成；此处填写域名不会自动创建它们。可留空稍后配置，公网回调需配置完成后才能使用。"
     DOMAIN_DEFAULT="$PUBLIC_DOMAIN"
     while true; do
         if [ -n "$DOMAIN_DEFAULT" ]; then
@@ -650,6 +655,9 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     elif [ -f scripts/tunnel/start-tunnel.sh ]; then
         mkdir -p "$LOG_DIR"
         tunnel_token_args=()
+        # 下载在前台完成，不占用后台连接器的 30 秒启动等待窗口。
+        ensure_cloudflared "$PROJECT_DIR" >/dev/null
+        show_tunnel_token_help
         need_tunnel_token_prompt=0
         if [ -n "${TUNNEL_TOKEN:-}" ]; then
             : # 裸 token 由子脚本读取。
