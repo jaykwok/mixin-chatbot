@@ -24,7 +24,6 @@ $RuntimeDir = Join-Path $DataDir "runtime"
 $DefaultGroupDataRoot = Join-Path $DataDir "groups"
 $ModelsFile = Join-Path $ConfigDir "models.json"
 $WebhookSecretFile = Join-Path $ConfigDir "webhook-secret"
-$TunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
 $PortFile = Join-Path $StateDir "bot-port"
 $ModeFile = Join-Path $StateDir "deploy-mode"
 $DomainFile = Join-Path $StateDir "bot-domain"
@@ -683,30 +682,30 @@ if ($mode -eq "cloudflare") {
         } else {
             Done "Cloudflared 服务已经在运行。"
         }
-        if (Test-Path -LiteralPath $TunnelTokenFile -PathType Leaf) {
-            Warn "检测到 data\config\tunnel-token；现有服务可能仍使用旧 token。token 更新后请使用 $(Get-OpsCommandHint 'repair-tunnel')。"
-        }
+        Done "继续沿用现有隧道连接；更新 data\config\cloudflared-token 后，请使用 $(Get-OpsCommandHint 'repair-tunnel') 使新 token 生效。"
     } else {
         Warn "未安装 Cloudflared 服务，正在进入隧道安装流程..."
         $stPath = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
         $env:BOT_PORT = $Port
         Show-TunnelTokenHelp
         while ($true) {
-            $tokIn = Read-Host "隧道 token 文件 [直接回车按 TUNNEL_TOKEN_FILE / TUNNEL_TOKEN / data\config\tunnel-token 的顺序查找]"
+            $tokIn = Read-TunnelTokenInput
+            try { $null = Resolve-TunnelToken $Project $tokIn }
+            catch { Warn $_.Exception.Message; continue }
+            $previousTokenInput = $env:MIXIN_TUNNEL_TOKEN_INPUT
             $previousErrorActionPreference = $ErrorActionPreference
             $tunnelExitCode = 1
             try {
                 # Windows PowerShell 5.1 会把原生命令的 stderr 包装为 ErrorRecord；
                 # 此处让子脚本直接输出，再按真实退出码判断，避免错误提示中断退出码采集。
                 $ErrorActionPreference = "Continue"
-                if ([string]::IsNullOrWhiteSpace($tokIn)) {
-                    & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stPath
-                } else {
-                    & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stPath $tokIn.Trim()
-                }
+                $env:MIXIN_TUNNEL_TOKEN_INPUT = $tokIn
+                & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stPath
                 $tunnelExitCode = $LASTEXITCODE
             } finally {
                 $ErrorActionPreference = $previousErrorActionPreference
+                $env:MIXIN_TUNNEL_TOKEN_INPUT = $previousTokenInput
+                $tokIn = $null
             }
             $installedTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
             if ($tunnelExitCode -eq 0 -and $installedTunnelService -and $installedTunnelService.Status -eq "Running") {
@@ -738,6 +737,7 @@ if ($cleanupFirewallAfterHealth) {
 # 机器人健康且隧道/直连切换成功后再提交，避免 doctor 读取半完成配置。
 Save-DeploymentState
 Done "部署状态已写入 data\state。"
+Done "可选大文件外链：运行 bun run tui，进入「数据 → 外链 → 配置外链」按需启用。"
 $deploymentCommitted = $true
 
 } finally {

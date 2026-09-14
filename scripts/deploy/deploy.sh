@@ -26,7 +26,6 @@ DEFAULT_GROUP_DATA_ROOT="${DATA_DIR}/groups"
 LOG_DIR="${PROJECT_DIR}/logs"
 MODELS_FILE="${CONFIG_DIR}/models.json"
 WEBHOOK_SECRET_FILE="${CONFIG_DIR}/webhook-secret"
-DEFAULT_TUNNEL_TOKEN_FILE="${CONFIG_DIR}/tunnel-token"
 BOT_PORT_FILE="${STATE_DIR}/bot-port"
 DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
 BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
@@ -74,13 +73,16 @@ trim_input() {
 }
 
 read_input() {
-    local prompt="$1" output_name="$2" input_value=""
+    local prompt="$1" output_name="$2" input_value="" hidden="${3:-0}"
+    local read_options=(-r)
+    if [ "$hidden" = "1" ]; then read_options+=(-s); fi
     print_prompt "$prompt"
-    if ! IFS= read -r input_value; then
+    if ! IFS= read "${read_options[@]}" input_value; then
         echo ""
         print_warning "输入已结束，部署已取消"
         exit 130
     fi
+    if [ "$hidden" = "1" ]; then printf '\n'; fi
     printf -v "$output_name" '%s' "$input_value"
 }
 
@@ -654,44 +656,24 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
         fi
     elif [ -f scripts/tunnel/start-tunnel.sh ]; then
         mkdir -p "$LOG_DIR"
-        tunnel_token_args=()
+        tunnel_token_input=""
         # 下载在前台完成，不占用后台连接器的 30 秒启动等待窗口。
         ensure_cloudflared "$PROJECT_DIR" >/dev/null
         show_tunnel_token_help
         need_tunnel_token_prompt=0
-        if [ -n "${TUNNEL_TOKEN:-}" ]; then
-            : # 裸 token 由子脚本读取。
-        elif [ -n "${TUNNEL_TOKEN_FILE:-}" ]; then
-            if [ ! -f "$TUNNEL_TOKEN_FILE" ]; then
-                print_warning "TUNNEL_TOKEN_FILE 指向的文件不存在：$TUNNEL_TOKEN_FILE"
-                need_tunnel_token_prompt=1
-            fi
-        elif [ ! -f "$DEFAULT_TUNNEL_TOKEN_FILE" ]; then
+        if ! (load_tunnel_token) >/dev/null 2>&1; then
             need_tunnel_token_prompt=1
         fi
         while ! managed_cloudflared_pid >/dev/null 2>&1; do
             if [ "$need_tunnel_token_prompt" = "1" ]; then
-                read_input "隧道 token 文件 [直接回车按 TUNNEL_TOKEN_FILE / TUNNEL_TOKEN / data/config/tunnel-token 的顺序查找]：" tunnel_token_file_in
-                tunnel_token_file_in="$(trim_input "$tunnel_token_file_in")"
-                tunnel_token_args=()
-                if [ -n "$tunnel_token_file_in" ]; then
-                    if [ ! -f "$tunnel_token_file_in" ]; then
-                        print_warning "找不到 token 文件：$tunnel_token_file_in"
-                        continue
-                    fi
-                    tunnel_token_args=("$tunnel_token_file_in")
-                elif [ -n "${TUNNEL_TOKEN_FILE:-}" ] && [ ! -f "$TUNNEL_TOKEN_FILE" ] && [ -f "$DEFAULT_TUNNEL_TOKEN_FILE" ]; then
-                    tunnel_token_args=("$DEFAULT_TUNNEL_TOKEN_FILE")
-                elif [ -z "${TUNNEL_TOKEN:-}" ] &&
-                     { [ -z "${TUNNEL_TOKEN_FILE:-}" ] || [ ! -f "$TUNNEL_TOKEN_FILE" ]; } &&
-                     [ ! -f "$DEFAULT_TUNNEL_TOKEN_FILE" ]; then
-                    print_warning "没有可用的 token 来源，请输入 token 文件路径"
+                read_input "隧道 token 或文件路径（输入隐藏；留空自动读取，默认 data/config/cloudflared-token）：" tunnel_token_input 1
+                if ! (load_tunnel_token "$tunnel_token_input"); then
                     continue
                 fi
             fi
 
             print_warning "cloudflared 未运行，正在后台启动隧道连接器..."
-            BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh "${tunnel_token_args[@]}" >>"$LOG_DIR/cloudflared.log" 2>&1 9>&- &
+            MIXIN_TUNNEL_TOKEN_INPUT="$tunnel_token_input" BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh >>"$LOG_DIR/cloudflared.log" 2>&1 9>&- &
             tunnel_launcher_pid=$!
             tunnel_launcher_start="$(process_start_identity "$tunnel_launcher_pid")"
             TUNNEL_STARTED_BY_DEPLOY=1
@@ -799,6 +781,7 @@ elif docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo "  日志:      $(pwd)/logs/"
     echo "  数据:      $(pwd)/data/"
     echo "  群数据根:  $HOST_GROUP_DATA_ROOT"
+    echo "  可选外链:  bun run tui → 数据 → 外链 → 配置外链"
     echo "  监听:      $BOT_HOST:$BOT_PORT"
     echo ""
     echo "  内存限制: 512MB | CPU: 1核"

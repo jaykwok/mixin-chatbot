@@ -89,8 +89,91 @@ function Ensure-ProjectCloudflared([string]$ProjectRoot) {
 function Show-TunnelTokenHelp {
     Write-Host 'token 获取：Cloudflare 控制台 → Networking → Tunnels → 创建 Cloudflared 隧道，或选择已有隧道 → Add a replica（添加副本）。'
     Write-Host '控制台入口：https://dash.cloudflare.com/?to=/:account/tunnels'
-    Write-Host '复制安装命令中 eyJ 开头的完整 token，单独保存到 data\config\tunnel-token（不要带 .txt 后缀）。'
-    Write-Host '部署提示中输入的是 token 文件路径；保存在默认位置后直接回车。连接器安装由本脚本完成。'
+    Write-Host '复制安装命令中 eyJ 开头的完整 token，可直接粘贴，或保存到 data\config\cloudflared-token（不要带 .txt 后缀）。'
+    Write-Host '部署时可输入 token 或文件路径；留空读取 data\config\cloudflared-token，已设置的 TUNNEL_TOKEN_FILE / TUNNEL_TOKEN 环境变量优先。'
+    Write-Host '默认文件直接用于运行；直接粘贴的 token 也保存到 data\config\cloudflared-token。'
+}
+
+function ConvertTo-TunnelTokenValue([string]$Value) {
+    # Only remove paste formatting; do not turn arbitrary text or a path into a token.
+    $clean = $Value -replace '[\s"''\uFEFF]', ''
+    if ($clean -cmatch '^eyJ[A-Za-z0-9+/_-]{17,}={0,2}$') { return $clean }
+    return $null
+}
+
+function Read-TunnelTokenFile([string]$Path) {
+    $content = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+    $match = [regex]::Match($content, '(?m)^[ \t]*(?:export[ \t]+)?TUNNEL_TOKEN[ \t]*=(.*)$')
+    if ($match.Success) { return ConvertTo-TunnelTokenValue $match.Groups[1].Value }
+    # A bare base64 token may end in "=" or "=="; that does not make it a .env assignment.
+    return ConvertTo-TunnelTokenValue $content
+}
+
+function Resolve-TunnelToken([string]$ProjectRoot, [string]$InputValue = '') {
+    $path = $null
+    $value = $null
+    $kind = 'file'
+    $display = ''
+    $selection = $InputValue.Trim().Trim('"').Trim("'")
+    if ($selection) {
+        try {
+            $candidate = if ([IO.Path]::IsPathRooted($selection)) { [IO.Path]::GetFullPath($selection) } else {
+                [IO.Path]::GetFullPath((Join-Path $ProjectRoot $selection))
+            }
+            if ([IO.File]::Exists($candidate)) { $path = $candidate }
+        } catch { }
+        if (-not $path) {
+            $value = ConvertTo-TunnelTokenValue $selection
+            if (-not $value) { throw '未找到 token 文件或输入格式无效；请输入文件路径或 eyJ 开头的完整 token。' }
+            $kind = 'input'
+            $display = '直接输入（值已隐藏）'
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:TUNNEL_TOKEN_FILE)) {
+        $selection = $env:TUNNEL_TOKEN_FILE.Trim().Trim('"').Trim("'")
+        try {
+            $path = if ([IO.Path]::IsPathRooted($selection)) { [IO.Path]::GetFullPath($selection) } else {
+                [IO.Path]::GetFullPath((Join-Path $ProjectRoot $selection))
+            }
+        } catch { throw 'TUNNEL_TOKEN_FILE 路径无效。' }
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:TUNNEL_TOKEN)) {
+        $value = ConvertTo-TunnelTokenValue $env:TUNNEL_TOKEN
+        $kind = 'env'
+        $display = 'env:TUNNEL_TOKEN（值已隐藏）'
+    } else {
+        $path = Join-Path $ProjectRoot 'data\config\cloudflared-token'
+    }
+    if ($path) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw '找不到隧道 token 文件；请检查 TUNNEL_TOKEN_FILE，或保存到 data\config\cloudflared-token。'
+        }
+        try { $value = Read-TunnelTokenFile $path }
+        catch { throw '无法读取隧道 token 文件，请检查文件权限和编码。' }
+        $display = $path
+    }
+    if (-not $value) { throw 'token 为空或格式无效；需要 eyJ 开头的完整 token，.env 文件需包含 TUNNEL_TOKEN。' }
+    return [pscustomobject]@{ Token = $value; Kind = $kind; Path = $path; Display = $display }
+}
+
+function Save-ProjectTunnelToken([string]$ProjectRoot, [string]$Token) {
+    $value = ConvertTo-TunnelTokenValue $Token
+    if (-not $value) { throw '不能保存无效的隧道 token。' }
+    $path = Join-Path $ProjectRoot 'data\config\cloudflared-token'
+    New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
+    # Reuse an already normalized default file without rewriting it.
+    $current = if (Test-Path -LiteralPath $path -PathType Leaf) { [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($path)) } else { $null }
+    if ($current -cne $value) { [IO.File]::WriteAllText($path, $value, [Text.UTF8Encoding]::new($false)) }
+    Protect-ProjectSecretPath $path
+    return $path
+}
+
+function Read-TunnelTokenInput {
+    $secret = Read-Host '隧道 token 或文件路径（输入隐藏；留空自动读取，默认 data\config\cloudflared-token）' -AsSecureString
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+        $secret.Dispose()
+    }
 }
 
 function Get-ServiceStateLabel($State) {

@@ -377,12 +377,57 @@ relay_admin() {
         mixin-chatbot bun run scripts/ops/relay-admin.ts "$@"
 }
 
-# 用户临时目录的清理同样交给 bun 脚本：目录布局与「什么不能删」的边界定义在 src/ 里，
-# 在 shell 里抄一遍 rm -rf 是把最危险的一段逻辑维护成两份。
-#
-# 与 relay 不同的是这里要显式喂 GROUP_DATA_ROOT：exec 进正在运行的容器时它已经在容器
-# 环境里，用一次性容器时则要按 deploy.sh 的同一套规则把主机目录映射进去，否则脚本会去
-# 扫容器内那个空的 /app/data/groups。
+# 向导先生成确认过的草稿，随后才停机提交，退出时恢复原运行状态并移除草稿。
+relay_configure() (
+    local draft_dir="" draft_file="" container_draft="" owner="" was_running=0 stop_attempted=0
+    if ! command -v docker >/dev/null 2>&1; then ER "找不到 docker"; return 1; fi
+    mkdir -p -- "$CONFIG_DIR" || return 1
+    draft_dir="$(mktemp -d "${CONFIG_DIR}/.relay-config-XXXXXX")" || return 1
+    draft_file="${draft_dir}/draft.json"
+    restore_relay_service() {
+        local code=$?
+        trap - EXIT INT TERM
+        if [ "$was_running" = 1 ] && [ "$stop_attempted" = 1 ]; then start_bot || code=1; fi
+        rm -f -- "$draft_file" || code=1
+        rmdir -- "$draft_dir" || code=1
+        exit "$code"
+    }
+    trap restore_relay_service EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    cd "$PROJECT_DIR" || return 1
+    owner="$(stat -c '%u:%g' "$DATA_DIR")" || return 1
+    if [ "$(stat -c '%u:%g' "$draft_dir")" != "$owner" ]; then chown "$owner" "$draft_dir" || return 1; fi
+    container_draft="/app/data/config/$(basename "$draft_dir")/draft.json"
+    relay_config_cli() {
+        local terminal=()
+        if [ "$1" = "--draft" ]; then
+            terminal=(-i)
+            if [ -t 0 ] && [ -t 1 ]; then terminal+=(-t); fi
+        fi
+        docker run --rm "${terminal[@]}" --user "$owner" -e HOME=/app/data/runtime/home \
+            -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
+            mixin-chatbot bun run scripts/config/configure-relay.ts "$1" "$container_draft"
+    }
+    # 复用镜像内的 Bun 和依赖；向导在独立容器里填写草稿，不影响正在运行的机器人。
+    relay_config_cli --draft || return 1
+    [ -f "$draft_file" ] || return 0
+    local state=""
+    state="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.State}}')" || {
+        ER "无法查询容器状态，外链配置未写入"; return 1;
+    }
+    if [ "$state" = "running" ]; then
+        was_running=1
+        stop_attempted=1
+        P "外链配置已确认，短暂停止机器人以应用设置"
+        docker stop "$CONTAINER" >/dev/null || { ER "停止容器失败，外链配置未写入"; return 1; }
+    fi
+    relay_config_cli --apply || return 1
+    if [ "$was_running" = 0 ]; then OK "外链设置将在下次启动机器人时生效；已保持停止状态"; fi
+)
+
+# 群数据操作由 Bun 统一管理存储边界；一次性容器必须按部署时的规则映射
+# GROUP_DATA_ROOT，防止自定义群数据根被误认为容器中的默认 /app/data/groups。
 group_data_admin() {
     local script="$1"; shift
     if ! command -v docker >/dev/null 2>&1; then
@@ -693,6 +738,7 @@ case "${1:-}" in
     stop)      stop_bot ;;
     start)     start_bot ;;
     logs)      show_logs ;;
+    relay-configure) relay_configure ;;
     relay-ls)    relay_admin list ;;
     relay-purge) shift; relay_admin purge "$@" ;;
     tmp-ls)      shift; tmp_admin list "$@" ;;
@@ -723,6 +769,7 @@ case "${1:-}" in
         echo "  stop       停止 Docker 容器"
         echo "  start      启动 Docker 容器"
         echo "  logs       持续查看最近 50 行 Docker 日志"
+        echo "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
         echo "  relay-ls   列出已发出、仍在册的大文件外链"
         echo "  relay-purge <关键字>|--all"
         echo "             删除匹配的外链对象并清掉索引记录"

@@ -128,6 +128,7 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
     $env:ProgramData=Join-Path $root 'programdata'
     New-Item -ItemType Directory -Force -Path (Join-Path $env:ProgramData 'cloudflared') | Out-Null
     Set-Content (Join-Path $root 'data/config/models.json') 'old-config'
+    Set-Content (Join-Path $root 'data/config/cloudflared-token') 'old-project-token'
     Set-Content (Join-Path $root 'data/state/cloudflared-managed') 'Cloudflared'
     Set-Content (Join-Path $root 'data/state/bot-port') '1011'
     Set-Content (Join-Path $root 'node_modules/version') 'old-dependencies'
@@ -150,6 +151,7 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
             if($stage -in @('task','health')){throw 'task/health failure'}
             $script:serviceExists=$false
             Set-Content (Join-Path $env:ProgramData 'cloudflared/token') 'new-token'
+            Set-Content (Join-Path $root 'data/config/cloudflared-token') 'new-project-token'
             if($stage -eq 'tunnel'){throw 'tunnel failure'}
             $script:rules=@([pscustomobject]@{Name='new-rule'})
             if($stage -eq 'firewall'){throw 'firewall failure'}
@@ -160,6 +162,7 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
         if((Get-Content (Join-Path $root 'data/config/models.json')).Trim() -ne 'old-config'){throw 'config not restored'}
         if((Get-Content (Join-Path $root 'data/state/bot-port')).Trim() -ne '1011'){throw 'state not restored'}
         if((Get-Content (Join-Path $env:ProgramData 'cloudflared/token')).Trim() -ne 'fake-original-token'){throw 'connector token not restored'}
+        if((Get-Content (Join-Path $root 'data/config/cloudflared-token')).Trim() -ne 'old-project-token'){throw 'project connector token not restored'}
         if($script:task.State -ne $(if($running){'Running'}else{'Ready'})){throw 'task run state not preserved'}
         if($script:serviceStatus -ne $(if($running){'Running'}else{'Stopped'})){throw 'connector run state not preserved'}
         if($script:rules.Count -ne 1 -or $script:rules[0].Name -ne 'old-rule'){throw 'firewall not restored'}

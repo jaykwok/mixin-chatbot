@@ -4,15 +4,15 @@
 # 前置条件：
 #   1) 机器人已在 localhost:BOT_PORT 运行（scripts\deploy\deploy.ps1，Cloudflare 模式）
 #   2) 隧道 token。来源优先级：
-#        参数： .\scripts\tunnel\start-tunnel.ps1 <token文件>  # 相对或绝对路径
+#        参数： .\scripts\tunnel\start-tunnel.ps1 <token或文件> # 完整 token 或文件路径
 #        环境： $env:TUNNEL_TOKEN_FILE='<路径>'                  # token 文件路径
 #        环境： $env:TUNNEL_TOKEN='<裸 token>'                  # 直接提供 token
-#        默认： data\config\tunnel-token                         # 裸 token 或 .env 形式
+#        默认： data\config\cloudflared-token                    # 输入与运行共用
 #      token 文件可以是裸 token，也可以是复制来的 .env 文件。
 #      任何包含 TUNNEL_TOKEN=<值> 的 .env 文件都可以直接使用。
 #
 # 请在管理员 PowerShell 中运行：
-#   powershell -ExecutionPolicy Bypass -File scripts\tunnel\start-tunnel.ps1 [token文件]
+#   powershell -ExecutionPolicy Bypass -File scripts\tunnel\start-tunnel.ps1 [token或文件]
 $ErrorActionPreference = "Stop"
 $Project = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 # 加载共享实例控制、部署事务和辅助函数。
@@ -24,22 +24,9 @@ if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
 . $CommonLib
 Set-Location $Project
 $DataDir = Join-Path $Project "data"
-$ConfigDir = Join-Path $DataDir "config"
 $StateDir = Join-Path $DataDir "state"
 $PersistedPortFile = Join-Path $StateDir "bot-port"
-$DefaultTunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
 $TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
-
-
-function Resolve-ProjectPath([string]$Value) {
-    if ([System.IO.Path]::IsPathRooted($Value)) { return [System.IO.Path]::GetFullPath($Value) }
-    return [System.IO.Path]::GetFullPath((Join-Path $Project $Value))
-}
-
-function Test-TunnelTokenValue([string]$Value) {
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
-    return (($Value -replace '[^A-Za-z0-9+/=_-]', '').Length -ge 20)
-}
 
 function Register-ProjectCloudflared([string]$Executable, [string]$TokenFile) {
     # Official service install accepts a positional token, not --token-file.
@@ -130,62 +117,21 @@ if ($existingService -and $env:CLOUDFLARED_REINSTALL -ne "1") {
 }
 
 # ---- 1. 读取 token ----
-function Read-TokenFile($path) {
-    $abs = Resolve-ProjectPath $path
-    if (-not (Test-Path -LiteralPath $abs -PathType Leaf)) { return $null }
-    $content = Get-Content -LiteralPath $abs -Raw -ErrorAction SilentlyContinue
-    if ($null -eq $content) { return $null }
-    $m = [regex]::Match($content, '(?m)^[ \t]*TUNNEL_TOKEN[ \t]*=(.+?)[ \t\r]*$')
-    if ($m.Success) {
-        $val = $m.Groups[1].Value.Trim().Trim('"').Trim("'")
-        return @{ token = $val; from = $abs }
-    }
-    if ($content -match '(?m)^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=') {
-        return @{ token = ""; from = $abs }
-    }
-    return @{ token = $content; from = $abs }
-}
-
-$token = $null
-$source = $null
-if ($args.Count -ge 1 -and $args[0]) {
-    $file = $args[0]
-} elseif ($env:TUNNEL_TOKEN_FILE) {
-    $file = $env:TUNNEL_TOKEN_FILE
-} elseif ($env:TUNNEL_TOKEN) {
-    $file = $null
-    $token = $env:TUNNEL_TOKEN
-    $source = "env:TUNNEL_TOKEN"
-} else {
-    $file = $DefaultTunnelTokenFile
-}
-if ($file) {
-    $r = Read-TokenFile $file
-    if ($null -eq $r) {
-        Show-TunnelTokenHelp
-        Write-Host "错误：找不到 tunnel token 文件：$file" -ForegroundColor Red
-        if ($env:MIXIN_OPS_TUI -eq '1') {
-            Write-Host "  在部署向导的「隧道 token 文件」中填写已有文件路径，或将 token 保存到 data\config\tunnel-token 后直接回车。" -ForegroundColor Red
-        } else {
-            Write-Host "  使用优先级：" -ForegroundColor Red
-            Write-Host "    .\scripts\tunnel\start-tunnel.ps1 <token文件>   # 相对或绝对路径" -ForegroundColor Red
-            Write-Host "    `$env:TUNNEL_TOKEN_FILE='<路径>'             # 指定 token 文件" -ForegroundColor Red
-            Write-Host "    `$env:TUNNEL_TOKEN='<裸 token>'             # 直接提供 token 值" -ForegroundColor Red
-            Write-Host "    默认：data\config\tunnel-token          # 裸 token 或 .env 文件" -ForegroundColor Red
-        }
-        Write-Host "  （包含 TUNNEL_TOKEN=<值> 的 .env 文件可直接使用）" -ForegroundColor Red
-        exit 1
-    }
-    $token = $r.token
-    $source = $r.from
-}
-# 清洗：只保留 base64 字符（去除空白、引号、BOM、CRLF）
-$token = $token -replace '[^A-Za-z0-9+/=_-]', ''
-if (-not (Test-TunnelTokenValue $token)) {
-    Write-Host "错误：token 为空或格式明显无效（清洗后长度不足 20）。" -ForegroundColor Red
+$tokenInput = if ($args.Count -ge 1 -and $args[0]) { [string]$args[0] } else { [string]$env:MIXIN_TUNNEL_TOKEN_INPUT }
+try {
+    $resolvedToken = Resolve-TunnelToken $Project $tokenInput
+} catch {
+    Show-TunnelTokenHelp
+    Write-Host ("错误：" + $_.Exception.Message) -ForegroundColor Red
     exit 1
+} finally {
+    # Interactive credentials travel to this child through the environment, never its command line.
+    $env:MIXIN_TUNNEL_TOKEN_INPUT = $null
+    $env:TUNNEL_TOKEN = $null
+    $tokenInput = $null
 }
-Write-Host "[*] token 来源：$source" -ForegroundColor Cyan
+$token = $resolvedToken.Token
+Write-Host "[*] token 来源：$($resolvedToken.Display)" -ForegroundColor Cyan
 
 # ---- 2. 只使用项目根目录的 cloudflared.exe；缺失或不可用时下载并校验。 ----
 $cfPath = Ensure-ProjectCloudflared $Project
@@ -227,11 +173,8 @@ if ($isAdmin) {
     Set-Content -LiteralPath $TunnelManagedFile -Value "Cloudflared" -NoNewline -Encoding ASCII
     $svc = $existingService
     if (-not $svc -or $env:CLOUDFLARED_REINSTALL -eq '1') {
-        $serviceTokenFile = Join-Path $ConfigDir 'cloudflared-token'
-        New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
         if ($svc) { Stop-Service Cloudflared -ErrorAction Stop }
-        [IO.File]::WriteAllText($serviceTokenFile, $token, (New-Object Text.UTF8Encoding($false)))
-        Protect-ProjectSecretPath $serviceTokenFile
+        $serviceTokenFile = Save-ProjectTunnelToken $Project $token
         Register-ProjectCloudflared $cfPath $serviceTokenFile
         Write-Host 'Cloudflared 服务已配置为开机自启，凭据从受保护文件读取。' -ForegroundColor Green
     } else {
@@ -264,10 +207,7 @@ if ($isAdmin) {
     $foregroundExitCode = 1
     try {
         $ErrorActionPreference = "Continue"
-        $foregroundTokenFile = Join-Path $ConfigDir 'cloudflared-token'
-        New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
-        [IO.File]::WriteAllText($foregroundTokenFile, $token, (New-Object Text.UTF8Encoding($false)))
-        Protect-ProjectSecretPath $foregroundTokenFile
+        $foregroundTokenFile = Save-ProjectTunnelToken $Project $token
         & $cfPath tunnel --no-autoupdate run --token-file $foregroundTokenFile
         $foregroundExitCode = $LASTEXITCODE
     } finally {

@@ -4,19 +4,18 @@
 # 前置：
 #   1) 机器人已在本机 BOT_PORT 跑起来（./scripts/deploy/deploy.sh 选 Cloudflare 模式）
 #   2) 隧道 token。来源（按优先级）：
-#        位置参数：./scripts/tunnel/start-tunnel.sh <token文件>   # 路径，相对或绝对
+#        位置参数：./scripts/tunnel/start-tunnel.sh <token或文件> # 完整 token 或文件路径
 #        环境变量：TUNNEL_TOKEN_FILE=<路径>                   # 指定文件
 #        环境变量：TUNNEL_TOKEN=<裸 token>                    # 直接给值
-#        默认：    data/config/tunnel-token                   # 裸值或 .env 形式均可
+#        默认：    data/config/cloudflared-token              # 输入与运行共用
 #      token 文件可以是裸 token，也可以是直接拷来的 .env
 #      （也可直接使用内含 TUNNEL_TOKEN=<值> 的 .env 文件）。
 #
-# 用法： ./scripts/tunnel/start-tunnel.sh [token文件]
+# 用法： ./scripts/tunnel/start-tunnel.sh [token或文件]
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
 BOT_PORT_FILE="${PROJECT_DIR}/data/state/bot-port"
-DEFAULT_TUNNEL_TOKEN_FILE="${PROJECT_DIR}/data/config/tunnel-token"
 TUNNEL_PID_FILE="${PROJECT_DIR}/data/state/cloudflared.pid"
 
 . "$PROJECT_DIR/scripts/lib/common.sh"
@@ -38,76 +37,13 @@ if ! [[ "$BOT_PORT" =~ ^[0-9]+$ ]] || [ "$BOT_PORT" -lt 1 ] || [ "$BOT_PORT" -gt
     exit 1
 fi
 
-# 从 token 文件取值。三种结局，靠退出码区分：
-#   0 → 文件是 .env 且 TUNNEL_TOKEN 有值，值已打印到 stdout
-#   7 → 文件里没有任何 KEY=VALUE 行，按裸 token 文件处理
-#   8 → 文件确实是 .env，但 TUNNEL_TOKEN 缺失或为空
-# 第三种必须和第二种分开：把整个 .env 当裸 token 读进来，清洗掉非 base64 字符之后
-# 剩下的仍然是个非空字符串（`FOO=bar` 全是合法字符），于是一个由别的变量拼出来的
-# 伪 token 会被原样喂给 cloudflared，报错还指向隧道本身。
-extract_env_token() {
-    awk '
-        /^[[:space:]]*TUNNEL_TOKEN[[:space:]]*=/ {
-            envlike = 1
-            sub(/^[^=]*=/, "")
-            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "")
-            gsub(/^["'\'']+|["'\'']+$/, "")
-            if (length($0) > 0) { print; found = 1; exit }
-            next
-        }
-        /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=/ { envlike = 1 }
-        END {
-            if (found) exit 0
-            exit (envlike ? 8 : 7)
-        }
-    ' "$1"
-}
-
 # ---- 1. 取 token（位置参数 > TUNNEL_TOKEN_FILE > TUNNEL_TOKEN > 默认文件）----
-if [ "$#" -ge 1 ] && [ -n "$1" ]; then
-    TOKEN_FILE="$1"
-elif [ -n "${TUNNEL_TOKEN_FILE:-}" ]; then
-    TOKEN_FILE="$TUNNEL_TOKEN_FILE"
-elif [ -n "${TUNNEL_TOKEN:-}" ]; then
-    TOKEN_FILE=""
-    echo "ℹ 使用环境变量 TUNNEL_TOKEN"
-else
-    TOKEN_FILE="$DEFAULT_TUNNEL_TOKEN_FILE"
-fi
-
-if [ -n "$TOKEN_FILE" ]; then
-    if [ ! -f "$TOKEN_FILE" ]; then
-        show_tunnel_token_help >&2
-        echo "✗ 未找到隧道 token 文件：$TOKEN_FILE" >&2
-        if [ "${MIXIN_OPS_TUI:-}" = "1" ]; then
-            echo "  请在部署向导中填写 token 文件路径，或将 token 保存到 data/config/tunnel-token 后重新部署。" >&2
-        else
-            echo "  优先级：位置参数 > TUNNEL_TOKEN_FILE > TUNNEL_TOKEN > data/config/tunnel-token" >&2
-        fi
-        exit 1
-    fi
-    extract_rc=0
-    val="$(extract_env_token "$TOKEN_FILE")" || extract_rc=$?
-    case "$extract_rc" in
-        0) TUNNEL_TOKEN="$val" ;;
-        7) TUNNEL_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")" ;;
-        *)
-            echo "✗ ${TOKEN_FILE} 看起来是 .env 文件，但其中的 TUNNEL_TOKEN 缺失或为空" >&2
-            echo "  请补上 TUNNEL_TOKEN=<值>，或改用只含裸 token 的文件" >&2
-            exit 1
-            ;;
-    esac
-    echo "ℹ token 来自文件：$(cd "$(dirname "$TOKEN_FILE")" && pwd)/$(basename "$TOKEN_FILE")"
-fi
-
-# 统一清洗：只保留 base64 字符（去空白/引号/BOM/CR）
-TUNNEL_TOKEN="$(printf '%s' "$TUNNEL_TOKEN" | tr -cd 'A-Za-z0-9+/=_-')"
-# 与 start-tunnel.ps1 的 Test-TunnelTokenValue 对齐：只判非空拦不住明显不是 token 的
-# 输入（一个字符也算非空），真实的 connector token 是几百字符的 base64。
-if [ "${#TUNNEL_TOKEN}" -lt 20 ]; then
-    echo "✗ token 为空或格式明显无效（清洗后长度不足 20）" >&2
+if ! load_tunnel_token "${1:-${MIXIN_TUNNEL_TOKEN_INPUT:-}}"; then
+    show_tunnel_token_help >&2
     exit 1
 fi
+unset MIXIN_TUNNEL_TOKEN_INPUT TUNNEL_TOKEN
+echo "ℹ token 来源：$TUNNEL_TOKEN_SOURCE"
 
 # ---- 2. 只使用项目根目录的 cloudflared；缺失或不可用时下载并校验。 ----
 cloudflared_path="$(ensure_cloudflared "$PROJECT_DIR")"
@@ -118,7 +54,7 @@ cloudflared_path="$(ensure_cloudflared "$PROJECT_DIR")"
 # 让人看清将要接入哪条隧道，secret 一个字符都不输出。解不开就跳过，这只是给人看的信息。
 if command -v base64 >/dev/null 2>&1; then
     tunnel_identity="$(
-        printf '%s' "$TUNNEL_TOKEN" | tr '_-' '/+' \
+        printf '%s' "$TUNNEL_TOKEN_VALUE" | tr '_-' '/+' \
             | { padded="$(cat)"; case $(( ${#padded} % 4 )) in
                     2) printf '%s==' "$padded" ;;
                     3) printf '%s=' "$padded" ;;
@@ -151,10 +87,7 @@ fi
 # ---- 4. 起隧道（前台）----
 echo "▶ 启动 cloudflared connector（控制台 Published application 应配置为 http://localhost:${BOT_PORT}）"
 echo "  （前台运行，Ctrl+C 停止。常驻开机自启可用 systemd/tmux 包一层）"
-mkdir -p "$PROJECT_DIR/data/config"
-token_path="$PROJECT_DIR/data/config/cloudflared-token"
-(umask 077 && printf '%s' "$TUNNEL_TOKEN" > "$token_path")
-chmod 600 "$token_path"
-unset TUNNEL_TOKEN
+token_path="$(save_project_tunnel_token "$TUNNEL_TOKEN_VALUE")"
+unset TUNNEL_TOKEN_VALUE
 record_cloudflared_pid "$$"
 exec "$cloudflared_path" tunnel --no-autoupdate run --token-file "$token_path"

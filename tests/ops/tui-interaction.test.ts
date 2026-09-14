@@ -1256,9 +1256,27 @@ test("操作预览在宽窄窗口及无色终端都完整容纳菜单，最后�
         const ctx = { ...context(width, rows), theme: createTheme(depth) };
         const frame = view.render(ctx);
         fits(frame, ctx);
-        expect(plain(frame)).toContain(view.id === "maintain" ? "卸载" : view.id === "relay" ? "清理全部外链" : "移除废弃绑定");
+        expect(plain(frame)).toContain(view.id === "maintain" ? "卸载" : view.id === "relay" ? "配置外链" : "移除废弃绑定");
       }
     }
+  }
+});
+
+test("外链配置在两个平台接管真实终端，不通过普通弹窗或命令参数传递凭据", async () => {
+  for (const platform of ["windows", "linux"] as const) {
+    const { app, calls } = fakeApp();
+    app.deployment.platform = platform;
+    const interactive: string[][] = [];
+    app.runInteractive = async (_title, args) => { interactive.push(args); return 0; };
+    const view = createRelayView();
+    await view.onKey!(key("end"), app);
+    expect(plain(view.render(context(120, 35)))).toContain("保存前预览并确认");
+    await view.onKey!(key("enter"), app);
+    expect(interactive).toEqual([["relay-configure"]]);
+    expect(calls.commands).toHaveLength(0);
+    expect(calls.prompts).toHaveLength(0);
+    expect(calls.confirms).toHaveLength(0);
+    expect(calls.toasts).toEqual(["配置外链向导已结束"]);
   }
 });
 

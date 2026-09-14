@@ -62,7 +62,7 @@ export interface RelayConfig {
 }
 
 /** 默认外链上限；再大的文件多半是误发，也会长时间占住一次工具调用。 */
-const DEFAULT_RELAY_MAX_BYTES = 2 * 1024 ** 3;
+export const DEFAULT_RELAY_MAX_BYTES = 2 * 1024 ** 3;
 /** expireHours 的上限，够用且能拦住把毫秒当小时填进来的手误。 */
 const MAX_RELAY_EXPIRE_HOURS = 24 * 365;
 
@@ -147,6 +147,11 @@ export function loadRelayConfig(path: string = RELAY_CONFIG_PATH): RelayConfig |
   } catch (error) {
     throw new Error(`${path} 不是有效 JSON`, { cause: error });
   }
+  return validateRelayConfig(doc, path);
+}
+
+/** 配置向导与启动流程共用校验，未通过校验的草稿不能覆盖运行配置。 */
+export function validateRelayConfig(doc: unknown, path: string = RELAY_CONFIG_PATH): RelayConfig {
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
     throw new Error(`${path} 必须是 JSON 对象`);
   }

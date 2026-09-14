@@ -73,7 +73,6 @@ $TunnelScript = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
 $ModelsFile = Join-Path $ConfigDir "models.json"
 $WebhookSecretFile = Join-Path $ConfigDir "webhook-secret"
 $RelayConfigFile = Join-Path $ConfigDir "relay.json"
-$DefaultTunnelTokenFile = Join-Path $ConfigDir "tunnel-token"
 $LocalCloudflared = Join-Path $Project "cloudflared.exe"
 $TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -227,12 +226,53 @@ function Invoke-RelayAdmin([string[]]$RelayArgs) {
     }
 }
 
-# 用户临时目录的清理同样交给 scripts\ops\tmp-admin.ts。目录布局与「什么不能删」的边界
-# 定义在 src\ 里，在 PowerShell 里抄一遍 Remove-Item -Recurse 是把最危险的一段逻辑维护
-# 成两份——workspace 和 session.jsonl 就在 tmp 的隔壁。
-#
-# GROUP_DATA_ROOT 必须显式传：Windows 上机器人由计划任务启动，这个 PowerShell 会话里
-# 没有它，脚本会退回默认的 data\groups，自定义群数据根就扫不到。
+# 先形成经确认的配置草稿，再停机提交并恢复服务；凭据只存在于隐藏输入和配置文件中。
+function Invoke-RelayConfiguration {
+    $bunPath = Get-BunPath
+    if (-not $bunPath) { throw "找不到可用的 bun；请安装 Bun：https://bun.sh" }
+    $draft = Join-Path $ConfigDir (".relay-draft-" + [guid]::NewGuid().ToString("N") + ".json")
+    $wasRunning = $false
+    $stopAttempted = $false
+    Push-Location $Project
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        # 直接继承终端，保留密码掩码和 Ctrl+C；不把凭据放进参数或输出管道。
+        Invoke-WithUtf8Output { & $bunPath run "scripts\config\configure-relay.ts" --draft $draft }
+        if ($LASTEXITCODE -ne 0) { throw "外链配置未完成；原配置和服务保持原状" }
+        if (-not (Test-Path -LiteralPath $draft -PathType Leaf)) { return }
+        $ErrorActionPreference = "Stop"
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
+        if ($wasRunning -and -not $task) {
+            throw "机器人以前台方式运行，无法自动恢复；请先停止前台实例，再重新配置外链"
+        }
+        if ($wasRunning) {
+            Step "外链配置已确认，短暂停止机器人以应用设置"
+            $stopAttempted = $true
+            if (-not (Stop-Bot)) { throw "无法停止机器人，外链配置未写入" }
+        }
+        $ErrorActionPreference = "Continue"
+        Invoke-WithUtf8Output { & $bunPath run "scripts\config\configure-relay.ts" --apply $draft }
+        if ($LASTEXITCODE -ne 0) { throw "外链配置应用失败，请查看上方错误" }
+        if (-not $wasRunning) { Done "外链设置将在下次启动机器人时生效；已保持停止状态" }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        try {
+            if ($wasRunning -and $stopAttempted) {
+                if (-not (Start-Bot)) { throw "外链配置操作已结束，但机器人恢复启动失败" }
+                if ((Wait-Local) -ne 200) { throw "机器人恢复后未通过健康检查，请在 $(Get-OpsCommandHint 'logs') 查看日志" }
+                Done "机器人已恢复运行，已重新读取外链设置"
+            }
+        } finally {
+            Remove-Item -LiteralPath $draft -Force -ErrorAction SilentlyContinue
+            Pop-Location
+        }
+    }
+}
+
+# 群数据操作由 Bun 统一管理存储边界；计划任务的环境变量不会传到当前 PowerShell，
+# 所以自定义 GROUP_DATA_ROOT 必须显式传入，防止维护操作误用默认 data\groups。
 function Invoke-GroupDataAdmin([string]$Script, [string[]]$TmpArgs) {
     $bunPath = Get-BunPath
     if (-not $bunPath) {
@@ -345,63 +385,25 @@ function Resolve-ProjectPath([string]$Value) {
     return [System.IO.Path]::GetFullPath((Join-Path $Project $Value))
 }
 
-function Test-TunnelTokenValue([string]$Value) {
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
-    $clean = $Value -replace '[^A-Za-z0-9+/=_-]', ''
-    return $clean.Length -ge 20
-}
-
-function Get-TunnelTokenFileInfo([string]$Path, [string]$Display) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+function Get-TunnelTokenSource {
+    try {
+        $source = Resolve-TunnelToken $Project
+        return [pscustomobject]@{
+            Available = $true
+            Kind      = $source.Kind
+            Path      = $source.Path
+            Display   = $source.Display
+            Detail    = $(if ($source.Kind -eq 'file') { "$($source.Display)（值已隐藏）" } else { $source.Display })
+        }
+    } catch {
         return [pscustomobject]@{
             Available = $false
-            Kind      = "file"
-            Path      = $Path
-            Display   = $Display
-            Detail    = "缺少：$Display"
-        }
-    }
-
-    try {
-        $content = Get-Content -LiteralPath $Path -Raw
-        $match = [regex]::Match($content, '(?m)^[ \t]*TUNNEL_TOKEN[ \t]*=(.+?)[ \t\r]*$')
-        if ($match.Success) {
-            $value = $match.Groups[1].Value.Trim().Trim('"').Trim("'")
-        } elseif ($content -match '(?m)^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=') {
-            $value = ""
-        } else {
-            $value = $content.Trim().Trim('"').Trim("'")
-        }
-        $valid = Test-TunnelTokenValue $value
-    } catch {
-        $valid = $false
-    }
-
-    return [pscustomobject]@{
-        Available = $valid
-        Kind      = "file"
-        Path      = $Path
-        Display   = $Display
-        Detail    = $(if ($valid) { "$Display（值已隐藏）" } else { "为空或无效：$Display" })
-    }
-}
-
-function Get-TunnelTokenSource {
-    if (-not [string]::IsNullOrWhiteSpace($env:TUNNEL_TOKEN_FILE)) {
-        $path = Resolve-ProjectPath $env:TUNNEL_TOKEN_FILE.Trim()
-        return Get-TunnelTokenFileInfo $path "env:TUNNEL_TOKEN_FILE -> $path"
-    }
-    if (-not [string]::IsNullOrWhiteSpace($env:TUNNEL_TOKEN)) {
-        $valid = Test-TunnelTokenValue $env:TUNNEL_TOKEN
-        return [pscustomobject]@{
-            Available = $valid
-            Kind      = "env"
+            Kind      = "missing"
             Path      = $null
-            Display   = "env:TUNNEL_TOKEN"
-            Detail    = $(if ($valid) { "env:TUNNEL_TOKEN（值已隐藏）" } else { "env:TUNNEL_TOKEN 为空或无效" })
+            Display   = "隧道 token"
+            Detail    = $_.Exception.Message
         }
     }
-    return Get-TunnelTokenFileInfo $DefaultTunnelTokenFile "data\config\tunnel-token"
 }
 
 # 通用 HTTP 探测，禁用系统代理；凭据通过 .NET 请求设置，不进入命令行或临时文件。
@@ -615,7 +617,7 @@ function Invoke-TunnelRepair {
     $tokenSource = Get-TunnelTokenSource
     if (-not $tokenSource.Available) {
         Err "没有可用的 Cloudflare 隧道 token 来源：$($tokenSource.Detail)"
-        Warn "请将裸 token（或 TUNNEL_TOKEN=...）放入 data\config\tunnel-token 后重试"
+        Warn "请将 token 放入 data\config\cloudflared-token 后重试"
         return $false
     }
 
@@ -742,7 +744,7 @@ function Show-Doctor {
     if ($DeployMode -eq "cloudflare") {
         $tokenSource = Get-TunnelTokenSource
         $tokenDetail = if ($tokenSource.Available) { "$($tokenSource.Detail)；仅表示可用于修复，无法证明服务已安装同一 token" } else { $tokenSource.Detail }
-        $rows += New-DoctorRow "隧道 token 来源" $(if ($tokenSource.Available) { "pass" } else { "warn" }) $tokenDetail $(if ($tokenSource.Available) { "" } else { "将 token（裸值或 TUNNEL_TOKEN=...）放入 data\config\tunnel-token，再使用 $(Get-OpsCommandHint 'repair-tunnel')。" })
+        $rows += New-DoctorRow "隧道 token 来源" $(if ($tokenSource.Available) { "pass" } else { "warn" }) $tokenDetail $(if ($tokenSource.Available) { "" } else { "将 token 放入 data\config\cloudflared-token，再使用 $(Get-OpsCommandHint 'repair-tunnel')。" })
 
         $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
         $managedTunnel = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
@@ -879,7 +881,7 @@ function Invoke-DoctorRepair {
                 $ok = $false
             } else {
                 Err "Cloudflared 需要修复，但没有可用的 token 来源"
-                Warn "请将 token 放入 data\config\tunnel-token，然后以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')"
+                Warn "请将 token 放入 data\config\cloudflared-token，然后以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')"
                 $ok = $false
             }
         }
@@ -1310,6 +1312,9 @@ switch ($Command) {
         if (-not (Test-Path $LogPath)) { Warn "找不到日志文件 $LogPath（机器人可能从未启动）"; exit 1 }
         Show-Logs
     }
+    "relay-configure" {
+        try { Invoke-RelayConfiguration } catch { Err $_.Exception.Message; exit 1 }
+    }
     "relay-ls" { if (-not (Invoke-RelayAdmin @("list"))) { exit 1 } }
     "relay-purge" {
         if (-not $All -and -not $Target) {
@@ -1391,6 +1396,7 @@ switch ($Command) {
         Write-Host "  start           启动机器人计划任务"
         Write-Host "  foreground      以前台方式运行 launcher（Ctrl+C 停止）"
         Write-Host "  logs            持续查看 logs\mixin-chatbot.log"
+        Write-Host "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
         Write-Host "  relay-purge <关键字>|-All"
         Write-Host "                  删除匹配的外链对象并清掉索引记录"

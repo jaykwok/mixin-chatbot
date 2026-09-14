@@ -100,7 +100,7 @@ Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。D
 
 基础组件通过官方渠道安装：[Bun](https://bun.sh/docs/installation)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Docker Engine（Debian）](https://docs.docker.com/engine/install/debian/)。
 
-Cloudflare 模式会自动将官方 `cloudflared` 下载到项目根目录（Windows 为 `cloudflared.exe`，Linux 为 `cloudflared`），校验 SHA-256 后使用；已有可运行的根目录副本会直接复用。域名需先接入 Cloudflare DNS 并激活，再配置机器人子域名和隧道公开路由。隧道 token 从 Cloudflare 控制台获取，保存到 `data/config/tunnel-token`；交互界面会说明获取路径，完整步骤见[隧道托管](docs/operations.md#隧道托管)。
+Cloudflare 模式会自动将官方 `cloudflared` 下载到项目根目录（Windows 为 `cloudflared.exe`，Linux 为 `cloudflared`），校验 SHA-256 后使用；已有可运行的根目录副本会直接复用。域名需先接入 Cloudflare DNS 并激活，再配置机器人子域名和隧道公开路由。隧道 token 从 Cloudflare 控制台获取，部署时可直接粘贴 token、填写文件路径，或预先保存到 `data/config/cloudflared-token` 后留空读取。输入会隐藏，默认输入与运行凭据统一使用这个文件。完整步骤见[隧道托管](docs/operations.md#隧道托管)。
 
 ### 执行部署
 
@@ -179,7 +179,7 @@ Windows 和 Linux 均在项目根目录运行。需要交互式终端和宿主�
 
 *预览由实际 TUI 渲染生成，使用演示数据；示例为 Docker 部署，100×24 终端。*
 
-> **Docker 部署**：机器人运行和命令行运维无需宿主机安装 Bun；使用 TUI 时，需在宿主机另装 Bun。界面管理的是宿主机上的部署，可在机器人停止时启动。
+> **Docker 部署**：机器人运行和命令行运维无需宿主机安装 Bun；使用 TUI 时，需在宿主机另装 Bun。外链配置向导复用部署镜像内的依赖。界面管理的是宿主机上的部署，可在机器人停止时启动。
 
 ### 五个主分区
 
@@ -188,7 +188,7 @@ Windows 和 Linux 均在项目根目录运行。需要交互式终端和宿主�
 | 总览 | 今日概况、待处理事项、常用入口 | 查看服务状态、用量与趋势，直接进入需要处理的功能 |
 | 监控 | 体检、日志 | 查看故障与修复建议；搜索日志、筛选级别、按任务编号提取排查记录 |
 | 统计 | 群与成员用量、报表 | 筛选群或成员，按日期查看用量、趋势和工具调用，导出 HTML 报表 |
-| 数据 | 会话、临时文件、外链 | 查看全部成员和文件明细；预览清理范围，归档会话与临时文件，管理远端外链 |
+| 数据 | 会话、临时文件、外链 | 查看全部成员和文件明细；预览清理范围，归档会话与临时文件，配置和管理远端外链 |
 | 系统 | 服务部署、回调路由 | 启停、升级、部署、修复和卸载；查看 callback 冲突，重绑或移除废弃绑定 |
 
 切换主分区会记住上次查看的子页。常用的启动、重启、停止排在服务菜单前面；操作影响随选择立即展示，清理和卸载等操作仍需确认。
@@ -322,8 +322,7 @@ data/
 │   ├── runtime.json           持久运行设置
 │   ├── webhook-secret         入站鉴权密钥
 │   ├── relay.json             可选大文件分发配置
-│   ├── tunnel-token           可选连接器凭据输入
-│   └── cloudflared-token      部署生成的连接器 token 文件
+│   └── cloudflared-token      隧道 token：默认输入与运行共用，直接粘贴时自动保存
 ├── state/
 │   ├── agent.sqlite           待交付内容、路由隔离与路径身份
 │   ├── relay.sqlite           远端对象的持久账本
@@ -356,7 +355,13 @@ logs/                          应用日志
 
 ### 大文件外链配置
 
-超过附件上限的本地文件可通过 WebDAV 分发。配置 `data/config/relay.json`：
+超过附件上限的本地文件可通过 WebDAV 分发。外链是可选功能，部署向导只提示入口；需要时运行 `bun run tui`，进入 **数据 → 外链 → 配置外链**。
+
+向导可启用、修改或停用外链。填写 WebDAV 上传目录、对应的公开下载目录，以及可选的用户名和密码；密码隐藏输入，同一地址和账号的密码可留空沿用。文件上限、有效期和 Alist / OpenList 兼容签名放在可选的高级设置中，跳过时保留已有设置，新配置默认上限 2 GiB、不自动过期、不使用签名。
+
+保存前会显示配置摘要和到期处理方式。确认后才短暂停止原本运行中的机器人，校验并写入配置，然后恢复运行；原本停止的服务保持停止，取消不会改配置或停机。Windows 以前台方式运行且未安装计划任务时，须先手动停止实例再配置。停用会把配置归档到 `backup/rm`，保留远端文件和账本，同时停止机器人的到期清理。
+
+也可手工配置 `data/config/relay.json`，并重启机器人使其生效：
 
 ```json
 {
