@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { opsCommand, PROJECT_DIR } from "../../scripts/ops/tui/platform.ts";
+import { stream } from "../../scripts/ops/tui/exec.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const windowsTest = process.platform === "win32" ? test : test.skip;
@@ -15,10 +16,10 @@ $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:TUI_TEST_OPS, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'ops.ps1 syntax error' }
 $common = [Management.Automation.Language.Parser]::ParseFile($env:TUI_TEST_COMMON, [ref]$tokens, [ref]$errors)
-$parts = @($ast.ParamBlock.Extent.Text, '$ErrorActionPreference = "Stop"')
+$parts = @($ast.ParamBlock.Extent.Text, '$ErrorActionPreference = "Stop"', '[Console]::OutputEncoding = [Text.Encoding]::GetEncoding(936)')
 $utf8 = $common.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-WithUtf8Output'}, $true)
 $parts += $utf8.Extent.Text
-foreach ($name in @('Show-Doctor', 'Step', 'New-DoctorRow', 'Get-DeployModeLabel')) {
+foreach ($name in @('Show-Doctor', 'Step', 'Done', 'New-DoctorRow', 'Get-DeployModeLabel')) {
     $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     if (-not $definition) { throw "missing function $name" }
     $parts += $definition.Extent.Text
@@ -45,6 +46,8 @@ function Get-NetTCPConnection { param($LocalPort, $State, $ErrorAction)
 function Get-ScheduledTask { param($TaskName, $ErrorAction) }
 function Get-RelayDoctorRows { }
 function Err($message) { [Console]::Error.WriteLine($message) }
+function Start-Bot { Step $env:TUI_TEST_PROGRESS; [Console]::Error.WriteLine($env:TUI_TEST_DIAGNOSTIC); return $true }
+function Wait-Local { return 200 }
 function Write-Captured([string]$Script, [string[]]$CliArgs) {
     $payload = [pscustomobject]@{ script = $Script; argv = @($CliArgs) }
     Invoke-WithUtf8Output { [Console]::WriteLine(($payload | ConvertTo-Json -Compress)) }
@@ -88,7 +91,8 @@ async function fixtureWrapper() {
     command.args[4] = wrapper;
     const child = Bun.spawn([command.command, ...command.args], {
       stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
-      env: { ...process.env, TUI_TEST_HEALTH: health, TUI_TEST_BUN: process.execPath, TUI_TEST_VALIDATOR: join(PROJECT_DIR, "scripts/config/validate-models.ts") },
+      env: { ...process.env, TUI_TEST_HEALTH: health, TUI_TEST_BUN: process.execPath, TUI_TEST_VALIDATOR: join(PROJECT_DIR, "scripts/config/validate-models.ts"),
+        TUI_TEST_PROGRESS: "正在启动机器人", TUI_TEST_DIAGNOSTIC: "测试诊断：隧道信息" },
     });
     const [stdout, stderr, code] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -136,6 +140,29 @@ windowsTest("Windows TUI 部署入口调用部署脚本并保留失败退出码"
       const result = await fixture.run(["deploy"]);
       expect(result.stdout).toContain("DEPLOY_FIXTURE"); expect(result.code, result.stderr).toBe(code);
     }
+  } finally { await fixture.cleanup(); }
+}, 15000);
+
+windowsTest("Windows TUI 在中文代码页下通过 UTF-8 输出普通进度、诊断和错误", async () => {
+  const fixture = await fixtureWrapper();
+  try {
+    const result = await fixture.run(["start"]);
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("正在启动机器人");
+    expect(result.stdout).toContain("机器人已启动");
+    expect(result.stderr.trim()).toBe("测试诊断：隧道信息");
+    const command = opsCommand("windows", ["start"]);
+    command.args[4] = join(fixture.root, "ops-fixture.ps1");
+    const lines: string[] = [];
+    expect(await stream(command.command, command.args, line => lines.push(line), {
+      env: { TUI_TEST_PROGRESS: "正在启动机器人", TUI_TEST_DIAGNOSTIC: "测试诊断：隧道信息" },
+    }).done).toBe(0);
+    expect(lines.join("\n")).toContain("正在启动机器人");
+    expect(lines).toContain("测试诊断：隧道信息");
+    expect(lines.join("\n")).not.toContain("�");
+    const error = await fixture.run(["未知操作"]);
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain("无法识别的命令：未知操作");
   } finally { await fixture.cleanup(); }
 }, 15000);
 

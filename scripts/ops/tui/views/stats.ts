@@ -24,6 +24,8 @@ export class StatsView implements View {
   private unmasked = false;
   private scroll = new Viewport();
   private lastReport: { path: string; unmasked: boolean } | null = null;
+  private exporting = false;
+  private opening = false;
   private revision = 0;
   private filter = new ListFilter();
 
@@ -31,9 +33,10 @@ export class StatsView implements View {
 
   hints(): [string, string][] {
     const keys: [string, string][] = this.detail
-      ? [["Esc", "返回"], ["↑↓", "滚动"], ["m", this.unmasked ? "打码" : "显号"], ["e", "导出"]]
-      : [["↑↓", "选择"], ["Enter", "明细"], ["/", "筛选"], ["w", "日期"], ["e", "导出"]];
-    if (this.lastReport) keys.push(["o", "打开"]);
+      ? [["Esc", "返回"], ["↑↓", "滚动"], ["m", this.unmasked ? "打码" : "显号"]]
+      : [["↑↓", "选择"], ["Enter", "明细"], ["/", "筛选"], ["w", "日期"]];
+    keys.push(["e", this.exporting ? "导出中" : "导出"]);
+    if (this.lastReport) keys.push(["o", this.opening ? "打开中" : "打开"]);
     return keys;
   }
 
@@ -45,8 +48,8 @@ export class StatsView implements View {
           { value: "/", label: "筛选群或成员", description: "按群名、成员号码或打码后的号码查找" }]),
       { value: "w", label: "选择日期范围", description: "今天、近 7 天、近 30 天、本月、全部或自定义" },
       { value: "d", label: "自定义起止日期", description: this.describeWindow() },
-      { value: "e", label: "导出当前范围的 HTML 报表", description: "导出所列群；在群明细中还会附上当前群的明细", disabled: this.overview.kind !== "ready" },
-      { value: "o", label: "打开最近的报表", disabled: !this.lastReport },
+      { value: "e", label: "导出当前范围的 HTML 报表", description: "导出所列群；在群明细中还会附上当前群的明细", disabled: this.exporting || this.overview.kind !== "ready" },
+      { value: "o", label: "打开最近的报表", disabled: this.opening || !this.lastReport },
     ];
   }
 
@@ -102,8 +105,8 @@ export class StatsView implements View {
     if (key.name === "m" && this.detail) { this.unmasked = !this.unmasked; return true; }
     if (key.name === "w") { await this.pickPreset(app); return true; }
     if (key.name === "d") { await this.pickWindow(app); return true; }
-    if (key.name === "e") { await this.export(app); return true; }
-    if (key.name === "o" && this.lastReport) { await app.openFile(this.lastReport.path); return true; }
+    if (key.name === "e") { void this.export(app); return true; }
+    if (key.name === "o" && this.lastReport) { void this.openReport(app); return true; }
     if (this.overview.kind !== "ready") return false;
     if (this.detail) return this.scroll.onKey(key.name);
     const groups = this.groups;
@@ -139,8 +142,7 @@ export class StatsView implements View {
       until.setHours(23, 59, 59, 999);
       this.window = { since: since.getTime(), until: until.getTime() };
     }
-    this.scroll.reset();
-    await this.refresh(app, true);
+    this.reloadWindow(app);
   }
 
   private async pickWindow(app: AppApi): Promise<void> {
@@ -159,13 +161,20 @@ export class StatsView implements View {
       return;
     }
     this.window = { since, until };
+    this.reloadWindow(app);
+  }
+
+  private reloadWindow(app: AppApi): void {
     this.scroll.reset();
-    await this.refresh(app, true);
-    if (this.overview.kind === "ready") app.toast("ok", this.describeWindow());
+    app.toast("busy", `正在读取统计：${this.describeWindow()}`);
+    // 只等待日期输入；refresh 的 revision 会丢弃之前日期范围的迟到结果。
+    void this.refresh(app, true);
   }
 
   private async export(app: AppApi): Promise<void> {
-    if (this.overview.kind !== "ready") return;
+    if (this.exporting || this.overview.kind !== "ready") return;
+    this.exporting = true;
+    app.toast("busy", "正在导出报表…");
     const unmasked = this.unmasked && this.detail !== null;
     try {
       const groups = this.groups;
@@ -177,6 +186,16 @@ export class StatsView implements View {
       this.lastReport = { path, unmasked };
       app.toast("ok", "报表已保存，按 o 打开；路径保留在本页顶部");
     } catch (error) { app.toast("danger", "导出失败：" + String(error)); }
+    finally { this.exporting = false; app.redraw(); }
+  }
+
+  private async openReport(app: AppApi): Promise<void> {
+    if (this.opening || !this.lastReport) return;
+    this.opening = true;
+    app.redraw();
+    try { await app.openFile(this.lastReport.path); }
+    catch (error) { app.toast("warn", "打开报表失败：" + String(error)); }
+    finally { this.opening = false; app.redraw(); }
   }
 
   private describeWindow(): string {

@@ -113,12 +113,11 @@ export function loadGit(): Promise<GitState | null> {
 
 async function readGit(): Promise<GitState | null> {
   if (!Bun.which("git")) return null;
-  const [head, branch, status, counts] = await Promise.all([
-    git(["log", "-1", "--format=%H%n%s"]),
-    git(["rev-parse", "--abbrev-ref", "HEAD"]),
-    git(["status", "--porcelain", "--untracked-files=no"]),
-    git(["rev-list", "--left-right", "--count", "HEAD...origin/main"]),
-  ]);
+  // 短查询顺序复用已有宿主；并发排队会触发第二个 Windows 宿主的昂贵冷启动。
+  const head = await git(["log", "-1", "--format=%H%n%s"]);
+  const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"]);
+  const status = await git(["status", "--porcelain", "--untracked-files=no"]);
+  const counts = await git(["rev-list", "--left-right", "--count", "HEAD...origin/main"]);
   const failed = [head, branch, status].find(result => result.code !== 0);
   if (failed) {
     if (/not a git repository|does not have any commits yet/i.test(failed.stderr)) return null;

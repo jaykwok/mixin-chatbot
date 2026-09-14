@@ -66,7 +66,7 @@ export class App implements AppApi {
   private dirty = true;
   private paintQueued = false;
   private viewBusy = false;
-  private refreshing = false;
+  private readonly refreshing = new Set<View>();
   private chromeRevision = 0;
 
   constructor(sections: (Section | View)[], options: { screen?: Screen; deployment?: Deployment; theme?: Theme } = {}) {
@@ -213,10 +213,7 @@ export class App implements AppApi {
         await new Promise<void>(resolve => { input.once("line", () => resolve()); input.once("close", () => resolve()); });
       } finally { input.close(); process.stdin.pause(); }
     });
-    await this.refreshChrome();
-    await this.refreshView(this.current, true);
-    this.redraw();
-    this.paint();
+    this.refreshAfterOperation();
     return code;
   }
 
@@ -292,10 +289,12 @@ export class App implements AppApi {
 
     let code = 1;
     try {
+      const readOnly = ["logs", "relay-ls", "history-ls", "tmp-ls", "stat", "doctor", "status"].includes(args[0] ?? "") ||
+        (args[0] === "routes" && (args[1] ?? "list") === "list");
       const handle = stream(command, full, (line) => {
         pane.lines.push(line);
         this.redraw();
-      }, { cancelMode: ["logs", "relay-ls", "history-ls", "tmp-ls", "stat", "doctor", "status"].includes(args[0] ?? "") &&
+      }, { cancelMode: readOnly &&
         !args.includes("-Repair") && !args.includes("-RestartTunnel") ? "terminate" : "finish" });
       pane.cancel = handle.cancel;
       code = await handle.done;
@@ -307,11 +306,16 @@ export class App implements AppApi {
     this.redraw();
     this.paint();
 
-    // 命令跑完后状态多半变了：重新探一次服务和版本，页眉不要停留在旧结论上。
-    await this.refreshChrome();
-    await this.refreshView(this.current, true);
-    this.paint();
+    this.refreshAfterOperation();
     return code;
+  }
+
+  /** 操作已结束就释放按键通道；状态读取在后台更新，各页面自行限制依赖这些数据的操作。 */
+  private refreshAfterOperation(): void {
+    void Promise.all([this.refreshChrome(), this.refreshView(this.current, true)])
+      .catch(error => { if (!this.quit) this.toast("warn", `状态刷新失败：${String(error)}`); });
+    this.redraw();
+    this.paint();
   }
 
   // ===== 按键 =====
@@ -322,18 +326,16 @@ export class App implements AppApi {
     this.paint();
   }
 
-  private async refreshCurrent(): Promise<void> {
-    if (this.refreshing) return;
+  private refreshCurrent(): void {
     const view = this.current;
-    this.refreshing = true;
+    if (this.refreshing.has(view)) return;
+    this.refreshing.add(view);
     this.toast("busy", `正在刷新${view.label}…`);
-    try {
-      await Promise.all([this.refreshChrome(), this.refreshView(view, true)]);
-      if (this.current === view) this.toast("ok", `${view.label}已刷新 · ${fmt.clock()}`);
-    } finally {
-      this.refreshing = false;
-      this.redraw();
-    }
+    // 菜单和快捷键共用后台刷新；某页的慢体检不占用其他页面的刷新入口。
+    void Promise.all([this.refreshChrome(), this.refreshView(view, true)])
+      .then(() => { if (!this.quit && this.current === view) this.toast("ok", `${view.label}已刷新 · ${fmt.clock()}`); })
+      .catch(error => { if (!this.quit && this.current === view) this.toast("warn", `刷新失败：${String(error)}`); })
+      .finally(() => { this.refreshing.delete(view); this.redraw(); });
   }
 
   private async showActions(): Promise<void> {
@@ -352,7 +354,7 @@ export class App implements AppApi {
       description: "选择要做的事；清理、停止等操作会继续展示范围与确认步骤。", choices,
     });
     if (value === null) return;
-    if (value === "@refresh") await this.refreshCurrent();
+    if (value === "@refresh") this.refreshCurrent();
     else if (value === "@overview") this.go(this.views[0]!.id);
     else if (value === "@help") this.showHelp();
     else if (value.startsWith("@view/")) this.go(value.slice(6));
@@ -376,7 +378,7 @@ export class App implements AppApi {
         this.showHelp();
         return;
       case "r":
-        await this.refreshCurrent();
+        this.refreshCurrent();
         return;
       case "space":
       case "f2":

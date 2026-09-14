@@ -36,6 +36,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# TUI 按 UTF-8 读取 stdout/stderr，不能沿用 Windows PowerShell 5.1 的系统代码页。
+if ($RequestBase64) {
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    $OutputEncoding = [Console]::OutputEncoding
+}
+
 $Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 # 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、主机名校验、交互提示）。
 $CommonLib = Join-Path $PSScriptRoot "..\lib\common.ps1"

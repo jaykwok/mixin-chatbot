@@ -33,6 +33,7 @@ export class LogsView implements View {
   private timer: ReturnType<typeof setInterval> | null = null;
   private revision = 0;
   private polling = false;
+  private lookupController: AbortController | null = null;
   private pageSize = 10;
   private filter = new ListFilter();
 
@@ -42,7 +43,7 @@ export class LogsView implements View {
       ["End", "跟随"],
       ["/", "搜索"],
       ["l", "级别"],
-      ["t", "查任务"],
+      ["t", this.lookupController ? "查询中" : "查任务"],
     ];
   }
 
@@ -51,14 +52,14 @@ export class LogsView implements View {
       { value: "f", label: this.follow ? "暂停跟随" : "恢复跟随", description: "暂停后可用方向键回看，End 恢复最新输出" },
       { value: "/", label: "搜索日志内容", description: "按任务编号、错误内容或任意关键字筛选" },
       { value: "l", label: "筛选日志级别", description: "全部、警告及错误、仅错误" },
-      { value: "t", label: "提取任务排查记录", description: "输入 8 位任务编号，从当前与轮转日志中提取上下文" },
+      { value: "t", label: "提取任务排查记录", description: "输入 8 位任务编号，从当前与轮转日志中提取上下文", disabled: this.lookupController !== null },
       { value: "home", label: "跳到最早的可见记录" },
       { value: "end", label: "回到最新记录并跟随" },
     ];
   }
 
   async refresh(app: AppApi): Promise<void> {
-    this.onLeave();
+    this.stopPolling();
     const revision = this.revision;
     if (this.state.kind === "idle") this.state = { kind: "loading" };
     try {
@@ -91,13 +92,19 @@ export class LogsView implements View {
 
   /** 离开本页就停掉轮询：没人看的时候每两秒读一次日志纯属浪费，还会引起无谓的重绘。 */
   onLeave(): true {
+    this.stopPolling();
+    this.lookupController?.abort();
+    this.lookupController = null;
+    return true;
+  }
+
+  private stopPolling(): void {
     this.revision++;
     this.polling = false;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
-    return true;
   }
 
   private filtered(lines: LogLine[]): LogLine[] {
@@ -148,13 +155,14 @@ export class LogsView implements View {
       return true;
     }
     if (key.name === "t") {
+      if (this.lookupController) return true;
       const id = await app.ask("任务 ID（8 位十六进制，日志里「任务：」后面那串）");
       if (!id) return true;
       if (!/^[0-9a-fA-F]{8}$/.test(id.trim())) {
         app.toast("warn", "任务 ID 应为 8 位十六进制");
         return true;
       }
-      await this.lookup(app, id.trim());
+      void this.lookup(app, id.trim());
       return true;
     }
     return false;
@@ -165,25 +173,39 @@ export class LogsView implements View {
    * 机器人停着也能用——而排查超时的时候，机器人往往正停着。
    */
   private async lookup(app: AppApi, id: string): Promise<void> {
+    const controller = new AbortController();
+    this.lookupController = controller;
     app.toast("busy", `正在扫描日志找任务 ${id}…`);
     const windows = app.deployment.platform === "windows";
     const script = join(PROJECT_DIR, "scripts", "ops", windows ? "task-logs.ps1" : "task-logs.sh");
-    const result = windows
-      ? await capture("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, id], { timeout: 120_000 })
-      : await capture("bash", [script, id], { timeout: 120_000 });
-
-    if (result.code === 2) {
-      app.toast("warn", `保留的日志里没有任务 ${id}；可能已被轮转覆盖`);
-      return;
+    try {
+      const options = { timeout: 120_000, signal: controller.signal };
+      const result = windows
+        ? await capture("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, id], options)
+        : await capture("bash", [script, id], options);
+      if (controller.signal.aborted) return;
+      if (result.timedOut) {
+        app.toast("warn", `任务 ${id} 的日志扫描超时，请重试`);
+        return;
+      }
+      if (result.code === 2) {
+        app.toast("warn", `保留的日志里没有任务 ${id}；可能已被轮转覆盖`);
+        return;
+      }
+      if (result.code !== 0) {
+        app.toast("danger", `取证失败：${result.stderr.trim().slice(0, 80) || `退出码 ${result.code}`}`);
+        return;
+      }
+      // 摘要里最后一行是结果目录，那是运维接下来真正要打开的东西。
+      const lines = result.stdout.trim().split(/\r?\n/);
+      const dir = lines.reverse().find((line) => line.includes("结果目录")) ?? "";
+      app.toast("ok", dir.trim() || `任务 ${id} 已提取`);
+    } catch (error) {
+      if (!controller.signal.aborted) app.toast("danger", `取证失败：${String(error)}`);
+    } finally {
+      if (this.lookupController === controller) this.lookupController = null;
+      app.redraw();
     }
-    if (result.code !== 0) {
-      app.toast("danger", `取证失败：${result.stderr.trim().slice(0, 80) || `退出码 ${result.code}`}`);
-      return;
-    }
-    // 摘要里最后一行是结果目录，那是运维接下来真正要打开的东西。
-    const lines = result.stdout.trim().split(/\r?\n/);
-    const dir = lines.reverse().find((line) => line.includes("结果目录")) ?? "";
-    app.toast("ok", dir.trim() || `任务 ${id} 已提取`);
   }
 
   render(ctx: ViewContext): string[] {

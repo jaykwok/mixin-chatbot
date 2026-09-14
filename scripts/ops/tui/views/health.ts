@@ -36,7 +36,7 @@ export class HealthView implements View {
       ...(this.expanded ? [{ value: "escape", label: "返回检查列表" }]
         : [{ value: "enter", label: "展开选中检查项", description: "查看完整诊断内容与处理建议", disabled: this.state.kind !== "ready" }]),
       { value: "f", label: this.platform === "windows" ? "自动修复部署" : "进入重建修复向导",
-        description: "查看修复步骤并确认后执行", danger: true, disabled: this.state.kind !== "ready" },
+        description: "查看修复步骤并确认后执行", danger: true },
     ];
   }
 
@@ -61,22 +61,7 @@ export class HealthView implements View {
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
-    if (this.state.kind !== "ready") return false;
-    const checks = this.state.value.checks;
-    if (this.expanded) {
-      if (key.name === "escape") { this.expanded = false; return true; }
-      if (this.scroll.onKey(key.name)) return true;
-    } else if (key.name === "enter" && checks[this.selected]) {
-      this.expanded = true;
-      this.scroll.reset();
-      return true;
-    }
-    const moved = this.expanded ? null : moveSelection(key.name, this.selected, checks.length);
-    if (moved !== null) {
-      this.selected = moved;
-      this.moved = true;
-      return true;
-    }
+    // 修复入口只依赖部署平台，不必等待公网等诊断项返回；确认与维护流程仍由 App 管理。
     if (key.name === "f") {
       const windows = app.deployment.platform === "windows";
       const ok = await app.confirm({
@@ -95,6 +80,22 @@ export class HealthView implements View {
           : await app.runInteractive("重建修复", ["deploy"]);
         app.toast(code === 0 ? "ok" : "danger", code === 0 ? "修复完成" : `修复未成功（退出码 ${code}）`);
       }
+      return true;
+    }
+    if (this.state.kind !== "ready") return false;
+    const checks = this.state.value.checks;
+    if (this.expanded) {
+      if (key.name === "escape") { this.expanded = false; return true; }
+      if (this.scroll.onKey(key.name)) return true;
+    } else if (key.name === "enter" && checks[this.selected]) {
+      this.expanded = true;
+      this.scroll.reset();
+      return true;
+    }
+    const moved = this.expanded ? null : moveSelection(key.name, this.selected, checks.length);
+    if (moved !== null) {
+      this.selected = moved;
+      this.moved = true;
       return true;
     }
     return false;

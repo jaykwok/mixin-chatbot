@@ -16,8 +16,11 @@ import { HistoryView } from "../../scripts/ops/tui/views/history.ts";
 import { LogsView } from "../../scripts/ops/tui/views/logs.ts";
 import { MaintainView } from "../../scripts/ops/tui/views/maintain.ts";
 import * as tuiData from "../../scripts/ops/tui/data.ts";
+import * as tuiExec from "../../scripts/ops/tui/exec.ts";
+import * as tuiReport from "../../scripts/ops/tui/report.ts";
 import { createRelayView, createRoutesView } from "../../scripts/ops/tui/views/passthrough.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { waitFor } from "../helpers/tui-process.ts";
 
 const deployment: Deployment = {
   platform: "linux", runtime: "docker", mode: "direct", port: 1011, domain: "",
@@ -493,7 +496,11 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
   }
 });
 
-test("自动修复的执行面板收到 Esc 后等待维护完成", async () => {
+test.each([
+  { args: ["doctor", "-Repair"], readOnly: false },
+  { args: ["routes", "list"], readOnly: true },
+  { args: ["routes", "reset", "fixture", "--group", "group"], readOnly: false },
+])("执行面板收到 Esc：只读列表可中止，维护写入等待完成（%j）", async ({ args, readOnly }) => {
   const tty = terminal();
   const app = new App([{ id: "fixture", label: "测试", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
   app["refreshChrome"] = async () => {};
@@ -505,11 +512,11 @@ test("自动修复的执行面板收到 Esc 后等待维护完成", async () => 
     kill() { killed = true; finish(143); } };
   const spawn = spyOn(Bun, "spawn").mockImplementationOnce(() => child as ReturnType<typeof Bun.spawn>);
   try {
-    const done = app.run("自动修复", ["doctor", "-Repair"]);
+    const done = app.run("测试命令", [...args]);
     await app["handleKey"](key("escape"));
-    expect(killed).toBe(false);
+    expect(killed).toBe(readOnly);
     output.enqueue(new TextEncoder().encode("MAINTENANCE_DONE\n")); output.close(); finish(0);
-    expect(await done).toBe(0);
+    expect(await done).toBe(readOnly ? 143 : 0);
     expect(plain(app["renderAction"](80, 24))).toContain("MAINTENANCE_DONE");
   } finally { spawn.mockRestore(); finish(0); tty.close(); }
 });
@@ -577,7 +584,7 @@ test("统计、会话和临时文件刷新保留列表，切换数据根后清�
   } finally { finishes.forEach(finish => finish()); mocks.forEach(mock => mock.mockRestore()); await fixture.cleanup(); }
 });
 
-test("维护页保留版本预览，但新版本查询结束前不能执行操作", async () => {
+test("维护页保留版本预览，刷新期间只暂停升级操作", async () => {
   const view = new MaintainView();
   const { app, calls } = fakeApp();
   const value: tuiData.GitState = { branch: "main", sha: "abcdef1234", subject: "fixture", dirty: false, ahead: 0, behind: 0, incoming: [] };
@@ -588,8 +595,9 @@ test("维护页保留版本预览，但新版本查询结束前不能执行操�
     git.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
     const refresh = view.refresh(app);
     expect(plain(view.render(context()))).toContain("abcdef1");
-    expect(view.actions().every(action => action.disabled)).toBe(true);
-    await view.onKey(key("enter"), app);
+    expect(view.actions().find(action => action.value === "update")?.disabled).toBe(true);
+    expect(view.actions().filter(action => action.value !== "update").every(action => !action.disabled)).toBe(true);
+    await view.onKey(key("update"), app);
     expect(calls.commands).toHaveLength(0);
     finish(value);
     await refresh;
@@ -597,7 +605,7 @@ test("维护页保留版本预览，但新版本查询结束前不能执行操�
   } finally { git.mockRestore(); }
 });
 
-test("维护页首次或再次读取失败时显示错误、禁用执行，并允许刷新恢复", async () => {
+test("维护页版本读取失败时禁用升级，服务操作仍可用，并允许刷新恢复", async () => {
   const { app, calls } = fakeApp();
   const value: tuiData.GitState = { branch: "main", sha: "abcdef1234", subject: "fixture", dirty: false, ahead: 0, behind: 3, incoming: [] };
   const git = spyOn(tuiData, "loadGit");
@@ -610,16 +618,270 @@ test("维护页首次或再次读取失败时显示错误、禁用执行，并�
       expect(plain(view.render(context()))).toContain("版本读取失败");
       expect(plain(view.render(context()))).not.toContain("abcdef1");
       expect(plain(view.render(context()))).not.toContain("非 git 部署");
-      expect(view.actions().every(action => action.disabled)).toBe(true);
-      for (const name of ["enter", "update", "start"]) await view.onKey(key(name), app);
-      expect(calls.commands).toHaveLength(0);
+      expect(view.actions().find(action => action.value === "update")?.disabled).toBe(true);
+      const before = calls.commands.length;
+      await view.onKey(key("update"), app);
+      expect(calls.commands).toHaveLength(before);
       expect(calls.confirms).toHaveLength(0);
+      await view.onKey(key("start"), app);
+      expect(calls.commands.at(-1)?.args).toEqual(["start"]);
       git.mockResolvedValueOnce(value);
       await view.refresh(app);
       expect(view.actions().some(action => !action.disabled)).toBe(true);
       expect(plain(view.render(context()))).toContain("abcdef1");
     }
   } finally { git.mockRestore(); }
+});
+
+test("菜单刷新不占用按键，上一页的慢查询也不阻止刷新新页面", async () => {
+  const tty = terminal();
+  const pending = Promise.withResolvers<void>();
+  let reads = 0;
+  const first: View = { id: "first", label: "体检", render: () => [], hints: () => [], refresh: () => pending.promise };
+  const second: View = { id: "second", label: "统计", render: () => [], hints: () => [], async refresh() { reads++; } };
+  const app = new App([first, second], { screen: tty.screen, deployment });
+  app["refreshChrome"] = () => pending.promise;
+  const choose = spyOn(app, "choose").mockResolvedValue("@refresh");
+  tty.screen.start(() => {}, () => {});
+  const refresh = app["handleKey"](key("space"));
+  try {
+    await tick();
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("second");
+    await tick();
+    const again = app["handleKey"](key("r"));
+    await tick();
+    expect(reads).toBe(2);
+    await app["handleKey"](key("?"));
+    expect(app["modal"]?.kind).toBe("help");
+    pending.resolve();
+    await again;
+  } finally { pending.resolve(); await refresh; await tick(); choose.mockRestore(); tty.close(); }
+});
+
+test("统计切换日期在后台加载，仍可改日期和切页，过期结果不能覆盖新范围", async () => {
+  for (const dateKey of ["w", "d"]) {
+    const tty = terminal();
+    const view = new StatsView();
+    const first = Promise.withResolvers<tuiData.GroupStats[]>();
+    const second = Promise.withResolvers<tuiData.GroupStats[]>();
+    const read = spyOn(tuiData, "loadStatsOverview").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const app = new App([view, { id: "other", label: "其他", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
+    const choose = spyOn(app, "choose").mockResolvedValueOnce("today").mockResolvedValueOnce("7");
+    const ask = spyOn(app, "ask").mockResolvedValueOnce("2026-08-01").mockResolvedValueOnce("2026-08-31")
+      .mockResolvedValueOnce("2026-09-01").mockResolvedValueOnce("2026-09-12");
+    tty.screen.start(() => {}, () => {});
+    const change = app["handleKey"](key(dateKey));
+    try {
+      await tick();
+      expect(plain(view.render(context()))).toContain("正在读取");
+      const next = app["handleKey"](key(dateKey));
+      await tick();
+      expect(read).toHaveBeenCalledTimes(2);
+      const selected = { ...view["window"] };
+      await app["handleKey"](key("right"));
+      expect(app["current"].id).toBe("other");
+      second.resolve([]);
+      await tick();
+      first.reject(new Error("旧范围读取失败"));
+      await change;
+      await next;
+      await tick();
+      expect(view["window"]).toEqual(selected);
+      expect(view["overview"]).toEqual({ kind: "ready", value: [] });
+    } finally {
+      first.resolve([]); second.resolve([]); await change; await tick();
+      read.mockRestore(); choose.mockRestore(); ask.mockRestore(); tty.close();
+    }
+  }
+});
+
+test("报表写入和打开浏览器不阻止导航，也不重复启动同一操作", async () => {
+  const tty = terminal();
+  const view = new StatsView();
+  view["overview"] = { kind: "ready", value: [] };
+  const saved = Promise.withResolvers<string>();
+  const opened = Promise.withResolvers<void>();
+  const write = spyOn(tuiReport, "writeReport").mockReturnValue(saved.promise);
+  const read = spyOn(tuiData, "loadStatsOverview").mockResolvedValue([]);
+  const app = new App([view, { id: "other", label: "其他", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
+  const open = spyOn(app, "openFile").mockReturnValue(opened.promise);
+  tty.screen.start(() => {}, () => {});
+  const exporting = app["handleKey"](key("e"));
+  try {
+    await tick();
+    expect(view.actions().find(action => action.value === "e")?.disabled).toBe(true);
+    await app["handleKey"](key("e"));
+    expect(write).toHaveBeenCalledTimes(1);
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("other");
+    saved.resolve("fixture-report.html");
+    await tick();
+    await app["handleKey"](key("left"));
+    const opening = app["handleKey"](key("o"));
+    await tick();
+    await app["handleKey"](key("o"));
+    expect(open).toHaveBeenCalledTimes(1);
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("other");
+    opened.resolve();
+    await opening;
+  } finally {
+    saved.resolve("fixture-report.html"); opened.resolve(); await exporting; await tick();
+    write.mockRestore(); read.mockRestore(); open.mockRestore(); tty.close();
+  }
+});
+
+test("日志任务扫描不阻止翻阅或切页，离页会取消查询并忽略迟到的结果", async () => {
+  const tty = terminal();
+  const view = new LogsView();
+  const result = Promise.withResolvers<tuiExec.RunResult>();
+  const capture = spyOn(tuiExec, "capture").mockReturnValue(result.promise);
+  const tail = spyOn(tuiData, "loadLogTail").mockResolvedValue([]);
+  const app = new App([view, { id: "other", label: "其他", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
+  const ask = spyOn(app, "ask").mockResolvedValue("1234abcd");
+  const toast = spyOn(app, "toast");
+  tty.screen.start(() => {}, () => {});
+  const lookup = app["handleKey"](key("t"));
+  try {
+    await tick();
+    const signal = capture.mock.calls[0]?.[2]?.signal;
+    expect(signal).toBeDefined();
+    expect(signal?.aborted).toBe(false);
+    await view.refresh(app);
+    expect(signal?.aborted).toBe(false);
+    await app["handleKey"](key("t"));
+    expect(capture).toHaveBeenCalledTimes(1);
+    await app["handleKey"](key("home"));
+    expect(view["follow"]).toBe(false);
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("other");
+    expect(signal?.aborted).toBe(true);
+    result.resolve({ code: 0, stdout: "结果目录：fixture-result", stderr: "", timedOut: false });
+    await lookup;
+    await tick();
+    expect(toast.mock.calls.some(([, text]) => text.includes("fixture-result"))).toBe(false);
+    expect(view["timer"]).toBeNull();
+  } finally {
+    result.resolve({ code: 2, stdout: "", stderr: "", timedOut: false }); await lookup; await tick();
+    view.onLeave(); capture.mockRestore(); tail.mockRestore(); ask.mockRestore(); toast.mockRestore(); tty.close();
+  }
+});
+
+test("后台日志查询失败或超时后可重试，成功时显示结果目录", async () => {
+  const view = new LogsView();
+  const { app, calls } = fakeApp();
+  const capture = spyOn(tuiExec, "capture").mockRejectedValueOnce(new Error("fixture query failure"))
+    .mockResolvedValueOnce({ code: 124, stdout: "", stderr: "", timedOut: true })
+    .mockResolvedValueOnce({ code: 0, stdout: "结果目录：fixture-result", stderr: "", timedOut: false });
+  try {
+    for (const expected of ["fixture query failure", "扫描超时", "结果目录：fixture-result"]) {
+      calls.answers.push("1234abcd");
+      await view.onKey(key("t"), app);
+      await tick();
+      expect(calls.toasts.at(-1)).toContain(expected);
+      expect(view.actions().find(action => action.value === "t")?.disabled).toBe(false);
+    }
+  } finally { view.onLeave(); capture.mockRestore(); }
+});
+
+test("进入系统页时慢版本查询不隐藏菜单、不吞方向键，也不阻止服务操作", async () => {
+  const tty = terminal();
+  const view = new MaintainView();
+  const commands: string[][] = [];
+  const app = new App([
+    { id: "home", label: "总览", render: () => [], hints: () => [] },
+    { id: "system", label: "系统", views: [view] },
+  ], { screen: tty.screen, deployment });
+  app.run = async (_title, args) => { commands.push(args); return 0; };
+  let finish!: (value: null) => void;
+  const pending = new Promise<null>(resolve => { finish = resolve; });
+  const git = spyOn(tuiData, "loadGit").mockReturnValue(pending);
+  tty.screen.start(() => {}, () => {});
+  try {
+    await app["handleKey"](key("right"));
+    expect(plain(view.render(context()))).toContain("服务与部署");
+    expect(plain(view.render(context()))).toContain("版本读取中");
+    await app["handleKey"](key("down"));
+    expect(plain(view.render(context()))).toContain("2 / 7");
+    await app["handleKey"](key("update"));
+    expect(commands).toEqual([]);
+    await app["handleKey"](key("home"));
+    await app["handleKey"](key("enter"));
+    expect(commands).toEqual([["start"]]);
+    for (const [columns, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(columns, rows)), context(columns, rows));
+    await app["handleKey"](key("left"));
+    expect(app["current"].id).toBe("home");
+  } finally { finish(null); await tick(); git.mockRestore(); tty.close(); }
+});
+
+test("慢体检不阻止修复入口，未确认时不执行维护且仍可切页", async () => {
+  const tty = terminal();
+  const view = new HealthView();
+  const result = Promise.withResolvers<tuiData.Health>();
+  const read = spyOn(tuiData, "loadHealth").mockReturnValue(result.promise);
+  const app = new App([view, { id: "other", label: "其他", render: () => [], hints: () => [] }],
+    { screen: tty.screen, deployment: { ...deployment, platform: "windows" } });
+  const confirm = spyOn(app, "confirm").mockResolvedValue(false);
+  const run = spyOn(app, "run").mockImplementation(async () => { throw new Error("取消后不应执行维护"); });
+  tty.screen.start(() => {}, () => {});
+  const refresh = app["refreshView"](view);
+  try {
+    expect(view.actions().find(action => action.value === "f")?.disabled).toBeFalsy();
+    expect(view.actions().find(action => action.value === "enter")?.disabled).toBe(true);
+    await app["handleKey"](key("f"));
+    expect(confirm.mock.calls[0]?.[0].title).toBe("自动修复");
+    expect(run).not.toHaveBeenCalled();
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("other");
+  } finally {
+    result.resolve({ pass: 0, warn: 0, fail: 0, checks: [] }); await refresh;
+    read.mockRestore(); confirm.mockRestore(); run.mockRestore(); tty.close();
+  }
+});
+
+test("交互操作和执行面板完成后，后台刷新不再锁住导航与后续按键", async () => {
+  for (const interactive of [false, true]) {
+    const tty = terminal();
+    let finishChrome!: () => void, finishView!: () => void;
+    const chrome = new Promise<void>(resolve => { finishChrome = resolve; });
+    const refresh = new Promise<void>(resolve => { finishView = resolve; });
+    let completed = false, received = false;
+    const view: View = {
+      id: "maintain", label: "服务部署", render: () => [], hints: () => [], refresh: () => refresh,
+      async onKey(key, app) {
+        if (key.name !== "enter") return false;
+        if (interactive) await app.runInteractive("升级", ["update"]);
+        else await app.run("修复", ["doctor", "-Repair"]);
+        completed = true;
+        return true;
+      },
+    };
+    const app = new App([view, { id: "other", label: "其他", render: () => [], hints: () => [], onKey() { received = true; return true; } }],
+      { screen: tty.screen, deployment });
+    app["refreshChrome"] = () => chrome;
+    // 外部维护与终端交接已有独立测试；这里验证返回后的真实刷新和按键分发。
+    const suspend = spyOn(tty.screen, "suspend").mockResolvedValue(undefined);
+    const spawn = spyOn(Bun, "spawn").mockImplementationOnce(() => ({
+      exited: Promise.resolve(0), kill() {},
+      stdout: new ReadableStream({ start(controller) { controller.close(); } }),
+      stderr: new ReadableStream({ start(controller) { controller.close(); } }),
+    }) as ReturnType<typeof Bun.spawn>);
+    tty.screen.start(() => {}, () => {});
+    const operation = app["handleKey"](key("enter"));
+    try {
+      await tick();
+      expect(completed).toBe(true);
+      if (!interactive) await app["handleKey"](key("enter"));
+      await app["handleKey"](key("right"));
+      expect(app["current"].id).toBe("other");
+      await app["handleKey"](key("down"));
+      expect(received).toBe(true);
+    } finally {
+      finishChrome(); finishView(); await operation; await tick();
+      suspend.mockRestore(); spawn.mockRestore(); tty.close();
+    }
+  }
 });
 
 test("统计在 80×24 先显示成员，所有成员与月度、工具均可滚到；报表路径保留且显号离页重置", async () => {
@@ -644,6 +906,7 @@ test("统计在 80×24 先显示成员，所有成员与月度、工具均可滚
     await view.onKey(key("m"), app);
     expect(plain(view.render(context()))).toContain("13812345678");
     await view.onKey(key("e"), app);
+    await waitFor(() => view["lastReport"] !== null, "统计报表保存", 2000);
     await view.onKey(key("o"), app);
     const report = calls.opened[0]!;
     expect(report.startsWith(fixture.root)).toBe(true);
@@ -667,6 +930,7 @@ test("日期仅设上限有效，取消第二次输入保留原区间，非法�
     await view.refresh(app);
     calls.answers.push("", "2026-08-31");
     await view.onKey(key("d"), app);
+    await waitFor(() => view["overview"].kind !== "loading", "统计日期范围加载", 2000);
     expect(plain(view.render(context()))).toContain("最早 ~ 2026-08-31");
     expect(plain(view.render(context()))).toContain("1 次提问");
     calls.answers.push("2026-08-01", null);
@@ -762,12 +1026,14 @@ test("群筛选控制统计导出范围，常用日期可选，会话全部成�
     await stats.onKey(key("/"), app);
     expect(plain(stats.render(context()))).not.toContain("other-group");
     await stats.onKey(key("e"), app);
+    await waitFor(() => stats["lastReport"] !== null, "筛选后的报表保存", 2000);
     await stats.onKey(key("o"), app);
     const report = await Bun.file(calls.opened[0]!).text();
     expect(report).toContain("support-group");
     expect(report).not.toContain("other-group");
     calls.choices.push("7");
     await stats.onKey(key("w"), app);
+    await waitFor(() => stats["overview"].kind !== "loading", "统计日期范围加载", 2000);
     const start = new Date();
     start.setHours(0, 0, 0, 0);
     start.setDate(start.getDate() - 6);

@@ -5,7 +5,7 @@ import type { StatusName } from "../render/theme.ts";
 import * as fmt from "../render/format.ts";
 import { loadGit, type GitState } from "../data.ts";
 import type { AppApi, ConfirmSpec, Loading, View, ViewAction, ViewContext } from "../view.ts";
-import { actionWorkbench, moveSelection, pending } from "./common.ts";
+import { actionWorkbench, moveSelection } from "./common.ts";
 
 interface Action {
   key: string;
@@ -186,6 +186,8 @@ export class MaintainView implements View {
   private selected = 0;
   private platform: "windows" | "linux" = "linux";
 
+  private get waitingForVersion(): boolean { return this.refreshing || this.state.kind !== "ready"; }
+
   private get availableActions(): Action[] {
     return ACTIONS.filter((action) => !action.only || action.only === this.platform)
       .sort((a, b) => ACTION_ORDER.indexOf(a.key) - ACTION_ORDER.indexOf(b.key))
@@ -204,7 +206,7 @@ export class MaintainView implements View {
     return this.availableActions.map(action => ({
       value: action.key, label: action.label, description: action.summary,
       danger: action.status === "danger" || action.key === "stop" || action.key === "repair-tunnel",
-      disabled: this.refreshing || this.state.kind !== "ready",
+      disabled: action.key === "update" && this.waitingForVersion,
     }));
   }
 
@@ -231,9 +233,12 @@ export class MaintainView implements View {
       return true;
     }
     if (key.name === "enter" || actions.some(action => action.key === key.name)) {
-      if (this.refreshing || this.state.kind !== "ready") return true;
       const action = key.name === "enter" ? actions[this.selected] : actions.find(action => action.key === key.name);
       if (!action) return true;
+      if (action.key === "update" && this.waitingForVersion) {
+        app.toast("warn", this.state.kind === "error" ? this.state.message : "版本读取中，请稍后再升级");
+        return true;
+      }
       const git = this.state.kind === "ready" ? this.state.value : null;
       const spec = action.confirm(app, git);
       if (spec) {
@@ -257,15 +262,16 @@ export class MaintainView implements View {
   }
 
   render(ctx: ViewContext): string[] {
-    const { theme, width: total } = ctx;
-    const waiting = pending(theme, total, this.state, "");
-    if (waiting) return waiting;
+    const { theme } = ctx;
     const git = this.state.kind === "ready" ? this.state.value : null;
     const actions = this.availableActions;
     const action = actions[this.selected]!;
     const spec = action.confirm(ctx, git);
     const blocked = action.key === "update" && (!git || git.dirty);
-    const details = [
+    const versionNotice = this.state.kind === "error" ? this.state.message : "版本读取中…（升级暂不可用）";
+    const details = action.key === "update" && this.waitingForVersion ? [
+      theme.bold(versionNotice), "读取完成后可确认升级；其他服务操作和页面切换仍可使用。",
+    ] : [
       theme.bold(blocked ? spec!.subject : action.summary),
       theme.c(spec?.danger || blocked ? "warn" : "accent", spec ? "影响：" + spec.steps[0] : "启动完成后检查服务是否就绪"),
       "",
@@ -276,9 +282,10 @@ export class MaintainView implements View {
         ...git.incoming.map(commit => `${commit.sha}  ${commit.subject}`),
       ] : []),
     ];
-    const version = git?.dirty ? "工作区有改动，升级会被拒绝"
+    const version = this.state.kind !== "ready" ? versionNotice : git?.dirty ? "工作区有改动，升级会被拒绝"
       : git ? `${fmt.shortSha(git.sha)} · ${git.behind > 0 ? `待更新 ${git.behind} 个提交（上次同步）` : git.ahead > 0 ? "本地有领先提交" : git.behind < 0 ? "尚无远端对照" : "与上次同步一致"}`
         : "非 git 部署，升级不可用";
-    return actionWorkbench(ctx, { title: "服务与部署", items: actions, selected: this.selected, details, note: version });
+    const note = this.refreshing && this.state.kind === "ready" ? `${version} · ${versionNotice}` : version;
+    return actionWorkbench(ctx, { title: "服务与部署", items: actions, selected: this.selected, details, note });
   }
 }

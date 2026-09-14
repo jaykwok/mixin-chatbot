@@ -6,7 +6,7 @@ import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import { parseDate } from "../../scripts/ops/stats-admin.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
-test("Git 并发调用共享一次查询，下一次刷新仍读取最新版本", async () => {
+test("Git 调用共享一次查询并顺序复用宿主，下一次刷新仍读取最新版本", async () => {
   let done!: (value: tuiExec.RunResult) => void;
   let sha = "123456789abcdef";
   const result = (stdout: string): tuiExec.RunResult => ({ code: 0, stdout, stderr: "", timedOut: false });
@@ -19,7 +19,8 @@ test("Git 并发调用共享一次查询，下一次刷新仍读取最新版本"
   try {
     const first = loadGit();
     expect(loadGit()).toBe(first);
-    expect(capture).toHaveBeenCalledTimes(4);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(capture).toHaveBeenCalledTimes(3); // status 未结束前不会排队启动下一条命令。
     done(result(" M tracked.ts\n"));
     expect(await first).toEqual({ branch: "main", sha, subject: "fixture subject", dirty: true, ahead: 2, behind: 1,
       incoming: [{ sha: "abcdef0", subject: "incoming subject" }] });
@@ -27,6 +28,7 @@ test("Git 并发调用共享一次查询，下一次刷新仍读取最新版本"
     sha = "fedcba987654321";
     const second = loadGit();
     expect(second).not.toBe(first);
+    await new Promise<void>(resolve => setImmediate(resolve));
     done(result(""));
     expect(await second).toMatchObject({ sha, dirty: false });
     capture.mockRejectedValue(new Error("git missing"));
