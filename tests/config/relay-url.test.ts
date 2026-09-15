@@ -27,6 +27,23 @@ test.each([
 });
 
 test.each([
+  ["127.0.0.1:5244/dav/relay", "files.example.com", "https://files.example.com/d/relay/"],
+  ["http://127.0.0.1:5244/dav/relay/", "https://files.example.com/", "https://files.example.com/d/relay/"],
+  ["127.0.0.1:5244/dav/relay", "http://files.example.com:8080", "http://files.example.com:8080/d/relay/"],
+  ["127.0.0.1:5244/dav/team/relay", "files.example.com/", "https://files.example.com/d/team/relay/"],
+  ["127.0.0.1:5244/dav/网盘/relay", "files.example.com", "https://files.example.com/d/%E7%BD%91%E7%9B%98/relay/"],
+  ["127.0.0.1:5244/dav/%E7%BD%91%E7%9B%98/relay", "files.example.com", "https://files.example.com/d/%E7%BD%91%E7%9B%98/relay/"],
+  ["127.0.0.1:5244/dav/", "files.example.com", "https://files.example.com/d/"],
+  ["127.0.0.1:5244/dav/dav/relay", "files.example.com", "https://files.example.com/d/dav/relay/"],
+  ["127.0.0.1:5244/dav/relay", "files.example.com/d/relay", "https://files.example.com/d/relay/"],
+  ["127.0.0.1:5244/dav/relay", "files.example.com/custom/other", "https://files.example.com/custom/other/"],
+  ["dav.example.com/remote.php/dav/files/bot", "files.example.com", "https://files.example.com/"],
+  ["127.0.0.1:5244/alist/dav/relay", "files.example.com/alist/d/relay", "https://files.example.com/alist/d/relay/"],
+] as const)("从 Alist 上传目录推导仅填域名的下载地址，保留手写路径：%s → %s", (webdav, input, expected) => {
+  expect(normalizeRelayUrlInput(input, "public", webdav)).toBe(expected);
+});
+
+test.each([
   undefined, "", "   ", "ftp://files.example.com/relay", "/dav/relay", "//files.example.com/d/relay",
   "https:/files.example.com/d/relay", "https:files.example.com/d/relay", "mailto:bot@example.com",
   "not a host/d/relay", "files.example.com:99999/d/relay", "files.example.com\\d\\relay",

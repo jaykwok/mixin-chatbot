@@ -56,7 +56,7 @@ test("外链先形成可审阅草稿，确认后提交并使用运行时的默�
   const fixture = await tempFixture("relay-configure-basic-");
   try {
     const prepared = await run(fixture.root, "--draft", {
-      "WebDAV 上传目录": "127.0.0.1:5244/dav/relay", "公开下载目录": "files.example.test/d/relay",
+      "WebDAV 上传目录": "127.0.0.1:5244/dav/relay", "公开下载目录": "files.example.test",
     });
     expect(prepared.code, prepared.output).toBe(0);
     expect(prepared.output).toContain("保存预览");
@@ -69,6 +69,25 @@ test("外链先形成可审阅草稿，确认后提交并使用运行时的默�
     expect(applied.code, applied.output).toBe(0);
     expect(loadRelayConfig(file(fixture.root))).toEqual(base);
     if (process.platform !== "win32") expect((await stat(file(fixture.root))).mode & 0o777).toBe(0o600);
+  } finally { await fixture.cleanup(); }
+});
+
+test("仅填下载域名时，多级中文挂载目录会用于下载地址和签名路径", async () => {
+  const fixture = await tempFixture("relay-configure-derived-");
+  try {
+    const prepared = await run(fixture.root, "--draft", {
+      "WebDAV 上传目录": "127.0.0.1:5244/dav/网盘/relay", "公开下载目录": "files.example.test",
+      "调整高级": true, "公开下载签名": "alist", "下载签名密钥": "fixture-signing-key",
+    });
+    const expectedPublic = "https://files.example.test/d/%E7%BD%91%E7%9B%98/relay/";
+    expect(prepared.code, prepared.output).toBe(0);
+    expect(prepared.output).toContain("公开目录：" + expectedPublic);
+    expect(prepared.output).not.toContain("fixture-signing-key");
+    expect((await run(fixture.root, "--apply")).code).toBe(0);
+    expect(loadRelayConfig(file(fixture.root))).toEqual({
+      ...base, webdavUrl: "http://127.0.0.1:5244/dav/%E7%BD%91%E7%9B%98/relay/", publicBaseUrl: expectedPublic,
+      signSecret: "fixture-signing-key", signPathPrefix: "/网盘/relay/",
+    });
   } finally { await fixture.cleanup(); }
 });
 

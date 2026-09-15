@@ -27,14 +27,14 @@ function fingerprint(raw: string | null): string | null {
   return raw === null ? null : createHash("sha256").update(raw).digest("hex");
 }
 
-function requireUrl(value: string | undefined, kind: "webdav" | "public"): string | undefined {
-  try { normalizeRelayUrlInput(value, kind); }
+function requireUrl(value: string | undefined, kind: "webdav" | "public", webdavUrl?: string): string | undefined {
+  try { normalizeRelayUrlInput(value, kind, webdavUrl); }
   catch (error) { return error instanceof Error ? error.message : "请输入有效的目录地址"; }
 }
 
-async function askUrl(message: string, previous: string, kind: "webdav" | "public"): Promise<string> {
-  const initial = requireUrl(previous, kind) ? "" : normalizeRelayUrlInput(previous, kind);
-  return normalizeRelayUrlInput(await askText(message, initial, value => requireUrl(value, kind)), kind);
+async function askUrl(message: string, previous: string, kind: "webdav" | "public", webdavUrl?: string): Promise<string> {
+  const initial = requireUrl(previous, kind, webdavUrl) ? "" : normalizeRelayUrlInput(previous, kind, webdavUrl);
+  return normalizeRelayUrlInput(await askText(message, initial, value => requireUrl(value, kind, webdavUrl)), kind, webdavUrl);
 }
 
 async function askText(message: string, initialValue: string, validate?: (value: string | undefined) => string | undefined): Promise<string> {
@@ -99,19 +99,22 @@ async function prepare(draftPath: string): Promise<void> {
       "   账号需有 WebDAV 读取、管理、创建目录或上传、删除权限。",
       "2) 将 example.com 的 DNS 接入 Cloudflare 并激活；在隧道 Published application 新增",
       "   files.example.com，服务指向 http://localhost:5244（Alist 所在地址）。",
-      "3) 下方填写同一目录的两种地址：",
+      "3) 填写上传目录，再填写公开下载域名：",
       "   WebDAV 上传：http://127.0.0.1:5244/dav/relay/",
-      "   公开下载：https://files.example.com/d/relay/",
-      "/relay 是 Alist 的挂载目录，也可使用挂载内的子目录；请替换为实际路径。",
+      "   公开下载填 files.example.com，自动补成 https://files.example.com/d/relay/",
+      "上传地址填写到 Alist 挂载目录，例如 127.0.0.1:5244/dav/relay，",
+      "此处挂载目录为 relay；请替换为实际挂载目录，也可填写挂载内的子目录。",
       "只填目录，不带日期子目录和文件名。127.0.0.1 适用于机器人与 Alist 可在本机互访；",
       "公开下载填写接收者能访问的域名。DNS 和隧道路由需在 Cloudflare 控制台配置。",
     ].join("\n"), "Alist + Cloudflare 子域名示例");
     note("http://、https:// 和末尾 / 均可省略，保存前会显示完整地址。\n" +
       "WebDAV 的 localhost、回环及私有 IP 默认补 http://；其他地址（含公开下载）默认补 https://。\n" +
-      "显式填写的协议会保留；/dav/、/d/ 及实际目录仍需填写。", "地址填写方式");
+      "上传地址需包含 /dav/ 和挂载目录；公开下载只填域名时，由上传地址推导 /d/ 下的目录。\n" +
+      "显式填写的协议和下载目录会保留；其他 WebDAV 后端请填写完整公开下载地址。", "地址填写方式");
     const next: RelayConfig = { ...(previous ?? { maxBytes: DEFAULT_RELAY_MAX_BYTES, webdavUrl: "", publicBaseUrl: "" }) };
-    next.webdavUrl = await askUrl("WebDAV 上传目录 URL（可省略协议，如 127.0.0.1:5244/dav/relay）", next.webdavUrl, "webdav");
-    next.publicBaseUrl = await askUrl("公开下载目录 URL（可省略协议，如 files.example.com/d/relay）", next.publicBaseUrl, "public");
+    next.webdavUrl = await askUrl("WebDAV 上传目录 URL（填写到 Alist 挂载目录）", next.webdavUrl, "webdav");
+    next.publicBaseUrl = await askUrl("公开下载目录 URL（Alist 可只填域名，如 files.example.com；也可填完整目录地址）",
+      next.publicBaseUrl, "public", next.webdavUrl);
     const auth = bail<string>(await select({
       message: "WebDAV 认证方式", initialValue: previous?.username !== undefined ? "basic" : "none",
       options: [{ value: "basic", label: "用户名和密码" }, { value: "none", label: "无需认证" }],

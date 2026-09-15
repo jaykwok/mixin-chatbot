@@ -219,14 +219,16 @@ token 来源优先级为：本次输入的 token 或文件路径 → `TUNNEL_TOK
 
 1. 在 Alist 中挂载支持上传、建目录和删除的存储，挂载路径填 `/relay`。这里指 Alist 对外展示的虚拟路径；它也可以是某个挂载下的子目录，例如 `/网盘/relay`，不必和磁盘物理目录同名。示例账号基本路径为 `/`，需有该目录的 **WebDAV 读取、WebDAV 管理、创建目录或上传、删除** 权限。使用受限账号时，以该账号实际可访问的 WebDAV 目录为准，确保它与公开下载地址映射到同一存储目录。
 2. 按[隧道托管](#隧道托管)的方式，将根域名 `example.com` 的 DNS 接入 Cloudflare 并等待激活。在已有 Cloudflared 隧道中新增 **Published application** 路由：子域名 `files`、域名 `example.com`，Path 留空，服务类型选 **HTTP**，URL 填 `localhost:5244`（完整服务地址为 `http://localhost:5244`）。这里的服务地址应从运行连接器的位置可达；机器人与 Alist 使用各自的子域名和路由。
-3. 在 **系统 → 设置 → 外链配置** 中填写下面的两个目录地址。DNS 和隧道路由在 Cloudflare 控制台完成；外链向导只保存机器人配置。
+3. 在 **系统 → 设置 → 外链配置** 中，上传地址填写到 Alist 挂载目录，例如 `127.0.0.1:5244/dav/relay`，此处挂载目录为 `relay`。公开下载项可以只填文件域名，向导会推导对应目录。DNS 和隧道路由在 Cloudflare 控制台完成；外链向导只保存机器人配置。
 
 | 用途 | 完整地址 | 向导也接受的输入 |
 |---|---|---|
 | WebDAV 上传目录 `webdavUrl` | `http://127.0.0.1:5244/dav/relay/` | `127.0.0.1:5244/dav/relay` |
-| 公开下载目录 `publicBaseUrl` | `https://files.example.com/d/relay/` | `files.example.com/d/relay` |
+| 公开下载目录 `publicBaseUrl` | `https://files.example.com/d/relay/` | `files.example.com`（自动推导），也可填 `files.example.com/d/relay` |
 
-`/dav/` 是 WebDAV 入口，`/d/` 是下载入口，后面均接实际挂载目录。例如挂载路径为 `/网盘/relay` 时，分别填写 `http://127.0.0.1:5244/dav/网盘/relay/` 和 `https://files.example.com/d/网盘/relay/`；向导会将中文路径编码为有效 URL。
+`/dav/` 是 WebDAV 入口，`/d/` 是下载入口，后面均接实际挂载目录。例如上传地址填 `127.0.0.1:5244/dav/网盘/relay`，公开下载只填 `files.example.com`，即可推导为 `https://files.example.com/d/网盘/relay/`；向导会将中文路径编码为有效 URL。
+
+只填域名、带协议的域名或末尾带 `/` 的域名时，均从上传地址的 `/dav/` 后提取挂载目录，拼到下载域名的 `/d/` 下。若已填写完整下载目录（例如 `https://files.example.com/custom/relay/`），则保留填写的目录。自动推导仅识别标准 Alist 上传路径；其他 WebDAV 后端、反代子路径或不同的目录映射，请填写实际公开下载地址。
 
 浏览页面地址 `http://127.0.0.1:5244/relay/` 可帮助确认挂载路径，但上传时应使用 `/dav/relay/`，公开下载时使用 `/d/relay/`。不要把已生成文件的 `<日期>-<UUID>/<文件名>` 或 `?sign=...` 填进目录配置。
 

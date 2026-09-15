@@ -12,7 +12,7 @@ function localUploadHost(hostname: string): boolean {
 }
 
 /** 交互输入允许省略协议；配置文件仍保存完整 URL，运行时无需猜测。 */
-export function normalizeRelayUrlInput(value: string | undefined, kind: "webdav" | "public"): string {
+export function normalizeRelayUrlInput(value: string | undefined, kind: "webdav" | "public", webdavUrl?: string): string {
   const input = value?.trim() ?? "";
   const hasScheme = /^[a-z][a-z\d+.-]*:\/\//i.test(input);
   const invalid = "请输入目录地址，如 127.0.0.1:5244/dav/relay/ 或 files.example.com/d/relay/";
@@ -30,6 +30,11 @@ export function normalizeRelayUrlInput(value: string | undefined, kind: "webdav"
   if (!hasScheme && kind === "webdav" && localUploadHost(url.hostname)) {
     // 从原输入重新解析，保留显式端口（例如 :443），避免切换协议时丢失默认端口。
     url = new URL("http://" + input);
+  }
+  if (kind === "public" && url.pathname === "/" && webdavUrl) {
+    const uploadPath = new URL(normalizeRelayUrlInput(webdavUrl, "webdav")).pathname;
+    // 仅对标准 Alist 路径推导；已填写的下载目录、其他后端或反代路径保持原样。
+    if (uploadPath.startsWith("/dav/")) url.pathname = "/d/" + uploadPath.slice("/dav/".length);
   }
   if (!url.pathname.endsWith("/")) url.pathname += "/";
   return url.href;
