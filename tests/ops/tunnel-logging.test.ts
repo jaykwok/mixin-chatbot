@@ -24,6 +24,7 @@ for (const shell of ["powershell", "bash"] as const) {
           const config = join(fixture.root, "data/config");
           const preference = join(config, "cloudflared-logging");
           await mkdir(config, { recursive: true });
+          await writeFile(join(config, "cloudflared-protocol"), "http2");
           await mkdir(join(fixture.root, "data/state"), { recursive: true });
           await mkdir(join(fixture.root, "logs"));
           const token = join(config, "cloudflared-token");
@@ -109,6 +110,7 @@ for (const shell of ["powershell", "bash"] as const) {
           if (expected !== null) expect(await readFile(preference, "utf8"), scenario).toBe(expected);
           expect(await readFile(token, "utf8"), scenario).toBe("unchanged-fixture-credential");
           expect(await readFile(log, "utf8"), scenario).toBe("previous diagnostic record\n");
+          expect(await readFile(join(config, "cloudflared-protocol"), "utf8"), scenario).toBe("http2");
           expect((await readdir(config)).filter(name => name.includes(".backup-") || name.includes(".tmp"))).toEqual([]);
           const recorded = (await readFile(events, "utf8")).trim().split(/\r?\n/).filter(Boolean);
           if (["unchanged", "default-off", "unowned", "custom", "lock", "no-admin"].includes(scenario)) expect(recorded, scenario).toEqual([]);
@@ -121,6 +123,7 @@ for (const shell of ["powershell", "bash"] as const) {
           if (existsSync(join(fixture.root, "command"))) {
             const command = await readFile(join(fixture.root, "command"), "utf8");
             expect(command).not.toContain("unchanged-fixture-credential");
+            expect(command.replaceAll("\n", " ")).toContain("--protocol http2");
             if (scenario !== "custom" && scenario !== "absent") expect(command.includes("--loglevel"), scenario).toBe((success ? mode : old) === "on");
           }
         } finally { await fixture.cleanup(); }

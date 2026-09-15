@@ -90,7 +90,7 @@ test.skipIf(process.platform !== "win32")("Windows service registration uses onl
   await writeFile(ps, "\ufeff" + [
     "$ErrorActionPreference='Stop'",
     functionLoader(join(project, "scripts/tunnel/start-tunnel.ps1"), ["Register-ProjectCloudflared"]),
-    functionLoader(join(project, "scripts/lib/tunnel-logging.ps1"), ["Get-CloudflaredLogArguments", "Get-CloudflaredServiceCommand"]),
+    functionLoader(join(project, "scripts/lib/tunnel-logging.ps1"), ["Get-CloudflaredProtocol", "Get-CloudflaredLogArguments", "Get-CloudflaredServiceCommand"]),
     "function New-EventLog {}",
     "function Get-Service { if($script:exists){@{Status='Running'}} }",
     "function Stop-Service {}",
@@ -99,7 +99,7 @@ test.skipIf(process.platform !== "win32")("Windows service registration uses onl
     "function New-Service { param($Name,$DisplayName,$BinaryPathName,$StartupType,$ErrorAction); $script:command=$BinaryPathName }",
     "function Get-CimInstance { @{PathName=$(if($script:bad){'wrong command'}else{$script:command})} }",
     "$executable='C:\\Project With Spaces\\cloudflared.exe'; $tokenFile='C:\\Project With Spaces\\data\\cloudflared-token'",
-    "foreach($script:exists in @($true,$false)) { Register-ProjectCloudflared $executable $tokenFile; if($script:command -cne ('\"'+$executable+'\" tunnel --no-autoupdate run --token-file \"'+$tokenFile+'\"')){throw 'wrong command'} }",
+    "foreach($script:exists in @($true,$false)) { Register-ProjectCloudflared $executable $tokenFile; if($script:command -cne ('\"'+$executable+'\" tunnel --no-autoupdate --protocol auto run --token-file \"'+$tokenFile+'\"')){throw 'wrong command'} }",
     "$script:bad=$true; $rejected=$false; try{Register-ProjectCloudflared $executable $tokenFile}catch{$rejected=$true}; if(-not $rejected){throw 'accepted mismatched service'}",
     "Write-Output 'SERVICE_ARGV_PASSED'",
   ].join("\n"));

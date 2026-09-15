@@ -163,15 +163,18 @@ test.skipIf(!bash || !existsSync(bash))("the original shell launcher consumes pa
     ].join("\n") + "\n");
     await chmod(binary, 0o755);
     for (const mode of ["default", "on", "off", "background"]) {
+      const protocol = mode === "on" ? "http2" : mode === "off" ? "quic" : "auto";
       if (mode !== "default") await writeFile(join(fixture.root, "data/config/cloudflared-logging"), mode === "background" ? "on" : mode);
+      if (mode !== "default") await writeFile(join(fixture.root, "data/config/cloudflared-protocol"), protocol);
       const result = await execute([bash!, posixPath(join(fixture.root, "scripts/tunnel/start-tunnel.sh"))], fixture.root, {
         FIXTURE_ROOT: posixPath(fixture.root), MIXIN_TUNNEL_TOKEN_INPUT: tokens[1], TUNNEL_TOKEN: tokens[0], TUNNEL_TOKEN_FILE: "",
-        CLOUDFLARED_BACKGROUND: mode === "background" ? "1" : "0",
+        CLOUDFLARED_BACKGROUND: mode === "background" ? "1" : "0", TUNNEL_TRANSPORT_PROTOCOL: "conflicting-environment",
       });
       expect(result.code, result.output).toBe(0);
       expect(result.output).not.toContain(tokens[1]!);
       expect(result.output.includes("fixture-native-output"), mode).toBe(mode !== "background");
       const args = await readFile(join(fixture.root, "args"), "utf8");
+      expect(args).toContain("--protocol\n" + protocol + "\n");
       expect(args.includes("--loglevel\ndebug\n--log-directory\n" + posixPath(join(fixture.root, "logs"))), mode).toBe(mode === "on" || mode === "background");
       expect(args).not.toContain("--logfile");
       expect(args).toContain("--token-file\n" + posixPath(join(fixture.root, "data/config/cloudflared-token")));

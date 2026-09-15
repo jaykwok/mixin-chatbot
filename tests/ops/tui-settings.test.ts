@@ -49,16 +49,21 @@ test("设置仅加载选中项，重复选择复用在途读取；离页丢弃�
   const old = Promise.withResolvers<settings.RuntimeSnapshot>(), fresh = Promise.withResolvers<settings.RuntimeSnapshot>();
   let tunnelSignal: AbortSignal | undefined, runtimeSignal: AbortSignal | undefined;
   const readTunnel = spyOn(data, "loadTunnelLogging").mockImplementation((_project, signal) => { tunnelSignal = signal; return tunnel.promise; });
+  const readProtocol = spyOn(data, "loadTunnelProtocol").mockResolvedValue("auto");
   const readRuntime = spyOn(data, "loadRuntimeSettings").mockImplementationOnce((_project, signal) => {
     runtimeSignal = signal; return old.promise;
   }).mockReturnValue(fresh.promise);
   try {
     await view.refresh(app);
     expect(readTunnel).not.toHaveBeenCalled(); expect(readRuntime).not.toHaveBeenCalled();
+    expect(readProtocol).not.toHaveBeenCalled();
     await view.onKey(key("down"), app);
     expect(readTunnel).toHaveBeenCalledTimes(1);
     await view.onKey(key("down"), app);
     expect(tunnelSignal?.aborted).toBe(true);
+    expect(readProtocol).toHaveBeenCalledTimes(1);
+    expect(readRuntime).not.toHaveBeenCalled();
+    await view.onKey(key("down"), app);
     expect(readRuntime).toHaveBeenCalledTimes(1);
     await view.onKey(key("end"), app);
     expect(readRuntime).toHaveBeenCalledTimes(1);
@@ -75,7 +80,7 @@ test("设置仅加载选中项，重复选择复用在途读取；离页丢弃�
     expect(plain(view.render(ctx()))).toContain("0 项自定义");
   } finally {
     tunnel.resolve("off"); old.resolve(snapshot); fresh.resolve(snapshot);
-    view.onLeave(); readTunnel.mockRestore(); readRuntime.mockRestore();
+    view.onLeave(); readTunnel.mockRestore(); readProtocol.mockRestore(); readRuntime.mockRestore();
   }
 });
 

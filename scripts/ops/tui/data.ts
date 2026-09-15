@@ -268,6 +268,19 @@ export interface LogLine {
 }
 
 export type TunnelLogging = "off" | "on";
+export type TunnelProtocol = "auto" | "http2" | "quic";
+
+export async function loadTunnelProtocol(project = PROJECT_DIR, signal?: AbortSignal): Promise<TunnelProtocol> {
+  let value: string;
+  try {
+    value = (await readFile(join(project, "data", "config", "cloudflared-protocol"), { encoding: "utf8", signal })).trim();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "auto";
+    throw error;
+  }
+  if (value !== "auto" && value !== "http2" && value !== "quic") throw new Error("cloudflared-protocol 只接受 auto、http2 或 quic");
+  return value;
+}
 
 export async function loadTunnelLogging(project = PROJECT_DIR, signal?: AbortSignal): Promise<TunnelLogging> {
   let value: string;

@@ -97,7 +97,7 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
         if (args[i] === "--keyword") i++;
         request.Target = args[i++] ?? "";
       }
-    } else if (["history-clear", "stat", "tunnel-logging", "runtime-configure"].includes(args[0] ?? "") && args[i] && !args[i]!.startsWith("--")) {
+    } else if (["history-clear", "stat", "tunnel-logging", "tunnel-protocol", "runtime-configure"].includes(args[0] ?? "") && args[i] && !args[i]!.startsWith("--")) {
       request.Target = args[i++]!;
     }
     const switches: Record<string, string> = {

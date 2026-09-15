@@ -811,6 +811,7 @@ case "${1:-}" in
     start)     start_bot ;;
     logs)      show_logs ;;
     tunnel-logging) configure_tunnel_logging "${2:-}" ;;
+    tunnel-protocol) configure_tunnel_protocol "${2:-}" ;;
     relay-configure) relay_configure ;;
     runtime-configure) runtime_configure "${2:-}" ;;
     relay-ls)    relay_admin list ;;
@@ -846,6 +847,7 @@ case "${1:-}" in
         echo "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
         echo "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
         echo "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
+        echo "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"
         echo "  relay-ls   列出已发出、仍在册的大文件外链"
         echo "  relay-purge <关键字>|--all"
         echo "             删除匹配的外链对象并清掉索引记录"

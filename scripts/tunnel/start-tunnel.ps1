@@ -94,6 +94,7 @@ function Get-TunnelTokenIdentity([string]$Value) {
 }
 
 $loggingMode = Get-CloudflaredLogging $Project
+$protocol = Get-CloudflaredProtocol $Project
 $loggingArgs = @(Get-CloudflaredLogArguments $Project $loggingMode)
 $loggingHint = if ($loggingMode -eq 'on') { 'logs/cloudflared.log（自动轮转）' } else { '文件日志已关闭，可在 TUI「系统 → 设置」开启；服务事件见 Windows 事件查看器' }
 if ($loggingMode -eq 'on') { New-Item -ItemType Directory -Force -Path (Join-Path $Project 'logs') | Out-Null }
@@ -211,7 +212,7 @@ if ($isAdmin) {
     try {
         $ErrorActionPreference = "Continue"
         $foregroundTokenFile = Save-ProjectTunnelToken $Project $token
-        & $cfPath tunnel --no-autoupdate @loggingArgs run --token-file $foregroundTokenFile
+        & $cfPath tunnel --no-autoupdate --protocol $protocol @loggingArgs run --token-file $foregroundTokenFile
         $foregroundExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference

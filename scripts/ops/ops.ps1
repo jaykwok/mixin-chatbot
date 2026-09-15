@@ -1367,6 +1367,9 @@ switch ($Command) {
     "tunnel-logging" {
         try { Set-CloudflaredLogging $Project $Target } catch { Err $_.Exception.Message; exit 1 }
     }
+    "tunnel-protocol" {
+        try { Set-CloudflaredProtocol $Project $Target } catch { Err $_.Exception.Message; exit 1 }
+    }
     "restart"   { if (-not (Restart-Bot)) { exit 1 } }
     "stop"      {
         Step "停止机器人..."
@@ -1475,6 +1478,7 @@ switch ($Command) {
         Write-Host "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
         Write-Host "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
         Write-Host "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
+        Write-Host "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
         Write-Host "  relay-purge <关键字>|-All"
         Write-Host "                  删除匹配的外链对象并清掉索引记录"

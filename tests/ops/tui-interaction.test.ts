@@ -1281,6 +1281,63 @@ test("日志设置只显示关闭和开启，取消或选择当前值不执行�
   } finally { read.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
 });
 
+test("连接模式默认自动，三种选择可保存；取消、原值和恢复后的失败都正确显示", async () => {
+  const { app, calls } = fakeApp();
+  const view = new SettingsView();
+  let saved: tuiData.TunnelProtocol = "auto";
+  const read = spyOn(tuiData, "loadTunnelProtocol").mockImplementation(async () => saved);
+  const confirm = spyOn(app, "confirm").mockResolvedValue(false);
+  const run = spyOn(app, "run").mockImplementation(async (_title, args) => { saved = args[1] as tuiData.TunnelProtocol; return 0; });
+  try {
+    await view.onKey(key("p"), app);
+    await view.refresh(app);
+    calls.choices.push(null, "auto", "http2");
+    for (let i = 0; i < 3; i++) await view.onKey(key("enter"), app);
+    expect(calls.menus[0]!.choices.map(choice => choice.value)).toEqual(["auto", "http2", "quic"]);
+    expect(calls.menus[0]!.initial).toBe("auto");
+    expect(run).not.toHaveBeenCalled();
+    expect(confirm).toHaveBeenCalledTimes(1);
+    confirm.mockResolvedValue(true);
+    for (const mode of ["http2", "quic", "auto"] as const) {
+      calls.choices.push(mode);
+      await view.onKey(key("enter"), app);
+      expect(run.mock.calls.at(-1)?.[1]).toEqual(["tunnel-protocol", mode]);
+      expect(view["protocol"].state).toEqual({ kind: "ready", value: mode });
+    }
+    run.mockResolvedValue(1);
+    calls.choices.push("http2");
+    await view.onKey(key("enter"), app);
+    expect(view["protocol"].state).toEqual({ kind: "ready", value: "auto" });
+    for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) {
+      const ctx = context(width, rows);
+      fits(view.render(ctx), ctx);
+      expect(plain(view.render(ctx))).toContain("Cloudflared 连接模式");
+    }
+  } finally { view.onLeave(); read.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
+});
+
+test("离开连接模式时取消加载，迟到的结果不能覆盖状态；读取错误可重试", async () => {
+  const { app } = fakeApp();
+  const view = new SettingsView();
+  let finish!: (value: tuiData.TunnelProtocol) => void;
+  const read = spyOn(tuiData, "loadTunnelProtocol").mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  try {
+    await view.onKey(key("p"), app);
+    const loading = view.refresh(app);
+    expect(view.activity()).toContain("连接模式");
+    await view.onKey(key("home"), app);
+    finish("quic"); await loading;
+    expect(view["protocol"].state.kind).toBe("idle");
+    read.mockRejectedValueOnce(new Error("invalid preference"));
+    await view.onKey(key("p"), app);
+    expect(view["protocol"].state.kind).toBe("error");
+    expect(plain(view.render(context(120, 35)))).toContain("invalid preference");
+    read.mockResolvedValue("auto");
+    await view.refresh(app);
+    expect(view["protocol"].state).toEqual({ kind: "ready", value: "auto" });
+  } finally { view.onLeave(); read.mockRestore(); }
+});
+
 test("隧道日志复用跟随搜索和级别筛选，读取独立文件，任务查询只用于机器人日志", async () => {
   const { app, calls } = fakeApp();
   const view = new LogsView("cloudflared");

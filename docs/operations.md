@@ -183,6 +183,24 @@ token 来源优先级为：本次输入的 token 或文件路径 → `TUNNEL_TOK
 
 常驻命令使用同一个 `data/config/cloudflared-token` 文件。Windows 通过服务控制管理器注册项目根目录的可执行文件，命令行只包含受 ACL 保护的 token 文件路径，并核对注册后的命令；交互粘贴的 token 不作为子进程命令行参数传入。已有 Windows 服务继续沿用当前连接，更改文件后通过“修复隧道”应用新 token。Linux 记录 PID、启动时间和系统启动 ID 验证归属，内置 nohup 仅负责当前运行，开机托管需运维配置 systemd 等服务管理方式。
 
+## 隧道连接模式
+
+运行 `bun run tui`，进入 **系统 → 设置 → Cloudflared 连接模式**：
+
+| 选项 | 行为 |
+| --- | --- |
+| 自动（默认） | `auto`：优先 QUIC，无法建立 UDP 连接时回退 HTTP2；不保证每次短暂超时都立即切换 |
+| HTTP2（TCP） | `http2`：固定使用 TCP 7844，UDP 不稳定时可尝试 |
+| QUIC（UDP） | `quic`：固定使用 UDP 7844，不回退 HTTP2 |
+
+配置保存到 `data/config/cloudflared-protocol`，缺失时为 `auto`。Windows 服务、前台启动和 Linux 启动都显式传入 `--protocol`，因此项目设置优先于 `TUNNEL_TRANSPORT_PROTOCOL` 和 cloudflared 配置文件中的协议值。连接模式与日志开关分别保存，切换其中一项会保留另一项。是否经过代理由系统及代理路由决定；协议选择本身不控制直连或代理。
+
+命令行也可使用 `scripts/ops/ops.ps1 tunnel-protocol http2` 或 `bash scripts/ops/ops.sh tunnel-protocol http2`，将 `http2` 换成 `auto` 或 `quic` 即可切换。
+
+TUI 保存前会显示确认预览；命令行直接应用指定模式。应用时只重启正在运行的本项目连接器，公网访问短暂中断；已停止时保持停止，尚未安装时下次部署生效。启动或写入失败会尝试恢复原配置与运行状态。启动检查只确认服务或进程保持运行，不保证已经连通 Cloudflare；切换后请结合隧道注册日志及外部请求验证可用性。
+
+Windows 修改已安装的服务需要管理员权限。连接器必须使用当前项目生成的启动参数；此前没有 `--protocol` 的服务不做兼容迁移，Windows 先执行 **系统 → 服务部署 → 修复隧道**，Linux 停止原连接器后用当前脚本重新启动。无需删除日志。
+
 ## 隧道日志
 
 运行 `bun run tui`，进入 **系统 → 设置 → Cloudflared 日志**，选择“关闭 / 开启”，默认关闭。开启后记录隧道连接、HTTP 请求和源站响应，写入项目 `logs/cloudflared.log`。配置持久化到 `data/config/cloudflared-logging`（`off` / `on`），部署和前台启动都会读取。命令行也可使用 `scripts/ops/ops.ps1 tunnel-logging on` 或 `bash scripts/ops/ops.sh tunnel-logging on`；关闭时将 `on` 改为 `off`。
