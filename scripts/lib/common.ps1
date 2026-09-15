@@ -3,6 +3,7 @@
 
 . (Join-Path $PSScriptRoot 'lifecycle.ps1')
 . (Join-Path $PSScriptRoot 'deployment.ps1')
+. (Join-Path $PSScriptRoot 'tunnel-logging.ps1')
 
 # 交互界面沿用相同运维命令，但建议指向界面中真实存在的入口。
 function Get-OpsCommandHint([string]$Command) {

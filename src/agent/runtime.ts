@@ -23,6 +23,7 @@ import { DeliveryStore } from "./delivery-store.ts";
 import { refreshDeliveryText } from "./delivery-links.ts";
 import { SessionQueue } from "./session-queue.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
+import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
 import { ensureStorageIdentity } from "./storage-identity.ts";
 import { redactSecrets } from "./failure.ts";
 import { openModelRuntime, openSettings, resolveModelSelection } from "../core/model-config.ts";
@@ -51,7 +52,7 @@ async function getRuntime(): Promise<RuntimeSelection> {
     const runtime = await openModelRuntime({ signal: application.signal });
     const settings = openSettings();
     const { model, thinkingLevel } = await resolveModelSelection(runtime, settings, { signal: application.signal });
-    configureModelCache(runtime, (runtimeSetting("BOT_MODEL_CACHE_RETENTION") ?? "auto") as CachePolicy);
+    configureModelCache(runtime, (runtimeSetting("BOT_MODEL_CACHE_RETENTION") ?? RUNTIME_DEFAULTS.BOT_MODEL_CACHE_RETENTION) as CachePolicy);
     resolvedRuntime = { runtime, settings, model, thinkingLevel };
     log.info(
       `Pi ModelRuntime 就绪（provider=${model.provider}, model=${model.id}, api=${model.api}, thinkingLevel=${thinkingLevel}, 群数据总根=${GROUP_DATA_ROOT}）`

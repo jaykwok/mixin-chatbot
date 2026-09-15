@@ -22,8 +22,9 @@ import { resolveToolPath } from "./tool-path.ts";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
 import { application } from "../core/lifecycle.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
+import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
 
-const attachmentSlots = new AsyncSemaphore(Number(runtimeSetting("BOT_ATTACHMENT_CONCURRENCY") ?? 2));
+const attachmentSlots = new AsyncSemaphore(Number(runtimeSetting("BOT_ATTACHMENT_CONCURRENCY") ?? RUNTIME_DEFAULTS.BOT_ATTACHMENT_CONCURRENCY));
 
 async function uploadBuffered(source: ResolvedSource, callbackUrl: string, name: string, type: "image" | "file", group: string, signal?: AbortSignal) {
   const budget = AbortSignal.any([application.signal, ...(signal ? [signal] : [])]);

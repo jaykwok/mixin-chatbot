@@ -737,7 +737,7 @@ if ($cleanupFirewallAfterHealth) {
 # 机器人健康且隧道/直连切换成功后再提交，避免 doctor 读取半完成配置。
 Save-DeploymentState
 Done "部署状态已写入 data\state。"
-Done "可选大文件外链：运行 bun run tui，进入「数据 → 外链 → 配置外链」按需启用。"
+Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 → 外链配置」按需启用。"
 $deploymentCommitted = $true
 
 } finally {

@@ -156,20 +156,28 @@ test.skipIf(!bash || !existsSync(bash))("the original shell launcher consumes pa
       "#!/usr/bin/env bash", "set -euo pipefail",
       'if [ "${1:-}" = --version ]; then echo "cloudflared version fixture"; exit 0; fi',
       'printf "%s\\n" "$@" > "$FIXTURE_ROOT/args"',
+      'printf "fixture-native-output\\n"',
       'test -z "${MIXIN_TUNNEL_TOKEN_INPUT:-}"',
       'test -z "${TUNNEL_TOKEN:-}"',
       'test -z "${TUNNEL_TOKEN_VALUE:-}"',
     ].join("\n") + "\n");
     await chmod(binary, 0o755);
-    const result = await execute([bash!, posixPath(join(fixture.root, "scripts/tunnel/start-tunnel.sh"))], fixture.root, {
-      FIXTURE_ROOT: posixPath(fixture.root), MIXIN_TUNNEL_TOKEN_INPUT: tokens[1], TUNNEL_TOKEN: tokens[0], TUNNEL_TOKEN_FILE: "",
-    });
-    expect(result.code, result.output).toBe(0);
-    expect(result.output).not.toContain(tokens[1]!);
-    const args = await readFile(join(fixture.root, "args"), "utf8");
-    expect(args).toContain("--token-file\n" + posixPath(join(fixture.root, "data/config/cloudflared-token")));
-    for (const token of tokens) expect(args).not.toContain(token);
-    expect(await readFile(join(fixture.root, "data/config/cloudflared-token"), "utf8")).toBe(tokens[1]!);
-    expect(existsSync(join(fixture.root, "data/config/tunnel-token"))).toBe(false);
+    for (const mode of ["default", "on", "off", "background"]) {
+      if (mode !== "default") await writeFile(join(fixture.root, "data/config/cloudflared-logging"), mode === "background" ? "on" : mode);
+      const result = await execute([bash!, posixPath(join(fixture.root, "scripts/tunnel/start-tunnel.sh"))], fixture.root, {
+        FIXTURE_ROOT: posixPath(fixture.root), MIXIN_TUNNEL_TOKEN_INPUT: tokens[1], TUNNEL_TOKEN: tokens[0], TUNNEL_TOKEN_FILE: "",
+        CLOUDFLARED_BACKGROUND: mode === "background" ? "1" : "0",
+      });
+      expect(result.code, result.output).toBe(0);
+      expect(result.output).not.toContain(tokens[1]!);
+      expect(result.output.includes("fixture-native-output"), mode).toBe(mode !== "background");
+      const args = await readFile(join(fixture.root, "args"), "utf8");
+      expect(args.includes("--loglevel\ndebug\n--log-directory\n" + posixPath(join(fixture.root, "logs"))), mode).toBe(mode === "on" || mode === "background");
+      expect(args).not.toContain("--logfile");
+      expect(args).toContain("--token-file\n" + posixPath(join(fixture.root, "data/config/cloudflared-token")));
+      for (const token of tokens) expect(args).not.toContain(token);
+      expect(await readFile(join(fixture.root, "data/config/cloudflared-token"), "utf8")).toBe(tokens[1]!);
+      expect(existsSync(join(fixture.root, "data/config/tunnel-token"))).toBe(false);
+    }
   } finally { await fixture.cleanup(); }
-});
+}, 30000);

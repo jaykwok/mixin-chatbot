@@ -88,6 +88,7 @@ rollback_deployment() {
         exit 1
     fi
     stop_tunnel_launcher || failed=1
+    if [ -n "${tunnel_startup_log:-}" ]; then rm -f -- "$tunnel_startup_log" || failed=1; fi
     if [ "$TUNNEL_STARTED_BY_DEPLOY" = 1 ] || [ "$PREVIOUS_TUNNEL_RUNNING" = 0 ]; then
         if managed_cloudflared_pid >/dev/null 2>&1; then stop_managed_cloudflared || failed=1; fi
     fi
@@ -121,14 +122,7 @@ rollback_deployment() {
     fi
     if [ "$PREVIOUS_TUNNEL_RUNNING" = 1 ] && ! managed_cloudflared_pid >/dev/null 2>&1; then
         if [ "${#TUNNEL_COMMAND[@]}" -gt 0 ]; then
-            nohup "${TUNNEL_COMMAND[@]}" >> "$LOG_DIR/cloudflared.log" 2>&1 9>&- &
-            record_cloudflared_pid "$!" || failed=1
-            local attempt
-            for ((attempt=0; attempt<5; attempt++)); do
-                managed_cloudflared_pid >/dev/null && break
-                sleep 1
-            done
-            managed_cloudflared_pid >/dev/null || failed=1
+            start_managed_cloudflared_command "${TUNNEL_COMMAND[@]}" || failed=1
         else failed=1; fi
     fi
     if [ "$failed" = 0 ]; then print_warning "已恢复配置、容器、网络入口和原运行状态；快照在 $DEPLOY_SNAPSHOT"

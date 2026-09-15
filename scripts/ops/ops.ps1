@@ -11,7 +11,7 @@
 param(
     [Parameter(Position = 0)]
     [string]$Command = "",
-    # relay-purge 的过滤关键字、routes 的子命令，或 stat/history-clear 的群号。
+    # relay-purge 的关键字、routes 的子命令、stat/history-clear 的群号，或 tunnel-logging 的开关。
     [Parameter(Position = 1)]
     [string]$Target = "",
     [switch]$Repair,
@@ -268,6 +268,76 @@ function Invoke-RelayConfiguration {
             Remove-Item -LiteralPath $draft -Force -ErrorAction SilentlyContinue
             Pop-Location
         }
+    }
+}
+
+# 应用 TUI 已确认的运行参数；预检在停机前完成，失败时恢复原配置和运行状态。
+function Invoke-RuntimeConfiguration([string]$DraftName) {
+    if ($DraftName -cnotmatch '^\.runtime-draft-[a-f0-9-]{36}\.json$') { throw '运行参数草稿名称无效' }
+    $bunPath = Get-BunPath
+    if (-not $bunPath) { throw '找不到可用的 bun' }
+    $draft = Join-Path $ConfigDir $DraftName
+    $receipt = $draft + '.rollback'
+    $statePath = Join-Path $Project 'data\state'
+    New-Item -ItemType Directory -Force -Path $statePath | Out-Null
+    $lock = [IO.File]::Open((Join-Path $statePath 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $wasRunning = $false
+    $stopAttempted = $false
+    $applyAttempted = $false
+    $preserve = Test-Path -LiteralPath $receipt -PathType Leaf
+    Push-Location $Project
+    function Invoke-RuntimeConfigStep([string]$Mode) {
+        $previous = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            Invoke-WithUtf8Output { & $bunPath run 'scripts\config\runtime-settings.ts' $Mode $DraftName 2>&1 | Out-Host }
+            return ($LASTEXITCODE -eq 0)
+        } finally { $ErrorActionPreference = $previous }
+    }
+    try {
+        if ($preserve) { throw '此草稿留有未完成的恢复材料，请先完成恢复后再重新保存' }
+        if (-not (Invoke-RuntimeConfigStep '--check')) { throw '运行参数校验失败，尚未停止机器人或写入配置' }
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($task -and (@($task.Actions).Count -ne 1 -or -not $task.Actions[0].WorkingDirectory -or
+            [IO.Path]::GetFullPath($task.Actions[0].WorkingDirectory) -ne [IO.Path]::GetFullPath($Project))) {
+            throw '计划任务不属于当前项目，未修改配置或服务'
+        }
+        $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
+        if ($wasRunning -and -not $task) { throw '机器人以前台方式运行，无法自动恢复；请先停止前台实例，再保存运行参数' }
+        if ($wasRunning) {
+            Step '运行参数已确认，短暂停止机器人以应用设置'
+            $stopAttempted = $true
+            if (-not (Stop-Bot)) { throw '无法停止机器人，运行参数未写入' }
+        }
+        $applyAttempted = $true
+        if (-not (Invoke-RuntimeConfigStep '--apply')) { throw '运行参数应用失败' }
+        if ($wasRunning) {
+            if (-not (Start-Bot)) { throw '应用运行参数后启动失败' }
+            if ((Wait-Local) -ne 200) { throw '应用运行参数后健康检查失败' }
+            Done '机器人已恢复运行，已重新读取运行参数'
+        } else { Done '运行参数已保存；机器人保持停止，下次启动生效' }
+    } catch {
+        $failure = $_.Exception.Message
+        try {
+            if ($applyAttempted -and (Test-Path -LiteralPath $receipt -PathType Leaf)) {
+                if ($wasRunning -and -not (Stop-Bot)) { throw '无法停止实例以恢复原参数' }
+                if (-not (Invoke-RuntimeConfigStep '--rollback')) { throw '原运行参数恢复失败' }
+            }
+            if ($wasRunning -and $stopAttempted) {
+                if (-not (Start-Bot)) { throw '原服务恢复启动失败' }
+                if ((Wait-Local) -ne 200) { throw '原服务恢复后未通过健康检查' }
+            }
+        } catch {
+            $preserve = $true
+            throw "$failure；恢复失败：$($_.Exception.Message)。请查看机器人日志，恢复材料保留在 $receipt"
+        }
+        throw "$failure；原配置及运行状态已保留或恢复"
+    } finally {
+        if (-not $preserve) {
+            Remove-Item -LiteralPath $draft, $receipt -Force -ErrorAction SilentlyContinue
+        }
+        Pop-Location
+        $lock.Dispose()
     }
 }
 
@@ -1294,6 +1364,9 @@ switch ($Command) {
         if (-not (Show-Doctor)) { exit 1 }
     }
     "uninstall-tunnel" { if (-not (Uninstall-TunnelService)) { exit 1 } }
+    "tunnel-logging" {
+        try { Set-CloudflaredLogging $Project $Target } catch { Err $_.Exception.Message; exit 1 }
+    }
     "restart"   { if (-not (Restart-Bot)) { exit 1 } }
     "stop"      {
         Step "停止机器人..."
@@ -1314,6 +1387,9 @@ switch ($Command) {
     }
     "relay-configure" {
         try { Invoke-RelayConfiguration } catch { Err $_.Exception.Message; exit 1 }
+    }
+    "runtime-configure" {
+        try { Invoke-RuntimeConfiguration $Target } catch { Err $_.Exception.Message; exit 1 }
     }
     "relay-ls" { if (-not (Invoke-RelayAdmin @("list"))) { exit 1 } }
     "relay-purge" {
@@ -1397,6 +1473,8 @@ switch ($Command) {
         Write-Host "  foreground      以前台方式运行 launcher（Ctrl+C 停止）"
         Write-Host "  logs            持续查看 logs\mixin-chatbot.log"
         Write-Host "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
+        Write-Host "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
+        Write-Host "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
         Write-Host "  relay-purge <关键字>|-All"
         Write-Host "                  删除匹配的外链对象并清掉索引记录"

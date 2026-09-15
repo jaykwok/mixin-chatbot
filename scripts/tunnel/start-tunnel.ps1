@@ -28,11 +28,10 @@ $StateDir = Join-Path $DataDir "state"
 $PersistedPortFile = Join-Path $StateDir "bot-port"
 $TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
 
-function Register-ProjectCloudflared([string]$Executable, [string]$TokenFile) {
+function Register-ProjectCloudflared([string]$Executable, [string]$TokenFile, [string]$Logging = 'off') {
     # Official service install accepts a positional token, not --token-file.
     # Register the official executable with its supported tunnel run arguments instead.
-    if ($Executable.Contains('"') -or $TokenFile.Contains('"')) { throw '连接器路径无效' }
-    $binaryPath = '"' + $Executable + '" tunnel --no-autoupdate run --token-file "' + $TokenFile + '"'
+    $binaryPath = Get-CloudflaredServiceCommand (Split-Path $Executable -Parent) $Executable $TokenFile $Logging
     if (-not (Test-Path -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\Cloudflared')) {
         New-EventLog -LogName Application -Source Cloudflared
     }
@@ -94,6 +93,10 @@ function Get-TunnelTokenIdentity([string]$Value) {
     }
 }
 
+$loggingMode = Get-CloudflaredLogging $Project
+$loggingArgs = @(Get-CloudflaredLogArguments $Project $loggingMode)
+$loggingHint = if ($loggingMode -eq 'on') { 'logs/cloudflared.log（自动轮转）' } else { '文件日志已关闭，可在 TUI「系统 → 设置」开启；服务事件见 Windows 事件查看器' }
+if ($loggingMode -eq 'on') { New-Item -ItemType Directory -Force -Path (Join-Path $Project 'logs') | Out-Null }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $existingService = if ($isAdmin) { Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue } else { $null }
 if ($existingService -and $env:CLOUDFLARED_REINSTALL -ne "1") {
@@ -112,7 +115,7 @@ if ($existingService -and $env:CLOUDFLARED_REINSTALL -ne "1") {
     if (-not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
         Write-Host "该服务没有本项目归属标记；切换回直连模式时部署脚本不会自动停止它。" -ForegroundColor Yellow
     }
-    Write-Host "完成。状态检查：$(Get-OpsCommandHint 'doctor')；隧道日志：Windows 事件查看器。" -ForegroundColor Green
+    Write-Host "完成。状态检查：$(Get-OpsCommandHint 'doctor')；隧道日志：$loggingHint。" -ForegroundColor Green
     exit 0
 }
 
@@ -175,7 +178,7 @@ if ($isAdmin) {
     if (-not $svc -or $env:CLOUDFLARED_REINSTALL -eq '1') {
         if ($svc) { Stop-Service Cloudflared -ErrorAction Stop }
         $serviceTokenFile = Save-ProjectTunnelToken $Project $token
-        Register-ProjectCloudflared $cfPath $serviceTokenFile
+        Register-ProjectCloudflared $cfPath $serviceTokenFile $loggingMode
         Write-Host 'Cloudflared 服务已配置为开机自启，凭据从受保护文件读取。' -ForegroundColor Green
     } else {
         if ($svc.Status -ne 'Running') { Start-Service Cloudflared }
@@ -190,7 +193,7 @@ if ($isAdmin) {
     if ($installedService.Status -ne "Running") { throw "Cloudflared 服务已安装，但未能进入运行状态" }
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     Set-Content -LiteralPath $TunnelManagedFile -Value "Cloudflared" -NoNewline -Encoding ASCII
-    Write-Host "完成。状态检查：$(Get-OpsCommandHint 'doctor')；隧道日志：Windows 事件查看器。" -ForegroundColor Green
+    Write-Host "完成。状态检查：$(Get-OpsCommandHint 'doctor')；隧道日志：$loggingHint。" -ForegroundColor Green
     $connectorCommitted = $true
     } finally {
         try {
@@ -208,7 +211,7 @@ if ($isAdmin) {
     try {
         $ErrorActionPreference = "Continue"
         $foregroundTokenFile = Save-ProjectTunnelToken $Project $token
-        & $cfPath tunnel --no-autoupdate run --token-file $foregroundTokenFile
+        & $cfPath tunnel --no-autoupdate @loggingArgs run --token-file $foregroundTokenFile
         $foregroundExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference

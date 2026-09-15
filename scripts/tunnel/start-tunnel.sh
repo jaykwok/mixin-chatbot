@@ -20,6 +20,12 @@ TUNNEL_PID_FILE="${PROJECT_DIR}/data/state/cloudflared.pid"
 
 . "$PROJECT_DIR/scripts/lib/common.sh"
 
+logging_mode="$(cloudflared_logging)"
+cloudflared_log_args "$logging_mode"
+if [ "$logging_mode" = on ]; then
+    mkdir -p "$PROJECT_DIR/logs"
+fi
+
 if existing_pid="$(managed_cloudflared_pid)"; then
     echo "✓ 本项目 cloudflared 已在运行（pid ${existing_pid}）"
     exit 0
@@ -90,4 +96,8 @@ echo "  （前台运行，Ctrl+C 停止。常驻开机自启可用 systemd/tmux 
 token_path="$(save_project_tunnel_token "$TUNNEL_TOKEN_VALUE")"
 unset TUNNEL_TOKEN_VALUE
 record_cloudflared_pid "$$"
-exec "$cloudflared_path" tunnel --no-autoupdate run --token-file "$token_path"
+# Background console output must not also append to the rolling file, or to an unlinked
+# startup capture forever. Foreground use still prints native diagnostics to the terminal.
+if [ "${CLOUDFLARED_BACKGROUND:-}" = 1 ]; then exec >/dev/null 2>&1; fi
+umask 077
+exec "$cloudflared_path" tunnel --no-autoupdate "${CLOUDFLARED_LOG_ARGS[@]}" run --token-file "$token_path"

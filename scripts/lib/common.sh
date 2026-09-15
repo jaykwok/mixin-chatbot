@@ -5,6 +5,7 @@
 #
 # 用法：. "${PROJECT_DIR}/scripts/lib/common.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/lifecycle.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/tunnel-logging.sh"
 
 # TUI 中显示菜单路径；命令行调用仍显示可直接执行的命令。
 ops_command_hint() {

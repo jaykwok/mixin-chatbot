@@ -2,7 +2,7 @@ import { matchesInstance } from "../../../src/core/health.ts";
 // 统计、会话和临时目录直接读取宿主机文件，无需 npm 依赖。
 // 健康诊断复用 ops 的 JSON 接口，容器和服务维护转交对应平台脚本。
 
-import { readdir, lstat } from "node:fs/promises";
+import { readdir, lstat, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { collectAll, type GroupStats, type Window } from "../stats-admin.ts";
 import { scanHistory, type GroupHistory } from "../../lib/history-scan.ts";
@@ -10,6 +10,7 @@ import { scanTmp, type UserTmp } from "../../lib/tmp-scan.ts";
 import { capture, parseJson, type RunResult } from "./exec.ts";
 import { LOG_FILE, PROJECT_DIR, opsCommand, type Deployment } from "./platform.ts";
 import { day } from "./render/format.ts";
+import { readRuntimeSettings } from "../../config/runtime-settings.ts";
 
 // ===== 体检 =====
 
@@ -263,30 +264,67 @@ export async function loadDiskUsage(paths: string[]): Promise<number> {
 
 export interface LogLine {
   text: string;
-  level: "info" | "warn" | "error" | "other";
+  level: "debug" | "info" | "warn" | "error" | "other";
+}
+
+export type TunnelLogging = "off" | "on";
+
+export async function loadTunnelLogging(project = PROJECT_DIR, signal?: AbortSignal): Promise<TunnelLogging> {
+  let value: string;
+  try {
+    value = (await readFile(join(project, "data", "config", "cloudflared-logging"), { encoding: "utf8", signal })).trim();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "off";
+    throw error;
+  }
+  if (value !== "off" && value !== "on") throw new Error("cloudflared-logging 只接受 off 或 on");
+  return value;
+}
+
+export function loadRuntimeSettings(project = PROJECT_DIR, signal?: AbortSignal) {
+  return readRuntimeSettings(join(project, "data", "config", "runtime.json"), signal);
+}
+
+function parseLogLine(text: string): LogLine {
+  // Cloudflared's rolling files contain JSON with UTC timestamps. Display local time
+  // alongside the bot's local timestamps, retaining cfRay and request/response fields.
+  if (text.startsWith("{")) {
+    try {
+      const row = JSON.parse(text) as Record<string, unknown>;
+      const level: LogLine["level"] = row.level === "debug" || row.level === "info" || row.level === "warn"
+        ? row.level : ["error", "fatal", "panic"].includes(String(row.level)) ? "error" : "other";
+      const date = new Date(String(row.time));
+      const two = (n: number) => String(n).padStart(2, "0");
+      const time = Number.isNaN(date.getTime()) ? String(row.time ?? "")
+        : `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())}`;
+      const fields = Object.entries(row).filter(([key]) => !["time", "level", "message"].includes(key))
+        .map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(" ");
+      const message = `${time} - ${String(row.level ?? "other").toUpperCase()} - ${String(row.message ?? "")}${fields ? " " + fields : ""}`;
+      // Parsing JSON must not reintroduce terminal escapes or forged multi-line records.
+      return { level, text: message.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu,
+        character => "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0")) };
+    } catch { /* Older text logs and partially written JSON remain readable. */ }
+  }
+  return {
+    text,
+    level: text.includes(" - ERROR - ") ? "error"
+      : text.includes(" - WARNING - ") || text.includes(" - WARN - ") ? "warn"
+        : text.includes(" - INFO - ") ? "info" : "other",
+  };
 }
 
 /**
  * 读日志尾部。
  *
- * 只读文件末尾那一段，不整文件读进内存：日志上限 5MB，轮转前读全量既慢又没必要。
+ * 只读文件末尾那一段，不把整份日志读进内存；每次按路径重开，轮转后自动跟到新文件。
  */
-export async function loadLogTail(lines: number, bytes = 256 * 1024): Promise<LogLine[]> {
-  const file = Bun.file(LOG_FILE);
+export async function loadLogTail(lines: number, bytes = 256 * 1024, path = LOG_FILE): Promise<LogLine[]> {
+  const file = Bun.file(path);
   const size = file.size;
   if (!size) return [];
   const slice = await file.slice(Math.max(0, size - bytes)).text();
   const rows = slice.split(/\r?\n/).filter((line) => line.trim().length > 0);
   // 第一行多半是从中间截断的，丢掉，避免显示半句话。
   if (size > bytes && rows.length > 1) rows.shift();
-  return rows.slice(-lines).map((text) => ({
-    text,
-    level: text.includes(" - ERROR - ")
-      ? "error"
-      : text.includes(" - WARNING - ") || text.includes(" - WARN - ")
-        ? "warn"
-        : text.includes(" - INFO - ")
-          ? "info"
-          : "other",
-  }));
+  return rows.slice(-lines).map(parseLogLine);
 }

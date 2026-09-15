@@ -673,7 +673,8 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
             fi
 
             print_warning "cloudflared 未运行，正在后台启动隧道连接器..."
-            MIXIN_TUNNEL_TOKEN_INPUT="$tunnel_token_input" BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh >>"$LOG_DIR/cloudflared.log" 2>&1 9>&- &
+            tunnel_startup_log="$(mktemp "$STATE_DIR/cloudflared-start-XXXXXX")"
+            CLOUDFLARED_BACKGROUND=1 MIXIN_TUNNEL_TOKEN_INPUT="$tunnel_token_input" BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh >"$tunnel_startup_log" 2>&1 9>&- &
             tunnel_launcher_pid=$!
             tunnel_launcher_start="$(process_start_identity "$tunnel_launcher_pid")"
             TUNNEL_STARTED_BY_DEPLOY=1
@@ -684,14 +685,24 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
             done
             if managed_pid="$(managed_cloudflared_pid)"; then
                 TUNNEL_STARTED_BY_DEPLOY=1
-                print_success "cloudflared 已后台启动（pid ${managed_pid}，日志 logs/cloudflared.log）"
+                rm -f -- "$tunnel_startup_log"
+                tunnel_startup_log=""
+                print_success "cloudflared 已后台启动（pid ${managed_pid}）"
+                if [ "$(cloudflared_logging)" = on ]; then
+                    print_success "隧道日志：logs/cloudflared.log（自动轮转）"
+                else
+                    print_status "隧道文件日志已关闭，可在 TUI「系统 → 设置」开启"
+                fi
                 print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
                 break
             fi
             stop_tunnel_launcher || { print_error "无法结束连接器启动进程"; exit 1; }
             tunnel_launcher_pid=""
-            print_warning "cloudflared 未能启动，最近日志："
-            tail -n 10 "$LOG_DIR/cloudflared.log" 2>/dev/null || true
+            print_warning "cloudflared 未能启动，启动检查输出："
+            tail -n 10 "$tunnel_startup_log" 2>/dev/null || true
+            rm -f -- "$tunnel_startup_log"
+            tunnel_startup_log=""
+            if [ "$(cloudflared_logging)" = on ]; then tail -n 10 "$LOG_DIR/cloudflared.log" 2>/dev/null || true; fi
             print_warning "请修正 token 来源后重试；按 Ctrl+C 可取消部署。"
             need_tunnel_token_prompt=1
         done
@@ -781,7 +792,7 @@ elif docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo "  日志:      $(pwd)/logs/"
     echo "  数据:      $(pwd)/data/"
     echo "  群数据根:  $HOST_GROUP_DATA_ROOT"
-    echo "  可选外链:  bun run tui → 数据 → 外链 → 配置外链"
+    echo "  可选外链:  bun run tui → 系统 → 设置 → 外链配置"
     echo "  监听:      $BOT_HOST:$BOT_PORT"
     echo ""
     echo "  内存限制: 512MB | CPU: 1核"

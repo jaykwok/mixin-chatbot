@@ -201,7 +201,7 @@ if (import.meta.main) {
   try {
     const [mode, path, extra] = process.argv.slice(2);
     if (!path || extra || !["--draft", "--apply"].includes(mode ?? "")) {
-      throw new Error("请从 TUI 的「数据 → 外链 → 配置外链」进入配置向导");
+      throw new Error("请从 TUI 的「系统 → 设置 → 外链配置」进入配置向导");
     }
     if (mode === "--draft") await prepare(path);
     else await apply(path);

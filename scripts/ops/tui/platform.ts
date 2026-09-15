@@ -12,6 +12,7 @@ const STATE_DIR = join(PROJECT_DIR, "data", "state");
 const DEFAULT_GROUP_DATA_ROOT = join(PROJECT_DIR, "data", "groups");
 
 export const LOG_FILE = join(PROJECT_DIR, "logs", "mixin-chatbot.log");
+export const TUNNEL_LOG_FILE = join(PROJECT_DIR, "logs", "cloudflared.log");
 
 export type Platform = "windows" | "linux";
 type DeployMode = "direct" | "cloudflare";
@@ -96,7 +97,7 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
         if (args[i] === "--keyword") i++;
         request.Target = args[i++] ?? "";
       }
-    } else if (["history-clear", "stat"].includes(args[0] ?? "") && args[i] && !args[i]!.startsWith("--")) {
+    } else if (["history-clear", "stat", "tunnel-logging", "runtime-configure"].includes(args[0] ?? "") && args[i] && !args[i]!.startsWith("--")) {
       request.Target = args[i++]!;
     }
     const switches: Record<string, string> = {

@@ -426,6 +426,78 @@ relay_configure() (
     if [ "$was_running" = 0 ]; then OK "外链设置将在下次启动机器人时生效；已保持停止状态"; fi
 )
 
+# 应用 TUI 已确认的运行参数；整个停机、发布和恢复过程与部署互斥。
+runtime_configure() (
+    local draft_name="${1:-}" draft_file="" owner="" image="mixin-chatbot"
+    local was_running=0 stop_attempted=0 committed=0 state="" environment=""
+    local runtime_env=()
+    if ! [[ "$draft_name" =~ ^\.runtime-draft-[a-f0-9-]{36}\.json$ ]]; then ER '运行参数草稿名称无效'; return 1; fi
+    if ! command -v docker >/dev/null 2>&1; then ER '找不到 docker'; return 1; fi
+    acquire_deploy_lock || { ER '另一个部署或设置操作正在进行'; return 1; }
+    draft_file="${CONFIG_DIR}/${draft_name}"
+    [ -f "$draft_file" ] || { ER '找不到已确认的运行参数草稿'; return 1; }
+    [ ! -f "${draft_file}.rollback" ] || { ER '此草稿留有未完成的恢复材料，请先完成恢复后再重新保存'; return 1; }
+    cd "$PROJECT_DIR" || return 1
+    owner="$(stat -c '%u:%g' "$CONFIG_DIR")" || return 1
+    if [ "$(stat -c '%u:%g' "$draft_file")" != "$owner" ]; then chown "$owner" "$draft_file" || return 1; fi
+    runtime_config_cli() {
+        # 复用部署镜像的依赖，并挂载当前代码；git 更新后无需先重建镜像才能打开设置。
+        docker run --rm --user "$owner" -e HOME=/app/data/runtime/home "${runtime_env[@]}" \
+            -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
+            -v "${PROJECT_DIR}/scripts:/app/scripts:ro" -v "${PROJECT_DIR}/src:/app/src:ro" \
+            "$image" bun run scripts/config/runtime-settings.ts "$1" "$draft_name"
+    }
+    restore_runtime_configuration() {
+        local code=$? recovered=1
+        trap - EXIT INT TERM
+        if [ "$committed" = 0 ]; then
+            if [ -f "${draft_file}.rollback" ]; then
+                if [ "$was_running" = 1 ]; then docker stop "$CONTAINER" >/dev/null || recovered=0; fi
+                if [ "$recovered" = 1 ]; then runtime_config_cli --rollback || recovered=0; fi
+            fi
+            if [ "$was_running" = 1 ] && [ "$stop_attempted" = 1 ] && [ "$recovered" = 1 ]; then
+                start_bot || recovered=0
+            fi
+        fi
+        if [ "$recovered" = 1 ]; then rm -f -- "$draft_file" "${draft_file}.rollback" || code=1
+        else ER "原参数或服务恢复失败，请查看日志；恢复材料：${draft_file}.rollback"; code=1; fi
+        exit "$code"
+    }
+    trap restore_runtime_configuration EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    state="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.State}}')" || {
+        ER '无法查询容器状态，运行参数未写入'; return 1;
+    }
+    case "$state" in ''|running|exited|created) ;; *) ER "容器处于 ${state} 状态，请恢复正常后再修改运行参数"; return 1 ;; esac
+    if [ -n "$state" ]; then
+        local mounted_data=""
+        mounted_data="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER")" || return 1
+        if [ -z "$mounted_data" ] || [ "$(realpath -m -- "$mounted_data")" != "$(realpath -m -- "$DATA_DIR")" ]; then
+            ER '容器的数据目录不属于当前项目，未修改配置或服务'; return 1
+        fi
+        image="$(docker inspect --format '{{.Image}}' "$CONTAINER")" || return 1
+        environment="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER")" || return 1
+        # 只传递受支持的高级参数以检查实际容器的环境覆盖，不输出其他环境变量或凭据。
+        while IFS= read -r setting; do
+            case "${setting%%=*}" in
+                BOT_DEBUG|BOT_MAX_ACTIVE_REQUESTS|BOT_BASH_TIMEOUT|BOT_INDEX_TTL_MINUTES|BOT_INDEX_MAX_FILES|BOT_INDEX_MAX_DEPTH|BOT_RUN_TIMEOUT_SECONDS|BOT_MODEL_IDLE_TIMEOUT_SECONDS|BOT_MODEL_RESPONSE_TIMEOUT_SECONDS|BOT_SHUTDOWN_TIMEOUT_SECONDS|BOT_DELIVERY_TIMEOUT_SECONDS|BOT_DOCUMENT_ENV|BOT_MODEL_CACHE_RETENTION|BOT_ATTACHMENT_CONCURRENCY)
+                    runtime_env+=(-e "$setting") ;;
+            esac
+        done <<< "$environment"
+    fi
+    runtime_config_cli --check || return 1
+    if [ "$state" = running ]; then
+        was_running=1; stop_attempted=1
+        P '运行参数已确认，短暂停止机器人以应用设置'
+        docker stop "$CONTAINER" >/dev/null || { ER '停止容器失败，运行参数未写入'; return 1; }
+    fi
+    runtime_config_cli --apply || return 1
+    if [ "$was_running" = 1 ]; then start_bot || return 1
+    else OK '运行参数已保存；机器人保持停止，下次启动生效'; fi
+    committed=1
+)
+
 # 群数据操作由 Bun 统一管理存储边界；一次性容器必须按部署时的规则映射
 # GROUP_DATA_ROOT，防止自定义群数据根被误认为容器中的默认 /app/data/groups。
 group_data_admin() {
@@ -738,7 +810,9 @@ case "${1:-}" in
     stop)      stop_bot ;;
     start)     start_bot ;;
     logs)      show_logs ;;
+    tunnel-logging) configure_tunnel_logging "${2:-}" ;;
     relay-configure) relay_configure ;;
+    runtime-configure) runtime_configure "${2:-}" ;;
     relay-ls)    relay_admin list ;;
     relay-purge) shift; relay_admin purge "$@" ;;
     tmp-ls)      shift; tmp_admin list "$@" ;;
@@ -770,6 +844,8 @@ case "${1:-}" in
         echo "  start      启动 Docker 容器"
         echo "  logs       持续查看最近 50 行 Docker 日志"
         echo "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
+        echo "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
+        echo "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
         echo "  relay-ls   列出已发出、仍在册的大文件外链"
         echo "  relay-purge <关键字>|--all"
         echo "             删除匹配的外链对象并清掉索引记录"

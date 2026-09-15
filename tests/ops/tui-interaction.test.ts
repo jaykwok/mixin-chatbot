@@ -15,6 +15,7 @@ import { StorageView } from "../../scripts/ops/tui/views/storage.ts";
 import { HistoryView } from "../../scripts/ops/tui/views/history.ts";
 import { LogsView } from "../../scripts/ops/tui/views/logs.ts";
 import { MaintainView } from "../../scripts/ops/tui/views/maintain.ts";
+import { SettingsView } from "../../scripts/ops/tui/views/settings.ts";
 import * as tuiData from "../../scripts/ops/tui/data.ts";
 import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import * as tuiReport from "../../scripts/ops/tui/report.ts";
@@ -1246,9 +1247,74 @@ test("快速离开日志页后，未完成的加载不会重新启动后台轮�
   } finally { view.onLeave(); load.mockRestore(); }
 });
 
+test("日志设置只显示关闭和开启，取消或选择当前值不执行；失败后显示恢复的设置", async () => {
+  const { app, calls } = fakeApp();
+  const view = new SettingsView();
+  let saved: tuiData.TunnelLogging = "off";
+  const read = spyOn(tuiData, "loadTunnelLogging").mockImplementation(async () => saved);
+  const confirm = spyOn(app, "confirm").mockResolvedValue(false);
+  const run = spyOn(app, "run").mockImplementation(async (_title, args) => { saved = args[1] as tuiData.TunnelLogging; return 0; });
+  try {
+    await view.onKey(key("down"), app);
+    await view.refresh(app);
+    calls.choices.push(null, "off", "on");
+    for (let i = 0; i < 3; i++) await view.onKey(key("l"), app);
+    expect(calls.menus[0]!.choices.map(choice => choice.label)).toEqual(["关闭", "开启"]);
+    expect(calls.menus[0]!.initial).toBe("off");
+    expect(run).not.toHaveBeenCalled();
+    expect(confirm).toHaveBeenCalledTimes(1);
+    confirm.mockResolvedValue(true);
+    calls.choices.push("on");
+    await view.onKey(key("l"), app);
+    expect(run.mock.calls.at(-1)?.[1]).toEqual(["tunnel-logging", "on"]);
+    expect(view["state"]).toEqual({ kind: "ready", value: "on" });
+    run.mockResolvedValue(1);
+    calls.choices.push("off");
+    await view.onKey(key("l"), app);
+    expect(view["state"]).toEqual({ kind: "ready", value: "on" });
+    await view.onKey(key("home"), app);
+    await view.onKey(key("down"), app);
+    expect(plain(view.render(context(120, 35)))).not.toMatch(/debug/i);
+    await view.onKey(key("v"), app);
+    expect(calls.destinations).toEqual(["tunnel-logs"]);
+    expect(createRelayView().actions!().map(action => action.label)).not.toContain("配置外链");
+  } finally { read.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
+});
+
+test("隧道日志复用跟随搜索和级别筛选，读取独立文件，任务查询只用于机器人日志", async () => {
+  const { app, calls } = fakeApp();
+  const view = new LogsView("cloudflared");
+  const read = spyOn(tuiData, "loadLogTail").mockResolvedValue([
+    { level: "debug", text: "request fixture-ray" }, { level: "info", text: "connected" },
+    { level: "warn", text: "retrying" }, { level: "error", text: "refused" },
+  ]);
+  try {
+    await view.refresh(app);
+    expect(read.mock.calls[0]![2]).toEndWith(join("logs", "cloudflared.log"));
+    expect(plain(view.render(context()))).toContain("request fixture-ray");
+    expect(view.actions().some(action => action.value === "t")).toBe(false);
+    await view.onKey(key("t"), app);
+    expect(calls.prompts).toEqual([]);
+    calls.choices.push("1");
+    await view.onKey(key("l"), app);
+    const filtered = plain(view.render(context()));
+    expect(filtered).toContain("retrying");
+    expect(filtered).toContain("refused");
+    expect(filtered).not.toContain("fixture-ray");
+    calls.choices.push("0");
+    await view.onKey(key("l"), app);
+    calls.answers.push("fixture-ray");
+    await view.onKey(key("/"), app);
+    expect(plain(view.render(context()))).not.toContain("retrying");
+    await view.onKey(key("o"), app);
+    expect(calls.destinations).toEqual(["settings"]);
+  } finally { view.onLeave(); read.mockRestore(); }
+  expect(view["timer"]).toBeNull();
+});
+
 test("操作预览在宽窄窗口及无色终端都完整容纳菜单，最后一项始终可达", async () => {
   const { app } = fakeApp();
-  for (const view of [new MaintainView(), createRelayView(), createRoutesView()]) {
+  for (const view of [new MaintainView(), new SettingsView(), createRelayView(), createRoutesView()]) {
     if (view instanceof MaintainView) view["state"] = { kind: "ready", value: null };
     await view.onKey!(key("end"), app);
     for (const [width, rows] of [[72, 20], [80, 24], [96, 20], [100, 24], [120, 35]]) {
@@ -1256,28 +1322,31 @@ test("操作预览在宽窄窗口及无色终端都完整容纳菜单，最后�
         const ctx = { ...context(width, rows), theme: createTheme(depth) };
         const frame = view.render(ctx);
         fits(frame, ctx);
-        expect(plain(frame)).toContain(view.id === "maintain" ? "卸载" : view.id === "relay" ? "配置外链" : "移除废弃绑定");
+        expect(plain(frame)).toContain(view.id === "maintain" ? "卸载" : view.id === "settings" ? "Cloudflared 日志"
+          : view.id === "relay" ? "清理全部外链" : "移除废弃绑定");
       }
     }
   }
 });
 
 test("外链配置在两个平台接管真实终端，不通过普通弹窗或命令参数传递凭据", async () => {
-  for (const platform of ["windows", "linux"] as const) {
-    const { app, calls } = fakeApp();
-    app.deployment.platform = platform;
-    const interactive: string[][] = [];
-    app.runInteractive = async (_title, args) => { interactive.push(args); return 0; };
-    const view = createRelayView();
-    await view.onKey!(key("end"), app);
-    expect(plain(view.render(context(120, 35)))).toContain("保存前预览并确认");
-    await view.onKey!(key("enter"), app);
-    expect(interactive).toEqual([["relay-configure"]]);
-    expect(calls.commands).toHaveLength(0);
-    expect(calls.prompts).toHaveLength(0);
-    expect(calls.confirms).toHaveLength(0);
-    expect(calls.toasts).toEqual(["配置外链向导已结束"]);
-  }
+  const settings = spyOn(tuiData, "loadTunnelLogging").mockResolvedValue("off");
+  try {
+    for (const platform of ["windows", "linux"] as const) {
+      const { app, calls } = fakeApp();
+      app.deployment.platform = platform;
+      const interactive: string[][] = [];
+      app.runInteractive = async (_title, args) => { interactive.push(args); return 0; };
+      const view = new SettingsView();
+      expect(plain(view.render(context(120, 35)))).toContain("保存前预览并确认");
+      await view.onKey!(key("enter"), app);
+      expect(interactive).toEqual([["relay-configure"]]);
+      expect(calls.commands).toHaveLength(0);
+      expect(calls.prompts).toHaveLength(0);
+      expect(calls.confirms).toHaveLength(0);
+      expect(calls.toasts).toEqual(["外链配置向导已结束"]);
+    }
+  } finally { settings.mockRestore(); }
 });
 
 test("必填输入为空会停止，路由群名中的空格完整传递", async () => {

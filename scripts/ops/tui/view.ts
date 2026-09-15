@@ -94,6 +94,8 @@ export interface View {
   invalidate?(): void;
   /** refresh 之外的后台工作；返回提示文字，由 App 持续显示加载动画。 */
   activity?(): string | null;
+  /** 内存中尚未提交的编辑；退出 TUI 前由 App 统一提醒。 */
+  hasUnsavedChanges?(): boolean;
   /** 离开时停止轮询；返回 true 表示当前读取已失效，重入时需要补一次刷新。 */
   onLeave?(): boolean | void;
   /** 返回 true 表示按键已被消费，app 不再继续处理。 */

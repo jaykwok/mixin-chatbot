@@ -15,6 +15,7 @@ const functionLoader = (file: string, names: string[]) => [
 ].join("\n");
 
 test("deployment health requires a ready matching instance, including UUID with reused PID", async () => {
+  startQueries();
   const fixture = await tempFixture("health-protocol-");
   let status = 200;
   const identity = { service: "mixin-chatbot", version: 1, instanceId: crypto.randomUUID(), pid: 42, startedAt: Date.now() };
@@ -89,6 +90,7 @@ test.skipIf(process.platform !== "win32")("Windows service registration uses onl
   await writeFile(ps, "\ufeff" + [
     "$ErrorActionPreference='Stop'",
     functionLoader(join(project, "scripts/tunnel/start-tunnel.ps1"), ["Register-ProjectCloudflared"]),
+    functionLoader(join(project, "scripts/lib/tunnel-logging.ps1"), ["Get-CloudflaredLogArguments", "Get-CloudflaredServiceCommand"]),
     "function New-EventLog {}",
     "function Get-Service { if($script:exists){@{Status='Running'}} }",
     "function Stop-Service {}",
@@ -114,7 +116,7 @@ test.skipIf(process.platform !== "linux")("original Linux tunnel launcher record
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(identity) });
   try {
     for (const dir of ["scripts/tunnel", "scripts/lib", "scripts/ops", "src/core", "data/state"]) await mkdir(join(fixture.root, dir), { recursive: true });
-    for (const path of ["scripts/tunnel/start-tunnel.sh", "scripts/lib/common.sh", "scripts/lib/lifecycle.sh", "scripts/ops/health-check.ts", "src/core/health.ts"]) {
+    for (const path of ["scripts/tunnel/start-tunnel.sh", "scripts/lib/common.sh", "scripts/lib/lifecycle.sh", "scripts/lib/tunnel-logging.sh", "scripts/ops/health-check.ts", "src/core/health.ts"]) {
       await copyFile(join(project, path), join(fixture.root, path));
     }
     await writeFile(join(fixture.root, "data/state/instance.json"), JSON.stringify({ ...identity, port: server.port }));

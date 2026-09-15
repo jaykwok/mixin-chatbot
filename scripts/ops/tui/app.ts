@@ -397,6 +397,10 @@ export class App implements AppApi {
     if (this.modal) return this.handleModalKey(key);
 
     if ((key.ctrl && key.name === "c") || (!key.ctrl && key.name === "q")) {
+      if (this.views.some(view => view.hasUnsavedChanges?.()) && !await this.confirm({
+        title: "退出运维界面", subject: "有尚未保存的设置",
+        steps: ["退出会丢弃当前草稿；已保存的配置不会改变"], recovery: "取消后可回到系统 → 设置继续编辑或保存",
+      })) return;
       this.quit = true;
       return;
     }
@@ -707,8 +711,8 @@ export class App implements AppApi {
         "Enter                 进入或执行", "Esc                   返回上一层",
         "r                     刷新", "q / Ctrl+C            退出",
         "1–5                   直接进入主分区", "",
-        "总览 · 监控（体检 / 日志）· 统计",
-        "数据（会话 / 临时文件 / 外链）· 系统（服务部署 / 回调路由）", "",
+        "总览 · 监控（体检 / 日志 / 隧道日志）· 统计",
+        "数据（会话 / 临时文件 / 外链）· 系统（服务部署 / 回调路由 / 设置）", "",
         "菜单：↑↓ 选择，Enter 确认；直接输入文字可筛选菜单。",
         "统计：w 选择常用日期，d 自定义区间，e 导出，o 打开报表。",
         "临时文件：d 选择天数，Enter 看文件，p 清当前成员，a 清全部。",

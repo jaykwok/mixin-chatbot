@@ -8,7 +8,7 @@ import { rule } from "../render/widgets.ts";
 import { pad, truncate } from "../render/width.ts";
 import type { ColorName } from "../render/theme.ts";
 import { loadLogTail, type LogLine } from "../data.ts";
-import { PROJECT_DIR } from "../platform.ts";
+import { LOG_FILE, PROJECT_DIR, TUNNEL_LOG_FILE } from "../platform.ts";
 import { capture } from "../exec.ts";
 import type { AppApi, Loading, View, ViewAction, ViewContext } from "../view.ts";
 import { ListFilter, pending } from "./common.ts";
@@ -17,6 +17,7 @@ import { join } from "node:path";
 const LEVELS = ["全部", "warn", "error"] as const;
 
 const LEVEL_COLOR: Record<LogLine["level"], ColorName> = {
+  debug: "muted",
   error: "danger",
   warn: "warn",
   info: "muted",
@@ -24,8 +25,9 @@ const LEVEL_COLOR: Record<LogLine["level"], ColorName> = {
 };
 
 export class LogsView implements View {
-  readonly id = "logs";
-  readonly label = "日志";
+  readonly id: string;
+  readonly label: string;
+  private readonly path: string;
   private state: Loading<LogLine[]> = { kind: "idle" };
   private levelIndex = 0;
   private follow = true;
@@ -37,6 +39,12 @@ export class LogsView implements View {
   private pageSize = 10;
   private filter = new ListFilter();
 
+  constructor(private readonly source: "bot" | "cloudflared" = "bot") {
+    this.id = source === "bot" ? "logs" : "tunnel-logs";
+    this.label = source === "bot" ? "日志" : "隧道日志";
+    this.path = source === "bot" ? LOG_FILE : TUNNEL_LOG_FILE;
+  }
+
   activity(): string | null {
     return this.lookupController ? "正在扫描任务日志…" : null;
   }
@@ -47,7 +55,7 @@ export class LogsView implements View {
       ["End", "跟随"],
       ["/", "搜索"],
       ["l", "级别"],
-      ["t", this.lookupController ? "查询中" : "查任务"],
+      this.source === "bot" ? ["t", this.lookupController ? "查询中" : "查任务"] : ["o", "日志设置"],
     ];
   }
 
@@ -56,7 +64,9 @@ export class LogsView implements View {
       { value: "f", label: this.follow ? "暂停跟随" : "恢复跟随", description: "暂停后可用方向键回看，End 恢复最新输出" },
       { value: "/", label: "搜索日志内容", description: "按任务编号、错误内容或任意关键字筛选" },
       { value: "l", label: "筛选日志级别", description: "全部、警告及错误、仅错误" },
-      { value: "t", label: "提取任务排查记录", description: "输入 8 位任务编号，从当前与轮转日志中提取上下文", disabled: this.lookupController !== null },
+      ...(this.source === "bot"
+        ? [{ value: "t", label: "提取任务排查记录", description: "输入 8 位任务编号，从当前与轮转日志中提取上下文", disabled: this.lookupController !== null }]
+        : [{ value: "o", label: "设置隧道日志", description: "进入系统设置，开启或关闭隧道日志" }]),
       { value: "home", label: "跳到最早的可见记录" },
       { value: "end", label: "回到最新记录并跟随" },
     ];
@@ -67,7 +77,7 @@ export class LogsView implements View {
     const revision = this.revision;
     if (this.state.kind === "idle") this.state = { kind: "loading" };
     try {
-      const lines = await loadLogTail(400);
+      const lines = await loadLogTail(400, 256 * 1024, this.path);
       if (revision !== this.revision) return;
       this.state = { kind: "ready", value: lines };
     } catch (error) {
@@ -82,7 +92,7 @@ export class LogsView implements View {
       this.timer = setInterval(() => {
         if (!this.follow || this.polling) return;
         this.polling = true;
-        void loadLogTail(400)
+        void loadLogTail(400, 256 * 1024, this.path)
           .then((lines) => {
             if (revision !== this.revision || !this.follow) return;
             this.state = { kind: "ready", value: lines };
@@ -118,6 +128,7 @@ export class LogsView implements View {
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
+    if (key.name === "o" && this.source === "cloudflared") { app.go("settings"); return true; }
     if (key.name === "escape" && this.filter.clear()) { this.offset = 0; return true; }
     if (key.name === "/") {
       if (await this.filter.edit(app, "搜索日志内容")) this.offset = 0;
@@ -158,7 +169,7 @@ export class LogsView implements View {
       this.offset = Math.max(0, this.offset - this.pageSize);
       return true;
     }
-    if (key.name === "t") {
+    if (key.name === "t" && this.source === "bot") {
       if (this.lookupController) return true;
       const id = await app.ask("任务 ID（8 位十六进制，日志里「任务：」后面那串）");
       if (!id) return true;
@@ -214,7 +225,9 @@ export class LogsView implements View {
 
   render(ctx: ViewContext): string[] {
     const { theme, width: total, height } = ctx;
-    const waiting = pending(theme, total, this.state, "日志文件还不存在（机器人可能从未启动）");
+    const empty = this.source === "bot" ? "暂无机器人日志"
+      : "暂无隧道日志；在「系统 → 设置」开启后查看，按 o 进入";
+    const waiting = pending(theme, total, this.state, empty);
     if (waiting) return waiting;
     const all = this.filtered((this.state as { value: LogLine[] }).value);
 
@@ -232,13 +245,13 @@ export class LogsView implements View {
       : `已暂停 · 距末尾 ${this.offset} 行 · ${LEVELS[this.levelIndex]}`;
 
     return [
-      rule(theme, total, `日志 · ${state}`, this.filter.value
+      rule(theme, total, `${this.label}${this.source === "cloudflared" ? "（本机时间）" : ""} · ${state}`, this.filter.value
         ? `搜索「${this.filter.value}」 · ${all.length} 条 · Esc 清除`
         : `${all.length} 条 · / 搜索 · Home 最早 · End 跟随`,
         this.follow ? "accent" : "muted"),
       ...(visible.length
         ? visible.map((line) => pad(" " + theme.c(LEVEL_COLOR[line.level], truncate(line.text, total - 1)), total))
-        : [pad(`  ${theme.c("muted", "该级别下没有记录")}`, total)]),
+        : [pad(`  ${theme.c("muted", (this.state as { value: LogLine[] }).value.length ? "当前筛选下没有记录" : empty)}`, total)]),
     ];
   }
 }

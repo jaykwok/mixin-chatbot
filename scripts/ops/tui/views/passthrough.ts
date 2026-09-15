@@ -16,8 +16,6 @@ interface Command {
   status: StatusName;
   /** 按顺序询问必填参数，群名中的空格不会被拆成多个参数。 */
   ask?: string[];
-  /** 配置向导接管终端，自行显示保存预览并隐藏密码。 */
-  interactive?: boolean;
   /** 需要确认时给出说明；返回 null 表示只读操作，直接执行。 */
   danger?: (values: string[]) => {
     subject: string;
@@ -91,11 +89,9 @@ class CommandMenu implements View {
       }
     }
 
-    const code = command.interactive
-      ? await app.runInteractive(command.label, command.args(values))
-      : await app.run(command.label, command.args(values));
+    const code = await app.run(command.label, command.args(values));
     app.toast(code === 0 ? "ok" : "danger", code === 0
-      ? command.interactive ? `${command.label}向导已结束` : `${command.label}完成`
+      ? `${command.label}完成`
       : `${command.label}退出码 ${code}`);
     return true;
   }
@@ -106,14 +102,12 @@ class CommandMenu implements View {
       title: this.title, items: this.commands, selected: this.selected,
       details: [
         ctx.theme.bold(command.summary),
-        ctx.theme.c(command.danger || command.interactive ? "warn" : "ok",
-          command.interactive ? "交互配置 · 保存前预览并确认" : command.danger ? "修改操作 · 执行前需确认" : "只读查看"),
+        ctx.theme.c(command.danger ? "warn" : "ok", command.danger ? "修改操作 · 执行前需确认" : "只读查看"),
         "",
         ...(command.ask?.length ? ["需要提供：" + command.ask.join("、"), ""] : []),
         this.intro,
       ],
-      note: command.interactive ? "Enter 打开配置向导 · 密码隐藏输入"
-        : command.danger ? "Enter 填写范围并查看确认步骤" : "Enter 查看结果 · 支持滚动回看完整输出",
+      note: command.danger ? "Enter 填写范围并查看确认步骤" : "Enter 查看结果 · 支持滚动回看完整输出",
     });
   }
 }
@@ -123,8 +117,7 @@ export function createRelayView(): View {
     "relay",
     "外链",
     "大文件外链",
-    "外链是可选功能，可用「配置外链」填写 WebDAV 与公开下载地址，或停用外链。" +
-      "确认保存后重启原本运行中的机器人，取消不改变配置和服务。" +
+    "外链配置请进入「系统 → 设置 → 外链配置」。这里查看和清理已生成的外链。" +
       "清理只删后端对象和索引记录，已经发进群里的旧链接不会因此复活或消失。",
     [
       {
@@ -166,13 +159,6 @@ export function createRelayView(): View {
           typeToConfirm: "全部清理",
         }),
         args: () => ["relay-purge", "--all"],
-      },
-      {
-        label: "配置外链",
-        summary: "启用、修改或停用外链；高级设置可选，确认后应用",
-        status: "idle",
-        interactive: true,
-        args: () => ["relay-configure"],
       },
     ]
   );

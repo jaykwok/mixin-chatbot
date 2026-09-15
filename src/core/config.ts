@@ -7,11 +7,13 @@
 import { DEFAULT_GROUP_DATA_ROOT } from "./storage.ts";
 import { readFileSync } from "node:fs";
 import { runtimeSetting } from "./runtime-config.ts";
+import { RUNTIME_DEFAULTS, RUNTIME_RANGES } from "./runtime-schema.ts";
 import { documentPackages } from "../../scripts/runtime/document-manifest.ts";
 
-function integerEnv(name: string, fallback: number, min: number, max: number): number {
+function integerEnv(name: keyof typeof RUNTIME_RANGES): number {
+  const [min, max] = RUNTIME_RANGES[name];
   const raw = runtimeSetting(name);
-  if (!raw) return fallback;
+  if (!raw) return Number(RUNTIME_DEFAULTS[name]);
   const value = Number(raw);
   if (!Number.isInteger(value) || value < min || value > max) {
     throw new Error(`${name} 必须是 ${min}-${max} 的整数`);
@@ -30,19 +32,19 @@ export const GROUP_DATA_ROOT =
   runtimeSetting("GROUP_DATA_ROOT") || DEFAULT_GROUP_DATA_ROOT;
 
 // ===== 服务 =====
-export const PORT = integerEnv("BOT_PORT", 1011, 1, 65_535);
-export const HOST = runtimeSetting("BOT_HOST") || "0.0.0.0";
+export const PORT = integerEnv("BOT_PORT");
+export const HOST = runtimeSetting("BOT_HOST") || RUNTIME_DEFAULTS.BOT_HOST;
 /** 仅本地开发可显式开启无 secret 的 /webhook；生产默认失败关闭。 */
 export const ALLOW_INSECURE_WEBHOOK = process.env.ALLOW_INSECURE_WEBHOOK === "1";
 /** 详细日志会记录用户消息正文，默认关闭。 */
-export const DEBUG = runtimeSetting("BOT_DEBUG") === "1";
-export const RUN_TIMEOUT_MS = integerEnv("BOT_RUN_TIMEOUT_SECONDS", 1200, 10, 7200) * 1000;
+export const DEBUG = (runtimeSetting("BOT_DEBUG") ?? RUNTIME_DEFAULTS.BOT_DEBUG) === "1";
+export const RUN_TIMEOUT_MS = integerEnv("BOT_RUN_TIMEOUT_SECONDS") * 1000;
 /** Only model waiting/streaming; raw tool deltas do not renew this budget without parsed changes. */
-export const MODEL_IDLE_TIMEOUT_MS = integerEnv("BOT_MODEL_IDLE_TIMEOUT_SECONDS", 180, 10, 7200) * 1000;
+export const MODEL_IDLE_TIMEOUT_MS = integerEnv("BOT_MODEL_IDLE_TIMEOUT_SECONDS") * 1000;
 /** Per response, including time to first content; even continuous progress cannot renew it. */
-export const MODEL_RESPONSE_TIMEOUT_MS = integerEnv("BOT_MODEL_RESPONSE_TIMEOUT_SECONDS", 600, 10, 7200) * 1000;
-export const SHUTDOWN_TIMEOUT_MS = integerEnv("BOT_SHUTDOWN_TIMEOUT_SECONDS", 20, 5, 25) * 1000;
-export const DELIVERY_TIMEOUT_MS = integerEnv("BOT_DELIVERY_TIMEOUT_SECONDS", 180, 1, 600) * 1000;
+export const MODEL_RESPONSE_TIMEOUT_MS = integerEnv("BOT_MODEL_RESPONSE_TIMEOUT_SECONDS") * 1000;
+export const SHUTDOWN_TIMEOUT_MS = integerEnv("BOT_SHUTDOWN_TIMEOUT_SECONDS") * 1000;
+export const DELIVERY_TIMEOUT_MS = integerEnv("BOT_DELIVERY_TIMEOUT_SECONDS") * 1000;
 export const MAX_WEBHOOK_BODY_BYTES = 64 * 1024;
 
 // ===== IM 服务 =====
@@ -100,39 +102,24 @@ export const RATE_LIMIT_MAX_REQUESTS = 10;
 export const MAX_RATE_LIMIT_KEYS = 10_000;
 export const RATE_LIMIT_CLEANUP_INTERVAL = 300_000; // ms
 /** 已确认但尚未完成清理的 Pi 后台任务总数；超限时通过 callback 通知用户重发。 */
-export const MAX_ACTIVE_REQUESTS = integerEnv(
-  "BOT_MAX_ACTIVE_REQUESTS",
-  32,
-  1,
-  1000
-);
+export const MAX_ACTIVE_REQUESTS = integerEnv("BOT_MAX_ACTIVE_REQUESTS");
 
 // ===== Agent 工具 =====
 /**
  * 模型没有显式声明 timeout 时，注入给 bash 工具的默认上限（秒）。
  * 同时受整轮期限和取消信号约束；模型声明的 timeout 最大为 3600 秒。
  */
-export const BASH_DEFAULT_TIMEOUT = integerEnv("BOT_BASH_TIMEOUT", 600, 10, 3600);
+export const BASH_DEFAULT_TIMEOUT = integerEnv("BOT_BASH_TIMEOUT");
 
 // ===== 资料索引 =====
 /**
  * 每轮检查索引是否过期；有效 manifest 可复用，否则首次等待构建，过期后后台刷新。
  */
-export const MATERIALS_INDEX_TTL = integerEnv(
-  "BOT_INDEX_TTL_MINUTES",
-  5,
-  1,
-  1440
-) * 60_000;
+export const MATERIALS_INDEX_TTL = integerEnv("BOT_INDEX_TTL_MINUTES") * 60_000;
 /** 单次扫描收录的文件数上限，防止异常巨大的目录树吃光内存与磁盘。 */
-export const MATERIALS_INDEX_MAX_FILES = integerEnv(
-  "BOT_INDEX_MAX_FILES",
-  50_000,
-  100,
-  1_000_000
-);
+export const MATERIALS_INDEX_MAX_FILES = integerEnv("BOT_INDEX_MAX_FILES");
 /** 目录递归深度上限；跳过更深分支并将索引标为不完整。 */
-export const MATERIALS_INDEX_MAX_DEPTH = integerEnv("BOT_INDEX_MAX_DEPTH", 12, 1, 64);
+export const MATERIALS_INDEX_MAX_DEPTH = integerEnv("BOT_INDEX_MAX_DEPTH");
 
 // ===== 文档解析环境 =====
 /**

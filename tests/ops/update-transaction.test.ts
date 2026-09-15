@@ -31,7 +31,7 @@ test.skipIf(process.platform !== "linux")("Linux update shares its real flock wi
     expect(dispatch).toBeGreaterThan(0);
     // Source the original function definitions without the CLI dispatcher's explicit exit.
     await writeFile(join(work, "scripts/ops/ops.sh"), ops.slice(0, dispatch));
-    for (const path of ["scripts/lib/common.sh", "scripts/lib/lifecycle.sh", "scripts/lib/deployment.sh"]) await copyFile(join(project, path), join(work, path));
+    for (const path of ["scripts/lib/common.sh", "scripts/lib/lifecycle.sh", "scripts/lib/tunnel-logging.sh", "scripts/lib/deployment.sh"]) await copyFile(join(project, path), join(work, path));
     await writeFile(join(work, ".gitignore"), "data/\nbackup/\n");
     await writeFile(join(work, "scripts/deploy/deploy.sh"), [
       "#!/usr/bin/env bash", "set -euo pipefail",
