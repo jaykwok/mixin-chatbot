@@ -10,7 +10,9 @@ import {
   loadRelayConfig,
   publicUrlFor,
   purgeRelayObjects,
+  refreshRelayReference,
   relayFile,
+  relayReference,
   sweepExpiredRelayObjects,
   type RelayConfig,
 } from "../../src/integrations/relay.ts";
@@ -88,6 +90,125 @@ function mockFetch(
 }
 
 describe("relay lifecycle regressions", () => {
+  test.each([403, 405, 501, 200])("uses a signed range GET when HEAD cannot verify the file (%s)", async status => {
+    await withFixture(async ({ file, index }) => {
+      const config = { ...CONFIG, signSecret: "test-signing-key", signPathPrefix: "/relay/", expireHours: 8 };
+      const filename = "安全大脑-产品介绍.pptx";
+      let puts = 0;
+      let gets = 0;
+      let cancelledBodies = 0;
+      let probeSignal: AbortSignal | undefined;
+      const restore = mockFetch((input, init) => {
+        const url = new URL(String(input));
+        if (init?.method === "PUT") {
+          expect(decodeURIComponent(url.pathname).endsWith("/" + filename)).toBe(true);
+          puts++;
+          return new Response(null, { status: 201 });
+        }
+        const headers = new Headers(init?.headers);
+        expect(headers.has("authorization")).toBe(false);
+        if (init?.method === "GET") expect(headers.get("range")).toBe("bytes=0-0");
+        if (url.origin === new URL(config.publicBaseUrl).origin) {
+          expect(url.searchParams.has("sign")).toBe(true);
+          expect(decodeURIComponent(url.pathname).endsWith("/" + filename)).toBe(true);
+          if (init?.method === "HEAD") probeSignal = init.signal ?? undefined;
+          else expect(init?.signal).toBe(probeSignal);
+          // A signed redirect may differ by method; GET must start at the public URL again.
+          return new Response(null, { status: 302, headers: { location: "https://cdn.invalid/" + init?.method } });
+        }
+        expect(url.pathname).toBe("/" + init?.method);
+        if (init?.method === "HEAD") return new Response(null, { status });
+        gets++;
+        return new Response(new ReadableStream({ cancel() { cancelledBodies++; } }), {
+          status: 206, headers: { "content-range": "bytes 0-0/5", "content-length": "1" },
+        });
+      });
+      try {
+        const request = { config, localPath: file, size: 5, filename, index };
+        const first = await relayFile(request);
+        expect(new URL(await relayFile(request)).searchParams.has("sign")).toBe(true);
+        expect(puts).toBe(1);
+        const fresh = await refreshRelayReference(relayReference(config, first, filename, 5), undefined, config, index);
+        expect(new URL(fresh.url).searchParams.has("sign")).toBe(true);
+        expect(decodeURIComponent(new URL(fresh.url).pathname).endsWith("/" + filename)).toBe(true);
+        expect(gets).toBe(2);
+        expect(cancelledBodies).toBe(2);
+      } finally { restore(); }
+    });
+  });
+
+  test("cancels a full response when the backend ignores Range and verifies its full length", async () => {
+    await withFixture(async ({ index }) => {
+      const url = CONFIG.publicBaseUrl + "20260915-uuid/note.txt";
+      await index.remember({ key: "existing", url, name: "note.txt", size: 5, state: "uploaded", at: new Date().toISOString() });
+      let cancelled = false;
+      const restore = mockFetch((_input, init) => init?.method === "HEAD"
+        ? new Response(null, { status: 200 })
+        : new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
+          status: 200, headers: { "content-length": "5" },
+        }));
+      try {
+        const fresh = await refreshRelayReference(relayReference(CONFIG, url, "note.txt", 5), undefined, CONFIG, index);
+        expect(fresh.url).toBe(url);
+        expect(cancelled).toBe(true);
+      } finally { restore(); }
+    });
+  });
+
+  test.each([
+    [206, null, "1"], [206, "bytes 0-0/*", "1"], [206, "bytes 0-0/6", "1"],
+    [206, "bytes 1-1/5", "1"], [206, "bytes 0-0/5oops", "1"], [206, "bytes 0-0/5", "5"],
+    [200, null, "51"], [200, null, null], [403, null, "5"], [404, null, null],
+  ] as const)("does not deliver an unverified range response (%s, %s, %s)", async (status, range, length) => {
+    await withFixture(async ({ index }) => {
+      const url = CONFIG.publicBaseUrl + "20260915-uuid/note.txt";
+      await index.remember({ key: "existing", url, name: "note.txt", size: 5, state: "uploaded", at: new Date().toISOString() });
+      const before = index.entries();
+      let gets = 0;
+      const restore = mockFetch((_input, init) => {
+        if (init?.method === "HEAD") return new Response(null, { status: 403 });
+        expect(init?.method).toBe("GET");
+        gets++;
+        const headers = new Headers();
+        if (range !== null) headers.set("content-range", range);
+        if (length !== null) headers.set("content-length", length);
+        return new Response(null, { status, headers });
+      });
+      try {
+        await expect(refreshRelayReference(relayReference(CONFIG, url, "note.txt", 5), undefined, CONFIG, index)).rejects.toThrow();
+        expect(gets).toBe(1);
+        expect(index.entries()).toEqual(before);
+      } finally { restore(); }
+    });
+  });
+
+  test("a cancelled range GET cannot start another upload", async () => {
+    await withFixture(async ({ file, index }) => {
+      const controller = new AbortController();
+      let puts = 0;
+      let gets = 0;
+      const restore = mockFetch((_input, init) => {
+        if (init?.method === "HEAD") return new Response(null, { status: 403 });
+        if (init?.method === "GET") {
+          gets++;
+          controller.abort(new Error("stop range probe"));
+          throw controller.signal.reason;
+        }
+        puts++;
+        return new Response(null, { status: 201 });
+      });
+      try {
+        const request = { config: CONFIG, localPath: file, size: 5, filename: "note.txt", index };
+        await relayFile(request);
+        const before = index.entries();
+        await expect(relayFile({ ...request, signal: controller.signal })).rejects.toThrow("stop range probe");
+        expect(gets).toBe(1);
+        expect(puts).toBe(1);
+        expect(index.entries()).toEqual(before);
+      } finally { restore(); }
+    });
+  });
+
   test.each(["file", "login", "missing", "loop"])("verifies the final HEAD after a %s redirect", async kind => {
     await withFixture(async ({ file, index }) => {
       let puts = 0;
@@ -131,11 +252,11 @@ describe("relay lifecycle regressions", () => {
     });
   });
 
-  test.each([500, 401, "network"])("recovers from an unconfirmed HEAD (%s) by PUT to the same object", async failure => {
+  test.each([500, 401, "network"])("recovers from an unconfirmed probe (%s) by PUT to the same object", async failure => {
     await withFixture(async ({ file, index }) => {
       const puts: string[] = [];
       const restore = mockFetch((input, init) => {
-        if (init?.method === "HEAD") {
+        if (init?.method === "HEAD" || init?.method === "GET") {
           if (failure === "network") throw new TypeError("temporary probe failure");
           return new Response(null, { status: Number(failure) });
         }
@@ -179,7 +300,7 @@ describe("relay lifecycle regressions", () => {
       let puts = 0;
       let deletes = 0;
       const restore = mockFetch((_input, init) => {
-        if (init?.method === "HEAD") return new Response(null, { status: 500 });
+        if (init?.method === "HEAD" || init?.method === "GET") return new Response(null, { status: 500 });
         if (init?.method === "DELETE") { deletes++; return new Response(null, { status: 204 }); }
         return new Response(null, { status: ++puts === 1 ? 201 : 503 });
       });
@@ -482,7 +603,7 @@ describe("relay upload", () => {
       let puts = 0;
       const envelope = JSON.stringify({ code: 401, message: "sign invalid" });
       const restore = mockFetch((_input, init) => {
-        if (init?.method === "HEAD") {
+        if (init?.method === "HEAD" || init?.method === "GET") {
           return new Response(null, {
             status: 200,
             headers: {

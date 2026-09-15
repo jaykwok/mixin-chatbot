@@ -383,8 +383,9 @@ async function putObject(
  *
  * 状态码不够用：这类文件服务常把业务错误塞进 HTTP 200 的 JSON 里（"未授权"、
  * "对象不存在" 都是 200），只看 `status < 400` 会把错误信封当成文件还在。
- * 所以 2xx 还要求 Content-Length 与当初存下的大小一致——错误信封只有几十字节，
- * 对不上。
+ * 所以还要求完整文件大小与账本一致。部分网盘直链只允许 GET，HEAD 会返回 403，
+ * 或经过代理后不提供 Content-Length；此时从公开地址重新 GET bytes=0-0，使用
+ * Content-Range 的总长度校验。读取响应头后立即取消响应体，避免后端忽略 Range 时下载整份文件。
  * 未知状态不等同于不存在；调用方保留账本，并在同一对象名上尝试一次幂等重传。
  */
 async function remoteStillExists(
@@ -394,24 +395,43 @@ async function remoteStillExists(
 ): Promise<boolean> {
   const timeout = AbortSignal.timeout(RELAY_PROBE_TIMEOUT);
   const probeSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-  let target = url;
-  for (let redirects = 0; redirects <= 5; redirects++) {
-    const response = await fetch(target, { method: "HEAD", redirect: "manual", signal: probeSignal });
-    await response.body?.cancel().catch(() => {});
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
+  async function probe(method: "HEAD" | "GET"): Promise<Response> {
+    // GET 必须重新经过公开地址：HEAD 获得的网盘签名可能绑定了 HTTP 方法。
+    let target = url;
+    for (let redirects = 0; ; redirects++) {
+      probeSignal.throwIfAborted();
+      const response = await fetch(target, {
+        method, redirect: "manual", signal: probeSignal,
+        ...(method === "GET" ? { headers: { Range: "bytes=0-0" } } : {}),
+      });
+      await response.body?.cancel().catch(() => {});
+      probeSignal.throwIfAborted();
+      if (![301, 302, 303, 307, 308].includes(response.status)) return response;
       const location = response.headers.get("location");
       if (!location || redirects === 5) throw new Error("外链探测重定向无效或过多");
       const next = new URL(location, target);
       if (!["http:", "https:"].includes(next.protocol) || next.username || next.password) throw new Error("外链探测重定向地址无效");
       target = next.toString();
-      continue;
     }
-    if (response.status === 404 || response.status === 410) return false;
-    const length = response.headers.get("content-length");
-    if (response.ok && length !== null && /^\d+$/.test(length) && Number(length) === size) return true;
-    throw new Error("外链探测无法确认对象状态 (HTTP " + response.status + ")");
   }
-  return false;
+  function hasFullLength(response: Response): boolean {
+    const length = response.headers.get("content-length");
+    return response.status === 200 && length !== null && /^\d+$/.test(length) && Number(length) === size;
+  }
+  const head = await probe("HEAD");
+  if (head.status === 404 || head.status === 410) return false;
+  if (hasFullLength(head)) return true;
+
+  const get = await probe("GET");
+  if (get.status === 404 || get.status === 410) return false;
+  if (hasFullLength(get)) return true; // 后端忽略 Range，仍可按完整长度核验。
+  if (get.status === 206) {
+    const range = /^bytes 0-0\/(\d+)$/i.exec(get.headers.get("content-range") ?? "");
+    const length = get.headers.get("content-length");
+    if (range && Number(range[1]) === size && size > 0 &&
+        (length === null || /^0*1$/.test(length))) return true;
+  }
+  throw new Error(`外链探测无法确认对象状态 (HEAD HTTP ${head.status}, GET HTTP ${get.status}，期望文件大小 ${size} 字节)`);
 }
 
 /**
