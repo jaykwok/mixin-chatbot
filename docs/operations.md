@@ -1,18 +1,64 @@
 # 运维手册
 
-[README](../README.md) 讲怎么把服务跑起来、日常用哪个界面；这里放出事才需要翻的内容：排查、取证、数据维护和磁盘策略。
+[返回 README](../README.md) · [部署与配置](deployment.md) · [管理台与报表](tui.md)
+
+本文用于命令行管理、故障排查、配置调整和数据维护。首次安装请从[部署与配置](deployment.md)开始。
 
 使用管理台时，先到“监控 → 体检”查看逐项结果，按页面建议进入对应菜单，例如 Windows 的“系统 → 服务部署 → 修复隧道”。部署或修复返回后会丢弃旧体检，重新进入该页即可检查新实例，无需关闭终端。读取期间动画持续更新，仍可切换页面；需要修改 Cloudflare 控制台或配置文件时，按具体说明处理。
 
 **排查**：[长时间没有回复](#长时间没有回复) · [按任务编号提取日志](#按任务编号提取日志) · [HTTP 拒绝日志](#http-拒绝日志)
 
+**命令行**：[日常控制](#日常控制)
+
+**配置**：[高级运行参数](#高级运行参数) · [大文件外链](#配置可选的大文件外链) · [隧道连接模式](#隧道连接模式) · [隧道日志](#隧道日志)
+
 **维护**：[重新配置模型](#重新配置模型) · [数据维护](#数据维护) · [回调路由恢复](#回调路由恢复) · [磁盘保留](#磁盘保留) · [隧道托管](#隧道托管)
+
+## 命令行运维
+
+日常交互操作从[运维界面](tui.md#运维界面)进入。这里保留命令行入口，便于脚本调用和没有装 Bun 的 Docker 宿主机使用；排查与数据维护步骤见本文后面的对应章节。
+
+### 日常控制
+
+在项目根目录选择对应平台的命令行入口。
+
+Windows：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 doctor
+```
+
+Linux / Docker：
+
+```sh
+bash scripts/ops/ops.sh doctor
+```
+
+将示例中的 `doctor` 替换为所需命令：
+
+| 命令 | 用途 |
+| --- | --- |
+| `doctor` | 检查配置、实例、群数据根及已配置的网络入口；加 `--json`（Windows 为 `-Json`）输出单行 JSON |
+| `start` / `stop` / `restart` | 启动、正常关闭或重启实例 |
+| `logs` | 持续查看日志 |
+| `tunnel-logging off\|on` | 关闭或开启隧道文件日志，应用时重启正在运行的本项目隧道 |
+| `tunnel-protocol auto\|http2\|quic` | 设置隧道连接模式，默认 auto，应用时重启正在运行的本项目隧道 |
+| `update` | 同步 origin/main 并部署，保留原运行或停止状态 |
+| `deploy` | 部署当前代码；可重新配置并重建现有部署，失败恢复原部署 |
+
+`update` 要求已跟踪文件没有本地改动，失败时尝试恢复原提交和部署状态。Windows 在改工作树与依赖之前停止实例，Linux 已运行容器与主机源码隔离。
+
+Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件、安装配置和补丁未变，且已安装的直接依赖版本匹配时，会保留 `node_modules` 并跳过安装；缺包、版本不匹配或依赖输入发生变化时，才备份旧依赖并按锁文件安装。版本更高也不视为匹配，避免偏离经过验证的依赖组合。
+
+部署、升级和连接器安装的备份放在 `backup/snapshots`，被替换的旧文件放在 `backup/rm`。成功后删除本次操作的快照，并清空整个 `backup/rm`，包括历史目录、散落文件和手动清理的会话归档；其他 `backup/snapshots` 快照保留。操作失败时不执行成功清理，保留回滚现场。Windows 会移除空的 `backup` 目录；Linux 保留空的容器挂载目录，避免运行中的容器丢失后续归档。部署锁保存在 `data/state/deploy.lock`。
+
+关闭服务使用 `stop`：Windows 验证实例身份后先请求优雅关闭，超时再复核归属并终止进程树；Linux 使用 Docker 停止期限。
 
 ## 长时间没有回复
 
 “消息发送成功（处理中提示）”只表示发送了“正在处理”，最终回答需要看到“回复发送完成”或“任务完成”。`/status` 显示任务编号、当前阶段、已用时间、最近进展距今和时限；服务器每 60 秒输出一次仍在运行的任务摘要，每个模型响应结束时输出“模型流结束”。流日志只记录统计和响应标识，不记录模型输出、思考正文或工具参数。
 
-1. 在异常群发送 `/status`，记下任务编号。用[日常控制](../README.md#日常控制)里的 `logs` 入口查看日志，或在 PowerShell 执行 `Get-Content logs/mixin-chatbot.log -Tail 200`，按任务编号、群号定位。
+1. 在异常群发送 `/status`，记下任务编号。用[日常控制](#日常控制)里的 `logs` 入口查看日志，或在 PowerShell 执行 `Get-Content logs/mixin-chatbot.log -Tail 200`，按任务编号、群号定位。
 2. “模型调用准备”涵盖 Pi 的校验与历史检查；“等待模型响应”表示进入模型轮次；“接收模型输出”表示 SDK 正在收到流事件；“压缩会话历史”表示正在压缩该群该用户的历史。工具执行和最终发送也分别记录。
 3. 只有某个群异常时，发送 `/stop`，等待 `/status` 变为空闲，再发 `/clear`。收到归档确认后，用“只回复 OK”测试。`/clear` 归档当前用户在本群的会话，不清除群资料。若恢复，旧会话上下文是重要线索；若仍失败，保留这一轮阶段日志继续检查 Pi 请求与模型服务。
 4. 普通 HTTP 流探测成功只验证该次请求，不能验证机器人的完整历史、工具定义、思考模式和压缩请求。`doctor`/健康检查也不能证明模型回答正常。
@@ -28,7 +74,7 @@
 任务摘要中的 `模型流` 按当前模型响应累计，`response` 标识本任务的第几个模型响应：
 
 | 字段 | 含义 |
-|---|---|
+| --- | --- |
 | `events` / `lastEvent` | SDK 流事件类型与数量（含 assistant 的 `message_start`、`message_end`），不是原始网络包 |
 | `emptyDeltas` / `whitespaceDeltas` | 空字符串 / 仅空白的增量数量 |
 | `textChars` / `thinkingChars` / `toolArgsChars` | 已收到的正文 / 思考 / 工具参数增量字符量，包含空白，按 UTF-16 计数 |
@@ -140,7 +186,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 ### 日志分类、计数与脱敏规则
 
 | 日志分类 | 含义 | 原因标签示例 |
-|---|---|---|
+| --- | --- | --- |
 | `suspected_probe` | 疑似探测，也可能是调用地址配置错误，需结合 IP、频率与路径判断 | `webhook_secret_mismatch`、`webhook_secret_missing`、`route_not_found` |
 | `request_validation` | 请求格式、大小或字段校验拒绝，不直接认定为扫描 | `invalid_request`、`payload_too_large`、`unsupported_media_type` |
 | `runtime_protection` | 停机、容量或 callback 路由保护，不计入疑似探测 | `service_stopping`、`callback_route_capacity`、`callback_route_conflict`、`request_capacity` |
@@ -156,7 +202,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 ## 磁盘保留
 
 | 内容 | 保留策略 |
-|---|---|
+| --- | --- |
 | 配置、SQLite 状态库、群资料 | 持久保存，纳入停机备份 |
 | Pi 设置与模型目录缓存 | `data/runtime/pi/settings.json` 与 `data/runtime/models-store.json` 随配置备份；动态目录服务商需缓存才能离线启动 |
 | 会话、用户 tmp | 清理时归档到 `backup/rm`，下次部署、升级或连接器安装成功后清空 |
@@ -250,7 +296,7 @@ Windows 修改已安装的服务需要管理员权限。连接器必须使用当
 3. 在 **系统 → 设置 → 外链配置** 中，上传地址填写到 Alist 挂载目录，例如 `127.0.0.1:5244/dav/relay`，此处挂载目录为 `relay`。公开下载项可以只填文件域名，向导会推导对应目录。DNS 和隧道路由在 Cloudflare 控制台完成；外链向导只保存机器人配置。
 
 | 用途 | 完整地址 | 向导也接受的输入 |
-|---|---|---|
+| --- | --- | --- |
 | WebDAV 上传目录 `webdavUrl` | `http://127.0.0.1:5244/dav/relay/` | `127.0.0.1:5244/dav/relay` |
 | 公开下载目录 `publicBaseUrl` | `https://files.example.com/d/relay/` | `files.example.com`（自动推导），也可填 `files.example.com/d/relay` |
 
