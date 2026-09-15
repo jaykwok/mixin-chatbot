@@ -95,10 +95,10 @@ export interface GitState {
   incoming: { sha: string; subject: string }[];
 }
 
-async function git(args: string[]): Promise<RunResult> {
+async function git(args: string[], signal?: AbortSignal, timeout = 15_000): Promise<RunResult> {
   // GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在一个没人应答的提示上。
-  const result = await capture("git", args, { env: { GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" }, timeout: 15_000 });
-  if (result.timedOut) throw new Error(`Git 查询超时（15 秒）：${result.stderr.trim() || args[0]}`);
+  const result = await capture("git", args, { env: { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never", LC_ALL: "C" }, timeout, signal });
+  if (result.timedOut) throw new Error(`Git 查询超时（${timeout / 1000} 秒）：${result.stderr.trim() || args[0]}`);
   return result;
 }
 
@@ -106,19 +106,42 @@ let gitRead: Promise<GitState | null> | null = null;
 
 /**
  * 页眉、总览和维护页共享在途查询；下次刷新仍读取最新状态。
- * 不 fetch：落后提交数相对上次 fetch，真正升级时由 update 流程联网。
+ * 不 fetch：页眉与总览只读本地；升级预览通过 loadUpgrade 联网检查。
  */
 export function loadGit(): Promise<GitState | null> {
   return gitRead ??= readGit().finally(() => { gitRead = null; });
 }
 
-async function readGit(): Promise<GitState | null> {
+export interface UpgradeState {
+  git: GitState;
+  targetSha: string;
+}
+
+/** 升级预览先同步明确的远端分支，再独立读取，不能复用 fetch 前的在途快照。 */
+export async function loadUpgrade(signal?: AbortSignal): Promise<UpgradeState | null> {
+  if (!Bun.which("git")) return null;
+  const fetched = await git(["fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"], signal, 60_000);
+  if (fetched.code !== 0) {
+    if (/not a git repository/i.test(fetched.stderr)) return null;
+    throw new Error(`远端检查失败：${fetched.stderr.trim() || `退出码 ${fetched.code}`}`);
+  }
+  signal?.throwIfAborted();
+  const target = await git(["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"], signal);
+  const targetSha = target.stdout.trim();
+  if (target.code !== 0 || !/^[0-9a-f]{40,64}$/.test(targetSha)) throw new Error("无法读取 origin/main 的目标提交，请重新检查远端");
+  const state = await readGit(signal, targetSha);
+  if (!state) return null;
+  if (state.behind < 0) throw new Error("无法比较本地版本与远端提交，请重新检查远端");
+  return { git: state, targetSha };
+}
+
+async function readGit(signal?: AbortSignal, target = "origin/main"): Promise<GitState | null> {
   if (!Bun.which("git")) return null;
   // 短查询顺序复用已有宿主；并发排队会触发第二个 Windows 宿主的昂贵冷启动。
-  const head = await git(["log", "-1", "--format=%H%n%s"]);
-  const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"]);
-  const status = await git(["status", "--porcelain", "--untracked-files=no"]);
-  const counts = await git(["rev-list", "--left-right", "--count", "HEAD...origin/main"]);
+  const head = await git(["log", "-1", "--format=%H%n%s"], signal);
+  const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], signal);
+  const status = await git(["status", "--porcelain", "--untracked-files=no"], signal);
+  const counts = await git(["rev-list", "--left-right", "--count", `HEAD...${target}`], signal);
   const failed = [head, branch, status].find(result => result.code !== 0);
   if (failed) {
     if (/not a git repository|does not have any commits yet/i.test(failed.stderr)) return null;
@@ -136,7 +159,8 @@ async function readGit(): Promise<GitState | null> {
 
   const incoming: GitState["incoming"] = [];
   if (behind > 0) {
-    const log = await git(["log", "--pretty=%h %s", "HEAD..origin/main"]);
+    const log = await git(["log", "--pretty=%h %s", `HEAD..${target}`], signal);
+    if (log.code !== 0) throw new Error(`Git 提交列表读取失败：${log.stderr.trim() || `退出码 ${log.code}`}`);
     for (const line of log.stdout.split("\n")) {
       const match = /^(\S+)\s+(.*)$/.exec(line.trim());
       if (match) incoming.push({ sha: match[1]!, subject: match[2]! });

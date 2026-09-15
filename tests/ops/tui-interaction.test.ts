@@ -606,6 +606,10 @@ test("健康页可展开完整结果和建议，窄窗口不会遮住分页或�
 });
 
 test("维护页在两个平台均可完成部署、升级、重启和修复，交互向导使用终端交接", async () => {
+  const check = spyOn(tuiData, "loadUpgrade").mockResolvedValue({ targetSha: "987654321", git: {
+    branch: "main", sha: "123456789", subject: "fixture", ahead: 0, behind: 1, dirty: false, incoming: [{ sha: "987654321", subject: "fixture" }],
+  } });
+  try {
   for (const platform of ["windows", "linux"] as const) {
     const { app, calls } = fakeApp();
     app.deployment.platform = platform;
@@ -629,6 +633,7 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
     await health.onKey(key("f"), app);
     expect(calls.commands.at(-1)?.args).toEqual(platform === "windows" ? ["doctor", "-Repair"] : ["deploy"]);
   }
+  } finally { check.mockRestore(); }
 });
 
 test.each([
@@ -717,6 +722,76 @@ test("统计、会话和临时文件刷新保留列表，切换数据根后清�
       await refresh;
     }
   } finally { finishes.forEach(finish => finish()); mocks.forEach(mock => mock.mockRestore()); await fixture.cleanup(); }
+});
+
+test("选中升级先联网，后台检查不阻塞导航，预览与确认显示最新目标提交", async () => {
+  const { app, calls } = fakeApp();
+  app.runInteractive = async (title, args) => { calls.commands.push({ title, args }); return 0; };
+  const view = new MaintainView();
+  const cached: tuiData.GitState = { branch: "main", sha: "1111111", subject: "installed", dirty: false, ahead: 0, behind: 1,
+    incoming: [{ sha: "2222222", subject: "previous update" }] };
+  const fresh: tuiData.UpgradeState = { targetSha: "3333333", git: { ...cached, behind: 2,
+    incoming: [{ sha: "3333333", subject: "newest update" }, ...cached.incoming] } };
+  const check = Promise.withResolvers<tuiData.UpgradeState | null>();
+  const local = spyOn(tuiData, "loadGit").mockResolvedValue(cached);
+  const remote = spyOn(tuiData, "loadUpgrade").mockReturnValue(check.promise);
+  try {
+    await view.refresh(app);
+    expect(remote).not.toHaveBeenCalled();
+    for (let i = 0; i < 3; i++) await view.onKey(key("down"), app);
+    const pending = view.refresh(app);
+    expect(remote).toHaveBeenCalledTimes(1);
+    expect(view.activity()).toContain("最新提交");
+    expect(plain(view.render(context()))).not.toContain("previous update");
+    await view.onKey(key("enter"), app);
+    expect(calls.confirms).toHaveLength(0);
+    expect(calls.commands).toHaveLength(0);
+    check.resolve(fresh); await pending;
+    for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
+    const preview = plain(view.render(context(120, 35)));
+    expect(preview).toContain("3333333");
+    expect(preview).toContain("1111111");
+    expect(preview).toContain("newest update");
+    expect(preview).not.toContain("上次同步");
+    await view.onKey(key("enter"), app);
+    expect(calls.confirms.at(-1)?.subject).toBe("1111111 → 3333333，共 2 个提交");
+    expect(calls.commands.at(-1)?.args).toEqual(["update"]);
+  } finally { view.onLeave(); check.resolve(fresh); local.mockRestore(); remote.mockRestore(); }
+});
+
+test("升级检查失败后拒绝确认，离开取消旧检查，重入和刷新获取新版本", async () => {
+  const { app, calls } = fakeApp();
+  const view = new MaintainView();
+  const git: tuiData.GitState = { branch: "main", sha: "1111111", subject: "installed", dirty: false, ahead: 0, behind: 0, incoming: [] };
+  const local = spyOn(tuiData, "loadGit").mockResolvedValue(git);
+  const old = Promise.withResolvers<tuiData.UpgradeState | null>();
+  let signal: AbortSignal | undefined;
+  const remote = spyOn(tuiData, "loadUpgrade").mockImplementationOnce(value => { signal = value; return old.promise; });
+  try {
+    await view.refresh(app);
+    await view.onKey(key("update"), app);
+    const pending = view.refresh(app);
+    await view.onKey(key("home"), app);
+    expect(signal?.aborted).toBe(true);
+    remote.mockRejectedValueOnce(new Error("network unavailable"));
+    await view.onKey(key("update"), app);
+    expect(view["upgrade"].state.kind).toBe("error");
+    old.resolve({ git, targetSha: "2222222" }); await pending;
+    expect(view["upgrade"].state.kind).toBe("error");
+    expect(plain(view.render(context(120, 35)))).toContain("network unavailable");
+    await view.onKey(key("enter"), app);
+    expect(calls.confirms).toHaveLength(0);
+    expect(calls.commands).toHaveLength(0);
+    remote.mockResolvedValue({ git, targetSha: "3333333" });
+    await view.refresh(app);
+    expect(plain(view.render(context()))).toContain("3333333");
+    view.invalidate();
+    expect(view["upgrade"].state.kind).toBe("idle");
+    remote.mockResolvedValue({ git: { ...git, sha: "3333333" }, targetSha: "4444444" });
+    await view.refresh(app);
+    expect(view.actions().find(action => action.value === "update")?.disabled).toBe(false);
+    expect(plain(view.render(context()))).toContain("当前 3333333 → origin/main 4444444");
+  } finally { view.onLeave(); old.resolve(null); local.mockRestore(); remote.mockRestore(); }
 });
 
 test("维护页保留版本预览，刷新期间只暂停升级操作", async () => {

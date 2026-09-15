@@ -1,11 +1,12 @@
 // 部署、升级、启停、修复和卸载入口；执行前展示各自的范围与恢复方式。
-// 提交列表来自本地远端引用，实际升级时由运维脚本重新 fetch。
+// 选中升级后联网检查，预览使用本次同步的目标提交。
 
 import type { StatusName } from "../render/theme.ts";
 import * as fmt from "../render/format.ts";
-import { loadGit, type GitState } from "../data.ts";
+import { loadGit, loadUpgrade, type GitState, type UpgradeState } from "../data.ts";
 import type { AppApi, ConfirmSpec, Loading, View, ViewAction, ViewContext } from "../view.ts";
 import { actionWorkbench, moveSelection } from "./common.ts";
+import { LazySetting } from "./settings-state.ts";
 
 interface Action {
   key: string;
@@ -16,7 +17,7 @@ interface Action {
   status: StatusName;
   /** 该命令会向用户提问，必须拿到真正的 TTY（update 转调的 deploy.sh 全程交互）。 */
   interactive?: boolean | ((app: AppApi) => boolean);
-  confirm(app: Pick<AppApi, "deployment">, git: GitState | null): ConfirmSpec | null;
+  confirm(app: Pick<AppApi, "deployment">, git: GitState | null, targetSha?: string): ConfirmSpec | null;
   args(app: AppApi): string[];
 }
 
@@ -44,7 +45,7 @@ const ACTIONS: Action[] = [
     summary: "同步 origin/main，重建并切换，失败自动回滚",
     status: "busy",
     interactive: true,
-    confirm: (app, git) => {
+    confirm: (app, git, targetSha) => {
       if (!git) {
         return {
           title: "升级",
@@ -62,20 +63,20 @@ const ACTIONS: Action[] = [
       const steps =
         git.behind > 0
           ? [
-              `快进到 origin/main（${git.behind} 个提交）`,
+              `快进到 origin/main ${targetSha ? fmt.shortSha(targetSha) : ""}（${git.behind} 个提交）`,
               app.deployment.runtime === "docker"
                 ? "通过部署向导重建镜像并切换容器"
                 : "重装依赖并重启计划任务",
               "失败时自动回滚代码，并恢复升级前的容器/服务",
               "完成后自动跑一次体检",
             ]
-          : ["先拉取远端并显示实际更新内容", "有更新时重新部署；无更新时询问是否重启", "完成后自动跑一次体检"];
+          : ["重新核对远端版本", "有更新时重新部署；无更新时按平台流程检查或重启", "完成后自动跑一次体检"];
       return {
         title: "升级",
         subject:
           git.behind > 0
-            ? `${fmt.shortSha(git.sha)} → origin/main，共 ${git.behind} 个提交`
-            : `当前 ${fmt.shortSha(git.sha)}；远端版本将在执行时确认`,
+            ? `${fmt.shortSha(git.sha)} → ${targetSha ? fmt.shortSha(targetSha) : "origin/main"}，共 ${git.behind} 个提交`
+            : `当前 ${fmt.shortSha(git.sha)}；origin/main ${targetSha ? fmt.shortSha(targetSha) : "待检查"}`,
         steps,
         untouched: ["data/ 下的配置与群数据", "会话历史"],
         recovery: "失败时自动回滚代码并恢复原容器；部署过程中服务会短暂中断",
@@ -183,10 +184,24 @@ export class MaintainView implements View {
   readonly label = "服务部署";
   private state: Loading<GitState | null> = { kind: "idle" };
   private refreshing = false;
+  private revision = 0;
+  private readonly upgrade = new LazySetting<UpgradeState | null>(signal => loadUpgrade(signal));
   private selected = 0;
   private platform: "windows" | "linux" = "linux";
 
   private get waitingForVersion(): boolean { return this.refreshing || this.state.kind !== "ready"; }
+  private get selectingUpgrade(): boolean { return this.availableActions[this.selected]?.key === "update"; }
+
+  activity(): string | null { return this.upgrade.state.kind === "loading" ? "正在检查 origin/main 最新提交…" : null; }
+
+  invalidate(): void {
+    this.revision++;
+    this.state = { kind: "idle" };
+    this.refreshing = false;
+    this.upgrade.invalidate();
+  }
+
+  onLeave(): boolean { this.invalidate(); return true; }
 
   private get availableActions(): Action[] {
     return ACTIONS.filter((action) => !action.only || action.only === this.platform)
@@ -206,21 +221,39 @@ export class MaintainView implements View {
     return this.availableActions.map(action => ({
       value: action.key, label: action.label, description: action.summary,
       danger: action.status === "danger" || action.key === "stop" || action.key === "repair-tunnel",
-      disabled: action.key === "update" && this.waitingForVersion,
+      disabled: action.key === "update" && (this.selectingUpgrade ? this.upgrade.state.kind !== "ready" : this.waitingForVersion),
     }));
   }
 
   async refresh(app: AppApi): Promise<void> {
     this.platform = app.deployment.platform;
+    if (this.selectingUpgrade) {
+      await this.checkUpgrade(app, true);
+      return;
+    }
+    const revision = ++this.revision;
     this.refreshing = true;
     if (this.state.kind !== "ready") this.state = { kind: "loading" };
     app.redraw();
     try {
-      this.state = { kind: "ready", value: await loadGit() };
+      const value = await loadGit();
+      if (revision === this.revision) this.state = { kind: "ready", value };
     } catch (error) {
-      this.state = { kind: "error", message: `版本读取失败，请刷新重试：${String(error)}` };
+      if (revision === this.revision) this.state = { kind: "error", message: `版本读取失败，请刷新重试：${String(error)}` };
     } finally {
+      if (revision === this.revision) this.refreshing = false;
+      app.redraw();
+    }
+  }
+
+  private async checkUpgrade(app: AppApi, force = false): Promise<void> {
+    await this.upgrade.load(app, force);
+    if (this.upgrade.state.kind === "ready") {
+      // The remote check also read HEAD. Reuse that result when leaving Upgrade,
+      // and prevent an older local-only query from overwriting it.
+      this.revision++;
       this.refreshing = false;
+      this.state = { kind: "ready", value: this.upgrade.state.value?.git ?? null };
       app.redraw();
     }
   }
@@ -229,18 +262,38 @@ export class MaintainView implements View {
     const actions = this.availableActions;
     const moved = moveSelection(key.name, this.selected, actions.length);
     if (moved !== null) {
+      const previous = this.selected;
       this.selected = moved;
+      if (this.selectingUpgrade) {
+        if (previous !== moved) this.upgrade.invalidate();
+        void this.checkUpgrade(app);
+      } else {
+        this.upgrade.onLeave();
+        if (this.state.kind === "idle") void this.refresh(app);
+      }
       return true;
     }
     if (key.name === "enter" || actions.some(action => action.key === key.name)) {
       const action = key.name === "enter" ? actions[this.selected] : actions.find(action => action.key === key.name);
       if (!action) return true;
-      if (action.key === "update" && this.waitingForVersion) {
+      if (action.key === "update" && !this.selectingUpgrade && this.waitingForVersion) {
         app.toast("warn", this.state.kind === "error" ? this.state.message : "版本读取中，请稍后再升级");
         return true;
       }
-      const git = this.state.kind === "ready" ? this.state.value : null;
-      const spec = action.confirm(app, git);
+      if (action.key === "update" && (!this.selectingUpgrade || this.upgrade.state.kind === "idle")) {
+        this.selected = actions.indexOf(action);
+        this.upgrade.invalidate();
+        void this.checkUpgrade(app);
+        return true;
+      }
+      const upgrade = this.upgrade.state;
+      if (action.key === "update" && upgrade.kind !== "ready") {
+        app.toast("warn", upgrade.kind === "error" ? `${upgrade.message}；按 r 重试` : "正在检查远端，请稍后确认升级");
+        return true;
+      }
+      const preview = action.key === "update" && upgrade.kind === "ready" ? upgrade.value : null;
+      const git = action.key === "update" ? preview?.git ?? null : this.state.kind === "ready" ? this.state.value : null;
+      const spec = action.confirm(app, git, preview?.targetSha);
       if (spec) {
         // 没有可执行步骤的 spec（升级被工作区拦下这类）只是用来解释为什么不能做，
         // 让它走同一个确认框，但确认后什么也不执行。
@@ -263,14 +316,17 @@ export class MaintainView implements View {
 
   render(ctx: ViewContext): string[] {
     const { theme } = ctx;
-    const git = this.state.kind === "ready" ? this.state.value : null;
+    const upgrade = this.upgrade.state;
+    const preview = this.selectingUpgrade && upgrade.kind === "ready" ? upgrade.value : null;
+    const git = this.selectingUpgrade ? preview?.git ?? null : this.state.kind === "ready" ? this.state.value : null;
     const actions = this.availableActions;
     const action = actions[this.selected]!;
-    const spec = action.confirm(ctx, git);
+    const spec = action.confirm(ctx, git, preview?.targetSha);
     const blocked = action.key === "update" && (!git || git.dirty);
     const versionNotice = this.state.kind === "error" ? this.state.message : "版本读取中…（升级暂不可用）";
-    const details = action.key === "update" && this.waitingForVersion ? [
-      theme.bold(versionNotice), "读取完成后可确认升级；其他服务操作和页面切换仍可使用。",
+    const details = action.key === "update" && upgrade.kind !== "ready" ? [
+      theme.bold(upgrade.kind === "error" ? `远端检查失败：${upgrade.message}` : "正在检查 origin/main 最新提交…"),
+      upgrade.kind === "error" ? "按 r 重新检查；检查成功后才可升级。" : "检查完成后按 Enter 确认升级；其他服务操作和页面切换仍可使用。",
     ] : [
       theme.bold(blocked ? spec!.subject : action.summary),
       theme.c(spec?.danger || blocked ? "warn" : "accent", spec ? "影响：" + spec.steps[0] : "启动完成后检查服务是否就绪"),
@@ -278,14 +334,17 @@ export class MaintainView implements View {
       ...(spec ? [theme.bold("执行步骤"), ...spec.steps.map((step, i) => `${i + 1}. ${step}`),
         ...(spec.recovery ? ["", "恢复说明：" + spec.recovery] : [])] : ["启动机器人，等待健康检查通过。"]),
       ...(action.key === "update" && git && git.behind > 0 ? [
-        "", theme.bold(`待应用的提交（${git.behind}，上次同步）`),
+        "", theme.bold(`待应用的提交（${git.behind}，本次检查）`),
         ...git.incoming.map(commit => `${commit.sha}  ${commit.subject}`),
       ] : []),
     ];
-    const version = this.state.kind !== "ready" ? versionNotice : git?.dirty ? "工作区有改动，升级会被拒绝"
+    const version = this.selectingUpgrade ? (preview
+      ? `当前 ${fmt.shortSha(preview.git.sha)} → origin/main ${fmt.shortSha(preview.targetSha)}`
+      : upgrade.kind === "ready" ? "非 git 部署，升级不可用" : upgrade.kind === "error" ? "远端检查失败，请按 r 重试" : "正在检查远端版本…")
+      : this.state.kind !== "ready" ? versionNotice : git?.dirty ? "工作区有改动，升级会被拒绝"
       : git ? `${fmt.shortSha(git.sha)} · ${git.behind > 0 ? `待更新 ${git.behind} 个提交（上次同步）` : git.ahead > 0 ? "本地有领先提交" : git.behind < 0 ? "尚无远端对照" : "与上次同步一致"}`
         : "非 git 部署，升级不可用";
-    const note = this.refreshing && this.state.kind === "ready" ? `${version} · ${versionNotice}` : version;
+    const note = !this.selectingUpgrade && this.refreshing && this.state.kind === "ready" ? `${version} · ${versionNotice}` : version;
     return actionWorkbench(ctx, { title: "服务与部署", items: actions, selected: this.selected, details, note });
   }
 }

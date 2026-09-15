@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { lstat, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { loadDiskUsage, loadGit, loadHealth, loadHistory, loadRecentStats, loadStatsOverview, loadTmp, probeService, type Health } from "../../scripts/ops/tui/data.ts";
+import { loadDiskUsage, loadGit, loadUpgrade, loadHealth, loadHistory, loadRecentStats, loadStatsOverview, loadTmp, probeService, type Health } from "../../scripts/ops/tui/data.ts";
 import type { Deployment } from "../../scripts/ops/tui/platform.ts";
 import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import { parseDate } from "../../scripts/ops/stats-admin.ts";
@@ -62,6 +62,55 @@ test("Git 超时与执行故障显示读取错误，仅明确的非仓库返回�
     capture.mockResolvedValue({ code: 128, stdout: "", stderr: "fatal: not a git repository", timedOut: false });
     expect(await loadGit()).toBeNull();
   } finally { capture.mockRestore(); }
+});
+
+test("升级检查传递取消与超时，远端失败时不使用本地缓存继续预览", async () => {
+  const capture = spyOn(tuiExec, "capture");
+  const controller = new AbortController();
+  try {
+    capture.mockResolvedValue({ code: 128, stdout: "", stderr: "network unavailable", timedOut: false });
+    await expect(loadUpgrade(controller.signal)).rejects.toThrow("network unavailable");
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(capture.mock.calls[0]?.[1]).toEqual(["fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
+    expect(capture.mock.calls[0]?.[2]).toMatchObject({ signal: controller.signal, timeout: 60_000,
+      env: { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" } });
+    capture.mockResolvedValue({ code: 124, stdout: "", stderr: "", timedOut: true });
+    await expect(loadUpgrade()).rejects.toThrow("60 秒");
+    capture.mockResolvedValue({ code: 128, stdout: "", stderr: "fatal: not a git repository", timedOut: false });
+    expect(await loadUpgrade()).toBeNull();
+    capture.mockClear();
+    capture.mockImplementation(async () => {
+      controller.abort();
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    });
+    await expect(loadUpgrade(controller.signal)).rejects.toThrow();
+    expect(capture).toHaveBeenCalledTimes(1);
+  } finally { capture.mockRestore(); }
+});
+
+test("升级预览独立读取同步后的版本，不复用尚未返回的旧 Git 查询", async () => {
+  const old = Promise.withResolvers<tuiExec.RunResult>();
+  const oldSha = "1".repeat(40), targetSha = "2".repeat(40);
+  let oldHead = true;
+  const result = (stdout: string): tuiExec.RunResult => ({ code: 0, stdout, stderr: "", timedOut: false });
+  const capture = spyOn(tuiExec, "capture").mockImplementation(async (_command, args) => {
+    if (args.includes("-1")) {
+      if (oldHead) { oldHead = false; return old.promise; }
+      return result(oldSha + "\ncurrent version");
+    }
+    if (args.includes("--verify")) return result(targetSha);
+    if (args[0] === "rev-parse") return result("main");
+    if (args[0] === "rev-list") return result("0\t1");
+    if (args[0] === "log") return result(targetSha.slice(0, 7) + " fresh remote update");
+    return result("");
+  });
+  const local = loadGit();
+  try {
+    expect(await loadUpgrade()).toMatchObject({ targetSha, git: { sha: oldSha, behind: 1,
+      incoming: [{ sha: targetSha.slice(0, 7), subject: "fresh remote update" }] } });
+    expect(capture.mock.calls.some(call => call[1].includes("HEAD..." + targetSha))).toBe(true);
+    expect(capture.mock.calls.some(call => call[1].includes("HEAD.." + targetSha))).toBe(true);
+  } finally { old.resolve(result(oldSha + "\nold cached version")); await local; capture.mockRestore(); }
 });
 
 test("并发磁盘扫描不重复计算重叠根目录，也不跟随目录链接", async () => {
