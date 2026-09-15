@@ -213,6 +213,29 @@ token 来源优先级为：本次输入的 token 或文件路径 → `TUNNEL_TOK
 
 停用会将配置归档到 `backup/rm`，保留外链账本和远端文件；停用期间机器人不再清理过期对象，后端签名仍按自己的期限失效。设置有效期但不启用签名时，到期会删除远端文件；启用兼容签名后，到期只使签名失效。保存预览会显示具体规则。这里校验配置格式，不会向远端上传测试文件；两个地址是否映射同一目录、后端权限及签名规则需按存储服务配置。
 
+### Alist 与 Cloudflare 子域名示例
+
+以 Alist 监听本机 `5244` 端口、对外挂载路径为 `/relay`、文件子域名为 `files.example.com` 为例：
+
+1. 在 Alist 中挂载支持上传、建目录和删除的存储，挂载路径填 `/relay`。这里指 Alist 对外展示的虚拟路径；它也可以是某个挂载下的子目录，例如 `/网盘/relay`，不必和磁盘物理目录同名。示例账号基本路径为 `/`，需有该目录的 **WebDAV 读取、WebDAV 管理、创建目录或上传、删除** 权限。使用受限账号时，以该账号实际可访问的 WebDAV 目录为准，确保它与公开下载地址映射到同一存储目录。
+2. 按[隧道托管](#隧道托管)的方式，将根域名 `example.com` 的 DNS 接入 Cloudflare 并等待激活。在已有 Cloudflared 隧道中新增 **Published application** 路由：子域名 `files`、域名 `example.com`，Path 留空，服务类型选 **HTTP**，URL 填 `localhost:5244`（完整服务地址为 `http://localhost:5244`）。这里的服务地址应从运行连接器的位置可达；机器人与 Alist 使用各自的子域名和路由。
+3. 在 **系统 → 设置 → 外链配置** 中填写下面的两个目录地址。DNS 和隧道路由在 Cloudflare 控制台完成；外链向导只保存机器人配置。
+
+| 用途 | 完整地址 | 向导也接受的输入 |
+|---|---|---|
+| WebDAV 上传目录 `webdavUrl` | `http://127.0.0.1:5244/dav/relay/` | `127.0.0.1:5244/dav/relay` |
+| 公开下载目录 `publicBaseUrl` | `https://files.example.com/d/relay/` | `files.example.com/d/relay` |
+
+`/dav/` 是 WebDAV 入口，`/d/` 是下载入口，后面均接实际挂载目录。例如挂载路径为 `/网盘/relay` 时，分别填写 `http://127.0.0.1:5244/dav/网盘/relay/` 和 `https://files.example.com/d/网盘/relay/`；向导会将中文路径编码为有效 URL。
+
+浏览页面地址 `http://127.0.0.1:5244/relay/` 可帮助确认挂载路径，但上传时应使用 `/dav/relay/`，公开下载时使用 `/d/relay/`。不要把已生成文件的 `<日期>-<UUID>/<文件名>` 或 `?sign=...` 填进目录配置。
+
+省略协议时，WebDAV 的 `localhost`、回环及私有 IP 自动补 `http://`；其余地址（包括公开下载目录）自动补 `https://`。显式填写的 HTTP/HTTPS 会保留，末尾 `/` 自动补齐，保存预览可核对最终地址；配置文件始终保存完整 URL。
+
+`127.0.0.1` 仅适用于机器人与 Alist 能在本机互访的情况；在其他主机或独立容器网络中，上传地址应改为机器人实际可达的 Alist 地址。公开下载需要填写接收者能访问的域名。Alist 若对该目录开启签名，需在高级设置中配置匹配的签名密钥和规则。
+
+路径及权限依据：[Alist WebDAV 文档](https://alistgo.com/zh/guide/webdav.html)、[挂载路径说明](https://alistgo.com/zh/guide/drivers/common.html#挂载路径)、[官方下载路由](https://github.com/alist-org/alist/blob/main/server/router.go)。
+
 ## 重新配置模型
 
 模型配置使用 `data/config/models.json` 的 Pi 原生 `providers` 和 `data/runtime/pi/settings.json` 的 `defaultProvider` / `defaultModel` / `defaultThinkingLevel`。旧顶层 `modelId` / `thinkingLevel` 不参与选型，也不做兼容迁移。旧配置需要重建时，先停机并将这两个文件及 `data/runtime/models-store.json` 归档到 `backup/rm`，再运行 `bun run configure`；没有宿主机 Bun 的 Docker 部署可重新运行部署脚本，由镜像内的向导生成配置。`backup/rm` 会在部署成功后清空，需要长期保留的配置副本请另行备份。

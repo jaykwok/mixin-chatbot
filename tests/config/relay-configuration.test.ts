@@ -56,10 +56,12 @@ test("外链先形成可审阅草稿，确认后提交并使用运行时的默�
   const fixture = await tempFixture("relay-configure-basic-");
   try {
     const prepared = await run(fixture.root, "--draft", {
-      "WebDAV 上传目录": base.webdavUrl, "公开下载目录": base.publicBaseUrl,
+      "WebDAV 上传目录": "127.0.0.1:5244/dav/relay", "公开下载目录": "files.example.test/d/relay",
     });
     expect(prepared.code, prepared.output).toBe(0);
     expect(prepared.output).toContain("保存预览");
+    expect(prepared.output).toContain("上传目录：" + base.webdavUrl);
+    expect(prepared.output).toContain("公开目录：" + base.publicBaseUrl);
     expect(prepared.output).toContain("不自动过期");
     expect(existsSync(file(fixture.root))).toBe(false);
     expect(existsSync(draft(fixture.root))).toBe(true);
@@ -74,8 +76,9 @@ test("修改时可留空沿用密码，跳过高级设置保留有效期、签�
   const fixture = await tempFixture("relay-configure-existing-");
   const secrets = { password: "fixture-password-private", signSecret: "fixture-signing-key-private" };
   try {
-    await seed(fixture.root, { ...base, username: "operator", ...secrets, expireHours: 12, signPathPrefix: "/relay/", customNote: "preserve" });
-    const prepared = await run(fixture.root, "--draft");
+    await seed(fixture.root, { ...base, webdavUrl: base.webdavUrl.slice(0, -1),
+      username: "operator", ...secrets, expireHours: 12, signPathPrefix: "/relay/", customNote: "preserve" });
+    const prepared = await run(fixture.root, "--draft", { "WebDAV 上传目录": "127.0.0.1:5244/dav/relay" });
     expect(prepared.code, prepared.output).toBe(0);
     expect(prepared.output).toContain("留空沿用已保存值");
     expect(prepared.output).toContain("12 小时后签名失效");

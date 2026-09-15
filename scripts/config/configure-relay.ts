@@ -8,6 +8,7 @@ import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import { archiveFile, replaceFile, withMaintenance } from "../../src/core/maintenance.ts";
 import { RELAY_CONFIG_PATH } from "../../src/core/storage.ts";
 import { DEFAULT_RELAY_MAX_BYTES, validateRelayConfig, type RelayConfig } from "../../src/integrations/relay.ts";
+import { normalizeRelayUrlInput } from "./relay-url.ts";
 
 const MIB = 1024 ** 2;
 const CONFIG_FIELDS = ["webdavUrl", "publicBaseUrl", "username", "password", "maxBytes", "expireHours", "signSecret", "signPathPrefix"];
@@ -26,12 +27,14 @@ function fingerprint(raw: string | null): string | null {
   return raw === null ? null : createHash("sha256").update(raw).digest("hex");
 }
 
-function requireUrl(value: string | undefined): string | undefined {
-  try {
-    const url = new URL(value?.trim() ?? "");
-    if (url.protocol !== "http:" && url.protocol !== "https:") return "只支持 http:// 或 https://";
-    if (url.username || url.password) return "账号和密码请在后续认证项中填写，不要放在 URL 中";
-  } catch { return "请输入有效的 HTTP(S) URL"; }
+function requireUrl(value: string | undefined, kind: "webdav" | "public"): string | undefined {
+  try { normalizeRelayUrlInput(value, kind); }
+  catch (error) { return error instanceof Error ? error.message : "请输入有效的目录地址"; }
+}
+
+async function askUrl(message: string, previous: string, kind: "webdav" | "public"): Promise<string> {
+  const initial = requireUrl(previous, kind) ? "" : normalizeRelayUrlInput(previous, kind);
+  return normalizeRelayUrlInput(await askText(message, initial, value => requireUrl(value, kind)), kind);
 }
 
 async function askText(message: string, initialValue: string, validate?: (value: string | undefined) => string | undefined): Promise<string> {
@@ -91,17 +94,32 @@ async function prepare(draftPath: string): Promise<void> {
     note("将停用大文件外链分发，并把 relay.json 归档到 backup/rm。\n" +
       "远端文件和外链账本会保留；停用期间机器人不会执行到期清理，后端签名仍按自身期限失效。", "停用预览");
   } else {
+    note([
+      "1) 在 Alist 挂载可写存储，示例挂载路径为 /relay，账号基本路径为 /。",
+      "   账号需有 WebDAV 读取、管理、创建目录或上传、删除权限。",
+      "2) 将 example.com 的 DNS 接入 Cloudflare 并激活；在隧道 Published application 新增",
+      "   files.example.com，服务指向 http://localhost:5244（Alist 所在地址）。",
+      "3) 下方填写同一目录的两种地址：",
+      "   WebDAV 上传：http://127.0.0.1:5244/dav/relay/",
+      "   公开下载：https://files.example.com/d/relay/",
+      "/relay 是 Alist 的挂载目录，也可使用挂载内的子目录；请替换为实际路径。",
+      "只填目录，不带日期子目录和文件名。127.0.0.1 适用于机器人与 Alist 可在本机互访；",
+      "公开下载填写接收者能访问的域名。DNS 和隧道路由需在 Cloudflare 控制台配置。",
+    ].join("\n"), "Alist + Cloudflare 子域名示例");
+    note("http://、https:// 和末尾 / 均可省略，保存前会显示完整地址。\n" +
+      "WebDAV 的 localhost、回环及私有 IP 默认补 http://；其他地址（含公开下载）默认补 https://。\n" +
+      "显式填写的协议会保留；/dav/、/d/ 及实际目录仍需填写。", "地址填写方式");
     const next: RelayConfig = { ...(previous ?? { maxBytes: DEFAULT_RELAY_MAX_BYTES, webdavUrl: "", publicBaseUrl: "" }) };
-    next.webdavUrl = await askText("WebDAV 上传目录 URL", requireUrl(next.webdavUrl) ? "" : next.webdavUrl, requireUrl);
-    next.publicBaseUrl = await askText("公开下载目录 URL（与上传地址对应同一目录）",
-      requireUrl(next.publicBaseUrl) ? "" : next.publicBaseUrl, requireUrl);
+    next.webdavUrl = await askUrl("WebDAV 上传目录 URL（可省略协议，如 127.0.0.1:5244/dav/relay）", next.webdavUrl, "webdav");
+    next.publicBaseUrl = await askUrl("公开下载目录 URL（可省略协议，如 files.example.com/d/relay）", next.publicBaseUrl, "public");
     const auth = bail<string>(await select({
       message: "WebDAV 认证方式", initialValue: previous?.username !== undefined ? "basic" : "none",
       options: [{ value: "basic", label: "用户名和密码" }, { value: "none", label: "无需认证" }],
     }));
     if (auth === "basic") {
       next.username = await askText("WebDAV 用户名", previous?.username ?? "", value => value?.trim() ? undefined : "不能为空");
-      const sameAccount = previous?.webdavUrl === next.webdavUrl && previous.username === next.username;
+      const sameAccount = previous?.username === next.username && !requireUrl(previous?.webdavUrl, "webdav") &&
+        normalizeRelayUrlInput(previous?.webdavUrl, "webdav") === next.webdavUrl;
       next.password = await askSecret("WebDAV 密码", sameAccount ? previous?.password : undefined);
     } else {
       delete next.username;

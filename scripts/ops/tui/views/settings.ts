@@ -112,7 +112,7 @@ export class SettingsView implements View {
       ],
       details: this.selected === 0 ? [
         "可选的大文件外链：启用、修改或停用。",
-        "填写 WebDAV 上传目录、公开下载地址及可选认证。",
+        "向导含 Alist + Cloudflare 子域名示例，地址可省略 http(s)://。",
         "文件上限、有效期和兼容签名放在高级设置。",
         "保存前预览并确认，取消不修改配置。",
         "确认后重启原本运行中的机器人，已停止时保持停止。",
