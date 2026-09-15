@@ -92,7 +92,7 @@ else
 fi
 
 # ---- 4. 起隧道（前台）----
-echo "▶ 启动 cloudflared connector（控制台 Published application 应配置为 http://localhost:${BOT_PORT}）"
+echo "▶ 启动 cloudflared connector（控制台 Published application 应配置为 http://127.0.0.1:${BOT_PORT}）"
 echo "  （前台运行，Ctrl+C 停止。常驻开机自启可用 systemd/tmux 包一层）"
 token_path="$(save_project_tunnel_token "$TUNNEL_TOKEN_VALUE")"
 unset TUNNEL_TOKEN_VALUE

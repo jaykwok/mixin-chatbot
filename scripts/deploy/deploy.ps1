@@ -447,7 +447,7 @@ if ($mode -eq "cloudflare") {
     Write-Host "Cloudflare 公网域名准备："
     Write-Host "  1) 将根域名（如 example.com）添加到 Cloudflare，按指引在域名注册商修改 NS，等待状态变为 Active（已激活）。域名无需转移注册商，但 DNS 需托管到 Cloudflare。"
     Write-Host "  2) 下面填写机器人使用的子域名，例如 bot.example.com。"
-    Write-Host "  3) 在同一 Cloudflare 账户的 Networking → Tunnels 中创建或选择 Cloudflared 隧道；Published application 路由填相同子域名，服务地址设为 http://localhost:$Port。"
+    Write-Host "  3) 在同一 Cloudflare 账户的 Networking → Tunnels 中创建或选择 Cloudflared 隧道；Published application 路由填相同子域名，服务地址设为 http://127.0.0.1:$Port。"
     Write-Host "DNS 接入和公开路由需在控制台完成；此处填写域名不会自动创建它们。可留空稍后配置，公网回调需配置完成后才能使用。"
     $domainDefault = $publicDomain
     while ($true) {

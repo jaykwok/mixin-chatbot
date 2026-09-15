@@ -1,8 +1,8 @@
 ﻿# Windows Server 连接器：使用项目根目录的 cloudflared.exe 注册服务；缺失时下载官方版本。
-#   Cloudflare Tunnel  <==>  localhost:BOT_PORT（默认 1011）
+#   Cloudflare Tunnel  <==>  127.0.0.1:BOT_PORT（默认 1011）
 #
 # 前置条件：
-#   1) 机器人已在 localhost:BOT_PORT 运行（scripts\deploy\deploy.ps1，Cloudflare 模式）
+#   1) 机器人已在 127.0.0.1:BOT_PORT 运行（scripts\deploy\deploy.ps1，Cloudflare 模式）
 #   2) 隧道 token。来源优先级：
 #        参数： .\scripts\tunnel\start-tunnel.ps1 <token或文件> # 完整 token 或文件路径
 #        环境： $env:TUNNEL_TOKEN_FILE='<路径>'                  # token 文件路径
@@ -163,7 +163,7 @@ if (-not $botOnline -and $env:TUNNEL_ALLOW_NO_BOT -ne "1") {
 }
 
 # ---- 4. 启动隧道 ----
-Write-Host "cloudflared 连接器：请在控制台将 Published application 服务地址设为 http://localhost:$BotPort"
+Write-Host "cloudflared 连接器：请在控制台将 Published application 服务地址设为 http://127.0.0.1:$BotPort"
 if ($isAdmin) {
     if ($existingService -and -not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
         throw '现有 Cloudflared 服务没有本项目归属记录；请通过其原管理方式维护，不能自动重装。'

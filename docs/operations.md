@@ -221,7 +221,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 
 1. 将根域名（如 `example.com`）添加到 Cloudflare，按指引在域名注册商修改 NS，等待状态变为 **Active（已激活）**。域名无需转移注册商，但 DNS 需托管到 Cloudflare。部署交互中填写机器人使用的子域名，如 `bot.example.com`。
 2. 在同一 Cloudflare 账户打开 **Networking → Tunnels**（[控制台入口](https://dash.cloudflare.com/?to=/:account/tunnels)），创建 Cloudflared 隧道；已有隧道则选择它，再打开 **Add a replica（添加副本）**。在安装连接器页面，只复制安装命令中 `eyJ` 开头的完整 token 值。在部署的“隧道 token 或文件路径”提示中直接粘贴，或保存到项目的 `data/config/cloudflared-token` 后留空读取，也可填写其他 token 文件的路径。输入会隐藏；Windows 文件名不要带 `.txt` 后缀。连接器由项目脚本安装。
-3. 在该隧道的 **Published application** 路由中填写相同子域名，服务地址设为 `http://localhost:<BOT_PORT>`（类型选 HTTP，URL 填 `localhost:<BOT_PORT>`；默认端口为 `1011`）。DNS 接入与公开路由需在控制台完成；部署脚本填写域名不会自动创建它们。域名可在部署时留空、稍后配置，公网回调需这些步骤完成后才能使用。
+3. 在该隧道的 **Published application** 路由中填写相同子域名，服务地址设为 `http://127.0.0.1:<BOT_PORT>`（类型选 HTTP，URL 填 `127.0.0.1:<BOT_PORT>`；默认端口为 `1011`）。DNS 接入与公开路由需在控制台完成；部署脚本填写域名不会自动创建它们。域名可在部署时留空、稍后配置，公网回调需这些步骤完成后才能使用。
+
+`<BOT_PORT>` 使用部署时选择的端口。Cloudflare 模式下机器人监听 IPv4 回环地址，源站显式使用 `127.0.0.1`，避免 `localhost` 解析为 IPv6 `::1`。已有隧道需在控制台手动更新服务地址；修改仓库或重新部署不会自动更新远程路由。
 
 脚本使用项目根目录的 `cloudflared.exe`（Windows）或 `cloudflared`（Linux）。已有可运行副本会直接复用；缺失或不可用时，从 [Cloudflare 官方 GitHub 发布](https://github.com/cloudflare/cloudflared/releases) 下载对应架构的版本，先校验 SHA-256，再检查可执行性并保存。下载版本与校验值统一记录在 `scripts/tunnel/cloudflared-release.txt`；更新清单只影响后续下载。下载失败或校验失败会保留原文件并清理下载残留，也可提前将官方可执行文件放到项目根目录。
 
@@ -289,10 +291,10 @@ Windows 修改已安装的服务需要管理员权限。连接器必须使用当
 
 ### Alist 与 Cloudflare 子域名示例
 
-以 Alist 监听本机 `5244` 端口、对外挂载路径为 `/relay`、文件子域名为 `files.example.com` 为例：
+以 Alist 监听本机 `5244` 端口、对外挂载路径为 `/relay`、文件子域名为 `files.example.com` 为例。以下 `5244` 均需替换为 Alist 实际监听端口；外链设置会保留填写的端口：
 
 1. 在 Alist 中挂载支持上传、建目录和删除的存储，挂载路径填 `/relay`。这里指 Alist 对外展示的虚拟路径；它也可以是某个挂载下的子目录，例如 `/网盘/relay`，不必和磁盘物理目录同名。示例账号基本路径为 `/`，需有该目录的 **WebDAV 读取、WebDAV 管理、创建目录或上传、删除** 权限。使用受限账号时，以该账号实际可访问的 WebDAV 目录为准，确保它与公开下载地址映射到同一存储目录。
-2. 按[隧道托管](#隧道托管)的方式，将根域名 `example.com` 的 DNS 接入 Cloudflare 并等待激活。在已有 Cloudflared 隧道中新增 **Published application** 路由：子域名 `files`、域名 `example.com`，Path 留空，服务类型选 **HTTP**，URL 填 `localhost:5244`（完整服务地址为 `http://localhost:5244`）。这里的服务地址应从运行连接器的位置可达；机器人与 Alist 使用各自的子域名和路由。
+2. 按[隧道托管](#隧道托管)的方式，将根域名 `example.com` 的 DNS 接入 Cloudflare 并等待激活。在已有 Cloudflared 隧道中新增 **Published application** 路由：子域名 `files`、域名 `example.com`，Path 留空，服务类型选 **HTTP**，URL 填 `127.0.0.1:5244`（完整服务地址为 `http://127.0.0.1:5244`）。这里的服务地址应从运行连接器的位置可达；机器人与 Alist 使用各自的子域名和路由。
 3. 在 **系统 → 设置 → 外链配置** 中，上传地址填写到 Alist 挂载目录，例如 `127.0.0.1:5244/dav/relay`，此处挂载目录为 `relay`。公开下载项可以只填文件域名，向导会推导对应目录。DNS 和隧道路由在 Cloudflare 控制台完成；外链向导只保存机器人配置。
 
 | 用途 | 完整地址 | 向导也接受的输入 |
@@ -308,7 +310,7 @@ Windows 修改已安装的服务需要管理员权限。连接器必须使用当
 
 省略协议时，WebDAV 的 `localhost`、回环及私有 IP 自动补 `http://`；其余地址（包括公开下载目录）自动补 `https://`。显式填写的 HTTP/HTTPS 会保留，末尾 `/` 自动补齐，保存预览可核对最终地址；配置文件始终保存完整 URL。
 
-`127.0.0.1` 仅适用于机器人与 Alist 能在本机互访的情况；在其他主机或独立容器网络中，上传地址应改为机器人实际可达的 Alist 地址。公开下载需要填写接收者能访问的域名。Alist 若对该目录开启签名，需在高级设置中配置匹配的签名密钥和规则。
+隧道源站使用 `127.0.0.1` 的前提是连接器能通过本机 IPv4 回环访问 Alist；上传地址使用 `127.0.0.1` 的前提是机器人能通过该地址访问 Alist。在其他主机或独立容器网络中，两者分别填写连接器、机器人实际可达的 Alist 地址和端口。公开下载需要填写接收者能访问的域名。Alist 若对该目录开启签名，需在高级设置中配置匹配的签名密钥和规则。
 
 路径及权限依据：[Alist WebDAV 文档](https://alistgo.com/zh/guide/webdav.html)、[挂载路径说明](https://alistgo.com/zh/guide/drivers/common.html#挂载路径)、[官方下载路由](https://github.com/alist-org/alist/blob/main/server/router.go)。
 

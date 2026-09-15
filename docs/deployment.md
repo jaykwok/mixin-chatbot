@@ -55,7 +55,7 @@ bash scripts/ops/ops.sh doctor
 | 入口模式 | 配置要点 |
 | --- | --- |
 | 直连 | 只放行项目配置的平台来源 IP；可通过 `PLATFORM_IP` 指定 |
-| Cloudflare | 应用绑定回环地址；Published application 指向 `http://localhost:<BOT_PORT>`，域名和 WAF 由部署方配置 |
+| Cloudflare | 应用绑定回环地址；Published application 指向 `http://127.0.0.1:<BOT_PORT>`，域名和 WAF 由部署方配置 |
 
 把脚本输出的完整回调地址填到 IM 平台；每个群使用独立的 callback key（平台回调标识），不要跨群共用。
 

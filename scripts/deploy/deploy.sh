@@ -240,7 +240,7 @@ else
 fi
 print_status "部署模式：$DEPLOY_MODE_LABEL"
 if [ "$DEPLOY_MODE" = "cloudflare" ]; then
-    print_warning "请把 Cloudflare Tunnel 的 Published application 服务地址设为 http://localhost:${BOT_PORT}"
+    print_warning "请把 Cloudflare Tunnel 的 Published application 服务地址设为 http://127.0.0.1:${BOT_PORT}"
 fi
 
 # ---- Pi 群数据总根（<group>/workspace + <group>/users/<phone>/{tmp,session.jsonl}）----
@@ -444,7 +444,7 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     echo "Cloudflare 公网域名准备："
     echo "  1) 将根域名（如 example.com）添加到 Cloudflare，按指引在域名注册商修改 NS，等待状态变为 Active（已激活）。域名无需转移注册商，但 DNS 需托管到 Cloudflare。"
     echo "  2) 下面填写机器人使用的子域名，例如 bot.example.com。"
-    echo "  3) 在同一 Cloudflare 账户的 Networking → Tunnels 中创建或选择 Cloudflared 隧道；Published application 路由填相同子域名，服务地址设为 http://localhost:${BOT_PORT}。"
+    echo "  3) 在同一 Cloudflare 账户的 Networking → Tunnels 中创建或选择 Cloudflared 隧道；Published application 路由填相同子域名，服务地址设为 http://127.0.0.1:${BOT_PORT}。"
     echo "DNS 接入和公开路由需在控制台完成；此处填写域名不会自动创建它们。可留空稍后配置，公网回调需配置完成后才能使用。"
     DOMAIN_DEFAULT="$PUBLIC_DOMAIN"
     while true; do
@@ -496,7 +496,7 @@ else
     fi
     echo ""
     print_warning "Cloudflare 模式仅监听 127.0.0.1:${BOT_PORT}，不会直接暴露公网端口"
-    print_warning "部署末尾会启动 cloudflared connector；远程管理隧道的源站端口需在 Cloudflare 控制台配置为 http://localhost:${BOT_PORT}"
+    print_warning "部署末尾会启动 cloudflared connector；远程管理隧道的源站端口需在 Cloudflare 控制台配置为 http://127.0.0.1:${BOT_PORT}"
     print_warning "WAF 应只限制 /webhook/ 前缀：平台 IP + POST 放行，其他 webhook 请求 Block；可保留 /favicon.svg 供健康检查"
 fi
 if [ "$SHOW_SECRET" = "1" ]; then
