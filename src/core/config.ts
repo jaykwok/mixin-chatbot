@@ -125,7 +125,7 @@ export const MATERIALS_INDEX_MAX_DEPTH = integerEnv("BOT_INDEX_MAX_DEPTH");
 /**
  * 解析和生成文档的直接依赖，完整依赖锁为 uv.lock。
  * 就绪校验包含解释器、锁定版本和导入结果；文件状态未变时可短期复用成功结果。
- * 使用指定环境、预装项目 .venv 或按需准备的群 venv；模型不能修改共享环境。
+ * 默认按需准备每群独立 venv；仅显式指定时共享环境，模型不能修改环境。
  */
 export const DOCUMENT_TOOLCHAIN_PACKAGES: readonly string[] = documentPackages(readFileSync(
   new URL("../../pyproject.toml", import.meta.url), "utf8"

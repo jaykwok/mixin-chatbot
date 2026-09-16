@@ -8,6 +8,7 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from docx import Document
 from docx.shared import Inches as WordInches
@@ -82,6 +83,28 @@ def add_tag_fixture(path):
         assert "tag777.xml" in str(error)
 
 
+def check_office_errors(root):
+    script = Path(__file__).resolve().parents[2] / "src/agent/modules/document-work/scripts/document_ops.py"
+    spec = importlib.util.spec_from_file_location("document_ops", script)
+    operations = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(operations)
+    source = root / "source.docx"
+    for code, diagnostic in ((1, b"Read-only file system: /tmp/OSL_PIPE_fixture"), (0, b"Error: source file could not be loaded")):
+        folder = root / f"office-error-{code}"
+        folder.mkdir()
+        result = subprocess.CompletedProcess([], code, stdout=b"", stderr=diagnostic)
+        with patch.object(operations, "office_binary", return_value="fixture-soffice"), patch.object(operations.subprocess, "run", return_value=result) as run:
+            try:
+                operations.convert_office(source, folder)
+                raise AssertionError("conversion failure must be reported")
+            except ValueError as error:
+                assert diagnostic.decode() in str(error), str(error)
+            env = run.call_args.kwargs["env"]
+            for key in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "TMPDIR"):
+                target = Path(env[key])
+                assert target.is_dir() and target.is_relative_to(folder)
+
+
 def prepare(root):
     check_edit_guards()
     root.mkdir(parents=True, exist_ok=True)
@@ -101,6 +124,7 @@ def prepare(root):
     table.cell(0, 0).text, table.cell(0, 1).text = "项目", "内容"
     table.cell(1, 0).text, table.cell(1, 1).text = "部署", "本地部署"
     document.save(root / "source.docx")
+    check_office_errors(root)
     supplement = Document()
     supplement.add_heading("实施计划", 1)
     supplement.add_paragraph("准备、实施、验证。")

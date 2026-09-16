@@ -1,6 +1,7 @@
 // Production runtime -> official Pi SDK -> real adapter; intercept before any HTTP.
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { mock } from "bun:test";
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 const sdk = await import("@earendil-works/pi-coding-agent");
@@ -8,6 +9,11 @@ const [kind, policy] = process.argv.slice(2);
 const documentWorkEnabled = kind !== "document-work-disabled";
 delete process.env.BOT_DOCUMENT_WORK_ENABLED;
 if (!documentWorkEnabled) process.env.BOT_DOCUMENT_WORK_ENABLED = "0";
+delete process.env.BOT_DOCUMENT_ENV;
+if (kind === "shared-env") process.env.BOT_DOCUMENT_ENV = "shared-fixture-venv";
+// A preinstalled root venv must not silently replace per-group environments.
+await mkdir(".venv", { recursive: true });
+await writeFile(".venv/.mixin-doc-toolchain", "fixture preinstalled environment");
 delete process.env.PI_CACHE_RETENTION;
 process.env.BOT_MODEL_CACHE_RETENTION = policy;
 if (kind === "sdk-env") process.env.PI_CACHE_RETENTION = "long";
@@ -42,7 +48,11 @@ mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
     return liveRuntime;
   } },
 }));
-mock.module("../../src/agent/local-tools.ts", () => ({ buildLocalTools: async () => [] }));
+const environments = new Map<string, string>();
+mock.module("../../src/agent/local-tools.ts", () => ({ buildLocalTools: async (options: any) => {
+  environments.set(options.groupId, options.venvDir);
+  return [];
+} }));
 mock.module("../../src/integrations/im.ts", () => ({
   abortOutboundRequests() {}, getOutboundRateStatus: () => ({ used: 0, limit: 20 }), sendReplyWithMention: async () => true, sendText: async () => true,
   uploadAttachment: async () => { throw new Error("unexpected upload"); }, sendFile: async () => false, sendImage: async () => false,
@@ -65,6 +75,11 @@ try {
   assert.ok(forwarded[0].sessionId);
   assert.equal(forwarded[0].sessionId, forwarded[1].sessionId);
   assert.equal(payloads[0].prompt_cache_key, payloads[1].prompt_cache_key);
+  assert.equal(environments.get("group"), resolve(kind === "shared-env" ? "shared-fixture-venv" : "data/groups/group/venv"));
+  if (kind === "group-env" || kind === "shared-env") {
+    await assert.rejects(runtime.handleUserMessage("user", "another-group", "Separate group fixture", "https://im.zdxlz.com/im-external/v1/webhook/send?key=another-fixture"), /captured before HTTP/);
+    assert.equal(environments.get("another-group"), resolve(kind === "shared-env" ? "shared-fixture-venv" : "data/groups/another-group/venv"));
+  }
   if (policy === "long" || kind === "sdk-env") {
     if (kind === "legacy") assert.equal(payloads[0].prompt_cache_retention, "24h");
     else assert.deepEqual(payloads[0].prompt_cache_options, { ttl: "30m" });

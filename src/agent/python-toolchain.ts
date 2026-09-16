@@ -33,7 +33,7 @@ async function toolchainEnv() {
   await mkdir(temporary, { recursive: true });
   return { ...process.env, TMPDIR: temporary, TEMP: temporary, TMP: temporary,
     UV_CACHE_DIR: join(temporary, "uv-cache"), UV_PYTHON_INSTALL_DIR: process.env.UV_PYTHON_INSTALL_DIR || join(temporary, "python"),
-    PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1", UV_NO_CONFIG: "1" };
+    PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1", UV_NO_CONFIG: "1", UV_LINK_MODE: "copy" };
 }
 
 export function venvPythonPath(venvDir: string): string {

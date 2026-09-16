@@ -58,6 +58,8 @@ jobs:
             mixin-chatbot-check bun run test tests/core/process.test.ts
       - name: Test editable documents and Office previews in the restricted image
         run: |
+          # Match production: LibreOffice's Unix socket uses /tmp, not TMPDIR.
           docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/tests:/app/tests:ro" \
             mixin-chatbot-check bun run tests/helpers/document-work-integration.ts /app/.venv --office

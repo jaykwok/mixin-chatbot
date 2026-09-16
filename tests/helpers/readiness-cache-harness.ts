@@ -19,6 +19,7 @@ mock.module("../../src/core/process.ts", () => ({ runProcess: async (options: an
     assert.equal(options.args.at(-1), "3.14");
     const target = options.env.UV_PROJECT_ENVIRONMENT;
     assert.equal(options.env.VIRTUAL_ENV, target);
+    assert.equal(options.env.UV_LINK_MODE, "copy", "group packages must not be hard-linked to the shared download cache");
     prepared.push(target);
     const interpreter = venvPythonPath(target);
     await mkdir(dirname(interpreter), { recursive: true });

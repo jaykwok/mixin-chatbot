@@ -1,5 +1,4 @@
 // Pi local SDK integration. One SessionQueue owns each user's entire task lifecycle.
-import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -150,8 +149,7 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
   const tempDir = resolve(userTempDir(GROUP_DATA_ROOT, record.groupId, record.phone));
   const history = resolve(sessionFilePath(GROUP_DATA_ROOT, record.groupId, record.phone));
   const indexPath = resolve(materialsIndexPath(GROUP_DATA_ROOT, record.groupId));
-  const venvDir = resolve(runtimeSetting("BOT_DOCUMENT_ENV") ||
-    (existsSync(".venv/.mixin-doc-toolchain") ? ".venv" : groupVenvDir(GROUP_DATA_ROOT, record.groupId)));
+  const venvDir = resolve(runtimeSetting("BOT_DOCUMENT_ENV") || groupVenvDir(GROUP_DATA_ROOT, record.groupId));
   for (const dir of [cwd, tempDir, dirname(history), PI_AGENT_DIR, groupIndexDir(GROUP_DATA_ROOT, record.groupId)]) {
     await mkdir(dir, { recursive: true });
   }

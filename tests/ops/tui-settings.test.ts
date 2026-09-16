@@ -193,6 +193,10 @@ test("文档模块开关默认开启，选择关闭后只保存对应运行参�
     await view.onKey(key("end"), app); await view.onKey(key("enter"), app);
     expect(plain(view.render(ctx()))).toContain("文档加工模块");
     expect(plain(view.render(ctx()))).toContain("开启（默认）");
+    await view.onKey(key("down"), app);
+    expect(plain(view.render(ctx()))).toContain("共享文档环境覆盖");
+    expect(plain(view.render(ctx()))).toContain("每群独立 venv（默认）");
+    await view.onKey(key("up"), app);
     choices.push("edit", "0");
     await view.onKey(key("enter"), app);
     expect(plain(view.render(ctx()))).toContain("关闭（待保存）");

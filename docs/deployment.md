@@ -23,7 +23,9 @@ Cloudflare 模式会自动将官方 `cloudflared` 下载到项目根目录（Win
 
 ### Python 与文档预览
 
-Python 小版本范围固定为 `>=3.14,<3.15`，补丁版本由 uv 选择；依赖及传递依赖由 `uv.lock` 锁定。原生部署沿用每群 `venv/` 按需准备的机制；显式配置 `BOT_DOCUMENT_ENV` 或已有带就绪标记的项目 `.venv` 时沿用该环境选择方式。旧 Python 3.12 环境在下次使用文档功能时由 uv 按新配置重建，因此首次任务可能需要联网下载 Python 和依赖。生成文件保留在用户 tmp，venv 只存工具依赖。
+Python 小版本范围固定为 `>=3.14,<3.15`，补丁版本由 uv 选择；依赖及传递依赖由 `uv.lock` 锁定。Windows 和 Docker 默认都使用 `<群目录>/venv/`，每群独立、首次使用时按需 `uv sync`；不会自动使用项目根目录 `.venv`。各群依赖从下载缓存复制安装，避免硬链接导致原地修改相互影响；基础 Python 解释器和下载缓存可以共用。
+
+仅管理员显式配置 `BOT_DOCUMENT_ENV` 时，所有群才共用指定环境。TUI「设置 → 高级运行参数 → 文档与诊断」中的「共享文档环境覆盖」留空或恢复默认，即为每群独立。Docker 镜像里的 `/app/.venv` 用于构建验证和显式选择，不再自动替代群 venv。旧 Python 3.12 群环境在下次使用文档功能时由 uv 按新配置重建，因此首次任务可能需要联网下载 Python 和依赖。生成文件保留在用户 tmp，venv 只存工具依赖。
 
 通常无需手工同步。需要预热某个群时，停止服务，在项目根目录执行（将路径换成实际群目录）：
 
@@ -39,6 +41,8 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 Linux 的同等操作为 `UV_PROJECT_ENVIRONMENT=/absolute/group/venv uv sync --locked --no-dev --no-install-project`，成功后运行 `bun scripts/runtime/document-manifest.ts . /absolute/group/venv`。marker 只记录预期配置，运行时仍验证实际解释器、依赖及导入。
 
 Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffice.org/download/download-libreoffice/)安装，并将 `soffice` 加入服务账户的 PATH；工具也识别 `Program Files/LibreOffice/program/soffice.exe`。使用便携目录时将其 `program` 目录加入 PATH，变更后重启服务。PDF 预览直接使用 Python 库。预览字体取自运行主机，建议安装与客户模板一致的字体；Docker 提供 Noto CJK。缺少 LibreOffice 时仍可编辑和组装文件，工具会明确报告未完成视觉检查。
+
+只读 Docker 容器需要可写的 `/tmp`，例如 `--tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777`；部署脚本已提供该挂载。LibreOffice 的 Unix 进程通信文件使用 `/tmp`，仅设置 `TMPDIR` 无法代替它。Office 配置、缓存和输出另行放在本次任务临时目录；转换错误会保留 LibreOffice 的诊断输出。
 
 ## 执行部署
 
@@ -150,7 +154,7 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 | `BOT_INDEX_TTL_MINUTES` | 5 分钟 | 1–1440 分钟，活跃会话每轮检查 |
 | `BOT_INDEX_MAX_FILES` | 50000 | 100–1000000 |
 | `BOT_INDEX_MAX_DEPTH` | 12 | 1–64 |
-| `BOT_DOCUMENT_ENV` | 自动选择 | 指定已配置解析环境；否则使用就绪的项目 .venv 或本群 venv |
+| `BOT_DOCUMENT_ENV` | 每群独立 venv | 留空使用本群 venv；显式填写才让所有群共享指定环境 |
 | `BOT_DOCUMENT_WORK_ENABLED` | `1` | 文档加工模块开关；`0` 同时关闭 skill、四个编辑/预览工具及模块提示词，重启生效；基础解析和发文件保留 |
 
 ### 数据目录

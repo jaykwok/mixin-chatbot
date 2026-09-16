@@ -304,31 +304,45 @@ def office_binary():
     return next((p for p in candidates if p and Path(p).is_file()), None)
 
 
+def convert_office(source, folder):
+    package(source)
+    binary = office_binary()
+    if not binary:
+        raise ValueError("缺少 LibreOffice，无法渲染 Office 预览；安装后将 soffice 加入 PATH，Windows 也支持标准安装目录。文件编辑能力仍可用，不能声称已完成视觉检查。")
+    profile = folder / "office-profile"
+    (profile / "user").mkdir(parents=True)
+    # Dedicated profile isolates concurrent conversions and disables macro execution.
+    (profile / "user/registrymodifications.xcu").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
+        '<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item></oor:items>', encoding="utf-8")
+    env = {**os.environ}
+    for key, name in (("HOME", "office-home"), ("XDG_CONFIG_HOME", "office-config"),
+                      ("XDG_CACHE_HOME", "office-cache"), ("XDG_DATA_HOME", "office-data")):
+        path = folder / name
+        path.mkdir()
+        env[key] = str(path)
+    env.update(TMPDIR=str(folder), TMP=str(folder), TEMP=str(folder))
+    # Unix IPC still requires writable /tmp (TMPDIR does not redirect it).
+    # Keep stderr/stdout: CalledProcessError alone hides the actual Office failure.
+    result = subprocess.run([binary, "-env:UserInstallation=" + profile.as_uri(), "--headless", "--nologo", "--nodefault",
+                             "--norestore", "--convert-to", "pdf", "--outdir", str(folder), str(source)],
+                            timeout=150, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+    diagnostic = (result.stdout + b"\n" + result.stderr).decode("utf-8", errors="replace").strip()[-1400:]
+    if result.returncode != 0:
+        raise ValueError(f"LibreOffice 转换失败（退出码 {result.returncode}）：{diagnostic or '未返回诊断输出'}")
+    pdf = folder / (source.stem + ".pdf")
+    if not pdf.is_file():
+        raise ValueError("LibreOffice 没有生成 PDF，视觉检查未完成：" + (diagnostic or "未返回诊断输出"))
+    return pdf
+
+
 def render(request):
     import pypdfium2 as pdfium
     from PIL import Image, ImageDraw
     source = Path(request["source"])
     folder = Path(request["directory"])
-    pdf = source
-    if source.suffix.lower() != ".pdf":
-        package(source)
-        binary = office_binary()
-        if not binary:
-            raise ValueError("缺少 LibreOffice，无法渲染 Office 预览；安装后将 soffice 加入 PATH，Windows 也支持标准安装目录。文件编辑能力仍可用，不能声称已完成视觉检查。")
-        profile = folder / "office-profile"
-        profile.mkdir()
-        # Dedicated profile isolates concurrent conversions and disables macro execution.
-        (profile / "user").mkdir()
-        (profile / "user/registrymodifications.xcu").write_text(
-            '<?xml version="1.0" encoding="UTF-8"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
-            '<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item></oor:items>', encoding="utf-8")
-        subprocess.run([binary, "-env:UserInstallation=" + profile.as_uri(), "--headless", "--nologo", "--nodefault",
-                        "--norestore", "--convert-to", "pdf", "--outdir", str(folder), str(source)],
-                       check=True, timeout=150, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
-        pdf = folder / (source.stem + ".pdf")
-        if not pdf.is_file():
-            raise ValueError("LibreOffice 没有生成 PDF，视觉检查未完成")
+    pdf = source if source.suffix.lower() == ".pdf" else convert_office(source, folder)
     images, contacts = [], []
     with closing(pdfium.PdfDocument(str(pdf))) as document:
         total = len(document)
