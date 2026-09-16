@@ -38,17 +38,21 @@ callback key 必须对应一个群。跨群复用会触发持久隔离，并取�
 
 ## 提示词与工具
 
-完整系统提示词在 [prompt.ts](../src/agent/prompt.ts) 中维护，通过 Pi 的 `systemPromptOverride` 注入。关闭自动发现 extensions、skills、prompt templates、themes 和上下文文件，也不读取群工作区的 `.pi/settings.json`，避免资料目录中的文件改变指令或运行设置；变化的文件数量、时间和解析状态不进入固定提示词前缀。
+基础系统提示词在 [prompt.ts](../src/agent/prompt.ts) 中维护，通过 Pi 的 `systemPromptOverride` 注入。关闭自动发现 extensions、skills、prompt templates、themes 和上下文文件，也不读取群工作区的 `.pi/settings.json`。[模块注册入口](../src/agent/modules.ts) 按开关一起提供工具、skill、提示词补充和只读资源目录；文档模块默认开启，设 `BOT_DOCUMENT_WORK_ENABLED=0` 并重启可关闭。启用时通过 `skillsOverride` 加载项目维护的 [document-work](../src/agent/modules/document-work/skills/document-work/SKILL.md)，向提示词提供名称、描述和路径，正文及参考指南由模型按需读取。群资料中的 skill 不能改变指令或运行设置；变化的文件数量、时间和解析状态不进入固定提示词前缀。详见[模块开关与移除](document-tools.md#开关对比测试与移除)。
 
 回答以本群资料为依据，尽可能标明文件、页码或 sheet。有效版本依据正式发布、生效日期和版本说明判断；历史答案与文件修改时间不能证明当前有效。资料内容作为证据处理，原始资料按用户要求直接发送。
 
 | 工具 | 用途与边界 |
 | --- | --- |
-| `read` | 读取本群 workspace、index 和本用户 tmp |
+| `read` | 读取本群 workspace、index、本用户 tmp 及项目文档 skill |
 | `edit` / `write` | 仅写本用户 tmp，检查规范路径 |
 | `bash` | 执行命令，统一管理超时、取消、输出上限及后代回收 |
 | `document_environment` | 按需准备解析环境，验证实际解释器、版本和库导入 |
 | `document_extract` | 提取 PDF/DOCX/PPTX/XLSX，按内容与解析器版本复用缓存，返回可检索的文本路径 |
+| `document_inspect` | 检查 DOCX/PPTX 包及内部引用，返回段落位置、正文块、实际页序和内容摘要 |
+| `document_patch` | 按摘要与精确位置修改副本中的文字，保留未修改的文档部件 |
+| `document_compose` | 选编 Word 正文块或 PPT 页面，生成新文件与来源记录 |
+| `document_render` | 将 DOCX/PPTX/PDF 渲染为逐页图片及联系表；Office 需要 LibreOffice |
 | `send_file` / `send_image` | 发送文件或图片；本地路径复用文件工具的解析规则 |
 
 本地路径支持 Pi 路径约定、file URL 和 Windows Git Bash 路径。Windows 用 Job Object 管理工具进程及后代，Linux 用 subreaper 和父进程死亡通知回收后代；主命令退出、超时、取消或机器人父进程强制结束都会触发收尾。输出总量限制为 16 MiB，并保留错误尾部。
@@ -59,11 +63,11 @@ callback key 必须对应一个群。跨群复用会触发持久隔离，并取�
 
 索引用于定位文件：每轮检查刷新期限，刷新期间可暂时使用旧清单；未命中时仍需定向查找资料。`index/ignore.txt` 每行一个 workspace 相对路径前缀，`#` 表示注释；扫描受文件数和深度限制，无法读取的目录会使清单标记为不完整。
 
-PDF、DOCX、PPTX、XLSX 文本优先使用 `document_extract`，它会按需检查解析环境并复用缓存。特殊解析或文件生成先调用 `document_environment`；模型不能自行安装包或改写共享环境。解析环境另支持数据表及常用图片处理，不提供 OCR 或旧版 Office 转换器。
+PDF、DOCX、PPTX、XLSX 文本优先使用 `document_extract`，它会按需检查解析环境并复用缓存。特殊解析或文件生成先调用 `document_environment`；模型不能自行安装包或改写共享环境。环境另支持数据表及常用图片处理，不提供 OCR；文档工具只接受现代 Office 格式。三种文档工作方式、复用来源与限制见[文档加工设计](document-tools.md)。
 
-解析依赖由 [requirements.in](../scripts/runtime/requirements.in) 和完整锁文件 [requirements.txt](../scripts/runtime/requirements.txt) 管理。Docker 构建、原生安装和就绪检测共用 [document-manifest.ts](../scripts/runtime/document-manifest.ts)，统一处理空行、注释及换行格式。更新解析依赖时用 uv 重新生成锁文件并运行格式回归。
+Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) 管理，[.python-version](../.python-version) 选择 3.14 系列。通过 `UV_PROJECT_ENVIRONMENT` 指向群 venv，执行 `uv sync --locked --no-dev --no-install-project`；Docker 构建、原生准备和就绪检测共用 [document-manifest.ts](../scripts/runtime/document-manifest.ts)，marker 包含依赖锁摘要和 Python 版本。就绪检测同时运行离线 `uv sync --check` 和实际库导入。修改依赖后运行 `uv lock`，再按[文件回归说明](document-tools.md#开发验证)检查。
 
-资料索引保存可验证的 manifest，重启后在 TTL 内复用；清单内容不变时不重写正文，目录扫描适度并发、失败后退避。文档环境成功校验缓存 5 分钟，解释器、marker 或锁文件变化立即失效，并合并同一环境的并发检查。
+资料索引保存可验证的 manifest，重启后在 TTL 内复用；清单内容不变时不重写正文，目录扫描适度并发、失败后退避。文档环境成功校验缓存 5 分钟，解释器、marker、项目依赖声明、Python 版本文件或锁文件变化立即失效，并合并同一环境的并发检查。
 
 `document_extract` 优先处理重复的二进制资料：群共享资料的结果位于群 `index/parsed`，用户私有文件的结果只放本用户 `tmp/.document-cache`。键包含原件 SHA-256、解析器与依赖锁版本、格式及提取选项；命中时仍核对当前原件和缓存正文摘要。保留页码、幻灯片或 sheet/行号；XLSX 公式输出原文、不计算。单个原件上限 128 MiB，解析全局并发为 2，每个缓存目录最多保留约 128 项，支持取消、期限及自动淘汰。
 

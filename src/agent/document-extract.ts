@@ -17,7 +17,7 @@ import { isPathInside } from "./paths.ts";
 import { resolveToolPath } from "./tool-path.ts";
 
 const script = fileURLToPath(new URL("../../scripts/runtime/extract_document.py", import.meta.url));
-const lock = fileURLToPath(new URL("../../scripts/runtime/requirements.txt", import.meta.url));
+const lock = fileURLToPath(new URL("../../uv.lock", import.meta.url));
 const MAX_SOURCE_BYTES = 128 * 1024 * 1024;
 const parserSlots = new AsyncSemaphore(2);
 interface Extracted { path: string; digest: string; units: number; truncated: boolean; characters: number; cacheHit: boolean; }

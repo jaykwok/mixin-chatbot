@@ -123,12 +123,12 @@ export const MATERIALS_INDEX_MAX_DEPTH = integerEnv("BOT_INDEX_MAX_DEPTH");
 
 // ===== 文档解析环境 =====
 /**
- * 解析和生成文档的直接依赖，完整依赖锁为 requirements.txt。
+ * 解析和生成文档的直接依赖，完整依赖锁为 uv.lock。
  * 就绪校验包含解释器、锁定版本和导入结果；文件状态未变时可短期复用成功结果。
  * 使用指定环境、预装项目 .venv 或按需准备的群 venv；模型不能修改共享环境。
  */
 export const DOCUMENT_TOOLCHAIN_PACKAGES: readonly string[] = documentPackages(readFileSync(
-  new URL("../../scripts/runtime/requirements.in", import.meta.url), "utf8"
+  new URL("../../pyproject.toml", import.meta.url), "utf8"
 ));
 /** 建环境、装包与验证的总时限（ms）；失败由能力工具明确返回。 */
 export const DOCUMENT_TOOLCHAIN_TIMEOUT = 10 * 60_000;

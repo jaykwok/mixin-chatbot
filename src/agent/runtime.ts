@@ -29,6 +29,7 @@ import { redactSecrets } from "./failure.ts";
 import { openModelRuntime, openSettings, resolveModelSelection } from "../core/model-config.ts";
 import { configureModelCache, type CachePolicy } from "./model-cache.ts";
 import { buildDocumentTool } from "./document-extract.ts";
+import { loadAgentModules } from "./modules.ts";
 import { ModelProgress } from "./model-progress.ts";
 
 // Pi 运行时单例：目录、原生设置的只读快照和选中的模型，全实例共用一份。
@@ -154,21 +155,26 @@ async function createSession(record: SessionRecord, signal: AbortSignal): Promis
   for (const dir of [cwd, tempDir, dirname(history), PI_AGENT_DIR, groupIndexDir(GROUP_DATA_ROOT, record.groupId)]) {
     await mkdir(dir, { recursive: true });
   }
+  const modules = await loadAgentModules({ workspaceDir: cwd, tempDir, indexPath, venvDir,
+    documentWorkEnabled: (runtimeSetting("BOT_DOCUMENT_WORK_ENABLED") ?? RUNTIME_DEFAULTS.BOT_DOCUMENT_WORK_ENABLED) === "1" });
   const resourceLoader = new DefaultResourceLoader({
     cwd, agentDir: resolve(PI_AGENT_DIR), settingsManager,
     noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-    systemPromptOverride: () => buildChatContext({ relayEnabled: !!getRelayConfig() }),
+    skillsOverride: () => modules.skills,
+    systemPromptOverride: () => buildChatContext({ relayEnabled: !!getRelayConfig(), modulePrompt: modules.prompt }),
     appendSystemPromptOverride: () => [],
   });
   await resourceLoader.reload();
   signal.throwIfAborted();
   const localTools = await buildLocalTools({ workspaceDir: cwd, tempDir, phone: record.phone,
-    groupId: record.groupId, venvDir, materialsIndexPath: indexPath });
+    groupId: record.groupId, venvDir, materialsIndexPath: indexPath, resourceReadDirs: modules.readOnlyDirs });
   const { session } = await createAgentSession({
     cwd, agentDir: resolve(PI_AGENT_DIR), modelRuntime: runtime, model, thinkingLevel, settingsManager, resourceLoader,
     sessionManager: SessionManager.open(history, undefined, cwd),
-    tools: ["read", "bash", "edit", "write", "send_image", "send_file", "document_environment", "document_extract"],
-    customTools: [...localTools, buildDocumentTool({ workspaceDir: cwd, tempDir, indexPath, venvDir }), ...buildSendTools({
+    tools: ["read", "bash", "edit", "write", "send_image", "send_file", "document_environment", "document_extract",
+      ...modules.tools.map(tool => tool.name)],
+    customTools: [...localTools, buildDocumentTool({ workspaceDir: cwd, tempDir, indexPath, venvDir }),
+      ...modules.tools, ...buildSendTools({
       getCallbackUrl: () => record.callbackUrl, groupId: record.groupId, workspaceDir: cwd, tempDir,
       relay: getRelayConfig(), notes: record.notes,
     }), {

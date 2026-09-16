@@ -1,12 +1,15 @@
 # Bun 运行时镜像
 FROM ghcr.io/astral-sh/uv:0.11.29 AS uv
 FROM oven/bun:1.4.0-debian
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice-writer libreoffice-impress fonts-noto-cjk fonts-liberation && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_PYTHON_INSTALL_DIR=/opt/python
-COPY scripts/runtime/requirements.in scripts/runtime/requirements.txt scripts/runtime/document-manifest.ts /opt/doc-requirements/
-RUN uv venv --python 3.12.13 /app/.venv && \
-    uv pip sync --python /app/.venv/bin/python /opt/doc-requirements/requirements.txt && \
-    bun /opt/doc-requirements/document-manifest.ts /opt/doc-requirements/requirements.in /app/.venv
+COPY pyproject.toml uv.lock .python-version /opt/doc-environment/
+COPY scripts/runtime/document-manifest.ts /opt/doc-environment/document-manifest.ts
+RUN UV_PROJECT_ENVIRONMENT=/app/.venv uv sync --locked --no-dev --no-install-project --project /opt/doc-environment && \
+    bun /opt/doc-environment/document-manifest.ts /opt/doc-environment /app/.venv
 
 # 非 root 运行用户
 RUN groupadd -r -g 1001 appgroup && \
@@ -16,6 +19,7 @@ WORKDIR /app
 
 # 先装依赖（利用层缓存；.dockerignore 排除本地 node_modules，容器内重装）
 COPY package.json bun.lock ./
+COPY pyproject.toml uv.lock .python-version ./
 COPY scripts/patches ./scripts/patches
 RUN bun install --frozen-lockfile --production
 

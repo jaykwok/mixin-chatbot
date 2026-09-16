@@ -22,21 +22,24 @@ async function venvWithMarker(content: string | null): Promise<string> {
 }
 
 describe("document toolchain readiness", () => {
-  test("image marker generation accepts comments and whitespace exactly like runtime readiness", async () => {
+  test("image marker records the locked project and Python series", async () => {
     const root = await mkdtemp(join(tmpdir(), "document-manifest-"));
-    const requirements = join(root, "requirements.in");
-    const contents = "# direct parser dependencies\r\n\r\n z-package==2.0 \r\n  # a comment\r\n a-package==1.0\r\n\r\n";
+    const requirements = join(root, "pyproject.toml");
+    const contents = '# dependencies\r\n[project]\r\ndependencies = ["z-package==2.0", "a-package==1.0"]\r\n';
     await writeFile(requirements, contents);
+    await writeFile(join(root, "uv.lock"), "version = 1\n");
+    await writeFile(join(root, ".python-version"), "3.14\n");
     const child = Bun.spawn([process.execPath,
-      fileURLToPath(new URL("../../scripts/runtime/document-manifest.ts", import.meta.url)), requirements, root],
+      fileURLToPath(new URL("../../scripts/runtime/document-manifest.ts", import.meta.url)), root, root],
       { cwd: root, stdout: "pipe", stderr: "pipe", windowsHide: true });
     const timer = setTimeout(() => child.kill(), 10000);
     try {
       const [code, err] = await Promise.all([child.exited, new Response(child.stderr).text()]);
       expect(code, err).toBe(0);
       const actual = await readFile(join(root, MARKER), "utf8");
-      expect(actual).toBe("a-package==1.0\nz-package==2.0");
-      expect(actual).toBe(documentMarker(documentPackages(contents)));
+      expect(actual).toBe(documentMarker(documentPackages(contents), "version = 1\n", "3.14"));
+      expect(actual).not.toBe(documentMarker(documentPackages(contents), "version = 2\n", "3.14"));
+      expect(actual).not.toBe(documentMarker(documentPackages(contents), "version = 1\n", "3.12"));
       expect(await readFile(requirements, "utf8")).toBe(contents);
     } finally { clearTimeout(timer); child.kill(); await child.exited; await rm(root, { recursive: true, force: true }); }
   });

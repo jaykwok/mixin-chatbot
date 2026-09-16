@@ -270,6 +270,8 @@ export interface LocalToolsOptions {
   venvDir: string;
   /** 资料索引文件路径；所在目录对 read 只读放行。 */
   materialsIndexPath: string;
+  /** Enabled modules may expose application-owned instructions for read only. */
+  resourceReadDirs?: string[];
 }
 
 /** Pi 官方工具工厂 + 本项目的 workspace/tmp 边界和调用者环境。 */
@@ -280,7 +282,7 @@ export async function buildLocalTools(
   const indexPath = resolve(options.materialsIndexPath);
   const guard = await AllowedPathGuard.create(
     [tempDir],
-    [cwd, dirname(indexPath)]
+    [cwd, dirname(indexPath), ...(options.resourceReadDirs ?? [])]
   );
   const readOperations = {
     readFile: async (path: string) => readFile(await guard.readable(path)),

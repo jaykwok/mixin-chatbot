@@ -56,3 +56,8 @@ jobs:
           docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/backup:/app/backup" -v "$PWD/tests:/app/tests:ro" \
             mixin-chatbot-check bun run test tests/core/process.test.ts
+      - name: Test editable documents and Office previews in the restricted image
+        run: |
+          docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/tests:/app/tests:ro" \
+            mixin-chatbot-check bun run tests/helpers/document-work-integration.ts /app/.venv --office

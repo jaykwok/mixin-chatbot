@@ -40,6 +40,9 @@ const groups: { label: string; description: string; options: RuntimeOption[] }[]
     ] },
   ] },
   { label: "文档与诊断", description: "文档解析环境与机器人详细日志", options: [
+    { key: "BOT_DOCUMENT_WORK_ENABLED", label: "文档加工模块", description: "统一启停文档 skill、编辑/组装/渲染工具及其提示词；基础检索、解析和原文件发送仍可用。应用后重启生效。", choices: [
+      { value: "1", label: "开启" }, { value: "0", label: "关闭" },
+    ] },
     { key: "BOT_DOCUMENT_ENV", label: "文档解析环境", description: "指定已配置的虚拟环境目录；默认自动选择就绪的项目 .venv 或本群环境。Linux 填容器内路径。" },
     { key: "BOT_DEBUG", label: "机器人详细日志", description: "开启后机器人日志会记录用户消息正文，分享前请脱敏。与 Cloudflared 日志分别控制。", choices: [
       { value: "0", label: "关闭" }, { value: "1", label: "开启" },

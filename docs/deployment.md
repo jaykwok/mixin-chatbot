@@ -12,14 +12,33 @@
 
 | 方式 | 主机要求 | 文档解析环境 |
 | --- | --- | --- |
-| Windows 原生 | Bun 1.4.0+、Git for Windows 的 GNU Bash、原生 `uv.exe`；管理员 PowerShell 部署 | 首次解析按需准备 |
-| Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；当前用户需可运行 Docker，直连模式需要 UFW 及 root / sudo 权限 | 镜像预装 Python 3.12.13 和固定版本解析库 |
+| Windows 原生 | Bun 1.4.0+、Git for Windows 的 GNU Bash、原生 `uv.exe`；管理员 PowerShell 部署 | Python 3.14 群 venv 按需准备；Word/PPT 预览另需 LibreOffice |
+| Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；当前用户需可运行 Docker，直连模式需要 UFW 及 root / sudo 权限 | 镜像预装 Python 3.14、锁定的文档库、LibreOffice 和中文字体 |
 
 Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。Docker 的配置向导与应用运行在镜像内，宿主机无需额外安装 Bun；若使用[运维界面](tui.md#运维界面)，则需在宿主机安装 Bun 1.4.0+。
 
 基础组件通过官方渠道安装：[Bun](https://bun.sh/docs/installation)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Docker Engine（Debian）](https://docs.docker.com/engine/install/debian/)。
 
 Cloudflare 模式会自动将官方 `cloudflared` 下载到项目根目录（Windows 为 `cloudflared.exe`，Linux 为 `cloudflared`），校验 SHA-256 后使用；已有可运行的根目录副本会直接复用。域名需先接入 Cloudflare DNS 并激活，再配置机器人子域名和隧道公开路由。隧道 token 从 Cloudflare 控制台获取，部署时可直接粘贴 token、填写文件路径，或预先保存到 `data/config/cloudflared-token` 后留空读取。输入会隐藏，默认输入与运行凭据统一使用这个文件。完整步骤见[隧道托管](operations.md#隧道托管)。
+
+### Python 与文档预览
+
+Python 小版本范围固定为 `>=3.14,<3.15`，补丁版本由 uv 选择；依赖及传递依赖由 `uv.lock` 锁定。原生部署沿用每群 `venv/` 按需准备的机制；显式配置 `BOT_DOCUMENT_ENV` 或已有带就绪标记的项目 `.venv` 时沿用该环境选择方式。旧 Python 3.12 环境在下次使用文档功能时由 uv 按新配置重建，因此首次任务可能需要联网下载 Python 和依赖。生成文件保留在用户 tmp，venv 只存工具依赖。
+
+通常无需手工同步。需要预热某个群时，停止服务，在项目根目录执行（将路径换成实际群目录）：
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = (Join-Path $PWD 'data/groups/<group>/venv')
+uv sync --locked --no-dev --no-install-project
+if ($LASTEXITCODE -eq 0) {
+    bun scripts/runtime/document-manifest.ts . $env:UV_PROJECT_ENVIRONMENT
+}
+Remove-Item Env:UV_PROJECT_ENVIRONMENT
+```
+
+Linux 的同等操作为 `UV_PROJECT_ENVIRONMENT=/absolute/group/venv uv sync --locked --no-dev --no-install-project`，成功后运行 `bun scripts/runtime/document-manifest.ts . /absolute/group/venv`。marker 只记录预期配置，运行时仍验证实际解释器、依赖及导入。
+
+Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffice.org/download/download-libreoffice/)安装，并将 `soffice` 加入服务账户的 PATH；工具也识别 `Program Files/LibreOffice/program/soffice.exe`。使用便携目录时将其 `program` 目录加入 PATH，变更后重启服务。PDF 预览直接使用 Python 库。预览字体取自运行主机，建议安装与客户模板一致的字体；Docker 提供 Noto CJK。缺少 LibreOffice 时仍可编辑和组装文件，工具会明确报告未完成视觉检查。
 
 ## 执行部署
 
@@ -132,6 +151,7 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 | `BOT_INDEX_MAX_FILES` | 50000 | 100–1000000 |
 | `BOT_INDEX_MAX_DEPTH` | 12 | 1–64 |
 | `BOT_DOCUMENT_ENV` | 自动选择 | 指定已配置解析环境；否则使用就绪的项目 .venv 或本群 venv |
+| `BOT_DOCUMENT_WORK_ENABLED` | `1` | 文档加工模块开关；`0` 同时关闭 skill、四个编辑/预览工具及模块提示词，重启生效；基础解析和发文件保留 |
 
 ### 数据目录
 

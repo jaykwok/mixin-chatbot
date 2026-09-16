@@ -182,6 +182,25 @@ test("运行参数在 TUI 校验和预览，确认前不写草稿；保存通过
   }
 });
 
+test("文档模块开关默认开启，选择关闭后只保存对应运行参数", async () => {
+  const { app, choices } = stub(), view = new SettingsView();
+  const read = spyOn(data, "loadRuntimeSettings").mockResolvedValue(snapshot);
+  const write = spyOn(settings, "writeRuntimeDraft").mockResolvedValue("module-draft");
+  const discard = spyOn(settings, "discardRuntimeDraft").mockResolvedValue();
+  const run = spyOn(app, "run").mockResolvedValue(0);
+  try {
+    await view.onKey(key("a"), app); await view.refresh(app);
+    await view.onKey(key("end"), app); await view.onKey(key("enter"), app);
+    expect(plain(view.render(ctx()))).toContain("文档加工模块");
+    expect(plain(view.render(ctx()))).toContain("开启（默认）");
+    choices.push("edit", "0");
+    await view.onKey(key("enter"), app);
+    expect(plain(view.render(ctx()))).toContain("关闭（待保存）");
+    await view.onKey(key("s"), app);
+    expect(write.mock.calls[0]!.slice(0, 2)).toEqual([snapshot, { BOT_DOCUMENT_WORK_ENABLED: "0" }]);
+  } finally { view.onLeave(); read.mockRestore(); write.mockRestore(); discard.mockRestore(); run.mockRestore(); }
+});
+
 test("分类、默认值和开关在宽窄窗口完整可达；退出 TUI 前提醒未保存草稿", async () => {
   const { app, choices } = stub(), view = new SettingsView(), tty = terminal();
   const read = spyOn(data, "loadRuntimeSettings").mockResolvedValue({ hash: null, values: { BOT_DEBUG: "1" } });

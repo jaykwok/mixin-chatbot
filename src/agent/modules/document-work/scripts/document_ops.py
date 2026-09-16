@@ -1,0 +1,378 @@
+"""Local Office operations. Requests and outputs are scoped by the module's tools.ts."""
+import hashlib
+import json
+import math
+import os
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
+from contextlib import closing
+from pathlib import Path
+from urllib.parse import unquote
+
+from lxml import etree
+
+NS = {
+    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+}
+MAX_FILE = 128 * 1024 * 1024
+
+
+def xml(data):
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)
+    root = etree.fromstring(data, parser)
+    if root.getroottree().docinfo.doctype:
+        raise ValueError("不支持包含 DTD 的 Office XML")
+    return root
+
+
+def digest(path):
+    with open(path, "rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def relationship_target(name, target):
+    target = unquote(target.split("#")[0])
+    owner_dir = posixpath.dirname(posixpath.dirname(name))
+    if not target:
+        return posixpath.join(owner_dir, posixpath.basename(name)[:-5])
+    return posixpath.normpath(target.lstrip("/") if target.startswith("/") else posixpath.join(owner_dir, target))
+
+
+def package(path, *, prune_unused_tags=False):
+    if Path(path).stat().st_size > MAX_FILE:
+        raise ValueError("原文件超过 128 MiB")
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+        if len(infos) > 20000 or sum(i.file_size for i in infos) > 256 * 1024 * 1024:
+            raise ValueError("Office 解压大小或条目数超过上限")
+        names = [i.filename for i in infos]
+        if len(names) != len(set(names)) or any(n.startswith("/") or ".." in n.split("/") or "\\" in n for n in names):
+            raise ValueError("Office 包含重复或无效部件路径")
+        data = {i.filename: archive.read(i) for i in infos if not i.is_dir()}
+    if "[Content_Types].xml" not in data or "_rels/.rels" not in data:
+        raise ValueError("缺少 Office 包元数据")
+    removed_tags = 0
+    if prune_unused_tags:
+        # pptx-automizer removes p:custDataLst but, with cleanup disabled,
+        # leaves its tag relationships behind without copying their parts.
+        # Remove only these now-unused metadata relationships. Referenced tags
+        # and all other missing targets must still fail normal validation.
+        for name, content in list(data.items()):
+            if not name.endswith(".rels"):
+                continue
+            owner = posixpath.join(posixpath.dirname(posixpath.dirname(name)), posixpath.basename(name)[:-5])
+            if owner not in data or not owner.endswith(".xml"):
+                continue
+            used = {value for node in xml(data[owner]).iter() for key, value in node.attrib.items()
+                    if key.startswith("{" + NS["r"] + "}")}
+            relationships = xml(content)
+            stale = [node for node in relationships if node.get("Type") == NS["r"] + "/tags"
+                     and node.get("TargetMode") != "External" and node.get("Id") not in used]
+            for node in stale:
+                relationships.remove(node)
+            if stale:
+                data[name] = etree.tostring(relationships, encoding="UTF-8", xml_declaration=True)
+                removed_tags += len(stale)
+    # Check internal targets without fetching external resources or extracting archives.
+    external = 0
+    for name, content in data.items():
+        if name.endswith(".xml") or name.endswith(".rels"):
+            root = xml(content)
+            if not name.endswith(".rels"):
+                continue
+            for relationship in root:
+                if relationship.get("TargetMode") == "External":
+                    external += 1
+                    continue
+                resolved = relationship_target(name, relationship.get("Target", ""))
+                if resolved not in data:
+                    raise ValueError("Office 内部引用缺失：" + name + " -> " + resolved)
+    warnings = [f"包含 {external} 个外部关联，未访问或验证其内容"] if external else []
+    if removed_tags:
+        warnings.append(f"已清理 {removed_tags} 个未被页面引用的自定义标签关联；组装器不保留这些非视觉元数据")
+    return data, warnings
+
+
+def paragraphs(root, kind):
+    return root.findall(".//" + ("w:p" if kind == "docx" else "a:p"), NS)
+
+
+def paragraph_nodes(paragraph):
+    # Text boxes can contain their own paragraphs inside a Word paragraph.
+    # Those have separate locations in the inspection and must not be edited twice.
+    pending = [paragraph]
+    while pending:
+        node = pending.pop()
+        if node is not paragraph and node.tag in ("{" + NS["w"] + "}p", "{" + NS["a"] + "}p"):
+            continue
+        yield node
+        pending.extend(reversed(node))
+
+
+def visible_text(paragraph):
+    pieces = []
+    for node in paragraph_nodes(paragraph):
+        if node.tag in ("{" + NS["w"] + "}t", "{" + NS["a"] + "}t"):
+            pieces.append(node.text or "")
+        elif node.tag == "{" + NS["w"] + "}tab":
+            pieces.append("\t")
+        elif node.tag in ("{" + NS["w"] + "}br", "{" + NS["w"] + "}cr", "{" + NS["a"] + "}br"):
+            pieces.append("\n")
+    return "".join(pieces)
+
+
+def editable_part(name, kind):
+    if kind == "docx":
+        return re.fullmatch(r"word/(document|header\d+|footer\d+|footnotes|endnotes)\.xml", name)
+    return re.fullmatch(r"ppt/(slides/slide\d+|notesSlides/notesSlide\d+)\.xml", name)
+
+
+def inspect(path):
+    kind = Path(path).suffix.lower().lstrip(".")
+    if kind not in ("docx", "pptx"):
+        raise ValueError("结构检查支持 DOCX/PPTX")
+    data, warnings = package(path)
+    result = {"format": kind, "digest": digest(path), "warnings": warnings, "paragraphs": [], "truncated": False}
+    chars = 0
+    for part in sorted(data):
+        if not editable_part(part, kind):
+            continue
+        for index, paragraph in enumerate(paragraphs(xml(data[part]), kind), 1):
+            text = visible_text(paragraph)
+            if chars + len(text) > 500000 or len(result["paragraphs"]) >= 15000:
+                result["truncated"] = True
+                break
+            result["paragraphs"].append({"part": part, "paragraph": index, "text": text})
+            chars += len(text)
+    if kind == "docx":
+        body = xml(data["word/document.xml"]).find("w:body", NS)
+        blocks = [n for n in body if n.tag != "{" + NS["w"] + "}sectPr"]
+        result["blocks"] = [{"block": i, "type": etree.QName(n).localname,
+                             "text": " ".join(n.xpath(".//w:t/text()", namespaces=NS))[:400]}
+                            for i, n in enumerate(blocks, 1)]
+    else:
+        presentation = xml(data["ppt/presentation.xml"])
+        rels = {r.get("Id"): r.get("Target") for r in xml(data["ppt/_rels/presentation.xml.rels"])}
+        size = presentation.find("p:sldSz", NS)
+        result["size"] = {"width": int(size.get("cx")), "height": int(size.get("cy"))}
+        result["slides"] = []
+        for i, item in enumerate(presentation.findall("p:sldIdLst/p:sldId", NS), 1):
+            target = rels[item.get("{" + NS["r"] + "}id")]
+            part = posixpath.normpath(target.lstrip("/") if target.startswith("/") else posixpath.join("ppt", target))
+            match = re.fullmatch(r"ppt/slides/slide(\d+)\.xml", part)
+            if not match:
+                raise ValueError("不支持非标准幻灯片部件名：" + part)
+            result["slides"].append({"page": i, "part": part, "slideFile": int(match.group(1)),
+                                     "hidden": xml(data[part]).get("show") in ("0", "false")})
+    return result
+
+
+def replace_text(paragraph, before, after):
+    if not before or any(c in before + after for c in "\r\n\t"):
+        raise ValueError("替换要求非空原文字，且不跨换行或制表符；结构修改请使用专门脚本")
+    if paragraph.xpath(".//w:fldChar | .//w:fldSimple | .//w:instrText | .//w:ins | .//w:del | .//a:fld | ancestor::w:ins | ancestor::w:del | ancestor::w:fldSimple", namespaces=NS):
+        raise ValueError("该段含域或修订记录，需专门处理")
+    text = visible_text(paragraph)
+    if text.count(before) != 1:
+        raise ValueError("原文字必须在目标段落中恰好出现一次；请重新检查文件并精确定位")
+    start, end = text.index(before), text.index(before) + len(before)
+    position, inserted = 0, False
+    for node in paragraph_nodes(paragraph):
+        if node.tag in ("{" + NS["w"] + "}t", "{" + NS["a"] + "}t"):
+            value = node.text or ""
+            stop = position + len(value)
+            if position < end and stop > start:
+                left, right = max(0, start - position), min(len(value), end - position)
+                node.text = value[:left] + (after if not inserted else "") + value[right:]
+                node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                inserted = True
+            position = stop
+        elif node.tag in ("{" + NS["w"] + "}tab", "{" + NS["w"] + "}br", "{" + NS["w"] + "}cr", "{" + NS["a"] + "}br"):
+            position += 1
+    if not inserted:
+        raise ValueError("未找到可修改文字")
+
+
+def patch(request):
+    source, output = request["source"], request["output"]
+    if digest(source) != request["digest"]:
+        raise ValueError("原文件已变化，请重新 document_inspect")
+    kind = Path(source).suffix.lower().lstrip(".")
+    data, _ = package(source)
+    changed = {}
+    for edit in request["edits"]:
+        part = edit["part"]
+        if not editable_part(part, kind) or part not in data:
+            raise ValueError("不支持该编辑部件")
+        root = changed.setdefault(part, xml(data[part]))
+        items = paragraphs(root, kind)
+        number = edit["paragraph"]
+        if not isinstance(number, int) or not 1 <= number <= len(items):
+            raise ValueError("段落位置不存在")
+        replace_text(items[number - 1], edit["before"], edit["after"])
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED) as target:
+        for item in original.infolist():
+            payload = etree.tostring(changed[item.filename], encoding="UTF-8", xml_declaration=True, standalone=True) if item.filename in changed else original.read(item)
+            target.writestr(item, payload)
+    result = inspect(output)
+    result["changedParts"] = list(changed)
+    return result
+
+
+def compose_word(request):
+    from docx import Document
+    from docxcompose.composer import Composer
+    composer = None
+    for item in request["items"]:
+        package(item["source"])
+        document = Document(item["source"])
+        body = document.element.body
+        blocks = [n for n in body if n.tag != "{" + NS["w"] + "}sectPr"]
+        start, end = item.get("start", 1), item.get("end", len(blocks))
+        if not blocks or not 1 <= start <= end <= len(blocks):
+            raise ValueError("Word 章节范围不存在")
+        for index, block in enumerate(blocks, 1):
+            if not start <= index <= end:
+                body.remove(block)
+        if composer is None:
+            composer = Composer(document)
+        else:
+            composer.append(document)
+    composer.save(request["output"])
+    return inspect(request["output"])
+
+
+def finalize_slides(request):
+    """Keep the assembled deck's reachable parts; preserve chart/media relations."""
+    data, warnings = package(request["source"], prune_unused_tags=True)
+    presentation = xml(data["ppt/presentation.xml"])
+    active_ids = {n.get("{" + NS["r"] + "}id") for n in presentation.findall("p:sldIdLst/p:sldId", NS)}
+    relname = "ppt/_rels/presentation.xml.rels"
+    relationships = xml(data[relname])
+    active_parts = set()
+    for node in list(relationships):
+        if node.get("Type", "").endswith("/slide"):
+            if node.get("Id") in active_ids:
+                active_parts.add(relationship_target(relname, node.get("Target")))
+            else:
+                relationships.remove(node)
+    data[relname] = etree.tostring(relationships, encoding="UTF-8", xml_declaration=True)
+    keep, pending = {"[Content_Types].xml"}, ["_rels/.rels"]
+    while pending:
+        part = pending.pop()
+        if part in keep:
+            continue
+        keep.add(part)
+        if part.endswith(".rels"):
+            for node in xml(data[part]):
+                if node.get("TargetMode") != "External":
+                    pending.append(relationship_target(part, node.get("Target", "")))
+        else:
+            rel = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
+            if rel in data:
+                pending.append(rel)
+    extra_slides = {p for p in keep if re.fullmatch(r"ppt/slides/slide\d+\.xml", p)} - active_parts
+    if extra_slides:
+        raise ValueError("选中页面仍引用未选取页面；请处理跨页链接后重新组装")
+    types = xml(data["[Content_Types].xml"])
+    for node in list(types):
+        if node.get("PartName") and unquote(node.get("PartName")).lstrip("/") not in keep:
+            types.remove(node)
+    data["[Content_Types].xml"] = etree.tostring(types, encoding="UTF-8", xml_declaration=True)
+    with zipfile.ZipFile(request["output"], "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        for part in sorted(keep):
+            archive.writestr(part, data[part])
+    result = inspect(request["output"])
+    result["warnings"] = list(dict.fromkeys(result["warnings"] + warnings))
+    return result
+
+
+def office_binary():
+    candidates = [shutil.which("soffice"), shutil.which("libreoffice")]
+    if os.name == "nt":
+        for folder in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+            if folder:
+                candidates.append(str(Path(folder) / "LibreOffice/program/soffice.exe"))
+    return next((p for p in candidates if p and Path(p).is_file()), None)
+
+
+def render(request):
+    import pypdfium2 as pdfium
+    from PIL import Image, ImageDraw
+    source = Path(request["source"])
+    folder = Path(request["directory"])
+    pdf = source
+    if source.suffix.lower() != ".pdf":
+        package(source)
+        binary = office_binary()
+        if not binary:
+            raise ValueError("缺少 LibreOffice，无法渲染 Office 预览；安装后将 soffice 加入 PATH，Windows 也支持标准安装目录。文件编辑能力仍可用，不能声称已完成视觉检查。")
+        profile = folder / "office-profile"
+        profile.mkdir()
+        # Dedicated profile isolates concurrent conversions and disables macro execution.
+        (profile / "user").mkdir()
+        (profile / "user/registrymodifications.xcu").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
+            '<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item></oor:items>', encoding="utf-8")
+        subprocess.run([binary, "-env:UserInstallation=" + profile.as_uri(), "--headless", "--nologo", "--nodefault",
+                        "--norestore", "--convert-to", "pdf", "--outdir", str(folder), str(source)],
+                       check=True, timeout=150, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+        pdf = folder / (source.stem + ".pdf")
+        if not pdf.is_file():
+            raise ValueError("LibreOffice 没有生成 PDF，视觉检查未完成")
+    images, contacts = [], []
+    with closing(pdfium.PdfDocument(str(pdf))) as document:
+        total = len(document)
+        selected = request.get("pages") or list(range(1, min(total, 20) + 1))
+        if not selected or len(selected) > 50 or any(not isinstance(i, int) or not 1 <= i <= total for i in selected):
+            raise ValueError("预览页码越界，单次最多 50 页")
+        selected = list(dict.fromkeys(selected))
+        thumbs = []
+        for number in selected:
+            with closing(document[number - 1]) as page:
+                scale = min(1.5, 1800 / max(page.get_size()))
+                with closing(page.render(scale=scale)) as bitmap:
+                    picture = bitmap.to_pil().convert("RGB")
+                    path = folder / f"page-{number:04}.png"
+                    picture.save(path)
+                    images.append({"page": number, "path": str(path)})
+                    picture.thumbnail((440, 300))
+                    tile = Image.new("RGB", (460, 335), "#eef1f5")
+                    tile.paste(picture, ((460 - picture.width) // 2, 25))
+                    ImageDraw.Draw(tile).text((10, 7), str(number), fill="black")
+                    thumbs.append(tile)
+                    picture.close()
+        for start in range(0, len(thumbs), 12):
+            batch = thumbs[start:start + 12]
+            contact = Image.new("RGB", (460 * min(3, len(batch)), 335 * math.ceil(len(batch) / 3)), "white")
+            for offset, thumb in enumerate(batch):
+                contact.paste(thumb, ((offset % 3) * 460, (offset // 3) * 335))
+                thumb.close()
+            path = folder / f"contact-{start // 12 + 1}.jpg"
+            contact.save(path, quality=88)
+            contact.close()
+            contacts.append(str(path))
+    return {"pdf": str(pdf), "pages": total, "images": images, "contacts": contacts,
+            "unrenderedPages": [i for i in range(1, total + 1) if i not in selected], "visuallyReviewed": False}
+
+
+def main():
+    operation, request_path, result_path = sys.argv[1:]
+    request = json.loads(Path(request_path).read_text(encoding="utf-8"))
+    handlers = {"inspect": lambda r: inspect(r["source"]), "patch": patch, "compose_word": compose_word,
+                "finalize_slides": finalize_slides, "render": render}
+    result = handlers[operation](request)
+    Path(result_path).write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

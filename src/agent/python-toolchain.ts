@@ -6,10 +6,12 @@ import { DOCUMENT_TOOLCHAIN_PACKAGES, DOCUMENT_TOOLCHAIN_TIMEOUT } from "../core
 import { KeyedQueue, application, waitFor } from "../core/lifecycle.ts";
 import { runProcess } from "../core/process.ts";
 import { log } from "../core/log.ts";
-import { DOCUMENT_TOOLCHAIN_MARKER, documentMarker, documentPackages } from "../../scripts/runtime/document-manifest.ts";
+import { DOCUMENT_TOOLCHAIN_MARKER, documentMarker } from "../../scripts/runtime/document-manifest.ts";
 
-const expected = async () => documentMarker(DOCUMENT_TOOLCHAIN_PACKAGES, await readFile(requirements, "utf8"));
-const requirements = fileURLToPath(new URL("../../scripts/runtime/requirements.txt", import.meta.url));
+const project = fileURLToPath(new URL("../../", import.meta.url));
+const lock = join(project, "uv.lock"), manifest = join(project, "pyproject.toml"), pythonPin = join(project, ".python-version");
+const pythonVersion = async () => (await readFile(pythonPin, "utf8")).trim();
+const expected = async () => documentMarker(DOCUMENT_TOOLCHAIN_PACKAGES, await readFile(lock, "utf8"), await pythonVersion());
 const provisioning = new KeyedQueue();
 const verified = new Map<string, { fingerprint: string; at: number }>();
 interface Check { promise: Promise<boolean>; controller: AbortController; consumers: number; done: boolean; }
@@ -17,7 +19,7 @@ const checking = new Map<string, Check>();
 const READY_TTL = 5 * 60_000;
 
 async function fingerprint(venvDir: string): Promise<string> {
-  const paths = [venvPythonPath(venvDir), join(venvDir, DOCUMENT_TOOLCHAIN_MARKER), requirements];
+  const paths = [venvPythonPath(venvDir), join(venvDir, DOCUMENT_TOOLCHAIN_MARKER), lock, manifest, pythonPin];
   const metadata = await Promise.all(paths.map(async path => {
     const info = await stat(path);
     if (!info.isFile()) throw new Error("文档环境文件缺失");
@@ -45,18 +47,18 @@ function uvPath(): string {
 }
 
 async function verify(venvDir: string, signal?: AbortSignal): Promise<boolean> {
-  const packages = documentPackages(await readFile(requirements, "utf8")).filter(line => {
-    const marker = line.split(";")[1]?.trim();
-    if (!marker) return true;
-    if (!/^sys_platform == '[a-z0-9_]+'(?: or sys_platform == '[a-z0-9_]+')*$/.test(marker)) throw new Error("不支持的文档锁文件环境标记");
-    return [...marker.matchAll(/'([a-z0-9_]+)'/g)].some(match => match[1] === process.platform);
-  }).map(line => line.split(";")[0]!.trim());
-  const code = "import importlib.metadata as m; expected=" + JSON.stringify(packages) +
-    "; assert all(m.version(p.split('==')[0]) == p.split('==')[1] for p in expected); import pptx, docx, openpyxl, pypdf, pandas, numpy, dateutil, xlsxwriter, PIL";
-  const result = await runProcess({ command: uvPath(),
-    args: ["run", "--no-project", "--no-python-downloads", "--python", venvPythonPath(venvDir), "-c", code],
+  const env = { ...await toolchainEnv(), VIRTUAL_ENV: resolve(venvDir), UV_PROJECT_ENVIRONMENT: resolve(venvDir) };
+  // Check the complete platform-specific lock resolution, including transitive dependencies.
+  const check = await runProcess({ command: uvPath(),
+    args: ["sync", "--check", "--locked", "--offline", "--no-python-downloads", "--no-dev", "--no-install-project", "--project", project, "--python", await pythonVersion()],
+    cwd: process.cwd(), timeoutMs: 30000, signal, env });
+  if (check.exitCode !== 0) return false;
+  const pin = await pythonVersion();
+  const code = "import sys; assert '.'.join(map(str,sys.version_info[:" + pin.split(".").length + "])) == " + JSON.stringify(pin) +
+    "; import pptx, docx, openpyxl, pypdf, pandas, numpy, dateutil, xlsxwriter, PIL, docxcompose, pypdfium2, lxml";
+  const result = await runProcess({ command: venvPythonPath(venvDir), args: ["-c", code],
     cwd: process.cwd(), timeoutMs: 30000, signal,
-    env: { ...await toolchainEnv(), VIRTUAL_ENV: resolve(venvDir), UV_PROJECT_ENVIRONMENT: resolve(venvDir) },
+    env,
   });
   return result.exitCode === 0;
 }
@@ -105,14 +107,10 @@ export async function ensureDocumentToolchain(venvDir: string, signal?: AbortSig
     if (await documentToolchainReady(target, budget)) return true;
     verified.delete(target);
     const uv = uvPath();
-    const env = await toolchainEnv();
-    for (const args of [
-      ["venv", "--allow-existing", "--python", "3.12.13", target],
-      ["pip", "sync", "--python", venvPythonPath(target), requirements],
-    ]) {
-      const result = await runProcess({ command: uv, args, cwd: process.cwd(), env, signal: budget, timeoutMs: DOCUMENT_TOOLCHAIN_TIMEOUT });
-      if (result.exitCode !== 0) { log.warn("文档环境准备失败: " + result.output.slice(-1000)); return false; }
-    }
+    const env = { ...await toolchainEnv(), VIRTUAL_ENV: target, UV_PROJECT_ENVIRONMENT: target };
+    const args = ["sync", "--locked", "--no-dev", "--no-install-project", "--project", project, "--python", await pythonVersion()];
+    const result = await runProcess({ command: uv, args, cwd: process.cwd(), env, signal: budget, timeoutMs: DOCUMENT_TOOLCHAIN_TIMEOUT });
+    if (result.exitCode !== 0) { log.warn("文档环境准备失败: " + result.output.slice(-1000)); return false; }
     if (!await verify(target, budget)) return false;
     await writeFile(join(target, DOCUMENT_TOOLCHAIN_MARKER), await expected(), "utf8");
     verified.set(target, { fingerprint: await fingerprint(target), at: Date.now() });

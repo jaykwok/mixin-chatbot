@@ -27,6 +27,7 @@
     "fs-extra": "11.4.0",
     "hono": "4.13.7",
     "marked": "18.0.5",
+    "pptx-automizer": "0.9.3",
     "proper-lockfile": "4.1.2"
   },
   "devDependencies": {
@@ -38,6 +39,7 @@
   },
   "overrides": {
     "brace-expansion": "5.0.9",
+    "image-size": "2.0.4",
     "smol-toml": "1.8.0"
   },
   "patchedDependencies": {

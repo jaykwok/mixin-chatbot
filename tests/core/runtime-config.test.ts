@@ -13,11 +13,15 @@ test("runtime settings retain previous values and validate explicit overrides", 
     await saveRuntimeSettings(path, { BOT_BASH_TIMEOUT: "456", BOT_DEBUG: "1", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "240", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "540", API_KEY: "must-not-copy" });
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ BOT_BASH_TIMEOUT: "456", BOT_INDEX_MAX_DEPTH: "4", BOT_DEBUG: "1", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "240", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "540" });
     await saveRuntimeSettings(path, { BOT_DEBUG: "0" });
+    await saveRuntimeSettings(path, { BOT_DOCUMENT_WORK_ENABLED: "0" });
+    expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_DOCUMENT_WORK_ENABLED", "0");
     expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_MODEL_IDLE_TIMEOUT_SECONDS", "240");
     expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_MODEL_RESPONSE_TIMEOUT_SECONDS", "540");
     for (const value of [{ BOT_DEBUG: "yes" }, { BOT_SHUTDOWN_TIMEOUT_SECONDS: 999 }, { BOT_HOST: "https://host" }, { UNUSED: "1" }]) {
       expect(() => validateRuntimeConfig(value)).toThrow();
     }
+    for (const value of [0, 1, "0", "1"]) expect(validateRuntimeConfig({ BOT_DOCUMENT_WORK_ENABLED: value })).toHaveProperty("BOT_DOCUMENT_WORK_ENABLED", String(value));
+    for (const value of ["yes", "false", true, 2, -1]) expect(() => validateRuntimeConfig({ BOT_DOCUMENT_WORK_ENABLED: value })).toThrow();
     for (const key of ["BOT_MODEL_IDLE_TIMEOUT_SECONDS", "BOT_MODEL_RESPONSE_TIMEOUT_SECONDS"] as const) {
       for (const value of [0, 9, 7201, 10.5, "abc"]) expect(() => validateRuntimeConfig({ [key]: value })).toThrow();
       for (const value of [10, 180, 600, 7200]) expect(validateRuntimeConfig({ [key]: value })).toHaveProperty(key, String(value));

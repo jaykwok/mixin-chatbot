@@ -5,6 +5,9 @@ import { mock } from "bun:test";
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 const sdk = await import("@earendil-works/pi-coding-agent");
 const [kind, policy] = process.argv.slice(2);
+const documentWorkEnabled = kind !== "document-work-disabled";
+delete process.env.BOT_DOCUMENT_WORK_ENABLED;
+if (!documentWorkEnabled) process.env.BOT_DOCUMENT_WORK_ENABLED = "0";
 delete process.env.PI_CACHE_RETENTION;
 process.env.BOT_MODEL_CACHE_RETENTION = policy;
 if (kind === "sdk-env") process.env.PI_CACHE_RETENTION = "long";
@@ -26,6 +29,12 @@ mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
     liveRuntime = await createRuntime({ ...options, credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(), refreshOnCreate: false });
     const realStream = liveRuntime.streamSimple.bind(liveRuntime);
     liveRuntime.streamSimple = (model: any, context: any, streamOptions: any) => {
+      if (context.systemPrompt) {
+        assert.equal(context.systemPrompt.includes("<name>document-work</name>"), documentWorkEnabled);
+        assert.equal(context.systemPrompt.includes("SKILL.md"), documentWorkEnabled);
+        assert.equal(context.systemPrompt.includes("## 文档加工"), documentWorkEnabled);
+        assert.ok(!context.systemPrompt.includes("底稿提供结构，当前正式资料提供事实"), "skill body must load on demand");
+      }
       forwarded.push({ cacheRetention: streamOptions?.cacheRetention, sessionId: streamOptions?.sessionId });
       return realStream(model, context, { ...streamOptions, apiKey: "fixture-only", maxRetries: 0,
         onPayload(body: any) { payloads.push(body); throw new Error("captured before HTTP"); } });
@@ -46,6 +55,12 @@ try {
     await assert.rejects(runtime.handleUserMessage("user", "group", text, "https://im.zdxlz.com/im-external/v1/webhook/send?key=fixture"), /captured before HTTP/);
   }
   assert.equal(payloads.length, 2);
+  for (const name of ["document_inspect", "document_patch", "document_compose", "document_render"]) {
+    assert.equal(payloads[0].tools.some((tool: any) => tool.name === name), documentWorkEnabled, "module tool visibility: " + name);
+  }
+  for (const name of ["document_extract", "document_environment", "send_file", "send_image"]) {
+    assert.ok(payloads[0].tools.some((tool: any) => tool.name === name), "base tool missing: " + name);
+  }
   assert.equal(forwarded[0].cacheRetention, policy === "auto" ? undefined : policy);
   assert.ok(forwarded[0].sessionId);
   assert.equal(forwarded[0].sessionId, forwarded[1].sessionId);

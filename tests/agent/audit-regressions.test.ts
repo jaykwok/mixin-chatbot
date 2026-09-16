@@ -15,7 +15,7 @@ test.each(["runtime", "legacy-schema"])("audit counterexamples and startup schem
   } finally { clearTimeout(timer); child.kill(); await child.exited; await fixture.cleanup(); }
 }, 25000);
 
-test.each([["astra", "auto"], ["zai", "auto"], ["astra", "long"], ["legacy", "long"], ["sdk-env", "auto"]])(
+test.each([["astra", "auto"], ["zai", "auto"], ["astra", "long"], ["legacy", "long"], ["sdk-env", "auto"], ["document-work-disabled", "auto"]])(
   "production cache policy %s/%s preserves SDK semantics without network calls", async (kind, policy) => {
     const fixture = await tempFixture("cache-payload-");
     const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../helpers/cache-payload-harness.ts", import.meta.url)), kind!, policy!], {

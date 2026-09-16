@@ -60,6 +60,10 @@ else {
       await fixture.assertStopped();
       const { host } = await fixture.pids();
       await waitFor(async () => !await alive(host), `${mode} 查询宿主退出`, 5000);
+    } catch (error) {
+      try { child.kill("SIGKILL"); } catch {}
+      await child.exited;
+      throw new Error(`${mode} UI shutdown fixture failed:\n${await stdout}${await stderr}`, { cause: error });
     } finally {
       try { child.kill("SIGKILL"); } catch {}
       await child.exited;
