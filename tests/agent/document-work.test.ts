@@ -28,7 +28,7 @@ describe("project document resources", () => {
         skillsOverride: () => resources.skills });
       await loader.reload();
       expect(loader.getSkills().skills.map(s => s.name)).toEqual(enabled ? ["document-work"] : []);
-      expect(resources.tools.map(t => t.name)).toEqual(enabled ? ["document_inspect", "document_patch", "document_compose", "document_render"] : []);
+      expect(resources.tools.map(t => t.name)).toEqual(enabled ? ["document_inspect", "document_patch", "document_compose", "document_build", "document_render", "document_images"] : []);
       const prompt = buildChatContext({ relayEnabled: false, modulePrompt: resources.prompt });
       expect(prompt.includes("document-work")).toBe(enabled);
       expect(prompt).toContain("document_extract");
@@ -80,6 +80,12 @@ describe("project document resources", () => {
       await expect(call("document_inspect", { source: foreign })).rejects.toThrow("本群");
       await expect(call("document_render", { source: foreign })).rejects.toThrow("本群");
       await expect(call("document_compose", { items: [{ source: foreign }] })).rejects.toThrow("本群");
+      await expect(call("document_build", { format: "docx", template: foreign, content: "# x" })).rejects.toThrow("本群");
+      const foreignImage = join(other, "p.png");
+      await writeFile(foreignImage, "png");
+      await expect(call("document_build", { format: "pptx", content: "# x\n\n![图](" + foreignImage.replaceAll("\\", "/") + ")" })).rejects.toThrow("本群");
+      await expect(call("document_build", { format: "pptx", content: "# x", keepSlides: [1] })).rejects.toThrow("模板");
+      await expect(call("document_compose", { items: [{ content: "# 无文件来源" }] })).rejects.toThrow("第一项");
       const source = join(workspace, "source.docx");
       await writeFile(source, "unchanged");
       await expect(call("document_patch", { source, digest: "0".repeat(64), edits: [

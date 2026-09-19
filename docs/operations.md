@@ -273,7 +273,7 @@ Windows 修改已安装的服务需要管理员权限。连接器必须使用当
 
 ## 配置可选的大文件外链
 
-运行 `bun run tui`，进入 **系统 → 设置 → 外链配置**；已有外链的查看与清理在 **数据 → 外链**。部署向导只提示配置入口，不要求填写外链配置。基础设置为 WebDAV 上传目录、指向同一目录的公开下载地址，以及可选认证；高级设置可调整文件上限、有效期和 Alist / OpenList 兼容签名。
+运行 `bun run tui`，进入 **系统 → 设置 → 外链配置**；已有外链的查看与清理在 **数据 → 外链**。部署向导只提示配置入口，不要求填写外链配置。基础设置为 WebDAV 上传目录、指向同一目录的公开下载地址，以及可选认证；高级设置可调整文件上限、有效期和 [OpenList](https://github.com/OpenListTeam/OpenList) 兼容签名。
 
 填写时保持机器人运行，密码与签名密钥隐藏输入，已有密码可留空沿用。向导先展示保存预览；确认后才停止原本运行中的机器人，复用启动校验来提交 `data/config/relay.json`，随后恢复运行并检查本地健康。原本停止的服务保持停止，取消不修改配置也不停机。Windows 前台实例若没有计划任务可供恢复，须先手动停止再配置；Linux 使用已部署镜像内的 Bun 和依赖。
 
@@ -285,17 +285,17 @@ Windows 修改已安装的服务需要管理员权限。连接器必须使用当
 
 下载验证应使用完整的带签名链接。部分网盘直链拒绝 `HEAD`，但允许正常的 `GET` 下载；机器人在 `HEAD` 无法核验文件大小时，会从公开链接重新发起 `Range: bytes=0-0` 的 GET 请求，核对响应中的文件总大小后取消响应体。无法确认大小的错误响应仍会阻止交付。
 
-排查时分别查看公开域名和最终网盘域名的状态码。若公开域名返回 302、最终 OSS 直链对 HEAD 返回 403，而同一链接的 GET 成功，应检查最终响应的 `x-oss-ec`：例如 `0002-00000201` 表示 [OSS V4 签名不匹配](https://help.aliyun.com/zh/oss/user-guide/0002-00000201)。[OSS 签名包含 HTTP 请求方法](https://help.aliyun.com/zh/oss/developer-reference/recommend-to-use-signature-version-4)，按 GET 签发的下载链接不能直接改用 HEAD 验证；它与机器人公开链接中的 Alist `sign` 是两层签名。
+排查时分别查看公开域名和最终网盘域名的状态码。若公开域名返回 302、最终 OSS 直链对 HEAD 返回 403，而同一链接的 GET 成功，应检查最终响应的 `x-oss-ec`：例如 `0002-00000201` 表示 [OSS V4 签名不匹配](https://help.aliyun.com/zh/oss/user-guide/0002-00000201)。[OSS 签名包含 HTTP 请求方法](https://help.aliyun.com/zh/oss/developer-reference/recommend-to-use-signature-version-4)，按 GET 签发的下载链接不能直接改用 HEAD 验证；它与机器人公开链接中的 [OpenList](https://github.com/OpenListTeam/OpenList) `sign` 是两层签名。
 
 公开链接保留原始文件名及扩展名。若链接会跳转到网盘，浏览器采用的下载名称还取决于最终响应的 `Content-Disposition`；中文文件名应由后端通过 `filename*=UTF-8''...` 返回。排查时同时检查最终下载响应和浏览器保存的名称。
 
-### Alist 与 Cloudflare 子域名示例
+### [OpenList](https://github.com/OpenListTeam/OpenList) 与 Cloudflare 子域名示例
 
-以 Alist 监听本机 `5244` 端口、对外挂载路径为 `/relay`、文件子域名为 `files.example.com` 为例。以下 `5244` 均需替换为 Alist 实际监听端口；外链设置会保留填写的端口：
+以 [OpenList](https://github.com/OpenListTeam/OpenList) 监听本机 `5244` 端口、对外挂载路径为 `/relay`、文件子域名为 `files.example.com` 为例。以下 `5244` 均需替换为 [OpenList](https://github.com/OpenListTeam/OpenList) 实际监听端口；外链设置会保留填写的端口：
 
-1. 在 Alist 中挂载支持上传、建目录和删除的存储，挂载路径填 `/relay`。这里指 Alist 对外展示的虚拟路径；它也可以是某个挂载下的子目录，例如 `/网盘/relay`，不必和磁盘物理目录同名。示例账号基本路径为 `/`，需有该目录的 **WebDAV 读取、WebDAV 管理、创建目录或上传、删除** 权限。使用受限账号时，以该账号实际可访问的 WebDAV 目录为准，确保它与公开下载地址映射到同一存储目录。
-2. 按[隧道托管](#隧道托管)的方式，将根域名 `example.com` 的 DNS 接入 Cloudflare 并等待激活。在已有 Cloudflared 隧道中新增 **Published application** 路由：子域名 `files`、域名 `example.com`，Path 留空，服务类型选 **HTTP**，URL 填 `127.0.0.1:5244`（完整服务地址为 `http://127.0.0.1:5244`）。这里的服务地址应从运行连接器的位置可达；机器人与 Alist 使用各自的子域名和路由。
-3. 在 **系统 → 设置 → 外链配置** 中，上传地址填写到 Alist 挂载目录，例如 `127.0.0.1:5244/dav/relay`，此处挂载目录为 `relay`。公开下载项可以只填文件域名，向导会推导对应目录。DNS 和隧道路由在 Cloudflare 控制台完成；外链向导只保存机器人配置。
+1. 在 [OpenList](https://github.com/OpenListTeam/OpenList) 中挂载支持上传、建目录和删除的存储，挂载路径填 `/relay`。这里指 [OpenList](https://github.com/OpenListTeam/OpenList) 对外展示的虚拟路径；它也可以是某个挂载下的子目录，例如 `/网盘/relay`，不必和磁盘物理目录同名。示例账号基本路径为 `/`，需有该目录的 **WebDAV 读取、WebDAV 管理、创建目录或上传、删除** 权限。使用受限账号时，以该账号实际可访问的 WebDAV 目录为准，确保它与公开下载地址映射到同一存储目录。
+2. 按[隧道托管](#隧道托管)的方式，将根域名 `example.com` 的 DNS 接入 Cloudflare 并等待激活。在已有 Cloudflared 隧道中新增 **Published application** 路由：子域名 `files`、域名 `example.com`，Path 留空，服务类型选 **HTTP**，URL 填 `127.0.0.1:5244`（完整服务地址为 `http://127.0.0.1:5244`）。这里的服务地址应从运行连接器的位置可达；机器人与 [OpenList](https://github.com/OpenListTeam/OpenList) 使用各自的子域名和路由。
+3. 在 **系统 → 设置 → 外链配置** 中，上传地址填写到 [OpenList](https://github.com/OpenListTeam/OpenList) 挂载目录，例如 `127.0.0.1:5244/dav/relay`，此处挂载目录为 `relay`。公开下载项可以只填文件域名，向导会推导对应目录。DNS 和隧道路由在 Cloudflare 控制台完成；外链向导只保存机器人配置。
 
 | 用途 | 完整地址 | 向导也接受的输入 |
 | --- | --- | --- |
@@ -304,15 +304,15 @@ Windows 修改已安装的服务需要管理员权限。连接器必须使用当
 
 `/dav/` 是 WebDAV 入口，`/d/` 是下载入口，后面均接实际挂载目录。例如上传地址填 `127.0.0.1:5244/dav/网盘/relay`，公开下载只填 `files.example.com`，即可推导为 `https://files.example.com/d/网盘/relay/`；向导会将中文路径编码为有效 URL。
 
-只填域名、带协议的域名或末尾带 `/` 的域名时，均从上传地址的 `/dav/` 后提取挂载目录，拼到下载域名的 `/d/` 下。若已填写完整下载目录（例如 `https://files.example.com/custom/relay/`），则保留填写的目录。自动推导仅识别标准 Alist 上传路径；其他 WebDAV 后端、反代子路径或不同的目录映射，请填写实际公开下载地址。
+只填域名、带协议的域名或末尾带 `/` 的域名时，均从上传地址的 `/dav/` 后提取挂载目录，拼到下载域名的 `/d/` 下。若已填写完整下载目录（例如 `https://files.example.com/custom/relay/`），则保留填写的目录。自动推导仅识别标准 [OpenList](https://github.com/OpenListTeam/OpenList) 上传路径；其他 WebDAV 后端、反代子路径或不同的目录映射，请填写实际公开下载地址。
 
 浏览页面地址 `http://127.0.0.1:5244/relay/` 可帮助确认挂载路径，但上传时应使用 `/dav/relay/`，公开下载时使用 `/d/relay/`。不要把已生成文件的 `<日期>-<UUID>/<文件名>` 或 `?sign=...` 填进目录配置。
 
 省略协议时，WebDAV 的 `localhost`、回环及私有 IP 自动补 `http://`；其余地址（包括公开下载目录）自动补 `https://`。显式填写的 HTTP/HTTPS 会保留，末尾 `/` 自动补齐，保存预览可核对最终地址；配置文件始终保存完整 URL。
 
-隧道源站使用 `127.0.0.1` 的前提是连接器能通过本机 IPv4 回环访问 Alist；上传地址使用 `127.0.0.1` 的前提是机器人能通过该地址访问 Alist。在其他主机或独立容器网络中，两者分别填写连接器、机器人实际可达的 Alist 地址和端口。公开下载需要填写接收者能访问的域名。Alist 若对该目录开启签名，需在高级设置中配置匹配的签名密钥和规则。
+隧道源站使用 `127.0.0.1` 的前提是连接器能通过本机 IPv4 回环访问 [OpenList](https://github.com/OpenListTeam/OpenList)；上传地址使用 `127.0.0.1` 的前提是机器人能通过该地址访问 [OpenList](https://github.com/OpenListTeam/OpenList)。在其他主机或独立容器网络中，两者分别填写连接器、机器人实际可达的 [OpenList](https://github.com/OpenListTeam/OpenList) 地址和端口。公开下载需要填写接收者能访问的域名。[OpenList](https://github.com/OpenListTeam/OpenList) 若对该目录开启签名，需在高级设置中配置匹配的签名密钥和规则。
 
-路径及权限依据：[Alist WebDAV 文档](https://alistgo.com/zh/guide/webdav.html)、[挂载路径说明](https://alistgo.com/zh/guide/drivers/common.html#挂载路径)、[官方下载路由](https://github.com/alist-org/alist/blob/main/server/router.go)。
+路径及权限依据：[WebDAV 文档](https://doc.oplist.org/guide/advanced/webdav)、[挂载路径说明](https://doc.oplist.org/guide/drivers/common#挂载路径)、[官方下载路由](https://github.com/OpenListTeam/OpenList/blob/main/server/router.go)。
 
 ## 重新配置模型
 

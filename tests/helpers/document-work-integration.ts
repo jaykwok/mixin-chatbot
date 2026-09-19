@@ -60,14 +60,77 @@ await assert.rejects(call("document_compose", { items: [{ source: "source.pptx",
 await assert.rejects(call("document_patch", { source: "source.docx", digest: word.digest, edits: [
   { part: customer.part, paragraph: customer.paragraph, before: "原件不存在的文字", after: "不应修改" },
 ] }), /恰好出现一次/);
+// Outline, Markdown builds on fixture templates and inline content inside compose.
+const outline = await call("document_inspect", { source: "source.pptx", outline: true });
+const wordOutline = await call("document_inspect", { source: "source.docx", outline: true });
+const markdown = [
+  "# 客户交流目标", "本次交流围绕 **OpenClaw 安全接入** 展开：", "", "- 现状与风险", "  - 二级要点", "- 试点范围", "", "> 依据：正式产品资料 2026-09 版", "",
+  "## 组件与适用场景", "| 场景 | 组件 | 前提 |", "|---|---|:--:|", "| 个人使用 | 小卫士 | 可装客户端 |", "| 私有化 | 安全大脑 | 独立资源池 |", "",
+  "## 架构示意", '![产品架构](product.png "width=6cm")', "说明文字与图片同页。", "<!-- notes: 讲稿：强调试点先行 -->", "",
+  "## 附录：长文", "很长的一段说明文字用于测试自动续页与字号调整。".repeat(120),
+].join("\n");
+const wordBuild = await call("document_build", { format: "docx", template: "source.docx", content: markdown, title: "客户交流说明", subtitle: "客户交流版", filename: "模板成稿.docx" });
+const wordDefault = await call("document_build", { format: "docx", content: markdown, title: "默认版式" });
+const slideBuild = await call("document_build", { format: "pptx", template: "source.pptx", content: markdown, title: "交流方案", subtitle: "面向客户", keepSlides: [1, 3], sequence: [1, "content", 3], filename: "模板成稿.pptx" });
+const slideDefault = await call("document_build", { format: "pptx", content: markdown, title: "默认版式", cover: false });
+const slideInline = await call("document_compose", { filename: "选编加新页.pptx", items: [
+  { source: "source.pptx", slides: [2] }, { content: "## 新增页面\n- 要点一\n- 要点二\n\n| A | B |\n|---|---|\n| 1 | 2 |" }, { source: "supplement.pptx", slides: [1] },
+] });
+const wordInline = await call("document_compose", { filename: "章节加新章.docx", items: [
+  { source: "source.docx", start: 1, end: 2 }, { content: "# 补充章节\n1. 第一步\n2. 第二步\n\n![图](product.png)" },
+] });
+await assert.rejects(call("document_compose", { items: [{ content: "# 无文件" }] }), /第一项/);
+await assert.rejects(call("document_build", { format: "pptx", template: "source.docx", content: "# x" }), /格式/);
+await assert.rejects(call("document_build", { format: "pptx", template: "source.pptx", content: "# x", keepSlides: [9] }), /页码不存在/);
+await assert.rejects(call("document_build", { format: "pptx", template: "source.pptx", content: "# x", keepSlides: [1], sequence: [2, "content"] }), /keepSlides/);
+// Automatic and explicit card / timeline layouts, plus image assets pulled out of PDF, PPT and Word.
+const layoutMarkdown = [
+  "## 三层防护", "围绕三个层面建立防护。", "", "### 终端侧", "- 客户端", "- 行为监控", "", "### 网络侧", "流量识别与阻断。", "", "### 平台侧", "集中分析。", "",
+  "## 实施安排", "1. 第一阶段：调研与试点范围确认", "2. 第二阶段：试点部署", "3. 第三阶段：全量推广", "",
+  "## 关键能力", "<!-- cards -->", "- 资产识别：自动发现实例", "- 风险检测：覆盖 12 类风险", "- 审计溯源：完整记录调用链", "",
+  "## 保持列表", "<!-- plain -->", "1. 第一阶段：调研", "2. 第二阶段：部署", "3. 第三阶段：推广", "",
+  "## 无法分段", "<!-- timeline -->", "只有一段文字，没有分段。", "",
+  "## 实施流程", "调研评估 → 方案设计 → 试点部署 → 全量推广", "",
+  "## 带图标的流程", "<!-- flow -->", "- 🔍 资产识别：自动发现实例", "- 🛡️ 风险检测：覆盖 12 类风险", "- ⚙️ 策略管控：按部门下发策略", "",
+  "## 防护体系架构", "### 应用层", "- 客户端", "- 控制台", "### 平台层", "- 安全大脑", "- 策略中心", "- 情报", "### 基础设施层", "资源池与现网防火墙。", "",
+  "## 关键指标", "- 135000+：公网暴露实例", "- 512：审计发现漏洞", "- 24h：预警响应时间", "",
+  "## 运营闭环", "<!-- cycle -->", "- 监测：持续发现", "- 分析：研判", "- 处置：阻断", "- 复盘：优化", "",
+  "## 能力成熟度", "<!-- pyramid -->", "### 智能防护", "自适应策略", "### 基础防护", "资产识别、审计留痕", "",
+  "## 带图标的卡片", "### ⭐ 资产识别", "自动发现实例。", "### 风险检测", "![](product.png)", "覆盖 12 类风险。", "",
+  "## 处理流程", "收到告警后按下图处置。", "", "```mermaid", "flowchart TB", "  S([收到告警]) --> A[初判]", "  A --> B{是否高危?}", "  B -- 是 --> C[立即阻断]",
+  "  B -- 否 --> D[进入队列]", "  C --> E([结束])", "  D --> E", "  E -.-> A", "```", "",
+  "## 无法解析", "```mermaid", "A -->", "```", "",
+  "## 图片分层", "<!-- layers -->", "### 应用层", "![](product.png)", "客户端。", "### 平台层", "![](product.png)", "安全大脑。",
+].join("\n");
+const layoutBuild = await call("document_build", { format: "pptx", template: "source.pptx", content: layoutMarkdown, title: "布局", cover: false, filename: "布局.pptx" });
+// Edge cases: inherited headers, links to dropped template pages, explicit line breaks, tall table rows, image filters.
+const sectionsBuild = await call("document_build", { format: "docx", template: "sections.docx", content: "# 新标题\n\n新正文。", filename: "多节.docx" });
+const linkedBuild = await call("document_build", { format: "pptx", template: "linked.pptx", content: "## 新页\n内容", cover: false, keepSlides: [1, 3], sequence: [1, "content", 3], filename: "链接.pptx" });
+const longCell = "这是一段很长的说明文字，用来验证单元格换行后的表格分页是否按实际高度计算，而不是按固定行高。".repeat(2);
+const overflowBuild = await call("document_build", { format: "pptx", content: [
+  "## 逐行文字", Array.from({ length: 40 }, (_, i) => `第 ${i + 1} 行`).join("  \n"), "",
+  "## 长表格", "| 项目 | 说明 |", "|---|---|", `| 首行较长的项目名称用于验证列宽跨页固定 | ${longCell} |`,
+  ...Array.from({ length: 9 }, (_, i) => `| 项目${i + 2} | ${longCell} |`),
+].join("\n"), cover: false, filename: "溢出.pptx" });
+const shapeImages = await call("document_images", { source: "shapes.pptx" });
+const filteredImages = await call("document_images", { source: "shapes.pptx", minSize: 1000 });
+const bigImages = await call("document_images", { source: "big.pptx" });
+const wordFlow = await call("document_build", { format: "docx", template: "source.docx", filename: "流程.docx", title: "流程",
+  content: "# 处理流程\n\n```mermaid\nflowchart TB\n  A([开始]) --> B{通过?}\n  B -- 是 --> C([结束])\n  B -- 否 --> A\n```\n\n后续说明。" });
+const pdfImages = await call("document_images", { source: "figure.pdf", crops: [{ page: 1, box: [0.1, 0.1, 0.6, 0.9] }] });
+const deckImages = await call("document_images", { source: "source.pptx", pages: [1, 2, 3] });
+const wordImages = await call("document_images", { source: "source.docx" });
+await assert.rejects(call("document_images", { source: "figure.pdf", pages: [9] }), /页码/);
 const preview = await call("document_render", { source: "pages.pdf", pages: [22, 1, 2] });
 const officePreviews: unknown[] = [];
 if (process.argv.includes("--office")) {
-  for (const source of [wordCompose.output, pptPatch.output, "客户方案.docx", "补充页面.pptx"]) {
+  for (const source of [wordCompose.output, pptPatch.output, wordBuild.output, slideBuild.output, slideInline.output, layoutBuild.output, overflowBuild.output]) {
     officePreviews.push(await call("document_render", { source }));
   }
 }
-const results = { wordPatch, wordCompose, wordSelection, pptCompose, pptPatch, pptPatchPart: pptPart, preview, officePreviews, sourceDigests };
+const results = { wordPatch, wordCompose, wordSelection, pptCompose, pptPatch, pptPatchPart: pptPart, preview, officePreviews, sourceDigests,
+  outline, wordOutline, wordBuild, wordDefault, slideBuild, slideDefault, slideInline, wordInline, layoutBuild, pdfImages, deckImages, wordImages, wordFlow,
+  sectionsBuild, linkedBuild, overflowBuild, shapeImages, filteredImages, bigImages };
 const report = join(root, "results.json");
 await writeFile(report, JSON.stringify(results, null, 2));
 console.log(await python("check", workspace, report));

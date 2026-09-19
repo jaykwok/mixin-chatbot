@@ -1,29 +1,40 @@
 ---
 name: document-work
-description: 基于本群资料修改 Word、选编和修改 PPT，或整合多份资料生成可编辑的客户方案、交付文档和问题处理报告。查询资料或发送原件时无需使用。
+description: 基于本群资料修改 Word、选编和修改 PPT，或在产品资料和模板的版式上生成新的客户方案、交付文档和问题处理报告。查询资料或发送原件时无需使用。
 ---
 
 # 文档加工
 
-根据用户的读者、用途和修改范围选择底稿及输出结构。优先复用适用的原文、原页、原图；结构、素材选择、编辑路径由你决定。简单修改可直接进行，复杂组装才需要简短的章节或页面编排清单，无需为常规编辑逐步请求确认。
+四类任务，各有一条主路径；先判断属于哪类，再读对应指南。
 
-底稿提供结构，当前正式资料提供事实，模板提供样式；三者可以来自不同文件。旧客户方案中的参数、客户信息和承诺需要重新核对。新增内容尽量融入底稿，用户要求统一模板时按该模板调整。缺少品牌模板时采用清晰、克制的版式。
+| 任务 | 主路径 | 指南 |
+| --- | --- | --- |
+| 改几处文字，保留原版式 | `document_inspect` 定位 → `document_patch` 改副本 | [word.md](references/word.md) · [slides.md](references/slides.md) |
+| 从已有资料选页 / 选章节 | `document_inspect(outline)` 选 → `document_compose` 组装 | 同上 |
+| 在资料和模板基础上写新内容 | 用 Markdown 写内容 → `document_build` 或 `document_compose` 的 `content` 项；需要原图时先 `document_images` 取素材 | [build.md](references/build.md) |
+| 规划方案、交付文档、问题报告的内容 | 按读者要回答的问题组织，再走上面三条路径 | [content.md](references/content.md) |
 
-原始资料、历史方案和模板都从本群 `workspace` 按需检索，不要求独立的素材目录或固定文件夹名称。文件刚替换时重新核对当前文件；生成稿、编排记录和预览放当前用户临时目录，继续改稿时可以复用这些成品。
+底稿提供结构，当前正式资料提供事实，模板提供样式；三者可来自不同文件，都从本群 `workspace` 检索。旧客户方案中的参数、客户名和承诺必须重新核对。
 
-## 按需使用
+## 工作原则
 
-- 修改已有文件：`document_inspect` 获取可定位的内容和文件摘要，`document_patch` 在副本上替换指定文字。保留未修改的文档部件；无需把整份文档转为纯文本重建。
-- 选编章节或页面：`document_compose` 按给定顺序组装。Word 以第一份材料为主文档，PPT 保留来源页面的母版。工具会返回来源记录，便于核对和后续修改。
-- 新增或重新组织内容：先调用 `document_environment`，再用固定 Python 环境及已有库生成 Word/PPT，或生成补充文件后组装。指南中的示例是可调整的起点。
-- 检查成品：`document_inspect` 核对文字、顺序和结构，`document_render` 生成页面预览。用 `read` 查看返回的图片，检查溢出、遮挡、断表、残留客户信息及图片缺失。渲染失败或模型不能看图时，如实说明未完成视觉检查。
+- **先看大纲再选材**。`document_inspect` 加 `outline: true` 返回 PPT 每页标题、文字量、图片与表格数，以及 Word 标题层级和可用样式；用它决定复用哪几页、以哪份文件为模板，不要通读全部段落。
+- **复用优先于重写**。原页、原图、原表能直接用就用 `slides` / `start,end` 选进来；只有资料里没有的内容才用 Markdown 新写。新写内容放在 `content` 项里，工具会按第一份来源的母版和样式排版；页内 `###` 短段自动成多栏卡片，“层”结尾的小节成分层架构图，箭头串成流程图，阶段式列表成时间轴，数字标签成指标；循环图、金字塔用注释指定；带判断和回退的流程图写 ```` ```mermaid ```` 代码块。资料里的架构图、流程图用 `document_images` 提取或按区域截取后在 Markdown 中引用。
+- **一次组装成稿**。`document_compose` 的 `items` 可以混合 `{source, slides}`、`{source, start, end}` 和 `{content}`，输出一个文件和完整来源记录。不要先生成补充文件再二次组装。
+- **成品要看图**。生成或修改后调用 `document_render`，用 `read` 读联系表和需要放大的单页，检查溢出、遮挡、断表、占位文字、旧客户名和图片缺失。`build.attention` 列出的页优先检查。渲染失败或不能看图时如实说明未完成视觉检查。
+- **只写自己的临时目录**。所有工具只读资料、在当前用户 tmp 生成新文件；继续改稿以最近一次成品为底稿，操作前重新 `document_inspect` 取新摘要。
 
-工具只读资料，在当前用户临时目录生成新文件。后续修改以最近一次成品为底稿；操作前重新检查文件，使用其摘要避免改到已变化的内容。
+## 工具速查
 
-## 参考资料
+| 工具 | 用途 | 关键参数 |
+| --- | --- | --- |
+| `document_inspect` | 结构清单、摘要、大纲 | `outline: true` |
+| `document_patch` | 副本内精确替换文字 | `digest`、`part`、`paragraph`、`before`、`after` |
+| `document_compose` | 选编 + 新增内容组装 | `items[]`：`source`+`slides` / `start`,`end` / `content` |
+| `document_build` | 按模板整份生成 | `format`、`template`、`content`、`title`、`keepSlides`、`sequence` |
+| `document_images` | 从 PDF/PPT/Word 提取图片素材或按区域截图 | `source`、`pages`、`crops` |
+| `document_render` | 渲染逐页图片与联系表 | `pages` |
 
-- [Word 操作与新建示例](references/word.md)：Word 局改、章节复用或成稿时读取。
-- [PPT 操作与新建示例](references/slides.md)：选页、改页、补页或成稿时读取。
-- [业务内容与交付检查](references/content.md)：需要规划方案、交付文档或问题报告时参考，可按任务裁剪。
+对现有页面加流程图，或需要和原页对齐的定制图示，先调用 `document_environment`，在固定环境运行本 skill 目录下的 `scripts/flowchart.py`，或用 python-docx / python-pptx 写针对性脚本处理副本；指南里有起点示例。
 
-交付可编辑文件，简要说明实际改动、主要来源和待确认项。文件发送仍使用 `send_file`；来源记录和预览用于核对，按用户需要提供。
+交付可编辑文件，简要说明改了什么、主要来源和待确认项。文件用 `send_file` 发送；来源记录和预览用于核对，按需提供。

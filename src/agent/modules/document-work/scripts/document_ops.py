@@ -135,7 +135,7 @@ def editable_part(name, kind):
     return re.fullmatch(r"ppt/(slides/slide\d+|notesSlides/notesSlide\d+)\.xml", name)
 
 
-def inspect(path):
+def inspect(path, outline=False):
     kind = Path(path).suffix.lower().lstrip(".")
     if kind not in ("docx", "pptx"):
         raise ValueError("结构检查支持 DOCX/PPTX")
@@ -172,6 +172,9 @@ def inspect(path):
                 raise ValueError("不支持非标准幻灯片部件名：" + part)
             result["slides"].append({"page": i, "part": part, "slideFile": int(match.group(1)),
                                      "hidden": xml(data[part]).get("show") in ("0", "false")})
+    if outline:
+        import document_build
+        result["outline"] = document_build.outline(path, kind)
     return result
 
 
@@ -379,11 +382,196 @@ def render(request):
             "unrenderedPages": [i for i in range(1, total + 1) if i not in selected], "visuallyReviewed": False}
 
 
+def build(request):
+    import document_build
+    for path in [request.get("template"), *request.get("assets", {}).values()]:
+        if path and Path(path).suffix.lower() in (".docx", ".pptx"):
+            package(path)
+    result = document_build.build(request)
+    inspection = inspect(request["output"])
+    inspection["build"] = result
+    inspection["warnings"] = list(dict.fromkeys(inspection["warnings"] + result.pop("warnings", [])))
+    return inspection
+
+
+RASTER_TYPES = {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"}
+MAX_IMAGE_EDGE = 2000
+
+
+def images(request):
+    """Extract embedded raster images (and optional cropped page regions) as reusable assets."""
+    import hashlib
+    import io
+    from PIL import Image
+    source = Path(request["source"])
+    folder = Path(request["directory"]) / "images"
+    folder.mkdir()
+    kind = source.suffix.lower()
+    min_side = max(16, int(request.get("minSize") or 96))
+    crops = request.get("crops") or []
+    if len(crops) > 20:
+        raise ValueError("单次最多截取 20 个区域")
+    results, warnings, unsupported = [], [], []
+    skipped = {"small": 0, "repeated": 0, "unsupported": 0}
+    seen = {}
+
+    def clamp(value):
+        return round(min(1.0, max(0.0, value)), 4)
+
+    def record(picture, page, box, name, extra=None):
+        # Pixel-size and page-share filters apply to every source; icons drawn at a few percent of the page
+        # are noise for reuse even when their pixel size is large.
+        if min(picture.size) < min_side or (box and (box[2] - box[0]) < 0.03 and (box[3] - box[1]) < 0.05):
+            skipped["small"] += 1
+            picture.close()
+            return
+        # Exact content match: a thumbnail signature would merge different shapes on transparent backgrounds.
+        signature = (picture.size, hashlib.sha1(picture.convert("RGBA").tobytes()).hexdigest())
+        if signature in seen:
+            entry = seen[signature]
+            if page not in entry["pages"]:
+                entry["pages"].append(page)
+            skipped["repeated"] += 1
+            return
+        if len(results) >= 60:
+            picture.close()
+            return
+        if max(picture.size) > MAX_IMAGE_EDGE:
+            picture.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE))
+        path = folder / name
+        if picture.mode not in ("RGB", "RGBA", "L"):
+            picture = picture.convert("RGBA" if "A" in picture.mode or "transparency" in picture.info else "RGB")
+        picture.save(path)
+        entry = {"page": page, "pages": [page], "path": str(path), "width": picture.width, "height": picture.height, "box": box,
+                 "fullPage": bool(box and (box[2] - box[0]) * (box[3] - box[1]) >= 0.85), **(extra or {})}
+        results.append(entry)
+        seen[signature] = entry
+        picture.close()
+
+    def page_list(total, cap):
+        selected = request.get("pages")
+        if not selected:
+            selected = list(range(1, min(total, cap) + 1))
+            if total > cap:
+                warnings.append(f"共 {total} 页，默认只处理前 {cap} 页；其余页用 pages 指定，每次最多 50 页")
+        if len(selected) > 50 or any(not isinstance(i, int) or not 1 <= i <= total for i in selected):
+            raise ValueError("页码越界，单次最多 50 页")
+        return list(dict.fromkeys(selected))
+
+    total = 0
+    if kind == ".pdf":
+        import pypdfium2 as pdfium
+        from pypdfium2 import raw
+        with closing(pdfium.PdfDocument(str(source))) as document:
+            total = len(document)
+            selected = page_list(total, 20)
+            for number in selected:
+                with closing(document[number - 1]) as page:
+                    width, height = page.get_size()
+                    for index, obj in enumerate(page.get_objects(filter=(raw.FPDF_PAGEOBJ_IMAGE,), max_depth=4), 1):
+                        px_w, px_h = obj.get_px_size()
+                        if min(px_w, px_h) < min_side:
+                            skipped["small"] += 1
+                            continue
+                        left, bottom, right, top = obj.get_bounds()
+                        box = [clamp(left / width), clamp(1 - top / height), clamp(right / width), clamp(1 - bottom / height)]
+                        try:
+                            bitmap = obj.get_bitmap(render=True)
+                        except Exception as error:  # noqa: BLE001 - unusual colour spaces or broken streams
+                            skipped["unsupported"] += 1
+                            warnings.append(f"第 {number} 页第 {index} 张图片无法解码：{type(error).__name__}")
+                            continue
+                        with closing(bitmap):
+                            record(bitmap.to_pil(), number, box, f"p{number:03}-{index:02}.png")
+    else:
+        package(source)
+        if kind == ".pptx":
+            from pptx import Presentation
+            presentation = Presentation(str(source))
+            total = len(presentation.slides)
+            selected = page_list(total, 50)
+            width, height = presentation.slide_width, presentation.slide_height
+
+            def walk(shapes):
+                for shape in shapes:
+                    if shape.shape_type == 6:
+                        yield from walk(shape.shapes)
+                    elif shape.shape_type == 13:
+                        yield shape
+
+            for number in selected:
+                for index, shape in enumerate(walk(presentation.slides[number - 1].shapes), 1):
+                    image = shape.image
+                    extension = image.ext.lower()
+                    if extension not in RASTER_TYPES:
+                        skipped["unsupported"] += 1
+                        unsupported.append({"page": number, "name": shape.name, "format": extension})
+                        continue
+                    picture = Image.open(io.BytesIO(image.blob))
+                    picture.load()
+                    crop = (shape.crop_left or 0, shape.crop_top or 0, shape.crop_right or 0, shape.crop_bottom or 0)
+                    if any(value > 0 for value in crop):
+                        w, h = picture.size
+                        picture = picture.crop((int(w * crop[0]), int(h * crop[1]), int(w * (1 - crop[2])), int(h * (1 - crop[3]))))
+                    box = None
+                    if shape.left is not None and shape.width:
+                        box = [clamp(shape.left / width), clamp(shape.top / height), clamp((shape.left + shape.width) / width), clamp((shape.top + shape.height) / height)]
+                    record(picture, number, box, f"s{number:03}-{index:02}.{'png' if picture.mode in ('RGBA', 'P', 'LA') else 'jpg' if extension in ('jpg', 'jpeg') else 'png'}", {"name": shape.name})
+        else:
+            from docx import Document
+            document = Document(str(source))
+            total = 0
+            selected = []
+            # Walk blips in body order so anchored (floating) pictures are included, not only inline ones.
+            index = 0
+            for blip in document.element.body.iter("{%s}blip" % NS["a"]):
+                embed = blip.get("{%s}embed" % NS["r"])
+                part = document.part.related_parts.get(embed) if embed else None
+                if part is None:
+                    continue
+                index += 1
+                extension = Path(str(part.partname)).suffix.lstrip(".").lower()
+                if extension not in RASTER_TYPES:
+                    skipped["unsupported"] += 1
+                    unsupported.append({"index": index, "format": extension})
+                    continue
+                picture = Image.open(io.BytesIO(part.blob))
+                picture.load()
+                record(picture, index, None, f"w{index:03}.{'jpg' if extension in ('jpg', 'jpeg') else 'png'}")
+    crop_results = []
+    if crops:
+        import pypdfium2 as pdfium
+        pdf = source if kind == ".pdf" else convert_office(source, Path(request["directory"]))
+        with closing(pdfium.PdfDocument(str(pdf))) as document:
+            for index, crop in enumerate(crops, 1):
+                number, box = crop.get("page"), crop.get("box")
+                if not isinstance(number, int) or not 1 <= number <= len(document) or not isinstance(box, list) or len(box) != 4:
+                    raise ValueError("crops 需要 page 与 box=[x0,y0,x1,y1]（页面比例，左上角为原点）")
+                x0, y0, x1, y1 = (min(1.0, max(0.0, float(v))) for v in box)
+                if x1 - x0 < 0.02 or y1 - y0 < 0.02:
+                    raise ValueError("截取区域太小")
+                with closing(document[number - 1]) as page:
+                    width, height = page.get_size()
+                    scale = min(3.0, 2400 / max(width, height))
+                    with closing(page.render(scale=scale, crop=(x0 * width, (1 - y1) * height, (1 - x1) * width, y0 * height))) as bitmap:
+                        picture = bitmap.to_pil().convert("RGB")
+                        path = folder / f"crop-p{number:03}-{index:02}.png"
+                        picture.save(path)
+                        crop_results.append({"page": number, "box": [x0, y0, x1, y1], "path": str(path), "width": picture.width, "height": picture.height})
+                        picture.close()
+    if unsupported:
+        warnings.append("跳过了 %d 张矢量或不支持格式的图片（EMF/WMF/SVG 等），可用 crops 从渲染页面截取" % len(unsupported))
+    results.sort(key=lambda item: (item["page"], -(item["width"] * item["height"])))
+    return {"pages": total, "selectedPages": selected, "images": results, "crops": crop_results, "skipped": skipped,
+            "unsupported": unsupported[:40], "warnings": warnings, "directory": str(folder)}
+
+
 def main():
     operation, request_path, result_path = sys.argv[1:]
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     request = json.loads(Path(request_path).read_text(encoding="utf-8"))
-    handlers = {"inspect": lambda r: inspect(r["source"]), "patch": patch, "compose_word": compose_word,
-                "finalize_slides": finalize_slides, "render": render}
+    handlers = {"inspect": lambda r: inspect(r["source"], r.get("outline", False)), "patch": patch, "compose_word": compose_word,
+                "finalize_slides": finalize_slides, "render": render, "build": build, "images": images}
     result = handlers[operation](request)
     Path(result_path).write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
 

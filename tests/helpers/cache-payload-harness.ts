@@ -65,7 +65,7 @@ try {
     await assert.rejects(runtime.handleUserMessage("user", "group", text, "https://im.zdxlz.com/im-external/v1/webhook/send?key=fixture"), /captured before HTTP/);
   }
   assert.equal(payloads.length, 2);
-  for (const name of ["document_inspect", "document_patch", "document_compose", "document_render"]) {
+  for (const name of ["document_inspect", "document_patch", "document_compose", "document_build", "document_render", "document_images"]) {
     assert.equal(payloads[0].tools.some((tool: any) => tool.name === name), documentWorkEnabled, "module tool visibility: " + name);
   }
   for (const name of ["document_extract", "document_environment", "send_file", "send_image"]) {

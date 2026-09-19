@@ -155,7 +155,7 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 | `BOT_INDEX_MAX_FILES` | 50000 | 100–1000000 |
 | `BOT_INDEX_MAX_DEPTH` | 12 | 1–64 |
 | `BOT_DOCUMENT_ENV` | 每群独立 venv | 留空使用本群 venv；显式填写才让所有群共享指定环境 |
-| `BOT_DOCUMENT_WORK_ENABLED` | `1` | 文档加工模块开关；`0` 同时关闭 skill、四个编辑/预览工具及模块提示词，重启生效；基础解析和发文件保留 |
+| `BOT_DOCUMENT_WORK_ENABLED` | `1` | 文档加工模块开关；`0` 同时关闭 skill、六个文档编辑、生成与预览工具及模块提示词，重启生效；基础解析和发文件保留 |
 
 ### 数据目录
 
@@ -201,11 +201,11 @@ logs/                          应用日志与可选的隧道日志
 
 超过附件上限的本地文件可通过 WebDAV 分发。外链是可选功能，部署向导只提示入口；需要时运行 `bun run tui`，进入 **系统 → 设置 → 外链配置**。已生成外链的查看与清理位于 **数据 → 外链**。
 
-向导可启用、修改或停用外链。填写 WebDAV 上传目录、对应的公开下载目录，以及可选的用户名和密码；密码隐藏输入，同一地址和账号的密码可留空沿用。文件上限、有效期和 Alist / OpenList 兼容签名放在可选的高级设置中，跳过时保留已有设置，新配置默认上限 2 GiB、不自动过期、不使用签名。
+向导可启用、修改或停用外链。填写 WebDAV 上传目录、对应的公开下载目录，以及可选的用户名和密码；密码隐藏输入，同一地址和账号的密码可留空沿用。文件上限、有效期和 [OpenList](https://github.com/OpenListTeam/OpenList) 兼容签名放在可选的高级设置中，跳过时保留已有设置，新配置默认上限 2 GiB、不自动过期、不使用签名。
 
-向导内提供 Alist + Cloudflare 子域名示例：上传地址填写到 Alist 挂载目录，例如 `127.0.0.1:5244/dav/relay`，此处挂载目录为 `relay`。公开下载项只填 `files.example.com` 即可推导为 `https://files.example.com/d/relay/`；也可填写完整下载目录地址。`/dav/` 是 WebDAV 入口，`/d/` 是下载入口，后面的 `relay` 换成实际挂载路径或其子目录。Cloudflare 路由及账号权限见[外链配置示例](operations.md#alist-与-cloudflare-子域名示例)。
+向导内提供 [OpenList](https://github.com/OpenListTeam/OpenList) + Cloudflare 子域名示例：上传地址填写到 [OpenList](https://github.com/OpenListTeam/OpenList) 挂载目录，例如 `127.0.0.1:5244/dav/relay`，此处挂载目录为 `relay`。公开下载项只填 `files.example.com` 即可推导为 `https://files.example.com/d/relay/`；也可填写完整下载目录地址。`/dav/` 是 WebDAV 入口，`/d/` 是下载入口，后面的 `relay` 换成实际挂载路径或其子目录。Cloudflare 路由及账号权限见[外链配置示例](operations.md#openlist-与-cloudflare-子域名示例)。
 
-交互输入可省略 `http://`、`https://` 及末尾 `/`。WebDAV 上传地址中的 `localhost`、回环及私有 IP 默认补 `http://`，其他地址（含公开下载）默认补 `https://`；显式填写的协议和下载目录保留，保存预览显示补全后的地址。下载目录只从标准 Alist 上传路径 `/dav/挂载目录` 推导，支持多级和中文目录；其他后端或反代路径需填写实际公开下载地址。上传地址填写到挂载目录，不带日期 UUID 子目录、文件名或签名参数；手写 JSON 时仍填写完整 URL。
+交互输入可省略 `http://`、`https://` 及末尾 `/`。WebDAV 上传地址中的 `localhost`、回环及私有 IP 默认补 `http://`，其他地址（含公开下载）默认补 `https://`；显式填写的协议和下载目录保留，保存预览显示补全后的地址。下载目录只从标准 [OpenList](https://github.com/OpenListTeam/OpenList) 上传路径 `/dav/挂载目录` 推导，支持多级和中文目录；其他后端或反代路径需填写实际公开下载地址。上传地址填写到挂载目录，不带日期 UUID 子目录、文件名或签名参数；手写 JSON 时仍填写完整 URL。
 
 保存前会显示配置摘要和到期处理方式。确认后才短暂停止原本运行中的机器人，校验并写入配置，然后恢复运行；原本停止的服务保持停止，取消不会改配置或停机。Windows 以前台方式运行且未安装计划任务时，须先手动停止实例再配置。停用会把配置归档到 `backup/rm`，保留远端文件和账本，同时停止机器人的到期清理。
 

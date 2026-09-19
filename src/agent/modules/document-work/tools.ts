@@ -14,22 +14,31 @@ import { isPathInside } from "../../paths.ts";
 import { resolveToolPath } from "../../tool-path.ts";
 import { ensureDocumentToolchain, venvPythonPath } from "../../python-toolchain.ts";
 import type { DocumentOptions } from "../../document-extract.ts";
+import { markdownToBlocks, type Block } from "./markdown.ts";
 
 const pythonScript = fileURLToPath(new URL("./scripts/document_ops.py", import.meta.url));
 const slidesScript = fileURLToPath(new URL("./scripts/compose_slides.ts", import.meta.url));
 const slots = new AsyncSemaphore(2);
 const MAX_BYTES = 128 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
 interface Inspection {
   digest: string; format: "docx" | "pptx"; warnings: string[]; truncated: boolean;
   paragraphs: unknown[]; blocks?: unknown[];
   slides?: { page: number; part: string; slideFile: number; hidden: boolean }[];
   size?: { width: number; height: number };
+  outline?: unknown;
+  build?: { generatedPages?: number[]; keptPages?: number[]; attention?: unknown[]; titleStyle?: unknown; layout?: string; headings?: number; templated?: boolean };
 }
 interface Source { source: string; original: string; digest: string; }
-interface Item { source: string; digest?: string; slides?: number[]; start?: number; end?: number; }
+interface Item { source?: string; digest?: string; slides?: number[]; start?: number; end?: number; content?: string; }
+interface BuildRequest {
+  format: "docx" | "pptx"; output: string; blocks: Block[]; assets: Record<string, string>;
+  template?: string; title?: string; subtitle?: string; cover?: boolean; sequence?: (number | "content")[]; styleFrom?: number[];
+}
 interface Job {
   directory: string; signal: AbortSignal;
   snapshot(source: string, expected?: string, pdf?: boolean): Promise<Source>;
+  assets(paths: string[]): Promise<Record<string, string>>;
   python<T>(operation: string, request: object): Promise<{ result: T; report: string }>;
   run(command: string, args: string[]): Promise<void>;
 }
@@ -47,12 +56,16 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
       const result = await runProcess({ command, args, cwd: directory, env, signal: budget, timeoutMs: 240000 });
       if (result.exitCode !== 0) throw new Error("文档操作失败：" + result.output.slice(-2000));
     };
+    const locate = async (value: string): Promise<string> => {
+      const original = await realpath(resolveToolPath(value, workspace));
+      if (![workspace, temp].some(root => isPathInside(original, root))) throw new Error("只能读取本群 workspace 或当前用户 tmp 中的文件");
+      return original;
+    };
     const job: Job = {
       directory, signal: budget, run,
       async snapshot(value, expected, pdf = false) {
         budget.throwIfAborted();
-        const original = await realpath(resolveToolPath(value, workspace));
-        if (![workspace, temp].some(root => isPathInside(original, root))) throw new Error("只能读取本群 workspace 或当前用户 tmp 中的文件");
+        const original = await locate(value);
         const extension = extname(original).toLowerCase();
         if (!(pdf ? [".docx", ".pptx", ".pdf"] : [".docx", ".pptx"]).includes(extension)) throw new Error("仅支持 DOCX/PPTX，渲染另支持 PDF");
         const info = await stat(original);
@@ -68,6 +81,25 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
         const digest = hash.digest("hex");
         if (expected && expected !== digest) throw new Error("原文件已变化，请重新 document_inspect");
         return { source, original, digest };
+      },
+      async assets(paths) {
+        // Images referenced by Markdown are copied beside the job so Python never reads outside it.
+        const copied: Record<string, string> = {};
+        for (const value of paths) {
+          budget.throwIfAborted();
+          let original: string;
+          try { original = await locate(value); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+          const info = await stat(original);
+          if (!info.isFile() || !/\.(png|jpe?g|gif|bmp|tiff?)$/i.test(original)) continue;
+          if (info.size > MAX_IMAGE_BYTES) throw new Error("图片超过 32 MiB：" + value);
+          totalBytes += info.size;
+          if (totalBytes > MAX_BYTES * 2) throw new Error("本次来源总量超过 256 MiB");
+          const target = join(directory, "asset-" + randomUUID() + extname(original).toLowerCase());
+          await pipeline(createReadStream(original), createWriteStream(target, { flags: "wx" }), { signal: budget });
+          copied[value] = target;
+        }
+        return copied;
       },
       async python<T>(operation: string, request: object) {
         if (!ready) {
@@ -99,7 +131,8 @@ function response(details: object) {
 
 function summary(result: Inspection) {
   return { digest: result.digest, format: result.format, paragraphs: result.paragraphs.length,
-    blocks: result.blocks?.length, slides: result.slides?.length, truncated: result.truncated, warnings: result.warnings };
+    blocks: result.blocks?.length, slides: result.slides?.length, truncated: result.truncated, warnings: result.warnings,
+    ...(result.outline ? { outline: result.outline } : {}), ...(result.build ? { build: result.build } : {}) };
 }
 
 async function provenance(job: Job, operation: string, sources: Source[], output: string, selection?: unknown) {
@@ -108,15 +141,28 @@ async function provenance(job: Job, operation: string, sources: Source[], output
   return path;
 }
 
+async function prepareContent(job: Job, content: string) {
+  const parsed = markdownToBlocks(content);
+  return { blocks: parsed.blocks, assets: await job.assets(parsed.images), warnings: parsed.warnings };
+}
+
+/** Provenance keeps the intent of inline content without duplicating long Markdown. */
+function selectionRecord(items: Item[]) {
+  return items.map(item => item.content !== undefined
+    ? { content: item.content.length > 2000 ? item.content.slice(0, 2000) + "…" : item.content } : item);
+}
+
+const MARKDOWN_HINT = "Markdown：#/## 标题（PPT 中起新页）、段落、**粗体**、列表、表格、图片 ![说明](路径 \"width=8cm\")、> 引用、代码块、--- 分页、<!-- notes: 讲稿 -->。PPT 自动图示：页内 2–6 个 ### 短段→多栏卡片（都以“层”结尾→分层架构图），“第一阶段：…”式列表→时间轴，“A → B → C”段落→流程图，纯数字标签列表→数字指标；也可用 <!-- cards | timeline | flow | layers | pyramid | cycle | stats | plain --> 指定。标签开头的表情符号或 ### 内的一张图片作为图标。```mermaid 代码块（flowchart TB，A --> B{判断?}，B -- 是 --> C）生成带分支、汇合、回退的流程图。";
+
 export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition[] {
   const inspect = defineTool({
     name: "document_inspect", label: "检查文档结构",
-    description: "检查 DOCX/PPTX 内部引用，返回内容清单路径、摘要和数量。清单包含可定位的段落、Word 正文块、PPT 实际页序；再用 read 按需读取。",
-    parameters: Type.Object({ source: Type.String() }),
+    description: "检查 DOCX/PPTX 内部引用，返回内容清单路径、摘要和数量。清单包含可定位的段落、Word 正文块、PPT 实际页序。outline=true 时直接返回大纲：PPT 每页标题、文字量、图片/表格数与版式，Word 标题层级与可用样式，用于选页、选章节或选模板；完整段落仍在清单文件中，用 read 按需读取。",
+    parameters: Type.Object({ source: Type.String(), outline: Type.Optional(Type.Boolean()) }),
     async execute(_id, params, signal) {
       return withJob(options, signal, async job => {
         const source = await job.snapshot(params.source);
-        const { result, report } = await job.python<Inspection>("inspect", source);
+        const { result, report } = await job.python<Inspection>("inspect", { ...source, outline: !!params.outline });
         return response({ ...summary(result), inspection: report, source: source.original });
       });
     },
@@ -139,20 +185,40 @@ export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition
   });
   const compose = defineTool({
     name: "document_compose", label: "组装文档",
-    description: "按 items 顺序组装同一格式的资料。PPT slides 为实际页码（1 起始），保留来源母版；Word start/end 为正文块闭区间，省略为全文，第一份提供页眉页脚及主样式。可先生成补充文件再组装。",
+    description: "按 items 顺序组装同一格式的资料，可混合复用与新增：{source, slides} 选 PPT 实际页码（1 起始，保留来源母版）；{source, start, end} 选 Word 正文块闭区间（省略为全文）；{content} 用 Markdown 在第一份来源的母版/样式上生成新页或新章节。第一项必须是文件，提供页眉页脚、母版及主样式。" + MARKDOWN_HINT,
     parameters: Type.Object({ filename: Type.Optional(Type.String()), items: Type.Array(Type.Object({
-      source: Type.String(), digest: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
+      source: Type.Optional(Type.String()), digest: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
       slides: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, maxItems: 200 })),
       start: Type.Optional(Type.Integer({ minimum: 1 })), end: Type.Optional(Type.Integer({ minimum: 1 })),
+      content: Type.Optional(Type.String({ minLength: 1, maxLength: 200000 })),
     }), { minItems: 1, maxItems: 20 }) }),
     async execute(_id, params, signal) {
       return withJob(options, signal, async job => {
         const sources: Source[] = [], prepared: (Item & { slideFiles?: number[] })[] = [];
-        let kind: string | undefined, size: string | undefined, slides = 0;
-        for (const item of params.items) {
-          const source = await job.snapshot(item.source, item.digest);
+        let kind: "docx" | "pptx" | undefined, size: string | undefined, slides = 0;
+        const contentWarnings: string[] = [];
+        if (params.items[0]?.source === undefined) throw new Error("第一项必须是文件来源，作为母版与样式的依据");
+        for (const [index, item] of params.items.entries()) {
+          if (item.content !== undefined) {
+            if (item.source !== undefined || item.slides || item.start !== undefined || item.end !== undefined) throw new Error("content 项不能同时指定 source/slides/start/end");
+            const content = await prepareContent(job, item.content);
+            contentWarnings.push(...content.warnings);
+            const generated = join(job.directory, "generated-" + index + "." + kind);
+            const request: BuildRequest = { format: kind!, output: generated, blocks: content.blocks, assets: content.assets,
+              template: sources[0]!.source, cover: false, sequence: [] };
+            const { result: built } = await job.python<Inspection>("build", request);
+            contentWarnings.push(...built.warnings.filter(warning => !warning.startsWith("包含 ")));
+            if (kind === "pptx") {
+              const pages = built.slides!.map(s => s.page);
+              slides += pages.length;
+              if (slides > 200) throw new Error("输出 PPT 须为 1–200 页");
+              prepared.push({ source: generated, slides: pages, slideFiles: built.slides!.map(s => s.slideFile) });
+            } else prepared.push({ source: generated });
+            continue;
+          }
+          const source = await job.snapshot(item.source!, item.digest);
           const { result } = await job.python<Inspection>("inspect", source);
-          if (kind && kind !== result.format) throw new Error("组装来源必须为相同格式；可先根据资料生成目标格式的补充文件");
+          if (kind && kind !== result.format) throw new Error("组装来源必须为相同格式；可用 content 项按第一份来源生成补充内容");
           kind = result.format;
           if (kind === "pptx") {
             if (item.start !== undefined || item.end !== undefined) throw new Error("PPT 使用 slides 页码选择");
@@ -187,8 +253,49 @@ export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition
           await job.python<Inspection>("compose_word", request);
         }
         const { result, report } = await job.python<Inspection>("inspect", { source: output });
-        result.warnings = [...new Set([...result.warnings, ...processingWarnings])];
-        const record = await provenance(job, "compose", sources, output, params.items);
+        result.warnings = [...new Set([...result.warnings, ...processingWarnings, ...contentWarnings])];
+        const record = await provenance(job, "compose", sources, output, selectionRecord(params.items));
+        return response({ ...summary(result), output, inspection: report, provenance: record, visuallyReviewed: false });
+      });
+    },
+  });
+  const build = defineTool({
+    name: "document_build", label: "按模板生成文档",
+    description: "用 Markdown 内容在本群模板（任意同格式 DOCX/PPTX）的母版、版式与样式上生成可编辑的新 Word 或 PPT。Word 继承页面设置、页眉页脚和样式；PPT 继承母版，从模板样例页推断标题样式与内容区域，#/## 起新页，文字超出自动续页并在 build.attention 中提示。keepSlides 保留模板指定页（封面、封底等），sequence 决定保留页与新页顺序。无模板时使用默认中文版式。生成后仍需 document_render 检查。" + MARKDOWN_HINT,
+    parameters: Type.Object({
+      format: Type.Union([Type.Literal("docx"), Type.Literal("pptx")]),
+      content: Type.String({ minLength: 1, maxLength: 200000 }),
+      template: Type.Optional(Type.String({ description: "本群 workspace 或本用户 tmp 中同格式的模板或样例文件" })),
+      title: Type.Optional(Type.String({ maxLength: 200 })), subtitle: Type.Optional(Type.String({ maxLength: 300 })),
+      filename: Type.Optional(Type.String()),
+      keepSlides: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { maxItems: 50, description: "PPT：保留模板中的这些页（实际页码）" })),
+      sequence: Type.Optional(Type.Array(Type.Union([Type.Integer({ minimum: 1 }), Type.Literal("content")]), { maxItems: 60,
+        description: "PPT：输出顺序，元素为保留页页码或 \"content\"（新页插入位置）；默认保留页在前、新页在后" })),
+      styleFrom: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { maxItems: 50, description: "PPT：仅从这些模板页推断标题样式与内容版式" })),
+      cover: Type.Optional(Type.Boolean({ description: "PPT：有 title 时是否生成封面页，默认 true" })),
+    }),
+    async execute(_id, params, signal) {
+      return withJob(options, signal, async job => {
+        const extension = "." + params.format;
+        const sources: Source[] = [];
+        let template: string | undefined;
+        if (params.template) {
+          const source = await job.snapshot(params.template);
+          if (extname(source.source) !== extension) throw new Error("模板格式必须与 format 一致");
+          template = source.source;
+          sources.push(source);
+        }
+        const content = await prepareContent(job, params.content);
+        const output = outputPath(job.directory, params.filename, extension);
+        const keep = params.keepSlides ?? [];
+        if (!template && (keep.length || params.sequence?.some(value => typeof value === "number"))) throw new Error("keepSlides/sequence 需要指定模板");
+        const sequence: (number | "content")[] = params.sequence ?? [...keep, "content"];
+        for (const item of sequence) if (typeof item === "number" && !keep.includes(item)) throw new Error("sequence 中的页码必须先列入 keepSlides：" + item);
+        const request: BuildRequest = { format: params.format, output, blocks: content.blocks, assets: content.assets, template,
+          title: params.title, subtitle: params.subtitle, cover: params.cover ?? true, sequence, styleFrom: params.styleFrom };
+        const { result, report } = await job.python<Inspection>("build", request);
+        result.warnings = [...new Set([...result.warnings, ...content.warnings])];
+        const record = await provenance(job, "build", sources, output, { template: params.template, keepSlides: keep, sequence, images: Object.keys(content.assets) });
         return response({ ...summary(result), output, inspection: report, provenance: record, visuallyReviewed: false });
       });
     },
@@ -205,5 +312,26 @@ export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition
       });
     },
   });
-  return [inspect, patch, compose, render];
+  const images = defineTool({
+    name: "document_images", label: "提取图片素材",
+    description: "从 PDF、PPTX、DOCX 中提取内嵌的位图图片到本用户 tmp，作为 document_build / document_compose 中 Markdown 图片的素材。PDF 与 PPT 按页提取，返回每张图的页码、像素尺寸和在页面中的位置（box 为页面比例，左上角为原点）；重复出现的图（背景、logo）只保留一次并列出出现页码，fullPage 标记整页大图。矢量图（EMF/WMF/SVG）无法提取，可用 crops 按页面比例截取渲染区域（PDF 直接可用，Office 需要 LibreOffice）。PDF 默认处理前 20 页、PPT 前 50 页，pages 每次最多 50 页；单次最多返回 60 张。",
+    parameters: Type.Object({
+      source: Type.String({ description: "本群 workspace 或本用户 tmp 中的 PDF/PPTX/DOCX" }),
+      pages: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, maxItems: 50, description: "PDF 页码或 PPT 页码；Word 忽略" })),
+      minSize: Type.Optional(Type.Integer({ minimum: 16, maximum: 2000, description: "跳过短边小于该像素的图（默认 96，用于滤掉图标）" })),
+      crops: Type.Optional(Type.Array(Type.Object({
+        page: Type.Integer({ minimum: 1 }),
+        box: Type.Array(Type.Number({ minimum: 0, maximum: 1 }), { minItems: 4, maxItems: 4, description: "[x0, y0, x1, y1]，页面宽高比例，左上角为原点" }),
+      }), { minItems: 1, maxItems: 20, description: "按渲染页面截取区域，适合矢量图或组合图示" })),
+    }),
+    async execute(_id, params, signal) {
+      return withJob(options, signal, async job => {
+        const source = await job.snapshot(params.source, undefined, true);
+        const { result, report } = await job.python<{ images: unknown[]; crops: unknown[]; warnings: string[] }>("images",
+          { ...source, directory: job.directory, pages: params.pages, minSize: params.minSize, crops: params.crops });
+        return response({ ...result, report, source: source.original, digest: source.digest });
+      });
+    },
+  });
+  return [inspect, patch, compose, build, render, images];
 }

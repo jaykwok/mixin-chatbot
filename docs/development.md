@@ -49,9 +49,11 @@ callback key 必须对应一个群。跨群复用会触发持久隔离，并取�
 | `bash` | 执行命令，统一管理超时、取消、输出上限及后代回收 |
 | `document_environment` | 按需准备解析环境，验证实际解释器、版本和库导入 |
 | `document_extract` | 提取 PDF/DOCX/PPTX/XLSX，按内容与解析器版本复用缓存，返回可检索的文本路径 |
-| `document_inspect` | 检查 DOCX/PPTX 包及内部引用，返回段落位置、正文块、实际页序和内容摘要 |
+| `document_inspect` | 检查 DOCX/PPTX 包及内部引用，返回段落位置、正文块、实际页序和内容摘要；可附带页面或章节大纲 |
 | `document_patch` | 按摘要与精确位置修改副本中的文字，保留未修改的文档部件 |
-| `document_compose` | 选编 Word 正文块或 PPT 页面，生成新文件与来源记录 |
+| `document_compose` | 选编 Word 正文块或 PPT 页面，可混合 Markdown 新内容，生成新文件与来源记录 |
+| `document_build` | 用 Markdown 在模板的母版、版式与样式上整份生成 Word 或 PPT |
+| `document_images` | 从 PDF/PPTX/DOCX 提取内嵌图片或按区域截取渲染页，作为 Markdown 图片素材 |
 | `document_render` | 将 DOCX/PPTX/PDF 渲染为逐页图片及联系表；Office 需要 LibreOffice |
 | `send_file` / `send_image` | 发送文件或图片；本地路径复用文件工具的解析规则 |
 
