@@ -93,7 +93,14 @@ process.stdin.on("data", (chunk) => {
       cwd: request.cwd, env: request.env, shell: false, windowsHide: true,
       stdio: ["ignore", "inherit", "inherit"],
     });
-    child.once("error", (error) => { process.stderr.write(String(error)); finish(127); });
+    child.once("error", (error) => {
+      // Our waitpid loop can reap this child before Bun's exit watcher does.
+      // During cleanup, its ECHILD must not write to a dead parent's stderr:
+      // the resulting EPIPE would exit us before adopted descendants are reaped.
+      if (finishing) return;
+      process.stderr.write(String(error));
+      finish(127);
+    });
     child.once("exit", (code) => finish(code ?? 1));
   } catch (error) {
     process.stderr.write(String(error));

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runProcess } from "../../src/core/process.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -43,6 +43,47 @@ describe("supervised real subprocesses", () => {
       await stderr;
     } finally {
       if (signals) clearInterval(signals);
+      clearTimeout(watchdog);
+      child.kill("SIGKILL");
+      await child.exited;
+      for (const pid of ids) { try { process.kill(pid, "SIGKILL"); } catch {} }
+      await fixture.cleanup();
+    }
+  }, 20000);
+
+  test.skipIf(process.platform !== "linux")("finishes reaping with closed output pipes when waitpid wins the child-exit race", async () => {
+    const fixture = await tempFixture("supervised-reap-race-");
+    const command = join(fixture.root, "command.cjs");
+    const reaped = join(fixture.root, "reaped.pid");
+    const supervisor = fileURLToPath(new URL("../../src/core/process-supervisor.ts", import.meta.url));
+    const preload = fileURLToPath(new URL("../helpers/process-reap-race.ts", import.meta.url));
+    await writeFile(command, `const {spawn}=require('child_process'); console.log('DIRECT:'+process.pid); spawn(process.execPath,['-e',"console.log('READY:'+process.pid); setTimeout(()=>process.exit(0),8000)"],{detached:true,stdio:['ignore','inherit','inherit']}).unref(); setTimeout(()=>process.exit(0),10000);`);
+    const child = Bun.spawn([process.execPath, "--preload", preload, supervisor, reaped], {
+      cwd: fixture.root, stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    });
+    child.stdin.write(JSON.stringify({ command: process.execPath, args: [command], cwd: fixture.root, env: process.env }) + "\n");
+    await child.stdin.flush();
+    const watchdog = setTimeout(() => child.kill("SIGKILL"), 15000);
+    let ids: number[] = [];
+    try {
+      let output = "";
+      for await (const data of child.stdout) {
+        output += Buffer.from(data).toString();
+        const direct = output.match(/DIRECT:(\d+)\n/);
+        const ready = output.match(/READY:(\d+)\n/);
+        if (!direct || !ready) continue;
+        ids = [Number(direct[1]), Number(ready[1])];
+        break; // Cancels stdout, closing its read end.
+      }
+      // Reproduce the dead parent's pipes without losing the supervisor's exit status.
+      await child.stderr.cancel();
+      child.stdin.end();
+      const code = await child.exited;
+      expect(ids).toHaveLength(2);
+      expect(Number(await readFile(reaped, "utf8"))).toBe(ids[0]);
+      expect(code).toBe(143);
+      expect(ids.filter(alive)).toEqual([]);
+    } finally {
       clearTimeout(watchdog);
       child.kill("SIGKILL");
       await child.exited;
