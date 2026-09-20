@@ -451,6 +451,36 @@ def check_layouts_and_images(root, results):
     pictured = by_title["图片分层"]
     assert any("layers" in w and "图片图标" in w for w in results["layoutBuild"]["warnings"]), results["layoutBuild"]["warnings"]
     assert any(s.shape_type == 13 for s in pictured.shapes) and not names("图片分层", "Layer "), "pictures fall back to the plain layout instead of vanishing"
+    assert names("指标单位", "Stat ") == ["Stat 135,000+", "Stat 82 个国家", "Stat 14.6%"], "numbers with short units are stats"
+    assert names("小数指标", "Stat ") == ["Stat 1024.50 GB", "Stat 2048.25 GB", "Stat 4096.75 GB"], "decimals with units are stats, not dates"
+    for title, labels in (
+            ("年月形小数指标", ["2000.01 GB", "2000.02 GB", "2000.03 GB"]),
+            ("混合小数指标", ["1024.50 GB", "2048.01 GB", "4096.75 GB"]),
+            ("小数指标单位", ["2000.01GiB", "2000.02 ms", "2000.03 万元", "2000.04%"])):
+        assert names(title, "Stat ") == ["Stat " + label for label in labels], f"{title}: units keep date-like decimals as stats"
+        assert not names(title, "Timeline"), title
+        page = deck.slides.index(by_title[title]) + 1
+        assert any(item["page"] == page and item["mode"] == "stats" for item in build["layouts"]), title
+    assert [n.text_frame.text for n in by_title["日期节点"].shapes if n.name.startswith("Timeline node")] == ["1", "2", "3"], "pure dates form a timeline"
+    assert [n.text_frame.text for n in by_title["日期事件"].shapes if n.name.startswith("Timeline node")] == ["1", "2", "3"], "date + event labels stay a timeline, never stats"
+    assert not names("日期事件", "Stat ") and any(s.has_text_frame and s.text_frame.text == "2026年3月立项" for s in by_title["日期事件"].shapes)
+    assert [n.text_frame.text for n in by_title["数字日期事件"].shapes if n.name.startswith("Timeline node")] == ["1", "2", "3"], "numeric dates with event names stay a timeline"
+    assert not names("数字日期事件", "Stat ") and any(s.has_text_frame and s.text_frame.text == "2026.09 UAT" for s in by_title["数字日期事件"].shapes)
+    assert [n.text_frame.text for n in by_title["分期安排"].shapes if n.name.startswith("Timeline node")] == ["1", "2", "3"], "long parenthesised stage labels still form a timeline"
+    assert any(s.has_text_frame and s.text_frame.text == "第一阶段（第 1 个月）风险摸底与试点" for s in by_title["分期安排"].shapes)
+    wide = by_title["宽图说明"]
+    picture = next(s for s in wide.shapes if s.shape_type == 13)
+    caption = next(s for s in wide.shapes if s.has_text_frame and "整体架构" in s.text_frame.text)
+    assert picture.width >= deck.slide_width * 0.6 and picture.top >= caption.top + caption.height, "wide figure with a short caption is stacked full-width"
+    missed = next(item for item in build["attention"] if item["page"] == deck.slides.index(by_title["未识别列表"]) + 1)
+    assert "未自动排成图示" in missed["reason"] and "<!-- cards -->" in missed["reason"], missed
+    layouts = {item["page"]: item["mode"] for item in build["layouts"]}
+    assert layouts[deck.slides.index(by_title["三层防护"]) + 1] == "cards" and layouts[deck.slides.index(by_title["实施安排"]) + 1] == "timeline"
+    assert layouts[deck.slides.index(by_title["处理流程"]) + 1] == "flowchart" and layouts[deck.slides.index(by_title["指标单位"]) + 1] == "stats"
+    assert deck.slides.index(by_title["未识别列表"]) + 1 not in layouts and deck.slides.index(by_title["保持列表"]) + 1 not in layouts
+    assert not any(item["page"] == deck.slides.index(by_title["保持列表"]) + 1 for item in build["attention"]), "<!-- plain --> pages are not flagged"
+    kept_build = results["slideBuild"]["build"]
+    assert all(item["page"] in kept_build["generatedPages"] for item in kept_build["layouts"]) and kept_build["keptPages"], "layouts only describe generated pages"
     check_edge_cases(root, results)
     check_flowcharts(root, results)
 

@@ -93,7 +93,7 @@ def strip_runs(runs):
 STAGE_LABEL = re.compile(
     r"^\s*(第\s*[一二三四五六七八九十\d]+\s*(阶段|期|步|周|月|季度|年|天|轮|批)|(阶段|步骤|里程碑)\s*[一二三四五六七八九十\d]+"
     r"|(step|phase|stage|sprint|week|day|milestone|m|q|t\+?)\s*\d+|\d{4}\s*年(\s*\d{1,2}\s*月)?|\d{1,2}\s*月(\s*\d{1,2}\s*日)?"
-    r"|\d{4}[-./]\d{1,2}([-./]\d{1,2})?|(20\d{2})?\s*[qh][1-4]|近期|中期|远期|短期|长期|当前|现状|未来)", re.I)
+    r"|(19|20)\d{2}[-./](0?[1-9]|1[0-2])([-./](0?[1-9]|[12]\d|3[01]))?(?![\d.])|(20\d{2})?\s*[qh][1-4]|近期|中期|远期|短期|长期|当前|现状|未来)", re.I)
 LABEL_SEPARATORS = ("：", ":", "——", "—", "–", " - ", "｜", "|")
 
 
@@ -103,7 +103,7 @@ def split_label(runs):
     best = None
     for separator in LABEL_SEPARATORS:
         position = text.find(separator)
-        if 0 < position <= 18 and (best is None or position < best[0]):
+        if 0 < position <= 24 and (best is None or position < best[0]):
             best = (position, separator)
     if best is None:
         return strip_runs(runs), []
@@ -113,9 +113,20 @@ def split_label(runs):
 
 
 CHAIN_SEPARATOR = re.compile(r"\s*(?:→|➡|⇒|⟶|->|=>|>>)\s*")
-STAT_LABEL = re.compile(r"^[+\-≥≤>≈~]?\d[\d.,]*\s*(?:[%％+倍万亿千百个项类天次人台×/\d]|[A-Za-z]){0,4}$")
+STAT_LABEL = re.compile(r"^[+\-≥≤>≈~]?\d[\d.,]*\s*[^\s：:，,；;]{0,6}$")
+# A decimal can spell a valid year/month ("2000.01"); an explicit measurement unit resolves the ambiguity.
+MEASURED_STAT_LABEL = re.compile(
+    r"[+\-≥≤>≈~]?\d[\d,]*(?:\.\d+)?\s*(?:"
+    r"[kmgtpe]?i?b(?:ps|/s)?|bytes?|[nuµμm]?s|min|h|[kmgt]?hz|[km]?w(?:h)?"
+    r"|usd|eur|gbp|cny|rmb|jpy|hkd|[%％‰℃]|°c"
+    r"|[万亿]?(?:元|美元|港元|人|台|个|项|次)|倍|天|个月|个国家)", re.I)
 LAYOUT_RANGES = {"cards": (2, 8), "timeline": (2, 8), "flow": (2, 8), "layers": (2, 6), "pyramid": (2, 6), "cycle": (3, 8), "stats": (2, 5)}
 LAYOUT_NAMES = {"cards": "卡片", "timeline": "时间轴", "flow": "流程图", "layers": "分层图", "pyramid": "金字塔", "cycle": "循环图", "stats": "数字指标"}
+
+
+def is_stage_label(label):
+    """Dates and event prefixes are stages, unless the entire label is a value with a measurement unit."""
+    return bool(STAGE_LABEL.match(label)) and not MEASURED_STAT_LABEL.fullmatch(label.strip())
 
 
 def is_glyph(char):
@@ -603,6 +614,7 @@ class SlideBuilder:
         bottom = int(self.height * 0.92)
         self.region = (margin, top, self.width - 2 * margin, max(bottom - top, int(self.height * 0.4)))
         self.attention = []
+        self.layouts = []
         self.generated = []
 
     # -- slide bookkeeping -------------------------------------------------
@@ -634,6 +646,8 @@ class SlideBuilder:
             if not isinstance(part, XmlPart):
                 continue
             removed = self.unlink(part, dropped)
+            if part is presentation_part:
+                continue  # its own slide-list relationships are not user-visible links
             if removed and part in page_of_part:
                 self.warnings.append(f"模板第 {page_of_part[part]} 页有 {removed} 处指向未保留页面的链接，已移除")
             elif removed:
@@ -928,10 +942,12 @@ class SlideBuilder:
     def segment(self, runs):
         label, description = split_label(runs)
         label, glyph = split_glyph(label)
-        return {"label": label, "glyph": glyph, "icon": None, "lines": [(description, 0, "text", False)] if description else []}
+        return {"label": label, "glyph": glyph, "icon": None, "labelled": bool(description),
+                "lines": [(description, 0, "text", False)] if description else []}
 
-    def choose_layout(self, group):
-        """An explicit directive wins; otherwise recognise arrow chains, short ### groups, layer names, figures and stage lists."""
+    def choose_layout(self, slide, group):
+        """An explicit directive wins; otherwise recognise arrow chains, short ### groups, layer names, figures and stage lists.
+        A page that looks like a diagram candidate but matches no rule is reported, never silently left as a list."""
         explicit = next((b["mode"] for b in group if b["type"] == "layout"), None)
         if explicit == "plain":
             return None, None
@@ -948,22 +964,31 @@ class SlideBuilder:
                 return None, None
             low, high = LAYOUT_RANGES[explicit]
             return explicit, (intro, segments) if low <= count <= high and intro_chars <= 300 else None
-        if intro_chars > 160:
-            return None, None
         body_chars = [sum(len(runs_text(line[0])) for line in s["lines"]) for s in segments]
         labels = [runs_text(s["label"]) for s in segments]
         short = all(c <= 220 and len(s["lines"]) <= 6 for c, s in zip(body_chars, segments))
-        if origin == "chain":
-            return "flow", (intro, segments)
-        if origin == "headings" and 2 <= count <= 6 and short:
-            if all(label.endswith("层") for label in labels) and not pictures:
-                return "layers", (intro, segments)
-            return "cards", (intro, segments)
-        if origin == "list" and 2 <= count <= 5 and all(STAT_LABEL.match(label) for label in labels) and all(c <= 60 for c in body_chars):
-            return "stats", (intro, segments)
-        if origin == "list" and 3 <= count <= 6 and all(
-                STAGE_LABEL.match(label) and len(label) <= 18 and c <= 120 for label, c in zip(labels, body_chars)):
-            return "timeline", (intro, segments)
+        if intro_chars <= 160:
+            if origin == "chain":
+                return "flow", (intro, segments)
+            if origin == "headings" and 2 <= count <= 6 and short:
+                if all(label.endswith("层") for label in labels) and not pictures:
+                    return "layers", (intro, segments)
+                return "cards", (intro, segments)
+            # Resolve date-like decimals by their unit before choosing either layout.
+            if origin == "list" and 2 <= count <= 5 and all(STAT_LABEL.match(label) and not is_stage_label(label) for label in labels) and all(c <= 60 for c in body_chars):
+                return "stats", (intro, segments)
+            if origin == "list" and 3 <= count <= 6 and all(
+                    is_stage_label(label) and len(label) <= 24 and c <= 120 for label, c in zip(labels, body_chars)):
+                return "timeline", (intro, segments)
+        candidate = (origin == "headings" and 2 <= count <= 6) or (origin == "list" and 2 <= count <= 8 and all(s.get("labelled") for s in segments))
+        if candidate:
+            if intro_chars > 160:
+                why = f"图示前的引导文字有 {intro_chars} 字，超过 160 字"
+            elif origin == "headings":
+                why = f"{count} 个 ### 小节中有的超过 6 行或 220 字"
+            else:
+                why = f"{count} 项“标签：说明”列表的标签不是阶段或数字模式"
+            self.attention.append({"slide": slide, "reason": why + "，未自动排成图示，已按普通版式排版；需要卡片、时间轴、指标等请在 ## 标题后加 <!-- cards -->、<!-- timeline -->、<!-- stats --> 等注释并精简文字"})
         return None, None
 
     def accent(self):
@@ -1056,6 +1081,7 @@ class SlideBuilder:
                 self.warnings.append("图示页的引导文字过长，超出部分未显示")
 
     def note_layout(self, slide, mode, count, detail=""):
+        self.layouts.append({"slide": slide, "mode": mode, "segments": count})
         self.attention.append({"slide": slide, "reason": f"已排成 {count} 段{LAYOUT_NAMES[mode]}{detail}，请检查图示文字"})
 
     def render_cards(self, slide, intro, segments):
@@ -1391,8 +1417,9 @@ class SlideBuilder:
             frame.vertical_anchor = 4
             frame.paragraphs[0].alignment = 2
             number_size = 44 if count <= 3 else 36
-            while char_units(runs_text(segment["label"]), number_size) > self.text_width_pt and number_size > 24:
-                number_size -= 4
+            # Bold figures run wider than the average estimate; keep a margin so a number never breaks across lines.
+            while char_units(runs_text(segment["label"]), number_size) > self.text_width_pt * 0.82 and number_size > 20:
+                number_size -= 2
             if segment.get("glyph"):
                 run = frame.paragraphs[0].add_run()
                 run.text = segment["glyph"] + " "
@@ -1482,6 +1509,7 @@ class SlideBuilder:
             self.add_text_block(slide, lines, left, top, width, height)
             return
         self.warnings.extend(f"流程图：{w}" for w in summary["warnings"])
+        self.layouts.append({"slide": slide, "mode": "flowchart", "segments": summary["nodes"]})
         self.attention.append({"slide": slide, "reason": f"已生成 {summary['nodes']} 节点流程图（{summary['direction']}，{summary['fontSize']}pt），请检查连线与文字"})
 
     def add_image(self, slide, path, alt, left, top, width, height):
@@ -1529,8 +1557,9 @@ class SlideBuilder:
         self.presentation.save(request["output"])
         generated = [self.page_of(s) for s in produced]
         attention = [{"page": self.page_of(item["slide"]), "reason": item["reason"]} for item in self.attention]
+        layouts = [{"page": self.page_of(item["slide"]), "mode": item["mode"], "segments": item["segments"]} for item in self.layouts]
         return {"generatedPages": generated, "keptPages": [self.page_of_entry(kept_entries[p]) for p in keep],
-                "attention": attention, "titleStyle": self.title_style.describe(), "layout": self.layout.name}
+                "attention": attention, "layouts": layouts, "titleStyle": self.title_style.describe(), "layout": self.layout.name}
 
     def page_of_entry(self, entry):
         return list(self.presentation.slides._sldIdLst).index(entry) + 1
@@ -1575,7 +1604,7 @@ class SlideBuilder:
             if block["type"] == "pagebreak":
                 break
             group.append(block)
-        mode, plan = self.choose_layout(group)
+        mode, plan = self.choose_layout(slide, group)
         if plan is not None:
             renderers = {"cards": self.render_cards, "timeline": self.render_timeline, "flow": self.render_flow, "layers": self.render_layers,
                          "pyramid": self.render_pyramid, "cycle": self.render_cycle, "stats": self.render_stats}
@@ -1639,9 +1668,18 @@ class SlideBuilder:
                 rest = self.lines_to_blocks(overflow) + rest
             return rest
         if image and text_lines:
-            text_width = int(width * 0.52)
-            overflow = self.add_text_block(slide, text_lines, left, top, text_width, height)
-            self.add_image(slide, image["path"], image.get("alt", ""), left + text_width + int(width * 0.04), top, width - text_width - int(width * 0.04), height)
+            real = self.assets.get(image["path"])
+            pixels = image_size(real) if real and Path(real).suffix.lower() in IMAGE_TYPES else None
+            needed = self.estimate_text_height(text_lines, width)
+            gap = int(self.height * 0.02)
+            if pixels and pixels[0] >= pixels[1] * 1.5 and needed <= int(height * 0.35):
+                # A wide figure with a short caption-like text is stacked so the figure keeps the full width.
+                overflow = self.add_text_block(slide, text_lines, left, top, width, needed)
+                self.add_image(slide, image["path"], image.get("alt", ""), left, top + needed + gap, width, height - needed - gap)
+            else:
+                text_width = int(width * 0.52)
+                overflow = self.add_text_block(slide, text_lines, left, top, text_width, height)
+                self.add_image(slide, image["path"], image.get("alt", ""), left + text_width + int(width * 0.04), top, width - text_width - int(width * 0.04), height)
         elif image:
             self.add_image(slide, image["path"], image.get("alt", ""), left, top, width, height)
             overflow = []

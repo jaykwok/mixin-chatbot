@@ -27,7 +27,7 @@ interface Inspection {
   slides?: { page: number; part: string; slideFile: number; hidden: boolean }[];
   size?: { width: number; height: number };
   outline?: unknown;
-  build?: { generatedPages?: number[]; keptPages?: number[]; attention?: unknown[]; titleStyle?: unknown; layout?: string; headings?: number; templated?: boolean };
+  build?: { generatedPages?: number[]; keptPages?: number[]; attention?: unknown[]; layouts?: unknown[]; titleStyle?: unknown; layout?: string; headings?: number; templated?: boolean };
 }
 interface Source { source: string; original: string; digest: string; }
 interface Item { source?: string; digest?: string; slides?: number[]; start?: number; end?: number; content?: string; }
@@ -152,7 +152,7 @@ function selectionRecord(items: Item[]) {
     ? { content: item.content.length > 2000 ? item.content.slice(0, 2000) + "…" : item.content } : item);
 }
 
-const MARKDOWN_HINT = "Markdown：#/## 标题（PPT 中起新页）、段落、**粗体**、列表、表格、图片 ![说明](路径 \"width=8cm\")、> 引用、代码块、--- 分页、<!-- notes: 讲稿 -->。PPT 自动图示：页内 2–6 个 ### 短段→多栏卡片（都以“层”结尾→分层架构图），“第一阶段：…”式列表→时间轴，“A → B → C”段落→流程图，纯数字标签列表→数字指标；也可用 <!-- cards | timeline | flow | layers | pyramid | cycle | stats | plain --> 指定。标签开头的表情符号或 ### 内的一张图片作为图标。```mermaid 代码块（flowchart TB，A --> B{判断?}，B -- 是 --> C）生成带分支、汇合、回退的流程图。";
+const MARKDOWN_HINT = "Markdown：#/## 标题（PPT 中起新页）、段落、**粗体**、列表、表格、图片 ![说明](路径 \"width=8cm\")、> 引用、代码块、--- 分页、<!-- notes: 讲稿 -->。PPT 自动图示：页内 2–6 个 ### 短段→多栏卡片（都以“层”结尾→分层架构图），“第一阶段：…”式列表→时间轴，“A → B → C”段落→流程图，纯数字标签列表→数字指标；打算做成某种图示时务必写 <!-- cards | timeline | flow | layers | pyramid | cycle | stats | plain --> 注释，自动识别只是没写注释时的兜底。标签开头的表情符号或 ### 内的一张图片作为图标。```mermaid 代码块（flowchart TB，A --> B{判断?}，B -- 是 --> C）生成带分支、汇合、回退的流程图。";
 
 export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition[] {
   const inspect = defineTool({
@@ -261,7 +261,7 @@ export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition
   });
   const build = defineTool({
     name: "document_build", label: "按模板生成文档",
-    description: "用 Markdown 内容在本群模板（任意同格式 DOCX/PPTX）的母版、版式与样式上生成可编辑的新 Word 或 PPT。Word 继承页面设置、页眉页脚和样式；PPT 继承母版，从模板样例页推断标题样式与内容区域，#/## 起新页，文字超出自动续页并在 build.attention 中提示。keepSlides 保留模板指定页（封面、封底等），sequence 决定保留页与新页顺序。无模板时使用默认中文版式。生成后仍需 document_render 检查。" + MARKDOWN_HINT,
+    description: "用 Markdown 内容在本群模板（任意同格式 DOCX/PPTX）的母版、版式与样式上生成可编辑的新 Word 或 PPT。Word 继承页面设置、页眉页脚和样式；PPT 继承母版，从模板样例页推断标题样式与内容区域，#/## 起新页，文字超出自动续页并在 build.attention 中提示；build.layouts 列出本次新生成页中实际排成图示的页，描述新页版式时以它为准，新页未列出即普通版式；keepSlides 保留的模板页不在其中，其版式看大纲或渲染图。keepSlides 保留模板指定页（封面、封底等），sequence 决定保留页与新页顺序。无模板时使用默认中文版式。生成后仍需 document_render 检查。" + MARKDOWN_HINT,
     parameters: Type.Object({
       format: Type.Union([Type.Literal("docx"), Type.Literal("pptx")]),
       content: Type.String({ minLength: 1, maxLength: 200000 }),

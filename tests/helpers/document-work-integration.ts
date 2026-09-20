@@ -100,7 +100,18 @@ const layoutMarkdown = [
   "## 处理流程", "收到告警后按下图处置。", "", "```mermaid", "flowchart TB", "  S([收到告警]) --> A[初判]", "  A --> B{是否高危?}", "  B -- 是 --> C[立即阻断]",
   "  B -- 否 --> D[进入队列]", "  C --> E([结束])", "  D --> E", "  E -.-> A", "```", "",
   "## 无法解析", "```mermaid", "A -->", "```", "",
-  "## 图片分层", "<!-- layers -->", "### 应用层", "![](product.png)", "客户端。", "### 平台层", "![](product.png)", "安全大脑。",
+  "## 图片分层", "<!-- layers -->", "### 应用层", "![](product.png)", "客户端。", "### 平台层", "![](product.png)", "安全大脑。", "",
+  "## 指标单位", "- 135,000+ : 公网暴露实例", "- 82 个国家 : 分布范围", "- 14.6%：高危占比", "",
+  "## 小数指标", "- 1024.50 GB：已用容量", "- 2048.25 GB：总容量", "- 4096.75 GB：峰值", "",
+  "## 年月形小数指标", "- 2000.01 GB：已用容量", "- 2000.02 GB：总容量", "- 2000.03 GB：峰值", "",
+  "## 混合小数指标", "- 1024.50 GB：已用容量", "- 2048.01 GB：总容量", "- 4096.75 GB：峰值", "",
+  "## 小数指标单位", "- 2000.01GiB：存储", "- 2000.02 ms：延迟", "- 2000.03 万元：投入", "- 2000.04%：增长率", "",
+  "## 日期节点", "- 2026年3月：立项", "- 2026.06：试点", "- 2026-09-30：验收", "",
+  "## 日期事件", "- 2026年3月立项：完成方案评审", "- 2026年6月试点：两个部门上线", "- 2026年9月验收：全量推广", "",
+  "## 数字日期事件", "- 2026.03 立项：完成方案评审", "- 2026.06 上线：两个部门上线", "- 2026.09 UAT：全量验收", "",
+  "## 分期安排", "1. 第一阶段（第 1 个月）风险摸底与试点：暴露面探测与资产清点", "2. 第二阶段（第 2-3 个月）能力部署：出口与终端部署", "3. 第三阶段（第 4 个月起）常态运营：巡检与复盘", "",
+  "## 宽图说明", "整体架构如下图。", "![架构](product.png)", "",
+  "## 未识别列表", "- 资产识别能力（含影子资产发现）：自动发现实例", "- 风险检测能力（含配置基线）：覆盖 12 类风险", "- 审计溯源能力（含调用链）：完整记录",
 ].join("\n");
 const layoutBuild = await call("document_build", { format: "pptx", template: "source.pptx", content: layoutMarkdown, title: "布局", cover: false, filename: "布局.pptx" });
 // Edge cases: inherited headers, links to dropped template pages, explicit line breaks, tall table rows, image filters.
@@ -124,9 +135,11 @@ await assert.rejects(call("document_images", { source: "figure.pdf", pages: [9] 
 const preview = await call("document_render", { source: "pages.pdf", pages: [22, 1, 2] });
 const officePreviews: unknown[] = [];
 if (process.argv.includes("--office")) {
-  for (const source of [wordCompose.output, pptPatch.output, wordBuild.output, slideBuild.output, slideInline.output, layoutBuild.output, overflowBuild.output]) {
+  for (const source of [wordCompose.output, pptPatch.output, wordBuild.output, slideBuild.output, slideInline.output, overflowBuild.output]) {
     officePreviews.push(await call("document_render", { source }));
   }
+  // The layout deck has grown past the 20-page render default, so ask for every generated page explicitly.
+  officePreviews.push(await call("document_render", { source: layoutBuild.output, pages: layoutBuild.build.generatedPages }));
 }
 const results = { wordPatch, wordCompose, wordSelection, pptCompose, pptPatch, pptPatchPart: pptPart, preview, officePreviews, sourceDigests,
   outline, wordOutline, wordBuild, wordDefault, slideBuild, slideDefault, slideInline, wordInline, layoutBuild, pdfImages, deckImages, wordImages, wordFlow,
