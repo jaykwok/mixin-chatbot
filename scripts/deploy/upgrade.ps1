@@ -5,6 +5,9 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Console]::OutputEncoding
 . (Join-Path $PSScriptRoot '..\lib\common.ps1')
+$operation = Start-OperationLog $Project 'upgrade'
+$operationExit = 1
+try {
 Set-Location -LiteralPath $Project
 $TaskName = 'mixin-chatbot'
 $bun = if ($BunPath) { $BunPath } else { @(Get-ApplicationPaths 'bun.exe' | Select-Object -First 1)[0] }
@@ -23,9 +26,13 @@ function Invoke-Migration([string]$Action) {
 
 # This phase uses built-ins only, so even a changed Pi dependency cannot block decisions.
 try {
+Set-OperationStage 'migration-preview'
+Write-OperationEvent 'info' ("original=$OriginalSha target=$TargetSha")
 & $bun run $previewRunner preview --decisions-only --interactive --project $Project --groups $groups --plan $plan
 if ($LASTEXITCODE -ne 0) { throw '迁移预览未完成；旧服务尚未停止' }
+Set-OperationStage 'deployment-snapshot'
 $snapshot = Open-UpgradeSnapshot $Project $TaskName $OriginalSha $OriginalBranch $TargetSha
+Write-OperationEvent 'info' ('snapshot=' + $snapshot.Path)
 $OriginalSha = $snapshot.UpgradeOriginal
 $OriginalBranch = $snapshot.UpgradeBranch
 $transactionPointer = Join-Path $Project 'data\state\upgrade-transaction'
@@ -37,22 +44,24 @@ try {
     # previous process committed and died, installation failure must never roll back data.
     & $bun run $previewRunner committed --project $Project --groups $groups --deployment (Split-Path $snapshot.Path -Leaf)
     $committed = $LASTEXITCODE -eq 0
+    Set-OperationStage 'stop-service'
     if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '旧实例未停止' }
     $mutated = $true
-    & $git -C $Project checkout main
-    if ($LASTEXITCODE -ne 0) { throw '切换 main 失败' }
-    & $git -C $Project merge --ff-only $TargetSha
-    if ($LASTEXITCODE -ne 0) { throw '目标提交无法快进' }
+    Set-OperationStage 'checkout'
+    if ((Invoke-OperationNative $git @('-C', $Project, 'checkout', 'main')) -ne 0) { throw '切换 main 失败' }
+    if ((Invoke-OperationNative $git @('-C', $Project, 'merge', '--ff-only', $TargetSha)) -ne 0) { throw '目标提交无法快进' }
     $checkedOut = [string](& $git -C $Project rev-parse HEAD)
     if ($LASTEXITCODE -ne 0 -or $checkedOut.Trim() -ne $TargetSha) { throw '当前代码不是预览的目标提交，拒绝执行迁移' }
     if (-not (Test-DeploymentDependenciesReusable $Project $git $OriginalSha $TargetSha)) {
+        Set-OperationStage 'install-dependencies'
         Save-DeploymentDependencies $snapshot
-        & $bun install --frozen-lockfile
-        if ($LASTEXITCODE -ne 0) { throw '依赖安装失败' }
+        if ((Invoke-OperationNative $bun @('install', '--frozen-lockfile')) -ne 0) { throw '依赖安装失败' }
     }
     if (-not $committed) {
+    Set-OperationStage 'migration-apply'
     $migrationAttempted = $true
     Invoke-Migration 'apply'
+    Set-OperationStage 'verification-service'
     Set-Content -LiteralPath (Join-Path $Project 'data\state\verify-only') -Value 'verify' -Encoding ASCII
     if (-not $snapshot.TaskXml) { throw '未安装计划任务，请先部署' }
     Enable-ScheduledTask -TaskName $TaskName | Out-Null
@@ -67,9 +76,11 @@ try {
     if (-not $ready) { throw '只验证实例健康检查失败' }
     if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止' }
     if ($RestartTunnel -and (Get-Service Cloudflared -ErrorAction SilentlyContinue)) { Restart-Service Cloudflared -ErrorAction Stop }
+    Set-OperationStage 'migration-commit'
     Invoke-Migration 'commit'
     $committed = $true
     }
+    Set-OperationStage 'activate-service'
     Remove-Item -LiteralPath (Join-Path $Project 'data\state\verify-only') -Force -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $TaskName -Xml $snapshot.TaskXml -Force | Out-Null
     if ($snapshot.WasRunning) {
@@ -86,9 +97,13 @@ try {
     }
     Remove-Item -LiteralPath $transactionPointer -Force
     Write-Host "升级完成：$OriginalSha -> $TargetSha；原运行状态已保留。"
+} catch {
+    Write-OperationFailure $_
+    throw
 } finally {
     try {
     if (-not $committed -and $mutated) {
+        Set-OperationStage 'rollback'
         if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '无法停止新实例，拒绝恢复数据；请人工处理' }
         if ($migrationAttempted) {
             & $bun run $runner rollback --project $Project --groups $groups --deployment (Split-Path $snapshot.Path -Leaf)
@@ -105,6 +120,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw '原代码恢复失败' }
         Restore-DeploymentSnapshot $snapshot
         Remove-Item -LiteralPath $transactionPointer -Force
+        Write-OperationEvent 'info' 'data, code and service restored'
     }
     } finally {
     $snapshot.Lock.Dispose()
@@ -115,3 +131,6 @@ try {
 } finally {
     Remove-Item -LiteralPath $plan -Force -ErrorAction SilentlyContinue
 }
+$operationExit = 0
+} catch { Write-OperationFailure $_; throw }
+finally { Stop-OperationLog $operation $operationExit }

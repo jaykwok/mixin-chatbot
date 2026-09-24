@@ -1,5 +1,5 @@
 export interface Decisions { acceptNativeCache?: boolean; provider?: string; model?: string }
-export interface Context { project: string; groups: string; decisions: Decisions }
+export interface Context { project: string; groups: string; decisions: Decisions; report?: (stage: string, detail: string) => void }
 export interface PreviewContext {
   project: string;
   decisions: Decisions;

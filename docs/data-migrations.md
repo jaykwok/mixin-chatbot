@@ -24,6 +24,18 @@ Windows 从尚不支持迁移的旧升级器过渡：
 
 从本版起，Windows 运维入口从目标 Git 提交导出升级程序和迁移步骤，先预览决策，再由目标版本程序停机、切换代码与安装依赖。目标升级程序拥有整个事务。升级结束或失败时清理本次 `tmp/upgrade-<GUID>` 导出目录和临时预览计划，恢复所需快照仍保留。新装机器使用平台部署脚本完成模型配置、迁移校验及初始化。
 
+Windows 子进程统一使用系统自带的 Windows PowerShell 5.1；从 PowerShell 7 启动运维入口也会明确定位系统的 `powershell.exe`。快照替换使用 `[NullString]::Value` 向 .NET 传递真正的 null 参数，避免 PS5.1 将 `$null` 转成空路径。若曾在 `Save-DeploymentSnapshot` 的 `File.Replace` 处遇到 “The path is not of a legal form”，该步骤尚未停止旧实例、切换代码或执行数据迁移；发布修复后重新进入 TUI 升级即可，无需手动修改版本标记。
+
+## 失败日志
+
+升级、部署和迁移诊断写入项目的 `logs/operations/`，开始与结束时打印本次日志的完整路径。`upgrade-*.log` / `deploy-*.log` 记录阶段、原始与目标提交、快照位置、迁移事务号、异常堆栈、命令退出码和回滚结果。同一次升级的父进程、目标升级器和迁移子进程共用文件；Docker 迁移使用服务 UID，将日志写回宿主机挂载的同一目录。
+
+独立运行迁移命令会生成 `migration-*.log`；只读的 `status` / `committed` 不创建日志。服务在业务日志初始化之前启动失败时，写入同目录的 `startup-*.log`；计划任务启动的验证实例失败时也检查这些文件。日志模块只依赖内置能力，配置尚未迁移、依赖安装失败时仍可记录。回滚删除事务回执、恢复配置和代码时保留诊断日志。
+
+Windows 可用 `Get-ChildItem logs/operations | Sort-Object LastWriteTime -Descending` 查找最近文件，再用 `Get-Content <日志路径> -Tail 100` 查看。Linux 可用 `ls -lt logs/operations`、`tail -n 100 <日志路径>`。原业务日志仍从 TUI 的“监控 → 日志”查看。
+
+日志保留最近 20 份，每份上限约 2 MiB；命令输出达到约 1 MiB 后停止收录大段输出，剩余空间留给阶段、异常和回滚结果。不会抄录交互输入或整份配置，常见 token、API key、Authorization、带凭据 URL 和 webhook 密钥会脱敏。日志并非终端逐字转录，分享前仍需检查第三方命令的自定义凭据格式。日志目录无法写入时提示原因并保留终端输出，不让诊断失败改变升级或回滚行为。
+
 ## 事务边界
 
 1. 停机前预览。旧 `none` 或缓存冲突需要明确接受原生缓存；移除的 Codex 模型需要指定替代 provider/model。不会自动改选模型。环境变量里的 `BOT_MODEL_CACHE_RETENTION` 需要管理员移除。

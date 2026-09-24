@@ -75,10 +75,10 @@ if [ -n "$DOMAIN" ]; then
 fi
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
-P()  { echo -e "${BLUE}[*]${NC} $1"; }
-OK() { echo -e "${GREEN}[+]${NC} $1"; }
-WA() { echo -e "${YELLOW}[!]${NC} $1"; }
-ER() { echo -e "${RED}[x]${NC} $1"; }
+P()  { echo -e "${BLUE}[*]${NC} $1"; operation_event info "$1"; }
+OK() { echo -e "${GREEN}[+]${NC} $1"; operation_event info "$1"; }
+WA() { echo -e "${YELLOW}[!]${NC} $1"; operation_event warn "$1"; }
+ER() { echo -e "${RED}[x]${NC} $1"; operation_event error "$1"; }
 
 ask_yes_no() {
     local prompt="$1" answer=""
@@ -587,6 +587,8 @@ restore_checkout() {
 }
 
 update() (
+    operation_start upgrade
+    trap 'operation_finish "$?"' EXIT
     acquire_deploy_lock || { ER "另一个部署或升级正在进行"; return 1; }
     local deploy_script="${PROJECT_DIR}/scripts/deploy/deploy.sh"
     P "同步到 origin/main 并重新部署"
@@ -634,9 +636,11 @@ update() (
             rm -f -- "$commit_file" || WA "升级回执清理失败：$commit_file"
         fi
         if [ "$update_changed" = 1 ] && [ "$update_committed" != 1 ]; then
+            operation_stage rollback-code
             ER "升级未提交，正在恢复升级前的代码..."
             restore_checkout "$original_branch" "$original_sha" || { ER "代码自动回滚失败，请检查当前 git 状态"; status=1; }
         fi
+        operation_finish "$status"
         exit "$status"
     }
     trap finish_update EXIT
@@ -644,7 +648,8 @@ update() (
     trap 'exit 143' TERM
 
     P "拉取 origin/main..."
-    if ! git_here fetch --prune origin main; then
+    operation_stage fetch
+    if ! operation_capture git_here fetch --prune origin main; then
         ER "git fetch 失败"
         return 1
     fi
@@ -669,6 +674,7 @@ update() (
     local current_sha target_sha
     current_sha="$(git_here rev-parse HEAD)"
     target_sha="$(git_here rev-parse origin/main 2>/dev/null)"
+    operation_event info "original=$original_sha target=$target_sha"
     if [ -s "$PROJECT_DIR/data/state/deploy-transaction" ]; then
         local pending_name pending_target
         pending_name="$(cat "$PROJECT_DIR/data/state/deploy-transaction")"
@@ -702,7 +708,8 @@ update() (
     echo ""
 
     update_changed=1
-    if ! git_here merge --ff-only "$target_sha"; then
+    operation_stage checkout
+    if ! operation_capture git_here merge --ff-only "$target_sha"; then
         ER "git merge --ff-only 失败"
         return 1
     fi

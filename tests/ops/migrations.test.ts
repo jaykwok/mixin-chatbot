@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
@@ -34,6 +34,46 @@ async function execute(args: string[], cwd: string, env: Record<string, string> 
   const [code, output, errors] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr as ReadableStream).text()]);
   return { code, text: output + errors };
 }
+
+test("migration decisions and diagnostics work with the original updater export manifest", async () => {
+  const f = await fixture("none");
+  try {
+    const stage = join(f.root, "export");
+    // Migration preview can use only the built-ins and paths in the original updater export.
+    // The PowerShell orchestrator is not needed by preview (or shipped inside the Linux image).
+    for (const path of ["scripts/lib", "scripts/migrations", "src/core/data-version.ts"]) {
+      await mkdir(dirname(join(stage, path)), { recursive: true });
+      await cp(join(project, path), join(stage, path), { recursive: true });
+    }
+    const result = await execute([join(stage, "scripts/migrations/run.ts"), "preview", "--decisions-only", "--project", f.root, "--groups", f.context.groups], f.root);
+    expect(result.code, result.text).toBe(2);
+    expect(result.text).toContain("acceptNativeCache");
+    const logs = await readdir(join(f.root, "logs/operations")); expect(logs).toHaveLength(1);
+    expect(await readFile(join(f.root, "logs/operations", logs[0]!), "utf8")).toContain("migration-finished: exit=2");
+    expect(await json(join(f.root, "data/state/migration.json"))).toBeNull();
+  } finally { await f.cleanup(); }
+}, 15000);
+
+test("migration failure diagnostics survive rollback and recovery journal removal", async () => {
+  const f = await fixture();
+  try {
+    const runtimePath = join(f.root, "data/config/runtime.json"), original = await readFile(runtimePath);
+    const planPath = join(f.root, "plan.json"), name = "upgrade-20260925T000000Z-fixture.log";
+    const command = (action: string) => execute([join(project, "scripts/migrations/run.ts"), action, "--project", f.root,
+      "--groups", f.context.groups, "--plan", planPath], f.root, { BOT_OPERATION_LOG: name });
+    for (const action of ["preview", "apply"]) { const result = await command(action); expect(result.code, result.text).toBe(0); }
+    await writeFile(runtimePath, "invalid-json");
+    const failed = await command("commit"); expect(failed.code, failed.text).toBe(1);
+    const restored = await command("rollback"); expect(restored.code, restored.text).toBe(0);
+    expect(await json(join(f.root, "data/state/migration.json"))).toBeNull();
+    expect(await readFile(runtimePath)).toEqual(original);
+    expect(await readdir(join(f.root, "logs/operations"))).toEqual([name]);
+    const text = await readFile(join(f.root, "logs/operations", name), "utf8");
+    expect(text).toContain("当前版本完整校验失败"); expect(text).toContain("migration-finished: exit=1");
+    expect(text).toContain("rollback-complete: transaction="); expect(text).toContain("backup=");
+    expect(text).not.toContain("fixture-key");
+  } finally { await f.cleanup(); }
+}, 30000);
 
 test.each(["auto", "short", "long"])("legacy %s and partially migrated settings converge without repeated writes", async retention => {
   const f = await fixture(retention);
@@ -207,7 +247,7 @@ test("normal startup ignores a leftover verification flag after the project comm
   const f = await fixture(), c = f.context;
   try {
     await apply(c, (await preview(c)).plan!); await commit(c);
-    for (const path of ["src/core/data-version.ts", "src/server/index.ts"]) {
+    for (const path of ["src/core/data-version.ts", "scripts/lib/operation-log.ts", "src/server/index.ts"]) {
       await mkdir(dirname(join(f.root, path)), { recursive: true }); await copyFile(join(project, path), join(f.root, path));
     }
     await writeFile(join(f.root, "src/server/app.ts"), 'console.log("NORMAL_ENTRY")');
@@ -305,12 +345,15 @@ test("TUI recovery and service gate load without importing invalid legacy config
   const f = await fixture("none");
   try {
     // Copy only the bootstrap graph. Business views and npm dependencies are deliberately absent.
-    for (const path of ["scripts/ops/tui.ts", "scripts/ops/tui/recovery.ts", "scripts/ops/tui/platform.ts", "src/core/data-version.ts", "src/server/index.ts"]) {
+    for (const path of ["scripts/ops/tui.ts", "scripts/ops/tui/recovery.ts", "scripts/ops/tui/platform.ts", "src/core/data-version.ts", "scripts/lib/operation-log.ts", "src/server/index.ts"]) {
       await mkdir(dirname(join(f.root, path)), { recursive: true }); await copyFile(join(project, path), join(f.root, path));
     }
     const tui = await execute([join(f.root, "scripts/ops/tui.ts")], f.root);
     expect(tui.code).toBe(1); expect(tui.text).toContain("尚未登记"); expect(tui.text).not.toContain("Cannot find");
     const service = await execute([join(f.root, "src/server/index.ts")], f.root, { GROUP_DATA_ROOT: f.context.groups });
     expect(service.code).toBe(1); expect(service.text).toContain("尚未登记"); expect(service.text).not.toContain("BOT_MODEL_CACHE_RETENTION");
+    const logs = await readdir(join(f.root, "logs/operations")); expect(logs).toHaveLength(1);
+    expect(logs[0]).toStartWith("startup-");
+    expect(await readFile(join(f.root, "logs/operations", logs[0]!), "utf8")).toContain("尚未登记");
   } finally { await f.cleanup(); }
 }, 30000);

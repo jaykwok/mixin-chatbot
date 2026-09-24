@@ -71,6 +71,7 @@ begin_deployment() {
         fi
         NEW_CONTAINER_ATTEMPTED=0; DEPLOY_FILES_MUTATED=1; TUNNEL_STARTED_BY_DEPLOY=0; DEPLOYMENT_COMMITTED=0
         MIGRATION_APPLY_ATTEMPTED=1
+        operation_event info "resuming snapshot=$DEPLOY_SNAPSHOT; originally_running=$PREVIOUS_RUNNING"
         trap rollback_deployment EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
         print_warning "继续中断的部署，沿用原快照和原运行状态：$saved_name"
         return 0
@@ -127,6 +128,7 @@ begin_deployment() {
     DEPLOY_FILES_MUTATED=0
     TUNNEL_STARTED_BY_DEPLOY=0
     DEPLOYMENT_COMMITTED=0
+    operation_event info "snapshot=$DEPLOY_SNAPSHOT; originally_running=$PREVIOUS_RUNNING"
     trap rollback_deployment EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -146,17 +148,21 @@ commit_deployment() {
     fi
     DEPLOYMENT_COMMITTED=1
     trap - EXIT INT TERM
+    if declare -F operation_finish >/dev/null; then trap 'operation_finish "$?"' EXIT; fi
 }
 
 rollback_deployment() {
     local status=$? failed=0
     trap - EXIT INT TERM
-    [ "$DEPLOYMENT_COMMITTED" = 0 ] || return "$status"
+    [ "$DEPLOYMENT_COMMITTED" = 0 ] || { operation_finish "$status"; return "$status"; }
     # A signal can arrive after the receipt write and before the local flag is assigned.
-    if [ "${MIGRATION_APPLY_ATTEMPTED:-0}" = 0 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ] && [ "$(cat "$BOT_UPDATE_COMMIT_FILE" 2>/dev/null)" = committed ]; then return "$status"; fi
+    if [ "${MIGRATION_APPLY_ATTEMPTED:-0}" = 0 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ] && [ "$(cat "$BOT_UPDATE_COMMIT_FILE" 2>/dev/null)" = committed ]; then operation_finish "$status"; return "$status"; fi
+    operation_event error "deployment interrupted; exit=$status"
+    operation_stage rollback
     set +e
     if [ "$DEPLOY_FILES_MUTATED" = 0 ]; then
         if [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ]; then docker start mixin-chatbot >/dev/null; fi
+        operation_finish 1
         exit 1
     fi
     stop_tunnel_launcher || failed=1
@@ -169,6 +175,7 @@ rollback_deployment() {
             docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || failed=1
         else
             print_error "新容器未停止，拒绝覆盖其配置；快照保留在 $DEPLOY_SNAPSHOT"
+            operation_finish 1
             exit 1
         fi
     fi
@@ -182,6 +189,7 @@ rollback_deployment() {
             # code (and its recovery tools) even when data restoration itself failed.
             if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
             print_error "数据回滚未完成或已经提交；保持停止，不恢复旧容器。"
+            operation_finish 1
             exit 1
         fi
     fi
@@ -217,5 +225,6 @@ rollback_deployment() {
         print_warning "已恢复配置、容器、网络入口和原运行状态；快照在 $DEPLOY_SNAPSHOT"
     else print_error "自动回滚未完成；请检查保留的快照 $DEPLOY_SNAPSHOT"; fi
     [ "$status" -ne 0 ] || status=1
+    operation_finish "$status"
     exit "$status"
 }

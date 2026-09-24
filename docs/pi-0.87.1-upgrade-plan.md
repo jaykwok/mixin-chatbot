@@ -81,6 +81,8 @@ Meta OAuth 暂不安排：项目刻意用 models.json + 内存凭据存储，新
 - 兜底扫描重试修正：文件与目录错误逐项隔离并记录失败数，有失败不标记当天完成；成功文件指纹持久保存在现有 meta 中，同日重试和重启后跳过未变化原件，跨日或强制扫描重新读取。回归覆盖持续 EACCES、后续文件与群、进程重启、权限恢复、成功文件追加及强制扫描失败；旧实现已确认遇到第一个 EACCES 就中断。
 - 新版 edit/write 会先为变更队列 realpath；路径差分测试改用子进程临时 home。完整检查还发现文档环境缓存的时间戳精度和失效证明复用问题，已修正为纳秒指纹及观察到变化即丢弃旧校验。
 
+2026-09-25 运维补充：修复 PS5.1 的 `File.Replace` 空参数绑定；PS7 入口显式使用系统 PS5.1 子进程。升级、部署、迁移与早期启动失败写入有容量限制并脱敏的 `logs/operations/`，回滚保留诊断。旧升级器的导出清单可直接启动新预览，Docker 迁移共用宿主日志目录。真实 PS5.1 连续保存快照先在旧逻辑复现失败，再通过修复。专项 37 项通过，完整 `bun run check` 为 606 pass、4 个 Linux 专属 skip、0 fail，TypeScript 与两轮 Knip 通过；日志在 `tmp/pi087/full-check-operation-logs.txt`。本机未运行真实 Docker 构建。
+
 **执行任务（按依赖顺序）**
 
 - [x] **P0-1：统一升级与冻结依赖。** 修改 package.json 两个直接依赖到 0.87.1，重新生成 bun.lock，核对 pi-agent-core/pi-tui/pi-telemetry/chord 解析版本一致；更新 `docs/development.md` 和测试中版本标签。验收：干净安装与 typecheck 通过；正式构建允许并验证必要安装脚本，不能把本次 `--ignore-scripts` 当生产安装验证。

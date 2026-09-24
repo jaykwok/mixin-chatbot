@@ -5,6 +5,9 @@ import { DATA_VERSION, inspectDataVersion, serviceGroupRoot } from "../../src/co
 import { apply, commit, committedDeployment, preview, rollback, type Plan } from "./lib/runner.ts";
 import { json, publishJson } from "./lib/io.ts";
 import type { Context } from "./lib/types.ts";
+import { openOperationLog, operationError } from "../lib/operation-log.ts";
+
+let diagnostic: ReturnType<typeof openOperationLog> | undefined;
 
 async function main() {
   const args = process.argv.slice(2), command = args.shift() ?? "status";
@@ -25,7 +28,14 @@ async function main() {
     if (arg === "--model") decisions.model = value;
     if (arg === "--deployment") deployment = value;
   }
-  const context: Context = { project: resolve(project), groups: groups ? resolve(project, groups) : serviceGroupRoot(project), decisions };
+  // Start logging before configuration or group-root validation; status remains read-only.
+  if (!["status", "committed"].includes(command)) {
+    diagnostic = openOperationLog(resolve(project), "migration");
+    diagnostic.event("info", command, `target=${DATA_VERSION}; deployment=${process.env.BOT_DEPLOY_BACKUP_ID ?? "manual"}`);
+    if (diagnostic.path) console.error("迁移日志：" + diagnostic.path);
+  }
+  const context: Context = { project: resolve(project), groups: groups ? resolve(project, groups) : serviceGroupRoot(project), decisions,
+    report: (stage, detail) => diagnostic?.event("info", stage, detail) };
   if (command === "status") { console.log(JSON.stringify(inspectDataVersion(context.project, context.groups))); return; }
   if (command === "committed") { process.exitCode = await committedDeployment(context, deployment) ? 0 : 1; return; }
   if (command === "preview") {
@@ -56,4 +66,10 @@ async function main() {
   else if (command === "rollback") { if (!await rollback(context, deployment || undefined)) { console.error("迁移已提交；保留新代码和数据，禁止自动回退"); process.exitCode = 42; } }
   else throw new Error("用法：bun run scripts/migrations/run.ts status|preview|apply|commit|rollback [--groups PATH] [--plan PATH] [--interactive]");
 }
-if (import.meta.main) main().catch(error => { console.error((error as Error).message); process.exitCode = 1; });
+if (import.meta.main) main().catch(error => {
+  diagnostic?.event("error", "migration", operationError(error));
+  console.error((error as Error).message); process.exitCode = 1;
+}).finally(() => {
+  const code = Number(process.exitCode ?? 0);
+  diagnostic?.event(code ? "error" : "info", "migration-finished", `exit=${code}`);
+});

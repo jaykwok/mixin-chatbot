@@ -122,7 +122,7 @@ test.skipIf(process.platform !== "linux")("original Linux tunnel launcher record
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(identity) });
   try {
     for (const dir of ["scripts/tunnel", "scripts/lib", "scripts/ops", "src/core", "data/state"]) await mkdir(join(fixture.root, dir), { recursive: true });
-    for (const path of ["scripts/tunnel/start-tunnel.sh", "scripts/lib/common.sh", "scripts/lib/lifecycle.sh", "scripts/lib/tunnel-logging.sh", "scripts/ops/health-check.ts", "src/core/health.ts"]) {
+    for (const path of ["scripts/tunnel/start-tunnel.sh", "scripts/lib/common.sh", "scripts/lib/lifecycle.sh", "scripts/lib/tunnel-logging.sh", "scripts/lib/operation-log.sh", "scripts/ops/health-check.ts", "src/core/health.ts"]) {
       await copyFile(join(project, path), join(fixture.root, path));
     }
     await writeFile(join(fixture.root, "data/state/instance.json"), JSON.stringify({ ...identity, port: server.port }));

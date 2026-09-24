@@ -6,10 +6,6 @@
 # 两种部署模式：直连（公网 IP + UFW 限平台 IP）/ Cloudflare（cloudflared 隧道 + WAF）。
 
 set -euo pipefail
-if [ -n "${BOT_MODEL_CACHE_RETENTION:-}" ]; then
-    echo 'BOT_MODEL_CACHE_RETENTION 已移除；请先迁移配置并移除旧环境变量，再部署。' >&2
-    exit 1
-fi
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # 与 deploy.sh / ops.sh 共用的纯辅助函数（主机名校验与规范化）。
 COMMON_LIB="${PROJECT_DIR}/scripts/lib/common.sh"
@@ -20,6 +16,13 @@ fi
 # shellcheck source=../lib/common.sh
 . "$COMMON_LIB"
 . "${PROJECT_DIR}/scripts/lib/deployment.sh"
+operation_start deploy
+trap 'operation_finish "$?"' EXIT
+if [ -n "${BOT_MODEL_CACHE_RETENTION:-}" ]; then
+    operation_event error 'BOT_MODEL_CACHE_RETENTION 已移除，请先移除旧环境变量'
+    echo 'BOT_MODEL_CACHE_RETENTION 已移除；请先迁移配置并移除旧环境变量，再部署。' >&2
+    exit 1
+fi
 cd "$PROJECT_DIR"
 DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
@@ -40,6 +43,7 @@ TUNNEL_PID_FILE="${STATE_DIR}/cloudflared.pid"
 PLATFORM_IP="${PLATFORM_IP:-223.244.14.237}"
 BOT_DEBUG_VALUE="${BOT_DEBUG:-0}"
 if [ "$BOT_DEBUG_VALUE" != "0" ] && [ "$BOT_DEBUG_VALUE" != "1" ]; then
+    operation_event error 'BOT_DEBUG 只能是 0 或 1'
     echo "BOT_DEBUG 只能是 0 或 1" >&2
     exit 1
 fi
@@ -47,6 +51,7 @@ BOT_MAX_ACTIVE_REQUESTS_VALUE="${BOT_MAX_ACTIVE_REQUESTS:-32}"
 if ! [[ "$BOT_MAX_ACTIVE_REQUESTS_VALUE" =~ ^[0-9]+$ ]] ||
    [ "$BOT_MAX_ACTIVE_REQUESTS_VALUE" -lt 1 ] ||
    [ "$BOT_MAX_ACTIVE_REQUESTS_VALUE" -gt 1000 ]; then
+    operation_event error 'BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数'
     echo "BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数" >&2
     exit 1
 fi
@@ -66,10 +71,10 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-print_status() { echo -e "${BLUE}[*] $1${NC}"; }
-print_success() { echo -e "${GREEN}[+] $1${NC}"; }
-print_warning() { echo -e "${YELLOW}[!] $1${NC}"; }
-print_error() { echo -e "${RED}[-] $1${NC}"; }
+print_status() { echo -e "${BLUE}[*] $1${NC}"; operation_stage "$1"; }
+print_success() { echo -e "${GREEN}[+] $1${NC}"; operation_event info "$1"; }
+print_warning() { echo -e "${YELLOW}[!] $1${NC}"; operation_event warn "$1"; }
+print_error() { echo -e "${RED}[-] $1${NC}"; operation_event error "$1"; }
 print_prompt() { echo -e "${CYAN}?> $1${NC}"; }
 
 trim_input() {
@@ -321,7 +326,7 @@ print_success "目录就绪"
 # ---- 构建镜像 ----
 
 print_status "构建 Docker 镜像..."
-if docker build -t mixin-chatbot .; then
+if operation_capture docker build -t mixin-chatbot .; then
     print_success "镜像构建成功"
 else
     print_error "镜像构建失败"
@@ -357,8 +362,8 @@ print_success "持久化目录权限正常"
 # The target image owns migration semantics, including the first unversioned upgrade.
 migration_docker() {
     docker run --rm -i --user "$CONTAINER_UID:$CONTAINER_GID" \
-      -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -e PI_CACHE_RETENTION -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
-      "${GROUP_ROOT_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" -v "$PROJECT_DIR/backup:/app/backup" \
+      -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -e BOT_OPERATION_LOG -e PI_CACHE_RETENTION -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
+      "${GROUP_ROOT_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" -v "$PROJECT_DIR/backup:/app/backup" -v "$PROJECT_DIR/logs:/app/logs" \
       mixin-chatbot bun run scripts/migrations/run.ts "$@" --groups "$GROUP_ROOT_ENV_VAL"
 }
 MIGRATION_APPLY_ATTEMPTED=0

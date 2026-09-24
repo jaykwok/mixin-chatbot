@@ -15,6 +15,9 @@ if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
     exit 1
 }
 . $CommonLib
+$operation = Start-OperationLog $Project 'deploy'
+$operationExit = 1
+try {
 $Entry    = Join-Path $Project "src\server\index.ts"
 $TaskName = "mixin-chatbot"
 $DataDir = Join-Path $Project "data"
@@ -33,9 +36,10 @@ $LauncherFile = Join-Path $RuntimeDir "bot-launcher.ps1"
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsPowerShell = "powershell.exe" }
 
-function Step($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
-function Done($m) { Write-Host "[+] $m" -ForegroundColor Green }
-function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
+function Step($m) { Write-Host "[*] $m" -ForegroundColor Cyan; Set-OperationStage $m }
+function Done($m) { Write-Host "[+] $m" -ForegroundColor Green; Write-OperationEvent 'info' $m }
+function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow; Write-OperationEvent 'warn' $m }
+function Fail($m) { Write-Host $m -ForegroundColor Red; Write-OperationEvent 'error' $m }
 function Test-VersionedApplication([string]$Path, [string]$RequiredPattern = "") {
     try {
         $output = @(& $Path --version 2>$null)
@@ -70,7 +74,7 @@ $runtimeFile = Join-Path $ConfigDir 'runtime.json'
 if (Test-Path -LiteralPath $runtimeFile) { $savedRuntime = Get-Content -LiteralPath $runtimeFile -Raw -Encoding UTF8 | ConvertFrom-Json }
 $BotDebug = if ($env:BOT_DEBUG) { $env:BOT_DEBUG.Trim() } elseif ($savedRuntime.BOT_DEBUG) { [string]$savedRuntime.BOT_DEBUG } else { '0' }
 if ($BotDebug -notin @("0", "1")) {
-    Write-Host "BOT_DEBUG 只能是 0 或 1。" -ForegroundColor Red
+    Fail "BOT_DEBUG 只能是 0 或 1。"
     exit 1
 }
 $BotMaxActiveRequests = if ($env:BOT_MAX_ACTIVE_REQUESTS) { $env:BOT_MAX_ACTIVE_REQUESTS.Trim() }
@@ -78,7 +82,7 @@ $BotMaxActiveRequests = if ($env:BOT_MAX_ACTIVE_REQUESTS) { $env:BOT_MAX_ACTIVE_
 $parsedMaxActiveRequests = 0
 if (-not [int]::TryParse($BotMaxActiveRequests, [ref]$parsedMaxActiveRequests) -or
     $parsedMaxActiveRequests -lt 1 -or $parsedMaxActiveRequests -gt 1000) {
-    Write-Host "BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数。" -ForegroundColor Red
+    Fail "BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数。"
     exit 1
 }
 function Register-BotTask($Action, $Settings, [string]$UserId, [bool]$UseS4U) {
@@ -122,7 +126,7 @@ foreach ($gitPathCandidate in $gitPaths) {
     if ($gitProbe) { $workingGitPaths += $gitProbe.Path }
 }
 if ($workingGitPaths.Count -eq 0) {
-    Write-Host "缺少 git。请安装 Git for Windows（同时提供 agent bash 工具所需的 bash.exe）：" -ForegroundColor Red
+    Fail "缺少 git。请安装 Git for Windows（同时提供 agent bash 工具所需的 bash.exe）："
     Write-Host "  https://git-scm.com/download/win"
     exit 1
 }
@@ -165,7 +169,7 @@ foreach ($candidateBash in $bashCandidates) {
     }
 }
 if (-not $BashPath) {
-    Write-Host "缺少 bash.exe。请安装并启用 Git Bash；agent bash 工具需要它。" -ForegroundColor Red
+    Fail "缺少 bash.exe。请安装并启用 Git Bash；agent bash 工具需要它。"
     exit 1
 }
 $BashDir = Split-Path $BashPath -Parent
@@ -182,7 +186,7 @@ foreach ($knownBunPath in $knownBunPaths) {
     }
 }
 if ($bunPaths.Count -eq 0) {
-    Write-Host "缺少 bun。请选择一种方式安装：" -ForegroundColor Red
+    Fail "缺少 bun。请选择一种方式安装："
     Write-Host "  powershell -c ""irm bun.sh/install.ps1 | iex"""
     Write-Host "  winget install Oven-sh.Bun"
     Write-Host "安装后请重新打开管理员 PowerShell，再运行部署脚本。"
@@ -198,7 +202,7 @@ foreach ($bunPathCandidate in $bunPaths) {
         break
     }
 }
-if (-not $bunPath) { Write-Host "bun --version 执行失败；找到的 bun 命令都不可用。" -ForegroundColor Red; exit 1 }
+if (-not $bunPath) { Fail "bun --version 执行失败；找到的 bun 命令都不可用。"; exit 1 }
 Done "bun 版本：$bunVersion"
 
 # 从此处开始才允许修改持久配置、依赖、服务和网络入口。
@@ -219,7 +223,9 @@ if ((Test-Path -LiteralPath $ModelsFile) -and (Test-Path -LiteralPath (Join-Path
     if ($LASTEXITCODE -ne 0) { throw '迁移预览未完成；旧服务尚未停止' }
     $migrationPlanned = $true
 }
+Set-OperationStage 'deployment-snapshot'
 $snapshot = New-DeploymentSnapshot $Project $TaskName
+Write-OperationEvent 'info' ('snapshot=' + $snapshot.Path)
 $deploymentCommitted = $false
 $deploymentMutated = $false
 try {
@@ -229,16 +235,8 @@ try {
     Save-DeploymentDependencies $snapshot
 # ---- 2. 依赖 ----
 Step "安装依赖（bun install --frozen-lockfile）..."
-$previousErrorActionPreference = $ErrorActionPreference
-$bunInstallExitCode = 1
-try {
-    $ErrorActionPreference = "Continue"
-    & $bunPath install --frozen-lockfile
-    $bunInstallExitCode = $LASTEXITCODE
-} finally {
-    $ErrorActionPreference = $previousErrorActionPreference
-}
-if ($bunInstallExitCode -ne 0) { Write-Host "bun install 执行失败（退出码 $bunInstallExitCode）。" -ForegroundColor Red; exit 1 }
+$bunInstallExitCode = Invoke-OperationNative $bunPath @('install', '--frozen-lockfile')
+if ($bunInstallExitCode -ne 0) { Fail "bun install 执行失败（退出码 $bunInstallExitCode）。"; exit 1 }
 if ($migrationPlanned) {
     $migrationAttempted = $true
     & $bunPath run $migrationRunner apply --project $Project --groups $migrationGroups --plan $migrationPlan
@@ -261,8 +259,8 @@ if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
-    if ($configureExitCode -ne 0) { Write-Host "AI 配置失败（退出码 $configureExitCode）。" -ForegroundColor Red; exit 1 }
-    if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) { Write-Host "未生成 data\config\models.json，部署中止。" -ForegroundColor Red; exit 1 }
+    if ($configureExitCode -ne 0) { Fail "AI 配置失败（退出码 $configureExitCode）。"; exit 1 }
+    if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) { Fail "未生成 data\config\models.json，部署中止。"; exit 1 }
 } else {
     Done "data\config\models.json 已存在"
     if (Read-YesNo "是否重新配置 AI（provider/key/model）？[y/N]" $false) {
@@ -275,7 +273,7 @@ if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
         }
-        if ($configureExitCode -ne 0) { Write-Host "AI 配置失败（退出码 $configureExitCode）。" -ForegroundColor Red; exit 1 }
+        if ($configureExitCode -ne 0) { Fail "AI 配置失败（退出码 $configureExitCode）。"; exit 1 }
     }
 }
 
@@ -295,7 +293,7 @@ if (-not (Test-Path -LiteralPath $WebhookSecretFile -PathType Leaf)) {
 } else {
     $secret = (Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim()
     if ($secret -notmatch "^[0-9a-fA-F]{64}$") {
-        Write-Host "data\config\webhook-secret 格式无效（应为 64 位十六进制字符）。" -ForegroundColor Red
+        Fail "data\config\webhook-secret 格式无效（应为 64 位十六进制字符）。"
         Write-Host "停机并将该文件移入 backup\rm 后，重新部署可生成新密钥。" -ForegroundColor Red
         exit 1
     }
@@ -500,7 +498,7 @@ $currentFirewallRuleName = $null
 if ($mode -eq "direct") {
     $parsedIp = $null
     if (-not [System.Net.IPAddress]::TryParse($platformIp, [ref]$parsedIp)) {
-        Write-Host "PLATFORM_IP 无效：$platformIp" -ForegroundColor Red
+        Fail "PLATFORM_IP 无效：$platformIp"
         exit 1
     }
 }
@@ -521,7 +519,7 @@ if ($mode -eq "direct") {
         Done "Windows 防火墙已写入限定回调来源的 TCP $Port 规则"
     } catch {
         if (-not $allowUnmanagedFirewall) {
-            Write-Host "Windows 防火墙安全基线无法生效，直连模式拒绝在 0.0.0.0 上启动：$($_.Exception.Message)" -ForegroundColor Red
+            Fail "Windows 防火墙安全基线无法生效，直连模式拒绝在 0.0.0.0 上启动：$($_.Exception.Message)"
             Write-Host "修复 Windows 防火墙，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。" -ForegroundColor Red
             exit 1
         }
@@ -544,7 +542,7 @@ if ($preflightTunnelService -and -not $preflightTunnelManaged) {
         "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]"
     }
     if (-not (Read-YesNo $tunnelQuestion $false)) {
-        Write-Host "未确认未托管 Cloudflared 的归属，部署取消并恢复原状态。" -ForegroundColor Red
+        Fail "未确认未托管 Cloudflared 的归属，部署取消并恢复原状态。"
         exit 1
     }
     $unmanagedTunnelConfirmed = $true
@@ -651,7 +649,7 @@ $healthy = Wait-BotHealth $Port -AllowVerification
 if (-not $healthy) {
     $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
     $lastResult = if ($taskInfo) { "$(Get-ResultCodeHex $taskInfo.LastTaskResult) / $($taskInfo.LastTaskResult)" } else { "未知" }
-    Write-Host "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请在 $(Get-OpsCommandHint 'logs') 查看日志，并使用 $(Get-OpsCommandHint 'doctor')。" -ForegroundColor Red
+    Fail "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请在 $(Get-OpsCommandHint 'logs') 查看日志，并使用 $(Get-OpsCommandHint 'doctor')。"
     throw "新部署未通过健康检查"
 }
 if ($mode -eq "direct") {
@@ -666,7 +664,7 @@ if ($mode -eq "direct") {
                 Set-Service -Name "Cloudflared" -StartupType Disabled -ErrorAction Stop
                 Done "本项目 Cloudflared 已停止并禁用，重启后也不会恢复旧隧道入口"
             } catch {
-                Write-Host "无法停止或禁用本项目 Cloudflared 服务：$($_.Exception.Message)" -ForegroundColor Red
+                Fail "无法停止或禁用本项目 Cloudflared 服务：$($_.Exception.Message)"
                 exit 1
             }
         } else {
@@ -674,7 +672,7 @@ if ($mode -eq "direct") {
                 Warn "部署期间出现未标记为本项目所有的 Cloudflared 服务；不会自动修改。"
             }
             if (-not $unmanagedTunnelConfirmed -and -not (Read-YesNo "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]" $false)) {
-                Write-Host "未确认遗留隧道的安全边界；直连模式部署已停止。" -ForegroundColor Red
+                Fail "未确认遗留隧道的安全边界；直连模式部署已停止。"
                 exit 1
             }
         }
@@ -694,7 +692,7 @@ if ($mode -eq "cloudflare") {
                 Warn "部署期间出现没有本项目归属标记的 Cloudflared 服务，无法自动确认它连接的是当前隧道。"
             }
             if (-not $unmanagedTunnelConfirmed -and -not (Read-YesNo "确认该服务正在服务本项目，继续沿用？[y/N]" $false)) {
-                Write-Host "未确认未托管的 Cloudflared 服务归属；Cloudflare 模式部署已停止。" -ForegroundColor Red
+                Fail "未确认未托管的 Cloudflared 服务归属；Cloudflare 模式部署已停止。"
                 exit 1
             }
         } else {
@@ -740,7 +738,7 @@ if ($mode -eq "cloudflare") {
     }
     $finalTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if (-not $finalTunnelService -or $finalTunnelService.Status -ne "Running") {
-        Write-Host "Cloudflare 模式部署未完成：Cloudflared 服务没有运行。请使用 $(Get-OpsCommandHint 'doctor -Repair')。" -ForegroundColor Red
+        Fail "Cloudflare 模式部署未完成：Cloudflared 服务没有运行。请使用 $(Get-OpsCommandHint 'doctor -Repair')。"
         exit 1
     }
     Done "Cloudflared 隧道服务正在运行。"
@@ -771,8 +769,9 @@ Enable-ScheduledTask -TaskName $TaskName | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 if (-not (Wait-BotHealth $Port)) { throw '数据已提交，但业务实例未就绪；保留新版本，请检查日志后启动' }
 
-} finally {
+} catch { Write-OperationFailure $_; throw } finally {
     if (-not $deploymentCommitted -and $deploymentMutated) {
+        Set-OperationStage 'rollback'
         try {
             if ($migrationAttempted) {
                 if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止，拒绝恢复数据' }
@@ -782,8 +781,9 @@ if (-not (Wait-BotHealth $Port)) { throw '数据已提交，但业务实例未�
             }
             Remove-Item -LiteralPath (Join-Path $StateDir 'verify-only') -Force -ErrorAction SilentlyContinue
             Restore-DeploymentSnapshot $snapshot
+            Write-OperationEvent 'info' ('data and deployment restored; snapshot=' + $snapshot.Path)
         }
-        catch { Write-Host ("自动回滚未完成，保留快照 " + $snapshot.Path + "：" + $_.Exception.Message) -ForegroundColor Red }
+        catch { Write-OperationFailure $_; Write-Host ("自动回滚未完成，保留快照 " + $snapshot.Path + "：" + $_.Exception.Message) -ForegroundColor Red }
     } elseif ($deploymentCommitted) {
         try { Remove-CompletedBackup $snapshot.Path $Project }
         catch { Warn ('部署已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }
@@ -791,3 +791,6 @@ if (-not (Wait-BotHealth $Port)) { throw '数据已提交，但业务实例未�
     $snapshot.Lock.Dispose()
     $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId
 }
+$operationExit = 0
+} catch { Write-OperationFailure $_; throw }
+finally { Stop-OperationLog $operation $operationExit }

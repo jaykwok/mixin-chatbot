@@ -81,7 +81,7 @@ if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsP
 function Step($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Done($m) { Write-Host "[+] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
-function Err($m)  { Write-Host "[x] $m" -ForegroundColor Red }
+function Err($m)  { Write-Host "[x] $m" -ForegroundColor Red; Write-OperationEvent 'error' $m }
 function IsAdmin  { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
 function Find-VersionedApplication([string]$Name, [string]$Pattern, [string[]]$AdditionalPaths = @()) {
     $candidates = @(Get-ApplicationPaths $Name)
@@ -416,6 +416,7 @@ function Invoke-GitCapture([string[]]$GitArgs) {
         $ErrorActionPreference = "Continue"
         $output = & $gitPath -C $Project @GitArgs 2>&1
         $exitCode = $LASTEXITCODE
+        if ($env:BOT_OPERATION_LOG) { Write-OperationEvent 'info' ('git ' + $GitArgs[0] + '; exit=' + $exitCode + "`n" + (@($output) -join "`n")) }
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
         if ($hadPromptEnv) { $env:GIT_TERMINAL_PROMPT = $previousPromptEnv }
@@ -1042,6 +1043,10 @@ function Restore-Checkout([string]$Branch, [string]$Sha) {
 # 升级失败后把代码退回升级前那次提交并重新拉起。进入升级前已确认工作区干净，
 # 所以 reset --hard 不会毁掉任何本地内容。
 function Invoke-Update {
+    $operation = Start-OperationLog $Project 'upgrade'
+    $operationExit = 1
+    try {
+    Set-OperationStage 'upgrade-preflight'
     if (-not (IsAdmin)) { Err 'update 需要管理员 PowerShell'; return $false }
     if (-not (Get-GitPath) -or -not (Get-BunPath)) { Err '需要 Git 和 Bun'; return $false }
     $dirty = Invoke-GitCapture @('status', '--porcelain', '--untracked-files=no')
@@ -1051,6 +1056,7 @@ function Invoke-Update {
     $fetch = Invoke-GitCapture @('fetch', 'origin', 'main:refs/remotes/origin/main')
     if ($fetch.ExitCode -ne 0) { Err $fetch.Text; return $false }
     $target = (Invoke-GitCapture @('rev-parse', 'origin/main')).Text
+    Write-OperationEvent 'info' ("original=$original target=$target")
     if ($original -notmatch '^[0-9a-f]{40}$' -or $target -notmatch '^[0-9a-f]{40}$') { Err '无法识别提交'; return $false }
     $pendingUpgrade = Join-Path $Project 'data\state\upgrade-transaction'
     if (Test-Path -LiteralPath $pendingUpgrade) {
@@ -1062,6 +1068,7 @@ function Invoke-Update {
     }
     # Export the target's preview before stopping or changing the live checkout.
     $stage = Join-Path $Project ('tmp\upgrade-' + [Guid]::NewGuid().ToString('N'))
+    Set-OperationStage 'export-target-upgrader'
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
     $archive = Join-Path $stage 'target.zip'
@@ -1069,17 +1076,22 @@ function Invoke-Update {
         'scripts/deploy/upgrade.ps1', 'scripts/lib', 'scripts/migrations', 'src/core/data-version.ts')
     if ($export.ExitCode -ne 0) { Err $export.Text; return $false }
     Expand-Archive -LiteralPath $archive -DestinationPath $stage
-    $shell = Join-Path $PSHOME 'powershell.exe'
+    # The parent may be pwsh 7; the supported child host is Windows PowerShell 5.1.
+    $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $stage 'scripts\deploy\upgrade.ps1'),
         '-Project', $Project, '-OriginalSha', $original, '-TargetSha', $target, '-OriginalBranch', $branch,
         '-BunPath', (Get-BunPath), '-GitPath', (Get-GitPath))
     if ($RestartTunnel) { $arguments += '-RestartTunnel' }
+    Set-OperationStage 'target-upgrader'
     & $shell @arguments | Out-Host
+    $operationExit = $LASTEXITCODE
     return ($LASTEXITCODE -eq 0)
     } finally {
         try { Remove-UpgradeStage $Project $stage }
         catch { Warn ('升级导出目录清理失败，保留 ' + $stage + '：' + $_.Exception.Message) }
     }
+    } catch { Write-OperationFailure $_; throw }
+    finally { Stop-OperationLog $operation $operationExit }
 }
 
 function Show-Logs {

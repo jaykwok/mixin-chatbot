@@ -33,6 +33,7 @@ async function inputs(context: Context) {
   return result;
 }
 async function validate(context: Context, configProject = context.project): Promise<void> {
+  context.report?.("validate", `project=${configProject}; groups=${context.groups}`);
   // Never block the event loop: the service lease heartbeat must run during validation.
   await new Promise<void>((resolve, reject) => {
     const child = spawn(process.execPath, [fileURLToPath(new URL("../validate.ts", import.meta.url)), configProject, context.groups, context.project], {
@@ -92,6 +93,7 @@ export async function preview(context: Context, validatePreview = true): Promise
   const journal = await readJournal(context);
   if (journal && !committed(context, journal)) return { pending: true, decisions: [], plan: undefined };
   const steps = selected(context);
+  context.report?.("preview", `steps=${steps.map(step => step.to).join(",") || "verification"}`);
   const initialInputs = await inputs(context);
   const { descriptions, files } = await describeMigrations(context, steps, configPaths(context.project), validatePreview ? staging => validate(context, staging) : undefined);
   if (JSON.stringify(initialInputs) !== JSON.stringify(await inputs(context))) throw new Error("预览期间配置或版本标记变化，请重新预览");
@@ -144,6 +146,7 @@ export async function apply(context: Context, plan?: Plan): Promise<void> {
         for (const db of databases) for (const suffix of ["", "-wal", "-shm", "-journal"]) paths.add(db + suffix);
       }
       const id = randomUUID(), backup = kind === "verification" ? null : `backup/snapshots/migration-${id}`;
+      context.report?.("snapshot", `transaction=${id}; kind=${kind}; backup=${backup ?? "none"}; files=${paths.size}`);
       if (backup) {
         await ordinaryPath(context.project, join(context.project, backup));
         await mkdir(join(context.project, backup), { recursive: true });
@@ -167,8 +170,12 @@ export async function apply(context: Context, plan?: Plan): Promise<void> {
       await publishJson(statePath(context), journal);
     }
     context = { ...context, decisions: journal.decisions };
+    context.report?.("apply", `transaction=${journal.id}; phase=${journal.phase}`);
     // Restart every idempotent step after interruption, including between the two marker writes.
-    for (const to of journal.steps) { const step = migrations.find(m => m.to === to)!; await step.apply(context); await step.validate(context); }
+    for (const to of journal.steps) {
+      context.report?.("migration-step", `version=${to}`);
+      const step = migrations.find(m => m.to === to)!; await step.apply(context); await step.validate(context);
+    }
     await validate(context);
     journal.phase = "validated";
     await publishJson(statePath(context), journal);
@@ -179,6 +186,7 @@ export async function commit(context: Context): Promise<void> {
   await withLease(context, async () => {
     const journal = await readJournal(context);
     if (!journal || journal.target !== DATA_VERSION || !["validated", "committed"].includes(journal.phase)) throw new Error("迁移尚未完成校验");
+    context.report?.("commit", `transaction=${journal.id}; phase=${journal.phase}`);
     if (committed(context, journal)) {
       if (!pairedMarker(context)) throw new Error("已提交事务的标记不成对，请通过升级重新校验并登记");
       if (journal.phase !== "committed") { journal.phase = "committed"; await publishJson(statePath(context), journal); }
@@ -196,6 +204,7 @@ export async function commit(context: Context): Promise<void> {
     }
     journal.phase = "committed";
     await publishJson(statePath(context), journal);
+    context.report?.("committed", `transaction=${journal.id}`);
     if (process.env.BOT_UPDATE_COMMIT_FILE) await publish(process.env.BOT_UPDATE_COMMIT_FILE, "committed\n");
   });
 }
@@ -204,11 +213,12 @@ export async function rollback(context: Context, deployment?: string): Promise<b
   return withLease(context, async () => {
     const journal = await readJournal(context);
     if (!journal) return true;
+    context.report?.("rollback", `transaction=${journal.id}; phase=${journal.phase}; backup=${journal.backup ?? "none"}`);
     if (deployment && journal.deployment !== deployment) {
       if (committed(context, journal)) return true;
       throw new Error("未提交迁移属于另一部署事务，请使用原快照恢复");
     }
-    if (committed(context, journal)) return false;
+    if (committed(context, journal)) { context.report?.("rollback-refused", "data already committed"); return false; }
     // Validate every backup before overwriting anything. Restore SQLite sidecars with their database.
     for (const file of journal.files) if (file.hash !== null && await fileDigest(join(context.project, journal.backup!, file.saved)) !== file.hash) throw new Error("备份缺失或损坏；保持停机，请人工恢复");
     for (const file of journal.files) {
@@ -216,6 +226,7 @@ export async function rollback(context: Context, deployment?: string): Promise<b
       else await publishFile(file.path, join(context.project, journal.backup!, file.saved));
     }
     await unlink(statePath(context));
+    context.report?.("rollback-complete", `transaction=${journal.id}`);
     return true;
   });
 }

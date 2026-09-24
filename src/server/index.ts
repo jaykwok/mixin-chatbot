@@ -1,6 +1,7 @@
 // Stable process entry. Gate persistent data before loading configuration or business modules.
 import { existsSync } from "node:fs";
 import { assertDataVersion, serviceGroupRoot, verificationPending } from "../core/data-version.ts";
+import { openOperationLog, operationError } from "../../scripts/lib/operation-log.ts";
 try {
   const groups = serviceGroupRoot();
   const pending = verificationPending(process.cwd(), groups);
@@ -12,4 +13,10 @@ try {
     assertDataVersion(process.cwd(), groups);
     await import("./app.ts");
   }
-} catch (error) { console.error("服务启动失败: " + (error as Error).message); process.exitCode = 1; }
+} catch (error) {
+  const diagnostic = openOperationLog(process.cwd(), "startup");
+  diagnostic.event("error", "startup", operationError(error));
+  console.error("服务启动失败: " + (error as Error).message);
+  if (diagnostic.path) console.error("启动日志：" + diagnostic.path);
+  process.exitCode = 1;
+}

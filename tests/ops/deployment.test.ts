@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tempFixture } from "../helpers/temp.ts";
@@ -181,6 +181,7 @@ test.skipIf(process.platform !== "win32")("Windows target upgrade previews befor
   const fixture = await tempFixture("update-flow-");
   const script = join(fixture.root, "update.ps1");
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+. ${quotePS(join(project, "scripts/lib/operation-log.ps1"))}
 $tokens=$null; $errors=$null
 $sourcePath=${quotePS(join(project, "scripts/deploy/upgrade.ps1"))}
 $ast=[Management.Automation.Language.Parser]::ParseFile($sourcePath,[ref]$tokens,[ref]$errors)
@@ -254,6 +255,39 @@ foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$
   } finally { await fixture.cleanup(); }
 }, 60000);
 
+test.skipIf(process.platform !== "win32")("Windows upgrade replaces the existing snapshot with durable upgrade metadata", async () => {
+  const fixture = await tempFixture("upgrade-snapshot-replace-");
+  const script = join(fixture.root, "replace.ps1");
+  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+. ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+$root=Join-Path $PSScriptRoot 'project with spaces'
+New-Item -ItemType Directory -Force -Path (Join-Path $root 'data/state') | Out-Null
+function New-DeploymentSnapshot($projectRoot,$taskName) {
+    $path=Join-Path $projectRoot ('backup/snapshots/deploy-'+[Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $path | Out-Null
+    $state=[pscustomobject]@{Project=$projectRoot;Path=$path;WasRunning=$false;TaskName=$taskName;Lock=(New-Object IO.MemoryStream)}
+    Save-DeploymentSnapshot $state
+    return $state
+}
+$snapshot=Open-UpgradeSnapshot $root 'fixture' 'old-commit' 'main' 'new-commit'
+try {
+    $saved=Import-Clixml -LiteralPath (Join-Path $snapshot.Path 'deployment.xml')
+    if($saved.UpgradeOriginal -ne 'old-commit' -or $saved.UpgradeTarget -ne 'new-commit'){throw 'upgrade metadata not persisted'}
+    if((Get-Content -LiteralPath (Join-Path $root 'data/state/upgrade-transaction')).Trim() -ne (Split-Path $snapshot.Path -Leaf)){throw 'transaction pointer not published'}
+    if(Test-Path -LiteralPath (Join-Path $snapshot.Path 'deployment.xml.tmp')){throw 'temporary snapshot remains'}
+    $snapshot.UpgradeTarget='updated-commit'
+    Save-DeploymentSnapshot $snapshot
+    if((Import-Clixml -LiteralPath (Join-Path $snapshot.Path 'deployment.xml')).UpgradeTarget -ne 'updated-commit'){throw 'second replacement failed'}
+} finally { $snapshot.Lock.Dispose() }
+Write-Output 'SNAPSHOT_REPLACE_VERIFIED'
+`);
+  try {
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("SNAPSHOT_REPLACE_VERIFIED");
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
 test.skipIf(process.platform !== "win32")("Windows upgrade snapshot survives restart and retains its original code and running state", async () => {
   const fixture = await tempFixture("upgrade-resume-");
   const script = join(fixture.root, "resume.ps1");
@@ -299,6 +333,10 @@ test.skipIf(process.platform !== "win32")("Windows target upgrade really boots i
     expect(result.code, result.output).toBe(1);
     expect(result.output).toContain("迁移预览未完成");
     expect(existsSync(join(fixture.root, "data/state/upgrade-transaction"))).toBe(false);
+    const logs = await readdir(join(fixture.root, "logs/operations")); expect(logs).toHaveLength(1);
+    const text = await readFile(join(fixture.root, "logs/operations", logs[0]!), "utf8");
+    expect(text).toContain("migration-preview"); expect(text).toContain("迁移预览未完成");
+    expect(text).toContain("upgrade.ps1"); expect(text).toContain("exit=1");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -325,7 +363,7 @@ function Invoke-GitCapture([string[]]$GitArgs) {
 function Expand-Archive($LiteralPath,$DestinationPath) {
     $target=Join-Path $DestinationPath 'scripts/deploy'
     New-Item -ItemType Directory -Force -Path $target | Out-Null
-    Set-Content -LiteralPath (Join-Path $target 'upgrade.ps1') -Encoding ASCII -Value 'if($env:UPGRADE_CASE -eq "child"){exit 17}; exit 0'
+    Set-Content -LiteralPath (Join-Path $target 'upgrade.ps1') -Encoding ASCII -Value 'if($PSVersionTable.PSVersion.Major -ne 5){throw "wrong child host"}; if($env:UPGRADE_CASE -eq "child"){exit 17}; exit 0'
 }
 foreach($env:UPGRADE_CASE in @('success','export','child')) {
     $result=Invoke-Update
@@ -344,6 +382,12 @@ Write-Output 'EXPORT_CLEANUP_VERIFIED'
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain("EXPORT_CLEANUP_VERIFIED");
+    const pwsh = Bun.which("pwsh");
+    if (pwsh) {
+      const fromPS7 = await execute([pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+      expect(fromPS7.code, fromPS7.output).toBe(0);
+      expect(fromPS7.output).toContain("EXPORT_CLEANUP_VERIFIED");
+    }
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -493,11 +537,11 @@ set -euo pipefail
 PROJECT_DIR="$1"
 CONTAINER_UID=1001; CONTAINER_GID=1002; GROUP_ROOT_ENV_VAL=/app/group-data
 GROUP_ROOT_ARGS=(-v "$PROJECT_DIR/external groups:/app/group-data")
-export PI_CACHE_RETENTION=long BOT_DEPLOY_BACKUP_ID=deploy-fixture
+export PI_CACHE_RETENTION=long BOT_DEPLOY_BACKUP_ID=deploy-fixture BOT_OPERATION_LOG=upgrade-20260925T000000Z-fixture.log
 docker(){
     while [ "$#" -gt 0 ]; do
         if [ "$1" = -e ]; then shift; case "$1" in
-            PI_CACHE_RETENTION|BOT_DEPLOY_BACKUP_ID) printf '%s=%s\\n' "$1" "\${!1}" ;;
+            PI_CACHE_RETENTION|BOT_DEPLOY_BACKUP_ID|BOT_OPERATION_LOG) printf '%s=%s\\n' "$1" "\${!1}" ;;
             *) printf '%s\\n' "$1" ;;
         esac
         else printf '%s\\n' "$1"; fi
@@ -512,6 +556,8 @@ migration_docker preview --decisions-only
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain("PI_CACHE_RETENTION=long");
     expect(result.output).toContain("BOT_DEPLOY_BACKUP_ID=deploy-fixture");
+    expect(result.output).toContain("BOT_OPERATION_LOG=upgrade-20260925T000000Z-fixture.log");
+    expect(result.output).toContain("logs:/app/logs");
     expect(result.output).toContain("1001:1002");
     expect(result.output).toContain("external groups:/app/group-data");
     expect(result.output).toContain("GROUP_DATA_ROOT=/app/group-data");
@@ -528,7 +574,8 @@ cd "$PROJECT_DIR"
 . '${posixPath(join(project, "scripts/lib/lifecycle.sh"))}'
 . '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
 LOG_DIR="$PROJECT_DIR/logs"; TUNNEL_PID_FILE="$PROJECT_DIR/data/state/cloudflared.pid"
-print_error(){ echo "$*" >&2; }; print_warning(){ echo "$*"; }
+operation_start deploy
+print_error(){ echo "$*" >&2; operation_event error "$*"; }; print_warning(){ echo "$*"; operation_event warn "$*"; }
 flock(){ :; }; can_manage_ufw(){ return 0; }
 managed_cloudflared_pid(){ return 1; }; stop_tunnel_launcher(){ :; }
 ufw(){ :; }
@@ -581,6 +628,9 @@ exit 42
       await writeFile(join(root, "mock/ufw"), "ufw allow 22/tcp\nufw allow proto tcp from 192.0.2.1 to any port 1011 comment 'Mixin-Chatbot (平台IP)'\n");
       const result = await execute([bash!, posixPath(script), posixPath(root), stage], root, { ...process.env, MSYS_NO_PATHCONV: "1" });
       expect(result.code, `${stage}: ${result.output}`).toBe(42);
+      const logs = await readdir(join(root, "logs/operations")); expect(logs).toHaveLength(1);
+      const text = await readFile(join(root, "logs/operations", logs[0]!), "utf8");
+      expect(text).toContain("rollback"); expect(text).toContain("已恢复配置"); expect(text).toContain("operation finished; exit=42");
       expect(await readFile(join(root, "data/config/models.json"), "utf8")).toBe("old-config");
       expect(await readFile(join(root, "data/state/bot-port"), "utf8")).toBe("1011");
       expect(await readFile(join(root, "mock/containers/mixin-chatbot"), "utf8")).toBe(`old-image ${running}\n`);

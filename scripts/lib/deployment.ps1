@@ -1,4 +1,6 @@
-﻿# A deployment snapshot excludes live SQLite databases and conversation data.
+﻿. (Join-Path $PSScriptRoot 'operation-log.ps1')
+
+# A deployment snapshot excludes live SQLite databases and conversation data.
 function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
     $previousBackupId = $env:BOT_DEPLOY_BACKUP_ID
     $temporaryRoot = Join-Path $ProjectRoot 'backup\snapshots'
@@ -48,7 +50,8 @@ function Save-DeploymentSnapshot($Snapshot) {
     $Snapshot | Select-Object * -ExcludeProperty Lock | Export-Clixml -LiteralPath $temporary
     $stream = [IO.File]::Open($temporary, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
     try { $stream.Flush($true) } finally { $stream.Dispose() }
-    if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temporary, $path, $null) }
+    # Windows PowerShell 5.1 binds $null to an empty string for .NET string arguments.
+    if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temporary, $path, [NullString]::Value) }
     else { [IO.File]::Move($temporary, $path) }
 }
 
