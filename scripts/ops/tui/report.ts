@@ -332,7 +332,7 @@ function detailSection(input: ReportInput, stats: GroupStats): string {
         </div>
       </section>
       <section><h2>模型与压缩用量</h2>
-        ${tableView(["类型", "调用", "输入", "输出", "缓存读", "缓存写", "估算费用"], Object.entries(stats.usage.kinds).map(([kind, u]) => [kind, String(u.requests), String(u.input), String(u.output), String(u.cacheRead), String(u.cacheWrite), "$" + u.cost.toFixed(6)]), "类型用量")}
+        ${tableView(["类型", "调用", "输入", "输出", "缓存读", "缓存写", "估算费用"], [...stats.usage.kinds].map(([kind, u]) => [kind, String(u.requests), String(u.input), String(u.output), String(u.cacheRead), String(u.cacheWrite), "$" + u.cost.toFixed(6)]), "类型用量")}
         ${tableView(["provider / model", "调用", "加权缓存读率", "估算费用", "未知费用"], [...stats.usage.models].map(([key, u]) => [JSON.parse(key).join(" / "), String(u.requests), formatCacheRate(u), "$" + u.cost.toFixed(6), String(u.unknownCost)]), "模型用量")}
         ${tableView(["日期", "调用", "加权缓存读率", "缓存写", "估算费用"], [...stats.usage.days].sort(([a], [b]) => a.localeCompare(b)).map(([day, u]) => [day, String(u.requests), formatCacheRate(u), String(u.cacheWrite), "$" + u.cost.toFixed(6)]), "每日用量")}
       </section>

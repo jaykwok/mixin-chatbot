@@ -36,6 +36,8 @@ mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
   createAgentSession: async (options: any) => {
     await writeFile(options.sessionManager.filename, '{"type":"session","version":3}\n');
     const session = { state: { messages: [] }, controller: undefined as AbortController | undefined, release: undefined as (() => void) | undefined,
+      settingsManager: options.settingsManager,
+      setCacheWarmingMode: (mode: "off" | "streaming" | "idle") => options.settingsManager.setCacheWarmingMode(mode),
       async prompt(text: string) {
         prompts.push(text); session.controller = new AbortController();
         if (text.startsWith("block-")) await waitFor(new Promise<void>(resolve => { session.release = resolve; }), session.controller.signal);
@@ -58,7 +60,7 @@ await writeFile("data/config/models.json", JSON.stringify({ providers: { fake: {
 await writeFile("data/runtime/pi/settings.json", JSON.stringify({ defaultProvider: "fake", defaultModel: "fake" }));
 const runtime = await import("../../src/agent/runtime.ts");
 const webhook = await import("../../src/server/webhook.ts");
-const { createApp } = await import("../../src/server/app.ts");
+const { createApp } = await import("../../src/server/http-app.ts");
 const { DeliveryStore } = await import("../../src/agent/delivery-store.ts");
 const { stateDatabase } = await import("../../src/core/state.ts");
 if (process.argv[2] === "legacy-schema") {

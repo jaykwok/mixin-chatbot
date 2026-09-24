@@ -6,6 +6,10 @@
 # 两种部署模式：直连（公网 IP + UFW 限平台 IP）/ Cloudflare（cloudflared 隧道 + WAF）。
 
 set -euo pipefail
+if [ -n "${BOT_MODEL_CACHE_RETENTION:-}" ]; then
+    echo 'BOT_MODEL_CACHE_RETENTION 已移除；请先迁移配置并移除旧环境变量，再部署。' >&2
+    exit 1
+fi
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # 与 deploy.sh / ops.sh 共用的纯辅助函数（主机名校验与规范化）。
 COMMON_LIB="${PROJECT_DIR}/scripts/lib/common.sh"
@@ -159,14 +163,14 @@ for file in "${required_files[@]}"; do
     fi
 done
 
-if [ -f "$MODELS_FILE" ]; then validate_model_configuration || { print_error "模型配置无效；尚未停止旧服务"; exit 1; }; fi
 print_success "环境检查通过"
 
 # ---- 目录 + 监听端口 ----
 
 command -v flock >/dev/null || { print_error "需要 util-linux flock"; exit 1; }
-print_warning "开始部署事务：旧容器在配置期间保持停止；任一步失败都会恢复原配置和运行状态。"
-begin_deployment
+acquire_deploy_lock || { print_error "另一个部署或升级正在进行"; exit 1; }
+verify_deployed_group_root
+print_warning "先预览迁移，再停止旧容器；提交前失败恢复数据、配置和原运行状态。"
 mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 if [ -n "${BOT_PORT:-}" ]; then
     PORT_DEFAULT_SOURCE="BOT_PORT"
@@ -349,6 +353,39 @@ if ! verify_container_storage; then
     exit 1
 fi
 print_success "持久化目录权限正常"
+
+# The target image owns migration semantics, including the first unversioned upgrade.
+migration_docker() {
+    docker run --rm -i --user "$CONTAINER_UID:$CONTAINER_GID" \
+      -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -e PI_CACHE_RETENTION -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
+      "${GROUP_ROOT_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" -v "$PROJECT_DIR/backup:/app/backup" \
+      mixin-chatbot bun run scripts/migrations/run.ts "$@" --groups "$GROUP_ROOT_ENV_VAL"
+}
+MIGRATION_APPLY_ATTEMPTED=0
+rollback_data_migration() {
+    [ "$MIGRATION_APPLY_ATTEMPTED" = 1 ] || return 0
+    local result=0
+    migration_docker rollback --deployment "$BOT_DEPLOY_BACKUP_ID" || result=$?
+    if [ "$result" = 42 ]; then
+        commit_deployment
+        print_error "数据已经提交，保留新代码；请检查服务状态后启动。"
+    fi
+    return "$result"
+}
+MIGRATION_PLANNED=0
+if [ -f "$MODELS_FILE" ] && [ -f "$RUNTIME_DIR/pi/settings.json" ]; then
+    migration_docker preview --interactive --plan /app/data/state/migration-plan.json
+    MIGRATION_PLANNED=1
+fi
+# All migration decisions have been made while the old service was still available.
+begin_deployment
+if [ "$MIGRATION_PLANNED" = 1 ]; then
+    # The legacy parent understands only a committed receipt. Retain target code on
+    # abrupt termination; a completed rollback below clears it before restoring code.
+    if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
+    MIGRATION_APPLY_ATTEMPTED=1
+    migration_docker apply --plan /app/data/state/migration-plan.json
+fi
 
 # ---- AI 配置（容器内 TUI 写 data/config/models.json）----
 # 首次必须配置；已存在则询问是否重配。
@@ -570,9 +607,18 @@ fi
 
 # 旧容器和配置已在 begin_deployment 中保存。
 
+if [ "$MIGRATION_PLANNED" = 0 ]; then
+    migration_docker preview --interactive --plan /app/data/state/migration-plan.json
+    if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
+    MIGRATION_APPLY_ATTEMPTED=1
+    migration_docker apply --plan /app/data/state/migration-plan.json
+fi
+# The scheduled/container entry reads this flag; readiness cannot accept messages.
+printf 'verify\n' > "$PROJECT_DIR/data/state/verify-only"
+
 # 持久化受支持的显式环境配置；容器路径由部署计算，其他值沿用 runtime.json。
 runtime_env_args=()
-for runtime_key in BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_TTL_MINUTES BOT_INDEX_MAX_FILES BOT_INDEX_MAX_DEPTH BOT_RUN_TIMEOUT_SECONDS BOT_MODEL_IDLE_TIMEOUT_SECONDS BOT_MODEL_RESPONSE_TIMEOUT_SECONDS BOT_SHUTDOWN_TIMEOUT_SECONDS BOT_DELIVERY_TIMEOUT_SECONDS BOT_DOCUMENT_ENV BOT_DOCUMENT_WORK_ENABLED BOT_MODEL_CACHE_RETENTION BOT_ATTACHMENT_CONCURRENCY; do
+for runtime_key in BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_TTL_MINUTES BOT_INDEX_MAX_FILES BOT_INDEX_MAX_DEPTH BOT_RUN_TIMEOUT_SECONDS BOT_MODEL_IDLE_TIMEOUT_SECONDS BOT_MODEL_RESPONSE_TIMEOUT_SECONDS BOT_SHUTDOWN_TIMEOUT_SECONDS BOT_DELIVERY_TIMEOUT_SECONDS BOT_DOCUMENT_ENV BOT_DOCUMENT_WORK_ENABLED PI_CACHE_RETENTION BOT_ATTACHMENT_CONCURRENCY; do
     if [ -n "${!runtime_key:-}" ]; then runtime_env_args+=(-e "$runtime_key"); fi
 done
 docker run --rm --user "$CONTAINER_UID:$CONTAINER_GID" \
@@ -621,12 +667,11 @@ fi
 
 print_status "等待服务就绪..."
 for i in $(seq 1 18); do
-    status=$(docker inspect --format='{{.State.Health.Status}}' mixin-chatbot 2>/dev/null || echo "unknown")
-    if [ "$status" = "healthy" ]; then
+    if docker exec mixin-chatbot bun run scripts/ops/health-check.ts --allow-verification; then
         print_success "健康检查通过"
         break
     fi
-    if [ "$status" = "unhealthy" ]; then
+    if [ "$(docker inspect --format='{{.State.Running}}' mixin-chatbot 2>/dev/null || echo false)" != true ]; then
         print_error "健康检查失败，请查看日志: $(ops_command_hint logs)"
         docker logs --tail 50 mixin-chatbot 2>&1 || true
         exit 1
@@ -754,11 +799,24 @@ elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = "1" ]; then
     archive_project_path "$BOT_DOMAIN_FILE"
 fi
 
-# update preserves an existing stopped deployment after checking the new instance.
-if [ "${DEPLOY_PRESERVE_STOPPED:-0}" = 1 ] && [ "$PREVIOUS_RUNNING" = 0 ]; then
-    docker stop --time 30 mixin-chatbot >/dev/null
-fi
+# Stop the verification-only process before committing. Normal work starts after commit.
+docker stop --time 30 mixin-chatbot >/dev/null
+migration_docker commit
 commit_deployment
+rm -f -- "$PROJECT_DIR/data/state/verify-only" "$PROJECT_DIR/data/state/migration-plan.json"
+if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
+    docker start mixin-chatbot >/dev/null
+    normal_ready=0
+    for i in $(seq 1 18); do
+        if docker exec mixin-chatbot bun run scripts/ops/health-check.ts --normal; then normal_ready=1; break; fi
+        sleep 5
+    done
+    if [ "$normal_ready" != 1 ]; then
+        print_error "数据已经提交，但业务实例未就绪；保留新版本，请检查日志后重试升级"
+        exit 1
+    fi
+fi
+rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
 cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，但备份清理未完成，请检查 $DEPLOY_SNAPSHOT 和 $PROJECT_DIR/backup/rm"
 # Let process exit close descriptor 9. Explicit unlock would also unlock an update parent's inherited descriptor.
 if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ]; then

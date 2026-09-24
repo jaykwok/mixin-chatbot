@@ -1,8 +1,10 @@
 // Executed in a fresh process: module substitutes cannot leak into the real SDK tests.
 import assert from "node:assert/strict";
+import { appendFileSync } from "node:fs";
 import { mkdir, writeFile, access } from "node:fs/promises";
 import { mock } from "bun:test";
 import type { AssistantMessage, ToolCall } from "@earendil-works/pi-ai";
+import type { SettingsManager } from "@earendil-works/pi-coding-agent";
 import { waitFor, application } from "../../src/core/lifecycle.ts";
 const sdk = await import("@earendil-works/pi-coding-agent");
 const completed: string[] = [];
@@ -17,6 +19,7 @@ async function until(check: () => boolean, timeoutMs = 3000) {
   while (!check()) { assert.ok(Date.now() < end, "lifecycle condition timed out"); await delay(); }
 }
 type Fake = { cwd: string; history: string; state: { errorMessage?: string; messages: unknown[] }; prompt: (text: string) => Promise<void>;
+  settingsManager: SettingsManager; setCacheWarmingMode: (mode: "off" | "streaming" | "idle") => void;
   abort: () => Promise<void>; dispose: () => Promise<void>; subscribe: () => () => void; getLastAssistantText: () => string;
   active: boolean; disposed: boolean; controller?: AbortController; disposeGate?: ReturnType<typeof gate>; disposeError?: Error;
   promptGate?: ReturnType<typeof gate>; abortGate?: ReturnType<typeof gate>;
@@ -41,7 +44,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
   ModelRuntime: { create: async () => ({ getError: () => undefined, getModel: () => ({ id: "fake", provider: "fake", api: "openai-responses", reasoning: false }), checkAuth: async () => true }) },
   DefaultResourceLoader: class { async reload() {} },
   SessionManager: { open: (filename: string) => ({ filename }) },
-  createAgentSession: async (options: { cwd: string; sessionManager: { filename: string } }) => {
+  createAgentSession: async (options: { cwd: string; sessionManager: { filename: string }; settingsManager: SettingsManager }) => {
     creating = true;
     await creationGate?.promise;
     creating = false;
@@ -49,10 +52,15 @@ mock.module("@earendil-works/pi-coding-agent", () => ({ ...sdk,
     await writeFile(history, '{"type":"session","version":3}\n');
     const session: Fake = {
       cwd: options.cwd, history, state: { messages: [] }, active: false, disposed: false,
+      settingsManager: options.settingsManager,
+      setCacheWarmingMode: mode => options.settingsManager.setCacheWarmingMode(mode),
       async prompt(text) {
         assert.equal(session.active, false, "overlapping prompt on one session");
         assert.equal(session.disposed, false, "prompt started after disposal");
         prompts.push(text); session.active = true; active++; peak = Math.max(peak, active);
+        // Pi persists synchronously; an await here would also delay the prompt gate the harness inspects.
+        appendFileSync(history, JSON.stringify({ type: "message", timestamp: new Date().toISOString(),
+          message: { role: "user", content: [{ type: "text", text: "fixture" }] } }) + "\n");
         session.controller = new AbortController();
         try {
           if (text.startsWith("block")) { session.promptGate = gate(); await waitFor(session.promptGate.promise, session.controller.signal); }
@@ -385,6 +393,17 @@ finalGate.release(); await Promise.all([first, second]); finalGate = undefined;
 assert.deepEqual(prompts.slice(-2), ["first", "second"]); assert.equal(peak, 1);
 completed.push("final-delivery-fifo");
 
+// Each finished task is ingested inside its own queue, so today's statistics need no sweep.
+const { readLedger, openStatsLedger } = await import("../../src/agent/stats-ledger.ts");
+const { userSegment } = await import("../../src/agent/paths.ts");
+const { GROUP_DATA_ROOT } = await import("../../src/core/config.ts");
+const ledger = openStatsLedger(GROUP_DATA_ROOT);
+try {
+  const asks = readLedger(ledger).activity.filter(row => row.user === userSegment("fifo")).reduce((sum, row) => sum + row.asks, 0);
+  assert.equal(asks, 2);
+} finally { ledger.close(); }
+completed.push("finished-tasks-ingested");
+
 // Cancellation cleanup remains a barrier even when two messages arrive during abort.
 const blocked = request("race", "block-race");
 await until(() => prompts.includes("block-race"));
@@ -459,7 +478,7 @@ await request("delivery", "/deliver"); assert.equal(sent.at(-1), "你在本群�
 await request("delivery", "/stop"); assert.doesNotMatch(sent.at(-1)!, /已保留/);
 completed.push("durable-delivery-after-clear");
 
-const { createApp } = await import("../../src/server/app.ts");
+const { createApp } = await import("../../src/server/http-app.ts");
 const httpSignal = new AbortController();
 let shutdownRequested = false;
 const app = createApp({ signal: httpSignal.signal, webhookSecret: "a".repeat(64), allowInsecure: false,

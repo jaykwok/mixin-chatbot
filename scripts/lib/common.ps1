@@ -251,7 +251,8 @@ function Read-YesNo([string]$Prompt, [bool]$Default = $false) {
         Write-Host "[!] 请输入 y 或 n（也可直接回车采用默认值）" -ForegroundColor Yellow
     }
 }
-function Test-ProjectBotHealth([string]$ProjectRoot, [int]$ListenPort) {
+function Test-ProjectBotHealth([string]$ProjectRoot, [int]$ListenPort, [switch]$AllowVerification, [ref]$VerificationOnly) {
+    if ($VerificationOnly) { $VerificationOnly.Value = $false }
     try {
         $expected = Get-Content -LiteralPath (Join-Path $ProjectRoot 'data\state\instance.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$ListenPort/health")
@@ -263,10 +264,13 @@ function Test-ProjectBotHealth([string]$ProjectRoot, [int]$ListenPort) {
             if ([int]$response.StatusCode -ne 200) { return $false }
             $reader = New-Object IO.StreamReader($response.GetResponseStream())
             try { $body = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
-            return ($body.service -ceq 'mixin-chatbot' -and $body.version -eq 1 -and $body.status -ceq 'ready' -and
+            $matches = ($body.service -ceq 'mixin-chatbot' -and $body.version -eq 1 -and $body.status -ceq 'ready' -and
                 $body.instanceId -cmatch '^[a-f0-9-]{36}$' -and $body.instanceId -ceq $expected.instanceId -and
                 $body.pid -gt 0 -and $body.pid -eq $expected.pid -and $expected.port -eq $ListenPort -and
                 $body.startedAt -gt 0 -and $body.startedAt -eq $expected.startedAt)
+            if (-not $matches) { return $false }
+            if ($VerificationOnly) { $VerificationOnly.Value = [bool]$body.verificationOnly }
+            return ($AllowVerification -or -not $body.verificationOnly)
         } finally { $response.Close() }
     } catch { return $false }
 }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { mock, spyOn } from "bun:test";
 import { application, waitFor } from "../../src/core/lifecycle.ts";
@@ -43,6 +43,8 @@ await writeFile(marker, expected);
 assert.deepEqual(await Promise.all(Array.from({ length: 8 }, () => documentToolchainReady(venv))), Array(8).fill(true));
 assert.equal(runs, 1); assert.equal(await documentToolchainReady(venv), true); assert.equal(runs, 1);
 await writeFile(python, "changed-interpreter");
+// Same-size writes can share a timestamp on coarse filesystems; explicitly change metadata.
+await utimes(python, new Date(), new Date(Date.now() + 1000));
 assert.equal(await documentToolchainReady(venv), true); assert.equal(runs, 2);
 await writeFile(marker, "old-marker"); assert.equal(await documentToolchainReady(venv), false); assert.equal(runs, 2);
 await writeFile(marker, expected);

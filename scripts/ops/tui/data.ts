@@ -50,7 +50,7 @@ export async function loadHealth(deployment: Deployment, signal?: AbortSignal): 
 
 export interface Service {
   /** unreachable 表示请求失败、响应无效或实例身份不匹配。 */
-  state: "ready" | "stopping" | "unreachable";
+  state: "ready" | "verifying" | "stopping" | "unreachable";
   pid?: number;
   /** 往返毫秒；unreachable 时为空。 */
   latency?: number;
@@ -70,7 +70,7 @@ export async function probeService(port: number, instanceFile = join(PROJECT_DIR
     const startedAt = instance.startedAt;
 
     return {
-      state: body.status === "stopping" ? "stopping" : "ready",
+      state: body.status === "stopping" ? "stopping" : body.verificationOnly ? "verifying" : "ready",
       pid: body.pid,
       latency: Date.now() - started,
       startedAt,

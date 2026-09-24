@@ -33,7 +33,7 @@ test("运行参数按需读取、形成独立草稿，预检不写配置，应�
     expect(existsSync(configFile(fixture.root))).toBe(false);
     const old = { BOT_PORT: 8888, BOT_HOST: "127.0.0.1", GROUP_DATA_ROOT: "/app/group-data", BOT_DEBUG: "1", BOT_INDEX_MAX_DEPTH: 14 };
     const snapshot = await seed(fixture.root, old);
-    const draft = await writeRuntimeDraft(snapshot, { BOT_MAX_ACTIVE_REQUESTS: "64", BOT_MODEL_CACHE_RETENTION: "long" }, configFile(fixture.root));
+    const draft = await writeRuntimeDraft(snapshot, { BOT_MAX_ACTIVE_REQUESTS: "64", PI_CACHE_RETENTION: "long" }, configFile(fixture.root));
     const checked = await run(fixture.root, "--check", draft);
     expect(checked.code, checked.output).toBe(0);
     expect(JSON.parse(await readFile(configFile(fixture.root), "utf8"))).toEqual(old);
@@ -41,7 +41,7 @@ test("运行参数按需读取、形成独立草稿，预检不写配置，应�
     expect(applied.code, applied.output).toBe(0);
     expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({
       BOT_PORT: "8888", BOT_HOST: "127.0.0.1", GROUP_DATA_ROOT: "/app/group-data", BOT_DEBUG: "1", BOT_INDEX_MAX_DEPTH: "14",
-      BOT_MAX_ACTIVE_REQUESTS: "64", BOT_MODEL_CACHE_RETENTION: "long",
+      BOT_MAX_ACTIVE_REQUESTS: "64", PI_CACHE_RETENTION: "long",
     });
     await rm(draft + ".rollback");
     await discardRuntimeDraft(draft);

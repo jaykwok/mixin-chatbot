@@ -29,7 +29,8 @@ describe("自定义端点的模型资料预填", () => {
   test("只复制模型资料，provider 的传输设置不跟着进中转站条目", async () => {
     const runtime = await builtinRuntime();
     const source = catalogMatches(runtime, "gpt-5.2")[0]!;
-    const defaults = catalogDefaults({ ...source, headers: { "provider-specific": "value" }, compat: { supportsMaxOutputTokens: false } });
+    const defaults = catalogDefaults({ ...source, headers: { "provider-specific": "value" }, compat: { supportsMaxOutputTokens: false },
+      promptCache: { short: 300, long: 1800 }, inputLimits: { images: { resize: { maxWidth: 1280 } } } });
     expect(defaults).toEqual({
       contextWindow: source.contextWindow, maxTokens: source.maxTokens,
       input: source.input, reasoning: source.reasoning, cost: source.cost,
@@ -40,6 +41,8 @@ describe("自定义端点的模型资料预填", () => {
     expect(defaults).not.toHaveProperty("provider");
     expect(defaults).not.toHaveProperty("headers");
     expect(defaults).not.toHaveProperty("compat");
+    expect(defaults).not.toHaveProperty("promptCache");
+    expect(defaults).not.toHaveProperty("inputLimits");
     // 拷贝而非共享引用，后面的交互改动不会写回 Pi 的目录对象。
     expect(defaults.cost).not.toBe(source.cost);
     expect(defaults.input).not.toBe(source.input);

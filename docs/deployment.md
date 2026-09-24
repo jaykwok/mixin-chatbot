@@ -12,10 +12,10 @@
 
 | 方式 | 主机要求 | 文档解析环境 |
 | --- | --- | --- |
-| Windows 原生 | Bun 1.4.0+、Git for Windows 的 GNU Bash、原生 `uv.exe`；管理员 PowerShell 部署 | Python 3.14 群 venv 按需准备；Word/PPT 预览另需 LibreOffice |
+| Windows 原生 | Bun 1.4.2+、Git for Windows 的 GNU Bash、原生 `uv.exe`；管理员 PowerShell 部署 | Python 3.14 群 venv 按需准备；Word/PPT 预览另需 LibreOffice |
 | Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；当前用户需可运行 Docker，直连模式需要 UFW 及 root / sudo 权限 | 镜像预装 Python 3.14、锁定的文档库、LibreOffice 和中文字体 |
 
-Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。Docker 的配置向导与应用运行在镜像内，宿主机无需额外安装 Bun；若使用[运维界面](tui.md#运维界面)，则需在宿主机安装 Bun 1.4.0+。
+Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。Docker 的配置向导与应用运行在镜像内，宿主机无需额外安装 Bun；若使用[运维界面](tui.md#运维界面)，则需在宿主机安装 Bun 1.4.2+。
 
 基础组件通过官方渠道安装：[Bun](https://bun.sh/docs/installation)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Docker Engine（Debian）](https://docs.docker.com/engine/install/debian/)。
 
@@ -25,7 +25,7 @@ Cloudflare 模式会自动将官方 `cloudflared` 下载到项目根目录（Win
 
 Python 小版本范围固定为 `>=3.14,<3.15`，补丁版本由 uv 选择；依赖及传递依赖由 `uv.lock` 锁定。Windows 和 Docker 默认都使用 `<群目录>/venv/`，每群独立、首次使用时按需 `uv sync`；不会自动使用项目根目录 `.venv`。各群依赖从下载缓存复制安装，避免硬链接导致原地修改相互影响；基础 Python 解释器和下载缓存可以共用。
 
-仅管理员显式配置 `BOT_DOCUMENT_ENV` 时，所有群才共用指定环境。TUI「设置 → 高级运行参数 → 文档与诊断」中的「共享文档环境覆盖」留空或恢复默认，即为每群独立。Docker 镜像里的 `/app/.venv` 用于构建验证和显式选择，不再自动替代群 venv。旧 Python 3.12 群环境在下次使用文档功能时由 uv 按新配置重建，因此首次任务可能需要联网下载 Python 和依赖。生成文件保留在用户 tmp，venv 只存工具依赖。
+仅管理员显式配置 `BOT_DOCUMENT_ENV` 时，所有群才共用指定环境。TUI「设置 → 高级运行参数 → 文档与诊断」中的「共享文档环境覆盖」留空或恢复默认，即为每群独立。Docker 镜像里的 `/app/.venv` 用于构建验证和显式选择，不替代群 venv。群 venv 缺失或与当前配置不一致时由 uv 按需准备，因此该群首次使用文档功能可能需要联网下载 Python 和依赖。生成文件保留在用户 tmp，venv 只存工具依赖。
 
 通常无需手工同步。需要预热某个群时，停止服务，在项目根目录执行（将路径换成实际群目录）：
 
@@ -95,7 +95,7 @@ bash scripts/ops/ops.sh doctor
 
 Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在 Cloudflare 控制台维护，部署脚本不会同步；以控制台当前配置为准。
 
-新增或修改 `src/server/app.ts` 的公网路由时，必须同时检查控制台中的放行路径、HTTP 方法和来源条件，并同步所需规则。仅提交路由代码不足以开放公网访问。验收应分别检查本地源站响应和公网请求；如果本地正常而公网失败、源站日志全空，先查 Cloudflare 安全事件及规则命中情况，不要仅凭应用日志判断请求没有发出。
+新增或修改 `src/server/http-app.ts` 的公网路由时，必须同时检查控制台中的放行路径、HTTP 方法和来源条件，并同步所需规则。仅提交路由代码不足以开放公网访问。验收应分别检查本地源站响应和公网请求；如果本地正常而公网失败、源站日志全空，先查 Cloudflare 安全事件及规则命中情况，不要仅凭应用日志判断请求没有发出。
 
 </details>
 
@@ -147,7 +147,7 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 | `BOT_RUN_TIMEOUT_SECONDS` | 1200 秒 | 10–7200 秒，覆盖准备、模型、工具与最终交付 |
 | `BOT_MODEL_IDLE_TIMEOUT_SECONDS` | 180 秒 | 10–7200 秒；模型等待或输出期间连续无有效进展的上限 |
 | `BOT_MODEL_RESPONSE_TIMEOUT_SECONDS` | 600 秒 | 10–7200 秒；单次模型响应的上限，持续输出也不续期 |
-| `BOT_MODEL_CACHE_RETENTION` | auto | 默认沿用 Pi 官方 SDK；short/long/none 仅作显式覆盖，保留调用方设置 |
+| `PI_CACHE_RETENTION` | short | Pi 原生 short/long；模型请求与保温共用，服务商决定实际期限；不提供全局 none |
 | `BOT_ATTACHMENT_CONCURRENCY` | 2 | 1–8；在小附件读取前预约，覆盖读取与上传，限制内存峰值 |
 | `BOT_DELIVERY_TIMEOUT_SECONDS` | 180 秒 | 1–600 秒，包含出站排队和重试 |
 | `BOT_SHUTDOWN_TIMEOUT_SECONDS` | 20 秒 | 5–25 秒，覆盖 HTTP、任务、进程与租约收尾 |
@@ -158,6 +158,8 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 | `BOT_DOCUMENT_WORK_ENABLED` | `1` | 文档加工模块开关；`0` 同时关闭 skill、六个文档编辑、生成与预览工具及模块提示词，重启生效；基础解析和发文件保留 |
 
 ### 数据目录
+
+从 Pi 0.85.1 升级时，配置迁移和版本登记由[升级事务](data-migrations.md)完成；Windows 首次过渡需要按该文档先停机。保温默认关闭，历史无需格式转换。`tmp/pi087/` 只保留历史一次性迁移与账目修复工具，常规升级不需要单独复制它。
 
 ```text
 data/
@@ -170,19 +172,24 @@ data/
 ├── state/
 │   ├── agent.sqlite           待交付内容、路由隔离与路径身份
 │   ├── relay.sqlite           远端对象的持久账本
+│   ├── data-version.json      项目数据版本与迁移事务号
+│   ├── migration.json         迁移进度；提交后保留为回执
 │   ├── instance.json          实例 PID、启动时间与关闭令牌
 │   └── ...                    部署状态与维护租约
 ├── runtime/
 │   ├── pi/settings.json       Pi 原生选型：服务商、模型与推理级别（需备份）
 │   ├── models-store.json      模型目录缓存，动态目录服务商离线启动时需要
 │   └── ...                    其余 Pi 资源与启动脚本，可重建
-└── groups/<group>/
-    ├── workspace/             外部同步的资料源
-    ├── index/                 materials.md、扫描 manifest；可选 ignore.txt、parsed/ 文档缓存
-    ├── venv/                  原生部署按需准备的解析环境
-    └── users/<user>/
-        ├── session.jsonl      Pi 原生会话
-        └── tmp/               生成文件、缓存与完整工具输出
+└── groups/
+    ├── data-version.json      群根数据版本，与项目侧成对保存
+    ├── stats.sqlite           使用统计账本：独立于会话历史，清空上下文不影响统计
+    └── <group>/
+        ├── workspace/         外部同步的资料源
+        ├── index/             materials.md、扫描 manifest；可选 ignore.txt、parsed/ 文档缓存
+        ├── venv/              原生部署按需准备的解析环境
+        └── users/<user>/
+            ├── session.jsonl  Pi 原生会话
+            └── tmp/           生成文件、缓存与完整工具输出
 backup/                        为了能撤销某个操作而留的，别顺手清
 ├── snapshots/                 部署、升级与连接器安装的回滚现场
 ├── reports/                   TUI 导出的离线 HTML 报表
@@ -235,3 +242,7 @@ logs/                          应用日志与可选的隧道日志
 上传使用有大小上限的不可变快照，让哈希与 PUT 对应相同字节。对象先登记计划，确认上传后更新状态；快照在成功、失败或取消后的收尾中直接删除。相同后端、内容和文件名复用同一对象，布局为 `<日期>-<uuid>/<文件名>`。
 
 缓存探测返回 404/410，或遇到 500、401、网络异常等无法确认的响应时，会在原对象名上尝试 PUT。无法确认时保留原 `uploaded` 状态，避免重传失败后误删已有对象；取消后不再启动补传，操作共享总期限。切换后端后，无法归属当前配置的记录保留供运维处理。
+
+## 数据版本与升级
+
+参见[数据版本与升级事务](data-migrations.md)。业务入口 `src/server/index.ts` 和 TUI 入口在加载配置前检查项目与群根的版本；历史迁移集中在 `scripts/migrations/`。升级在提交前仅启动验证实例，提交后恢复正常业务。

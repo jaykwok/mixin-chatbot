@@ -29,6 +29,26 @@ async function settingsAt(root: string, contents: string | undefined): Promise<s
 }
 
 describe("Pi 原生设置视图", () => {
+  test.each(["off", "streaming", "idle"] as const)("保留原生保温 %s 与分模型压缩预算，reload 不复原默认值", async mode => {
+    const files = await tempFixture("pi-native-settings-");
+    try {
+      const path = await settingsAt(files.root, JSON.stringify({ cacheWarming: mode, compaction: {
+        reserveTokens: 1024, keepRecentTokens: 2048,
+        modelOverrides: { "faux/small": { reserveTokens: 512 }, "faux/large": { keepRecentTokens: 8192 } },
+      } }));
+      const settings = openSettings(path);
+      for (let i = 0; i < 2; i++) {
+        expect(settings.getCacheWarmingMode()).toBe(mode);
+        expect(settings.getCompactionSettings({ provider: "faux", id: "small" })).toEqual({ enabled: true, reserveTokens: 512, keepRecentTokens: 2048 });
+        expect(settings.getCompactionSettings({ provider: "faux", id: "large" })).toEqual({ enabled: true, reserveTokens: 1024, keepRecentTokens: 8192 });
+        expect(settings.getCompactionSettings({ provider: "faux", id: "other" })).toEqual({ enabled: true, reserveTokens: 1024, keepRecentTokens: 2048 });
+        settings.reload();
+      }
+      await settingsAt(files.root, JSON.stringify({ cacheWarming: "typo" }));
+      expect(() => openSettings(path)).toThrow(/cacheWarming/);
+    } finally { await files.cleanup(); }
+  });
+
   test("真实 SDK 资源重载和设置写入后仍保留固定运行策略", async () => {
     const files = await tempFixture("pi-settings-");
     try {
@@ -47,13 +67,14 @@ describe("Pi 原生设置视图", () => {
         noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       });
       const checkPolicy = () => {
-        expect(settings.getRetrySettings()).toEqual({ enabled: true, maxRetries: 1, baseDelayMs: 1000 });
+        expect(settings.getRetrySettings()).toEqual({ enabled: true, maxRetries: 1, baseDelayMs: 1000, maxAgentDelayMs: 5000 });
         expect(settings.getProviderRetrySettings()).toEqual({ timeoutMs: 120000, maxRetries: 1, maxRetryDelayMs: 5000 });
         expect(settings.getCompactionSettings()).toEqual({ enabled: true, reserveTokens: 1024, keepRecentTokens: 2048 });
         expect(settings.getGlobalSettings()).toMatchObject({
           enableAnalytics: false, enableInstallTelemetry: false, enableSkillCommands: false,
         });
         expect(settings.isProjectTrusted()).toBe(false);
+        expect(settings.getCacheWarmingMode()).toBe("off");
       };
       checkPolicy();
       await loader.reload();

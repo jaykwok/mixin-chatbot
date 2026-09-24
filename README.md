@@ -48,10 +48,10 @@ flowchart TD
 
 | 部署方式 | 需要准备 |
 | --- | --- |
-| Windows 原生 | Bun 1.4.0+、Git for Windows（含 GNU Bash）、原生 `uv.exe`；使用管理员 PowerShell |
+| Windows 原生 | Bun 1.4.2+、Git for Windows（含 GNU Bash）、原生 `uv.exe`；使用管理员 PowerShell |
 | Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；直连模式需要 UFW 及 root / sudo 权限 |
 
-Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需安装 Bun；使用终端管理台时，宿主机另需 Bun 1.4.0+。Linux 需要可访问 `/proc`，不支持 macOS、Alpine/musl。安装链接见[环境要求](docs/deployment.md#选择部署方式)。
+Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需安装 Bun；使用终端管理台时，宿主机另需 Bun 1.4.2+。Linux 需要可访问 `/proc`，不支持 macOS、Alpine/musl。安装链接见[环境要求](docs/deployment.md#选择部署方式)。
 
 同时准备：
 
@@ -140,6 +140,8 @@ bun run tui
 | 修改外链、隧道连接模式和运行参数 | 系统 → 设置 |
 
 详细键位与报表预览见[管理台与报表](docs/tui.md)。不用管理台时，可将上面命令中的 `doctor` 替换为 `start`、`stop`、`restart`、`logs` 或 `update`；升级条件与备份清理规则见[命令行运维](docs/operations.md#命令行运维)。
+
+升级会自动完成配置迁移和数据版本登记；尚未登记时，TUI 仅显示升级 / 诊断。Windows 从旧升级器首次过渡需要先停机，步骤见[数据版本与升级](docs/data-migrations.md)。
 
 ## 详细文档
 

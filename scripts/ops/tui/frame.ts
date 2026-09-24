@@ -22,6 +22,7 @@ export interface HeaderInput {
 function serviceStatus(service: Service | null): { name: keyof typeof STATUS; label: string } {
   if (!service) return { name: "idle", label: "未探测" };
   if (service.state === "ready") return { name: "running", label: "运行中" };
+  if (service.state === "verifying") return { name: "warn", label: "只验证" };
   if (service.state === "stopping") return { name: "warn", label: "正在停机" };
   return { name: "danger", label: "未响应" };
 }

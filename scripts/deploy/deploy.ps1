@@ -49,9 +49,9 @@ function Test-VersionedApplication([string]$Path, [string]$RequiredPattern = "")
     if ($RequiredPattern -and $text -notmatch $RequiredPattern) { return $null }
     return [pscustomobject]@{ Path = $Path; Version = ($output | Select-Object -First 1) }
 }
-function Wait-BotHealth([string]$ListenPort, [int]$Attempts = 18) {
+function Wait-BotHealth([string]$ListenPort, [int]$Attempts = 18, [switch]$AllowVerification) {
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        if (Test-ProjectBotHealth $Project ([int]$ListenPort)) { return $true }
+        if (Test-ProjectBotHealth $Project ([int]$ListenPort) -AllowVerification:$AllowVerification) { return $true }
         if ($attempt -lt $Attempts) { Start-Sleep -Seconds 3 }
     }
     return $false
@@ -204,13 +204,20 @@ Done "bun 版本：$bunVersion"
 # 从此处开始才允许修改持久配置、依赖、服务和网络入口。
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { throw "部署需要管理员权限；请在管理员终端中使用 $(Get-OpsCommandHint 'deploy')。" }
-if ([Version]($bunVersion -replace '-.*$', '') -lt [Version]'1.4.0') { throw '需要 Bun 1.4.0 或更高版本（Windows FFI 进程监督）。' }
+if ([Version]($bunVersion -replace '-.*$', '') -lt [Version]'1.4.2') { throw '需要 Bun 1.4.2 或更高版本（Windows FFI 进程监督）。' }
 $UvPath = @(Get-ApplicationPaths 'uv.exe' | Where-Object { Test-VersionedApplication $_ '^uv ' } | Select-Object -First 1)
 if ($UvPath.Count -ne 1) { throw '缺少原生 uv.exe，请先安装 uv 并加入 PATH。' }
 $UvDir = Split-Path $UvPath[0] -Parent
 $env:PATH = $UvDir + ';' + $BashDir + ';' + $env:PATH
-if ((Test-Path -LiteralPath $ModelsFile) -and -not (Test-ModelConfiguration $Project)) {
-    throw "模型配置无效；尚未停止旧服务。配置建议：$(Get-OpsCommandHint 'configure')。"
+$migrationPlan = Join-Path $Project ('tmp\migration-plan-' + [Guid]::NewGuid().ToString('N') + '.json')
+$migrationRunner = Join-Path $Project 'scripts\migrations\run.ts'
+$migrationPlanned = $false
+$migrationAttempted = $false
+$migrationGroups = if (Test-Path -LiteralPath $GroupRootFile) { (Get-Content -LiteralPath $GroupRootFile -Raw).Trim() } else { $DefaultGroupDataRoot }
+if ((Test-Path -LiteralPath $ModelsFile) -and (Test-Path -LiteralPath (Join-Path $RuntimeDir 'pi\settings.json'))) {
+    & $bunPath run $migrationRunner preview --decisions-only --interactive --project $Project --groups $migrationGroups --plan $migrationPlan
+    if ($LASTEXITCODE -ne 0) { throw '迁移预览未完成；旧服务尚未停止' }
+    $migrationPlanned = $true
 }
 $snapshot = New-DeploymentSnapshot $Project $TaskName
 $deploymentCommitted = $false
@@ -232,6 +239,11 @@ try {
     $ErrorActionPreference = $previousErrorActionPreference
 }
 if ($bunInstallExitCode -ne 0) { Write-Host "bun install 执行失败（退出码 $bunInstallExitCode）。" -ForegroundColor Red; exit 1 }
+if ($migrationPlanned) {
+    $migrationAttempted = $true
+    & $bunPath run $migrationRunner apply --project $Project --groups $migrationGroups --plan $migrationPlan
+    if ($LASTEXITCODE -ne 0) { throw '数据迁移失败' }
+}
 
 # ---- 3. 持久化目录 + AI 配置 ----
 New-Item -ItemType Directory -Force -Path $ConfigDir, $StateDir, $RuntimeDir, (Join-Path $Project "logs") | Out-Null
@@ -367,6 +379,10 @@ while ($true) {
         }
     }
     $GroupDataRoot = (Resolve-Path -LiteralPath $GroupDataRoot).Path
+    if ($migrationPlanned -and $GroupDataRoot -ne [IO.Path]::GetFullPath($migrationGroups)) {
+        Warn '本次迁移必须沿用原群根；更换挂载请在升级完成后单独操作。'
+        continue
+    }
     break
 }
 Done "群数据总根：$GroupDataRoot"
@@ -551,6 +567,14 @@ $env:BOT_PORT = $Port
 $env:BOT_HOST = $BotHost
 $env:BOT_DEBUG = $BotDebug
 $env:BOT_MAX_ACTIVE_REQUESTS = $BotMaxActiveRequests
+if (-not $migrationPlanned) {
+    & $bunPath run $migrationRunner preview --interactive --project $Project --groups $GroupDataRoot --plan $migrationPlan
+    if ($LASTEXITCODE -ne 0) { throw '迁移预览失败' }
+    $migrationAttempted = $true
+    & $bunPath run $migrationRunner apply --project $Project --groups $GroupDataRoot --plan $migrationPlan
+    if ($LASTEXITCODE -ne 0) { throw '数据迁移失败' }
+}
+Set-Content -LiteralPath (Join-Path $StateDir 'verify-only') -Value 'verify' -Encoding ASCII
 Invoke-WithUtf8Output { & $bunPath run scripts/config/runtime-settings.ts }
 if ($LASTEXITCODE -ne 0) { throw '运行配置持久化失败' }
 $launcherBody = @"
@@ -623,7 +647,7 @@ if ($taskUsesS4U) {
     }
 }
 Step "等待机器人健康检查通过..."
-$healthy = Wait-BotHealth $Port
+$healthy = Wait-BotHealth $Port -AllowVerification
 if (-not $healthy) {
     $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
     $lastResult = if ($taskInfo) { "$(Get-ResultCodeHex $taskInfo.LastTaskResult) / $($taskInfo.LastTaskResult)" } else { "未知" }
@@ -738,11 +762,27 @@ if ($cleanupFirewallAfterHealth) {
 Save-DeploymentState
 Done "部署状态已写入 data\state。"
 Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 → 外链配置」按需启用。"
+if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止' }
+& $bunPath run $migrationRunner commit --project $Project --groups $GroupDataRoot
+if ($LASTEXITCODE -ne 0) { throw '迁移提交失败' }
 $deploymentCommitted = $true
+Remove-Item -LiteralPath (Join-Path $StateDir 'verify-only') -Force
+Enable-ScheduledTask -TaskName $TaskName | Out-Null
+Start-ScheduledTask -TaskName $TaskName
+if (-not (Wait-BotHealth $Port)) { throw '数据已提交，但业务实例未就绪；保留新版本，请检查日志后启动' }
 
 } finally {
     if (-not $deploymentCommitted -and $deploymentMutated) {
-        try { Restore-DeploymentSnapshot $snapshot }
+        try {
+            if ($migrationAttempted) {
+                if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止，拒绝恢复数据' }
+                $rollbackGroups = if ($migrationPlanned) { $migrationGroups } else { $GroupDataRoot }
+                & $bunPath run $migrationRunner rollback --project $Project --groups $rollbackGroups --deployment (Split-Path $snapshot.Path -Leaf)
+                if ($LASTEXITCODE -ne 0) { throw '数据已提交或恢复失败；保持停机，保留备份' }
+            }
+            Remove-Item -LiteralPath (Join-Path $StateDir 'verify-only') -Force -ErrorAction SilentlyContinue
+            Restore-DeploymentSnapshot $snapshot
+        }
         catch { Write-Host ("自动回滚未完成，保留快照 " + $snapshot.Path + "：" + $_.Exception.Message) -ForegroundColor Red }
     } elseif ($deploymentCommitted) {
         try { Remove-CompletedBackup $snapshot.Path $Project }

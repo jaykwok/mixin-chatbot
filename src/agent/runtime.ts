@@ -2,83 +2,31 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { Type, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { GROUP_DATA_ROOT, SESSION_IDLE_TTL, RUN_TIMEOUT_MS, MODEL_IDLE_TIMEOUT_MS, MODEL_RESPONSE_TIMEOUT_MS } from "../core/config.ts";
 import { log } from "../core/log.ts";
-import { PI_AGENT_DIR, RUNTIME_DIR } from "../core/storage.ts";
 import { application, waitFor } from "../core/lifecycle.ts";
 import { archiveFile } from "../core/maintenance.ts";
 import { abortOutboundRequests, getOutboundRateStatus, sendReplyWithMention, sendText } from "../integrations/im.ts";
-import { getRelayConfig } from "../integrations/relay.ts";
-import { groupIndexDir, groupVenvDir, groupWorkspaceDir, materialsIgnorePath, materialsIndexPath, sessionFilePath, userTempDir } from "./paths.ts";
+import { groupSegment, groupWorkspaceDir, materialsIgnorePath, materialsIndexPath, sessionFilePath, userSegment } from "./paths.ts";
+import { ingestBeforeArchive, ingestUserSession } from "./stats-ledger.ts";
 import { ensureMaterialsIndex } from "./materials-index.ts";
-import { ensureDocumentToolchain, venvPythonPath } from "./python-toolchain.ts";
 import { canonicalCommand, HELP_TEXT, isSlashCommandMessage, stripLeadingMention, unknownCommandText } from "./commands.ts";
-import { buildLocalTools } from "./local-tools.ts";
-import { buildSendTools, createOutboundNotes, type OutboundNotes } from "./send-tools.ts";
-import { buildChatContext } from "./prompt.ts";
+import { createOutboundNotes, type OutboundNotes } from "./send-tools.ts";
 import { DeliveryStore } from "./delivery-store.ts";
 import { refreshDeliveryText } from "./delivery-links.ts";
 import { SessionQueue } from "./session-queue.ts";
-import { runtimeSetting } from "../core/runtime-config.ts";
-import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
 import { ensureStorageIdentity } from "./storage-identity.ts";
 import { redactSecrets } from "./failure.ts";
-import { openModelRuntime, openSettings, resolveModelSelection } from "../core/model-config.ts";
-import { configureModelCache, type CachePolicy } from "./model-cache.ts";
-import { buildDocumentTool } from "./document-extract.ts";
-import { loadAgentModules } from "./modules.ts";
 import { ModelProgress } from "./model-progress.ts";
+import { createChatSession, getRuntime } from "./session-factory.ts";
+import { progressText, setStage, subscribeProgress, type ProgressState } from "./session-events.ts";
+import { cancelCacheWarming } from "./session-control.ts";
 
-// Pi 运行时单例：目录、原生设置的只读快照和选中的模型，全实例共用一份。
-type RuntimeSelection = {
-  runtime: ModelRuntime;
-  settings: SettingsManager;
-  model: Model<Api>;
-  thinkingLevel: ModelThinkingLevel;
-};
-let resolvedRuntime: RuntimeSelection | null = null;
-let runtimePromise: Promise<RuntimeSelection> | null = null;
-
-async function getRuntime(): Promise<RuntimeSelection> {
-  if (resolvedRuntime) return resolvedRuntime;
-  if (runtimePromise) return runtimePromise;
-
-  runtimePromise = (async () => {
-    // Pi 默认把模型目录缓存写在 models.json 旁边；显式指向 data/runtime，让
-    // data/config 里只剩用户真正要维护的东西。首次写入前目录必须存在。
-    await mkdir(RUNTIME_DIR, { recursive: true });
-    const runtime = await openModelRuntime({ signal: application.signal });
-    const settings = openSettings();
-    const { model, thinkingLevel } = await resolveModelSelection(runtime, settings, { signal: application.signal });
-    configureModelCache(runtime, (runtimeSetting("BOT_MODEL_CACHE_RETENTION") ?? RUNTIME_DEFAULTS.BOT_MODEL_CACHE_RETENTION) as CachePolicy);
-    resolvedRuntime = { runtime, settings, model, thinkingLevel };
-    log.info(
-      `Pi ModelRuntime 就绪（provider=${model.provider}, model=${model.id}, api=${model.api}, thinkingLevel=${thinkingLevel}, 群数据总根=${GROUP_DATA_ROOT}）`
-    );
-    return resolvedRuntime;
-  })();
-
-  try {
-    return await runtimePromise;
-  } catch (e) {
-    runtimePromise = null;
-    throw e;
-  }
-}
-
-
-type AgentSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
-interface SessionRecord {
+interface SessionRecord extends ProgressState {
   key: string; phone: string; groupId: string; callbackUrl: string;
-  queue: SessionQueue; session?: AgentSession; lastUsed: number; lastTool?: string;
+  queue: SessionQueue; session?: AgentSession; lastUsed: number;
   notes: OutboundNotes; deliveryId?: string; unsubscribe?: () => void;
-  progress?: {
-    id: string; started: number; updated: number; stage: string;
-    model: ModelProgress; signal: AbortSignal; checkModelLimits: () => void;
-    abortReason?: "model_idle" | "model_response_timeout" | "task_timeout" | "user_cancel" | "shutdown";
-  };
 }
 const records = new Map<string, SessionRecord>();
 const controlReceipts = new Map<string, Promise<unknown>>();
@@ -86,32 +34,15 @@ let deliveries: DeliveryStore | undefined;
 const store = () => deliveries ??= new DeliveryStore();
 const sessionKey = (phone: string, groupId: string) => JSON.stringify([groupId, phone]);
 
-function progressText(record: SessionRecord): string {
-  const p = record.progress;
-  if (!p) return "";
-  const stream = p.model.snapshot();
-  return `任务: ${p.id}, 群: ${record.groupId}, 用户: ${record.phone}, 阶段: ${p.stage}, ` +
-    `耗时: ${Math.floor((Date.now() - p.started) / 1000)}秒, 最近进展距今: ${Math.floor((Date.now() - p.updated) / 1000)}秒` +
-    (stream ? ", 模型流: " + JSON.stringify(stream) : "") +
-    (p.abortReason ? ", 取消原因: " + p.abortReason : "");
-}
-
-function setStage(record: SessionRecord, stage: string, advanced = true): void {
-  const p = record.progress;
-  if (!p || (p.signal.aborted && stage !== "等待取消清理")) return;
-  const changed = p.stage !== stage;
-  p.stage = stage;
-  if (advanced) p.updated = Date.now();
-  if (changed) log.info("任务进展 - " + progressText(record));
-}
-
 export function resolveSessionCallbackUrl(phone: string, groupId: string, fallback: string): string {
   return records.get(sessionKey(phone, groupId))?.callbackUrl ?? fallback;
 }
 
 /** Stop remains available even if control receipts are already queued. */
 export function stopUserTask(phone: string, groupId: string): void {
-  void records.get(sessionKey(phone, groupId))?.queue.cancel();
+  const record = records.get(sessionKey(phone, groupId));
+  if (record?.session) cancelCacheWarming(record.session);
+  void record?.queue.cancel();
 }
 
 function getRecord(phone: string, groupId: string, callbackUrl: string): SessionRecord {
@@ -141,97 +72,10 @@ async function refreshIndex(record: SessionRecord, signal: AbortSignal): Promise
 }
 
 async function createSession(record: SessionRecord, signal: AbortSignal): Promise<AgentSession> {
-  await ensureStorageIdentity(GROUP_DATA_ROOT, record.groupId, record.phone);
-  signal.throwIfAborted();
-  const { runtime, settings: settingsManager, model, thinkingLevel } = await getRuntime();
-  signal.throwIfAborted();
-  const cwd = resolve(groupWorkspaceDir(GROUP_DATA_ROOT, record.groupId));
-  const tempDir = resolve(userTempDir(GROUP_DATA_ROOT, record.groupId, record.phone));
-  const history = resolve(sessionFilePath(GROUP_DATA_ROOT, record.groupId, record.phone));
-  const indexPath = resolve(materialsIndexPath(GROUP_DATA_ROOT, record.groupId));
-  const venvDir = resolve(runtimeSetting("BOT_DOCUMENT_ENV") || groupVenvDir(GROUP_DATA_ROOT, record.groupId));
-  for (const dir of [cwd, tempDir, dirname(history), PI_AGENT_DIR, groupIndexDir(GROUP_DATA_ROOT, record.groupId)]) {
-    await mkdir(dir, { recursive: true });
-  }
-  const modules = await loadAgentModules({ workspaceDir: cwd, tempDir, indexPath, venvDir,
-    documentWorkEnabled: (runtimeSetting("BOT_DOCUMENT_WORK_ENABLED") ?? RUNTIME_DEFAULTS.BOT_DOCUMENT_WORK_ENABLED) === "1" });
-  const resourceLoader = new DefaultResourceLoader({
-    cwd, agentDir: resolve(PI_AGENT_DIR), settingsManager,
-    noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-    skillsOverride: () => modules.skills,
-    systemPromptOverride: () => buildChatContext({ relayEnabled: !!getRelayConfig(), modulePrompt: modules.prompt }),
-    appendSystemPromptOverride: () => [],
-  });
-  await resourceLoader.reload();
-  signal.throwIfAborted();
-  const localTools = await buildLocalTools({ workspaceDir: cwd, tempDir, phone: record.phone,
-    groupId: record.groupId, venvDir, materialsIndexPath: indexPath, resourceReadDirs: modules.readOnlyDirs });
-  const { session } = await createAgentSession({
-    cwd, agentDir: resolve(PI_AGENT_DIR), modelRuntime: runtime, model, thinkingLevel, settingsManager, resourceLoader,
-    sessionManager: SessionManager.open(history, undefined, cwd),
-    tools: ["read", "bash", "edit", "write", "send_image", "send_file", "document_environment", "document_extract",
-      ...modules.tools.map(tool => tool.name)],
-    customTools: [...localTools, buildDocumentTool({ workspaceDir: cwd, tempDir, indexPath, venvDir }),
-      ...modules.tools, ...buildSendTools({
-      getCallbackUrl: () => record.callbackUrl, groupId: record.groupId, workspaceDir: cwd, tempDir,
-      relay: getRelayConfig(), notes: record.notes,
-    }), {
-      name: "document_environment", label: "文档解析环境", description: "查询并按需准备本群固定版本的文档解析环境；成功后返回解释器位置。失败时说明能力不可用，不自行安装或修改共享环境。",
-      parameters: Type.Object({}),
-      async execute(_id, _params, toolSignal) {
-        const ready = await ensureDocumentToolchain(venvDir, toolSignal);
-        if (!ready) throw new Error("文档解析环境不可用，请联系管理员检查 uv、网络或部署依赖");
-        return { content: [{ type: "text", text: "解析环境已验证，PI_PYTHON=" + venvPythonPath(venvDir) }], details: {} };
-      },
-    }],
-  });
+  const session = await createChatSession({ phone: record.phone, groupId: record.groupId,
+    notes: record.notes, getCallbackUrl: () => record.callbackUrl }, signal);
   record.session = session;
-  record.unsubscribe = session.subscribe((event) => {
-    // Only record metadata; never log model text, reasoning or tool arguments/results.
-    const p = record.progress;
-    if (!p) return;
-    // Cancellation can still yield a terminal assistant message; keep its finish reason.
-    if (event.type === "message_end" && event.message.role === "assistant") {
-      p.model.finish(event.message);
-      log.info("模型流结束 - " + progressText(record));
-      setStage(record, "模型响应结束");
-      return;
-    }
-    // Late SDK events must not rearm the watchdog or hide the cancellation cleanup stage.
-    if (p.signal.aborted) return;
-    if (event.type === "turn_start") {
-      p.model.begin();
-      setStage(record, "等待模型响应");
-    }
-    if (event.type === "message_start" && event.message.role === "assistant") p.model.start(event.message);
-    if (event.type === "message_update") {
-      setStage(record, "接收模型输出", p.model.update(event.assistantMessageEvent));
-      // Also check on events so a flood of empty deltas cannot conceal a stalled stream.
-      p.checkModelLimits();
-    }
-    if (event.type === "tool_execution_start" || event.type === "tool_execution_update" ||
-        event.type === "tool_execution_end" || event.type === "turn_end" ||
-        event.type === "compaction_start" || event.type === "auto_retry_start" ||
-        event.type === "summarization_retry_scheduled" || event.type === "summarization_retry_attempt_start") p.model.pause();
-    if (event.type === "tool_execution_start") {
-      record.lastTool = event.toolName;
-      setStage(record, "执行工具 " + event.toolName);
-    }
-    if (event.type === "tool_execution_update") setStage(record, "执行工具 " + event.toolName);
-    if (event.type === "tool_execution_end") setStage(record, "工具结束 " + event.toolName);
-    if (event.type === "compaction_start") setStage(record, "压缩会话历史");
-    if (event.type === "compaction_end") {
-      setStage(record, "会话历史压缩结束");
-      if (event.errorMessage) log.warn("历史压缩异常 - " + progressText(record) + ", 错误: " + redactSecrets(event.errorMessage));
-    }
-    if (event.type === "auto_retry_start" || event.type === "summarization_retry_scheduled") {
-      setStage(record, event.type === "auto_retry_start" ? "等待模型重试" : "等待历史压缩重试");
-      log.warn(`模型自动重试 - ${progressText(record)}, 次数: ${event.attempt}/${event.maxAttempts}, ` +
-        `延迟: ${event.delayMs}ms, 错误: ${redactSecrets(event.errorMessage)}`);
-    }
-    if (event.type === "auto_retry_end") setStage(record, "模型重试结束");
-    if (event.type === "summarization_retry_attempt_start") setStage(record, "重试会话历史压缩");
-  });
+  record.unsubscribe = subscribeProgress(session, record);
   signal.throwIfAborted();
   return session;
 }
@@ -280,7 +124,10 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
       p.model.pause();
       setStage(record, "等待取消清理");
     }
-    if (session) abortTask ??= session.abort().catch((error) => log.warn("Pi abort: " + String(error)));
+    if (session && !abortTask) {
+      cancelCacheWarming(session);
+      abortTask = session.abort().catch((error) => log.warn("Pi abort: " + String(error)));
+    }
   };
   signal.addEventListener("abort", onAbort, { once: true });
   try {
@@ -291,13 +138,16 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
     await refreshIndex(record, signal);
     record.queue.phase = "执行中";
     // A status message is disposable and cannot delay model execution.
-    const status = sendText("🤔 正在处理...", record.groupId, record.phone, record.callbackUrl,
+    const status = sendText("收到, 正在处理... 🤔💭", record.groupId, record.phone, record.callbackUrl,
       { traffic: "status", signal }).catch(() => false);
     application.track(status);
     setStage(record, "模型调用准备（含历史检查）");
     log.info(`模型调用开始 - ${progressText(record)}, 历史消息数: ${session.state.messages.length}`);
     await session.prompt(content);
     signal.throwIfAborted();
+    if (session.cacheWarmingStatus) {
+      log.info("Pi 缓存保温状态 - " + redactSecrets(JSON.stringify(session.cacheWarmingStatus)));
+    }
     p.model.pause();
     setStage(record, "模型调用结束");
     const failure = session.state.errorMessage;
@@ -335,6 +185,9 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
       record.progress = undefined;
     }
     record.lastUsed = Date.now();
+    // 失败和取消的任务也有真实消耗。仍在本成员队列里，与 /clear 的归档入账串行；失败留给每日兜底扫描。
+    await ingestUserSession(GROUP_DATA_ROOT, groupSegment(record.groupId), userSegment(record.phone)).catch((error) =>
+      log.warn(`统计入账失败，留待每日扫描 - 群: ${record.groupId}, 用户: ${record.phone}, 错误: ${String(error)}`));
   }
 }
 
@@ -346,6 +199,7 @@ export async function handleUserMessage(phone: string, groupId: string, content:
   const command = canonicalCommand(content);
   let reply: string;
   if (command === "/stop") {
+    if (record.session) cancelCacheWarming(record.session);
     await record.queue.cancel();
     reply = "⏹ 已停止你在本群的当前任务，并取消排队中的消息。已发出的内容不会撤回。";
     if (store().pending(record.key).length) reply += "\n已生成但尚未发完的回复已保留，发送 /deliver 可补发。";
@@ -354,6 +208,8 @@ export async function handleUserMessage(phone: string, groupId: string, content:
     await record.queue.enqueue(async () => {
       await ensureStorageIdentity(GROUP_DATA_ROOT, groupId, phone);
       await disposeSession(record);
+      // 统计只认账本，而 /clear 是成员随时能发的指令：归档前必须把这段历史落账。
+      await ingestBeforeArchive(GROUP_DATA_ROOT, groupSegment(groupId), userSegment(phone));
       await archiveFile(sessionFilePath(GROUP_DATA_ROOT, groupId, phone));
     });
     reply = "🧹 你在本群的聊天记录已归档，下条消息将开启新会话。其他人的聊天记录不受影响。";

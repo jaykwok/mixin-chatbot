@@ -170,6 +170,8 @@ test("重跑自定义配置保留模型级 headers、推理映射、采样参数
       headers: { "X-Model-Tenant": "fixture-tenant" },
       thinkingLevelMap: { low: "low", high: "high" },
       samplingParams: { temperature: 0.5 }, compat: { supportsStore: false },
+      inputLimits: { images: { resize: { maxWidth: 1280, maxHeight: 1280, maxBytes: 2000000, jpegQuality: 80 } } },
+      promptCache: { short: 300, long: 1800 },
     };
     await writeFile(join(files.root, MODELS_JSON), JSON.stringify({ providers: {
       "private-gw": { api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1", apiKey: "original", models: [model] },

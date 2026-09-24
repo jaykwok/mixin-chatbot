@@ -2,6 +2,19 @@
   "$schema": "https://unpkg.com/knip@latest/schema.json",
   "ignoreExportsUsedInFile": true,
   "includeEntryExports": true,
-  "entry": ["src/core/process-supervisor.ts!", "src/agent/modules/*/scripts/*.ts!", "scripts/config/{configure,configure-relay,runtime-settings,validate-models}.ts!", "scripts/ops/{*,tui/preview}.ts!", "scripts/runtime/*.ts!", "tests/**/*.test.ts", "tests/helpers/document-work-integration.ts"],
-  "project": ["src/**/*.ts!", "scripts/{config,ops,lib,runtime}/**/*.ts!", "tests/**/*.ts"]
+  "entry": [
+    "src/core/process-supervisor.ts!",
+    "src/agent/modules/*/scripts/*.ts!",
+    "scripts/config/{configure,configure-relay,runtime-settings,validate-models}.ts!",
+    "scripts/ops/{*,tui/preview}.ts!",
+    "scripts/runtime/*.ts!",
+    "tests/**/*.test.ts",
+    "tests/helpers/document-work-integration.ts",
+    "scripts/migrations/{run,validate}.ts!"
+  ],
+  "project": [
+    "src/**/*.ts!",
+    "scripts/{config,ops,lib,runtime,migrations}/**/*.ts!",
+    "tests/**/*.ts"
+  ]
 }

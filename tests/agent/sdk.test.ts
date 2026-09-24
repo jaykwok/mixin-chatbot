@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, getCurrentSystemPrompt, InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { buildChatContext } from "../../src/agent/prompt.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -35,7 +35,7 @@ describe("installed Pi SDK integration", () => {
       expect(payload).not.toHaveProperty("max_output_tokens");
     } finally { await files.cleanup(); }
   });
-  test.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"])("Pi 0.85.1 builds the real long-cache payload for %s", async (id) => {
+  test.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"])("Pi 0.87.1 builds the real long-cache payload for %s", async (id) => {
     const runtime = await ModelRuntime.create({ modelsPath: null, credentials: new InMemoryCredentialStore(),
       modelsStore: new InMemoryModelsStore(), refreshOnCreate: false });
     const model = runtime.getModel("openai", id)!;
@@ -113,7 +113,7 @@ describe("installed Pi SDK integration", () => {
     let session: Awaited<ReturnType<typeof create>> | undefined;
     try {
       let prompt = "";
-      faux.setResponses([(context) => { prompt = context.systemPrompt ?? ""; return fauxAssistantMessage("已记录"); }]);
+      faux.setResponses([(context) => { prompt = getCurrentSystemPrompt(context.messages) ?? ""; return fauxAssistantMessage("已记录"); }]);
       session = await create();
       const id = session.sessionManager.getSessionId();
       await session.prompt("记住项目编号 Q-85");

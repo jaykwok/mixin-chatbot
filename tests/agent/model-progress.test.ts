@@ -157,12 +157,13 @@ test("same-length parsed changes and in-place mutations count independently for 
   let now = 0;
   const stream = new ModelProgress(() => now);
   const partial = message();
-  const first = tool(partial, 0, { command: "a", options: { count: 1 } });
+  const args = { command: "a", options: { count: 1 } };
+  tool(partial, 0, args);
   const second = tool(partial, 1, { command: "z" });
   stream.begin();
   stream.update({ type: "toolcall_delta", contentIndex: 0, delta: "a", partial });
   now = 1000;
-  first.arguments.options.count = 2;
+  args.options.count = 2;
   expect(stream.update({ type: "toolcall_delta", contentIndex: 0, delta: "2", partial })).toBe(true);
   now = 2000;
   expect(stream.update({ type: "toolcall_delta", contentIndex: 1, delta: "z", partial })).toBe(true);

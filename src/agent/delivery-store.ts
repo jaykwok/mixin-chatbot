@@ -6,18 +6,27 @@ import type { RelayReference } from "../integrations/relay.ts";
 export interface DeliveryAttachment { original: string; reference: RelayReference; }
 export interface PendingDelivery { id: string; text: string; at: string; attachments: DeliveryAttachment[]; blockedReason?: string; }
 
+/** Shared read-only schema check; absent tables are initialized by the normal service. */
+export function assertDeliverySchema(db: Database): void {
+  const versionTable = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'delivery_schema'").get();
+  if (!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'").get()) {
+    if (versionTable) throw new Error("待补发账本 schema 存在但数据表缺失，请检查备份");
+    return;
+  }
+  const version = versionTable ? (db.query("SELECT version FROM delivery_schema WHERE id = 1").get() as { version: number } | null)?.version : undefined;
+  const columns = new Set((db.query("PRAGMA table_info(deliveries)").all() as { name: string }[]).map(column => column.name));
+  if (version !== 2 || ["id", "session", "text", "at", "attachments", "blocked_reason"].some(column => !columns.has(column))) {
+    throw new Error("待补发账本格式需要迁移；请先停止机器人，运行 tmp/migrate-audit-2026-09-13.ts --apply 后再启动");
+  }
+}
+
 /** Durable pending text, independent of Pi history. No callback credentials are stored. */
 export class DeliveryStore {
   constructor(private readonly db: Database = stateDatabase()) {
     db.transaction(() => {
       const exists = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'").get();
       if (exists) {
-        const versionTable = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'delivery_schema'").get();
-        const version = versionTable ? (db.query("SELECT version FROM delivery_schema WHERE id = 1").get() as { version: number } | null)?.version : undefined;
-        const columns = new Set((db.query("PRAGMA table_info(deliveries)").all() as { name: string }[]).map(column => column.name));
-        if (version !== 2 || !columns.has("attachments") || !columns.has("blocked_reason")) {
-          throw new Error("待补发账本格式需要迁移；请先停止机器人，运行 tmp/migrate-audit-2026-09-13.ts --apply 后再启动");
-        }
+        assertDeliverySchema(db);
       } else {
         db.exec("CREATE TABLE deliveries (id TEXT PRIMARY KEY, session TEXT NOT NULL, text TEXT NOT NULL, at TEXT NOT NULL, attachments TEXT NOT NULL DEFAULT '[]', blocked_reason TEXT)");
         db.exec("CREATE INDEX deliveries_session ON deliveries(session)");

@@ -1,46 +1,50 @@
 import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 // 这些数字会被抄进汇报材料，所以口径必须钉死：指令不算提问、干预算提问、区间按自然日
-// 闭区间、半行 JSON 不能让整份统计失败。测试用真实的 session.jsonl 记录形状。
-import { describe, expect, spyOn, test } from "bun:test";
+// 闭区间、半行 JSON 不能让整份统计失败。测试用真实的 session.jsonl 记录形状入账。
+import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectAll, collectGroup } from "../../scripts/ops/stats-admin.ts";
 import { cacheReadRate, emptyUsage, formatCacheRate } from "../../scripts/lib/usage.ts";
+import { ingestSessionFile, openStatsLedger, sweepSessionStats } from "../../src/agent/stats-ledger.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import * as statsCache from "../../scripts/lib/session-stats-cache.ts";
-import { waitFor } from "../helpers/tui-process.ts";
 
-test("会话逆序读完也按稳定顺序累加工具、模型与每日统计", async () => {
-  const fixture = await tempFixture("stats-read-order-");
-  type Source = Awaited<ReturnType<typeof statsCache.readSessionStats>>;
-  const readers = new Map<string, (value: Source) => void>();
-  const read = spyOn(statsCache, "readSessionStats").mockImplementation(path => new Promise(resolve => { readers.set(path, resolve); }));
+/** 统计只读账本，所以每个用例都要先把写好的会话文件入账。 */
+const ingest = (root: string) => sweepSessionStats(root, { force: true });
+
+test("账本按固定顺序折算：成员入账次序不影响工具、模型与每日统计", async () => {
+  const fixture = await tempFixture("stats-fold-order-");
   try {
     const users = ["a", "b", "c"];
-    for (const user of users) await mkdir(join(fixture.root, "group", "users", user), { recursive: true });
-    const run = async (order: string[]) => {
-      readers.clear();
-      const pending = collectGroup("group", fixture.root);
-      await waitFor(() => readers.size === 3, "并发会话读取");
-      for (const user of order) {
-        readers.get(join(fixture.root, "group", "users", user, "session.jsonl"))!({ skipped: 0, records: [{
-          type: "message", timestamp: `2026-09-0${users.indexOf(user) + 1}T12:00:00Z`,
+    const build = async (label: string) => {
+      const root = join(fixture.root, label);
+      for (const [index, user] of users.entries()) {
+        await mkdir(join(root, "group", "users", user), { recursive: true });
+        await writeFile(join(root, "group", "users", user, "session.jsonl"), JSON.stringify({
+          type: "message", timestamp: `2026-09-0${index + 1}T12:00:00Z`,
           message: { role: "assistant", provider: "fixture", model: user, content: [{ type: "toolCall", name: user }],
             usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } },
-        }] });
-        await Bun.sleep(0);
+        }) + "\n");
       }
-      return pending;
+      return root;
     };
-    const reverse = await run(["c", "b", "a"]);
-    const forward = await run(users);
+    const forwardRoot = await build("forward");
+    const reverseRoot = await build("reverse");
+    const db = openStatsLedger(reverseRoot);
+    try {
+      // 逆序入账：折算顺序由账本的 ORDER BY 决定，不受写入次序影响。
+      for (const user of [...users].reverse()) await ingestSessionFile(db, reverseRoot, "group", user);
+    } finally { db.close(); }
+    await ingest(forwardRoot);
+    const forward = await collectGroup("group", forwardRoot);
+    const reverse = await collectGroup("group", reverseRoot);
     const serialize = (value: unknown) => JSON.stringify(value, (_key, part) =>
       part instanceof Map ? [...part] : part instanceof Set ? [...part] : part);
     expect([...reverse.tools.keys()]).toEqual(users);
     expect(serialize(reverse)).toBe(serialize(forward));
-  } finally { read.mockRestore(); await fixture.cleanup(); }
+  } finally { await fixture.cleanup(); }
 });
 
 function userMsg(at: string, text: string): string {
@@ -71,7 +75,7 @@ async function makeRoot(): Promise<string> {
   };
 
   await write("group-a", "13800000000", [
-    JSON.stringify({ type: "session", version: 3, timestamp: "2026-08-10T01:00:00.000Z" }),
+    JSON.stringify({ type: "session", version: 3, id: "session-a1", timestamp: "2026-08-10T01:00:00.000Z" }),
     JSON.stringify({ type: "model_change", timestamp: "2026-08-10T01:00:00.100Z" }),
     userMsg("2026-08-10T01:00:01.000Z", "发一份安全大脑的介绍材料"),
     assistantMsg("2026-08-10T01:00:05.000Z", ["bash", "send_file"]),
@@ -96,6 +100,7 @@ async function makeRoot(): Promise<string> {
   // 只说过一句话就再没来过的成员，仍然算「使用过」。
   await write("group-b", "13700000000", [userMsg("2026-08-12T05:00:00.000Z", "在吗")]);
 
+  await ingest(root);
   return root;
 }
 
@@ -105,6 +110,7 @@ describe("usage stats", () => {
     const user = join(fixture.root, "g/users/u"); await mkdir(user, { recursive: true });
     await writeFile(join(user, "session.jsonl"), JSON.stringify({ type: "compaction", timestamp: "2026-09-11T12:01:00Z",
       usage: { input: 321, output: 20, cacheRead: 0, cacheWrite: 9, cost: { total: 0.5 } } }) + "\n");
+    await ingest(fixture.root);
     const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../../scripts/ops/stats-admin.ts", import.meta.url)), "g", "--group-id"],
       { cwd: fixture.root, env: { ...process.env, GROUP_DATA_ROOT: fixture.root }, stdout: "pipe", stderr: "pipe", windowsHide: true });
     const timer = setTimeout(() => child.kill(), 15000);
@@ -126,20 +132,22 @@ describe("usage stats", () => {
       { type: "model_change", provider: "next", modelId: "model", timestamp: "2026-09-12T12:00:00Z" },
       { type: "branch_summary", timestamp: "2026-09-12T12:01:00Z", usage: usage(50, 5, 100, 10, 3) },
       { type: "message", timestamp: "2026-09-12T12:02:00Z", message: { role: "assistant" } },
-    ].map(value => JSON.stringify(value)).join("\n"));
+    ].map(value => JSON.stringify(value)).join("\n") + "\n");
+    await ingest(fixture.root);
     try {
       const result = await collectGroup("g", fixture.root);
       expect(result.tokens).toMatchObject({ input: 350, output: 35, cacheRead: 1000, cacheWrite: 510,
         cost: 6, requests: 4, missingUsage: 1, unknownCost: 1 });
       expect(cacheReadRate(result.tokens)).toBeCloseTo(1000 / 1860, 10);
-      expect(result.usage.kinds.compaction.input).toBe(200);
-      expect(result.usage.kinds.branch_summary.cacheWrite).toBe(10);
+      expect(result.usage.kinds.get("compaction")?.input).toBe(200);
+      expect(result.usage.kinds.get("branch_summary")?.cacheWrite).toBe(10);
       expect(result.usage.models.get(JSON.stringify(["zai", "plan"]))?.requests).toBe(2);
       expect(result.usage.days.get("2026-09-12")?.requests).toBe(2);
-      const onlyCompaction = await collectAll(fixture.root, { since: Date.parse("2026-09-11T12:00:30Z"), until: Date.parse("2026-09-11T12:01:30Z") });
-      expect(onlyCompaction).toHaveLength(1);
-      expect(onlyCompaction[0]!.tokens.input).toBe(200);
-      expect(onlyCompaction[0]!.usage.models.get(JSON.stringify(["zai", "plan"]))?.requests).toBe(1);
+      // 账本是日粒度的：比一天更细的区间会被扩到整天，那天的两条用量都算进来。
+      const oneDay = await collectAll(fixture.root, { since: Date.parse("2026-09-11T12:00:30Z"), until: Date.parse("2026-09-11T12:01:30Z") });
+      expect(oneDay).toHaveLength(1);
+      expect(oneDay[0]!.tokens.input).toBe(300);
+      expect(oneDay[0]!.usage.models.get(JSON.stringify(["zai", "plan"]))?.requests).toBe(2);
       expect(formatCacheRate(emptyUsage())).toBe("无样本");
     } finally { await fixture.cleanup(); }
   });
@@ -212,6 +220,7 @@ describe("usage stats", () => {
     try {
       const path = join(root, "group-b", "users", "13700000000", "session.jsonl");
       await writeFile(path, (await Bun.file(path).text()) + '{"type":"message","times');
+      await ingest(root);
       const stats = await collectGroup("group-b", root);
       expect(stats.asks).toBe(1);
       expect(stats.skipped).toBe(1);
@@ -224,6 +233,7 @@ describe("usage stats", () => {
     const root = await makeRoot();
     try {
       await mkdir(join(root, "group-empty", "users"), { recursive: true });
+      await ingest(root);
       const groups = await collectAll(root);
       expect(groups.map((group) => group.group)).toEqual(["group-a", "group-b"]);
       expect(groups[0]!.asks).toBe(4);

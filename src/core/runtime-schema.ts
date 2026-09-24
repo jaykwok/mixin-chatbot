@@ -6,7 +6,7 @@ export const RUNTIME_KEYS = [
   "BOT_BASH_TIMEOUT", "BOT_INDEX_TTL_MINUTES", "BOT_INDEX_MAX_FILES", "BOT_INDEX_MAX_DEPTH",
   "BOT_RUN_TIMEOUT_SECONDS", "BOT_MODEL_IDLE_TIMEOUT_SECONDS", "BOT_MODEL_RESPONSE_TIMEOUT_SECONDS",
   "BOT_SHUTDOWN_TIMEOUT_SECONDS", "BOT_DELIVERY_TIMEOUT_SECONDS",
-  "BOT_DOCUMENT_ENV", "BOT_DOCUMENT_WORK_ENABLED", "BOT_MODEL_CACHE_RETENTION", "BOT_ATTACHMENT_CONCURRENCY",
+  "BOT_DOCUMENT_ENV", "BOT_DOCUMENT_WORK_ENABLED", "PI_CACHE_RETENTION", "BOT_ATTACHMENT_CONCURRENCY",
 ] as const;
 export type RuntimeKey = typeof RUNTIME_KEYS[number];
 export type RuntimeConfig = Partial<Record<RuntimeKey, string>>;
@@ -27,7 +27,7 @@ export const RUNTIME_DEFAULTS = {
   BOT_BASH_TIMEOUT: "600", BOT_INDEX_TTL_MINUTES: "5", BOT_INDEX_MAX_FILES: "50000", BOT_INDEX_MAX_DEPTH: "12",
   BOT_RUN_TIMEOUT_SECONDS: "1200", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "180", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "600",
   BOT_SHUTDOWN_TIMEOUT_SECONDS: "20", BOT_DELIVERY_TIMEOUT_SECONDS: "180",
-  BOT_DOCUMENT_ENV: "", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_MODEL_CACHE_RETENTION: "auto", BOT_ATTACHMENT_CONCURRENCY: "2",
+  BOT_DOCUMENT_ENV: "", BOT_DOCUMENT_WORK_ENABLED: "1", PI_CACHE_RETENTION: "short", BOT_ATTACHMENT_CONCURRENCY: "2",
 } satisfies Partial<Record<RuntimeKey, string>>;
 
 export function validateRuntimeConfig(value: unknown): RuntimeConfig {
@@ -44,7 +44,7 @@ export function validateRuntimeConfig(value: unknown): RuntimeConfig {
       throw new Error(`${key} 必须是 ${range[0]}-${range[1]} 的整数`);
     }
     if ((key === "BOT_DEBUG" || key === "BOT_DOCUMENT_WORK_ENABLED") && !["0", "1"].includes(text)) throw new Error(`${key} 只能是 0 或 1`);
-    if (key === "BOT_MODEL_CACHE_RETENTION" && !["auto", "short", "long", "none"].includes(text)) throw new Error("BOT_MODEL_CACHE_RETENTION 必须是 auto、short、long 或 none");
+    if (key === "PI_CACHE_RETENTION" && !["short", "long"].includes(text)) throw new Error("PI_CACHE_RETENTION 必须是 short 或 long");
     if (key === "BOT_HOST" && text !== "localhost" && !isIP(text)) throw new Error("BOT_HOST 必须是 IP 地址或 localhost");
   }
   return result;

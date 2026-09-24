@@ -8,7 +8,7 @@
 
 ## 工作原理
 
-基于 **Bun + Hono + Pi 0.85.1 本地 SDK**，支持 Windows 原生部署和 Linux / Docker。下面是任务处理与取消、交付之间的关系：
+基于 **Bun + Hono + Pi 0.87.1 本地 SDK**，支持 Windows 原生部署和 Linux / Docker。下面是任务处理与取消、交付之间的关系：
 
 ```mermaid
 flowchart TD
@@ -75,11 +75,19 @@ Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) �
 
 ### 缓存与费用统计
 
-模型缓存默认完全沿用 Pi SDK，不按 provider 是否内置区分。官方 Coding Plan 即使通过自定义 provider 配置，也不会被应用额外降级；智谱的自动缓存无需另外开启。通常只需配置接口、模型与凭据。只有服务商明确支持且需要覆盖时，才设置 `BOT_MODEL_CACHE_RETENTION`；这里的 `long` 是传给 SDK 的偏好，不保证服务端保留期限或套餐配额收益。
+模型缓存使用 Pi 原生 `PI_CACHE_RETENTION`（short/long，默认 short），环境变量优先于 runtime.json。机器人初始化时将配置映射到 Pi 环境，provider 和保温器读取同一策略；没有 streamSimple 补丁，SDK 摘要调用的显式 `none` 仍生效。`long` 的期限和收益取决于服务商。旧 `BOT_MODEL_CACHE_RETENTION` 已移除，升级前按[迁移说明](pi-0.87.1-migration.md)处理。
 
-提示词使用稳定的 `$PI_USER_TMP` 名称，避免用户绝对路径改变公共前缀；实际目录通过工具环境传入。会话 ID、工具顺序及 schema 保持稳定。资料查找、文档提取缓存和统计扫描缓存改善的是本地工作量，不与服务商的模型缓存命中率混算。
+`data/runtime/pi/settings.json` 的 `cacheWarming` 在本项目默认 **off**；可显式设 streaming 或 idle。保温是额外模型请求，与是否允许服务端缓存是两个选项。Pi 根据模型的原生 `promptCache` 元数据和费用判断是否刷新；日志记录模式、请求结束时的原生调度状态和独立 usage 费用。每个会话使用独立设置快照，reload 保留实例策略。`/stop`、任务超时会通过官方设置 API 取消当前保温计划；dispose 释放定时器。
 
-统计包含普通回复、历史压缩和分支摘要的 input/output/cacheRead/cacheWrite，按模型、日期及调用类型分组。缓存读取比例按 `ΣcacheRead / Σ(input + cacheRead + cacheWrite)` 计算，无有效输入样本时显示“无样本”。费用是 SDK 根据配置价格的估算，缺失项单列，**不代表 Coding Plan 实际账单或套餐配额**。CLI、TUI 和 HTML 报表共用同一统计来源；无变更的会话复用内存缓存，追加写入校验旧前缀后只重新解析新行，截断或改写则重建。
+原生 `compaction.modelOverrides` 可按 `provider/model` 调整 reserveTokens / keepRecentTokens；所选模型的预算在启动时由 Pi 校验。模型 `inputLimits.images.resize` 控制 read 图片的尺寸和 base64 大小。配置向导保留手填字段，但不会把原厂缓存寿命和图片限制盲目复制到未知代理。示例见[迁移说明](pi-0.87.1-migration.md)。
+
+提示词使用稳定的 `$PI_USER_TMP` 名称，避免用户绝对路径改变公共前缀；实际目录通过工具环境传入。会话 ID、工具顺序及 schema 保持稳定。资料查找、文档提取缓存和统计账本的增量入账改善的是本地工作量，不与服务商的模型缓存命中率混算。
+
+统计包含普通回复、历史压缩、分支摘要及 Pi 用量条目自带类型（例如缓存保温）的 input/output/cacheRead/cacheWrite，按模型、日期及调用类型分组。缓存读取比例按 `ΣcacheRead / Σ(input + cacheRead + cacheWrite)` 计算，无有效输入样本时显示“无样本”。费用是 SDK 根据配置价格的估算，缺失项单列，**不代表 Coding Plan 实际账单或套餐配额**。
+
+统计数据独立存放在使用统计账本 `<群数据根>/stats.sqlite`，CLI、TUI 和 HTML 报表都读这一份。入账由 [stats-ledger.ts](../src/agent/stats-ledger.ts) 负责：按「世代 × 自然日」聚合，`/clear` 后新会话是新世代，旧账目保留。[session-reader.ts](../src/agent/session-reader.ts) 在同一文件句柄上核对身份、校验旧前缀摘要并增量读取；读取期间身份、大小或修改时间变化则作废重试，截断或改写后的稳定内容才替换该世代。入账发生在每次任务结束（在该成员的任务队列里，与 `/clear` 串行）、归档前和每日兜底扫描；提交前核对这份文件在账本中的记录与读文件前完全一致（首次入账则仍不存在），被其他连接入账、重建或标记归档时作废重读，不会重复累加，也不会用较旧的读取覆盖新账。内容和尾行状态未变化时不写库，普通入账及重算都不撤销已有归档标记。`stat`、TUI 用只读连接读账本，不建库、不改日志模式，也能读只读快照。独立 usage 使用自身 provider/model，缺字段记 unknown，不改变主对话的模型归属；context_edit 不扣减真实消耗。**不得删库重建**：原件可能已删除，账本是仅存的历史。未知版本须停机备份并离线转换；历史归属错误可用定向修复工具处理。
+
+每日兜底扫描逐个隔离文件和目录枚举错误，记录路径、原因与失败数；有失败就不标记当天完成。已成功读取的文件指纹暂存在账本 `meta` 中，同日重试（包括重启之后）只检查身份、大小和纳秒时间戳，未变化的文件不再读取或计算前缀摘要；失败或已变化的文件才重新入账。跨日或 `force` 会重扫全部文件，整轮完成后清掉临时进度，无需迁移账本 schema。
 
 ## 开发与检查
 
@@ -99,12 +107,14 @@ bun audit
 
 `bun run tui:preview [页面] [列] [行]` 用固定的演示数据把任意页面渲染成文本，不读 `data/`，也不需要 TTY；加 `--plain` 去色，用来核对列宽。改动界面排版后用它比对同一份输入前后的样子，管理台截图也来自同一条渲染路径；图片核对与更新方式见[截图维护说明](assets/README.md)。渲染层的硬约束是「每个组件吐出的每一行显示宽度精确等于给它的宽度」——差一列不会报错，只会让右边所有东西错位，`tests/ops/tui-render.test.ts` 用中文、全角标点和带色文本压这条不变量。
 
-Pi 两个包精确固定为 0.85.1，使用官方本地 SDK。依赖升级通过改版本、更新锁文件和回归检查完成。当前外链存储使用 SQLite 账本。
+Pi 两个包精确固定为 0.87.1，使用官方本地 SDK。依赖升级通过改版本、更新锁文件和回归检查完成。会话上下文由 SessionManager 的持久化投影决定，禁止通过修改 agent.state.messages 模拟删除历史；官方重试/溢出恢复会追加 context_edit。原始 JSONL 版本仍是 3，不能据此原地降级。
 
 | 工程入口 | 职责 |
 | --- | --- |
-| [app.ts](../src/server/app.ts)、[webhook.ts](../src/server/webhook.ts) | HTTP 接入、鉴权与控制路径 |
+| [index.ts](../src/server/index.ts)、[app.ts](../src/server/app.ts) | 轻量版本检查与服务生命周期；验证模式独立启动 |
+| [http-app.ts](../src/server/http-app.ts)、[webhook.ts](../src/server/webhook.ts) | HTTP 接入、鉴权与控制路径 |
 | [runtime.ts](../src/agent/runtime.ts)、[session-queue.ts](../src/agent/session-queue.ts) | Pi 接线、任务生命周期和会话 FIFO |
+| [session-factory.ts](../src/agent/session-factory.ts)、[session-events.ts](../src/agent/session-events.ts)、[session-control.ts](../src/agent/session-control.ts) | SDK 创建、事件进度与保温取消；不拥有第二套任务队列 |
 | [prompt.ts](../src/agent/prompt.ts)、[local-tools.ts](../src/agent/local-tools.ts) | 资料助手提示词与本地工具边界 |
 | [process.ts](../src/core/process.ts)、[process-supervisor.ts](../src/core/process-supervisor.ts) | 工具进程执行与后代回收 |
 | [delivery-store.ts](../src/agent/delivery-store.ts)、[im.ts](../src/integrations/im.ts)、[relay.ts](../src/integrations/relay.ts) | 持久交付、平台发送与外链对象 |
@@ -114,3 +124,7 @@ Pi 两个包精确固定为 0.85.1，使用官方本地 SDK。依赖升级通过
 CI 配置了 Windows/Linux 检查及受限 Linux 镜像中的解析器与进程回收验证。部署验收还需检查目标机器的服务、入口和真实交付流程。
 
 Pi 路径适配代码的许可保留在对应源码中，开发检查补丁位于 `scripts/patches`。
+
+## 数据版本与升级
+
+参见[数据版本与升级事务](data-migrations.md)。业务入口 `src/server/index.ts` 和 TUI 入口在加载配置前检查项目与群根的版本；历史迁移集中在 `scripts/migrations/`。升级在提交前仅启动验证实例，提交后恢复正常业务。

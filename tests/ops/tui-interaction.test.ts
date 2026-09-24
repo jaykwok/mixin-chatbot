@@ -17,6 +17,7 @@ import { LogsView } from "../../scripts/ops/tui/views/logs.ts";
 import { MaintainView } from "../../scripts/ops/tui/views/maintain.ts";
 import { SettingsView } from "../../scripts/ops/tui/views/settings.ts";
 import * as tuiData from "../../scripts/ops/tui/data.ts";
+import { sweepSessionStats } from "../../src/agent/stats-ledger.ts";
 import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import * as tuiReport from "../../scripts/ops/tui/report.ts";
 import { createRelayView, createRoutesView } from "../../scripts/ops/tui/views/passthrough.ts";
@@ -668,6 +669,8 @@ async function history(root: string, group: string, user: string, days = ["2026-
     { type: "message", timestamp: day + "T12:00:00Z", message: { role: "user", content: [{ type: "text", text: "统计" }] } },
     { type: "message", timestamp: day + "T12:01:00Z", message: { role: "assistant", content: [{ type: "toolCall", name: "fixture_tool" }] } },
   ]).map(line => JSON.stringify(line)).join("\n") + "\n");
+  // 统计页读的是账本，不是会话文件本身。
+  await sweepSessionStats(root, { force: true });
 }
 
 test("统计、会话和临时文件刷新保留列表，切换数据根后清除旧范围", async () => {

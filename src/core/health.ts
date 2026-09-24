@@ -1,5 +1,5 @@
 export interface InstanceIdentity { instanceId: string; pid: number; port: number; startedAt: number; }
-export interface HealthBody { service: "mixin-chatbot"; version: 1; status: "ready" | "stopping"; instanceId: string; pid: number; startedAt: number; }
+export interface HealthBody { service: "mixin-chatbot"; version: 1; status: "ready" | "stopping"; instanceId: string; pid: number; startedAt: number; verificationOnly?: boolean; }
 
 export function matchesInstance(value: unknown, expected: InstanceIdentity, port: number): value is HealthBody {
   if (!value || typeof value !== "object") return false;

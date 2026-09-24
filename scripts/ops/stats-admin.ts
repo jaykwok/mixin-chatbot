@@ -1,14 +1,11 @@
-import { assertDataDirectory, byName, dataDirectoryNames, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
-import { readSessionStats } from "../lib/session-stats-cache.ts";
-import { mapConcurrent } from "../lib/concurrent.ts";
-import { addUsage, emptyUsageBreakdown, formatCacheRate, type UsageBreakdown, type UsageTotals } from "../lib/usage.ts";
-// 只读统计仍在 session.jsonl 中的用户消息、模型轮次及成功资料工具结果。
-// 斜杠指令按 commands.ts 排除；未完成的尾行跳过并报告。
-// /clear 与 history-clear 会归档会话，已归档部分不纳入本次统计。
-import { join } from "node:path";
+import { byName, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
+import { emptyUsageBreakdown, formatCacheRate, mergeUsage, type UsageBreakdown, type UsageTotals } from "../lib/usage.ts";
+// 统计只读使用统计账本（<群数据根>/stats.sqlite），不再现算 session.jsonl：
+// 会话历史会被 /clear 与 history clear 归档，归档前机器人已把那段入账，数字照样在。
+// 入账口径见 src/agent/stats-ledger.ts：指令不算提问、附件只认有 fileId 的成功结果。
+import { dayKey, dayWindow, openExistingStatsLedger, readLedger, type DayWindow, type LedgerRows } from "../../src/agent/stats-ledger.ts";
+import { groupSegment } from "../../src/agent/paths.ts";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
-
-const HISTORY_FILE = "session.jsonl";
 
 export interface UserStats {
   user: string;
@@ -51,14 +48,7 @@ function usage(): void {
   console.log("  --until <日期>    只统计该日期当天及之前（YYYY-MM-DD）");
   console.log("  --group-id / --storage-segment  明确使用原始群号或存储目录段，两者互斥");
   console.log("");
-  console.log("  只读取 session.jsonl，不修改任何文件，机器人运行中也可以执行。");
-}
-
-/** 本地时区的 YYYY-MM-DD；汇报材料按自然日和自然月看，不能用 UTC。 */
-function dayKey(at: number): string {
-  const date = new Date(at);
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  return `${date.getFullYear()}-${month}-${String(date.getDate()).padStart(2, "0")}`;
+  console.log("  只读取统计账本，不改动统计数据，机器人运行中也可以执行；每次任务结束后即入账。");
 }
 
 function formatDay(at: number): string {
@@ -105,107 +95,75 @@ function emptyGroup(group: string): GroupStats {
   };
 }
 
-function readUser(
-  source: Awaited<ReturnType<typeof readSessionStats>>,
-  user: string,
-  group: GroupStats,
-  window: Window
-): UserStats | null {
-  group.skipped += source.skipped;
-  let provider = "unknown", model = "unknown";
-
-  const stats: UserStats = {
-    user,
-    asks: 0,
-    replies: 0,
-    files: 0,
-    firstAt: Number.POSITIVE_INFINITY,
-    lastAt: Number.NEGATIVE_INFINITY,
-    days: new Set(),
+/**
+ * 把账本行折成一个群的统计。
+ *
+ * 账本行已按「世代 × 自然日」聚合，这里只做相加与去重：同一个人可能有多个世代
+ * （每次 /clear 之后是新的一代），所以成员维度按用户目录段合并。行的读取顺序固定，
+ * 浮点费用的累加顺序因此与平台、写入次序无关。
+ */
+function foldGroup(group: string, rows: LedgerRows): GroupStats {
+  const stats = emptyGroup(group);
+  stats.skipped = rows.skipped.get(group) ?? 0;
+  const users = new Map<string, UserStats>();
+  const entryOf = (user: string): UserStats => {
+    const existing = users.get(user);
+    if (existing) return existing;
+    const created: UserStats = { user, asks: 0, replies: 0, files: 0,
+      firstAt: Number.POSITIVE_INFINITY, lastAt: Number.NEGATIVE_INFINITY, days: new Set() };
+    users.set(user, created);
+    return created;
+  };
+  const dailyOf = (day: string) => {
+    const existing = stats.daily.get(day);
+    if (existing) return existing;
+    const created = { asks: 0, users: new Set<string>(), files: 0, images: 0 };
+    stats.daily.set(day, created);
+    return created;
   };
 
-  for (const record of source.records) {
-    if (record.type === "model_change") { provider = record.provider ?? "unknown"; model = record.modelId ?? "unknown"; continue; }
-    if (record.type === "message" && record.message?.role === "assistant") {
-      provider = record.message.provider ?? provider; model = record.message.model ?? model;
+  for (const row of rows.activity) {
+    const entry = entryOf(row.user);
+    entry.asks += row.asks;
+    entry.replies += row.replies;
+    entry.firstAt = Math.min(entry.firstAt, row.firstAt);
+    entry.lastAt = Math.max(entry.lastAt, row.lastAt);
+    const daily = dailyOf(row.day);
+    daily.asks += row.asks;
+    if (row.asks > 0 || row.replies > 0) daily.users.add(row.user);
+    if (row.asks > 0) {
+      entry.days.add(row.day);
+      stats.days.add(row.day);
+      const monthKey = row.day.slice(0, 7);
+      const month = stats.months.get(monthKey) ?? { asks: 0, users: new Set<string>() };
+      month.asks += row.asks;
+      month.users.add(row.user);
+      stats.months.set(monthKey, month);
     }
-    const at = Date.parse(record.timestamp ?? "");
-    if (!Number.isFinite(at)) continue;
-    if (window.since !== undefined && at < window.since) continue;
-    if (window.until !== undefined && at > window.until) continue;
-
-    if (record.type === "compaction" || record.type === "branch_summary") {
-      addUsage(group.usage, record.type, provider, model, dayKey(at), record.usage);
-      group.firstAt = Math.min(group.firstAt, at); group.lastAt = Math.max(group.lastAt, at);
+  }
+  for (const row of rows.tools) {
+    if (row.kind === "call") {
+      stats.tools.set(row.tool, (stats.tools.get(row.tool) ?? 0) + row.count);
       continue;
     }
-    if (record.type !== "message" || !record.message) continue;
-    const role = record.message.role;
-    const day = dayKey(at);
-    const daily = group.daily.get(day) ?? { asks: 0, users: new Set<string>(), files: 0, images: 0 };
-    if (role === "user") {
-      // 指令不算提问：它没有进过模型，只是让机器人停一下或清个历史。
-      if (record.message.command) continue;
-      stats.asks++;
-      daily.asks++;
-      stats.days.add(day);
-      group.days.add(day);
-      const monthKey = day.slice(0, 7);
-      const month = group.months.get(monthKey) ?? { asks: 0, users: new Set<string>() };
-      month.asks++;
-      month.users.add(user);
-      group.months.set(monthKey, month);
-    } else if (role === "assistant") {
-      stats.replies++;
-      addUsage(group.usage, "assistant", provider, model, day, record.message.usage);
-      if (Array.isArray(record.message.content)) {
-        for (const part of record.message.content) {
-          if (!part || typeof part !== "object") continue;
-          const { type, name } = part as { type?: string; name?: string };
-          if (type !== "toolCall" || !name) continue;
-          group.tools.set(name, (group.tools.get(name) ?? 0) + 1);
-
-        }
-      }
-    } else if (role === "toolResult") {
-      const message = record.message;
-      if (!message.isError && message.details?.fileId && ["send_file", "send_image"].includes(message.toolName ?? "")) {
-        const name = message.toolName!;
-        group.delivered.set(name, (group.delivered.get(name) ?? 0) + 1);
-        if (name === "send_file") stats.files++;
-        if (name === "send_file") daily.files++;
-        else daily.images++;
-      }
-    } else {
-      continue;
-    }
-    if (role === "user" || role === "assistant") daily.users.add(user);
-    group.daily.set(day, daily);
-    stats.firstAt = Math.min(stats.firstAt, at);
-    stats.lastAt = Math.max(stats.lastAt, at);
+    stats.delivered.set(row.tool, (stats.delivered.get(row.tool) ?? 0) + row.count);
+    const daily = dailyOf(row.day);
+    if (row.tool === "send_file") {
+      entryOf(row.user).files += row.count;
+      daily.files += row.count;
+    } else daily.images += row.count;
+  }
+  for (const row of rows.usage) {
+    mergeUsage(stats.usage, row.kind, JSON.stringify([row.provider || "unknown", row.model || "unknown"]), row.day, row);
+    // 压缩、分支摘要与缓存保温不属于任何一次提问，但它们确实发生过，要算进活跃区间。
+    if (row.kind === "assistant") continue;
+    stats.firstAt = Math.min(stats.firstAt, row.firstAt);
+    stats.lastAt = Math.max(stats.lastAt, row.lastAt);
   }
 
-  if (stats.asks === 0 && stats.replies === 0) return null;
-  return stats;
-}
-
-export async function collectGroup(
-  group: string,
-  root: string = GROUP_DATA_ROOT,
-  window: Window = {}
-): Promise<GroupStats> {
-  const stats = emptyGroup(group);
-  const usersDir = join(root, group, "users");
-  await assertDataDirectory(join(root, group), root);
-  const users = (await dataDirectoryNames(usersDir, root)).sort(byName);
-  const sources = await mapConcurrent(users, user =>
-    readSessionStats(join(usersDir, user, HISTORY_FILE)).catch(() => null));
-  // Read concurrently, then fold in directory order so maps and floating-point
-  // usage totals cannot depend on which file finished reading first.
-  for (const [index, source] of sources.entries()) {
-    if (!source) continue;
-    const entry = readUser(source, users[index]!, stats, window);
-    if (!entry) continue;
+  // 只有在区间内真正问过或被回答过的人才算「使用过」；只剩工具结果的成员不列名。
+  for (const entry of users.values()) {
+    if (entry.asks === 0 && entry.replies === 0) continue;
     stats.users.push(entry);
     stats.asks += entry.asks;
     stats.replies += entry.replies;
@@ -216,16 +174,56 @@ export async function collectGroup(
   return stats;
 }
 
+function rowsOf(rows: LedgerRows, group: string): LedgerRows {
+  return {
+    activity: rows.activity.filter(row => row.group === group),
+    tools: rows.tools.filter(row => row.group === group),
+    usage: rows.usage.filter(row => row.group === group),
+    skipped: rows.skipped,
+    groups: [group],
+  };
+}
+
+/** 服务还没建账本时按空账处理。 */
+function readRows(root: string, window: DayWindow = {}, group?: string): LedgerRows {
+  const db = openExistingStatsLedger(root);
+  if (!db) return { activity: [], tools: [], usage: [], skipped: new Map(), groups: [] };
+  try { return readLedger(db, window, group); } finally { db.close(); }
+}
+
+export async function collectGroup(
+  group: string,
+  root: string = GROUP_DATA_ROOT,
+  window: Window = {}
+): Promise<GroupStats> {
+  return foldGroup(group, readRows(root, dayWindow(window), group));
+}
+
 export async function collectAll(
   root: string = GROUP_DATA_ROOT,
   window: Window = {}
 ): Promise<GroupStats[]> {
-  const groups: GroupStats[] = [];
-  for (const group of await dataDirectoryNames(root, root)) {
-    const stats = await collectGroup(group, root, window);
-    if (stats.users.length > 0 || stats.usage.total.requests > 0) groups.push(stats);
+  const rows = readRows(root, dayWindow(window));
+  return rows.groups
+    .map(group => foldGroup(group, rowsOf(rows, group)))
+    .filter(stats => stats.users.length > 0 || stats.usage.total.requests > 0)
+    .sort((a, b) => b.asks - a.asks || byName(a.group, b.group));
+}
+
+/** 群目录可能已经被删掉，但账本里还有它的历史：按群号或目录段在账本里再找一次。 */
+async function resolveStatsGroup(value: string, root: string, kind: GroupSelection): Promise<string | null> {
+  const fromDisk = await resolveGroupName(value, root, kind);
+  if (fromDisk) return fromDisk;
+  const known = new Set(readRows(root).groups);
+  const encoded = groupSegment(value);
+  const byId = known.has(encoded) ? encoded : null;
+  const bySegment = known.has(value) ? value : null;
+  if (kind === "id") return byId;
+  if (kind === "segment") return bySegment;
+  if (byId && bySegment && byId !== bySegment) {
+    throw new Error("群号与存储目录存在歧义；请使用 --group-id 或 --storage-segment 明确选择");
   }
-  return groups.sort((a, b) => b.asks - a.asks || byName(a.group, b.group));
+  return byId ?? bySegment;
 }
 
 function describeWindow(window: Window): string {
@@ -240,7 +238,10 @@ function printFootnote(): void {
     "统计口径：一条发给机器人的消息算一次提问（含干活途中的插话），/help /clear 等指令不计入。"
   );
   console.log(
-    "数据来自保留的 session.jsonl；归档历史未计入。附件数只计有 fileId 的成功工具结果，链接生成不等于送达。"
+    "数据来自统计账本，归档或清空会话都不影响已入账的历史；区间按自然日裁剪。"
+  );
+  console.log(
+    "附件数只计有 fileId 的成功工具结果，链接生成不等于送达。"
   );
 }
 
@@ -298,7 +299,7 @@ function printGroup(stats: GroupStats, window: Window): void {
 
   if (stats.skipped > 0) {
     console.log("");
-    console.log(`  跳过 ${stats.skipped} 行无法解析的记录（机器人正在写入时读到半行属正常）。`);
+    console.log(`  入账时跳过 ${stats.skipped} 行（无法解析的记录；尾部半行会在写完后补入）。`);
   }
   console.log("");
   printFootnote();
@@ -379,9 +380,9 @@ async function main(args: string[]): Promise<number> {
   const groupId = positional[0];
   if (!groupId) return overview(root, window);
 
-  const group = await resolveGroupName(groupId, root, selection);
+  const group = await resolveStatsGroup(groupId, root, selection);
   if (!group) {
-    console.error(`在 ${root} 下找不到群 ${groupId}。不带参数运行可以列出现有的群。`);
+    console.error(`在 ${root} 的群目录和统计账本里都找不到群 ${groupId}。不带参数运行可以列出有记录的群。`);
     return 1;
   }
   const stats = await collectGroup(group, root, window);
@@ -393,7 +394,7 @@ async function main(args: string[]): Promise<number> {
   console.log("缓存写入: " + stats.tokens.cacheWrite + "；加权缓存读率: " + formatCacheRate(stats.tokens));
   console.log("已知估算费用: $" + stats.tokens.cost.toFixed(6) + "；费用未知记录: " + stats.tokens.unknownCost + "；用量不完整记录: " + stats.tokens.missingUsage);
   console.log("费用按 SDK 配置价格估算，不代表 Coding Plan 的实际账单或套餐配额。");
-  for (const [kind, usage] of Object.entries(stats.usage.kinds)) console.log(kind + ": " + JSON.stringify(usage));
+  for (const [kind, usage] of stats.usage.kinds) console.log(kind + ": " + JSON.stringify(usage));
   for (const [model, usage] of stats.usage.models) console.log("模型 " + model + ": " + JSON.stringify(usage));
   for (const [day, usage] of stats.usage.days) console.log("日期 " + day + ": " + JSON.stringify(usage));
   return 0;

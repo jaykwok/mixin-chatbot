@@ -34,9 +34,8 @@ const groups: { label: string; description: string; options: RuntimeOption[] }[]
     { key: "BOT_INDEX_TTL_MINUTES", label: "索引刷新间隔", unit: "分钟", description: "活跃会话每轮检查；首次等待构建，过期后后台刷新。" },
     { key: "BOT_INDEX_MAX_FILES", label: "索引文件上限", description: "单次扫描收录的文件数，防止过大的目录树占满资源。" },
     { key: "BOT_INDEX_MAX_DEPTH", label: "索引目录深度", description: "超过此深度的目录会跳过，索引标记为不完整。" },
-    { key: "BOT_MODEL_CACHE_RETENTION", label: "模型缓存策略", description: "自动沿用模型 SDK；其他选项显式指定缓存保留策略，仍取决于服务商支持。", choices: [
-      { value: "auto", label: "自动", description: "沿用 SDK 默认值" },
-      { value: "short", label: "短期" }, { value: "long", label: "长期" }, { value: "none", label: "关闭" },
+    { key: "PI_CACHE_RETENTION", label: "模型缓存保留", description: "使用 Pi 原生设置，供模型请求和缓存保温共同读取；期限和收益取决于服务商支持。保温另在 Pi 设置中开启，默认关闭。", choices: [
+      { value: "short", label: "短期（默认）" }, { value: "long", label: "长期" },
     ] },
   ] },
   { label: "文档与诊断", description: "文档解析环境与机器人详细日志", options: [

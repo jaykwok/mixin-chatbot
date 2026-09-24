@@ -43,7 +43,61 @@ function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
 }
 
 function Save-DeploymentSnapshot($Snapshot) {
-    $Snapshot | Select-Object * -ExcludeProperty Lock | Export-Clixml -LiteralPath (Join-Path $Snapshot.Path 'deployment.xml')
+    $path = Join-Path $Snapshot.Path 'deployment.xml'
+    $temporary = $path + '.tmp'
+    $Snapshot | Select-Object * -ExcludeProperty Lock | Export-Clixml -LiteralPath $temporary
+    $stream = [IO.File]::Open($temporary, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
+    try { $stream.Flush($true) } finally { $stream.Dispose() }
+    if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temporary, $path, $null) }
+    else { [IO.File]::Move($temporary, $path) }
+}
+
+# An interrupted upgrade reuses its original snapshot and original running state.
+function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha) {
+    $pointer = Join-Path $ProjectRoot 'data\state\upgrade-transaction'
+    if (Test-Path -LiteralPath $pointer) {
+        $name = (Get-Content -LiteralPath $pointer -Raw).Trim()
+        if ($name -notmatch '^deploy-[0-9a-f]{32}$') { throw '升级事务快照名称无效' }
+        $path = Join-Path $ProjectRoot ('backup\snapshots\' + $name)
+        $deploymentLock = [IO.File]::Open((Join-Path $ProjectRoot 'data\state\deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            $state = Import-Clixml -LiteralPath (Join-Path $path 'deployment.xml')
+            if ($state.Project -ne $ProjectRoot -or $state.Path -ne $path -or $state.UpgradeTarget -ne $TargetSha) { throw '中断升级必须使用原项目与原目标提交继续' }
+            $state | Add-Member -NotePropertyName Lock -NotePropertyValue $deploymentLock
+            $env:BOT_DEPLOY_BACKUP_ID = $name
+            return $state
+        } catch { $deploymentLock.Dispose(); throw }
+    }
+    $state = New-DeploymentSnapshot $ProjectRoot $TaskName
+    try {
+        $state | Add-Member -NotePropertyName UpgradeOriginal -NotePropertyValue $OriginalSha
+        $state | Add-Member -NotePropertyName UpgradeBranch -NotePropertyValue $OriginalBranch
+        $state | Add-Member -NotePropertyName UpgradeTarget -NotePropertyValue $TargetSha
+        Save-DeploymentSnapshot $state
+        [IO.File]::WriteAllText($pointer + '.tmp', (Split-Path $state.Path -Leaf))
+        [IO.File]::Move($pointer + '.tmp', $pointer)
+        return $state
+    } catch { $state.Lock.Dispose(); throw }
+}
+
+function Remove-UpgradeStage([string]$ProjectRoot, [string]$Stage) {
+    $temporaryRoot = [IO.Path]::GetFullPath((Join-Path $ProjectRoot 'tmp')).TrimEnd('\')
+    $target = [IO.Path]::GetFullPath($Stage).TrimEnd('\')
+    if ((Split-Path $target -Parent) -ne $temporaryRoot -or (Split-Path $target -Leaf) -notmatch '^upgrade-[0-9a-f]{32}$') { throw '升级临时目录越界' }
+    if (-not (Test-Path -LiteralPath $target)) { return }
+    if ((Get-Item -LiteralPath $temporaryRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '升级临时目录经过链接' }
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $pending.Push($target)
+    while ($pending.Count) {
+        $directory = $pending.Pop()
+        $item = Get-Item -LiteralPath $directory -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '升级临时目录含链接' }
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '升级临时目录含链接' }
+            if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+        }
+    }
+    Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
 }
 
 function Test-DeploymentDependenciesReusable([string]$ProjectRoot, [string]$GitPath, [string]$OldRevision, [string]$NewRevision) {
@@ -84,13 +138,20 @@ function Save-DeploymentDependencies($Snapshot) {
     $source = [IO.Path]::GetFullPath((Join-Path $root 'node_modules'))
     $target = [IO.Path]::GetFullPath((Join-Path $Snapshot.Path 'node_modules'))
     if (-not $target.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '依赖快照目录越界' }
-    if (Test-Path -LiteralPath $source) {
-        Move-Item -LiteralPath $source -Destination $target -ErrorAction Stop
+    if (Test-Path -LiteralPath $target) {
         $Snapshot.DependenciesMoved = $true
+        $Snapshot.DependenciesAttempted = $true
+        Save-DeploymentSnapshot $Snapshot
+        return
     }
-    # Do not mark installation attempted before the original dependency directory has moved.
+    # Write intent before the atomic same-volume move. Recovery distinguishes a
+    # completed move by the backup directory, so interruption cannot overwrite it.
+    $Snapshot.DependenciesMoved = Test-Path -LiteralPath $source
     $Snapshot.DependenciesAttempted = $true
     Save-DeploymentSnapshot $Snapshot
+    if ($Snapshot.DependenciesMoved) {
+        Move-Item -LiteralPath $source -Destination $target -ErrorAction Stop
+    }
 }
 
 function Restore-DeploymentSnapshot($Snapshot) {
@@ -99,12 +160,14 @@ function Restore-DeploymentSnapshot($Snapshot) {
     Restore-CloudflaredSnapshot $Snapshot -DeferStart
     Restore-DeploymentFiles $root $Snapshot.Path $Snapshot.Paths
     if ($Snapshot.DependenciesAttempted) {
-        Move-ToProjectArchive (Join-Path $root 'node_modules') $root
         if ($Snapshot.DependenciesMoved) {
             $saved = [IO.Path]::GetFullPath((Join-Path $Snapshot.Path 'node_modules'))
             if (-not $saved.StartsWith([IO.Path]::GetFullPath($root).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '依赖快照路径无效' }
-            Move-Item -LiteralPath $saved -Destination (Join-Path $root 'node_modules') -ErrorAction Stop
-        }
+            if (Test-Path -LiteralPath $saved) {
+                Move-ToProjectArchive (Join-Path $root 'node_modules') $root
+                Move-Item -LiteralPath $saved -Destination (Join-Path $root 'node_modules') -ErrorAction Stop
+            } elseif (-not (Test-Path -LiteralPath (Join-Path $root 'node_modules'))) { throw '原依赖及其备份都缺失' }
+        } else { Move-ToProjectArchive (Join-Path $root 'node_modules') $root }
     }
     foreach ($rule in @(Get-NetFirewallRule -Group 'mixin-chatbot' -ErrorAction SilentlyContinue)) {
         if ($Snapshot.Firewall.Name -notcontains $rule.Name) { $rule | Remove-NetFirewallRule -ErrorAction Stop }

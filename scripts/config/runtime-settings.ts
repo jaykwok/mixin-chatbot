@@ -79,6 +79,7 @@ async function writeAtomic(path: string, raw: string): Promise<void> {
 
 /** Persist explicit deployment settings, including supported values inherited from the shell. */
 export async function saveRuntimeSettings(path = RUNTIME_CONFIG_PATH, env = process.env): Promise<void> {
+  if (env.BOT_MODEL_CACHE_RETENTION?.trim()) throw new Error("BOT_MODEL_CACHE_RETENTION 已移除；请先迁移配置并移除旧环境变量，再部署");
   const settings = (await readRuntimeSettings(path)).values;
   for (const name of RUNTIME_KEYS) if (env[name]?.trim()) settings[name] = env[name]!.trim();
   await writeAtomic(path, JSON.stringify(validateRuntimeConfig(settings), null, 2) + "\n");

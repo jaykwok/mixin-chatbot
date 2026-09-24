@@ -1,236 +1,114 @@
-import { Hono, type Context } from "hono";
-import { readFile } from "node:fs/promises";
+// Own the service lease, SDK startup and the single bounded shutdown sequence.
+import { readFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { randomBytes, randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { isSlashCommandMessage } from "../agent/commands.ts";
-import { waitFor } from "../core/lifecycle.ts";
-import { MAX_WEBHOOK_BODY_BYTES } from "../core/config.ts";
-import { WEBHOOK_SECRET_FILE } from "../core/storage.ts";
+import { createApp } from "./http-app.ts";
+import { application } from "../core/lifecycle.ts";
+import { acquireLease, archiveFile } from "../core/maintenance.ts";
+import { ALLOW_INSECURE_WEBHOOK, GROUP_DATA_ROOT, HOST, PORT, RATE_LIMIT_CLEANUP_INTERVAL, SHUTDOWN_TIMEOUT_MS } from "../core/config.ts";
+import { STATE_DIR, WEBHOOK_SECRET_FILE } from "../core/storage.ts";
 import { log } from "../core/log.ts";
-import { observeCallbackRoute } from "../integrations/callback-route.ts";
-import { constantTimeEqual, getClientIp, HttpError, isJsonContentType } from "./http.ts";
-import { RejectionLogger } from "./rejection-log.ts";
-import { randomUUID } from "node:crypto";
-import { enqueueUserRequest, enqueueUserNotice, hasUserRequestCapacity, isDuplicate,
-  isRateLimited, validateWebhookData } from "./webhook.ts";
+import { cleanupCallbackRoutes } from "../integrations/callback-route.ts";
+import { initializeRelay, sweepExpiredRelayObjects } from "../integrations/relay.ts";
+import { cleanupRateLimits, drainUserRequests } from "./webhook.ts";
+import { cleanupIdleSessions, disposeAllSessions, initializeAgentRuntime } from "../agent/runtime.ts";
+import { sweepSessionStats } from "../agent/stats-ledger.ts";
 
-export interface AppOptions {
-  signal: AbortSignal;
-  webhookSecret: string | null;
-  allowInsecure: boolean;
-  isStopping: () => boolean;
-  adminToken: string;
-  shutdown: () => void;
-  instanceId?: string;
-  startedAt?: number;
-}
+import { assertDataVersion } from "../core/data-version.ts";
+import { validateCurrentData } from "../core/data-validation.ts";
 
-/** HTTP construction is separate from SDK startup and OS signal ownership. */
-export function createApp(options: AppOptions): Hono {
-const app = new Hono();
-const identity = { service: "mixin-chatbot" as const, version: 1 as const, instanceId: options.instanceId ?? randomUUID(),
-  startedAt: options.startedAt ?? Date.now(), pid: process.pid };
+let stopping = false;
+let server: ReturnType<typeof Bun.serve> | undefined;
+let releaseLease: (() => Promise<void>) | undefined;
+let timer: ReturnType<typeof setInterval> | undefined;
+let maintenance: Promise<unknown> | undefined;
+const instanceFile = join(STATE_DIR, "instance.json");
+const adminToken = randomBytes(32).toString("hex");
+const instanceId = randomUUID();
+const startedAt = Date.now() - process.uptime() * 1000;
 
-const rejectionLog = new RejectionLogger();
-options.signal.addEventListener("abort", () => rejectionLog.flush(), { once: true });
-
-
-/** 限量读取 JSON，避免在进入字段校验前接收无限大的请求体。 */
-async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
-  const contentLength = c.req.header("content-length");
-  if (contentLength) {
-    const declared = Number(contentLength);
-    if (!Number.isInteger(declared) || declared < 0) {
-      throw new HttpError(400, "无效的 Content-Length");
-    }
-    if (declared > MAX_WEBHOOK_BODY_BYTES) {
-      throw new HttpError(413, `请求体过大（上限 ${MAX_WEBHOOK_BODY_BYTES} 字节）`);
-    }
-  }
-
-  const reader = c.req.raw.body?.getReader();
-  if (!reader) throw new HttpError(400, "请求体不能为空");
-  const signal = AbortSignal.any([options.signal, AbortSignal.timeout(10000)]);
-  const chunks: Uint8Array[] = [];
-  let total = 0;
+async function shutdown(reason: string, code = 0): Promise<void> {
+  if (stopping) return;
+  stopping = true;
+  if (timer) clearInterval(timer);
+  application.abort();
+  // Includes filesystem/lease cleanup; none of the awaited operations may extend this deadline.
+  const force = setTimeout(() => {
+    log.error("关机超过总期限，强制退出；进程监督器将回收工具后代");
+    void server?.stop(true);
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
   try {
-  while (true) {
-    const { done, value } = await waitFor(reader.read(), signal);
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_WEBHOOK_BODY_BYTES) {
-      void reader.cancel().catch(() => {});
-      throw new HttpError(413, `请求体过大（上限 ${MAX_WEBHOOK_BODY_BYTES} 字节）`);
+    const results = await Promise.allSettled([
+      server?.stop(), disposeAllSessions(), drainUserRequests(), application.drain(),
+    ]);
+    if (results.some((result) => result.status === "rejected")) code = 1;
+    if (releaseLease) {
+      await archiveFile(instanceFile);
+      await releaseLease();
     }
-    chunks.push(value);
-  }
   } catch (error) {
-    void reader.cancel().catch(() => {});
-    if (signal.aborted) throw new HttpError(408, "请求体读取超时或服务关闭",
-      options.signal.aborted ? "service_stopping" : undefined);
-    throw error;
-  } finally { reader.releaseLock(); }
-
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
+    log.error("关机清理失败: " + String(error));
+    code = 1;
   }
+  clearTimeout(force);
+  log.info("收到 " + reason + "，服务关闭完成");
+  process.exit(code);
+}
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
-  let parsed: unknown;
+try {
+  releaseLease = await application.track(acquireLease("service"));
+  assertDataVersion(process.cwd(), GROUP_DATA_ROOT);
+  await validateCurrentData(process.cwd(), GROUP_DATA_ROOT);
+  application.signal.throwIfAborted();
+  let webhookSecret: string | null = null;
   try {
-    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  } catch {
-    throw new HttpError(400, "请求必须是有效的 UTF-8 JSON");
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new HttpError(400, "请求 JSON 必须是对象");
-  }
-  return parsed as Record<string, unknown>;
-}
-
-/** webhook 业务处理：解析 + 校验 + 去重 + 限流 + 后台异步。 */
-const webhookHandler = async (c: Context) => {
-  if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试", "service_stopping");
-
-  // 声明了 Content-Type 时只接受标准 JSON 或 +json 媒体类型。
-  const ct = c.req.header("content-type") ?? "";
-  if (ct && !isJsonContentType(ct)) {
-    throw new HttpError(415, "Content-Type 必须是 application/json");
-  }
-
-  const clientIp = getClientIp(c);
-  const data = await readJsonBody(c);
-  const { phone, groupId, content, callbackUrl } = validateWebhookData(data);
-  const callbackRoute = observeCallbackRoute(callbackUrl, groupId);
-
-  log.info(
-    `收到请求 - IP: ${clientIp}, 用户: ${phone}, 群组: ${groupId}, 回复key指纹: ${callbackRoute.fingerprint}, 内容长度: ${content.length}`
-  );
-
-  if (!callbackRoute.safe) {
-    if (callbackRoute.reason === "capacity") {
-      log.error(`callback 路由保护容量已满，拒绝未知 key ${callbackRoute.fingerprint}`);
-      throw new HttpError(503, "回调路由保护暂时无法接收新的机器人 key", "callback_route_capacity");
-    }
-    log.error(
-      `阻止跨群广播：回复 key ${callbackRoute.fingerprint} 同时对应多个群 (${callbackRoute.groups.join(", ")})；请为每个群重新创建独立的会话机器人`
-    );
-    throw new HttpError(
-      409,
-      "同一个机器人回复 key 被多个群共用；为防止消息串群，本次请求已停止",
-      "callback_route_conflict"
-    );
-  }
-
-  if (isSlashCommandMessage(content)) {
-    if (options.isStopping()) throw new HttpError(503, "服务正在关闭", "service_stopping");
-    const accepted = enqueueUserRequest(content, phone, groupId, callbackUrl, clientIp);
-    if (!accepted) rejectionLog.record(c, 503, "request_capacity");
-    return c.json({ status: accepted ? "success" : "busy" }, accepted ? 200 : 503);
-  }
-  if (isDuplicate(phone, groupId, content)) {
-    log.info(`跳过重复请求 - 用户: ${phone}`);
-    return c.json({ status: "success" });
-  }
-  if (!hasUserRequestCapacity()) {
-    log.warn(`后台请求容量已满 - 用户: ${phone}, 群: ${groupId}`);
-    enqueueUserNotice(
-      "capacity",
-      "⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。",
-      phone,
-      groupId,
-      callbackUrl
-    );
-    return c.json({ status: "success" });
-  }
-  if (isRateLimited(phone, groupId)) {
-    log.warn(`速率限制触发 - 用户: ${phone}, 群: ${groupId}`);
-    enqueueUserNotice(
-      "rate-limit",
-      "⚠️ 短时间内收到的消息较多，这条消息未加入队列，不会自动处理，请稍后重新发送。",
-      phone,
-      groupId,
-      callbackUrl
-    );
-    return c.json({ status: "success" });
-  }
-  // readJsonBody 等 await 期间可能收到关闭信号；不再接收无法被关机流程追踪的新任务。
-  if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试", "service_stopping");
-  // ack 200，后台异步处理；同一会话由 agent 层 FIFO 和控制屏障协调。
-  if (!enqueueUserRequest(content, phone, groupId, callbackUrl, clientIp)) {
-    // 单线程内无 await，正常不会在容量预检后命中；仍按不可重投平台处理。
-    enqueueUserNotice(
-      "capacity",
-      "⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。",
-      phone,
-      groupId,
-      callbackUrl
-    );
-    return c.json({ status: "success" });
-  }
-  return c.json({ status: "success" });
-};
-
-// ---- webhook 路由：有密钥走随机路径鉴权；无密钥仅显式开发模式可开放 ----
-const webhookSecret = options.webhookSecret;
-if (webhookSecret) {
-  log.info("Webhook 已启用随机密钥路径鉴权（/webhook/<secret>）");
-  app.post("/webhook/:secret", async (c) => {
-    const got = c.req.param("secret");
-    if (!got || !constantTimeEqual(got, webhookSecret)) {
-      rejectionLog.record(c, 404, "webhook_secret_mismatch");
-      return c.json({ status: "error", message: "Not Found" }, 404);
-    }
-    return webhookHandler(c);
-  });
-  // 无密钥路径直接 404，强制走密钥路径
-  app.post("/webhook", (c) => {
-    rejectionLog.record(c, 404, "webhook_secret_missing");
-    return c.json({ status: "error", message: "Not Found" }, 404);
-  });
-} else {
-  if (!options.allowInsecure) {
-    throw new Error(
-      `${WEBHOOK_SECRET_FILE} 缺失或格式无效；生产默认拒绝无鉴权启动。本地调试可显式设置 ALLOW_INSECURE_WEBHOOK=1。`
-    );
-  }
-  log.warn("ALLOW_INSECURE_WEBHOOK=1：开放 /webhook，仅限隔离的本地开发环境！");
-  app.post("/webhook", webhookHandler);
-}
-
-app.get("/favicon.svg", async () =>
-  new Response(await readFile(join("public", "favicon.svg")), {
-    headers: { "Content-Type": "image/svg+xml" },
-  }));
-app.get("/favicon.ico", async () =>
-  new Response(await readFile(join("public", "favicon.svg")), {
-    headers: { "Content-Type": "image/svg+xml" },
-  }));
-
-app.onError((err, c) => {
-  if (err instanceof HttpError) {
-    // err.message 可能包含来自请求体的字段值，日志只记录稳定的原因标签。
-    rejectionLog.httpError(c, err);
-    return new Response(JSON.stringify({ status: "error", message: err.message }), {
-      status: err.status,
-      headers: { "Content-Type": "application/json" },
+    const raw = readFileSync(WEBHOOK_SECRET_FILE, "utf8").trim();
+    if (/^[0-9a-f]{64}$/i.test(raw)) webhookSecret = raw;
+  } catch {}
+  const app = createApp({ signal: application.signal, webhookSecret, allowInsecure: ALLOW_INSECURE_WEBHOOK,
+    isStopping: () => stopping, adminToken, instanceId, startedAt, shutdown: () => void shutdown("local control") });
+  await initializeAgentRuntime();
+  application.signal.throwIfAborted();
+  initializeRelay();
+  server = Bun.serve({ hostname: HOST, port: PORT, idleTimeout: 15, fetch: app.fetch });
+  await application.track(writeFile(instanceFile, JSON.stringify({ pid: process.pid, port: server.port, token: adminToken,
+    host: HOST, cwd: process.cwd(), instanceId, startedAt }), { mode: 0o600 }));
+  application.signal.throwIfAborted();
+  /**
+   * 兜底入账：一天一次全量扫会话文件。
+   *
+   * 当天的数字靠任务结束与归档前的入账，这里只补崩溃、手工改动、旧文件和任务之间的
+   * 缓存保温用量留下的缺口，所以没必要每轮维护都把所有会话文件摸一遍。
+   */
+  const sweepStats = async () => {
+    const result = await sweepSessionStats(GROUP_DATA_ROOT, {
+      onError: (path, error) => log.warn(`统计账本扫描失败 - 路径: ${path}, 错误: ${String(error)}`),
     });
-  }
-  log.error(`未处理异常 - IP: ${getClientIp(c)}, 错误: ${String(err)}`);
-  return c.json({ status: "error", message: "内部服务器错误" }, 500);
-});
-app.notFound((c) => {
-  rejectionLog.record(c, 404, "route_not_found");
-  return c.json({ status: "error", message: "Not Found" }, 404);
-});
-
-
-app.get("/health", (c) => c.json({ ...identity, status: options.isStopping() ? "stopping" : "ready" }, options.isStopping() ? 503 : 200));
-app.post("/_admin/shutdown", (c) => {
-  if (!constantTimeEqual(c.req.header("Authorization") ?? "", "Bearer " + options.adminToken)) return c.notFound();
-  setTimeout(options.shutdown, 0);
-  return c.json({ status: "stopping" });
-});
-return app;
+    if (!result.skippedDay) {
+      const detail = `${result.files} 份会话、${result.records} 条新记录，跳过当天已完成且未变化的 ${result.skippedFiles} 份`;
+      if (result.failed) log.warn(`统计账本扫描未完成：${detail}，${result.failed} 项失败，下轮维护重试`);
+      else log.info(`统计账本入账完成：${detail}`);
+    }
+  };
+  const maintain = () => {
+    if (maintenance || stopping) return;
+    cleanupRateLimits();
+    cleanupCallbackRoutes();
+    maintenance = application.track(Promise.allSettled([cleanupIdleSessions(), sweepExpiredRelayObjects(), sweepStats()]));
+    void maintenance.then((results) => {
+      for (const result of results as PromiseSettledResult<unknown>[]) {
+        if (result.status === "rejected") log.error("后台维护失败: " + String(result.reason));
+      }
+    }).finally(() => { maintenance = undefined; });
+  };
+  timer = setInterval(() => { try { maintain(); } catch (error) { log.error(String(error)); } }, RATE_LIMIT_CLEANUP_INTERVAL);
+  maintain();
+  log.info("服务启动完成，监听地址: " + HOST + ":" + PORT);
+} catch (error) {
+  log.error("服务启动失败: " + String(error));
+  await shutdown("startup failure", 1);
 }

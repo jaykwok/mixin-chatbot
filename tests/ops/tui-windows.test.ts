@@ -41,7 +41,7 @@ function Test-ModelConfiguration($project) {
 }
 $WebhookSecretFile = Join-Path $PSScriptRoot 'webhook-secret'
 function Resolve-ProjectPath($value) { return $value }
-function Test-Local { if ($env:TUI_TEST_HEALTH -eq 'fail') { return 0 }; return 200 }
+function Test-Local { if ($env:TUI_TEST_HEALTH -eq 'fail') { return 0 }; if ($env:TUI_TEST_HEALTH -eq 'verification') { return 503 }; return 200 }
 function Get-BotPids { if ($env:TUI_TEST_HEALTH -ne 'fail') { return 42 } }
 function Get-NetTCPConnection { param($LocalPort, $State, $ErrorAction)
     if ($env:TUI_TEST_HEALTH -ne 'fail') { return [pscustomobject]@{ OwningProcess = 42 } }
@@ -120,14 +120,19 @@ windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非�
   const fixture = await fixtureWrapper();
   try {
     for (const command of ["doctor", "status"]) {
-      for (const state of ["pass", "fail"]) {
+      for (const state of ["pass", "fail", "verification"]) {
         const result = await fixture.run([command, "--json"], state);
         expect(result.stderr).toBe("");
         expect(result.stdout.trim().split(/\r?\n/)).toHaveLength(1);
         const payload = JSON.parse(result.stdout);
         expect(payload.checks.some((check: { name: string }) => check.name === "本地机器人健康")).toBe(true);
         expect(result.code).toBe(state === "pass" ? 0 : 1);
-        expect(payload.fail > 0).toBe(state === "fail");
+        expect(payload.fail > 0).toBe(state !== "pass");
+        if (state === "verification") {
+          const health = payload.checks.find((check: { name: string }) => check.name === "本地机器人健康");
+          expect(health.detail).toContain("只验证");
+          expect(health.fix).toContain("系统 → 服务部署 → 升级");
+        }
         for (const check of payload.checks) expect(typeof check.fix).toBe("string");
       }
     }

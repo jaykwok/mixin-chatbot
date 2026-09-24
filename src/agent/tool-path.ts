@@ -26,7 +26,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * Pi 0.85.1 resolveToCwd 的路径语义。上游未公开该函数；这里只适配工具路径，
+ * Pi resolveToCwd 的路径语义（0.85.1 移植，已按 0.87.1 的 core/tools/path-utils 核对未变）。上游未公开该函数；这里只适配工具路径，
  * 用官方 edit/write 的 operations 接口做差分回归，升级 Pi 时必须一起核对。
  * 来源：packages/coding-agent/src/utils/paths.ts（MIT）。
  */

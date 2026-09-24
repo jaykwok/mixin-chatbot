@@ -21,9 +21,9 @@ const READY_TTL = 5 * 60_000;
 async function fingerprint(venvDir: string): Promise<string> {
   const paths = [venvPythonPath(venvDir), join(venvDir, DOCUMENT_TOOLCHAIN_MARKER), lock, manifest, pythonPin];
   const metadata = await Promise.all(paths.map(async path => {
-    const info = await stat(path);
+    const info = await stat(path, { bigint: true });
     if (!info.isFile()) throw new Error("文档环境文件缺失");
-    return [info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs];
+    return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
   }));
   return JSON.stringify(metadata);
 }
@@ -74,6 +74,9 @@ export async function documentToolchainReady(venvDir: string, signal?: AbortSign
       signal?.throwIfAborted();
       return true;
     }
+    // An observed mismatch invalidates the old proof even if files later regain
+    // the same metadata (for example a marker is removed and immediately restored).
+    verified.delete(target);
     const content = await readFile(join(target, DOCUMENT_TOOLCHAIN_MARKER), "utf8");
     if (content.replace(/\r\n?/g, "\n").trim() !== await expected()) return false;
     const key = target + stamp;

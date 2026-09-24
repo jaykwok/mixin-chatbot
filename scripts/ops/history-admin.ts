@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
 import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
+import { ingestBeforeArchive } from "../../src/agent/stats-ledger.ts";
 import { assertDataDirectory, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
 import { scanHistory, type GroupHistory } from "../lib/history-scan.ts";
 
@@ -70,6 +71,8 @@ export async function clearGroup(
       await assertDataDirectory(dirname(user.path), root);
       const info = await lstat(user.path);
       if (!info.isFile() || info.isSymbolicLink()) throw new Error("历史文件已改变或是链接");
+      // 先落账再归档：统计只认账本，这一步漏了这段历史就再也补不回来。
+      await ingestBeforeArchive(root, target.group, user.user);
       await archiveFile(user.path);
       removed++;
       freed += user.bytes;

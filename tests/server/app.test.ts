@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { MAX_WEBHOOK_BODY_BYTES, REJECTION_LOG_DETAIL_LIMIT } from "../../src/core/config.ts";
 import { log } from "../../src/core/log.ts";
-import { createApp } from "../../src/server/app.ts";
+import { createApp } from "../../src/server/http-app.ts";
 import { observeCallbackRoute } from "../../src/integrations/callback-route.ts";
 
 const secret = "a".repeat(64);

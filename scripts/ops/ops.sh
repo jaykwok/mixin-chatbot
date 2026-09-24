@@ -265,7 +265,10 @@ doctor() {
     check "部署回滚容器" "$(! has_rollback_container && echo 1 || echo 0)" \
         "$(! has_rollback_container && echo 无 || echo "发现 ${ROLLBACK_CONTAINER}，请确认后恢复或删除")"
 
-    if bot_local_ready "$PORT" >/dev/null 2>&1; then check "本地机器人健康" 1 "就绪且实例身份匹配"
+    local health_status=0
+    bot_local_ready "$PORT" >/dev/null 2>&1 || health_status=$?
+    if [ "$health_status" = 0 ]; then check "本地机器人健康" 1 "就绪且实例身份匹配"
+    elif [ "$health_status" = 3 ]; then check "本地机器人健康" 0 "只验证实例，不处理消息" "使用 $(ops_command_hint update) 继续升级并完成提交。"
     else check "本地机器人健康" 0 "未就绪或实例身份不匹配" \
         "使用 $(ops_command_hint restart)，再到 $(ops_command_hint logs) 查看日志。"; fi
 
@@ -481,7 +484,10 @@ runtime_configure() (
         # 只传递受支持的高级参数以检查实际容器的环境覆盖，不输出其他环境变量或凭据。
         while IFS= read -r setting; do
             case "${setting%%=*}" in
-                BOT_DEBUG|BOT_MAX_ACTIVE_REQUESTS|BOT_BASH_TIMEOUT|BOT_INDEX_TTL_MINUTES|BOT_INDEX_MAX_FILES|BOT_INDEX_MAX_DEPTH|BOT_RUN_TIMEOUT_SECONDS|BOT_MODEL_IDLE_TIMEOUT_SECONDS|BOT_MODEL_RESPONSE_TIMEOUT_SECONDS|BOT_SHUTDOWN_TIMEOUT_SECONDS|BOT_DELIVERY_TIMEOUT_SECONDS|BOT_DOCUMENT_ENV|BOT_DOCUMENT_WORK_ENABLED|BOT_MODEL_CACHE_RETENTION|BOT_ATTACHMENT_CONCURRENCY)
+                BOT_MODEL_CACHE_RETENTION)
+                    ER '容器仍有旧 BOT_MODEL_CACHE_RETENTION 环境变量；请先停机迁移并移除该覆盖'
+                    return 1 ;;
+                BOT_DEBUG|BOT_MAX_ACTIVE_REQUESTS|BOT_BASH_TIMEOUT|BOT_INDEX_TTL_MINUTES|BOT_INDEX_MAX_FILES|BOT_INDEX_MAX_DEPTH|BOT_RUN_TIMEOUT_SECONDS|BOT_MODEL_IDLE_TIMEOUT_SECONDS|BOT_MODEL_RESPONSE_TIMEOUT_SECONDS|BOT_SHUTDOWN_TIMEOUT_SECONDS|BOT_DELIVERY_TIMEOUT_SECONDS|BOT_DOCUMENT_ENV|BOT_DOCUMENT_WORK_ENABLED|PI_CACHE_RETENTION|BOT_ATTACHMENT_CONCURRENCY)
                     runtime_env+=(-e "$setting") ;;
             esac
         done <<< "$environment"
@@ -663,20 +669,22 @@ update() (
     local current_sha target_sha
     current_sha="$(git_here rev-parse HEAD)"
     target_sha="$(git_here rev-parse origin/main 2>/dev/null)"
+    if [ -s "$PROJECT_DIR/data/state/deploy-transaction" ]; then
+        local pending_name pending_target
+        pending_name="$(cat "$PROJECT_DIR/data/state/deploy-transaction")"
+        [[ "$pending_name" =~ ^deploy-[a-zA-Z0-9]+$ ]] || { ER "中断事务名称无效"; return 1; }
+        pending_target="$(cat "$PROJECT_DIR/backup/snapshots/$pending_name/target-sha")"
+        [[ "$pending_target" =~ ^[0-9a-f]{40}$ ]] || { ER "中断事务目标无效"; return 1; }
+        target_sha="$pending_target"
+        P "继续中断的目标提交 ${target_sha:0:7}"
+    fi
     if [ -z "$target_sha" ]; then
         ER "无法解析 origin/main；请确认远端存在 main 分支"
         return 1
     fi
 
     if [ "$current_sha" = "$target_sha" ]; then
-        update_committed=1
-        OK "已经是 origin/main 最新版本（${target_sha:0:7}）"
-        if ask_yes_no "代码没有变化；仍然重启容器？[y/N] "; then
-            restart_bot || return 1
-        fi
-        echo ""
-        doctor
-        return $?
+        OK "代码已经最新，仍检查数据版本并完成必要迁移"
     fi
 
     # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
@@ -726,7 +734,7 @@ update() (
     deploy_pid=''
     if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then
         update_committed=1
-        ER "新部署已提交，但后续操作未完成；保留当前代码，请执行 doctor 检查"
+        ER "数据迁移已开始或部署已提交，但后续操作未完成；保留当前代码，请检查后重试升级"
         return 1
     fi
     ER "部署失败，退出前将恢复升级前的代码"

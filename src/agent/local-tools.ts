@@ -27,14 +27,6 @@ import { isPathInside } from "./paths.ts";
 import { venvPythonPath } from "./python-toolchain.ts";
 import { runProcess } from "../core/process.ts";
 
-/** 使用 Pi 官方类型收窄助手，使独立工具可安全放入 customTools。 */
-function asSdkTool<T extends ToolDefinition<any, any, any>>(tool: T) {
-  return defineTool({
-    ...tool,
-    constrainedSampling: { type: "json_schema", strict: "prefer" },
-  });
-}
-
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
@@ -316,5 +308,5 @@ export async function buildLocalTools(
   const editTool = createEditToolDefinition(cwd, { operations: editOperations });
   const writeTool = createWriteToolDefinition(cwd, { operations: writeOperations });
 
-  return [readTool, bashTool, editTool, writeTool].map(asSdkTool);
+  return [readTool, bashTool, editTool, writeTool].map(tool => defineTool(tool));
 }

@@ -26,8 +26,10 @@ test("runtime settings retain previous values and validate explicit overrides", 
       for (const value of [0, 9, 7201, 10.5, "abc"]) expect(() => validateRuntimeConfig({ [key]: value })).toThrow();
       for (const value of [10, 180, 600, 7200]) expect(validateRuntimeConfig({ [key]: value })).toHaveProperty(key, String(value));
     }
-    for (const policy of ["auto", "none", "short", "long"]) expect(validateRuntimeConfig({ BOT_MODEL_CACHE_RETENTION: policy })).toHaveProperty("BOT_MODEL_CACHE_RETENTION", policy);
-    for (const policy of ["", "24h", "LONG", false]) expect(() => validateRuntimeConfig({ BOT_MODEL_CACHE_RETENTION: policy })).toThrow();
+    for (const policy of ["short", "long"]) expect(validateRuntimeConfig({ PI_CACHE_RETENTION: policy })).toHaveProperty("PI_CACHE_RETENTION", policy);
+    for (const policy of ["", "auto", "none", "24h", "LONG", false]) expect(() => validateRuntimeConfig({ PI_CACHE_RETENTION: policy })).toThrow();
+    expect(() => validateRuntimeConfig({ BOT_MODEL_CACHE_RETENTION: "auto" })).toThrow();
+    await expect(saveRuntimeSettings(path, { BOT_MODEL_CACHE_RETENTION: "none" })).rejects.toThrow(/已移除/);
     for (const value of [1, 2, 8]) expect(validateRuntimeConfig({ BOT_ATTACHMENT_CONCURRENCY: value })).toHaveProperty("BOT_ATTACHMENT_CONCURRENCY", String(value));
     for (const value of [0, 9, 1.5]) expect(() => validateRuntimeConfig({ BOT_ATTACHMENT_CONCURRENCY: value })).toThrow();
     await expect(saveRuntimeSettings(path, { BOT_INDEX_MAX_DEPTH: "0" })).rejects.toThrow();

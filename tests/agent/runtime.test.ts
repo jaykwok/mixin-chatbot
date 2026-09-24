@@ -15,7 +15,7 @@ test("real runtime and HTTP scheduling survive lifecycle races", async () => {
     expect(code, stdout + "\n" + stderr).toBe(0);
     const line = stdout.split("\n").find(line => line.startsWith("HARNESS_RESULT="));
     expect(line, stderr).toBeDefined();
-    expect(JSON.parse(line!.slice("HARNESS_RESULT=".length))).toHaveLength(10);
+    expect(JSON.parse(line!.slice("HARNESS_RESULT=".length))).toHaveLength(11);
   } finally { clearTimeout(timer); child.kill(); await child.exited; await fixture.cleanup(); }
 }, 30000);
 

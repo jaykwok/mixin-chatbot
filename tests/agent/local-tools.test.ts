@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 
 import { isAbsolute, join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { buildLocalTools } from "../../src/agent/local-tools.ts";
 import { isPathInside } from "../../src/agent/paths.ts";
 import { venvPythonPath } from "../../src/agent/python-toolchain.ts";
@@ -28,6 +29,40 @@ function toolsFor(
 }
 
 describe("local Pi tool boundaries", () => {
+  test("official read honors current model image limits behind the existing path guard", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mixin-image-resize-"));
+    const workspace = join(root, "workspace"), userTemp = join(root, "tmp");
+    await Promise.all([mkdir(workspace), mkdir(userTemp)]);
+    const chunk = (name: string, data: Buffer) => {
+      const body = Buffer.concat([Buffer.from(name), data]);
+      let crc = 0xffffffff;
+      for (const byte of body) { crc ^= byte; for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0); }
+      const prefix = Buffer.alloc(4), suffix = Buffer.alloc(4);
+      prefix.writeUInt32BE(data.length); suffix.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
+      return Buffer.concat([prefix, body, suffix]);
+    };
+    // A deterministic valid PNG, without a second image-processing dependency.
+    const header = Buffer.alloc(13); header.writeUInt32BE(2048); header.writeUInt32BE(1024, 4); header[8] = 8; header[9] = 6;
+    const row = Buffer.alloc(2048 * 4 + 1, 180); row[0] = 0;
+    const png = Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), chunk("IHDR", header),
+      chunk("IDAT", deflateSync(Buffer.concat(Array.from({ length: 1024 }, () => row)))), chunk("IEND", Buffer.alloc(0))]);
+    try {
+      const path = join(workspace, "page.png"); await writeFile(path, png);
+      const read = (await toolsFor(root, workspace, userTemp)).find(tool => tool.name === "read")!;
+      const invoke = (input: string[]) => read.execute("image", { path }, undefined, undefined, {
+        cwd: workspace, model: { input, inputLimits: { images: { resize: { maxWidth: 512, maxHeight: 512, maxBytes: 100000, jpegQuality: 75 } } } },
+      } as never);
+      const result = await invoke(["text", "image"]);
+      const image = result.content.find(part => part.type === "image");
+      expect(image?.data.length).toBeLessThanOrEqual(100000);
+      expect(result.content.filter(part => part.type === "text").map(part => part.text).join("\n")).toContain("displayed at 512x256");
+      const textOnly = await invoke(["text"]);
+      expect(textOnly.content.filter(part => part.type === "text").map(part => part.text).join("\n")).toContain("does not support images");
+      expect(result.content.find(part => part.type === "image")?.data).toBe(image?.data);
+      expect(await readFile(path)).toEqual(png);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   test("file tools read workspace but write only caller tmp", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-tools-"));
     const workspace = join(root, "workspace");
@@ -41,6 +76,7 @@ describe("local Pi tool boundaries", () => {
 
     try {
       const tools = await toolsFor(root, workspace, userTemp);
+      expect(tools.map(tool => tool.constrainedSampling)).toEqual(Array.from({ length: 4 }, () => ({ type: "json_schema", strict: "prefer" })));
       const read = tools.find((tool) => tool.name === "read")!;
       const write = tools.find((tool) => tool.name === "write")!;
 

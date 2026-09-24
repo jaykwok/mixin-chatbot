@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"01a0cbf9-5ad3-7155-88d1-b41bdae53156","timestamp":"2026-09-23T01:55:11.699Z","cwd":"/legacy/pi-0.85.1/workspace"}
+{"type":"model_change","id":"b3944c57","parentId":null,"timestamp":"2026-09-23T01:55:11.700Z","provider":"faux","modelId":"faux-model"}
+{"type":"message","id":"785cb595","parentId":"b3944c57","timestamp":"2026-09-23T01:55:11.700Z","message":{"role":"user","content":"LEGACY_0851","timestamp":1790128511700}}
+{"type":"message","id":"db8c02a8","parentId":"785cb595","timestamp":"2026-09-23T01:55:11.700Z","message":{"role":"assistant","content":[{"type":"text","text":"acknowledged"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1790128511700}}

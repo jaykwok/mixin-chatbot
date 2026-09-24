@@ -628,7 +628,9 @@ function Start-Bot {
 }
 
 function Test-Local {
-    if (Test-ProjectBotHealth $Project ([int]$Port)) { return 200 }
+    $verification = $false
+    if (Test-ProjectBotHealth $Project ([int]$Port) -VerificationOnly ([ref]$verification)) { return 200 }
+    if ($verification) { return 503 }
     return 0
 }
 
@@ -809,7 +811,7 @@ function Show-Doctor {
         }
     }
 
-    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')，再到 $(Get-OpsCommandHint 'logs') 查看日志。" })
+    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } elseif ($localStatus -eq 503) { "只验证实例，不处理消息" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } elseif ($localStatus -eq 503) { "使用 $(Get-OpsCommandHint 'update') 继续升级并完成提交。" } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')，再到 $(Get-OpsCommandHint 'logs') 查看日志。" })
 
     if ($DeployMode -eq "cloudflare") {
         $tokenSource = Get-TunnelTokenSource
@@ -1040,65 +1042,43 @@ function Restore-Checkout([string]$Branch, [string]$Sha) {
 # 升级失败后把代码退回升级前那次提交并重新拉起。进入升级前已确认工作区干净，
 # 所以 reset --hard 不会毁掉任何本地内容。
 function Invoke-Update {
-    Step '同步到 origin/main；停止旧实例后才变更工作树和依赖'
-    if (-not (IsAdmin)) { Err 'update 需要管理员 PowerShell，以保证失败时能还原计划任务。'; return $false }
+    if (-not (IsAdmin)) { Err 'update 需要管理员 PowerShell'; return $false }
     if (-not (Get-GitPath) -or -not (Get-BunPath)) { Err '需要 Git 和 Bun'; return $false }
     $dirty = Invoke-GitCapture @('status', '--porcelain', '--untracked-files=no')
-    if ($dirty.ExitCode -ne 0 -or $dirty.Text) { Err '已跟踪文件有改动或无法读取 Git 状态；请先处理后更新。'; return $false }
-    $originalBranch = (Invoke-GitCapture @('rev-parse', '--abbrev-ref', 'HEAD')).Text
-    $originalSha = (Invoke-GitCapture @('rev-parse', 'HEAD')).Text
-    if ($originalSha -notmatch '^[0-9a-f]{40}$') { Err '无法识别原提交'; return $false }
-    $fetch = Invoke-GitCapture @('fetch', 'origin', 'main')
+    if ($dirty.ExitCode -ne 0 -or $dirty.Text) { Err '已跟踪文件有改动，请先处理'; return $false }
+    $branch = (Invoke-GitCapture @('rev-parse', '--abbrev-ref', 'HEAD')).Text
+    $original = (Invoke-GitCapture @('rev-parse', 'HEAD')).Text
+    $fetch = Invoke-GitCapture @('fetch', 'origin', 'main:refs/remotes/origin/main')
     if ($fetch.ExitCode -ne 0) { Err $fetch.Text; return $false }
-    $target = Invoke-GitCapture @('rev-parse', 'origin/main')
-    if ($target.ExitCode -ne 0 -or $target.Text -notmatch '^[0-9a-f]{40}$') { Err '无法识别 origin/main 提交'; return $false }
-    $targetSha = $target.Text
-    if (-not (Test-ModelConfiguration $Project)) { Err '模型配置无效；尚未停止旧服务。'; return $false }
-    Step ("提交：{0} -> {1}" -f $originalSha.Substring(0, 7), $targetSha.Substring(0, 7))
-    $snapshot = New-DeploymentSnapshot $Project $TaskName
-    $committed = $false
-    $mutated = $false
+    $target = (Invoke-GitCapture @('rev-parse', 'origin/main')).Text
+    if ($original -notmatch '^[0-9a-f]{40}$' -or $target -notmatch '^[0-9a-f]{40}$') { Err '无法识别提交'; return $false }
+    $pendingUpgrade = Join-Path $Project 'data\state\upgrade-transaction'
+    if (Test-Path -LiteralPath $pendingUpgrade) {
+        $pendingName = (Get-Content -LiteralPath $pendingUpgrade -Raw).Trim()
+        if ($pendingName -notmatch '^deploy-[0-9a-f]{32}$') { Err '升级事务名称无效'; return $false }
+        $pendingState = Import-Clixml -LiteralPath (Join-Path $Project ('backup\snapshots\' + $pendingName + '\deployment.xml'))
+        $target = $pendingState.UpgradeTarget
+        if ($target -notmatch '^[0-9a-f]{40}$') { Err '中断事务目标无效'; return $false }
+    }
+    # Export the target's preview before stopping or changing the live checkout.
+    $stage = Join-Path $Project ('tmp\upgrade-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
-        if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '旧实例未停止，未变更代码' }
-        $mutated = $true
-        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
-        $checkout = Invoke-GitCapture @('checkout', 'main')
-        if ($checkout.ExitCode -ne 0) { throw $checkout.Text }
-        $merge = Invoke-GitCapture @('merge', '--ff-only', $targetSha)
-        if ($merge.ExitCode -ne 0) { throw $merge.Text }
-        $current = Invoke-GitCapture @('rev-parse', 'HEAD')
-        if ($current.ExitCode -ne 0 -or $current.Text -ne $targetSha) { throw '同步后 HEAD 与 origin/main 目标提交不一致' }
-        if (Test-DeploymentDependenciesReusable $Project (Get-GitPath) $originalSha $targetSha) {
-            Done '依赖清单、锁文件和补丁未变，已安装版本匹配；跳过依赖安装。'
-        } else {
-            Save-DeploymentDependencies $snapshot
-            if (-not (Invoke-BunInstall)) { throw '新依赖安装失败' }
-        }
-        if ($snapshot.WasRunning) {
-            if (-not (Start-Bot) -or (Wait-Local) -ne 200) { throw '新实例健康检查失败' }
-        } elseif ($snapshot.TaskXml) {
-            Register-ScheduledTask -TaskName $TaskName -Xml $snapshot.TaskXml -Force | Out-Null
-        }
-        if ($RestartTunnel -and -not (Restart-TunnelService)) { throw '隧道重启失败' }
-        $committed = $true
-        Done ("升级完成：{0} -> {1}；原来的运行或停止状态已保留。" -f $originalSha.Substring(0, 7), $targetSha.Substring(0, 7))
-        return $true
-    } catch {
-        Err ('升级未完成：' + $_.Exception.Message)
-        return $false
+    $archive = Join-Path $stage 'target.zip'
+    $export = Invoke-GitCapture @('archive', '--format=zip', ('--output=' + $archive), $target,
+        'scripts/deploy/upgrade.ps1', 'scripts/lib', 'scripts/migrations', 'src/core/data-version.ts')
+    if ($export.ExitCode -ne 0) { Err $export.Text; return $false }
+    Expand-Archive -LiteralPath $archive -DestinationPath $stage
+    $shell = Join-Path $PSHOME 'powershell.exe'
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $stage 'scripts\deploy\upgrade.ps1'),
+        '-Project', $Project, '-OriginalSha', $original, '-TargetSha', $target, '-OriginalBranch', $branch,
+        '-BunPath', (Get-BunPath), '-GitPath', (Get-GitPath))
+    if ($RestartTunnel) { $arguments += '-RestartTunnel' }
+    & $shell @arguments | Out-Host
+    return ($LASTEXITCODE -eq 0)
     } finally {
-        if (-not $committed -and $mutated) {
-            try {
-                if (-not (Stop-Bot)) { throw '新实例未停止' }
-                if (-not (Restore-Checkout $originalBranch $originalSha)) { throw '原工作树恢复失败' }
-                Restore-DeploymentSnapshot $snapshot
-            } catch { Err ('自动回滚未完成，快照保留在 ' + $snapshot.Path + '：' + $_.Exception.Message) }
-        } elseif ($committed) {
-            try { Remove-CompletedBackup $snapshot.Path $Project }
-            catch { Warn ('升级已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }
-        }
-        $snapshot.Lock.Dispose()
-        $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId
+        try { Remove-UpgradeStage $Project $stage }
+        catch { Warn ('升级导出目录清理失败，保留 ' + $stage + '：' + $_.Exception.Message) }
     }
 }
 

@@ -1,6 +1,6 @@
 # Bun 运行时镜像
 FROM ghcr.io/astral-sh/uv:0.11.29 AS uv
-FROM oven/bun:1.4.0-debian
+FROM oven/bun:1.4.2-debian
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer libreoffice-impress fonts-noto-cjk fonts-liberation && \
     rm -rf /var/lib/apt/lists/*
@@ -30,6 +30,7 @@ COPY --chown=appuser:appgroup scripts/config ./scripts/config
 COPY --chown=appuser:appgroup scripts/ops/*.ts ./scripts/ops/
 COPY --chown=appuser:appgroup scripts/lib/*.ts ./scripts/lib/
 COPY --chown=appuser:appgroup scripts/runtime ./scripts/runtime
+COPY --chown=appuser:appgroup scripts/migrations ./scripts/migrations
 COPY --chown=appuser:appgroup scripts/test.ts ./scripts/test.ts
 
 RUN mkdir -p \

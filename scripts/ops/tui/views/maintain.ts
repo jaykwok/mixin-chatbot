@@ -67,10 +67,10 @@ const ACTIONS: Action[] = [
               app.deployment.runtime === "docker"
                 ? "通过部署向导重建镜像并切换容器"
                 : "重装依赖并重启计划任务",
-              "失败时自动回滚代码，并恢复升级前的容器/服务",
-              "完成后自动跑一次体检",
+              "停机前预览迁移并选择缓存与模型策略；停机后备份、迁移和完整校验",
+              "以只验证模式检查新实例，提交数据版本后恢复原运行状态",
             ]
-          : ["重新核对远端版本", "有更新时重新部署；无更新时按平台流程检查或重启", "完成后自动跑一次体检"];
+          : ["重新核对远端版本", "代码已最新时仍检查数据版本、迁移和中断续做", "备份、迁移、只验证检查，通过后提交并恢复原运行状态"];
       return {
         title: "升级",
         subject:
@@ -78,8 +78,8 @@ const ACTIONS: Action[] = [
             ? `${fmt.shortSha(git.sha)} → ${targetSha ? fmt.shortSha(targetSha) : "origin/main"}，共 ${git.behind} 个提交`
             : `当前 ${fmt.shortSha(git.sha)}；origin/main ${targetSha ? fmt.shortSha(targetSha) : "待检查"}`,
         steps,
-        untouched: ["data/ 下的配置与群数据", "会话历史"],
-        recovery: "失败时自动回滚代码并恢复原容器；部署过程中服务会短暂中断",
+        untouched: ["会话历史", "群共享资料"],
+        recovery: "提交前失败会恢复数据、代码和原服务；恢复失败保持停机。提交后保留新版本并报告启动问题",
       };
     },
     args: () => ["update"],

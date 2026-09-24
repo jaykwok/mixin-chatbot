@@ -12,5 +12,9 @@ try {
     if (!response.ok) throw new Error("not ready");
     body = await response.json();
   }
-  process.exitCode = matchesInstance(body, expected, port) && body.status === "ready" ? 0 : 1;
+  if (!matchesInstance(body, expected, port) || body.status !== "ready") process.exitCode = 1;
+  else if (body.verificationOnly && !process.argv.includes("--allow-verification")) {
+    console.error("实例处于只验证模式，尚未处理消息；请继续升级完成提交");
+    process.exitCode = 3;
+  } else process.exitCode = 0;
 } catch { process.exitCode = 1; }

@@ -22,7 +22,7 @@ const FALLBACK_THINKING_LEVEL: ModelThinkingLevel = "medium";
  */
 const AGENT_SETTINGS: PiSettings = {
   retry: {
-    enabled: true, maxRetries: 1, baseDelayMs: 1000,
+    enabled: true, maxRetries: 1, baseDelayMs: 1000, maxAgentDelayMs: 5000,
     provider: { timeoutMs: 120000, maxRetries: 1, maxRetryDelayMs: 5000 },
   },
   compaction: { enabled: true },
@@ -84,6 +84,12 @@ function readOnlySettingsStorage(readGlobal: () => string | undefined): PiSettin
   };
 }
 
+/** 每个会话拥有独立的可变 SDK 视图，reload 仍回到实例启动时的只读策略。 */
+export function forkSettings(settings: SettingsManager): SettingsManager {
+  const snapshot = JSON.stringify(settings.getGlobalSettings());
+  return SettingsManager.fromStorage(readOnlySettingsStorage(() => snapshot), { projectTrusted: false });
+}
+
 /**
  * Pi 原生设置管理器，全局作用域读项目私有 agent 目录下的 settings.json。
  *
@@ -102,10 +108,15 @@ export function openSettings(path = PI_SETTINGS_PATH): SettingsManager {
   // Pi 先解析原生设置，再固定本进程的全局视图。策略必须进入 storage 的内容：
   // applyOverrides() 会被 SDK 的 resourceLoader.reload() 清掉，且单例会影响其他会话。
   const configured = settings.getGlobalSettings();
+  if (configured.cacheWarming !== undefined && !["off", "streaming", "idle"].includes(configured.cacheWarming)) {
+    throw new Error(`${path}: cacheWarming 必须是 off、streaming 或 idle`);
+  }
   const snapshot = JSON.stringify({
     ...configured,
     ...AGENT_SETTINGS,
     compaction: { ...configured.compaction, ...AGENT_SETTINGS.compaction },
+    // Pi 0.86 默认 streaming；服务器必须由管理员显式开启额外的模型请求。
+    cacheWarming: configured.cacheWarming ?? "off",
   });
   return SettingsManager.fromStorage(readOnlySettingsStorage(() => snapshot), { projectTrusted: false });
 }
@@ -133,6 +144,8 @@ export async function resolveModelSelection(
   if (!model) {
     throw new Error(`Pi 未提供 ${providerId}/${modelId}，请运行 bun run configure 重新选择`);
   }
+  // Let Pi validate native per-model budgets during startup, before accepting work.
+  settings.getCompactionSettings(model);
   const auth = await runtime.checkAuth(providerId, { signal: options.signal });
   if (!auth) {
     throw new Error(`provider ${providerId} 未配置可用凭证，请运行 bun run configure`);

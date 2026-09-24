@@ -177,62 +177,175 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
   } finally { await fixture.cleanup(); }
 }, 60000);
 
-test.skipIf(process.platform !== "win32")("Windows update reports hashes, skips matching installs and preserves rollback on failure", async () => {
+test.skipIf(process.platform !== "win32")("Windows target upgrade previews before stopping and rolls data back before code or old service", async () => {
   const fixture = await tempFixture("update-flow-");
   const script = join(fixture.root, "update.ps1");
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
-# Extract only the update function; never execute the operations CLI or host controls.
 $tokens=$null; $errors=$null
-$ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/ops/ops.ps1"))},[ref]$tokens,[ref]$errors)
+$sourcePath=${quotePS(join(project, "scripts/deploy/upgrade.ps1"))}
+$ast=[Management.Automation.Language.Parser]::ParseFile($sourcePath,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw ($errors | Out-String)}
-$definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Update'},$true)
-Invoke-Expression $definition.Extent.Text
-$Project=$PSScriptRoot; $TaskName='fixture'; $RestartTunnel=$false
-$env:BOT_DEPLOY_BACKUP_ID='deploy-previous'
-$old='1111111111111111111111111111111111111111'; $new='2222222222222222222222222222222222222222'
-function Step($text){ Write-Host $text }; function Done($text){ Write-Host $text }; function Err($text){ Write-Host $text }; function Warn($text){ Write-Host $text }
-function IsAdmin { $true }; function Get-GitPath { 'fixture-git' }; function Get-BunPath { 'fixture-bun' }
-function Test-ModelConfiguration { $true }
-function Invoke-GitCapture($arguments) {
-    $text=''
-    if($arguments[0] -eq 'rev-parse') {
-        if($arguments[1] -eq '--abbrev-ref'){$text='main'}
-        elseif($arguments[1] -eq 'origin/main' -or $script:merged){$text=$new}else{$text=$old}
-    }
-    if($arguments[0] -eq 'merge') { if($arguments[2] -ne $new){throw 'merge did not use displayed target'}; $script:merged=$true }
-    @{ExitCode=0;Text=$text}
+$body=(Get-Content -LiteralPath $sourcePath -Raw -Encoding UTF8).Substring($ast.ParamBlock.Extent.EndOffset)
+$body=(($body -split '\\r?\\n') | Where-Object { -not $_.StartsWith('. (Join-Path') }) -join [Environment]::NewLine
+$body=$body.Replace('$PSScriptRoot', "'" + $PSScriptRoot.Replace("'", "''") + "'")
+$run=[scriptblock]::Create($body)
+$BunPath='fixture-bun'; $GitPath='fixture-git'
+$Project=$PSScriptRoot; $OriginalSha='1111111111111111111111111111111111111111'; $TargetSha='2222222222222222222222222222222222222222'; $OriginalBranch='main'
+New-Item -ItemType Directory -Force -Path (Join-Path $Project 'data/state'),(Join-Path $Project 'data/groups') | Out-Null
+function Get-BunPath { 'fixture-bun' }; function Get-GitPath { 'fixture-git' }
+function fixture-git {
+    $global:LASTEXITCODE=0
+    if($args -contains 'rev-parse'){ if($script:failure -eq 'code'){'3333333333333333333333333333333333333333'}else{$TargetSha} }
+    if($args -contains 'reset') { if($script:applied -and -not $script:dataRestored){throw 'code restored before data'}; $script:codeRestored=$true }
 }
-function New-DeploymentSnapshot { $previous=$env:BOT_DEPLOY_BACKUP_ID; $env:BOT_DEPLOY_BACKUP_ID='deploy-current'; [pscustomobject]@{WasRunning=$script:running;TaskXml='<Task/>';Path=$PSScriptRoot;Lock=(New-Object IO.MemoryStream);DependenciesAttempted=$false;PreviousBackupId=$previous} }
-function Stop-ProjectBot { $true }; function Get-ScheduledTask { $null }
+function fixture-bun {
+    $global:LASTEXITCODE=0
+    if($args -contains 'preview') { if($script:stopped){throw 'preview after stop'}; if($script:failure -eq 'preview'){ $global:LASTEXITCODE=2 } }
+    elseif($args -contains 'install') { $script:installs++; if($script:failure -eq 'install'){$global:LASTEXITCODE=1} }
+    elseif($args -contains 'apply') { $script:applied=$true; if($script:failure -eq 'apply'){$global:LASTEXITCODE=1} }
+    elseif($args -contains 'committed') { $global:LASTEXITCODE=1 }
+    elseif($args -contains 'commit') { if($script:failure -eq 'commit'){$global:LASTEXITCODE=1}else{$script:committed=$true} }
+    elseif($args -contains 'rollback') { if($script:committed){$global:LASTEXITCODE=42}else{$script:dataRestored=$true} }
+    else {
+        $verifying=Test-Path -LiteralPath (Join-Path $Project 'data/state/verify-only')
+        if($verifying -ne ($args -contains '--allow-verification')){throw 'wrong verification health policy'}
+        if($script:failure -eq 'health'){throw 'health failure'}
+    }
+}
+function New-DeploymentSnapshot { [pscustomobject]@{WasRunning=$script:running;TaskXml='<Task/>';Path=$Project;Lock=(New-Object IO.MemoryStream);PreviousBackupId='previous'} }
+function Open-UpgradeSnapshot($root,$task,$original,$branch,$target) {
+    $state=New-DeploymentSnapshot
+    $state | Add-Member -NotePropertyName UpgradeOriginal -NotePropertyValue $original
+    $state | Add-Member -NotePropertyName UpgradeBranch -NotePropertyValue $branch
+    $state | Add-Member -NotePropertyName DependenciesAttempted -NotePropertyValue $false
+    Set-Content -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction') 'fixture'
+    return $state
+}
+function Stop-ProjectBot { $script:stopped=$true; $true }
 function Test-DeploymentDependenciesReusable { $script:reuse }
-function Save-DeploymentDependencies($snapshot) { $snapshot.DependenciesAttempted=$true; $script:backups++ }
-function Invoke-BunInstall { $script:installs++; return $script:failure -ne 'install' }
-function Start-Bot { $script:starts++; $true }; function Wait-Local { if($script:failure -eq 'health'){503}else{200} }
-function Register-ScheduledTask { $script:restoredStopped++ }
-function Stop-Bot { $true }; function Restore-Checkout { $true }
-function Restore-DeploymentSnapshot($snapshot) { $script:rollbacks++; if($snapshot.DependenciesAttempted -eq $script:reuse){throw 'wrong dependency rollback flag'} }
-function Remove-CompletedBackup { $script:archived++ }
-foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','install','health')) {
-    if(($script:failure -eq 'install' -and $script:reuse) -or ($script:failure -eq 'health' -and -not $script:running)){continue}
-    $script:merged=$false; $script:backups=0; $script:installs=0; $script:starts=0; $script:restoredStopped=0; $script:rollbacks=0; $script:archived=0
-    $result=Invoke-Update
-    if($env:BOT_DEPLOY_BACKUP_ID -ne 'deploy-previous'){throw 'temporary backup environment leaked'}
-    $success=$script:failure -eq 'none'
-    if($result -ne $success){throw 'wrong update result'}
-    $expectedInstalls=[int](-not $script:reuse)
-    if($script:installs -ne $expectedInstalls -or $script:backups -ne $expectedInstalls){throw 'unexpected install/backup'}
-    if($script:rollbacks -ne [int](-not $success) -or $script:archived -ne [int]$success){throw 'wrong transaction outcome'}
-    if($success -and ($script:starts -ne [int]$script:running -or $script:restoredStopped -ne [int](-not $script:running))){throw 'run state not preserved'}
+function Save-DeploymentDependencies { $script:backups++ }
+function Enable-ScheduledTask { }
+function Start-ScheduledTask {
+    if(Test-Path -LiteralPath (Join-Path $Project 'data/state/verify-only')){ $script:verifications++ }
+    else { if(-not $script:committed){throw 'normal start before commit'}; $script:starts++; if($script:failure -eq 'postcommit'){throw 'normal start failed'} }
+}
+function Register-ScheduledTask { }
+function Restore-DeploymentSnapshot { if(-not $script:codeRestored){throw 'old service before code restore'}; $script:restores++ }
+foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','preview','code','install','apply','health','commit','postcommit')) {
+    if(($script:failure -eq 'install' -and $script:reuse) -or ($script:failure -eq 'postcommit' -and -not $script:running)){continue}
+    $script:stopped=$false; $script:applied=$false; $script:committed=$false; $script:dataRestored=$false; $script:codeRestored=$false
+    $script:backups=0; $script:installs=0; $script:starts=0; $script:verifications=0; $script:restores=0
+    $ok=$true
+    try { & $run } catch { $ok=$false; Write-Host $_.Exception.Message }
+    if($ok -ne ($script:failure -eq 'none')){throw ('wrong result: '+$script:failure)}
+    if($script:failure -eq 'code' -and ($script:installs -or $script:applied)){throw 'wrong release mutated data or dependencies'}
+    if($script:failure -eq 'preview') { if($script:stopped){throw 'stopped after failed preview'} }
+    elseif($script:failure -in @('none','postcommit')) {
+        if($script:restores -ne 0 -or -not $script:committed -or $script:starts -ne [int]$script:running){throw 'wrong committed state'}
+        if($script:backups -ne [int](-not $script:reuse) -or $script:installs -ne $script:backups){throw 'dependency reuse failed'}
+    } elseif($script:restores -ne 1) { throw 'rollback missing' }
     Write-Output 'VERIFIED'
 } } }
 `);
   try {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
-    expect(result.output.match(/VERIFIED/g)).toHaveLength(8);
-    expect(result.output).toContain("1111111 -> 2222222");
+    expect(result.output.match(/VERIFIED/g)).toHaveLength(28);
   } finally { await fixture.cleanup(); }
 }, 60000);
+
+test.skipIf(process.platform !== "win32")("Windows upgrade snapshot survives restart and retains its original code and running state", async () => {
+  const fixture = await tempFixture("upgrade-resume-");
+  const script = join(fixture.root, "resume.ps1");
+  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+. ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+$root=Join-Path $PSScriptRoot 'project'
+New-Item -ItemType Directory -Force -Path (Join-Path $root 'data/state') | Out-Null
+function New-DeploymentSnapshot($projectRoot,$taskName) {
+    $path=Join-Path $projectRoot ('backup/snapshots/deploy-'+[Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $path | Out-Null
+    $lease=[IO.File]::Open((Join-Path $projectRoot 'data/state/deploy.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    [pscustomobject]@{Project=$projectRoot;Path=$path;WasRunning=$true;TaskName=$taskName;Lock=$lease}
+}
+$first=Open-UpgradeSnapshot $root 'fixture' 'original' 'main' 'target'
+$first.Lock.Dispose()
+$second=Open-UpgradeSnapshot $root 'fixture' 'wrong-current' 'HEAD' 'target'
+try {
+    if($second.Path -ne $first.Path -or -not $second.WasRunning -or $second.UpgradeOriginal -ne 'original' -or $second.UpgradeBranch -ne 'main'){throw 'lost original transaction'}
+    $blocked=$false
+    try { $other=Open-UpgradeSnapshot $root 'fixture' 'x' 'main' 'target'; $other.Lock.Dispose() } catch { $blocked=$true }
+    if(-not $blocked){throw 'competing deployment acquired lock'}
+} finally { $second.Lock.Dispose() }
+$blocked=$false
+try { $other=Open-UpgradeSnapshot $root 'fixture' 'x' 'main' 'different-target'; $other.Lock.Dispose() } catch { $blocked=$true }
+if(-not $blocked){throw 'resumed a different release'}
+Write-Output 'RESUME_VERIFIED'
+`);
+  try {
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("RESUME_VERIFIED");
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+test.skipIf(process.platform !== "win32")("Windows target upgrade really boots in a fresh process and rejects preflight before service control", async () => {
+  const fixture = await tempFixture("upgrade-bootstrap-");
+  try {
+    await mkdir(join(fixture.root, "data/groups"), { recursive: true });
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+      join(project, "scripts/deploy/upgrade.ps1"), "-Project", fixture.root,
+      "-OriginalSha", "1".repeat(40), "-TargetSha", "2".repeat(40),
+      "-BunPath", process.execPath, "-GitPath", Bun.which("git")!], fixture.root);
+    expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain("迁移预览未完成");
+    expect(existsSync(join(fixture.root, "data/state/upgrade-transaction"))).toBe(false);
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+test.skipIf(process.platform !== "win32")("Windows upgrade removes only its own export on success, export failure and child failure", async () => {
+  const fixture = await tempFixture("upgrade-export-cleanup-");
+  const script = join(fixture.root, "cleanup.ps1");
+  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+. ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/ops/ops.ps1"))},[ref]$tokens,[ref]$errors)
+if($errors.Count){throw ($errors | Out-String)}
+$definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Update'},$true)
+Invoke-Expression $definition.Extent.Text
+$Project=Join-Path $PSScriptRoot 'project'
+New-Item -ItemType Directory -Force -Path (Join-Path $Project 'tmp/keep') | Out-Null
+Set-Content -LiteralPath (Join-Path $Project 'tmp/keep/evidence') 'original'
+function IsAdmin { $true }; function Get-GitPath { 'fixture-git' }; function Get-BunPath { 'fixture-bun' }
+function Err($message) { Write-Host $message }; function Warn($message) { throw $message }
+function Invoke-GitCapture([string[]]$GitArgs) {
+    if($GitArgs[0] -eq 'archive') { return @{ExitCode=$(if($env:UPGRADE_CASE -eq 'export'){1}else{0});Text='fixture export'} }
+    $text=if($GitArgs -contains '--abbrev-ref'){'main'}elseif($GitArgs[0] -eq 'rev-parse'){'1'*40}else{''}
+    return @{ExitCode=0;Text=$text}
+}
+function Expand-Archive($LiteralPath,$DestinationPath) {
+    $target=Join-Path $DestinationPath 'scripts/deploy'
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Set-Content -LiteralPath (Join-Path $target 'upgrade.ps1') -Encoding ASCII -Value 'if($env:UPGRADE_CASE -eq "child"){exit 17}; exit 0'
+}
+foreach($env:UPGRADE_CASE in @('success','export','child')) {
+    $result=Invoke-Update
+    if($result -ne ($env:UPGRADE_CASE -eq 'success')){throw 'wrong upgrade result'}
+    if(@(Get-ChildItem -LiteralPath (Join-Path $Project 'tmp') -Filter 'upgrade-*').Count){throw 'export directory leaked'}
+}
+foreach($invalid in @((Join-Path $Project 'tmp/keep'), (Join-Path $PSScriptRoot ('upgrade-'+('a'*32))))) {
+    $rejected=$false
+    try { Remove-UpgradeStage $Project $invalid } catch { $rejected=$true }
+    if(-not $rejected){throw 'accepted invalid cleanup path'}
+}
+if((Get-Content -LiteralPath (Join-Path $Project 'tmp/keep/evidence')).Trim() -ne 'original'){throw 'unrelated data changed'}
+Write-Output 'EXPORT_CLEANUP_VERIFIED'
+`);
+  try {
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("EXPORT_CLEANUP_VERIFIED");
+  } finally { await fixture.cleanup(); }
+}, 30000);
 
 test.skipIf(process.platform !== "win32")("Windows successful backup cleanup empties all recycled files and preserves other tmp snapshots", async () => {
   const fixture = await tempFixture("backup-cleanup-windows-");
@@ -309,6 +422,102 @@ cleanup_completed_backup "$snapshot"
   } finally { await fixture.cleanup(); }
 }, 60000);
 
+test.skipIf(!bash || !existsSync(bash))("Docker deployment refuses missing persisted group roots before recreating directories", async () => {
+  const fixture = await tempFixture("deployment-group-root-");
+  const script = join(fixture.root, "preflight.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_DIR="$1"; cd "$PROJECT_DIR"
+. '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
+print_error(){ echo "$*" >&2; }
+verify_deployed_group_root
+mkdir -p data/state
+printf 'data/groups' > data/state/group-data-root
+if verify_deployed_group_root; then exit 1; fi
+test ! -e data/groups
+mkdir -p data/groups
+verify_deployed_group_root
+printf '%s' "$PROJECT_DIR/external groups" > data/state/group-data-root
+if verify_deployed_group_root; then exit 1; fi
+mkdir -p 'external groups'
+verify_deployed_group_root
+`);
+  try {
+    const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
+    expect(result.code, result.output).toBe(0);
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+test.skipIf(!bash || !existsSync(bash))("Docker deployment explicitly accepts verification health without trusting the normal HEALTHCHECK", async () => {
+  const fixture = await tempFixture("deployment-verification-health-");
+  const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+  const wait = source.split("# ---- 等待健康检查 ----")[1]?.split("# ---- Cloudflare 模式：")[0];
+  expect(wait).toBeDefined();
+  const script = join(fixture.root, "health.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+probes=0
+print_status(){ :; }; print_success(){ :; }; print_error(){ echo "$*" >&2; }
+ops_command_hint(){ echo "$*"; }; sleep(){ :; }
+docker(){
+    if [ "$1" = exec ]; then
+        [[ "$*" = *--allow-verification ]] || return 90
+        probes=$((probes+1)); echo PROBE
+        [ "$probes" -ge 3 ]
+    elif [ "$1" = inspect ]; then
+        if [[ "$*" = *State.Running* ]]; then [ "$FIXTURE_MODE" != stopped ] && echo true || echo false
+        else echo unhealthy; fi
+    fi
+}
+${wait}
+[ "$probes" = 3 ]
+`);
+  try {
+    for (const mode of ["verification", "stopped"]) {
+      const result = await execute([bash!, posixPath(script)], fixture.root,
+        { ...process.env, MSYS_NO_PATHCONV: "1", FIXTURE_MODE: mode });
+      expect(result.code, result.output).toBe(mode === "verification" ? 0 : 1);
+      expect(result.output.match(/PROBE/g)).toHaveLength(mode === "verification" ? 3 : 1);
+    }
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+test.skipIf(!bash || !existsSync(bash))("Docker migration passes the service identity, mounted group root and native cache environment", async () => {
+  const fixture = await tempFixture("deployment-migration-env-");
+  const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+  const migration = source.match(/^migration_docker\(\) \{[\s\S]*?^\}/m)?.[0];
+  expect(migration).toBeDefined();
+  const script = join(fixture.root, "environment.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_DIR="$1"
+CONTAINER_UID=1001; CONTAINER_GID=1002; GROUP_ROOT_ENV_VAL=/app/group-data
+GROUP_ROOT_ARGS=(-v "$PROJECT_DIR/external groups:/app/group-data")
+export PI_CACHE_RETENTION=long BOT_DEPLOY_BACKUP_ID=deploy-fixture
+docker(){
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = -e ]; then shift; case "$1" in
+            PI_CACHE_RETENTION|BOT_DEPLOY_BACKUP_ID) printf '%s=%s\\n' "$1" "\${!1}" ;;
+            *) printf '%s\\n' "$1" ;;
+        esac
+        else printf '%s\\n' "$1"; fi
+        shift
+    done
+}
+${migration}
+migration_docker preview --decisions-only
+`);
+  try {
+    const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("PI_CACHE_RETENTION=long");
+    expect(result.output).toContain("BOT_DEPLOY_BACKUP_ID=deploy-fixture");
+    expect(result.output).toContain("1001:1002");
+    expect(result.output).toContain("external groups:/app/group-data");
+    expect(result.output).toContain("GROUP_DATA_ROOT=/app/group-data");
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
 test.skipIf(!bash || !existsSync(bash))("Linux deployment transaction restores old container and configuration at every failure stage", async () => {
   const fixture = await tempFixture("deployment-linux-");
   const script = join(fixture.root, "rollback.sh");
@@ -381,3 +590,66 @@ exit 42
     }
   } finally { await fixture.cleanup(); }
 }, 60000);
+
+test.skipIf(!bash || !existsSync(bash))("Docker deployment resumes the original snapshot and restores data before starting the old container", async () => {
+  const fixture = await tempFixture("deployment-resume-linux-");
+  const script = join(fixture.root, "resume.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_DIR="$1"; phase="$2"; cd "$PROJECT_DIR"
+. '${posixPath(join(project, "scripts/lib/lifecycle.sh"))}'
+. '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
+LOG_DIR="$PROJECT_DIR/logs"; TUNNEL_PID_FILE="$PROJECT_DIR/data/state/cloudflared.pid"
+print_error(){ echo "$*" >&2; }; print_warning(){ echo "$*"; }
+flock(){ :; }; can_manage_ufw(){ return 1; }
+managed_cloudflared_pid(){ return 1; }; stop_tunnel_launcher(){ :; }
+docker(){
+    local cmd="$1"; shift
+    case "$cmd" in
+        ps) for file in mock/*; do [ -f "$file" ] && basename "$file"; done ;;
+        inspect)
+            local name="\${!#}" image running
+            [ -f "mock/$name" ] || return 1
+            read -r image running < "mock/$name"
+            if [ "\${2:-}" = '{{.State.Running}}' ]; then echo "$running"; else echo "$image"; fi ;;
+        stop|start)
+            local name="\${!#}" image running
+            read -r image running < "mock/$name"
+            if [ "$cmd" = start ]; then
+                test "$(cat data/config/models.json)" = original
+                test "$(cat restored-data)" = yes
+                running=true
+            else running=false; fi
+            printf '%s %s\\n' "$image" "$running" > "mock/$name" ;;
+        rename) mv -- "mock/$1" "mock/$2" ;;
+        tag) : ;;
+        *) return 1 ;;
+    esac
+}
+if [ "$phase" = initial ]; then
+    begin_deployment
+    printf '%s' "$DEPLOY_SNAPSHOT" > original-snapshot
+    printf changed > data/config/models.json
+    printf 'new-image true\\n' > mock/mixin-chatbot
+    # Simulate termination without running EXIT recovery.
+    trap - EXIT INT TERM
+    exit 0
+fi
+rollback_data_migration(){ printf yes > restored-data; }
+begin_deployment
+test "$DEPLOY_SNAPSHOT" = "$(cat original-snapshot)"
+test "$PREVIOUS_RUNNING" = 1
+test "$PREVIOUS_IMAGE" = old-image
+exit 42
+`);
+  try {
+    for (const dir of ["data/config", "data/state", "mock", "logs"]) await mkdir(join(fixture.root, dir), { recursive: true });
+    await writeFile(join(fixture.root, "data/config/models.json"), "original");
+    await writeFile(join(fixture.root, "mock/mixin-chatbot"), "old-image true\n");
+    const run = (phase: string) => execute([bash!, posixPath(script), posixPath(fixture.root), phase], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
+    const first = await run("initial"); expect(first.code, first.output).toBe(0);
+    const second = await run("resume"); expect(second.code, second.output).toBe(42);
+    expect(await readFile(join(fixture.root, "mock/mixin-chatbot"), "utf8")).toBe("old-image true\n");
+    expect(existsSync(join(fixture.root, "data/state/deploy-transaction"))).toBe(false);
+  } finally { await fixture.cleanup(); }
+}, 30000);

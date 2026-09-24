@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { collectAll, collectGroup } from "../../scripts/ops/stats-admin.ts";
+import { sweepSessionStats } from "../../src/agent/stats-ledger.ts";
 import { writeReport } from "../../scripts/ops/tui/report.ts";
 import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 
@@ -38,6 +39,8 @@ async function makeRoot(group: string): Promise<string> {
       }),
     ].join("\n") + "\n"
   );
+  // 报表读的是统计账本，写完会话文件还要入账一次。
+  await sweepSessionStats(root, { force: true });
   return root;
 }
 

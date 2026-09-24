@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: oven-sh/setup-bun@v2.2.0
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun run check
       - name: Dependency vulnerability audit
@@ -56,6 +56,12 @@ jobs:
           docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/backup:/app/backup" -v "$PWD/tests:/app/tests:ro" \
             mixin-chatbot-check bun run test tests/core/process.test.ts
+      - name: Test data migration and verification mode in the restricted image
+        run: |
+          docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/backup:/app/backup" -v "$PWD/tests:/app/tests:ro" \
+            -v "$PWD/scripts/ops/tui:/app/scripts/ops/tui:ro" \
+            mixin-chatbot-check bun run test tests/ops/migrations.test.ts
       - name: Test editable documents and Office previews in the restricted image
         run: |
           # Match production: LibreOffice's Unix socket uses /tmp, not TMPDIR.
