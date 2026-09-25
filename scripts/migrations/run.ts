@@ -35,7 +35,10 @@ async function main() {
     if (diagnostic.path) console.error("迁移日志：" + diagnostic.path);
   }
   const context: Context = { project: resolve(project), groups: groups ? resolve(project, groups) : serviceGroupRoot(project), decisions,
-    report: (stage, detail) => diagnostic?.event("info", stage, detail) };
+    report: (stage, detail) => {
+      diagnostic?.event("info", stage, detail);
+      if (stage === "skip-migration") console.error(detail);
+    } };
   if (command === "status") { console.log(JSON.stringify(inspectDataVersion(context.project, context.groups))); return; }
   if (command === "committed") { process.exitCode = await committedDeployment(context, deployment) ? 0 : 1; return; }
   if (command === "preview") {
@@ -46,7 +49,7 @@ async function main() {
         for (const decision of result.decisions) {
           console.log(decision.message);
           if (decision.key === "acceptNativeCache") {
-            if (!/^(y|yes)$/i.test((await rl.question("接受原生缓存？[y/N] ")).trim())) throw new Error("已取消，服务尚未停止");
+            if (!/^(y|yes)$/i.test((await rl.question("接受原生缓存？[y/N] ")).trim())) throw new Error("已取消，尚未写入迁移数据");
             decisions.acceptNativeCache = true;
           } else {
             decisions.provider = (await rl.question("provider: ")).trim();
@@ -56,7 +59,7 @@ async function main() {
       } finally { rl.close(); }
       result = await preview(context, validatePreview);
     }
-    console.log(JSON.stringify({ target: DATA_VERSION, pending: result.pending, steps: result.plan?.steps, files: result.plan?.files, decisions: result.decisions }, null, 2));
+    console.log(JSON.stringify({ target: DATA_VERSION, kind: result.plan?.kind, pending: result.pending, steps: result.plan?.steps, files: result.plan?.files, decisions: result.decisions }, null, 2));
     if (result.decisions.length) { process.exitCode = 2; return; }
     if (planPath) await publishJson(planPath, result.plan ?? { pending: true });
     return;

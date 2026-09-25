@@ -48,7 +48,7 @@ export const v1: Migration = {
   },
   async apply(context) {
     const result = await changes(context);
-    if (result.questions.length) throw new Error("迁移决策尚未完成；请在停机前重新预览");
+    if (result.questions.length) throw new Error("迁移决策尚未完成；请重新预览并确认选择");
     for (const file of result.files) if (file.changed) await publishJson(file.path, file.value);
   },
   async validate(context) {

@@ -15,7 +15,7 @@ const migrations = [v1];
 interface FileCopy { path: string; saved: string; hash: string | null }
 type Kind = "migration" | "verification" | "registration";
 interface Journal { format: 1; id: string; target: number; steps: number[]; deployment?: string; groups: string; backup: string | null; phase: "applying" | "validated" | "committed"; kind?: Kind; marker?: DataVersion; decisions: Decisions; files: FileCopy[] }
-export interface Plan { format: 1; target: number; groups: string; decisions: Decisions; inputs: Record<string, string | null>; steps: string[]; files: string[] }
+export interface Plan { format: 1; target: number; kind: Kind; groups: string; decisions: Decisions; inputs: Record<string, string | null>; steps: string[]; files: string[] }
 const statePath = (c: Context) => join(c.project, "data/state", MIGRATION_FILE);
 const configPaths = (project: string) => ["data/config/runtime.json", "data/config/models.json", "data/runtime/pi/settings.json", "data/runtime/models-store.json"].map(path => join(project, path));
 const markerPaths = (context: Context) => [join(context.project, "data/state", VERSION_FILE), join(context.groups, VERSION_FILE)];
@@ -98,7 +98,8 @@ export async function preview(context: Context, validatePreview = true): Promise
   const { descriptions, files } = await describeMigrations(context, steps, configPaths(context.project), validatePreview ? staging => validate(context, staging) : undefined);
   if (JSON.stringify(initialInputs) !== JSON.stringify(await inputs(context))) throw new Error("预览期间配置或版本标记变化，请重新预览");
   const decisions = descriptions.flatMap(result => result.decisions);
-  const plan: Plan = { format: 1, target: DATA_VERSION, groups: context.groups, decisions: context.decisions,
+  const kind: Kind = steps.length ? "migration" : pairedMarker(context) ? "verification" : "registration";
+  const plan: Plan = { format: 1, target: DATA_VERSION, kind, groups: context.groups, decisions: context.decisions,
     inputs: initialInputs, steps: descriptions.flatMap(result => result.steps), files };
   return { plan, decisions, pending: false };
 }
@@ -171,6 +172,7 @@ export async function apply(context: Context, plan?: Plan): Promise<void> {
     }
     context = { ...context, decisions: journal.decisions };
     context.report?.("apply", `transaction=${journal.id}; phase=${journal.phase}`);
+    if (journal.kind === "verification") context.report?.("skip-migration", `数据版本 ${DATA_VERSION} 一致且标记配对，跳过数据迁移与数据库备份，仅校验配置和新实例`);
     // Restart every idempotent step after interruption, including between the two marker writes.
     for (const to of journal.steps) {
       context.report?.("migration-step", `version=${to}`);

@@ -175,7 +175,7 @@ print_success "环境检查通过"
 command -v flock >/dev/null || { print_error "需要 util-linux flock"; exit 1; }
 acquire_deploy_lock || { print_error "另一个部署或升级正在进行"; exit 1; }
 verify_deployed_group_root
-print_warning "先预览迁移，再停止旧容器；提交前失败恢复数据、配置和原运行状态。"
+print_warning "转换数据前先预览；应用变更时保持停机，提交前失败恢复数据、配置和原运行状态。"
 mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 if [ -n "${BOT_PORT:-}" ]; then
     PORT_DEFAULT_SOURCE="BOT_PORT"
@@ -382,7 +382,7 @@ if [ -f "$MODELS_FILE" ] && [ -f "$RUNTIME_DIR/pi/settings.json" ]; then
     migration_docker preview --interactive --plan /app/data/state/migration-plan.json
     MIGRATION_PLANNED=1
 fi
-# All migration decisions have been made while the old service was still available.
+# Decisions precede persistent changes; ops update may already have stopped the old container.
 begin_deployment
 if [ "$MIGRATION_PLANNED" = 1 ]; then
     # The legacy parent understands only a committed receipt. Retain target code on

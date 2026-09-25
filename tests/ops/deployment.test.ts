@@ -196,13 +196,14 @@ New-Item -ItemType Directory -Force -Path (Join-Path $Project 'data/state'),(Joi
 function Get-BunPath { 'fixture-bun' }; function Get-GitPath { 'fixture-git' }
 function fixture-git {
     $global:LASTEXITCODE=0
+    if(($args -contains 'checkout' -or $args -contains 'merge') -and -not $script:stopped){throw 'live checkout changed before stop'}
     if($args -contains 'rev-parse'){ if($script:failure -eq 'code'){'3333333333333333333333333333333333333333'}else{$TargetSha} }
     if($args -contains 'reset') { if($script:applied -and -not $script:dataRestored){throw 'code restored before data'}; $script:codeRestored=$true }
 }
 function fixture-bun {
     $global:LASTEXITCODE=0
     if($args -contains 'preview') { if($script:stopped){throw 'preview after stop'}; if($script:failure -eq 'preview'){ $global:LASTEXITCODE=2 } }
-    elseif($args -contains 'install') { $script:installs++; if($script:failure -eq 'install'){$global:LASTEXITCODE=1} }
+    elseif($args -contains 'install') { if(-not $script:stopped){throw 'dependencies changed before stop'}; $script:installs++; if($script:failure -eq 'install'){$global:LASTEXITCODE=1} }
     elseif($args -contains 'apply') { $script:applied=$true; if($script:failure -eq 'apply'){$global:LASTEXITCODE=1} }
     elseif($args -contains 'committed') { $global:LASTEXITCODE=1 }
     elseif($args -contains 'commit') { if($script:failure -eq 'commit'){$global:LASTEXITCODE=1}else{$script:committed=$true} }
@@ -591,7 +592,7 @@ docker(){
             local name="\${!#}" image running
             [ -f "mock/containers/$name" ] || return 1
             read -r image running < "mock/containers/$name"
-            if [ "\${2:-}" = '{{.Image}}' ]; then printf '%s' "$image"; elif [ "\${2:-}" = '{{.State.Running}}' ]; then printf '%s' "$running"; fi ;;
+            if [ "\${2:-}" = '{{.Image}}' ]; then printf '%s' "$image"; elif [ "\${2:-}" = '{{.State.Running}}' ]; then printf '%s' "$running"; elif [ "\${2:-}" = '{{.Id}}' ]; then printf '%064d' 1; fi ;;
         stop|start)
             local name="\${!#}" image running
             read -r image running < "mock/containers/$name"
@@ -603,7 +604,15 @@ docker(){
         *) echo "unexpected Docker operation" >&2; return 1 ;;
     esac
 }
+if [ "$2" = pre-stopped ]; then
+    DEPLOY_PREVIOUS_RUNNING=0
+    if [ "$(docker inspect --format '{{.State.Running}}' mixin-chatbot)" = true ]; then DEPLOY_PREVIOUS_RUNNING=1; fi
+    DEPLOY_ORIGINAL_CONTAINER="$(docker inspect --format '{{.Id}}' mixin-chatbot)"
+    export DEPLOY_PREVIOUS_RUNNING DEPLOY_ORIGINAL_CONTAINER
+    docker stop mixin-chatbot
+fi
 begin_deployment
+if [ "$2" = pre-stopped ]; then test "$(cat "$DEPLOY_SNAPSHOT/was-running")" = "$DEPLOY_PREVIOUS_RUNNING"; fi
 printf 'new-config' > data/config/models.json
 [ "$2" != configuration ] || exit 42
 printf 'new-image' > mock/image
@@ -619,7 +628,7 @@ printf '2022' > data/state/bot-port
 exit 42
 `);
   try {
-    for (const running of [true, false]) for (const stage of ["configuration", "image", "container", "health", "tunnel", "firewall", "state"]) {
+    for (const running of [true, false]) for (const stage of ["configuration", "image", "container", "health", "tunnel", "firewall", "state", "pre-stopped"]) {
       const root = join(fixture.root, `${stage}-${running}`);
       await Promise.all(["data/config", "data/state", "mock/containers", "logs"].map(dir => mkdir(join(root, dir), { recursive: true })));
       await writeFile(join(root, "data/config/models.json"), "old-config");

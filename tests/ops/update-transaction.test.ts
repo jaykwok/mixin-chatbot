@@ -43,6 +43,8 @@ test.skipIf(process.platform !== "linux")("Linux update shares its real flock wi
       'trap \'printf "child-restored\\n" >> "$FIXTURE_MARKERS/order"; exit 143\' TERM INT',
       'printf "%s" "$PPID" > "$FIXTURE_MARKERS/update-pid"',
       'printf "child-started\\n" >> "$FIXTURE_MARKERS/order"',
+      'test "$(cat "$FIXTURE_MARKERS/running")" = false',
+      'test "$DEPLOY_PREVIOUS_RUNNING" = 1',
       'if [ "$FIXTURE_MODE" = fail ]; then exit 1; fi',
       'while [ ! -f "$FIXTURE_MARKERS/release" ]; do sleep 0.05; done',
       'printf "child-committed\\n" >> "$FIXTURE_MARKERS/order"',
@@ -56,7 +58,7 @@ test.skipIf(process.platform !== "linux")("Linux update shares its real flock wi
     const launcher = join(fixture.root, "launch.sh");
     await writeFile(launcher, [
       'source "$FIXTURE_WORK/scripts/ops/ops.sh" help >/dev/null',
-      'docker() { if [ "$1" = inspect ]; then echo true; else return 1; fi; }',
+      'docker() { case "$1" in info) : ;; ps) echo mixin-chatbot ;; inspect) if [ "$3" = "{{.Id}}" ]; then printf "%064d\\n" 1; else cat "$FIXTURE_MARKERS/running"; fi ;; stop) printf false > "$FIXTURE_MARKERS/running" ;; start) printf true > "$FIXTURE_MARKERS/running" ;; *) return 1 ;; esac; }',
       'doctor() { if flock -n "$FIXTURE_WORK/data/state/deploy.lock" true; then echo "update lock released before doctor"; return 22; fi; if [ "$FIXTURE_MODE" = doctor-fail ]; then return 17; fi; return 0; }',
       'update',
     ].join("\n") + "\n");
@@ -72,6 +74,7 @@ test.skipIf(process.platform !== "linux")("Linux update shares its real flock wi
     for (const mode of ["fail", "doctor-fail", "postcommit-fail", "signal", "signal-committed", "success"]) {
       await git("reset", "--hard", old);
       const markers = join(fixture.root, mode); await mkdir(markers);
+      await writeFile(join(markers, "running"), "true");
       if (["doctor-fail", "postcommit-fail", "signal-committed"].includes(mode)) await writeFile(join(markers, "release"), "go");
       const env = { ...process.env, FIXTURE_WORK: work, FIXTURE_MARKERS: markers, FIXTURE_MODE: mode };
       const child = Bun.spawn(["bash", launcher], { cwd: work, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });

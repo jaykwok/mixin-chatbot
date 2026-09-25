@@ -42,7 +42,7 @@ const ACTIONS: Action[] = [
   {
     key: "update",
     label: "升级",
-    summary: "同步 origin/main，重建并切换，失败自动回滚",
+    summary: "停机后同步 origin/main，按需迁移并验证新实例",
     status: "busy",
     interactive: true,
     confirm: (app, git, targetSha) => {
@@ -63,14 +63,15 @@ const ACTIONS: Action[] = [
       const steps =
         git.behind > 0
           ? [
+              "停止旧实例，确认退出后才切换代码和更新依赖",
               `快进到 origin/main ${targetSha ? fmt.shortSha(targetSha) : ""}（${git.behind} 个提交）`,
               app.deployment.runtime === "docker"
-                ? "通过部署向导重建镜像并切换容器"
-                : "重装依赖并重启计划任务",
-              "停机前预览迁移并选择缓存与模型策略；停机后备份、迁移和完整校验",
+                ? "保持停机，通过部署向导重建镜像"
+                : "保持停机，按需安装依赖",
+              "按需预览并迁移；同版本且标记配对时跳过数据迁移和数据库备份",
               "以只验证模式检查新实例，提交数据版本后恢复原运行状态",
             ]
-          : ["重新核对远端版本", "代码已最新时仍检查数据版本、迁移和中断续做", "备份、迁移、只验证检查，通过后提交并恢复原运行状态"];
+          : ["重新核对远端版本", "停止旧实例，检查数据版本并续做中断事务", "同版本且标记配对时跳过迁移和数据库备份；需要迁移时先预览再备份执行", "以只验证模式检查新实例，通过后提交并恢复原运行状态"];
       return {
         title: "升级",
         subject:

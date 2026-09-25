@@ -624,8 +624,25 @@ update() (
     original_sha="$(git_here rev-parse HEAD 2>/dev/null)"
     if [ -z "$original_sha" ]; then ER "无法读取当前提交"; return 1; fi
     local update_changed=0 update_committed=0 deploy_pid='' commit_file=''
+    local current_sha="$original_sha" target_sha='' was_running=0 original_container='-' handoff_container='-'
+    local stop_state="$STATE_DIR/update-transaction" saved=() pending_running='' pending_snapshot=''
+    if [ -e "$stop_state" ]; then
+        [ -f "$stop_state" ] && [ ! -L "$stop_state" ] || { ER '升级停机记录不是普通文件'; return 1; }
+        mapfile -t saved < "$stop_state"
+        [ "${#saved[@]}" = 6 ] && [ "${saved[0]}" = 1 ] &&
+          [[ "${saved[1]}" =~ ^[0-9a-f]{40}$ && "${saved[3]}" =~ ^[0-9a-f]{40}$ && "${saved[4]}" =~ ^(-|[0-9a-f]{64})$ && "${saved[5]}" =~ ^[01]$ ]] || { ER '升级停机记录无效'; return 1; }
+        [ "${saved[2]}" = HEAD ] || git_here check-ref-format --branch "${saved[2]}" >/dev/null || return 1
+        [ "$current_sha" = "${saved[1]}" ] || [ "$current_sha" = "${saved[3]}" ] || { ER '当前代码与中断升级不匹配'; return 1; }
+        original_sha="${saved[1]}"; original_branch="${saved[2]}"; target_sha="${saved[3]}"
+        original_container="${saved[4]}"; was_running="${saved[5]}"
+        commit_file="$STATE_DIR/update-commit"
+        [ -f "$commit_file" ] && [ ! -L "$commit_file" ] || { ER '升级提交回执缺失或无效，保留停机状态'; return 1; }
+        case "$(cat "$commit_file")" in ''|committed) ;; *) ER '升级提交回执损坏，保留停机状态'; return 1 ;; esac
+        [ "$current_sha" = "$original_sha" ] || update_changed=1
+        P "继续中断升级 ${target_sha:0:7}，沿用原运行状态"
+    fi
     finish_update() {
-        local status=$?
+        local status=$? recovered=1 pending=0
         trap - EXIT INT TERM
         if [ -n "$deploy_pid" ]; then
             kill -TERM "$deploy_pid" 2>/dev/null || true
@@ -633,12 +650,27 @@ update() (
         fi
         if [ -n "$commit_file" ]; then
             if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then update_committed=1; fi
-            rm -f -- "$commit_file" || WA "升级回执清理失败：$commit_file"
         fi
-        if [ "$update_changed" = 1 ] && [ "$update_committed" != 1 ]; then
+        # A child that has not completed rollback still owns its stopped containers/data.
+        if [ -e "$STATE_DIR/deploy-transaction" ]; then pending=1; fi
+        if [ "$update_changed" = 1 ] && [ "$update_committed" != 1 ] && [ "$pending" = 0 ]; then
             operation_stage rollback-code
             ER "升级未提交，正在恢复升级前的代码..."
-            restore_checkout "$original_branch" "$original_sha" || { ER "代码自动回滚失败，请检查当前 git 状态"; status=1; }
+            restore_checkout "$original_branch" "$original_sha" || { ER "代码自动回滚失败，请检查当前 git 状态"; status=1; recovered=0; }
+        fi
+        if [ -f "$stop_state" ] && [ "$pending" = 0 ] && [ "$recovered" = 1 ]; then
+            if [ "$update_committed" != 1 ] && [ "$original_container" != - ]; then
+                if [ "$(docker inspect --format '{{.Id}}' "$CONTAINER" 2>/dev/null)" != "$original_container" ]; then
+                    ER '原容器身份不匹配，保留停机记录，拒绝启动其他容器'; recovered=0; status=1
+                elif [ "$was_running" = 1 ]; then
+                    docker start "$original_container" >/dev/null || { recovered=0; status=1; ER '恢复原容器失败'; }
+                fi
+            fi
+            if [ "$recovered" = 1 ]; then
+                rm -f -- "$stop_state" "$commit_file" || WA '升级停机记录清理失败'
+            fi
+        elif [ "$pending" = 1 ]; then
+            WA '部署事务尚未完成，保留当前代码和停机记录，请重试升级继续'
         fi
         operation_finish "$status"
         exit "$status"
@@ -664,16 +696,9 @@ update() (
             WA "已取消升级"
             return 1
         fi
-        update_changed=1
-        if ! git_here checkout main; then
-            ER "切换到 main 失败"
-            return 1
-        fi
     fi
 
-    local current_sha target_sha
-    current_sha="$(git_here rev-parse HEAD)"
-    target_sha="$(git_here rev-parse origin/main 2>/dev/null)"
+    if [ -z "$target_sha" ]; then target_sha="$(git_here rev-parse origin/main 2>/dev/null)"; fi
     operation_event info "original=$original_sha target=$target_sha"
     if [ -s "$PROJECT_DIR/data/state/deploy-transaction" ]; then
         local pending_name pending_target
@@ -681,7 +706,11 @@ update() (
         [[ "$pending_name" =~ ^deploy-[a-zA-Z0-9]+$ ]] || { ER "中断事务名称无效"; return 1; }
         pending_target="$(cat "$PROJECT_DIR/backup/snapshots/$pending_name/target-sha")"
         [[ "$pending_target" =~ ^[0-9a-f]{40}$ ]] || { ER "中断事务目标无效"; return 1; }
+        if [ -f "$stop_state" ] && [ "$target_sha" != "$pending_target" ]; then ER '停机记录与部署事务目标不一致'; return 1; fi
         target_sha="$pending_target"
+        pending_snapshot="$PROJECT_DIR/backup/snapshots/$pending_name"
+        pending_running="$(cat "$pending_snapshot/was-running")"
+        [[ "$pending_running" =~ ^[01]$ ]] || { ER '中断部署的原运行状态无效'; return 1; }
         P "继续中断的目标提交 ${target_sha:0:7}"
     fi
     if [ -z "$target_sha" ]; then
@@ -694,7 +723,7 @@ update() (
     fi
 
     # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
-    if ! git_here merge-base --is-ancestor HEAD "$target_sha"; then
+    if ! git_here merge-base --is-ancestor main "$target_sha"; then
         ER "本地 main 与 origin/main 已分叉，无法快进升级"
         WA "本地独有的提交："
         git_here log --oneline origin/main..HEAD | sed 's/^/      /'
@@ -707,8 +736,40 @@ update() (
     git_here log --oneline HEAD..origin/main | sed 's/^/      /'
     echo ""
 
+    docker info >/dev/null 2>&1 || { ER '无法连接 Docker，尚未应用升级'; return 1; }
+    if has_container; then
+        handoff_container="$(docker inspect --format '{{.Id}}' "$CONTAINER")" || return 1
+        [[ "$handoff_container" =~ ^[0-9a-f]{64}$ ]] || { ER '无法识别原容器'; return 1; }
+    fi
+    if [ ! -f "$stop_state" ]; then
+        original_container="$handoff_container"
+        if [ "$original_container" != - ] && [ "$(docker inspect --format '{{.State.Running}}' "$original_container")" = true ]; then was_running=1; fi
+        if [ -n "$pending_snapshot" ]; then
+            was_running="$pending_running"
+            if [ ! -s "$pending_snapshot/previous-image" ]; then original_container='-'
+            else original_container="$(docker inspect --format '{{.Id}}' "$ROLLBACK_CONTAINER" 2>/dev/null || printf '%s' "$handoff_container")"; fi
+        fi
+        # Persist before stop: a hard interruption must not lose the original running state.
+        commit_file="$STATE_DIR/update-commit"
+        [ ! -L "$commit_file" ] || { ER '升级回执不能是链接'; return 1; }
+        : > "$commit_file" || return 1
+        local stop_temporary
+        stop_temporary="$(mktemp "$STATE_DIR/update-transaction-XXXXXXXX")" || return 1
+        printf '%s\n' 1 "$original_sha" "$original_branch" "$target_sha" "$original_container" "$was_running" > "$stop_temporary" &&
+          mv -- "$stop_temporary" "$stop_state" || return 1
+    elif [ "$handoff_container" != "$original_container" ] && [ ! -e "$STATE_DIR/deploy-transaction" ] && [ "$(cat "$commit_file")" != committed ]; then
+        ER '原容器已被替换，拒绝继续中断升级'; return 1
+    fi
+    operation_stage stop-service
+    P '先停止旧容器，再切换代码和构建镜像；升级期间服务保持停止'
+    if [ "$handoff_container" != - ]; then
+        operation_capture docker stop --time 30 "$handoff_container" || { ER '旧容器停止失败，未切换代码'; return 1; }
+        [ "$(docker inspect --format '{{.State.Running}}' "$handoff_container")" = false ] || { ER '旧容器尚未停止，未切换代码'; return 1; }
+    fi
+    OK '旧实例已停止，开始应用升级'
     update_changed=1
     operation_stage checkout
+    if ! operation_capture git_here checkout main; then ER '切换到 main 失败'; return 1; fi
     if ! operation_capture git_here merge --ff-only "$target_sha"; then
         ER "git merge --ff-only 失败"
         return 1
@@ -721,11 +782,8 @@ update() (
     # 隧道也由 deploy.sh 一并处理，不需要在这里单独重启 cloudflared。
     P "通过部署向导重建镜像并切换容器（各项提示直接回车即沿用当前配置）..."
     echo ""
-    local was_running
-    was_running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
     mkdir -p "$PROJECT_DIR/tmp" || return 1
-    commit_file="$(mktemp "$PROJECT_DIR/tmp/update-commit-XXXXXXXX")" || return 1
-    BOT_UPDATE_COMMIT_FILE="$commit_file" DEPLOY_PRESERVE_STOPPED=1 bash "$deploy_script" <&0 &
+    BOT_UPDATE_COMMIT_FILE="$commit_file" DEPLOY_PRESERVE_STOPPED=1 DEPLOY_PREVIOUS_RUNNING="$was_running" DEPLOY_ORIGINAL_CONTAINER="$handoff_container" bash "$deploy_script" <&0 &
     deploy_pid=$!
     if wait "$deploy_pid"; then
         deploy_pid=''
@@ -733,7 +791,7 @@ update() (
         echo ""
         OK "升级完成：${original_sha:0:7} -> ${target_sha:0:7}"
         echo ""
-        if [ "$was_running" = true ]; then doctor; return $?; fi
+        if [ "$was_running" = 1 ]; then doctor; return $?; fi
         OK "保留原停止状态，使用 start 可启动新版本"
         return 0
     fi

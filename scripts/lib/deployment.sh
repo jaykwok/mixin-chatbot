@@ -44,6 +44,7 @@ begin_deployment() {
             if [ "$PREVIOUS_RUNNING" = 1 ]; then docker start mixin-chatbot >/dev/null || return 1; fi
             if docker inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then docker rm "$ROLLBACK_CONTAINER" >/dev/null || return 1; fi
             rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
+            unset DEPLOY_PREVIOUS_RUNNING DEPLOY_ORIGINAL_CONTAINER
             begin_deployment
             return $?
         fi
@@ -94,6 +95,13 @@ begin_deployment() {
     PREVIOUS_STOP_ATTEMPTED=0
     PREVIOUS_IMAGE="$(docker inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null || true)"
     if [ "$(docker inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then PREVIOUS_RUNNING=1; fi
+    if [ -n "${DEPLOY_PREVIOUS_RUNNING:-}" ]; then
+        [[ "$DEPLOY_PREVIOUS_RUNNING" =~ ^[01]$ ]] || { print_error '升级原运行状态无效'; return 1; }
+        local actual_container
+        actual_container="$(docker inspect --format '{{.Id}}' mixin-chatbot 2>/dev/null || echo -)"
+        [ "$actual_container" = "${DEPLOY_ORIGINAL_CONTAINER:-}" ] || { print_error '升级停机后原容器被替换，拒绝部署'; return 1; }
+        PREVIOUS_RUNNING="$DEPLOY_PREVIOUS_RUNNING"
+    fi
     PREVIOUS_TUNNEL_RUNNING=0
     TUNNEL_COMMAND=()
     local tunnel_pid

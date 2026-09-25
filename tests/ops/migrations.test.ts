@@ -177,16 +177,30 @@ test("committed upgrades never restore old database backups after the group mark
   } finally { await f.cleanup(); }
 }, 30000);
 
-test("upgrades without migration steps keep paired markers and create no additional SQLite snapshots", async () => {
+test("matching data versions skip migration code and database copies while retaining validation", async () => {
   const f = await fixture(), c = f.context;
   try {
     await apply(c, (await preview(c)).plan!); await commit(c);
     const marker = await readFile(join(c.groups, "data-version.json"));
     const snapshots = await readdir(join(f.root, "backup/snapshots"));
-    await apply(c, (await preview(c)).plan!); await commit(c);
+    const plan = (await preview(c)).plan!;
+    expect(plan.kind).toBe("verification"); expect(plan.steps).toEqual([]);
+    const original = { preview: v1.preview, apply: v1.apply, validate: v1.validate };
+    const rejectMigration = async (): Promise<never> => { throw new Error("same version executed a migration"); };
+    v1.preview = rejectMigration; v1.apply = rejectMigration; v1.validate = rejectMigration;
+    try {
+      const reports: string[] = [], verified = { ...c, report: (stage: string) => reports.push(stage) };
+      await apply(verified, plan);
+      const journal = (await json(join(f.root, "data/state/migration.json")))!;
+      expect(journal).toMatchObject({ kind: "verification", steps: [], files: [], backup: null });
+      expect(reports).toContain("skip-migration"); expect(reports).toContain("validate");
+      await commit(verified);
+    } finally { Object.assign(v1, original); }
     expect(await readFile(join(c.groups, "data-version.json"))).toEqual(marker);
     expect(await readFile(join(f.root, "data/state/data-version.json"))).toEqual(marker);
     expect(await readdir(join(f.root, "backup/snapshots"))).toEqual(snapshots);
+    await publishJson(join(f.root, "data/config/runtime.json"), { BOT_MAX_ACTIVE_REQUESTS: "invalid" });
+    await expect(preview(c)).rejects.toThrow("完整校验失败");
   } finally { await f.cleanup(); }
 }, 30000);
 
@@ -204,6 +218,7 @@ test("a legacy receipt protects the project commit point and a restored group is
     expect(inspectDataVersion(c.project, c.groups).detail).toContain("不成对");
     const plan = (await preview(c)).plan!;
     expect(plan.steps).toEqual([]);
+    expect(plan.kind).toBe("registration");
     await apply(c, plan); await commit(c);
     expect(inspectDataVersion(c.project, c.groups).current).toBe(true);
     expect((await json(journalPath))?.phase).toBe("committed");

@@ -45,7 +45,9 @@ try {
     & $bun run $previewRunner committed --project $Project --groups $groups --deployment (Split-Path $snapshot.Path -Leaf)
     $committed = $LASTEXITCODE -eq 0
     Set-OperationStage 'stop-service'
+    Write-Host '停止旧实例；确认退出后才切换代码、安装依赖和检查数据。'
     if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '旧实例未停止' }
+    Write-Host '旧实例已停止，开始应用升级。'
     $mutated = $true
     Set-OperationStage 'checkout'
     if ((Invoke-OperationNative $git @('-C', $Project, 'checkout', 'main')) -ne 0) { throw '切换 main 失败' }
