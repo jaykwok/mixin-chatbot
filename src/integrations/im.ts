@@ -1,7 +1,7 @@
-import { setTimeout as delay } from "node:timers/promises";
-import { abortError, waitFor } from "../core/lifecycle.ts";
 // 发送层：量子密信群聊 webhook 消息、附件上传和出站限流。
 import { createHash } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import { abortError, waitFor } from "../core/lifecycle.ts";
 import { log } from "../core/log.ts";
 import { callbackDeliverySignal } from "./callback-route.ts";
 import { DELIVERY_TIMEOUT_MS } from "../core/config.ts";
@@ -25,7 +25,6 @@ import {
 const UPLOAD_PATH = "/im-external/v1/webhook/upload-attachment";
 
 const outboundAbortController = new AbortController();
-
 
 function throwIfDeliveryAborted(signal?: AbortSignal): void {
   const abortedSignal = signal?.aborted

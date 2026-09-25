@@ -5,7 +5,7 @@
     $text = $text -replace '(?i)(https?://)[^\s/@]+:[^\s/@]+@', '$1[redacted]@'
     $text = $text -replace '(?i)([?&](?:key|token|secret|password)=)[^\s&#"'']+', '$1[redacted]'
     $text = $text -replace '(?i)/webhook/[a-f\d]{64}\b', '/webhook/[redacted]'
-    return ($text -replace '\bsk-[\w-]{12,}\b', '[redacted]')
+    return ($text -replace '(?i)\b((?:sk|pk|ghp|xoxb|hf)[-_]|github_pat_)[A-Za-z0-9_-]{6,}', '$1[redacted]')
 }
 
 function Write-OperationEvent([string]$Level, [string]$Message) {

@@ -208,6 +208,14 @@ describe("重置时刻识别", () => {
 });
 
 describe("凭据脱敏", () => {
+  test.each(["sk-", "pk-", "ghp-", "ghp_", "github_pat_", "xoxb-", "hf-", "hf_"])("redacts standalone %s credentials in group failure replies", prefix => {
+    const token = prefix + "fixtureSecret123456";
+    expect(redactSecrets(`rejected (${token}), retry later`)).toBe(`rejected (${prefix}***), retry later`);
+    const reply = describeRequestFailure(new Error(`401: rejected ${token}`));
+    expect(reply).toContain("密钥无效");
+    expect(reply).not.toContain("fixtureSecret123456");
+  });
+
   test("抹掉 key、Bearer 与 URL 参数", () => {
     expect(redactSecrets("key sk-live-abcdef123456")).toBe("key sk-***");
     expect(redactSecrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9")).toContain("Bearer ***");

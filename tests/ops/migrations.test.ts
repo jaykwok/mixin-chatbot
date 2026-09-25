@@ -59,6 +59,27 @@ test.each(["committed", "validated"])("a %s receipt permits a new group root wit
   } finally { await f.cleanup(); }
 }, 60000);
 
+test("a committed migration can initialize a completely empty replacement group root", async () => {
+  const f = await fixture(), c = f.context;
+  try {
+    await apply(c, (await preview(c)).plan!); await commit(c);
+    const next = { ...c, groups: join(f.root, "empty-groups") };
+    await mkdir(next.groups);
+    await rename(c.groups, c.groups + "-offline");
+    expect(inspectDataVersion(next.project, next.groups).current).toBe(false);
+    const result = await preview(next);
+    expect(result.decisions).toEqual([]);
+    expect(result.plan?.kind).toBe("migration");
+    expect(result.plan?.steps).toHaveLength(3);
+    expect(await readdir(next.groups)).toEqual([]);
+    await apply(next, result.plan!); await commit(next);
+    expect(inspectDataVersion(next.project, next.groups).current).toBe(true);
+    expect(await readdir(next.groups)).toEqual(["data-version.json"]);
+    expect(await json(join(next.groups, "data-version.json"))).toEqual(await json(join(f.root, "data/state/data-version.json")));
+    expect((await preview(next)).plan?.kind).toBe("verification");
+  } finally { await f.cleanup(); }
+}, 60000);
+
 test("migration decisions and diagnostics work with the original updater export manifest", async () => {
   const f = await fixture("none");
   try {

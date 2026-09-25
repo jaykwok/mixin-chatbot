@@ -18,7 +18,7 @@ operation_event() {
       -e 's#(https?://)[^ /@:]+:[^ /@]+@#\1[redacted]@#gI' \
       -e 's/([?&](key|token|secret|password)=)[^[:space:]&#"]+/\1[redacted]/gI' \
       -e 's#/webhook/[a-f0-9]{64}#/webhook/[redacted]#gI' \
-      -e 's/sk-[a-zA-Z0-9_-]{12,}/[redacted]/g')"
+      -e 's/\b((sk|pk|ghp|xoxb|hf)[_-]|github_pat_)[a-zA-Z0-9_-]{6,}/\1[redacted]/gI')"
     text="${text//$'\r'/\\r}"; text="${text//$'\n'/\\n}"
     printf '%s [%s] %s %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BASHPID" "$level" "${BOT_OPERATION_STAGE:-operation}" "$text" >> "$BOT_OPERATION_LOG_PATH" || echo '运维日志写入失败' >&2
     return 0

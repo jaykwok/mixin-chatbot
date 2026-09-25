@@ -17,6 +17,27 @@ async function run(args: string[], cwd: string, env: Record<string, string> = {}
 }
 
 for (const writer of ["typescript", ...(process.platform === "win32" ? ["powershell"] : []), ...(bash && existsSync(bash) ? ["bash"] : [])]) {
+  test(`${writer} diagnostics redact bare provider tokens without labels`, async () => {
+    const f = await tempFixture("log-token-prefixes-");
+    const message = ["sk-", "pk-", "ghp-", "ghp_", "github_pat_", "xoxb-", "hf-", "hf_"].map(prefix => prefix + "fixtureSecret123456").join(" ");
+    try {
+      if (writer === "typescript") openOperationLog(f.root, "startup", "").event("error", "fixture", message);
+      else {
+        const script = join(f.root, writer === "bash" ? "tokens.sh" : "tokens.ps1");
+        await writeFile(script, writer === "bash"
+          ? `PROJECT_DIR="$1"\nunset BOT_OPERATION_LOG\n. '${posix(join(project, "scripts/lib/operation-log.sh"))}'\noperation_start startup\noperation_event error '${message}'\n`
+          : `\ufeff$ErrorActionPreference='Stop'\n$env:BOT_OPERATION_LOG=''\n. ${quotePS(join(project, "scripts/lib/operation-log.ps1"))}\nStart-OperationLog $PSScriptRoot 'startup' | Out-Null\nWrite-OperationEvent 'error' '${message}'\n`);
+        const result = await run(writer === "bash" ? [bash!, posix(script), posix(f.root)] : ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+        expect(result.code, result.text).toBe(0);
+      }
+      const directory = join(f.root, "logs/operations"), files = await readdir(directory);
+      expect(files).toHaveLength(1);
+      const text = await readFile(join(directory, files[0]!), "utf8");
+      expect(text).toContain("ghp_"); expect(text).toContain("github_pat_"); expect(text).toContain("hf_");
+      expect(text).not.toContain("fixtureSecret123456");
+    } finally { await f.cleanup(); }
+  }, 15000);
+
   test(`${writer} startup rotation preserves upgrade, deploy and migration evidence`, async () => {
     const f = await tempFixture("log-families-");
     try {
