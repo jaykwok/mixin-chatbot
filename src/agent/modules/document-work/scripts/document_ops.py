@@ -345,7 +345,7 @@ def render(request):
     from PIL import Image, ImageDraw
     source = Path(request["source"])
     folder = Path(request["directory"])
-    pdf = source if source.suffix.lower() == ".pdf" else convert_office(source, folder)
+    pdf = source if source.suffix.lower() == ".pdf" else convert_office(source, Path(request.get("workdir", folder)))
     images, contacts = [], []
     with closing(pdfium.PdfDocument(str(pdf))) as document:
         total = len(document)
@@ -378,7 +378,7 @@ def render(request):
             contact.save(path, quality=88)
             contact.close()
             contacts.append(str(path))
-    return {"pdf": str(pdf), "pages": total, "images": images, "contacts": contacts,
+    return {"pages": total, "images": images, "contacts": contacts,
             "unrenderedPages": [i for i in range(1, total + 1) if i not in selected], "visuallyReviewed": False}
 
 
@@ -541,7 +541,7 @@ def images(request):
     crop_results = []
     if crops:
         import pypdfium2 as pdfium
-        pdf = source if kind == ".pdf" else convert_office(source, Path(request["directory"]))
+        pdf = source if kind == ".pdf" else convert_office(source, Path(request.get("workdir", request["directory"])))
         with closing(pdfium.PdfDocument(str(pdf))) as document:
             for index, crop in enumerate(crops, 1):
                 number, box = crop.get("page"), crop.get("box")

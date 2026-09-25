@@ -34,7 +34,9 @@ const rejectionLog = new RejectionLogger();
 options.signal.addEventListener("abort", () => rejectionLog.flush(), { once: true });
 
 
-/** 限量读取 JSON，避免在进入字段校验前接收无限大的请求体。 */
+/** Hono 4.13 body-limit trusts Content-Length and reads chunked bodies without
+ * cancellation. Keep the actual byte cap, read deadline and fatal UTF-8 decoding
+ * together here; swapping just the size check would weaken this boundary. */
 async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
   const contentLength = c.req.header("content-length");
   if (contentLength) {

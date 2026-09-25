@@ -310,9 +310,6 @@ export async function ensureMaterialsIndex(
       retryAt.delete(key);
       return summary;
     })())
-    .then((summary) => {
-      return summary;
-    })
     .catch((e) => {
       // 索引是加速手段，不是必需品：失败时退回让模型自己 find，不能阻断会话创建。
       log.error(`资料索引生成失败，本次会话退回目录遍历 - ${String(e)}`);

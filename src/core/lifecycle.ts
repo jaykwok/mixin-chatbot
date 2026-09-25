@@ -7,9 +7,12 @@ export function waitFor<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(signal.reason);
   return new Promise<T>((resolve, reject) => {
-    const cancel = () => reject(signal.reason);
+    const cancel = () => { signal.removeEventListener("abort", cancel); reject(signal.reason); };
     signal.addEventListener("abort", cancel, { once: true });
-    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", cancel));
+    void promise.then(
+      value => { signal.removeEventListener("abort", cancel); resolve(value); },
+      error => { signal.removeEventListener("abort", cancel); reject(error); },
+    );
   });
 }
 

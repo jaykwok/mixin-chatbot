@@ -378,26 +378,30 @@ class WordBuilder:
         import tempfile
         from docx.shared import Emu
         flowchart = flowchart_module()
+        path = None
         try:
-            graph = flowchart.parse(text)
-            lay = flowchart.layout(graph, graph.direction or "TB", 12)
-            font = flowchart.find_cjk_font()
-            handle, path = tempfile.mkstemp(prefix="flow-", suffix=".png", dir=str(self.output_dir))
-            os.close(handle)
-            flowchart.render_png(lay, path, 1600, font)
-        except (ValueError, LookupError) as error:
-            self.warnings.append(f"流程图未生成，已保留源码：{error}")
-            self.code(text)
-            return
-        self.warnings.extend(f"流程图：{w}" for w in lay["warnings"])
-        section = self.document.sections[-1]
-        content_height = section.page_height - section.top_margin - section.bottom_margin
-        bbox_w, bbox_h = lay["bbox"][2], lay["bbox"][3]
-        width = min(int(bbox_w * EMU_PER_PT * 1.1), self.content_width, int(content_height * 0.75 * bbox_w / max(bbox_h, 1)))
-        paragraph = self.document.add_paragraph()
-        paragraph.alignment = 1
-        paragraph.add_run().add_picture(path, width=Emu(width))
-        Path(path).unlink(missing_ok=True)
+            try:
+                graph = flowchart.parse(text)
+                lay = flowchart.layout(graph, graph.direction or "TB", 12)
+                font = flowchart.find_cjk_font()
+                handle, path = tempfile.mkstemp(prefix="flow-", suffix=".png", dir=str(self.output_dir))
+                os.close(handle)
+                flowchart.render_png(lay, path, 1600, font)
+            except (ValueError, LookupError) as error:
+                self.warnings.append(f"流程图未生成，已保留源码：{error}")
+                self.code(text)
+                return
+            self.warnings.extend(f"流程图：{w}" for w in lay["warnings"])
+            section = self.document.sections[-1]
+            content_height = section.page_height - section.top_margin - section.bottom_margin
+            bbox_w, bbox_h = lay["bbox"][2], lay["bbox"][3]
+            width = min(int(bbox_w * EMU_PER_PT * 1.1), self.content_width, int(content_height * 0.75 * bbox_w / max(bbox_h, 1)))
+            paragraph = self.document.add_paragraph()
+            paragraph.alignment = 1
+            paragraph.add_run().add_picture(path, width=Emu(width))
+        finally:
+            if path:
+                Path(path).unlink(missing_ok=True)
 
     def code(self, text):
         from docx.oxml import OxmlElement

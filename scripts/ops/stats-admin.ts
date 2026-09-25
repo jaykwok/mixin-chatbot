@@ -1,4 +1,5 @@
 import { byName, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
+import { cliArgs, groupOptions, groupSelection } from "../lib/cli.ts";
 import { emptyUsageBreakdown, formatCacheRate, mergeUsage, type UsageBreakdown, type UsageTotals } from "../lib/usage.ts";
 // 统计只读使用统计账本（<群数据根>/stats.sqlite），不再现算 session.jsonl：
 // 会话历史会被 /clear 与 history clear 归档，归档前机器人已把那段入账，数字照样在。
@@ -332,40 +333,11 @@ async function overview(root: string, window: Window): Promise<number> {
 
 async function main(args: string[]): Promise<number> {
   const window: Window = {};
-  let selection: GroupSelection = "auto";
-  const positional: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
-    if (arg === "--help" || arg === "-h") {
-      usage();
-      return 0;
-    }
-    if (arg === "--since" || arg === "--until") {
-      const value = args[++i];
-      if (!value) {
-        console.error(`${arg} 需要一个日期，格式 YYYY-MM-DD`);
-        return 1;
-      }
-      try {
-        if (arg === "--since") window.since = parseDate(value, false);
-        else window.until = parseDate(value, true);
-      } catch (error) {
-        console.error(String(error instanceof Error ? error.message : error));
-        return 1;
-      }
-      continue;
-    }
-    if (arg === "--storage-segment" || arg === "--group-id") {
-      if (selection !== "auto") throw new Error("群目录选择参数不能重复");
-      selection = arg === "--storage-segment" ? "segment" : "id";
-      continue;
-    }
-    if (arg.startsWith("-")) {
-      console.error(`无法识别的参数：${arg}`);
-      return 1;
-    }
-    positional.push(arg);
-  }
+  const { values, positionals: positional } = cliArgs(args, { ...groupOptions, help: { type: "boolean", short: "h" }, since: { type: "string" }, until: { type: "string" } });
+  if (values.help) { usage(); return 0; }
+  if (values.since) window.since = parseDate(values.since, false);
+  if (values.until) window.until = parseDate(values.until, true);
+  const selection = groupSelection(values, positional[0]);
 
   if (positional.length > 1) {
     console.error("一次只能统计一个群。");
@@ -402,5 +374,5 @@ async function main(args: string[]): Promise<number> {
 
 // 直接运行时才执行；测试要 import 这些函数，不能顺带把整个 CLI 跑起来。
 if (import.meta.main) {
-  process.exit(await main(process.argv.slice(2)));
+  process.exit(await main(process.argv.slice(2)).catch(error => { console.error((error as Error).message); return 1; }));
 }

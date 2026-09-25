@@ -2,19 +2,10 @@
 import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { redactSecrets as redact } from "./redact.ts";
 
 const namePattern = /^(upgrade|deploy|migration|startup)-[\dTZ]+-[\w-]+\.log$/;
 const maxBytes = 2 * 1024 * 1024;
-
-function redact(value: string): string {
-  return value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/(Bearer\s+)[^\s"',;]+/gi, "$1[redacted]")
-    .replace(/((?:api[_-]?key|token|secret|password|authorization)["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi, "$1[redacted]")
-    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[redacted]@")
-    .replace(/([?&](?:key|token|secret|password)=)[^\s&#"']+/gi, "$1[redacted]")
-    .replace(/\/webhook\/[a-f\d]{64}\b/gi, "/webhook/[redacted]")
-    .replace(/\bsk-[\w-]{12,}\b/g, "[redacted]");
-}
 
 export function operationError(error: unknown): string {
   const seen = new Set<unknown>();
@@ -37,8 +28,10 @@ export function openOperationLog(project: string, kind: "upgrade" | "deploy" | "
     path = join(directory, name);
     if (existsSync(path) && (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink())) throw new Error("diagnostic file is not a regular file");
     if (!existsSync(path)) closeSync(openSync(path, "wx", 0o600));
-    // Keep this operation and the 19 most recently written operation logs.
-    const old = readdirSync(directory).filter(file => file !== name && namePattern.test(file))
+    // Rotate only this file's family, including inherited upgrade logs. Startup
+    // restart loops must never evict the upgrade or migration that caused them.
+    const family = name.split("-")[0] + "-";
+    const old = readdirSync(directory).filter(file => file !== name && file.startsWith(family) && namePattern.test(file))
       .map(file => ({ file, stat: lstatSync(join(directory, file)) }))
       .filter(item => item.stat.isFile() && !item.stat.isSymbolicLink())
       .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);

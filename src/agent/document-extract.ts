@@ -11,7 +11,7 @@ import { application, waitFor } from "../core/lifecycle.ts";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
 import { runProcess } from "../core/process.ts";
 import { log } from "../core/log.ts";
-import { hashFile } from "../integrations/relay-index.ts";
+import { hashFile } from "../core/file-hash.ts";
 import { ensureDocumentToolchain, venvPythonPath } from "./python-toolchain.ts";
 import { isPathInside } from "./paths.ts";
 import { resolveToolPath } from "./tool-path.ts";

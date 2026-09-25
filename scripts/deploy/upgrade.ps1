@@ -30,6 +30,11 @@ Set-OperationStage 'migration-preview'
 Write-OperationEvent 'info' ("original=$OriginalSha target=$TargetSha")
 & $bun run $previewRunner preview --decisions-only --interactive --project $Project --groups $groups --plan $plan
 if ($LASTEXITCODE -ne 0) { throw '迁移预览未完成；旧服务尚未停止' }
+Set-OperationStage 'upgrade-preflight'
+if ((Invoke-OperationNative $git @('-C', $Project, 'show-ref', '--verify', '--quiet', 'refs/heads/main')) -ne 0) { throw '本地 main 分支不存在；旧服务尚未停止' }
+if ((Invoke-OperationNative $git @('-C', $Project, 'merge-base', '--is-ancestor', 'main', $TargetSha)) -ne 0) { throw '本地 main 无法快进到目标提交；旧服务尚未停止' }
+if (-not (Test-Path -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction')) -and
+    -not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) { throw '未安装计划任务，请先部署；旧服务尚未停止' }
 Set-OperationStage 'deployment-snapshot'
 $snapshot = Open-UpgradeSnapshot $Project $TaskName $OriginalSha $OriginalBranch $TargetSha
 Write-OperationEvent 'info' ('snapshot=' + $snapshot.Path)
@@ -40,6 +45,7 @@ $committed = $false
 $mutated = $false
 $migrationAttempted = Test-Path -LiteralPath (Join-Path $Project 'data\state\migration.json')
 try {
+    if (-not $snapshot.TaskXml) { throw '升级快照没有计划任务，请先部署；旧服务尚未停止' }
     # Use the exported built-in-only command before dependency installation: if a
     # previous process committed and died, installation failure must never roll back data.
     & $bun run $previewRunner committed --project $Project --groups $groups --deployment (Split-Path $snapshot.Path -Leaf)
@@ -65,7 +71,6 @@ try {
     Invoke-Migration 'apply'
     Set-OperationStage 'verification-service'
     Set-Content -LiteralPath (Join-Path $Project 'data\state\verify-only') -Value 'verify' -Encoding ASCII
-    if (-not $snapshot.TaskXml) { throw '未安装计划任务，请先部署' }
     Enable-ScheduledTask -TaskName $TaskName | Out-Null
     Start-ScheduledTask -TaskName $TaskName
     $ready = $false

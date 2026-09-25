@@ -213,11 +213,71 @@ $UvPath = @(Get-ApplicationPaths 'uv.exe' | Where-Object { Test-VersionedApplica
 if ($UvPath.Count -ne 1) { throw '缺少原生 uv.exe，请先安装 uv 并加入 PATH。' }
 $UvDir = Split-Path $UvPath[0] -Parent
 $env:PATH = $UvDir + ';' + $BashDir + ';' + $env:PATH
+# ---- 4b. Pi 群数据总根（<group>/workspace + <group>/users/<phone>/{tmp,session.jsonl}）----
+Step "配置 Pi 群数据总根"
+$savedGroupRoot = if (Test-Path -LiteralPath $GroupRootFile -PathType Leaf) {
+    (Get-Content -LiteralPath $GroupRootFile -Raw).Trim()
+} else {
+    ""
+}
+$groupRootDefault = if (-not [string]::IsNullOrWhiteSpace($env:GROUP_DATA_ROOT)) {
+    $env:GROUP_DATA_ROOT.Trim()
+} elseif (-not [string]::IsNullOrWhiteSpace($savedGroupRoot)) {
+    $savedGroupRoot
+} else {
+    "data\groups"
+}
+Write-Host "  默认 data\groups；GROUP_DATA_ROOT 可覆盖到其他磁盘。"
+Write-Host "  部署成功后会记入 data\state\group-data-root，下次自动沿用。"
+Write-Host "  如需调整，可输入相对仓库路径或绝对路径。"
+Write-Host "  每个群使用 <root>\<group>\workspace；每个调用用户使用 <group>\users\<phone>\tmp 和 session.jsonl。"
+while ($true) {
+    $wdIn = Read-Host "群数据总根 [默认：$groupRootDefault]"
+    $groupRootCandidate = if ($wdIn) { $wdIn.Trim() } else { $groupRootDefault }
+    try {
+        $GroupDataRoot = if ([System.IO.Path]::IsPathRooted($groupRootCandidate)) {
+            [System.IO.Path]::GetFullPath($groupRootCandidate)
+        } else {
+            [System.IO.Path]::GetFullPath((Join-Path $Project $groupRootCandidate))
+        }
+    } catch {
+        Warn "群数据总根路径无效：$groupRootCandidate"
+        continue
+    }
+    $volumeRoot = [System.IO.Path]::GetPathRoot($GroupDataRoot).TrimEnd('\')
+    if ($GroupDataRoot.TrimEnd('\') -eq $volumeRoot -or $GroupDataRoot.TrimEnd('\') -eq $Project.TrimEnd('\')) {
+        Warn "群数据总根不能是文件系统根目录或项目根目录：$GroupDataRoot"
+        continue
+    }
+    $projectChildPrefix = $Project.TrimEnd('\') + '\'
+    if ($GroupDataRoot.StartsWith($projectChildPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $GroupDataRoot.TrimEnd('\') -ne $DefaultGroupDataRoot.TrimEnd('\')) {
+        Warn "项目内群数据目录固定为 data\groups；如需自定义，请选择项目外的路径：$GroupDataRoot"
+        continue
+    }
+    if (Test-Path -LiteralPath $GroupDataRoot) {
+        if (-not (Test-Path -LiteralPath $GroupDataRoot -PathType Container)) {
+            Warn "群数据总根不是目录：$GroupDataRoot"
+            continue
+        }
+    } else {
+        try {
+            New-Item -ItemType Directory -Force -Path $GroupDataRoot | Out-Null
+        } catch {
+            Warn "无法创建群数据总根：$GroupDataRoot（$($_.Exception.Message)）"
+            continue
+        }
+    }
+    $GroupDataRoot = (Resolve-Path -LiteralPath $GroupDataRoot).Path
+    break
+}
+Done "群数据总根：$GroupDataRoot"
+
 $migrationPlan = Join-Path $Project ('tmp\migration-plan-' + [Guid]::NewGuid().ToString('N') + '.json')
 $migrationRunner = Join-Path $Project 'scripts\migrations\run.ts'
 $migrationPlanned = $false
 $migrationAttempted = $false
-$migrationGroups = if (Test-Path -LiteralPath $GroupRootFile) { (Get-Content -LiteralPath $GroupRootFile -Raw).Trim() } else { $DefaultGroupDataRoot }
+$migrationGroups = $GroupDataRoot
 if ((Test-Path -LiteralPath $ModelsFile) -and (Test-Path -LiteralPath (Join-Path $RuntimeDir 'pi\settings.json'))) {
     & $bunPath run $migrationRunner preview --decisions-only --interactive --project $Project --groups $migrationGroups --plan $migrationPlan
     if ($LASTEXITCODE -ne 0) { throw '迁移预览未完成；旧服务尚未停止' }
@@ -320,70 +380,6 @@ if ($rawPublicDomain -and -not $publicDomain) {
 } elseif ($publicDomain -and ($domainSource -eq "BOT_DOMAIN" -or $publicDomain -cne $rawPublicDomain)) {
     $persistDomain = $true
 }
-
-# ---- 4b. Pi 群数据总根（<group>/workspace + <group>/users/<phone>/{tmp,session.jsonl}）----
-Step "配置 Pi 群数据总根"
-$savedGroupRoot = if (Test-Path -LiteralPath $GroupRootFile -PathType Leaf) {
-    (Get-Content -LiteralPath $GroupRootFile -Raw).Trim()
-} else {
-    ""
-}
-$groupRootDefault = if (-not [string]::IsNullOrWhiteSpace($env:GROUP_DATA_ROOT)) {
-    $env:GROUP_DATA_ROOT.Trim()
-} elseif (-not [string]::IsNullOrWhiteSpace($savedGroupRoot)) {
-    $savedGroupRoot
-} else {
-    "data\groups"
-}
-Write-Host "  默认 data\groups；GROUP_DATA_ROOT 可覆盖到其他磁盘。"
-Write-Host "  部署成功后会记入 data\state\group-data-root，下次自动沿用。"
-Write-Host "  如需调整，可输入相对仓库路径或绝对路径。"
-Write-Host "  每个群使用 <root>\<group>\workspace；每个调用用户使用 <group>\users\<phone>\tmp 和 session.jsonl。"
-while ($true) {
-    $wdIn = Read-Host "群数据总根 [默认：$groupRootDefault]"
-    $groupRootCandidate = if ($wdIn) { $wdIn.Trim() } else { $groupRootDefault }
-    try {
-        $GroupDataRoot = if ([System.IO.Path]::IsPathRooted($groupRootCandidate)) {
-            [System.IO.Path]::GetFullPath($groupRootCandidate)
-        } else {
-            [System.IO.Path]::GetFullPath((Join-Path $Project $groupRootCandidate))
-        }
-    } catch {
-        Warn "群数据总根路径无效：$groupRootCandidate"
-        continue
-    }
-    $volumeRoot = [System.IO.Path]::GetPathRoot($GroupDataRoot).TrimEnd('\')
-    if ($GroupDataRoot.TrimEnd('\') -eq $volumeRoot -or $GroupDataRoot.TrimEnd('\') -eq $Project.TrimEnd('\')) {
-        Warn "群数据总根不能是文件系统根目录或项目根目录：$GroupDataRoot"
-        continue
-    }
-    $projectChildPrefix = $Project.TrimEnd('\') + '\'
-    if ($GroupDataRoot.StartsWith($projectChildPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
-        $GroupDataRoot.TrimEnd('\') -ne $DefaultGroupDataRoot.TrimEnd('\')) {
-        Warn "项目内群数据目录固定为 data\groups；如需自定义，请选择项目外的路径：$GroupDataRoot"
-        continue
-    }
-    if (Test-Path -LiteralPath $GroupDataRoot) {
-        if (-not (Test-Path -LiteralPath $GroupDataRoot -PathType Container)) {
-            Warn "群数据总根不是目录：$GroupDataRoot"
-            continue
-        }
-    } else {
-        try {
-            New-Item -ItemType Directory -Force -Path $GroupDataRoot | Out-Null
-        } catch {
-            Warn "无法创建群数据总根：$GroupDataRoot（$($_.Exception.Message)）"
-            continue
-        }
-    }
-    $GroupDataRoot = (Resolve-Path -LiteralPath $GroupDataRoot).Path
-    if ($migrationPlanned -and $GroupDataRoot -ne [IO.Path]::GetFullPath($migrationGroups)) {
-        Warn '本次迁移必须沿用原群根；更换挂载请在升级完成后单独操作。'
-        continue
-    }
-    break
-}
-Done "群数据总根：$GroupDataRoot"
 
 # ---- 4c. 监听端口（显式环境变量 > 已保存值 > 1011）----
 $portDefaultSource = ""

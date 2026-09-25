@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { copyFile, cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
@@ -34,6 +34,30 @@ async function execute(args: string[], cwd: string, env: Record<string, string> 
   const [code, output, errors] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr as ReadableStream).text()]);
   return { code, text: output + errors };
 }
+
+test.each(["committed", "validated"])("a %s receipt permits a new group root without restoring the old root", async phase => {
+  const f = await fixture(), c = f.context;
+  try {
+    await apply(c, (await preview(c)).plan!);
+    const next = { ...c, groups: join(f.root, "replacement-groups") };
+    await mkdir(next.groups);
+    await expect(preview(next)).rejects.toThrow("群挂载");
+    await commit(c);
+    const receipt = (await json(join(f.root, "data/state/migration.json")))!;
+    await publishJson(join(f.root, "data/state/migration.json"), { ...receipt, phase });
+    await rename(c.groups, c.groups + "-offline");
+    await publishJson(join(next.groups, "data-version.json"), { dataVersion: 1, transaction: "restored-root" });
+    const ledger = openStatsLedger(next.groups); ledger.close();
+    const before = await readFile(join(next.groups, "stats.sqlite"));
+    expect(await rollback(next)).toBe(false);
+    const plan = (await preview(next)).plan!;
+    expect(plan.kind).toBe("registration");
+    await apply(next, plan); await commit(next);
+    expect(inspectDataVersion(next.project, next.groups).current).toBe(true);
+    expect(await readFile(join(next.groups, "stats.sqlite"))).toEqual(before);
+    expect((await json(join(next.project, "data/state/migration.json")))?.groups).toBe(next.groups);
+  } finally { await f.cleanup(); }
+}, 60000);
 
 test("migration decisions and diagnostics work with the original updater export manifest", async () => {
   const f = await fixture("none");
@@ -262,7 +286,7 @@ test("normal startup ignores a leftover verification flag after the project comm
   const f = await fixture(), c = f.context;
   try {
     await apply(c, (await preview(c)).plan!); await commit(c);
-    for (const path of ["src/core/data-version.ts", "scripts/lib/operation-log.ts", "src/server/index.ts"]) {
+    for (const path of ["src/core/data-version.ts", "scripts/lib/operation-log.ts", "scripts/lib/redact.ts", "src/server/index.ts"]) {
       await mkdir(dirname(join(f.root, path)), { recursive: true }); await copyFile(join(project, path), join(f.root, path));
     }
     await writeFile(join(f.root, "src/server/app.ts"), 'console.log("NORMAL_ENTRY")');
@@ -318,7 +342,7 @@ test("current validator prevents registration of invalid runtime and delivery sc
     await publishJson(join(f.root, "data/config/runtime.json"), {});
     const db = new Database(join(f.root, "data/state/agent.sqlite"));
     db.exec("CREATE TABLE deliveries (id TEXT)"); db.close();
-    await expect(preview(c)).rejects.toThrow("待补发账本格式需要迁移");
+    await expect(preview(c)).rejects.toThrow("待补发账本格式不受当前迁移支持");
   } finally { await f.cleanup(); }
 }, 30000);
 
@@ -360,7 +384,7 @@ test("TUI recovery and service gate load without importing invalid legacy config
   const f = await fixture("none");
   try {
     // Copy only the bootstrap graph. Business views and npm dependencies are deliberately absent.
-    for (const path of ["scripts/ops/tui.ts", "scripts/ops/tui/recovery.ts", "scripts/ops/tui/platform.ts", "src/core/data-version.ts", "scripts/lib/operation-log.ts", "src/server/index.ts"]) {
+    for (const path of ["scripts/ops/tui.ts", "scripts/ops/tui/recovery.ts", "scripts/ops/tui/platform.ts", "src/core/data-version.ts", "scripts/lib/operation-log.ts", "scripts/lib/redact.ts", "scripts/lib/cli.ts", "src/server/index.ts"]) {
       await mkdir(dirname(join(f.root, path)), { recursive: true }); await copyFile(join(project, path), join(f.root, path));
     }
     const tui = await execute([join(f.root, "scripts/ops/tui.ts")], f.root);

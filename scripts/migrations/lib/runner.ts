@@ -67,16 +67,20 @@ function selected(context: Context) {
 async function readJournal(context: Context): Promise<Journal | null> {
   const journal = await json(statePath(context)) as Journal | null;
   if (!journal) return null;
-  if (journal.format !== 1 || !Number.isSafeInteger(journal.target) || journal.target < 1 || journal.target > DATA_VERSION || journal.groups !== context.groups || !/^[\da-f-]{36}$/.test(journal.id) || !Array.isArray(journal.files) || !Array.isArray(journal.steps) || !["applying", "validated", "committed"].includes(journal.phase) || ![undefined, "migration", "verification", "registration"].includes(journal.kind)) throw new Error("迁移状态无法识别，或群挂载与原事务不同");
+  if (journal.format !== 1 || !Number.isSafeInteger(journal.target) || journal.target < 1 || journal.target > DATA_VERSION || typeof journal.groups !== "string" || !/^[\da-f-]{36}$/.test(journal.id) || !Array.isArray(journal.files) || !Array.isArray(journal.steps) || !["applying", "validated", "committed"].includes(journal.phase) || ![undefined, "migration", "verification", "registration"].includes(journal.kind)) throw new Error("迁移状态无法识别");
   if (journal.kind === "verification") {
     if (journal.backup !== null || journal.files.length || journal.steps.length || journal.marker?.dataVersion !== journal.target || !journal.marker.transaction) throw new Error("只校验事务状态无效");
   } else if (journal.backup !== `backup/snapshots/migration-${journal.id}`) throw new Error("迁移备份路径无效");
+  // A committed receipt prevents rollback; it does not bind future deployments to
+  // its old mount or require that old mount and backups to remain accessible.
+  if (committed(context, journal)) return journal;
+  if (journal.groups !== context.groups) throw new Error("群挂载与未提交迁移的原事务不同，请先使用原群根完成或回滚迁移");
   for (const file of journal.files) {
     if (!/^\d+$/.test(file.saved)) throw new Error("迁移备份条目无效");
     await ordinaryPath(file.path.startsWith(context.groups + "/") || file.path.startsWith(context.groups + "\\") ? context.groups : context.project, file.path);
   }
   if (journal.backup) await ordinaryPath(context.project, join(context.project, journal.backup));
-  if (!committed(context, journal) && (journal.target !== DATA_VERSION || journal.steps.some(to => !migrations.some(m => m.to === to)))) throw new Error(`请先使用数据版本 ${journal.target} 的代码完成中断迁移`);
+  if (journal.target !== DATA_VERSION || journal.steps.some(to => !migrations.some(m => m.to === to))) throw new Error(`请先使用数据版本 ${journal.target} 的代码完成中断迁移`);
   return journal;
 }
 function committed(context: Context, journal: Journal) {

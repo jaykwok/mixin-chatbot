@@ -723,17 +723,21 @@ update() (
     fi
 
     # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
+    if ! git_here show-ref --verify --quiet refs/heads/main; then
+        ER "本地 main 分支不存在，请先建立 main 后重试"
+        return 1
+    fi
     if ! git_here merge-base --is-ancestor main "$target_sha"; then
-        ER "本地 main 与 origin/main 已分叉，无法快进升级"
+        ER "本地 main 无法快进到目标提交 ${target_sha:0:7}"
         WA "本地独有的提交："
-        git_here log --oneline origin/main..HEAD | sed 's/^/      /'
+        git_here log --oneline "$target_sha..main" | sed 's/^/      /'
         WA "请先推送或丢弃这些提交后重试"
         return 1
     fi
 
     echo ""
     echo -e "${CYAN}将要应用的提交：${NC}"
-    git_here log --oneline HEAD..origin/main | sed 's/^/      /'
+    git_here log --oneline "main..$target_sha" | sed 's/^/      /'
     echo ""
 
     docker info >/dev/null 2>&1 || { ER '无法连接 Docker，尚未应用升级'; return 1; }

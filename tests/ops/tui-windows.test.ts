@@ -209,8 +209,9 @@ windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 C
       ...["-All", "-all", "-A", "--all", "--group", "含 空格与'引号"].map(keyword => ({
         input: ["relay-purge", "--keyword", keyword], argv: ["purge", "--keyword", keyword], script: "relay",
       })),
-      { input: ["tmp-purge", "--all", "--group", "g1", "--user", "13812345678"], argv: ["purge", "--all", "--user", "13812345678", "--group", "g1"], script: "tmp" },
-      { input: ["tmp-ls", "--group", "g1"], argv: ["list", "--group", "g1"], script: "tmp" },
+      { input: ["tmp-purge", "--all", "--group", "g1", "--user", "13812345678"], argv: ["purge", "--all", "--user=13812345678", "--group=g1"], script: "tmp" },
+      { input: ["tmp-ls", "--group", "-Repair", "--group-id"], argv: ["list", "--group=-Repair", "--group-id"], script: "tmp" },
+      { input: ["stat", "-Repair", "--group-id"], argv: ["--group-id", "--", "-Repair"], script: "scripts\\ops\\stats-admin.ts" },
     ];
     for (const { input, argv, script } of cases) {
       const result = await fixture.run(input);

@@ -5,24 +5,12 @@
 // 自救」，再附上模型服务自己的原文（脱敏、压成一行、截断）。修复步骤不写进群——管理员看
 // 原文就知道该动哪里，写出来只是刷屏。
 //
-// 原文来源见 runtime.ts 的 readTurnFailure：Pi 把 provider 的报错写在 assistant 消息的
+// Pi 把 provider 的报错写在 assistant 消息的
 // errorMessage 上，额度耗尽、key 失效、限流都长这样。
+import { redactSecrets } from "../../scripts/lib/redact.ts";
 
 /** 群聊里放不下 provider 动辄几千字的报文，原文只留够定位的一段。 */
 const MAX_DETAIL_CHARS = 300;
-
-/** 报错原文常把请求头或 URL 原样回显，进群前先抹掉里面的凭据。 */
-export function redactSecrets(text: string): string {
-  return text
-    .replace(/\b(sk|pk|ghp|xoxb|hf)-[A-Za-z0-9_-]{6,}/gi, "$1-***")
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi, "$1***")
-    .replace(
-      /(["']?(?:api[_-]?key|apikey|access[_-]?token|token|secret|password|passwd)["']?\s*[:=]\s*["']?)[^"'\s,;}&]+/gi,
-      "$1***"
-    )
-    .replace(/([?&](?:key|token|secret|sig|sign|signature|password)=)[^&\s"']+/gi, "$1***")
-    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1***@");
-}
 
 // pi-ai 的 formatProviderError 会把状态码拼成 `429: <body>` 或 `<provider> (429): <body>`；
 // 各家 SDK 自己的 message 则多是 `HTTP 401` / `403 status code (no body)` 这类写法。

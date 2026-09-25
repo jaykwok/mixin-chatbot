@@ -16,6 +16,31 @@ async function run(args: string[], cwd: string, env: Record<string, string> = {}
   return { code, text: out + err };
 }
 
+for (const writer of ["typescript", ...(process.platform === "win32" ? ["powershell"] : []), ...(bash && existsSync(bash) ? ["bash"] : [])]) {
+  test(`${writer} startup rotation preserves upgrade, deploy and migration evidence`, async () => {
+    const f = await tempFixture("log-families-");
+    try {
+      const directory = join(f.root, "logs/operations"); await mkdir(directory, { recursive: true });
+      for (const kind of ["startup", "upgrade", "deploy", "migration"]) for (let i = 0; i < 23; i++) {
+        const path = join(directory, `${kind}-20200101T000000Z-${i}.log`);
+        await writeFile(path, "failure evidence"); await utimes(path, i, i);
+      }
+      if (writer === "typescript") openOperationLog(f.root, "startup", "");
+      else {
+        const script = join(f.root, writer === "bash" ? "rotate.sh" : "rotate.ps1");
+        await writeFile(script, writer === "bash"
+          ? `PROJECT_DIR="$1"\nunset BOT_OPERATION_LOG\n. '${posix(join(project, "scripts/lib/operation-log.sh"))}'\noperation_start startup\n`
+          : `\ufeff$ErrorActionPreference='Stop'\n$env:BOT_OPERATION_LOG=''\n. ${quotePS(join(project, "scripts/lib/operation-log.ps1"))}\nStart-OperationLog $PSScriptRoot 'startup' | Out-Null\n`);
+        const result = await run(writer === "bash" ? [bash!, posix(script), posix(f.root)] : ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+        expect(result.code, result.text).toBe(0);
+      }
+      const names = await readdir(directory);
+      expect(names.filter(name => name.startsWith("startup-"))).toHaveLength(20);
+      for (const kind of ["upgrade", "deploy", "migration"]) expect(names.filter(name => name.startsWith(kind + "-"))).toHaveLength(23);
+    } finally { await f.cleanup(); }
+  }, 15000);
+}
+
 test("bootstrap diagnostics redact errors and causes, cap log size and retain only operation logs", async () => {
   const f = await tempFixture("operation-log-");
   try {

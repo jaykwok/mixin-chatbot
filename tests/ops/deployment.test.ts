@@ -194,8 +194,11 @@ $BunPath='fixture-bun'; $GitPath='fixture-git'
 $Project=$PSScriptRoot; $OriginalSha='1111111111111111111111111111111111111111'; $TargetSha='2222222222222222222222222222222222222222'; $OriginalBranch='main'
 New-Item -ItemType Directory -Force -Path (Join-Path $Project 'data/state'),(Join-Path $Project 'data/groups') | Out-Null
 function Get-BunPath { 'fixture-bun' }; function Get-GitPath { 'fixture-git' }
+function Get-ScheduledTask { if($script:failure -ne 'task-missing'){ [pscustomobject]@{State='Ready'} } }
 function fixture-git {
     $global:LASTEXITCODE=0
+    if($args -contains 'show-ref' -and $script:failure -eq 'main-missing'){$global:LASTEXITCODE=1}
+    if($args -contains 'merge-base' -and $script:failure -eq 'diverged'){$global:LASTEXITCODE=1}
     if(($args -contains 'checkout' -or $args -contains 'merge') -and -not $script:stopped){throw 'live checkout changed before stop'}
     if($args -contains 'rev-parse'){ if($script:failure -eq 'code'){'3333333333333333333333333333333333333333'}else{$TargetSha} }
     if($args -contains 'reset') { if($script:applied -and -not $script:dataRestored){throw 'code restored before data'}; $script:codeRestored=$true }
@@ -233,15 +236,16 @@ function Start-ScheduledTask {
 }
 function Register-ScheduledTask { }
 function Restore-DeploymentSnapshot { if(-not $script:codeRestored){throw 'old service before code restore'}; $script:restores++ }
-foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','preview','code','install','apply','health','commit','postcommit')) {
+foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','preview','main-missing','diverged','task-missing','code','install','apply','health','commit','postcommit')) {
     if(($script:failure -eq 'install' -and $script:reuse) -or ($script:failure -eq 'postcommit' -and -not $script:running)){continue}
     $script:stopped=$false; $script:applied=$false; $script:committed=$false; $script:dataRestored=$false; $script:codeRestored=$false
     $script:backups=0; $script:installs=0; $script:starts=0; $script:verifications=0; $script:restores=0
+    Remove-Item -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction') -Force -ErrorAction SilentlyContinue
     $ok=$true
     try { & $run } catch { $ok=$false; Write-Host $_.Exception.Message }
     if($ok -ne ($script:failure -eq 'none')){throw ('wrong result: '+$script:failure)}
     if($script:failure -eq 'code' -and ($script:installs -or $script:applied)){throw 'wrong release mutated data or dependencies'}
-    if($script:failure -eq 'preview') { if($script:stopped){throw 'stopped after failed preview'} }
+    if($script:failure -in @('preview','main-missing','diverged','task-missing')) { if($script:stopped -or $script:applied -or $script:installs){throw 'preflight failure mutated deployment'} }
     elseif($script:failure -in @('none','postcommit')) {
         if($script:restores -ne 0 -or -not $script:committed -or $script:starts -ne [int]$script:running){throw 'wrong committed state'}
         if($script:backups -ne [int](-not $script:reuse) -or $script:installs -ne $script:backups){throw 'dependency reuse failed'}
@@ -252,9 +256,41 @@ foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$
   try {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
-    expect(result.output.match(/VERIFIED/g)).toHaveLength(28);
+    expect(result.output.match(/VERIFIED/g)).toHaveLength(40);
   } finally { await fixture.cleanup(); }
 }, 60000);
+
+test.skipIf(process.platform !== "win32")("Windows redeployment selects the new group root before preview and persistent changes", async () => {
+  const f = await tempFixture("deploy-group-root-");
+  try {
+    const source = await readFile(join(project, "scripts/deploy/deploy.ps1"), "utf8");
+    const start = source.indexOf("# ---- 4b. Pi"), end = source.indexOf("Set-OperationStage 'deployment-snapshot'", start);
+    expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
+    const script = join(f.root, "group-root.ps1");
+    await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+$Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data/state'; $RuntimeDir=Join-Path $Project 'data/runtime'
+$GroupRootFile=Join-Path $StateDir 'group-data-root'; $DefaultGroupDataRoot=Join-Path $Project 'data/groups'
+$ModelsFile=Join-Path $Project 'data/config/models.json'; $newRoot=Join-Path $PSScriptRoot 'new groups'
+New-Item -ItemType Directory -Force -Path $StateDir,(Split-Path $ModelsFile),(Join-Path $RuntimeDir 'pi'),$newRoot | Out-Null
+Set-Content -LiteralPath $GroupRootFile (Join-Path $PSScriptRoot 'old-offline-root')
+Set-Content -LiteralPath $ModelsFile '{}'; Set-Content -LiteralPath (Join-Path $RuntimeDir 'pi/settings.json') '{}'
+$env:GROUP_DATA_ROOT=''; $bunPath='fixture-bun'; $script:questions=0; $script:previews=0
+function Step {}; function Done {}; function Warn($message){throw $message}
+function Read-Host { $script:questions++; if($script:questions -gt 1){throw 'group selection looped'}; return $newRoot }
+function fixture-bun {
+    if($args -notcontains 'preview'){throw 'changed data before preview'}
+    $offset=[Array]::IndexOf($args,'--groups')
+    if($offset -lt 0 -or $args[$offset+1] -ne $newRoot){throw 'preview still uses old root'}
+    $script:previews++; $global:LASTEXITCODE=0
+}
+${source.slice(start, end)}
+if($script:previews -ne 1 -or $migrationGroups -ne $newRoot){throw 'missing selected-root preview'}
+Write-Output 'ROOT_SELECTED'
+`);
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("ROOT_SELECTED");
+  } finally { await f.cleanup(); }
+}, 15000);
 
 test.skipIf(process.platform !== "win32")("Windows upgrade replaces the existing snapshot with durable upgrade metadata", async () => {
   const fixture = await tempFixture("upgrade-snapshot-replace-");

@@ -1,3 +1,5 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { abortError, waitFor } from "../core/lifecycle.ts";
 // 发送层：量子密信群聊 webhook 消息、附件上传和出站限流。
 import { createHash } from "node:crypto";
 import { log } from "../core/log.ts";
@@ -24,11 +26,6 @@ const UPLOAD_PATH = "/im-external/v1/webhook/upload-attachment";
 
 const outboundAbortController = new AbortController();
 
-function abortError(): Error {
-  const error = new Error("应用正在关闭，出站发送已取消");
-  error.name = "AbortError";
-  return error;
-}
 
 function throwIfDeliveryAborted(signal?: AbortSignal): void {
   const abortedSignal = signal?.aborted
@@ -56,20 +53,9 @@ async function waitForDelivery(ms: number, signal?: AbortSignal): Promise<void> 
   const waitSignal = signal
     ? AbortSignal.any([outboundAbortController.signal, signal])
     : outboundAbortController.signal;
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      waitSignal.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(waitSignal.reason instanceof Error ? waitSignal.reason : abortError());
-    };
-    waitSignal.addEventListener("abort", onAbort, { once: true });
-    if (waitSignal.aborted) onAbort();
-  });
+  try { await delay(ms, undefined, { signal: waitSignal }); }
+  catch (error) { throwIfDeliveryAborted(signal); throw error; }
 }
-
 /**
  * 等待前一个 FIFO 事务结束，但允许当前事务在尚未到达队首前立即取消。
  * 调用方的 gate 会串到 previous 之后，所以提前释放自身也不会让后续消息越过前一条。
@@ -82,33 +68,13 @@ async function waitForQueueTurn(
   const waitSignal = signal
     ? AbortSignal.any([outboundAbortController.signal, signal])
     : outboundAbortController.signal;
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const finish = (callback: () => void) => {
-      if (settled) return;
-      settled = true;
-      waitSignal.removeEventListener("abort", onAbort);
-      callback();
-    };
-    const onAbort = () =>
-      finish(() =>
-        reject(
-          waitSignal.reason instanceof Error ? waitSignal.reason : abortError()
-        )
-      );
-    waitSignal.addEventListener("abort", onAbort, { once: true });
-    if (waitSignal.aborted) {
-      onAbort();
-      return;
-    }
-    void previous.then(() => finish(resolve));
-  });
+  try { await waitFor(previous, waitSignal); }
+  catch (error) { throwIfDeliveryAborted(signal); throw error; }
 }
-
 /** 仅供进程关闭：取消正在等待/发送的出站请求，让会话清理可以及时完成。 */
 export function abortOutboundRequests(): void {
   if (!outboundAbortController.signal.aborted) {
-    outboundAbortController.abort(abortError());
+    outboundAbortController.abort(abortError("应用正在关闭，出站发送已取消"));
   }
 }
 

@@ -1,9 +1,9 @@
+import { redactSecrets } from "../../scripts/lib/redact.ts";
 import { describe, expect, test } from "bun:test";
 import {
   describeRequestFailure,
   extractHttpStatus,
   extractResetMoment,
-  redactSecrets,
 } from "../../src/agent/failure.ts";
 
 describe("请求失败回执", () => {

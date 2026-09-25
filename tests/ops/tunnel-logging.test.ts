@@ -84,7 +84,7 @@ for (const shell of ["powershell", "bash"] as const) {
               '  if [ "$FIXTURE_SCENARIO" = start-fail ] && [ ! -f "$PROJECT_DIR/started" ]; then touch "$PROJECT_DIR/started"; return 1; fi',
               '}',
               'if [ "$FIXTURE_SCENARIO" = unowned ]; then printf 0 > "$FIXTURE_STATE"; fi',
-              'if [ "$FIXTURE_SCENARIO" = save-fail ]; then save_cloudflared_logging() { return 1; }; fi',
+              'if [ "$FIXTURE_SCENARIO" = save-fail ]; then save_cloudflared_preference() { return 1; }; fi',
               'configure_tunnel_logging "$FIXTURE_MODE"',
             ].join("\n") + "\n");
           }

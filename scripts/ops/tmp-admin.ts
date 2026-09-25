@@ -1,3 +1,5 @@
+import { describeAge } from "../lib/age.ts";
+import { cliArgs, groupOptions, groupSelection } from "../lib/cli.ts";
 // 查看用户 tmp 占用，停机后将选中的内容归档到 backup/rm。
 // tmp 包含缓存、完整工具输出及生成的交付物，不能假设全部可以重建。
 // 目录边界由共享解析器验证；扫描和归档均不跟随目录链接。
@@ -21,13 +23,6 @@ function usage(): void {
   console.log("  停机后将选中内容移入 backup/rm；tmp 目录、workspace 和 session.jsonl 保留。");
 }
 
-function describeAge(at: number): string {
-  const minutes = Math.max(0, Math.round((Date.now() - at) / 60_000));
-  if (minutes < 60) return `${minutes} 分钟前`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours} 小时前`;
-  return `${Math.floor(hours / 24)} 天前`;
-}
 
 /**
  * 扫描本身在 scripts/lib/tmp-scan.ts，宿主机上的运维界面直接调那一份。
@@ -128,42 +123,13 @@ export async function purge(
 }
 
 async function main(args: string[]): Promise<number> {
-  const command = args[0];
-  let days: number | undefined;
-  let userFilter: string | undefined;
-  let groupFilter: string | undefined;
-  let selection: GroupSelection = "auto";
-  for (let i = 1; i < args.length; i++) {
-    const flag = args[i];
-    if (flag === "--all") {
-      days = 0;
-    } else if (flag === "--days") {
-      const value = Number(args[++i]);
-      if (!Number.isFinite(value) || value < 0) {
-        console.error("--days 需要一个不小于 0 的天数");
-        return 1;
-      }
-      days = value;
-    } else if (flag === "--user") {
-      userFilter = args[++i];
-      if (!userFilter) {
-        console.error("--user 需要一个手机号");
-        return 1;
-      }
-    } else if (flag === "--group") {
-      groupFilter = args[++i];
-      if (!groupFilter) {
-        console.error("--group 需要一个群号");
-        return 1;
-      }
-    } else if (flag === "--storage-segment" || flag === "--group-id") {
-      if (selection !== "auto") throw new Error("群目录选择参数不能重复");
-      selection = flag === "--storage-segment" ? "segment" : "id";
-    } else {
-      console.error(`无法识别的参数：${flag}`);
-      return 1;
-    }
-  }
+  const { values, positionals } = cliArgs(args, { ...groupOptions, all: { type: "boolean" }, days: { type: "string" }, user: { type: "string" }, group: { type: "string" } });
+  if (positionals.length > 1) throw new Error("只能指定一个命令");
+  const command = positionals[0], userFilter = values.user, groupFilter = values.group;
+  const selection = groupSelection(values, groupFilter);
+  if (values.all && values.days !== undefined) throw new Error("--all 和 --days 不能同时使用");
+  const days = values.all ? 0 : values.days === undefined ? undefined : Number(values.days);
+  if (days !== undefined && (!Number.isFinite(days) || days < 0)) throw new Error("--days 需要一个不小于 0 的天数");
 
   switch (command) {
     case "list":
@@ -188,5 +154,5 @@ async function main(args: string[]): Promise<number> {
 
 // 直接运行时才执行；测试要 import 这些函数，不能顺带把整个 CLI 跑起来。
 if (import.meta.main) {
-  process.exit(await main(process.argv.slice(2)));
+  process.exit(await main(process.argv.slice(2)).catch(error => { console.error((error as Error).message); return 1; }));
 }

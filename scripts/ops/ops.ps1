@@ -430,24 +430,7 @@ function Invoke-GitCapture([string[]]$GitArgs) {
     }
 }
 
-function Invoke-BunInstall {
-    $bunPath = Get-BunPath
-    Step "安装依赖（bun install --frozen-lockfile）..."
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        & $bunPath install --frozen-lockfile
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($exitCode -ne 0) {
-        Err "bun install 失败（退出码 $exitCode）"
-        return $false
-    }
-    Done "依赖已就绪"
-    return $true
-}
+
 
 function Resolve-ProjectPath([string]$Value) {
     if ([System.IO.Path]::IsPathRooted($Value)) {
@@ -980,68 +963,9 @@ function Restart-Bot {
     return $false
 }
 
-function Restart-TunnelService {
-    # 只重启，不重装。隧道服务与仓库代码无关（它只是把公网流量转发到 localhost:$Port），
-    # 例行升级没有理由重装它；token 变化这类需要重装的场景交给 repair-tunnel。
-    $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-    if (-not $svc) {
-        Err "Cloudflared 服务未安装"
-        Warn "请以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')"
-        return $false
-    }
-    if (-not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
-        Err "Cloudflared 服务没有本项目归属标记，update 不会自动重启它"
-        Warn "确认该服务属于本项目后，以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')"
-        return $false
-    }
-    if (-not (IsAdmin)) {
-        Err "重启 Cloudflared 服务需要管理员 PowerShell"
-        Warn "请在管理员终端中使用 $(Get-OpsCommandHint 'update') 或 $(Get-OpsCommandHint 'repair-tunnel')"
-        return $false
-    }
-    Step "重启 Cloudflared 服务..."
-    try {
-        if ($svc.Status -eq "Running") { Restart-Service Cloudflared -ErrorAction Stop }
-        else { Start-Service Cloudflared -ErrorAction Stop }
-    } catch {
-        Err "重启 Cloudflared 失败：$($_.Exception.Message)"
-        return $false
-    }
-    Done "Cloudflared 服务已重启"
-    return $true
-}
 
-# 把工作区退回升级前那个提交。
-#
-# 升级前是 detached HEAD 时（rev-parse --abbrev-ref 返回字面量 "HEAD"）绝不能用 reset：
-# 升级过程中已经 checkout 到 main 了，reset --hard 会把 main 这个分支指针拖回那个游离
-# 提交，等于用一次回滚顺手毁掉 main。这种情况直接 checkout 回那个提交，恢复原本的
-# detached 状态，分支指针一个都不动。
-function Restore-Checkout([string]$Branch, [string]$Sha) {
-    if (-not $Branch -or $Branch -eq "HEAD") {
-        $detached = Invoke-GitCapture @("checkout", "--force", $Sha)
-        if ($detached.ExitCode -ne 0) {
-            Err "回滚到游离提交 $Sha 失败：$($detached.Text)"
-            return $false
-        }
-        Warn "已恢复到升级前的游离 HEAD（$($Sha.Substring(0, [Math]::Min(7, $Sha.Length)))）；分支指针未改动"
-        return $true
-    }
-    $checkout = Invoke-GitCapture @("checkout", $Branch)
-    if ($checkout.ExitCode -ne 0) {
-        Err "切回分支 $Branch 失败：$($checkout.Text)"
-        return $false
-    }
-    $reset = Invoke-GitCapture @("reset", "--hard", $Sha)
-    if ($reset.ExitCode -ne 0) {
-        Err "回滚到 $Sha 失败：$($reset.Text)"
-        return $false
-    }
-    return $true
-}
 
-# 升级失败后把代码退回升级前那次提交并重新拉起。进入升级前已确认工作区干净，
-# 所以 reset --hard 不会毁掉任何本地内容。
+# 获取目标提交并交给目标版本升级器；停机、迁移、回滚由升级器负责。
 function Invoke-Update {
     $operation = Start-OperationLog $Project 'upgrade'
     $operationExit = 1
@@ -1413,8 +1337,8 @@ switch ($Command) {
     }
     "tmp-ls" {
         $tmpArgs = @("list")
-        if ($User) { $tmpArgs += @("--user", $User) }
-        if ($Group) { $tmpArgs += @("--group", $Group) }
+        if ($User) { $tmpArgs += "--user=$User" }
+        if ($Group) { $tmpArgs += "--group=$Group" }
         if ($StorageSegment) { $tmpArgs += "--storage-segment" }
         elseif ($GroupId) { $tmpArgs += "--group-id" }
         if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
@@ -1426,19 +1350,19 @@ switch ($Command) {
         }
         $tmpArgs = @("purge")
         if ($All) { $tmpArgs += "--all" } else { $tmpArgs += @("--days", "$Days") }
-        if ($User) { $tmpArgs += @("--user", $User) }
-        if ($Group) { $tmpArgs += @("--group", $Group) }
+        if ($User) { $tmpArgs += "--user=$User" }
+        if ($Group) { $tmpArgs += "--group=$Group" }
         if ($StorageSegment) { $tmpArgs += "--storage-segment" }
         elseif ($GroupId) { $tmpArgs += "--group-id" }
         if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
     }
     "stat" {
         $statArgs = @()
-        if ($Target) { $statArgs += $Target }
         if ($Since)  { $statArgs += @("--since", $Since) }
         if ($Until)  { $statArgs += @("--until", $Until) }
         if ($StorageSegment) { $statArgs += "--storage-segment" }
         elseif ($GroupId) { $statArgs += "--group-id" }
+        if ($Target) { $statArgs += @("--", $Target) }
         if (-not (Invoke-GroupDataAdmin "scripts\ops\stats-admin.ts" $statArgs)) { exit 1 }
     }
     "history-ls" {
@@ -1458,8 +1382,8 @@ switch ($Command) {
         Write-Host ""
         Write-Host "  doctor          只读诊断；-Json 输出 JSON；-Repair 自动修复"
         Write-Host "  deploy          配置并部署当前代码；已有部署可重建，失败自动回滚"
-        Write-Host "  update          同步 origin/main、装依赖、重启并体检；失败自动回滚"
-        Write-Host "                  隧道默认只在公网检查失败时重启，加 -RestartTunnel 可强制"
+        Write-Host "  update          预检、停机后同步 origin/main，按需迁移并验证；提交前失败回滚"
+        Write-Host "                  默认沿用隧道，只有加 -RestartTunnel 才重启"
         Write-Host "  repair-tunnel   按当前 token 来源强制重装 Cloudflared 服务"
         Write-Host "  uninstall-tunnel 停止并卸载 Cloudflared 服务，可选删除本地程序"
         Write-Host "  restart         停止并重新启动机器人"

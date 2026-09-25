@@ -1,3 +1,4 @@
+import { describeAge } from "../lib/age.ts";
 import { withMaintenance } from "../../src/core/maintenance.ts";
 // 外链账本只读展示与停机清理；复用 relay 的后端协议，凭据不传入 shell 参数。
 import { formatSize } from "@earendil-works/pi-coding-agent";
@@ -16,15 +17,6 @@ function usage(): void {
 }
 
 /** 「3 小时前」比一个 ISO 时间戳更容易判断该不该清掉它。 */
-function describeAge(at: string): string {
-  const parsed = Date.parse(at);
-  if (Number.isNaN(parsed)) return "时间未知";
-  const minutes = Math.max(0, Math.round((Date.now() - parsed) / 60_000));
-  if (minutes < 60) return `${minutes} 分钟前`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours} 小时前`;
-  return `${Math.floor(hours / 24)} 天前`;
-}
 
 async function list(): Promise<number> {
   const config = getRelayConfig();

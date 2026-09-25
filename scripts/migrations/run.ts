@@ -6,28 +6,21 @@ import { apply, commit, committedDeployment, preview, rollback, type Plan } from
 import { json, publishJson } from "./lib/io.ts";
 import type { Context } from "./lib/types.ts";
 import { openOperationLog, operationError } from "../lib/operation-log.ts";
+import { cliArgs } from "../lib/cli.ts";
 
 let diagnostic: ReturnType<typeof openOperationLog> | undefined;
 
 async function main() {
-  const args = process.argv.slice(2), command = args.shift() ?? "status";
-  let project = process.cwd(), groups: string | undefined, planPath: string | undefined, deployment = "", interactive = false, validatePreview = true;
-  const decisions: Context["decisions"] = {};
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
-    if (arg === "--interactive") { interactive = true; continue; }
-    if (arg === "--decisions-only") { validatePreview = false; continue; }
-    if (arg === "--accept-native-cache") { decisions.acceptNativeCache = true; continue; }
-    if (!["--project", "--groups", "--plan", "--provider", "--model", "--deployment"].includes(arg)) throw new Error(`未知参数 ${arg}`);
-    const value = args[++i];
-    if (!value || value.startsWith("--")) throw new Error(`${arg} 缺少值`);
-    if (arg === "--project") project = resolve(value);
-    if (arg === "--groups") groups = value;
-    if (arg === "--plan") planPath = resolve(value);
-    if (arg === "--provider") decisions.provider = value;
-    if (arg === "--model") decisions.model = value;
-    if (arg === "--deployment") deployment = value;
-  }
+  const { values, positionals } = cliArgs(process.argv.slice(2), {
+    project: { type: "string" }, groups: { type: "string" }, plan: { type: "string" }, deployment: { type: "string" },
+    provider: { type: "string" }, model: { type: "string" }, interactive: { type: "boolean" },
+    "decisions-only": { type: "boolean" }, "accept-native-cache": { type: "boolean" },
+  });
+  if (positionals.length > 1) throw new Error("只能指定一个迁移命令");
+  const command = positionals[0] ?? "status", project = resolve(values.project ?? process.cwd()), groups = values.groups;
+  const planPath = values.plan ? resolve(values.plan) : undefined, deployment = values.deployment ?? "";
+  const interactive = values.interactive, validatePreview = !values["decisions-only"];
+  const decisions: Context["decisions"] = { provider: values.provider, model: values.model, acceptNativeCache: values["accept-native-cache"] };
   // Start logging before configuration or group-root validation; status remains read-only.
   if (!["status", "committed"].includes(command)) {
     diagnostic = openOperationLog(resolve(project), "migration");

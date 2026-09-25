@@ -27,7 +27,7 @@ operation_event() {
 operation_stage() { export BOT_OPERATION_STAGE="$1"; operation_event info begin; }
 
 operation_start() {
-    local kind="$1" directory="$PROJECT_DIR/logs/operations" file name count=0
+    local kind="$1" directory="$PROJECT_DIR/logs/operations" file name family count=0
     local pattern='^(upgrade|deploy|migration|startup)-[0-9TZ]+-[a-zA-Z0-9_-]+\.log$'
     mkdir -p -- "$directory" || { echo '无法创建运维日志目录，继续使用终端输出' >&2; return 0; }
     [ ! -L "$directory" ] || { echo '日志目录不能是链接' >&2; return 0; }
@@ -39,10 +39,11 @@ operation_start() {
         file="$(umask 077; mktemp "$directory/$kind-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXX.log")" || return 0
     fi
     export BOT_OPERATION_LOG="${file##*/}" BOT_OPERATION_LOG_PATH="$file"
+    family="${BOT_OPERATION_LOG%%-*}"
     operation_stage "$kind"
     while IFS= read -r file; do
         name="${file##*/}"
-        [[ "$name" =~ $pattern ]] && [ "$name" != "$BOT_OPERATION_LOG" ] && [ ! -L "$file" ] || continue
+        [[ "$name" =~ $pattern ]] && [[ "$name" == "$family-"* ]] && [ "$name" != "$BOT_OPERATION_LOG" ] && [ -f "$file" ] && [ ! -L "$file" ] || continue
         count=$((count+1))
         if [ "$count" -ge 20 ]; then rm -f -- "$directory/$name" || true; fi
     done < <(ls -1t -- "$directory"/*.log 2>/dev/null)

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AssistantMessage, AssistantMessageEvent, ToolCall } from "@earendil-works/pi-ai";
-import { redactSecrets } from "./failure.ts";
+import { redactSecrets } from "../../scripts/lib/redact.ts";
 
 type EventType = AssistantMessageEvent["type"] | "message_start" | "message_end";
 type Metadata = Pick<AssistantMessage, "responseId" | "stopReason" | "rawStopReason">;

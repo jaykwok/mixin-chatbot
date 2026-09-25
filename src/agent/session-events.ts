@@ -1,7 +1,7 @@
 // Translate SDK events into host progress without owning the task or starting another agent loop.
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { log } from "../core/log.ts";
-import { redactSecrets } from "./failure.ts";
+import { redactSecrets } from "../../scripts/lib/redact.ts";
 import type { ModelProgress } from "./model-progress.ts";
 
 export interface ProgressState {

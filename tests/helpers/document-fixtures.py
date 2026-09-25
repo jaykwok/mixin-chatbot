@@ -512,6 +512,21 @@ FLOW_SPEC = """flowchart TB
 
 
 def check_flowcharts(root, results):
+    # A failed renderer must clean its temporary PNG even on unexpected errors.
+    script = Path(__file__).resolve().parents[2] / "src/agent/modules/document-work/scripts/document_build.py"
+    spec = importlib.util.spec_from_file_location("document_build_cleanup", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    builder = module.WordBuilder({"output": str(root / "cleanup.docx")}, [])
+    flowchart = module.flowchart_module()
+    for error in [ValueError("fixture fallback"), RuntimeError("fixture fatal")]:
+        with patch.object(flowchart, "find_cjk_font", return_value=None), patch.object(flowchart, "render_png", side_effect=error):
+            try:
+                builder.diagram("flowchart TB\nA --> B")
+                assert isinstance(error, ValueError)
+            except RuntimeError:
+                assert isinstance(error, RuntimeError)
+        assert not list(root.glob("flow-*.png")), "failed flowchart leaked a PNG"
     deck = Presentation(results["layoutBuild"]["output"])
     build = results["layoutBuild"]["build"]
     by_title = {first_text(slide): slide for slide in deck.slides}

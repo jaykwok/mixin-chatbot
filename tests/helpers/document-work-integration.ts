@@ -1,7 +1,7 @@
 /** Real, offline document operations against an explicitly supplied test venv. */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
@@ -30,8 +30,20 @@ for (const name of ["source.docx", "source.pptx", "supplement.docx", "supplement
   sourceDigests[name] = createHash("sha256").update(await readFile(join(workspace, name))).digest("hex");
 }
 const tools = buildDocumentWorkTools({ workspaceDir: workspace, tempDir, venvDir, indexPath: join(root, "index/materials.md") });
-const call = async (name: string, params: object): Promise<any> =>
-  (await tools.find(t => t.name === name)!.execute("verify", params, undefined, undefined, {} as never)).details;
+const call = async (name: string, params: object): Promise<any> => {
+  const details = (await tools.find(t => t.name === name)!.execute("verify", params, undefined, undefined, {} as never)).details;
+  for (const job of await readdir(tempDir)) {
+    const files = await readdir(join(tempDir, job));
+    assert(!files.includes(".work"), "completed job retained source copies or Office intermediates");
+    assert(files.every(file => !file.endsWith(".request.json") && !file.startsWith("office-")));
+  }
+  if (name === "document_render") {
+    const preview = details as { images: { path: string }[]; contacts: string[]; report: string; pdf?: string };
+    assert.equal(preview.pdf, undefined, "render must not return an intermediate PDF that cleanup removes");
+    for (const file of [...preview.images.map(image => image.path), ...preview.contacts, preview.report]) await readFile(file);
+  }
+  return details;
+};
 const inspection = async (source: string) => {
   const value = await call("document_inspect", { source });
   return JSON.parse(await readFile(value.inspection, "utf8"));

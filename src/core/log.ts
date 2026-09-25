@@ -8,7 +8,7 @@ import {
   statSync,
 } from "node:fs";
 import { join } from "node:path";
-import { redactSecrets } from "../agent/failure.ts";
+import { redactSecrets } from "../../scripts/lib/redact.ts";
 import {
   LOG_BACKUP_COUNT,
   LOG_DIR,

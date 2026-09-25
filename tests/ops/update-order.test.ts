@@ -99,5 +99,27 @@ update
       expect(existsSync(join(state, "update-transaction"))).toBe(false);
       expect(existsSync(join(state, "update-commit"))).toBe(false);
     }
+
+    // Preflight must report the local main branch, even when HEAD is elsewhere.
+    await git("branch", "-m", "topic");
+    await writeFile(join(state, "running"), "true"); await writeFile(join(state, "events"), "");
+    const missing = await run([bash!, posix(launcher), posix(work)], { FIXTURE_MODE: "success" });
+    expect(missing.code).toBe(1); expect(missing.text).toContain("main 分支不存在");
+    expect(await readFile(join(state, "events"), "utf8")).toBe("");
+    await git("branch", "-m", "main");
+    await writeFile(join(work, "main-only.txt"), "local"); await git("add", "."); await git("commit", "-m", "fixture-local-main");
+    await git("checkout", "-b", "topic", old);
+    await writeFile(join(work, "topic-only.txt"), "topic"); await git("add", "."); await git("commit", "-m", "fixture-topic-only");
+    const topic = await git("rev-parse", "HEAD");
+    const diverged = await run([bash!, posix(launcher), posix(work)], { FIXTURE_MODE: "success" });
+    expect(diverged.code).toBe(1); expect(diverged.text).toContain("fixture-local-main");
+    expect(diverged.text).not.toContain("fixture-topic-only");
+    expect(await readFile(join(state, "events"), "utf8")).toBe("");
+    expect(await readFile(join(state, "running"), "utf8")).toBe("true");
+    await git("branch", "-f", "main", old);
+    const planned = await run([bash!, posix(launcher), posix(work)], { FIXTURE_MODE: "stop-fail" });
+    expect(planned.code).toBe(1); expect(planned.text).toContain(`${target.slice(0, 7)} new`);
+    expect(planned.text).not.toContain("fixture-topic-only");
+    expect(await git("rev-parse", "HEAD")).toBe(topic);
   } finally { await f.cleanup(); }
-}, 90000);
+}, 150000);

@@ -17,7 +17,7 @@ import { DeliveryStore } from "./delivery-store.ts";
 import { refreshDeliveryText } from "./delivery-links.ts";
 import { SessionQueue } from "./session-queue.ts";
 import { ensureStorageIdentity } from "./storage-identity.ts";
-import { redactSecrets } from "./failure.ts";
+import { redactSecrets } from "../../scripts/lib/redact.ts";
 import { ModelProgress } from "./model-progress.ts";
 import { createChatSession, getRuntime } from "./session-factory.ts";
 import { progressText, setStage, subscribeProgress, type ProgressState } from "./session-events.ts";

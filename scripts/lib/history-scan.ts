@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { assertDataDirectory, byName, dataDirectoryNames } from "./group-data.ts";
 import { mapConcurrent } from "./concurrent.ts";
 
-const HISTORY_FILE = "session.jsonl";
+import { SESSION_FILE } from "../../src/agent/paths.ts";
 
 interface UserHistory {
   user: string;
@@ -28,7 +28,7 @@ export async function scanHistory(root: string): Promise<GroupHistory[]> {
   for (const group of await dataDirectoryNames(root, root)) {
     const dir = join(root, group);
     const entries = await mapConcurrent(await dataDirectoryNames(join(dir, "users"), root), async user => {
-      const path = join(dir, "users", user, HISTORY_FILE);
+      const path = join(dir, "users", user, SESSION_FILE);
       try {
         await assertDataDirectory(dirname(path), root);
         const info = await lstat(path);

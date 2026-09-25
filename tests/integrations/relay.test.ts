@@ -1,3 +1,4 @@
+import { hashFile } from "../../src/core/file-hash.ts";
 import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
@@ -17,7 +18,6 @@ import {
   type RelayConfig,
 } from "../../src/integrations/relay.ts";
 import {
-  hashFile,
   openRelayIndex,
   relayCacheKey,
   type RelayIndex,
@@ -332,7 +332,7 @@ describe("relay lifecycle regressions", () => {
         expect(first.startsWith(CONFIG.publicBaseUrl)).toBe(true);
         expect(second.startsWith(otherConfig.publicBaseUrl)).toBe(true);
         expect(calls).toEqual(["PUT", "PUT"]);
-        expect(index.size()).toBe(2);
+        expect(index.entries().length).toBe(2);
         expect(index.get(relayCacheKey(digest, "note.txt", CONFIG.publicBaseUrl))?.url).toBe(first);
         expect(index.get(relayCacheKey(digest, "note.txt", otherConfig.publicBaseUrl))?.url).toBe(second);
       } finally { restore(); }
@@ -346,7 +346,7 @@ describe("relay lifecycle regressions", () => {
         state: "planned", at: new Date(Date.now() - 32 * 60000).toISOString() });
       const calls: string[] = [];
       const restore = mockFetch((_input, init) => { calls.push(init!.method!); return new Response(null, { status: 204 }); });
-      try { await sweepExpiredRelayObjects({ config, index }); expect(calls).toEqual(["DELETE"]); expect(index.size()).toBe(0); }
+      try { await sweepExpiredRelayObjects({ config, index }); expect(calls).toEqual(["DELETE"]); expect(index.entries().length).toBe(0); }
       finally { restore(); }
     });
   });
@@ -396,7 +396,7 @@ describe("relay lifecycle regressions", () => {
       const restore = mockFetch(async () => { calls++; return new Response(null, { status: 201 }); }, { handleMkcol: true });
       try {
         await expect(relayFile({ config: CONFIG, localPath: file, size: 4, filename: "note.txt", index })).rejects.toThrow("大小发生变化");
-        expect(calls).toBe(0); expect(index.size()).toBe(0);
+        expect(calls).toBe(0); expect(index.entries().length).toBe(0);
       } finally { restore(); }
     });
   });
@@ -767,7 +767,7 @@ describe("relay upload", () => {
           })
         ).rejects.toThrow("wrong password");
         // 保留未完成计划；下次按同一对象名重试，不当作已上传对象复用。
-        expect(index.size()).toBe(1);
+        expect(index.entries().length).toBe(1);
         expect(index.entries()[0]!.state).toBe("planned");
       } finally {
         restore();
@@ -1103,7 +1103,7 @@ describe("relay object layout", () => {
           relayFile({ config: CONFIG, localPath: file, size: 5, filename: "note.txt", index })
         ).rejects.toThrow("存储空间不足");
         // 建目录失败也保留计划，后续重试与过期清理都有持久依据。
-        expect(index.size()).toBe(1);
+        expect(index.entries().length).toBe(1);
         expect(index.entries()[0]!.state).toBe("planned");
       } finally {
         restore();
@@ -1159,7 +1159,7 @@ describe("relay object layout", () => {
         const result = await purgeRelayObjects({ config: CONFIG, index });
         expect(deleted).toEqual([]);
         expect(result.orphaned).toBe(1);
-        expect(index.size()).toBe(1);
+        expect(index.entries().length).toBe(1);
       } finally {
         restore();
       }
@@ -1413,7 +1413,7 @@ describe("relay admin", () => {
         expect(result).toEqual({ matched: 3, deleted: 3, failed: 0, orphaned: 0 });
         expect(deleted).toHaveLength(3);
         expect(deleted.every((url) => url.startsWith(CONFIG.webdavUrl))).toBe(true);
-        expect(index.size()).toBe(0);
+        expect(index.entries().length).toBe(0);
       } finally {
         restore();
       }
@@ -1434,7 +1434,7 @@ describe("relay admin", () => {
         expect(result.deleted).toBe(1);
         expect(deleted[0]).toContain("mid.zip");
         // 另外两条必须原样留着——手滑打错关键字不该清掉别人的链接。
-        expect(index.size()).toBe(2);
+        expect(index.entries().length).toBe(2);
       } finally {
         restore();
       }
@@ -1449,7 +1449,7 @@ describe("relay admin", () => {
         const result = await purgeRelayObjects({ config: CONFIG, index });
         expect(result.deleted).toBe(0);
         expect(result.failed).toBe(3);
-        expect(index.size()).toBe(3);
+        expect(index.entries().length).toBe(3);
       } finally {
         restore();
       }
@@ -1476,7 +1476,7 @@ describe("relay admin", () => {
         // 换过后端之后我们删不掉旧对象，但也绝不能把请求发给新后端。
         expect(called).toBe(false);
         expect(result).toEqual({ matched: 1, deleted: 0, failed: 0, orphaned: 1 });
-        expect(index.size()).toBe(1);
+        expect(index.entries().length).toBe(1);
       } finally {
         restore();
       }

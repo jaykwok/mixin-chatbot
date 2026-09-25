@@ -49,14 +49,7 @@ export function duration(ms: number): string {
  * 距今多久。与 history-admin / tmp-admin / relay-admin 的三段口径保持一致
  * （分钟 → 小时 → 天），运维在 TUI 和命令行之间来回看不会觉得是两套东西。
  */
-export function since(at: number): string {
-  if (!Number.isFinite(at) || at <= 0) return "—";
-  const minutes = Math.max(0, Math.round((Date.now() - at) / 60_000));
-  if (minutes < 60) return `${minutes} 分钟前`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours} 小时前`;
-  return `${Math.floor(hours / 24)} 天前`;
-}
+export { describeAge as since } from "../../../lib/age.ts";
 
 /** 本地时区的 YYYY-MM-DD。汇报材料按自然日看，不能用 UTC。 */
 export function day(at: number): string {

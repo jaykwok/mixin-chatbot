@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
@@ -94,6 +94,7 @@ describe("project document resources", () => {
       await expect(call("document_patch", { source, digest: createHash("sha256").update("unchanged").digest("hex"),
         filename: "NUL.docx", edits: [] })).rejects.toThrow("filename");
       expect(await readFile(source, "utf8")).toBe("unchanged");
+      expect(await readdir(own)).toEqual([]);
     } finally { await fixture.cleanup(); }
   });
 });

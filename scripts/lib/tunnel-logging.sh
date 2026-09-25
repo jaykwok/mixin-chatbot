@@ -14,9 +14,6 @@ cloudflared_protocol() {
     case "$protocol" in auto|http2|quic) printf '%s' "$protocol" ;; *) echo 'cloudflared-protocol 只接受 auto、http2 或 quic' >&2; return 1 ;; esac
 }
 
-save_cloudflared_logging() { save_cloudflared_preference logging "$1"; }
-save_cloudflared_protocol() { save_cloudflared_preference protocol "$1"; }
-
 save_cloudflared_preference() (
     case "$1" in logging|protocol) ;; *) return 1 ;; esac
     local path="$PROJECT_DIR/data/config/cloudflared-$1" temporary
@@ -149,7 +146,7 @@ configure_tunnel_setting() (
         stop_attempted=1
         stop_managed_cloudflared || return 1
     fi
-    "save_cloudflared_$setting" "$level" || return 1
+    save_cloudflared_preference "$setting" "$level" || return 1
     if [ "$was_running" = 1 ]; then
         cloudflared_command "$logging" "$protocol" || return 1
         start_managed_cloudflared_command "${CLOUDFLARED_COMMAND[@]}" || return 1

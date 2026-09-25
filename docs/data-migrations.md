@@ -36,7 +36,7 @@ Windows 子进程统一使用系统自带的 Windows PowerShell 5.1；从 PowerS
 
 Windows 可用 `Get-ChildItem logs/operations | Sort-Object LastWriteTime -Descending` 查找最近文件，再用 `Get-Content <日志路径> -Tail 100` 查看。Linux 可用 `ls -lt logs/operations`、`tail -n 100 <日志路径>`。原业务日志仍从 TUI 的“监控 → 日志”查看。
 
-日志保留最近 20 份，每份上限约 2 MiB；命令输出达到约 1 MiB 后停止收录大段输出，剩余空间留给阶段、异常和回滚结果。不会抄录交互输入或整份配置，常见 token、API key、Authorization、带凭据 URL 和 webhook 密钥会脱敏。日志并非终端逐字转录，分享前仍需检查第三方命令的自定义凭据格式。日志目录无法写入时提示原因并保留终端输出，不让诊断失败改变升级或回滚行为。
+四类日志各自保留最近 20 份，启动重试不会淘汰升级或迁移的证据；嵌套操作按父日志文件所属类别保留。每份上限约 2 MiB，命令输出达到约 1 MiB 后停止收录大段输出，剩余空间留给阶段、异常和回滚结果。不会抄录交互输入或整份配置，常见 token、API key、Authorization、带凭据 URL 和 webhook 密钥会脱敏。日志并非终端逐字转录，分享前仍需检查第三方命令的自定义凭据格式。日志目录无法写入时提示原因并保留终端输出，不让诊断失败改变升级或回滚行为。
 
 ## 事务边界
 
@@ -59,6 +59,12 @@ Docker 提前停机的恢复记录为 `data/state/update-transaction` 与 `data/
 
 外置群根不存在时会报错。Docker 的运行配置保存容器路径，宿主机工具必须使用 `data/state/group-data-root` 中的宿主路径；容器内执行则使用与服务相同的挂载和 UID。预览的暂存配置放在已挂载的 `data/runtime/tmp`，结束后删除，不要求服务 UID 能写镜像内的 `/app/tmp`。
 
+## 更换群数据根
+
+已提交迁移的回执只防止回滚，不限制后续群根位置，也不要求旧挂载继续在线。在 TUI 的“部署 / 重部署”中选择新群根；Windows 在预览和停机前完成选择，迁移及验证始终针对所选根。新根没有版本文件时执行幂等迁移，已有同版本但标记不配对时仅重新登记。已有未提交事务时仍拒绝换根，必须先在原根完成或回滚。
+
+该入口不搬移资料。需要保留原群数据时先停机并完整复制或恢复群根（含账本与版本文件），再选择目标目录重新部署。不要删除 migration.json 来绕过事务检查。
+
 ## 迁移代码维护
 
 `scripts/migrations/vN.ts` 每步提供 `preview / apply / validate`，预览声明修改文件和需要决定的事项。`preview` 只接收临时项目配置副本和群根的只读接口 `groups.read / groups.directories`，不接收真实群根路径；以 `configuration` 返回待校验的项目配置投影，以 `{ root: "project" | "groups", path }` 声明执行时要备份的文件。执行器只把投影写进配置副本，预览期间绝不调用 `apply`。历史迁移只导入 Node 内置模块与 `migrations/lib`，不导入业务代码。公共执行器负责锁、备份、发布、回滚和中断续做；最终完整校验通过独立进程调用当前业务校验器。
@@ -69,4 +75,8 @@ Docker 提前停机的恢复记录为 `data/state/update-transaction` 与 `data/
 
 底层维护入口是 `bun run scripts/migrations/run.ts`，支持 `status / preview / apply / commit / rollback`。`preview --interactive --plan <文件>` 收集选择，`apply --plan <文件>` 在停机后执行，验证实例停止后才可 `commit`。这些命令用于离线恢复；正常部署优先使用升级事务。`rollback` 返回 42 表示数据已经提交，不能自动回退。
 
-`tmp/pi087/repair-usage.ts` 仍是特定历史账目的修复工具，不作为每次升级的常规迁移步骤；`tmp/pi087/migrate.ts` 保留为旧版一次性工具，不会登记新数据版本。
+## 未支持的旧账本
+
+当前迁移范围是 Pi 0.85.1 配置到当前数据版本，要求已有待补发账本为 schema 2（新部署允许没有表）。更早的附件存储格式不能仅凭字段名可靠转换，升级器会在完整校验时拒绝继续，且不会清空待补发记录。
+
+遇到此错误，应保持停机，保留 data/state/agent.sqlite、relay.sqlite 及各自 WAL/SHM，并保留对应原代码、配置和外链账本。先在副本上核对旧 deliveries 表及附件引用，制定并验证该格式的迁移，再重跑升级；也可整体恢复匹配的旧部署备份继续使用。仓库不提供早期单独交付的 tmp 修复脚本，不能按过期命令直接执行或删除表绕过检查。

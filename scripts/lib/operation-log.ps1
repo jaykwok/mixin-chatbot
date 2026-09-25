@@ -55,7 +55,8 @@ function Start-OperationLog([string]$ProjectRoot, [string]$Kind) {
         $env:BOT_OPERATION_LOG = $name
         $env:BOT_OPERATION_STAGE = $Kind
         Write-OperationEvent 'info' 'operation started'
-        $old = @(Get-ChildItem -LiteralPath $directory -File | Where-Object { $_.Name -ne $name -and $_.Name -match $pattern -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip 19)
+        $family = ($name -split '-',2)[0] + '-'
+        $old = @(Get-ChildItem -LiteralPath $directory -File | Where-Object { $_.Name -ne $name -and $_.Name.StartsWith($family) -and $_.Name -match $pattern -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip 19)
         foreach ($file in $old) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop }
         Write-Host ('运维日志：' + $path)
     } catch { Write-Warning ('无法创建运维日志，继续使用终端输出：' + (Protect-OperationMessage $_.Exception.Message)) }

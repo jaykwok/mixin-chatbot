@@ -4,6 +4,7 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cliArgs } from "../../lib/cli.ts";
 
 /** 仓库根目录。从本文件位置回溯，不依赖调用时的 cwd。 */
 export const PROJECT_DIR = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -101,18 +102,28 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
       request.Target = args[i++]!;
     }
     const switches: Record<string, string> = {
-      "--all": "All", "--json": "Json", "-Repair": "Repair", "-RestartTunnel": "RestartTunnel",
-      "--storage-segment": "StorageSegment", "--group-id": "GroupId",
+      all: "All", json: "Json", repair: "Repair", "restart-tunnel": "RestartTunnel",
+      "storage-segment": "StorageSegment", "group-id": "GroupId",
     };
-    const values: Record<string, string> = { "--days": "Days", "--user": "User", "--group": "Group", "--since": "Since", "--until": "Until" };
+    const values: Record<string, string> = { days: "Days", user: "User", group: "Group", since: "Since", until: "Until" };
+    // TUI passes argument values as opaque strings (including leading dashes).
+    // Encode them with '=' before the standard parser, preserving that contract.
+    const encodedArgs: string[] = [];
     for (; i < args.length; i++) {
       const flag = args[i]!;
-      if (switches[flag]) request[switches[flag]!] = true;
-      else if (values[flag] && args[i + 1] !== undefined) {
-        const value = args[++i]!;
-        request[values[flag]!] = flag === "--days" ? Number(value) : value;
-      } else throw new Error(`无法识别的运维参数：${flag}`);
+      if (values[flag.slice(2)] && args[i + 1] !== undefined) encodedArgs.push(flag + "=" + args[++i]);
+      else encodedArgs.push(flag === "-Repair" ? "--repair" : flag === "-RestartTunnel" ? "--restart-tunnel" : flag);
     }
+    const parsed = cliArgs(encodedArgs, {
+      all: { type: "boolean" }, json: { type: "boolean" }, repair: { type: "boolean" }, "restart-tunnel": { type: "boolean" },
+      "storage-segment": { type: "boolean" }, "group-id": { type: "boolean" },
+      days: { type: "string" }, user: { type: "string" }, group: { type: "string" }, since: { type: "string" }, until: { type: "string" },
+    });
+    if (parsed.positionals.length) throw new Error("存在多余的运维参数");
+    for (const [name, value] of Object.entries(parsed.values)) {
+      request[switches[name] ?? values[name]!] = name === "days" ? Number(value) : value;
+    }
+    if (request.StorageSegment && request.GroupId) throw new Error("群目录选择参数不能同时使用");
     // Only base64 crosses PowerShell's parameter binder. Values are never parsed as switches.
     const encoded = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
     return {
@@ -121,7 +132,18 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
       args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(PROJECT_DIR, "scripts", "ops", "ops.ps1"), "-RequestBase64", encoded],
     };
   }
-  return { command: "bash", args: [join(PROJECT_DIR, "scripts", "ops", "ops.sh"), ...args], env };
+  const commandArgs = [...args];
+  if (["tmp-ls", "tmp-purge"].includes(args[0] ?? "")) {
+    for (let i = 1; i < commandArgs.length; i++) {
+      if (["--group", "--user", "--days"].includes(commandArgs[i]!) && commandArgs[i + 1] !== undefined) {
+        commandArgs.splice(i, 2, commandArgs[i] + "=" + commandArgs[i + 1]);
+      }
+    }
+  } else if (args[0] === "stat" && args[1] && !args[1].startsWith("--")) {
+    commandArgs.splice(1, 1);
+    commandArgs.push("--", args[1]);
+  }
+  return { command: "bash", args: [join(PROJECT_DIR, "scripts", "ops", "ops.sh"), ...commandArgs], env };
 }
 
 /** 人话的模式标签，界面和报表共用。 */

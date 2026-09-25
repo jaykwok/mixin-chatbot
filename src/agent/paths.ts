@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative } from "node:path";
+export const SESSION_FILE = "session.jsonl";
 
 const SAFE_GROUP_SEGMENT = /^[A-Za-z0-9_+\-]{1,64}$/;
 const WINDOWS_RESERVED_SEGMENT = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
@@ -68,7 +69,7 @@ export function sessionFilePath(root: string, groupId: string, phone: string): s
     groupSegment(groupId),
     "users",
     userSegment(phone),
-    "session.jsonl"
+    SESSION_FILE
   );
 }
 

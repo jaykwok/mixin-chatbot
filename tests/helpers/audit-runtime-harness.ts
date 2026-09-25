@@ -66,7 +66,7 @@ const { stateDatabase } = await import("../../src/core/state.ts");
 if (process.argv[2] === "legacy-schema") {
   const db = stateDatabase();
   db.exec("CREATE TABLE deliveries (id TEXT PRIMARY KEY, session TEXT NOT NULL, text TEXT NOT NULL, at TEXT NOT NULL)");
-  await assert.rejects(runtime.initializeAgentRuntime(), /需要迁移/);
+  await assert.rejects(runtime.initializeAgentRuntime(), /不受当前迁移支持/);
   assert.equal((db.query("PRAGMA table_info(deliveries)").all() as { name: string }[]).some(column => column.name === "attachments"), false);
   db.close(); console.log("AUDIT_REGRESSIONS_PASSED"); process.exit(0);
 }

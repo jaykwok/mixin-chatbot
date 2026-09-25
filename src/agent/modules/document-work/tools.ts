@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
@@ -9,6 +9,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { AsyncSemaphore } from "../../../core/async-semaphore.ts";
 import { application } from "../../../core/lifecycle.ts";
+import { log } from "../../../core/log.ts";
 import { runProcess } from "../../../core/process.ts";
 import { isPathInside } from "../../paths.ts";
 import { resolveToolPath } from "../../tool-path.ts";
@@ -36,7 +37,7 @@ interface BuildRequest {
   template?: string; title?: string; subtitle?: string; cover?: boolean; sequence?: (number | "content")[]; styleFrom?: number[];
 }
 interface Job {
-  directory: string; signal: AbortSignal;
+  directory: string; scratch: string; signal: AbortSignal;
   snapshot(source: string, expected?: string, pdf?: boolean): Promise<Source>;
   assets(paths: string[]): Promise<Record<string, string>>;
   python<T>(operation: string, request: object): Promise<{ result: T; report: string }>;
@@ -46,14 +47,17 @@ interface Job {
 async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefined, task: (job: Job) => Promise<T>): Promise<T> {
   const budget = AbortSignal.any([application.signal, AbortSignal.timeout(300000), ...(signal ? [signal] : [])]);
   const release = await slots.acquire(budget);
+  let directory: string | undefined, succeeded = false;
   try {
     const workspace = await realpath(options.workspaceDir), temp = await realpath(options.tempDir);
-    const directory = await mkdtemp(join(temp, "document-work-"));
-    const env = { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory,
-      PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1", XDG_CACHE_HOME: join(directory, ".cache") };
+    const output = directory = await mkdtemp(join(temp, "document-work-"));
+    const scratch = join(output, ".work");
+    await mkdir(scratch);
+    const env = { ...process.env, TMPDIR: scratch, TMP: scratch, TEMP: scratch,
+      PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1", XDG_CACHE_HOME: join(scratch, ".cache") };
     let ready = false, totalBytes = 0;
     const run = async (command: string, args: string[]) => {
-      const result = await runProcess({ command, args, cwd: directory, env, signal: budget, timeoutMs: 240000 });
+      const result = await runProcess({ command, args, cwd: scratch, env, signal: budget, timeoutMs: 240000 });
       if (result.exitCode !== 0) throw new Error("文档操作失败：" + result.output.slice(-2000));
     };
     const locate = async (value: string): Promise<string> => {
@@ -62,7 +66,7 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
       return original;
     };
     const job: Job = {
-      directory, signal: budget, run,
+      directory: output, scratch, signal: budget, run,
       async snapshot(value, expected, pdf = false) {
         budget.throwIfAborted();
         const original = await locate(value);
@@ -70,7 +74,7 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
         if (!(pdf ? [".docx", ".pptx", ".pdf"] : [".docx", ".pptx"]).includes(extension)) throw new Error("仅支持 DOCX/PPTX，渲染另支持 PDF");
         const info = await stat(original);
         if (!info.isFile() || info.size > MAX_BYTES) throw new Error("文档必须是不超过 128 MiB 的普通文件");
-        const source = join(directory, randomUUID() + extension);
+        const source = join(scratch, randomUUID() + extension);
         const hash = createHash("sha256");
         let bytes = 0;
         await pipeline(createReadStream(original), new Transform({ transform(chunk: Buffer, _encoding, next) {
@@ -95,7 +99,7 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
           if (info.size > MAX_IMAGE_BYTES) throw new Error("图片超过 32 MiB：" + value);
           totalBytes += info.size;
           if (totalBytes > MAX_BYTES * 2) throw new Error("本次来源总量超过 256 MiB");
-          const target = join(directory, "asset-" + randomUUID() + extname(original).toLowerCase());
+          const target = join(scratch, "asset-" + randomUUID() + extname(original).toLowerCase());
           await pipeline(createReadStream(original), createWriteStream(target, { flags: "wx" }), { signal: budget });
           copied[value] = target;
         }
@@ -106,14 +110,23 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
           if (!await ensureDocumentToolchain(options.venvDir, budget)) throw new Error("文档环境不可用，请检查固定依赖环境");
           ready = true;
         }
-        const id = randomUUID(), input = join(directory, id + ".request.json"), report = join(directory, id + ".json");
-        await writeFile(input, JSON.stringify(request), { flag: "wx" });
+        const id = randomUUID(), input = join(scratch, id + ".request.json"), report = join(output, id + ".json");
+        await writeFile(input, JSON.stringify({ ...request, workdir: scratch }), { flag: "wx" });
         await run(venvPythonPath(options.venvDir), [pythonScript, operation, input, report]);
         return { result: JSON.parse(await readFile(report, "utf8")) as T, report };
       },
     };
-    return await task(job);
-  } finally { release(); }
+    const result = await task(job);
+    succeeded = true;
+    return result;
+  } finally {
+    try {
+      // Only directories created by this invocation are removed. Successful jobs
+      // retain their outputs/reports; failed or cancelled jobs have no deliverable.
+      if (directory) await rm(succeeded ? join(directory, ".work") : directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (error) { log.warn("文档工作目录清理失败：" + String(error)); }
+    finally { release(); }
+  }
 }
 
 function outputPath(directory: string, filename: string | undefined, extension: string): string {
@@ -203,7 +216,7 @@ export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition
             if (item.source !== undefined || item.slides || item.start !== undefined || item.end !== undefined) throw new Error("content 项不能同时指定 source/slides/start/end");
             const content = await prepareContent(job, item.content);
             contentWarnings.push(...content.warnings);
-            const generated = join(job.directory, "generated-" + index + "." + kind);
+            const generated = join(job.scratch, "generated-" + index + "." + kind);
             const request: BuildRequest = { format: kind!, output: generated, blocks: content.blocks, assets: content.assets,
               template: sources[0]!.source, cover: false, sequence: [] };
             const { result: built } = await job.python<Inspection>("build", request);
@@ -243,8 +256,8 @@ export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition
         const request = { output, items: prepared };
         let processingWarnings: string[] = [];
         if (kind === "pptx") {
-          const input = join(job.directory, "compose.json");
-          const assembled = join(job.directory, randomUUID() + ".pptx");
+          const input = join(job.scratch, "compose.json");
+          const assembled = join(job.scratch, randomUUID() + ".pptx");
           await writeFile(input, JSON.stringify({ ...request, output: assembled }));
           await job.run(process.execPath, [slidesScript, input]);
           const { result: finalized } = await job.python<Inspection>("finalize_slides", { source: assembled, output });

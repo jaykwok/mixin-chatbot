@@ -16,7 +16,7 @@ export function assertDeliverySchema(db: Database): void {
   const version = versionTable ? (db.query("SELECT version FROM delivery_schema WHERE id = 1").get() as { version: number } | null)?.version : undefined;
   const columns = new Set((db.query("PRAGMA table_info(deliveries)").all() as { name: string }[]).map(column => column.name));
   if (version !== 2 || ["id", "session", "text", "at", "attachments", "blocked_reason"].some(column => !columns.has(column))) {
-    throw new Error("待补发账本格式需要迁移；请先停止机器人，运行 tmp/migrate-audit-2026-09-13.ts --apply 后再启动");
+    throw new Error("待补发账本格式不受当前迁移支持（需要 schema 2）；请保持停机并保留数据库及 WAL，按 docs/data-migrations.md 的旧账本说明处理");
   }
 }
 

@@ -10,9 +10,9 @@ import { join, resolve } from "node:path";
 import { dataDirectoryNames } from "../../scripts/lib/group-data.ts";
 import { countUsageRecord, emptyUsage, type UsageTotals } from "../../scripts/lib/usage.ts";
 import { readSessionSlice, SessionFileChangedError, type SessionSlice, type StatsRecord } from "./session-reader.ts";
+import { SESSION_FILE } from "./paths.ts";
 
 const SCHEMA_VERSION = 1;
-const SESSION_FILE = "session.jsonl";
 
 /** 账本跟着群数据走：群数据根可以指到别的磁盘，统计不能留在项目目录里对不上。 */
 export function statsLedgerPath(root: string): string {

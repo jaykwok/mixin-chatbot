@@ -12,7 +12,7 @@ test("rejects old delivery schemas without changing their rows or columns", asyn
   try {
     db.exec("CREATE TABLE deliveries (id TEXT PRIMARY KEY, session TEXT NOT NULL, text TEXT NOT NULL, at TEXT NOT NULL)");
     db.query("INSERT INTO deliveries VALUES (?, ?, ?, ?)").run("old", "session", "legacy reply", "2026-09-13");
-    expect(() => new DeliveryStore(db)).toThrow("需要迁移");
+    expect(() => new DeliveryStore(db)).toThrow("不受当前迁移支持");
     expect(db.query("SELECT text FROM deliveries").get()).toEqual({ text: "legacy reply" });
     expect((db.query("PRAGMA table_info(deliveries)").all() as { name: string }[]).map(column => column.name)).toEqual(["id", "session", "text", "at"]);
   } finally { db.close(); await fixture.cleanup(); }

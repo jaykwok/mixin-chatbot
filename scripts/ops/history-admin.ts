@@ -1,3 +1,4 @@
+import { describeAge } from "../lib/age.ts";
 // 查看各群会话占用，停机后将指定群的 session.jsonl 归档到 backup/rm。
 // 未交付记录独立保留；目录遍历使用实际存储段并拒绝链接。
 import { lstat } from "node:fs/promises";
@@ -20,13 +21,6 @@ function usage(): void {
   console.log("  清空后每位成员的下一条消息都会开启全新会话。");
 }
 
-function describeAge(at: number): string {
-  const minutes = Math.max(0, Math.round((Date.now() - at) / 60_000));
-  if (minutes < 60) return `${minutes} 分钟前`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours} 小时前`;
-  return `${Math.floor(hours / 24)} 天前`;
-}
 
 /** 扫描本身在 scripts/lib/history-scan.ts，宿主机上的运维界面直接调那一份。 */
 export async function collect(root: string = GROUP_DATA_ROOT): Promise<GroupHistory[]> {

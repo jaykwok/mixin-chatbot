@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { groupSegment, isPathInside } from "../../src/agent/paths.ts";
 
 export type GroupSelection = "auto" | "id" | "segment";
+class UnsafeDataDirectoryError extends Error {}
 
 /**
  * 扫描结果排序时的并列打破依据：按名字定序。
@@ -38,7 +39,7 @@ export async function assertDataDirectory(path: string, root: string): Promise<v
   for (;;) {
     const info = await lstat(current);
     if (!info.isDirectory() || info.isSymbolicLink() || !isPathInside(await realpath(current), canonical)) {
-      throw new Error("群数据路径已改变或包含符号链接，拒绝操作");
+      throw new UnsafeDataDirectoryError("群数据路径已改变或包含符号链接，拒绝操作");
     }
     if (current === base) break;
     current = dirname(current);
@@ -53,7 +54,7 @@ export async function dataDirectoryNames(path: string, root: string): Promise<st
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     // Listing never follows an unsafe directory; a clear/purge rechecks before each archive.
-    if (String(error).includes("符号链接")) return [];
+    if (error instanceof UnsafeDataDirectoryError) return [];
     throw error;
   }
 }
