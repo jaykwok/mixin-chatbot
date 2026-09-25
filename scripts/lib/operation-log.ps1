@@ -38,13 +38,14 @@ function Write-OperationFailure($Failure) {
 }
 
 function Start-OperationLog([string]$ProjectRoot, [string]$Kind) {
-    $context = [pscustomobject]@{ Name=$env:BOT_OPERATION_LOG; Project=$env:BOT_OPERATION_PROJECT; Stage=$env:BOT_OPERATION_STAGE; Path=$null }
+    $context = [pscustomobject]@{ Name=$env:BOT_OPERATION_LOG; Project=$env:BOT_OPERATION_PROJECT; Stage=$env:BOT_OPERATION_STAGE; Path=$null; OwnsLog=$false }
     try {
         $directory = Join-Path $ProjectRoot 'logs\operations'
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
         if ((Get-Item -LiteralPath $directory).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '日志目录不能是链接' }
         $pattern = '^(upgrade|deploy|migration|startup)-[0-9TZ]+-[a-zA-Z0-9_-]+\.log$'
-        $name = if ($env:BOT_OPERATION_LOG -match $pattern) { $env:BOT_OPERATION_LOG } else { $Kind + '-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-' + [Guid]::NewGuid().ToString('N') + '.log' }
+        $context.OwnsLog = -not ($env:BOT_OPERATION_LOG -match $pattern)
+        $name = if (-not $context.OwnsLog) { $env:BOT_OPERATION_LOG } else { $Kind + '-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-' + [Guid]::NewGuid().ToString('N') + '.log' }
         $path = Join-Path $directory $name
         if (Test-Path -LiteralPath $path) {
             $item = Get-Item -LiteralPath $path
@@ -58,14 +59,14 @@ function Start-OperationLog([string]$ProjectRoot, [string]$Kind) {
         $family = ($name -split '-',2)[0] + '-'
         $old = @(Get-ChildItem -LiteralPath $directory -File | Where-Object { $_.Name -ne $name -and $_.Name.StartsWith($family) -and $_.Name -match $pattern -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip 19)
         foreach ($file in $old) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop }
-        Write-Host ('运维日志：' + $path)
+        if ($context.OwnsLog) { Write-Host ('本次操作日志：' + $path) }
     } catch { Write-Warning ('无法创建运维日志，继续使用终端输出：' + (Protect-OperationMessage $_.Exception.Message)) }
     return $context
 }
 
 function Stop-OperationLog($Context, [int]$ExitCode) {
     Write-OperationEvent $(if ($ExitCode) { 'error' } else { 'info' }) ('operation finished; exit=' + $ExitCode)
-    if ($Context.Path) { Write-Host ('运维日志：' + $Context.Path) }
+    if ($ExitCode -ne 0 -and $Context.OwnsLog -and $Context.Path) { Write-Host ('本次操作日志：' + $Context.Path) }
     $env:BOT_OPERATION_LOG = $Context.Name
     $env:BOT_OPERATION_PROJECT = $Context.Project
     $env:BOT_OPERATION_STAGE = $Context.Stage

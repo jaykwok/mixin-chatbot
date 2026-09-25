@@ -25,7 +25,7 @@ async function main() {
   if (!["status", "committed"].includes(command)) {
     diagnostic = openOperationLog(resolve(project), "migration");
     diagnostic.event("info", command, `target=${DATA_VERSION}; deployment=${process.env.BOT_DEPLOY_BACKUP_ID ?? "manual"}`);
-    if (diagnostic.path) console.error("迁移日志：" + diagnostic.path);
+    if (diagnostic.ownsLog && diagnostic.path) console.error("本次操作日志：" + diagnostic.path);
   }
   const context: Context = { project: resolve(project), groups: groups ? resolve(project, groups) : serviceGroupRoot(project), decisions,
     report: (stage, detail) => {
@@ -68,4 +68,5 @@ if (import.meta.main) main().catch(error => {
 }).finally(() => {
   const code = Number(process.exitCode ?? 0);
   diagnostic?.event(code ? "error" : "info", "migration-finished", `exit=${code}`);
+  if (code && diagnostic?.ownsLog && diagnostic.path) console.error("本次操作日志：" + diagnostic.path);
 });

@@ -16,6 +16,46 @@ async function run(args: string[], cwd: string, env: Record<string, string> = {}
   return { code, text: out + err };
 }
 
+for (const entry of ["migration", ...(process.platform === "win32" ? ["powershell"] : []), ...(bash && existsSync(bash) ? ["bash"] : [])]) {
+  for (const status of [0, 1]) test(`${entry} announces one operation log, repeating it only on failure (exit ${status})`, async () => {
+    const f = await tempFixture("operation-log-chain-");
+    try {
+      const groups = join(f.root, "groups"), migration = join(project, "scripts/migrations/run.ts");
+      await mkdir(join(f.root, "data/runtime/pi"), { recursive: true });
+      await writeFile(join(f.root, "data/runtime/pi/settings.json"), JSON.stringify({ defaultProvider: "fixture", defaultModel: "fixture" }));
+      if (status === 0) await mkdir(groups);
+      let args = [process.execPath, migration, "preview", "--decisions-only", "--project", f.root, "--groups", groups];
+      if (entry === "powershell") {
+        const header = `\ufeff$ErrorActionPreference='Stop'\n[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)\n. ${quotePS(join(project, "scripts/lib/operation-log.ps1"))}\n`;
+        const child = join(f.root, "child.ps1"), parent = join(f.root, "parent.ps1");
+        await writeFile(child, header + `$context=Start-OperationLog $PSScriptRoot 'deploy'\n& ${args.map(quotePS).join(" ")}\n$code=$LASTEXITCODE\nStop-OperationLog $context $code\nexit $code\n`);
+        await writeFile(parent, header + `$context=Start-OperationLog $PSScriptRoot 'upgrade'\n& (Join-Path $PSHOME 'powershell.exe') -NoProfile -ExecutionPolicy Bypass -File ${quotePS(child)}\n$code=$LASTEXITCODE\nStop-OperationLog $context $code\nexit $code\n`);
+        args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", parent];
+      } else if (entry === "bash") {
+        const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+        const header = `#!/usr/bin/env bash\nset -uo pipefail\nPROJECT_DIR=${quote(posix(f.root))}\n. ${quote(posix(join(project, "scripts/lib/operation-log.sh")))}\n`;
+        const child = join(f.root, "child.sh"), parent = join(f.root, "parent.sh");
+        const command = [posix(process.execPath), ...args.slice(1).map(arg => arg.replaceAll("\\", "/"))].map(quote).join(" ");
+        await writeFile(child, header + `operation_start deploy\ncode=0\n${command} || code=$?\noperation_finish "$code"\nexit "$code"\n`);
+        await writeFile(parent, header + `operation_start upgrade\ncode=0\nbash ${quote(posix(child))} || code=$?\noperation_finish "$code"\nexit "$code"\n`);
+        args = [bash!, posix(parent)];
+      }
+      const result = await run(args, f.root, { BOT_OPERATION_LOG: "", BOT_MODEL_CACHE_RETENTION: "", PI_CACHE_RETENTION: "", MSYS_NO_PATHCONV: "1" });
+      expect(result.code, result.text).toBe(status);
+      const directory = join(f.root, "logs/operations"), logs = await readdir(directory);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toStartWith(entry === "migration" ? "migration-" : "upgrade-");
+      expect(result.text.split(logs[0]!).length - 1, result.text).toBe(status === 0 ? 1 : 2);
+      expect(result.text.match(/本次操作日志：/g), result.text).toHaveLength(status === 0 ? 1 : 2);
+      const text = await readFile(join(directory, logs[0]!), "utf8");
+      expect(text).toContain(`migration-finished: exit=${status}`);
+      if (entry !== "migration") expect(text).toContain(`operation finished; exit=${status}`);
+      if (status) expect(text).toContain("目录不存在");
+      else expect(result.text).toContain('"decisions": []');
+    } finally { await f.cleanup(); }
+  }, 30000);
+}
+
 for (const writer of ["typescript", ...(process.platform === "win32" ? ["powershell"] : []), ...(bash && existsSync(bash) ? ["bash"] : [])]) {
   test(`${writer} diagnostics redact bare provider tokens without labels`, async () => {
     const f = await tempFixture("log-token-prefixes-");

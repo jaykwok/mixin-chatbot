@@ -20,11 +20,13 @@ export function operationError(error: unknown): string {
 
 export function openOperationLog(project: string, kind: "upgrade" | "deploy" | "migration" | "startup", inherited = process.env.BOT_OPERATION_LOG) {
   const directory = join(project, "logs/operations");
+  // Inheriting a log also delegates its terminal announcement to the caller.
+  const parentName = inherited && namePattern.test(inherited) ? inherited : undefined;
   let path: string | undefined, name: string | undefined;
   try {
     mkdirSync(directory, { recursive: true });
     if (lstatSync(directory).isSymbolicLink()) throw new Error("diagnostic directory is a link");
-    name = inherited && namePattern.test(inherited) ? inherited : `${kind}-${new Date().toISOString().replace(/[-:.]/g, "")}-${randomUUID()}.log`;
+    name = parentName ?? `${kind}-${new Date().toISOString().replace(/[-:.]/g, "")}-${randomUUID()}.log`;
     path = join(directory, name);
     if (existsSync(path) && (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink())) throw new Error("diagnostic file is not a regular file");
     if (!existsSync(path)) closeSync(openSync(path, "wx", 0o600));
@@ -59,5 +61,5 @@ export function openOperationLog(project: string, kind: "upgrade" | "deploy" | "
       warned = true;
     }
   };
-  return { path, name, event };
+  return { path, name, event, ownsLog: !parentName };
 }

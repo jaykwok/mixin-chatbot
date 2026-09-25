@@ -138,7 +138,7 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
     await refreshIndex(record, signal);
     record.queue.phase = "执行中";
     // A status message is disposable and cannot delay model execution.
-    const status = sendText("收到, 正在处理... 🤔💭", record.groupId, record.phone, record.callbackUrl,
+    const status = sendText("收到，正在处理🤔💭", record.groupId, record.phone, record.callbackUrl,
       { traffic: "status", signal }).catch(() => false);
     application.track(status);
     setStage(record, "模型调用准备（含历史检查）");

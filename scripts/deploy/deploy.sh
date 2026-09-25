@@ -670,19 +670,19 @@ fi
 
 # ---- 等待健康检查 ----
 
-print_status "等待服务就绪..."
+print_status "等待部署预检通过..."
 for i in $(seq 1 18); do
     if docker exec mixin-chatbot bun run scripts/ops/health-check.ts --allow-verification; then
-        print_success "健康检查通过"
+        print_success "部署预检通过"
         break
     fi
     if [ "$(docker inspect --format='{{.State.Running}}' mixin-chatbot 2>/dev/null || echo false)" != true ]; then
-        print_error "健康检查失败，请查看日志: $(ops_command_hint logs)"
+        print_error "部署预检失败，请查看日志: $(ops_command_hint logs)"
         docker logs --tail 50 mixin-chatbot 2>&1 || true
         exit 1
     fi
     if [ $i -eq 18 ]; then
-        print_error "健康检查超时（90s），请查看日志: $(ops_command_hint logs)"
+        print_error "部署预检超时（90s），请查看日志: $(ops_command_hint logs)"
         docker logs --tail 50 mixin-chatbot 2>&1 || true
         exit 1
     fi
@@ -794,7 +794,8 @@ if [ "${CLEANUP_UFW_AFTER_HEALTH:-0}" = "1" ]; then
     fi
 fi
 
-# 只有机器人健康且部署模式切换完成后才提交状态，避免运维脚本读取到半完成配置。
+# 只有部署预检通过且部署模式切换完成后才提交状态，避免运维脚本读取到半完成配置。
+print_status "提交部署..."
 printf '%s' "$BOT_PORT" > "$BOT_PORT_FILE"
 printf '%s' "$DEPLOY_MODE" > "$DEPLOY_MODE_FILE"
 printf '%s' "$HOST_GROUP_DATA_ROOT" > "$GROUP_DATA_ROOT_FILE"
@@ -810,6 +811,7 @@ migration_docker commit
 commit_deployment
 rm -f -- "$PROJECT_DIR/data/state/verify-only" "$PROJECT_DIR/data/state/migration-plan.json"
 if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
+    print_status "启动机器人并等待健康检查..."
     docker start mixin-chatbot >/dev/null
     normal_ready=0
     for i in $(seq 1 18); do
@@ -837,7 +839,7 @@ fi
 if [ "${DEPLOY_PRESERVE_STOPPED:-0}" = 1 ] && [ "$PREVIOUS_RUNNING" = 0 ]; then
     print_success '升级完成，已恢复原停止状态。'
 elif docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
-    print_success "服务启动成功"
+    print_success "机器人已启动"
 
     echo ""
     echo "=========================================="

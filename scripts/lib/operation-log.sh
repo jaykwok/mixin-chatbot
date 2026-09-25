@@ -29,6 +29,8 @@ operation_stage() { export BOT_OPERATION_STAGE="$1"; operation_event info begin;
 operation_start() {
     local kind="$1" directory="$PROJECT_DIR/logs/operations" file name family count=0
     local pattern='^(upgrade|deploy|migration|startup)-[0-9TZ]+-[a-zA-Z0-9_-]+\.log$'
+    # Only the process creating the log announces it; children inherit its name.
+    OPERATION_LOG_OWNER=0
     mkdir -p -- "$directory" || { echo '无法创建运维日志目录，继续使用终端输出' >&2; return 0; }
     [ ! -L "$directory" ] || { echo '日志目录不能是链接' >&2; return 0; }
     if [[ "${BOT_OPERATION_LOG:-}" =~ $pattern ]]; then
@@ -37,6 +39,7 @@ operation_start() {
         (umask 077; touch -- "$file") || return 0
     else
         file="$(umask 077; mktemp "$directory/$kind-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXX.log")" || return 0
+        OPERATION_LOG_OWNER=1
     fi
     export BOT_OPERATION_LOG="${file##*/}" BOT_OPERATION_LOG_PATH="$file"
     family="${BOT_OPERATION_LOG%%-*}"
@@ -47,12 +50,14 @@ operation_start() {
         count=$((count+1))
         if [ "$count" -ge 20 ]; then rm -f -- "$directory/$name" || true; fi
     done < <(ls -1t -- "$directory"/*.log 2>/dev/null)
-    echo "运维日志：$BOT_OPERATION_LOG_PATH" >&2
+    if [ "$OPERATION_LOG_OWNER" = 1 ]; then echo "本次操作日志：$BOT_OPERATION_LOG_PATH" >&2; fi
 }
 
 operation_finish() {
     operation_event "$([ "$1" = 0 ] && echo info || echo error)" "operation finished; exit=$1"
-    [ -z "${BOT_OPERATION_LOG_PATH:-}" ] || echo "运维日志：$BOT_OPERATION_LOG_PATH" >&2
+    if [ "$1" != 0 ] && [ "${OPERATION_LOG_OWNER:-0}" = 1 ] && [ -n "${BOT_OPERATION_LOG_PATH:-}" ]; then
+        echo "本次操作日志：$BOT_OPERATION_LOG_PATH" >&2
+    fi
     return 0
 }
 

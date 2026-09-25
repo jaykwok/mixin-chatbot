@@ -640,14 +640,15 @@ if ($taskUsesS4U) {
         Start-ScheduledTask -TaskName $TaskName
     }
 }
-Step "等待机器人健康检查通过..."
+Step "等待部署预检通过..."
 $healthy = Wait-BotHealth $Port -AllowVerification
 if (-not $healthy) {
     $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
     $lastResult = if ($taskInfo) { "$(Get-ResultCodeHex $taskInfo.LastTaskResult) / $($taskInfo.LastTaskResult)" } else { "未知" }
-    Fail "机器人在 90 秒内未通过健康检查（任务结果：$lastResult）。请在 $(Get-OpsCommandHint 'logs') 查看日志，并使用 $(Get-OpsCommandHint 'doctor')。"
-    throw "新部署未通过健康检查"
+    Fail "部署预检未通过（任务结果：$lastResult）。请在 $(Get-OpsCommandHint 'logs') 查看日志，并使用 $(Get-OpsCommandHint 'doctor')。"
+    throw "新部署未通过预检"
 }
+Done "部署预检通过"
 if ($mode -eq "direct") {
     $existingTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
     if ($existingTunnelService) {
@@ -674,7 +675,6 @@ if ($mode -eq "direct") {
         }
     }
 }
-Done "机器人健康（群数据总根=$GroupDataRoot）。停止请用 $(Get-OpsCommandHint 'stop')；日志：$(Get-OpsCommandHint 'logs')"
 Warn "任务启动方式：$taskStartDescription。"
 
 # ---- 7b. Cloudflare 模式：确保隧道在线（已有服务则启动，否则调用安装脚本）----
@@ -752,18 +752,21 @@ if ($cleanupFirewallAfterHealth) {
         Done "Cloudflare 模式已清理本项目旧直连防火墙规则"
     }
 }
-# 机器人健康且隧道/直连切换成功后再提交，避免 doctor 读取半完成配置。
+# 部署预检通过且隧道/直连切换成功后再提交，避免 doctor 读取半完成配置。
+Step "提交部署..."
 Save-DeploymentState
 Done "部署状态已写入 data\state。"
-Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 → 外链配置」按需启用。"
 if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止' }
 & $bunPath run $migrationRunner commit --project $Project --groups $GroupDataRoot
 if ($LASTEXITCODE -ne 0) { throw '迁移提交失败' }
 $deploymentCommitted = $true
 Remove-Item -LiteralPath (Join-Path $StateDir 'verify-only') -Force
+Step "启动机器人并等待健康检查..."
 Enable-ScheduledTask -TaskName $TaskName | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 if (-not (Wait-BotHealth $Port)) { throw '数据已提交，但业务实例未就绪；保留新版本，请检查日志后启动' }
+Done "机器人已启动（群数据总根=$GroupDataRoot）。停止请用 $(Get-OpsCommandHint 'stop')；日志：$(Get-OpsCommandHint 'logs')"
+Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 → 外链配置」按需启用。"
 
 } catch { Write-OperationFailure $_; throw } finally {
     if (-not $deploymentCommitted -and $deploymentMutated) {
