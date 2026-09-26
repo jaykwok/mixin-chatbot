@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tempFixture } from "../helpers/temp.ts";
@@ -25,12 +25,15 @@ test.skipIf(!bash || !existsSync(bash))("Docker update stops before checkout and
   };
   try {
     await mkdir(join(work, "scripts/deploy"), { recursive: true }); await mkdir(state, { recursive: true });
+    const models = join(work, "data/config/models.json");
+    await mkdir(join(work, "data/config"), { recursive: true }); await writeFile(models, "{}");
     await writeFile(join(work, ".gitignore"), "data/\nlogs/\ntmp/\nbackup/\n");
     await writeFile(join(work, "scripts/deploy/deploy.sh"), `#!/usr/bin/env bash
 set -euo pipefail
 test "$(cat data/state/running)" = false
 test "$(cat version.txt)" = new
 test "$DEPLOY_PREVIOUS_RUNNING" = "$EXPECT_RUNNING"
+test "$DEPLOY_REUSE_SETTINGS" = 1
 test "$DEPLOY_TUNNEL_INPUT_PREPARED" = "\${EXPECT_TUNNEL_PREPARED:-}"
 test "$DEPLOY_TUNNEL_TOKEN_INPUT" = "\${EXPECT_TUNNEL_INPUT:-}"
 test "$DEPLOY_UNMANAGED_TUNNEL_CONFIRMED" = "\${EXPECT_UNMANAGED:-}"
@@ -46,6 +49,7 @@ if [ "$DEPLOY_PREVIOUS_RUNNING" = 1 ]; then printf true > data/state/running; fi
     await writeFile(launcher, `#!/usr/bin/env bash
 set -uo pipefail
 PROJECT_DIR="$1"; STATE_DIR="$PROJECT_DIR/data/state"; CONTAINER=mixin-chatbot
+MODELS_FILE="$PROJECT_DIR/data/config/models.json"; ops_command_hint(){ echo "$*"; }
 CYAN=''; NC=''; ROLLBACK_CONTAINER=mixin-chatbot-rollback
 cd "$PROJECT_DIR"
 . '${posix(join(project, "scripts/lib/operation-log.sh"))}'
@@ -136,6 +140,15 @@ update
       expect(await readFile(join(state, "running"), "utf8"), tunnel.name).toBe("true");
       expect(result.text, tunnel.name).not.toContain("fixture-token");
     }
+
+    // Updates reuse the saved AI configuration; a missing one needs the interactive wizard, so refuse before the stop.
+    await git("reset", "--hard", old);
+    await rm(models); await writeFile(join(state, "running"), "true"); await writeFile(join(state, "events"), "");
+    const unconfigured = await run([bash!, posix(launcher), posix(work)], { FIXTURE_MODE: "success", EXPECT_RUNNING: "1" });
+    expect(unconfigured.code, unconfigured.text).toBe(1); expect(unconfigured.text).toContain("models.json");
+    expect(await readFile(join(state, "events"), "utf8")).toBe("");
+    expect(await git("rev-parse", "HEAD")).toBe(old);
+    await writeFile(models, "{}");
 
     // Preflight must report the local main branch, even when HEAD is elsewhere.
     await git("branch", "-m", "topic");

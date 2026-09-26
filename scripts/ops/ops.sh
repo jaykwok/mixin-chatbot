@@ -741,6 +741,8 @@ update() (
     echo ""
 
     docker info >/dev/null 2>&1 || { ER '无法连接 Docker，尚未应用升级'; return 1; }
+    # 升级沿用现有 AI 配置；缺少模型配置需要交互向导，应先通过部署完成，不能留到停机后。
+    [ -f "$MODELS_FILE" ] || { ER "缺少 data/config/models.json；升级沿用现有 AI 配置，请先使用 $(ops_command_hint deploy) 完成配置"; return 1; }
     # 部署脚本在停机后不再询问隧道：未托管 connector 的归属和缺失的 token 都在停机前按当前模式确认。
     local tunnel_prepared='' tunnel_input='' unmanaged_confirmed='' unmanaged_pid=''
     if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1; then
@@ -812,14 +814,15 @@ update() (
 
     # Docker 部署升级必须重建镜像，而「重建 + 换容器 + 失败自动换回旧容器」这套逻辑已经
     # 完整存在于 deploy.sh 里。在这里再写一遍等于把最关键的安全逻辑维护成两份，所以直接
-    # 交给它；端口、模式、域名、群数据根这些提示都默认沿用当前值，回车即可。
+    # 交给它。DEPLOY_REUSE_SETTINGS 让它沿用已保存的端口、模式、域名、群数据根和 AI 配置，
+    # 停机期间不再询问配置；要改这些配置请使用 deploy。
     # 隧道也由 deploy.sh 一并处理，不需要在这里单独重启 cloudflared；它需要的 token 和归属确认已在停机前取得。
-    P "通过部署向导重建镜像并切换容器（各项提示直接回车即沿用当前配置）..."
+    P "沿用现有配置重建镜像并切换容器（端口、入口模式、群数据总根、域名和 AI 配置不变）..."
     echo ""
     mkdir -p "$PROJECT_DIR/tmp" || return 1
     # 停机前的隧道确认经环境交给部署脚本（不进入命令行参数），部署脚本读入后立即清除。
     DEPLOY_TUNNEL_INPUT_PREPARED="$tunnel_prepared" DEPLOY_TUNNEL_TOKEN_INPUT="$tunnel_input" DEPLOY_UNMANAGED_TUNNEL_CONFIRMED="$unmanaged_confirmed" \
-      BOT_UPDATE_COMMIT_FILE="$commit_file" DEPLOY_PRESERVE_STOPPED=1 DEPLOY_PREVIOUS_RUNNING="$was_running" DEPLOY_ORIGINAL_CONTAINER="$handoff_container" bash "$deploy_script" <&0 &
+      DEPLOY_REUSE_SETTINGS=1 BOT_UPDATE_COMMIT_FILE="$commit_file" DEPLOY_PRESERVE_STOPPED=1 DEPLOY_PREVIOUS_RUNNING="$was_running" DEPLOY_ORIGINAL_CONTAINER="$handoff_container" bash "$deploy_script" <&0 &
     deploy_pid=$!
     tunnel_input=''
     if wait "$deploy_pid"; then
@@ -949,7 +952,7 @@ case "${1:-}" in
         echo "             加 --json 输出单行 JSON，供运维界面消费"
         echo "  deploy     配置并部署当前代码；已有部署可用于重建修复，失败自动回滚"
         echo "  update     同步 origin/main，再交给 deploy.sh 重建并切换容器；失败自动回滚代码"
-        echo "             deploy.sh 的各项提示直接回车即沿用现有配置"
+        echo "             沿用现有端口、入口模式、群数据根、域名和 AI 配置，停机后不再询问配置；改配置请用 deploy"
         echo "  restart    重启 Docker 容器"
         echo "  stop       停止 Docker 容器"
         echo "  start      启动 Docker 容器"

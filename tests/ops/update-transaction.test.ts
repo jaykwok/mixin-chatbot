@@ -25,7 +25,9 @@ test.skipIf(process.platform !== "linux")("Linux update shares its real flock wi
     const commit = deployment.indexOf("\ncommit_deployment\n");
     expect(commit).toBeGreaterThan(0);
     const completion = deployment.slice(commit);
-    for (const dir of ["scripts/ops", "scripts/lib", "scripts/deploy"]) await mkdir(join(work, dir), { recursive: true });
+    for (const dir of ["scripts/ops", "scripts/lib", "scripts/deploy", "data/config"]) await mkdir(join(work, dir), { recursive: true });
+    // Updates reuse the saved AI configuration and refuse to stop without one.
+    await writeFile(join(work, "data/config/models.json"), "{}");
     const ops = await readFile(join(project, "scripts/ops/ops.sh"), "utf8");
     const dispatch = ops.indexOf('\ncase "${1:-}" in\n');
     expect(dispatch).toBeGreaterThan(0);

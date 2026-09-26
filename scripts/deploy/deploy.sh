@@ -29,6 +29,8 @@ PREPARED_TUNNEL_READY="${DEPLOY_TUNNEL_INPUT_PREPARED:-0}"
 PREPARED_TUNNEL_INPUT="${DEPLOY_TUNNEL_TOKEN_INPUT:-}"
 PREPARED_UNMANAGED_MODE="${DEPLOY_UNMANAGED_TUNNEL_CONFIRMED:-}"
 unset DEPLOY_TUNNEL_INPUT_PREPARED DEPLOY_TUNNEL_TOKEN_INPUT DEPLOY_UNMANAGED_TUNNEL_CONFIRMED
+# ops update 已先停机：沿用已保存的端口、入口模式、群数据根、域名和 AI 配置，停机期间不再询问配置。
+REUSE_SETTINGS="${DEPLOY_REUSE_SETTINGS:-0}"
 DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
 STATE_DIR="${DATA_DIR}/state"
@@ -89,6 +91,11 @@ trim_input() {
 read_input() {
     local prompt="$1" output_name="$2" input_value="" hidden="${3:-0}"
     local read_options=(-r)
+    if [ "$REUSE_SETTINGS" = 1 ]; then
+        # 升级期间服务已停止；需要回答的问题说明现有配置不可直接沿用，回滚后由部署脚本处理。
+        print_error "升级沿用现有配置，停机期间不能等待输入：${prompt}；升级将回滚，请先运行部署脚本调整配置"
+        exit 1
+    fi
     if [ "$hidden" = "1" ]; then read_options+=(-s); fi
     print_prompt "$prompt"
     if ! IFS= read "${read_options[@]}" input_value; then
@@ -196,18 +203,26 @@ else
     PORT_DEFAULT="1011"
 fi
 if ! [[ "$PORT_DEFAULT" =~ ^[0-9]+$ ]] || [ "$PORT_DEFAULT" -lt 1 ] || [ "$PORT_DEFAULT" -gt 65535 ]; then
+    if [ "$REUSE_SETTINGS" = 1 ]; then
+        print_error "${PORT_DEFAULT_SOURCE} 中的端口无效：${PORT_DEFAULT}；升级不会改用其他端口，将回滚，请先运行部署脚本修正"
+        exit 1
+    fi
     print_warning "${PORT_DEFAULT_SOURCE} 中的端口无效，已改用安全默认值 1011：${PORT_DEFAULT}"
     PORT_DEFAULT="1011"
 fi
-while true; do
-    read_input "机器人监听端口 [默认 ${PORT_DEFAULT}]：" port_in
-    port_in="$(trim_input "$port_in")"
-    BOT_PORT="${port_in:-$PORT_DEFAULT}"
-    if [[ "$BOT_PORT" =~ ^[0-9]+$ ]] && [ "$BOT_PORT" -ge 1 ] && [ "$BOT_PORT" -le 65535 ]; then
-        break
-    fi
-    print_warning "端口必须是 1–65535 的整数，请重新输入"
-done
+if [ "$REUSE_SETTINGS" = 1 ]; then
+    BOT_PORT="$PORT_DEFAULT"
+else
+    while true; do
+        read_input "机器人监听端口 [默认 ${PORT_DEFAULT}]：" port_in
+        port_in="$(trim_input "$port_in")"
+        BOT_PORT="${port_in:-$PORT_DEFAULT}"
+        if [[ "$BOT_PORT" =~ ^[0-9]+$ ]] && [ "$BOT_PORT" -ge 1 ] && [ "$BOT_PORT" -le 65535 ]; then
+            break
+        fi
+        print_warning "端口必须是 1–65535 的整数，请重新输入"
+    done
+fi
 print_success "监听端口：$BOT_PORT"
 
 # ---- 部署模式 ----
@@ -226,6 +241,10 @@ else
     DEPLOY_MODE_DEFAULT="direct"
 fi
 if [ "$DEPLOY_MODE_DEFAULT" != "direct" ] && [ "$DEPLOY_MODE_DEFAULT" != "cloudflare" ]; then
+    if [ "$REUSE_SETTINGS" = 1 ]; then
+        print_error "${DEPLOY_MODE_DEFAULT_SOURCE} 中的部署模式无效：${DEPLOY_MODE_DEFAULT}；升级不会改用其他入口，将回滚，请先运行部署脚本修正"
+        exit 1
+    fi
     print_warning "${DEPLOY_MODE_DEFAULT_SOURCE} 中的部署模式无效，已改用安全默认值 direct：${DEPLOY_MODE_DEFAULT}"
     DEPLOY_MODE_DEFAULT="direct"
 fi
@@ -237,20 +256,24 @@ else
     DEPLOY_MODE_DEFAULT_LABEL="直连"
 fi
 
-echo ""
-print_prompt "选择部署模式："
-echo "  1) 直连模式 — 服务器有公网 IP，直接暴露 :${BOT_PORT}（UFW 只放行平台 IP）"
-echo "  2) Cloudflare 模式 — 经 cloudflared 隧道 + WAF（无公网 IP / 想要边缘防护）"
-while true; do
-    read_input "输入 1 或 2 [默认 ${DEPLOY_MODE_DEFAULT_CHOICE} / ${DEPLOY_MODE_DEFAULT_LABEL}]：" mode_choice
-    mode_choice="$(trim_input "$mode_choice")"
-    mode_choice="${mode_choice:-$DEPLOY_MODE_DEFAULT_CHOICE}"
-    case "$mode_choice" in
-        1) DEPLOY_MODE="direct"; break ;;
-        2) DEPLOY_MODE="cloudflare"; break ;;
-        *) print_warning "请输入 1 或 2" ;;
-    esac
-done
+if [ "$REUSE_SETTINGS" = 1 ]; then
+    DEPLOY_MODE="$DEPLOY_MODE_DEFAULT"
+else
+    echo ""
+    print_prompt "选择部署模式："
+    echo "  1) 直连模式 — 服务器有公网 IP，直接暴露 :${BOT_PORT}（UFW 只放行平台 IP）"
+    echo "  2) Cloudflare 模式 — 经 cloudflared 隧道 + WAF（无公网 IP / 想要边缘防护）"
+    while true; do
+        read_input "输入 1 或 2 [默认 ${DEPLOY_MODE_DEFAULT_CHOICE} / ${DEPLOY_MODE_DEFAULT_LABEL}]：" mode_choice
+        mode_choice="$(trim_input "$mode_choice")"
+        mode_choice="${mode_choice:-$DEPLOY_MODE_DEFAULT_CHOICE}"
+        case "$mode_choice" in
+            1) DEPLOY_MODE="direct"; break ;;
+            2) DEPLOY_MODE="cloudflare"; break ;;
+            *) print_warning "请输入 1 或 2" ;;
+        esac
+    done
+fi
 if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     BOT_HOST="127.0.0.1"
     DEPLOY_MODE_LABEL="Cloudflare"
@@ -273,8 +296,18 @@ else
     GROUP_DATA_ROOT_DEFAULT="$DEFAULT_GROUP_DATA_ROOT"
 fi
 GROUP_DATA_ROOT="$GROUP_DATA_ROOT_DEFAULT"
+GROUP_ROOT_CHECKED=0
 while true; do
-    read_input "Pi 群数据总根 [默认 ${GROUP_DATA_ROOT_DEFAULT}；首次为 ${DEFAULT_GROUP_DATA_ROOT}]：" cwd_in
+    # 升级沿用的群数据根只检查一次；不可用时回滚，而不是在停机期间反复询问。
+    if [ "$REUSE_SETTINGS" = 1 ] && [ "$GROUP_ROOT_CHECKED" = 1 ]; then
+        print_error "现有群数据总根不可用（原因见上方）；升级将回滚，请先运行部署脚本调整"
+        exit 1
+    fi
+    GROUP_ROOT_CHECKED=1
+    cwd_in=""
+    if [ "$REUSE_SETTINGS" != 1 ]; then
+        read_input "Pi 群数据总根 [默认 ${GROUP_DATA_ROOT_DEFAULT}；首次为 ${DEFAULT_GROUP_DATA_ROOT}]：" cwd_in
+    fi
     cwd_in="$(trim_input "$cwd_in")"
     GROUP_DATA_ROOT="${cwd_in:-$GROUP_DATA_ROOT_DEFAULT}"
     if ! HOST_GROUP_DATA_ROOT="$(realpath -m -- "$GROUP_DATA_ROOT")"; then
@@ -395,7 +428,14 @@ if [ -f "$MODELS_FILE" ] && [ -f "$RUNTIME_DIR/pi/settings.json" ]; then
 fi
 # ---- 停机前的交互选择：只读取和校验，全部答完才停止机器人服务 ----
 RECONFIGURE_AI=0
-if [ -f "$MODELS_FILE" ]; then
+if [ "$REUSE_SETTINGS" = 1 ]; then
+    # 首次配置向导需要交互；升级前缺少模型配置时回滚，由部署脚本完成配置。
+    if [ ! -f "$MODELS_FILE" ]; then
+        print_error "缺少 data/config/models.json；升级沿用现有 AI 配置，将回滚，请先运行部署脚本完成配置"
+        exit 1
+    fi
+    print_status "升级沿用现有 AI 配置、端口、入口模式、群数据总根和域名"
+elif [ -f "$MODELS_FILE" ]; then
     print_status "检测到已有 data/config/models.json"
     if ask_yes_no "是否重新配置 AI（provider/key/model）？[y/N]：" "n"; then
         RECONFIGURE_AI=1
@@ -435,7 +475,7 @@ fi
 if [ -n "$INVALID_CONFIGURED_DOMAIN" ]; then
     print_warning "$DOMAIN_SOURCE 中的域名无效，已忽略：$INVALID_CONFIGURED_DOMAIN"
 fi
-if [ "$DEPLOY_MODE" = "cloudflare" ]; then
+if [ "$DEPLOY_MODE" = "cloudflare" ] && [ "$REUSE_SETTINGS" != 1 ]; then
     echo "Cloudflare 公网域名准备："
     echo "  1) 将根域名（如 example.com）添加到 Cloudflare，按指引在域名注册商修改 NS，等待状态变为 Active（已激活）。域名无需转移注册商，但 DNS 需托管到 Cloudflare。"
     echo "  2) 下面填写机器人使用的子域名，例如 bot.example.com。"
@@ -883,7 +923,7 @@ elif docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo "    体检: $(ops_command_hint doctor)"
     echo "    日志: $(ops_command_hint logs)"
     echo "    重启: $(ops_command_hint restart)"
-    echo "    升级: $(ops_command_hint update)（提示回车即沿用现有配置）"
+    echo "    升级: $(ops_command_hint update)（沿用现有配置，停机后不再询问配置；改配置请重新部署）"
     echo ""
     if [ "${MIXIN_OPS_TUI:-}" != "1" ]; then
         echo "  底层命令（ops.sh 不适用时排障用）:"

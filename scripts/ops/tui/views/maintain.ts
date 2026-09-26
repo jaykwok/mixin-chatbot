@@ -66,7 +66,7 @@ const ACTIONS: Action[] = [
               "停止旧实例，确认退出后才切换代码和更新依赖",
               `快进到 origin/main ${targetSha ? fmt.shortSha(targetSha) : ""}（${git.behind} 个提交）`,
               app.deployment.runtime === "docker"
-                ? "保持停机，通过部署向导重建镜像"
+                ? "保持停机，沿用现有配置重建镜像（改配置请用服务部署）"
                 : "保持停机，按需安装依赖",
               "按需预览并迁移；同版本且标记配对时跳过数据迁移和数据库备份",
               "以只验证模式检查新实例，提交数据版本后恢复原运行状态",

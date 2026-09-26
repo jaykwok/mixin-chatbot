@@ -694,7 +694,7 @@ test.skipIf(!bash || !existsSync(bash))("Docker deployment collects every answer
   await writeFile(join(fixture.root, "scripts/tunnel/start-tunnel.sh"), "");
   await writeFile(join(fixture.root, "models.json"), "{}");
   const stubs = `. '${posixPath(join(project, "scripts/lib/common.sh"))}'
-PROJECT_DIR="$PWD"; STATE_DIR="$PWD/state"; LOG_DIR="$PWD/logs"; PROMPTS="$STATE_DIR/prompts"
+PROJECT_DIR="$PWD"; STATE_DIR="$PWD/state"; LOG_DIR="$PWD/logs"; PROMPTS="$STATE_DIR/prompts"; REUSE_SETTINGS=0
 print_status(){ :; }; print_success(){ :; }; print_warning(){ :; }; print_error(){ echo "$*" >&2; }; show_tunnel_token_help(){ :; }
 managed_cloudflared_pid(){ [ -f "$STATE_DIR/managed" ] && echo 777; }
 pgrep(){ if [ "\${FIXTURE_UNMANAGED:-0}" = 1 ]; then echo 4242; return 0; fi; return 1; }
@@ -775,6 +775,59 @@ echo TUNNEL_READY
     }
   } finally { await fixture.cleanup(); }
 }, 90000);
+
+test.skipIf(!bash || !existsSync(bash))("Docker update reuses saved settings and never waits for input after the stop", async () => {
+  const fixture = await tempFixture("deployment-docker-reuse-");
+  const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+  const settings = source.split("# ---- 目录 + 监听端口 ----")[1]?.split("\n# ---- 目录 ----\n")[0];
+  const preflight = source.split("# ---- 停机前的交互选择")[1]?.split("# Decisions precede persistent changes")[0]?.replace(/^[^\n]*/, "");
+  const helpers = ["trim_input", "read_input", "ask_yes_no"].map(name => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"))?.[0]);
+  expect(settings).toBeDefined(); expect(preflight).toBeDefined(); expect(helpers.every(Boolean)).toBe(true);
+  const root = join(fixture.root, "project"), external = join(fixture.root, "external groups");
+  await mkdir(join(root, "data/state"), { recursive: true }); await mkdir(join(root, "data/config"), { recursive: true }); await mkdir(external);
+  await writeFile(join(root, "data/state/bot-port"), "2022"); await writeFile(join(root, "data/state/deploy-mode"), "cloudflare");
+  await writeFile(join(root, "data/state/bot-domain"), "bot.example.com");
+  const script = join(fixture.root, "reuse.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+. '${posixPath(join(project, "scripts/lib/common.sh"))}'
+PROJECT_DIR="$1"; REUSE_SETTINGS=1; CONTAINER_UID=1001; CONTAINER_GID=1001
+DATA_DIR="$PROJECT_DIR/data"; CONFIG_DIR="$DATA_DIR/config"; STATE_DIR="$DATA_DIR/state"; RUNTIME_HOME_DIR="$DATA_DIR/runtime/home"
+LOG_DIR="$PROJECT_DIR/logs"; DEFAULT_GROUP_DATA_ROOT="$DATA_DIR/groups"; MODELS_FILE="$CONFIG_DIR/models.json"
+BOT_PORT_FILE="$STATE_DIR/bot-port"; DEPLOY_MODE_FILE="$STATE_DIR/deploy-mode"; BOT_DOMAIN_FILE="$STATE_DIR/bot-domain"; GROUP_DATA_ROOT_FILE="$STATE_DIR/group-data-root"
+PREPARED_TUNNEL_READY="\${FIXTURE_PREPARED:-0}"; PREPARED_TUNNEL_INPUT=""; PREPARED_UNMANAGED_MODE=""
+print_status(){ :; }; print_success(){ :; }; print_warning(){ echo "$*" >&2; }; print_error(){ echo "$*" >&2; }; print_prompt(){ :; }
+flock(){ :; }; acquire_deploy_lock(){ :; }; verify_deployed_group_root(){ :; }; show_tunnel_token_help(){ :; }
+managed_cloudflared_pid(){ return 1; }; pgrep(){ return 1; }
+load_tunnel_token(){ [ -z "\${1:-}" ] && [ "\${FIXTURE_SAVED_TOKEN:-0}" = 1 ]; }
+${helpers.join("\n")}
+${settings}
+${preflight}
+echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT ai=$RECONFIGURE_AI domain=$PUBLIC_DOMAIN"
+`);
+  const run = (env: Record<string, string>) => execute([bash!, posixPath(script), posixPath(root)], fixture.root,
+    { ...process.env, MSYS_NO_PATHCONV: "1", BOT_PORT: "", DEPLOY_MODE: "", GROUP_DATA_ROOT: "", BOT_DOMAIN: "", ...env });
+  try {
+    await writeFile(join(root, "data/state/group-data-root"), posixPath(external));
+    await writeFile(join(root, "data/config/models.json"), "{}");
+    let result = await run({ FIXTURE_SAVED_TOKEN: "1" });
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain(`RESULT port=2022 mode=cloudflare root=${posixPath(external)} ai=0 domain=bot.example.com`);
+    // A token the update did not prepare would need an answer: fail through the guard instead of waiting.
+    result = await run({});
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("停机期间不能等待输入");
+    // An unusable saved group root rolls back after one check instead of looping on a prompt.
+    await writeFile(join(fixture.root, "not-a-directory"), "");
+    await writeFile(join(root, "data/state/group-data-root"), posixPath(join(fixture.root, "not-a-directory")));
+    result = await run({ FIXTURE_SAVED_TOKEN: "1" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("现有群数据总根不可用");
+    // The first-run AI wizard is interactive, so an update without models.json rolls back before the stop-time wizard.
+    await writeFile(join(root, "data/state/group-data-root"), posixPath(external));
+    await rm(join(root, "data/config/models.json"));
+    result = await run({ FIXTURE_SAVED_TOKEN: "1" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("缺少 data/config/models.json");
+  } finally { await fixture.cleanup(); }
+}, 60000);
 
 test.skipIf(!bash || !existsSync(bash))("Docker migration passes the service identity, mounted group root and native cache environment", async () => {
   const fixture = await tempFixture("deployment-migration-env-");
