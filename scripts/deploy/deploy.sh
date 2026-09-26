@@ -24,6 +24,11 @@ if [ -n "${BOT_MODEL_CACHE_RETENTION:-}" ]; then
     exit 1
 fi
 cd "$PROJECT_DIR"
+# ops update 在停机前确认的隧道选择；读入后立即移出环境，避免 token 传给后续子进程。
+PREPARED_TUNNEL_READY="${DEPLOY_TUNNEL_INPUT_PREPARED:-0}"
+PREPARED_TUNNEL_INPUT="${DEPLOY_TUNNEL_TOKEN_INPUT:-}"
+PREPARED_UNMANAGED_MODE="${DEPLOY_UNMANAGED_TUNNEL_CONFIRMED:-}"
+unset DEPLOY_TUNNEL_INPUT_PREPARED DEPLOY_TUNNEL_TOKEN_INPUT DEPLOY_UNMANAGED_TUNNEL_CONFIRMED
 DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
 STATE_DIR="${DATA_DIR}/state"
@@ -141,11 +146,14 @@ remove_managed_ufw_rules() {
         number="$(sed -n 's/^[[:space:]]*\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<< "$line")"
         [ -n "$number" ] && rule_numbers+=("$number")
     done < <(run_ufw status numbered)
-    local sorted_numbers=()
+    local sorted_numbers=() failed=0
     mapfile -t sorted_numbers < <(printf '%s\n' "${rule_numbers[@]}" | sed '/^$/d' | sort -rn)
+    # Callers report only rules that were actually removed.
+    REMOVED_UFW_RULES=0
     for number in "${sorted_numbers[@]}"; do
-        run_ufw --force delete "$number" >/dev/null
+        if run_ufw --force delete "$number" >/dev/null; then REMOVED_UFW_RULES=$((REMOVED_UFW_RULES+1)); else failed=1; fi
     done
+    return "$failed"
 }
 
 # Connector identity and bounded stop are shared in scripts/lib/lifecycle.sh.
@@ -204,6 +212,9 @@ print_success "监听端口：$BOT_PORT"
 
 # ---- 部署模式 ----
 
+# 上次成功部署记录的模式，只用于判断是否可能遗留直连防火墙规则。
+PREVIOUS_DEPLOY_MODE=""
+if [ -f "$DEPLOY_MODE_FILE" ]; then PREVIOUS_DEPLOY_MODE="$(tr '[:upper:]' '[:lower:]' < "$DEPLOY_MODE_FILE" | tr -d '[:space:]')"; fi
 if [ -n "${DEPLOY_MODE:-}" ]; then
     DEPLOY_MODE_DEFAULT_SOURCE="DEPLOY_MODE"
     DEPLOY_MODE_DEFAULT="$(trim_input "${DEPLOY_MODE,,}")"
@@ -382,72 +393,14 @@ if [ -f "$MODELS_FILE" ] && [ -f "$RUNTIME_DIR/pi/settings.json" ]; then
     migration_docker preview --interactive --plan /app/data/state/migration-plan.json
     MIGRATION_PLANNED=1
 fi
-# Decisions precede persistent changes; ops update may already have stopped the old container.
-begin_deployment
-if [ "$MIGRATION_PLANNED" = 1 ]; then
-    # The legacy parent understands only a committed receipt. Retain target code on
-    # abrupt termination; a completed rollback below clears it before restoring code.
-    if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
-    MIGRATION_APPLY_ATTEMPTED=1
-    migration_docker apply --plan /app/data/state/migration-plan.json
-fi
-
-# ---- AI 配置（容器内 TUI 写 data/config/models.json）----
-# 首次必须配置；已存在则询问是否重配。
-
-if [ ! -f "$MODELS_FILE" ]; then
-    print_status "首次配置 AI（provider/key/model）..."
-    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" mixin-chatbot bun run configure; then
-        print_error "AI 配置命令执行失败"
-        exit 1
-    fi
-    if [ ! -f "$MODELS_FILE" ]; then
-        print_error "未生成 data/config/models.json，已中止"
-        exit 1
-    fi
-else
+# ---- 停机前的交互选择：只读取和校验，全部答完才停止机器人服务 ----
+RECONFIGURE_AI=0
+if [ -f "$MODELS_FILE" ]; then
     print_status "检测到已有 data/config/models.json"
     if ask_yes_no "是否重新配置 AI（provider/key/model）？[y/N]：" "n"; then
-        if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" mixin-chatbot bun run configure; then
-            print_error "AI 配置命令执行失败"
-            exit 1
-        fi
+        RECONFIGURE_AI=1
+        print_status "将在停止机器人服务后运行 AI 配置向导"
     fi
-fi
-validate_model_configuration || { print_error "模型配置无效，正在恢复原部署"; exit 1; }
-if [ "$(id -u)" -eq 0 ]; then
-    chown "$CONTAINER_UID:$CONTAINER_GID" "$MODELS_FILE"
-fi
-chmod 600 "$MODELS_FILE"
-
-# ---- Webhook 随机密钥路径（两模式共用，应用层鉴权）----
-# data/config/webhook-secret 存 64hex（256bit）；应用启动读它，存在则启用 /webhook/<secret>。
-if [ ! -f "$WEBHOOK_SECRET_FILE" ]; then
-    print_status "生成 webhook 随机密钥路径..."
-    if SECRET=$(openssl rand -hex 32 2>/dev/null) && [ -n "$SECRET" ]; then
-        : # openssl 可用
-    else
-        SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n') # 回退
-    fi
-    printf '%s' "$SECRET" > "$WEBHOOK_SECRET_FILE"
-    if [ "$(id -u)" -eq 0 ]; then
-        chown "$CONTAINER_UID:$CONTAINER_GID" "$WEBHOOK_SECRET_FILE"
-    fi
-    chmod 600 "$WEBHOOK_SECRET_FILE"
-    print_success "已生成 webhook 密钥"
-    SHOW_SECRET=1
-else
-    SECRET="$(tr -d '[:space:]' < "$WEBHOOK_SECRET_FILE")"
-    if ! [[ "$SECRET" =~ ^[0-9a-fA-F]{64}$ ]]; then
-        print_error "data/config/webhook-secret 格式无效（应为 64 位十六进制）；请停机并将该文件移入 backup/rm 后重新部署"
-        exit 1
-    fi
-    SHOW_SECRET=0
-    print_status "检测到已有 data/config/webhook-secret（沿用）"
-fi
-if ! verify_container_storage; then
-    print_error "models.json 或 webhook-secret 对容器用户（UID ${CONTAINER_UID}）不可读写；请修复目录/文件权限后重试"
-    exit 1
 fi
 
 # 域名接受 hostname 或仅含 hostname 的 http(s) 根 URL，并统一规范化为 hostname。
@@ -510,6 +463,112 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     done
 fi
 
+# 外部 connector 不能仅凭进程名认领；此时尚未停止服务，拒绝不会改动部署。
+UNMANAGED_TUNNEL_CONFIRMED=0
+if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1; then
+    unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
+    if [ "$PREPARED_UNMANAGED_MODE" = "$DEPLOY_MODE" ]; then
+        # ops update 已在停机前按同一模式确认过归属。
+        print_status "沿用升级前对未托管 cloudflared（pid ${unmanaged_pid}）的确认"
+    elif [ "$DEPLOY_MODE" = "cloudflare" ]; then
+        print_warning "检测到未由本项目记录的 cloudflared（pid ${unmanaged_pid}），无法自动确认它连接的是当前隧道"
+        unmanaged_prompt="确认该 connector 正在服务本项目，继续沿用？[y/N]："
+    else
+        print_warning "系统有未由本项目记录的 cloudflared（pid ${unmanaged_pid}）；不会自动停止，以免影响其他隧道"
+        unmanaged_prompt="确认该 connector 与本项目无关或其入口仍受保护，继续直连部署？[y/N]："
+    fi
+    if [ "$PREPARED_UNMANAGED_MODE" != "$DEPLOY_MODE" ] && ! ask_yes_no "$unmanaged_prompt" "n"; then
+        print_error "未确认未托管 cloudflared 的安全边界；部署已取消，配置未改动"
+        exit 1
+    fi
+    UNMANAGED_TUNNEL_CONFIRMED=1
+fi
+
+# 缺少 connector 时在停机前确定 token 来源（输入隐藏）；部署验证实例就绪后只启动一次。
+TUNNEL_TOKEN_INPUT=""
+if [ "$DEPLOY_MODE" = "cloudflare" ] && ! managed_cloudflared_pid >/dev/null 2>&1 && ! pgrep -x cloudflared >/dev/null 2>&1; then
+    if [ "$PREPARED_TUNNEL_READY" = 1 ] && (load_tunnel_token "$PREPARED_TUNNEL_INPUT") >/dev/null 2>&1; then
+        TUNNEL_TOKEN_INPUT="$PREPARED_TUNNEL_INPUT"
+        print_status "未运行 cloudflared；沿用升级前确认的隧道 token，部署验证实例就绪后启动"
+    elif (load_tunnel_token) >/dev/null 2>&1; then
+        print_status "未运行 cloudflared；将使用已保存的隧道 token，部署验证实例就绪后启动"
+    else
+        print_status "未运行 cloudflared；请先提供隧道 token，部署验证实例就绪后启动"
+        show_tunnel_token_help
+        while true; do
+            read_input "隧道 token 或文件路径（输入隐藏；留空自动读取，默认 data/config/cloudflared-token）：" TUNNEL_TOKEN_INPUT 1
+            if (load_tunnel_token "$TUNNEL_TOKEN_INPUT"); then break; fi
+        done
+    fi
+fi
+PREPARED_TUNNEL_INPUT=""
+
+# Decisions precede persistent changes; ops update may already have stopped the old container.
+begin_deployment
+if [ "$MIGRATION_PLANNED" = 1 ]; then
+    # The legacy parent understands only a committed receipt. Retain target code on
+    # abrupt termination; a completed rollback below clears it before restoring code.
+    if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
+    MIGRATION_APPLY_ATTEMPTED=1
+    migration_docker apply --plan /app/data/state/migration-plan.json
+fi
+
+# ---- AI 配置（容器内 TUI 写 data/config/models.json）----
+# 首次必须配置；已存在时按停机前的选择决定是否重配。
+
+if [ ! -f "$MODELS_FILE" ]; then
+    print_status "首次配置 AI（provider/key/model）..."
+    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" mixin-chatbot bun run configure; then
+        print_error "AI 配置命令执行失败"
+        exit 1
+    fi
+    if [ ! -f "$MODELS_FILE" ]; then
+        print_error "未生成 data/config/models.json，已中止"
+        exit 1
+    fi
+elif [ "$RECONFIGURE_AI" = 1 ]; then
+    print_status "重新配置 AI（provider/key/model）..."
+    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" mixin-chatbot bun run configure; then
+        print_error "AI 配置命令执行失败"
+        exit 1
+    fi
+fi
+validate_model_configuration || { print_error "模型配置无效，正在恢复原部署"; exit 1; }
+if [ "$(id -u)" -eq 0 ]; then
+    chown "$CONTAINER_UID:$CONTAINER_GID" "$MODELS_FILE"
+fi
+chmod 600 "$MODELS_FILE"
+
+# ---- Webhook 随机密钥路径（两模式共用，应用层鉴权）----
+# data/config/webhook-secret 存 64hex（256bit）；应用启动读它，存在则启用 /webhook/<secret>。
+if [ ! -f "$WEBHOOK_SECRET_FILE" ]; then
+    print_status "生成 webhook 随机密钥路径..."
+    if SECRET=$(openssl rand -hex 32 2>/dev/null) && [ -n "$SECRET" ]; then
+        : # openssl 可用
+    else
+        SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n') # 回退
+    fi
+    printf '%s' "$SECRET" > "$WEBHOOK_SECRET_FILE"
+    if [ "$(id -u)" -eq 0 ]; then
+        chown "$CONTAINER_UID:$CONTAINER_GID" "$WEBHOOK_SECRET_FILE"
+    fi
+    chmod 600 "$WEBHOOK_SECRET_FILE"
+    print_success "已生成 webhook 密钥"
+    SHOW_SECRET=1
+else
+    SECRET="$(tr -d '[:space:]' < "$WEBHOOK_SECRET_FILE")"
+    if ! [[ "$SECRET" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        print_error "data/config/webhook-secret 格式无效（应为 64 位十六进制）；请停机并将该文件移入 backup/rm 后重新部署"
+        exit 1
+    fi
+    SHOW_SECRET=0
+    print_status "检测到已有 data/config/webhook-secret（沿用）"
+fi
+if ! verify_container_storage; then
+    print_error "models.json 或 webhook-secret 对容器用户（UID ${CONTAINER_UID}）不可读写；请修复目录/文件权限后重试"
+    exit 1
+fi
+
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 SERVER_IP="${SERVER_IP:-<服务器IP>}"
 
@@ -537,7 +596,7 @@ else
         echo "    https://${PUBLIC_DOMAIN_DISPLAY}/webhook/<secret>（密钥未变；忘记可 cat data/config/webhook-secret）"
     fi
     echo ""
-    print_warning "Cloudflare 模式仅监听 127.0.0.1:${BOT_PORT}，不会直接暴露公网端口"
+    print_status "Cloudflare 模式仅监听 127.0.0.1:${BOT_PORT}，不会直接暴露公网端口"
     print_warning "部署末尾会启动 cloudflared connector；远程管理隧道的源站端口需在 Cloudflare 控制台配置为 http://127.0.0.1:${BOT_PORT}"
     print_warning "WAF 应只限制 /webhook/ 前缀：平台 IP + POST 放行，其他 webhook 请求 Block；可保留 /favicon.svg 供健康检查"
 fi
@@ -586,28 +645,10 @@ if [ "$DEPLOY_MODE" = "direct" ]; then
 else
     if command -v ufw >/dev/null 2>&1 && can_manage_ufw; then
         CLEANUP_UFW_AFTER_HEALTH=1
-        print_status "Cloudflare 模式将在新部署成功后清理本项目旧直连规则"
-    else
-        print_warning "UFW 不可用或当前用户没有 root/sudo 权限；无法自动清理以前的直连规则"
+    elif [ "$PREVIOUS_DEPLOY_MODE" = direct ]; then
+        # 只有从直连模式切换过来时才可能遗留本项目的直连规则。
+        print_warning "UFW 不可用或当前用户没有 root/sudo 权限；无法自动清理原直连模式的防火墙规则"
     fi
-fi
-
-# 在产生机器人停机窗口前确认未托管 connector 的归属；用户拒绝时旧服务保持不变。
-UNMANAGED_TUNNEL_CONFIRMED=0
-if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1; then
-    unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
-    if [ "$DEPLOY_MODE" = "cloudflare" ]; then
-        print_warning "检测到未由本项目记录的 cloudflared（pid ${unmanaged_pid}），无法自动确认它连接的是当前隧道"
-        unmanaged_prompt="确认该 connector 正在服务本项目，继续沿用？[y/N]："
-    else
-        print_warning "系统有未由本项目记录的 cloudflared（pid ${unmanaged_pid}）；不会自动停止，以免影响其他隧道"
-        unmanaged_prompt="确认该 connector 与本项目无关或其入口仍受保护，继续直连部署？[y/N]："
-    fi
-    if ! ask_yes_no "$unmanaged_prompt" "n"; then
-        print_error "未确认未托管 cloudflared 的安全边界；尚未停止现有机器人"
-        exit 1
-    fi
-    UNMANAGED_TUNNEL_CONFIRMED=1
 fi
 
 # 旧容器和配置已在 begin_deployment 中保存。
@@ -690,6 +731,7 @@ for i in $(seq 1 18); do
 done
 
 # ---- Cloudflare 模式：确保 cloudflared 在线 ----
+# 停机后不再询问：token 已在停机前确认，connector 只启动一次，失败或出现未确认的 connector 即回滚。
 if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     print_status "Cloudflare 模式：确保 cloudflared 隧道在线..."
     if managed_pid="$(managed_cloudflared_pid)"; then
@@ -697,55 +739,27 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     elif pgrep -x cloudflared >/dev/null 2>&1; then
         unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
         if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ]; then
-            print_warning "检测到部署期间出现的未托管 cloudflared（pid ${unmanaged_pid}），无法自动确认归属"
-        fi
-        if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ] &&
-           ! ask_yes_no "确认该 connector 正在服务本项目，继续沿用？[y/N]：" "n"; then
-            print_error "未确认未托管的 cloudflared 归属；Cloudflare 模式部署已停止"
+            print_error "部署期间出现未托管的 cloudflared（pid ${unmanaged_pid}），无法确认它连接的是当前隧道；部署将回滚。确认其归属后重新部署。"
             exit 1
         fi
     elif [ -f scripts/tunnel/start-tunnel.sh ]; then
         mkdir -p "$LOG_DIR"
-        tunnel_token_input=""
         # 下载在前台完成，不占用后台连接器的 30 秒启动等待窗口。
         ensure_cloudflared "$PROJECT_DIR" >/dev/null
-        show_tunnel_token_help
-        need_tunnel_token_prompt=0
-        if ! (load_tunnel_token) >/dev/null 2>&1; then
-            need_tunnel_token_prompt=1
-        fi
-        while ! managed_cloudflared_pid >/dev/null 2>&1; do
-            if [ "$need_tunnel_token_prompt" = "1" ]; then
-                read_input "隧道 token 或文件路径（输入隐藏；留空自动读取，默认 data/config/cloudflared-token）：" tunnel_token_input 1
-                if ! (load_tunnel_token "$tunnel_token_input"); then
-                    continue
-                fi
-            fi
-
-            print_warning "cloudflared 未运行，正在后台启动隧道连接器..."
-            tunnel_startup_log="$(mktemp "$STATE_DIR/cloudflared-start-XXXXXX")"
-            CLOUDFLARED_BACKGROUND=1 MIXIN_TUNNEL_TOKEN_INPUT="$tunnel_token_input" BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh >"$tunnel_startup_log" 2>&1 9>&- &
-            tunnel_launcher_pid=$!
-            tunnel_launcher_start="$(process_start_identity "$tunnel_launcher_pid")"
-            TUNNEL_STARTED_BY_DEPLOY=1
-            for attempt in $(seq 1 30); do
-                managed_cloudflared_pid >/dev/null 2>&1 && break
-                kill -0 "$tunnel_launcher_pid" 2>/dev/null || break
-                sleep 1
-            done
-            if managed_pid="$(managed_cloudflared_pid)"; then
-                TUNNEL_STARTED_BY_DEPLOY=1
-                rm -f -- "$tunnel_startup_log"
-                tunnel_startup_log=""
-                print_success "cloudflared 已后台启动（pid ${managed_pid}）"
-                if [ "$(cloudflared_logging)" = on ]; then
-                    print_success "隧道日志：logs/cloudflared.log（自动轮转）"
-                else
-                    print_status "隧道文件日志已关闭，可在 TUI「系统 → 设置」开启"
-                fi
-                print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
-                break
-            fi
+        print_status "启动 cloudflared 隧道连接器（使用停机前确认的 token 来源）..."
+        tunnel_startup_log="$(mktemp "$STATE_DIR/cloudflared-start-XXXXXX")"
+        # 提交前运行的是验证实例；连接器启动检查需要明确放行它，否则会判定为本机没有机器人。
+        CLOUDFLARED_BACKGROUND=1 MIXIN_TUNNEL_ALLOW_VERIFICATION=1 MIXIN_TUNNEL_TOKEN_INPUT="$TUNNEL_TOKEN_INPUT" BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh >"$tunnel_startup_log" 2>&1 9>&- &
+        tunnel_launcher_pid=$!
+        TUNNEL_TOKEN_INPUT=""
+        tunnel_launcher_start="$(process_start_identity "$tunnel_launcher_pid")"
+        TUNNEL_STARTED_BY_DEPLOY=1
+        for attempt in $(seq 1 30); do
+            managed_cloudflared_pid >/dev/null 2>&1 && break
+            kill -0 "$tunnel_launcher_pid" 2>/dev/null || break
+            sleep 1
+        done
+        if ! managed_pid="$(managed_cloudflared_pid)"; then
             stop_tunnel_launcher || { print_error "无法结束连接器启动进程"; exit 1; }
             tunnel_launcher_pid=""
             print_warning "cloudflared 未能启动，启动检查输出："
@@ -753,9 +767,18 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
             rm -f -- "$tunnel_startup_log"
             tunnel_startup_log=""
             if [ "$(cloudflared_logging)" = on ]; then tail -n 10 "$LOG_DIR/cloudflared.log" 2>/dev/null || true; fi
-            print_warning "请修正 token 来源后重试；按 Ctrl+C 可取消部署。"
-            need_tunnel_token_prompt=1
-        done
+            print_error "cloudflared 未能启动（见上方输出）；部署将回滚。确认 token 后重新部署或升级。"
+            exit 1
+        fi
+        rm -f -- "$tunnel_startup_log"
+        tunnel_startup_log=""
+        print_success "cloudflared 已后台启动（pid ${managed_pid}）"
+        if [ "$(cloudflared_logging)" = on ]; then
+            print_success "隧道日志：logs/cloudflared.log（自动轮转）"
+        else
+            print_status "隧道文件日志已关闭，可在 TUI「系统 → 设置」开启"
+        fi
+        print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
     else
         print_error "未找到 scripts/tunnel/start-tunnel.sh，无法启动 Cloudflare 隧道"
         exit 1
@@ -772,11 +795,7 @@ else
     elif pgrep -x cloudflared >/dev/null 2>&1; then
         unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
         if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ]; then
-            print_warning "部署期间出现未由本项目记录的 cloudflared（pid ${unmanaged_pid}）；不会自动停止"
-        fi
-        if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ] &&
-           ! ask_yes_no "确认该 connector 与本项目无关或其入口仍受保护，继续直连部署？[y/N]：" "n"; then
-            print_error "未确认遗留隧道的安全边界；直连模式部署已停止"
+            print_error "部署期间出现未由本项目记录的 cloudflared（pid ${unmanaged_pid}），无法确认遗留隧道的安全边界；部署将回滚。确认其归属后重新部署。"
             exit 1
         fi
     fi
@@ -784,13 +803,11 @@ fi
 
 if [ "${CLEANUP_UFW_AFTER_HEALTH:-0}" = "1" ]; then
     if [ "$DEPLOY_MODE" = "direct" ]; then
-        print_status "新入口已就绪，清理本项目旧 UFW 规则..."
         remove_managed_ufw_rules "$BOT_PORT" "$PLATFORM_IP"
-        print_success "UFW 仅保留当前机器人入口"
+        if [ "$REMOVED_UFW_RULES" -gt 0 ]; then print_success "已删除 ${REMOVED_UFW_RULES} 条本项目旧 UFW 规则，只保留当前机器人入口"; fi
     else
-        print_status "新隧道部署已就绪，清理本项目旧 UFW 规则..."
         remove_managed_ufw_rules
-        print_success "Cloudflare 模式已移除本项目的直连 UFW 规则"
+        if [ "$REMOVED_UFW_RULES" -gt 0 ]; then print_success "Cloudflare 模式已删除 ${REMOVED_UFW_RULES} 条本项目旧直连 UFW 规则"; fi
     fi
 fi
 
@@ -815,7 +832,7 @@ if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
     docker start mixin-chatbot >/dev/null
     normal_ready=0
     for i in $(seq 1 18); do
-        if docker exec mixin-chatbot bun run scripts/ops/health-check.ts --normal; then normal_ready=1; break; fi
+        if docker exec mixin-chatbot bun run scripts/ops/health-check.ts; then normal_ready=1; break; fi
         sleep 5
     done
     if [ "$normal_ready" != 1 ]; then

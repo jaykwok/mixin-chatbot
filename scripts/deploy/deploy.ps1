@@ -283,81 +283,12 @@ if ((Test-Path -LiteralPath $ModelsFile) -and (Test-Path -LiteralPath (Join-Path
     if ($LASTEXITCODE -ne 0) { throw '迁移预览未完成；旧服务尚未停止' }
     $migrationPlanned = $true
 }
-Set-OperationStage 'deployment-snapshot'
-$snapshot = New-DeploymentSnapshot $Project $TaskName
-Write-OperationEvent 'info' ('snapshot=' + $snapshot.Path)
-$deploymentCommitted = $false
-$deploymentMutated = $false
-try {
-    if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '旧服务未停止，部署取消。' }
-    $deploymentMutated = $true
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
-    Save-DeploymentDependencies $snapshot
-# ---- 2. 依赖 ----
-Step "安装依赖（bun install --frozen-lockfile）..."
-$bunInstallExitCode = Invoke-OperationNative $bunPath @('install', '--frozen-lockfile')
-if ($bunInstallExitCode -ne 0) { Fail "bun install 执行失败（退出码 $bunInstallExitCode）。"; exit 1 }
-if ($migrationPlanned) {
-    $migrationAttempted = $true
-    & $bunPath run $migrationRunner apply --project $Project --groups $migrationGroups --plan $migrationPlan
-    if ($LASTEXITCODE -ne 0) { throw '数据迁移失败' }
-}
-
-# ---- 3. 持久化目录 + AI 配置 ----
-New-Item -ItemType Directory -Force -Path $ConfigDir, $StateDir, $RuntimeDir, (Join-Path $Project "logs") | Out-Null
-Protect-ProjectSecretPath $ConfigDir
-Protect-ProjectSecretPath $StateDir
-if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
-    Step "首次配置 AI（provider/key/model）..."
-    $previousErrorActionPreference = $ErrorActionPreference
-    $configureExitCode = 1
-    try {
-        $ErrorActionPreference = "Continue"
-        # 向导全程是中文提示，不切 UTF-8 就没法读，见 Invoke-WithUtf8Output。
-        Invoke-WithUtf8Output { & $bunPath run configure }
-        $configureExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($configureExitCode -ne 0) { Fail "AI 配置失败（退出码 $configureExitCode）。"; exit 1 }
-    if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) { Fail "未生成 data\config\models.json，部署中止。"; exit 1 }
-} else {
+# ---- 停机前的交互选择：只读取和校验，全部答完才停止机器人服务 ----
+$reconfigureAi = $false
+if (Test-Path -LiteralPath $ModelsFile -PathType Leaf) {
     Done "data\config\models.json 已存在"
-    if (Read-YesNo "是否重新配置 AI（provider/key/model）？[y/N]" $false) {
-        $previousErrorActionPreference = $ErrorActionPreference
-        $configureExitCode = 1
-        try {
-            $ErrorActionPreference = "Continue"
-            Invoke-WithUtf8Output { & $bunPath run configure }
-            $configureExitCode = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previousErrorActionPreference
-        }
-        if ($configureExitCode -ne 0) { Fail "AI 配置失败（退出码 $configureExitCode）。"; exit 1 }
-    }
-}
-
-if (-not (Test-ModelConfiguration $Project)) { throw '模型配置无效，正在恢复原部署。' }
-
-# ---- 4. webhook 密钥 ----
-$showSecret = $false
-if (-not (Test-Path -LiteralPath $WebhookSecretFile -PathType Leaf)) {
-    Step "生成 webhook 随机密钥..."
-    $bytes = New-Object byte[] 32
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $rng.GetBytes($bytes)
-    $secret = -join ($bytes | ForEach-Object { $_.ToString("x2") })
-    Set-Content -LiteralPath $WebhookSecretFile -Value $secret -NoNewline -Encoding ASCII
-    $showSecret = $true
-    Done "webhook 密钥已生成"
-} else {
-    $secret = (Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim()
-    if ($secret -notmatch "^[0-9a-fA-F]{64}$") {
-        Fail "data\config\webhook-secret 格式无效（应为 64 位十六进制字符）。"
-        Write-Host "停机并将该文件移入 backup\rm 后，重新部署可生成新密钥。" -ForegroundColor Red
-        exit 1
-    }
-    Done "沿用已有 webhook-secret"
+    $reconfigureAi = Read-YesNo "是否重新配置 AI（provider/key/model）？[y/N]" $false
+    if ($reconfigureAi) { Write-Host "  配置向导需要新安装的依赖，将在停止机器人服务并安装依赖后打开。" }
 }
 
 $persistDomain = $false
@@ -484,8 +415,6 @@ if ($mode -eq "cloudflare") {
     }
 }
 
-# 让直连模式防火墙规则始终跟随所选端口。Cloudflare 模式只监听 loopback，
-# 并删除本脚本遗留的直连规则。
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $platformIp = if ($env:PLATFORM_IP) { $env:PLATFORM_IP } else { "223.244.14.237" }
 $allowUnmanagedFirewall = $env:ALLOW_UNMANAGED_FIREWALL -eq "1"
@@ -498,6 +427,119 @@ if ($mode -eq "direct") {
         exit 1
     }
 }
+
+# 外部连接器不能仅凭服务名认领；此时尚未停止服务，取消不会改动部署。
+$unmanagedTunnelConfirmed = $false
+$preflightTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+$preflightTunnelManaged = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
+if ($preflightTunnelService -and -not $preflightTunnelManaged) {
+    Warn "系统存在没有本项目归属标记的 Cloudflared 服务，部署脚本不会自动修改它。"
+    $tunnelQuestion = if ($mode -eq "cloudflare") {
+        "确认该服务正在服务本项目，继续沿用？[y/N]"
+    } else {
+        "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]"
+    }
+    if (-not (Read-YesNo $tunnelQuestion $false)) {
+        Fail "未确认未托管 Cloudflared 的归属，部署已取消；机器人服务和配置均未改动。"
+        exit 1
+    }
+    $unmanagedTunnelConfirmed = $true
+}
+# 缺少隧道服务时先收集 token（输入隐藏），部署实例就绪后再安装，避免停机期间等待输入。
+$tunnelInputPrepared = $false
+$preparedTunnelInput = $null
+if ($mode -eq "cloudflare" -and -not $preflightTunnelService) {
+    Step "未安装 Cloudflared 服务；请先提供隧道 token，部署实例就绪后自动安装"
+    Show-TunnelTokenHelp
+    while ($true) {
+        $preparedTunnelInput = Read-TunnelTokenInput
+        try { $null = Resolve-TunnelToken $Project $preparedTunnelInput; break }
+        catch { Warn $_.Exception.Message }
+    }
+    $tunnelInputPrepared = $true
+}
+
+Set-OperationStage 'deployment-snapshot'
+$snapshot = New-DeploymentSnapshot $Project $TaskName
+Write-OperationEvent 'info' ('snapshot=' + $snapshot.Path)
+$deploymentCommitted = $false
+$deploymentMutated = $false
+try {
+    if ($snapshot.WasRunning) { Step "停止机器人服务（计划任务 $TaskName）..." }
+    if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '机器人服务未能停止，部署已取消。' }
+    $deploymentMutated = $true
+    if ($snapshot.WasRunning) { Done "已停止机器人服务（计划任务 $TaskName）；部署完成前不处理消息。" }
+    elseif ($snapshot.TaskXml) { Done "机器人服务当前未运行（计划任务 $TaskName），部署完成后启动。" }
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Disable-ScheduledTask -TaskName $TaskName | Out-Null }
+    Save-DeploymentDependencies $snapshot
+# ---- 2. 依赖 ----
+Step "安装依赖（bun install --frozen-lockfile）..."
+$bunInstallExitCode = Invoke-OperationNative $bunPath @('install', '--frozen-lockfile')
+if ($bunInstallExitCode -ne 0) { Fail "bun install 执行失败（退出码 $bunInstallExitCode）。"; exit 1 }
+if ($migrationPlanned) {
+    $migrationAttempted = $true
+    & $bunPath run $migrationRunner apply --project $Project --groups $migrationGroups --plan $migrationPlan
+    if ($LASTEXITCODE -ne 0) { throw '数据迁移失败' }
+}
+
+# ---- 3. 持久化目录 + AI 配置 ----
+New-Item -ItemType Directory -Force -Path $ConfigDir, $StateDir, $RuntimeDir, (Join-Path $Project "logs") | Out-Null
+Protect-ProjectSecretPath $ConfigDir
+Protect-ProjectSecretPath $StateDir
+if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
+    Step "首次配置 AI（provider/key/model）..."
+    $previousErrorActionPreference = $ErrorActionPreference
+    $configureExitCode = 1
+    try {
+        $ErrorActionPreference = "Continue"
+        # 向导全程是中文提示，不切 UTF-8 就没法读，见 Invoke-WithUtf8Output。
+        Invoke-WithUtf8Output { & $bunPath run configure }
+        $configureExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($configureExitCode -ne 0) { Fail "AI 配置失败（退出码 $configureExitCode）。"; exit 1 }
+    if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) { Fail "未生成 data\config\models.json，部署中止。"; exit 1 }
+} elseif ($reconfigureAi) {
+    # 是否重配已在停机前确认；向导依赖刚安装的依赖，只能在这里运行。
+    Step "重新配置 AI（provider/key/model）..."
+    $previousErrorActionPreference = $ErrorActionPreference
+    $configureExitCode = 1
+    try {
+        $ErrorActionPreference = "Continue"
+        Invoke-WithUtf8Output { & $bunPath run configure }
+        $configureExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($configureExitCode -ne 0) { Fail "AI 配置失败（退出码 $configureExitCode）。"; exit 1 }
+}
+
+if (-not (Test-ModelConfiguration $Project)) { throw '模型配置无效，正在恢复原部署。' }
+
+# ---- 4. webhook 密钥 ----
+$showSecret = $false
+if (-not (Test-Path -LiteralPath $WebhookSecretFile -PathType Leaf)) {
+    Step "生成 webhook 随机密钥..."
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $rng.GetBytes($bytes)
+    $secret = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+    Set-Content -LiteralPath $WebhookSecretFile -Value $secret -NoNewline -Encoding ASCII
+    $showSecret = $true
+    Done "webhook 密钥已生成"
+} else {
+    $secret = (Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim()
+    if ($secret -notmatch "^[0-9a-fA-F]{64}$") {
+        Fail "data\config\webhook-secret 格式无效（应为 64 位十六进制字符）。"
+        Write-Host "停机并将该文件移入 backup\rm 后，重新部署可生成新密钥。" -ForegroundColor Red
+        exit 1
+    }
+    Done "沿用已有 webhook-secret"
+}
+
+# 让直连模式防火墙规则始终跟随所选端口。Cloudflare 模式只监听 loopback，
+# 并删除本脚本遗留的直连规则。
 if ($mode -eq "direct") {
     try {
         $firewallProfiles = @(Get-NetFirewallProfile -ErrorAction Stop)
@@ -526,23 +568,6 @@ if ($mode -eq "direct") {
     $cleanupFirewallAfterHealth = $true
 }
 
-# 外部连接器不能仅凭服务名认领；取消时由部署事务恢复旧状态。
-$unmanagedTunnelConfirmed = $false
-$preflightTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-$preflightTunnelManaged = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
-if ($preflightTunnelService -and -not $preflightTunnelManaged) {
-    Warn "系统存在没有本项目归属标记的 Cloudflared 服务，部署脚本不会自动修改它。"
-    $tunnelQuestion = if ($mode -eq "cloudflare") {
-        "确认该服务正在服务本项目，继续沿用？[y/N]"
-    } else {
-        "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]"
-    }
-    if (-not (Read-YesNo $tunnelQuestion $false)) {
-        Fail "未确认未托管 Cloudflared 的归属，部署取消并恢复原状态。"
-        exit 1
-    }
-    $unmanagedTunnelConfirmed = $true
-}
 
 # 旧服务已在依赖和配置变更之前停止，所有后续失败统一进入 finally 回滚。
 function Sq($s) { return "'" + ($s -replace "'", "''") + "'" }
@@ -596,7 +621,7 @@ if ($showSecret) {
     Warn "密钥仅显示一次；轮换时停机并将 data\config\webhook-secret 移入 backup\rm，再重新部署。"
 } else {
     Write-Host "  $url" -ForegroundColor White
-    Warn "密钥未变化；查看命令：Get-Content data\config\webhook-secret"
+    Write-Host "  密钥未变化；查看：Get-Content data\config\webhook-secret"
 }
 
 Step "安装 Windows 计划任务 '$TaskName'（优先开机启动，失败自动重试）..."
@@ -664,18 +689,15 @@ if ($mode -eq "direct") {
                 Fail "无法停止或禁用本项目 Cloudflared 服务：$($_.Exception.Message)"
                 exit 1
             }
-        } else {
-            if (-not $unmanagedTunnelConfirmed) {
-                Warn "部署期间出现未标记为本项目所有的 Cloudflared 服务；不会自动修改。"
-            }
-            if (-not $unmanagedTunnelConfirmed -and -not (Read-YesNo "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]" $false)) {
-                Fail "未确认遗留隧道的安全边界；直连模式部署已停止。"
-                exit 1
-            }
+        } elseif (-not $unmanagedTunnelConfirmed) {
+            # 停机期间不再询问；停机前没有这项服务，说明它是部署期间出现的，回滚后重新部署时再确认。
+            Fail "部署期间出现未标记为本项目所有的 Cloudflared 服务，无法确认遗留隧道的安全边界；部署将回滚。确认其归属后重新部署。"
+            throw '部署期间出现未确认的 Cloudflared 服务'
         }
     }
 }
-Warn "任务启动方式：$taskStartDescription。"
+# 登录时启动意味着无人值守重启后不会自动运行，需要提醒；正常的开机任务只做说明。
+if ($taskUsesS4U) { Done "任务启动方式：$taskStartDescription。" } else { Warn "任务启动方式：$taskStartDescription。" }
 
 # ---- 7b. Cloudflare 模式：确保隧道在线（已有服务则启动，否则调用安装脚本）----
 if ($mode -eq "cloudflare") {
@@ -685,11 +707,8 @@ if ($mode -eq "cloudflare") {
         $managedTunnelService = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
         if (-not $managedTunnelService) {
             if (-not $unmanagedTunnelConfirmed) {
-                Warn "部署期间出现没有本项目归属标记的 Cloudflared 服务，无法自动确认它连接的是当前隧道。"
-            }
-            if (-not $unmanagedTunnelConfirmed -and -not (Read-YesNo "确认该服务正在服务本项目，继续沿用？[y/N]" $false)) {
-                Fail "未确认未托管的 Cloudflared 服务归属；Cloudflare 模式部署已停止。"
-                exit 1
+                Fail "部署期间出现没有本项目归属标记的 Cloudflared 服务，无法确认它连接的是当前隧道；部署将回滚。确认其归属后重新部署。"
+                throw '部署期间出现未确认的 Cloudflared 服务'
             }
         } else {
             Set-Service -Name "Cloudflared" -StartupType Automatic -ErrorAction Stop
@@ -702,34 +721,36 @@ if ($mode -eq "cloudflare") {
         }
         Done "继续沿用现有隧道连接；更新 data\config\cloudflared-token 后，请使用 $(Get-OpsCommandHint 'repair-tunnel') 使新 token 生效。"
     } else {
-        Warn "未安装 Cloudflared 服务，正在进入隧道安装流程..."
+        Step "安装 Cloudflared 隧道服务（使用停机前提供的 token）..."
         $stPath = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
         $env:BOT_PORT = $Port
-        Show-TunnelTokenHelp
-        while ($true) {
-            $tokIn = Read-TunnelTokenInput
-            try { $null = Resolve-TunnelToken $Project $tokIn }
-            catch { Warn $_.Exception.Message; continue }
-            $previousTokenInput = $env:MIXIN_TUNNEL_TOKEN_INPUT
-            $previousErrorActionPreference = $ErrorActionPreference
-            $tunnelExitCode = 1
-            try {
-                # Windows PowerShell 5.1 会把原生命令的 stderr 包装为 ErrorRecord；
-                # 此处让子脚本直接输出，再按真实退出码判断，避免错误提示中断退出码采集。
-                $ErrorActionPreference = "Continue"
-                $env:MIXIN_TUNNEL_TOKEN_INPUT = $tokIn
-                & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stPath
-                $tunnelExitCode = $LASTEXITCODE
-            } finally {
-                $ErrorActionPreference = $previousErrorActionPreference
-                $env:MIXIN_TUNNEL_TOKEN_INPUT = $previousTokenInput
-                $tokIn = $null
-            }
-            $installedTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-            if ($tunnelExitCode -eq 0 -and $installedTunnelService -and $installedTunnelService.Status -eq "Running") {
-                break
-            }
-            Warn "Cloudflared 未安装成功或尚未运行，请检查上方提示后重新输入 token 来源。按 Ctrl+C 可取消部署。"
+        # 停机前已校验 token 来源；服务在停机前后才消失时没有预先输入，由安装器读取默认来源。
+        $tokIn = if ($tunnelInputPrepared) { $preparedTunnelInput } else { '' }
+        $preparedTunnelInput = $null
+        $previousTokenInput = $env:MIXIN_TUNNEL_TOKEN_INPUT
+        $previousAllowVerification = $env:MIXIN_TUNNEL_ALLOW_VERIFICATION
+        $previousErrorActionPreference = $ErrorActionPreference
+        $tunnelExitCode = 1
+        try {
+            # Windows PowerShell 5.1 会把原生命令的 stderr 包装为 ErrorRecord；
+            # 此处让子脚本直接输出，再按真实退出码判断，避免错误提示中断退出码采集。
+            $ErrorActionPreference = "Continue"
+            $env:MIXIN_TUNNEL_TOKEN_INPUT = $tokIn
+            # 提交前运行的是验证实例；安装器需要明确放行它，否则会判定为本机没有机器人。
+            $env:MIXIN_TUNNEL_ALLOW_VERIFICATION = '1'
+            & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stPath
+            $tunnelExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+            $env:MIXIN_TUNNEL_TOKEN_INPUT = $previousTokenInput
+            $env:MIXIN_TUNNEL_ALLOW_VERIFICATION = $previousAllowVerification
+            $tokIn = $null
+        }
+        $installedTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
+        if ($tunnelExitCode -ne 0 -or -not $installedTunnelService -or $installedTunnelService.Status -ne "Running") {
+            # 停机期间不再重新询问 token；回滚恢复原服务后，重新部署会在停机前再次收集。
+            Fail "Cloudflared 隧道未能安装或启动（见上方提示）；部署将回滚。确认 token 后重新部署。"
+            throw 'Cloudflared 隧道安装失败'
         }
     }
     $finalTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
@@ -737,19 +758,16 @@ if ($mode -eq "cloudflare") {
         Fail "Cloudflare 模式部署未完成：Cloudflared 服务没有运行。请使用 $(Get-OpsCommandHint 'doctor -Repair')。"
         exit 1
     }
-    Done "Cloudflared 隧道服务正在运行。"
 }
 
 if ($cleanupFirewallAfterHealth) {
-    if ($mode -eq "direct") {
-        Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne $currentFirewallRuleName } |
-            Remove-NetFirewallRule -ErrorAction Stop
-        Done "Windows 防火墙已只保留当前机器人入口"
-    } else {
-        Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule -ErrorAction Stop
-        Done "Cloudflare 模式已清理本项目旧直连防火墙规则"
+    # 只在确实删除了旧规则时提示；没有遗留规则的常规重部署不输出。
+    $staleFirewallRules = @(Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
+        Where-Object { $mode -ne "direct" -or $_.Name -ne $currentFirewallRuleName })
+    if ($staleFirewallRules.Count -gt 0) {
+        $staleFirewallRules | Remove-NetFirewallRule -ErrorAction Stop
+        if ($mode -eq "direct") { Done "已删除 $($staleFirewallRules.Count) 条本项目旧防火墙规则，Windows 防火墙只保留当前机器人入口" }
+        else { Done "Cloudflare 模式已删除 $($staleFirewallRules.Count) 条本项目旧直连防火墙规则" }
     }
 }
 # 部署预检通过且隧道/直连切换成功后再提交，避免 doctor 读取半完成配置。
@@ -781,6 +799,8 @@ Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 �
             Remove-Item -LiteralPath (Join-Path $StateDir 'verify-only') -Force -ErrorAction SilentlyContinue
             Restore-DeploymentSnapshot $snapshot
             Write-OperationEvent 'info' ('data and deployment restored; snapshot=' + $snapshot.Path)
+            $serviceState = if ($snapshot.WasRunning) { '机器人服务已重新启动' } else { '机器人服务保持停止' }
+            Write-Host ('部署已回滚：配置、依赖、计划任务和网络入口已恢复到部署前；' + $serviceState + '。') -ForegroundColor Yellow
         }
         catch { Write-OperationFailure $_; Write-Host ("自动回滚未完成，保留快照 " + $snapshot.Path + "：" + $_.Exception.Message) -ForegroundColor Red }
     } elseif ($deploymentCommitted) {

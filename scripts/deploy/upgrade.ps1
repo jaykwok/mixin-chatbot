@@ -51,26 +51,32 @@ try {
     & $bun run $previewRunner committed --project $Project --groups $groups --deployment (Split-Path $snapshot.Path -Leaf)
     $committed = $LASTEXITCODE -eq 0
     Set-OperationStage 'stop-service'
-    Write-Host '停止旧实例；确认退出后才切换代码、安装依赖和检查数据。'
-    if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '旧实例未停止' }
-    Write-Host '旧实例已停止，开始应用升级。'
+    if ($snapshot.WasRunning) { Write-Host "正在停止机器人服务（计划任务 $TaskName）..." }
+    if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '机器人服务未能停止，升级未改动代码和数据' }
+    if ($snapshot.WasRunning) { Write-Host "已停止机器人服务（计划任务 $TaskName）；升级完成前不处理消息。" }
+    else { Write-Host "机器人服务升级前未运行（计划任务 $TaskName），升级后保持停止。" }
     $mutated = $true
     Set-OperationStage 'checkout'
-    if ((Invoke-OperationNative $git @('-C', $Project, 'checkout', 'main')) -ne 0) { throw '切换 main 失败' }
-    if ((Invoke-OperationNative $git @('-C', $Project, 'merge', '--ff-only', $TargetSha)) -ne 0) { throw '目标提交无法快进' }
+    if ((Invoke-OperationNative $git @('-C', $Project, 'checkout', '--quiet', 'main') -Quiet) -ne 0) { throw '切换 main 失败' }
+    if ((Invoke-OperationNative $git @('-C', $Project, 'merge', '--ff-only', '--quiet', $TargetSha) -Quiet) -ne 0) { throw '目标提交无法快进' }
     $checkedOut = [string](& $git -C $Project rev-parse HEAD)
     if ($LASTEXITCODE -ne 0 -or $checkedOut.Trim() -ne $TargetSha) { throw '当前代码不是预览的目标提交，拒绝执行迁移' }
-    if (-not (Test-DeploymentDependenciesReusable $Project $git $OriginalSha $TargetSha)) {
+    Write-Host ('代码已更新：' + $OriginalSha.Substring(0, 7) + ' -> ' + $TargetSha.Substring(0, 7))
+    if (Test-DeploymentDependenciesReusable $Project $git $OriginalSha $TargetSha) { Write-Host '依赖未变化，沿用现有依赖。' }
+    else {
         Set-OperationStage 'install-dependencies'
+        Write-Host '安装依赖（bun install --frozen-lockfile）...'
         Save-DeploymentDependencies $snapshot
         if ((Invoke-OperationNative $bun @('install', '--frozen-lockfile')) -ne 0) { throw '依赖安装失败' }
     }
-    if (-not $committed) {
+    if ($committed) { Write-Host '数据已在上次中断前提交，直接启用新版本。' }
+    else {
     Set-OperationStage 'migration-apply'
     $migrationAttempted = $true
     Invoke-Migration 'apply'
     Set-OperationStage 'verification-service'
     Set-Content -LiteralPath (Join-Path $Project 'data\state\verify-only') -Value 'verify' -Encoding ASCII
+    Write-Host '启动验证实例，等待部署预检通过（最长 90 秒）...'
     Enable-ScheduledTask -TaskName $TaskName | Out-Null
     Start-ScheduledTask -TaskName $TaskName
     $ready = $false
@@ -80,30 +86,34 @@ try {
         if ($LASTEXITCODE -eq 0) { $ready = $true; break }
         Start-Sleep -Milliseconds 500
     }
-    if (-not $ready) { throw '只验证实例健康检查失败' }
+    if (-not $ready) { throw '部署预检未通过：验证实例 90 秒内未就绪' }
+    Write-Host '部署预检通过。'
     if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止' }
     if ($RestartTunnel -and (Get-Service Cloudflared -ErrorAction SilentlyContinue)) { Restart-Service Cloudflared -ErrorAction Stop }
     Set-OperationStage 'migration-commit'
     Invoke-Migration 'commit'
     $committed = $true
+    Write-Host '升级已提交；此后失败不再回退数据。'
     }
     Set-OperationStage 'activate-service'
     Remove-Item -LiteralPath (Join-Path $Project 'data\state\verify-only') -Force -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $TaskName -Xml $snapshot.TaskXml -Force | Out-Null
     if ($snapshot.WasRunning) {
+        Write-Host '启动机器人服务，等待健康检查（最长 90 秒）...'
         Enable-ScheduledTask -TaskName $TaskName | Out-Null
         Start-ScheduledTask -TaskName $TaskName
         $ready = $false
         $deadline = [DateTime]::UtcNow.AddSeconds(90)
         while ([DateTime]::UtcNow -lt $deadline) {
-            & $bun run (Join-Path $Project 'scripts\ops\health-check.ts') --normal
+            & $bun run (Join-Path $Project 'scripts\ops\health-check.ts')
             if ($LASTEXITCODE -eq 0) { $ready = $true; break }
             Start-Sleep -Milliseconds 500
         }
         if (-not $ready) { throw '数据已经提交，但业务实例未就绪；保留新版本，请检查日志后重试升级' }
-    }
+        Write-Host '机器人已启动。'
+    } else { Write-Host '机器人服务保持停止（升级前未运行）。' }
     Remove-Item -LiteralPath $transactionPointer -Force
-    Write-Host "升级完成：$OriginalSha -> $TargetSha；原运行状态已保留。"
+    Write-Host ('升级完成：' + $OriginalSha.Substring(0, 7) + ' -> ' + $TargetSha.Substring(0, 7))
 } catch {
     Write-OperationFailure $_
     throw
@@ -128,6 +138,8 @@ try {
         Restore-DeploymentSnapshot $snapshot
         Remove-Item -LiteralPath $transactionPointer -Force
         Write-OperationEvent 'info' 'data, code and service restored'
+        $serviceState = if ($snapshot.WasRunning) { '机器人服务已重新启动' } else { '机器人服务保持停止' }
+        Write-Host ('升级已回滚：数据、代码和计划任务已恢复到 ' + $OriginalSha.Substring(0, 7) + '；' + $serviceState + '。')
     }
     } finally {
     $snapshot.Lock.Dispose()

@@ -43,6 +43,8 @@ async function askText(message: string, initialValue: string, validate?: (value:
 
 async function askSecret(label: string, previous?: string): Promise<string> {
   const value = bail<string>(await password({
+    // ASCII mask: the default ▪ shows as "?" in Windows GBK consoles.
+    mask: "*",
     message: label + (previous ? "（留空沿用已保存值）" : ""),
     validate: (input) => input?.trim() || previous ? undefined : "不能为空",
   }));

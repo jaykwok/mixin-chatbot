@@ -142,9 +142,13 @@ begin_deployment() {
     trap 'exit 143' TERM
     if [ -n "$PREVIOUS_IMAGE" ]; then
         PREVIOUS_STOP_ATTEMPTED=1
+        # An update parent may already have stopped it; announce only a stop made here.
+        local running_now
+        running_now="$(docker inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)"
         docker stop --time 30 mixin-chatbot >/dev/null
         docker rename mixin-chatbot "$ROLLBACK_CONTAINER"
         PREVIOUS_CONTAINER_SAVED=1
+        if [ "$running_now" = true ]; then print_success "已停止机器人服务（容器 mixin-chatbot）；部署完成前不处理消息"; fi
     fi
     DEPLOY_FILES_MUTATED=1
 }

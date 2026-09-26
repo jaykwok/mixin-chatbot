@@ -10,11 +10,25 @@ import { cliArgs } from "../lib/cli.ts";
 
 let diagnostic: ReturnType<typeof openOperationLog> | undefined;
 
+const decisionOptions: Record<string, string> = { acceptNativeCache: "--accept-native-cache", model: "--provider <id> --model <id>" };
+function describePreview(summary: { target: number; kind?: string; pending: boolean; steps?: string[]; decisions: { key: string; message: string }[] }): string {
+  if (summary.decisions.length) {
+    return ["迁移预检需要确认后才能继续：", ...summary.decisions.map(decision =>
+      `  - ${decision.message}（非交互运行可加 ${decisionOptions[decision.key] ?? "--interactive"}）`)].join("\n");
+  }
+  if (summary.pending) return "迁移预检：发现未完成的迁移事务，将按原事务继续";
+  if (summary.kind === "verification") return `迁移预检：数据版本 ${summary.target} 一致且标记配对，无需迁移数据`;
+  if (summary.kind === "registration") return `迁移预检：数据版本 ${summary.target} 一致，将重新登记项目与群根的版本标记`;
+  const steps = summary.steps ?? [];
+  // plan.files only lists files the steps rewrite; the real backup also covers config, markers and SQLite.
+  return [`迁移预检：需要迁移到数据版本 ${summary.target}：`, ...steps.map(step => "  - " + step)].join("\n");
+}
+
 async function main() {
   const { values, positionals } = cliArgs(process.argv.slice(2), {
     project: { type: "string" }, groups: { type: "string" }, plan: { type: "string" }, deployment: { type: "string" },
     provider: { type: "string" }, model: { type: "string" }, interactive: { type: "boolean" },
-    "decisions-only": { type: "boolean" }, "accept-native-cache": { type: "boolean" },
+    "decisions-only": { type: "boolean" }, "accept-native-cache": { type: "boolean" }, json: { type: "boolean" },
   });
   if (positionals.length > 1) throw new Error("只能指定一个迁移命令");
   const command = positionals[0] ?? "status", project = resolve(values.project ?? process.cwd()), groups = values.groups;
@@ -52,7 +66,10 @@ async function main() {
       } finally { rl.close(); }
       result = await preview(context, validatePreview);
     }
-    console.log(JSON.stringify({ target: DATA_VERSION, kind: result.plan?.kind, pending: result.pending, steps: result.plan?.steps, files: result.plan?.files, decisions: result.decisions }, null, 2));
+    const summary = { target: DATA_VERSION, kind: result.plan?.kind, pending: result.pending, steps: result.plan?.steps, files: result.plan?.files, decisions: result.decisions };
+    // Operators get one readable line; the machine-readable plan stays in the operation log.
+    diagnostic?.event("info", "preview-result", JSON.stringify(summary));
+    console.log(values.json ? JSON.stringify(summary, null, 2) : describePreview(summary));
     if (result.decisions.length) { process.exitCode = 2; return; }
     if (planPath) await publishJson(planPath, result.plan ?? { pending: true });
     return;
@@ -60,7 +77,7 @@ async function main() {
   if (command === "apply") await apply(context, planPath ? await json(planPath) as Plan : undefined);
   else if (command === "commit") await commit(context);
   else if (command === "rollback") { if (!await rollback(context, deployment || undefined)) { console.error("迁移已提交；保留新代码和数据，禁止自动回退"); process.exitCode = 42; } }
-  else throw new Error("用法：bun run scripts/migrations/run.ts status|preview|apply|commit|rollback [--groups PATH] [--plan PATH] [--interactive]");
+  else throw new Error("用法：bun run scripts/migrations/run.ts status|preview|apply|commit|rollback [--groups PATH] [--plan PATH] [--interactive] [--json]");
 }
 if (import.meta.main) main().catch(error => {
   diagnostic?.event("error", "migration", operationError(error));

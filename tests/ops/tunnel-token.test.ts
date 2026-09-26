@@ -108,25 +108,29 @@ test.skipIf(process.platform !== "win32")("Windows deployment hides pasted crede
     await writeFile(runner, "\ufeff" + [
       "$ErrorActionPreference='Stop'",
       ". " + psQuote(join(project, "scripts/lib/common.ps1")),
-      "$Project=$env:FIXTURE_ROOT; $Port='1011'; $mode='cloudflare'",
+      "$Project=$env:FIXTURE_ROOT; $Port='1011'; $mode='cloudflare'; $preflightTunnelService=$null",
       "$WindowsPowerShell='Invoke-FixtureInstaller'",
       "$TunnelManagedFile=Join-Path $Project 'data/state/cloudflared-managed'",
-      "function Read-Host { param($Prompt,[switch]$AsSecureString); if(-not $AsSecureString){throw 'token input was not hidden'}; $secure=[Security.SecureString]::new(); foreach($char in $env:FIXTURE_INPUT.ToCharArray()){$secure.AppendChar($char)}; return $secure }",
+      "function Read-Host { param($Prompt,[switch]$AsSecureString); if(-not $AsSecureString){throw 'token input was not hidden'}; if($script:stopped){throw 'token requested after stop'}; $secure=[Security.SecureString]::new(); foreach($char in $env:FIXTURE_INPUT.ToCharArray()){$secure.AppendChar($char)}; return $secure }",
       "function Get-Service { if($script:installed){@{Status='Running'}} }",
-      "function Step($message){}; function Done($message){}; function Warn($message){}",
+      "function Step($message){}; function Done($message){}; function Warn($message){}; function Fail($message){}",
       "function Invoke-FixtureInstaller {",
       "  if(($args -join ' ') -like ('*'+$env:FIXTURE_INPUT+'*')){throw 'token leaked to argv'}",
       "  if($env:MIXIN_TUNNEL_TOKEN_INPUT -cne $env:FIXTURE_INPUT){throw 'token did not reach child'}",
+      "  if($env:MIXIN_TUNNEL_ALLOW_VERIFICATION -ne '1'){throw 'verification instance not allowed for the installer'}",
       "  $script:installed=$true; $global:LASTEXITCODE=0",
       "}",
       "$tokenAst=$null; $errors=$null",
       "$ast=[Management.Automation.Language.Parser]::ParseFile(" + psQuote(join(project, "scripts/deploy/deploy.ps1")) + ",[ref]$tokenAst,[ref]$errors)",
       "if($errors){throw 'deployment script has syntax errors'}",
-      "$block=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text -eq '$mode -eq \"cloudflare\"' -and $node.Extent.Text.Contains('Read-TunnelTokenInput')}, $true))",
-      "if($block.Count -ne 1){throw 'missing deployment tunnel flow'}",
-      "$env:MIXIN_TUNNEL_TOKEN_INPUT='original-environment'",
-      ". ([scriptblock]::Create($block[0].Extent.Text))",
-      "if($env:MIXIN_TUNNEL_TOKEN_INPUT -cne 'original-environment'){throw 'environment not restored'}",
+      "function Find-Block([string]$condition,[string]$marker) { $found=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text -eq $condition -and $node.Extent.Text.Contains($marker)}.GetNewClosure(), $true)); if($found.Count -ne 1){throw ('missing block: '+$condition)}; $found[0].Extent.Text }",
+      "$collect=Find-Block '$mode -eq \"cloudflare\" -and -not $preflightTunnelService' 'Read-TunnelTokenInput'",
+      "$install=Find-Block '$mode -eq \"cloudflare\"' 'start-tunnel.ps1'",
+      "$env:MIXIN_TUNNEL_TOKEN_INPUT='original-environment'; $env:MIXIN_TUNNEL_ALLOW_VERIFICATION='original-policy'",
+      ". ([scriptblock]::Create($collect))",
+      "$script:stopped=$true",
+      ". ([scriptblock]::Create($install))",
+      "if($env:MIXIN_TUNNEL_TOKEN_INPUT -cne 'original-environment' -or $env:MIXIN_TUNNEL_ALLOW_VERIFICATION -cne 'original-policy'){throw 'environment not restored'}",
       "if(-not $script:installed){throw 'installer not called'}",
       "Write-Output 'TUNNEL_INPUT_PASSED'",
     ].join("\n"));
@@ -183,4 +187,42 @@ test.skipIf(!bash || !existsSync(bash))("the original shell launcher consumes pa
       expect(existsSync(join(fixture.root, "data/config/tunnel-token"))).toBe(false);
     }
   } finally { await fixture.cleanup(); }
+}, 30000);
+
+test.skipIf(!bash || !existsSync(bash))("the shell launcher accepts a verification-only instance only when deployment allows it", async () => {
+  const fixture = await tempFixture("tunnel-verification-");
+  const identity = { instanceId: crypto.randomUUID(), pid: 42, startedAt: Date.now() };
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json({
+    service: "mixin-chatbot", version: 1, status: "ready", verificationOnly: true, ...identity,
+  }) });
+  try {
+    for (const dir of ["scripts/tunnel", "scripts/lib", "scripts/ops", "src/core", "data/state"]) await mkdir(join(fixture.root, dir), { recursive: true });
+    for (const path of ["scripts/tunnel/start-tunnel.sh", "scripts/ops/health-check.ts", "src/core/health.ts"]) await copyFile(join(project, path), join(fixture.root, path));
+    // The real health gate runs; only process bookkeeping is stubbed.
+    await writeFile(join(fixture.root, "scripts/lib/common.sh"), [
+      ". " + shQuote(posixPath(join(project, "scripts/lib/common.sh"))),
+      "managed_cloudflared_pid() { return 1; }",
+      "record_cloudflared_pid() { :; }",
+    ].join("\n") + "\n");
+    await writeFile(join(fixture.root, "data/state/instance.json"), JSON.stringify({ ...identity, port: server.port }));
+    const binary = join(fixture.root, "cloudflared");
+    await writeFile(binary, [
+      "#!/usr/bin/env bash",
+      'if [ "${1:-}" = --version ]; then echo "cloudflared version fixture"; exit 0; fi',
+      'printf "%s\n" "$@" > "$FIXTURE_ROOT/args"',
+    ].join("\n") + "\n");
+    await chmod(binary, 0o755);
+    for (const allowed of [false, true]) {
+      const result = await execute([bash!, posixPath(join(fixture.root, "scripts/tunnel/start-tunnel.sh"))], fixture.root, {
+        FIXTURE_ROOT: posixPath(fixture.root), BOT_PORT: String(server.port), TUNNEL_TOKEN: tokens[0], TUNNEL_TOKEN_FILE: "",
+        MIXIN_TUNNEL_TOKEN_INPUT: "", CLOUDFLARED_BACKGROUND: "0", TUNNEL_ALLOW_NO_BOT: "", MIXIN_TUNNEL_ALLOW_VERIFICATION: allowed ? "1" : "",
+      });
+      expect(result.code, result.output).toBe(allowed ? 0 : 1);
+      expect(result.output).toContain(allowed ? "部署验证实例已就绪" : "已中止");
+      expect(existsSync(join(fixture.root, "args")), result.output).toBe(allowed);
+    }
+    // Docker deployment starts the connector before commit, so it must opt in explicitly.
+    const deploy = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+    expect(deploy).toMatch(/MIXIN_TUNNEL_ALLOW_VERIFICATION=1 [^\n]*start-tunnel\.sh/);
+  } finally { await server.stop(true); await fixture.cleanup(); }
 }, 30000);

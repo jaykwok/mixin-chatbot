@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tempFixture } from "../helpers/temp.ts";
@@ -264,7 +264,7 @@ test.skipIf(process.platform !== "win32")("Windows redeployment selects the new 
   const f = await tempFixture("deploy-group-root-");
   try {
     const source = await readFile(join(project, "scripts/deploy/deploy.ps1"), "utf8");
-    const start = source.indexOf("# ---- 4b. Pi"), end = source.indexOf("Set-OperationStage 'deployment-snapshot'", start);
+    const start = source.indexOf("# ---- 4b. Pi"), end = source.indexOf("# ---- 停机前的交互选择", start);
     expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
     const script = join(f.root, "group-root.ps1");
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
@@ -291,6 +291,121 @@ Write-Output 'ROOT_SELECTED'
     expect(result.code, result.output).toBe(0); expect(result.output).toContain("ROOT_SELECTED");
   } finally { await f.cleanup(); }
 }, 15000);
+
+test.skipIf(process.platform !== "win32")("Windows redeployment collects every answer before stopping the bot service", async () => {
+  const f = await tempFixture("deploy-preflight-");
+  try {
+    const source = await readFile(join(project, "scripts/deploy/deploy.ps1"), "utf8");
+    const start = source.indexOf("# ---- 停机前的交互选择"), end = source.indexOf("Set-OperationStage 'deployment-snapshot'", start);
+    const stop = source.indexOf("Stop-ProjectBot $Project $TaskName -KeepDisabled");
+    expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start); expect(stop).toBeGreaterThan(end);
+    // From the stop through verification, connector setup and commit to the normal start, only the AI wizard may interact.
+    const normalStart = source.indexOf("Enable-ScheduledTask -TaskName $TaskName", stop);
+    expect(normalStart).toBeGreaterThan(source.indexOf("commit --project $Project", stop));
+    expect(source.slice(stop, normalStart).match(/Read-Host|Read-YesNo|Read-TunnelTokenInput/g)).toBeNull();
+    const script = join(f.root, "preflight.ps1");
+    await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+. ${quotePS(join(project, "scripts/lib/common.ps1"))}
+$Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data/state'
+$ModelsFile=Join-Path $Project 'data/config/models.json'; $DomainFile=Join-Path $StateDir 'bot-domain'
+$PortFile=Join-Path $StateDir 'bot-port'; $ModeFile=Join-Path $StateDir 'deploy-mode'
+$TunnelManagedFile=Join-Path $StateDir 'cloudflared-managed'
+New-Item -ItemType Directory -Force -Path $StateDir,(Split-Path $ModelsFile) | Out-Null
+Set-Content -LiteralPath $ModelsFile '{}'; Set-Content -LiteralPath $PortFile '1011' -NoNewline
+Set-Content -LiteralPath $ModeFile 'direct' -NoNewline
+$env:BOT_DOMAIN=''; $env:BOT_PORT=''; $env:DEPLOY_MODE=''; $env:PLATFORM_IP=''
+function Step {}; function Done {}; function Warn($message){throw $message}; function Fail($message){throw $message}
+function Read-Host($Prompt) {
+    if($Prompt -like '机器人监听端口*'){ return '2022' }
+    if($Prompt -like '输入 1 或 2*'){ return '2' }
+    if($Prompt -like 'Cloudflare 公网域名*'){ return 'https://bot.example.com' }
+    throw ('unexpected prompt: ' + $Prompt)
+}
+function Read-YesNo($Prompt, $Default) { if($Prompt -like '是否重新配置 AI*'){ return $true }; throw ('unexpected question: ' + $Prompt) }
+function Get-Service { $null }
+function Show-TunnelTokenHelp {}
+function Read-TunnelTokenInput { 'fixture-token-input' }
+function Resolve-TunnelToken($root, $value) { if($value -cne 'fixture-token-input'){ throw 'wrong token input' } }
+${source.slice(start, end)}
+if($Port -ne '2022' -or $mode -ne 'cloudflare' -or $publicDomain -ne 'bot.example.com' -or -not $persistDomain){ throw 'answers not collected' }
+if(-not $reconfigureAi -or -not $tunnelInputPrepared -or $preparedTunnelInput -cne 'fixture-token-input'){ throw 'deferred work not prepared' }
+Write-Output 'PREFLIGHT_COLLECTED'
+`);
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("PREFLIGHT_COLLECTED");
+  } finally { await f.cleanup(); }
+}, 15000);
+
+test.skipIf(process.platform !== "win32")("Windows Cloudflare deployment installs the connector against its verification instance and reaches the normal start", async () => {
+  const f = await tempFixture("deploy-tunnel-verification-");
+  const state = join(f.root, "project/data/state"), verifyOnly = join(state, "verify-only");
+  const identity = { instanceId: "11111111-2222-3333-4444-555555555555", pid: 4242, startedAt: 1700000000000 };
+  // The live endpoint reports verification mode exactly while deploy keeps data/state/verify-only.
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json({
+    service: "mixin-chatbot", version: 1, status: "ready", ...identity, verificationOnly: existsSync(verifyOnly),
+  }) });
+  try {
+    await mkdir(state, { recursive: true });
+    await writeFile(join(state, "instance.json"), JSON.stringify({ ...identity, port: server.port }));
+    const source = await readFile(join(project, "scripts/deploy/deploy.ps1"), "utf8");
+    const start = source.indexOf('Step "等待部署预检通过..."'), end = source.indexOf('Done "可选大文件外链', start);
+    expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
+    const script = join(f.root, "tunnel.ps1");
+    await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+. ${quotePS(join(project, "scripts/lib/common.ps1"))}
+function Get-Definition([string]$path,[scriptblock]$match) { $t=$null; $e=$null; $ast=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$t,[ref]$e); if($e.Count){throw ($e | Out-String)}; (@($ast.FindAll($match,$true)) | ForEach-Object { $_.Extent.Text }) -join [Environment]::NewLine }
+$deploySource=${quotePS(join(project, "scripts/deploy/deploy.ps1"))}; $tunnelSource=${quotePS(join(project, "scripts/tunnel/start-tunnel.ps1"))}
+. ([scriptblock]::Create((Get-Definition $deploySource { param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Wait-BotHealth' })))
+# The installer's own health gate, taken verbatim from start-tunnel.ps1.
+$gate=Get-Definition $tunnelSource { param($n) ($n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-LocalBot') -or ($n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$allowVerification') }
+$Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data/state'; $TunnelManagedFile=Join-Path $StateDir 'cloudflared-managed'
+$verifyOnly=Join-Path $StateDir 'verify-only'; $Port=$env:FIXTURE_PORT; $TaskName='mixin-chatbot'; $mode='cloudflare'
+$bunPath='fixture-bun'; $migrationRunner='fixture-runner'; $GroupDataRoot=Join-Path $Project 'groups'; $WindowsPowerShell='Invoke-FixtureInstaller'
+$taskUsesS4U=$true; $taskStartDescription='fixture'; $cleanupFirewallAfterHealth=$false
+function Step {}; function Done {}; function Warn {}; function Fail {}
+function Read-Host { throw 'prompted while the bot service was stopped' }
+function Read-YesNo { throw 'prompted while the bot service was stopped' }
+function Read-TunnelTokenInput { throw 'prompted while the bot service was stopped' }
+function Save-DeploymentState {}; function Enable-ScheduledTask {}; function Set-Service {}; function Start-Service {}; function Get-ScheduledTaskInfo {}
+function Get-Service { if($script:service -ne 'none'){ [pscustomobject]@{Status='Running'} } }
+function Stop-ProjectBot { $script:verificationStopped=$true; $true }
+function Start-ScheduledTask { if((Test-Path -LiteralPath $verifyOnly) -or -not $script:committed){throw 'normal start before commit'}; $script:normalStarts++ }
+function fixture-bun { if($args -contains 'commit'){ if(-not $script:verificationStopped){throw 'commit while verifying'}; $script:committed=$true }; $global:LASTEXITCODE=0 }
+function Invoke-FixtureInstaller {
+    if($env:MIXIN_TUNNEL_TOKEN_INPUT -cne 'prepared-token-input'){throw 'prepared token not passed'}
+    $BotPort=$env:BOT_PORT; . ([scriptblock]::Create($gate))
+    if($script:installerFails -or -not (Test-LocalBot)){ $global:LASTEXITCODE=1; return }
+    $script:service='installed'; $script:installs++; $global:LASTEXITCODE=0
+}
+$run=[scriptblock]::Create(${quotePS(source.slice(start, end))})
+# Without the deployment's explicit policy the installer still refuses a verification-only instance.
+Set-Content -LiteralPath $verifyOnly 'verify'; $BotPort=$Port; $env:MIXIN_TUNNEL_ALLOW_VERIFICATION=$null; . ([scriptblock]::Create($gate))
+if(Test-LocalBot){throw 'installer accepted a verification instance without deploy policy'}
+foreach($case in @('install','installer-failure','unmanaged-appeared')) {
+    Set-Content -LiteralPath $verifyOnly 'verify'
+    $script:service=$(if($case -eq 'unmanaged-appeared'){'unmanaged'}else{'none'}); $script:installerFails=$case -eq 'installer-failure'
+    $script:verificationStopped=$false; $script:committed=$false; $script:normalStarts=0; $script:installs=0
+    $unmanagedTunnelConfirmed=$false; $tunnelInputPrepared=$true; $preparedTunnelInput='prepared-token-input'
+    $env:MIXIN_TUNNEL_TOKEN_INPUT='original-input'; $env:MIXIN_TUNNEL_ALLOW_VERIFICATION=$null
+    $failure=$null
+    try { & $run } catch { $failure=$_.Exception.Message }
+    if($env:MIXIN_TUNNEL_TOKEN_INPUT -cne 'original-input' -or $env:MIXIN_TUNNEL_ALLOW_VERIFICATION){throw ($case+': installer environment not restored')}
+    if($case -eq 'install') {
+        if($failure){throw ('install: '+$failure)}
+        if($script:installs -ne 1 -or -not $script:committed -or $script:normalStarts -ne 1 -or (Test-Path -LiteralPath $verifyOnly)){throw 'install: normal start not reached'}
+    } else {
+        if(-not $failure -or $failure -like 'prompted*'){throw ($case+': expected rollback without prompting, got '+$failure)}
+        if($script:committed -or $script:normalStarts){throw ($case+': committed after connector failure')}
+    }
+    Write-Output ('VERIFIED '+$case)
+}
+`);
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root,
+      { ...process.env, FIXTURE_PORT: String(server.port), MIXIN_TUNNEL_ALLOW_VERIFICATION: "" });
+    expect(result.code, result.output).toBe(0);
+    expect(result.output.match(/VERIFIED /g), result.output).toHaveLength(3);
+  } finally { server.stop(true); await f.cleanup(); }
+}, 30000);
 
 test.skipIf(process.platform !== "win32")("Windows upgrade replaces the existing snapshot with durable upgrade metadata", async () => {
   const fixture = await tempFixture("upgrade-snapshot-replace-");
@@ -563,6 +678,104 @@ ${wait}
   } finally { await fixture.cleanup(); }
 }, 30000);
 
+test.skipIf(!bash || !existsSync(bash))("Docker deployment collects every answer before stopping and starts the connector once", async () => {
+  const fixture = await tempFixture("deployment-docker-preflight-");
+  const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+  const stop = source.indexOf("\nbegin_deployment\n"), commit = source.indexOf("\ncommit_deployment\n", stop);
+  const preflight = source.split("# ---- 停机前的交互选择")[1]?.split("# Decisions precede persistent changes")[0]?.replace(/^[^\n]*/, "");
+  const tunnel = source.split("# ---- Cloudflare 模式：确保 cloudflared 在线 ----")[1]?.split('if [ "${CLEANUP_UFW_AFTER_HEALTH')[0];
+  expect(preflight).toBeDefined(); expect(tunnel).toBeDefined();
+  expect(source.indexOf("# ---- 停机前的交互选择")).toBeLessThan(stop);
+  // Only the AI wizard container may interact between the stop and the commit.
+  expect(stop).toBeGreaterThan(0); expect(commit).toBeGreaterThan(stop);
+  expect(source.slice(stop, commit).match(/read_input|ask_yes_no/g)).toBeNull();
+  const state = join(fixture.root, "state");
+  await mkdir(join(fixture.root, "scripts/tunnel"), { recursive: true }); await mkdir(state, { recursive: true });
+  await writeFile(join(fixture.root, "scripts/tunnel/start-tunnel.sh"), "");
+  await writeFile(join(fixture.root, "models.json"), "{}");
+  const stubs = `. '${posixPath(join(project, "scripts/lib/common.sh"))}'
+PROJECT_DIR="$PWD"; STATE_DIR="$PWD/state"; LOG_DIR="$PWD/logs"; PROMPTS="$STATE_DIR/prompts"
+print_status(){ :; }; print_success(){ :; }; print_warning(){ :; }; print_error(){ echo "$*" >&2; }; show_tunnel_token_help(){ :; }
+managed_cloudflared_pid(){ [ -f "$STATE_DIR/managed" ] && echo 777; }
+pgrep(){ if [ "\${FIXTURE_UNMANAGED:-0}" = 1 ]; then echo 4242; return 0; fi; return 1; }
+load_tunnel_token(){
+    if [ -z "\${1:-}" ]; then [ "\${FIXTURE_SAVED_TOKEN:-0}" = 1 ]; return; fi
+    [ "$1" = fixture-token ] || { echo 'invalid token' >&2; return 1; }
+}
+`;
+  await writeFile(join(fixture.root, "preflight.sh"), `#!/usr/bin/env bash
+set -euo pipefail
+${stubs}
+read_input(){
+    printf '%s\\n' "$1" >> "$PROMPTS"
+    case "$1" in
+        *公网域名*) printf -v "$2" '%s' bot.example.com ;;
+        *隧道\\ token*) [ "\${3:-0}" = 1 ] || exit 96; printf -v "$2" '%s' "\${FIXTURE_TOKEN_ANSWER:?unexpected token prompt}" ;;
+        *) echo "unexpected prompt: $1" >&2; exit 97 ;;
+    esac
+}
+ask_yes_no(){ printf '%s\\n' "$1" >> "$PROMPTS"; case "$1" in *重新配置\\ AI*) return 0 ;; *connector*) [ "\${FIXTURE_CONFIRM:-y}" = y ] ;; *) exit 98 ;; esac; }
+MODELS_FILE="$PWD/models.json"; BOT_DOMAIN_FILE="$STATE_DIR/bot-domain"; BOT_PORT=1011; unset BOT_DOMAIN
+DEPLOY_MODE="$FIXTURE_DEPLOY_MODE"; PREPARED_TUNNEL_READY="\${FIXTURE_PREPARED:-0}"; PREPARED_TUNNEL_INPUT="\${FIXTURE_PREPARED_INPUT:-}"
+PREPARED_UNMANAGED_MODE="\${FIXTURE_PREPARED_UNMANAGED:-}"
+${preflight}
+echo "RESULT ai=$RECONFIGURE_AI token=$TUNNEL_TOKEN_INPUT unmanaged=$UNMANAGED_TUNNEL_CONFIRMED domain=$PUBLIC_DOMAIN handoff=$PREPARED_TUNNEL_INPUT"
+`);
+  await writeFile(join(fixture.root, "tunnel.sh"), `#!/usr/bin/env bash
+set -euo pipefail
+${stubs}
+read_input(){ echo "prompted after stop: $1" >&2; exit 95; }; ask_yes_no(){ echo "prompted after stop: $1" >&2; exit 95; }
+ensure_cloudflared(){ :; }; process_start_identity(){ echo 1; }; stop_tunnel_launcher(){ :; }; cloudflared_logging(){ echo off; }
+nohup(){
+    [ "$MIXIN_TUNNEL_ALLOW_VERIFICATION" = 1 ] || exit 3
+    [ "$MIXIN_TUNNEL_TOKEN_INPUT" = fixture-token ] || exit 4
+    printf 'launch\\n' >> "$STATE_DIR/launches"
+    if [ "$FIXTURE_LAUNCH" = ok ]; then : > "$STATE_DIR/managed"; fi
+}
+DEPLOY_MODE="$FIXTURE_DEPLOY_MODE"; BOT_PORT=1011; TUNNEL_TOKEN_INPUT=fixture-token; UNMANAGED_TUNNEL_CONFIRMED=0
+${tunnel}
+[ -z "$TUNNEL_TOKEN_INPUT" ] || exit 5
+echo TUNNEL_READY
+`);
+  const run = async (name: string, env: Record<string, string>) => {
+    await writeFile(join(state, "prompts"), ""); await writeFile(join(state, "launches"), "");
+    await rm(join(state, "managed"), { force: true });
+    const result = await execute([bash!, posixPath(join(fixture.root, name))], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1", ...env });
+    const prompts = await readFile(join(state, "prompts"), "utf8"), launches = await readFile(join(state, "launches"), "utf8");
+    return { ...result, prompts, launches: launches.split("\n").filter(Boolean).length };
+  };
+  try {
+    // ops update handed over the token for the unchanged mode: nothing tunnel-related is asked again.
+    let result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_PREPARED: "1", FIXTURE_PREPARED_INPUT: "fixture-token" });
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("RESULT ai=1 token=fixture-token unmanaged=0 domain=bot.example.com handoff=");
+    expect(result.prompts).not.toContain("隧道 token");
+    // Direct deployment asks for the missing token (hidden) before the stop.
+    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_TOKEN_ANSWER: "fixture-token" });
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("token=fixture-token");
+    // A valid saved token needs no answer; the launcher reads it itself.
+    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_SAVED_TOKEN: "1" });
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("token= "); expect(result.prompts).not.toContain("隧道 token");
+    // An unmanaged connector confirmed by ops update for the same mode is not asked again; a changed mode is.
+    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_UNMANAGED: "1", FIXTURE_PREPARED_UNMANAGED: "cloudflare" });
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("unmanaged=1"); expect(result.prompts).not.toContain("connector");
+    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_UNMANAGED: "1", FIXTURE_PREPARED_UNMANAGED: "direct" });
+    expect(result.code, result.output).toBe(0); expect(result.prompts).toContain("connector");
+    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "direct", FIXTURE_UNMANAGED: "1", FIXTURE_CONFIRM: "n" });
+    expect(result.code, result.output).toBe(1);
+
+    // After the stop the connector starts once against the verification instance; failures roll back instead of prompting.
+    result = await run("tunnel.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_LAUNCH: "ok" });
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("TUNNEL_READY"); expect(result.launches).toBe(1);
+    result = await run("tunnel.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_LAUNCH: "fail" });
+    expect(result.code, result.output).toBe(1); expect(result.launches).toBe(1); expect(result.output).not.toContain("prompted after stop");
+    for (const mode of ["cloudflare", "direct"]) {
+      result = await run("tunnel.sh", { FIXTURE_DEPLOY_MODE: mode, FIXTURE_UNMANAGED: "1", FIXTURE_LAUNCH: "ok" });
+      expect(result.code, result.output).toBe(1); expect(result.launches).toBe(0); expect(result.output).not.toContain("prompted after stop");
+    }
+  } finally { await fixture.cleanup(); }
+}, 90000);
+
 test.skipIf(!bash || !existsSync(bash))("Docker migration passes the service identity, mounted group root and native cache environment", async () => {
   const fixture = await tempFixture("deployment-migration-env-");
   const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
@@ -613,6 +826,7 @@ cd "$PROJECT_DIR"
 LOG_DIR="$PROJECT_DIR/logs"; TUNNEL_PID_FILE="$PROJECT_DIR/data/state/cloudflared.pid"
 operation_start deploy
 print_error(){ echo "$*" >&2; operation_event error "$*"; }; print_warning(){ echo "$*"; operation_event warn "$*"; }
+print_success(){ echo "$*"; }
 flock(){ :; }; can_manage_ufw(){ return 0; }
 managed_cloudflared_pid(){ return 1; }; stop_tunnel_launcher(){ :; }
 ufw(){ :; }
@@ -695,7 +909,7 @@ PROJECT_DIR="$1"; phase="$2"; cd "$PROJECT_DIR"
 . '${posixPath(join(project, "scripts/lib/lifecycle.sh"))}'
 . '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
 LOG_DIR="$PROJECT_DIR/logs"; TUNNEL_PID_FILE="$PROJECT_DIR/data/state/cloudflared.pid"
-print_error(){ echo "$*" >&2; }; print_warning(){ echo "$*"; }
+print_error(){ echo "$*" >&2; }; print_warning(){ echo "$*"; }; print_success(){ echo "$*"; }
 flock(){ :; }; can_manage_ufw(){ return 1; }
 managed_cloudflared_pid(){ return 1; }; stop_tunnel_launcher(){ :; }
 docker(){

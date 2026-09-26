@@ -71,3 +71,16 @@ operation_capture() {
     operation_event info "${1##*/}; exit=$result"
     return "$result"
 }
+
+# Routine output (for example git's diffstat) goes only to the operation log; the
+# terminal sees it when the command fails.
+operation_capture_quiet() {
+    local output result line
+    if output="$("$@" 2>&1)"; then result=0; else result=$?; fi
+    while IFS= read -r line; do
+        [ -z "$line" ] || operation_event output "$line"
+    done <<< "$output"
+    operation_event info "${1##*/}; exit=$result"
+    if [ "$result" != 0 ] && [ -n "$output" ]; then printf '%s\n' "$output" >&2; fi
+    return "$result"
+}

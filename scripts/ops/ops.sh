@@ -741,6 +741,32 @@ update() (
     echo ""
 
     docker info >/dev/null 2>&1 || { ER '无法连接 Docker，尚未应用升级'; return 1; }
+    # 部署脚本在停机后不再询问隧道：未托管 connector 的归属和缺失的 token 都在停机前按当前模式确认。
+    local tunnel_prepared='' tunnel_input='' unmanaged_confirmed='' unmanaged_pid=''
+    if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1; then
+        unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
+        if [ "$DEPLOY_MODE" = cloudflare ]; then
+            WA "检测到未由本项目记录的 cloudflared（pid ${unmanaged_pid}），无法自动确认它连接的是当前隧道"
+            ask_yes_no "确认该 connector 正在服务本项目，继续升级？[y/N] " || { WA '已取消升级；代码和配置未改动'; return 1; }
+        else
+            WA "系统有未由本项目记录的 cloudflared（pid ${unmanaged_pid}）；不会自动停止，以免影响其他隧道"
+            ask_yes_no "确认该 connector 与本项目无关或其入口仍受保护，继续升级？[y/N] " || { WA '已取消升级；代码和配置未改动'; return 1; }
+        fi
+        unmanaged_confirmed="$DEPLOY_MODE"
+    elif [ "$DEPLOY_MODE" = cloudflare ] && ! managed_cloudflared_pid >/dev/null 2>&1; then
+        if ! (load_tunnel_token) >/dev/null 2>&1; then
+            P '未运行 cloudflared 且没有可用的已保存 token；请先提供，升级验证实例就绪后启动'
+            show_tunnel_token_help
+            while true; do
+                if ! IFS= read -r -s -p '隧道 token 或文件路径（输入隐藏）：' tunnel_input; then
+                    echo ""; WA '输入已结束，已取消升级；代码和配置未改动'; return 1
+                fi
+                echo ""
+                if (load_tunnel_token "$tunnel_input"); then break; fi
+            done
+        fi
+        tunnel_prepared=1
+    fi
     if has_container; then
         handoff_container="$(docker inspect --format '{{.Id}}' "$CONTAINER")" || return 1
         [[ "$handoff_container" =~ ^[0-9a-f]{64}$ ]] || { ER '无法识别原容器'; return 1; }
@@ -770,25 +796,32 @@ update() (
         operation_capture docker stop --time 30 "$handoff_container" || { ER '旧容器停止失败，未切换代码'; return 1; }
         [ "$(docker inspect --format '{{.State.Running}}' "$handoff_container")" = false ] || { ER '旧容器尚未停止，未切换代码'; return 1; }
     fi
-    OK '旧实例已停止，开始应用升级'
+    if [ "$was_running" = 1 ]; then
+        OK "已停止机器人服务（容器 ${CONTAINER}）；升级完成前不处理消息"
+    else
+        OK "机器人服务升级前未运行（容器 ${CONTAINER}），升级后保持停止"
+    fi
     update_changed=1
     operation_stage checkout
-    if ! operation_capture git_here checkout main; then ER '切换到 main 失败'; return 1; fi
-    if ! operation_capture git_here merge --ff-only "$target_sha"; then
+    if ! operation_capture_quiet git_here checkout --quiet main; then ER '切换到 main 失败'; return 1; fi
+    if ! operation_capture_quiet git_here merge --ff-only --quiet "$target_sha"; then
         ER "git merge --ff-only 失败"
         return 1
     fi
-    OK "代码已更新到 ${target_sha:0:7}"
+    OK "代码已更新：${original_sha:0:7} -> ${target_sha:0:7}"
 
     # Docker 部署升级必须重建镜像，而「重建 + 换容器 + 失败自动换回旧容器」这套逻辑已经
     # 完整存在于 deploy.sh 里。在这里再写一遍等于把最关键的安全逻辑维护成两份，所以直接
     # 交给它；端口、模式、域名、群数据根这些提示都默认沿用当前值，回车即可。
-    # 隧道也由 deploy.sh 一并处理，不需要在这里单独重启 cloudflared。
+    # 隧道也由 deploy.sh 一并处理，不需要在这里单独重启 cloudflared；它需要的 token 和归属确认已在停机前取得。
     P "通过部署向导重建镜像并切换容器（各项提示直接回车即沿用当前配置）..."
     echo ""
     mkdir -p "$PROJECT_DIR/tmp" || return 1
-    BOT_UPDATE_COMMIT_FILE="$commit_file" DEPLOY_PRESERVE_STOPPED=1 DEPLOY_PREVIOUS_RUNNING="$was_running" DEPLOY_ORIGINAL_CONTAINER="$handoff_container" bash "$deploy_script" <&0 &
+    # 停机前的隧道确认经环境交给部署脚本（不进入命令行参数），部署脚本读入后立即清除。
+    DEPLOY_TUNNEL_INPUT_PREPARED="$tunnel_prepared" DEPLOY_TUNNEL_TOKEN_INPUT="$tunnel_input" DEPLOY_UNMANAGED_TUNNEL_CONFIRMED="$unmanaged_confirmed" \
+      BOT_UPDATE_COMMIT_FILE="$commit_file" DEPLOY_PRESERVE_STOPPED=1 DEPLOY_PREVIOUS_RUNNING="$was_running" DEPLOY_ORIGINAL_CONTAINER="$handoff_container" bash "$deploy_script" <&0 &
     deploy_pid=$!
+    tunnel_input=''
     if wait "$deploy_pid"; then
         deploy_pid=''
         update_committed=1

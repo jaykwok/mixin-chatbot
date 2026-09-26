@@ -80,7 +80,8 @@ async function askText(message: string, previous: string | undefined, validate: 
 }
 
 async function askApiKey(): Promise<string> {
-  const key = bail<string>(await password({ message: "API Key", validate: requireText })).trim();
+  // ASCII mask: clack's default ▪ is outside the GBK console code page and shows as "?" on Windows.
+  const key = bail<string>(await password({ message: "API Key", mask: "*", validate: requireText })).trim();
   log.info("Key 会写进 models.json。也可以改填 $ENV_VAR 或 !command，由 Pi 在启动时解析。");
   return key;
 }
@@ -261,7 +262,8 @@ function preserved(previous: JsonObject | undefined): JsonObject {
 }
 
 async function main(draft: ModelConfigurationDraft): Promise<void> {
-  intro(`🤖 AI 配置（写入 ${MODELS_JSON_PATH} 与 ${PI_SETTINGS_PATH}）`);
+  // No emoji in console output: Windows Server consoles render them as "??".
+  intro(`AI 配置（写入 ${MODELS_JSON_PATH} 与 ${PI_SETTINGS_PATH}）`);
 
   // 先离线建运行时：随包目录足够列出内置服务商，选定之后只刷新那一个。
   const runtime = await openModelRuntime({ ...draft, writableCatalog: true });
@@ -341,7 +343,7 @@ async function main(draft: ModelConfigurationDraft): Promise<void> {
     "完成"
   );
   log.info("需要更细的服务商设置时，可按 Pi 的 models.json 格式手工添加 headers、compat、authHeader 或 modelOverrides；重新运行本向导不会覆盖它们。");
-  outro("✅ AI 配置完成。");
+  outro("AI 配置完成。");
 }
 
 if (import.meta.main) {

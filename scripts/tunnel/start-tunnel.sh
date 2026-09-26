@@ -74,8 +74,11 @@ if command -v base64 >/dev/null 2>&1; then
 fi
 
 # 连接器注册后会参与分流；默认要求本地服务健康，避免向无服务实例导入生产流量。
+# 部署在提交前启动连接器，此时只运行验证实例；只有部署脚本显式声明时才接受它。
 if bot_local_ready "$BOT_PORT" >/dev/null 2>&1; then
     echo "✓ 本机 :${BOT_PORT} 机器人在线"
+elif [ "${MIXIN_TUNNEL_ALLOW_VERIFICATION:-}" = "1" ] && bot_local_ready "$BOT_PORT" --allow-verification >/dev/null 2>&1; then
+    echo "✓ 本机 :${BOT_PORT} 部署验证实例已就绪；部署提交后切换为正式实例，此前消息返回 503"
 elif [ "${TUNNEL_ALLOW_NO_BOT:-}" = "1" ]; then
     echo "⚠ 本机 :${BOT_PORT} 无响应，但 TUNNEL_ALLOW_NO_BOT=1，继续连接" >&2
 else

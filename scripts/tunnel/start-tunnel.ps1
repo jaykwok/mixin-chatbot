@@ -62,10 +62,14 @@ if (-not [int]::TryParse($BotPort, [ref]$portNumber) -or $portNumber -lt 1 -or $
 }
 $BotPort = "$portNumber"
 
+# 部署在提交前安装连接器，此时只运行验证实例；只有部署脚本显式声明时才接受它。
+$allowVerification = $env:MIXIN_TUNNEL_ALLOW_VERIFICATION -eq '1'
 function Test-LocalBot {
     try {
-        if (-not (Test-ProjectBotHealth $Project ([int]$BotPort))) { throw '实例未就绪或身份不匹配' }
-        Write-Host "正常：机器人已在 :$BotPort 在线。" -ForegroundColor Green
+        $verificationOnly = $false
+        if (-not (Test-ProjectBotHealth $Project ([int]$BotPort) -AllowVerification:$allowVerification -VerificationOnly ([ref]$verificationOnly))) { throw '实例未就绪或身份不匹配' }
+        if ($verificationOnly) { Write-Host "正常：部署验证实例已在 :$BotPort 就绪；部署提交后切换为正式实例，此前消息返回 503。" -ForegroundColor Green }
+        else { Write-Host "正常：机器人已在 :$BotPort 在线。" -ForegroundColor Green }
         return $true
     } catch {
         Write-Host "警告：:$BotPort 无响应；请先通过 $(Get-OpsCommandHint 'deploy') 启动机器人（Cloudflare 模式）。" -ForegroundColor Yellow

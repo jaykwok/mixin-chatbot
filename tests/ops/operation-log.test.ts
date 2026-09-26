@@ -51,7 +51,11 @@ for (const entry of ["migration", ...(process.platform === "win32" ? ["powershel
       expect(text).toContain(`migration-finished: exit=${status}`);
       if (entry !== "migration") expect(text).toContain(`operation finished; exit=${status}`);
       if (status) expect(text).toContain("目录不存在");
-      else expect(result.text).toContain('"decisions": []');
+      else {
+        expect(result.text).toContain("迁移预检：需要迁移到数据版本");
+        expect(result.text).not.toContain('"decisions"');
+        expect(text).toContain("preview-result:");
+      }
     } finally { await f.cleanup(); }
   }, 30000);
 }

@@ -61,13 +61,15 @@ normalize_hostname_input() {
 }
 
 # Host-port response must identify this project's current instance. Docker provides Bun when the host does not.
+# Pass --allow-verification only when a deployment deliberately checks its verification-only instance.
 bot_local_ready() {
     local port="$1" body
+    shift
     body="$(curl --noproxy '*' --max-time 3 -fsS "http://127.0.0.1:$port/health")" || return 1
     if command -v bun >/dev/null 2>&1; then
-        (cd "$PROJECT_DIR" && printf '%s' "$body" | BOT_PORT="$port" bun run scripts/ops/health-check.ts --stdin)
+        (cd "$PROJECT_DIR" && printf '%s' "$body" | BOT_PORT="$port" bun run scripts/ops/health-check.ts --stdin "$@")
     else
-        printf '%s' "$body" | docker exec -i -e BOT_PORT="$port" mixin-chatbot bun run scripts/ops/health-check.ts --stdin
+        printf '%s' "$body" | docker exec -i -e BOT_PORT="$port" mixin-chatbot bun run scripts/ops/health-check.ts --stdin "$@"
     fi
 }
 

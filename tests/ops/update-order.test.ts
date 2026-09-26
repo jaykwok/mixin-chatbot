@@ -11,8 +11,9 @@ const posix = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):
 
 test.skipIf(!bash || !existsSync(bash))("Docker update stops before checkout and build, restores failures and resumes the original running state", async () => {
   const f = await tempFixture("update-order-"), work = join(f.root, "work"), state = join(work, "data/state");
-  const run = async (args: string[], env: Record<string, string> = {}) => {
-    const child = Bun.spawn(args, { cwd: work, env: { ...process.env, ...env }, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true });
+  const run = async (args: string[], env: Record<string, string> = {}, input?: string) => {
+    const stdin = input === undefined ? "ignore" : new Blob([input]);
+    const child = Bun.spawn(args, { cwd: work, env: { ...process.env, ...env }, stdin, stdout: "pipe", stderr: "pipe", windowsHide: true });
     const timeout = setTimeout(() => child.kill(), 20000);
     try {
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -30,6 +31,9 @@ set -euo pipefail
 test "$(cat data/state/running)" = false
 test "$(cat version.txt)" = new
 test "$DEPLOY_PREVIOUS_RUNNING" = "$EXPECT_RUNNING"
+test "$DEPLOY_TUNNEL_INPUT_PREPARED" = "\${EXPECT_TUNNEL_PREPARED:-}"
+test "$DEPLOY_TUNNEL_TOKEN_INPUT" = "\${EXPECT_TUNNEL_INPUT:-}"
+test "$DEPLOY_UNMANAGED_TUNNEL_CONFIRMED" = "\${EXPECT_UNMANAGED:-}"
 printf 'build\\n' >> data/state/events
 if [ "$FIXTURE_MODE" = build-fail ]; then exit 19; fi
 printf committed > "$BOT_UPDATE_COMMIT_FILE"
@@ -46,7 +50,18 @@ CYAN=''; NC=''; ROLLBACK_CONTAINER=mixin-chatbot-rollback
 cd "$PROJECT_DIR"
 . '${posix(join(project, "scripts/lib/operation-log.sh"))}'
 P(){ echo "$*"; }; OK(){ echo "$*"; }; WA(){ echo "$*"; }; ER(){ echo "$*" >&2; }
-acquire_deploy_lock(){ :; }; ask_yes_no(){ return 0; }; has_container(){ return 0; }; doctor(){ return 0; }
+acquire_deploy_lock(){ :; }; has_container(){ return 0; }; doctor(){ return 0; }
+DEPLOY_MODE="\${FIXTURE_DEPLOY_MODE:-direct}"
+# Tunnel answers are recorded as events so the test can prove they precede the stop.
+ask_yes_no(){ case "$1" in *connector*) printf 'confirm-tunnel\\n' >> data/state/events; [ "\${FIXTURE_CONFIRM:-y}" = y ] ;; *) return 0 ;; esac; }
+managed_cloudflared_pid(){ return 1; }
+pgrep(){ if [ "\${FIXTURE_UNMANAGED:-0}" = 1 ]; then echo 4242; return 0; fi; return 1; }
+show_tunnel_token_help(){ :; }
+load_tunnel_token(){
+    if [ -z "\${1:-}" ]; then [ "\${FIXTURE_SAVED_TOKEN:-0}" = 1 ]; return; fi
+    [ "$1" = fixture-token ] || { echo 'invalid token' >&2; return 1; }
+    printf 'token\\n' >> data/state/events
+}
 git_here(){
     case "$1" in checkout|merge|reset)
         if [ "$(cat data/state/running)" != false ]; then echo 'MUTATION_WHILE_RUNNING' >&2; return 91; fi
@@ -98,6 +113,28 @@ update
       else { expect(events.indexOf("checkout")).toBeGreaterThan(events.indexOf("stop")); expect(events.indexOf("build")).toBeGreaterThan(events.indexOf("merge")); }
       expect(existsSync(join(state, "update-transaction"))).toBe(false);
       expect(existsSync(join(state, "update-commit"))).toBe(false);
+    }
+
+    // Tunnel answers are collected before the stop and handed to the target deploy script.
+    const tunnelCases: { name: string; env: Record<string, string>; input: string; first: string; ok: boolean }[] = [
+      { name: "token-prompt", env: { FIXTURE_DEPLOY_MODE: "cloudflare", EXPECT_TUNNEL_PREPARED: "1", EXPECT_TUNNEL_INPUT: "fixture-token" }, input: "invalid\nfixture-token\n", first: "token", ok: true },
+      { name: "saved-token", env: { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_SAVED_TOKEN: "1", EXPECT_TUNNEL_PREPARED: "1" }, input: "", first: "stop", ok: true },
+      { name: "unmanaged-confirmed", env: { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_UNMANAGED: "1", EXPECT_UNMANAGED: "cloudflare" }, input: "", first: "confirm-tunnel", ok: true },
+      { name: "unmanaged-declined", env: { FIXTURE_UNMANAGED: "1", FIXTURE_CONFIRM: "n" }, input: "", first: "confirm-tunnel", ok: false },
+      { name: "token-input-ended", env: { FIXTURE_DEPLOY_MODE: "cloudflare" }, input: "", first: "", ok: false },
+    ];
+    for (const tunnel of tunnelCases) {
+      await git("reset", "--hard", old);
+      await writeFile(join(state, "running"), "true"); await writeFile(join(state, "events"), "");
+      const result = await run([bash!, posix(launcher), posix(work)], { FIXTURE_MODE: "success", EXPECT_RUNNING: "1", ...tunnel.env }, tunnel.input);
+      expect(result.code, `${tunnel.name}: ${result.text}`).toBe(tunnel.ok ? 0 : 1);
+      const events = (await readFile(join(state, "events"), "utf8")).trim().split("\n").filter(Boolean);
+      expect(events[0] ?? "", tunnel.name).toBe(tunnel.first);
+      // events[0] proves any tunnel answer preceded the stop; the target deploy script then checked the handoff.
+      if (tunnel.ok) expect(events, tunnel.name).toContain("build");
+      else { expect(events, tunnel.name).not.toContain("stop"); expect(await git("rev-parse", "HEAD")).toBe(old); }
+      expect(await readFile(join(state, "running"), "utf8"), tunnel.name).toBe("true");
+      expect(result.text, tunnel.name).not.toContain("fixture-token");
     }
 
     // Preflight must report the local main branch, even when HEAD is elsewhere.

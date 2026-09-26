@@ -92,7 +92,7 @@ test("migration decisions and diagnostics work with the original updater export 
     }
     const result = await execute([join(stage, "scripts/migrations/run.ts"), "preview", "--decisions-only", "--project", f.root, "--groups", f.context.groups], f.root);
     expect(result.code, result.text).toBe(2);
-    expect(result.text).toContain("acceptNativeCache");
+    expect(result.text).toContain("--accept-native-cache");
     const logs = await readdir(join(f.root, "logs/operations")); expect(logs).toHaveLength(1);
     expect(await readFile(join(f.root, "logs/operations", logs[0]!), "utf8")).toContain("migration-finished: exit=2");
     expect(await json(join(f.root, "data/state/migration.json"))).toBeNull();
@@ -143,7 +143,7 @@ test("model replacement and native cache conflicts require explicit decisions", 
     const conflict = await execute([join(project, "scripts/migrations/run.ts"), "preview", "--decisions-only", "--project", f.root,
       "--groups", f.context.groups], f.root, { PI_CACHE_RETENTION: "long" });
     expect(conflict.code, conflict.text).toBe(2);
-    expect(conflict.text).toContain("acceptNativeCache");
+    expect(conflict.text).toContain("--accept-native-cache");
     await publishJson(join(f.root, "data/config/runtime.json"), { BOT_MODEL_CACHE_RETENTION: "short", PI_CACHE_RETENTION: "long" });
     await publishJson(join(f.root, "data/runtime/pi/settings.json"), { defaultProvider: "openai-codex", defaultModel: "gpt-5.4" });
     expect((await v1.preview(previewContext(f.context))).decisions.map(d => d.key)).toEqual(["acceptNativeCache", "model"]);

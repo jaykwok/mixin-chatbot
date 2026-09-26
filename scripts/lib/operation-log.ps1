@@ -73,15 +73,23 @@ function Stop-OperationLog($Context, [int]$ExitCode) {
 }
 
 # Only noninteractive commands use this pipe; prompts retain their original terminal.
-function Invoke-OperationNative([string]$Executable, [string[]]$Arguments) {
+# -Quiet keeps routine output (for example git's diffstat) in the operation log and
+# shows it on the terminal only when the command fails.
+function Invoke-OperationNative([string]$Executable, [string[]]$Arguments, [switch]$Quiet) {
     $previous = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
         # Native commands update the global automatic variable in Windows PowerShell 5.1.
         $global:LASTEXITCODE = 1
-        & $Executable @Arguments 2>&1 | ForEach-Object { Write-Host $_; Write-OperationEvent 'output' ([string]$_) }
+        $captured = [Collections.Generic.List[string]]::new()
+        & $Executable @Arguments 2>&1 | ForEach-Object {
+            $line = [string]$_
+            if ($Quiet) { $captured.Add($line) } else { Write-Host $line }
+            Write-OperationEvent 'output' $line
+        }
         $code = $LASTEXITCODE
         Write-OperationEvent 'info' ((Split-Path $Executable -Leaf) + '; exit=' + $code)
+        if ($Quiet -and $code -ne 0) { foreach ($line in $captured) { Write-Host $line } }
         return [int]$code
     } finally { $ErrorActionPreference = $previous }
 }
