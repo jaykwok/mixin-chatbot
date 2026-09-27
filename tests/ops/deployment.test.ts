@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tempFixture } from "../helpers/temp.ts";
@@ -1216,16 +1216,16 @@ echo TUNNEL_READY
 
 test.skipIf(!bash || !existsSync(bash))("Docker deployment refuses the legacy update entry before any change and prints the bootstrap command", async () => {
   const fixture = await tempFixture("deployment-legacy-entry-");
-  const root = join(fixture.root, "project"), stubs = join(fixture.root, "bin"), dockerLog = join(fixture.root, "docker.log");
-  await mkdir(join(root, "scripts/deploy"), { recursive: true }); await mkdir(stubs);
+  const root = join(fixture.root, "project"), dockerLog = join(fixture.root, "docker.log");
+  await mkdir(join(root, "scripts/deploy"), { recursive: true });
   await Bun.write(join(root, "scripts/deploy/deploy.sh"), Bun.file(join(project, "scripts/deploy/deploy.sh")));
   for (const name of await readdir(join(project, "scripts/lib"))) {
     if (name.endsWith(".sh")) await Bun.write(join(root, "scripts/lib", name), Bun.file(join(project, "scripts/lib", name)));
   }
-  await writeFile(join(stubs, "docker"), `#!/usr/bin/env bash\necho "$*" >> '${posixPath(dockerLog)}'\nexit 1\n`);
-  await chmod(join(stubs, "docker"), 0o755);
+  // An exported function, not a PATH stub: the Windows CI runner skipped the stub and reached its real Docker.
+  const docker = `() { echo "$*" >> '${posixPath(dockerLog)}'; return 1\n}`;
   const run = (env: Record<string, string>) => execute([bash!, posixPath(join(root, "scripts/deploy/deploy.sh"))], root,
-    { ...process.env, MSYS_NO_PATHCONV: "1", PATH: `${posixPath(stubs)}:${process.env.PATH}`, ...env });
+    { ...process.env, MSYS_NO_PATHCONV: "1", "BASH_FUNC_docker%%": docker, ...env });
   try {
     // The previous ops.sh stopped the service and handed over with DEPLOY_REUSE_SETTINGS=1: refuse before Docker, data or state.
     let result = await run({ DEPLOY_REUSE_SETTINGS: "1" });
