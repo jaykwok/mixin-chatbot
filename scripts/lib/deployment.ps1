@@ -47,7 +47,7 @@ function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
 function Save-DeploymentSnapshot($Snapshot) {
     $path = Join-Path $Snapshot.Path 'deployment.xml'
     $temporary = $path + '.tmp'
-    $Snapshot | Select-Object * -ExcludeProperty Lock | Export-Clixml -LiteralPath $temporary
+    $Snapshot | Select-Object * -ExcludeProperty Lock, Record | Export-Clixml -LiteralPath $temporary
     $stream = [IO.File]::Open($temporary, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
     try { $stream.Flush($true) } finally { $stream.Dispose() }
     # Windows PowerShell 5.1 binds $null to an empty string for .NET string arguments.
@@ -55,11 +55,115 @@ function Save-DeploymentSnapshot($Snapshot) {
     else { [IO.File]::Move($temporary, $path) }
 }
 
+# 部署/升级事务记录：快照目录中的 transaction 文件，与 Linux 同一格式（每行 key=value）。
+# 记录停机前确认的全部选择；续做和回滚只使用记录值，不重新读取默认值。隧道 token 永不写入。
+function Get-TransactionKeys {
+    return @('format', 'operation', 'snapshot', 'target_sha', 'original_sha', 'original_branch', 'original_group_root',
+        'target_group_root', 'was_running', 'bot_port', 'deploy_mode', 'bot_domain', 'domain_action', 'unmanaged_tunnel', 'platform_ip', 'reconfigure_ai')
+}
+
+function Test-TransactionValue([string]$Key, [string]$Value) {
+    if ($Value -match '[\x00-\x1f\x7f]') { return $false }
+    switch -CaseSensitive ($Key) {
+        'format' { return $Value -ceq '1' }
+        'operation' { return $Value -cin @('deploy', 'upgrade') }
+        'snapshot' { return $Value -cmatch '^deploy-[A-Za-z0-9]+$' }
+        'target_sha' { return $Value -cmatch '^([0-9a-f]{40}|[0-9a-f]{64})?$' }
+        'original_sha' { return $Value -cmatch '^([0-9a-f]{40}|[0-9a-f]{64})?$' }
+        'original_branch' { return $Value -cmatch '^[^\s~^:?*\[\\]*$' }
+        'original_group_root' { return [IO.Path]::IsPathRooted($Value) }
+        'target_group_root' { return [IO.Path]::IsPathRooted($Value) }
+        'was_running' { return $Value -cin @('0', '1') }
+        'reconfigure_ai' { return $Value -cin @('0', '1') }
+        'bot_port' { $number = 0; return ($Value -cmatch '^[1-9][0-9]{0,4}$') -and [int]::TryParse($Value, [ref]$number) -and $number -le 65535 }
+        'deploy_mode' { return $Value -cin @('direct', 'cloudflare') }
+        'bot_domain' { return (-not $Value) -or ((ConvertTo-Hostname $Value) -ceq $Value) }
+        'domain_action' { return $Value -cin @('keep', 'persist', 'clear') }
+        'unmanaged_tunnel' { return $Value -cin @('', 'direct', 'cloudflare') }
+        # 直连防火墙放行的来源：IPv4 或 IPv6，可带前缀长度。
+        'platform_ip' { return $Value.Length -le 64 -and $Value -cmatch '^(([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-Fa-f]*:[0-9A-Fa-f:.]*)(/[0-9]{1,3})?$' }
+    }
+    return $false
+}
+
+# 逐项校验后先写临时文件再改名，读者不会看到半份记录。
+function Write-DeploymentTransaction([string]$Directory, [hashtable]$Record) {
+    $lines = foreach ($key in (Get-TransactionKeys)) {
+        $value = [string]$Record[$key]
+        if (-not (Test-TransactionValue $key $value)) { throw "事务记录值无效：$key=$value" }
+        "$key=$value"
+    }
+    $path = Join-Path $Directory 'transaction'
+    [IO.File]::WriteAllText($path + '.tmp', (($lines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath ($path + '.tmp') -Destination $path -Force
+}
+
+# 旧版快照没有记录时返回 $null；存在但无效时拒绝。
+function Read-DeploymentTransaction([string]$Directory) {
+    $path = Join-Path $Directory 'transaction'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    $record = @{}
+    foreach ($line in [IO.File]::ReadAllLines($path, [Text.UTF8Encoding]::new($false))) {
+        $index = $line.IndexOf('=')
+        if ($index -lt 1) { throw '事务记录无效' }
+        $key = $line.Substring(0, $index)
+        $value = $line.Substring($index + 1)
+        if ($record.ContainsKey($key) -or -not (Test-TransactionValue $key $value)) { throw "事务记录无效：$key" }
+        $record[$key] = $value
+    }
+    foreach ($key in (Get-TransactionKeys)) { if (-not $record.ContainsKey($key)) { throw "事务记录缺少：$key" } }
+    return $record
+}
+
+# 已提交部署保存的群根；未保存时为默认 data\groups。
+function Get-SavedGroupDataRoot([string]$ProjectRoot) {
+    $file = Join-Path $ProjectRoot 'data\state\group-data-root'
+    $root = if (Test-Path -LiteralPath $file -PathType Leaf) { "$(Get-Content -LiteralPath $file -Raw)".Trim() } else { '' }
+    if (-not $root) { $root = 'data\groups' }
+    return [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($root)) { $root } else { Join-Path $ProjectRoot $root }))
+}
+
+function Format-DeploymentTransaction($Record) {
+    $kind = if ($Record.operation -eq 'upgrade') { '升级' } else { '部署' }
+    $state = if ($Record.was_running -eq '1') { '运行' } else { '停止' }
+    $sha = if ($Record.target_sha) { $Record.target_sha.Substring(0, 7) } else { '（非 git 部署）' }
+    $entry = if ($Record.deploy_mode -eq 'direct') { "direct（来源 $($Record.platform_ip)）" } else { $Record.deploy_mode }
+    return "未完成的$($kind)：目标提交 $($sha)；群数据总根 $($Record.target_group_root)（原 $($Record.original_group_root)）；端口 $($Record.bot_port)；入口 $($entry)；原运行状态：$($state)"
+}
+
+# Reopen an interrupted deployment with its original snapshot, lock and recorded choices.
+function Open-DeploymentTransaction([string]$ProjectRoot) {
+    try {
+        $deploymentLock = [IO.File]::Open((Join-Path $ProjectRoot 'data\state\deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch [IO.IOException] { throw '另一个部署或升级正在进行' }
+    try {
+        $name = "$(Get-Content -LiteralPath (Join-Path $ProjectRoot 'data\state\deploy-transaction') -Raw)".Trim()
+        if ($name -notmatch '^deploy-[0-9a-f]{32}$') { throw '部署事务快照名称无效' }
+        $path = Join-Path $ProjectRoot ('backup\snapshots\' + $name)
+        $state = Import-Clixml -LiteralPath (Join-Path $path 'deployment.xml')
+        if ($state.Project -ne $ProjectRoot -or $state.Path -ne $path) { throw '部署事务快照与当前项目不一致' }
+        $record = Read-DeploymentTransaction $path
+        if (-not $record -or $record.snapshot -ne $name) { throw '部署事务记录缺失或与快照不一致' }
+        $state | Add-Member -NotePropertyName Lock -NotePropertyValue $deploymentLock
+        $state | Add-Member -NotePropertyName Record -NotePropertyValue $record
+        $env:BOT_DEPLOY_BACKUP_ID = $name
+        return $state
+    } catch { $deploymentLock.Dispose(); throw }
+}
+
+# The pointer is published only after the confirmed choices are recorded; resume and rollback read only that record.
+function Publish-DeploymentTransaction($Snapshot, [hashtable]$Record, [string]$Pointer, [string]$MigrationPlan = '') {
+    Write-DeploymentTransaction $Snapshot.Path $Record
+    if ($MigrationPlan) { Copy-Item -LiteralPath $MigrationPlan -Destination (Join-Path $Snapshot.Path 'migration-plan.json') -ErrorAction Stop }
+    [IO.File]::WriteAllText($Pointer + '.tmp', (Split-Path $Snapshot.Path -Leaf))
+    Move-Item -LiteralPath ($Pointer + '.tmp') -Destination $Pointer -Force
+}
+
 # An interrupted upgrade reuses its original snapshot and original running state.
-function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha) {
+function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha, [hashtable]$Record = $null, [string]$MigrationPlan = '') {
     $pointer = Join-Path $ProjectRoot 'data\state\upgrade-transaction'
     if (Test-Path -LiteralPath $pointer) {
-        $name = (Get-Content -LiteralPath $pointer -Raw).Trim()
+        $name = "$(Get-Content -LiteralPath $pointer -Raw)".Trim()
         if ($name -notmatch '^deploy-[0-9a-f]{32}$') { throw '升级事务快照名称无效' }
         $path = Join-Path $ProjectRoot ('backup\snapshots\' + $name)
         $deploymentLock = [IO.File]::Open((Join-Path $ProjectRoot 'data\state\deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -67,6 +171,7 @@ function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$
             $state = Import-Clixml -LiteralPath (Join-Path $path 'deployment.xml')
             if ($state.Project -ne $ProjectRoot -or $state.Path -ne $path -or $state.UpgradeTarget -ne $TargetSha) { throw '中断升级必须使用原项目与原目标提交继续' }
             $state | Add-Member -NotePropertyName Lock -NotePropertyValue $deploymentLock
+            $state | Add-Member -NotePropertyName Record -NotePropertyValue (Read-DeploymentTransaction $path)
             $env:BOT_DEPLOY_BACKUP_ID = $name
             return $state
         } catch { $deploymentLock.Dispose(); throw }
@@ -77,10 +182,18 @@ function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$
         $state | Add-Member -NotePropertyName UpgradeBranch -NotePropertyValue $OriginalBranch
         $state | Add-Member -NotePropertyName UpgradeTarget -NotePropertyValue $TargetSha
         Save-DeploymentSnapshot $state
+        if ($Record) {
+            $Record.snapshot = Split-Path $state.Path -Leaf
+            $Record.was_running = if ($state.WasRunning) { '1' } else { '0' }
+            Write-DeploymentTransaction $state.Path $Record
+        }
+        if ($MigrationPlan -and (Test-Path -LiteralPath $MigrationPlan -PathType Leaf)) {
+            Copy-Item -LiteralPath $MigrationPlan -Destination (Join-Path $state.Path 'migration-plan.json') -ErrorAction Stop
+        }
         [IO.File]::WriteAllText($pointer + '.tmp', (Split-Path $state.Path -Leaf))
         [IO.File]::Move($pointer + '.tmp', $pointer)
         return $state
-    } catch { $state.Lock.Dispose(); throw }
+    } catch { $state.Lock.Dispose(); $env:BOT_DEPLOY_BACKUP_ID = $state.PreviousBackupId; throw }
 }
 
 function Remove-UpgradeStage([string]$ProjectRoot, [string]$Stage) {
@@ -141,6 +254,9 @@ function Save-DeploymentDependencies($Snapshot) {
     $source = [IO.Path]::GetFullPath((Join-Path $root 'node_modules'))
     $target = [IO.Path]::GetFullPath((Join-Path $Snapshot.Path 'node_modules'))
     if (-not $target.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '依赖快照目录越界' }
+    # A resumed transaction already recorded that there were no original
+    # dependencies; the node_modules present now came from the interrupted install.
+    if ($Snapshot.DependenciesAttempted -and -not $Snapshot.DependenciesMoved) { return }
     if (Test-Path -LiteralPath $target) {
         $Snapshot.DependenciesMoved = $true
         $Snapshot.DependenciesAttempted = $true

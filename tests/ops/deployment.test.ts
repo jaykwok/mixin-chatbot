@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tempFixture } from "../helpers/temp.ts";
@@ -177,6 +177,57 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
   } finally { await fixture.cleanup(); }
 }, 60000);
 
+test.skipIf(process.platform !== "win32")("Windows continue keeps the original dependency state instead of snapshotting the interrupted install", async () => {
+  const fixture = await tempFixture("deployment-resume-dependencies-");
+  const script = join(fixture.root, "resume-dependencies.ps1");
+  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
+. ${quotePS(join(project, "scripts/lib/lifecycle.ps1"))}
+. ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+function Get-ProjectBotPids { @() }
+function Stop-ProjectBot { return $true }
+function Get-ScheduledTask { [pscustomobject]@{State='Ready'} }
+function Export-ScheduledTask { '<Task original="true" />' }
+function Register-ScheduledTask { param($TaskName,$Xml,[switch]$Force,$ErrorAction) }
+function Get-CimInstance { $null }
+function Get-Service { $null }
+function Get-NetFirewallRule { @() }
+foreach ($original in @($false, $true)) {
+    $root=Join-Path ${quotePS(fixture.root)} ('project-' + $original)
+    New-Item -ItemType Directory -Force -Path (Join-Path $root 'data/config'),(Join-Path $root 'data/state') | Out-Null
+    $env:ProgramData=Join-Path $root 'programdata'
+    if ($original) { New-Item -ItemType Directory -Force -Path (Join-Path $root 'node_modules') | Out-Null; Set-Content (Join-Path $root 'node_modules/version') 'original' }
+    $snapshot=New-DeploymentSnapshot $root 'test-task'
+    $record=@{ format='1'; operation='deploy'; snapshot=(Split-Path $snapshot.Path -Leaf); target_sha=''; original_sha=''; original_branch=''
+        original_group_root=(Join-Path $root 'data\\groups'); target_group_root=(Join-Path $root 'data\\groups'); was_running='0'; bot_port='1011'
+        deploy_mode='direct'; bot_domain=''; domain_action='keep'; unmanaged_tunnel=''; platform_ip='203.0.113.17'; reconfigure_ai='0' }
+    Publish-DeploymentTransaction $snapshot $record (Join-Path $root 'data\\state\\deploy-transaction')
+    Save-DeploymentDependencies $snapshot
+    # The install is interrupted after writing new dependencies; only the pointer survives the process.
+    New-Item -ItemType Directory -Force -Path (Join-Path $root 'node_modules') | Out-Null
+    Set-Content (Join-Path $root 'node_modules/version') 'interrupted-install'
+    $snapshot.Lock.Dispose()
+    $resumed=Open-DeploymentTransaction $root
+    try {
+        Save-DeploymentDependencies $resumed
+        $saved=Join-Path $resumed.Path 'node_modules/version'
+        if ($original) { if ((Get-Content $saved).Trim() -ne 'original') { throw 'original dependencies replaced in the snapshot' } }
+        elseif (Test-Path -LiteralPath $saved) { throw 'interrupted install captured as original dependencies' }
+        Restore-DeploymentSnapshot $resumed
+        $restored=Join-Path $root 'node_modules/version'
+        if ($original) { if ((Get-Content $restored).Trim() -ne 'original') { throw 'original dependencies not restored' } }
+        elseif (Test-Path -LiteralPath $restored) { throw 'interrupted install survived the rollback' }
+        Write-Output ('VERIFIED original=' + $original)
+    } finally { $resumed.Lock.Dispose() }
+}
+`);
+  try {
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("VERIFIED original=False"); expect(result.output).toContain("VERIFIED original=True");
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
 test.skipIf(process.platform !== "win32")("Windows target upgrade previews before stopping and rolls data back before code or old service", async () => {
   const fixture = await tempFixture("update-flow-");
   const script = join(fixture.root, "update.ps1");
@@ -193,7 +244,8 @@ $run=[scriptblock]::Create($body)
 $BunPath='fixture-bun'; $GitPath='fixture-git'
 $Project=$PSScriptRoot; $OriginalSha='1111111111111111111111111111111111111111'; $TargetSha='2222222222222222222222222222222222222222'; $OriginalBranch='main'
 New-Item -ItemType Directory -Force -Path (Join-Path $Project 'data/state'),(Join-Path $Project 'data/groups') | Out-Null
-function Get-BunPath { 'fixture-bun' }; function Get-GitPath { 'fixture-git' }
+function Get-BunPath { 'fixture-bun' }; function Get-GitPath { 'fixture-git' }; function Get-PlatformIp { '203.0.113.17' }
+function Get-SavedGroupDataRoot { Join-Path $Project 'data/groups' }; function Test-TransactionValue { $true }
 function Get-ScheduledTask { if($script:failure -ne 'task-missing'){ [pscustomobject]@{State='Ready'} } }
 function fixture-git {
     $global:LASTEXITCODE=0
@@ -205,10 +257,10 @@ function fixture-git {
 }
 function fixture-bun {
     $global:LASTEXITCODE=0
-    if($args -contains 'preview') { if($script:stopped){throw 'preview after stop'}; if($script:failure -eq 'preview'){ $global:LASTEXITCODE=2 } }
+    if($args -contains 'preview') { $script:previews++; if($script:stopped){throw 'preview after stop'}; if($script:failure -eq 'preview'){ $global:LASTEXITCODE=2 } }
     elseif($args -contains 'install') { if(-not $script:stopped){throw 'dependencies changed before stop'}; $script:installs++; if($script:failure -eq 'install'){$global:LASTEXITCODE=1} }
     elseif($args -contains 'apply') { $script:applied=$true; if($script:failure -eq 'apply'){$global:LASTEXITCODE=1} }
-    elseif($args -contains 'committed') { $global:LASTEXITCODE=1 }
+    elseif($args -contains 'committed') { if($script:stopped){throw 'commit check after stop'}; $global:LASTEXITCODE=[int](-not $script:committed) }
     elseif($args -contains 'commit') { if($script:failure -eq 'commit'){$global:LASTEXITCODE=1}else{$script:committed=$true} }
     elseif($args -contains 'rollback') { if($script:committed){$global:LASTEXITCODE=42}else{$script:dataRestored=$true} }
     else {
@@ -219,6 +271,7 @@ function fixture-bun {
 }
 function New-DeploymentSnapshot { [pscustomobject]@{WasRunning=$script:running;TaskXml='<Task/>';Path=$Project;Lock=(New-Object IO.MemoryStream);PreviousBackupId='previous'} }
 function Open-UpgradeSnapshot($root,$task,$original,$branch,$target) {
+    $script:record=$args[0]
     $state=New-DeploymentSnapshot
     $state | Add-Member -NotePropertyName UpgradeOriginal -NotePropertyValue $original
     $state | Add-Member -NotePropertyName UpgradeBranch -NotePropertyValue $branch
@@ -252,11 +305,33 @@ foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$
     } elseif($script:restores -ne 1) { throw 'rollback missing' }
     Write-Output 'VERIFIED'
 } } }
+# Explicit rollback of an interrupted upgrade: no preview or preflight, committed data is refused before the stop.
+function Read-DeploymentTransaction { @{ target_group_root = (Join-Path $Project 'data/groups') } }
+function Get-OpsCommandHint($name) { 'ops ' + $name }
+# Rollback opens the recorded snapshot only: empty ordinary settings and the terminal's PLATFORM_IP are never read.
+function Get-PlatformIp { throw 'ordinary settings read during rollback' }
+foreach($name in @('bot-port','deploy-mode','bot-domain')) { Set-Content -LiteralPath (Join-Path $Project ('data/state/' + $name)) '' -NoNewline }
+$Rollback=$true; $script:failure='none'; $script:running=$true
+Set-Content -LiteralPath (Join-Path $Project 'data/state/migration.json') '{}'
+foreach($script:committedBefore in @($true,$false)) {
+    Set-Content -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction') ('deploy-' + ('a' * 32))
+    $script:stopped=$false; $script:applied=$true; $script:committed=$script:committedBefore; $script:dataRestored=$false; $script:codeRestored=$false
+    $script:previews=0; $script:installs=0; $script:restores=0
+    $ok=$true
+    try { & $run } catch { $ok=$false; Write-Host $_.Exception.Message }
+    $pointer=Test-Path -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction')
+    if($script:previews -or $script:installs){throw 'rollback previewed or installed'}
+    if($script:record){throw 'rollback built a new record from ordinary settings'}
+    if($script:committedBefore) { if($ok -or $script:stopped -or $script:restores -or -not $pointer){throw 'committed upgrade rolled back'} }
+    elseif(-not $ok -or -not $script:dataRestored -or -not $script:codeRestored -or $script:restores -ne 1 -or $pointer){throw 'rollback incomplete'}
+    Write-Output 'ROLLBACK_VERIFIED'
+}
 `);
   try {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
-    expect(result.output.match(/VERIFIED/g)).toHaveLength(40);
+    expect(result.output.match(/VERIFIED/g)).toHaveLength(42);
+    expect(result.output.match(/ROLLBACK_VERIFIED/g)).toHaveLength(2);
   } finally { await fixture.cleanup(); }
 }, 60000);
 
@@ -272,7 +347,8 @@ $Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data/s
 $GroupRootFile=Join-Path $StateDir 'group-data-root'; $DefaultGroupDataRoot=Join-Path $Project 'data/groups'
 $ModelsFile=Join-Path $Project 'data/config/models.json'; $newRoot=Join-Path $PSScriptRoot 'new groups'
 New-Item -ItemType Directory -Force -Path $StateDir,(Split-Path $ModelsFile),(Join-Path $RuntimeDir 'pi'),$newRoot | Out-Null
-Set-Content -LiteralPath $GroupRootFile (Join-Path $PSScriptRoot 'old-offline-root')
+# An empty saved root falls back to the default instead of being dereferenced as null.
+Set-Content -LiteralPath $GroupRootFile $(if ($env:FIXTURE_EMPTY -eq '1') { '' } else { Join-Path $PSScriptRoot 'old-offline-root' }) -NoNewline
 Set-Content -LiteralPath $ModelsFile '{}'; Set-Content -LiteralPath (Join-Path $RuntimeDir 'pi/settings.json') '{}'
 $env:GROUP_DATA_ROOT=''; $bunPath='fixture-bun'; $script:questions=0; $script:previews=0
 function Step {}; function Done {}; function Warn($message){throw $message}
@@ -287,7 +363,9 @@ ${source.slice(start, end)}
 if($script:previews -ne 1 -or $migrationGroups -ne $newRoot){throw 'missing selected-root preview'}
 Write-Output 'ROOT_SELECTED'
 `);
-    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+    let result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("ROOT_SELECTED");
+    result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root, { ...process.env, FIXTURE_EMPTY: "1" });
     expect(result.code, result.output).toBe(0); expect(result.output).toContain("ROOT_SELECTED");
   } finally { await f.cleanup(); }
 }, 15000);
@@ -297,7 +375,7 @@ test.skipIf(process.platform !== "win32")("Windows redeployment collects every a
   try {
     const source = await readFile(join(project, "scripts/deploy/deploy.ps1"), "utf8");
     const start = source.indexOf("# ---- 停机前的交互选择"), end = source.indexOf("Set-OperationStage 'deployment-snapshot'", start);
-    const stop = source.indexOf("Stop-ProjectBot $Project $TaskName -KeepDisabled");
+    const stop = source.indexOf("机器人服务未能停止，部署已取消");
     expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start); expect(stop).toBeGreaterThan(end);
     // From the stop through verification, connector setup and commit to the normal start, only the AI wizard may interact.
     const normalStart = source.indexOf("Enable-ScheduledTask -TaskName $TaskName", stop);
@@ -311,10 +389,13 @@ $ModelsFile=Join-Path $Project 'data/config/models.json'; $DomainFile=Join-Path 
 $PortFile=Join-Path $StateDir 'bot-port'; $ModeFile=Join-Path $StateDir 'deploy-mode'
 $TunnelManagedFile=Join-Path $StateDir 'cloudflared-managed'
 New-Item -ItemType Directory -Force -Path $StateDir,(Split-Path $ModelsFile) | Out-Null
-Set-Content -LiteralPath $ModelsFile '{}'; Set-Content -LiteralPath $PortFile '1011' -NoNewline
-Set-Content -LiteralPath $ModeFile 'direct' -NoNewline
+# Empty saved settings are reported and replaced by defaults before the questions, never dereferenced as null.
+$empty=$env:FIXTURE_EMPTY -eq '1'
+Set-Content -LiteralPath $ModelsFile '{}'; Set-Content -LiteralPath $PortFile $(if ($empty) { '' } else { '1011' }) -NoNewline
+Set-Content -LiteralPath $ModeFile $(if ($empty) { '' } else { 'direct' }) -NoNewline
+if ($empty) { Set-Content -LiteralPath $DomainFile '' -NoNewline }
 $env:BOT_DOMAIN=''; $env:BOT_PORT=''; $env:DEPLOY_MODE=''; $env:PLATFORM_IP=''
-function Step {}; function Done {}; function Warn($message){throw $message}; function Fail($message){throw $message}
+function Step {}; function Done {}; function Warn($message){ if ($empty) { [Console]::WriteLine('WARN ' + $message) } else { throw $message } }; function Fail($message){throw $message}
 function Read-Host($Prompt) {
     if($Prompt -like '机器人监听端口*'){ return '2022' }
     if($Prompt -like '输入 1 或 2*'){ return '2' }
@@ -331,10 +412,272 @@ if($Port -ne '2022' -or $mode -ne 'cloudflare' -or $publicDomain -ne 'bot.exampl
 if(-not $reconfigureAi -or -not $tunnelInputPrepared -or $preparedTunnelInput -cne 'fixture-token-input'){ throw 'deferred work not prepared' }
 Write-Output 'PREFLIGHT_COLLECTED'
 `);
-    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+    let result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
     expect(result.code, result.output).toBe(0); expect(result.output).toContain("PREFLIGHT_COLLECTED");
+    result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root, { ...process.env, FIXTURE_EMPTY: "1" });
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("PREFLIGHT_COLLECTED");
+    expect(result.output).toContain("WARN data\\state\\bot-port"); expect(result.output).toContain("WARN data\\state\\deploy-mode");
   } finally { await f.cleanup(); }
 }, 15000);
+
+test.skipIf(process.platform !== "win32")("Windows deployment continue takes every setting from the record without prompting", async () => {
+  const f = await tempFixture("deploy-resume-");
+  try {
+    const source = await readFile(join(project, "scripts/deploy/deploy.ps1"), "utf8");
+    const start = source.indexOf("# ---- 4b. Pi 群数据总根"), end = source.indexOf("Set-OperationStage 'deployment-snapshot'", start);
+    const publish = source.indexOf("Publish-DeploymentTransaction $snapshot", end), stop = source.indexOf("机器人服务未能停止，部署已取消");
+    expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
+    // The record and pointer are published before the service is stopped.
+    expect(publish).toBeGreaterThan(end); expect(stop).toBeGreaterThan(publish);
+    const script = join(f.root, "resume.ps1");
+    await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+. ${quotePS(join(project, "scripts/lib/common.ps1"))}
+$Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data\\state'; $RuntimeDir=Join-Path $Project 'data\\runtime'
+$DefaultGroupDataRoot=Join-Path $Project 'data\\groups'; $GroupRootFile=Join-Path $StateDir 'group-data-root'
+$ModelsFile=Join-Path $Project 'data\\config\\models.json'; $DomainFile=Join-Path $StateDir 'bot-domain'
+$PortFile=Join-Path $StateDir 'bot-port'; $ModeFile=Join-Path $StateDir 'deploy-mode'; $TunnelManagedFile=Join-Path $StateDir 'cloudflared-managed'
+$target=Join-Path $PSScriptRoot 'target groups'; $elsewhere=Join-Path $PSScriptRoot 'elsewhere'
+New-Item -ItemType Directory -Force -Path $StateDir,(Split-Path $ModelsFile),$target,$elsewhere | Out-Null
+Set-Content -LiteralPath $ModelsFile '{}'; Set-Content -LiteralPath $PortFile '3000' -NoNewline; Set-Content -LiteralPath $ModeFile 'direct' -NoNewline
+Set-Content -LiteralPath $DomainFile 'other.example.com' -NoNewline; Set-Content -LiteralPath $GroupRootFile $elsewhere -NoNewline
+$env:BOT_DOMAIN='env.example.com'; $env:BOT_PORT='9999'; $env:DEPLOY_MODE='direct'; $env:GROUP_DATA_ROOT=$elsewhere; $env:PLATFORM_IP='203.0.113.99'
+$resuming=$true; $pendingSnapshot=[pscustomobject]@{ Path=(Join-Path $PSScriptRoot 'snapshot') }
+$record=@{ target_group_root=$target; bot_port='2022'; deploy_mode='cloudflare'; bot_domain='bot.example.com'; domain_action='persist'; unmanaged_tunnel=''
+    platform_ip='198.51.100.9'; reconfigure_ai='1' }
+function Step {}; function Done {}; function Warn($message){ Write-Output ('WARN ' + $message) }; function Fail($message){throw $message}
+function Read-Host($Prompt) { throw ('prompted while continuing: ' + $Prompt) }
+function Read-YesNo($Prompt) { throw ('asked while continuing: ' + $Prompt) }
+function Read-TunnelTokenInput { throw 'token asked while continuing' }
+function Get-Service { $null }
+function Resolve-TunnelToken($root, $value) { if ($value -or $env:FIXTURE_SAVED_TOKEN -ne '1') { throw 'no saved token' } }
+${source.slice(start, end)}
+Write-Output ('RESULT root=' + $GroupDataRoot + ' port=' + $Port + ' mode=' + $mode + ' domain=' + $publicDomain + ' persist=' + $persistDomain + ' ai=' + $reconfigureAi + ' prepared=' + $tunnelInputPrepared + ' platform=' + $platformIp)
+`);
+    const run = (saved: string) => execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root, { ...process.env, FIXTURE_SAVED_TOKEN: saved });
+    let result = await run("1");
+    expect(result.code, result.output).toBe(0);
+    // The firewall source confirmed before the stop wins over the current terminal's PLATFORM_IP.
+    expect(result.output).toContain(`RESULT root=${join(f.root, "target groups")} port=2022 mode=cloudflare domain=bot.example.com persist=True ai=False prepared=False platform=198.51.100.9`);
+    expect(result.output).toContain("AI 重新配置不会在续做中运行");
+    result = await run("0");
+    expect(result.code).toBe(1); expect(result.output).toContain("续做需要隧道 token");
+  } finally { await f.cleanup(); }
+}, 15000);
+
+test.skipIf(process.platform !== "win32")("Windows deployment continue after committed data only starts the new instance", async () => {
+  const f = await tempFixture("deploy-resume-committed-");
+  try {
+    const source = await readFile(join(project, "scripts/deploy/deploy.ps1"), "utf8");
+    const start = source.indexOf("# ---- 未完成的事务"), end = source.indexOf("$resuming = [bool]$pendingSnapshot", start);
+    expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
+    const script = join(f.root, "committed.ps1");
+    await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+. ${quotePS(join(project, "scripts/lib/common.ps1"))}
+$Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data\\state'; $TaskName='fixture'
+$Resume=$true; $Rollback=$false; $bunPath='fixture-bun'; $gitPath='fixture-git'; $target=Join-Path $PSScriptRoot 'target'
+New-Item -ItemType Directory -Force -Path $StateDir,$target | Out-Null
+foreach ($name in @('deploy-transaction', 'verify-only', 'migration.json')) { Set-Content -LiteralPath (Join-Path $StateDir $name) '{}' }
+$env:BOT_DEPLOY_BACKUP_ID='deploy-fixture'; $lock=New-Object IO.MemoryStream; $script:calls=@()
+function Open-DeploymentTransaction { [pscustomobject]@{ Path=(Join-Path $PSScriptRoot 'deploy-fixture'); Lock=$lock; PreviousBackupId='previous'
+    Record=@{ target_sha=('a' * 40); target_group_root=$target; bot_port='2022' } } }
+function Format-DeploymentTransaction { 'record' }
+function Read-TransactionAction { throw 'asked while continuing' }
+function Invoke-PendingDeploymentRollback { throw 'rolled back while continuing' }
+function Step($message) { Write-Output ('STEP ' + $message) }; function Done($message) { Write-Output ('DONE ' + $message) }; function Warn {}; function Set-OperationStage {}
+function fixture-git { 'a' * 40 }
+function fixture-bun { $script:calls += ,('bun ' + $args[2]); $global:LASTEXITCODE = [int]($env:FIXTURE_COMMITTED -ne '1') }
+function Stop-ProjectBot { $script:calls += ,'stop'; $true }
+function Enable-ScheduledTask { $script:calls += ,'enable' }
+function Start-ScheduledTask { $script:calls += ,'start' }
+function Wait-BotHealth($port) { $script:calls += ,('health ' + $port); $env:FIXTURE_UNHEALTHY -ne '1' }
+function Remove-CompletedBackup { $script:calls += ,'cleanup' }
+try {
+${source.slice(start, end)}
+Write-Output 'FELL THROUGH'
+} finally {
+    Write-Output ('CALLS ' + ($script:calls -join '|') + ' pointer=' + (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) + ' verify=' + (Test-Path -LiteralPath (Join-Path $StateDir 'verify-only')) + ' lock=' + $lock.CanRead + ' backup=' + $env:BOT_DEPLOY_BACKUP_ID)
+}
+`);
+    const run = (committed: string, unhealthy = "0") => execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root,
+      { ...process.env, FIXTURE_COMMITTED: committed, FIXTURE_UNHEALTHY: unhealthy });
+    // Committed data: applying again would start a new migration journal, so only the new instance is started.
+    let result = await run("1");
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("CALLS bun committed|stop|enable|start|health 2022|cleanup pointer=False verify=False lock=False backup=previous");
+    expect(result.output).toContain("DONE 上次部署已完成"); expect(result.output).not.toContain("FELL THROUGH");
+    // An instance that does not become healthy keeps the transaction, so continuing again retries only the activation.
+    result = await run("1", "1");
+    expect(result.code).not.toBe(0); expect(result.output).toContain("业务实例未就绪"); expect(result.output).toContain("resume");
+    expect(result.output).toContain("CALLS bun committed|stop|enable|start|health 2022 pointer=True verify=False lock=False backup=previous");
+    // Rollback and continue read only the record: corrupt ordinary runtime settings cannot block them.
+    const runtime = source.slice(start, source.indexOf("# ---- 4b. Pi 群数据总根", end));
+    expect(runtime).toContain("runtime.json");
+    const gate = join(f.root, "runtime-gate.ps1");
+    await writeFile(gate, `\ufeff$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+. ${quotePS(join(project, "scripts/lib/common.ps1"))}
+$Project=Join-Path $PSScriptRoot 'gate'; $StateDir=Join-Path $Project 'data\\state'; $ConfigDir=Join-Path $Project 'data\\config'; $TaskName='fixture'
+$Resume=$env:FIXTURE_RESUME -eq '1'; $Rollback=$env:FIXTURE_ROLLBACK -eq '1'; $bunPath='fixture-bun'; $gitPath='fixture-git'
+New-Item -ItemType Directory -Force -Path $StateDir,$ConfigDir | Out-Null
+Set-Content -LiteralPath (Join-Path $ConfigDir 'runtime.json') $env:FIXTURE_RUNTIME
+if ($Rollback -or $Resume) { Set-Content -LiteralPath (Join-Path $StateDir 'deploy-transaction') 'deploy-fixture' } else { Remove-Item -LiteralPath (Join-Path $StateDir 'deploy-transaction') -ErrorAction SilentlyContinue }
+function Open-DeploymentTransaction { [pscustomobject]@{ Path='deploy-fixture'; Lock=(New-Object IO.MemoryStream); PreviousBackupId=''; Record=@{ target_sha=''; target_group_root=$PSScriptRoot } } }
+function Format-DeploymentTransaction { 'record' }; function Warn {}; function Step {}; function Done {}; function Fail($message) { throw $message }; function fixture-git {}
+function Invoke-PendingDeploymentRollback { Write-Output 'ROLLED_BACK' }
+${runtime}
+Write-Output ('ORDINARY_SETTINGS_READ debug=' + $BotDebug + ' active=' + $BotMaxActiveRequests + ' env=' + $env:BOT_DEBUG + $env:BOT_MAX_ACTIVE_REQUESTS + $env:BOT_BASH_TIMEOUT)
+`);
+    const gated = (env: Record<string, string>) => execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", gate], f.root,
+      { ...process.env, FIXTURE_RUNTIME: "{broken-json", ...env });
+    result = await gated({ FIXTURE_ROLLBACK: "1" });
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("ROLLED_BACK"); expect(result.output).not.toContain("ORDINARY_SETTINGS_READ");
+    result = await gated({});
+    expect(result.code).not.toBe(0); expect(result.output).toContain("runtime.json 无法解析"); expect(result.output).toContain("重新部署");
+    // Continuing keeps runtime.json; the new terminal's runtime variables are neither validated nor persisted.
+    const terminal = { FIXTURE_RUNTIME: '{"BOT_DEBUG":"1","BOT_MAX_ACTIVE_REQUESTS":"8"}', BOT_DEBUG: "maybe", BOT_MAX_ACTIVE_REQUESTS: "0", BOT_BASH_TIMEOUT: "5" };
+    result = await gated({ ...terminal, FIXTURE_RESUME: "1" });
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("ORDINARY_SETTINGS_READ debug=1 active=8 env=\r\n");
+    result = await gated(terminal);
+    expect(result.code).not.toBe(0); expect(result.output).toContain("BOT_DEBUG 只能是 0 或 1");
+    // A normal deployment whose committed instance is unhealthy keeps its transaction for the same activation-only continue.
+    const cleanupStart = source.indexOf("    if (-not $deploymentCommitted -and $deploymentMutated) {"), cleanupEnd = source.indexOf("    $snapshot.Lock.Dispose()", cleanupStart);
+    expect(cleanupStart).toBeGreaterThan(0); expect(cleanupEnd).toBeGreaterThan(cleanupStart);
+    const finish = join(f.root, "finish.ps1");
+    await writeFile(finish, `\ufeff$ErrorActionPreference='Stop'
+$transactionPointer=Join-Path $PSScriptRoot 'deploy-transaction'; $snapshot=[pscustomobject]@{ Path='deploy-fixture' }; $Project=$PSScriptRoot
+function Remove-CompletedBackup { Write-Output 'CLEANUP' }; function Write-OperationEvent {}; function Warn {}
+foreach ($activated in @($false, $true)) {
+    Set-Content -LiteralPath $transactionPointer 'deploy-fixture'
+    $deploymentCommitted=$true; $deploymentMutated=$true; $deploymentActivated=$activated
+${source.slice(cleanupStart, cleanupEnd)}
+    Write-Output ('ACTIVATED=' + $activated + ' pointer=' + (Test-Path -LiteralPath $transactionPointer))
+}
+`);
+    result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", finish], f.root);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toMatch(/^ACTIVATED=False pointer=True\r?\nCLEANUP\r?\nACTIVATED=True pointer=False/m);
+    result = await run("0");
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("STEP 继续上次部署"); expect(result.output).toContain("FELL THROUGH");
+    expect(result.output).toContain("CALLS bun committed pointer=True verify=True lock=True backup=deploy-fixture");
+  } finally { await f.cleanup(); }
+}, 15000);
+
+test.skipIf(process.platform !== "win32")("Windows deployment rollback refuses committed data before touching the service", async () => {
+  const f = await tempFixture("deploy-rollback-");
+  try {
+    const source = await readFile(join(project, "scripts/deploy/deploy.ps1"), "utf8");
+    const rollback = source.match(/^function Invoke-PendingDeploymentRollback\(\$Snapshot\) \{[\s\S]*?^\}/m)?.[0];
+    expect(rollback).toBeDefined();
+    const script = join(f.root, "rollback.ps1");
+    await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+. ${quotePS(join(project, "scripts/lib/common.ps1"))}
+$Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data\\state'; $TaskName='fixture'
+$bunPath='fixture-bun'; $migrationRunner='run.ts'; $target=Join-Path $PSScriptRoot 'target'
+New-Item -ItemType Directory -Force -Path $StateDir,$target | Out-Null
+function Step {}; function Done($message) { Write-Output $message }; function Set-OperationStage {}; function Write-OperationEvent {}
+function fixture-bun { $script:calls += ,($args -join ' '); $global:LASTEXITCODE = if ($args -contains 'committed') { [int]($script:case -ne 'committed') } elseif ($script:case -eq 'refused') { 42 } else { 0 } }
+function Stop-ProjectBot { $script:calls += ,'stop'; $true }
+function Restore-DeploymentSnapshot { $script:calls += ,'restore' }
+${rollback}
+foreach ($script:case in @('committed', 'refused', 'original-missing', 'rolled-back')) {
+    $script:calls=@()
+    Set-Content -LiteralPath (Join-Path $StateDir 'deploy-transaction') 'deploy-fixture'
+    Set-Content -LiteralPath (Join-Path $StateDir 'migration.json') '{}'
+    $original = if ($script:case -eq 'original-missing') { Join-Path $PSScriptRoot 'unmounted' } else { $target }
+    $lock = New-Object IO.MemoryStream
+    $snapshot=[pscustomobject]@{ Path=(Join-Path $PSScriptRoot 'deploy-fixture'); Lock=$lock; PreviousBackupId='previous'; WasRunning=$true
+        Record=@{ original_group_root=$original; target_group_root=$target } }
+    $message=''
+    try { Invoke-PendingDeploymentRollback $snapshot } catch { $message=$_.Exception.Message }
+    $pointer = Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')
+    Write-Output ('CASE ' + $script:case + ' calls=' + ($script:calls -join '|') + ' pointer=' + $pointer + ' lock=' + $lock.CanRead + ' error=' + $message)
+}
+`);
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+    expect(result.code, result.output).toBe(0);
+    const line = (name: string) => result.output.split(/\r?\n/).find(item => item.startsWith(`CASE ${name} `)) ?? "";
+    // Committed data: only the read-only check ran; service, snapshot and pointer untouched.
+    expect(line("committed")).toMatch(/calls=run run\.ts committed [^|]* pointer=True lock=False error=.*已经提交，不能回滚/);
+    expect(line("refused")).toContain("pointer=True"); expect(line("refused")).toContain("已经提交，不能回滚");
+    expect(line("refused")).not.toContain("restore");
+    expect(line("original-missing")).toMatch(/calls= pointer=True lock=False error=原群数据总根不存在/);
+    expect(line("rolled-back")).toMatch(/calls=run run\.ts committed [^|]*\|stop\|run run\.ts rollback [^|]*\|restore pointer=False lock=False error=$/);
+  } finally { await f.cleanup(); }
+}, 15000);
+
+test.skipIf(process.platform !== "win32")("Windows resume and rollback dispatch the recorded transaction without fetching a newer target", async () => {
+  const f = await tempFixture("ops-transaction-");
+  try {
+    const script = join(f.root, "ops.ps1");
+    await mkdir(join(f.root, "scripts/deploy"), { recursive: true });
+    await writeFile(join(f.root, "scripts/deploy/deploy.ps1"), "\ufeffparam([switch]$Resume, [switch]$Rollback)\nWrite-Output ('DEPLOY resume=' + $Resume + ' rollback=' + $Rollback)\n");
+    await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+. ${quotePS(join(project, "scripts/lib/common.ps1"))}
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/ops/ops.ps1"))},[ref]$tokens,[ref]$errors)
+foreach ($name in @('Invoke-PendingDeployment', 'Invoke-TransactionCommand', 'Invoke-Update')) {
+    $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$Project=$PSScriptRoot; $RestartTunnel=$false; $original='1'*40; $latest='3'*40; $recorded='2'*40
+New-Item -ItemType Directory -Force -Path (Join-Path $Project 'data\\state') | Out-Null
+function IsAdmin { $true }; function Get-GitPath { 'git' }; function Get-BunPath { 'bun' }
+function Step($m) { Write-Output "STEP $m" }; function Done($m) { Write-Output "DONE $m" }; function Warn($m) { Write-Output "WARN $m" }; function Err($m) { Write-Output "ERR $m" }
+function Invoke-GitCapture([string[]]$GitArgs) {
+    $script:git += ,($GitArgs -join ' ')
+    $text = switch ($GitArgs[0]) { 'rev-parse' { if ($GitArgs[1] -eq 'origin/main') { $latest } elseif ($GitArgs[1] -eq 'HEAD') { $original } else { 'main' } } default { '' } }
+    [pscustomobject]@{ ExitCode=0; Text=$text }
+}
+function Expand-Archive($LiteralPath, $DestinationPath) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $DestinationPath 'scripts\\deploy') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $DestinationPath 'scripts\\deploy\\upgrade.ps1'), "Set-Content -LiteralPath '" + (Join-Path $Project 'upgrader.txt') + "' -Value (\`$args -join ' ')", [Text.UTF8Encoding]::new($true))
+}
+function Case($name, [scriptblock]$body) {
+    $script:git=@()
+    $result = try { & $body } catch { 'THROWN ' + $_.Exception.Message }
+    $upgrader = Join-Path $Project 'upgrader.txt'
+    $launched = if (Test-Path -LiteralPath $upgrader) { 'UPGRADER ' + (Get-Content -LiteralPath $upgrader -Raw).Trim(); Remove-Item -LiteralPath $upgrader } else { 'no upgrader' }
+    Write-Output ("CASE $name => " + (($result | ForEach-Object { [string]$_ }) -join ' / ') + ' ## ' + $launched + ' ## git: ' + ($script:git -join ' ; '))
+}
+$state=Join-Path $Project 'data\\state'
+Case 'idle-resume' { Invoke-TransactionCommand 'continue' }
+Set-Content -LiteralPath (Join-Path $state 'deploy-transaction') ('deploy-' + ('a' * 32))
+Case 'deploy-rollback' { Invoke-TransactionCommand 'rollback' }
+Case 'deploy-update-undecided' { Invoke-Update }
+Remove-Item -LiteralPath (Join-Path $state 'deploy-transaction')
+$snapshot=Join-Path $Project ('backup\\snapshots\\deploy-' + ('b' * 32))
+New-Item -ItemType Directory -Force -Path $snapshot | Out-Null
+[pscustomobject]@{ UpgradeTarget=$recorded } | Export-Clixml -LiteralPath (Join-Path $snapshot 'deployment.xml')
+Set-Content -LiteralPath (Join-Path $state 'upgrade-transaction') ('deploy-' + ('b' * 32))
+Case 'upgrade-rollback' { Invoke-TransactionCommand 'rollback' }
+Case 'upgrade-resume' { Invoke-TransactionCommand 'continue' }
+Remove-Item -LiteralPath (Join-Path $state 'upgrade-transaction')
+Case 'fresh-update' { Invoke-Update }
+`);
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+    expect(result.code, result.output).toBe(0);
+    const line = (name: string) => result.output.split(/\r?\n/).find(item => item.startsWith(`CASE ${name} `)) ?? "";
+    expect(line("idle-resume")).toMatch(/没有未完成的部署或升级 \/ True ## no upgrader ## git: $/);
+    expect(line("deploy-rollback")).toContain("DEPLOY resume=False rollback=True / True ## no upgrader");
+    // Without a TTY the pending deployment must be resolved explicitly, before any git access.
+    expect(line("deploy-update-undecided")).toMatch(/THROWN .*resume.*rollback.* ## git: $/);
+    const recorded = "2".repeat(40), latest = "3".repeat(40);
+    for (const name of ["upgrade-rollback", "upgrade-resume"]) {
+      expect(line(name)).toContain(`-TargetSha ${recorded}`);
+      expect(line(name)).toContain(`archive --format=zip`);
+      expect(line(name)).not.toContain("fetch");
+      expect(line(name)).not.toContain(latest);
+    }
+    expect(line("upgrade-rollback")).toContain(" -Rollback");
+    expect(line("upgrade-resume")).not.toContain("-Rollback");
+    expect(line("fresh-update")).toContain("fetch origin main"); expect(line("fresh-update")).toContain(`-TargetSha ${latest}`);
+  } finally { await f.cleanup(); }
+}, 30000);
 
 test.skipIf(process.platform !== "win32")("Windows Cloudflare deployment installs the connector against its verification instance and reaches the normal start", async () => {
   const f = await tempFixture("deploy-tunnel-verification-");
@@ -694,8 +1037,10 @@ test.skipIf(!bash || !existsSync(bash))("Docker deployment collects every answer
   await writeFile(join(fixture.root, "scripts/tunnel/start-tunnel.sh"), "");
   await writeFile(join(fixture.root, "models.json"), "{}");
   const stubs = `. '${posixPath(join(project, "scripts/lib/common.sh"))}'
-PROJECT_DIR="$PWD"; STATE_DIR="$PWD/state"; LOG_DIR="$PWD/logs"; PROMPTS="$STATE_DIR/prompts"; REUSE_SETTINGS=0
+PROJECT_DIR="$PWD"; STATE_DIR="$PWD/state"; LOG_DIR="$PWD/logs"; PROMPTS="$STATE_DIR/prompts"; RECORDED="\${FIXTURE_RECORDED:-0}"
+declare -A TRANSACTION=([reconfigure_ai]=0 [bot_domain]=recorded.example.com [domain_action]=keep)
 print_status(){ :; }; print_success(){ :; }; print_warning(){ :; }; print_error(){ echo "$*" >&2; }; show_tunnel_token_help(){ :; }
+settings_fixed_hint(){ echo 'recorded settings only'; }
 managed_cloudflared_pid(){ [ -f "$STATE_DIR/managed" ] && echo 777; }
 pgrep(){ if [ "\${FIXTURE_UNMANAGED:-0}" = 1 ]; then echo 4242; return 0; fi; return 1; }
 load_tunnel_token(){
@@ -716,7 +1061,7 @@ read_input(){
 }
 ask_yes_no(){ printf '%s\\n' "$1" >> "$PROMPTS"; case "$1" in *重新配置\\ AI*) return 0 ;; *connector*) [ "\${FIXTURE_CONFIRM:-y}" = y ] ;; *) exit 98 ;; esac; }
 MODELS_FILE="$PWD/models.json"; BOT_DOMAIN_FILE="$STATE_DIR/bot-domain"; BOT_PORT=1011; unset BOT_DOMAIN
-DEPLOY_MODE="$FIXTURE_DEPLOY_MODE"; PREPARED_TUNNEL_READY="\${FIXTURE_PREPARED:-0}"; PREPARED_TUNNEL_INPUT="\${FIXTURE_PREPARED_INPUT:-}"
+DEPLOY_MODE="$FIXTURE_DEPLOY_MODE"; PREPARED_TUNNEL_INPUT="\${FIXTURE_PREPARED_INPUT:-}"
 PREPARED_UNMANAGED_MODE="\${FIXTURE_PREPARED_UNMANAGED:-}"
 ${preflight}
 echo "RESULT ai=$RECONFIGURE_AI token=$TUNNEL_TOKEN_INPUT unmanaged=$UNMANAGED_TUNNEL_CONFIRMED domain=$PUBLIC_DOMAIN handoff=$PREPARED_TUNNEL_INPUT"
@@ -745,21 +1090,27 @@ echo TUNNEL_READY
     return { ...result, prompts, launches: launches.split("\n").filter(Boolean).length };
   };
   try {
-    // ops update handed over the token for the unchanged mode: nothing tunnel-related is asked again.
-    let result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_PREPARED: "1", FIXTURE_PREPARED_INPUT: "fixture-token" });
+    // The upgrader handed over the token it collected before the stop: the recorded continue asks nothing.
+    let result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_RECORDED: "1", FIXTURE_PREPARED_INPUT: "fixture-token" });
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toContain("RESULT ai=1 token=fixture-token unmanaged=0 domain=bot.example.com handoff=");
-    expect(result.prompts).not.toContain("隧道 token");
+    expect(result.output).toContain("RESULT ai=0 token=fixture-token unmanaged=0 domain=recorded.example.com handoff=");
+    expect(result.prompts).toBe("");
+    // A recorded continue without any token stops instead of asking.
+    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_RECORDED: "1" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("续做需要隧道 token"); expect(result.prompts).toBe("");
     // Direct deployment asks for the missing token (hidden) before the stop.
     result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_TOKEN_ANSWER: "fixture-token" });
     expect(result.code, result.output).toBe(0); expect(result.output).toContain("token=fixture-token");
     // A valid saved token needs no answer; the launcher reads it itself.
     result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_SAVED_TOKEN: "1" });
     expect(result.code, result.output).toBe(0); expect(result.output).toContain("token= "); expect(result.prompts).not.toContain("隧道 token");
-    // An unmanaged connector confirmed by ops update for the same mode is not asked again; a changed mode is.
-    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_UNMANAGED: "1", FIXTURE_PREPARED_UNMANAGED: "cloudflare" });
-    expect(result.code, result.output).toBe(0); expect(result.output).toContain("unmanaged=1"); expect(result.prompts).not.toContain("connector");
-    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_UNMANAGED: "1", FIXTURE_PREPARED_UNMANAGED: "direct" });
+    // An unmanaged connector recorded for the same mode is not asked again; one confirmed for another mode stops the continue.
+    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_RECORDED: "1", FIXTURE_UNMANAGED: "1", FIXTURE_PREPARED_UNMANAGED: "cloudflare" });
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("unmanaged=1"); expect(result.prompts).toBe("");
+    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_RECORDED: "1", FIXTURE_UNMANAGED: "1", FIXTURE_PREPARED_UNMANAGED: "direct" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("停机前没有确认过这个 cloudflared"); expect(result.prompts).toBe("");
+    // A new deployment asks about it before the stop.
+    result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "cloudflare", FIXTURE_UNMANAGED: "1" });
     expect(result.code, result.output).toBe(0); expect(result.prompts).toContain("connector");
     result = await run("preflight.sh", { FIXTURE_DEPLOY_MODE: "direct", FIXTURE_UNMANAGED: "1", FIXTURE_CONFIRM: "n" });
     expect(result.code, result.output).toBe(1);
@@ -776,58 +1127,235 @@ echo TUNNEL_READY
   } finally { await fixture.cleanup(); }
 }, 90000);
 
-test.skipIf(!bash || !existsSync(bash))("Docker update reuses saved settings and never waits for input after the stop", async () => {
-  const fixture = await tempFixture("deployment-docker-reuse-");
+test.skipIf(!bash || !existsSync(bash))("Docker deployment refuses the legacy update entry before any change and prints the bootstrap command", async () => {
+  const fixture = await tempFixture("deployment-legacy-entry-");
+  const root = join(fixture.root, "project"), stubs = join(fixture.root, "bin"), dockerLog = join(fixture.root, "docker.log");
+  await mkdir(join(root, "scripts/deploy"), { recursive: true }); await mkdir(stubs);
+  await Bun.write(join(root, "scripts/deploy/deploy.sh"), Bun.file(join(project, "scripts/deploy/deploy.sh")));
+  for (const name of await readdir(join(project, "scripts/lib"))) {
+    if (name.endsWith(".sh")) await Bun.write(join(root, "scripts/lib", name), Bun.file(join(project, "scripts/lib", name)));
+  }
+  await writeFile(join(stubs, "docker"), `#!/usr/bin/env bash\necho "$*" >> '${posixPath(dockerLog)}'\nexit 1\n`);
+  await chmod(join(stubs, "docker"), 0o755);
+  const run = (env: Record<string, string>) => execute([bash!, posixPath(join(root, "scripts/deploy/deploy.sh"))], root,
+    { ...process.env, MSYS_NO_PATHCONV: "1", PATH: `${posixPath(stubs)}:${process.env.PATH}`, ...env });
+  try {
+    // The previous ops.sh stopped the service and handed over with DEPLOY_REUSE_SETTINGS=1: refuse before Docker, data or state.
+    let result = await run({ DEPLOY_REUSE_SETTINGS: "1" });
+    expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain("旧版运维脚本不能直接升级到此版本");
+    expect(result.output).toContain("本次未改动数据和配置");
+    const bootstrap = ["git fetch origin main", "rm -rf tmp/upgrade-bootstrap && mkdir -p tmp/upgrade-bootstrap",
+      "git archive origin/main scripts/deploy/upgrade.sh scripts/lib scripts/migrations src/core/data-version.ts Dockerfile | tar -x -C tmp/upgrade-bootstrap",
+      'bash tmp/upgrade-bootstrap/scripts/deploy/upgrade.sh "$PWD" origin/main', "rm -rf tmp/upgrade-bootstrap"];
+    for (const line of bootstrap) expect(result.output).toContain(`      ${line}\n`);
+    // The documented command is the one printed.
+    expect(await readFile(join(project, "docs/data-migrations.md"), "utf8")).toContain("```bash\n" + bootstrap.join("\n") + "\n```");
+    expect(existsSync(dockerLog)).toBe(false);
+    expect(existsSync(join(root, "data"))).toBe(false); expect(existsSync(join(root, "backup"))).toBe(false);
+    // Without the legacy flag (or with an explicit transaction action) deployment proceeds to its normal checks.
+    for (const env of [{}, { DEPLOY_REUSE_SETTINGS: "1", DEPLOY_TRANSACTION_ACTION: "continue" }] as Record<string, string>[]) {
+      await rm(dockerLog, { force: true });
+      result = await run(env);
+      expect(result.code, result.output).toBe(1);
+      expect(result.output).not.toContain("旧版运维脚本"); expect(result.output).toContain("无法连接 Docker");
+      expect(await readFile(dockerLog, "utf8")).toBe("info\n");
+    }
+  } finally { await fixture.cleanup(); }
+}, 60000);
+
+test.skipIf(!bash || !existsSync(bash))("Docker continue and rollback use only the transaction record and never wait for input", async () => {
+  const fixture = await tempFixture("deployment-docker-transaction-");
   const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
   const settings = source.split("# ---- 目录 + 监听端口 ----")[1]?.split("\n# ---- 目录 ----\n")[0];
   const preflight = source.split("# ---- 停机前的交互选择")[1]?.split("# Decisions precede persistent changes")[0]?.replace(/^[^\n]*/, "");
-  const helpers = ["trim_input", "read_input", "ask_yes_no"].map(name => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"))?.[0]);
+  const helpers = ["trim_input", "settings_fixed_hint", "read_input", "ask_yes_no", "choose_transaction_action", "group_root_mount", "rollback_pending_deployment",
+    "activate_committed_deployment", "finish_committed_transaction", "check_deploy_environment"]
+    .map(name => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"))?.[0]);
   expect(settings).toBeDefined(); expect(preflight).toBeDefined(); expect(helpers.every(Boolean)).toBe(true);
-  const root = join(fixture.root, "project"), external = join(fixture.root, "external groups");
-  await mkdir(join(root, "data/state"), { recursive: true }); await mkdir(join(root, "data/config"), { recursive: true }); await mkdir(external);
-  await writeFile(join(root, "data/state/bot-port"), "2022"); await writeFile(join(root, "data/state/deploy-mode"), "cloudflare");
-  await writeFile(join(root, "data/state/bot-domain"), "bot.example.com");
-  const script = join(fixture.root, "reuse.sh");
+  const root = join(fixture.root, "project"), state = join(root, "data/state"), snapshot = join(root, "backup/snapshots/deploy-fixture");
+  const receipt = join(fixture.root, "update-commit"), dockerLog = join(fixture.root, "docker.log");
+  const target = join(fixture.root, "target groups"), original = join(fixture.root, "original groups"), elsewhere = join(fixture.root, "elsewhere");
+  for (const dir of [state, join(root, "data/config"), snapshot, target, original, elsewhere]) await mkdir(dir, { recursive: true });
+  // Saved settings and the environment deliberately disagree with the record.
+  await writeFile(join(state, "bot-port"), "3000"); await writeFile(join(state, "deploy-mode"), "direct");
+  await writeFile(join(state, "bot-domain"), "other.example.com"); await writeFile(join(state, "group-data-root"), posixPath(original));
+  await writeFile(join(root, "data/config/models.json"), "{}");
+  await writeFile(join(state, "deploy-transaction"), "deploy-fixture");
+  const record = (overrides: Record<string, string> = {}) => writeFile(join(snapshot, "transaction"), Object.entries({
+    format: "1", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "", original_sha: "", original_branch: "",
+    original_group_root: posixPath(original), target_group_root: posixPath(target), was_running: "1", bot_port: "2022",
+    deploy_mode: "cloudflare", bot_domain: "bot.example.com", domain_action: "persist", unmanaged_tunnel: "", platform_ip: "198.51.100.9",
+    reconfigure_ai: "1", ...overrides,
+  }).map(([key, value]) => `${key}=${value}\n`).join(""));
+  const script = join(fixture.root, "transaction.sh");
   await writeFile(script, `#!/usr/bin/env bash
 set -euo pipefail
-. '${posixPath(join(project, "scripts/lib/common.sh"))}'
-PROJECT_DIR="$1"; REUSE_SETTINGS=1; CONTAINER_UID=1001; CONTAINER_GID=1001
+. '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
+PROJECT_DIR="$1"; CONTAINER_UID=1001; CONTAINER_GID=1001; RECORDED=0
+TRANSACTION_ACTION="\${FIXTURE_ACTION:-}"; MIGRATION_PREVIEW_MODE=(--interactive)
 DATA_DIR="$PROJECT_DIR/data"; CONFIG_DIR="$DATA_DIR/config"; STATE_DIR="$DATA_DIR/state"; RUNTIME_HOME_DIR="$DATA_DIR/runtime/home"
 LOG_DIR="$PROJECT_DIR/logs"; DEFAULT_GROUP_DATA_ROOT="$DATA_DIR/groups"; MODELS_FILE="$CONFIG_DIR/models.json"
 BOT_PORT_FILE="$STATE_DIR/bot-port"; DEPLOY_MODE_FILE="$STATE_DIR/deploy-mode"; BOT_DOMAIN_FILE="$STATE_DIR/bot-domain"; GROUP_DATA_ROOT_FILE="$STATE_DIR/group-data-root"
-PREPARED_TUNNEL_READY="\${FIXTURE_PREPARED:-0}"; PREPARED_TUNNEL_INPUT=""; PREPARED_UNMANAGED_MODE=""
-print_status(){ :; }; print_success(){ :; }; print_warning(){ echo "$*" >&2; }; print_error(){ echo "$*" >&2; }; print_prompt(){ :; }
-flock(){ :; }; acquire_deploy_lock(){ :; }; verify_deployed_group_root(){ :; }; show_tunnel_token_help(){ :; }
+# What the upgrader passes in the same operation: a token typed before the stop and the handoff marker.
+PREPARED_TUNNEL_INPUT="\${FIXTURE_HANDOFF_TOKEN:-}"; TRANSACTION_HANDOFF="\${FIXTURE_HANDOFF:-}"; PREPARED_UNMANAGED_MODE=""
+print_status(){ echo "$*"; }; print_success(){ echo "$*"; }; print_warning(){ echo "$*" >&2; }; print_error(){ echo "$*" >&2; }; print_prompt(){ :; }
+flock(){ :; }; acquire_deploy_lock(){ :; }; verify_deployed_group_root(){ echo 'normal settings read' >&2; exit 90; }; show_tunnel_token_help(){ :; }
 managed_cloudflared_pid(){ return 1; }; pgrep(){ return 1; }
-load_tunnel_token(){ [ -z "\${1:-}" ] && [ "\${FIXTURE_SAVED_TOKEN:-0}" = 1 ]; }
+load_tunnel_token(){
+    if [ -z "\${1:-}" ]; then [ "\${FIXTURE_SAVED_TOKEN:-0}" = 1 ]; return; fi
+    [ "$1" = handed-over ]
+}
+migration_docker(){ [ "$1" = committed ] || { echo "MIGRATION $1" >&2; exit 93; }; [ "\${FIXTURE_COMMITTED:-0}" = 1 ]; }
+begin_deployment(){ echo "BEGIN rollback=\${ROLLBACK_REQUESTED:-0} root=$HOST_GROUP_DATA_ROOT mount=$GROUP_ROOT_ENV_VAL"; }
+docker(){
+    echo "$*" >> '${posixPath(dockerLog)}'
+    case "$1" in
+        inspect) [ "\${!#}" != mixin-chatbot-rollback ] || [ "\${FIXTURE_ROLLBACK_CONTAINER:-0}" = 1 ] ;;
+        exec) [ "\${FIXTURE_UNHEALTHY:-0}" != 1 ] ;;
+    esac
+}
+sleep(){ :; }; cleanup_completed_backup(){ echo "CLEANUP $1"; }
 ${helpers.join("\n")}
 ${settings}
 ${preflight}
-echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT ai=$RECONFIGURE_AI domain=$PUBLIC_DOMAIN"
+echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=$PUBLIC_DOMAIN persist=$PERSIST_BOT_DOMAIN ai=$RECONFIGURE_AI token=$TUNNEL_TOKEN_INPUT platform=$PLATFORM_IP runtime=\${BOT_DEBUG-}\${BOT_MAX_ACTIVE_REQUESTS-}\${BOT_BASH_TIMEOUT-}\${BOT_MODEL_CACHE_RETENTION-}"
 `);
+  // The new terminal's ordinary environment is invalid on purpose: recovery neither validates nor adopts it.
   const run = (env: Record<string, string>) => execute([bash!, posixPath(script), posixPath(root)], fixture.root,
-    { ...process.env, MSYS_NO_PATHCONV: "1", BOT_PORT: "", DEPLOY_MODE: "", GROUP_DATA_ROOT: "", BOT_DOMAIN: "", ...env });
+    { ...process.env, MSYS_NO_PATHCONV: "1", BOT_PORT: "9999", DEPLOY_MODE: "direct", GROUP_DATA_ROOT: posixPath(elsewhere), BOT_DOMAIN: "env.example.com",
+      PLATFORM_IP: "not-an-ip", BOT_DEBUG: "maybe", BOT_MAX_ACTIVE_REQUESTS: "0", BOT_BASH_TIMEOUT: "5", BOT_MODEL_CACHE_RETENTION: "short", ...env });
   try {
-    await writeFile(join(root, "data/state/group-data-root"), posixPath(external));
-    await writeFile(join(root, "data/config/models.json"), "{}");
-    let result = await run({ FIXTURE_SAVED_TOKEN: "1" });
+    await record();
+    let result = await run({ FIXTURE_ACTION: "continue", FIXTURE_SAVED_TOKEN: "1" });
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toContain(`RESULT port=2022 mode=cloudflare root=${posixPath(external)} ai=0 domain=bot.example.com`);
-    // A token the update did not prepare would need an answer: fail through the guard instead of waiting.
+    expect(result.output).toContain(`RESULT port=2022 mode=cloudflare root=${posixPath(target)} domain=bot.example.com persist=1 ai=0 token= platform=198.51.100.9 runtime=\n`);
+    expect(result.output).toContain("继续上次操作");
+    // The token typed before the stop is never recorded; continuing needs a saved one and stops instead of asking.
+    result = await run({ FIXTURE_ACTION: "continue" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("续做需要隧道 token");
+    // Within the same upgrade the handoff marker equals the recorded snapshot: the token typed before the stop is used.
+    result = await run({ FIXTURE_ACTION: "continue", FIXTURE_HANDOFF: "deploy-fixture", FIXTURE_HANDOFF_TOKEN: "handed-over" });
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("token=handed-over platform=");
+    expect(result.output).toContain("沿用升级器在停机前确认的隧道 token");
+    // A marker for another snapshot, or none at all (a restarted continue), never adopts a passed token.
+    for (const handoff of ["deploy-other", ""]) {
+      result = await run({ FIXTURE_ACTION: "continue", FIXTURE_HANDOFF: handoff, FIXTURE_HANDOFF_TOKEN: "handed-over" });
+      expect(result.code, result.output).toBe(1); expect(result.output).toContain("续做需要隧道 token"); expect(result.output).not.toContain("RESULT");
+    }
+    // Without an explicit action a pending upgrade is left to resume / rollback, which also switch or restore the code.
     result = await run({});
-    expect(result.code, result.output).toBe(1); expect(result.output).toContain("停机期间不能等待输入");
-    // An unusable saved group root rolls back after one check instead of looping on a prompt.
-    await writeFile(join(fixture.root, "not-a-directory"), "");
-    await writeFile(join(root, "data/state/group-data-root"), posixPath(join(fixture.root, "not-a-directory")));
-    result = await run({ FIXTURE_SAVED_TOKEN: "1" });
-    expect(result.code, result.output).toBe(1); expect(result.output).toContain("现有群数据总根不可用");
-    // The first-run AI wizard is interactive, so an update without models.json rolls back before the stop-time wizard.
-    await writeFile(join(root, "data/state/group-data-root"), posixPath(external));
-    await rm(join(root, "data/config/models.json"));
-    result = await run({ FIXTURE_SAVED_TOKEN: "1" });
-    expect(result.code, result.output).toBe(1); expect(result.output).toContain("缺少 data/config/models.json");
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("未完成的是升级"); expect(result.output).toContain("resume");
+    expect(result.output).not.toContain("RESULT");
+    // Data, configuration and containers already rolled back, only the code left: neither continued nor rolled back again here.
+    await writeFile(join(snapshot, "code-restore"), "");
+    for (const action of ["continue", "rollback"]) {
+      result = await run({ FIXTURE_ACTION: action });
+      expect(result.code, result.output).toBe(1); expect(result.output).toContain("只剩代码待恢复");
+      expect(result.output).not.toContain("BEGIN"); expect(result.output).not.toContain("RESULT");
+    }
+    await rm(join(snapshot, "code-restore"));
+    // A pending deployment without a TTY and without an explicit action: nothing is decided.
+    await record({ operation: "deploy" });
+    result = await run({});
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("发现未完成的部署"); expect(result.output).toContain("resume");
+    expect(result.output).not.toContain("RESULT");
+    await record();
+    // A recorded target commit must be checked out.
+    await record({ target_sha: "a".repeat(40) });
+    result = await run({ FIXTURE_ACTION: "continue", FIXTURE_SAVED_TOKEN: "1" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("不是上次操作的目标提交");
+    // A missing mount stops the continue; the empty root is never recreated.
+    const missing = join(fixture.root, "unmounted");
+    await record({ target_group_root: posixPath(missing) });
+    result = await run({ FIXTURE_ACTION: "continue", FIXTURE_SAVED_TOKEN: "1" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("事务记录的群数据总根不存在");
+    expect(existsSync(missing)).toBe(false);
+    // Rollback: committed data is refused before any container change; otherwise the snapshot is restored against the target root.
+    await record();
+    await writeFile(join(state, "migration.json"), "{}");
+    result = await run({ FIXTURE_ACTION: "rollback", FIXTURE_COMMITTED: "1" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("已经提交，不能回滚");
+    expect(result.output).not.toContain("BEGIN");
+    result = await run({ FIXTURE_ACTION: "rollback" });
+    expect(result.output).toContain(`BEGIN rollback=1 root=${posixPath(target)} mount=/app/group-data`);
+    await record({ original_group_root: posixPath(missing) });
+    result = await run({ FIXTURE_ACTION: "rollback" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("原群数据总根不存在");
+    expect(result.output).not.toContain("BEGIN");
+    // Continue after the data was committed: no new transaction, build or migration; only the verification
+    // instance is replaced by the normal one, and the transaction ends only once it is healthy.
+    const committed = async (env: Record<string, string>) => {
+      await writeFile(join(state, "deploy-transaction"), "deploy-fixture"); await writeFile(receipt, ""); await writeFile(dockerLog, "");
+      const output = await run({ FIXTURE_ACTION: "continue", FIXTURE_COMMITTED: "1", BOT_UPDATE_COMMIT_FILE: posixPath(receipt), ...env });
+      return { ...output, docker: (await readFile(dockerLog, "utf8")).trim().split("\n") };
+    };
+    await record();
+    let activation = await committed({ FIXTURE_ROLLBACK_CONTAINER: "1" });
+    expect(activation.code, activation.output).toBe(0);
+    expect(activation.docker).toEqual(["inspect mixin-chatbot-rollback", "inspect mixin-chatbot", "stop --time 30 mixin-chatbot", "start mixin-chatbot",
+      "exec mixin-chatbot bun run scripts/ops/health-check.ts", "rm mixin-chatbot-rollback"]);
+    expect(activation.output).toContain(`CLEANUP ${posixPath(snapshot)}`); expect(activation.output).toContain("机器人已启动");
+    expect(activation.output).not.toContain("BEGIN"); expect(activation.output).not.toContain("RESULT"); expect(activation.output).not.toContain("MIGRATION");
+    expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
+    expect(await readFile(receipt, "utf8")).toBe("committed\n");
+    // An upgrade that found the service stopped keeps it stopped.
+    await record({ was_running: "0" });
+    activation = await committed({});
+    expect(activation.code, activation.output).toBe(0); expect(activation.output).toContain("保持停止");
+    expect(activation.docker).toEqual(["inspect mixin-chatbot-rollback", "inspect mixin-chatbot", "stop --time 30 mixin-chatbot"]);
+    // An unhealthy instance keeps the transaction, so continuing again retries only the activation.
+    await record();
+    activation = await committed({ FIXTURE_UNHEALTHY: "1" });
+    expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("业务实例未就绪"); expect(activation.output).toContain("resume");
+    expect(existsSync(join(state, "deploy-transaction"))).toBe(true);
+    expect(activation.output).not.toContain("CLEANUP");
+    // Without a transaction the ordinary environment is validated before any setting is read.
+    await rm(join(state, "deploy-transaction"));
+    const valid = { PLATFORM_IP: "203.0.113.99", BOT_DEBUG: "1", BOT_MAX_ACTIVE_REQUESTS: "32", BOT_MODEL_CACHE_RETENTION: "" };
+    for (const [env, message] of [[{ ...valid, PLATFORM_IP: "not-an-ip" }, "PLATFORM_IP 无效：not-an-ip"], [{ ...valid, BOT_DEBUG: "maybe" }, "BOT_DEBUG 只能是 0 或 1"],
+      [{ ...valid, BOT_MAX_ACTIVE_REQUESTS: "0" }, "BOT_MAX_ACTIVE_REQUESTS 必须是"], [{ ...valid, BOT_MODEL_CACHE_RETENTION: "short" }, "BOT_MODEL_CACHE_RETENTION 已移除"]] as const) {
+      result = await run(env);
+      expect(result.code, result.output).toBe(1); expect(result.output).toContain(message); expect(result.output).not.toContain("normal settings read");
+    }
+    result = await run(valid);
+    expect(result.code, result.output).toBe(90); expect(result.output).toContain("normal settings read");
   } finally { await fixture.cleanup(); }
-}, 60000);
+}, 120000);
+
+test.skipIf(!bash || !existsSync(bash))("Docker continue applies the migration plan confirmed before the stop instead of previewing again", async () => {
+  const fixture = await tempFixture("deployment-docker-plan-");
+  const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+  const block = source.split("\nMIGRATION_PLANNED=0\n")[1]?.split("# ---- 停机前的交互选择")[0];
+  expect(block).toBeDefined();
+  const root = fixture.root, state = join(root, "state"), snapshot = join(root, "snapshot");
+  for (const dir of [state, snapshot, join(root, "runtime/pi")]) await mkdir(dir, { recursive: true });
+  await writeFile(join(root, "models.json"), "{}"); await writeFile(join(root, "runtime/pi/settings.json"), "{}");
+  await writeFile(join(snapshot, "migration-plan.json"), "confirmed-before-stop");
+  const script = join(root, "plan.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_DIR="$1"; STATE_DIR="$PROJECT_DIR/state"; TRANSACTION_SNAPSHOT="$PROJECT_DIR/snapshot"; RECORDED="$FIXTURE_RECORDED"; CONTAINER_UID=1001; CONTAINER_GID=1001
+MODELS_FILE="$PROJECT_DIR/models.json"; RUNTIME_DIR="$PROJECT_DIR/runtime"; MIGRATION_PLAN=/app/data/state/migration-plan.json; MIGRATION_PREVIEW_MODE=()
+print_error(){ echo "$*" >&2; }; settings_fixed_hint(){ echo hint; }
+migration_docker(){ echo "PREVIEW $*"; }
+MIGRATION_PLANNED=0
+${block}
+echo "PLANNED=$MIGRATION_PLANNED"
+`);
+  const run = (recorded: string) => execute([bash!, posixPath(script), posixPath(root)], root, { ...process.env, MSYS_NO_PATHCONV: "1", FIXTURE_RECORDED: recorded });
+  try {
+    await writeFile(join(state, "migration-plan.json"), "stale");
+    // The snapshot is readable only by the deploying user; the plan is copied back where the container reads it.
+    let result = await run("1");
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("PLANNED=1"); expect(result.output).not.toContain("PREVIEW");
+    expect(await readFile(join(state, "migration-plan.json"), "utf8")).toBe("confirmed-before-stop");
+    result = await run("0");
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("PREVIEW preview --plan /app/data/state/migration-plan.json"); expect(result.output).toContain("PLANNED=1");
+  } finally { await fixture.cleanup(); }
+}, 30000);
 
 test.skipIf(!bash || !existsSync(bash))("Docker migration passes the service identity, mounted group root and native cache environment", async () => {
   const fixture = await tempFixture("deployment-migration-env-");
@@ -907,15 +1435,7 @@ docker(){
         *) echo "unexpected Docker operation" >&2; return 1 ;;
     esac
 }
-if [ "$2" = pre-stopped ]; then
-    DEPLOY_PREVIOUS_RUNNING=0
-    if [ "$(docker inspect --format '{{.State.Running}}' mixin-chatbot)" = true ]; then DEPLOY_PREVIOUS_RUNNING=1; fi
-    DEPLOY_ORIGINAL_CONTAINER="$(docker inspect --format '{{.Id}}' mixin-chatbot)"
-    export DEPLOY_PREVIOUS_RUNNING DEPLOY_ORIGINAL_CONTAINER
-    docker stop mixin-chatbot
-fi
 begin_deployment
-if [ "$2" = pre-stopped ]; then test "$(cat "$DEPLOY_SNAPSHOT/was-running")" = "$DEPLOY_PREVIOUS_RUNNING"; fi
 printf 'new-config' > data/config/models.json
 [ "$2" != configuration ] || exit 42
 printf 'new-image' > mock/image
@@ -931,7 +1451,7 @@ printf '2022' > data/state/bot-port
 exit 42
 `);
   try {
-    for (const running of [true, false]) for (const stage of ["configuration", "image", "container", "health", "tunnel", "firewall", "state", "pre-stopped"]) {
+    for (const running of [true, false]) for (const stage of ["configuration", "image", "container", "health", "tunnel", "firewall", "state"]) {
       const root = join(fixture.root, `${stage}-${running}`);
       await Promise.all(["data/config", "data/state", "mock/containers", "logs"].map(dir => mkdir(join(root, dir), { recursive: true })));
       await writeFile(join(root, "data/config/models.json"), "old-config");
@@ -949,6 +1469,45 @@ exit 42
       expect(await readFile(join(root, "mock/image"), "utf8")).toBe("old-image");
       const rules = await readFile(join(root, "mock/ufw"), "utf8");
       expect(rules).toContain("ufw allow 22/tcp"); expect(rules).toContain("192.0.2.1"); expect(rules).not.toContain("192.0.2.2");
+    }
+  } finally { await fixture.cleanup(); }
+}, 60000);
+
+test.skipIf(!bash || !existsSync(bash))("Docker rollback of an upgrade keeps the transaction until the upgrader has restored the code", async () => {
+  const fixture = await tempFixture("deployment-code-restore-");
+  const root = fixture.root, script = join(root, "rollback.sh"), pointer = join(root, "data/state/deploy-transaction");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_DIR="$1" OPERATION="$2" ORIGINAL_SHA="$3"
+cd "$PROJECT_DIR"
+. '${posixPath(join(project, "scripts/lib/lifecycle.sh"))}'
+. '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
+LOG_DIR="$PROJECT_DIR/logs"; TUNNEL_PID_FILE="$PROJECT_DIR/data/state/cloudflared.pid"
+operation_start deploy
+print_error(){ echo "$*" >&2; }; print_warning(){ echo "$*"; }; print_success(){ echo "$*"; }
+flock(){ :; }; can_manage_ufw(){ return 1; }; managed_cloudflared_pid(){ return 1; }; stop_tunnel_launcher(){ :; }
+docker(){ case "$1" in ps) : ;; inspect) return 1 ;; *) echo "unexpected Docker operation" >&2; return 1 ;; esac; }
+record_deployment_transaction(){ declare -gA TRANSACTION=([operation]="$OPERATION" [original_sha]="$ORIGINAL_SHA"); }
+begin_deployment
+exit 42
+`);
+  try {
+    await mkdir(join(root, "data/state"), { recursive: true });
+    // No MSYS_NO_PATHCONV: the rollback asks the native git.exe for HEAD with a POSIX project path.
+    const git = (...args: string[]) => execute(["git", "-C", root, ...args], root);
+    await git("init", "--initial-branch=main"); await git("config", "user.name", "Fixture"); await git("config", "user.email", "fixture@example.invalid");
+    await writeFile(join(root, ".gitignore"), "*\n"); await git("add", "-f", ".gitignore"); await git("commit", "-m", "fixture");
+    const head = (await git("rev-parse", "HEAD")).output.trim();
+    expect(head).toMatch(/^[0-9a-f]{40}$/);
+    for (const [operation, original, kept] of [["upgrade", "0".repeat(40), true], ["upgrade", head, false], ["deploy", "", false]] as const) {
+      const result = await execute([bash!, posixPath(script), posixPath(root), operation, original], root);
+      expect(result.code, result.output).toBe(42);
+      expect(result.output).toContain("已恢复配置");
+      // An upgrade still on other code keeps its pointer, marked so that retrying only restores the code.
+      const [snapshot] = await readdir(join(root, "backup/snapshots"));
+      expect(existsSync(pointer), `${operation} ${original}`).toBe(kept);
+      expect(existsSync(join(root, "backup/snapshots", snapshot!, "code-restore"))).toBe(kept);
+      await rm(join(root, "backup"), { recursive: true }); await rm(pointer, { force: true });
     }
   } finally { await fixture.cleanup(); }
 }, 60000);
@@ -997,6 +1556,12 @@ if [ "$phase" = initial ]; then
     trap - EXIT INT TERM
     exit 0
 fi
+if [ "$phase" = committed ]; then
+    # Committed data is activated by deploy.sh before any settings are read; the transaction is never reopened here.
+    migration_docker(){ [ "$1" = committed ]; }
+    if begin_deployment; then echo REOPENED; fi
+    exit 0
+fi
 rollback_data_migration(){ printf yes > restored-data; }
 begin_deployment
 test "$DEPLOY_SNAPSHOT" = "$(cat original-snapshot)"
@@ -1010,6 +1575,9 @@ exit 42
     await writeFile(join(fixture.root, "mock/mixin-chatbot"), "old-image true\n");
     const run = (phase: string) => execute([bash!, posixPath(script), posixPath(fixture.root), phase], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
     const first = await run("initial"); expect(first.code, first.output).toBe(0);
+    const refused = await run("committed");
+    expect(refused.code, refused.output).toBe(0); expect(refused.output).toContain("已经提交"); expect(refused.output).not.toContain("REOPENED");
+    expect(await readFile(join(fixture.root, "mock/mixin-chatbot"), "utf8")).toBe("new-image true\n");
     const second = await run("resume"); expect(second.code, second.output).toBe(42);
     expect(await readFile(join(fixture.root, "mock/mixin-chatbot"), "utf8")).toBe("old-image true\n");
     expect(existsSync(join(fixture.root, "data/state/deploy-transaction"))).toBe(false);

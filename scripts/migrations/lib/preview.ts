@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
-import { bytes, ordinaryPath, publish, publishJson } from "./io.ts";
+import { bytes, info, ordinaryPath, publish, publishJson } from "./io.ts";
 import type { Context, Migration, Preview, PreviewContext } from "./types.ts";
 
 export function previewContext(context: Context): PreviewContext {
@@ -21,9 +21,15 @@ export function previewContext(context: Context): PreviewContext {
 
 /** Only preview callbacks run here. They receive a private project and a read-only group capability. */
 export async function describeMigrations(context: Context, steps: Migration[], configs: string[], validate?: (staging: string) => Promise<void>) {
-  const temporaryRoot = join(context.project, "data/runtime/tmp");
-  await ordinaryPath(context.project, temporaryRoot);
-  await mkdir(temporaryRoot, { recursive: true });
+  const temporaryRoot = context.scratch ?? join(context.project, "data/runtime/tmp");
+  if (context.scratch) {
+    await mkdir(temporaryRoot, { recursive: true });
+    const stat = await info(temporaryRoot);
+    if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new Error(`预览暂存目录不是普通目录：${temporaryRoot}`);
+  } else {
+    await ordinaryPath(context.project, temporaryRoot);
+    await mkdir(temporaryRoot, { recursive: true });
+  }
   const staging = await mkdtemp(join(temporaryRoot, "migration-preview-"));
   const descriptions: Preview[] = [], files: string[] = [];
   try {

@@ -17,6 +17,7 @@ import { LogsView } from "../../scripts/ops/tui/views/logs.ts";
 import { MaintainView } from "../../scripts/ops/tui/views/maintain.ts";
 import { SettingsView } from "../../scripts/ops/tui/views/settings.ts";
 import * as tuiData from "../../scripts/ops/tui/data.ts";
+import * as tuiTransaction from "../../scripts/ops/tui/transaction.ts";
 import { sweepSessionStats } from "../../src/agent/stats-ledger.ts";
 import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import * as tuiReport from "../../scripts/ops/tui/report.ts";
@@ -725,6 +726,74 @@ test("统计、会话和临时文件刷新保留列表，切换数据根后清�
       await refresh;
     }
   } finally { finishes.forEach(finish => finish()); mocks.forEach(mock => mock.mockRestore()); await fixture.cleanup(); }
+});
+
+test("未完成的事务只提供继续或回滚，确认页列出记录，数据已提交时禁止回滚", async () => {
+  const record: tuiTransaction.TransactionRecord = {
+    format: "1", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "2".repeat(40), original_sha: "1".repeat(40),
+    original_branch: "main", original_group_root: "/srv/old-groups", target_group_root: "/srv/new-groups", was_running: "1",
+    bot_port: "2022", deploy_mode: "cloudflare", bot_domain: "bot.example.com", domain_action: "keep", unmanaged_tunnel: "",
+    platform_ip: "203.0.113.17", reconfigure_ai: "0",
+  };
+  const pending: tuiTransaction.PendingTransaction = { operation: "upgrade", snapshot: "deploy-fixture", record, targetSha: record.target_sha, committed: false, codeRestorePending: false };
+  const load = spyOn(tuiTransaction, "loadPendingTransaction").mockReturnValue(pending);
+  const git = spyOn(tuiData, "loadGit").mockResolvedValue({ branch: "main", sha: "1111111", subject: "fixture", dirty: false, ahead: 0, behind: 1, incoming: [] });
+  const remote = spyOn(tuiData, "loadUpgrade");
+  try {
+    for (const platform of ["windows", "linux"] as const) {
+      const { app, calls } = fakeApp();
+      app.deployment.platform = platform;
+      app.runInteractive = async (title, args) => { calls.commands.push({ title, args }); return 0; };
+      const view = new MaintainView();
+      load.mockReturnValue(pending);
+      await view.refresh(app);
+      const actions = view.actions();
+      expect(actions.slice(0, 2).map(action => action.label)).toEqual(["继续上次操作", "回滚上次操作"]);
+      expect(actions.filter(action => action.disabled).map(action => action.value).sort()).toEqual(["deploy", "repair", "update"]);
+      expect(actions.find(action => action.value === "deploy")?.label).toBe("部署 / 修改设置");
+      expect(actions.find(action => action.value === "update")?.label).toBe("升级（保留设置）");
+      for (const [width, rows] of [[72, 20], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
+      // New deployments, upgrades and repairs are refused until the interrupted one is finished; no remote check starts.
+      for (const blocked of ["deploy", "update", "repair"]) await view.onKey(key(blocked), app);
+      expect(calls.commands).toHaveLength(0); expect(calls.confirms).toHaveLength(0);
+      expect(calls.toasts.at(-1)).toContain("继续上次操作");
+      expect(remote).not.toHaveBeenCalled();
+      await view.onKey(key("enter"), app);
+      const resume = calls.confirms.at(-1)!;
+      expect(resume.subject).toBe("未完成的升级：目标提交 2222222");
+      expect(resume.steps.join("\n")).toContain("/srv/new-groups（原 /srv/old-groups）");
+      expect(resume.steps.join("\n")).toContain("端口 2022 · 入口 Cloudflare · bot.example.com");
+      expect(resume.steps.join("\n")).toContain("原运行状态：运行");
+      expect(calls.commands.at(-1)?.args).toEqual(["resume"]);
+      await view.onKey(key("rollback"), app);
+      expect(calls.confirms.at(-1)?.danger).toBe(true);
+      expect(calls.commands.at(-1)?.args).toEqual(["rollback"]);
+      // Once the data is committed only continuing is possible; the rollback entry explains why and runs nothing.
+      load.mockReturnValue({ ...pending, committed: true });
+      await view.refresh(app);
+      expect(view.actions().find(action => action.value === "rollback")?.disabled).toBe(true);
+      const before = calls.commands.length;
+      await view.onKey(key("rollback"), app);
+      expect(calls.confirms.at(-1)?.subject).toBe("数据已经提交，不能回滚");
+      expect(calls.commands).toHaveLength(before);
+      // Data, configuration and containers already rolled back: only the code restore remains, so continuing is refused.
+      load.mockReturnValue({ ...pending, codeRestorePending: true });
+      await view.refresh(app);
+      expect(view.actions().find(action => action.value === "resume")?.disabled).toBe(true);
+      expect(view.actions().find(action => action.value === "rollback")?.disabled).toBe(false);
+      await view.onKey(key("resume"), app);
+      expect(calls.confirms.at(-1)?.subject).toBe("数据、配置和容器已经回滚，不能继续");
+      expect(calls.commands).toHaveLength(before);
+      await view.onKey(key("rollback"), app);
+      expect(calls.confirms.at(-1)?.steps[0]).toBe("把代码恢复到升级前的提交");
+      expect(calls.commands.at(-1)?.args).toEqual(["rollback"]);
+      // Finishing the transaction restores the normal entries.
+      load.mockReturnValue(null);
+      await view.refresh(app);
+      expect(view.actions().some(action => action.value === "resume" || action.value === "rollback")).toBe(false);
+      expect(view.actions().find(action => action.value === "deploy")?.disabled).toBe(false);
+    }
+  } finally { load.mockRestore(); git.mockRestore(); remote.mockRestore(); }
 });
 
 test("选中升级先联网，后台检查不阻塞导航，预览与确认显示最新目标提交", async () => {

@@ -7,14 +7,20 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lifecycle.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/tunnel-logging.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/operation-log.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/transaction.sh"
+
+# 量子密信平台出口 IP（webhook 来源；UFW/WAF 按此放行）。部署可用 PLATFORM_IP 覆盖，确认值写入事务记录。
+DEFAULT_PLATFORM_IP=223.244.14.237
 
 # TUI 中显示菜单路径；命令行调用仍显示可直接执行的命令。
 ops_command_hint() {
     local command="$1" path=""
     if [ "${MIXIN_OPS_TUI:-}" = "1" ]; then
         case "$command" in
-            deploy) path='系统 → 服务部署 → 部署 / 重部署' ;;
-            update) path='系统 → 服务部署 → 升级' ;;
+            deploy) path='系统 → 服务部署 → 部署 / 修改设置' ;;
+            update) path='系统 → 服务部署 → 升级（保留设置）' ;;
+            resume) path='系统 → 服务部署 → 继续上次操作' ;;
+            rollback) path='系统 → 服务部署 → 回滚上次操作' ;;
             start) path='系统 → 服务部署 → 启动' ;;
             stop) path='系统 → 服务部署 → 停止' ;;
             restart) path='系统 → 服务部署 → 重启' ;;
@@ -216,4 +222,47 @@ acquire_deploy_lock() {
     exec 9>"$lock_path"
     flock -n 9 || return 1
     export BOT_DEPLOY_LOCK_HELD="$lock_path"
+}
+
+# 部署时从环境写入 runtime.json 的运行参数。升级、续做和回滚沿用 runtime.json，不采用当前终端的这些值。
+RUNTIME_ENV_KEYS=(BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_TTL_MINUTES BOT_INDEX_MAX_FILES BOT_INDEX_MAX_DEPTH BOT_RUN_TIMEOUT_SECONDS BOT_MODEL_IDLE_TIMEOUT_SECONDS BOT_MODEL_RESPONSE_TIMEOUT_SECONDS BOT_SHUTDOWN_TIMEOUT_SECONDS BOT_DELIVERY_TIMEOUT_SECONDS BOT_DOCUMENT_ENV BOT_DOCUMENT_WORK_ENABLED PI_CACHE_RETENTION BOT_ATTACHMENT_CONCURRENCY)
+
+# 升级器从目标提交导出的文件：升级器、共用脚本、迁移（只用内置模块）和决定预览基础镜像的 Dockerfile。
+UPGRADER_EXPORT_PATHS=(scripts/deploy/upgrade.sh scripts/lib scripts/migrations src/core/data-version.ts Dockerfile)
+
+# 旧版运维脚本升级到新版时需在项目目录运行一次的引导命令；之后 ops.sh update 自行导出目标升级器。
+upgrade_bootstrap_command() {
+    printf '%s\n' 'git fetch origin main' \
+        'rm -rf tmp/upgrade-bootstrap && mkdir -p tmp/upgrade-bootstrap' \
+        "git archive origin/main ${UPGRADER_EXPORT_PATHS[*]} | tar -x -C tmp/upgrade-bootstrap" \
+        'bash tmp/upgrade-bootstrap/scripts/deploy/upgrade.sh "$PWD" origin/main' \
+        'rm -rf tmp/upgrade-bootstrap'
+}
+
+# git 只经这里调用：GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。
+git_here() {
+    GIT_TERMINAL_PROMPT=0 git -C "$PROJECT_DIR" "$@"
+}
+
+# 把工作区退回升级前那个提交（升级器和旧版升级记录的回滚共用）。
+#
+# 升级前是 detached HEAD 时（rev-parse --abbrev-ref 返回字面量 "HEAD"）绝不能用 reset：
+# 升级过程中已经 checkout 到 main 了，reset --hard 会把 main 这个分支指针拖回那个游离
+# 提交，等于用一次回滚顺手毁掉 main。这种情况直接 checkout 回那个提交，恢复原本的
+# detached 状态，分支指针一个都不动。
+restore_checkout() {
+    local branch="$1" sha="$2" failure=''
+    if [ -z "$branch" ] || [ "$branch" = HEAD ]; then
+        if git_here checkout --force "$sha" >/dev/null 2>&1; then
+            echo "已恢复到升级前的游离 HEAD（${sha:0:7}）；分支指针未改动"
+            operation_event warn "restored detached HEAD ${sha}"
+            return 0
+        fi
+        failure="回滚到游离提交 ${sha} 失败"
+    elif ! git_here checkout "$branch" >/dev/null 2>&1; then failure="切回分支 ${branch} 失败"
+    elif ! git_here reset --hard "$sha" >/dev/null 2>&1; then failure="回滚到 ${sha} 失败"
+    else return 0; fi
+    echo "$failure" >&2
+    operation_event error "$failure"
+    return 1
 }

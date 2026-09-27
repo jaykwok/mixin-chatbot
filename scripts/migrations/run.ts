@@ -26,7 +26,7 @@ function describePreview(summary: { target: number; kind?: string; pending: bool
 
 async function main() {
   const { values, positionals } = cliArgs(process.argv.slice(2), {
-    project: { type: "string" }, groups: { type: "string" }, plan: { type: "string" }, deployment: { type: "string" },
+    project: { type: "string" }, groups: { type: "string" }, plan: { type: "string" }, deployment: { type: "string" }, scratch: { type: "string" },
     provider: { type: "string" }, model: { type: "string" }, interactive: { type: "boolean" },
     "decisions-only": { type: "boolean" }, "accept-native-cache": { type: "boolean" }, json: { type: "boolean" },
   });
@@ -34,6 +34,8 @@ async function main() {
   const command = positionals[0] ?? "status", project = resolve(values.project ?? process.cwd()), groups = values.groups;
   const planPath = values.plan ? resolve(values.plan) : undefined, deployment = values.deployment ?? "";
   const interactive = values.interactive, validatePreview = !values["decisions-only"];
+  // 停机前的预览只读挂载 data/，暂存目录放到可写的 --scratch。
+  if (values.scratch && command !== "preview") throw new Error("--scratch 只能用于 preview");
   const decisions: Context["decisions"] = { provider: values.provider, model: values.model, acceptNativeCache: values["accept-native-cache"] };
   // Start logging before configuration or group-root validation; status remains read-only.
   if (!["status", "committed"].includes(command)) {
@@ -42,6 +44,7 @@ async function main() {
     if (diagnostic.ownsLog && diagnostic.path) console.error("本次操作日志：" + diagnostic.path);
   }
   const context: Context = { project: resolve(project), groups: groups ? resolve(project, groups) : serviceGroupRoot(project), decisions,
+    scratch: values.scratch ? resolve(values.scratch) : undefined,
     report: (stage, detail) => {
       diagnostic?.event("info", stage, detail);
       if (stage === "skip-migration") console.error(detail);
@@ -77,7 +80,7 @@ async function main() {
   if (command === "apply") await apply(context, planPath ? await json(planPath) as Plan : undefined);
   else if (command === "commit") await commit(context);
   else if (command === "rollback") { if (!await rollback(context, deployment || undefined)) { console.error("迁移已提交；保留新代码和数据，禁止自动回退"); process.exitCode = 42; } }
-  else throw new Error("用法：bun run scripts/migrations/run.ts status|preview|apply|commit|rollback [--groups PATH] [--plan PATH] [--interactive] [--json]");
+  else throw new Error("用法：bun run scripts/migrations/run.ts status|preview|apply|commit|rollback [--groups PATH] [--plan PATH] [--scratch DIR] [--interactive] [--json]");
 }
 if (import.meta.main) main().catch(error => {
   diagnostic?.event("error", "migration", operationError(error));

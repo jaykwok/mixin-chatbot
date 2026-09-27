@@ -6,6 +6,43 @@ DEPLOY_FILES=(data/config data/runtime/pi/settings.json data/runtime/models-stor
 
 # archive_project_path is shared with ops and tunnel scripts.
 
+# 部署、升级器和回滚共用的项目 UFW 规则操作。
+can_manage_ufw() {
+    [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1
+}
+
+run_ufw() {
+    if [ "$(id -u)" -eq 0 ]; then
+        ufw "$@"
+    else
+        sudo ufw "$@"
+    fi
+}
+
+remove_managed_ufw_rules() {
+    local preserve_port="${1:-}" preserve_ip="${2:-}" kept=0
+    local rule_numbers=()
+    local line number
+    while IFS= read -r line; do
+        [[ "$line" == *"Mixin-Chatbot (平台IP)"* ]] || continue
+        if [ -n "$preserve_port" ] && [ "$kept" -eq 0 ] &&
+            [[ "$line" == *"${preserve_port}/tcp"* && "$line" == *"$preserve_ip"* ]]; then
+            kept=1
+            continue
+        fi
+        number="$(sed -n 's/^[[:space:]]*\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<< "$line")"
+        [ -n "$number" ] && rule_numbers+=("$number")
+    done < <(run_ufw status numbered)
+    local sorted_numbers=() failed=0
+    mapfile -t sorted_numbers < <(printf '%s\n' "${rule_numbers[@]}" | sed '/^$/d' | sort -rn)
+    # Callers report only rules that were actually removed.
+    REMOVED_UFW_RULES=0
+    for number in "${sorted_numbers[@]}"; do
+        if run_ufw --force delete "$number" >/dev/null; then REMOVED_UFW_RULES=$((REMOVED_UFW_RULES+1)); else failed=1; fi
+    done
+    return "$failed"
+}
+
 # Check before mkdir or Docker bind mounts can recreate an empty, missing data root.
 verify_deployed_group_root() {
     local recorded="$PROJECT_DIR/data/state/group-data-root" root
@@ -18,7 +55,9 @@ verify_deployed_group_root() {
     fi
 }
 
+# 新事务的目标提交默认取当前代码；升级器在切换代码前开始事务，传入目标提交。
 begin_deployment() {
+    local target_sha="${1:-}"
     mkdir -p "$PROJECT_DIR/backup/snapshots" "$PROJECT_DIR/backup/rm" "$PROJECT_DIR/data/state"
     # util-linux flock owns the deployment lock; children launched as daemons close descriptor 9.
     acquire_deploy_lock || { print_error "另一个部署正在进行"; return 1; }
@@ -32,21 +71,16 @@ begin_deployment() {
         if [ -s "$DEPLOY_SNAPSHOT/group-root" ] && [ "$(cat "$DEPLOY_SNAPSHOT/group-root")" != "${HOST_GROUP_DATA_ROOT:-}" ]; then
             print_error "中断部署必须使用原群目录继续"; return 1
         fi
-        if [ -s "$DEPLOY_SNAPSHOT/target-sha" ] && [ "$(git -C "$PROJECT_DIR" rev-parse HEAD)" != "$(cat "$DEPLOY_SNAPSHOT/target-sha")" ]; then
+        # Rollback restores the snapshot whatever code is checked out; only continuing needs the original target.
+        if [ "${ROLLBACK_REQUESTED:-0}" != 1 ] && [ -s "$DEPLOY_SNAPSHOT/target-sha" ] && [ "$(git -C "$PROJECT_DIR" rev-parse HEAD)" != "$(cat "$DEPLOY_SNAPSHOT/target-sha")" ]; then
             print_error "中断部署必须使用原目标提交继续"; return 1
         fi
         PREVIOUS_RUNNING="$(cat "$DEPLOY_SNAPSHOT/was-running")"
         [[ "$PREVIOUS_RUNNING" =~ ^[01]$ ]] || return 1
-        # Complete an already committed activation before beginning another transaction.
+        # 已提交的事务由部署脚本在读取设置前直接完成激活；这里不能重新开始事务或迁移。
         if declare -F migration_docker >/dev/null && migration_docker committed --deployment "$saved_name"; then
-            docker stop --time 30 mixin-chatbot >/dev/null || return 1
-            rm -f -- "$PROJECT_DIR/data/state/verify-only"
-            if [ "$PREVIOUS_RUNNING" = 1 ]; then docker start mixin-chatbot >/dev/null || return 1; fi
-            if docker inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then docker rm "$ROLLBACK_CONTAINER" >/dev/null || return 1; fi
-            rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
-            unset DEPLOY_PREVIOUS_RUNNING DEPLOY_ORIGINAL_CONTAINER
-            begin_deployment
-            return $?
+            print_error "上次操作的数据已经提交；请使用 $(ops_command_hint resume) 完成新实例启动"
+            return 1
         fi
         export BOT_DEPLOY_BACKUP_ID="$saved_name"
         PREVIOUS_IMAGE="$(cat "$DEPLOY_SNAPSHOT/previous-image")"
@@ -95,13 +129,6 @@ begin_deployment() {
     PREVIOUS_STOP_ATTEMPTED=0
     PREVIOUS_IMAGE="$(docker inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null || true)"
     if [ "$(docker inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then PREVIOUS_RUNNING=1; fi
-    if [ -n "${DEPLOY_PREVIOUS_RUNNING:-}" ]; then
-        [[ "$DEPLOY_PREVIOUS_RUNNING" =~ ^[01]$ ]] || { print_error '升级原运行状态无效'; return 1; }
-        local actual_container
-        actual_container="$(docker inspect --format '{{.Id}}' mixin-chatbot 2>/dev/null || echo -)"
-        [ "$actual_container" = "${DEPLOY_ORIGINAL_CONTAINER:-}" ] || { print_error '升级停机后原容器被替换，拒绝部署'; return 1; }
-        PREVIOUS_RUNNING="$DEPLOY_PREVIOUS_RUNNING"
-    fi
     PREVIOUS_TUNNEL_RUNNING=0
     TUNNEL_COMMAND=()
     local tunnel_pid
@@ -128,8 +155,11 @@ begin_deployment() {
     printf '%s' "$PREVIOUS_IMAGE" > "$DEPLOY_SNAPSHOT/previous-image"
     printf '%s' "$PREVIOUS_TUNNEL_RUNNING" > "$DEPLOY_SNAPSHOT/tunnel-running"
     printf '%s' "${HOST_GROUP_DATA_ROOT:-}" > "$DEPLOY_SNAPSHOT/group-root"
-    git -C "$PROJECT_DIR" rev-parse HEAD > "$DEPLOY_SNAPSHOT/target-sha" 2>/dev/null || : > "$DEPLOY_SNAPSHOT/target-sha"
+    if [ -n "$target_sha" ]; then printf '%s\n' "$target_sha" > "$DEPLOY_SNAPSHOT/target-sha"
+    else git -C "$PROJECT_DIR" rev-parse HEAD > "$DEPLOY_SNAPSHOT/target-sha" 2>/dev/null || : > "$DEPLOY_SNAPSHOT/target-sha"; fi
     if [ "${#TUNNEL_COMMAND[@]}" -gt 0 ]; then printf '%s\0' "${TUNNEL_COMMAND[@]}" > "$DEPLOY_SNAPSHOT/tunnel-command"; fi
+    # The pointer is published only after the confirmed choices are recorded; resume and rollback read only that record.
+    if declare -F record_deployment_transaction >/dev/null; then record_deployment_transaction "$DEPLOY_SNAPSHOT" || return 1; fi
     printf '%s' "$(basename -- "$DEPLOY_SNAPSHOT")" > "$PROJECT_DIR/data/state/deploy-transaction.tmp"
     mv -- "$PROJECT_DIR/data/state/deploy-transaction.tmp" "$PROJECT_DIR/data/state/deploy-transaction"
     NEW_CONTAINER_ATTEMPTED=0
@@ -142,7 +172,7 @@ begin_deployment() {
     trap 'exit 143' TERM
     if [ -n "$PREVIOUS_IMAGE" ]; then
         PREVIOUS_STOP_ATTEMPTED=1
-        # An update parent may already have stopped it; announce only a stop made here.
+        # Announce only a stop made here; the container may already have been stopped.
         local running_now
         running_now="$(docker inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)"
         docker stop --time 30 mixin-chatbot >/dev/null
@@ -154,13 +184,19 @@ begin_deployment() {
 }
 
 commit_deployment() {
-    # The update parent must distinguish a committed deployment from a later diagnostic failure or signal.
+    # The upgrader must distinguish a committed deployment from a later diagnostic failure or signal.
     if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then
         printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE" || return 1
     fi
     DEPLOYMENT_COMMITTED=1
     trap - EXIT INT TERM
     if declare -F operation_finish >/dev/null; then trap 'operation_finish "$?"' EXIT; fi
+}
+
+upgrade_code_pending() {
+    declare -p TRANSACTION >/dev/null 2>&1 || return 1
+    [ "${TRANSACTION[operation]-}" = upgrade ] && [ -n "${TRANSACTION[original_sha]-}" ] &&
+        [ "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null)" != "${TRANSACTION[original_sha]}" ]
 }
 
 rollback_deployment() {
@@ -197,8 +233,8 @@ rollback_deployment() {
         local migration_status=0
         rollback_data_migration || migration_status=$?
         if [ "$migration_status" != 0 ]; then
-            # The legacy update parent only understands this receipt. Preserve the target
-            # code (and its recovery tools) even when data restoration itself failed.
+            # The upgrader keeps the target code (and its recovery tools) on this receipt,
+            # even when data restoration itself failed.
             if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
             print_error "数据回滚未完成或已经提交；保持停止，不恢复旧容器。"
             operation_finish 1
@@ -233,10 +269,17 @@ rollback_deployment() {
     fi
     if [ "$failed" = 0 ]; then
         if [ "${MIGRATION_APPLY_ATTEMPTED:-0}" = 1 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then : > "$BOT_UPDATE_COMMIT_FILE"; fi
-        rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
+        # 升级的代码由升级器恢复：代码还不是升级前的提交时保留事务指针，记下“待恢复代码”阶段
+        # （见 transaction_code_restore_pending），代码恢复后才清除，恢复失败时回滚仍可重试。
+        if upgrade_code_pending; then : > "$DEPLOY_SNAPSHOT/code-restore" || failed=1
+        else rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"; fi
+    fi
+    if [ "$failed" = 0 ]; then
         print_warning "已恢复配置、容器、网络入口和原运行状态；快照在 $DEPLOY_SNAPSHOT"
     else print_error "自动回滚未完成；请检查保留的快照 $DEPLOY_SNAPSHOT"; fi
-    [ "$status" -ne 0 ] || status=1
+    # An operator-requested rollback that completed is a success; any other rollback reports the failure.
+    if [ "${ROLLBACK_REQUESTED:-0}" = 1 ] && [ "$failed" = 0 ]; then status=0
+    elif [ "$status" -eq 0 ]; then status=1; fi
     operation_finish "$status"
     exit "$status"
 }

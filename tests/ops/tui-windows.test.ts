@@ -131,7 +131,7 @@ windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非�
         if (state === "verification") {
           const health = payload.checks.find((check: { name: string }) => check.name === "本地机器人健康");
           expect(health.detail).toContain("只验证");
-          expect(health.fix).toContain("系统 → 服务部署 → 升级");
+          expect(health.fix).toContain("系统 → 服务部署 → 继续上次操作");
         }
         for (const check of payload.checks) expect(typeof check.fix).toBe("string");
       }
@@ -165,7 +165,7 @@ windowsTest("TUI 体检与修复输出使用菜单路径，直接调用仍给命
       const health = JSON.parse(result.stdout);
       const fixes = health.checks.map((check: { fix: string }) => check.fix).join("\n");
       expect(fixes).toContain(tui ? "系统 → 服务部署 → 修复隧道" : "scripts\\ops\\ops.ps1 repair-tunnel");
-      expect(fixes).toContain(tui ? "系统 → 服务部署 → 部署 / 重部署" : "scripts\\ops\\ops.ps1 deploy");
+      expect(fixes).toContain(tui ? "系统 → 服务部署 → 部署 / 修改设置" : "scripts\\ops\\ops.ps1 deploy");
       expect(fixes).toContain(tui ? "监控 → 日志" : "scripts\\ops\\ops.ps1 logs");
       if (tui) expect(fixes).not.toMatch(/ops\.ps1|scripts[\\/]|bun run/);
       const printed = await fixture.run(["doctor"], "fail", env);

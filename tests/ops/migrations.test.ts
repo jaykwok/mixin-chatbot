@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { copyFile, cp, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
@@ -84,8 +84,8 @@ test("migration decisions and diagnostics work with the original updater export 
   const f = await fixture("none");
   try {
     const stage = join(f.root, "export");
-    // Migration preview can use only the built-ins and paths in the original updater export.
-    // The PowerShell orchestrator is not needed by preview (or shipped inside the Linux image).
+    // Migration preview can use only the built-ins and paths in the updater exports (Windows and the Linux
+    // UPGRADER_EXPORT_PATHS); the orchestrators and Dockerfile in those exports are not needed by preview.
     for (const path of ["scripts/lib", "scripts/migrations", "src/core/data-version.ts"]) {
       await mkdir(dirname(join(stage, path)), { recursive: true });
       await cp(join(project, path), join(stage, path), { recursive: true });
@@ -324,6 +324,27 @@ test("normal startup ignores a leftover verification flag after the project comm
   } finally { await f.cleanup(); }
 }, 30000);
 
+test("the pre-stop preview stages only in --scratch so data can be mounted read-only", async () => {
+  const f = await fixture();
+  try {
+    const scratch = join(f.root, "preview"), plan = join(scratch, "migration-plan.json");
+    const list = async () => (await readdir(join(f.root, "data"), { recursive: true })).sort();
+    const before = await list(), runtime = await readFile(join(f.root, "data/config/runtime.json"));
+    const result = await execute([join(project, "scripts/migrations/run.ts"), "preview", "--decisions-only", "--project", f.root,
+      "--groups", f.context.groups, "--scratch", scratch, "--plan", plan], f.root);
+    expect(result.code, result.text).toBe(0);
+    expect((await json(plan) as { target: number }).target).toBe(1);
+    // Nothing is created under data/ (not even data/runtime/tmp); the staging copy is removed from the scratch directory.
+    expect(await list()).toEqual(before);
+    expect(await readFile(join(f.root, "data/config/runtime.json"))).toEqual(runtime);
+    expect(await readdir(scratch)).toEqual(["migration-plan.json"]);
+    // Scratch staging is only for the read-only preview.
+    const refused = await execute([join(project, "scripts/migrations/run.ts"), "apply", "--project", f.root, "--groups", f.context.groups, "--scratch", scratch], f.root);
+    expect(refused.code, refused.text).toBe(1); expect(refused.text).toContain("--scratch 只能用于 preview");
+    expect(await json(join(f.root, "data/state/migration.json"))).toBeNull();
+  } finally { await f.cleanup(); }
+}, 30000);
+
 test("migration preview uses mounted runtime storage when the image temporary directory is unavailable", async () => {
   const f = await fixture();
   try {
@@ -401,13 +422,17 @@ test("verification serves health and rejects messages without touching sessions 
   } finally { if (child?.exitCode === null) { child.kill(); await child.exited; } await f.cleanup(); }
 }, 30000);
 
+// Copy only the bootstrap graph. Business views and npm dependencies are deliberately absent.
+async function copyBootstrap(root: string) {
+  for (const path of ["scripts/ops/tui.ts", "scripts/ops/tui/recovery.ts", "scripts/ops/tui/transaction.ts", "scripts/ops/tui/platform.ts", "src/core/data-version.ts", "scripts/lib/operation-log.ts", "scripts/lib/redact.ts", "scripts/lib/cli.ts", "src/server/index.ts"]) {
+    await mkdir(dirname(join(root, path)), { recursive: true }); await copyFile(join(project, path), join(root, path));
+  }
+}
+
 test("TUI recovery and service gate load without importing invalid legacy configuration or dependencies", async () => {
   const f = await fixture("none");
   try {
-    // Copy only the bootstrap graph. Business views and npm dependencies are deliberately absent.
-    for (const path of ["scripts/ops/tui.ts", "scripts/ops/tui/recovery.ts", "scripts/ops/tui/platform.ts", "src/core/data-version.ts", "scripts/lib/operation-log.ts", "scripts/lib/redact.ts", "scripts/lib/cli.ts", "src/server/index.ts"]) {
-      await mkdir(dirname(join(f.root, path)), { recursive: true }); await copyFile(join(project, path), join(f.root, path));
-    }
+    await copyBootstrap(f.root);
     const tui = await execute([join(f.root, "scripts/ops/tui.ts")], f.root);
     expect(tui.code).toBe(1); expect(tui.text).toContain("尚未登记"); expect(tui.text).not.toContain("Cannot find");
     const service = await execute([join(f.root, "src/server/index.ts")], f.root, { GROUP_DATA_ROOT: f.context.groups });
@@ -415,5 +440,34 @@ test("TUI recovery and service gate load without importing invalid legacy config
     const logs = await readdir(join(f.root, "logs/operations")); expect(logs).toHaveLength(1);
     expect(logs[0]).toStartWith("startup-");
     expect(await readFile(join(f.root, "logs/operations", logs[0]!), "utf8")).toContain("尚未登记");
+  } finally { await f.cleanup(); }
+}, 30000);
+
+test("TUI 有未完成的事务时按记录判断，普通设置损坏也进入继续或回滚", async () => {
+  const f = await fixture("none");
+  try {
+    await copyBootstrap(f.root);
+    const tui = () => execute([join(f.root, "scripts/ops/tui.ts")], f.root, { BOT_PORT: "", BOT_DOMAIN: "" });
+    // Only the recorded target root carries a marker, so the detail shows which root the entry inspected.
+    const target = join(f.root, "recorded groups"), snapshot = join(f.root, "backup/snapshots/deploy-abc123");
+    await mkdir(target); await mkdir(snapshot, { recursive: true });
+    await publishJson(join(target, "data-version.json"), { dataVersion: 999, transaction: "fixture" });
+    await writeFile(join(snapshot, "transaction"), Object.entries({
+      format: "1", operation: "deploy", snapshot: "deploy-abc123", target_sha: "", original_sha: "", original_branch: "",
+      original_group_root: f.context.groups, target_group_root: target, was_running: "1", bot_port: "2022", deploy_mode: "direct",
+      bot_domain: "", domain_action: "keep", unmanaged_tunnel: "", platform_ip: "203.0.113.17", reconfigure_ai: "0",
+    }).map(([key, value]) => `${key}=${value}\n`).join(""));
+    await writeFile(join(f.root, "data/state/deploy-transaction"), "deploy-abc123");
+    let result = await tui();
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("数据维护：数据版本比代码新");
+    // Broken ordinary settings no longer stop the entry before the recovery menu.
+    await writeFile(join(f.root, "data/state/bot-port"), "invalid");
+    result = await tui();
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("数据维护：普通设置无法读取（端口无效：invalid");
+    expect(result.text).toContain("先继续或回滚上次操作");
+    // Without a transaction the ordinary settings are loaded first, as before.
+    await rm(join(f.root, "data/state/deploy-transaction"));
+    result = await tui();
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("端口无效：invalid"); expect(result.text).not.toContain("数据维护");
   } finally { await f.cleanup(); }
 }, 30000);

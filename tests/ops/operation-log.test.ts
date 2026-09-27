@@ -69,10 +69,12 @@ for (const writer of ["typescript", ...(process.platform === "win32" ? ["powersh
       else {
         const script = join(f.root, writer === "bash" ? "tokens.sh" : "tokens.ps1");
         await writeFile(script, writer === "bash"
-          ? `PROJECT_DIR="$1"\nunset BOT_OPERATION_LOG\n. '${posix(join(project, "scripts/lib/operation-log.sh"))}'\noperation_start startup\noperation_event error '${message}'\n`
+          ? `set -e\nexport LC_ALL=en_US.UTF-8\nPROJECT_DIR="$1"\nunset BOT_OPERATION_LOG\n. '${posix(join(project, "scripts/lib/operation-log.sh"))}'\noperation_start startup\noperation_event error '${message}'\n`
           : `\ufeff$ErrorActionPreference='Stop'\n$env:BOT_OPERATION_LOG=''\n. ${quotePS(join(project, "scripts/lib/operation-log.ps1"))}\nStart-OperationLog $PSScriptRoot 'startup' | Out-Null\nWrite-OperationEvent 'error' '${message}'\n`);
         const result = await run(writer === "bash" ? [bash!, posix(script), posix(f.root)] : ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
         expect(result.code, result.text).toBe(0);
+        // 服务器常见的 en_US.UTF-8 下脱敏规则也必须能编译，否则 set -e 的部署脚本会中途退出。
+        expect(result.text).not.toContain("sed:");
       }
       const directory = join(f.root, "logs/operations"), files = await readdir(directory);
       expect(files).toHaveLength(1);

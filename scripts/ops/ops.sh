@@ -26,30 +26,19 @@ DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
 BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
 GROUP_DATA_ROOT_FILE="${STATE_DIR}/group-data-root"
 TUNNEL_PID_FILE="${STATE_DIR}/cloudflared.pid"
-if [ -n "${BOT_PORT:-}" ]; then
-    PORT="$BOT_PORT"
-elif [ -f "$BOT_PORT_FILE" ]; then
-    PORT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"
-else
+# 已保存的端口、入口、域名和群根。普通操作再叠加 BOT_PORT/BOT_DOMAIN 环境变量（见文件末尾的入口判断）；
+# 升级、继续和回滚只用已保存设置或事务记录，升级结束后的体检也重新读取这里。
+load_saved_settings() {
     PORT="1011"
-fi
-if [ -f "$DEPLOY_MODE_FILE" ]; then
-    DEPLOY_MODE="$(tr -d '[:space:]' < "$DEPLOY_MODE_FILE")"
-else
+    if [ -f "$BOT_PORT_FILE" ]; then PORT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"; fi
     DEPLOY_MODE="direct"
-fi
-if [ -n "${BOT_DOMAIN:-}" ]; then
-    DOMAIN="$BOT_DOMAIN"
-elif [ -f "$BOT_DOMAIN_FILE" ]; then
-    DOMAIN="$(tr -d '[:space:]' < "$BOT_DOMAIN_FILE")"
-else
+    if [ -f "$DEPLOY_MODE_FILE" ]; then DEPLOY_MODE="$(tr -d '[:space:]' < "$DEPLOY_MODE_FILE")"; fi
     DOMAIN=""
-fi
-if [ -s "$GROUP_DATA_ROOT_FILE" ]; then
-    DEPLOYED_GROUP_DATA_ROOT="$(tr -d '\r\n' < "$GROUP_DATA_ROOT_FILE")"
-else
+    if [ -f "$BOT_DOMAIN_FILE" ]; then DOMAIN="$(tr -d '[:space:]' < "$BOT_DOMAIN_FILE")"; fi
     DEPLOYED_GROUP_DATA_ROOT="$DEFAULT_GROUP_DATA_ROOT"
-fi
+    if [ -s "$GROUP_DATA_ROOT_FILE" ]; then DEPLOYED_GROUP_DATA_ROOT="$(tr -d '\r\n' < "$GROUP_DATA_ROOT_FILE")"; fi
+}
+load_saved_settings
 resolve_group_data_root() {
     local value="$1"
     case "$value" in
@@ -57,22 +46,36 @@ resolve_group_data_root() {
         *) realpath -m -- "${PROJECT_DIR}/${value}" ;;
     esac
 }
-if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-    echo "BOT_PORT/data/state/bot-port 中的端口无效：$PORT" >&2
-    exit 1
-fi
-if [ "$DEPLOY_MODE" != "direct" ] && [ "$DEPLOY_MODE" != "cloudflare" ]; then
-    echo "data/state/deploy-mode 中的部署模式无效：$DEPLOY_MODE" >&2
-    exit 1
-fi
-if [ -n "$DOMAIN" ]; then
-    if NORMALIZED_DOMAIN="$(normalize_hostname_input "$DOMAIN")"; then
-        DOMAIN="$NORMALIZED_DOMAIN"
-    else
-        echo "BOT_DOMAIN/data/state/bot-domain 中的域名无效：$DOMAIN" >&2
+# 普通操作使用已保存设置，入口处先校验。部署脚本自行校验并提供修正；
+# 继续或回滚只使用事务记录（use_transaction_settings），普通设置损坏不能挡住恢复入口。
+check_ordinary_settings() {
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+        echo "BOT_PORT/data/state/bot-port 中的端口无效：$PORT" >&2
         exit 1
     fi
-fi
+    if [ "$DEPLOY_MODE" != "direct" ] && [ "$DEPLOY_MODE" != "cloudflare" ]; then
+        echo "data/state/deploy-mode 中的部署模式无效：$DEPLOY_MODE" >&2
+        exit 1
+    fi
+    if [ -n "$DOMAIN" ]; then
+        if NORMALIZED_DOMAIN="$(normalize_hostname_input "$DOMAIN")"; then
+            DOMAIN="$NORMALIZED_DOMAIN"
+        else
+            echo "BOT_DOMAIN/data/state/bot-domain 中的域名无效：$DOMAIN" >&2
+            exit 1
+        fi
+    fi
+}
+
+# 未完成的部署事务：端口、入口、域名和群根取自记录（续做结束后的体检也用它们）。
+# 记录无法读取时保持原值，由部署脚本报告原因。
+use_transaction_settings() {
+    [ -e "$STATE_DIR/deploy-transaction" ] && load_pending_transaction >/dev/null 2>&1 || return 0
+    PORT="${TRANSACTION[bot_port]}"
+    DEPLOY_MODE="${TRANSACTION[deploy_mode]}"
+    DOMAIN="${TRANSACTION[bot_domain]}"
+    DEPLOYED_GROUP_DATA_ROOT="${TRANSACTION[target_group_root]}"
+}
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 P()  { echo -e "${BLUE}[*]${NC} $1"; operation_event info "$1"; }
@@ -268,7 +271,7 @@ doctor() {
     local health_status=0
     bot_local_ready "$PORT" >/dev/null 2>&1 || health_status=$?
     if [ "$health_status" = 0 ]; then check "本地机器人健康" 1 "就绪且实例身份匹配"
-    elif [ "$health_status" = 3 ]; then check "本地机器人健康" 0 "只验证实例，不处理消息" "使用 $(ops_command_hint update) 继续升级并完成提交。"
+    elif [ "$health_status" = 3 ]; then check "本地机器人健康" 0 "只验证实例，不处理消息" "使用 $(ops_command_hint resume) 继续上次操作并完成提交。"
     else check "本地机器人健康" 0 "未就绪或实例身份不匹配" \
         "使用 $(ops_command_hint restart)，再到 $(ops_command_hint logs) 查看日志。"; fi
 
@@ -564,53 +567,224 @@ history_clear() (
     return "$code"
 )
 
-# git 只在这里用；GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。
-git_here() {
-    GIT_TERMINAL_PROMPT=0 git -C "$PROJECT_DIR" "$@"
-}
+# git_here 和 restore_checkout 在 scripts/lib/common.sh，升级器和旧版升级记录的回滚共用。
 
-# 把工作区退回升级前那个提交。
-#
-# 升级前是 detached HEAD 时（rev-parse --abbrev-ref 返回字面量 "HEAD"）绝不能用 reset：
-# 升级过程中已经 checkout 到 main 了，reset --hard 会把 main 这个分支指针拖回那个游离
-# 提交，等于用一次回滚顺手毁掉 main。这种情况直接 checkout 回那个提交，恢复原本的
-# detached 状态，分支指针一个都不动。
-restore_checkout() {
-    local branch="$1" sha="$2"
-    if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
-        git_here checkout --force "$sha" >/dev/null 2>&1 || { ER "回滚到游离提交 ${sha} 失败"; return 1; }
-        WA "已恢复到升级前的游离 HEAD（${sha:0:7}）；分支指针未改动"
-        return 0
+# 未完成的部署或升级只能继续或回滚；非交互调用必须用 resume / rollback 明确指定。
+# 升级只剩代码待恢复时只能完成回滚。
+choose_pending_action() {
+    local choice menu='1 继续上次操作  2 回滚到操作前  0 退出 [默认 0]：' restore_only=0
+    if transaction_code_restore_pending; then restore_only=1; menu='2 完成回滚（只恢复代码）  0 退出 [默认 0]：'; fi
+    if [ ! -t 0 ]; then
+        if [ "$restore_only" = 1 ]; then ER "上次升级只剩代码待恢复；请使用 $(ops_command_hint rollback) 完成回滚"
+        else ER "发现未完成的部署或升级；请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"; fi
+        return 1
     fi
-    git_here checkout "$branch" >/dev/null 2>&1 || { ER "切回分支 ${branch} 失败"; return 1; }
-    git_here reset --hard "$sha" >/dev/null 2>&1 || { ER "回滚到 ${sha} 失败"; return 1; }
+    while true; do
+        IFS= read -r -p "$menu" choice || choice=0
+        case "$(printf '%s' "$choice" | tr -d '[:space:]')" in
+            1) if [ "$restore_only" = 1 ]; then WA '数据、配置和容器已经回滚，不能继续；请输入 2 或 0'; else PENDING_ACTION=continue; return 0; fi ;;
+            2) PENDING_ACTION=rollback; return 0 ;;
+            ''|0) WA '未处理上次操作，服务保持当前状态'; return 1 ;;
+            *) WA '请输入 1、2 或 0' ;;
+        esac
+    done
 }
 
-update() (
-    operation_start upgrade
-    trap 'operation_finish "$?"' EXIT
-    acquire_deploy_lock || { ER "另一个部署或升级正在进行"; return 1; }
-    local deploy_script="${PROJECT_DIR}/scripts/deploy/deploy.sh"
-    P "同步到 origin/main 并重新部署"
+# 继续或回滚中断的部署或升级：与 update 共用未完成事务的处理；都没有时说明无需处理。
+transaction_command() {
+    UPDATE_TRANSACTION_ACTION="$1" update
+}
 
+require_git_checkout() {
     if ! command -v git >/dev/null 2>&1; then
         ER "找不到 git；无法自动更新"
         return 1
     fi
-    if ! git_here rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        ER "${PROJECT_DIR} 不是 git 仓库，无法自动更新"
-        WA "这份部署可能是解压得到的；请改用 git clone 重新部署后再使用 update"
+    git_here rev-parse --is-inside-work-tree >/dev/null 2>&1 && return 0
+    ER "${PROJECT_DIR} 不是 git 仓库，无法自动更新"
+    WA "这份部署可能是解压得到的；请改用 git clone 重新部署后再使用 update"
+    return 1
+}
+
+remove_upgrade_stage() {
+    local stage="${UPGRADE_STAGE:-}"
+    UPGRADE_STAGE=''
+    case "$stage" in "$PROJECT_DIR"/tmp/upgrade-????????) ;; *) return 0 ;; esac
+    [ -d "$stage" ] && [ ! -L "$stage" ] || return 0
+    rm -rf -- "$stage" || WA "升级导出目录清理失败，保留 $stage"
+}
+
+forward_to_upgrader() {
+    [ -z "${UPGRADER_PID:-}" ] || kill -TERM "$UPGRADER_PID" 2>/dev/null || true
+}
+
+# 从目标提交导出升级器到 tmp/upgrade-*，在工作区外运行：停机、切换代码、迁移和回滚都由目标版本负责。
+run_target_upgrader() {
+    local target="$1" action="${2:-}" status=0
+    mkdir -p "$PROJECT_DIR/tmp" || return 1
+    UPGRADE_STAGE="$(mktemp -d "$PROJECT_DIR/tmp/upgrade-XXXXXXXX")" || { ER '无法创建升级导出目录'; return 1; }
+    operation_stage export-target-upgrader
+    if ! git_here archive --format=tar "$target" "${UPGRADER_EXPORT_PATHS[@]}" | tar -x -C "$UPGRADE_STAGE"; then
+        ER "无法从目标提交 ${target:0:7} 导出升级器"
+        remove_upgrade_stage
         return 1
     fi
-    if [ ! -f "$deploy_script" ]; then
-        ER "找不到部署脚本：$deploy_script"
+    operation_stage target-upgrader
+    # 升级器在后台运行以便转发中断：收到 INT/TERM 时让它按所处阶段回滚，等它结束后才清理导出目录。
+    trap forward_to_upgrader INT TERM
+    bash "$UPGRADE_STAGE/scripts/deploy/upgrade.sh" "$PROJECT_DIR" "$target" ${action:+"$action"} <&0 &
+    UPGRADER_PID=$!
+    while :; do
+        if wait "$UPGRADER_PID"; then status=0; else status=$?; fi
+        kill -0 "$UPGRADER_PID" 2>/dev/null || break
+    done
+    UPGRADER_PID=''
+    trap - INT TERM
+    remove_upgrade_stage
+    return "$status"
+}
+
+# 升级前运行的服务会被重新启动：再做一次完整体检；原先停止的保持停止。
+# 升级按已保存设置或事务记录完成并写回：体检参数按持久化设置重新读取，不用当前终端的环境变量。
+after_upgrade() {
+    load_saved_settings
+    check_ordinary_settings
+    if [ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; then doctor; return $?; fi
+    OK "保留原停止状态，使用 start 可启动新版本"
+}
+
+# 未完成的升级：从记录的目标提交（本地已有，不拉取）导出升级器继续或回滚。
+# 目标提交在本地缺失时无法继续；此时代码必然尚未切换，回滚交给当前版本的部署脚本。
+resume_recorded_upgrade() {
+    local action="$1" target="${TRANSACTION[target_sha]}"
+    require_git_checkout || return 1
+    [ -n "$target" ] || { ER '升级事务缺少目标提交，请人工检查 backup/snapshots'; return 1; }
+    if git_here cat-file -e "${target}^{commit}" 2>/dev/null; then
+        run_target_upgrader "$target" "$action" || return $?
+        if [ "$action" = continue ]; then after_upgrade; fi
+        return
+    fi
+    if [ "$action" = continue ]; then
+        ER "事务记录的目标提交 ${target:0:7} 在本地不存在，无法继续；请使用 $(ops_command_hint rollback) 回滚"
         return 1
+    fi
+    if [ "$(git_here rev-parse HEAD 2>/dev/null)" != "${TRANSACTION[original_sha]}" ]; then
+        ER "目标提交 ${target:0:7} 在本地不存在，当前代码也不是升级前的 ${TRANSACTION[original_sha]:0:7}；请人工检查 git 状态"
+        return 1
+    fi
+    if transaction_code_restore_pending; then
+        rm -f -- "$STATE_DIR/deploy-transaction" || { ER '事务指针清除失败，请重试'; return 1; }
+        OK "升级已回滚：代码已是升级前的 ${TRANSACTION[original_sha]:0:7}，数据、配置和原运行状态已恢复"
+        return 0
+    fi
+    WA "目标提交 ${target:0:7} 在本地不存在；代码尚未切换，由当前版本的部署脚本回滚"
+    DEPLOY_TRANSACTION_ACTION=rollback bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" </dev/null
+}
+
+# 旧版升级留下的停机记录（data/state/update-transaction）；新升级不再写它。新版运维脚本只会在
+# 旧版升级切换代码之后出现，此时当前代码就是那次升级的目标。部署已经开始：由部署脚本按事务继续或回滚，
+# 回滚后恢复升级前的代码；部署尚未开始：数据和配置未改动，只能回滚（恢复代码和原容器）。
+legacy_update_recovery() {
+    local action="$1" stop_state="$STATE_DIR/update-transaction" commit_file="$STATE_DIR/update-commit" saved=() current status=0
+    [ -f "$stop_state" ] && [ ! -L "$stop_state" ] || { ER '升级停机记录不是普通文件'; return 1; }
+    [ ! -L "$commit_file" ] || { ER '升级提交回执不能是链接'; return 1; }
+    require_git_checkout || return 1
+    mapfile -t saved < "$stop_state"
+    [ "${#saved[@]}" = 6 ] && [ "${saved[0]}" = 1 ] &&
+      [[ "${saved[1]}" =~ ^[0-9a-f]{40}$ && "${saved[3]}" =~ ^[0-9a-f]{40}$ && "${saved[4]}" =~ ^(-|[0-9a-f]{64})$ && "${saved[5]}" =~ ^[01]$ ]] || { ER '升级停机记录无效'; return 1; }
+    [ "${saved[2]}" = HEAD ] || git_here check-ref-format --branch "${saved[2]}" >/dev/null || { ER '升级停机记录的分支无效'; return 1; }
+    local original_sha="${saved[1]}" original_branch="${saved[2]}" target_sha="${saved[3]}" original_container="${saved[4]}" was_running="${saved[5]}"
+    current="$(git_here rev-parse HEAD 2>/dev/null)"
+    [ "$current" = "$original_sha" ] || [ "$current" = "$target_sha" ] || { ER '当前代码与中断升级不匹配'; return 1; }
+    WA "未完成的旧版升级：${original_sha:0:7} -> ${target_sha:0:7}；原运行状态：$([ "$was_running" = 1 ] && echo 运行 || echo 停止)"
+    if [ -e "$STATE_DIR/deploy-transaction" ]; then
+        if transaction_code_restore_pending; then
+            if [ "$action" = continue ]; then
+                ER "上次升级的数据、配置和容器已经回滚，只剩代码待恢复，不能继续；请使用 $(ops_command_hint rollback) 完成回滚"
+                return 1
+            fi
+        else
+            if [ "$action" = continue ] && [ "$current" != "$target_sha" ]; then
+                ER "当前代码不是中断升级的目标提交 ${target_sha:0:7}，无法继续；请使用 $(ops_command_hint rollback) 回滚"
+                return 1
+            fi
+            DEPLOY_TRANSACTION_ACTION="$action" BOT_UPDATE_COMMIT_FILE="$commit_file" bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" </dev/null || status=$?
+            if [ -e "$STATE_DIR/deploy-transaction" ] && ! transaction_code_restore_pending; then
+                WA "部署事务尚未完成，保留当前代码和停机记录；请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
+                return 1
+            fi
+            if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then
+                rm -f -- "$stop_state" "$commit_file" || WA '升级停机记录清理失败'
+                if [ "$status" = 0 ]; then OK "中断的升级已完成：${target_sha:0:7}"; else ER '数据已经提交，保留新版本；请检查服务状态'; fi
+                return "$status"
+            fi
+        fi
+        # 部署事务已回滚：原容器和原运行状态已由部署脚本恢复，再恢复升级前的代码。
+        # 代码恢复后才清除事务指针和停机记录；失败时重试回滚只恢复代码。
+        if [ "$(git_here rev-parse HEAD 2>/dev/null)" != "$original_sha" ]; then
+            restore_checkout "$original_branch" "$original_sha" || {
+                ER "代码未能恢复到升级前的 ${original_sha:0:7}（原因见上方）；数据、配置和原运行状态已恢复。处理 git 问题后运行 $(ops_command_hint rollback)，只恢复代码"
+                return 1
+            }
+        fi
+        rm -f -- "$STATE_DIR/deploy-transaction" "$stop_state" "$commit_file" || WA '升级停机记录清理失败'
+        if [ "$status" = 0 ]; then OK "升级已回滚：代码恢复到 ${original_sha:0:7}，数据、配置和原运行状态已恢复"
+        else ER "中断的升级未能完成，已回滚到 ${original_sha:0:7}"; fi
+        return "$status"
+    fi
+    if [ "$action" = continue ]; then
+        ER "旧版升级在部署开始前中断，无法按旧流程继续；请使用 $(ops_command_hint rollback) 恢复原版本后重新升级"
+        return 1
+    fi
+    if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then
+        ER "升级已经提交，不能回滚；保留新版本，请检查服务状态后启动"
+        return 1
+    fi
+    if [ "$current" != "$original_sha" ]; then
+        restore_checkout "$original_branch" "$original_sha" || { ER "代码自动回滚失败，请检查当前 git 状态"; return 1; }
+    fi
+    if [ "$original_container" != - ]; then
+        if [ "$(docker inspect --format '{{.Id}}' "$CONTAINER" 2>/dev/null)" != "$original_container" ]; then
+            ER '原容器身份不匹配，保留停机记录，拒绝启动其他容器'
+            return 1
+        fi
+        if [ "$was_running" = 1 ]; then docker start "$original_container" >/dev/null || { ER '恢复原容器失败'; return 1; }; fi
+    fi
+    rm -f -- "$stop_state" "$commit_file" || WA '升级停机记录清理失败'
+    if [ "$was_running" = 1 ]; then OK "升级已回滚：代码恢复到 ${original_sha:0:7}，原容器已重新启动"
+    else OK "升级已回滚：代码恢复到 ${original_sha:0:7}，机器人服务保持停止（升级前未运行）"; fi
+}
+
+update() (
+    operation_start upgrade
+    UPGRADE_STAGE=''
+    UPGRADER_PID=''
+    trap 'status=$?; remove_upgrade_stage; operation_finish "$status"' EXIT
+    acquire_deploy_lock || { ER "另一个部署或升级正在进行"; return 1; }
+    local action="${UPDATE_TRANSACTION_ACTION:-}"
+    # 未完成的事务最先处理，早于检查改动和拉取：继续固定使用记录的目标提交（本地已有），离线也能继续或回滚。
+    if [ -e "$STATE_DIR/update-transaction" ] || [ -e "$STATE_DIR/deploy-transaction" ]; then
+        if [ -e "$STATE_DIR/deploy-transaction" ]; then
+            load_pending_transaction || { ER '未完成事务的记录无法读取（原因见上方），请人工检查 backup/snapshots'; return 1; }
+            WA "$(describe_pending_transaction)"
+        fi
+        if [ -z "$action" ]; then choose_pending_action || return 1; action="$PENDING_ACTION"; fi
+        if [ -e "$STATE_DIR/update-transaction" ]; then legacy_update_recovery "$action"; return; fi
+        if [ "${TRANSACTION[operation]}" = upgrade ]; then resume_recorded_upgrade "$action"; return; fi
+        # 中断的是部署：交给部署脚本按事务记录继续或回滚。
+        DEPLOY_TRANSACTION_ACTION="$action" bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" </dev/null
+        return
+    elif [ -n "$action" ]; then
+        OK '没有未完成的部署或升级'
+        return 0
     fi
 
-    # 已跟踪文件的改动会被后面的 checkout/reset 冲掉，必须先拦下来。只看已跟踪文件：
+    P "同步到 origin/main，由目标版本的升级器完成升级"
+    require_git_checkout || return 1
+    # 已跟踪文件的改动会被升级器的 checkout 冲掉，必须先拦下来。只看已跟踪文件：
     # 未跟踪文件不会被这些操作动到，拿它们挡住升级只会让这条命令永远跑不起来。
     # data/ 和 logs/ 都在 .gitignore 里，配置与群数据本来就不算改动。
-    local dirty
+    local dirty target
     dirty="$(git_here status --porcelain --untracked-files=no 2>&1)"
     if [ -n "$dirty" ]; then
         ER "已跟踪文件有未提交的改动，已停止升级："
@@ -618,232 +792,17 @@ update() (
         WA "请先提交、撤销（git restore <文件>）或备份这些改动，然后重试"
         return 1
     fi
-
-    local original_branch original_sha
-    original_branch="$(git_here rev-parse --abbrev-ref HEAD 2>/dev/null)"
-    original_sha="$(git_here rev-parse HEAD 2>/dev/null)"
-    if [ -z "$original_sha" ]; then ER "无法读取当前提交"; return 1; fi
-    local update_changed=0 update_committed=0 deploy_pid='' commit_file=''
-    local current_sha="$original_sha" target_sha='' was_running=0 original_container='-' handoff_container='-'
-    local stop_state="$STATE_DIR/update-transaction" saved=() pending_running='' pending_snapshot=''
-    if [ -e "$stop_state" ]; then
-        [ -f "$stop_state" ] && [ ! -L "$stop_state" ] || { ER '升级停机记录不是普通文件'; return 1; }
-        mapfile -t saved < "$stop_state"
-        [ "${#saved[@]}" = 6 ] && [ "${saved[0]}" = 1 ] &&
-          [[ "${saved[1]}" =~ ^[0-9a-f]{40}$ && "${saved[3]}" =~ ^[0-9a-f]{40}$ && "${saved[4]}" =~ ^(-|[0-9a-f]{64})$ && "${saved[5]}" =~ ^[01]$ ]] || { ER '升级停机记录无效'; return 1; }
-        [ "${saved[2]}" = HEAD ] || git_here check-ref-format --branch "${saved[2]}" >/dev/null || return 1
-        [ "$current_sha" = "${saved[1]}" ] || [ "$current_sha" = "${saved[3]}" ] || { ER '当前代码与中断升级不匹配'; return 1; }
-        original_sha="${saved[1]}"; original_branch="${saved[2]}"; target_sha="${saved[3]}"
-        original_container="${saved[4]}"; was_running="${saved[5]}"
-        commit_file="$STATE_DIR/update-commit"
-        [ -f "$commit_file" ] && [ ! -L "$commit_file" ] || { ER '升级提交回执缺失或无效，保留停机状态'; return 1; }
-        case "$(cat "$commit_file")" in ''|committed) ;; *) ER '升级提交回执损坏，保留停机状态'; return 1 ;; esac
-        [ "$current_sha" = "$original_sha" ] || update_changed=1
-        P "继续中断升级 ${target_sha:0:7}，沿用原运行状态"
-    fi
-    finish_update() {
-        local status=$? recovered=1 pending=0
-        trap - EXIT INT TERM
-        if [ -n "$deploy_pid" ]; then
-            kill -TERM "$deploy_pid" 2>/dev/null || true
-            wait "$deploy_pid" 2>/dev/null || true
-        fi
-        if [ -n "$commit_file" ]; then
-            if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then update_committed=1; fi
-        fi
-        # A child that has not completed rollback still owns its stopped containers/data.
-        if [ -e "$STATE_DIR/deploy-transaction" ]; then pending=1; fi
-        if [ "$update_changed" = 1 ] && [ "$update_committed" != 1 ] && [ "$pending" = 0 ]; then
-            operation_stage rollback-code
-            ER "升级未提交，正在恢复升级前的代码..."
-            restore_checkout "$original_branch" "$original_sha" || { ER "代码自动回滚失败，请检查当前 git 状态"; status=1; recovered=0; }
-        fi
-        if [ -f "$stop_state" ] && [ "$pending" = 0 ] && [ "$recovered" = 1 ]; then
-            if [ "$update_committed" != 1 ] && [ "$original_container" != - ]; then
-                if [ "$(docker inspect --format '{{.Id}}' "$CONTAINER" 2>/dev/null)" != "$original_container" ]; then
-                    ER '原容器身份不匹配，保留停机记录，拒绝启动其他容器'; recovered=0; status=1
-                elif [ "$was_running" = 1 ]; then
-                    docker start "$original_container" >/dev/null || { recovered=0; status=1; ER '恢复原容器失败'; }
-                fi
-            fi
-            if [ "$recovered" = 1 ]; then
-                rm -f -- "$stop_state" "$commit_file" || WA '升级停机记录清理失败'
-            fi
-        elif [ "$pending" = 1 ]; then
-            WA '部署事务尚未完成，保留当前代码和停机记录，请重试升级继续'
-        fi
-        operation_finish "$status"
-        exit "$status"
-    }
-    trap finish_update EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-
     P "拉取 origin/main..."
     operation_stage fetch
     if ! operation_capture git_here fetch --prune origin main; then
         ER "git fetch 失败"
         return 1
     fi
-
-    if [ "$original_branch" != "main" ]; then
-        if [ "$original_branch" = "HEAD" ]; then
-            WA "当前是游离 HEAD（${original_sha:0:7}），不在任何分支上"
-        else
-            WA "当前在分支 ${original_branch}，不是 main"
-        fi
-        if ! ask_yes_no "切换到 main 并继续升级？[y/N] "; then
-            WA "已取消升级"
-            return 1
-        fi
-    fi
-
-    if [ -z "$target_sha" ]; then target_sha="$(git_here rev-parse origin/main 2>/dev/null)"; fi
-    operation_event info "original=$original_sha target=$target_sha"
-    if [ -s "$PROJECT_DIR/data/state/deploy-transaction" ]; then
-        local pending_name pending_target
-        pending_name="$(cat "$PROJECT_DIR/data/state/deploy-transaction")"
-        [[ "$pending_name" =~ ^deploy-[a-zA-Z0-9]+$ ]] || { ER "中断事务名称无效"; return 1; }
-        pending_target="$(cat "$PROJECT_DIR/backup/snapshots/$pending_name/target-sha")"
-        [[ "$pending_target" =~ ^[0-9a-f]{40}$ ]] || { ER "中断事务目标无效"; return 1; }
-        if [ -f "$stop_state" ] && [ "$target_sha" != "$pending_target" ]; then ER '停机记录与部署事务目标不一致'; return 1; fi
-        target_sha="$pending_target"
-        pending_snapshot="$PROJECT_DIR/backup/snapshots/$pending_name"
-        pending_running="$(cat "$pending_snapshot/was-running")"
-        [[ "$pending_running" =~ ^[01]$ ]] || { ER '中断部署的原运行状态无效'; return 1; }
-        P "继续中断的目标提交 ${target_sha:0:7}"
-    fi
-    if [ -z "$target_sha" ]; then
-        ER "无法解析 origin/main；请确认远端存在 main 分支"
-        return 1
-    fi
-
-    if [ "$current_sha" = "$target_sha" ]; then
-        OK "代码已经最新，仍检查数据版本并完成必要迁移"
-    fi
-
-    # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
-    if ! git_here show-ref --verify --quiet refs/heads/main; then
-        ER "本地 main 分支不存在，请先建立 main 后重试"
-        return 1
-    fi
-    if ! git_here merge-base --is-ancestor main "$target_sha"; then
-        ER "本地 main 无法快进到目标提交 ${target_sha:0:7}"
-        WA "本地独有的提交："
-        git_here log --oneline "$target_sha..main" | sed 's/^/      /'
-        WA "请先推送或丢弃这些提交后重试"
-        return 1
-    fi
-
-    echo ""
-    echo -e "${CYAN}将要应用的提交：${NC}"
-    git_here log --oneline "main..$target_sha" | sed 's/^/      /'
-    echo ""
-
-    docker info >/dev/null 2>&1 || { ER '无法连接 Docker，尚未应用升级'; return 1; }
-    # 升级沿用现有 AI 配置；缺少模型配置需要交互向导，应先通过部署完成，不能留到停机后。
-    [ -f "$MODELS_FILE" ] || { ER "缺少 data/config/models.json；升级沿用现有 AI 配置，请先使用 $(ops_command_hint deploy) 完成配置"; return 1; }
-    # 部署脚本在停机后不再询问隧道：未托管 connector 的归属和缺失的 token 都在停机前按当前模式确认。
-    local tunnel_prepared='' tunnel_input='' unmanaged_confirmed='' unmanaged_pid=''
-    if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1; then
-        unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
-        if [ "$DEPLOY_MODE" = cloudflare ]; then
-            WA "检测到未由本项目记录的 cloudflared（pid ${unmanaged_pid}），无法自动确认它连接的是当前隧道"
-            ask_yes_no "确认该 connector 正在服务本项目，继续升级？[y/N] " || { WA '已取消升级；代码和配置未改动'; return 1; }
-        else
-            WA "系统有未由本项目记录的 cloudflared（pid ${unmanaged_pid}）；不会自动停止，以免影响其他隧道"
-            ask_yes_no "确认该 connector 与本项目无关或其入口仍受保护，继续升级？[y/N] " || { WA '已取消升级；代码和配置未改动'; return 1; }
-        fi
-        unmanaged_confirmed="$DEPLOY_MODE"
-    elif [ "$DEPLOY_MODE" = cloudflare ] && ! managed_cloudflared_pid >/dev/null 2>&1; then
-        if ! (load_tunnel_token) >/dev/null 2>&1; then
-            P '未运行 cloudflared 且没有可用的已保存 token；请先提供，升级验证实例就绪后启动'
-            show_tunnel_token_help
-            while true; do
-                if ! IFS= read -r -s -p '隧道 token 或文件路径（输入隐藏）：' tunnel_input; then
-                    echo ""; WA '输入已结束，已取消升级；代码和配置未改动'; return 1
-                fi
-                echo ""
-                if (load_tunnel_token "$tunnel_input"); then break; fi
-            done
-        fi
-        tunnel_prepared=1
-    fi
-    if has_container; then
-        handoff_container="$(docker inspect --format '{{.Id}}' "$CONTAINER")" || return 1
-        [[ "$handoff_container" =~ ^[0-9a-f]{64}$ ]] || { ER '无法识别原容器'; return 1; }
-    fi
-    if [ ! -f "$stop_state" ]; then
-        original_container="$handoff_container"
-        if [ "$original_container" != - ] && [ "$(docker inspect --format '{{.State.Running}}' "$original_container")" = true ]; then was_running=1; fi
-        if [ -n "$pending_snapshot" ]; then
-            was_running="$pending_running"
-            if [ ! -s "$pending_snapshot/previous-image" ]; then original_container='-'
-            else original_container="$(docker inspect --format '{{.Id}}' "$ROLLBACK_CONTAINER" 2>/dev/null || printf '%s' "$handoff_container")"; fi
-        fi
-        # Persist before stop: a hard interruption must not lose the original running state.
-        commit_file="$STATE_DIR/update-commit"
-        [ ! -L "$commit_file" ] || { ER '升级回执不能是链接'; return 1; }
-        : > "$commit_file" || return 1
-        local stop_temporary
-        stop_temporary="$(mktemp "$STATE_DIR/update-transaction-XXXXXXXX")" || return 1
-        printf '%s\n' 1 "$original_sha" "$original_branch" "$target_sha" "$original_container" "$was_running" > "$stop_temporary" &&
-          mv -- "$stop_temporary" "$stop_state" || return 1
-    elif [ "$handoff_container" != "$original_container" ] && [ ! -e "$STATE_DIR/deploy-transaction" ] && [ "$(cat "$commit_file")" != committed ]; then
-        ER '原容器已被替换，拒绝继续中断升级'; return 1
-    fi
-    operation_stage stop-service
-    P '先停止旧容器，再切换代码和构建镜像；升级期间服务保持停止'
-    if [ "$handoff_container" != - ]; then
-        operation_capture docker stop --time 30 "$handoff_container" || { ER '旧容器停止失败，未切换代码'; return 1; }
-        [ "$(docker inspect --format '{{.State.Running}}' "$handoff_container")" = false ] || { ER '旧容器尚未停止，未切换代码'; return 1; }
-    fi
-    if [ "$was_running" = 1 ]; then
-        OK "已停止机器人服务（容器 ${CONTAINER}）；升级完成前不处理消息"
-    else
-        OK "机器人服务升级前未运行（容器 ${CONTAINER}），升级后保持停止"
-    fi
-    update_changed=1
-    operation_stage checkout
-    if ! operation_capture_quiet git_here checkout --quiet main; then ER '切换到 main 失败'; return 1; fi
-    if ! operation_capture_quiet git_here merge --ff-only --quiet "$target_sha"; then
-        ER "git merge --ff-only 失败"
-        return 1
-    fi
-    OK "代码已更新：${original_sha:0:7} -> ${target_sha:0:7}"
-
-    # Docker 部署升级必须重建镜像，而「重建 + 换容器 + 失败自动换回旧容器」这套逻辑已经
-    # 完整存在于 deploy.sh 里。在这里再写一遍等于把最关键的安全逻辑维护成两份，所以直接
-    # 交给它。DEPLOY_REUSE_SETTINGS 让它沿用已保存的端口、模式、域名、群数据根和 AI 配置，
-    # 停机期间不再询问配置；要改这些配置请使用 deploy。
-    # 隧道也由 deploy.sh 一并处理，不需要在这里单独重启 cloudflared；它需要的 token 和归属确认已在停机前取得。
-    P "沿用现有配置重建镜像并切换容器（端口、入口模式、群数据总根、域名和 AI 配置不变）..."
-    echo ""
-    mkdir -p "$PROJECT_DIR/tmp" || return 1
-    # 停机前的隧道确认经环境交给部署脚本（不进入命令行参数），部署脚本读入后立即清除。
-    DEPLOY_TUNNEL_INPUT_PREPARED="$tunnel_prepared" DEPLOY_TUNNEL_TOKEN_INPUT="$tunnel_input" DEPLOY_UNMANAGED_TUNNEL_CONFIRMED="$unmanaged_confirmed" \
-      DEPLOY_REUSE_SETTINGS=1 BOT_UPDATE_COMMIT_FILE="$commit_file" DEPLOY_PRESERVE_STOPPED=1 DEPLOY_PREVIOUS_RUNNING="$was_running" DEPLOY_ORIGINAL_CONTAINER="$handoff_container" bash "$deploy_script" <&0 &
-    deploy_pid=$!
-    tunnel_input=''
-    if wait "$deploy_pid"; then
-        deploy_pid=''
-        update_committed=1
-        echo ""
-        OK "升级完成：${original_sha:0:7} -> ${target_sha:0:7}"
-        echo ""
-        if [ "$was_running" = 1 ]; then doctor; return $?; fi
-        OK "保留原停止状态，使用 start 可启动新版本"
-        return 0
-    fi
-
-    deploy_pid=''
-    if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then
-        update_committed=1
-        ER "数据迁移已开始或部署已提交，但后续操作未完成；保留当前代码，请检查后重试升级"
-        return 1
-    fi
-    ER "部署失败，退出前将恢复升级前的代码"
-    return 1
+    target="$(git_here rev-parse --verify --quiet 'origin/main^{commit}')" || { ER "无法解析 origin/main；请确认远端存在 main 分支"; return 1; }
+    operation_event info "original=$(git_here rev-parse HEAD 2>/dev/null) target=$target"
+    # 停机前的预检、隧道确认和迁移预览，停机、切换代码和回滚都由目标版本的升级器负责。
+    run_target_upgrader "$target" || return $?
+    after_upgrade
 )
 
 show_logs() {
@@ -915,10 +874,24 @@ uninstall() {
     OK "卸载流程完成。"
 }
 
+# 升级、继续和回滚忽略当前终端的 BOT_PORT/BOT_DOMAIN，入口也不校验普通设置：有未完成事务时用事务记录，
+# 新升级由升级器在停机前校验已保存设置。部署脚本自行校验设置；其余操作采用环境变量并先校验。
+case "${1:-}" in
+    update|upgrade|resume|rollback) use_transaction_settings ;;
+    deploy) ;;
+    *)
+        if [ -n "${BOT_PORT:-}" ]; then PORT="$BOT_PORT"; fi
+        if [ -n "${BOT_DOMAIN:-}" ]; then DOMAIN="$BOT_DOMAIN"; fi
+        check_ordinary_settings
+        ;;
+esac
+
 case "${1:-}" in
     deploy) exec bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" ;;
     doctor|status) doctor ;;
     update|upgrade) update ;;
+    resume)    transaction_command continue ;;
+    rollback)  transaction_command rollback ;;
     restart)   restart_bot ;;
     stop)      stop_bot ;;
     start)     start_bot ;;
@@ -951,8 +924,11 @@ case "${1:-}" in
         echo "  doctor     健康检查：群数据根、容器、:$PORT、配置；隧道模式额外检查 Cloudflare"
         echo "             加 --json 输出单行 JSON，供运维界面消费"
         echo "  deploy     配置并部署当前代码；已有部署可用于重建修复，失败自动回滚"
-        echo "  update     同步 origin/main，再交给 deploy.sh 重建并切换容器；失败自动回滚代码"
-        echo "             沿用现有端口、入口模式、群数据根、域名和 AI 配置，停机后不再询问配置；改配置请用 deploy"
+        echo "  update     同步 origin/main，由目标版本的升级器在停机前预检、确认隧道并预览迁移，"
+        echo "             再停机重建并切换容器；提交前失败自动回滚。沿用现有端口、入口模式、群数据根、"
+        echo "             域名和 AI 配置；改配置请用 deploy"
+        echo "  resume     继续中断的部署或升级：使用事务记录中的目标提交和设置，不拉取新的 main"
+        echo "  rollback   回滚中断的部署或升级：恢复数据、配置、代码和原运行状态；数据已提交时拒绝"
         echo "  restart    重启 Docker 容器"
         echo "  stop       停止 Docker 容器"
         echo "  start      启动 Docker 容器"

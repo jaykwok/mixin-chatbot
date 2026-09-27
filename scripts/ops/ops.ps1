@@ -42,6 +42,19 @@ if ($RequestBase64) {
     $OutputEncoding = [Console]::OutputEncoding
 }
 
+# 先解码运维界面的请求：恢复入口要在读取普通设置之前识别。
+# Decode data after PowerShell parameter binding; no expression evaluation or token reparsing.
+if ($RequestBase64) {
+    $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
+    foreach ($property in $request.PSObject.Properties) {
+        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId')) {
+            throw "无效的运维请求字段"
+        }
+        Set-Variable -Name $property.Name -Value $property.Value
+    }
+}
+if ($StorageSegment -and $GroupId) { throw "群目录选择参数互斥" }
+
 $Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 # 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、主机名校验、交互提示）。
 $CommonLib = Join-Path $PSScriptRoot "..\lib\common.ps1"
@@ -56,18 +69,6 @@ $ConfigDir = Join-Path $DataDir "config"
 $StateDir = Join-Path $DataDir "state"
 $RuntimeDir = Join-Path $DataDir "runtime"
 $DefaultGroupDataRoot = Join-Path $DataDir "groups"
-$portFile = Join-Path $StateDir "bot-port"
-$Port     = if ($env:BOT_PORT) { $env:BOT_PORT } elseif (Test-Path $portFile) { (Get-Content $portFile -Raw).Trim() } else { "1011" }
-$modeFile = Join-Path $StateDir "deploy-mode"
-$DeployMode = if (Test-Path $modeFile) { (Get-Content $modeFile -Raw).Trim() } else { "direct" }
-$domainFile = Join-Path $StateDir "bot-domain"
-$Domain   = if ($env:BOT_DOMAIN) { $env:BOT_DOMAIN.Trim() } elseif (Test-Path $domainFile) { (Get-Content $domainFile -Raw).Trim() } else { "" }
-$groupRootFile = Join-Path $StateDir "group-data-root"
-$DeployedGroupDataRoot = if (Test-Path -LiteralPath $groupRootFile -PathType Leaf) {
-    (Get-Content -LiteralPath $groupRootFile -Raw).Trim()
-} else {
-    $DefaultGroupDataRoot
-}
 $LogPath  = Join-Path $Project "logs\mixin-chatbot.log"
 $TunnelScript = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
 $ModelsFile = Join-Path $ConfigDir "models.json"
@@ -578,20 +579,44 @@ function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]
     }
 }
 
-$portNumber = 0
-if (-not [int]::TryParse($Port, [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
-    throw "BOT_PORT/data/state/bot-port 中的端口无效：$Port"
+# 继续、回滚和有未完成事务的升级只把命令交给部署或升级脚本，由它们按事务记录执行：
+# 这里不读取普通设置，设置损坏或为空都不能挡住恢复入口。
+$pendingTransaction = (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) -or
+    (Test-Path -LiteralPath (Join-Path $StateDir 'upgrade-transaction'))
+$recovering = $Command -in @('resume', 'rollback') -or ($pendingTransaction -and $Command -in @('update', 'upgrade'))
+$Port = '1011'; $DeployMode = 'direct'; $Domain = ''; $DeployedGroupDataRoot = $DefaultGroupDataRoot
+function Read-StateText([string]$Name) {
+    $path = Join-Path $StateDir $Name
+    if (Test-Path -LiteralPath $path -PathType Leaf) { return "$(Get-Content -LiteralPath $path -Raw)".Trim() }
+    return $null
 }
-$Port = "$portNumber"
-if ($DeployMode -notin @("direct", "cloudflare")) {
-    throw "data/state/deploy-mode 中的部署模式无效：$DeployMode"
+if (-not $recovering) {
+    # 普通操作使用已保存设置（环境变量优先）；空文件与损坏的值一样报错，空的群根按默认值。
+    $savedPort = Read-StateText 'bot-port'
+    $Port = if ($env:BOT_PORT) { $env:BOT_PORT } elseif ($null -ne $savedPort) { $savedPort } else { '1011' }
+    $savedMode = Read-StateText 'deploy-mode'
+    $DeployMode = if ($null -ne $savedMode) { $savedMode } else { 'direct' }
+    $Domain = if ($env:BOT_DOMAIN) { $env:BOT_DOMAIN.Trim() } else { [string](Read-StateText 'bot-domain') }
+    $savedGroupRoot = Read-StateText 'group-data-root'
+    if ($savedGroupRoot) { $DeployedGroupDataRoot = $savedGroupRoot }
 }
-if ($Domain) {
-    $normalizedDomain = ConvertTo-Hostname $Domain
-    if (-not $normalizedDomain) {
-        throw "BOT_DOMAIN/data/state/bot-domain 中的域名无效：$Domain"
+# 部署脚本自行校验并提供修正。
+if (-not $recovering -and $Command -ne 'deploy') {
+    $portNumber = 0
+    if (-not [int]::TryParse($Port, [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
+        throw "BOT_PORT/data/state/bot-port 中的端口无效：$Port"
     }
-    $Domain = $normalizedDomain
+    $Port = "$portNumber"
+    if ($DeployMode -notin @("direct", "cloudflare")) {
+        throw "data/state/deploy-mode 中的部署模式无效：$DeployMode"
+    }
+    if ($Domain) {
+        $normalizedDomain = ConvertTo-Hostname $Domain
+        if (-not $normalizedDomain) {
+            throw "BOT_DOMAIN/data/state/bot-domain 中的域名无效：$Domain"
+        }
+        $Domain = $normalizedDomain
+    }
 }
 
 # 使用启动时间和本地实例记录识别相对路径启动的机器人。
@@ -795,7 +820,7 @@ function Show-Doctor {
         }
     }
 
-    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } elseif ($localStatus -eq 503) { "只验证实例，不处理消息" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } elseif ($localStatus -eq 503) { "使用 $(Get-OpsCommandHint 'update') 继续升级并完成提交。" } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')，再到 $(Get-OpsCommandHint 'logs') 查看日志。" })
+    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } elseif ($localStatus -eq 503) { "只验证实例，不处理消息" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } elseif ($localStatus -eq 503) { "使用 $(Get-OpsCommandHint 'resume') 继续上次操作并完成提交。" } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')，再到 $(Get-OpsCommandHint 'logs') 查看日志。" })
 
     if ($DeployMode -eq "cloudflare") {
         $tokenSource = Get-TunnelTokenSource
@@ -841,7 +866,7 @@ function Show-Doctor {
     $modelsOk = Test-ModelConfiguration $Project
     $rows += New-DoctorRow "模型配置（models.json + Pi 设置）" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } elseif (-not (Test-Path -LiteralPath $ModelsFile)) { "通过 $(Get-OpsCommandHint 'deploy') 完成首次模型配置。" } else { "模型配置建议：$(Get-OpsCommandHint 'configure')。" })
 
-    $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ((Get-Content -LiteralPath $WebhookSecretFile -Raw).Trim() -match "^[0-9a-fA-F]{64}$")
+    $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ("$(Get-Content -LiteralPath $WebhookSecretFile -Raw)".Trim() -match "^[0-9a-fA-F]{64}$")
     $rows += New-DoctorRow "data/config/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "使用 $(Get-OpsCommandHint 'deploy')；密钥变化后还必须更新 IM webhook URL。" })
 
     $rows += Get-RelayDoctorRows
@@ -965,31 +990,74 @@ function Restart-Bot {
 
 
 
+# 部署事务由部署脚本自己继续或回滚；只使用事务记录，不重新提问。
+function Invoke-PendingDeployment([string]$Action) {
+    $deployHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $switch = if ($Action -eq 'rollback') { '-Rollback' } else { '-Resume' }
+    Invoke-WithUtf8Output { & $deployHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Project 'scripts\deploy\deploy.ps1') $switch }
+    return ($LASTEXITCODE -eq 0)
+}
+
+# 继续或回滚未完成的部署/升级；Action 为空时交互选择。
+function Invoke-TransactionCommand([string]$Action) {
+    if (Test-Path -LiteralPath (Join-Path $Project 'data\state\upgrade-transaction')) { return (Invoke-Update $Action) }
+    if (Test-Path -LiteralPath (Join-Path $Project 'data\state\deploy-transaction')) {
+        if (-not (IsAdmin)) { Err "$Action 需要管理员 PowerShell"; return $false }
+        return (Invoke-PendingDeployment $Action)
+    }
+    Done '没有未完成的部署或升级'
+    return $true
+}
+
 # 获取目标提交并交给目标版本升级器；停机、迁移、回滚由升级器负责。
-function Invoke-Update {
+# 有未完成的事务时先继续或回滚，使用记录的目标提交，不追随最新 main。
+function Invoke-Update([string]$Action = '') {
     $operation = Start-OperationLog $Project 'upgrade'
     $operationExit = 1
     try {
     Set-OperationStage 'upgrade-preflight'
     if (-not (IsAdmin)) { Err 'update 需要管理员 PowerShell'; return $false }
     if (-not (Get-GitPath) -or -not (Get-BunPath)) { Err '需要 Git 和 Bun'; return $false }
+    $pendingDeploy = Join-Path $Project 'data\state\deploy-transaction'
+    $pendingUpgrade = Join-Path $Project 'data\state\upgrade-transaction'
+    if (-not (Test-Path -LiteralPath $pendingUpgrade) -and (Test-Path -LiteralPath $pendingDeploy)) {
+        if (-not $Action) {
+            Warn '发现未完成的部署，需先继续或回滚，再升级。'
+            $Action = Read-TransactionAction
+            if (-not $Action) { Warn '未处理上次操作，服务保持当前状态。'; return $false }
+        }
+        $operationExit = if (Invoke-PendingDeployment $Action) { 0 } else { 1 }
+        return ($operationExit -eq 0)
+    }
     $dirty = Invoke-GitCapture @('status', '--porcelain', '--untracked-files=no')
     if ($dirty.ExitCode -ne 0 -or $dirty.Text) { Err '已跟踪文件有改动，请先处理'; return $false }
     $branch = (Invoke-GitCapture @('rev-parse', '--abbrev-ref', 'HEAD')).Text
     $original = (Invoke-GitCapture @('rev-parse', 'HEAD')).Text
-    $fetch = Invoke-GitCapture @('fetch', 'origin', 'main:refs/remotes/origin/main')
-    if ($fetch.ExitCode -ne 0) { Err $fetch.Text; return $false }
-    $target = (Invoke-GitCapture @('rev-parse', 'origin/main')).Text
-    Write-OperationEvent 'info' ("original=$original target=$target")
-    if ($original -notmatch '^[0-9a-f]{40}$' -or $target -notmatch '^[0-9a-f]{40}$') { Err '无法识别提交'; return $false }
-    $pendingUpgrade = Join-Path $Project 'data\state\upgrade-transaction'
     if (Test-Path -LiteralPath $pendingUpgrade) {
-        $pendingName = (Get-Content -LiteralPath $pendingUpgrade -Raw).Trim()
+        $pendingName = "$(Get-Content -LiteralPath $pendingUpgrade -Raw)".Trim()
         if ($pendingName -notmatch '^deploy-[0-9a-f]{32}$') { Err '升级事务名称无效'; return $false }
-        $pendingState = Import-Clixml -LiteralPath (Join-Path $Project ('backup\snapshots\' + $pendingName + '\deployment.xml'))
+        $pendingPath = Join-Path $Project ('backup\snapshots\' + $pendingName)
+        $pendingState = Import-Clixml -LiteralPath (Join-Path $pendingPath 'deployment.xml')
         $target = $pendingState.UpgradeTarget
         if ($target -notmatch '^[0-9a-f]{40}$') { Err '中断事务目标无效'; return $false }
+        $pendingRecord = Read-DeploymentTransaction $pendingPath
+        if ($pendingRecord) { Warn (Format-DeploymentTransaction $pendingRecord) }
+        else { Warn ('未完成的升级（旧版事务，按已保存设置处理）：目标提交 ' + $target.Substring(0, 7)) }
+        if (-not $Action) {
+            $Action = Read-TransactionAction
+            if (-not $Action) { Warn '未处理上次操作，服务保持当前状态。'; return $false }
+        }
+    } elseif ($Action) {
+        Done '没有未完成的部署或升级'
+        $operationExit = 0
+        return $true
+    } else {
+        $fetch = Invoke-GitCapture @('fetch', 'origin', 'main:refs/remotes/origin/main')
+        if ($fetch.ExitCode -ne 0) { Err $fetch.Text; return $false }
+        $target = (Invoke-GitCapture @('rev-parse', 'origin/main')).Text
     }
+    Write-OperationEvent 'info' ("original=$original target=$target action=$Action")
+    if ($original -notmatch '^[0-9a-f]{40}$' -or $target -notmatch '^[0-9a-f]{40}$') { Err '无法识别提交'; return $false }
     # Export the target's preview before stopping or changing the live checkout.
     $stage = Join-Path $Project ('tmp\upgrade-' + [Guid]::NewGuid().ToString('N'))
     Set-OperationStage 'export-target-upgrader'
@@ -1006,10 +1074,14 @@ function Invoke-Update {
         '-Project', $Project, '-OriginalSha', $original, '-TargetSha', $target, '-OriginalBranch', $branch,
         '-BunPath', (Get-BunPath), '-GitPath', (Get-GitPath))
     if ($RestartTunnel) { $arguments += '-RestartTunnel' }
+    if ($Action -eq 'rollback') { $arguments += '-Rollback' }
     Set-OperationStage 'target-upgrader'
     & $shell @arguments | Out-Host
     $operationExit = $LASTEXITCODE
-    return ($LASTEXITCODE -eq 0)
+    if ($operationExit -ne 0 -and (Test-Path -LiteralPath $pendingUpgrade)) {
+        Warn "升级未完成；处理上方原因后，可用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 回滚。"
+    }
+    return ($operationExit -eq 0)
     } finally {
         try { Remove-UpgradeStage $Project $stage }
         catch { Warn ('升级导出目录清理失败，保留 ' + $stage + '：' + $_.Exception.Message) }
@@ -1233,18 +1305,6 @@ function Uninstall-Bot {
     return $true
 }
 
-# Decode data after PowerShell parameter binding; no expression evaluation or token reparsing.
-if ($RequestBase64) {
-    $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
-    foreach ($property in $request.PSObject.Properties) {
-        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId')) {
-            throw "无效的运维请求字段"
-        }
-        Set-Variable -Name $property.Name -Value $property.Value
-    }
-}
-if ($StorageSegment -and $GroupId) { throw "群目录选择参数互斥" }
-
 if ($Json -and $Command -in @("doctor", "status")) {
     if ($Repair) { [Console]::Error.WriteLine("-Json 只用于诊断；修复请使用 $(Get-OpsCommandHint 'doctor -Repair')。"); exit 2 }
     $result = Show-Doctor
@@ -1274,6 +1334,8 @@ switch ($Command) {
     "status"    { if (-not (Show-Doctor)) { exit 1 } }
     "update"    { if (-not (Invoke-Update)) { exit 1 } }
     "upgrade"   { if (-not (Invoke-Update)) { exit 1 } }
+    "resume"    { if (-not (Invoke-TransactionCommand 'continue')) { exit 1 } }
+    "rollback"  { if (-not (Invoke-TransactionCommand 'rollback')) { exit 1 } }
     "repair-tunnel" {
         if (-not (Invoke-TunnelRepair)) { exit 1 }
         Write-Host ""
@@ -1384,6 +1446,8 @@ switch ($Command) {
         Write-Host "  deploy          配置并部署当前代码；已有部署可重建，失败自动回滚"
         Write-Host "  update          预检、停机后同步 origin/main，按需迁移并验证；提交前失败回滚"
         Write-Host "                  默认沿用隧道，只有加 -RestartTunnel 才重启"
+        Write-Host "  resume          按事务记录继续中断的部署或升级（不重新提问）"
+        Write-Host "  rollback        回滚中断的部署或升级；数据已提交时只能继续"
         Write-Host "  repair-tunnel   按当前 token 来源强制重装 Cloudflared 服务"
         Write-Host "  uninstall-tunnel 停止并卸载 Cloudflared 服务，可选删除本地程序"
         Write-Host "  restart         停止并重新启动机器人"

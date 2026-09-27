@@ -32,6 +32,11 @@ export interface Deployment {
   groupDataRootIsCustom: boolean;
 }
 
+/** 宿主平台只取决于运行环境；恢复入口用它转交命令，不读取已保存的设置。 */
+export function hostPlatform(): Platform {
+  return process.platform === "win32" ? "windows" : "linux";
+}
+
 function readState(name: string): string {
   try {
     return readFileSync(join(STATE_DIR, name), "utf8").trim();
@@ -47,7 +52,7 @@ function readState(name: string): string {
  * 同一个值。非法值不静默兜底成默认值——那会让体检对着一个根本没人在用的端口报「正常」。
  */
 export function loadDeployment(): Deployment {
-  const platform: Platform = process.platform === "win32" ? "windows" : "linux";
+  const platform = hostPlatform();
 
   const rawPort = process.env.BOT_PORT?.trim() || readState("bot-port") || "1011";
   const port = Number(rawPort);

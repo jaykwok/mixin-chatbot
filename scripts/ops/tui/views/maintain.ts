@@ -1,9 +1,11 @@
 // 部署、升级、启停、修复和卸载入口；执行前展示各自的范围与恢复方式。
 // 选中升级后联网检查，预览使用本次同步的目标提交。
+// 有未完成的部署或升级时，顶部提供继续和回滚，新的部署、升级和修复暂不可用。
 
 import type { StatusName } from "../render/theme.ts";
 import * as fmt from "../render/format.ts";
 import { loadGit, loadUpgrade, type GitState, type UpgradeState } from "../data.ts";
+import { describePendingTransaction, loadPendingTransaction } from "../transaction.ts";
 import type { AppApi, ConfirmSpec, Loading, View, ViewAction, ViewContext } from "../view.ts";
 import { actionWorkbench, moveSelection } from "./common.ts";
 import { LazySetting } from "./settings-state.ts";
@@ -15,7 +17,7 @@ interface Action {
   /** 只在这些平台上出现；不给表示两个平台都有。 */
   only?: "windows" | "linux";
   status: StatusName;
-  /** 该命令会向用户提问，必须拿到真正的 TTY（update 转调的 deploy.sh 全程交互）。 */
+  /** 该命令会向用户提问，必须拿到真正的 TTY（update 的升级器在停机前确认隧道和迁移决策）。 */
   interactive?: boolean | ((app: AppApi) => boolean);
   confirm(app: Pick<AppApi, "deployment">, git: GitState | null, targetSha?: string): ConfirmSpec | null;
   args(app: AppApi): string[];
@@ -24,12 +26,12 @@ interface Action {
 const ACTIONS: Action[] = [
   {
     key: "deploy",
-    label: "部署 / 重部署",
+    label: "部署 / 修改设置",
     summary: "配置并部署当前代码，失败恢复原部署",
     status: "busy",
     interactive: true,
     confirm: (app) => ({
-      title: "部署 / 重部署",
+      title: "部署 / 修改设置",
       subject: "运行当前版本的部署向导",
       steps: ["确认模型、端口、群数据目录和访问方式，默认沿用已有配置",
         app.deployment.runtime === "docker" ? "构建镜像并切换容器" : "安装依赖并注册计划任务",
@@ -41,39 +43,40 @@ const ACTIONS: Action[] = [
   },
   {
     key: "update",
-    label: "升级",
-    summary: "停机后同步 origin/main，按需迁移并验证新实例",
+    label: "升级（保留设置）",
+    summary: "同步 origin/main，停机前预览迁移，停机后切换代码并验证新实例",
     status: "busy",
     interactive: true,
     confirm: (app, git, targetSha) => {
       if (!git) {
         return {
-          title: "升级",
+          title: "升级（保留设置）",
           subject: "这份部署不是 git 仓库，无法自动升级",
-          steps: ["先通过 Git 获取项目，再进入「系统 → 服务部署 → 部署 / 重部署」；之后即可在此升级"],
+          steps: ["先通过 Git 获取项目，再进入「系统 → 服务部署 → 部署 / 修改设置」；之后即可在此升级"],
         };
       }
       if (git.dirty) {
         return {
-          title: "升级",
+          title: "升级（保留设置）",
           subject: "已跟踪文件有未提交改动，升级会被拒绝",
-          steps: ["先提交、撤销或备份本地代码改动，再进入「系统 → 服务部署 → 升级」"],
+          steps: ["先提交、撤销或备份本地代码改动，再进入「系统 → 服务部署 → 升级（保留设置）」"],
         };
       }
       const steps =
         git.behind > 0
           ? [
+              "停机前由目标版本预览迁移并确认所需选择，写入事务记录",
               "停止旧实例，确认退出后才切换代码和更新依赖",
               `快进到 origin/main ${targetSha ? fmt.shortSha(targetSha) : ""}（${git.behind} 个提交）`,
               app.deployment.runtime === "docker"
                 ? "保持停机，沿用现有配置重建镜像（改配置请用服务部署）"
                 : "保持停机，按需安装依赖",
-              "按需预览并迁移；同版本且标记配对时跳过数据迁移和数据库备份",
+              "按停机前确认的计划迁移；同版本且标记配对时跳过数据迁移和数据库备份",
               "以只验证模式检查新实例，提交数据版本后恢复原运行状态",
             ]
-          : ["重新核对远端版本", "停止旧实例，检查数据版本并续做中断事务", "同版本且标记配对时跳过迁移和数据库备份；需要迁移时先预览再备份执行", "以只验证模式检查新实例，通过后提交并恢复原运行状态"];
+          : ["重新核对远端版本", "停机前检查数据版本并预览迁移", "停止旧实例；同版本且标记配对时跳过迁移和数据库备份，需要迁移时先备份再执行", "以只验证模式检查新实例，通过后提交并恢复原运行状态"];
       return {
-        title: "升级",
+        title: "升级（保留设置）",
         subject:
           git.behind > 0
             ? `${fmt.shortSha(git.sha)} → ${targetSha ? fmt.shortSha(targetSha) : "origin/main"}，共 ${git.behind} 个提交`
@@ -178,7 +181,65 @@ const ACTIONS: Action[] = [
   },
 ];
 
-const ACTION_ORDER = ["start", "restart", "stop", "update", "deploy", "repair", "repair-tunnel", "uninstall"];
+const ACTION_ORDER = ["resume", "rollback", "start", "restart", "stop", "update", "deploy", "repair", "repair-tunnel", "uninstall"];
+/** 有未完成的事务时，这些入口会开始新的部署或升级，必须先继续或回滚。 */
+const BLOCKED_BY_PENDING = new Set(["deploy", "update", "repair"]);
+const PENDING_NOTICE = "有未完成的部署或升级：请先「继续上次操作」或「回滚上次操作」";
+
+interface Pending { subject: string; record: string[]; committed: boolean; codeRestorePending: boolean }
+
+/** 继续和回滚都只使用事务记录；确认页列出记录内容。 */
+function transactionActions(pending: Pending): Action[] {
+  const { subject, record } = pending;
+  return [
+    {
+      key: "resume",
+      label: "继续上次操作",
+      summary: pending.codeRestorePending ? "数据已经回滚，不能继续" : "沿用事务记录完成中断的部署或升级",
+      status: "busy",
+      interactive: true,
+      confirm: () => pending.codeRestorePending ? {
+        title: "继续上次操作",
+        subject: "数据、配置和容器已经回滚，不能继续",
+        steps: ["请使用「回滚上次操作」恢复升级前的代码"],
+      } : ({
+        title: "继续上次操作",
+        subject,
+        steps: ["沿用事务记录继续：不拉取新的 origin/main，不重新提问", ...record,
+          pending.committed ? "数据已经提交：只启动新实例" : "完成迁移、验证和提交，再按原运行状态恢复服务"],
+        untouched: ["会话历史", "群共享资料"],
+        recovery: pending.committed ? "数据已提交，不能再回滚；启动失败时保留新版本并报告原因" : "失败时恢复到操作前；也可改用「回滚上次操作」",
+      }),
+      args: () => ["resume"],
+    },
+    {
+      key: "rollback",
+      label: "回滚上次操作",
+      summary: pending.committed ? "数据已经提交，不能回滚"
+        : pending.codeRestorePending ? "只恢复升级前的代码（数据、配置和容器已经回滚）" : "恢复到操作前的代码、数据和运行状态",
+      status: "warn",
+      interactive: true,
+      confirm: () => pending.committed ? {
+        title: "回滚上次操作",
+        subject: "数据已经提交，不能回滚",
+        steps: ["请使用「继续上次操作」完成新实例启动"],
+      } : pending.codeRestorePending ? {
+        title: "完成回滚",
+        subject,
+        steps: ["把代码恢复到升级前的提交", "数据、配置、容器和原运行状态已经恢复，不再重复", ...record],
+        recovery: "代码恢复失败时保留事务，处理 git 问题后可重试回滚",
+        danger: true,
+      } : {
+        title: "回滚上次操作",
+        subject,
+        steps: ["停止当前实例，恢复迁移前的数据", "恢复操作前的代码、配置、依赖和网络入口", ...record, "按原运行状态恢复服务"],
+        recovery: "回滚失败时保持停机并保留快照，处理后可重试回滚或改为继续",
+        danger: true,
+      },
+      args: () => ["rollback"],
+    },
+  ];
+}
 
 export class MaintainView implements View {
   readonly id = "maintain";
@@ -189,9 +250,24 @@ export class MaintainView implements View {
   private readonly upgrade = new LazySetting<UpgradeState | null>(signal => loadUpgrade(signal));
   private selected = 0;
   private platform: "windows" | "linux" = "linux";
+  private pending: Pending | null = null;
 
   private get waitingForVersion(): boolean { return this.refreshing || this.state.kind !== "ready"; }
-  private get selectingUpgrade(): boolean { return this.availableActions[this.selected]?.key === "update"; }
+  private get selectingUpgrade(): boolean { return !this.pending && this.availableActions[this.selected]?.key === "update"; }
+
+  /** 同步读取事务指针；出现或消失时把焦点移回第一项。 */
+  private loadPending(): void {
+    let pending: Pending | null;
+    try {
+      const value = loadPendingTransaction();
+      pending = value && { ...describePendingTransaction(value), committed: value.committed, codeRestorePending: value.codeRestorePending };
+    } catch (error) {
+      // 记录无法读取时仍提供两个入口，由脚本报告具体原因。
+      pending = { subject: "未完成的部署或升级", record: [`事务记录无法读取：${(error as Error).message}`], committed: false, codeRestorePending: false };
+    }
+    if (!!pending !== !!this.pending) this.selected = 0;
+    this.pending = pending;
+  }
 
   activity(): string | null { return this.upgrade.state.kind === "loading" ? "正在检查 origin/main 最新提交…" : null; }
 
@@ -205,7 +281,8 @@ export class MaintainView implements View {
   onLeave(): boolean { this.invalidate(); return true; }
 
   private get availableActions(): Action[] {
-    return ACTIONS.filter((action) => !action.only || action.only === this.platform)
+    return [...(this.pending ? transactionActions(this.pending) : []), ...ACTIONS]
+      .filter((action) => !action.only || action.only === this.platform)
       .sort((a, b) => ACTION_ORDER.indexOf(a.key) - ACTION_ORDER.indexOf(b.key))
       .map(action => action.key === "repair" ? { ...action, summary: this.platform === "windows"
         ? "检查并修复计划任务、防火墙与隧道" : "通过部署向导重建当前版本" } : action);
@@ -221,13 +298,16 @@ export class MaintainView implements View {
   actions(): ViewAction[] {
     return this.availableActions.map(action => ({
       value: action.key, label: action.label, description: action.summary,
-      danger: action.status === "danger" || action.key === "stop" || action.key === "repair-tunnel",
-      disabled: action.key === "update" && (this.selectingUpgrade ? this.upgrade.state.kind !== "ready" : this.waitingForVersion),
+      danger: action.status === "danger" || action.key === "stop" || action.key === "repair-tunnel" || action.key === "rollback",
+      disabled: this.pending ? BLOCKED_BY_PENDING.has(action.key) || (action.key === "rollback" && this.pending.committed)
+        || (action.key === "resume" && this.pending.codeRestorePending)
+        : action.key === "update" && (this.selectingUpgrade ? this.upgrade.state.kind !== "ready" : this.waitingForVersion),
     }));
   }
 
   async refresh(app: AppApi): Promise<void> {
     this.platform = app.deployment.platform;
+    this.loadPending();
     if (this.selectingUpgrade) {
       await this.checkUpgrade(app, true);
       return;
@@ -277,6 +357,10 @@ export class MaintainView implements View {
     if (key.name === "enter" || actions.some(action => action.key === key.name)) {
       const action = key.name === "enter" ? actions[this.selected] : actions.find(action => action.key === key.name);
       if (!action) return true;
+      if (this.pending && BLOCKED_BY_PENDING.has(action.key)) {
+        app.toast("warn", PENDING_NOTICE);
+        return true;
+      }
       if (action.key === "update" && !this.selectingUpgrade && this.waitingForVersion) {
         app.toast("warn", this.state.kind === "error" ? this.state.message : "版本读取中，请稍后再升级");
         return true;
@@ -310,6 +394,7 @@ export class MaintainView implements View {
         ? await app.runInteractive(action.label, action.args(app))
         : await app.run(action.label, action.args(app));
       app.toast(code === 0 ? "ok" : "danger", code === 0 ? `${action.label}完成` : `${action.label}未成功（退出码 ${code}）`);
+      this.loadPending();
       return true;
     }
     return false;
@@ -325,7 +410,13 @@ export class MaintainView implements View {
     const spec = action.confirm(ctx, git, preview?.targetSha);
     const blocked = action.key === "update" && (!git || git.dirty);
     const versionNotice = this.state.kind === "error" ? this.state.message : "版本读取中…（升级暂不可用）";
-    const details = action.key === "update" && upgrade.kind !== "ready" ? [
+    const details = this.pending && BLOCKED_BY_PENDING.has(action.key) ? [
+      theme.bold(action.summary),
+      theme.c("warn", PENDING_NOTICE),
+      "",
+      this.pending.subject,
+      ...this.pending.record,
+    ] : action.key === "update" && upgrade.kind !== "ready" ? [
       theme.bold(upgrade.kind === "error" ? `远端检查失败：${upgrade.message}` : "正在检查 origin/main 最新提交…"),
       upgrade.kind === "error" ? "按 r 重新检查；检查成功后才可升级。" : "检查完成后按 Enter 确认升级；其他服务操作和页面切换仍可使用。",
     ] : [

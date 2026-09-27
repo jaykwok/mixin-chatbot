@@ -5,12 +5,18 @@
 . (Join-Path $PSScriptRoot 'deployment.ps1')
 . (Join-Path $PSScriptRoot 'tunnel-logging.ps1')
 
+# 量子密信平台出口 IP（webhook 来源；防火墙按此放行）。部署可用 PLATFORM_IP 覆盖，确认值写入事务记录。
+$DefaultPlatformIp = '223.244.14.237'
+function Get-PlatformIp { if ($env:PLATFORM_IP) { return $env:PLATFORM_IP.Trim() } else { return $DefaultPlatformIp } }
+
 # 交互界面沿用相同运维命令，但建议指向界面中真实存在的入口。
 function Get-OpsCommandHint([string]$Command) {
     if ($env:MIXIN_OPS_TUI -eq '1') {
         $paths = @{
-            'deploy' = '系统 → 服务部署 → 部署 / 重部署'
-            'update' = '系统 → 服务部署 → 升级'
+            'deploy' = '系统 → 服务部署 → 部署 / 修改设置'
+            'update' = '系统 → 服务部署 → 升级（保留设置）'
+            'resume' = '系统 → 服务部署 → 继续上次操作'
+            'rollback' = '系统 → 服务部署 → 回滚上次操作'
             'start' = '系统 → 服务部署 → 启动'
             'stop' = '系统 → 服务部署 → 停止'
             'restart' = '系统 → 服务部署 → 重启'
@@ -22,7 +28,7 @@ function Get-OpsCommandHint([string]$Command) {
         }
         if ($paths.ContainsKey($Command)) { return "「$($paths[$Command])」" }
         if ($Command -eq 'configure') {
-            return '先修正 data/config/models.json 和 data/runtime/pi/settings.json；配置有效后，可在「系统 → 服务部署 → 部署 / 重部署」重新选择模型'
+            return '先修正 data/config/models.json 和 data/runtime/pi/settings.json；配置有效后，可在「系统 → 服务部署 → 部署 / 修改设置」重新选择模型'
         }
     }
     if ($Command -eq 'configure') { return 'bun run configure' }
@@ -241,6 +247,22 @@ function Invoke-WithUtf8Output([Parameter(Mandatory = $true)][scriptblock]$Comma
 
 # 提示不复用调用方的 Warn：start-tunnel.ps1 没有定义它，共用文件不该对宿主脚本
 # 有隐式要求。输出与 deploy.ps1 / ops.ps1 原来的 Warn 完全一致。
+# 未完成的部署或升级只能继续或回滚；非交互调用必须用 resume / rollback 明确指定。返回空串表示不处理。
+function Read-TransactionAction {
+    if ([Console]::IsInputRedirected) {
+        throw "发现未完成的部署或升级；请使用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 回滚"
+    }
+    while ($true) {
+        switch ((Read-Host '1 继续上次操作  2 回滚到操作前  0 退出 [默认 0]').Trim()) {
+            '1' { return 'continue' }
+            '2' { return 'rollback' }
+            '' { return '' }
+            '0' { return '' }
+            default { Write-Host '请输入 1、2 或 0' -ForegroundColor Yellow }
+        }
+    }
+}
+
 function Read-YesNo([string]$Prompt, [bool]$Default = $false) {
     while ($true) {
         $rawAnswer = Read-Host $Prompt

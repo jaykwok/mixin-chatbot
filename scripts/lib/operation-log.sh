@@ -11,7 +11,8 @@ operation_event() {
         level=warn
         message='Command output limit reached; subsequent stages and errors are still recorded.'
     fi
-    text="$(printf '%s' "${message:0:16384}" | sed -E \
+    # 字节序区间：en_US.UTF-8 等按排序规则解释 [ -/] 会编译失败，set -e 的调用方随之退出。
+    text="$(printf '%s' "${message:0:16384}" | LC_ALL=C sed -E \
       -e 's/\x1b\[[0-?]*[ -/]*[@-~]//g' \
       -e 's/(Bearer[[:space:]]+)[^[:space:]";,]+/\1[redacted]/gI' \
       -e 's/((api[_-]?key|token|secret|password|authorization)["[:space:]]*[:=]["[:space:]]*)[^[:space:]",;&}]+/\1[redacted]/gI' \

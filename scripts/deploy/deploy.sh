@@ -18,19 +18,36 @@ fi
 . "${PROJECT_DIR}/scripts/lib/deployment.sh"
 operation_start deploy
 trap 'operation_finish "$?"' EXIT
-if [ -n "${BOT_MODEL_CACHE_RETENTION:-}" ]; then
-    operation_event error 'BOT_MODEL_CACHE_RETENTION 已移除，请先移除旧环境变量'
-    echo 'BOT_MODEL_CACHE_RETENTION 已移除；请先迁移配置并移除旧环境变量，再部署。' >&2
+cd "$PROJECT_DIR"
+# 升级器在同一次升级中交接的隧道 token 和交接标记（事务快照名）。只有标记与事务记录一致时才采用该 token，
+# 见续做分支；读入后立即移出环境，避免 token 传给后续子进程。
+PREPARED_TUNNEL_INPUT="${DEPLOY_TUNNEL_TOKEN_INPUT:-}"
+TRANSACTION_HANDOFF="${DEPLOY_TRANSACTION_HANDOFF:-}"
+LEGACY_REUSE_REQUEST="${DEPLOY_REUSE_SETTINGS:-0}"
+unset DEPLOY_TUNNEL_TOKEN_INPUT DEPLOY_TRANSACTION_HANDOFF DEPLOY_REUSE_SETTINGS
+# 未完成事务的处理方式（ops resume / rollback 和升级器指定，否则下方询问）；续做和回滚只使用事务记录中的设置。
+TRANSACTION_ACTION="${DEPLOY_TRANSACTION_ACTION:-}"
+unset DEPLOY_TRANSACTION_ACTION
+case "$TRANSACTION_ACTION" in
+    ''|continue|rollback) ;;
+    *) echo "DEPLOY_TRANSACTION_ACTION 只能是 continue 或 rollback" >&2; exit 1 ;;
+esac
+# 旧版运维脚本的升级先停机，再以 DEPLOY_REUSE_SETTINGS=1 调用部署脚本；它不写事务记录，也没有停机前的迁移预览。
+# 在改动任何状态之前拒绝，旧脚本随后恢复原代码和原运行状态；新版升级器需要引导一次。
+if [ "$LEGACY_REUSE_REQUEST" = 1 ] && [ -z "$TRANSACTION_ACTION" ]; then
+    operation_event error "legacy upgrade entry refused"
+    {
+        echo "[-] 旧版运维脚本不能直接升级到此版本：新版升级在停机前预览迁移并记录全部设置，需由新版升级器执行。"
+        echo "    本次未改动数据和配置；旧脚本将恢复原代码和原运行状态。请在项目目录运行一次以下引导命令，之后照常使用 ops.sh update："
+        echo "      cd '$PROJECT_DIR'"
+        upgrade_bootstrap_command | sed 's/^/      /'
+    } >&2
     exit 1
 fi
-cd "$PROJECT_DIR"
-# ops update 在停机前确认的隧道选择；读入后立即移出环境，避免 token 传给后续子进程。
-PREPARED_TUNNEL_READY="${DEPLOY_TUNNEL_INPUT_PREPARED:-0}"
-PREPARED_TUNNEL_INPUT="${DEPLOY_TUNNEL_TOKEN_INPUT:-}"
-PREPARED_UNMANAGED_MODE="${DEPLOY_UNMANAGED_TUNNEL_CONFIRMED:-}"
-unset DEPLOY_TUNNEL_INPUT_PREPARED DEPLOY_TUNNEL_TOKEN_INPUT DEPLOY_UNMANAGED_TUNNEL_CONFIRMED
-# ops update 已先停机：沿用已保存的端口、入口模式、群数据根、域名和 AI 配置，停机期间不再询问配置。
-REUSE_SETTINGS="${DEPLOY_REUSE_SETTINGS:-0}"
+RECORDED=0
+PREPARED_UNMANAGED_MODE=""
+# 只有升级的续做保持原停止状态（续做分支设置）；部署完成后总是启动。
+DEPLOY_PRESERVE_STOPPED=0
 DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
 STATE_DIR="${DATA_DIR}/state"
@@ -45,23 +62,6 @@ DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
 BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
 GROUP_DATA_ROOT_FILE="${STATE_DIR}/group-data-root"
 TUNNEL_PID_FILE="${STATE_DIR}/cloudflared.pid"
-
-# 量子密信平台出口 IP（webhook 来源；UFW/WAF 按此放行）。变更可在此改或用环境变量覆盖。
-PLATFORM_IP="${PLATFORM_IP:-223.244.14.237}"
-BOT_DEBUG_VALUE="${BOT_DEBUG:-0}"
-if [ "$BOT_DEBUG_VALUE" != "0" ] && [ "$BOT_DEBUG_VALUE" != "1" ]; then
-    operation_event error 'BOT_DEBUG 只能是 0 或 1'
-    echo "BOT_DEBUG 只能是 0 或 1" >&2
-    exit 1
-fi
-BOT_MAX_ACTIVE_REQUESTS_VALUE="${BOT_MAX_ACTIVE_REQUESTS:-32}"
-if ! [[ "$BOT_MAX_ACTIVE_REQUESTS_VALUE" =~ ^[0-9]+$ ]] ||
-   [ "$BOT_MAX_ACTIVE_REQUESTS_VALUE" -lt 1 ] ||
-   [ "$BOT_MAX_ACTIVE_REQUESTS_VALUE" -gt 1000 ]; then
-    operation_event error 'BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数'
-    echo "BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数" >&2
-    exit 1
-fi
 if [ "$(id -u)" -eq 0 ]; then
     CONTAINER_UID=1001
     CONTAINER_GID=1001
@@ -88,14 +88,14 @@ trim_input() {
     printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
+# 续做不能提问：说明设置来源和失败后的下一步。
+settings_fixed_hint() {
+    printf '续做只使用事务记录中的设置，服务保持停止；处理后可重试继续，或回滚（%s）后重新部署' "$(ops_command_hint rollback)"
+}
+
 read_input() {
     local prompt="$1" output_name="$2" input_value="" hidden="${3:-0}"
     local read_options=(-r)
-    if [ "$REUSE_SETTINGS" = 1 ]; then
-        # 升级期间服务已停止；需要回答的问题说明现有配置不可直接沿用，回滚后由部署脚本处理。
-        print_error "升级沿用现有配置，停机期间不能等待输入：${prompt}；升级将回滚，请先运行部署脚本调整配置"
-        exit 1
-    fi
     if [ "$hidden" = "1" ]; then read_options+=(-s); fi
     print_prompt "$prompt"
     if ! IFS= read "${read_options[@]}" input_value; then
@@ -127,43 +127,170 @@ ask_yes_no() {
     done
 }
 
-can_manage_ufw() {
-    [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1
+# 未完成事务只能继续或回滚；不选择则保持现状退出，不开始新的部署。
+choose_transaction_action() {
+    local choice
+    while true; do
+        read_input "1 继续上次操作  2 回滚到操作前  0 退出 [默认 0]：" choice
+        case "$(trim_input "$choice")" in
+            1) TRANSACTION_ACTION=continue; return ;;
+            2) TRANSACTION_ACTION=rollback; return ;;
+            ''|0) print_warning "未处理上次操作，服务保持当前状态"; exit 1 ;;
+            *) print_warning "请输入 1、2 或 0" ;;
+        esac
+    done
 }
 
-run_ufw() {
-    if [ "$(id -u)" -eq 0 ]; then
-        ufw "$@"
+# Project UFW helpers and the deployment transaction are shared in scripts/lib/deployment.sh.
+# Connector identity and bounded stop are shared in scripts/lib/lifecycle.sh.
+
+# 项目内群根使用 data 挂载，项目外群根单独挂到 /app/group-data。
+group_root_mount() {
+    GROUP_ROOT_ARGS=()
+    if [ "$1" = "$DEFAULT_GROUP_DATA_ROOT" ]; then
+        GROUP_ROOT_ENV_VAL="/app/data/groups"
     else
-        sudo ufw "$@"
+        GROUP_ROOT_ARGS+=(-v "$1:/app/group-data")
+        GROUP_ROOT_ENV_VAL="/app/group-data"
     fi
 }
 
-remove_managed_ufw_rules() {
-    local preserve_port="${1:-}" preserve_ip="${2:-}" kept=0
-    local rule_numbers=()
-    local line number
-    while IFS= read -r line; do
-        [[ "$line" == *"Mixin-Chatbot (平台IP)"* ]] || continue
-        if [ -n "$preserve_port" ] && [ "$kept" -eq 0 ] &&
-            [[ "$line" == *"${preserve_port}/tcp"* && "$line" == *"$preserve_ip"* ]]; then
-            kept=1
-            continue
-        fi
-        number="$(sed -n 's/^[[:space:]]*\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<< "$line")"
-        [ -n "$number" ] && rule_numbers+=("$number")
-    done < <(run_ufw status numbered)
-    local sorted_numbers=() failed=0
-    mapfile -t sorted_numbers < <(printf '%s\n' "${rule_numbers[@]}" | sed '/^$/d' | sort -rn)
-    # Callers report only rules that were actually removed.
-    REMOVED_UFW_RULES=0
-    for number in "${sorted_numbers[@]}"; do
-        if run_ufw --force delete "$number" >/dev/null; then REMOVED_UFW_RULES=$((REMOVED_UFW_RULES+1)); else failed=1; fi
-    done
-    return "$failed"
+# The target image owns migration semantics, including the first unversioned upgrade.
+migration_docker() {
+    docker run --rm -i --user "$CONTAINER_UID:$CONTAINER_GID" \
+      -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -e BOT_OPERATION_LOG -e PI_CACHE_RETENTION -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
+      "${GROUP_ROOT_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" -v "$PROJECT_DIR/backup:/app/backup" -v "$PROJECT_DIR/logs:/app/logs" \
+      mixin-chatbot bun run scripts/migrations/run.ts "$@" --groups "$GROUP_ROOT_ENV_VAL"
+}
+MIGRATION_APPLY_ATTEMPTED=0
+MIGRATION_PLAN=/app/data/state/migration-plan.json
+MIGRATION_PREVIEW_MODE=(--interactive)
+rollback_data_migration() {
+    [ "$MIGRATION_APPLY_ATTEMPTED" = 1 ] || return 0
+    # Without a journal there is nothing to restore, and the image may never have been built.
+    [ -e "$STATE_DIR/migration.json" ] || return 0
+    local result=0
+    migration_docker rollback --deployment "$BOT_DEPLOY_BACKUP_ID" || result=$?
+    if [ "$result" = 42 ]; then
+        commit_deployment
+        print_error "数据已经提交，保留新代码；请检查服务状态后启动。"
+    fi
+    return "$result"
 }
 
-# Connector identity and bounded stop are shared in scripts/lib/lifecycle.sh.
+# begin_deployment 发布事务指针前调用：记录停机前确认的全部选择，续做和回滚只读这份记录。
+record_deployment_transaction() {
+    local snapshot="$1" domain_action=keep unmanaged=''
+    if [ "$PERSIST_BOT_DOMAIN" = 1 ]; then domain_action=persist
+    elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = 1 ]; then domain_action=clear; fi
+    if [ "$UNMANAGED_TUNNEL_CONFIRMED" = 1 ]; then unmanaged="$DEPLOY_MODE"; fi
+    declare -gA TRANSACTION=([format]=1 [operation]=deploy [snapshot]="$(basename -- "$snapshot")"
+        [target_sha]="$(cat "$snapshot/target-sha")" [original_sha]='' [original_branch]=''
+        [original_group_root]="$ORIGINAL_GROUP_DATA_ROOT" [target_group_root]="$HOST_GROUP_DATA_ROOT" [was_running]="$PREVIOUS_RUNNING"
+        [bot_port]="$BOT_PORT" [deploy_mode]="$DEPLOY_MODE" [bot_domain]="$PUBLIC_DOMAIN" [domain_action]="$domain_action"
+        [unmanaged_tunnel]="$unmanaged" [platform_ip]="$PLATFORM_IP" [reconfigure_ai]="$RECONFIGURE_AI")
+    write_transaction_record "$snapshot" || return 1
+    if [ "$MIGRATION_PLANNED" = 1 ]; then cp -- "$STATE_DIR/migration-plan.json" "$snapshot/migration-plan.json" || return 1; fi
+}
+
+# 回滚未完成的事务。数据已提交时拒绝，只能继续完成新实例启动；判定在改动任何容器之前。
+rollback_pending_deployment() {
+    local original="${TRANSACTION[original_group_root]}" target="${TRANSACTION[target_group_root]}"
+    case "$original" in
+        "$PROJECT_DIR"/*) ;;
+        *) [ -d "$original" ] || { print_error "原群数据总根不存在：$original；旧容器依赖它，请恢复原挂载后再回滚"; exit 1; } ;;
+    esac
+    group_root_mount "$target"
+    if [ -e "$STATE_DIR/migration.json" ]; then
+        [ -d "$target" ] || { print_error "本次操作的群数据总根不存在：$target；恢复迁移前的数据需要它，请恢复挂载后再回滚"; exit 1; }
+        if migration_docker committed --deployment "${TRANSACTION[snapshot]}"; then
+            print_error "上次操作的数据已经提交，不能回滚；请选择继续（$(ops_command_hint resume)）完成新实例启动"
+            exit 1
+        fi
+    fi
+    HOST_GROUP_DATA_ROOT="$target"
+    ROLLBACK_REQUESTED=1
+    print_status "回滚上次操作：恢复数据、配置、容器、网络入口和原运行状态"
+    begin_deployment
+    # The EXIT trap installed by begin_deployment restores the snapshot and reports the result.
+    exit 1
+}
+
+# 数据提交后启动正式实例，再清理事务和旧回滚容器。实例未就绪时保留事务指针，可再次继续。
+activate_committed_deployment() {
+    rm -f -- "$PROJECT_DIR/data/state/verify-only" "$PROJECT_DIR/data/state/migration-plan.json"
+    if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
+        print_status "启动机器人并等待健康检查..."
+        docker start mixin-chatbot >/dev/null
+        local normal_ready=0 attempt
+        for attempt in $(seq 1 18); do
+            if docker exec mixin-chatbot bun run scripts/ops/health-check.ts; then normal_ready=1; break; fi
+            sleep 5
+        done
+        if [ "$normal_ready" != 1 ]; then
+            print_error "数据已经提交，但业务实例未就绪；保留新版本，请检查日志后使用 $(ops_command_hint resume) 继续"
+            exit 1
+        fi
+    fi
+    rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
+    cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，但备份清理未完成，请检查 $DEPLOY_SNAPSHOT 和 $PROJECT_DIR/backup/rm"
+    # Let process exit close descriptor 9. Explicit unlock would also unlock an update parent's inherited descriptor.
+    if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ]; then
+        if docker rm "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+            print_success "部署已提交，旧容器回滚版本已清理"
+        else
+            print_warning "部署已成功，但旧回滚容器 ${ROLLBACK_CONTAINER} 清理失败；可确认后手动 docker rm"
+        fi
+    fi
+}
+
+# 数据已在中断前提交：配置、网络入口和状态文件都已写入，旧数据不能再用。
+# 只停止验证实例并启动正式实例；不重新创建事务、构建镜像或执行迁移。
+finish_committed_transaction() {
+    DEPLOY_SNAPSHOT="$TRANSACTION_SNAPSHOT"
+    PREVIOUS_RUNNING="${TRANSACTION[was_running]}"
+    ROLLBACK_CONTAINER=mixin-chatbot-rollback
+    PREVIOUS_CONTAINER_SAVED=0
+    if docker inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then PREVIOUS_CONTAINER_SAVED=1; fi
+    if ! docker inspect mixin-chatbot >/dev/null 2>&1; then
+        print_error "上次操作的数据已经提交，但新容器 mixin-chatbot 不存在；请用 docker ps -a 检查后处理，不能回滚"
+        exit 1
+    fi
+    print_status "上次操作的数据已经提交：启动新实例，不再迁移或重建"
+    docker stop --time 30 mixin-chatbot >/dev/null
+    commit_deployment
+    activate_committed_deployment
+    if [ "${DEPLOY_PRESERVE_STOPPED:-0}" = 1 ] && [ "$PREVIOUS_RUNNING" = 0 ]; then
+        print_success "上次操作已完成，机器人服务保持停止（操作前未运行）"
+    else
+        print_success "上次操作已完成，机器人已启动"
+    fi
+    exit 0
+}
+
+# 普通部署读取的环境变量，只在没有未完成的事务时校验。续做和回滚只使用事务记录和已保存的 runtime.json，
+# 新终端里的这些变量既不能挡住恢复，也不会被采用。
+check_deploy_environment() {
+    if [ -n "${BOT_MODEL_CACHE_RETENTION:-}" ]; then
+        print_error 'BOT_MODEL_CACHE_RETENTION 已移除；请先迁移配置并移除旧环境变量，再部署。'
+        exit 1
+    fi
+    # 量子密信平台出口 IP（webhook 来源；UFW/WAF 按此放行）：默认值见 scripts/lib/common.sh，可用环境变量覆盖。
+    PLATFORM_IP="${PLATFORM_IP:-$DEFAULT_PLATFORM_IP}"
+    if ! transaction_value_valid platform_ip "$PLATFORM_IP"; then
+        print_error "PLATFORM_IP 无效：$PLATFORM_IP（需要 IPv4 或 IPv6 地址，可带前缀长度）"
+        exit 1
+    fi
+    local debug="${BOT_DEBUG:-0}" active="${BOT_MAX_ACTIVE_REQUESTS:-32}"
+    if [ "$debug" != 0 ] && [ "$debug" != 1 ]; then
+        print_error 'BOT_DEBUG 只能是 0 或 1'
+        exit 1
+    fi
+    if ! [[ "$active" =~ ^[0-9]+$ ]] || [ "$active" -lt 1 ] || [ "$active" -gt 1000 ]; then
+        print_error 'BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数'
+        exit 1
+    fi
+}
 
 # ---- 前置检查 ----
 
@@ -189,7 +316,65 @@ print_success "环境检查通过"
 
 command -v flock >/dev/null || { print_error "需要 util-linux flock"; exit 1; }
 acquire_deploy_lock || { print_error "另一个部署或升级正在进行"; exit 1; }
-verify_deployed_group_root
+# 先处理未完成的事务，再读取普通部署设置：续做和回滚只使用事务记录，不重新读取默认值或环境变量。
+ORIGINAL_GROUP_DATA_ROOT="$(saved_group_data_root)"
+if [ -e "$STATE_DIR/deploy-transaction" ]; then
+    load_pending_transaction || { print_error "未完成部署的事务记录无法读取（原因见上方）；保持现状，请人工检查 backup/snapshots"; exit 1; }
+    print_warning "$(describe_pending_transaction)"
+    # 升级的继续和回滚还要切换或恢复代码，由升级器处理；部署脚本只执行升级器或运维入口转交的明确动作。
+    if [ -z "$TRANSACTION_ACTION" ] && [ "${TRANSACTION[operation]}" = upgrade ]; then
+        print_error "未完成的是升级：继续或回滚还需要切换或恢复代码，请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
+        exit 1
+    fi
+    # 数据、配置和容器已经回滚、只剩代码待恢复的升级由升级器完成，这里不再重复回滚或继续。
+    if transaction_code_restore_pending; then
+        print_error "上次升级只剩代码待恢复；请使用 $(ops_command_hint rollback) 完成回滚"
+        exit 1
+    fi
+    if [ -z "$TRANSACTION_ACTION" ]; then
+        if [ -t 0 ]; then
+            choose_transaction_action
+        else
+            print_error "发现未完成的部署；请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
+            exit 1
+        fi
+    fi
+    RECORDED=1
+    [ "$TRANSACTION_ACTION" != rollback ] || rollback_pending_deployment
+    if [ -n "${TRANSACTION[target_sha]}" ] && [ "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null)" != "${TRANSACTION[target_sha]}" ]; then
+        print_error "当前代码不是上次操作的目标提交 ${TRANSACTION[target_sha]:0:7}；请切回该提交后继续，或回滚"
+        exit 1
+    fi
+    # 挂载缺失时明确停止，绝不在续做中重新创建空的群数据总根。
+    [ -d "${TRANSACTION[target_group_root]}" ] || {
+        print_error "事务记录的群数据总根不存在：${TRANSACTION[target_group_root]}；请恢复挂载后重试继续，或回滚"; exit 1; }
+    BOT_PORT="${TRANSACTION[bot_port]}"
+    DEPLOY_MODE="${TRANSACTION[deploy_mode]}"
+    GROUP_DATA_ROOT="${TRANSACTION[target_group_root]}"
+    PLATFORM_IP="${TRANSACTION[platform_ip]}"
+    # 运行参数沿用 runtime.json；当前终端的环境变量不校验，也不写入。
+    unset "${RUNTIME_ENV_KEYS[@]}" BOT_MODEL_CACHE_RETENTION
+    PREPARED_UNMANAGED_MODE="${TRANSACTION[unmanaged_tunnel]}"
+    # 只有同一次升级的升级器知道快照名：交接标记一致才采用它在停机前确认的 token。
+    # 重启后的续做（ops resume、新终端）没有标记，只接受已保存的 token 来源。
+    if [ -z "$TRANSACTION_HANDOFF" ] || [ "$TRANSACTION_HANDOFF" != "${TRANSACTION[snapshot]}" ]; then PREPARED_TUNNEL_INPUT=""; fi
+    MIGRATION_PREVIEW_MODE=()
+    # 升级沿用原运行状态；部署完成后总是启动。
+    [ "${TRANSACTION[operation]}" != upgrade ] || DEPLOY_PRESERVE_STOPPED=1
+    group_root_mount "${TRANSACTION[target_group_root]}"
+    if [ -e "$STATE_DIR/migration.json" ] && migration_docker committed --deployment "${TRANSACTION[snapshot]}"; then
+        finish_committed_transaction
+    fi
+    print_status "继续上次操作：端口、入口模式、群数据总根、域名、平台 IP 和隧道确认均取自事务记录，运行参数沿用 runtime.json"
+elif [ -n "$TRANSACTION_ACTION" ]; then
+    print_success "没有未完成的部署或升级"
+    exit 0
+else
+    # 新部署在下方询问隧道 token；环境中残留的交接值一律不用。
+    PREPARED_TUNNEL_INPUT=""
+    check_deploy_environment
+    verify_deployed_group_root
+fi
 print_warning "转换数据前先预览；应用变更时保持停机，提交前失败恢复数据、配置和原运行状态。"
 mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
 if [ -n "${BOT_PORT:-}" ]; then
@@ -203,14 +388,10 @@ else
     PORT_DEFAULT="1011"
 fi
 if ! [[ "$PORT_DEFAULT" =~ ^[0-9]+$ ]] || [ "$PORT_DEFAULT" -lt 1 ] || [ "$PORT_DEFAULT" -gt 65535 ]; then
-    if [ "$REUSE_SETTINGS" = 1 ]; then
-        print_error "${PORT_DEFAULT_SOURCE} 中的端口无效：${PORT_DEFAULT}；升级不会改用其他端口，将回滚，请先运行部署脚本修正"
-        exit 1
-    fi
     print_warning "${PORT_DEFAULT_SOURCE} 中的端口无效，已改用安全默认值 1011：${PORT_DEFAULT}"
     PORT_DEFAULT="1011"
 fi
-if [ "$REUSE_SETTINGS" = 1 ]; then
+if [ "$RECORDED" = 1 ]; then
     BOT_PORT="$PORT_DEFAULT"
 else
     while true; do
@@ -241,10 +422,6 @@ else
     DEPLOY_MODE_DEFAULT="direct"
 fi
 if [ "$DEPLOY_MODE_DEFAULT" != "direct" ] && [ "$DEPLOY_MODE_DEFAULT" != "cloudflare" ]; then
-    if [ "$REUSE_SETTINGS" = 1 ]; then
-        print_error "${DEPLOY_MODE_DEFAULT_SOURCE} 中的部署模式无效：${DEPLOY_MODE_DEFAULT}；升级不会改用其他入口，将回滚，请先运行部署脚本修正"
-        exit 1
-    fi
     print_warning "${DEPLOY_MODE_DEFAULT_SOURCE} 中的部署模式无效，已改用安全默认值 direct：${DEPLOY_MODE_DEFAULT}"
     DEPLOY_MODE_DEFAULT="direct"
 fi
@@ -256,7 +433,7 @@ else
     DEPLOY_MODE_DEFAULT_LABEL="直连"
 fi
 
-if [ "$REUSE_SETTINGS" = 1 ]; then
+if [ "$RECORDED" = 1 ]; then
     DEPLOY_MODE="$DEPLOY_MODE_DEFAULT"
 else
     echo ""
@@ -298,14 +475,14 @@ fi
 GROUP_DATA_ROOT="$GROUP_DATA_ROOT_DEFAULT"
 GROUP_ROOT_CHECKED=0
 while true; do
-    # 升级沿用的群数据根只检查一次；不可用时回滚，而不是在停机期间反复询问。
-    if [ "$REUSE_SETTINGS" = 1 ] && [ "$GROUP_ROOT_CHECKED" = 1 ]; then
-        print_error "现有群数据总根不可用（原因见上方）；升级将回滚，请先运行部署脚本调整"
+    # 沿用的群数据根只检查一次；不可用时停止，而不是在停机期间反复询问。
+    if [ "$RECORDED" = 1 ] && [ "$GROUP_ROOT_CHECKED" = 1 ]; then
+        print_error "群数据总根不可用（原因见上方）；$(settings_fixed_hint)"
         exit 1
     fi
     GROUP_ROOT_CHECKED=1
     cwd_in=""
-    if [ "$REUSE_SETTINGS" != 1 ]; then
+    if [ "$RECORDED" != 1 ]; then
         read_input "Pi 群数据总根 [默认 ${GROUP_DATA_ROOT_DEFAULT}；首次为 ${DEFAULT_GROUP_DATA_ROOT}]：" cwd_in
     fi
     cwd_in="$(trim_input "$cwd_in")"
@@ -342,15 +519,11 @@ while true; do
     [ -w "$HOST_GROUP_DATA_ROOT" ] || { print_warning '群数据根不可写'; continue; }
     break
 done
-GROUP_ROOT_ARGS=()
-if [ "$HOST_GROUP_DATA_ROOT" = "$DEFAULT_GROUP_DATA_ROOT" ]; then
-    GROUP_ROOT_ENV_VAL="/app/data/groups"
-else
+group_root_mount "$HOST_GROUP_DATA_ROOT"
+if [ "$HOST_GROUP_DATA_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
     if [ "$(id -u)" -eq 0 ]; then
         chown "$CONTAINER_UID:$CONTAINER_GID" "$HOST_GROUP_DATA_ROOT"
     fi
-    GROUP_ROOT_ARGS+=(-v "$HOST_GROUP_DATA_ROOT:/app/group-data")
-    GROUP_ROOT_ENV_VAL="/app/group-data"
     print_warning "主机群数据目录挂到容器 /app/group-data"
 fi
 print_status "Pi 群数据总根：$HOST_GROUP_DATA_ROOT（容器内：$GROUP_ROOT_ENV_VAL）"
@@ -403,38 +576,31 @@ if ! verify_container_storage; then
 fi
 print_success "持久化目录权限正常"
 
-# The target image owns migration semantics, including the first unversioned upgrade.
-migration_docker() {
-    docker run --rm -i --user "$CONTAINER_UID:$CONTAINER_GID" \
-      -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -e BOT_OPERATION_LOG -e PI_CACHE_RETENTION -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
-      "${GROUP_ROOT_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" -v "$PROJECT_DIR/backup:/app/backup" -v "$PROJECT_DIR/logs:/app/logs" \
-      mixin-chatbot bun run scripts/migrations/run.ts "$@" --groups "$GROUP_ROOT_ENV_VAL"
-}
-MIGRATION_APPLY_ATTEMPTED=0
-rollback_data_migration() {
-    [ "$MIGRATION_APPLY_ATTEMPTED" = 1 ] || return 0
-    local result=0
-    migration_docker rollback --deployment "$BOT_DEPLOY_BACKUP_ID" || result=$?
-    if [ "$result" = 42 ]; then
-        commit_deployment
-        print_error "数据已经提交，保留新代码；请检查服务状态后启动。"
-    fi
-    return "$result"
-}
 MIGRATION_PLANNED=0
-if [ -f "$MODELS_FILE" ] && [ -f "$RUNTIME_DIR/pi/settings.json" ]; then
-    migration_docker preview --interactive --plan /app/data/state/migration-plan.json
+if [ "$RECORDED" = 1 ] && [ -f "$TRANSACTION_SNAPSHOT/migration-plan.json" ]; then
+    # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
+    # 快照目录仅部署用户可读，计划复制回容器可读的状态目录。
+    cp -- "$TRANSACTION_SNAPSHOT/migration-plan.json" "$STATE_DIR/migration-plan.json" || { print_error "无法恢复停机前确认的迁移计划"; exit 1; }
+    # root 复制出的文件属 root；迁移容器以 UID ${CONTAINER_UID} 读取它。
+    if [ "$(id -u)" -eq 0 ]; then chown "$CONTAINER_UID:$CONTAINER_GID" "$STATE_DIR/migration-plan.json"; fi
+    MIGRATION_PLANNED=1
+elif [ -f "$MODELS_FILE" ] && [ -f "$RUNTIME_DIR/pi/settings.json" ]; then
+    if ! migration_docker preview "${MIGRATION_PREVIEW_MODE[@]}" --plan "$MIGRATION_PLAN"; then
+        if [ "$RECORDED" = 1 ]; then print_error "续做无法沿用迁移确认（原因见上方）；$(settings_fixed_hint)"; fi
+        exit 1
+    fi
     MIGRATION_PLANNED=1
 fi
 # ---- 停机前的交互选择：只读取和校验，全部答完才停止机器人服务 ----
 RECONFIGURE_AI=0
-if [ "$REUSE_SETTINGS" = 1 ]; then
-    # 首次配置向导需要交互；升级前缺少模型配置时回滚，由部署脚本完成配置。
+if [ "$RECORDED" = 1 ]; then
+    # 配置向导需要交互；续做从不运行向导，缺少模型配置时停止。
     if [ ! -f "$MODELS_FILE" ]; then
-        print_error "缺少 data/config/models.json；升级沿用现有 AI 配置，将回滚，请先运行部署脚本完成配置"
+        print_error "缺少 data/config/models.json；$(settings_fixed_hint)"
         exit 1
     fi
-    print_status "升级沿用现有 AI 配置、端口、入口模式、群数据总根和域名"
+    print_status "续做沿用现有 AI 配置"
+    if [ "${TRANSACTION[reconfigure_ai]}" = 1 ]; then print_warning "上次选择的 AI 重新配置不会在续做中运行；需要时请在部署完成后重新部署修改"; fi
 elif [ -f "$MODELS_FILE" ]; then
     print_status "检测到已有 data/config/models.json"
     if ask_yes_no "是否重新配置 AI（provider/key/model）？[y/N]：" "n"; then
@@ -472,10 +638,19 @@ if [ -n "$RAW_PUBLIC_DOMAIN" ]; then
         fi
     fi
 fi
-if [ -n "$INVALID_CONFIGURED_DOMAIN" ]; then
+if [ "$RECORDED" = 1 ]; then
+    # 续做使用停机前确认的域名及其写回方式。
+    PUBLIC_DOMAIN="${TRANSACTION[bot_domain]}"
+    PERSIST_BOT_DOMAIN=0
+    CLEAR_PERSISTED_BOT_DOMAIN=0
+    case "${TRANSACTION[domain_action]}" in
+        persist) PERSIST_BOT_DOMAIN=1 ;;
+        clear) CLEAR_PERSISTED_BOT_DOMAIN=1 ;;
+    esac
+elif [ -n "$INVALID_CONFIGURED_DOMAIN" ]; then
     print_warning "$DOMAIN_SOURCE 中的域名无效，已忽略：$INVALID_CONFIGURED_DOMAIN"
 fi
-if [ "$DEPLOY_MODE" = "cloudflare" ] && [ "$REUSE_SETTINGS" != 1 ]; then
+if [ "$DEPLOY_MODE" = "cloudflare" ] && [ "$RECORDED" != 1 ]; then
     echo "Cloudflare 公网域名准备："
     echo "  1) 将根域名（如 example.com）添加到 Cloudflare，按指引在域名注册商修改 NS，等待状态变为 Active（已激活）。域名无需转移注册商，但 DNS 需托管到 Cloudflare。"
     echo "  2) 下面填写机器人使用的子域名，例如 bot.example.com。"
@@ -508,8 +683,8 @@ UNMANAGED_TUNNEL_CONFIRMED=0
 if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1; then
     unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
     if [ "$PREPARED_UNMANAGED_MODE" = "$DEPLOY_MODE" ]; then
-        # ops update 已在停机前按同一模式确认过归属。
-        print_status "沿用升级前对未托管 cloudflared（pid ${unmanaged_pid}）的确认"
+        # 事务记录中已有停机前按同一模式确认的归属。
+        print_status "沿用停机前对未托管 cloudflared（pid ${unmanaged_pid}）的确认"
     elif [ "$DEPLOY_MODE" = "cloudflare" ]; then
         print_warning "检测到未由本项目记录的 cloudflared（pid ${unmanaged_pid}），无法自动确认它连接的是当前隧道"
         unmanaged_prompt="确认该 connector 正在服务本项目，继续沿用？[y/N]："
@@ -517,9 +692,13 @@ if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 
         print_warning "系统有未由本项目记录的 cloudflared（pid ${unmanaged_pid}）；不会自动停止，以免影响其他隧道"
         unmanaged_prompt="确认该 connector 与本项目无关或其入口仍受保护，继续直连部署？[y/N]："
     fi
-    if [ "$PREPARED_UNMANAGED_MODE" != "$DEPLOY_MODE" ] && ! ask_yes_no "$unmanaged_prompt" "n"; then
-        print_error "未确认未托管 cloudflared 的安全边界；部署已取消，配置未改动"
-        exit 1
+    if [ "$PREPARED_UNMANAGED_MODE" != "$DEPLOY_MODE" ]; then
+        # 续做不提问：停机前没有确认过的 connector 只能处理后重试，或回滚。
+        if [ "$RECORDED" = 1 ]; then print_error "停机前没有确认过这个 cloudflared；$(settings_fixed_hint)"; exit 1; fi
+        if ! ask_yes_no "$unmanaged_prompt" "n"; then
+            print_error "未确认未托管 cloudflared 的安全边界；部署已取消，配置未改动"
+            exit 1
+        fi
     fi
     UNMANAGED_TUNNEL_CONFIRMED=1
 fi
@@ -527,11 +706,15 @@ fi
 # 缺少 connector 时在停机前确定 token 来源（输入隐藏）；部署验证实例就绪后只启动一次。
 TUNNEL_TOKEN_INPUT=""
 if [ "$DEPLOY_MODE" = "cloudflare" ] && ! managed_cloudflared_pid >/dev/null 2>&1 && ! pgrep -x cloudflared >/dev/null 2>&1; then
-    if [ "$PREPARED_TUNNEL_READY" = 1 ] && (load_tunnel_token "$PREPARED_TUNNEL_INPUT") >/dev/null 2>&1; then
+    if [ -n "$PREPARED_TUNNEL_INPUT" ] && (load_tunnel_token "$PREPARED_TUNNEL_INPUT") >/dev/null 2>&1; then
         TUNNEL_TOKEN_INPUT="$PREPARED_TUNNEL_INPUT"
-        print_status "未运行 cloudflared；沿用升级前确认的隧道 token，部署验证实例就绪后启动"
+        print_status "未运行 cloudflared；沿用升级器在停机前确认的隧道 token，部署验证实例就绪后启动"
     elif (load_tunnel_token) >/dev/null 2>&1; then
         print_status "未运行 cloudflared；将使用已保存的隧道 token，部署验证实例就绪后启动"
+    elif [ "$RECORDED" = 1 ]; then
+        # 停机前输入的 token 不写入事务记录；重启后的续做只能使用已保存的来源。
+        print_error "续做需要隧道 token，但没有可用的已保存 token；请保存到 data/config/cloudflared-token 后重试继续，或回滚（$(ops_command_hint rollback)）"
+        exit 1
     else
         print_status "未运行 cloudflared；请先提供隧道 token，部署验证实例就绪后启动"
         show_tunnel_token_help
@@ -543,14 +726,14 @@ if [ "$DEPLOY_MODE" = "cloudflare" ] && ! managed_cloudflared_pid >/dev/null 2>&
 fi
 PREPARED_TUNNEL_INPUT=""
 
-# Decisions precede persistent changes; ops update may already have stopped the old container.
+# Decisions precede persistent changes; a continued transaction reopens its original snapshot.
 begin_deployment
 if [ "$MIGRATION_PLANNED" = 1 ]; then
-    # The legacy parent understands only a committed receipt. Retain target code on
-    # abrupt termination; a completed rollback below clears it before restoring code.
+    # The upgrader keeps the target code on this receipt after abrupt termination;
+    # a completed rollback clears it before the upgrader restores the original code.
     if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
     MIGRATION_APPLY_ATTEMPTED=1
-    migration_docker apply --plan /app/data/state/migration-plan.json
+    migration_docker apply --plan "$MIGRATION_PLAN"
 fi
 
 # ---- AI 配置（容器内 TUI 写 data/config/models.json）----
@@ -694,17 +877,17 @@ fi
 # 旧容器和配置已在 begin_deployment 中保存。
 
 if [ "$MIGRATION_PLANNED" = 0 ]; then
-    migration_docker preview --interactive --plan /app/data/state/migration-plan.json
+    migration_docker preview "${MIGRATION_PREVIEW_MODE[@]}" --plan "$MIGRATION_PLAN"
     if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
     MIGRATION_APPLY_ATTEMPTED=1
-    migration_docker apply --plan /app/data/state/migration-plan.json
+    migration_docker apply --plan "$MIGRATION_PLAN"
 fi
 # The scheduled/container entry reads this flag; readiness cannot accept messages.
 printf 'verify\n' > "$PROJECT_DIR/data/state/verify-only"
 
 # 持久化受支持的显式环境配置；容器路径由部署计算，其他值沿用 runtime.json。
 runtime_env_args=()
-for runtime_key in BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_TTL_MINUTES BOT_INDEX_MAX_FILES BOT_INDEX_MAX_DEPTH BOT_RUN_TIMEOUT_SECONDS BOT_MODEL_IDLE_TIMEOUT_SECONDS BOT_MODEL_RESPONSE_TIMEOUT_SECONDS BOT_SHUTDOWN_TIMEOUT_SECONDS BOT_DELIVERY_TIMEOUT_SECONDS BOT_DOCUMENT_ENV BOT_DOCUMENT_WORK_ENABLED PI_CACHE_RETENTION BOT_ATTACHMENT_CONCURRENCY; do
+for runtime_key in "${RUNTIME_ENV_KEYS[@]}"; do
     if [ -n "${!runtime_key:-}" ]; then runtime_env_args+=(-e "$runtime_key"); fi
 done
 docker run --rm --user "$CONTAINER_UID:$CONTAINER_GID" \
@@ -866,30 +1049,7 @@ fi
 docker stop --time 30 mixin-chatbot >/dev/null
 migration_docker commit
 commit_deployment
-rm -f -- "$PROJECT_DIR/data/state/verify-only" "$PROJECT_DIR/data/state/migration-plan.json"
-if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
-    print_status "启动机器人并等待健康检查..."
-    docker start mixin-chatbot >/dev/null
-    normal_ready=0
-    for i in $(seq 1 18); do
-        if docker exec mixin-chatbot bun run scripts/ops/health-check.ts; then normal_ready=1; break; fi
-        sleep 5
-    done
-    if [ "$normal_ready" != 1 ]; then
-        print_error "数据已经提交，但业务实例未就绪；保留新版本，请检查日志后重试升级"
-        exit 1
-    fi
-fi
-rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
-cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，但备份清理未完成，请检查 $DEPLOY_SNAPSHOT 和 $PROJECT_DIR/backup/rm"
-# Let process exit close descriptor 9. Explicit unlock would also unlock an update parent's inherited descriptor.
-if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ]; then
-    if docker rm "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
-        print_success "部署已提交，旧容器回滚版本已清理"
-    else
-        print_warning "部署已成功，但旧回滚容器 ${ROLLBACK_CONTAINER} 清理失败；可确认后手动 docker rm"
-    fi
-fi
+activate_committed_deployment
 
 # ---- 输出信息 ----
 
@@ -923,7 +1083,7 @@ elif docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo "    体检: $(ops_command_hint doctor)"
     echo "    日志: $(ops_command_hint logs)"
     echo "    重启: $(ops_command_hint restart)"
-    echo "    升级: $(ops_command_hint update)（沿用现有配置，停机后不再询问配置；改配置请重新部署）"
+    echo "    升级: $(ops_command_hint update)（沿用现有配置，停机前完成全部确认；改配置请重新部署）"
     echo ""
     if [ "${MIXIN_OPS_TUI:-}" != "1" ]; then
         echo "  底层命令（ops.sh 不适用时排障用）:"

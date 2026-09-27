@@ -14,7 +14,7 @@ try {
   }
   if (!matchesInstance(body, expected, port) || body.status !== "ready") process.exitCode = 1;
   else if (body.verificationOnly && !process.argv.includes("--allow-verification")) {
-    console.error("实例处于只验证模式，尚未处理消息；请继续升级完成提交");
+    console.error("实例处于只验证模式，尚未处理消息；请继续上次操作完成提交");
     process.exitCode = 3;
   } else process.exitCode = 0;
 } catch { process.exitCode = 1; }
