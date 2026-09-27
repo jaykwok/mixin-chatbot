@@ -91,6 +91,7 @@ for (const shell of ["powershell", "bash"] as const) {
               '  else return 99; fi',
               '}',
               'docker() {',
+              '  if [ "$1" = container ]; then shift; elif [ "$1" = inspect ]; then return 97; fi',
               '  case "$1" in',
               '    ps) cat "$FIXTURE_STATE" ;;',
               '    inspect) if [[ "$3" == *Config.Env* ]]; then printf "BOT_DEBUG=0\\nAPI_KEY=private-credential\\n";',

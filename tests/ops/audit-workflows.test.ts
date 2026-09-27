@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { copyFile, mkdir, readFile, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,52 +14,56 @@ const functionLoader = (file: string, names: string[]) => [
   ...names.map(name => "$definition=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq " + quotePS(name) + "},$true); if(-not $definition){throw 'missing function'}; Invoke-Expression $definition.Extent.Text"),
 ].join("\n");
 
-test("deployment health requires a ready matching instance, including UUID with reused PID", async () => {
-  startQueries();
-  const fixture = await tempFixture("health-protocol-");
-  let status = 200;
+// One test per response variant: each starts a Bun and (on Windows) one or two PowerShell processes, so a
+// single shared budget for all variants ran out on a loaded machine.
+describe("deployment health requires a ready matching instance, including UUID with reused PID", () => {
   const identity = { service: "mixin-chatbot", version: 1, instanceId: crypto.randomUUID(), pid: 42, startedAt: Date.now() };
+  let fixture: Awaited<ReturnType<typeof tempFixture>>, server: ReturnType<typeof Bun.serve>, port = 0, instance = "", ps = "";
+  let status = 200;
   let body: unknown = { ...identity, status: "ready" };
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(body, { status }) });
-  const port = server.port!;
-  await mkdir(join(fixture.root, "data/state"), { recursive: true });
-  const instance = join(fixture.root, "data/state/instance.json");
-  await writeFile(instance, JSON.stringify({ ...identity, port }));
-  const ps = join(fixture.root, "health.ps1");
-  await writeFile(ps, "\ufeff" + [
-    "$ErrorActionPreference='Stop'",
-    ". " + quotePS(join(project, "scripts/lib/common.ps1")),
-    functionLoader(join(project, "scripts/deploy/deploy.ps1"), ["Wait-BotHealth"]),
-    "$Project=$env:FIXTURE_PROJECT",
-    "if(Wait-BotHealth $env:BOT_PORT 1 -AllowVerification:($env:ALLOW_VERIFICATION -eq '1')){exit 0}else{exit 1}",
-  ].join("\n"));
-  try {
-    for (const variant of ["ready", "verification", "stopping", "wrong-service", "wrong-instance", "wrong-pid", "wrong-port", "503"]) {
-      body = { ...identity, status: variant === "stopping" ? "stopping" : "ready",
-        ...(variant === "verification" && { verificationOnly: true }),
-        ...(variant === "wrong-service" && { service: "other" }),
-        ...(variant === "wrong-instance" && { instanceId: crypto.randomUUID() }),
-        ...(variant === "wrong-pid" && { pid: 43 }) };
-      status = variant === "503" ? 503 : 200;
-      await writeFile(instance, JSON.stringify({ ...identity, port: variant === "wrong-port" ? port + 1 : port }));
-      const child = Bun.spawn([process.execPath, join(project, "scripts/ops/health-check.ts")], {
-        cwd: fixture.root, env: { ...process.env, BOT_PORT: String(port) }, stdout: "pipe", stderr: "pipe", windowsHide: true,
-      });
-      const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      expect(code, variant + out + err).toBe(variant === "ready" ? 0 : variant === "verification" ? 3 : 1);
-      if (process.platform === "win32") {
-        const result = await capture("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps],
-          { env: { FIXTURE_PROJECT: fixture.root, BOT_PORT: String(port) } });
-        expect(result.code, variant + result.stderr).toBe(variant === "ready" ? 0 : 1);
-        if (variant === "verification") {
-          const allowed = await capture("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps],
-            { env: { FIXTURE_PROJECT: fixture.root, BOT_PORT: String(port), ALLOW_VERIFICATION: "1" } });
-          expect(allowed.code, allowed.stderr).toBe(0);
-        }
+  beforeAll(async () => {
+    startQueries();
+    fixture = await tempFixture("health-protocol-");
+    server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(body, { status }) });
+    port = server.port!;
+    await mkdir(join(fixture.root, "data/state"), { recursive: true });
+    instance = join(fixture.root, "data/state/instance.json");
+    ps = join(fixture.root, "health.ps1");
+    await writeFile(ps, "\ufeff" + [
+      "$ErrorActionPreference='Stop'",
+      ". " + quotePS(join(project, "scripts/lib/common.ps1")),
+      functionLoader(join(project, "scripts/deploy/deploy.ps1"), ["Wait-BotHealth"]),
+      "$Project=$env:FIXTURE_PROJECT",
+      "if(Wait-BotHealth $env:BOT_PORT 1 -AllowVerification:($env:ALLOW_VERIFICATION -eq '1')){exit 0}else{exit 1}",
+    ].join("\n"));
+  });
+  afterAll(async () => { await server?.stop(true); await fixture?.cleanup(); });
+
+  test.each(["ready", "verification", "stopping", "wrong-service", "wrong-instance", "wrong-pid", "wrong-port", "503"])("%s", async variant => {
+    body = { ...identity, status: variant === "stopping" ? "stopping" : "ready",
+      ...(variant === "verification" && { verificationOnly: true }),
+      ...(variant === "wrong-service" && { service: "other" }),
+      ...(variant === "wrong-instance" && { instanceId: crypto.randomUUID() }),
+      ...(variant === "wrong-pid" && { pid: 43 }) };
+    status = variant === "503" ? 503 : 200;
+    await writeFile(instance, JSON.stringify({ ...identity, port: variant === "wrong-port" ? port + 1 : port }));
+    const child = Bun.spawn([process.execPath, join(project, "scripts/ops/health-check.ts")], {
+      cwd: fixture.root, env: { ...process.env, BOT_PORT: String(port) }, stdout: "pipe", stderr: "pipe", windowsHide: true,
+    });
+    const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code, variant + out + err).toBe(variant === "ready" ? 0 : variant === "verification" ? 3 : 1);
+    if (process.platform === "win32") {
+      const result = await capture("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps],
+        { env: { FIXTURE_PROJECT: fixture.root, BOT_PORT: String(port) } });
+      expect(result.code, variant + result.stderr).toBe(variant === "ready" ? 0 : 1);
+      if (variant === "verification") {
+        const allowed = await capture("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps],
+          { env: { FIXTURE_PROJECT: fixture.root, BOT_PORT: String(port), ALLOW_VERIFICATION: "1" } });
+        expect(allowed.code, allowed.stderr).toBe(0);
       }
     }
-  } finally { await server.stop(true); await fixture.cleanup(); }
-}, 30000);
+  }, 30000);
+});
 
 test.skipIf(process.platform !== "win32")("TUI cancellation waits for real history maintenance to restore scheduled and foreground bots", async () => {
   const fixture = await tempFixture("protected-maintenance-"), ps = join(fixture.root, "operation.ps1");
@@ -122,7 +126,7 @@ test.skipIf(process.platform !== "linux")("original Linux tunnel launcher record
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(identity) });
   try {
     for (const dir of ["scripts/tunnel", "scripts/lib", "scripts/ops", "src/core", "data/state"]) await mkdir(join(fixture.root, dir), { recursive: true });
-    for (const path of ["scripts/tunnel/start-tunnel.sh", "scripts/lib/common.sh", "scripts/lib/lifecycle.sh", "scripts/lib/tunnel-logging.sh", "scripts/lib/operation-log.sh", "scripts/ops/health-check.ts", "src/core/health.ts"]) {
+    for (const path of ["scripts/tunnel/start-tunnel.sh", "scripts/lib/common.sh", "scripts/lib/lifecycle.sh", "scripts/lib/tunnel-logging.sh", "scripts/lib/operation-log.sh", "scripts/lib/transaction.sh", "scripts/ops/health-check.ts", "src/core/health.ts"]) {
       await copyFile(join(project, path), join(fixture.root, path));
     }
     await writeFile(join(fixture.root, "data/state/instance.json"), JSON.stringify({ ...identity, port: server.port }));

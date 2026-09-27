@@ -98,6 +98,12 @@ try {
     if ($Rollback) {
     # 数据已提交只能继续；判定在停止服务或改动代码之前。
     if ($committed) { throw "上次升级的数据已经提交，不能回滚；请使用 $(Get-OpsCommandHint 'resume') 完成新实例启动。" }
+    # 回滚最后要恢复代码：工作区有升级后的人工改动时，在恢复任何内容之前停止。
+    $conflicts = @(Get-CodeRestoreConflicts $git $Project $OriginalBranch $OriginalSha $TargetSha)
+    if ($conflicts.Count) {
+        throw ("没有回滚：恢复升级前的代码会覆盖升级后的工作区改动，数据、代码和计划任务保持现状：`n  - " + ($conflicts -join "`n  - ") +
+            "`n把改动提交到其他分支、备份或撤销后重试 $(Get-OpsCommandHint 'rollback')。")
+    }
     Write-Host '回滚上次升级：恢复数据、代码、依赖、计划任务和原运行状态...'
     $mutated = $true
     } else {
@@ -180,6 +186,12 @@ try {
             if ($LASTEXITCODE -ne 0) { throw '数据恢复失败；保持停机，保留新代码和备份' }
         }
         Remove-Item -LiteralPath (Join-Path $Project 'data\state\verify-only') -Force -ErrorAction SilentlyContinue
+        # 旧服务直接运行工作区代码，必须先恢复代码；有人工改动时保持停机并保留事务，处理后重试回滚。
+        $conflicts = @(Get-CodeRestoreConflicts $git $Project $OriginalBranch $OriginalSha $TargetSha)
+        if ($conflicts.Count) {
+            throw ("代码没有恢复：升级后的工作区改动会被覆盖；服务保持停止，事务保留：`n  - " + ($conflicts -join "`n  - ") +
+                "`n把改动提交到其他分支、备份或撤销后运行 $(Get-OpsCommandHint 'rollback')，继续恢复代码和计划任务。")
+        }
         if ($OriginalBranch -eq 'HEAD') { & $git -C $Project checkout --force $OriginalSha }
         else {
             & $git -C $Project checkout $OriginalBranch

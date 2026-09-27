@@ -9,11 +9,13 @@ await mkdir(parent, { recursive: true });
 const cwd = await mkdtemp(join(parent, "tests-"));
 const fixtures = join(cwd, "fixtures");
 await mkdir(fixtures);
+// 夹具归档到本次工作目录的 trash/，不进项目的 backup/rm：成功后随工作目录删除，失败时作为现场保留。
+const trash = join(cwd, "trash");
 const args = process.argv.slice(2);
 const targets = args.filter(arg => !arg.startsWith("-") && existsSync(join(project, arg)));
 const child = Bun.spawn([process.execPath, "test", ...(targets.length ? [] : [join(project, "tests")]),
   ...args.map(arg => targets.includes(arg) ? join(project, arg) : arg)], { cwd, env: { ...process.env, TEMP: fixtures, TMP: fixtures, TMPDIR: fixtures,
-  TEST_TEMP_ROOT: fixtures, TEST_TRASH_DIR: join(project, "backup/rm"), GROUP_DATA_ROOT: "data/groups" },
+  TEST_TEMP_ROOT: fixtures, TEST_TRASH_DIR: trash, GROUP_DATA_ROOT: "data/groups" },
   stdin: "inherit", stdout: "inherit", stderr: "inherit", windowsHide: true });
 process.once("SIGINT", () => child.kill("SIGINT"));
 process.once("SIGTERM", () => child.kill("SIGTERM"));

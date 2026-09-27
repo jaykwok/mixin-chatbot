@@ -4,7 +4,7 @@
 import { readFileSync } from "node:fs";
 import { join, posix, win32 } from "node:path";
 import { MIGRATION_FILE, migrationCommitted, readMetadata, type MigrationState } from "../../../src/core/data-version.ts";
-import { PROJECT_DIR } from "./platform.ts";
+import { PROJECT_DIR, type Platform } from "./platform.ts";
 
 const KEYS = ["format", "operation", "snapshot", "target_sha", "original_sha", "original_branch", "original_group_root",
   "target_group_root", "was_running", "bot_port", "deploy_mode", "bot_domain", "domain_action", "unmanaged_tunnel", "platform_ip", "reconfigure_ai"] as const;
@@ -14,7 +14,7 @@ export interface PendingTransaction {
   operation: "deploy" | "upgrade";
   /** Linux 升级在调用部署脚本前中断时还没有快照。 */
   snapshot: string | null;
-  /** 旧版事务没有记录，脚本会按已保存设置合成。 */
+  /** 旧版事务没有记录：Windows 按已保存设置合成；Linux 已有快照时继续前在终端逐项确认并补录一次。 */
   record: TransactionRecord | null;
   targetSha: string | null;
   /** 数据已经提交时只能继续完成新实例启动。 */
@@ -119,7 +119,8 @@ export function loadPendingTransaction(project = PROJECT_DIR): PendingTransactio
 const shortSha = (sha: string | null) => sha ? sha.slice(0, 7) : "（非 git 部署）";
 
 /** 维护页确认框和恢复菜单共用的摘要：标题一行，记录内容逐行。 */
-export function describePendingTransaction(pending: PendingTransaction): { subject: string; record: string[] } {
+export function describePendingTransaction(pending: PendingTransaction,
+  platform: Platform = process.platform === "win32" ? "windows" : "linux"): { subject: string; record: string[] } {
   const kind = pending.operation === "upgrade" ? "升级" : "部署";
   const record = pending.record;
   return {
@@ -128,6 +129,6 @@ export function describePendingTransaction(pending: PendingTransaction): { subje
       `群数据总根：${record.target_group_root}${record.original_group_root !== record.target_group_root ? `（原 ${record.original_group_root}）` : ""}`,
       `端口 ${record.bot_port} · 入口 ${record.deploy_mode === "cloudflare" ? "Cloudflare" : `直连（来源 ${record.platform_ip}）`}${record.bot_domain ? ` · ${record.bot_domain}` : ""}`,
       `原运行状态：${record.was_running === "1" ? "运行" : "停止"}`,
-    ] : ["旧版事务：继续时按已保存设置处理"],
+    ] : [platform === "linux" && pending.snapshot && !pending.codeRestorePending ? "旧版事务没有记录：继续前需在终端逐项确认并补录一次，回滚不需要" : "旧版事务：继续时按已保存设置处理"],
   };
 }

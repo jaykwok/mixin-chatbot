@@ -79,11 +79,60 @@ bot_local_ready() {
     fi
 }
 
+# rootless Docker 把容器里的 root 映射为运行守护进程的宿主机用户，其他 UID 映射到 subuid 区间，
+# 读写不了部署用户拥有的 bind mount；此时容器以 0:0 运行，在宿主机上仍是这个普通用户。
+docker_rootless() {
+    local options
+    options="$(docker info --format '{{.SecurityOptions}}' 2>/dev/null)" || return 1
+    [[ "$options" == *name=rootless* ]]
+}
+
+# 访问宿主机上属于 owner（uid:gid）的挂载目录时，容器进程使用的身份。
+container_user() {
+    if docker_rootless; then echo 0:0; else echo "$1"; fi
+}
+
+# rootless Docker 发布的端口由 rootlesskit 父进程（默认 builtin 端口驱动）以部署用户身份在宿主机上监听：
+# 低于 net.ipv4.ip_unprivileged_port_start（通常 1024）的端口要求它有 CAP_NET_BIND_SERVICE，
+# 否则要到停机后启动容器时才报 cannot expose privileged port。
+unprivileged_port_start() {
+    local start
+    start="$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null)" || start=1024
+    [[ "$start" =~ ^[0-9]+$ ]] || start=1024
+    echo "$start"
+}
+
+rootless_port_publishable() {
+    local port="$1" pid caps
+    [ "$port" -lt "$(unprivileged_port_start)" ] || return 0
+    # 父进程名为 rootlesskit（重新执行的子进程叫 exe）。带文件能力的进程不可转储，读不到它的 user namespace，
+    # 所以按能力区分：父进程只有被授予的 CAP_NET_BIND_SERVICE（第 10 位）；自己 user namespace 里的子进程拥有全部能力，
+    # 包括 CAP_SYS_ADMIN（第 21 位），不算。
+    for pid in $(pgrep -u "$(id -u)" -x rootlesskit 2>/dev/null); do
+        caps="$(sed -n 's/^CapEff:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)"
+        [[ "$caps" =~ ^[0-9a-fA-F]+$ ]] || continue
+        (( (16#$caps >> 10) & 1 && !((16#$caps >> 21) & 1) )) && return 0
+    done
+    return 1
+}
+
+rootless_port_hint() {
+    local port="$1" start
+    start="$(unprivileged_port_start)"
+    printf '%s%s%s\n' "rootless Docker 不能发布低于 ${start} 的端口 ${port}：请改用 ${start}–65535 的端口；或放开低端口后重试：" \
+        "sudo sysctl -w net.ipv4.ip_unprivileged_port_start=${port}（写入 /etc/sysctl.d/ 持久化），" \
+        "或 sudo setcap cap_net_bind_service=ep \"\$(command -v rootlesskit)\" 后运行 systemctl --user restart docker"
+}
+
+# Docker 部署的工作区没有依赖（node_modules 只在镜像里）：此时用镜像自带的检查脚本和依赖，只读挂载 data/。
+# 容器用户与部署相同（root 部署降权到 1001），才能读取 600 权限的配置文件。
 validate_model_configuration() {
-    if command -v bun >/dev/null 2>&1; then
+    if command -v bun >/dev/null 2>&1 && [ -d "$PROJECT_DIR/node_modules" ]; then
         bun run "$PROJECT_DIR/scripts/config/validate-models.ts" "$PROJECT_DIR"
     else
-        docker run --rm --network none --entrypoint bun -v "$PROJECT_DIR:/audit:ro" mixin-chatbot run /audit/scripts/config/validate-models.ts /audit
+        local user=1001:1001
+        [ "$(id -u)" -eq 0 ] || user="$(container_user "$(id -u):$(id -g)")"
+        docker run --rm --network none --user "$user" -v "$PROJECT_DIR/data:/app/data:ro" mixin-chatbot bun run scripts/config/validate-models.ts /app
     fi
 }
 
@@ -264,5 +313,53 @@ restore_checkout() {
     else return 0; fi
     echo "$failure" >&2
     operation_event error "$failure"
+    return 1
+}
+
+# restore_checkout 会丢弃工作区的改动（reset --hard / checkout --force）：恢复前检查升级后的人工改动。
+# 当前提交和要重置的原分支只能停在升级前或目标提交；已跟踪文件不能有改动。升级前有、当前提交没有的路径由恢复重建：
+# 路径本身已有的内容只能是目标版本跟踪的目录，且其中没有未跟踪或忽略的文件；各级父路径只能是目录、不存在，
+# 或目标版本跟踪的文件，否则 git 会删掉占位的文件或链接再建目录（或经链接写到别处）。有冲突时逐项列出并返回 1，调用方保留事务并停止。
+code_restore_safe() {
+    local branch="$1" original="$2" target="$3" head ref line path parent conflicts=()
+    local -A checked=()
+    head="$(git_here rev-parse --verify --quiet 'HEAD^{commit}')" || head=''
+    [ "$head" = "$original" ] || [ "$head" = "$target" ] ||
+        conflicts+=("当前提交 ${head:0:7} 既不是升级前的 ${original:0:7}，也不是目标 ${target:0:7}：升级后有新的提交或切换")
+    if [ -n "$branch" ] && [ "$branch" != HEAD ]; then
+        ref="$(git_here rev-parse --verify --quiet "refs/heads/${branch}^{commit}")" || ref=''
+        [ "$ref" = "$original" ] || [ "$ref" = "$target" ] ||
+            conflicts+=("分支 ${branch} 指向 ${ref:0:7}，不是升级前或目标提交：回滚会把它重置到 ${original:0:7}")
+    fi
+    while IFS= read -r line; do
+        [ -z "$line" ] || conflicts+=("未提交的改动：$line")
+    done < <(git_here status --porcelain --untracked-files=no 2>&1)
+    if [ -n "$head" ] && git_here cat-file -e "${original}^{commit}" 2>/dev/null; then
+        while IFS= read -r -d '' path; do
+            if [ -e "$PROJECT_DIR/$path" ] || [ -L "$PROJECT_DIR/$path" ]; then
+                if [ ! -L "$PROJECT_DIR/$path" ] && [ -d "$PROJECT_DIR/$path" ] && [ "$(git_here cat-file -t "$head:$path" 2>/dev/null)" = tree ]; then
+                    while IFS= read -r -d '' line; do
+                        conflicts+=("未跟踪的文件会随目录删除（升级前的版本在 $path 是文件）：$line")
+                    done < <(git_here --literal-pathspecs ls-files -z --others -- "$path" 2>/dev/null)
+                else
+                    conflicts+=("未跟踪的文件会被升级前的版本覆盖：$path")
+                fi
+            fi
+            parent="$path"
+            while [[ "$parent" == */* ]]; do
+                parent="${parent%/*}"
+                [ -z "${checked[$parent]:-}" ] || break
+                checked[$parent]=1
+                if [ -L "$PROJECT_DIR/$parent" ] || { [ -e "$PROJECT_DIR/$parent" ] && [ ! -d "$PROJECT_DIR/$parent" ]; }; then
+                    [ "$(git_here cat-file -t "$head:$parent" 2>/dev/null)" = blob ] ||
+                        conflicts+=("未跟踪的文件或链接占着升级前版本的目录位置：$parent")
+                fi
+            done
+        done < <(git_here diff --name-only --no-renames -z --diff-filter=D "$original" "$head" 2>/dev/null)
+    fi
+    [ "${#conflicts[@]}" -gt 0 ] || return 0
+    echo "恢复升级前的代码会丢弃以下内容：" >&2
+    printf '  - %s\n' "${conflicts[@]}" >&2
+    operation_event error "code restore blocked by ${#conflicts[@]} local change(s)"
     return 1
 }

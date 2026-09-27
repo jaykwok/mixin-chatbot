@@ -40,7 +40,7 @@ if [ "$(id -u)" -eq 0 ]; then
     CONTAINER_UID=1001
     CONTAINER_GID=1001
 else
-    # 与 deploy.sh 相同：普通 Docker 用户由容器沿用当前 UID/GID。
+    # 与 deploy.sh 相同：普通 Docker 用户由容器沿用当前 UID/GID；rootless Docker 下是容器里的 root，连上 Docker 后判定。
     CONTAINER_UID="$(id -u)"
     CONTAINER_GID="$(id -g)"
 fi
@@ -49,6 +49,8 @@ ORIGINAL_BRANCH=''
 TARGET_SHA=''
 TUNNEL_INPUT=''
 DEPLOY_PID=''
+PREVIEW_PID=''
+PREVIEW_CONTAINER=''
 DEPLOY_STATUS=0
 DEPLOY_RECEIPT="$UPGRADER_DIR/commit-receipt"
 INTERRUPTED=0
@@ -110,10 +112,14 @@ checkout_target() {
 }
 
 # 数据、配置、容器和原运行状态已由部署脚本恢复（事务处于“待恢复代码”阶段），再恢复升级前的代码。
-# 代码恢复后才清除事务指针；失败时保留该阶段，处理后重试回滚只恢复代码。
+# 代码恢复后才清除事务指针；失败或工作区有人工改动时保留该阶段，处理后重试回滚只恢复代码。
 complete_code_restore() {
     if [ "$(git_here rev-parse HEAD 2>/dev/null)" != "$ORIGINAL_SHA" ]; then
         operation_stage rollback-code
+        code_restore_safe "$ORIGINAL_BRANCH" "$ORIGINAL_SHA" "$TARGET_SHA" || {
+            print_error "代码没有恢复：升级后的工作区改动（见上方）会被覆盖；数据、配置和原运行状态已恢复。把改动提交到其他分支、备份或撤销后运行 $(ops_command_hint rollback)，只恢复代码"
+            exit 1
+        }
         restore_checkout "$ORIGINAL_BRANCH" "$ORIGINAL_SHA" || {
             print_error "代码未能恢复到升级前的 ${ORIGINAL_SHA:0:7}（原因见上方）；数据、配置和原运行状态已恢复。处理 git 问题（如残留的 .git/index.lock）后运行 $(ops_command_hint rollback)，只恢复代码"
             exit 1
@@ -226,6 +232,11 @@ resume_upgrade() {
     fi
     if [ "$ACTION" = rollback ]; then
         [ "$head" = "$TARGET_SHA" ] || rollback_before_checkout
+        # 回滚最后要恢复代码：工作区有升级后的人工改动时，在恢复任何内容之前停止。
+        code_restore_safe "$ORIGINAL_BRANCH" "$ORIGINAL_SHA" "$TARGET_SHA" || {
+            print_error "没有回滚：恢复升级前的代码会覆盖升级后的工作区改动（见上方），数据、配置和容器保持现状。把改动提交到其他分支、备份或撤销后重试 $(ops_command_hint rollback)"
+            exit 1
+        }
         # 代码已切换：由目标版本的部署脚本恢复数据、配置、容器和网络入口，再恢复升级前的代码。
         print_status "回滚上次升级：恢复数据、配置、容器、网络入口、代码和原运行状态"
         run_deploy rollback
@@ -233,7 +244,7 @@ resume_upgrade() {
     fi
     if [ "$head" != "$TARGET_SHA" ]; then
         # 中断发生在停机完成之前时服务可能仍在运行；切换代码前先停止。
-        if [ "$(docker inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then
+        if [ "$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then
             print_status "停止机器人服务后再切换代码..."
             operation_capture docker stop --time 30 mixin-chatbot || { print_error "旧容器停止失败，未切换代码；可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
         fi
@@ -332,6 +343,15 @@ confirm_tunnel() {
 # 在目标版本 Dockerfile 的 Bun 基础镜像中预览迁移：只运行 run.ts preview --decisions-only（只用内置模块），
 # 目标依赖相关的完整校验留到停机后在目标镜像中进行。data/ 和群根只读挂载，容器内路径与正式迁移相同，
 # 计划中的输入摘要可直接用于停机后的 apply；暂存目录和计划写在导出目录的 preview/ 下。
+stop_preview() {
+    [ -n "$PREVIEW_PID" ] || return 0
+    docker rm -f "$PREVIEW_CONTAINER" >/dev/null 2>&1 || true
+    kill "$PREVIEW_PID" 2>/dev/null || true
+    wait "$PREVIEW_PID" 2>/dev/null || true
+    PREVIEW_PID=''
+    print_warning '迁移预览已中断并清理；服务尚未停止，代码和数据未改动'
+}
+
 preview_migration() {
     local image preview_dir="$UPGRADER_DIR/preview" groups mounts=() mode=() status=0
     image="$(sed -n 's#^FROM[[:space:]][[:space:]]*\(oven/bun:[^[:space:]]*\).*#\1#p' "$UPGRADER_DIR/Dockerfile" | head -n 1)"
@@ -354,11 +374,21 @@ preview_migration() {
     fi
     [ ! -t 0 ] || mode=(--interactive)
     print_status "在目标版本中预览迁移（只读挂载数据，服务尚未停止）..."
-    docker run --rm -i --user "$CONTAINER_UID:$CONTAINER_GID" -w /app -e HOME=/tmp -e BOT_OPERATION_LOG -e GROUP_DATA_ROOT="$groups" \
+    # 预览容器有名称并在后台运行，升级器等待它：中断（ops.sh 转发的 TERM、终端 Ctrl+C、断线）时先删除容器再退出。
+    # 在前台运行时 docker CLI 会随升级器退出变成孤儿，容器（例如正在等待迁移确认）一直留着。
+    PREVIEW_CONTAINER="mixin-chatbot-preview-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+    trap 'stop_preview; exit 130' INT
+    trap 'stop_preview; exit 143' TERM
+    trap 'stop_preview; exit 129' HUP
+    docker run --rm -i --name "$PREVIEW_CONTAINER" --user "$CONTAINER_UID:$CONTAINER_GID" -w /app -e HOME=/tmp -e BOT_OPERATION_LOG -e GROUP_DATA_ROOT="$groups" \
         -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" -v "$PROJECT_DIR/logs:/app/logs" \
         -v "$UPGRADER_DIR:/upgrade:ro" -v "$preview_dir:/preview" \
         "$image" bun --no-install /upgrade/scripts/migrations/run.ts preview --decisions-only "${mode[@]}" \
-        --project /app --groups "$groups" --scratch /preview --plan /preview/migration-plan.json || status=$?
+        --project /app --groups "$groups" --scratch /preview --plan /preview/migration-plan.json <&0 &
+    PREVIEW_PID=$!
+    wait "$PREVIEW_PID" || status=$?
+    PREVIEW_PID=''
+    trap - INT TERM HUP
     if [ "$status" != 0 ]; then
         print_error "迁移预览未完成（原因见上方）；服务尚未停止，代码和数据未改动"
         # 退出码 2：有需要确认的迁移选择。升级不接受命令行确认参数，只能在交互终端中回答。
@@ -387,8 +417,8 @@ abort_before_handoff() {
     trap - EXIT
     if [ "$(git_here rev-parse HEAD 2>/dev/null)" != "$ORIGINAL_SHA" ]; then
         # 失败时事务保留“待恢复代码”阶段（见 rollback_deployment），处理后重试回滚只恢复代码。
-        restore_checkout "$ORIGINAL_BRANCH" "$ORIGINAL_SHA" ||
-            print_error "代码未能恢复到升级前的 ${ORIGINAL_SHA:0:7}（原因见上方）；恢复数据和服务后，处理 git 问题再运行 $(ops_command_hint rollback)，只恢复代码"
+        { code_restore_safe "$ORIGINAL_BRANCH" "$ORIGINAL_SHA" "$TARGET_SHA" && restore_checkout "$ORIGINAL_BRANCH" "$ORIGINAL_SHA"; } ||
+            print_error "代码未能恢复到升级前的 ${ORIGINAL_SHA:0:7}（原因见上方）；恢复数据和服务后，处理 git 问题或工作区改动再运行 $(ops_command_hint rollback)，只恢复代码"
     fi
     (exit "$status")
     rollback_deployment
@@ -433,11 +463,18 @@ fresh_upgrade() {
         echo ""
     fi
     docker info >/dev/null 2>&1 || { print_error '无法连接 Docker，尚未应用升级'; exit 1; }
+    if [ "$(id -u)" -ne 0 ]; then IFS=: read -r CONTAINER_UID CONTAINER_GID <<< "$(container_user "$CONTAINER_UID:$CONTAINER_GID")"; fi
     # 升级沿用现有 AI 配置；缺少时需要交互向导，应先通过部署完成。
     [ -f "$MODELS_FILE" ] || { print_error "缺少 data/config/models.json；升级沿用现有 AI 配置，请先使用 $(ops_command_hint deploy) 完成配置"; exit 1; }
     check_upgrade_environment
     read_saved_settings
     print_status "升级沿用现有设置：端口 ${BOT_PORT}；入口 ${DEPLOY_MODE}；群数据总根 ${GROUP_ROOT}；域名 ${PUBLIC_DOMAIN:-未设置}"
+    # rootless Docker 要到停机后启动容器时才拒绝发布低端口：沿用的端口发布不了就在这里停止。
+    if docker_rootless && ! rootless_port_publishable "$BOT_PORT"; then
+        print_error "$(rootless_port_hint "$BOT_PORT")"
+        print_error "升级沿用已保存的端口 ${BOT_PORT}；改端口请用 $(ops_command_hint deploy)（服务尚未停止）"
+        exit 1
+    fi
     confirm_tunnel
     preview_migration
 

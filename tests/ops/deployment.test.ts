@@ -241,6 +241,9 @@ $body=(Get-Content -LiteralPath $sourcePath -Raw -Encoding UTF8).Substring($ast.
 $body=(($body -split '\\r?\\n') | Where-Object { -not $_.StartsWith('. (Join-Path') }) -join [Environment]::NewLine
 $body=$body.Replace('$PSScriptRoot', "'" + $PSScriptRoot.Replace("'", "''") + "'")
 $run=[scriptblock]::Create($body)
+# The real conflict check runs against fixture-git: HEAD and the branch come from rev-parse, changes from status.
+$libraryAst=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/lib/deployment.ps1"))},[ref]$tokens,[ref]$errors)
+Invoke-Expression $libraryAst.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-CodeRestoreConflicts'},$true).Extent.Text
 $BunPath='fixture-bun'; $GitPath='fixture-git'
 $Project=$PSScriptRoot; $OriginalSha='1111111111111111111111111111111111111111'; $TargetSha='2222222222222222222222222222222222222222'; $OriginalBranch='main'
 New-Item -ItemType Directory -Force -Path (Join-Path $Project 'data/state'),(Join-Path $Project 'data/groups') | Out-Null
@@ -254,6 +257,7 @@ function fixture-git {
     if(($args -contains 'checkout' -or $args -contains 'merge') -and -not $script:stopped){throw 'live checkout changed before stop'}
     if($args -contains 'rev-parse'){ if($script:failure -eq 'code'){'3333333333333333333333333333333333333333'}else{$TargetSha} }
     if($args -contains 'reset') { if($script:applied -and -not $script:dataRestored){throw 'code restored before data'}; $script:codeRestored=$true }
+    if($args -contains 'status' -and $script:dirty) { ' M version.txt' }
 }
 function fixture-bun {
     $global:LASTEXITCODE=0
@@ -298,7 +302,9 @@ foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$
     try { & $run } catch { $ok=$false; Write-Host $_.Exception.Message }
     if($ok -ne ($script:failure -eq 'none')){throw ('wrong result: '+$script:failure)}
     if($script:failure -eq 'code' -and ($script:installs -or $script:applied)){throw 'wrong release mutated data or dependencies'}
-    if($script:failure -in @('preview','main-missing','diverged','task-missing')) { if($script:stopped -or $script:applied -or $script:installs){throw 'preflight failure mutated deployment'} }
+    # HEAD at a commit that is neither the original nor the target: the rollback never resets over it and keeps the transaction.
+    if($script:failure -eq 'code') { if($script:codeRestored -or $script:restores){throw 'unknown commit overwritten'} }
+    elseif($script:failure -in @('preview','main-missing','diverged','task-missing')) { if($script:stopped -or $script:applied -or $script:installs){throw 'preflight failure mutated deployment'} }
     elseif($script:failure -in @('none','postcommit')) {
         if($script:restores -ne 0 -or -not $script:committed -or $script:starts -ne [int]$script:running){throw 'wrong committed state'}
         if($script:backups -ne [int](-not $script:reuse) -or $script:installs -ne $script:backups){throw 'dependency reuse failed'}
@@ -326,12 +332,27 @@ foreach($script:committedBefore in @($true,$false)) {
     elseif(-not $ok -or -not $script:dataRestored -or -not $script:codeRestored -or $script:restores -ne 1 -or $pointer){throw 'rollback incomplete'}
     Write-Output 'ROLLBACK_VERIFIED'
 }
+# Manual changes after the upgrade are never reset: an explicit rollback stops before anything changes; a failed
+# upgrade restores the data first, then stops before the code and the old task, keeping the transaction.
+$script:dirty=$true
+foreach($Rollback in @($true,$false)) {
+    Set-Content -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction') ('deploy-' + ('a' * 32))
+    $script:failure=if($Rollback){'none'}else{'apply'}; $script:reuse=$true
+    $script:stopped=$false; $script:applied=$Rollback; $script:committed=$false; $script:dataRestored=$false; $script:codeRestored=$false; $script:restores=0
+    $ok=$true; $message=''
+    try { & $run } catch { $ok=$false; $message=$_.Exception.Message }
+    if($ok -or $script:codeRestored -or $script:restores -or -not (Test-Path -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction'))){throw 'manual change overwritten'}
+    if($script:stopped -ne (-not $Rollback) -or $script:dataRestored -ne (-not $Rollback)){throw 'wrong rollback extent'}
+    if($message -notmatch '未提交的改动： M version.txt'){throw ('conflict not listed: ' + $message)}
+    Write-Output 'MANUAL_CHANGES_KEPT'
+}
 `);
   try {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
     expect(result.output.match(/VERIFIED/g)).toHaveLength(42);
     expect(result.output.match(/ROLLBACK_VERIFIED/g)).toHaveLength(2);
+    expect(result.output.match(/MANUAL_CHANGES_KEPT/g)).toHaveLength(2);
   } finally { await fixture.cleanup(); }
 }, 60000);
 
@@ -987,6 +1008,72 @@ verify_deployed_group_root
   } finally { await fixture.cleanup(); }
 }, 30000);
 
+test.skipIf(!bash || !existsSync(bash))("Docker deployment offers a publishable port under rootless Docker and stops a recorded one before the build", async () => {
+  const fixture = await tempFixture("deployment-rootless-port-");
+  const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+  const section = source.split("# rootless Docker 通常不能发布 1024 以下的端口")[1]?.split('print_success "监听端口：$BOT_PORT"')[0]?.replace(/^[^\n]*/, "");
+  const trim = /^trim_input\(\) \{[\s\S]*?^\}/m.exec(source)?.[0];
+  expect(section).toBeDefined(); expect(trim).toBeDefined();
+  const script = join(fixture.root, "port.sh");
+  // Answers to the port prompt are the arguments after the state directory; running out of them is the end of input.
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+state="$1"; shift; answers=("$@")
+. '${posixPath(join(project, "scripts/lib/common.sh"))}'
+# No rootlesskit holding CAP_NET_BIND_SERVICE: only the kernel's unprivileged port start decides.
+pgrep() { return 1; }
+print_warning() { echo "WARN $*"; }; print_error() { echo "ERROR $*"; }
+${trim}
+read_input() {
+    echo "PROMPT $1"
+    [ "\${#answers[@]}" -gt 0 ] || { echo EOF; exit 130; }
+    printf -v "$2" '%s' "\${answers[0]}"; answers=("\${answers[@]:1}")
+}
+echo "START=$(unprivileged_port_start)"
+BOT_PORT_FILE="$state/bot-port"; RECORDED="\${FIXTURE_RECORDED:-0}"; DOCKER_ROOTLESS="$FIXTURE_ROOTLESS"
+[ -z "\${FIXTURE_PORT:-}" ] || BOT_PORT="$FIXTURE_PORT"
+${section}
+echo "PORT=$BOT_PORT"
+`);
+  const state = join(fixture.root, "state");
+  await mkdir(state);
+  const run = async (env: Record<string, string>, answers: string[] = []) => {
+    const result = await execute([bash!, posixPath(script), posixPath(state), ...answers], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1", ...env });
+    return { ...result, port: /^PORT=(\d+)/m.exec(result.output)?.[1], prompts: result.output.match(/^PROMPT .*/gm) ?? [] };
+  };
+  try {
+    let result = await run({ FIXTURE_ROOTLESS: "0" }, [""]);
+    const kernel = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
+    const start = process.platform !== "win32" && existsSync(kernel) ? Number((await readFile(kernel, "utf8")).trim()) : 1024;
+    expect(result.output).toContain(`START=${start}`);
+    expect({ code: result.code, port: result.port, prompts: result.prompts }).toEqual({ code: 0, port: "1011", prompts: ["PROMPT 机器人监听端口 [默认 1011]："] });
+    // A first rootless deployment defaults to a port it can publish.
+    const fallback = start > 1011 ? "11011" : "1011";
+    result = await run({ FIXTURE_ROOTLESS: "1" }, [""]);
+    expect({ code: result.code, port: result.port, prompts: result.prompts }).toEqual({ code: 0, port: fallback, prompts: [`PROMPT 机器人监听端口 [默认 ${fallback}]：`] });
+    if (start > 1) {
+      // A saved (or typed) privileged port is explained and asked again; without further input the deployment ends there.
+      const low = String(Math.min(1011, start - 1));
+      await writeFile(join(state, "bot-port"), low);
+      result = await run({ FIXTURE_ROOTLESS: "1" }, ["", "20000"]);
+      expect({ code: result.code, port: result.port, prompts: result.prompts.length }).toEqual({ code: 0, port: "20000", prompts: 2 });
+      expect(result.output).toContain(`WARN rootless Docker 不能发布低于 ${start} 的端口 ${low}：请改用 ${start}–65535 的端口`);
+      expect(result.output).toContain(`sudo sysctl -w net.ipv4.ip_unprivileged_port_start=${low}`);
+      result = await run({ FIXTURE_ROOTLESS: "1" }, [""]);
+      expect(result.code, result.output).toBe(130); expect(result.output).toContain("EOF"); expect(result.port).toBeUndefined();
+      // Rootful Docker publishes it on the host network as before.
+      result = await run({ FIXTURE_ROOTLESS: "0" }, [""]);
+      expect({ code: result.code, port: result.port }).toEqual({ code: 0, port: low });
+      // A resumed transaction keeps its recorded port: it stops with the way forward instead of failing after the build.
+      result = await run({ FIXTURE_ROOTLESS: "1", FIXTURE_RECORDED: "1", FIXTURE_PORT: low });
+      expect(result.code, result.output).toBe(1); expect(result.prompts).toEqual([]);
+      expect(result.output).toContain(`续做沿用事务记录的端口 ${low}`); expect(result.port).toBeUndefined();
+      result = await run({ FIXTURE_ROOTLESS: "0", FIXTURE_RECORDED: "1", FIXTURE_PORT: low });
+      expect({ code: result.code, port: result.port, prompts: result.prompts }).toEqual({ code: 0, port: low, prompts: [] });
+    }
+  } finally { await fixture.cleanup(); }
+}, 60000);
+
 test.skipIf(!bash || !existsSync(bash))("Docker deployment explicitly accepts verification health without trusting the normal HEALTHCHECK", async () => {
   const fixture = await tempFixture("deployment-verification-health-");
   const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
@@ -1003,7 +1090,7 @@ docker(){
         [[ "$*" = *--allow-verification ]] || return 90
         probes=$((probes+1)); echo PROBE
         [ "$probes" -ge 3 ]
-    elif [ "$1" = inspect ]; then
+    elif [ "$1 $2" = "container inspect" ]; then
         if [[ "$*" = *State.Running* ]]; then [ "$FIXTURE_MODE" != stopped ] && echo true || echo false
         else echo unhealthy; fi
     fi
@@ -1192,7 +1279,7 @@ test.skipIf(!bash || !existsSync(bash))("Docker continue and rollback use only t
   await writeFile(script, `#!/usr/bin/env bash
 set -euo pipefail
 . '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
-PROJECT_DIR="$1"; CONTAINER_UID=1001; CONTAINER_GID=1001; RECORDED=0
+PROJECT_DIR="$1"; CONTAINER_UID=1001; CONTAINER_GID=1001; RECORDED=0; DOCKER_ROOTLESS=0
 TRANSACTION_ACTION="\${FIXTURE_ACTION:-}"; MIGRATION_PREVIEW_MODE=(--interactive)
 DATA_DIR="$PROJECT_DIR/data"; CONFIG_DIR="$DATA_DIR/config"; STATE_DIR="$DATA_DIR/state"; RUNTIME_HOME_DIR="$DATA_DIR/runtime/home"
 LOG_DIR="$PROJECT_DIR/logs"; DEFAULT_GROUP_DATA_ROOT="$DATA_DIR/groups"; MODELS_FILE="$CONFIG_DIR/models.json"
@@ -1211,7 +1298,7 @@ begin_deployment(){ echo "BEGIN rollback=\${ROLLBACK_REQUESTED:-0} root=$HOST_GR
 docker(){
     echo "$*" >> '${posixPath(dockerLog)}'
     case "$1" in
-        inspect) [ "\${!#}" != mixin-chatbot-rollback ] || [ "\${FIXTURE_ROLLBACK_CONTAINER:-0}" = 1 ] ;;
+        container) [ "$2" = inspect ] && { [ "\${!#}" != mixin-chatbot-rollback ] || [ "\${FIXTURE_ROLLBACK_CONTAINER:-0}" = 1 ]; } ;;
         exec) [ "\${FIXTURE_UNHEALTHY:-0}" != 1 ] ;;
     esac
 }
@@ -1293,8 +1380,10 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
     await record();
     let activation = await committed({ FIXTURE_ROLLBACK_CONTAINER: "1" });
     expect(activation.code, activation.output).toBe(0);
-    expect(activation.docker).toEqual(["inspect mixin-chatbot-rollback", "inspect mixin-chatbot", "stop --time 30 mixin-chatbot", "start mixin-chatbot",
-      "exec mixin-chatbot bun run scripts/ops/health-check.ts", "rm mixin-chatbot-rollback"]);
+    expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect mixin-chatbot", "stop --time 30 mixin-chatbot", "start mixin-chatbot",
+      "exec mixin-chatbot bun run scripts/ops/health-check.ts", "rm mixin-chatbot-rollback",
+      // The committed transaction releases the tag that kept the original image for a rollback.
+      "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
     expect(activation.output).toContain(`CLEANUP ${posixPath(snapshot)}`); expect(activation.output).toContain("机器人已启动");
     expect(activation.output).not.toContain("BEGIN"); expect(activation.output).not.toContain("RESULT"); expect(activation.output).not.toContain("MIGRATION");
     expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
@@ -1303,7 +1392,7 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
     await record({ was_running: "0" });
     activation = await committed({});
     expect(activation.code, activation.output).toBe(0); expect(activation.output).toContain("保持停止");
-    expect(activation.docker).toEqual(["inspect mixin-chatbot-rollback", "inspect mixin-chatbot", "stop --time 30 mixin-chatbot"]);
+    expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect mixin-chatbot", "stop --time 30 mixin-chatbot", "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
     // An unhealthy instance keeps the transaction, so continuing again retries only the activation.
     await record();
     activation = await committed({ FIXTURE_UNHEALTHY: "1" });
@@ -1416,6 +1505,7 @@ run_ufw(){
 }
 remove_managed_ufw_rules(){ printf 'ufw allow 22/tcp\n' > mock/ufw; }
 docker(){
+    if [ "$1" = container ]; then shift; elif [ "$1" = inspect ]; then return 97; fi
     local cmd="$1"; shift
     case "$cmd" in
         ps) for file in mock/containers/*; do [ -f "$file" ] && basename "$file"; done ;;
@@ -1431,7 +1521,11 @@ docker(){
             [ "$cmd" != start ] || running=true
             printf '%s %s\n' "$image" "$running" > "mock/containers/$name" ;;
         rename) mv -- "mock/containers/$1" "mock/containers/$2" ;;
-        tag) printf '%s' "$1" > mock/image ;;
+        # Like the containerd image store: an image that lost its last tag is gone, even while a container uses it.
+        tag)
+            if [ "$1" != "$(cat mock/image 2>/dev/null)" ] && [ "$1" != "$(cat mock/previous 2>/dev/null)" ]; then echo "No such image: $1" >&2; return 1; fi
+            if [ "$2" = mixin-chatbot:previous ]; then printf '%s' "$1" > mock/previous; else printf '%s' "$1" > mock/image; fi ;;
+        image) case "$1" in inspect) [ -f mock/previous ] ;; rm) rm -- mock/previous ;; *) return 1 ;; esac ;;
         *) echo "unexpected Docker operation" >&2; return 1 ;;
     esac
 }
@@ -1457,6 +1551,7 @@ exit 42
       await writeFile(join(root, "data/config/models.json"), "old-config");
       await writeFile(join(root, "data/state/bot-port"), "1011");
       await writeFile(join(root, "mock/containers/mixin-chatbot"), `old-image ${running}\n`);
+      await writeFile(join(root, "mock/image"), "old-image");
       await writeFile(join(root, "mock/ufw"), "ufw allow 22/tcp\nufw allow proto tcp from 192.0.2.1 to any port 1011 comment 'Mixin-Chatbot (平台IP)'\n");
       const result = await execute([bash!, posixPath(script), posixPath(root), stage], root, { ...process.env, MSYS_NO_PATHCONV: "1" });
       expect(result.code, `${stage}: ${result.output}`).toBe(42);
@@ -1466,7 +1561,9 @@ exit 42
       expect(await readFile(join(root, "data/config/models.json"), "utf8")).toBe("old-config");
       expect(await readFile(join(root, "data/state/bot-port"), "utf8")).toBe("1011");
       expect(await readFile(join(root, "mock/containers/mixin-chatbot"), "utf8")).toBe(`old-image ${running}\n`);
+      // The rebuild moved the tag; the rollback tag kept the original image, and is released once it is restored.
       expect(await readFile(join(root, "mock/image"), "utf8")).toBe("old-image");
+      expect(existsSync(join(root, "mock/previous"))).toBe(false);
       const rules = await readFile(join(root, "mock/ufw"), "utf8");
       expect(rules).toContain("ufw allow 22/tcp"); expect(rules).toContain("192.0.2.1"); expect(rules).not.toContain("192.0.2.2");
     }
@@ -1486,7 +1583,7 @@ LOG_DIR="$PROJECT_DIR/logs"; TUNNEL_PID_FILE="$PROJECT_DIR/data/state/cloudflare
 operation_start deploy
 print_error(){ echo "$*" >&2; }; print_warning(){ echo "$*"; }; print_success(){ echo "$*"; }
 flock(){ :; }; can_manage_ufw(){ return 1; }; managed_cloudflared_pid(){ return 1; }; stop_tunnel_launcher(){ :; }
-docker(){ case "$1" in ps) : ;; inspect) return 1 ;; *) echo "unexpected Docker operation" >&2; return 1 ;; esac; }
+docker(){ case "$1 \${2:-}" in ps*) : ;; "container inspect") return 1 ;; *) echo "unexpected Docker operation" >&2; return 1 ;; esac; }
 record_deployment_transaction(){ declare -gA TRANSACTION=([operation]="$OPERATION" [original_sha]="$ORIGINAL_SHA"); }
 begin_deployment
 exit 42
@@ -1525,6 +1622,7 @@ print_error(){ echo "$*" >&2; }; print_warning(){ echo "$*"; }; print_success(){
 flock(){ :; }; can_manage_ufw(){ return 1; }
 managed_cloudflared_pid(){ return 1; }; stop_tunnel_launcher(){ :; }
 docker(){
+    if [ "$1" = container ]; then shift; elif [ "$1" = inspect ]; then return 97; fi
     local cmd="$1"; shift
     case "$cmd" in
         ps) for file in mock/*; do [ -f "$file" ] && basename "$file"; done ;;

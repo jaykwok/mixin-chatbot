@@ -54,7 +54,7 @@ test.skipIf(process.platform !== "linux")("Linux update holds its real flock thr
     const launcher = join(fixture.root, "launch.sh");
     await writeFile(launcher, [
       'source "$FIXTURE_WORK/scripts/ops/ops.sh" help >/dev/null',
-      'docker() { case "$1" in inspect) echo true ;; *) return 1 ;; esac; }',
+      'docker() { case "$1 $2" in "container inspect") echo true ;; *) return 1 ;; esac; }',
       'doctor() { if flock -n "$FIXTURE_WORK/data/state/deploy.lock" true; then echo "update lock released before doctor"; return 22; fi; return 0; }',
       'update',
     ].join("\n") + "\n");

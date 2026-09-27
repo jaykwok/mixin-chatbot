@@ -67,6 +67,7 @@ if [ "$(id -u)" -eq 0 ]; then
     CONTAINER_GID=1001
 else
     # bind mount 由当前部署用户拥有；用同一非 root 身份运行可同时保证主机与容器可维护。
+    # rootless Docker 下这个身份是容器里的 root，连上 Docker 后再判定（见 container_user）。
     CONTAINER_UID="$(id -u)"
     CONTAINER_GID="$(id -g)"
 fi
@@ -240,8 +241,10 @@ activate_committed_deployment() {
             print_success "部署已提交，旧容器回滚版本已清理"
         else
             print_warning "部署已成功，但旧回滚容器 ${ROLLBACK_CONTAINER} 清理失败；可确认后手动 docker rm"
+            return 0
         fi
     fi
+    release_previous_image
 }
 
 # 数据已在中断前提交：配置、网络入口和状态文件都已写入，旧数据不能再用。
@@ -251,8 +254,8 @@ finish_committed_transaction() {
     PREVIOUS_RUNNING="${TRANSACTION[was_running]}"
     ROLLBACK_CONTAINER=mixin-chatbot-rollback
     PREVIOUS_CONTAINER_SAVED=0
-    if docker inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then PREVIOUS_CONTAINER_SAVED=1; fi
-    if ! docker inspect mixin-chatbot >/dev/null 2>&1; then
+    if docker container inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then PREVIOUS_CONTAINER_SAVED=1; fi
+    if ! docker container inspect mixin-chatbot >/dev/null 2>&1; then
         print_error "上次操作的数据已经提交，但新容器 mixin-chatbot 不存在；请用 docker ps -a 检查后处理，不能回滚"
         exit 1
     fi
@@ -301,6 +304,10 @@ if ! docker info > /dev/null 2>&1; then
     echo "  提示: sudo usermod -aG docker \$USER && newgrp docker"
     exit 1
 fi
+# rootless Docker：容器里的 root 就是宿主机上的部署用户（见 container_user），host 网络只是 rootlesskit 的命名空间。
+DOCKER_ROOTLESS=0
+if docker_rootless; then DOCKER_ROOTLESS=1; fi
+if [ "$(id -u)" -ne 0 ] && [ "$DOCKER_ROOTLESS" = 1 ]; then CONTAINER_UID=0; CONTAINER_GID=0; fi
 
 required_files=("package.json" "src/server/index.ts" "scripts/config/configure.ts")
 for file in "${required_files[@]}"; do
@@ -339,6 +346,8 @@ if [ -e "$STATE_DIR/deploy-transaction" ]; then
             exit 1
         fi
     fi
+    # 旧版事务继续前在终端确认并补录记录；运维入口转交时（标准输入已关闭）应已补录。
+    if [ "$TRANSACTION_ACTION" = continue ]; then backfill_legacy_transaction || exit 1; fi
     RECORDED=1
     [ "$TRANSACTION_ACTION" != rollback ] || rollback_pending_deployment
     if [ -n "${TRANSACTION[target_sha]}" ] && [ "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null)" != "${TRANSACTION[target_sha]}" ]; then
@@ -376,7 +385,13 @@ else
     verify_deployed_group_root
 fi
 print_warning "转换数据前先预览；应用变更时保持停机，提交前失败恢复数据、配置和原运行状态。"
-mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
+# 容器挂载的目录都先由部署用户创建：不存在的 bind mount 源会被 Docker 以 root 身份创建，
+# 普通 Docker 用户随后无法在其中写入快照（全新克隆没有 backup/）。snapshots/ 和 rm/ 也在这里建好，
+# 下面 root 部署的 chown 才覆盖它们：成功的部署会删掉空的 snapshots/，之后由 root 重建的目录迁移容器写不进去。
+mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR" "$PROJECT_DIR/backup/snapshots" "$PROJECT_DIR/backup/rm"
+# rootless Docker 通常不能发布 1024 以下的端口（见 rootless_port_publishable）：没有指定或已保存的端口时默认改用高端口。
+FALLBACK_PORT=1011
+if [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$FALLBACK_PORT"; then FALLBACK_PORT=11011; fi
 if [ -n "${BOT_PORT:-}" ]; then
     PORT_DEFAULT_SOURCE="BOT_PORT"
     PORT_DEFAULT="$(trim_input "$BOT_PORT")"
@@ -385,23 +400,32 @@ elif [ -f "$BOT_PORT_FILE" ]; then
     PORT_DEFAULT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"
 else
     PORT_DEFAULT_SOURCE=""
-    PORT_DEFAULT="1011"
+    PORT_DEFAULT="$FALLBACK_PORT"
 fi
 if ! [[ "$PORT_DEFAULT" =~ ^[0-9]+$ ]] || [ "$PORT_DEFAULT" -lt 1 ] || [ "$PORT_DEFAULT" -gt 65535 ]; then
-    print_warning "${PORT_DEFAULT_SOURCE} 中的端口无效，已改用安全默认值 1011：${PORT_DEFAULT}"
-    PORT_DEFAULT="1011"
+    print_warning "${PORT_DEFAULT_SOURCE} 中的端口无效，已改用安全默认值 ${FALLBACK_PORT}：${PORT_DEFAULT}"
+    PORT_DEFAULT="$FALLBACK_PORT"
 fi
 if [ "$RECORDED" = 1 ]; then
     BOT_PORT="$PORT_DEFAULT"
+    # 续做沿用事务记录的端口，不能在这里修改；在构建和启动之前说明处理方法。
+    if [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$BOT_PORT"; then
+        print_error "$(rootless_port_hint "$BOT_PORT")"
+        print_error "续做沿用事务记录的端口 ${BOT_PORT}：放开低端口后重试继续，或用 $(ops_command_hint rollback) 回滚后再用 $(ops_command_hint deploy) 改端口"
+        exit 1
+    fi
 else
     while true; do
         read_input "机器人监听端口 [默认 ${PORT_DEFAULT}]：" port_in
         port_in="$(trim_input "$port_in")"
         BOT_PORT="${port_in:-$PORT_DEFAULT}"
-        if [[ "$BOT_PORT" =~ ^[0-9]+$ ]] && [ "$BOT_PORT" -ge 1 ] && [ "$BOT_PORT" -le 65535 ]; then
+        if ! [[ "$BOT_PORT" =~ ^[0-9]+$ ]] || [ "$BOT_PORT" -lt 1 ] || [ "$BOT_PORT" -gt 65535 ]; then
+            print_warning "端口必须是 1–65535 的整数，请重新输入"
+        elif [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$BOT_PORT"; then
+            print_warning "$(rootless_port_hint "$BOT_PORT")"
+        else
             break
         fi
-        print_warning "端口必须是 1–65535 的整数，请重新输入"
     done
 fi
 print_success "监听端口：$BOT_PORT"
@@ -543,6 +567,8 @@ print_success "目录就绪"
 # ---- 构建镜像 ----
 
 print_status "构建 Docker 镜像..."
+# 未完成的事务在首次构建前已保留原镜像；再打一次会把回滚标签指向失败的新镜像。
+if [ "$RECORDED" != 1 ]; then keep_previous_image || exit 1; fi
 if operation_capture docker build -t mixin-chatbot .; then
     print_success "镜像构建成功"
 else
@@ -898,15 +924,22 @@ docker run --rm --user "$CONTAINER_UID:$CONTAINER_GID" \
 # ---- 启动容器 ----
 
 print_status "启动容器..."
+# rootless Docker 的 host 网络连不到宿主机，平台回调和隧道都到不了：改为把端口发布到原监听地址，容器内监听所有接口。
+network_args=(--network host)
+container_bot_host="$BOT_HOST"
+if [ "$DOCKER_ROOTLESS" = 1 ]; then
+    network_args=(-p "$BOT_HOST:$BOT_PORT:$BOT_PORT")
+    container_bot_host=0.0.0.0
+fi
 NEW_CONTAINER_ATTEMPTED=1
 if docker run -d \
   --init \
   --user "$CONTAINER_UID:$CONTAINER_GID" \
-  --network host \
+  "${network_args[@]}" \
   -e HOME=/app/data/runtime/home \
   -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
   -e BOT_PORT="$BOT_PORT" \
-  -e BOT_HOST="$BOT_HOST" \
+  -e BOT_HOST="$container_bot_host" \
   "${GROUP_ROOT_ARGS[@]}" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" \
@@ -940,7 +973,7 @@ for i in $(seq 1 18); do
         print_success "部署预检通过"
         break
     fi
-    if [ "$(docker inspect --format='{{.State.Running}}' mixin-chatbot 2>/dev/null || echo false)" != true ]; then
+    if [ "$(docker container inspect --format='{{.State.Running}}' mixin-chatbot 2>/dev/null || echo false)" != true ]; then
         print_error "部署预检失败，请查看日志: $(ops_command_hint logs)"
         docker logs --tail 50 mixin-chatbot 2>&1 || true
         exit 1

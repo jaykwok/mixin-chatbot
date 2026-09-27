@@ -11,13 +11,15 @@ const posix = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):
 const token = "eyJhIjoiZml4dHVyZS1hY2NvdW50IiwidCI6ImZpeHR1cmUifQ";
 
 // Docker stub: containers are files "<image> <running>" under mock/containers; the preview writes its plan into the /preview mount.
+// A bare "docker inspect" also matches the mixin-chatbot image, so the scripts must name the object type.
 const dockerStub = `#!/usr/bin/env bash
 mock="$FIXTURE_MOCK"
 printf '%s\\n' "$*" >> "$mock/docker.log"
+if [ "$1" = container ]; then shift; elif [ "$1" = inspect ]; then echo "ambiguous docker inspect: $*" >&2; exit 97; fi
 current_head() { git -C "$FIXTURE_WORK" rev-parse --short HEAD; }
 cmd="$1"; shift
 case "$cmd" in
-    info) exit 0 ;;
+    info) [ "\${FIXTURE_ROOTLESS:-0}" != 1 ] || echo '[name=seccomp,profile=builtin name=rootless name=cgroupns]'; exit 0 ;;
     image) [ "\${FIXTURE_IMAGE:-present}" = present ] ;;
     pull) printf 'pull %s\\n' "$1" >> "$FIXTURE_EVENTS" ;;
     run)
@@ -28,6 +30,8 @@ case "$cmd" in
             previous="$arg"
         done
         printf 'preview head=%s\\n' "$(current_head)" >> "$FIXTURE_EVENTS"
+        # A preview that waits (for example for migration decisions) until it is removed.
+        [ "\${FIXTURE_PREVIEW:-ok}" != hold ] || exec sleep 30
         [ "\${FIXTURE_PREVIEW:-ok}" = ok ] || { echo '迁移预检需要确认后才能继续' >&2; exit 2; }
         printf '{"format":1,"fixture":"plan"}' > "$preview/migration-plan.json" ;;
     ps) for file in "$mock"/containers/*; do [ -f "$file" ] && basename "$file"; done ;;
@@ -45,6 +49,7 @@ case "$cmd" in
         printf '%s %s\\n' "$image" "$running" > "$mock/containers/$name"
         printf '%s %s head=%s\\n' "$cmd" "$name" "$(current_head)" >> "$FIXTURE_EVENTS" ;;
     rename) mv -- "$mock/containers/$1" "$mock/containers/$2"; printf 'rename %s %s\\n' "$1" "$2" >> "$FIXTURE_EVENTS" ;;
+    rm) printf 'rm %s\\n' "$*" >> "$FIXTURE_EVENTS" ;;
     tag) : ;;
     *) exit 93 ;;
 esac
@@ -144,9 +149,11 @@ async function upgraderFixture(prefix: string) {
   await git("init", "--initial-branch=main");
   await git("config", "user.name", "Fixture"); await git("config", "user.email", "fixture@example.invalid"); await git("config", "core.autocrlf", "false");
   await writeFile(join(f.root, "gitignore"), ""); await git("config", "core.excludesFile", join(f.root, "gitignore"));
-  await writeFile(join(work, "version.txt"), "old"); await git("add", "."); await git("commit", "-m", "old");
+  // retired.txt exists only in the old commit: restoring it would overwrite an untracked file at that path.
+  await writeFile(join(work, "version.txt"), "old"); await writeFile(join(work, "retired.txt"), "old only");
+  await git("add", "."); await git("commit", "-m", "old");
   const old = await git("rev-parse", "HEAD");
-  await writeFile(join(work, "version.txt"), "new"); await git("add", "."); await git("commit", "-m", "fixture-new");
+  await writeFile(join(work, "version.txt"), "new"); await rm(join(work, "retired.txt")); await git("add", "-A"); await git("commit", "-m", "fixture-new");
   const target = await git("rev-parse", "HEAD");
   // Export exactly UPGRADER_EXPORT_PATHS from the target, as ops.sh update does.
   await mkdir(stage, { recursive: true });
@@ -191,6 +198,31 @@ test.skipIf(!bash || !existsSync(bash))("the target upgrader confirms everything
       domain_action: "persist", unmanaged_tunnel: "", platform_ip: expect.any(String), reconfigure_ai: "0" });
     expect(await readFile(join(mock, "plan"), "utf8")).toBe('{"format":1,"fixture":"plan"}');
     expect(await git("rev-parse", "HEAD")).toBe(target);
+    // The preview runs as the deploying user (root deploys drop to 1001). Rootless Docker maps other UIDs to the
+    // subordinate range, which cannot read the deploying user's files; there the container's root is that user.
+    const user = (list: string[]) => list[list.indexOf("--user") + 1];
+    const root = process.platform !== "win32" && process.getuid!() === 0;
+    if (process.platform !== "win32") expect(user(args)).toBe(root ? "1001:1001" : `${process.getuid!()}:${process.getgid!()}`);
+    expect(user(args)).not.toBe("0:0");
+    await reset(old);
+    result = await upgrade([target], { FIXTURE_ROOTLESS: "1" });
+    expect(result.code, result.text).toBe(0);
+    expect(user((await readFile(join(mock, "preview-args"), "utf8")).trim().split("\n"))).toBe(root ? "1001:1001" : "0:0");
+    // Rootless Docker cannot publish a saved privileged port (rootlesskit listens as the deploying user): the upgrade
+    // stops before the preview and the stop instead of failing at the container start. Rootful Docker keeps upgrading.
+    const kernel = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
+    const start = process.platform !== "win32" && existsSync(kernel) ? Number((await readFile(kernel, "utf8")).trim()) : 1024;
+    if (start > 1) {
+      const low = String(Math.min(1011, start - 1));
+      await writeFile(join(state, "bot-port"), low);
+      await reset(old);
+      result = await upgrade([target], { FIXTURE_ROOTLESS: "1" });
+      await unchanged(old, result); expect(await log()).toEqual([]);
+      expect(result.text).toContain(`rootless Docker 不能发布低于 ${start} 的端口 ${low}`); expect(result.text).toContain("服务尚未停止");
+      result = await upgrade([target]);
+      expect(result.code, result.text).toBe(0); expect((await record()).bot_port).toBe(low);
+      await writeFile(join(state, "bot-port"), "2022");
+    }
 
     // An external group root is mounted read-only at the service path; a missing base image is pulled first.
     const external = join(f.root, "external groups");
@@ -220,6 +252,19 @@ test.skipIf(!bash || !existsSync(bash))("the target upgrader confirms everything
     await unchanged(old, result); expect(result.text).toContain("迁移预览未完成"); expect(result.text).toContain("服务尚未停止");
     // Decisions (exit 2) cannot be answered by flags through the upgrader; without a terminal it says where to answer them.
     expect(result.text).toContain("迁移选择需要在交互终端中确认");
+    // An interrupted preview (ops.sh forwards TERM to the upgrader) removes the named preview container before the
+    // upgrader exits, so no Docker CLI or container is left behind. Windows cannot deliver the signal to bash.
+    if (process.platform !== "win32") {
+      await rm(join(f.root, "events"), { force: true });
+      const held = Bun.spawn([bash!, posix(join(stage, "scripts/deploy/upgrade.sh")), posix(work), target],
+        { cwd: work, env: { ...process.env, ...env({ FIXTURE_PREVIEW: "hold" }) }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+      for (let waited = 0; !(await log()).some(line => line.startsWith("preview")) && waited < 20000; waited += 50) await Bun.sleep(50);
+      held.kill("SIGTERM");
+      const [code, out, err] = await Promise.all([held.exited, new Response(held.stdout).text(), new Response(held.stderr).text()]);
+      expect(code, out + err).toBe(143); expect(out + err).toContain("迁移预览已中断并清理");
+      expect((await log()).filter(line => !line.startsWith("preview"))).toEqual([expect.stringMatching(/^rm -f mixin-chatbot-preview-[0-9a-f]{12}$/)]);
+      expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
+    }
     result = await upgrade([target], { BOT_MODEL_CACHE_RETENTION: "short" });
     await unchanged(old, result); expect(result.text).toContain("BOT_MODEL_CACHE_RETENTION 已移除");
     await writeFile(join(state, "bot-port"), "abc");
@@ -393,5 +438,53 @@ test.skipIf(!bash || !existsSync(bash))("ops update ignores terminal settings th
     expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
     result = await ops(["rollback"]);
     expect(result.code, result.text).toBe(0); expect(result.text).toContain("没有未完成的部署或升级");
+  } finally { await f.cleanup(); }
+}, 240000);
+
+test.skipIf(!bash || !existsSync(bash))("rolling back never overwrites changes made after the upgrade: they are listed and the transaction stays", async () => {
+  const { f, work, state, git, upgrade, ops, log, container, reset, old, target } = await upgraderFixture("target-upgrader-manual-");
+  const pointer = join(state, "deploy-transaction");
+  try {
+    // A failed automatic rollback leaves the upgrade pending on the target code.
+    await reset(old);
+    let result = await upgrade([target], { FIXTURE_DEPLOY: "pending", FIXTURE_ROLLBACK: "fail" });
+    expect(result.code, result.text).toBe(1); expect(await git("rev-parse", "HEAD")).toBe(target);
+    // A tracked edit stops the explicit rollback before the deploy script restores anything.
+    await writeFile(join(work, "version.txt"), "hotfix");
+    result = await upgrade([target, "rollback"]);
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("没有回滚");
+    expect(result.text).toContain("未提交的改动： M version.txt");
+    expect(await log()).toEqual([]);
+    expect(await readFile(join(work, "version.txt"), "utf8")).toBe("hotfix"); expect(existsSync(pointer)).toBe(true);
+    await git("checkout", "--", "version.txt");
+    // So does an untracked file at a path the original commit tracks.
+    await writeFile(join(work, "retired.txt"), "local notes");
+    result = await upgrade([target, "rollback"]);
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("未跟踪的文件会被升级前的版本覆盖：retired.txt");
+    expect(await log()).toEqual([]); expect(await readFile(join(work, "retired.txt"), "utf8")).toBe("local notes");
+    await rm(join(work, "retired.txt"));
+    result = await upgrade([target, "rollback"]);
+    expect(result.code, result.text).toBe(0); expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(pointer)).toBe(false);
+
+    // Only the code is left to restore, and a commit was made on main after the upgrade: the restore stops and keeps
+    // the marker. A detached HEAD on the target with main still carrying the commit is refused too (the reset would drop it).
+    await reset(old);
+    result = await upgrade([target], { FIXTURE_DEPLOY: "pending", FIXTURE_INDEX_LOCK: "1" });
+    expect(result.code, result.text).toBe(1);
+    await rm(join(work, ".git/index.lock"));
+    await writeFile(join(work, "version.txt"), "hotfix"); await git("commit", "-qam", "hotfix");
+    const hotfix = await git("rev-parse", "HEAD");
+    result = await ops(["rollback"]);
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("代码没有恢复"); expect(result.text).toContain("既不是升级前的");
+    expect(await git("rev-parse", "HEAD")).toBe(hotfix); expect(existsSync(pointer)).toBe(true);
+    await git("branch", "hotfix", hotfix); await git("checkout", "-q", "--detach", target);
+    result = await ops(["rollback"]);
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain(`分支 main 指向 ${hotfix.slice(0, 7)}`);
+    // With the commit kept on its own branch, the same rollback finishes the code restore.
+    await git("branch", "-f", "main", target); await git("checkout", "-q", "main");
+    result = await ops(["rollback"]);
+    expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级已回滚");
+    expect(await git("rev-parse", "HEAD")).toBe(old); expect(await git("rev-parse", "hotfix")).toBe(hotfix);
+    expect(existsSync(pointer)).toBe(false); expect(await container("mixin-chatbot")).toBe("sha256:old true");
   } finally { await f.cleanup(); }
 }, 240000);

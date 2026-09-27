@@ -6,6 +6,25 @@ DEPLOY_FILES=(data/config data/runtime/pi/settings.json data/runtime/models-stor
 
 # archive_project_path is shared with ops and tunnel scripts.
 
+# 原容器使用的镜像在事务期间另存这个标签，必须在重新构建之前打上：构建会移走 mixin-chatbot 标签，
+# Docker 的 containerd 镜像存储（Docker 29 起新装默认）随即删除失去标签的镜像，回滚就无法按镜像 ID 找回原镜像。
+PREVIOUS_IMAGE_TAG=mixin-chatbot:previous
+
+keep_previous_image() {
+    local image
+    image="$(docker container inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null)" || return 0
+    docker tag "$image" "$PREVIOUS_IMAGE_TAG" && return 0
+    print_error "无法为原容器的镜像添加回滚标签 $PREVIOUS_IMAGE_TAG；为保证能回滚，未做任何改动"
+    return 1
+}
+
+# 事务结束（提交或回滚完成）后移除回滚标签；提交后旧镜像不再被引用，随之释放。
+release_previous_image() {
+    docker image inspect "$PREVIOUS_IMAGE_TAG" >/dev/null 2>&1 || return 0
+    docker image rm "$PREVIOUS_IMAGE_TAG" >/dev/null 2>&1 ||
+        print_warning "回滚标签 $PREVIOUS_IMAGE_TAG 清理失败；确认不再需要后可手动 docker image rm $PREVIOUS_IMAGE_TAG"
+}
+
 # 部署、升级器和回滚共用的项目 UFW 规则操作。
 can_manage_ufw() {
     [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1
@@ -90,9 +109,9 @@ begin_deployment() {
         UFW_SNAPSHOTTED=0
         if [ -f "$DEPLOY_SNAPSHOT/ufw-rules.txt" ]; then UFW_SNAPSHOTTED=1; fi
         PREVIOUS_CONTAINER_SAVED=0; PREVIOUS_STOP_ATTEMPTED=0
-        if docker inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+        if docker container inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
             PREVIOUS_CONTAINER_SAVED=1; PREVIOUS_STOP_ATTEMPTED=1
-            if docker inspect mixin-chatbot >/dev/null 2>&1; then
+            if docker container inspect mixin-chatbot >/dev/null 2>&1; then
                 docker stop --time 30 mixin-chatbot >/dev/null || return 1
                 docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || return 1
             fi
@@ -100,7 +119,7 @@ begin_deployment() {
             docker stop --time 30 mixin-chatbot >/dev/null || return 1
             docker rename mixin-chatbot "$ROLLBACK_CONTAINER" || return 1
             PREVIOUS_CONTAINER_SAVED=1; PREVIOUS_STOP_ATTEMPTED=1
-        elif docker inspect mixin-chatbot >/dev/null 2>&1; then
+        elif docker container inspect mixin-chatbot >/dev/null 2>&1; then
             docker stop --time 30 mixin-chatbot >/dev/null || return 1
             docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || return 1
         fi
@@ -114,6 +133,7 @@ begin_deployment() {
     if docker ps -a --format '{{.Names}}' | grep -qx "$ROLLBACK_CONTAINER"; then
         print_error "发现旧回滚容器，请先确认其状态"; return 1
     fi
+    keep_previous_image || return 1
     DEPLOY_SNAPSHOT="$(mktemp -d "$PROJECT_DIR/backup/snapshots/deploy-XXXXXXXX")"
     export BOT_DEPLOY_BACKUP_ID="$(basename -- "$DEPLOY_SNAPSHOT")"
     chmod 700 "$DEPLOY_SNAPSHOT"
@@ -127,8 +147,8 @@ begin_deployment() {
     PREVIOUS_RUNNING=0
     PREVIOUS_CONTAINER_SAVED=0
     PREVIOUS_STOP_ATTEMPTED=0
-    PREVIOUS_IMAGE="$(docker inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null || true)"
-    if [ "$(docker inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then PREVIOUS_RUNNING=1; fi
+    PREVIOUS_IMAGE="$(docker container inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null || true)"
+    if [ "$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then PREVIOUS_RUNNING=1; fi
     PREVIOUS_TUNNEL_RUNNING=0
     TUNNEL_COMMAND=()
     local tunnel_pid
@@ -174,7 +194,7 @@ begin_deployment() {
         PREVIOUS_STOP_ATTEMPTED=1
         # Announce only a stop made here; the container may already have been stopped.
         local running_now
-        running_now="$(docker inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)"
+        running_now="$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)"
         docker stop --time 30 mixin-chatbot >/dev/null
         docker rename mixin-chatbot "$ROLLBACK_CONTAINER"
         PREVIOUS_CONTAINER_SAVED=1
@@ -218,7 +238,7 @@ rollback_deployment() {
     if [ "$TUNNEL_STARTED_BY_DEPLOY" = 1 ] || [ "$PREVIOUS_TUNNEL_RUNNING" = 0 ]; then
         if managed_cloudflared_pid >/dev/null 2>&1; then stop_managed_cloudflared || failed=1; fi
     fi
-    if [ "$NEW_CONTAINER_ATTEMPTED" = 1 ] && docker inspect mixin-chatbot >/dev/null 2>&1; then
+    if [ "$NEW_CONTAINER_ATTEMPTED" = 1 ] && docker container inspect mixin-chatbot >/dev/null 2>&1; then
         if docker stop --time 30 mixin-chatbot >/dev/null; then
             docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || failed=1
         else
@@ -257,7 +277,10 @@ rollback_deployment() {
             run_ufw allow from "$address" to any port "$port" proto tcp comment 'Mixin-Chatbot (平台IP)' || failed=1
         done < "$DEPLOY_SNAPSHOT/ufw-rules.txt"
     fi
-    if [ -n "$PREVIOUS_IMAGE" ]; then docker tag "$PREVIOUS_IMAGE" mixin-chatbot || failed=1; fi
+    if [ -n "$PREVIOUS_IMAGE" ] && ! docker tag "$PREVIOUS_IMAGE" mixin-chatbot; then
+        failed=1
+        print_error "原镜像 ${PREVIOUS_IMAGE#sha256:} 已不存在（回滚标签 $PREVIOUS_IMAGE_TAG 缺失），无法恢复 mixin-chatbot 标签"
+    fi
     if [ "$PREVIOUS_CONTAINER_SAVED" = 1 ]; then docker rename "$ROLLBACK_CONTAINER" mixin-chatbot || failed=1; fi
     if [ "$failed" = 0 ] && [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ]; then
         docker start mixin-chatbot >/dev/null || failed=1
@@ -275,6 +298,7 @@ rollback_deployment() {
         else rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"; fi
     fi
     if [ "$failed" = 0 ]; then
+        release_previous_image
         print_warning "已恢复配置、容器、网络入口和原运行状态；快照在 $DEPLOY_SNAPSHOT"
     else print_error "自动回滚未完成；请检查保留的快照 $DEPLOY_SNAPSHOT"; fi
     # An operator-requested rollback that completed is a success; any other rollback reports the failure.

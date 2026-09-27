@@ -63,6 +63,13 @@ test("运维界面按指针读取事务，数据已提交只看本事务的迁�
     // Direct entries show the recorded firewall source that continuing will use.
     await writeFile(join(snapshot, "transaction"), serialize({ ...record, deploy_mode: "direct", bot_domain: "" }));
     expect(describePendingTransaction(loadPendingTransaction(root)!).record).toContain("端口 2022 · 入口 直连（来源 203.0.113.17）");
+    // A legacy snapshot without a record: Linux continues only after the one-time backfill in a terminal.
+    await Bun.file(join(snapshot, "transaction")).delete();
+    const legacy = loadPendingTransaction(root)!;
+    expect(describePendingTransaction(legacy, "linux").record).toEqual(["旧版事务没有记录：继续前需在终端逐项确认并补录一次，回滚不需要"]);
+    for (const [pending, platform] of [[legacy, "windows"], [{ ...legacy, snapshot: null }, "linux"], [{ ...legacy, codeRestorePending: true }, "linux"]] as const) {
+      expect(describePendingTransaction(pending, platform).record).toEqual(["旧版事务：继续时按已保存设置处理"]);
+    }
     await writeFile(join(snapshot, "transaction"), serialize(record));
     // A committed journal from another deployment does not block rolling back this one.
     const journal = { id: "migration-1", target: 1, phase: "committed", groups: "/srv/new", deployment: "deploy-older" };
@@ -140,6 +147,13 @@ PLATFORM_IP=198.51.100.9
 load_pending_transaction
 echo "LEGACY port=\${TRANSACTION[bot_port]} root=\${TRANSACTION[target_group_root]} original=\${TRANSACTION[original_group_root]} domain=\${TRANSACTION[bot_domain]} action=\${TRANSACTION[domain_action]} platform=\${TRANSACTION[platform_ip]} legacy=$TRANSACTION_LEGACY"
 describe_pending_transaction; echo
+# The original group root comes from the snapshot's copy of the saved setting when there is one; every value names its source.
+mkdir -p "$snap/data/state"; printf /srv/original > "$snap/data/state/group-data-root"
+load_pending_transaction
+echo "SOURCES original=\${TRANSACTION[original_group_root]} from=\${TRANSACTION_SOURCE[original_group_root]} target=\${TRANSACTION_SOURCE[target_sha]} port=\${TRANSACTION_SOURCE[bot_port]} platform=\${TRANSACTION_SOURCE[platform_ip]}"
+# Continuing needs the values confirmed in a terminal; without one nothing is written.
+if backfill_legacy_transaction </dev/null; then echo 'backfilled without a terminal'; exit 1; fi
+[ ! -e "$snap/transaction" ] || { echo 'record written without confirmation'; exit 1; }
 `);
   try {
     const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
@@ -148,6 +162,45 @@ describe_pending_transaction; echo
     expect(result.output).toContain(`LEGACY port=3033 root=/srv/legacy original=${posixPath(fixture.root)}/data/groups domain=bot.example.com action=persist platform=198.51.100.9 legacy=1`);
     expect(result.output).toContain(`VERDICTS ${platformIpVerdicts()}\n`);
     expect(result.output).toContain("旧版事务");
+    expect(result.output).toContain("SOURCES original=/srv/original from=快照 data/state/group-data-root target=快照 target-sha port=已保存设置 platform=当前终端的 PLATFORM_IP");
+    expect(result.output).toContain("逐项确认并补录");
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+// The confirmation reads a terminal: util-linux script provides one on Linux.
+test.skipIf(process.platform !== "linux" || !Bun.which("script"))("旧版事务继续前在终端核对每个值的来源，确认后只补录一次完整记录", async () => {
+  const fixture = await tempFixture("transaction-backfill-");
+  const snap = join(fixture.root, "backup/snapshots/deploy-abc123"), state = join(fixture.root, "data/state"), script = join(fixture.root, "backfill.sh");
+  await mkdir(join(snap, "data/state"), { recursive: true }); await mkdir(state, { recursive: true });
+  await writeFile(join(snap, "target-sha"), "c".repeat(40)); await writeFile(join(snap, "was-running"), "1");
+  await writeFile(join(snap, "group-root"), "/srv/groups"); await writeFile(join(snap, "data/state/group-data-root"), "/srv/groups");
+  await writeFile(join(state, "bot-port"), "3033"); await writeFile(join(state, "deploy-transaction"), "deploy-abc123");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+. '${join(project, "scripts/lib/common.sh")}'
+PROJECT_DIR="$1"
+load_pending_transaction
+if backfill_legacy_transaction; then echo "BACKFILLED legacy=$TRANSACTION_LEGACY"; else echo DECLINED; fi
+load_pending_transaction
+echo "RELOADED legacy=$TRANSACTION_LEGACY port=\${TRANSACTION[bot_port]} root=\${TRANSACTION[target_group_root]}"
+`);
+  const answer = async (input: string) => {
+    const child = Bun.spawn(["script", "-qec", `bash '${script}' '${fixture.root}'`, "/dev/null"], {
+      cwd: fixture.root, env: { ...process.env, PLATFORM_IP: "" }, stdin: new Blob([input]), stdout: "pipe", stderr: "pipe" });
+    const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code, out + err).toBe(0);
+    return out + err;
+  };
+  try {
+    let output = await answer("n\n");
+    expect(output).toContain("DECLINED"); expect(output).toContain("RELOADED legacy=1");
+    expect(output).toMatch(/目标提交\s+c{40}（快照 target-sha）/); expect(output).toMatch(/端口\s+3033（已保存设置）/);
+    expect(output).toMatch(/原群数据总根\s+\/srv\/groups（快照 data\/state\/group-data-root）/); expect(output).toMatch(/平台IP\s+\S+（默认值）/);
+    expect(existsSync(join(snap, "transaction"))).toBe(false);
+    output = await answer("y\n");
+    expect(output).toContain("BACKFILLED legacy=0"); expect(output).toContain("RELOADED legacy=0 port=3033 root=/srv/groups");
+    const record = await readFile(join(snap, "transaction"), "utf8");
+    expect(record).toContain(`target_sha=${"c".repeat(40)}\n`); expect(record).toContain("operation=deploy\n"); expect(record).toContain("was_running=1\n");
   } finally { await fixture.cleanup(); }
 }, 30000);
 

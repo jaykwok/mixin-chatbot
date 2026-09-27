@@ -40,6 +40,7 @@ acquire_deploy_lock(){ :; }; doctor(){ echo DOCTOR; }
 # The post-upgrade check reloads the persisted settings (see load_saved_settings in ops.sh).
 load_saved_settings(){ echo SETTINGS-RELOADED; }; check_ordinary_settings(){ :; }
 docker(){
+    if [ "$1" = container ]; then shift; elif [ "$1" = inspect ]; then return 97; fi
     printf 'docker %s\\n' "$1" >> "$FIXTURE_EVENTS"
     case "$1" in
         inspect) if [[ "$*" = *'{{.Id}}'* ]]; then printf '%064d\\n' 1; else cat data/state/running; fi ;;
@@ -69,6 +70,11 @@ here="$(cd "$(dirname "\${BASH_SOURCE[0]}")/../.." && pwd)"
 [ -f "$here/src/core/data-version.ts" ] && [ -f "$here/scripts/lib/fixture.sh" ] && [ -f "$here/scripts/migrations/fixture.ts" ] || exit 44
 input=''; IFS= read -r input || true
 printf 'upgrader version=%s dir=%s args=%s stdin=%s\\n' "$(cat "$here/Dockerfile")" "\${here#"$1"/}" "\${*:2}" "$input" >> "$FIXTURE_EVENTS"
+if [ "\${FIXTURE_UPGRADER_HOLD:-0}" = 1 ]; then
+    sleep 30 >/dev/null 2>&1 &
+    trap 'kill $!; echo "upgrader TERM" >> "$FIXTURE_EVENTS"; exit 143' TERM
+    wait
+fi
 exit "\${FIXTURE_UPGRADER_EXIT:-0}"
 `);
     await writeFile(join(work, "scripts/deploy/deploy.sh"), `#!/usr/bin/env bash
@@ -110,6 +116,19 @@ esac
     // The upgrader's failure is the update's failure; the export is still removed.
     result = await update({ FIXTURE_UPGRADER_EXIT: "7" });
     expect(result.code, result.text).toBe(7); expect(result.text).not.toContain("DOCTOR"); expect(await exports()).toEqual([]);
+    // A TERM sent to ops.sh itself reaches the upgrader, which cancels where it stands; update waits for it and removes
+    // the export. (When update ran in a subshell, only the parent died and the upgrade went on.) Windows cannot signal bash.
+    if (process.platform !== "win32") {
+      await rm(events, { force: true });
+      const held = Bun.spawn([bash!, posix(launcher), posix(work)], { cwd: work,
+        env: { ...process.env, FIXTURE_EVENTS: posix(events), FIXTURE_UPGRADER_HOLD: "1" }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+      const output = Promise.all([new Response(held.stdout).text(), new Response(held.stderr).text()]);
+      for (let attempt = 0; attempt < 100 && !(await events_()).some(line => line.startsWith("upgrader version=")); attempt++) await Bun.sleep(100);
+      held.kill("SIGTERM");
+      expect(await Promise.race([held.exited, Bun.sleep(10_000).then(() => "still running")])).toBe(143);
+      expect(await events_()).toContain("upgrader TERM");
+      await output; expect(await exports()).toEqual([]);
+    }
     // Tracked changes stop the update before fetching.
     await writeFile(join(work, "Dockerfile"), "dirty");
     result = await update();
@@ -183,6 +202,13 @@ esac
       } else await rm(join(state, "deploy-transaction"), { force: true });
     };
     await legacy(true);
+    // Its deployment transaction has no record: continuing needs the synthesized values confirmed in a terminal
+    // and written once (see transaction-record.test.ts); without a terminal nothing runs. Rolling back needs no record.
+    result = await update({ UPDATE_TRANSACTION_ACTION: "continue" });
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("逐项确认并补录");
+    expect(await events_()).toEqual([]); expect(existsSync(join(snapshot, "transaction"))).toBe(false);
+    expect(existsSync(join(state, "update-transaction"))).toBe(true);
+    await record();
     result = await update({ UPDATE_TRANSACTION_ACTION: "continue", FIXTURE_DEPLOY: "fail" });
     expect(result.code, result.text).toBe(1); expect(result.text).toContain("部署事务尚未完成");
     expect(existsSync(join(state, "update-transaction"))).toBe(true); expect(await git("rev-parse", "HEAD")).toBe(target);

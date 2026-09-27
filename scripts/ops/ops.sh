@@ -258,7 +258,7 @@ doctor() {
 
     local cstate="缺少"
     if has_container; then
-        cstate="$(docker inspect --format '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo "?")"
+        cstate="$(docker container inspect --format '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo "?")"
     fi
     local cstate_label="$cstate"
     [ "$cstate" = "running" ] && cstate_label="运行中"
@@ -362,6 +362,7 @@ start_bot() {
 #
 # 优先 exec 进正在运行的容器：网络命名空间、挂载和运行身份都与机器人自己完全一致，
 # webdavUrl 里的 127.0.0.1 才能指向宿主机上的后端（容器用的是 --network host）。
+# rootless Docker 下两种容器都在 rootlesskit 的网络里，到不了宿主机的 127.0.0.1（见部署文档）。
 relay_admin() {
     if [ ! -f "$RELAY_CONFIG_FILE" ]; then
         ER "未配置 ${RELAY_CONFIG_FILE}，外链分发未启用"
@@ -377,7 +378,7 @@ relay_admin() {
     fi
     WA "容器未在运行，改用一次性容器执行"
     docker run --rm --network host \
-        --user "$(stat -c '%u:%g' "$DATA_DIR")" \
+        --user "$(container_user "$(stat -c '%u:%g' "$DATA_DIR")")" \
         -e HOME=/app/data/runtime/home \
         -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
         mixin-chatbot bun run scripts/ops/relay-admin.ts "$@"
@@ -411,7 +412,7 @@ relay_configure() (
             terminal=(-i)
             if [ -t 0 ] && [ -t 1 ]; then terminal+=(-t); fi
         fi
-        docker run --rm "${terminal[@]}" --user "$owner" -e HOME=/app/data/runtime/home \
+        docker run --rm "${terminal[@]}" --user "$(container_user "$owner")" -e HOME=/app/data/runtime/home \
             -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
             mixin-chatbot bun run scripts/config/configure-relay.ts "$1" "$container_draft"
     }
@@ -448,7 +449,7 @@ runtime_configure() (
     if [ "$(stat -c '%u:%g' "$draft_file")" != "$owner" ]; then chown "$owner" "$draft_file" || return 1; fi
     runtime_config_cli() {
         # 复用部署镜像的依赖，并挂载当前代码；git 更新后无需先重建镜像才能打开设置。
-        docker run --rm --user "$owner" -e HOME=/app/data/runtime/home "${runtime_env[@]}" \
+        docker run --rm --user "$(container_user "$owner")" -e HOME=/app/data/runtime/home "${runtime_env[@]}" \
             -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
             -v "${PROJECT_DIR}/scripts:/app/scripts:ro" -v "${PROJECT_DIR}/src:/app/src:ro" \
             "$image" bun run scripts/config/runtime-settings.ts "$1" "$draft_name"
@@ -478,12 +479,12 @@ runtime_configure() (
     case "$state" in ''|running|exited|created) ;; *) ER "容器处于 ${state} 状态，请恢复正常后再修改运行参数"; return 1 ;; esac
     if [ -n "$state" ]; then
         local mounted_data=""
-        mounted_data="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER")" || return 1
+        mounted_data="$(docker container inspect --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER")" || return 1
         if [ -z "$mounted_data" ] || [ "$(realpath -m -- "$mounted_data")" != "$(realpath -m -- "$DATA_DIR")" ]; then
             ER '容器的数据目录不属于当前项目，未修改配置或服务'; return 1
         fi
-        image="$(docker inspect --format '{{.Image}}' "$CONTAINER")" || return 1
-        environment="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER")" || return 1
+        image="$(docker container inspect --format '{{.Image}}' "$CONTAINER")" || return 1
+        environment="$(docker container inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER")" || return 1
         # 只传递受支持的高级参数以检查实际容器的环境覆盖，不输出其他环境变量或凭据。
         while IFS= read -r setting; do
             case "${setting%%=*}" in
@@ -531,7 +532,7 @@ group_data_admin() {
         group_root_env="/app/group-data"
     fi
     docker run --rm \
-        --user "$(stat -c '%u:%g' "$DATA_DIR")" \
+        --user "$(container_user "$(stat -c '%u:%g' "$DATA_DIR")")" \
         -e HOME=/app/data/runtime/home \
         -e GROUP_DATA_ROOT="$group_root_env" \
         "${group_root_args[@]}" \
@@ -649,7 +650,7 @@ run_target_upgrader() {
 after_upgrade() {
     load_saved_settings
     check_ordinary_settings
-    if [ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; then doctor; return $?; fi
+    if [ "$(docker container inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; then doctor; return $?; fi
     OK "保留原停止状态，使用 start 可启动新版本"
 }
 
@@ -697,6 +698,11 @@ legacy_update_recovery() {
     current="$(git_here rev-parse HEAD 2>/dev/null)"
     [ "$current" = "$original_sha" ] || [ "$current" = "$target_sha" ] || { ER '当前代码与中断升级不匹配'; return 1; }
     WA "未完成的旧版升级：${original_sha:0:7} -> ${target_sha:0:7}；原运行状态：$([ "$was_running" = 1 ] && echo 运行 || echo 停止)"
+    # 回滚最后要恢复代码：工作区有升级后的人工改动时，在恢复任何内容之前停止。
+    if [ "$action" = rollback ] && [ "$current" != "$original_sha" ] && ! code_restore_safe "$original_branch" "$original_sha" "$target_sha"; then
+        ER "没有回滚：恢复升级前的代码会覆盖升级后的工作区改动（见上方），数据、配置和容器保持现状。把改动提交到其他分支、备份或撤销后重试 $(ops_command_hint rollback)"
+        return 1
+    fi
     if [ -e "$STATE_DIR/deploy-transaction" ]; then
         if transaction_code_restore_pending; then
             if [ "$action" = continue ]; then
@@ -722,6 +728,10 @@ legacy_update_recovery() {
         # 部署事务已回滚：原容器和原运行状态已由部署脚本恢复，再恢复升级前的代码。
         # 代码恢复后才清除事务指针和停机记录；失败时重试回滚只恢复代码。
         if [ "$(git_here rev-parse HEAD 2>/dev/null)" != "$original_sha" ]; then
+            code_restore_safe "$original_branch" "$original_sha" "$target_sha" || {
+                ER "代码没有恢复：升级后的工作区改动（见上方）会被覆盖；数据、配置和原运行状态已恢复。把改动提交到其他分支、备份或撤销后运行 $(ops_command_hint rollback)，只恢复代码"
+                return 1
+            }
             restore_checkout "$original_branch" "$original_sha" || {
                 ER "代码未能恢复到升级前的 ${original_sha:0:7}（原因见上方）；数据、配置和原运行状态已恢复。处理 git 问题后运行 $(ops_command_hint rollback)，只恢复代码"
                 return 1
@@ -744,7 +754,7 @@ legacy_update_recovery() {
         restore_checkout "$original_branch" "$original_sha" || { ER "代码自动回滚失败，请检查当前 git 状态"; return 1; }
     fi
     if [ "$original_container" != - ]; then
-        if [ "$(docker inspect --format '{{.Id}}' "$CONTAINER" 2>/dev/null)" != "$original_container" ]; then
+        if [ "$(docker container inspect --format '{{.Id}}' "$CONTAINER" 2>/dev/null)" != "$original_container" ]; then
             ER '原容器身份不匹配，保留停机记录，拒绝启动其他容器'
             return 1
         fi
@@ -755,7 +765,9 @@ legacy_update_recovery() {
     else OK "升级已回滚：代码恢复到 ${original_sha:0:7}，机器人服务保持停止（升级前未运行）"; fi
 }
 
-update() (
+# 在主 shell 中运行（不是子 shell）：发给 ops.sh 的 TERM 才能由升级器转发处理，否则只杀掉父进程，升级在后台继续。
+# 升级是 ops.sh 的最后一个命令，退出陷阱在脚本结束时运行。
+update() {
     operation_start upgrade
     UPGRADE_STAGE=''
     UPGRADER_PID=''
@@ -769,6 +781,8 @@ update() (
             WA "$(describe_pending_transaction)"
         fi
         if [ -z "$action" ]; then choose_pending_action || return 1; action="$PENDING_ACTION"; fi
+        # 旧版事务在这里补录：之后的部署脚本和升级器都在关闭的标准输入下运行，只读记录。
+        if [ "$action" = continue ] && [ -e "$STATE_DIR/deploy-transaction" ]; then backfill_legacy_transaction || return 1; fi
         if [ -e "$STATE_DIR/update-transaction" ]; then legacy_update_recovery "$action"; return; fi
         if [ "${TRANSACTION[operation]}" = upgrade ]; then resume_recorded_upgrade "$action"; return; fi
         # 中断的是部署：交给部署脚本按事务记录继续或回滚。
@@ -803,7 +817,7 @@ update() (
     # 停机前的预检、隧道确认和迁移预览，停机、切换代码和回滚都由目标版本的升级器负责。
     run_target_upgrader "$target" || return $?
     after_upgrade
-)
+}
 
 show_logs() {
     if ! has_container; then ER "找不到容器 '$CONTAINER'"; return 1; fi
@@ -841,6 +855,7 @@ uninstall() {
     fi
 
     if ask_yes_no "是否删除 Docker 镜像 mixin-chatbot？[y/N] "; then
+        if docker image inspect mixin-chatbot:previous >/dev/null 2>&1 && ! docker rmi mixin-chatbot:previous >/dev/null 2>&1; then WA "部署回滚标签 mixin-chatbot:previous 删除失败"; fi
         if docker rmi mixin-chatbot >/dev/null 2>&1; then OK "镜像已删除"; else WA "镜像删除失败"; fi
     fi
 

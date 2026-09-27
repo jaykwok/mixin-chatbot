@@ -50,7 +50,10 @@ function Get-ProjectBotInstance([string]$ProjectRoot) {
         $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$identity.pid)" -ErrorAction Stop
         if (-not $processInfo -or $processInfo.Name -ne 'bun.exe') { return $null }
         $created = ([DateTimeOffset]$processInfo.CreationDate).ToUnixTimeMilliseconds()
-        if ([Math]::Abs($created - [double]$identity.startedAt) -gt 5000) { return $null }
+        # startedAt is recorded once the Bun runtime is up, after the process was created: seconds later under load
+        # or at boot. A reused PID belongs to a process created after the instance started, so only that side is tight.
+        $lag = [double]$identity.startedAt - $created
+        if ($lag -lt -5000 -or $lag -gt 300000) { return $null }
         return $identity
     } catch { return $null }
 }

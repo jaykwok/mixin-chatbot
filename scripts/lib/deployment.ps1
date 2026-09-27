@@ -216,6 +216,60 @@ function Remove-UpgradeStage([string]$ProjectRoot, [string]$Stage) {
     Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
 }
 
+# 恢复升级前的代码会丢弃工作区内容（reset --hard / checkout --force）：列出升级后的人工改动，调用方保留事务并停止。
+# 规则与 scripts/lib/common.sh 的 code_restore_safe 相同：当前提交和要重置的原分支只能停在升级前或目标提交；
+# 已跟踪文件不能有改动；升级前有、当前提交没有的路径由恢复重建，路径本身和各级父路径都不能被未跟踪或忽略的文件、
+# 目录或链接（含目录联接）占用。
+function Get-CodeRestoreConflicts([string]$GitPath, [string]$ProjectRoot, [string]$Branch, [string]$OriginalSha, [string]$TargetSha) {
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $short = { param([string]$Sha) if ($Sha.Length -gt 7) { $Sha.Substring(0, 7) } else { $Sha } }
+        $conflicts = @()
+        $head = "$(& $GitPath -C $ProjectRoot rev-parse --verify --quiet 'HEAD^{commit}')".Trim()
+        if ($head -ne $OriginalSha -and $head -ne $TargetSha) {
+            $conflicts += "当前提交 $(& $short $head) 既不是升级前的 $(& $short $OriginalSha)，也不是目标 $(& $short $TargetSha)：升级后有新的提交或切换"
+        }
+        if ($Branch -and $Branch -ne 'HEAD') {
+            $ref = "$(& $GitPath -C $ProjectRoot rev-parse --verify --quiet "refs/heads/$Branch^{commit}")".Trim()
+            if ($ref -ne $OriginalSha -and $ref -ne $TargetSha) {
+                $conflicts += "分支 $Branch 指向 $(& $short $ref)，不是升级前或目标提交：回滚会把它重置到 $(& $short $OriginalSha)"
+            }
+        }
+        foreach ($line in @(& $GitPath -C $ProjectRoot status --porcelain --untracked-files=no)) {
+            if ("$line") { $conflicts += "未提交的改动：$line" }
+        }
+        if ($head) {
+            # 属性不跟随链接；取不到（不存在，或父路径不是目录）时为 $null。
+            $attributesOf = { param([string]$Path) try { [IO.File]::GetAttributes((Join-Path $ProjectRoot $Path)) } catch { $null } }
+            $realDirectory = { param($Attributes) $Attributes.HasFlag([IO.FileAttributes]::Directory) -and -not $Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) }
+            $trackedType = { param([string]$Path) "$(& $GitPath -C $ProjectRoot cat-file -t "${head}:$Path" 2>$null)".Trim() }
+            $checked = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($path in @(& $GitPath -C $ProjectRoot -c core.quotepath=off diff --name-only --no-renames --diff-filter=D $OriginalSha $head)) {
+                if (-not "$path") { continue }
+                $attributes = & $attributesOf $path
+                if ($null -ne $attributes) {
+                    if ((& $realDirectory $attributes) -and (& $trackedType $path) -eq 'tree') {
+                        foreach ($other in @(& $GitPath -C $ProjectRoot -c core.quotepath=off --literal-pathspecs ls-files --others -- $path)) {
+                            if ("$other") { $conflicts += "未跟踪的文件会随目录删除（升级前的版本在 $path 是文件）：$other" }
+                        }
+                    } else { $conflicts += "未跟踪的文件会被升级前的版本覆盖：$path" }
+                }
+                $parent = "$path"
+                while ($parent.Contains('/')) {
+                    $parent = $parent.Substring(0, $parent.LastIndexOf('/'))
+                    if (-not $checked.Add($parent)) { break }
+                    $attributes = & $attributesOf $parent
+                    if ($null -ne $attributes -and -not (& $realDirectory $attributes) -and (& $trackedType $parent) -ne 'blob') {
+                        $conflicts += "未跟踪的文件或链接占着升级前版本的目录位置：$parent"
+                    }
+                }
+            }
+        }
+        return $conflicts
+    } finally { $ErrorActionPreference = $previous }
+}
+
 function Test-DeploymentDependenciesReusable([string]$ProjectRoot, [string]$GitPath, [string]$OldRevision, [string]$NewRevision) {
     try {
         if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot 'node_modules') -PathType Container)) { return $false }

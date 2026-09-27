@@ -17,6 +17,8 @@
 
 Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。Docker 的配置向导与应用运行在镜像内，宿主机无需额外安装 Bun；若使用[运维界面](tui.md#运维界面)，则需在宿主机安装 Bun 1.4.2+。
 
+容器进程的身份取决于部署用户：root 部署时降权到 UID/GID 1001，并把挂载目录的属主改成它；docker 组中的普通用户沿用自己的 UID/GID；rootless Docker 下以容器内的 root 运行，它映射回宿主机上的部署用户，所以挂载目录仍归这个用户。机器人容器平时使用 host 网络；rootless 下 host 网络只是 rootlesskit 的网络命名空间，宿主机、平台回调和隧道都连不到，所以部署改为把端口发布到原监听地址（直连为 `0.0.0.0`，隧道为 `127.0.0.1`），容器内监听所有接口。来源 IP 仍由宿主机防火墙在该端口上限制。发布端口的是以部署用户身份运行的 rootlesskit，低于 `net.ipv4.ip_unprivileged_port_start`（通常 1024）的端口默认发布不了：首次部署的默认端口因此改为 `11011`，输入或已保存的低端口会在停机前被拒绝，并提示改用高端口，或调低该内核参数、给 rootlesskit 加 `CAP_NET_BIND_SERVICE` 后重试；升级沿用的低端口同样在停机前停止。rootless 下机器人容器和外链管理的一次性容器都访问不到只监听宿主机 `127.0.0.1` 的服务（例如本机的 WebDAV 外链后端或本地模型接口），监听非回环地址的服务可以用宿主机的该地址访问。启用 SELinux 强制模式的主机尚未验证。
+
 基础组件通过官方渠道安装：[Bun](https://bun.sh/docs/installation)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Docker Engine（Debian）](https://docs.docker.com/engine/install/debian/)。
 
 Cloudflare 模式会自动将官方 `cloudflared` 下载到项目根目录（Windows 为 `cloudflared.exe`，Linux 为 `cloudflared`），校验 SHA-256 后使用；已有可运行的根目录副本会直接复用。域名需先接入 Cloudflare DNS 并激活，再配置机器人子域名和隧道公开路由。隧道 token 从 Cloudflare 控制台获取，部署时可直接粘贴 token、填写文件路径，或预先保存到 `data/config/cloudflared-token` 后留空读取。输入会隐藏，默认输入与运行凭据统一使用这个文件。完整步骤见[隧道托管](operations.md#隧道托管)。
@@ -138,7 +140,7 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 
 | 设置 | 默认值 | 范围 / 说明 |
 | --- | --- | --- |
-| `BOT_PORT` | 1011 | 1–65535 |
+| `BOT_PORT` | 1011（rootless Docker 不能发布低端口时为 11011） | 1–65535 |
 | `BOT_HOST` | 0.0.0.0 | IP 或 localhost；Cloudflare 部署设为 127.0.0.1 |
 | `GROUP_DATA_ROOT` | data/groups | 可指定其他磁盘；容器自定义目录映射为 /app/group-data |
 | `BOT_DEBUG` | 0 | 0/1；开启后记录用户消息正文 |

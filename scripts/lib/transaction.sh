@@ -72,8 +72,9 @@ saved_group_data_root() {
 }
 
 # 读取未完成事务的指针和记录，结果在 TRANSACTION 中；调用方须持有部署锁。
-# 旧版快照没有记录：按快照中的目标群根、目标提交和原运行状态合成，端口、模式、域名取已保存设置，
-# 平台 IP 取当前 PLATFORM_IP 或默认值（与旧版续做相同）。
+# 旧版快照没有记录：按快照中的目标群根、目标提交和原运行状态合成，原群根取快照保存的群根设置，
+# 端口、模式、域名取已保存设置，平台 IP 取当前 PLATFORM_IP 或默认值；每个值的来源记在 TRANSACTION_SOURCE，
+# 继续前由 backfill_legacy_transaction 在终端确认并补录。
 load_pending_transaction() {
     local pointer="$PROJECT_DIR/data/state/deploy-transaction" name snapshot key value
     name="$(cat "$pointer")" || return 1
@@ -87,31 +88,47 @@ load_pending_transaction() {
         TRANSACTION_LEGACY=0
         return 0
     fi
-    local state="$PROJECT_DIR/data/state" saved=()
+    local state="$PROJECT_DIR/data/state" saved=() root
     declare -gA TRANSACTION=([format]=1 [operation]=deploy [snapshot]="$name" [original_sha]='' [original_branch]=''
         [reconfigure_ai]=0 [unmanaged_tunnel]='' [domain_action]=keep [bot_port]=1011 [deploy_mode]=direct [bot_domain]=''
         [platform_ip]="${PLATFORM_IP:-$DEFAULT_PLATFORM_IP}")
+    declare -gA TRANSACTION_SOURCE=([operation]='没有旧版升级停机记录' [original_sha]='部署没有' [original_branch]='部署没有'
+        [bot_port]='默认值' [deploy_mode]='默认值' [bot_domain]='未保存' [domain_action]='沿用' [platform_ip]='默认值')
+    [ -z "${PLATFORM_IP:-}" ] || TRANSACTION_SOURCE[platform_ip]='当前终端的 PLATFORM_IP'
     if [ -f "$state/update-transaction" ]; then
         mapfile -t saved < "$state/update-transaction"
         TRANSACTION[operation]=upgrade
         TRANSACTION[original_sha]="${saved[1]:-}"
         TRANSACTION[original_branch]="${saved[2]:-}"
+        for key in operation original_sha original_branch; do TRANSACTION_SOURCE[$key]='旧版升级停机记录 data/state/update-transaction'; done
     fi
     for key in target_sha:target-sha was_running:was-running target_group_root:group-root; do
         value=''
-        if [ -f "$snapshot/${key#*:}" ]; then value="$(cat "$snapshot/${key#*:}")"; fi
+        TRANSACTION_SOURCE[${key%%:*}]="快照缺少 ${key#*:}"
+        if [ -f "$snapshot/${key#*:}" ]; then value="$(cat "$snapshot/${key#*:}")"; TRANSACTION_SOURCE[${key%%:*}]="快照 ${key#*:}"; fi
         TRANSACTION[${key%%:*}]="$value"
     done
-    TRANSACTION[original_group_root]="$(saved_group_data_root)"
-    if [ -f "$state/bot-port" ]; then TRANSACTION[bot_port]="$(tr -d '[:space:]' < "$state/bot-port")"; fi
-    if [ -f "$state/deploy-mode" ]; then TRANSACTION[deploy_mode]="$(tr -d '[:space:]' < "$state/deploy-mode")"; fi
+    # 原群根：事务开始时快照保存的群根设置；旧快照没有保存时取当前已保存设置（提交前不会改写）。
+    if [ -s "$snapshot/data/state/group-data-root" ]; then
+        root="$(tr -d '\r\n' < "$snapshot/data/state/group-data-root")"
+        case "$root" in /*) ;; *) root="$PROJECT_DIR/$root" ;; esac
+        TRANSACTION[original_group_root]="$(realpath -m -- "$root")"
+        TRANSACTION_SOURCE[original_group_root]='快照 data/state/group-data-root'
+    else
+        TRANSACTION[original_group_root]="$(saved_group_data_root)"
+        TRANSACTION_SOURCE[original_group_root]='已保存设置'
+        [ -s "$state/group-data-root" ] || TRANSACTION_SOURCE[original_group_root]='默认 data/groups'
+    fi
+    if [ -f "$state/bot-port" ]; then TRANSACTION[bot_port]="$(tr -d '[:space:]' < "$state/bot-port")"; TRANSACTION_SOURCE[bot_port]='已保存设置'; fi
+    if [ -f "$state/deploy-mode" ]; then TRANSACTION[deploy_mode]="$(tr -d '[:space:]' < "$state/deploy-mode")"; TRANSACTION_SOURCE[deploy_mode]='已保存设置'; fi
     if [ -f "$state/bot-domain" ]; then
         value="$(tr -d '[:space:]' < "$state/bot-domain")"
+        TRANSACTION_SOURCE[bot_domain]='已保存设置'
         # 与部署脚本一致：无效域名清除，需要规范化的写回规范值。
         if TRANSACTION[bot_domain]="$(normalize_hostname_input "$value" 2>/dev/null)"; then
-            [ "${TRANSACTION[bot_domain]}" = "$value" ] || TRANSACTION[domain_action]=persist
+            [ "${TRANSACTION[bot_domain]}" = "$value" ] || { TRANSACTION[domain_action]=persist; TRANSACTION_SOURCE[domain_action]='规范化后写回'; }
         else
-            TRANSACTION[bot_domain]=''; TRANSACTION[domain_action]=clear
+            TRANSACTION[bot_domain]=''; TRANSACTION[domain_action]=clear; TRANSACTION_SOURCE[domain_action]="已保存的域名无效：${value}"
         fi
     fi
     for key in "${TRANSACTION_KEYS[@]}"; do
@@ -129,8 +146,35 @@ describe_pending_transaction() {
     printf '未完成的%s：目标提交 %s；群数据总根 %s（原 %s）；端口 %s；入口 %s；原运行状态：%s' "$kind" \
         "${TRANSACTION[target_sha]:0:7}" "${TRANSACTION[target_group_root]}" "${TRANSACTION[original_group_root]}" \
         "${TRANSACTION[bot_port]}" "$entry" "$state"
-    [ "${TRANSACTION_LEGACY:-0}" = 0 ] || printf '（旧版事务，端口、入口和域名按已保存设置，平台 IP 按当前设置）'
+    [ "${TRANSACTION_LEGACY:-0}" = 0 ] || printf '（旧版事务没有记录：继续前需在终端逐项确认并补录一次，回滚不需要）'
     ! transaction_code_restore_pending || printf '；数据、配置和容器已经回滚，只剩代码待恢复到升级前的 %s（只能完成回滚）' "${TRANSACTION[original_sha]:0:7}"
+}
+
+# 旧版事务没有记录：继续前逐项显示合成的值和来源，在终端确认后写入完整记录，之后续做只读这份记录。
+# 只补录一次；没有终端或未确认时保持现状并返回 1。回滚只用快照中的原状态，不需要补录。
+backfill_legacy_transaction() {
+    # 只剩代码待恢复时不能继续，由调用方拒绝；这里不再要求补录。
+    [ "${TRANSACTION_LEGACY:-0}" = 1 ] && ! transaction_code_restore_pending || return 0
+    local entry key answer
+    if [ ! -t 0 ]; then
+        echo "旧版事务没有记录，继续前需要逐项确认并补录；请在终端运行 $(ops_command_hint resume)，或用 $(ops_command_hint rollback) 回滚（回滚不需要补录）" >&2
+        return 1
+    fi
+    echo "旧版事务没有记录。继续只会使用以下值（括号内为来源），请核对："
+    for entry in operation:操作 target_sha:目标提交 original_sha:升级前提交 original_branch:升级前分支 original_group_root:原群数据总根 \
+        target_group_root:目标群数据总根 was_running:原运行状态 bot_port:端口 deploy_mode:入口 bot_domain:域名 domain_action:域名写回 platform_ip:平台IP; do
+        key="${entry%%:*}"
+        printf '  %-14s %s（%s）\n' "${entry#*:}" "${TRANSACTION[$key]:-（空）}" "${TRANSACTION_SOURCE[$key]:-}"
+    done
+    IFS= read -r -p "按以上值补录事务记录并继续？[y/N] " answer || answer=''
+    answer="$(printf '%s' "$answer" | tr -d '[:space:]')"
+    case "${answer,,}" in
+        y|yes|是) ;;
+        *) echo "未补录，保持现状；值不对时请用 $(ops_command_hint rollback) 回滚后重新部署" >&2; return 1 ;;
+    esac
+    write_transaction_record "$TRANSACTION_SNAPSHOT" || { echo "事务记录写入失败，保持现状" >&2; return 1; }
+    TRANSACTION_LEGACY=0
+    echo "已补录事务记录：$TRANSACTION_SNAPSHOT/transaction"
 }
 
 # 升级的回滚分两段：部署脚本恢复数据、配置、容器和原运行状态后，代码若还不是升级前的提交，
