@@ -1236,8 +1236,8 @@ test.skipIf(!bash || !existsSync(bash))("Docker deployment refuses the legacy up
       "git archive origin/main scripts/deploy/upgrade.sh scripts/lib scripts/migrations src/core/data-version.ts Dockerfile | tar -x -C tmp/upgrade-bootstrap",
       'bash tmp/upgrade-bootstrap/scripts/deploy/upgrade.sh "$PWD" origin/main', "rm -rf tmp/upgrade-bootstrap"];
     for (const line of bootstrap) expect(result.output).toContain(`      ${line}\n`);
-    // The documented command is the one printed.
-    expect(await readFile(join(project, "docs/data-migrations.md"), "utf8")).toContain("```bash\n" + bootstrap.join("\n") + "\n```");
+    // The documented command is the one printed (a Windows checkout may have CRLF line endings).
+    expect((await readFile(join(project, "docs/data-migrations.md"), "utf8")).replaceAll("\r\n", "\n")).toContain("```bash\n" + bootstrap.join("\n") + "\n```");
     expect(existsSync(dockerLog)).toBe(false);
     expect(existsSync(join(root, "data"))).toBe(false); expect(existsSync(join(root, "backup"))).toBe(false);
     // Without the legacy flag (or with an explicit transaction action) deployment proceeds to its normal checks.

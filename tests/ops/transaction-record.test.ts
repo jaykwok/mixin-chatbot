@@ -271,10 +271,10 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
     await writeFile(join(root, "backup/snapshots/deploy-abc123/transaction"), serialize(record));
     await writeFile(join(root, "data/state/deploy-transaction"), "deploy-abc123");
     // resume / rollback read the record under the deployment lock; Git Bash has no util-linux flock, Linux uses the real one.
-    await mkdir(join(root, "bin")); await writeFile(join(root, "bin/flock"), "#!/usr/bin/env bash\nexit 0\n");
-    const path = process.platform === "win32" ? `${posixPath(join(root, "bin"))}:${process.env.PATH}` : process.env.PATH!;
+    // An exported function, not a PATH stub: the Windows CI runner did not find a stub script written just before.
+    const lock = process.platform === "win32" ? { "BASH_FUNC_flock%%": "() { return 0\n}" } : {};
     const ops = (command: string, entry = "scripts/ops/ops.sh") => execute([bash!, posixPath(join(root, entry)), command], root,
-      { ...process.env, PATH: path, MSYS_NO_PATHCONV: "1", BOT_PORT: "", BOT_DOMAIN: "" });
+      { ...process.env, ...lock, MSYS_NO_PATHCONV: "1", BOT_PORT: "", BOT_DOMAIN: "" });
     for (const [command, action] of [["resume", "continue"], ["rollback", "rollback"]]) {
       const result = await ops(command!);
       expect(result.code, result.output).toBe(0); expect(result.output).toContain(`DISPATCHED action=${action}`);
