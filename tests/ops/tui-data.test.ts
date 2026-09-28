@@ -179,7 +179,7 @@ test("每日提问按消息当天计数，9 次和 1 次不会被平均成 5 次
     });
     await writeFile(join(dir, "session.jsonl"), [
       ...Array.from({ length: 9 }, () => message(11, "统计")),
-      message(12, "资料"), message(12, "/help"), message(12, "@机器人ﾠ/clear"),
+      message(12, "资料"), message(12, "/help"),
       JSON.stringify({ type: "message", timestamp: new Date(2026, 8, 12, 12, 1).toISOString(),
         message: { role: "toolResult", toolName: "send_file", isError: false, details: { fileId: "fixture" } } }),
     ].join("\n") + "\n");

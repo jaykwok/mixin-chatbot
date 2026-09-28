@@ -8,23 +8,15 @@ export const SUPPORTED_COMMANDS: ReadonlyMap<string, string> = new Map([
 ]);
 
 /**
- * Remove the IM platform's leading bot mention: @, the displayed bot name,
- * then U+FFA0 HALFWIDTH HANGUL FILLER. U+FFA0 is the platform's actual mention
- * separator even though it is rendered like a space. Normal whitespace is not
- * accepted. Only the first leading mention is removed so mentions that are
- * part of the user's actual prompt are kept.
+ * Extract a case-insensitive slash command token. The platform removes the
+ * @bot mention from textMsg.content before forwarding, wherever it was typed.
  */
-export function stripLeadingMention(content: string): string {
-  return content.trim().replace(/^@[^\uFFA0]+\uFFA0/u, "").trimStart();
-}
-
-/** Extract a case-insensitive slash command token from normalized IM text. */
 export function canonicalCommand(content: string): string {
-  const [token = ""] = stripLeadingMention(content).split(/\s+/, 1);
+  const [token = ""] = content.trim().split(/\s+/, 1);
   return token.toLowerCase();
 }
 
-/** Any normalized message whose first token starts with / is command syntax. */
+/** Any message whose first token starts with / is command syntax. */
 export function isSlashCommandMessage(content: string): boolean {
   return canonicalCommand(content).startsWith("/");
 }
@@ -33,7 +25,7 @@ const commandHelp = [...SUPPORTED_COMMANDS]
   .map(([command, description]) => `${command.padEnd(7)} ${description}`)
   .join("\n");
 
-export const HELP_TEXT = `可用指令（可前置 @机器人名，指令必须以 / 开头，大小写不敏感）：
+export const HELP_TEXT = `可用指令（@机器人名放在指令前后均可，指令必须以 / 开头，大小写不敏感）：
 ${commandHelp}
 
 提示：你在本群的消息会按顺序处理；/stop 不会撤回已发出的内容。/deliver 会补发之前保存的回复，可能与群里已有的内容重复。`;

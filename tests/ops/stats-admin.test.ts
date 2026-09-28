@@ -86,7 +86,6 @@ async function makeRoot(): Promise<string> {
     JSON.stringify({type:"message", timestamp:"2026-08-10T01:00:13.000Z", message:{role:"toolResult", toolName:"send_file", isError:true, details:{fileId:"failed-file"}}}),
     // 指令不进模型，早期版本残留在历史里的也要排除。
     userMsg("2026-08-10T01:00:20.000Z", "/stop"),
-    userMsg("2026-08-10T01:00:25.000Z", "@机器人ﾠ/clear"),
     // 跨月，用来验证按月分组。
     userMsg("2026-09-02T02:00:00.000Z", "这个月的价格有变化吗"),
     assistantMsg("2026-09-02T02:00:04.000Z", ["bash", "read"]),
@@ -155,7 +154,7 @@ describe("usage stats", () => {
     const root = await makeRoot();
     try {
       const stats = await collectGroup("group-a", root);
-      // 4 条普通消息（含一条干预），/stop 与 @机器人 /clear 都不计入。
+      // 4 条普通消息（含一条干预），/stop 不计入。
       expect(stats.asks).toBe(4);
       expect(stats.users).toHaveLength(2);
       expect(stats.users[0]!.user).toBe("13800000000");

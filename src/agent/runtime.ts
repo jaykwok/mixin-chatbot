@@ -11,7 +11,7 @@ import { abortOutboundRequests, getOutboundRateStatus, sendReplyWithMention, sen
 import { groupSegment, groupWorkspaceDir, materialsIgnorePath, materialsIndexPath, sessionFilePath, userSegment } from "./paths.ts";
 import { ingestBeforeArchive, ingestUserSession } from "./stats-ledger.ts";
 import { ensureMaterialsIndex } from "./materials-index.ts";
-import { canonicalCommand, HELP_TEXT, isSlashCommandMessage, stripLeadingMention, unknownCommandText } from "./commands.ts";
+import { canonicalCommand, HELP_TEXT, isSlashCommandMessage, unknownCommandText } from "./commands.ts";
 import { createOutboundNotes, type OutboundNotes } from "./send-tools.ts";
 import { DeliveryStore } from "./delivery-store.ts";
 import { refreshDeliveryText } from "./delivery-links.ts";
@@ -195,7 +195,7 @@ async function run(record: SessionRecord, content: string, cancellation: AbortSi
 export async function handleUserMessage(phone: string, groupId: string, content: string, callbackUrl: string, invalidate?: () => void): Promise<void> {
   application.signal.throwIfAborted();
   const record = getRecord(phone, groupId, callbackUrl);
-  if (!isSlashCommandMessage(content)) return record.queue.enqueue((signal) => run(record, stripLeadingMention(content), signal), invalidate);
+  if (!isSlashCommandMessage(content)) return record.queue.enqueue((signal) => run(record, content, signal), invalidate);
   const command = canonicalCommand(content);
   let reply: string;
   if (command === "/stop") {
