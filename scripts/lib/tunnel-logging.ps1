@@ -1,4 +1,6 @@
-﻿# Optional connector diagnostics. Missing preference means no file logging.
+﻿. (Join-Path $PSScriptRoot 'file-replace.ps1')
+
+# Optional connector diagnostics. Missing preference means no file logging.
 function Get-CloudflaredLogging([string]$ProjectRoot) {
     $path = Join-Path $ProjectRoot 'data\config\cloudflared-logging'
     if (-not (Test-Path -LiteralPath $path)) { return 'off' }
@@ -26,14 +28,7 @@ function Set-CloudflaredProtocolPreference([string]$ProjectRoot, [byte[]]$Conten
 function Set-CloudflaredPreference([string]$ProjectRoot, [ValidateSet('logging', 'protocol')][string]$Setting, [byte[]]$Content) {
     $path = Join-Path $ProjectRoot "data\config\cloudflared-$Setting"
     New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
-    $temporary = $path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
-    try {
-        [IO.File]::WriteAllBytes($temporary, $Content)
-        if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temporary, $path, [NullString]::Value) }
-        else { [IO.File]::Move($temporary, $path) }
-    } finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
-    }
+    Save-FileAtomically $path { param($temporary) [IO.File]::WriteAllBytes($temporary, $Content) }.GetNewClosure()
 }
 
 function Get-CloudflaredLogArguments([string]$ProjectRoot, [string]$Mode) {
@@ -148,9 +143,19 @@ function Set-CloudflaredSetting([string]$ProjectRoot, [ValidateSet('logging', 'p
                     if ((Get-Service -Name Cloudflared -ErrorAction Stop).Status -ne 'Stopped') { Stop-Service Cloudflared -ErrorAction Stop }
                     Set-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\Cloudflared' -Name ImagePath -Value $previousCommand -ErrorAction Stop
                 }
-                if ($hadPreference) { & $savePreference $ProjectRoot $previousContent }
-                elseif (Test-Path -LiteralPath $preference) { Remove-Item -LiteralPath $preference -Force -ErrorAction Stop }
+                # The service runs the restored command, not the preference file: a file that cannot be restored
+                # (still held by another process, for example) must not keep the connector stopped.
+                $preferenceFailure = $null
+                try {
+                    if ($hadPreference) {
+                        # A failed replacement usually left the file untouched; rewriting it would only wait on the same lock.
+                        $current = if (Test-Path -LiteralPath $preference -PathType Leaf) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($preference)) }
+                        if ($current -cne [Convert]::ToBase64String($previousContent)) { & $savePreference $ProjectRoot $previousContent }
+                    }
+                    elseif (Test-Path -LiteralPath $preference) { Remove-Item -LiteralPath $preference -Force -ErrorAction Stop }
+                } catch { $preferenceFailure = $_.Exception.Message }
                 if ($wasRunning -and (Get-Service -Name Cloudflared -ErrorAction Stop).Status -ne 'Running') { Start-CloudflaredChecked }
+                if ($preferenceFailure) { throw "设置文件 data/config/cloudflared-$Setting 未能恢复（服务已按原设置恢复）：$preferenceFailure" }
             } catch { throw "应用失败：$failure；恢复原设置或服务失败：$($_.Exception.Message)" }
             throw "应用失败，已恢复原设置及运行状态：$failure"
         }

@@ -54,7 +54,7 @@ bash scripts/ops/ops.sh doctor
 
 Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件、安装配置和补丁未变，且已安装的直接依赖版本匹配时，会保留 `node_modules` 并跳过安装；缺包、版本不匹配或依赖输入发生变化时，才备份旧依赖并按锁文件安装。版本更高也不视为匹配，避免偏离经过验证的依赖组合。
 
-部署、升级和连接器安装的备份放在 `backup/snapshots`，被替换的旧文件放在 `backup/rm`。普通部署和连接器安装成功后删除本次部署快照，并清空整个 `backup/rm`，包括历史目录、散落文件和手动清理的会话归档；Docker 升级也采用该清理策略。Windows 新升级器保留部署快照和归档，供人工清理。两平台都保留 `migration-*` 数据迁移快照；其他历史快照不自动删除。操作失败时保留回滚现场。Windows 会移除空的 `backup` 目录；Linux 保留空的容器挂载目录，避免运行中的容器丢失后续归档。部署锁保存在 `data/state/deploy.lock`。Docker 部署和升级在构建新镜像前，先给原容器使用的镜像打上 `mixin-chatbot:previous` 标签，事务提交或回滚完成后再移除。Docker 29 起新装默认使用 containerd 镜像存储，它会删除失去最后一个标签的镜像，回滚要靠这个标签恢复原镜像。
+部署、升级和连接器安装的备份放在 `backup/snapshots/<快照名>`，操作期间被替换的旧文件放在 `backup/rm/<快照名>`；会话、用户 tmp 等日常归档直接放在 `backup/rm` 下。两个平台的部署、升级和连接器安装成功后，只删除本次操作自己的快照和 `backup/rm/<快照名>`。新建快照时会避开 `backup/rm` 中已有同名目录的名称，保证这个目录只属于本次操作；快照或归档目录本身、或它们的上级目录是链接时拒绝清理。其他快照、历史事务目录、散落文件、手动清理的会话归档，以及 `migration-*` 数据迁移快照都保留，由[历史归档清理](#历史归档清理)处理。旧版本在部署成功后会清空整个 `backup/rm`，现在不再这样做。操作失败时保留回滚现场。Windows 会移除空的 `backup` 目录；Linux 保留空的容器挂载目录，避免运行中的容器丢失后续归档。部署锁保存在 `data/state/deploy.lock`。Docker 部署和升级在构建新镜像前，先给原容器使用的镜像打上 `mixin-chatbot:previous` 标签，事务提交或回滚完成后再移除。Docker 29 起新装默认使用 containerd 镜像存储，它会删除失去最后一个标签的镜像，回滚要靠这个标签恢复原镜像。
 
 关闭服务使用 `stop`：Windows 验证实例身份后先请求优雅关闭，超时再复核归属并终止进程树；Linux 使用 Docker 停止期限。
 
@@ -223,9 +223,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 | 配置、SQLite 状态库、群资料 | 持久保存，纳入停机备份 |
 | Pi 设置与模型目录缓存 | `data/runtime/pi/settings.json` 与 `data/runtime/models-store.json` 随配置备份；动态目录服务商需缓存才能离线启动 |
 | 使用统计账本 | `<群数据根>/stats.sqlite` 持久保存，纳入停机备份；清空会话不影响它，删掉就只能从现存会话回填，已归档的历史补不回来 |
-| 会话、用户 tmp | 清理时归档到 `backup/rm`，下次部署、升级或连接器安装成功后清空；归档前机器人已把该段历史入账 |
-| 部署备份 | 普通部署、连接器安装和 Docker 升级成功后删除本次部署快照并清空 `backup/rm`；Windows 新升级器与失败操作保留现场 |
-| 数据版本迁移备份 | 有格式迁移时创建 `backup/snapshots/migration-*`；同版本升级不复制 SQLite、不新增迁移快照。已有快照保留，确认业务验收通过且不再需要人工恢复后清理；已提交事务不能执行 `rollback` |
+| 会话、用户 tmp | 清理时归档到 `backup/rm`，不自动删除，用[历史归档清理](#历史归档清理)处理；归档前机器人已把该段历史入账 |
+| 部署备份 | 部署、升级和连接器安装成功后只删除本次快照和 `backup/rm/<快照名>`；失败操作保留现场，其余快照和归档用历史归档清理处理 |
+| 数据版本迁移备份 | 有格式迁移时创建 `backup/snapshots/migration-*`；同版本升级不复制 SQLite、不新增迁移快照。已有快照保留，确认业务验收通过且不再需要人工恢复后，用历史归档清理删除（当前迁移日志引用的快照不会被删除）；已提交事务不能执行 `rollback` |
 | 历史账本迁移备份 | 按当时工具的保留规则处理，确认数据转换及新实例验收完成后再清理 |
 | 测试与诊断现场 | 放在顶层 `tmp/`，确认没有测试、诊断或维护任务使用后可清理 |
 | TUI 统计报表 | 每次导出独立保存在 `backup/reports`，按需保留或手动清理 |
@@ -234,6 +234,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 | 升级、迁移与启动诊断 | `logs/operations/` 保留最近 20 份，每份约 2 MiB；命令输出约 1 MiB 后为后续阶段与错误保留空间，回滚保留日志 |
 
 归档不会立即释放磁盘空间，部署快照可能含凭据。应用日志常规预算约 20 MiB，运维诊断约 40 MiB，单条日志可使文件短暂超限；强制终止留下的临时现场需离线清理。
+
+### 历史归档清理
+
+`backup/rm` 和 `backup/snapshots` 中不属于某次成功操作的内容不会自动删除，用专门的入口分两步处理：
+
+1. `ops.sh backup-scan`（Windows：`ops.ps1 backup-scan`）只读扫描这两处的顶层条目，在 `backup/cleanup/<报告名>/` 写出 `manifest.json` 和便于查看的 `manifest.tsv`，列出每条的路径、大小、分类、分类依据和建议动作，不删除任何内容。`backup/reports` 等其他目录不扫描，会在输出中列出。
+2. `ops.sh backup-clean <报告名>`（Windows：`ops.ps1 backup-clean <报告名>`）预演：逐条重新检查清单中选为删除的条目，列出将删除、扫描后有变化、拒绝等结果，并给出确认码，不删除任何内容。确认后加 `--confirm <确认码>`（Windows：`-ConfirmCode <确认码>`）执行，结果写入同一报告目录的 `result-*.json`；`result-*.tsv` 逐条追加，进程中断时也留有已处理条目的记录。
+
+| 分类 | 判断依据 | 建议动作 |
+| --- | --- | --- |
+| 可确认测试数据 | 名称是测试夹具的归档格式 `<夹具名>-<UUIDv4>`（旧版测试辅助函数的命名，运维归档从不这样命名），且内容里有测试证据：夹具目录自己的随机名称、测试临时目录路径、至少 1 MiB 的单字节填充文件，或 RFC 6761 保留的 `.test` 域名 | 删除 |
+| 疑似测试数据 | 名称符合测试夹具格式，但没有找到内容证据 | 保留，工具不删除 |
+| 业务归档 | 运维归档格式（时间或 GUID 开头）、事务目录 `deploy-*` / `tunnel-*`、部署与连接器快照、`migration-*` 迁移快照 | 保留；确需删除时先另行备份，再把 `manifest.json` 中该条的 `action` 改为 `delete` |
+| 无法判断 | 条目本身或内部含链接、有无法读取的部分，或名称不符合任何已知格式 | 保留，工具不删除 |
+
+名称只是线索，内容证据不足的一律保留。执行时只处理清单中 `action` 为 `delete` 的条目，删除前逐条重新检查：
+
+- 路径必须是 `backup/rm` 或 `backup/snapshots` 下的单层条目，`backup` 和这两个目录不能是链接；
+- 条目本身和内部都不能有链接，工具从不跟随链接；
+- 每个普通文件都必须能完整读取；有不可读文件时整个条目保留，业务归档也适用；
+- 内容指纹（每个节点的相对路径、类型、大小、修改时间、设备号、inode，以及每个文件完整内容的 SHA-256）必须与扫描时一致。即使文件原地改为相同长度并恢复修改时间，也会跳过；重新扫描后再决定。扫描和复查采用分块读取，内存不随大文件大小增长。
+
+清单格式为 2。旧版格式 1 没有文件内容摘要，不能继续预演或删除；必须重新运行 `backup-scan`，审阅新清单并获取新确认码，旧确认码不再使用。
+
+有未完成的部署或升级时拒绝执行；未完成事务和当前迁移日志引用的快照与归档始终拒绝删除。`manifest.json` 中除 `action` 以外的字段被改动，或确认码与当前清单不符（预演后又改过清单）时，整份清单不执行。删除不可撤销，也不能用 Git 找回。Docker 部署在容器内执行清理；遇到容器用户无权删除的文件时，该条目记为“删除失败”，可能已部分删除，其余内容留在原处。
 
 ## 隧道托管
 
@@ -336,7 +361,7 @@ Windows 修改已安装的服务需要管理员权限。连接器必须使用当
 
 ## 重新配置模型
 
-模型配置使用 `data/config/models.json` 的 Pi 原生 `providers` 和 `data/runtime/pi/settings.json` 的 `defaultProvider` / `defaultModel` / `defaultThinkingLevel`。旧顶层 `modelId` / `thinkingLevel` 不参与选型，也不做兼容迁移。旧配置需要重建时，先停机并将这两个文件及 `data/runtime/models-store.json` 归档到 `backup/rm`，再运行 `bun run configure`；没有宿主机 Bun 的 Docker 部署可重新运行部署脚本，由镜像内的向导生成配置。`backup/rm` 会在部署成功后清空，需要长期保留的配置副本请另行备份。
+模型配置使用 `data/config/models.json` 的 Pi 原生 `providers` 和 `data/runtime/pi/settings.json` 的 `defaultProvider` / `defaultModel` / `defaultThinkingLevel`。旧顶层 `modelId` / `thinkingLevel` 不参与选型，也不做兼容迁移。旧配置需要重建时，先停机并将这两个文件及 `data/runtime/models-store.json` 归档到 `backup/rm`，再运行 `bun run configure`；没有宿主机 Bun 的 Docker 部署可重新运行部署脚本，由镜像内的向导生成配置。`backup/rm` 不是长期存储，需要长期保留的配置副本请另行备份。
 
 凭证由 Pi 从 `models.json` 解析，支持直接 Key、环境变量引用和命令引用；磁盘 `auth.json` 不参与解析。运行中的模型、设置及目录使用启动时的只读视图，更改配置后需重启。群工作区的 `.pi/settings.json` 不参与配置；重试、自动压缩开关及遥测策略由应用固定，编辑 Pi 设置也不会覆盖这些策略。
 

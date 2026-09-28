@@ -1,4 +1,5 @@
 ﻿. (Join-Path $PSScriptRoot 'operation-log.ps1')
+. (Join-Path $PSScriptRoot 'file-replace.ps1')
 
 # A deployment snapshot excludes live SQLite databases and conversation data.
 function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
@@ -9,7 +10,14 @@ function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
     New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null
     $deploymentLock = [IO.File]::Open((Join-Path $lockRoot 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     try {
-    $snapshot = Join-Path $ProjectRoot ('backup\snapshots\deploy-' + [Guid]::NewGuid().ToString('N'))
+    # Callers look for unfinished transactions before taking the lock (and a deployment asks its questions in between);
+    # another operation may have published and left one since. Check again under the lock before creating anything.
+    foreach ($name in @('deploy-transaction', 'upgrade-transaction')) {
+        if (Test-Path -LiteralPath (Join-Path $lockRoot $name)) {
+            throw "发现未完成的部署或升级（data\state\$name），可能刚由另一个操作留下；本次没有改动任何内容，请先继续或回滚那次操作。"
+        }
+    }
+    $snapshot = New-TransactionSnapshotPath $ProjectRoot 'deploy-'
     $env:BOT_DEPLOY_BACKUP_ID = Split-Path $snapshot -Leaf
     $paths = Save-DeploymentFiles $ProjectRoot $snapshot
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -44,15 +52,24 @@ function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
     } catch { $env:BOT_DEPLOY_BACKUP_ID = $previousBackupId; $deploymentLock.Dispose(); throw }
 }
 
+# A successful operation removes backup\rm\<snapshot name> as its own archive; never adopt a name whose snapshot or
+# archive already exists (left by an earlier operation or restored by hand).
+function New-TransactionSnapshotPath([string]$ProjectRoot, [string]$Prefix) {
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $name = $Prefix + [Guid]::NewGuid().ToString('N')
+        $taken = $false
+        foreach ($path in @((Join-Path $ProjectRoot "backup\snapshots\$name"), (Join-Path $ProjectRoot "backup\rm\$name"))) {
+            # GetAttributes reads the entry itself, so a link counts even when its target is gone.
+            try { [IO.File]::GetAttributes($path) | Out-Null; $taken = $true } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { }
+        }
+        if (-not $taken) { return Join-Path $ProjectRoot "backup\snapshots\$name" }
+    }
+    throw '无法分配新的快照名称：backup\rm 中已有同名归档'
+}
+
 function Save-DeploymentSnapshot($Snapshot) {
-    $path = Join-Path $Snapshot.Path 'deployment.xml'
-    $temporary = $path + '.tmp'
-    $Snapshot | Select-Object * -ExcludeProperty Lock, Record | Export-Clixml -LiteralPath $temporary
-    $stream = [IO.File]::Open($temporary, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
-    try { $stream.Flush($true) } finally { $stream.Dispose() }
-    # Windows PowerShell 5.1 binds $null to an empty string for .NET string arguments.
-    if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temporary, $path, [NullString]::Value) }
-    else { [IO.File]::Move($temporary, $path) }
+    $saved = $Snapshot | Select-Object * -ExcludeProperty Lock, Record
+    Save-FileAtomically (Join-Path $Snapshot.Path 'deployment.xml') { param($temporary) $saved | Export-Clixml -LiteralPath $temporary }.GetNewClosure()
 }
 
 # 部署/升级事务记录：快照目录中的 transaction 文件，与 Linux 同一格式（每行 key=value）。
@@ -93,9 +110,8 @@ function Write-DeploymentTransaction([string]$Directory, [hashtable]$Record) {
         if (-not (Test-TransactionValue $key $value)) { throw "事务记录值无效：$key=$value" }
         "$key=$value"
     }
-    $path = Join-Path $Directory 'transaction'
-    [IO.File]::WriteAllText($path + '.tmp', (($lines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath ($path + '.tmp') -Destination $path -Force
+    $text = ($lines -join "`n") + "`n"
+    Save-FileAtomically (Join-Path $Directory 'transaction') { param($temporary) [IO.File]::WriteAllText($temporary, $text, [Text.UTF8Encoding]::new($false)) }.GetNewClosure()
 }
 
 # 旧版快照没有记录时返回 $null；存在但无效时拒绝。
@@ -155,8 +171,9 @@ function Open-DeploymentTransaction([string]$ProjectRoot) {
 function Publish-DeploymentTransaction($Snapshot, [hashtable]$Record, [string]$Pointer, [string]$MigrationPlan = '') {
     Write-DeploymentTransaction $Snapshot.Path $Record
     if ($MigrationPlan) { Copy-Item -LiteralPath $MigrationPlan -Destination (Join-Path $Snapshot.Path 'migration-plan.json') -ErrorAction Stop }
-    [IO.File]::WriteAllText($Pointer + '.tmp', (Split-Path $Snapshot.Path -Leaf))
-    Move-Item -LiteralPath ($Pointer + '.tmp') -Destination $Pointer -Force
+    $name = Split-Path $Snapshot.Path -Leaf
+    # Publishing only ever creates the pointer: an existing one belongs to another unfinished transaction.
+    Save-FileAtomically $Pointer { param($temporary) [IO.File]::WriteAllText($temporary, $name) }.GetNewClosure() -CreateOnly
 }
 
 # An interrupted upgrade reuses its original snapshot and original running state.
@@ -190,8 +207,9 @@ function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$
         if ($MigrationPlan -and (Test-Path -LiteralPath $MigrationPlan -PathType Leaf)) {
             Copy-Item -LiteralPath $MigrationPlan -Destination (Join-Path $state.Path 'migration-plan.json') -ErrorAction Stop
         }
-        [IO.File]::WriteAllText($pointer + '.tmp', (Split-Path $state.Path -Leaf))
-        [IO.File]::Move($pointer + '.tmp', $pointer)
+        $name = Split-Path $state.Path -Leaf
+        # Create only: never replace the pointer of another unfinished transaction.
+        Save-FileAtomically $pointer { param($temporary) [IO.File]::WriteAllText($temporary, $name) }.GetNewClosure() -CreateOnly
         return $state
     } catch { $state.Lock.Dispose(); $env:BOT_DEPLOY_BACKUP_ID = $state.PreviousBackupId; throw }
 }
@@ -365,7 +383,7 @@ function New-CloudflaredSnapshot([string]$ProjectRoot, [string]$Directory = '') 
     $previousBackupId = $env:BOT_DEPLOY_BACKUP_ID
     try {
     if (-not $Directory) {
-        $Directory = Join-Path $ProjectRoot ('backup\snapshots\tunnel-' + [Guid]::NewGuid().ToString('N'))
+        $Directory = New-TransactionSnapshotPath $ProjectRoot 'tunnel-'
         $env:BOT_DEPLOY_BACKUP_ID = Split-Path $Directory -Leaf
     }
     New-Item -ItemType Directory -Force -Path $Directory | Out-Null

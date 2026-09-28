@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadLogTail, loadTunnelLogging } from "../../scripts/ops/tui/data.ts";
 import { opsCommand } from "../../scripts/ops/tui/platform.ts";
+import { fileHolderFunctions } from "../helpers/file-holder.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
@@ -18,7 +19,7 @@ for (const shell of ["powershell", "bash"] as const) {
     shell + " 隧道日志切换保留凭据、日志和原运行状态，失败恢复，拒绝未托管或自定义连接器",
     async () => {
       for (const scenario of ["running-on", "running-off", "stopped", "absent", "unchanged", "default-off",
-        "unowned", "custom", "stop-fail", "stop-partial", "start-fail", "save-fail", "lock", ...(shell === "powershell" ? ["no-admin", "write-fail"] : [])]) {
+        "unowned", "custom", "stop-fail", "stop-partial", "start-fail", "save-fail", "lock", ...(shell === "powershell" ? ["no-admin", "write-fail", "held-release", "held", "held-exclusive"] : [])]) {
         const fixture = await tempFixture("tunnel logging-");
         try {
           const config = join(fixture.root, "data/config");
@@ -32,8 +33,8 @@ for (const shell of ["powershell", "bash"] as const) {
           await writeFile(token, "unchanged-fixture-credential");
           await writeFile(log, "previous diagnostic record\n");
           if (scenario !== "unowned") await writeFile(join(fixture.root, "data/state/cloudflared-managed"), "Cloudflared");
-          const old = ["running-off", "unchanged"].includes(scenario) ? "on" : "off";
-          const mode = ["running-off", "default-off"].includes(scenario) ? "off" : "on";
+          const old = ["running-off", "unchanged", "held-release", "held", "held-exclusive"].includes(scenario) ? "on" : "off";
+          const mode = ["running-off", "default-off", "held-release", "held", "held-exclusive"].includes(scenario) ? "off" : "on";
           const original = old === "on" ? "on\r\n" : null;
           if (original) await writeFile(preference, original);
           const running = !["stopped", "absent"].includes(scenario);
@@ -49,6 +50,7 @@ for (const shell of ["powershell", "bash"] as const) {
             await writeFile(runner, "\ufeff" + [
               "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
               ". " + ps(join(project, "scripts/lib/tunnel-logging.ps1")),
+              await fileHolderFunctions(fixture.root),
               "$root=$env:FIXTURE_ROOT; $script:running=([IO.File]::ReadAllText($env:FIXTURE_STATE) -ne '0')",
               "$script:command=Get-CloudflaredServiceCommand $root (Join-Path $root 'cloudflared.exe') (Join-Path $root 'data/config/cloudflared-token') $env:FIXTURE_OLD",
               "if($env:FIXTURE_SCENARIO -eq 'custom'){$script:command+=' --protocol http2'}",
@@ -63,7 +65,13 @@ for (const shell of ["powershell", "bash"] as const) {
               "function Set-Service {throw 'must not change startup policy'}",
               "if($env:FIXTURE_SCENARIO -eq 'save-fail'){function Set-CloudflaredLogPreference {throw 'injected save failure'}}",
               "$held=$null; if($env:FIXTURE_SCENARIO -eq 'lock'){$held=[IO.File]::Open((Join-Path $root 'data/state/deploy.lock'),'OpenOrCreate','ReadWrite','None')}",
-              "$result=0; try {Set-CloudflaredLogging $root $env:FIXTURE_MODE} catch {Write-Output $_.Exception.Message; $result=1} finally {if($held){$held.Dispose()}}",
+              // Another process holds the preference briefly (released within the retry budget) or past two budgets, so a
+              // rollback that rewrote the unchanged file would fail too and leave the connector stopped.
+              "$script:holder=$null; if($env:FIXTURE_SCENARIO -in 'held','held-release'){$script:holder=Start-FileHolder (Join-Path $root 'data/config/cloudflared-logging') $(if($env:FIXTURE_SCENARIO -eq 'held'){6000}else{700})}",
+              // Once the connector is stopped another process takes the preference exclusively: it can be neither replaced
+              // nor read back, so the file cannot be restored, and the service still must be.
+              "if($env:FIXTURE_SCENARIO -eq 'held-exclusive'){$script:stopService=${function:Stop-Service}; function Stop-Service {param($Name,$ErrorAction); & $script:stopService -Name $Name; if(-not $script:holder){$script:holder=Start-FileHolder (Join-Path $root 'data/config/cloudflared-logging') 6000 -Exclusive}}}",
+              "$result=0; try {Set-CloudflaredLogging $root $env:FIXTURE_MODE} catch {Write-Output $_.Exception.Message; $result=1} finally {if($held){$held.Dispose()}; if($script:holder){Wait-FileHolder $script:holder}}",
               "[IO.File]::WriteAllText($env:FIXTURE_STATE,$(if($script:running){'101'}else{'0'}))",
               "[IO.File]::WriteAllText((Join-Path $root 'command'),$script:command)",
               "exit $result",
@@ -102,7 +110,7 @@ for (const shell of ["powershell", "bash"] as const) {
             const result = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
             code = result[0]; output = result[1] + result[2];
           } finally { clearTimeout(timeout); child.kill(); await child.exited; }
-          const success = ["running-on", "running-off", "stopped", "absent", "unchanged", "default-off"].includes(scenario);
+          const success = ["running-on", "running-off", "stopped", "absent", "unchanged", "default-off", "held-release"].includes(scenario);
           expect(code === 0, scenario + "\n" + output).toBe(success);
           const unchanged = ["unchanged", "default-off"].includes(scenario);
           const expected = success && !unchanged ? mode : original;
@@ -115,6 +123,16 @@ for (const shell of ["powershell", "bash"] as const) {
           const recorded = (await readFile(events, "utf8")).trim().split(/\r?\n/).filter(Boolean);
           if (["unchanged", "default-off", "unowned", "custom", "lock", "no-admin"].includes(scenario)) expect(recorded, scenario).toEqual([]);
           if (!running) expect(recorded.some(event => event === "stop" || event.startsWith("start:")), scenario).toBe(false);
+          // A preference held past the retry budget: the unchanged file is not rewritten, so the original command restarts.
+          if (scenario === "held") {
+            expect(recorded, output).toEqual(["stop", "write:off", "write:on", "start:on"]);
+            expect(output).toContain("错误码 32"); expect(output).toContain("已恢复原设置及运行状态");
+          }
+          if (scenario === "held-release") expect(recorded, output).toEqual(["stop", "write:off", "start:off"]);
+          if (scenario === "held-exclusive") {
+            expect(recorded, output).toEqual(["stop", "write:off", "write:on", "start:on"]);
+            expect(output).toContain("未能恢复（服务已按原设置恢复）");
+          }
           if (scenario === "start-fail" || scenario === "stop-partial" || scenario === "save-fail" || scenario === "write-fail") {
             expect(recorded.at(-1), scenario).toBe("start:off");
           }
@@ -128,7 +146,7 @@ for (const shell of ["powershell", "bash"] as const) {
           }
         } finally { await fixture.cleanup(); }
       }
-    }, 60000,
+    }, 120000,
   );
 }
 

@@ -170,6 +170,9 @@ try {
         Write-Host '机器人已启动。'
     } else { Write-Host '机器人服务保持停止（升级前未运行）。' }
     Remove-Item -LiteralPath $transactionPointer -Force
+    # 与部署相同：成功后只删除本次快照和本次归档；迁移快照、其他归档和历史事务留给明确的清理入口。
+    try { Remove-CompletedBackup $snapshot.Path $Project }
+    catch { Write-Warning ('升级已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }
     Write-Host ('升级完成：' + $OriginalSha.Substring(0, 7) + ' -> ' + $TargetSha.Substring(0, 7))
     }
 } catch {
@@ -209,7 +212,7 @@ try {
     $snapshot.Lock.Dispose()
     $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId
     }
-    # Keep the deployment and migration backups for recovery; housekeeping is explicit.
+    # A failed, refused or rolled-back upgrade keeps its snapshot for recovery; migration snapshots always stay.
 }
 } finally {
     Remove-Item -LiteralPath $plan -Force -ErrorAction SilentlyContinue

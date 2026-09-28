@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fileHolderFunctions } from "../helpers/file-holder.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
@@ -100,6 +101,7 @@ test.skipIf(process.platform !== "win32")("Windows deployment rollback restores 
 Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 . ${quotePS(join(project, "scripts/lib/lifecycle.ps1"))}
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+${await fileHolderFunctions(fixture.root)}
 # Every host control API is replaced; only the fixture filesystem is real.
 function Get-ProjectBotPids { @() }
 function Stop-ProjectBot { $script:task.State='Ready'; return $true }
@@ -121,7 +123,7 @@ function Get-NetFirewallAddressFilter { [CmdletBinding()]param([Parameter(ValueF
 function Remove-NetFirewallRule { [CmdletBinding()]param([Parameter(ValueFromPipeline)]$Rule); process{$script:rules=@($script:rules | Where-Object Name -ne $Rule.Name)} }
 function New-NetFirewallRule { param($Name,$DisplayName,$Group,$Direction,$Action,$Enabled,$Profile,$Protocol,$LocalPort,$RemotePort,$LocalAddress,$RemoteAddress,$ErrorAction); $script:rules+=@{Name=$Name} }
 function Move-Item { [CmdletBinding()]param($LiteralPath,$Destination,[switch]$Force); if($script:failBackup -and $LiteralPath -like '*\\node_modules'){throw 'injected backup failure'}; Microsoft.PowerShell.Management\\Move-Item @PSBoundParameters }
-$stages=@('backup','dependencies','configuration','task','health','tunnel','firewall','state')
+$stages=@('snapshot','backup','dependencies','configuration','task','health','tunnel','firewall','state')
 foreach($running in @($true,$false)) { foreach($stage in $stages) {
     $root=Join-Path ${quotePS(fixture.root)} ($stage+'-'+$running)
     New-Item -ItemType Directory -Force -Path (Join-Path $root 'data/config'),(Join-Path $root 'data/state'),(Join-Path $root 'node_modules') | Out-Null
@@ -140,6 +142,9 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
     $snapshot=New-DeploymentSnapshot $root 'test-task'
     try {
         $script:failBackup=$stage -eq 'backup'
+        # Another process holds the snapshot record past the retry budget when the stopped deployment records its dependencies.
+        $holder=if($stage -eq 'snapshot'){Start-FileHolder (Join-Path $snapshot.Path 'deployment.xml') 4000}
+        $script:failure=$null
         try {
             Save-DeploymentDependencies $snapshot
             New-Item -ItemType Directory -Force -Path (Join-Path $root 'node_modules') | Out-Null
@@ -157,7 +162,7 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
             if($stage -eq 'firewall'){throw 'firewall failure'}
             Set-Content (Join-Path $root 'data/state/bot-port') '2022'
             throw 'state failure'
-        } catch { $script:failBackup=$false; Restore-DeploymentSnapshot $snapshot }
+        } catch { $script:failure=$_.Exception.Message; $script:failBackup=$false; Restore-DeploymentSnapshot $snapshot }
         if((Get-Content (Join-Path $root 'node_modules/version')).Trim() -ne 'old-dependencies'){throw 'dependencies not restored'}
         if((Get-Content (Join-Path $root 'data/config/models.json')).Trim() -ne 'old-config'){throw 'config not restored'}
         if((Get-Content (Join-Path $root 'data/state/bot-port')).Trim() -ne '1011'){throw 'state not restored'}
@@ -166,6 +171,13 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
         if($script:task.State -ne $(if($running){'Running'}else{'Ready'})){throw 'task run state not preserved'}
         if($script:serviceStatus -ne $(if($running){'Running'}else{'Stopped'})){throw 'connector run state not preserved'}
         if($script:rules.Count -ne 1 -or $script:rules[0].Name -ne 'old-rule'){throw 'firewall not restored'}
+        if($holder){
+            Wait-FileHolder $holder
+            if($script:failure -notmatch '错误码 32'){throw ('unexpected snapshot failure: '+$script:failure)}
+            # The record kept on disk is still the one written before the stop, and no temporary was left behind.
+            if((Import-Clixml -LiteralPath (Join-Path $snapshot.Path 'deployment.xml')).DependenciesAttempted){throw 'snapshot record changed'}
+            if(Get-ChildItem -LiteralPath $snapshot.Path -Filter 'deployment.xml.*.tmp'){throw 'temporary snapshot remains'}
+        }
         Write-Output ('VERIFIED '+$stage+' '+$running)
     } finally { $snapshot.Lock.Dispose() }
 } }
@@ -173,9 +185,9 @@ foreach($running in @($true,$false)) { foreach($stage in $stages) {
   try {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
-    expect(result.output.match(/VERIFIED /g)).toHaveLength(16);
+    expect(result.output.match(/VERIFIED /g)).toHaveLength(18);
   } finally { await fixture.cleanup(); }
-}, 60000);
+}, 90000);
 
 test.skipIf(process.platform !== "win32")("Windows continue keeps the original dependency state instead of snapshotting the interrupted install", async () => {
   const fixture = await tempFixture("deployment-resume-dependencies-");
@@ -293,10 +305,11 @@ function Start-ScheduledTask {
 }
 function Register-ScheduledTask { }
 function Restore-DeploymentSnapshot { if(-not $script:codeRestored){throw 'old service before code restore'}; $script:restores++ }
+function Remove-CompletedBackup($path) { if(Test-Path -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction')){throw 'backup removed before the transaction closed'}; $script:cleanups++ }
 foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','preview','main-missing','diverged','task-missing','code','install','apply','health','commit','postcommit')) {
     if(($script:failure -eq 'install' -and $script:reuse) -or ($script:failure -eq 'postcommit' -and -not $script:running)){continue}
     $script:stopped=$false; $script:applied=$false; $script:committed=$false; $script:dataRestored=$false; $script:codeRestored=$false
-    $script:backups=0; $script:installs=0; $script:starts=0; $script:verifications=0; $script:restores=0
+    $script:backups=0; $script:installs=0; $script:starts=0; $script:verifications=0; $script:restores=0; $script:cleanups=0
     Remove-Item -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction') -Force -ErrorAction SilentlyContinue
     $ok=$true
     try { & $run } catch { $ok=$false; Write-Host $_.Exception.Message }
@@ -309,6 +322,8 @@ foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$
         if($script:restores -ne 0 -or -not $script:committed -or $script:starts -ne [int]$script:running){throw 'wrong committed state'}
         if($script:backups -ne [int](-not $script:reuse) -or $script:installs -ne $script:backups){throw 'dependency reuse failed'}
     } elseif($script:restores -ne 1) { throw 'rollback missing' }
+    # Only a completed upgrade discards its own snapshot and archive; every other outcome keeps them for recovery.
+    if($script:cleanups -ne [int]($script:failure -eq 'none')){throw ('wrong backup cleanup: ' + $script:failure)}
     Write-Output 'VERIFIED'
 } } }
 # Explicit rollback of an interrupted upgrade: no preview or preflight, committed data is refused before the stop.
@@ -322,11 +337,12 @@ Set-Content -LiteralPath (Join-Path $Project 'data/state/migration.json') '{}'
 foreach($script:committedBefore in @($true,$false)) {
     Set-Content -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction') ('deploy-' + ('a' * 32))
     $script:stopped=$false; $script:applied=$true; $script:committed=$script:committedBefore; $script:dataRestored=$false; $script:codeRestored=$false
-    $script:previews=0; $script:installs=0; $script:restores=0
+    $script:previews=0; $script:installs=0; $script:restores=0; $script:cleanups=0
     $ok=$true
     try { & $run } catch { $ok=$false; Write-Host $_.Exception.Message }
     $pointer=Test-Path -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction')
     if($script:previews -or $script:installs){throw 'rollback previewed or installed'}
+    if($script:cleanups){throw 'rollback removed the snapshot'}
     if($script:record){throw 'rollback built a new record from ordinary settings'}
     if($script:committedBefore) { if($ok -or $script:stopped -or $script:restores -or -not $pointer){throw 'committed upgrade rolled back'} }
     elseif(-not $ok -or -not $script:dataRestored -or -not $script:codeRestored -or $script:restores -ne 1 -or $pointer){throw 'rollback incomplete'}
@@ -790,7 +806,7 @@ try {
     $saved=Import-Clixml -LiteralPath (Join-Path $snapshot.Path 'deployment.xml')
     if($saved.UpgradeOriginal -ne 'old-commit' -or $saved.UpgradeTarget -ne 'new-commit'){throw 'upgrade metadata not persisted'}
     if((Get-Content -LiteralPath (Join-Path $root 'data/state/upgrade-transaction')).Trim() -ne (Split-Path $snapshot.Path -Leaf)){throw 'transaction pointer not published'}
-    if(Test-Path -LiteralPath (Join-Path $snapshot.Path 'deployment.xml.tmp')){throw 'temporary snapshot remains'}
+    if(Get-ChildItem -LiteralPath $snapshot.Path -Filter 'deployment.xml.*.tmp'){throw 'temporary snapshot remains'}
     $snapshot.UpgradeTarget='updated-commit'
     Save-DeploymentSnapshot $snapshot
     if((Import-Clixml -LiteralPath (Join-Path $snapshot.Path 'deployment.xml')).UpgradeTarget -ne 'updated-commit'){throw 'second replacement failed'}
@@ -803,6 +819,83 @@ Write-Output 'SNAPSHOT_REPLACE_VERIFIED'
     expect(result.output).toContain("SNAPSHOT_REPLACE_VERIFIED");
   } finally { await fixture.cleanup(); }
 }, 30000);
+
+for (const [name, shell] of [["Windows PowerShell 5.1", "powershell.exe"], ["PowerShell 7", Bun.which("pwsh") ?? "C:/Program Files/PowerShell/7/pwsh.exe"]] as const) {
+  test.skipIf(process.platform !== "win32" || (shell !== "powershell.exe" && !existsSync(shell)))(`${name}: a transaction left by another operation after the unlocked check is never replaced`, async () => {
+    const fixture = await tempFixture("transaction-pointer-race-");
+    const script = join(fixture.root, "race.ps1");
+    await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+. ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+# Host discovery is stubbed; pointers, snapshots and the exclusive deployment lock are real.
+function Save-DeploymentFiles([string]$ProjectRoot,[string]$Snapshot) { New-Item -ItemType Directory -Force -Path $Snapshot | Out-Null; return @() }
+function Get-ScheduledTask { return $null }
+function Get-ProjectBotPids { return @() }
+function Get-NetFirewallRule { return @() }
+function New-CloudflaredSnapshot { return [pscustomobject]@{Tunnel=$null;CloudConfigPath=''} }
+$root=Join-Path $PSScriptRoot 'project'
+$state=Join-Path $root 'data/state'
+$snapshots=Join-Path $root 'backup/snapshots'
+$script:realNew=\${function:New-DeploymentSnapshot}
+$script:interleaved=$false
+function New-DeploymentSnapshot([string]$ProjectRoot,[string]$TaskName) {
+    if(-not $script:interleaved) {
+        $script:interleaved=$true
+        # A found no pointer but has not taken the lock yet: B starts an upgrade, records its progress and is interrupted.
+        $b=Open-UpgradeSnapshot $ProjectRoot $TaskName ('a'*40) 'main' ('b'*40)
+        $b.WasRunning=$true; $b.DependenciesAttempted=$true
+        Save-DeploymentSnapshot $b
+        $script:b=Split-Path $b.Path -Leaf
+        # B ran in its own process: its lock and environment end with it.
+        $b.Lock.Dispose(); $env:BOT_DEPLOY_BACKUP_ID=$null
+    }
+    & $script:realNew $ProjectRoot $TaskName
+}
+function Assert-Untouched([string]$Pointer) {
+    if([IO.File]::ReadAllText((Join-Path $state $Pointer)) -ne $script:b){throw 'pointer no longer names the interrupted upgrade'}
+    $saved=Import-Clixml (Join-Path $snapshots ($script:b+'/deployment.xml'))
+    if(-not $saved.WasRunning -or -not $saved.DependenciesAttempted -or $saved.UpgradeTarget -ne ('b'*40)){throw 'interrupted upgrade record changed'}
+    if(@(Get-ChildItem -LiteralPath $snapshots -Directory).Count -ne 1){throw 'a refused operation left a snapshot'}
+    if($env:BOT_DEPLOY_BACKUP_ID){throw 'backup id leaked from a refused operation'}
+    $lock=[IO.File]::Open((Join-Path $state 'deploy.lock'),'OpenOrCreate','ReadWrite','None'); $lock.Dispose()
+}
+$failure=$null
+try { $a=Open-UpgradeSnapshot $root 'fixture-task' ('a'*40) 'main' ('c'*40); $a.Lock.Dispose(); $failure='accepted' } catch { $failure=$_.Exception.Message }
+if($failure -notmatch 'upgrade-transaction.*继续或回滚'){throw ('A was not refused under the lock: '+$failure)}
+Assert-Untouched 'upgrade-transaction'
+# The interrupted upgrade is still resumable.
+$resumed=Open-UpgradeSnapshot $root 'fixture-task' ('a'*40) 'main' ('b'*40)
+if((Split-Path $resumed.Path -Leaf) -ne $script:b){throw 'resume opened another snapshot'}
+$resumed.Lock.Dispose(); $env:BOT_DEPLOY_BACKUP_ID=$null
+# A new deployment rechecks both pointers under the lock.
+foreach($pointer in @('upgrade-transaction','deploy-transaction')) {
+    if($pointer -eq 'deploy-transaction'){Move-Item -LiteralPath (Join-Path $state 'upgrade-transaction') -Destination (Join-Path $state 'deploy-transaction')}
+    try { $c=& $script:realNew $root 'fixture-task'; $c.Lock.Dispose(); throw ('deployment accepted beside '+$pointer) } catch { if($_.Exception.Message -notmatch ($pointer+'.*继续或回滚')){throw} }
+    Assert-Untouched $pointer
+}
+# Publishing a pointer only ever creates it.
+$other=Join-Path $snapshots ('deploy-'+('c'*32)); New-Item -ItemType Directory -Path $other | Out-Null
+$record=@{format='1';operation='deploy';snapshot=(Split-Path $other -Leaf);target_sha='';original_sha='';original_branch='';original_group_root=$root;target_group_root=$root
+    was_running='0';bot_port='1011';deploy_mode='direct';bot_domain='';domain_action='keep';unmanaged_tunnel='';platform_ip='203.0.113.1';reconfigure_ai='0'}
+try { Publish-DeploymentTransaction ([pscustomobject]@{Path=$other}) $record (Join-Path $state 'deploy-transaction'); throw 'pointer replaced' } catch { if($_.Exception.Message -notmatch '目标已存在，未覆盖'){throw} }
+if([IO.File]::ReadAllText((Join-Path $state 'deploy-transaction')) -ne $script:b){throw 'publication replaced the pointer'}
+# The upgrade pointer too: one written after the recheck, by a writer ignoring the lock, is not replaced.
+Move-Item -LiteralPath (Join-Path $state 'deploy-transaction') -Destination (Join-Path $root 'parked-pointer')
+$script:realSave=\${function:Save-DeploymentSnapshot}
+function Save-DeploymentSnapshot($Snapshot) { & $script:realSave $Snapshot; if($Snapshot.UpgradeTarget -eq ('d'*40)){[IO.File]::WriteAllText((Join-Path $script:state 'upgrade-transaction'), $script:b)} }
+try { $d=Open-UpgradeSnapshot $root 'fixture-task' ('a'*40) 'main' ('d'*40); $d.Lock.Dispose(); throw 'upgrade pointer replaced' } catch { if($_.Exception.Message -notmatch '目标已存在，未覆盖'){throw} }
+if([IO.File]::ReadAllText((Join-Path $state 'upgrade-transaction')) -ne $script:b){throw 'upgrade publication replaced the pointer'}
+if($env:BOT_DEPLOY_BACKUP_ID){throw 'backup id leaked from a refused upgrade'}
+$lock=[IO.File]::Open((Join-Path $state 'deploy.lock'),'OpenOrCreate','ReadWrite','None'); $lock.Dispose()
+Write-Output 'POINTER_RACE_VERIFIED'
+`);
+    try {
+      const result = await execute([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+      expect(result.code, result.output).toBe(0);
+      expect(result.output).toContain("POINTER_RACE_VERIFIED");
+    } finally { await fixture.cleanup(); }
+  }, 30000);
+}
 
 test.skipIf(process.platform !== "win32")("Windows upgrade snapshot survives restart and retains its original code and running state", async () => {
   const fixture = await tempFixture("upgrade-resume-");
@@ -907,80 +1000,207 @@ Write-Output 'EXPORT_CLEANUP_VERIFIED'
   } finally { await fixture.cleanup(); }
 }, 30000);
 
-test.skipIf(process.platform !== "win32")("Windows successful backup cleanup empties all recycled files and preserves other tmp snapshots", async () => {
+// What a successful operation must leave in backup/: everything it does not own by name.
+const unrelatedBackups = {
+  "backup/snapshots/deploy-failed/recovery": "failed transaction",
+  "backup/snapshots/tunnel-0123456789abcdef0123456789abcdef/tunnel.xml": "connector snapshot",
+  "backup/snapshots/migration-7d7c1a2e-0d0b-4a8e-9a55-3c1f6a2b9e10/data/state/version": "migration snapshot",
+  "backup/rm/deploy-previous/old-config": "earlier transaction",
+  "backup/rm/deploy-currentX/old-config": "name sharing the prefix",
+  "backup/rm/loose-file": "loose archive",
+  "backup/rm/.hidden-file": "hidden archive",
+  "backup/rm/1758000000000-5f3a1c2e-8b4d-4e6f-9a1b-2c3d4e5f6a7b-session.jsonl": "manual history archive",
+  "backup/reports/usage.html": "report",
+};
+
+test.skipIf(process.platform !== "win32")("Windows successful backup cleanup removes only its own snapshot and archive, and refuses links", async () => {
   const fixture = await tempFixture("backup-cleanup-windows-");
   const script = join(fixture.root, "cleanup.ps1");
+  const root = join(fixture.root, "project");
+  for (const [path, text] of Object.entries(unrelatedBackups)) {
+    await mkdir(dirname(join(root, path)), { recursive: true }); await writeFile(join(root, path), text);
+  }
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/lifecycle.ps1"))}
 $root=Join-Path $PSScriptRoot 'project'
 $snapshot=Join-Path $root 'backup/snapshots/deploy-current'
-$failed=Join-Path $root 'backup/snapshots/deploy-failed'
-New-Item -ItemType Directory -Force -Path $snapshot,$failed,(Join-Path $root 'data/state') | Out-Null
+New-Item -ItemType Directory -Force -Path $snapshot,(Join-Path $root 'data/state') | Out-Null
 Set-Content (Join-Path $snapshot 'old-config') 'old'
-Set-Content (Join-Path $failed 'recovery') 'preserve'
 $env:BOT_DEPLOY_BACKUP_ID='deploy-current'
 Set-Content (Join-Path $root 'old-file') 'old'
 Move-ToProjectArchive (Join-Path $root 'old-file') $root
 if(-not (Test-Path (Join-Path $root 'backup/rm/deploy-current'))){throw 'wrong archive directory'}
-New-Item -ItemType Directory -Force -Path (Join-Path $root 'backup/rm/deploy-previous') | Out-Null
-Set-Content (Join-Path $root 'backup/rm/deploy-previous/old-config') 'historical'
-Set-Content (Join-Path $root 'backup/rm/loose-file') 'unscoped'
-Set-Content (Join-Path $root 'backup/rm/.hidden-file') 'hidden'
 $lock=[IO.File]::Open((Join-Path $root 'data/state/deploy.lock'),'OpenOrCreate','ReadWrite','None')
 try {
     Remove-CompletedBackup $snapshot $root
-    if((Test-Path $snapshot) -or (Test-Path (Join-Path $root 'backup/rm'))){throw 'completed backup or recycled files retained'}
-    if((Get-Content (Join-Path $failed 'recovery')) -ne 'preserve'){throw 'unrelated backup lost'}
+    if((Test-Path $snapshot) -or (Test-Path (Join-Path $root 'backup/rm/deploy-current'))){throw 'own snapshot or archive retained'}
     $rejected=$false
     try { Remove-CompletedBackup (Join-Path $root 'data') $root } catch { $rejected=$true }
     if(-not $rejected){throw 'out-of-scope cleanup accepted'}
-    Move-Item -LiteralPath $failed -Destination (Join-Path $PSScriptRoot 'saved-failure')
-    Remove-CompletedBackup $snapshot $root
-    if(Test-Path (Join-Path $root 'backup')){throw 'empty backup directory retained'}
+    # A junction in place of the archive is refused before anything is removed, and its target is never entered.
+    $outside=Join-Path $PSScriptRoot 'outside'
+    New-Item -ItemType Directory -Force -Path $outside,(Join-Path $root 'backup/snapshots/deploy-linked') | Out-Null
+    Set-Content (Join-Path $outside 'keep') 'outside'
+    New-Item -ItemType Junction -Path (Join-Path $root 'backup/rm/deploy-linked') -Target $outside | Out-Null
+    $message=''
+    try { Remove-CompletedBackup (Join-Path $root 'backup/snapshots/deploy-linked') $root } catch { $message=$_.Exception.Message }
+    if($message -ne '\u5907\u4efd\u6e05\u7406\u8def\u5f84\u5305\u542b\u94fe\u63a5'){throw ('link accepted: ' + $message)}
+    if(-not (Test-Path (Join-Path $root 'backup/snapshots/deploy-linked')) -or (Get-Content (Join-Path $outside 'keep')) -ne 'outside'){throw 'removed before the link check'}
+    [IO.Directory]::Delete((Join-Path $root 'backup/rm/deploy-linked'))
+    # With nothing else left, the empty directories go too; the active lock stays.
+    $alone=Join-Path $PSScriptRoot 'alone'
+    New-Item -ItemType Directory -Force -Path (Join-Path $alone 'backup/snapshots/deploy-only'),(Join-Path $alone 'backup/rm/deploy-only') | Out-Null
+    Remove-CompletedBackup (Join-Path $alone 'backup/snapshots/deploy-only') $alone
+    if(Test-Path (Join-Path $alone 'backup')){throw 'empty backup directory retained'}
     if(-not (Test-Path (Join-Path $root 'data/state/deploy.lock'))){throw 'active lock removed'}
 } finally { $lock.Dispose() }
 `);
   try {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
+    for (const [path, text] of Object.entries(unrelatedBackups)) expect(await readFile(join(root, path), "utf8"), path).toBe(text);
   } finally { await fixture.cleanup(); }
 }, 60000);
 
-test.skipIf(!bash || !existsSync(bash))("Linux successful backup cleanup empties all recycled files and preserves other tmp snapshots", async () => {
+test.skipIf(!bash || !existsSync(bash))("Linux successful backup cleanup removes only its own snapshot and archive, and refuses links", async () => {
   const fixture = await tempFixture("backup-cleanup-linux-");
   const script = join(fixture.root, "cleanup.sh");
+  const root = join(fixture.root, "project");
+  for (const [path, text] of Object.entries(unrelatedBackups)) {
+    await mkdir(dirname(join(root, path)), { recursive: true }); await writeFile(join(root, path), text);
+  }
   await writeFile(script, `#!/usr/bin/env bash
 set -euo pipefail
-PROJECT_DIR="$(realpath "$1")"
+PROJECT_DIR="$(realpath "$1/project")"
 . '${posixPath(join(project, "scripts/lib/lifecycle.sh"))}'
 snapshot="$PROJECT_DIR/backup/snapshots/deploy-current"
-failed="$PROJECT_DIR/backup/snapshots/deploy-failed"
-mkdir -p "$snapshot" "$failed"
+mkdir -p "$snapshot"
 printf old > "$snapshot/old-config"
-printf preserve > "$failed/recovery"
 export BOT_DEPLOY_BACKUP_ID=deploy-current
 printf old > "$PROJECT_DIR/old-file"
 archive_project_path "$PROJECT_DIR/old-file"
 [ -d "$PROJECT_DIR/backup/rm/deploy-current" ]
-mkdir -p "$PROJECT_DIR/backup/rm/deploy-previous"
-printf historical > "$PROJECT_DIR/backup/rm/deploy-previous/old-config"
-printf unscoped > "$PROJECT_DIR/backup/rm/loose-file"
-printf hidden > "$PROJECT_DIR/backup/rm/.hidden-file"
 cleanup_completed_backup "$snapshot"
-[ ! -e "$snapshot" ] && [ ! -e "$PROJECT_DIR/backup/rm" ]
-[ "$(cat "$failed/recovery")" = preserve ]
+[ ! -e "$snapshot" ] && [ ! -e "$PROJECT_DIR/backup/rm/deploy-current" ]
 if cleanup_completed_backup "$PROJECT_DIR/backup"; then exit 41; fi
-mv -- "$failed" "$PROJECT_DIR/saved-failure"
-cleanup_completed_backup "$snapshot" keep-root
-[ -d "$PROJECT_DIR/backup" ] && [ -z "$(ls -A "$PROJECT_DIR/backup")" ]
-cleanup_completed_backup "$snapshot"
-[ ! -e "$PROJECT_DIR/backup" ]
+# A link in place of the archive is refused before anything is removed, and its target is never entered.
+if [ "$2" = links ]; then
+    mkdir -p "$1/outside" "$PROJECT_DIR/backup/snapshots/deploy-linked"
+    printf outside > "$1/outside/keep"
+    ln -s "$1/outside" "$PROJECT_DIR/backup/rm/deploy-linked"
+    if cleanup_completed_backup "$PROJECT_DIR/backup/snapshots/deploy-linked"; then exit 42; fi
+    [ -d "$PROJECT_DIR/backup/snapshots/deploy-linked" ] && [ "$(cat "$1/outside/keep")" = outside ]
+    rm -- "$PROJECT_DIR/backup/rm/deploy-linked"
+fi
+# With nothing else left, the empty directories go too; keep-root leaves backup/ itself for a running container's bind mount.
+alone="$(realpath -m "$1/alone")"
+mkdir -p "$alone/backup/snapshots/deploy-only" "$alone/backup/rm/deploy-only"
+PROJECT_DIR="$alone" cleanup_completed_backup "$alone/backup/snapshots/deploy-only" keep-root
+[ -d "$alone/backup" ] && [ -z "$(ls -A "$alone/backup")" ]
+mkdir -p "$alone/backup/snapshots/deploy-only"
+PROJECT_DIR="$alone" cleanup_completed_backup "$alone/backup/snapshots/deploy-only"
+[ ! -e "$alone/backup" ]
 `);
   try {
-    const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
+    // Git Bash on Windows copies instead of linking unless native symlinks are available; real links run on Linux.
+    const links = process.platform === "win32" ? "none" : "links";
+    const result = await execute([bash!, posixPath(script), posixPath(fixture.root), links], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
     expect(result.code, result.output).toBe(0);
+    for (const [path, text] of Object.entries(unrelatedBackups)) expect(await readFile(join(root, path), "utf8"), path).toBe(text);
   } finally { await fixture.cleanup(); }
 }, 60000);
+
+test.skipIf(!bash || !existsSync(bash))("Docker deployment never adopts a snapshot name whose archive already exists", async () => {
+  const fixture = await tempFixture("deployment-fresh-name-");
+  const script = join(fixture.root, "fresh.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_DIR="$1" TAKEN="$2"
+cd "$PROJECT_DIR"
+. '${posixPath(join(project, "scripts/lib/lifecycle.sh"))}'
+. '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
+LOG_DIR="$PROJECT_DIR/logs"; TUNNEL_PID_FILE="$PROJECT_DIR/data/state/cloudflared.pid"
+operation_start deploy
+print_error(){ echo "$*" >&2; }; print_warning(){ echo "$*"; }; print_success(){ echo "$*"; }
+flock(){ :; }; can_manage_ufw(){ return 1; }; managed_cloudflared_pid(){ return 1; }; stop_tunnel_launcher(){ :; }
+docker(){ case "$1 \${2:-}" in ps*) : ;; "container inspect") return 1 ;; *) echo "unexpected Docker operation" >&2; return 1 ;; esac; }
+# The first TAKEN names collide; command substitution runs mktemp in a subshell, so the count lives in a file.
+mktemp(){
+    local count name
+    count=$(( $(cat mktemp-count 2>/dev/null || echo 0) + 1 )); printf '%s' "$count" > mktemp-count
+    if [ "$count" -le "$TAKEN" ]; then name="deploy-taken$count"; else name="deploy-fresh$count"; fi
+    mkdir -- "$PROJECT_DIR/backup/snapshots/$name" && printf '%s\\n' "$PROJECT_DIR/backup/snapshots/$name"
+}
+if begin_deployment; then trap - EXIT; echo "SNAPSHOT \${DEPLOY_SNAPSHOT##*/} ID $BOT_DEPLOY_BACKUP_ID"; else echo REFUSED; fi
+`);
+  try {
+    for (const taken of [2, 5]) {
+      const root = join(fixture.root, `taken-${taken}`);
+      await mkdir(join(root, "data/state"), { recursive: true });
+      for (let index = 1; index <= taken; index++) {
+        await mkdir(join(root, `backup/rm/deploy-taken${index}`), { recursive: true });
+        await writeFile(join(root, `backup/rm/deploy-taken${index}/old-config`), `earlier ${index}`);
+      }
+      const result = await execute([bash!, posixPath(script), posixPath(root), String(taken)], root, { ...process.env, MSYS_NO_PATHCONV: "1" });
+      expect(result.code, result.output).toBe(0);
+      if (taken === 2) {
+        expect(result.output).toContain("SNAPSHOT deploy-fresh3 ID deploy-fresh3");
+        expect(await readdir(join(root, "backup/snapshots"))).toEqual(["deploy-fresh3"]);
+      } else {
+        expect(result.output).toContain("REFUSED"); expect(result.output).toContain("无法分配新的部署快照名称");
+        expect(await readdir(join(root, "backup/snapshots"))).toEqual([]);
+        expect(existsSync(join(root, "data/state/deploy-transaction"))).toBe(false);
+      }
+      for (let index = 1; index <= taken; index++) expect(await readFile(join(root, `backup/rm/deploy-taken${index}/old-config`), "utf8")).toBe(`earlier ${index}`);
+    }
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+test.skipIf(process.platform !== "win32")("Windows snapshots never adopt a name whose snapshot or archive already exists", async () => {
+  const fixture = await tempFixture("snapshot-fresh-name-");
+  const script = join(fixture.root, "fresh.ps1");
+  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+. ${quotePS(join(project, "scripts/lib/lifecycle.ps1"))}
+. ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+$root=Join-Path $PSScriptRoot 'project'
+New-Item -ItemType Directory -Force -Path (Join-Path $root 'backup/rm/deploy-taken1'),(Join-Path $root 'backup/snapshots/deploy-taken3'),(Join-Path $PSScriptRoot 'gone') | Out-Null
+# A dangling junction still occupies its name.
+New-Item -ItemType Junction -Path (Join-Path $root 'backup/rm/deploy-taken2') -Target (Join-Path $PSScriptRoot 'gone') | Out-Null
+[IO.Directory]::Delete((Join-Path $PSScriptRoot 'gone'))
+# The real allocator, with its random part replaced by a fixed sequence.
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/lib/deployment.ps1"))},[ref]$tokens,[ref]$errors)
+$source=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'New-TransactionSnapshotPath'},$true).Extent.Text
+if(-not $source.Contains("[Guid]::NewGuid().ToString('N')")){throw 'allocator changed shape'}
+. ([scriptblock]::Create($source.Replace("[Guid]::NewGuid().ToString('N')", '(Get-FixtureName)')))
+function Get-FixtureName { $script:count++; if($script:count -le $script:taken){'taken' + $script:count}else{'fresh' + $script:count} }
+$script:count=0; $script:taken=3
+$path=New-TransactionSnapshotPath $root 'deploy-'
+if($path -ne (Join-Path $root 'backup\\snapshots\\deploy-fresh4')){throw ('taken name adopted: ' + $path)}
+New-Item -ItemType Directory -Force -Path (Join-Path $root 'backup/rm/deploy-taken4'),(Join-Path $root 'backup/rm/deploy-taken5') | Out-Null
+$script:count=0; $script:taken=5
+$message=''; try { New-TransactionSnapshotPath $root 'deploy-' | Out-Null } catch { $message=$_.Exception.Message }
+if($message -notmatch '无法分配新的快照名称'){throw ('exhausted names accepted: ' + $message)}
+# Deployment and connector snapshots both take their names from the allocator.
+function New-TransactionSnapshotPath($ProjectRoot, $Prefix) { $script:prefixes += ,$Prefix; Join-Path $ProjectRoot ('backup\\snapshots\\' + $Prefix + 'allocated') }
+$script:prefixes=@()
+$env:ProgramData=Join-Path $PSScriptRoot 'programdata'
+function Get-CimInstance { $null }; function Protect-ProjectSecretPath { }
+$connector=New-CloudflaredSnapshot $root
+function Save-DeploymentFiles([string]$ProjectRoot,[string]$Snapshot) { New-Item -ItemType Directory -Force -Path $Snapshot | Out-Null; return @() }
+function Get-ScheduledTask { return $null }; function Get-ProjectBotPids { return @() }; function Get-NetFirewallRule { return @() }
+function New-CloudflaredSnapshot { return [pscustomobject]@{Tunnel=$null;CloudConfigPath=''} }
+$state=New-DeploymentSnapshot $root 'fixture-task'
+$state.Lock.Dispose()
+if($connector.Path -ne (Join-Path $root 'backup\\snapshots\\tunnel-allocated') -or $state.Path -ne (Join-Path $root 'backup\\snapshots\\deploy-allocated') -or ($script:prefixes -join ',') -ne 'tunnel-,deploy-'){throw 'snapshot name not allocated'}
+Write-Output 'FRESH_NAMES_VERIFIED'
+`);
+  try {
+    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("FRESH_NAMES_VERIFIED");
+  } finally { await fixture.cleanup(); }
+}, 30000);
 
 test.skipIf(!bash || !existsSync(bash))("Docker deployment refuses missing persisted group roots before recreating directories", async () => {
   const fixture = await tempFixture("deployment-group-root-");

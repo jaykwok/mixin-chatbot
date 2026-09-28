@@ -16,7 +16,8 @@ function Move-ToProjectArchive([string]$Path, [string]$ProjectRoot, [string]$All
     Move-Item -LiteralPath $source -Destination $destination -ErrorAction Stop
 }
 
-# A successful deployment discards its snapshot and empties the entire recycle area.
+# A successful operation discards only what it owns: its snapshot and the archive made under the snapshot's name
+# (backup\rm\<name>). Other snapshots, loose or manual archives and earlier transactions stay for the explicit cleanup.
 function Remove-CompletedBackup([string]$SnapshotPath, [string]$ProjectRoot) {
     $root = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\', '/')
     $backup = Join-Path $root 'backup'
@@ -25,14 +26,15 @@ function Remove-CompletedBackup([string]$SnapshotPath, [string]$ProjectRoot) {
     if ((Split-Path $snapshot -Parent) -ne (Join-Path $backup 'snapshots') -or $name -notmatch '^(deploy|tunnel)-[a-zA-Z0-9-]+$') {
         throw '备份清理路径无效'
     }
-    $targets = @($snapshot, (Join-Path $backup 'rm'))
+    $targets = @($snapshot, (Join-Path $backup "rm\$name"))
+    # Reject a redirected path or a link in either place before removing anything; never follow a junction out of backup.
     foreach ($target in $targets) {
-        # Reject redirected ancestors before recursive removal; never follow a junction out of backup.
         for ($ancestor = $target; $ancestor -ne $root; $ancestor = Split-Path $ancestor -Parent) {
-            if (Test-Path -LiteralPath $ancestor) {
-                if ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '备份清理路径包含链接' }
-            }
+            try { $attributes = [IO.File]::GetAttributes($ancestor) } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { continue }
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw '备份清理路径包含链接' }
         }
+    }
+    foreach ($target in $targets) {
         if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop }
     }
     foreach ($directory in @((Join-Path $backup 'snapshots'), (Join-Path $backup 'rm'), $backup)) {

@@ -923,6 +923,9 @@ case "${1:-}" in
     stat)          shift; group_data_admin scripts/ops/stats-admin.ts "$@" ;;
     history-ls)    shift; group_data_admin scripts/ops/history-admin.ts list "$@" ;;
     history-clear) shift; history_clear "$@" ;;
+    # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具在容器内逐条重新检查。
+    backup-scan)   group_data_admin scripts/ops/backup-cleanup.ts scan ;;
+    backup-clean)  shift; group_data_admin scripts/ops/backup-cleanup.ts apply "$@" ;;
     uninstall) uninstall ;;
     *)
         # 空参和显式 help 是「我要看帮助」，退 0；其余都是打错了的命令，必须退非零。
@@ -967,6 +970,9 @@ case "${1:-}" in
         echo "  history-clear <群号>"
         echo "             归档该群会话；自动停机、清理，再恢复原运行或停止状态"
         echo "             群选择可加 --group-id（原始群号）或 --storage-segment（目录段）"
+        echo "  backup-scan 只读扫描 backup/rm 和 backup/snapshots，分类后在 backup/cleanup 生成清单，不删除"
+        echo "  backup-clean <报告名> [--confirm <确认码>]"
+        echo "             不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"
         echo "  uninstall  删除容器（可选镜像、cloudflared、data/、logs/）"
         # 显式 exit：case 分支的退出码取决于最后一条命令，靠自然结束会把 [ ] 的结果漏出去。
         [ "$UNKNOWN" = "1" ] && exit 1

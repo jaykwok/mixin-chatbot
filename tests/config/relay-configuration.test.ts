@@ -1,21 +1,29 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadRelayConfig } from "../../src/integrations/relay.ts";
-import { archiveFixture, tempFixture } from "../helpers/temp.ts";
+import { runCommand, ScenarioProcesses } from "../helpers/concurrent-scenarios.ts";
+import { tempFixture } from "../helpers/temp.ts";
 
 const wizard = fileURLToPath(new URL("../../scripts/config/configure-relay.ts", import.meta.url));
 const base = { webdavUrl: "http://127.0.0.1:5244/dav/relay/", publicBaseUrl: "https://files.example.test/d/relay/", maxBytes: 2 * 1024 ** 3 };
 const file = (root: string) => join(root, "data/config/relay.json");
 const draft = (root: string) => join(root, "data/config/draft.json");
+const hungPid = (root: string) => join(root, "hung.pid");
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// 一次向导运行的上限。到期后结束其进程树并等它退出，才报错返回，夹具在此之后才清理。
+const WIZARD_LIMIT_MS = 10000;
+// 每个流程用例的预算：在向导上限之外留出结束进程和清理夹具的时间。全局默认时限不变。
+const FLOW_BUDGET_MS = 30000;
 
 async function run(root: string, mode: "--draft" | "--apply", answers: Record<string, string | boolean> = {},
-  faults: { cancelAt?: string; failPublish?: boolean } = {}) {
+  faults: { cancelAt?: string; failPublish?: boolean; hangAt?: string } = {}) {
   const preload = join(root, "prompts.ts");
   await writeFile(preload, [
     'import { mock } from "bun:test";',
+    'import { writeFileSync } from "node:fs";',
     "import * as maintenance from " + JSON.stringify(import.meta.resolve("../../src/core/maintenance.ts")) + ";",
     "const answers = " + JSON.stringify(answers) + ", faults = " + JSON.stringify(faults) + ";",
     'const cancelled = Symbol("cancelled");',
@@ -24,6 +32,12 @@ async function run(root: string, mode: "--draft" | "--apply", answers: Record<st
       ', () => ({ ...maintenance, replaceFile: async () => { throw new Error("injected publish failure"); } }));',
     "function pick(options, secret = false) {",
     '  console.log("PROMPT " + options.message);',
+    // 卡在这个提示上永不返回，进程也不会自行退出。
+    "  if (faults.hangAt && String(options.message).includes(faults.hangAt)) {",
+    "    writeFileSync(" + JSON.stringify(hungPid(root)) + ", String(process.pid));",
+    "    setInterval(() => {}, 60000);",
+    "    return new Promise(() => {});",
+    "  }",
     "  if (String(options.message).includes(faults.cancelAt ?? '\\0')) return cancelled;",
     '  if (secret && (options.initialValue || options.defaultValue)) throw new Error("secret prefilled visibly");',
     "  const match = Object.entries(answers).find(([key]) => options.message.includes(key));",
@@ -39,11 +53,18 @@ async function run(root: string, mode: "--draft" | "--apply", answers: Record<st
     "  confirm: async options => pick(options), password: async options => pick(options, true),",
     "}));",
   ].join("\n"));
-  const child = Bun.spawn([process.execPath, "--preload", preload, wizard, mode, draft(root)], {
-    cwd: root, env: { ...process.env, FORCE_COLOR: "0" }, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
-  });
-  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  return { code, output: stdout + stderr };
+  const stage = `${mode === "--draft" ? "生成草稿" : "提交草稿"}（${basename(root)}）`;
+  const processes = new ScenarioProcesses();
+  const started = performance.now();
+  try {
+    const { code, text, limited } = await runCommand(processes, root, [process.execPath, "--preload", preload, wizard, mode, draft(root)],
+      { FORCE_COLOR: "0" }, undefined, WIZARD_LIMIT_MS);
+    if (limited) {
+      throw new Error(`外链向导在${stage}阶段超过 ${WIZARD_LIMIT_MS / 1000} 秒未退出，已结束并等待其进程树：`
+        + `用时 ${((performance.now() - started) / 1000).toFixed(1)} 秒，退出码 ${code}。已收集的输出：\n${text}`);
+    }
+    return { code, output: text };
+  } finally { await processes.stop(); }
 }
 
 async function seed(root: string, contents: unknown) {
@@ -70,7 +91,7 @@ test("外链先形成可审阅草稿，确认后提交并使用运行时的默�
     expect(loadRelayConfig(file(fixture.root))).toEqual(base);
     if (process.platform !== "win32") expect((await stat(file(fixture.root))).mode & 0o777).toBe(0o600);
   } finally { await fixture.cleanup(); }
-});
+}, FLOW_BUDGET_MS);
 
 test("仅填下载域名时，多级中文挂载目录会用于下载地址和签名路径", async () => {
   const fixture = await tempFixture("relay-configure-derived-");
@@ -89,7 +110,7 @@ test("仅填下载域名时，多级中文挂载目录会用于下载地址和�
       signSecret: "fixture-signing-key", signPathPrefix: "/网盘/relay/",
     });
   } finally { await fixture.cleanup(); }
-});
+}, FLOW_BUDGET_MS);
 
 test("修改时可留空沿用密码，跳过高级设置保留有效期、签名与自定义字段且不输出密钥", async () => {
   const fixture = await tempFixture("relay-configure-existing-");
@@ -109,7 +130,7 @@ test("修改时可留空沿用密码，跳过高级设置保留有效期、签�
     });
     for (const secret of Object.values(secrets)) expect(applied.output).not.toContain(secret);
   } finally { await fixture.cleanup(); }
-});
+}, FLOW_BUDGET_MS);
 
 test("高级设置说明到期删除与签名失效，并能清除旧认证及签名", async () => {
   const fixture = await tempFixture("relay-configure-advanced-");
@@ -123,7 +144,7 @@ test("高级设置说明到期删除与签名失效，并能清除旧认证及�
     expect((await run(fixture.root, "--apply")).code).toBe(0);
     expect(loadRelayConfig(file(fixture.root))).toEqual({ ...base, maxBytes: 512 * 1024 ** 2, expireHours: 2 });
   } finally { await fixture.cleanup(); }
-});
+}, FLOW_BUDGET_MS);
 
 test("新建签名配置会校验路径并使用隐藏输入，空有效期保持不自动过期", async () => {
   const fixture = await tempFixture("relay-configure-signing-");
@@ -142,10 +163,11 @@ test("新建签名配置会校验路径并使用隐藏输入，空有效期保�
       signSecret: "fixture-key", signPathPrefix: "/relay/",
     });
   } finally { await fixture.cleanup(); }
-});
+}, FLOW_BUDGET_MS);
 
-test("取消、无效输入及发布失败保留原配置，未确认不留下草稿", async () => {
-  for (const scenario of ["cancel", "decline", "bad-url", "bad-size", "bad-path", "changed-account", "publish"] as const) {
+// 每个场景一个用例，各有自己的预算。
+for (const scenario of ["cancel", "decline", "bad-url", "bad-size", "bad-path", "changed-account", "publish"] as const) {
+  test("取消、无效输入及发布失败保留原配置，未确认不留下草稿：" + scenario, async () => {
     const fixture = await tempFixture("relay-configure-" + scenario + "-");
     try {
       const original = await seed(fixture.root, { ...base, username: "operator", password: "original-password" });
@@ -169,11 +191,11 @@ test("取消、无效输入及发布失败保留原配置，未确认不留下�
       }
       expect(await readFile(file(fixture.root), "utf8")).toBe(original);
     } finally { await fixture.cleanup(); }
-  }
-}, 30000);
+  }, FLOW_BUDGET_MS);
+}
 
-test("提交拒绝覆盖填写期间的其他修改；停用只归档配置并保留账本", async () => {
-  const fixture = await tempFixture("relay-configure-disable-");
+test("提交拒绝覆盖填写期间的其他修改", async () => {
+  const fixture = await tempFixture("relay-configure-conflict-");
   try {
     await seed(fixture.root, base);
     expect((await run(fixture.root, "--draft")).code).toBe(0);
@@ -182,8 +204,13 @@ test("提交拒绝覆盖填写期间的其他修改；停用只归档配置并�
     expect(stale.code).toBe(1);
     expect(stale.output).toContain("已被其他操作修改");
     expect(await readFile(file(fixture.root), "utf8")).toBe(changed);
-    // 每次向导使用独立草稿；此处归档上一轮测试草稿后重新配置。
-    await archiveFixture(draft(fixture.root));
+  } finally { await fixture.cleanup(); }
+}, FLOW_BUDGET_MS);
+
+test("停用只归档配置并保留账本", async () => {
+  const fixture = await tempFixture("relay-configure-disable-");
+  try {
+    const saved = await seed(fixture.root, { ...base, maxBytes: 1024 ** 3 });
     await mkdir(join(fixture.root, "data/state"), { recursive: true });
     const ledger = join(fixture.root, "data/state/relay.sqlite");
     await writeFile(ledger, "ledger-sentinel");
@@ -195,6 +222,21 @@ test("提交拒绝覆盖填写期间的其他修改；停用只归档配置并�
     expect(await readFile(ledger, "utf8")).toBe("ledger-sentinel");
     const archived = (await readdir(join(fixture.root, "backup/rm"))).find(name => name.endsWith("-relay.json"));
     expect(archived).toBeDefined();
-    expect(await readFile(join(fixture.root, "backup/rm", archived!), "utf8")).toBe(changed);
+    expect(await readFile(join(fixture.root, "backup/rm", archived!), "utf8")).toBe(saved);
   } finally { await fixture.cleanup(); }
-});
+}, FLOW_BUDGET_MS);
+
+test("向导卡住时到上限即结束并等待其进程，不留下进程，报错说明阶段、耗时、退出码和已收集的输出", async () => {
+  const fixture = await tempFixture("relay-configure-hung-");
+  try {
+    const failure = await run(fixture.root, "--draft", {}, { hangAt: "WebDAV 上传目录" }).then(() => "exited", (error: Error) => error.message);
+    // 报错返回时进程已经结束，夹具在这之后才清理。
+    expect(alive(Number(await readFile(hungPid(fixture.root), "utf8")))).toBe(false);
+    expect(failure).toContain(`外链向导在生成草稿（${basename(fixture.root)}）阶段超过 10 秒未退出，已结束并等待其进程树：`);
+    const [, seconds, code] = /用时 ([\d.]+) 秒，退出码 (\d+)。已收集的输出：\n/.exec(failure) ?? [];
+    expect(Number(seconds)).toBeGreaterThanOrEqual(10);
+    expect(Number(seconds)).toBeLessThan(FLOW_BUDGET_MS / 1000);
+    expect(code).toBeDefined();
+    expect(failure).toContain("PROMPT WebDAV 上传目录");
+  } finally { await fixture.cleanup(); }
+}, FLOW_BUDGET_MS);

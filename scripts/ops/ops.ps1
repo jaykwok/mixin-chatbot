@@ -11,7 +11,7 @@
 param(
     [Parameter(Position = 0)]
     [string]$Command = "",
-    # relay-purge 的关键字、routes 的子命令、stat/history-clear 的群号，或 tunnel-logging 的开关。
+    # relay-purge 的关键字、routes 的子命令、stat/history-clear 的群号、backup-clean 的报告名，或 tunnel-logging 的开关。
     [Parameter(Position = 1)]
     [string]$Target = "",
     [switch]$Repair,
@@ -31,6 +31,8 @@ param(
     [string]$Group = "",
     [switch]$StorageSegment,
     [switch]$GroupId,
+    # backup-clean 的确认码（预演时给出）；不用 -Confirm，那是 PowerShell 的通用参数名。
+    [string]$ConfirmCode = "",
     [string]$RequestBase64 = ""
 )
 
@@ -1433,6 +1435,16 @@ switch ($Command) {
     "history-clear" {
         if (-not (Clear-GroupHistory $Target)) { exit 1 }
     }
+    # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具逐条重新检查。
+    "backup-scan" {
+        if (-not (Invoke-GroupDataAdmin "scripts\ops\backup-cleanup.ts" @("scan"))) { exit 1 }
+    }
+    "backup-clean" {
+        if (-not $Target) { Err "backup-clean 需要报告名（backup\cleanup 下的目录名）"; exit 2 }
+        $cleanArgs = @("apply", $Target)
+        if ($ConfirmCode) { $cleanArgs += @("--confirm", $ConfirmCode) }
+        if (-not (Invoke-GroupDataAdmin "scripts\ops\backup-cleanup.ts" $cleanArgs)) { exit 1 }
+    }
     "uninstall" { if (-not (Uninstall-Bot)) { exit 1 } }
     default {
         # 空参和显式 help 是「我要看帮助」，退 0；其余都是打错了的命令，必须退非零。
@@ -1473,6 +1485,9 @@ switch ($Command) {
         Write-Host "  history-clear <群号>"
         Write-Host "                  归档该群会话；自动停机、清理，再恢复原运行或停止状态"
         Write-Host "                  群选择可加 -GroupId（原始群号）或 -StorageSegment（目录段）"
+        Write-Host "  backup-scan     只读扫描 backup\rm 和 backup\snapshots，分类后在 backup\cleanup 生成清单，不删除"
+        Write-Host "  backup-clean <报告名> [-ConfirmCode <确认码>]"
+        Write-Host "                  不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"
         Write-Host "  uninstall       清理任务/进程/防火墙/launcher，可选清理隧道、data 和 logs"
         if ($unknown) { exit 1 }
     }

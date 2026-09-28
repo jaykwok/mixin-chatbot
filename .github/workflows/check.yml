@@ -53,14 +53,16 @@ jobs:
       - name: Test supervised processes in the restricted image
         run: |
           mkdir -p tmp backup/rm
+          # The read-only image can write only to the mounted /app/tmp; name it as the test work root.
           docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/backup:/app/backup" -v "$PWD/tests:/app/tests:ro" \
+            -e MIXIN_TEST_WORK_ROOT=/app/tmp \
             mixin-chatbot-check bun run test tests/core/process.test.ts
       - name: Test data migration and verification mode in the restricted image
         run: |
           docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/backup:/app/backup" -v "$PWD/tests:/app/tests:ro" \
-            -v "$PWD/scripts/ops/tui:/app/scripts/ops/tui:ro" \
+            -v "$PWD/scripts/ops/tui:/app/scripts/ops/tui:ro" -e MIXIN_TEST_WORK_ROOT=/app/tmp \
             mixin-chatbot-check bun run test tests/ops/migrations.test.ts
       - name: Test editable documents and Office previews in the restricted image
         run: |

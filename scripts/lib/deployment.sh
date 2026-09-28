@@ -134,7 +134,16 @@ begin_deployment() {
         print_error "发现旧回滚容器，请先确认其状态"; return 1
     fi
     keep_previous_image || return 1
-    DEPLOY_SNAPSHOT="$(mktemp -d "$PROJECT_DIR/backup/snapshots/deploy-XXXXXXXX")"
+    # A successful deployment removes backup/rm/<snapshot name> as its own archive; never adopt a name whose archive
+    # already exists (left by an earlier operation or restored by hand).
+    local attempt archive
+    for attempt in 1 2 3 4 5; do
+        DEPLOY_SNAPSHOT="$(mktemp -d "$PROJECT_DIR/backup/snapshots/deploy-XXXXXXXX")" || return 1
+        archive="$PROJECT_DIR/backup/rm/$(basename -- "$DEPLOY_SNAPSHOT")"
+        [ -e "$archive" ] || [ -L "$archive" ] || break
+        rmdir -- "$DEPLOY_SNAPSHOT"; DEPLOY_SNAPSHOT=""
+    done
+    [ -n "$DEPLOY_SNAPSHOT" ] || { print_error "无法分配新的部署快照名称；backup/rm 中已有同名归档"; return 1; }
     export BOT_DEPLOY_BACKUP_ID="$(basename -- "$DEPLOY_SNAPSHOT")"
     chmod 700 "$DEPLOY_SNAPSHOT"
     local relative

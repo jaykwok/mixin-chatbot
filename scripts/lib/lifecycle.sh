@@ -14,6 +14,8 @@ archive_project_path() {
     mv -- "$source" "$archive/$(date +%s)-${RANDOM}-${RANDOM}-$(basename "$source")"
 }
 
+# A successful operation discards only what it owns: its snapshot and the archive made under the snapshot's name
+# (backup/rm/<name>). Other snapshots, loose or manual archives and earlier transactions stay for the explicit cleanup.
 cleanup_completed_backup() {
     local backup snapshot name target
     backup="$PROJECT_DIR/backup"
@@ -21,10 +23,11 @@ cleanup_completed_backup() {
     name="$(basename -- "$snapshot")"
     [[ "$name" =~ ^(deploy|tunnel)-[a-zA-Z0-9-]+$ ]] || return 1
     [ "$(dirname -- "$snapshot")" = "$backup/snapshots" ] || return 1
-    # Include loose files and historical transaction directories in the recycle area.
-    for target in "$snapshot" "$backup/rm"; do
-        # Refuse redirected paths; rm unlinks any symlinks inside the snapshot.
+    # Refuse a redirected path or a link in either place before removing anything; rm unlinks links inside without following them.
+    for target in "$snapshot" "$backup/rm/$name"; do
         [ "$(realpath -m -- "$target")" = "$target" ] || return 1
+    done
+    for target in "$snapshot" "$backup/rm/$name"; do
         rm -rf -- "$target" || return 1
     done
     # Remove empty parents only, retaining other snapshots still present under snapshots/.

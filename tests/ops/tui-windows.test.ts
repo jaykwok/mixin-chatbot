@@ -222,3 +222,27 @@ windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 C
     expect((await fixture.run(["routes", "reset", "abcdef123456"])).code).toBe(2);
   } finally { await fixture.cleanup(); }
 }, 30000);
+
+windowsTest("Windows 备份清理入口把报告名和确认码原样交给清理工具", async () => {
+  const fixture = await fixtureWrapper();
+  try {
+    // 命令行入口，不经运维界面：直接用 ops.ps1 的原生参数调用。
+    const run = async (...args: string[]) => {
+      const child = Bun.spawn(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(fixture.root, "ops-fixture.ps1"), ...args], {
+        stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
+      });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      return { stdout, stderr, code };
+    };
+    const report = "20260928T000000Z-abcdef";
+    for (const [args, argv] of [[["backup-scan"], ["scan"]], [["backup-clean", report], ["apply", report]],
+      [["backup-clean", report, "-ConfirmCode", "0123456789abcdef"], ["apply", report, "--confirm", "0123456789abcdef"]]]) {
+      const result = await run(...args!);
+      expect(result.code, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({ script: "scripts\\ops\\backup-cleanup.ts", argv });
+    }
+    // 缺少报告名时不调用工具（错误信息按包装脚本模拟的 GBK 控制台输出，这里不比对文字）。
+    const missing = await run("backup-clean");
+    expect(missing.code).toBe(2); expect(missing.stdout).toBe("");
+  } finally { await fixture.cleanup(); }
+}, 30000);

@@ -99,7 +99,7 @@ bun audit
 
 配置向导和配置变更需要先停止服务。已有模型配置与 webhook 密钥时，用 `bun run start` 前台运行、`bun run dev` 监听代码变化。仅隔离开发可显式设置 `ALLOW_INSECURE_WEBHOOK=1` 使用无密钥的 `/webhook`。
 
-`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。TypeScript 拒绝未使用变量、参数、标签及不可达语句；Knip 同时检查入口文件的未使用导出。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。测试和诊断产物放在顶层 `tmp/`：每次运行的隔离 cwd 为 `tmp/tests-*`，夹具归档在其中的 `trash/`，全部通过后随 cwd 删除，失败时连同现场保留，不写入项目的 `backup/rm`。
+`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。TypeScript 拒绝未使用变量、参数、标签及不可达语句；Knip 同时检查入口文件的未使用导出。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。每次运行的隔离 cwd 为工作根目录下的 `tests-*`，夹具和归档用的 `trash/` 都在其中。工作根目录由 `MIXIN_TEST_WORK_ROOT` 指定；未设置时 Windows 和一般 Linux 用项目 `tmp/`，WSL 用 Linux 文件系统中的 `/tmp/mixin-tests`：仓库在 `/mnt/<盘符>` 时，DrvFs 上 chmod 是否生效取决于挂载设置。Linux 运行前先检查工作根目录能否 `chmod 0600`，不能则直接报错，提示换目录。受限容器 CI 显式使用挂载的 `/app/tmp`。测试输出同时写入项目 `tmp/` 下同名的 `tests-*.log`。全部通过后删除 cwd 和日志；失败时保留现场并打印两者的绝对路径，不写入项目的 `backup/rm`。旧版本的测试会把夹具归档到项目的 `backup/rm`，名称为 `<夹具名>-<UUID>`；这些遗留条目用[历史归档清理](operations.md#历史归档清理)识别和删除。
 
 `scripts/patches/knip@6.29.0.patch` 修复 Knip 对 Bun 脚本 production 入口标记的传递，仅影响开发检查。补丁随检查脚本维护；移除前需同步更新安装引用并通过普通和 production 两种 Knip 检查。
 

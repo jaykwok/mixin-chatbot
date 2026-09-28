@@ -192,10 +192,11 @@ data/
         └── users/<user>/
             ├── session.jsonl  Pi 原生会话
             └── tmp/           生成文件、缓存与完整工具输出
-backup/                        为了能撤销某个操作而留的，别顺手清
-├── snapshots/                 部署、升级与连接器安装的回滚现场
+backup/                        为了能撤销某个操作而留的；清理用 backup-scan / backup-clean，别手动删
+├── snapshots/                 部署、升级与连接器安装的回滚现场，以及数据迁移快照
 ├── reports/                   TUI 导出的离线 HTML 报表
-└── rm/                        被移除的旧文件、会话与用户 tmp
+├── cleanup/                   历史归档清理的清单和执行结果
+└── rm/                        被移除的旧文件、会话与用户 tmp；操作期间的归档在 rm/<快照名>/
 tmp/                           测试隔离 cwd、诊断产物、一次性脚本；无任务使用时可清理
 logs/                          应用日志与可选的隧道日志
 ```
