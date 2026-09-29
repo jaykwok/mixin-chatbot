@@ -50,7 +50,8 @@ if ($recordedPlan -and (Test-Path -LiteralPath $recordedPlan -PathType Leaf)) {
     Write-Host '继续上次升级：沿用停机前确认的迁移计划。'
 } else {
     # 续做不能等待输入：旧版事务没有保存计划时只做非交互预览，需要确认就停止。
-    $previewMode = if ($pendingPath) { @() } else { @('--interactive') }
+    # 外层 @() 保留数组；if 的单元素输出会变成字符串，传给原生程序时被 splat 拆成逐个字符。
+    $previewMode = @(if (-not $pendingPath) { '--interactive' })
     & $bun run $previewRunner preview --decisions-only @previewMode --project $Project --groups $groups --plan $plan
     if ($LASTEXITCODE -ne 0) {
         if ($pendingPath) { throw "续做无法沿用迁移确认（原因见上方）；请使用 $(Get-OpsCommandHint 'rollback') 回滚后重新升级。" }

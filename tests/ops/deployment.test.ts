@@ -931,21 +931,91 @@ Write-Output 'RESUME_VERIFIED'
   } finally { await fixture.cleanup(); }
 }, 30000);
 
-test.skipIf(process.platform !== "win32")("Windows target upgrade really boots in a fresh process and rejects preflight before service control", async () => {
+for (const [name, shell] of [["Windows PowerShell 5.1", "powershell.exe"], ["PowerShell 7", Bun.which("pwsh") ?? "C:/Program Files/PowerShell/7/pwsh.exe"]] as const) {
+  test.skipIf(process.platform !== "win32" || (shell !== "powershell.exe" && !existsSync(shell)))(`${name}: migration previews preserve native arguments and resume without interaction`, async () => {
+    const fixture = await tempFixture("migration-native-args-");
+    const script = join(fixture.root, "arguments.ps1"), probe = join(fixture.root, "native arguments.ts");
+    const root = join(fixture.root, "project with spaces"), groups = join(fixture.root, "groups with spaces");
+    const plan = join(fixture.root, "migration plan.json");
+    try {
+      await writeFile(probe, "console.log(JSON.stringify(process.argv.slice(2)));\n");
+      // Execute the real assignments and all three preview invocations against a native argv recorder. PowerShell
+      // function stubs hide the string-splatting bug, so these calls must cross the real executable boundary.
+      await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+$bun=$bunPath=${quotePS(process.execPath)}
+$previewRunner=$migrationRunner=${quotePS(probe)}
+$Project=${quotePS(root)}; $groups=$migrationGroups=$GroupDataRoot=${quotePS(groups)}; $plan=$migrationPlan=${quotePS(plan)}
+foreach($file in @(${quotePS(join(project, "scripts/deploy/upgrade.ps1"))},${quotePS(join(project, "scripts/deploy/deploy.ps1"))})) {
+    $tokens=$null; $errors=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw ($errors | Out-String)}
+    $mode=$ast.Find({param($node) $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$previewMode'},$true)
+    $commands=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.CommandAst] -and
+        $node.CommandElements.Count -gt 3 -and $node.CommandElements[0].Extent.Text -in @('$bun','$bunPath') -and
+        $node.CommandElements[3].Extent.Text -eq 'preview'},$true))
+    if(-not $mode -or -not $commands.Count){throw 'preview calls not found'}
+    foreach($resuming in @($false,$true)) {
+        $pendingPath=if($resuming){'recorded-snapshot'}else{$null}
+        Invoke-Expression $mode.Extent.Text
+        foreach($command in $commands) {
+            Invoke-Expression $command.Extent.Text
+            if($LASTEXITCODE -ne 0){throw 'native argv recorder failed'}
+        }
+    }
+}
+`);
+      const result = await execute([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
+      expect(result.code, result.output).toBe(0);
+      const actual = result.output.trim().split(/\r?\n/).map(line => JSON.parse(line));
+      const expected: string[][] = [];
+      for (const decisionsOnly of [[true], [true, false]]) {
+        for (const resuming of [false, true]) {
+          for (const decisions of decisionsOnly) expected.push(["preview", ...(decisions ? ["--decisions-only"] : []),
+            ...(resuming ? [] : ["--interactive"]), "--project", root, "--groups", groups, "--plan", plan]);
+        }
+      }
+      expect(actual).toEqual(expected);
+    } finally { await fixture.cleanup(); }
+  }, 30000);
+}
+
+test.skipIf(process.platform !== "win32")("Windows target upgrade really boots and reaches Git preflight after a valid migration preview", async () => {
   const fixture = await tempFixture("upgrade-bootstrap-");
   try {
     await mkdir(join(fixture.root, "data/groups"), { recursive: true });
-    const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+    const command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
       join(project, "scripts/deploy/upgrade.ps1"), "-Project", fixture.root,
       "-OriginalSha", "1".repeat(40), "-TargetSha", "2".repeat(40),
-      "-BunPath", process.execPath, "-GitPath", Bun.which("git")!], fixture.root);
+      "-BunPath", process.execPath, "-GitPath", Bun.which("git")!];
+    const result = await execute(command, fixture.root);
     expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain("模型选型缺失");
+    expect(result.output).not.toContain("只能指定一个迁移命令");
     expect(result.output).toContain("迁移预览未完成");
     expect(existsSync(join(fixture.root, "data/state/upgrade-transaction"))).toBe(false);
     const logs = await readdir(join(fixture.root, "logs/operations")); expect(logs).toHaveLength(1);
     const text = await readFile(join(fixture.root, "logs/operations", logs[0]!), "utf8");
     expect(text).toContain("migration-preview"); expect(text).toContain("迁移预览未完成");
     expect(text).toContain("upgrade.ps1"); expect(text).toContain("exit=1");
+    // A valid configuration must complete the real preview before the deliberate missing-main refusal. Use a
+    // separate empty repository so Git cannot discover the surrounding developer checkout or reach service control.
+    const init = await execute([Bun.which("git")!, "init", "--quiet", fixture.root], fixture.root);
+    expect(init.code, init.output).toBe(0);
+    await mkdir(join(fixture.root, "data/runtime/pi"), { recursive: true });
+    const settings = join(fixture.root, "data/runtime/pi/settings.json");
+    const original = JSON.stringify({ defaultProvider: "fixture", defaultModel: "test" });
+    await writeFile(settings, original);
+    const ready = await execute(command, fixture.root);
+    expect(ready.code, ready.output).toBe(1);
+    expect(ready.output).toContain("本地 main 分支不存在；旧服务尚未停止");
+    expect(ready.output).not.toContain("迁移预览未完成");
+    const allLogs = await readdir(join(fixture.root, "logs/operations")); expect(allLogs).toHaveLength(2);
+    const readyLog = await readFile(join(fixture.root, "logs/operations", allLogs.find(name => name !== logs[0])!), "utf8");
+    expect(readyLog).toContain("preview-result"); expect(readyLog).toContain("migration-finished: exit=0");
+    expect(readyLog).not.toContain("stop-service");
+    expect(await readFile(settings, "utf8")).toBe(original);
+    expect(await readdir(join(fixture.root, "data/groups"))).toEqual([]);
+    expect(existsSync(join(fixture.root, "data/state/upgrade-transaction"))).toBe(false);
   } finally { await fixture.cleanup(); }
 }, 30000);
 

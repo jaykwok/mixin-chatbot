@@ -414,7 +414,8 @@ $migrationAttempted = $resuming -and (Test-Path -LiteralPath (Join-Path $StateDi
 $migrationGroups = $GroupDataRoot
 $recordedMigrationPlan = if ($resuming) { Join-Path $pendingSnapshot.Path 'migration-plan.json' } else { '' }
 # 续做不能提问：迁移预览不带 --interactive，需要确认时停止。
-$previewMode = if ($resuming) { @() } else { @('--interactive') }
+# 外层 @() 保留数组；if 的单元素输出会变成字符串，传给原生程序时被 splat 拆成逐个字符。
+$previewMode = @(if (-not $resuming) { '--interactive' })
 if ($recordedMigrationPlan -and (Test-Path -LiteralPath $recordedMigrationPlan -PathType Leaf)) {
     # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
     $migrationPlan = $recordedMigrationPlan
