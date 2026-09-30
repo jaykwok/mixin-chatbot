@@ -62,15 +62,12 @@ DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
 BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
 GROUP_DATA_ROOT_FILE="${STATE_DIR}/group-data-root"
 TUNNEL_PID_FILE="${STATE_DIR}/cloudflared.pid"
-if [ "$(id -u)" -eq 0 ]; then
-    CONTAINER_UID=1001
-    CONTAINER_GID=1001
-else
-    # bind mount 由当前部署用户拥有；用同一非 root 身份运行可同时保证主机与容器可维护。
-    # rootless Docker 下这个身份是容器里的 root，连上 Docker 后再判定（见 container_user）。
-    CONTAINER_UID="$(id -u)"
-    CONTAINER_GID="$(id -g)"
-fi
+# 本次事务的镜像和服务身份：新部署在构建后固定 image ID、沿用原容器的数值 UID:GID（见 determine_service_user）；
+# 续做和回滚取自事务快照（load_transaction_runtime）。事务内的容器都只按它们运行，不按 mixin-chatbot 标签选择。
+IMAGE_ID=''
+SERVICE_USER=''
+SERVICE_USER_SOURCE=''
+CANDIDATE_PRESENT=1
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -158,10 +155,18 @@ group_root_mount() {
 
 # The target image owns migration semantics, including the first unversioned upgrade.
 migration_docker() {
-    docker run --rm -i --user "$CONTAINER_UID:$CONTAINER_GID" \
+    # 候选镜像已不存在时只允许回滚本事务从未开始迁移的操作（见 rollback_pending_deployment）：没有本事务的迁移可查或撤销。
+    if [ "$CANDIDATE_PRESENT" = 0 ]; then
+        case "$1" in
+            committed) return 1 ;;
+            rollback) return 0 ;;
+            *) print_error "候选镜像已不存在，不能运行迁移 $1"; return 1 ;;
+        esac
+    fi
+    docker run --rm -i --user "$SERVICE_USER" \
       -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -e BOT_OPERATION_LOG -e PI_CACHE_RETENTION -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
       "${GROUP_ROOT_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" -v "$PROJECT_DIR/backup:/app/backup" -v "$PROJECT_DIR/logs:/app/logs" \
-      mixin-chatbot bun run scripts/migrations/run.ts "$@" --groups "$GROUP_ROOT_ENV_VAL"
+      "$IMAGE_ID" bun run scripts/migrations/run.ts "$@" --groups "$GROUP_ROOT_ENV_VAL"
 }
 MIGRATION_APPLY_ATTEMPTED=0
 MIGRATION_PLAN=/app/data/state/migration-plan.json
@@ -179,9 +184,11 @@ rollback_data_migration() {
     return "$result"
 }
 
-# begin_deployment 发布事务指针前调用：记录停机前确认的全部选择，续做和回滚只读这份记录。
+# begin_deployment 发布事务指针前调用：记录停机前确认的全部选择，以及固定的镜像和服务身份（独立文件，事务记录保持
+# format 1）；续做和回滚只读这些记录。
 record_deployment_transaction() {
     local snapshot="$1" domain_action=keep unmanaged=''
+    write_candidate_record "$snapshot" && write_service_user_record "$snapshot" || return 1
     if [ "$PERSIST_BOT_DOMAIN" = 1 ]; then domain_action=persist
     elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = 1 ]; then domain_action=clear; fi
     if [ "$UNMANAGED_TUNNEL_CONFIRMED" = 1 ]; then unmanaged="$DEPLOY_MODE"; fi
@@ -202,6 +209,11 @@ rollback_pending_deployment() {
         *) [ -d "$original" ] || { print_error "原群数据总根不存在：$original；旧容器依赖它，请恢复原挂载后再回滚"; exit 1; } ;;
     esac
     group_root_mount "$target"
+    # 候选镜像已不存在：本事务从未开始迁移时不需要撤销数据，用原容器回滚；否则需要完全相同的镜像，不能重新构建代替。
+    if [ "$CANDIDATE_PRESENT" = 0 ] && migration_mentions_deployment "${TRANSACTION[snapshot]}"; then
+        print_error "上次操作的数据迁移已经开始，查看或撤销它需要记录的候选镜像 ${IMAGE_ID}，但它已不存在；请恢复完全相同的镜像（同一 image ID）后重试，重新构建的镜像不能代替；服务和数据保持现状"
+        exit 1
+    fi
     if [ -e "$STATE_DIR/migration.json" ]; then
         [ -d "$target" ] || { print_error "本次操作的群数据总根不存在：$target；恢复迁移前的数据需要它，请恢复挂载后再回滚"; exit 1; }
         if migration_docker committed --deployment "${TRANSACTION[snapshot]}"; then
@@ -217,7 +229,8 @@ rollback_pending_deployment() {
     exit 1
 }
 
-# 数据提交后启动正式实例，再清理事务和旧回滚容器。实例未就绪时保留事务指针，可再次继续。
+# 数据提交后启动正式实例（原本停止的升级保持停止），把正式标签 mixin-chatbot 指向本次镜像并核对，之后才清理事务、
+# 旧回滚容器和临时标签：停机状态下的运维命令按这个标签运行。实例未就绪或标签发布失败时保留事务指针，可再次继续。
 activate_committed_deployment() {
     rm -f -- "$PROJECT_DIR/data/state/verify-only" "$PROJECT_DIR/data/state/migration-plan.json"
     if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
@@ -233,7 +246,12 @@ activate_committed_deployment() {
             exit 1
         fi
     fi
+    candidate_publish "$IMAGE_ID" mixin-chatbot || {
+        print_error "数据已经提交，新版本已启用，但正式标签 mixin-chatbot 未能指向 ${IMAGE_ID}（原因见上方）；保留事务，处理后使用 $(ops_command_hint resume) 重试"
+        exit 1
+    }
     rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
+    release_transaction_candidate
     cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，但备份清理未完成，请检查 $DEPLOY_SNAPSHOT 和 $PROJECT_DIR/backup/rm"
     # Let process exit close descriptor 9. Explicit unlock would also unlock an update parent's inherited descriptor.
     if [ "$PREVIOUS_CONTAINER_SAVED" = "1" ]; then
@@ -255,10 +273,15 @@ finish_committed_transaction() {
     ROLLBACK_CONTAINER=mixin-chatbot-rollback
     PREVIOUS_CONTAINER_SAVED=0
     if docker container inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then PREVIOUS_CONTAINER_SAVED=1; fi
-    if ! docker container inspect mixin-chatbot >/dev/null 2>&1; then
+    local image
+    if ! image="$(docker container inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null)"; then
         print_error "上次操作的数据已经提交，但新容器 mixin-chatbot 不存在；请用 docker ps -a 检查后处理，不能回滚"
         exit 1
     fi
+    [ "$image" = "$IMAGE_ID" ] || {
+        print_error "上次操作的数据已经提交，但容器 mixin-chatbot 使用的镜像 ${image} 不是记录的候选镜像 ${IMAGE_ID}；请用 docker ps -a 检查后处理，不能回滚"
+        exit 1
+    }
     print_status "上次操作的数据已经提交：启动新实例，不再迁移或重建"
     docker stop --time 30 mixin-chatbot >/dev/null
     commit_deployment
@@ -295,19 +318,83 @@ check_deploy_environment() {
     fi
 }
 
+# 新部署的服务身份，在停机和任何改动之前确定：有原容器就沿用它的数值 UID:GID（不因改由 root 部署而迁移到 1001，
+# 也不改已有数据的属主）；真正的首次部署用默认身份；原容器不在但已部署过时身份不明，显示 data/state 的属主请操作者
+# 确认，不猜测。
+determine_service_user() {
+    local status=0 proposed
+    original_service_container || status=$?
+    if [ "$status" = 0 ]; then
+        service_user_from_container "$DOCKER_ROOTLESS" ||
+            { print_error "无法可靠确定原服务的运行身份（原因见上方）；部署已停止，服务和数据未改动"; return 1; }
+        print_status "沿用原容器的运行身份 ${SERVICE_USER}"
+        return 0
+    fi
+    [ "$status" = 2 ] || { print_error "无法读取原容器（原因见上方）；部署已停止，服务和数据未改动"; return 1; }
+    if docker container inspect mixin-chatbot-rollback >/dev/null 2>&1; then
+        print_error "发现旧回滚容器 mixin-chatbot-rollback，请先确认其状态"
+        return 1
+    fi
+    if ! deployment_recorded; then
+        SERVICE_USER="$(default_service_user "$DOCKER_ROOTLESS")"
+        SERVICE_USER_SOURCE=default
+        return 0
+    fi
+    proposed="$(service_user_from_data "$DOCKER_ROOTLESS")" ||
+        { print_error "找不到原容器 mixin-chatbot，也无法按 data/state 的属主确定服务身份（原因见上方）；部署已停止，服务和数据未改动"; return 1; }
+    print_warning "找不到原容器 mixin-chatbot，无法读取服务原来的运行身份；按 data/state 的属主，服务应以 ${proposed} 运行"
+    if ! ask_yes_no "确认服务以 ${proposed} 运行（已有数据的属主不变）？[y/N]：" n; then
+        print_error "未确认服务的运行身份；部署已取消，服务和数据未改动"
+        return 1
+    fi
+    SERVICE_USER="$proposed"
+    SERVICE_USER_SOURCE=confirmed
+}
+
+# 独立部署从工作区构建本次镜像：构建前检查磁盘空间，构建后按 image ID 固定（来源记为 workspace），之后的预检、迁移、
+# 验证实例和正式实例都用这个 ID；正式标签 mixin-chatbot 到数据提交后才指向它。失败或中断时只移除本次的保留标签。
+build_workspace_candidate() {
+    local previous head status=0 path paths=()
+    previous="$(docker container inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null)" || previous=''
+    for path in "$DATA_DIR" "$HOST_GROUP_DATA_ROOT" "$PROJECT_DIR/backup"; do [ ! -e "$path" ] || paths+=("$path"); done
+    print_status "检查构建所需的磁盘空间..."
+    check_build_disk_space "$previous" "${paths[@]}" ||
+        { print_error "磁盘空间不足或无法确认镜像存储位置（原因见上方）；服务尚未停止，未做任何改动"; exit 1; }
+    head="$(git -C "$PROJECT_DIR" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || head=''
+    trap release_before_pointer EXIT
+    print_status "构建 Docker 镜像..."
+    prepare_candidate_image "$PROJECT_DIR" "$head" workspace "$PROJECT_DIR" || status=$?
+    if [ "$status" != 0 ]; then
+        if [ "$status" -ge 128 ]; then print_warning "镜像构建已中断；服务尚未停止，未做任何改动"
+        else print_error "镜像构建失败（原因见上方）；服务尚未停止，未做任何改动"; status=1; fi
+        exit "$status"
+    fi
+    IMAGE_ID="${CANDIDATE[image_id]}"
+    print_success "镜像构建成功：${IMAGE_ID}"
+}
+
+# 事务指针发布之前的失败、取消或中断（从构建开始）只移除本次的保留标签；指针发布后由事务的提交或回滚处理。
+# 移除在独立的进程组中进行（run_shielded），收尾期间再来的中断打断不了它。
+release_before_pointer() {
+    local status=$?
+    trap - EXIT
+    trap : INT TERM HUP
+    [ -e "$STATE_DIR/deploy-transaction" ] || run_shielded release_transaction_candidate || true
+    operation_finish "$status"
+}
+
 # ---- 前置检查 ----
 
 print_status "检查运行环境..."
 
 if ! docker info > /dev/null 2>&1; then
     print_error "无法连接 Docker，请确保 Docker 已安装且当前用户有权限"
-    echo "  提示: sudo usermod -aG docker \$USER && newgrp docker"
+    echo "  rootful Docker 请用 root 运行部署；rootless Docker 请以运行它的用户部署"
     exit 1
 fi
-# rootless Docker：容器里的 root 就是宿主机上的部署用户（见 container_user），host 网络只是 rootlesskit 的命名空间。
-DOCKER_ROOTLESS=0
-if docker_rootless; then DOCKER_ROOTLESS=1; fi
-if [ "$(id -u)" -ne 0 ] && [ "$DOCKER_ROOTLESS" = 1 ]; then CONTAINER_UID=0; CONTAINER_GID=0; fi
+# rootful Docker 要求 root，rootless Docker 要求它所属的普通用户（设置 DOCKER_ROOTLESS）；在任何提问之前。
+# rootless 下容器里的 root 就是宿主机上的部署用户，host 网络只是 rootlesskit 的命名空间。
+require_deploy_operator deploy || exit 1
 
 required_files=("package.json" "src/server/index.ts" "scripts/config/configure.ts")
 for file in "${required_files[@]}"; do
@@ -338,6 +425,8 @@ if [ -e "$STATE_DIR/deploy-transaction" ]; then
         print_error "上次升级只剩代码待恢复；请使用 $(ops_command_hint rollback) 完成回滚"
         exit 1
     fi
+    # 先读记录的镜像和服务身份，再做 committed 检查、回滚或任何运行容器的操作。
+    load_transaction_runtime || exit 1
     if [ -z "$TRANSACTION_ACTION" ]; then
         if [ -t 0 ]; then
             choose_transaction_action
@@ -346,6 +435,12 @@ if [ -e "$STATE_DIR/deploy-transaction" ]; then
             exit 1
         fi
     fi
+    if [ "$TRANSACTION_ACTION" = continue ] && [ "$CANDIDATE_PRESENT" = 0 ]; then
+        print_error "继续需要记录的候选镜像 ${IMAGE_ID}，但它已不存在；请恢复完全相同的镜像（同一 image ID）后重试，重新构建的镜像不能代替。本次操作尚未开始迁移时也可以用 $(ops_command_hint rollback) 回滚"
+        exit 1
+    fi
+    # 容器以记录的身份写入本次操作日志（由部署用户创建）。
+    grant_operation_log_access || true
     # 旧版事务继续前在终端确认并补录记录；运维入口转交时（标准输入已关闭）应已补录。
     if [ "$TRANSACTION_ACTION" = continue ]; then backfill_legacy_transaction || exit 1; fi
     RECORDED=1
@@ -383,12 +478,15 @@ else
     PREPARED_TUNNEL_INPUT=""
     check_deploy_environment
     verify_deployed_group_root
+    determine_service_user || exit 1
+    grant_operation_log_access || true
 fi
 print_warning "转换数据前先预览；应用变更时保持停机，提交前失败恢复数据、配置和原运行状态。"
-# 容器挂载的目录都先由部署用户创建：不存在的 bind mount 源会被 Docker 以 root 身份创建，
-# 普通 Docker 用户随后无法在其中写入快照（全新克隆没有 backup/）。snapshots/ 和 rm/ 也在这里建好，
-# 下面 root 部署的 chown 才覆盖它们：成功的部署会删掉空的 snapshots/，之后由 root 重建的目录迁移容器写不进去。
-mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR" "$PROJECT_DIR/backup/snapshots" "$PROJECT_DIR/backup/rm"
+# 容器挂载的目录都先由部署脚本创建：不存在的 bind mount 源会被 Docker 以 root 身份创建，服务身份随后无法在其中写入
+# （全新克隆没有 backup/）。snapshots/ 和 rm/ 也在这里建好：成功的部署会删掉空的 snapshots/，迁移容器要在其中写备份。
+# 只有本次新建的目录交给服务身份，已有目录和数据的属主不变。
+make_service_directories "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR" "$PROJECT_DIR/backup/snapshots" "$PROJECT_DIR/backup/rm" ||
+    { print_error "无法创建数据目录"; exit 1; }
 # rootless Docker 通常不能发布 1024 以下的端口（见 rootless_port_publishable）：没有指定或已保存的端口时默认改用高端口。
 FALLBACK_PORT=1011
 if [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$FALLBACK_PORT"; then FALLBACK_PORT=11011; fi
@@ -531,7 +629,7 @@ while true; do
         print_warning "群数据总根不是目录：$HOST_GROUP_DATA_ROOT"
         continue
     fi
-    if ! mkdir -p -- "$HOST_GROUP_DATA_ROOT"; then
+    if ! make_service_directories "$HOST_GROUP_DATA_ROOT"; then
         print_warning "无法创建群数据总根：$HOST_GROUP_DATA_ROOT"
         continue
     fi
@@ -545,9 +643,8 @@ while true; do
 done
 group_root_mount "$HOST_GROUP_DATA_ROOT"
 if [ "$HOST_GROUP_DATA_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
-    if [ "$(id -u)" -eq 0 ]; then
-        chown "$CONTAINER_UID:$CONTAINER_GID" "$HOST_GROUP_DATA_ROOT"
-    fi
+    # 项目外的群根只交出这一级目录（不递归），其中已有数据的属主不变。
+    grant_service_access "$HOST_GROUP_DATA_ROOT"
     print_warning "主机群数据目录挂到容器 /app/group-data"
 fi
 print_status "Pi 群数据总根：$HOST_GROUP_DATA_ROOT（容器内：$GROUP_ROOT_ENV_VAL）"
@@ -556,36 +653,34 @@ echo ""
 # ---- 目录 ----
 
 print_status "设置目录权限..."
-# root 部署固定降权到 appuser(1001)；普通 Docker 用户则由容器沿用当前 UID/GID。
-if [ "$(id -u)" -eq 0 ]; then
-    chown -R "$CONTAINER_UID:$CONTAINER_GID" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup"
-    chown "$CONTAINER_UID:$CONTAINER_GID" "$HOST_GROUP_DATA_ROOT"
+# 真正的首次部署沿用原有做法：root 部署把刚建立的目录整体交给默认身份 appuser(1001)。沿用原容器身份时不批量改属主，
+# 已有数据本来就属于这个身份，本次新建的目录已在创建时交出。
+if [ "$SERVICE_USER_SOURCE" = default ] && [ "$(id -u)" -eq 0 ]; then
+    chown -R "$SERVICE_USER" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup"
+    chown "$SERVICE_USER" "$HOST_GROUP_DATA_ROOT"
 fi
 chmod 755 "$DATA_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
-print_success "目录就绪"
+print_success "目录就绪（服务身份 ${SERVICE_USER}）"
 
 # ---- 构建镜像 ----
 
-print_status "构建 Docker 镜像..."
-# 未完成的事务在首次构建前已保留原镜像；再打一次会把回滚标签指向失败的新镜像。
-if [ "$RECORDED" != 1 ]; then keep_previous_image || exit 1; fi
-if operation_capture docker build -t mixin-chatbot .; then
-    print_success "镜像构建成功"
+if [ "$RECORDED" = 1 ]; then
+    # 续做只用事务记录的镜像：不重新构建或拉取。
+    print_status "沿用事务记录的镜像 ${IMAGE_ID}，不重新构建"
 else
-    print_error "镜像构建失败"
-    exit 1
+    build_workspace_candidate
 fi
 
 verify_container_storage() {
     docker run --rm \
-      --user "$CONTAINER_UID:$CONTAINER_GID" \
+      --user "$SERVICE_USER" \
       -e HOME=/app/data/runtime/home \
       -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
       "${GROUP_ROOT_ARGS[@]}" \
       -v "$(pwd)/logs:/app/logs" \
       -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" \
       --entrypoint sh \
-      mixin-chatbot \
+      "$IMAGE_ID" \
       -c 'for directory in /app/data/config /app/data/state /app/data/runtime /app/data/runtime/home /app/logs "$GROUP_DATA_ROOT"; do
               [ -d "$directory" ] && [ -w "$directory" ] || { echo "容器用户不可写: $directory" >&2; exit 1; }
           done
@@ -596,8 +691,8 @@ verify_container_storage() {
 
 print_status "验证容器用户对持久化目录的权限..."
 if ! verify_container_storage; then
-    print_error "容器运行用户（UID ${CONTAINER_UID}）无法读写持久化目录"
-    echo "  请修复 data/、logs/ 与群数据根的属主/权限后重试；也可用 sudo 运行部署，让容器固定降权到 UID 1001。"
+    print_error "服务身份（${SERVICE_USER}）无法读写持久化目录；服务尚未停止"
+    echo "  部署沿用原容器的运行身份，不批量改已有数据的属主；请让 data/、logs/ 与群数据根可被该身份读写后重试。"
     exit 1
 fi
 print_success "持久化目录权限正常"
@@ -607,8 +702,8 @@ if [ "$RECORDED" = 1 ] && [ -f "$TRANSACTION_SNAPSHOT/migration-plan.json" ]; th
     # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
     # 快照目录仅部署用户可读，计划复制回容器可读的状态目录。
     cp -- "$TRANSACTION_SNAPSHOT/migration-plan.json" "$STATE_DIR/migration-plan.json" || { print_error "无法恢复停机前确认的迁移计划"; exit 1; }
-    # root 复制出的文件属 root；迁移容器以 UID ${CONTAINER_UID} 读取它。
-    if [ "$(id -u)" -eq 0 ]; then chown "$CONTAINER_UID:$CONTAINER_GID" "$STATE_DIR/migration-plan.json"; fi
+    # root 复制出的文件属 root；迁移容器以服务身份读取它。
+    grant_service_access "$STATE_DIR/migration-plan.json"
     MIGRATION_PLANNED=1
 elif [ -f "$MODELS_FILE" ] && [ -f "$RUNTIME_DIR/pi/settings.json" ]; then
     if ! migration_docker preview "${MIGRATION_PREVIEW_MODE[@]}" --plan "$MIGRATION_PLAN"; then
@@ -753,6 +848,11 @@ fi
 PREPARED_TUNNEL_INPUT=""
 
 # Decisions precede persistent changes; a continued transaction reopens its original snapshot.
+if [ "$RECORDED" != 1 ]; then
+    print_status "停机前复核剩余空间..."
+    check_stop_disk_space "$HOST_GROUP_DATA_ROOT" ||
+        { print_error "剩余空间不够写入停机后的快照（原因见上方）；服务尚未停止，未做任何改动"; exit 1; }
+fi
 begin_deployment
 if [ "$MIGRATION_PLANNED" = 1 ]; then
     # The upgrader keeps the target code on this receipt after abrupt termination;
@@ -767,7 +867,7 @@ fi
 
 if [ ! -f "$MODELS_FILE" ]; then
     print_status "首次配置 AI（provider/key/model）..."
-    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" mixin-chatbot bun run configure; then
+    if ! docker run --rm -it --user "$SERVICE_USER" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" "$IMAGE_ID" bun run configure; then
         print_error "AI 配置命令执行失败"
         exit 1
     fi
@@ -777,15 +877,13 @@ if [ ! -f "$MODELS_FILE" ]; then
     fi
 elif [ "$RECONFIGURE_AI" = 1 ]; then
     print_status "重新配置 AI（provider/key/model）..."
-    if ! docker run --rm -it --user "$CONTAINER_UID:$CONTAINER_GID" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" mixin-chatbot bun run configure; then
+    if ! docker run --rm -it --user "$SERVICE_USER" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" "$IMAGE_ID" bun run configure; then
         print_error "AI 配置命令执行失败"
         exit 1
     fi
 fi
-validate_model_configuration || { print_error "模型配置无效，正在恢复原部署"; exit 1; }
-if [ "$(id -u)" -eq 0 ]; then
-    chown "$CONTAINER_UID:$CONTAINER_GID" "$MODELS_FILE"
-fi
+validate_model_configuration "$IMAGE_ID" "$SERVICE_USER" || { print_error "模型配置无效，正在恢复原部署"; exit 1; }
+grant_service_access "$MODELS_FILE"
 chmod 600 "$MODELS_FILE"
 
 # ---- Webhook 随机密钥路径（两模式共用，应用层鉴权）----
@@ -798,9 +896,7 @@ if [ ! -f "$WEBHOOK_SECRET_FILE" ]; then
         SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n') # 回退
     fi
     printf '%s' "$SECRET" > "$WEBHOOK_SECRET_FILE"
-    if [ "$(id -u)" -eq 0 ]; then
-        chown "$CONTAINER_UID:$CONTAINER_GID" "$WEBHOOK_SECRET_FILE"
-    fi
+    grant_service_access "$WEBHOOK_SECRET_FILE"
     chmod 600 "$WEBHOOK_SECRET_FILE"
     print_success "已生成 webhook 密钥"
     SHOW_SECRET=1
@@ -814,7 +910,7 @@ else
     print_status "检测到已有 data/config/webhook-secret（沿用）"
 fi
 if ! verify_container_storage; then
-    print_error "models.json 或 webhook-secret 对容器用户（UID ${CONTAINER_UID}）不可读写；请修复目录/文件权限后重试"
+    print_error "models.json 或 webhook-secret 对服务身份（${SERVICE_USER}）不可读写；请修复目录/文件权限后重试"
     exit 1
 fi
 
@@ -916,10 +1012,10 @@ runtime_env_args=()
 for runtime_key in "${RUNTIME_ENV_KEYS[@]}"; do
     if [ -n "${!runtime_key:-}" ]; then runtime_env_args+=(-e "$runtime_key"); fi
 done
-docker run --rm --user "$CONTAINER_UID:$CONTAINER_GID" \
+docker run --rm --user "$SERVICE_USER" \
   -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" -e BOT_PORT="$BOT_PORT" -e BOT_HOST="$BOT_HOST" \
   -e BOT_DEPLOY_BACKUP_ID "${runtime_env_args[@]}" -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" \
-  mixin-chatbot bun run scripts/config/runtime-settings.ts
+  "$IMAGE_ID" bun run scripts/config/runtime-settings.ts
 
 # ---- 启动容器 ----
 
@@ -934,7 +1030,7 @@ fi
 NEW_CONTAINER_ATTEMPTED=1
 if docker run -d \
   --init \
-  --user "$CONTAINER_UID:$CONTAINER_GID" \
+  --user "$SERVICE_USER" \
   "${network_args[@]}" \
   -e HOME=/app/data/runtime/home \
   -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
@@ -957,7 +1053,7 @@ if docker run -d \
   --log-driver json-file \
   --log-opt max-size=5m \
   --log-opt max-file=2 \
-  mixin-chatbot; then
+  "$IMAGE_ID"; then
     print_success "容器启动成功"
 else
     print_error "容器启动失败"

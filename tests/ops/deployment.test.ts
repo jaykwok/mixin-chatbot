@@ -29,8 +29,9 @@ test("Docker COPY inputs and dependency patch paths exist in the checkout", asyn
   }
 });
 
-async function execute(args: string[], cwd: string, env = process.env) {
-  const child = Bun.spawn(args, { cwd, env, stdout: "pipe", stderr: "pipe", windowsHide: true });
+/** `group`: the command leads its own process group (POSIX only), as a terminal's foreground job would. */
+async function execute(args: string[], cwd: string, env = process.env, group = false) {
+  const child = Bun.spawn(args, { cwd, env, stdout: "pipe", stderr: "pipe", windowsHide: true, detached: group });
   const timeout = setTimeout(() => child.kill(), 45000);
   try {
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -1409,6 +1410,8 @@ test.skipIf(!bash || !existsSync(bash))("Docker deployment collects every answer
   // Only the AI wizard container may interact between the stop and the commit.
   expect(stop).toBeGreaterThan(0); expect(commit).toBeGreaterThan(stop);
   expect(source.slice(stop, commit).match(/read_input|ask_yes_no/g)).toBeNull();
+  // After the last answer and right before the stop, a new deployment checks again that the snapshot fits.
+  expect(source.slice(source.indexOf("# Decisions precede persistent changes"), stop)).toMatch(/\n    check_stop_disk_space "\$HOST_GROUP_DATA_ROOT" \|\|\n/);
   const state = join(fixture.root, "state");
   await mkdir(join(fixture.root, "scripts/tunnel"), { recursive: true }); await mkdir(state, { recursive: true });
   await writeFile(join(fixture.root, "scripts/tunnel/start-tunnel.sh"), "");
@@ -1559,18 +1562,27 @@ test.skipIf(!bash || !existsSync(bash))("Docker continue and rollback use only t
   await writeFile(join(state, "bot-domain"), "other.example.com"); await writeFile(join(state, "group-data-root"), posixPath(original));
   await writeFile(join(root, "data/config/models.json"), "{}");
   await writeFile(join(state, "deploy-transaction"), "deploy-fixture");
-  const record = (overrides: Record<string, string> = {}) => writeFile(join(snapshot, "transaction"), Object.entries({
-    format: "1", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "", original_sha: "", original_branch: "",
-    original_group_root: posixPath(original), target_group_root: posixPath(target), was_running: "1", bot_port: "2022",
-    deploy_mode: "cloudflare", bot_domain: "bot.example.com", domain_action: "persist", unmanaged_tunnel: "", platform_ip: "198.51.100.9",
-    reconfigure_ai: "1", ...overrides,
-  }).map(([key, value]) => `${key}=${value}\n`).join(""));
+  const lines = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => `${key}=${value}\n`).join("");
+  // The candidate image and the service identity are recorded beside the transaction; recovery reads them first.
+  const candidateId = `sha256:${"c".repeat(64)}`, candidateTag = "mixin-chatbot:candidate-0123456789ab-0123456789abcdef";
+  const record = async (overrides: Record<string, string> = {}) => {
+    const values = { format: "1", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "", original_sha: "", original_branch: "",
+      original_group_root: posixPath(original), target_group_root: posixPath(target), was_running: "1", bot_port: "2022",
+      deploy_mode: "cloudflare", bot_domain: "bot.example.com", domain_action: "persist", unmanaged_tunnel: "", platform_ip: "198.51.100.9",
+      reconfigure_ai: "1", ...overrides };
+    await writeFile(join(snapshot, "transaction"), lines(values));
+    await writeFile(join(snapshot, "candidate-image"), lines({ format: "1", source: values.target_sha ? "commit" : "workspace", target_sha: values.target_sha,
+      image_id: candidateId, image_tag: candidateTag, daemon_id: "5eec1de4-4518-46da-a461-80c0866ec11d", project_id: "0123456789ab", operation_id: "0123456789abcdef" }));
+    await writeFile(join(snapshot, "service-user"), lines({ format: "1", user: "1000:1000", source: "container" }));
+  };
   const script = join(fixture.root, "transaction.sh");
   await writeFile(script, `#!/usr/bin/env bash
 set -euo pipefail
 . '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
-PROJECT_DIR="$1"; CONTAINER_UID=1001; CONTAINER_GID=1001; RECORDED=0; DOCKER_ROOTLESS=0
+PROJECT_DIR="$1"; RECORDED=0; DOCKER_ROOTLESS=0; IMAGE_ID=''; SERVICE_USER=''; SERVICE_USER_SOURCE=''; CANDIDATE_PRESENT=1
 TRANSACTION_ACTION="\${FIXTURE_ACTION:-}"; MIGRATION_PREVIEW_MODE=(--interactive)
+# The recorded image as the daemon reports it: 0 present, 3 another daemon, 4 removed (see candidate_verify).
+candidate_verify(){ return "\${FIXTURE_CANDIDATE:-0}"; }
 DATA_DIR="$PROJECT_DIR/data"; CONFIG_DIR="$DATA_DIR/config"; STATE_DIR="$DATA_DIR/state"; RUNTIME_HOME_DIR="$DATA_DIR/runtime/home"
 LOG_DIR="$PROJECT_DIR/logs"; DEFAULT_GROUP_DATA_ROOT="$DATA_DIR/groups"; MODELS_FILE="$CONFIG_DIR/models.json"
 BOT_PORT_FILE="$STATE_DIR/bot-port"; DEPLOY_MODE_FILE="$STATE_DIR/deploy-mode"; BOT_DOMAIN_FILE="$STATE_DIR/bot-domain"; GROUP_DATA_ROOT_FILE="$STATE_DIR/group-data-root"
@@ -1588,8 +1600,12 @@ begin_deployment(){ echo "BEGIN rollback=\${ROLLBACK_REQUESTED:-0} root=$HOST_GR
 docker(){
     echo "$*" >> '${posixPath(dockerLog)}'
     case "$1" in
-        container) [ "$2" = inspect ] && { [ "\${!#}" != mixin-chatbot-rollback ] || [ "\${FIXTURE_ROLLBACK_CONTAINER:-0}" = 1 ]; } ;;
+        container)
+            [ "$2" = inspect ] && { [ "\${!#}" != mixin-chatbot-rollback ] || [ "\${FIXTURE_ROLLBACK_CONTAINER:-0}" = 1 ]; } || return 1
+            [ "\${4:-}" != '{{.Image}}' ] || echo "\${FIXTURE_CONTAINER_IMAGE:-${candidateId}}" ;;
         exec) [ "\${FIXTURE_UNHEALTHY:-0}" != 1 ] ;;
+        tag) [ "\${FIXTURE_TAG_FAIL:-0}" != 1 ] ;;
+        image) [ "$2" != inspect ] || [ "\${4:-}" != '{{.Id}}' ] || echo ${candidateId} ;;
     esac
 }
 sleep(){ :; }; cleanup_completed_backup(){ echo "CLEANUP $1"; }
@@ -1670,25 +1686,62 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
     await record();
     let activation = await committed({ FIXTURE_ROLLBACK_CONTAINER: "1" });
     expect(activation.code, activation.output).toBe(0);
-    expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect mixin-chatbot", "stop --time 30 mixin-chatbot", "start mixin-chatbot",
-      "exec mixin-chatbot bun run scripts/ops/health-check.ts", "rm mixin-chatbot-rollback",
-      // The committed transaction releases the tag that kept the original image for a rollback.
-      "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
+    // The new instance must run the recorded image. Once it is healthy the official tag names that image and is
+    // verified; only then the transaction ends and the reserved tag, the rollback container and its tag are released.
+    const publish = [`tag ${candidateId} mixin-chatbot`, "image inspect --format {{.Id}} mixin-chatbot"];
+    const released = [`image inspect --format {{.Id}} ${candidateTag}`, `image rm --force ${candidateTag}`];
+    expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect --format {{.Image}} mixin-chatbot",
+      "stop --time 30 mixin-chatbot", "start mixin-chatbot", "exec mixin-chatbot bun run scripts/ops/health-check.ts", ...publish, ...released,
+      "rm mixin-chatbot-rollback", "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
     expect(activation.output).toContain(`CLEANUP ${posixPath(snapshot)}`); expect(activation.output).toContain("机器人已启动");
     expect(activation.output).not.toContain("BEGIN"); expect(activation.output).not.toContain("RESULT"); expect(activation.output).not.toContain("MIGRATION");
     expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
     expect(await readFile(receipt, "utf8")).toBe("committed\n");
-    // An upgrade that found the service stopped keeps it stopped.
+    // An upgrade that found the service stopped keeps it stopped; the official tag still moves, for the maintenance commands.
     await record({ was_running: "0" });
     activation = await committed({});
     expect(activation.code, activation.output).toBe(0); expect(activation.output).toContain("保持停止");
-    expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect mixin-chatbot", "stop --time 30 mixin-chatbot", "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
-    // An unhealthy instance keeps the transaction, so continuing again retries only the activation.
+    expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect --format {{.Image}} mixin-chatbot",
+      "stop --time 30 mixin-chatbot", ...publish, ...released, "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
+    // An unhealthy instance, or an official tag that cannot be moved, keeps the transaction: continuing again retries only
+    // the activation. The committed data is never rolled back.
     await record();
     activation = await committed({ FIXTURE_UNHEALTHY: "1" });
     expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("业务实例未就绪"); expect(activation.output).toContain("resume");
     expect(existsSync(join(state, "deploy-transaction"))).toBe(true);
-    expect(activation.output).not.toContain("CLEANUP");
+    expect(activation.output).not.toContain("CLEANUP"); expect(activation.docker.filter(line => line.startsWith("tag"))).toEqual([]);
+    activation = await committed({ FIXTURE_TAG_FAIL: "1" });
+    expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("正式标签 mixin-chatbot 未能指向");
+    expect(existsSync(join(state, "deploy-transaction"))).toBe(true); expect(activation.output).not.toContain("CLEANUP");
+    expect(activation.docker.filter(line => line.startsWith("image rm"))).toEqual([]);
+    // The container left by the interrupted operation must run the recorded image; another one is not activated.
+    activation = await committed({ FIXTURE_CONTAINER_IMAGE: `sha256:${"d".repeat(64)}` });
+    expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("不是记录的候选镜像");
+    expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect --format {{.Image}} mixin-chatbot"]);
+    // Recovery reads the image and the identity first. Another Docker daemon, a missing record or an identity that does not
+    // fit the daemon refuses both ways before any container is touched.
+    for (const [change, message] of [["daemon", "Docker daemon 与开始事务时不同"], ["record", "缺少服务身份记录"], ["identity", "记录的服务身份与当前 Docker 的模式不符"]] as const) {
+      await record();
+      if (change === "record") await rm(join(snapshot, "service-user"));
+      if (change === "identity") await writeFile(join(snapshot, "service-user"), lines({ format: "1", user: "0:0", source: "container" }));
+      for (const action of ["continue", "rollback"]) {
+        await writeFile(dockerLog, "");
+        result = await run({ FIXTURE_ACTION: action, FIXTURE_COMMITTED: "1", FIXTURE_CANDIDATE: change === "daemon" ? "3" : "0" });
+        expect(result.code, result.output).toBe(1); expect(result.output).toContain(message);
+        expect(await readFile(dockerLog, "utf8")).toBe(""); expect(result.output).not.toContain("BEGIN");
+      }
+    }
+    // A removed candidate cannot be replaced by a rebuild: continuing is refused, and so is a rollback once this
+    // transaction's migration started; a rollback that never reached the migration restores the original container.
+    await record(); await rm(join(state, "migration.json"), { force: true });
+    result = await run({ FIXTURE_ACTION: "continue", FIXTURE_SAVED_TOKEN: "1", FIXTURE_CANDIDATE: "4" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("重新构建的镜像不能代替"); expect(result.output).not.toContain("RESULT");
+    await writeFile(join(state, "migration.json"), `{\n  "deployment": "deploy-fixture"\n}\n`);
+    result = await run({ FIXTURE_ACTION: "rollback", FIXTURE_CANDIDATE: "4" });
+    expect(result.code, result.output).toBe(1); expect(result.output).toContain("数据迁移已经开始"); expect(result.output).not.toContain("BEGIN");
+    await rm(join(state, "migration.json"));
+    result = await run({ FIXTURE_ACTION: "rollback", FIXTURE_CANDIDATE: "4" });
+    expect(result.output).toContain(`BEGIN rollback=1 root=${posixPath(target)}`);
     // Without a transaction the ordinary environment is validated before any setting is read.
     await rm(join(state, "deploy-transaction"));
     const valid = { PLATFORM_IP: "203.0.113.99", BOT_DEBUG: "1", BOT_MAX_ACTIVE_REQUESTS: "32", BOT_MODEL_CACHE_RETENTION: "" };
@@ -1714,9 +1767,9 @@ test.skipIf(!bash || !existsSync(bash))("Docker continue applies the migration p
   const script = join(root, "plan.sh");
   await writeFile(script, `#!/usr/bin/env bash
 set -euo pipefail
-PROJECT_DIR="$1"; STATE_DIR="$PROJECT_DIR/state"; TRANSACTION_SNAPSHOT="$PROJECT_DIR/snapshot"; RECORDED="$FIXTURE_RECORDED"; CONTAINER_UID=1001; CONTAINER_GID=1001
+PROJECT_DIR="$1"; STATE_DIR="$PROJECT_DIR/state"; TRANSACTION_SNAPSHOT="$PROJECT_DIR/snapshot"; RECORDED="$FIXTURE_RECORDED"
 MODELS_FILE="$PROJECT_DIR/models.json"; RUNTIME_DIR="$PROJECT_DIR/runtime"; MIGRATION_PLAN=/app/data/state/migration-plan.json; MIGRATION_PREVIEW_MODE=()
-print_error(){ echo "$*" >&2; }; settings_fixed_hint(){ echo hint; }
+print_error(){ echo "$*" >&2; }; settings_fixed_hint(){ echo hint; }; grant_service_access(){ echo "GRANT $*"; }
 migration_docker(){ echo "PREVIEW $*"; }
 MIGRATION_PLANNED=0
 ${block}
@@ -1730,6 +1783,8 @@ echo "PLANNED=$MIGRATION_PLANNED"
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain("PLANNED=1"); expect(result.output).not.toContain("PREVIEW");
     expect(await readFile(join(state, "migration-plan.json"), "utf8")).toBe("confirmed-before-stop");
+    // The copy belongs to the deploying user; the migration container reads it as the service identity.
+    expect(result.output).toContain(`GRANT ${posixPath(state)}/migration-plan.json`);
     result = await run("0");
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain("PREVIEW preview --plan /app/data/state/migration-plan.json"); expect(result.output).toContain("PLANNED=1");
@@ -1745,8 +1800,9 @@ test.skipIf(!bash || !existsSync(bash))("Docker migration passes the service ide
   await writeFile(script, `#!/usr/bin/env bash
 set -euo pipefail
 PROJECT_DIR="$1"
-CONTAINER_UID=1001; CONTAINER_GID=1002; GROUP_ROOT_ENV_VAL=/app/group-data
+SERVICE_USER=1001:1002; IMAGE_ID=sha256:${"c".repeat(64)}; CANDIDATE_PRESENT=1; GROUP_ROOT_ENV_VAL=/app/group-data
 GROUP_ROOT_ARGS=(-v "$PROJECT_DIR/external groups:/app/group-data")
+print_error(){ echo "$*" >&2; }
 export PI_CACHE_RETENTION=long BOT_DEPLOY_BACKUP_ID=deploy-fixture BOT_OPERATION_LOG=upgrade-20260925T000000Z-fixture.log
 docker(){
     while [ "$#" -gt 0 ]; do
@@ -1760,6 +1816,12 @@ docker(){
 }
 ${migration}
 migration_docker preview --decisions-only
+echo DONE
+# Without the recorded image nothing runs: nothing of this transaction can be committed, and there is nothing to undo.
+CANDIDATE_PRESENT=0
+if migration_docker committed --deployment deploy-fixture; then echo COMMITTED; fi
+migration_docker rollback --deployment deploy-fixture && echo ROLLBACK_SKIPPED
+migration_docker apply --plan plan || echo APPLY_REFUSED
 `);
   try {
     const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
@@ -1768,9 +1830,15 @@ migration_docker preview --decisions-only
     expect(result.output).toContain("BOT_DEPLOY_BACKUP_ID=deploy-fixture");
     expect(result.output).toContain("BOT_OPERATION_LOG=upgrade-20260925T000000Z-fixture.log");
     expect(result.output).toContain("logs:/app/logs");
-    expect(result.output).toContain("1001:1002");
+    expect(result.output).toContain("--user\n1001:1002\n");
     expect(result.output).toContain("external groups:/app/group-data");
     expect(result.output).toContain("GROUP_DATA_ROOT=/app/group-data");
+    // The transaction's image by ID, never the mutable mixin-chatbot tag.
+    expect(result.output).toContain(`sha256:${"c".repeat(64)}\nbun\nrun\nscripts/migrations/run.ts\npreview\n`);
+    expect(result.output).not.toContain("\nmixin-chatbot\n");
+    const after = result.output.slice(result.output.indexOf("DONE"));
+    expect(after).not.toContain("COMMITTED"); expect(after).toContain("ROLLBACK_SKIPPED"); expect(after).toContain("APPLY_REFUSED");
+    expect(after).toContain("候选镜像已不存在，不能运行迁移 apply"); expect(after).not.toContain("--user");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -1788,12 +1856,20 @@ operation_start deploy
 print_error(){ echo "$*" >&2; operation_event error "$*"; }; print_warning(){ echo "$*"; operation_event warn "$*"; }
 print_success(){ echo "$*"; }
 flock(){ :; }; can_manage_ufw(){ return 0; }
+# sudo asks for its password in the foreground, before the rollback steps start: interrupts there must not end it either.
+refresh_ufw_credentials(){
+    : > mock/refreshed
+    [ ! -f mock/interrupt-rollback ] || bash -c 'for signal in INT TERM HUP; do kill -s "$signal" -- "-$1"; done; sleep 0.5' - "$$" || true
+}
 managed_cloudflared_pid(){ return 1; }; stop_tunnel_launcher(){ :; }
 ufw(){ :; }
 run_ufw(){
     if [ "$1" = show ]; then cat mock/ufw; else printf 'ufw allow from %s to any port %s proto tcp comment Mixin-Chatbot (平台IP)\n' "$3" "$7" >> mock/ufw; fi
 }
 remove_managed_ufw_rules(){ printf 'ufw allow 22/tcp\n' > mock/ufw; }
+# This deployment's candidate: its reserved tag is released once the rollback has completed.
+declare -A CANDIDATE=([image_tag]=mixin-chatbot:candidate-0123456789ab-0123456789abcdef)
+release_candidate(){ printf '%s\n' "\${CANDIDATE[image_tag]}" >> mock/released; }
 docker(){
     if [ "$1" = container ]; then shift; elif [ "$1" = inspect ]; then return 97; fi
     local cmd="$1"; shift
@@ -1806,6 +1882,13 @@ docker(){
             if [ "\${2:-}" = '{{.Image}}' ]; then printf '%s' "$image"; elif [ "\${2:-}" = '{{.State.Running}}' ]; then printf '%s' "$running"; elif [ "\${2:-}" = '{{.Id}}' ]; then printf '%064d' 1; fi ;;
         stop|start)
             local name="\${!#}" image running
+            # Interrupts that arrive during the rollback: Ctrl+C and a hangup reach the terminal's whole foreground process
+            # group, which this script leads. The docker client stopping the new container, here a child process, must
+            # finish all the same.
+            if [ "$cmd" = stop ] && [ -f mock/interrupt-rollback ]; then
+                rm -f mock/interrupt-rollback
+                bash -c 'for signal in INT TERM HUP; do kill -s "$signal" -- "-$1"; done; sleep 0.5' - "$$" || return 1
+            fi
             read -r image running < "mock/containers/$name"
             [ "$cmd" != stop ] || running=false
             [ "$cmd" != start ] || running=true
@@ -1832,10 +1915,13 @@ TUNNEL_STARTED_BY_DEPLOY=1
 printf 'ufw allow 22/tcp\nufw allow from 192.0.2.2 to any port 2022 proto tcp comment Mixin-Chatbot (平台IP)\n' > mock/ufw
 [ "$2" != firewall ] || exit 42
 printf '2022' > data/state/bot-port
+if [ "$2" = signal ]; then : > mock/interrupt-rollback; kill -TERM $$; fi
 exit 42
 `);
   try {
-    for (const running of [true, false]) for (const stage of ["configuration", "image", "container", "health", "tunnel", "firewall", "state"]) {
+    // Windows cannot deliver the signals to bash.
+    const stages = ["configuration", "image", "container", "health", "tunnel", "firewall", "state", ...(process.platform === "win32" ? [] : ["signal"])];
+    for (const running of [true, false]) for (const stage of stages) {
       const root = join(fixture.root, `${stage}-${running}`);
       await Promise.all(["data/config", "data/state", "mock/containers", "logs"].map(dir => mkdir(join(root, dir), { recursive: true })));
       await writeFile(join(root, "data/config/models.json"), "old-config");
@@ -1843,22 +1929,90 @@ exit 42
       await writeFile(join(root, "mock/containers/mixin-chatbot"), `old-image ${running}\n`);
       await writeFile(join(root, "mock/image"), "old-image");
       await writeFile(join(root, "mock/ufw"), "ufw allow 22/tcp\nufw allow proto tcp from 192.0.2.1 to any port 1011 comment 'Mixin-Chatbot (平台IP)'\n");
-      const result = await execute([bash!, posixPath(script), posixPath(root), stage], root, { ...process.env, MSYS_NO_PATHCONV: "1" });
-      expect(result.code, `${stage}: ${result.output}`).toBe(42);
+      const result = await execute([bash!, posixPath(script), posixPath(root), stage], root, { ...process.env, MSYS_NO_PATHCONV: "1" }, stage === "signal");
+      // A TERM rolls back as well, and further interrupts during the rollback do not cut it short.
+      const status = stage === "signal" ? 143 : 42;
+      expect(result.code, `${stage}: ${result.output}`).toBe(status);
       const logs = await readdir(join(root, "logs/operations")); expect(logs).toHaveLength(1);
       const text = await readFile(join(root, "logs/operations", logs[0]!), "utf8");
-      expect(text).toContain("rollback"); expect(text).toContain("已恢复配置"); expect(text).toContain("operation finished; exit=42");
+      expect(text).toContain("rollback"); expect(text).toContain("已恢复配置"); expect(text).toContain(`operation finished; exit=${status}`);
+      expect(existsSync(join(root, "mock/interrupt-rollback"))).toBe(false);
       expect(await readFile(join(root, "data/config/models.json"), "utf8")).toBe("old-config");
       expect(await readFile(join(root, "data/state/bot-port"), "utf8")).toBe("1011");
       expect(await readFile(join(root, "mock/containers/mixin-chatbot"), "utf8")).toBe(`old-image ${running}\n`);
       // The rebuild moved the tag; the rollback tag kept the original image, and is released once it is restored.
       expect(await readFile(join(root, "mock/image"), "utf8")).toBe("old-image");
       expect(existsSync(join(root, "mock/previous"))).toBe(false);
+      expect(await readFile(join(root, "mock/released"), "utf8")).toBe("mixin-chatbot:candidate-0123456789ab-0123456789abcdef\n");
       const rules = await readFile(join(root, "mock/ufw"), "utf8");
       expect(rules).toContain("ufw allow 22/tcp"); expect(rules).toContain("192.0.2.1"); expect(rules).not.toContain("192.0.2.2");
+      // The firewall rules are restored through sudo: its credentials are refreshed before the rollback starts.
+      expect(existsSync(join(root, "mock/refreshed"))).toBe(true);
     }
   } finally { await fixture.cleanup(); }
-}, 60000);
+}, 120000);
+
+// Windows' ps cannot show process groups.
+test.skipIf(!bash || !existsSync(bash) || process.platform === "win32")("cleanups run in their own process group with stdin from /dev/null, where sudo only uses the credentials refreshed before", async () => {
+  const fixture = await tempFixture("deployment-shielded-");
+  try {
+    const script = join(fixture.root, "shielded.sh");
+    await writeFile(script, `exec < "$0"
+. '${join(project, "scripts/lib/deployment.sh")}'
+id() { if [ "$1" = -u ]; then echo 1000; else command id "$@"; fi; }
+sudo() { echo "sudo $*"; }
+where() {
+    if [ "$(ps -o pgid= -p "$BASHPID")" = "$(ps -o pgid= -p "$$")" ]; then echo "same group"; else echo "own group"; fi
+    echo "stdin $(readlink /proc/self/fd/0)"
+}
+refresh_ufw_credentials
+run_ufw status
+where
+run_shielded run_ufw status
+run_shielded where
+run_shielded sh -c 'exit 7'; echo "status $?"
+`);
+    const result = await execute([bash!, script], fixture.root);
+    expect(result.output.trim().split("\n")).toEqual(["sudo -v", "sudo ufw status", "same group", `stdin ${script}`,
+      "sudo -n ufw status", "own group", "stdin /dev/null", "status 7"]);
+  } finally { await fixture.cleanup(); }
+});
+
+// Windows cannot deliver the signals to bash.
+test.skipIf(!bash || !existsSync(bash) || process.platform === "win32")("deploy.sh releases its reserved tag before the transaction pointer, from the build on, even when interrupted again meanwhile", async () => {
+  const fixture = await tempFixture("deploy-release-");
+  try {
+    const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+    const extract = (name: string) => {
+      const start = source.indexOf(`\n${name}() {\n`), end = source.indexOf("\n}\n", start);
+      expect(start).toBeGreaterThan(0);
+      return source.slice(start + 1, end + 3);
+    };
+    const script = join(fixture.root, "release.sh");
+    // Ctrl+C and a hangup reach the terminal's whole foreground process group, which this script leads, while the docker
+    // client (here a child process) removes the tag: it must finish all the same. BUILD is the build's exit status.
+    await writeFile(script, `STATE_DIR="$1" DATA_DIR="$1" HOST_GROUP_DATA_ROOT="$1" PROJECT_DIR="$1"
+. '${join(project, "scripts/lib/deployment.sh")}'
+release_transaction_candidate() { bash -c 'for signal in INT TERM HUP; do kill -s "$signal" -- "-$1"; done; sleep 0.5; echo released' - "$$"; }
+operation_finish() { echo "finished $1"; }
+print_status() { :; }; print_success() { :; }; print_error() { echo error; }; print_warning() { echo warning; }
+docker() { return 1; }; check_build_disk_space() { :; }; prepare_candidate_image() { return "$BUILD"; }
+${extract("build_workspace_candidate")}${extract("release_before_pointer")}if [ "$2" = build ]; then build_workspace_candidate; else trap release_before_pointer EXIT; fi
+exit 7
+`);
+    const run = async (mode: string, build = 0) => {
+      const result = await execute([bash!, script, fixture.root, mode], fixture.root, { ...process.env, BUILD: String(build) }, true);
+      return { code: result.code, output: result.output.trim() };
+    };
+    expect(await run("exit")).toEqual({ code: 7, output: "released\nfinished 7" });
+    // A failed or interrupted build releases the tag as well: it exists before the build ends.
+    expect(await run("build", 1)).toEqual({ code: 1, output: "error\nreleased\nfinished 1" });
+    expect(await run("build", 130)).toEqual({ code: 130, output: "warning\nreleased\nfinished 130" });
+    // Once the pointer is published the transaction's commit or rollback owns the tag.
+    await writeFile(join(fixture.root, "deploy-transaction"), "deploy-fixture");
+    expect(await run("exit")).toEqual({ code: 7, output: "finished 7" });
+  } finally { await fixture.cleanup(); }
+});
 
 test.skipIf(!bash || !existsSync(bash))("Docker rollback of an upgrade keeps the transaction until the upgrader has restored the code", async () => {
   const fixture = await tempFixture("deployment-code-restore-");

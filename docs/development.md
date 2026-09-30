@@ -123,7 +123,13 @@ Pi 两个包精确固定为 0.87.1，使用官方本地 SDK。依赖升级通过
 
 CI 配置了 Windows/Linux 检查及受限 Linux 镜像中的解析器与进程回收验证。部署验收还需检查目标机器的服务、入口和真实交付流程。
 
-常规测试里的 Docker 都是桩。真实 Docker 的部署和升级由可选测试 [real-docker.test.ts](../tests/ops/real-docker.test.ts) 验证，只能在没有真实服务的 Linux 测试机（WSL 发行版或虚拟机）上运行：`MIXIN_REAL_DOCKER=1 bun run test tests/ops/real-docker.test.ts`。测试用合成数据，在 `/var/tmp/mixin-real-docker-*` 下依次执行首次部署、升级、中断迁移预览（向进程组发 SIGINT、向 `ops.sh` 发 SIGTERM）、验证失败回滚以及回滚后再次升级，默认群根和外部群根各跑一遍。它只清理挂载源在该目录下的容器；发现其他 `mixin-chatbot*` 容器时拒绝运行。失败或设置 `MIXIN_REAL_DOCKER_KEEP=1` 时保留现场。设置 `DOCKER_HOST` 可指向 rootless 守护进程。已在 WSL Ubuntu（Docker 29，containerd 镜像存储）上以 root、docker 组普通用户和 rootless Docker 验证。SELinux 强制模式（bind mount 的 `:z` 标签）尚未验证：WSL 内核不提供 SELinux，需要另起 Fedora/RHEL 虚拟机。
+常规测试里的 Docker 都是桩。真实 Docker 的部署和升级由可选测试 [real-docker.test.ts](../tests/ops/real-docker.test.ts) 验证，只能在没有真实服务的 Linux 测试机（WSL 发行版或虚拟机）上运行：`MIXIN_REAL_DOCKER=1 bun run test tests/ops/real-docker.test.ts`。测试用合成数据，在 `/var/tmp/mixin-real-docker-*` 下依次执行首次部署、升级、中断迁移预览（向进程组发 SIGINT、向 `ops.sh` 发 SIGTERM）、验证失败回滚以及回滚后再次升级，默认群根和外部群根各跑一遍；每一步都核对容器的运行身份、镜像 ID、预览容器和本次的保留标签已清理。运行身份决定覆盖的内容：
+
+- root（rootful）：上面的流程，之后还验证 docker 组用户用 98f1b4a 的脚本部署的实例：root 经旧版恢复入口升级、停机后被杀再继续、停机后被杀再回滚，都保留原容器的 UID/GID 和已有数据的属主。
+- rootless（设置 `DOCKER_HOST` 指向 rootless 守护进程，以其所属用户运行）：上面的流程；容器以映射为部署用户的 `0:0` 运行，已保存的特权端口在停机前拒绝，或在 rootlesskit 能绑定时使用。
+- docker 组普通用户（rootful）：部署和升级在任何提问、构建和停机之前被拒绝，不创建容器或镜像。
+
+它只清理挂载源在该目录下的容器和本次测试项目的镜像；发现其他 `mixin-chatbot*` 容器时拒绝运行。失败或设置 `MIXIN_REAL_DOCKER_KEEP=1` 时保留现场。已在 WSL Ubuntu（Docker 29，containerd 镜像存储）上以 root、docker 组普通用户和 rootless Docker 验证。SELinux 强制模式（bind mount 的 `:z` 标签）尚未验证：WSL 内核不提供 SELinux，需要另起 Fedora/RHEL 虚拟机。
 
 Pi 路径适配代码的许可保留在对应源码中，开发检查补丁位于 `scripts/patches`。
 

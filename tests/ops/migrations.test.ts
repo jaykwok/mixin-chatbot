@@ -245,7 +245,7 @@ test("matching data versions skip migration code and database copies while retai
     expect(await readFile(join(f.root, "data/state/data-version.json"))).toEqual(marker);
     expect(await readdir(join(f.root, "backup/snapshots"))).toEqual(snapshots);
     await publishJson(join(f.root, "data/config/runtime.json"), { BOT_MAX_ACTIVE_REQUESTS: "invalid" });
-    await expect(preview(c)).rejects.toThrow("完整校验失败");
+    await expect(preview(c)).rejects.toThrow("当前版本配置校验失败");
   } finally { await f.cleanup(); }
 }, 30000);
 
@@ -384,7 +384,12 @@ test("current validator prevents registration of invalid runtime and delivery sc
     await publishJson(join(f.root, "data/config/runtime.json"), {});
     const db = new Database(join(f.root, "data/state/agent.sqlite"));
     db.exec("CREATE TABLE deliveries (id TEXT)"); db.close();
-    await expect(preview(c)).rejects.toThrow("待补发账本格式不受当前迁移支持");
+    // The preview validates only the configuration: before the migration a database may still have the old schema,
+    // and the pre-stop preview mounts data read-only. apply checks the databases and refuses to register them.
+    const ledgerPlan = (await preview(c)).plan!;
+    await expect(apply(c, ledgerPlan)).rejects.toThrow("待补发账本格式不受当前迁移支持");
+    expect(await json(join(f.root, "data/state/data-version.json"))).toBeNull();
+    await rollback(c);
   } finally { await f.cleanup(); }
 }, 30000);
 

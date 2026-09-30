@@ -296,10 +296,15 @@ doctor() {
     fi
 
     # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
-    local models_ok="0"
-    if [ -s "$MODELS_FILE" ] && validate_model_configuration >/dev/null 2>&1; then models_ok="1"; fi
-    check "模型配置（models.json + Pi 设置）" "$models_ok" "$([ "$models_ok" = "1" ] && echo 有效 || echo '缺少或无效')" \
-        "首次配置请使用 $(ops_command_hint deploy)；已有文件无效时，先修正 data/config/models.json 与 data/runtime/pi/settings.json。"
+    # 校验在一次性容器中按正式标签运行：部署、升级或未完成的事务期间标签可能是旧版本，跳过并说明。
+    local models_ok="0" models_detail='缺少或无效'
+    local models_fix="首次配置请使用 $(ops_command_hint deploy)；已有文件无效时，先修正 data/config/models.json 与 data/runtime/pi/settings.json。"
+    if [ ! -s "$MODELS_FILE" ]; then :
+    elif deployment_in_progress; then
+        models_detail='部署或升级尚未完成，未检查'
+        models_fix="完成或回滚上次操作（$(ops_command_hint resume) / $(ops_command_hint rollback)）后重新体检。"
+    elif validate_model_configuration >/dev/null 2>&1; then models_ok="1"; models_detail='有效'; fi
+    check "模型配置（models.json + Pi 设置）" "$models_ok" "$models_detail" "$models_fix"
 
     local secret_ok="0"
     [ -f "$WEBHOOK_SECRET_FILE" ] &&
@@ -354,6 +359,27 @@ start_bot() {
     else WA "机器人未通过本地实例健康检查；请在 $(ops_command_hint logs) 查看日志"; return 1; fi
 }
 
+# 一次性容器按正式标签 mixin-chatbot 运行；部署或升级的事务期间它仍是旧镜像（数据提交后才指向新版本），用它处理
+# 迁移中或已迁移的数据会出错。服务未运行、需要一次性容器时先非阻塞地取得部署锁（部署或升级正在进行就停止），再检查
+# 未完成的事务。锁由调用的进程持有到一次性容器结束，检查之后不会出现新的事务。
+guard_one_off_container() {
+    acquire_deploy_lock || { ER "部署或升级正在进行；服务未运行时不能用一次性容器执行，请等它结束后重试"; return 1; }
+    if [ -e "$STATE_DIR/deploy-transaction" ] || [ -e "$STATE_DIR/update-transaction" ]; then
+        ER "有未完成的部署或升级，正式镜像可能与数据不一致；请先用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
+        return 1
+    fi
+}
+
+# 只读检查（体检的模型校验）遇到部署、升级或未完成的事务时跳过，不持有锁：体检会被界面反复调用，不能挡住部署。
+# 本进程自己持有的锁（升级结束后的体检）不算。
+deployment_in_progress() {
+    local lock_path
+    [ ! -e "$STATE_DIR/deploy-transaction" ] && [ ! -e "$STATE_DIR/update-transaction" ] || return 0
+    lock_path="$(realpath -m -- "$STATE_DIR")/deploy.lock"
+    [ -e "$lock_path" ] && [ "${BOT_DEPLOY_LOCK_HELD:-}" != "$lock_path" ] || return 1
+    ! flock -n "$lock_path" true
+}
+
 # 外链运维交给容器里的 bun 脚本执行，shell 这边只负责把它跑起来。
 #
 # 删一个对象要先从公开地址反推对象名、再拼 WebDAV 地址并带上 Basic 凭据，这些知识全在
@@ -376,9 +402,12 @@ relay_admin() {
         docker exec "$CONTAINER" bun run scripts/ops/relay-admin.ts "$@"
         return $?
     fi
+    guard_one_off_container || return 1
     WA "容器未在运行，改用一次性容器执行"
+    local user
+    user="$(service_container_user)" || return 1
     docker run --rm --network host \
-        --user "$(container_user "$(stat -c '%u:%g' "$DATA_DIR")")" \
+        --user "$user" \
         -e HOME=/app/data/runtime/home \
         -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
         mixin-chatbot bun run scripts/ops/relay-admin.ts "$@"
@@ -386,8 +415,10 @@ relay_admin() {
 
 # 向导先生成确认过的草稿，随后才停机提交，退出时恢复原运行状态并移除草稿。
 relay_configure() (
-    local draft_dir="" draft_file="" container_draft="" owner="" was_running=0 stop_attempted=0
+    local draft_dir="" draft_file="" container_draft="" user="" was_running=0 stop_attempted=0
     if ! command -v docker >/dev/null 2>&1; then ER "找不到 docker"; return 1; fi
+    # 向导和写入都在一次性容器中执行，写入前还要停机：整个过程持有部署锁。
+    guard_one_off_container || return 1
     mkdir -p -- "$CONFIG_DIR" || return 1
     draft_dir="$(mktemp -d "${CONFIG_DIR}/.relay-config-XXXXXX")" || return 1
     draft_file="${draft_dir}/draft.json"
@@ -403,8 +434,9 @@ relay_configure() (
     trap 'exit 130' INT
     trap 'exit 143' TERM
     cd "$PROJECT_DIR" || return 1
-    owner="$(stat -c '%u:%g' "$DATA_DIR")" || return 1
-    if [ "$(stat -c '%u:%g' "$draft_dir")" != "$owner" ]; then chown "$owner" "$draft_dir" || return 1; fi
+    # 一次性容器以服务的运行身份读写草稿；rootless 下草稿本来就属于部署用户（容器里的 0:0）。
+    user="$(service_container_user)" || return 1
+    if [ "$(id -u)" = 0 ]; then chown "$user" "$draft_dir" || return 1; fi
     container_draft="/app/data/config/$(basename "$draft_dir")/draft.json"
     relay_config_cli() {
         local terminal=()
@@ -412,7 +444,7 @@ relay_configure() (
             terminal=(-i)
             if [ -t 0 ] && [ -t 1 ]; then terminal+=(-t); fi
         fi
-        docker run --rm "${terminal[@]}" --user "$(container_user "$owner")" -e HOME=/app/data/runtime/home \
+        docker run --rm "${terminal[@]}" --user "$user" -e HOME=/app/data/runtime/home \
             -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
             mixin-chatbot bun run scripts/config/configure-relay.ts "$1" "$container_draft"
     }
@@ -473,6 +505,8 @@ runtime_configure() (
     trap restore_runtime_configuration EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    # 未完成事务的容器和正式标签可能与数据不一致（见 guard_one_off_container）；已持有部署锁，只检查事务。
+    guard_one_off_container || return 1
     state="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.State}}')" || {
         ER '无法查询容器状态，运行参数未写入'; return 1;
     }
@@ -520,9 +554,11 @@ group_data_admin() {
         docker exec "$CONTAINER" bun run "$script" "$@"
         return $?
     fi
+    guard_one_off_container || return 1
     WA "容器未在运行，改用一次性容器执行"
-    local resolved_root="" group_root_env="/app/data/groups"
+    local resolved_root="" group_root_env="/app/data/groups" user
     local group_root_args=()
+    user="$(service_container_user)" || return 1
     if ! resolved_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null)"; then
         ER "群数据总根路径无效：$DEPLOYED_GROUP_DATA_ROOT"
         return 1
@@ -532,7 +568,7 @@ group_data_admin() {
         group_root_env="/app/group-data"
     fi
     docker run --rm \
-        --user "$(container_user "$(stat -c '%u:%g' "$DATA_DIR")")" \
+        --user "$user" \
         -e HOME=/app/data/runtime/home \
         -e GROUP_DATA_ROOT="$group_root_env" \
         "${group_root_args[@]}" \
@@ -557,6 +593,8 @@ history_clear() (
     trap restore_history_service EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    # 停服务之前取得部署锁并检查事务，整个过程持有：停机后清理在一次性容器中执行。
+    guard_one_off_container || return 1
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
         was_running=1
         stop_bot || return 1
@@ -601,7 +639,9 @@ require_git_checkout() {
         ER "找不到 git；无法自动更新"
         return 1
     fi
+    local refusal
     git_here rev-parse --is-inside-work-tree >/dev/null 2>&1 && return 0
+    if refusal="$(git_ownership_refusal)"; then ER "$refusal"; return 1; fi
     ER "${PROJECT_DIR} 不是 git 仓库，无法自动更新"
     WA "这份部署可能是解压得到的；请改用 git clone 重新部署后再使用 update"
     return 1
@@ -631,8 +671,9 @@ run_target_upgrader() {
         return 1
     fi
     operation_stage target-upgrader
-    # 升级器在后台运行以便转发中断：收到 INT/TERM 时让它按所处阶段回滚，等它结束后才清理导出目录。
-    trap forward_to_upgrader INT TERM
+    # 升级器在后台运行以便转发中断：收到 INT/TERM/HUP（Ctrl+C、终止信号、断线）时让它按所处阶段回滚，等它结束后才清理
+    # 导出目录，升级器的提交回执也在其中。
+    trap forward_to_upgrader INT TERM HUP
     bash "$UPGRADE_STAGE/scripts/deploy/upgrade.sh" "$PROJECT_DIR" "$target" ${action:+"$action"} <&0 &
     UPGRADER_PID=$!
     while :; do
@@ -640,7 +681,7 @@ run_target_upgrader() {
         kill -0 "$UPGRADER_PID" 2>/dev/null || break
     done
     UPGRADER_PID=''
-    trap - INT TERM
+    trap - INT TERM HUP
     remove_upgrade_stage
     return "$status"
 }

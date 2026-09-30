@@ -125,15 +125,24 @@ rootless_port_hint() {
 }
 
 # Docker 部署的工作区没有依赖（node_modules 只在镜像里）：此时用镜像自带的检查脚本和依赖，只读挂载 data/。
-# 容器用户与部署相同（root 部署降权到 1001），才能读取 600 权限的配置文件。
+# 部署传入本次的 image ID 和服务身份；运维入口用正式标签和 service_container_user（服务身份才能读取 600 权限的配置文件）。
 validate_model_configuration() {
+    local image="${1:-mixin-chatbot}" user="${2:-}"
     if command -v bun >/dev/null 2>&1 && [ -d "$PROJECT_DIR/node_modules" ]; then
         bun run "$PROJECT_DIR/scripts/config/validate-models.ts" "$PROJECT_DIR"
     else
-        local user=1001:1001
-        [ "$(id -u)" -eq 0 ] || user="$(container_user "$(id -u):$(id -g)")"
-        docker run --rm --network none --user "$user" -v "$PROJECT_DIR/data:/app/data:ro" mixin-chatbot bun run scripts/config/validate-models.ts /app
+        [ -n "$user" ] || user="$(service_container_user)" || return 1
+        docker run --rm --network none --user "$user" -v "$PROJECT_DIR/data:/app/data:ro" "$image" bun run scripts/config/validate-models.ts /app
     fi
+}
+
+# 运维入口的一次性容器使用的身份：服务容器 mixin-chatbot 记录的数值 UID:GID；没有容器时按 data/config 的属主。
+service_container_user() {
+    local user owner
+    user="$(docker container inspect --format '{{.Config.User}}' mixin-chatbot 2>/dev/null)" || user=''
+    if [[ "$user" =~ ^[0-9]+:[0-9]+$ ]]; then echo "$user"; return 0; fi
+    owner="$(stat -c '%u:%g' -- "$PROJECT_DIR/data/config")" || return 1
+    container_user "$owner"
 }
 
 # A pinned official release keeps Windows and Linux downloads reproducible without a JSON parser.
@@ -276,7 +285,8 @@ acquire_deploy_lock() {
 # 部署时从环境写入 runtime.json 的运行参数。升级、续做和回滚沿用 runtime.json，不采用当前终端的这些值。
 RUNTIME_ENV_KEYS=(BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_TTL_MINUTES BOT_INDEX_MAX_FILES BOT_INDEX_MAX_DEPTH BOT_RUN_TIMEOUT_SECONDS BOT_MODEL_IDLE_TIMEOUT_SECONDS BOT_MODEL_RESPONSE_TIMEOUT_SECONDS BOT_SHUTDOWN_TIMEOUT_SECONDS BOT_DELIVERY_TIMEOUT_SECONDS BOT_DOCUMENT_ENV BOT_DOCUMENT_WORK_ENABLED PI_CACHE_RETENTION BOT_ATTACHMENT_CONCURRENCY)
 
-# 升级器从目标提交导出的文件：升级器、共用脚本、迁移（只用内置模块）和决定预览基础镜像的 Dockerfile。
+# 升级器从目标提交导出的文件。旧版运维脚本按它自己的这份列表导出新版升级器，所以列表只增不减；当前升级器只用
+# upgrade.sh 和 scripts/lib，镜像另从目标提交完整导出构建上下文（见 candidate_export_context）。
 UPGRADER_EXPORT_PATHS=(scripts/deploy/upgrade.sh scripts/lib scripts/migrations src/core/data-version.ts Dockerfile)
 
 # 旧版运维脚本升级到新版时需在项目目录运行一次的引导命令；之后 ops.sh update 自行导出目标升级器。
@@ -291,6 +301,17 @@ upgrade_bootstrap_command() {
 # git 只经这里调用：GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。
 git_here() {
     GIT_TERMINAL_PROMPT=0 git -C "$PROJECT_DIR" "$@"
+}
+
+# root 升级由 docker 组用户部署的实例时，检出属于那个用户：git 拒绝以 root 使用它，因为仓库中的钩子和配置会以 root
+# 运行。是否信任由操作者决定，脚本不代为加入 safe.directory。git 因此拒绝时输出说明并返回 0，否则返回 1。
+git_ownership_refusal() {
+    local output owner
+    output="$(LC_ALL=C git_here rev-parse --is-inside-work-tree 2>&1 >/dev/null)" && return 1
+    [[ "$output" == *"dubious ownership"* ]] || return 1
+    owner="$(stat -c %U -- "$PROJECT_DIR" 2>/dev/null)" || owner='其他用户'
+    printf '%s 的 git 仓库属于 %s，git 拒绝以当前用户操作它（仓库中的钩子和配置会以当前用户运行）。确认信任这份检出后执行 git config --global --add safe.directory %s，再重试\n' \
+        "$PROJECT_DIR" "$owner" "$PROJECT_DIR"
 }
 
 # 把工作区退回升级前那个提交（升级器和旧版升级记录的回滚共用）。

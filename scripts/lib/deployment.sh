@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Deployment transaction. Call begin_deployment only after read-only preflight succeeds.
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/candidate-image.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/service-user.sh"
 # 服务商、选型和动态目录缓存一起恢复，保证回滚后的实例仍能离线解析出原模型。
 DEPLOY_FILES=(data/config data/runtime/pi/settings.json data/runtime/models-store.json data/state/bot-port data/state/deploy-mode data/state/bot-domain data/state/group-data-root)
 
 # archive_project_path is shared with ops and tunnel scripts.
 
-# 原容器使用的镜像在事务期间另存这个标签，必须在重新构建之前打上：构建会移走 mixin-chatbot 标签，
-# Docker 的 containerd 镜像存储（Docker 29 起新装默认）随即删除失去标签的镜像，回滚就无法按镜像 ID 找回原镜像。
+# 原容器使用的镜像在事务期间另存这个标签：数据提交后正式标签 mixin-chatbot 改指向候选镜像，失去标签的镜像
+# 可能被清除（containerd 镜像存储的行为并无保证），回滚就无法按镜像 ID 找回原镜像。标签也可能被管理员清除，回滚时如实报告。
 PREVIOUS_IMAGE_TAG=mixin-chatbot:previous
 
 keep_previous_image() {
@@ -25,6 +27,84 @@ release_previous_image() {
         print_warning "回滚标签 $PREVIOUS_IMAGE_TAG 清理失败；确认不再需要后可手动 docker image rm $PREVIOUS_IMAGE_TAG"
 }
 
+# 事务结束（提交并发布正式标签，或回滚完成）后移除本次候选镜像的保留标签；被改指向的标签保留并报告。
+release_transaction_candidate() {
+    declare -p CANDIDATE >/dev/null 2>&1 && [ -n "${CANDIDATE[image_tag]:-}" ] || return 0
+    release_candidate ||
+        print_warning "候选镜像的保留标签 ${CANDIDATE[image_tag]} 未移除（原因见上方）；确认不再需要后可手动 docker image rm ${CANDIDATE[image_tag]}"
+}
+
+# 收尾（回滚、中断后的清理）一旦开始就要做完：在独立的进程组中运行命令，标准输入改为 /dev/null，忽略 INT/TERM/HUP
+# 等它结束，返回它的状态；此后这些信号保持忽略，只用于收尾。终端的 Ctrl+C 和断线只发给前台进程组，到不了收尾中的
+# docker 客户端、复制、git 和管道。只让本 shell 忽略信号不够：子进程会重设处理（docker 客户端自己处理 INT/TERM），
+# 管道和命令替换的子 shell 也会恢复默认处理。后台进程组读终端会被停住，所以 sudo 在其中只用已缓存的凭据（见 run_ufw）。
+run_shielded() {
+    local pid status=0
+    set -m
+    (SHIELDED_RUN=1; "$@") </dev/null &
+    pid=$!
+    set +m
+    trap '' INT TERM HUP
+    wait "$pid" || status=$?
+    return "$status"
+}
+
+# 未完成事务的镜像和服务身份（快照中的 candidate-image 与 service-user）。恢复入口在 committed 检查、回滚或任何运行
+# 容器的操作之前调用；此后只按记录的 image ID 和 UID:GID 运行容器，不重新构建、拉取，也不按标签选择。设置 IMAGE_ID、
+# SERVICE_USER 和 CANDIDATE_PRESENT：镜像已不存在时为 0，由调用方决定（续做和需要撤销数据的回滚都拒绝）。
+# 记录缺失或无效、与事务不符、daemon 已切换、镜像不是本次构建的都返回 1，不降级按标签运行。DOCKER_ROOTLESS 已设置。
+load_transaction_runtime() {
+    local snapshot="$TRANSACTION_SNAPSHOT" status=0 hint
+    hint="请人工检查 ${snapshot}；由旧版本开始的事务请切回它记录的目标提交 ${TRANSACTION[target_sha]:0:7} 后，用那个版本继续或回滚"
+    if ! read_candidate_record "$snapshot" || ! read_service_user_record "$snapshot"; then
+        print_error "事务缺少有效的候选镜像或服务身份记录（原因见上方）；不按标签猜测镜像，也不猜测运行身份。${hint}"
+        return 1
+    fi
+    [ "${CANDIDATE[target_sha]}" = "${TRANSACTION[target_sha]}" ] ||
+        { print_error "候选镜像记录的提交 ${CANDIDATE[target_sha]:0:7} 与事务的目标提交 ${TRANSACTION[target_sha]:0:7} 不一致；${hint}"; return 1; }
+    service_user_fits_daemon "$SERVICE_USER" "$DOCKER_ROOTLESS" ||
+        { print_error "记录的服务身份与当前 Docker 的模式不符（原因见上方）；请回到开始事务时的 Docker"; return 1; }
+    candidate_verify || status=$?
+    case "$status" in
+        0) CANDIDATE_PRESENT=1 ;;
+        6) CANDIDATE_PRESENT=1; print_warning "保留标签不再指向候选镜像；执行仍只按记录的 ID ${CANDIDATE[image_id]}" ;;
+        4) CANDIDATE_PRESENT=0 ;;
+        3) print_error "Docker daemon 与开始事务时不同：拒绝继续和自动回滚，不操作另一个 Docker 上的同名容器；请回到原来的 Docker 后重试"; return 1 ;;
+        *) print_error "候选镜像核对失败（原因见上方）；${hint}"; return 1 ;;
+    esac
+    IMAGE_ID="${CANDIDATE[image_id]}"
+}
+
+# 停机后写入 backup/ 的快照的预计大小（字节）：部署快照（配置和状态文件）与迁移备份（配置、版本标记、data/state
+# 和群根中的数据库）。只用来决定门槛，剩余空间以 df 实测为准。
+snapshot_size_estimate() {
+    local group_root="$1" path files=()
+    for path in "$PROJECT_DIR/data/config" "$PROJECT_DIR/data/runtime/pi/settings.json" "$PROJECT_DIR/data/runtime/models-store.json" \
+        "$PROJECT_DIR/data/state/data-version.json" "$group_root/data-version.json" "$PROJECT_DIR"/data/state/*.sqlite* "$group_root"/stats.sqlite*; do
+        [ ! -e "$path" ] || files+=("$path")
+    done
+    if [ "${#files[@]}" -eq 0 ]; then echo 0; return 0; fi
+    du -scb -- "${files[@]}" | tail -n 1 | cut -f1
+}
+
+# 停机前复核剩余空间：data/、群根和其余参数（例如升级器的导出目录）所在文件系统各保留 CANDIDATE_DATA_RESERVE_BYTES，
+# backup/ 再加上快照的预计大小；共享剩余空间的路径需求相加（见 check_free_space）。
+check_stop_disk_space() {
+    local group_root="$1" backup="$PROJECT_DIR/backup" estimate path args=()
+    shift
+    estimate="$(snapshot_size_estimate "$group_root")" || estimate=''
+    [[ "$estimate" =~ ^[0-9]+$ ]] || { echo "无法估算快照的大小" >&2; return 1; }
+    [ -e "$backup" ] || backup="$PROJECT_DIR"
+    args=("$backup" $(( CANDIDATE_DATA_RESERVE_BYTES + estimate )))
+    for path in "$PROJECT_DIR/data" "$group_root" "$@"; do args+=("$path" "$CANDIDATE_DATA_RESERVE_BYTES"); done
+    check_free_space "${args[@]}"
+}
+
+# 迁移日志是否属于这个事务：apply 以事务快照名记下 deployment。
+migration_mentions_deployment() {
+    [ -f "$PROJECT_DIR/data/state/migration.json" ] && grep -q "\"deployment\": \"$1\"" "$PROJECT_DIR/data/state/migration.json"
+}
+
 # 部署、升级器和回滚共用的项目 UFW 规则操作。
 can_manage_ufw() {
     [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1
@@ -33,9 +113,18 @@ can_manage_ufw() {
 run_ufw() {
     if [ "$(id -u)" -eq 0 ]; then
         ufw "$@"
+    elif [ "${SHIELDED_RUN:-0}" = 1 ]; then
+        # 回滚在后台进程组中运行（run_shielded），在那里询问密码会被终端停住；凭据已在回滚开始前刷新。
+        sudo -n ufw "$@"
     else
         sudo ufw "$@"
     fi
+}
+
+# 回滚要以普通用户恢复防火墙规则时，先在前台刷新 sudo 凭据（必要时询问密码）。
+refresh_ufw_credentials() {
+    [ "$(id -u)" -ne 0 ] || return 0
+    sudo -v || print_warning "sudo 凭据未能刷新；回滚恢复防火墙规则时可能失败"
 }
 
 remove_managed_ufw_rules() {
@@ -229,18 +318,31 @@ upgrade_code_pending() {
 }
 
 rollback_deployment() {
-    local status=$? failed=0
-    trap - EXIT INT TERM
+    local status=$?
+    # Always runs as the exit handler. Further interrupts must not cut the rollback short: a terminal Ctrl+C or hangup
+    # reaches the whole foreground process group and the upgrader forwards it as TERM as well, so the steps run in their
+    # own process group (run_shielded).
+    trap - EXIT
+    trap : INT TERM HUP
     [ "$DEPLOYMENT_COMMITTED" = 0 ] || { operation_finish "$status"; return "$status"; }
     # A signal can arrive after the receipt write and before the local flag is assigned.
     if [ "${MIGRATION_APPLY_ATTEMPTED:-0}" = 0 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ] && [ "$(cat "$BOT_UPDATE_COMMIT_FILE" 2>/dev/null)" = committed ]; then operation_finish "$status"; return "$status"; fi
     operation_event error "deployment interrupted; exit=$status"
     operation_stage rollback
     set +e
+    if [ "$DEPLOY_FILES_MUTATED" = 1 ] && [ "$UFW_SNAPSHOTTED" = 1 ]; then refresh_ufw_credentials; fi
+    run_shielded restore_deployment "$status"
+    status=$?
+    operation_finish "$status"
+    exit "$status"
+}
+
+# The rollback steps, run by rollback_deployment in their own process group; returns the operation's exit status.
+restore_deployment() {
+    local status="$1" failed=0
     if [ "$DEPLOY_FILES_MUTATED" = 0 ]; then
         if [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ]; then docker start mixin-chatbot >/dev/null; fi
-        operation_finish 1
-        exit 1
+        return 1
     fi
     stop_tunnel_launcher || failed=1
     if [ -n "${tunnel_startup_log:-}" ]; then rm -f -- "$tunnel_startup_log" || failed=1; fi
@@ -252,8 +354,7 @@ rollback_deployment() {
             docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || failed=1
         else
             print_error "新容器未停止，拒绝覆盖其配置；快照保留在 $DEPLOY_SNAPSHOT"
-            operation_finish 1
-            exit 1
+            return 1
         fi
     fi
     # Data must be restored before the old container can start. A committed data marker
@@ -266,8 +367,7 @@ rollback_deployment() {
             # even when data restoration itself failed.
             if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
             print_error "数据回滚未完成或已经提交；保持停止，不恢复旧容器。"
-            operation_finish 1
-            exit 1
+            return 1
         fi
     fi
     rm -f -- "$PROJECT_DIR/data/state/verify-only"
@@ -308,11 +408,11 @@ rollback_deployment() {
     fi
     if [ "$failed" = 0 ]; then
         release_previous_image
+        release_transaction_candidate
         print_warning "已恢复配置、容器、网络入口和原运行状态；快照在 $DEPLOY_SNAPSHOT"
     else print_error "自动回滚未完成；请检查保留的快照 $DEPLOY_SNAPSHOT"; fi
     # An operator-requested rollback that completed is a success; any other rollback reports the failure.
     if [ "${ROLLBACK_REQUESTED:-0}" = 1 ] && [ "$failed" = 0 ]; then status=0
     elif [ "$status" -eq 0 ]; then status=1; fi
-    operation_finish "$status"
-    exit "$status"
+    return "$status"
 }

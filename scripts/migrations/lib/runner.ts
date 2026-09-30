@@ -32,11 +32,14 @@ async function inputs(context: Context) {
   }
   return result;
 }
-async function validate(context: Context, configProject = context.project): Promise<void> {
-  context.report?.("validate", `project=${configProject}; groups=${context.groups}`);
+// A preview validates only the configuration projected into its staging directory: the databases still have the old
+// schema before the migration, and a read-only data mount cannot open a live WAL database. apply and commit check both.
+async function validate(context: Context, projection?: string): Promise<void> {
+  context.report?.("validate", projection ? `configuration=${projection}` : `project=${context.project}; groups=${context.groups}`);
+  const args = projection ? ["--config", projection] : [context.project, context.groups, context.project];
   // Never block the event loop: the service lease heartbeat must run during validation.
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(process.execPath, [fileURLToPath(new URL("../validate.ts", import.meta.url)), configProject, context.groups, context.project], {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("../validate.ts", import.meta.url)), ...args], {
       cwd: context.project, timeout: 120_000, killSignal: "SIGKILL", windowsHide: true, stdio: ["ignore", "ignore", "pipe"],
       env: { ...process.env, GROUP_DATA_ROOT: context.groups },
     });
@@ -44,7 +47,7 @@ async function validate(context: Context, configProject = context.project): Prom
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", chunk => { errors = (errors + chunk).slice(-8192); });
     child.once("error", reject);
-    child.once("close", code => code === 0 ? resolve() : reject(new Error(`当前版本完整校验失败：${errors || code}`)));
+    child.once("close", code => code === 0 ? resolve() : reject(new Error(`当前版本${projection ? "配置" : "完整"}校验失败：${errors || code}`)));
   });
 }
 async function ensureRoots(context: Context) {

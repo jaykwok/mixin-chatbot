@@ -2,7 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { runCommand, scenarioRunner, ScenarioProcesses } from "../helpers/concurrent-scenarios.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -11,47 +11,127 @@ const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" 
 const posix = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 const token = "eyJhIjoiZml4dHVyZS1hY2NvdW50IiwidCI6ImZpeHR1cmUifQ";
 
-// Docker stub: containers are files "<image> <running>" under mock/containers; the preview writes its plan into the /preview mount.
+// Docker stub: containers are files "<image> <running> [<user> [<id>]]" under mock/containers (the user defaults to the
+// daemon's mode: 0:0 rootless, 1000:1000 rootful), images are files of their platform and labels under mock/images and
+// tags files holding an ID under mock/tags. The preview writes its plan into the /preview mount.
 // A bare "docker inspect" also matches the mixin-chatbot image, so the scripts must name the object type.
 const dockerStub = `#!/usr/bin/env bash
 mock="$FIXTURE_MOCK"
-printf '%s\\n' "$*" >> "$mock/docker.log"
+printf '%s\n' "$*" >> "$mock/docker.log"
 if [ "$1" = container ]; then shift; elif [ "$1" = inspect ]; then echo "ambiguous docker inspect: $*" >&2; exit 97; fi
 current_head() { git -C "$FIXTURE_WORK" rev-parse --short HEAD; }
+# Rootless unless the tests run as root: a rootful daemon needs a root operator.
+rootless="\${FIXTURE_ROOTLESS:-$([ "$(id -u)" = 0 ] && echo 0 || echo 1)}"
+options='[name=seccomp,profile=builtin name=cgroupns]'
+[ "$rootless" != 1 ] || options='[name=seccomp,profile=builtin name=rootless name=cgroupns]'
+ref_file() { printf '%s/tags/%s' "$mock" "$(printf '%s' "$1" | tr '/:' '__')"; }
+resolve() {
+    local id="$1"
+    if [[ "$id" != sha256:* ]]; then [ -f "$(ref_file "$1")" ] || return 1; id="$(cat "$(ref_file "$1")")"; fi
+    [ -f "$mock/images/\${id#sha256:}" ] || return 1
+    printf '%s\n' "$id"
+}
 cmd="$1"; shift
 case "$cmd" in
-    info) [ "\${FIXTURE_ROOTLESS:-0}" != 1 ] || echo '[name=seccomp,profile=builtin name=rootless name=cgroupns]'; exit 0 ;;
-    image) [ "\${FIXTURE_IMAGE:-present}" = present ] ;;
-    pull) printf 'pull %s\\n' "$1" >> "$FIXTURE_EVENTS" ;;
+    info)
+        case "\${2:-}" in
+            '') ;;
+            '{{.ID}}') echo "\${FIXTURE_DAEMON:-5eec1de4-4518-46da-a461-80c0866ec11d}" ;;
+            '{{.SecurityOptions}}') echo "$options" ;;
+            *) printf '%s|%s|overlay2|[[Backing Filesystem extfs]]|%s\n' "$(uname -n)" "$mock/docker-root" "$options" ;;
+        esac ;;
+    version) echo amd64 ;;
+    build)
+        iid='' tag='' labels=()
+        while [ "$#" -gt 1 ]; do
+            case "$1" in
+                --iidfile) iid="$2"; shift 2 ;;
+                --tag) tag="$2"; shift 2 ;;
+                --label) labels+=("\${2#*=}"); shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        printf 'build head=%s context=%s\n' "$(current_head)" "$(cat "$1/version.txt")" >> "$FIXTURE_EVENTS"
+        [ "\${FIXTURE_BUILD:-ok}" != fail ] || { echo 'fixture build failed' >&2; exit 1; }
+        id="sha256:$(printf '%s' "$tag" | sha256sum | cut -c1-64)"
+        (IFS='|'; printf 'linux|amd64|%s\n' "\${labels[*]}") > "$mock/images/\${id#sha256:}"
+        printf '%s' "$id" > "$(ref_file "$tag")"
+        # Changes to the checkout while the image builds, which the check before the stop must notice.
+        case "\${FIXTURE_DURING_BUILD:-}" in
+            version) printf 'hotfix\\n' > "$FIXTURE_WORK/version.txt" ;;
+            deploy) printf '\\n# hotfix\\n' >> "$FIXTURE_WORK/scripts/deploy/deploy.sh" ;;
+            branch) git -C "$FIXTURE_WORK" checkout --quiet -b hotfix ;;
+            commit) git -C "$FIXTURE_WORK" commit --quiet --allow-empty -m hotfix ;;
+            main) git -C "$FIXTURE_WORK" update-ref refs/heads/main "$(git -C "$FIXTURE_WORK" commit-tree 'HEAD^{tree}' -p HEAD -m hotfix)" ;;
+        esac
+        # A build that is still running when the upgrader is interrupted; its tag already exists.
+        if [ "\${FIXTURE_BUILD:-ok}" = hold ]; then echo "$$" > "$mock/build-pid"; exec sleep 30; fi
+        printf '%s\n' "$id" > "$iid" ;;
+    image)
+        sub="$1"; shift
+        case "$sub" in
+            inspect)
+                format=''; if [ "$1" = --format ]; then format="$2"; fi
+                ref="\${!#}"
+                id="$(resolve "$ref")" || { echo "Error response from daemon: No such image: $ref" >&2; exit 1; }
+                case "$format" in
+                    '{{.Id}}'|'') echo "$id" ;;
+                    '{{.Id}}|'*) printf '%s|%s\n' "$id" "$(cat "$mock/images/\${id#sha256:}")" ;;
+                    *) cut -d'|' -f5 "$mock/images/\${id#sha256:}" ;;
+                esac ;;
+            rm) rm -f -- "$(ref_file "\${!#}")" ;;
+            ls) : ;;
+            *) exit 93 ;;
+        esac ;;
+    tag)
+        id="$(resolve "$1")" || { echo "Error response from daemon: No such image: $1" >&2; exit 1; }
+        printf '%s' "$id" > "$(ref_file "$2")" ;;
     run)
-        printf '%s\\n' "$@" > "$mock/preview-args"
         preview=''; previous=''
         for arg in "$@"; do
             if [ "$previous" = -v ] && [[ "$arg" == *:/preview ]]; then preview="\${arg%:/preview}"; fi
             previous="$arg"
         done
-        printf 'preview head=%s\\n' "$(current_head)" >> "$FIXTURE_EVENTS"
+        # Only the preview is a one-off container of the upgrader; others (the model check after ops update) succeed.
+        [ -n "$preview" ] || exit 0
+        printf '%s\n' "$@" > "$mock/preview-args"
+        printf 'preview head=%s\n' "$(current_head)" >> "$FIXTURE_EVENTS"
         # A preview that waits (for example for migration decisions) until it is removed.
         [ "\${FIXTURE_PREVIEW:-ok}" != hold ] || exec sleep 30
         [ "\${FIXTURE_PREVIEW:-ok}" = ok ] || { echo '迁移预检需要确认后才能继续' >&2; exit 2; }
+        # Changes made while the preview runs, which the check before the stop must notice.
+        case "\${FIXTURE_DURING_PREVIEW:-}" in
+            config) printf '{"changed":true}' > "$FIXTURE_WORK/data/config/models.json" ;;
+            container) read -r image running user id < "$mock/containers/mixin-chatbot"
+                printf '%s %s %s replaced\n' "$image" "$running" "\${user:-0:0}" > "$mock/containers/mixin-chatbot" ;;
+            tag) rm -f "$mock"/tags/mixin-chatbot_candidate-* ;;
+            disk) : > "$mock/disk-full" ;;
+        esac
         printf '{"format":1,"fixture":"plan"}' > "$preview/migration-plan.json" ;;
     ps) for file in "$mock"/containers/*; do [ -f "$file" ] && basename "$file"; done ;;
     inspect)
-        name="\${!#}"; [ -f "$mock/containers/$name" ] || exit 1
-        read -r image running < "$mock/containers/$name"
-        case "\${2:-}" in
+        format=''; if [ "$1" = --format ]; then format="$2"; fi
+        name="\${!#}"
+        [ -f "$mock/containers/$name" ] || { echo "Error: No such container: $name" >&2; exit 1; }
+        read -r image running user id < "$mock/containers/$name"
+        [ -n "$user" ] || user="$([ "$rootless" = 1 ] && echo 0:0 || echo 1000:1000)"
+        case "$format" in
             '{{.Image}}') echo "$image" ;;
             '{{.State.Running}}') echo "$running" ;;
             '{{.State.Status}}') if [ "$running" = true ]; then echo running; else echo exited; fi ;;
+            '{{.Config.User}}') echo "$user" ;;
+            '{{.Id}}|'*) printf '%s|%s|%s|%s|\n' "\${id:-c0ffee}" "$user" "$image" "\${FIXTURE_DATA_MOUNT:-$FIXTURE_WORK/data}" ;;
         esac ;;
     stop|start)
-        name="\${!#}"; read -r image running < "$mock/containers/$name"
+        name="\${!#}"; read -r image running user id < "$mock/containers/$name"
         if [ "$cmd" = stop ]; then running=false; else running=true; fi
-        printf '%s %s\\n' "$image" "$running" > "$mock/containers/$name"
-        printf '%s %s head=%s\\n' "$cmd" "$name" "$(current_head)" >> "$FIXTURE_EVENTS" ;;
-    rename) mv -- "$mock/containers/$1" "$mock/containers/$2"; printf 'rename %s %s\\n' "$1" "$2" >> "$FIXTURE_EVENTS" ;;
-    rm) printf 'rm %s\\n' "$*" >> "$FIXTURE_EVENTS" ;;
-    tag) : ;;
+        printf '%s %s %s %s\n' "$image" "$running" "$user" "$id" > "$mock/containers/$name"
+        printf '%s %s head=%s\n' "$cmd" "$name" "$(current_head)" >> "$FIXTURE_EVENTS" ;;
+    rename) mv -- "$mock/containers/$1" "$mock/containers/$2"; printf 'rename %s %s\n' "$1" "$2" >> "$FIXTURE_EVENTS" ;;
+    # More interrupts reach the whole foreground process group (named in mock/group) while the cleanup removes the preview
+    # container: the docker client, this stub, must finish all the same.
+    rm) if [ "\${FIXTURE_RM_SIGNALS:-0}" = 1 ]; then for signal in INT TERM; do kill -s "$signal" -- "-$(cat "$mock/group")"; done; sleep 0.5; fi
+        printf 'rm %s\n' "$*" >> "$FIXTURE_EVENTS" ;;
     *) exit 93 ;;
 esac
 `;
@@ -70,6 +150,7 @@ if [ -n "$snapshot" ]; then
     printf '%s' "$snapshot" > "$FIXTURE_MOCK/snapshot"
     cp "backup/snapshots/$snapshot/transaction" "$FIXTURE_MOCK/record"
     cp "backup/snapshots/$snapshot/migration-plan.json" "$FIXTURE_MOCK/plan" 2>/dev/null || true
+    for sidecar in candidate-image service-user; do cp "backup/snapshots/$snapshot/$sidecar" "$FIXTURE_MOCK/$sidecar" 2>/dev/null || true; done
 fi
 mode="\${FIXTURE_DEPLOY:-success}"
 [ "\${DEPLOY_TRANSACTION_ACTION:-}" != rollback ] || mode="\${FIXTURE_ROLLBACK:-rollback}"
@@ -91,8 +172,24 @@ case "$mode" in
     rolled-back) restore; exit 1 ;;
     committed) printf 'committed\\n' > "$BOT_UPDATE_COMMIT_FILE"; rm -f data/state/deploy-transaction; exit 1 ;;
     fail) exit 1 ;;
+    # Waits, as a migration would, until the upgrader forwards an interrupt as TERM or a hangup reaches it, then rolls back
+    # once like the real script. The upgrader's receipt (in its export directory) must still be there meanwhile.
+    hold)
+        held_rollback() {
+            trap '' TERM HUP; kill "$!" 2>/dev/null; sleep 0.3
+            [ ! -e "$BOT_UPDATE_COMMIT_FILE" ] || printf 'deploy receipt kept\\n' >> "$FIXTURE_EVENTS"
+            restore; exit "$1"
+        }
+        trap 'held_rollback 143' TERM
+        trap 'held_rollback 129' HUP
+        printf 'deploy held\\n' >> "$FIXTURE_EVENTS"
+        sleep 30 >/dev/null 2>&1 & wait "$!"
+        exit 1 ;;
 esac
 `;
+
+const dfFunction = `() { case " $* " in *" --output=avail "*) if [ -e "$FIXTURE_MOCK/disk-full" ]; then printf 'Avail\\n1024\\n'; \
+else printf 'Avail\\n1099511627776\\n'; fi ;; *) command df "$@" ;; esac\n}`;
 
 // The upgrader is Linux-only shell code, and a single run starts about 150 processes: cheap on Linux, 20–45 ms each under
 // Git Bash on Windows. The scenarios below are independent, so they run concurrently, at most four at a time, each on its
@@ -167,11 +264,23 @@ async function upgraderFixture(prefix: string, processes: ScenarioProcesses) {
     const result = await run(["git", ...args]); expect(result.code, result.text).toBe(0); return result.text.trim();
   };
   // No MSYS_NO_PATHCONV: Git Bash must translate the POSIX project path for the native git.exe (the stubs are scripts).
-  const env = (extra: Record<string, string> = {}) => ({ PATH: `${posix(bin)}:${process.env.PATH}`, FIXTURE_EVENTS: posix(events),
-    FIXTURE_MOCK: posix(mock), FIXTURE_WORK: posix(work), FIXTURE_TOKEN: token, ...extra });
+  // The disk checks read df: an exported function (a PATH stub loses to /usr/bin under Git Bash) reports plenty of space,
+  // or almost none once mock/disk-full exists. A local unix socket endpoint lets the checks find the daemon's storage.
+  // Every command runs in work. Git Bash mounts /tmp on a TEMP directory (the test launcher's fixtures, or the user's),
+  // so the work tree can have two POSIX names; without a PWD naming it, bash takes getcwd's /tmp/... form and the scripts
+  // would see another project than the stub's container mounts. PWD pins the form the stubs use, for every entry.
+  const env = (extra: Record<string, string> = {}) => ({ PATH: `${posix(bin)}:${process.env.PATH}`, PWD: posix(work),
+    FIXTURE_EVENTS: posix(events), FIXTURE_MOCK: posix(mock), FIXTURE_WORK: posix(work), FIXTURE_TOKEN: token,
+    DOCKER_HOST: "unix:///var/run/docker.sock", "BASH_FUNC_df%%": dfFunction, ...extra });
   const clearEvents = async () => {
-    await rm(events, { force: true }); await rm(join(mock, "record"), { force: true }); await rm(join(mock, "preview-args"), { force: true });
+    for (const name of ["record", "preview-args", "candidate-image", "service-user", "disk-full"]) await rm(join(mock, name), { force: true });
+    await rm(events, { force: true });
   };
+  /** Reserved candidate tags left in the stub, and the image the official tag names. */
+  const candidateTags = async () => (await readdir(join(mock, "tags")).catch(() => [])).filter(name => name.startsWith("mixin-chatbot_candidate-"));
+  const officialTag = () => readFile(join(mock, "tags/mixin-chatbot"), "utf8").catch(() => "absent");
+  const sidecar = async (name: string) => Object.fromEntries((await readFile(join(mock, name), "utf8")).trim().split("\n")
+    .map(line => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   const upgrade = async (args: string[], extra: Record<string, string> = {}, input?: string) => {
     await clearEvents();
     return run([bash!, posix(join(stage, "scripts/deploy/upgrade.sh")), posix(work), ...args], env(extra), input);
@@ -183,14 +292,18 @@ async function upgraderFixture(prefix: string, processes: ScenarioProcesses) {
   const log = async () => existsSync(events) ? (await readFile(events, "utf8")).trim().split("\n").filter(Boolean) : [];
   const record = async () => Object.fromEntries((await readFile(join(mock, "record"), "utf8")).trim().split("\n").map(line => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   const container = (name: string) => readFile(join(mock, "containers", name), "utf8").then(text => text.trim(), () => "absent");
-  const reset = async (ref: string, running = true) => {
+  // The original container runs the old image, which the official tag names; no candidate image or tag is left.
+  const reset = async (ref: string, running = true, user = "") => {
     await git("reset", "--hard", ref);
-    await rm(join(mock, "containers"), { recursive: true, force: true }); await mkdir(join(mock, "containers"), { recursive: true });
-    await writeFile(join(mock, "containers/mixin-chatbot"), `sha256:old ${running}\n`);
+    for (const name of ["containers", "images", "tags", "docker-root"]) {
+      await rm(join(mock, name), { recursive: true, force: true }); await mkdir(join(mock, name), { recursive: true });
+    }
+    await writeFile(join(mock, "containers/mixin-chatbot"), `sha256:old ${running} ${user}\n`);
+    await writeFile(join(mock, "images/old"), "linux|amd64||||\n"); await writeFile(join(mock, "tags/mixin-chatbot"), "sha256:old");
     await rm(join(state, "deploy-transaction"), { force: true });
   };
   const fixture = { f, work, state, mock, stage, run, git, env, upgrade, ops, log, record, container, reset, old, target, processes,
-    cleanup: () => f.cleanup() };
+    candidateTags, officialTag, sidecar, cleanup: () => f.cleanup() };
   try {
     await cp(source.work, work, { recursive: true }); await cp(source.bin, bin, { recursive: true });
     // The copied Git settings still name the template's exclude file; this copy gets its own.
@@ -210,7 +323,8 @@ function unchangedCheck({ log, git, state, container }: Fixture) {
     expect(result.code, result.text).toBe(1);
     expect((await log()).filter(line => /^(stop|rename|deploy)/.test(line)), result.text).toEqual([]);
     expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
-    expect(await container("mixin-chatbot")).toBe("sha256:old true");
+    // Image and running state; a scenario may have changed the container's identity fields itself.
+    expect((await container("mixin-chatbot")).split(" ").slice(0, 2).join(" ")).toBe("sha256:old true");
   };
 }
 
@@ -307,27 +421,42 @@ scenario("restoring only the code stops at a commit made after the upgrade and f
 });
 
 scenario("target upgrader: refusals before the stop leave code, data and service untouched; an unmanaged connector is confirmed first", "target-upgrader-refusals-", async fx => {
-  const { f, work, state, stage, git, env, upgrade, log, record, reset, old, target, processes } = fx;
+  const { f, work, state, stage, git, env, upgrade, log, record, reset, candidateTags, old, target, processes } = fx;
   const unchanged = unchangedCheck(fx);
   let result: { code: number; text: string };
-  // Refusals before the stop leave code, data and service untouched.
+  // Refusals before the stop leave code, data and service untouched, and release the candidate's reserved tag.
   await reset(old);
   result = await upgrade([target], { FIXTURE_PREVIEW: "fail" });
-  await unchanged(old, result); expect(result.text).toContain("迁移预览未完成"); expect(result.text).toContain("服务尚未停止");
+  await unchanged(old, result); expect(result.text).toContain("迁移预览或配置校验未通过"); expect(result.text).toContain("服务尚未停止");
+  expect(await candidateTags()).toEqual([]);
   // Decisions (exit 2) cannot be answered by flags through the upgrader; without a terminal it says where to answer them.
   expect(result.text).toContain("迁移选择需要在交互终端中确认");
   // An interrupted preview (ops.sh forwards TERM to the upgrader) removes the named preview container before the
-  // upgrader exits, so no Docker CLI or container is left behind. Windows cannot deliver the signal to bash.
+  // upgrader exits, so no Docker CLI or container is left behind, even when INT and TERM reach its whole process group
+  // again during that cleanup; an interrupted build ends only this build's client. Windows cannot deliver the signal to bash.
   if (process.platform !== "win32") {
-    await rm(join(f.root, "events"), { force: true });
-    const held = processes.spawn([bash!, posix(join(stage, "scripts/deploy/upgrade.sh")), posix(work), target],
-      { cwd: work, env: { ...process.env, ...env({ FIXTURE_PREVIEW: "hold" }) } });
-    for (let waited = 0; !(await log()).some(line => line.startsWith("preview")) && waited < 20000; waited += 50) await Bun.sleep(50);
-    held.kill("SIGTERM");
-    const [code, { out, err }] = await Promise.all([held.exited, held.output()]);
-    expect(code, out + err).toBe(143); expect(out + err).toContain("迁移预览已中断并清理");
-    expect((await log()).filter(line => !line.startsWith("preview"))).toEqual([expect.stringMatching(/^rm -f mixin-chatbot-preview-[0-9a-f]{12}$/)]);
-    expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
+    const interrupt = async (extra: Record<string, string>, started: string) => {
+      await rm(join(f.root, "events"), { force: true });
+      const held = processes.spawn([bash!, posix(join(stage, "scripts/deploy/upgrade.sh")), posix(work), target],
+        { cwd: work, env: { ...process.env, ...env(extra) } });
+      await writeFile(join(fx.mock, "group"), String(held.pid));
+      for (let waited = 0; !(await log()).some(line => line.startsWith(started)) && waited < 20000; waited += 50) await Bun.sleep(50);
+      held.kill("SIGTERM");
+      const [code, { out, err }] = await Promise.all([held.exited, held.output()]);
+      expect(code, out + err).toBe(143);
+      expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
+      expect(await candidateTags()).toEqual([]);
+      return out + err;
+    };
+    expect(await interrupt({ FIXTURE_PREVIEW: "hold", FIXTURE_RM_SIGNALS: "1" }, "preview")).toContain("迁移预览已中断并清理");
+    expect((await log()).filter(line => !/^(build|preview)/.test(line))).toEqual([expect.stringMatching(/^rm -f mixin-chatbot-preview-[0-9a-f]{12}$/)]);
+    // The build's tag exists before its ID is known: it is claimed by the operation label and released.
+    expect(await interrupt({ FIXTURE_BUILD: "hold" }, "build")).toContain("镜像构建已中断");
+    expect((await log()).filter(line => !line.startsWith("build"))).toEqual([]);
+    const client = Number(await readFile(join(fx.mock, "build-pid"), "utf8"));
+    const alive = () => { try { process.kill(client, 0); return true; } catch { return false; } };
+    for (let waited = 0; alive() && waited < 5000; waited += 50) await Bun.sleep(50);
+    expect(alive()).toBe(false);
   }
   result = await upgrade([target], { BOT_MODEL_CACHE_RETENTION: "short" });
   await unchanged(old, result); expect(result.text).toContain("BOT_MODEL_CACHE_RETENTION 已移除");
@@ -353,6 +482,111 @@ scenario("target upgrader: refusals before the stop leave code, data and service
   await reset(old);
   result = await upgrade([target], { FIXTURE_UNMANAGED: "1" }, "y\n");
   expect(result.code, result.text).toBe(0); expect((await record()).unmanaged_tunnel).toBe("direct");
+});
+
+// ops.sh starts the upgrader in the background, so the upgrader ignores the INT of a Ctrl+C and gets it from ops.sh
+// as TERM, also after the build ran in its own process group. Before the pointer the preview container and this
+// upgrade's reserved tag are removed, even when more interrupts arrive during that cleanup; after the handoff the
+// upgrader forwards the interrupt to the deploy script, waits for its rollback and restores the code. On a hangup
+// ops.sh, too, waits for the upgrader before it removes the export directory with the upgrader's receipt. Windows
+// cannot deliver the signals.
+scenario("ops update interrupted by Ctrl+C, TERM or a hangup cleans up before the stop and rolls back after the handoff", "target-upgrader-ops-cancel-", async fx => {
+  if (process.platform === "win32") return;
+  const { f, work, mock, state, git, env, log, container, reset, candidateTags, processes, old, target } = fx;
+  const origin = join(f.root, "origin.git");
+  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/heads/main`);
+  const interrupt = async (signal: "group" | "hangup" | "ops", started: string, extra: Record<string, string>) => {
+    await reset(old); await rm(join(f.root, "events"), { force: true });
+    const held = processes.spawn([bash!, "scripts/ops/ops.sh", "update"], { cwd: work, env: { ...process.env, ...env(extra) } });
+    // ops.sh leads its own process group, as the foreground job of a terminal would.
+    await writeFile(join(mock, "group"), String(held.pid));
+    for (let waited = 0; !(await log()).some(line => line.startsWith(started)) && waited < 20000; waited += 50) await Bun.sleep(50);
+    if (signal === "ops") held.kill("SIGTERM"); else process.kill(-held.pid, signal === "group" ? "SIGINT" : "SIGHUP");
+    const [code, { out, err }] = await Promise.all([held.exited, held.output()]);
+    expect(code, out + err).not.toBe(0);
+    expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
+    expect((await readdir(join(work, "tmp"))).filter(name => name.startsWith("upgrade-") && name !== "upgrade-fixture")).toEqual([]);
+    return out + err;
+  };
+  for (const [signal, extra] of [["group", {}], ["ops", {}], ["ops", { FIXTURE_RM_SIGNALS: "1" }]] as const) {
+    expect(await interrupt(signal, "preview", { FIXTURE_PREVIEW: "hold", ...extra })).toContain("迁移预览已中断并清理");
+    expect((await log()).filter(line => !/^(build|preview)/.test(line))).toEqual([expect.stringMatching(/^rm -f mixin-chatbot-preview-[0-9a-f]{12}$/)]);
+    expect(await candidateTags()).toEqual([]);
+  }
+  // The stub deploy script's rollback does not release the reserved tag; the real one does (deployment.test.ts).
+  for (const signal of ["group", "hangup", "ops"] as const) {
+    expect(await interrupt(signal, "deploy held", { FIXTURE_DEPLOY: "hold" })).toContain("升级失败，已回滚");
+    expect(await container("mixin-chatbot")).toBe("sha256:old true");
+    expect((await log()).filter(line => /^(deploy|rename|start)/.test(line))).toEqual(["rename mixin-chatbot mixin-chatbot-rollback",
+      expect.stringMatching(/^deploy action=continue /), "deploy held", "deploy receipt kept", "rename mixin-chatbot-rollback mixin-chatbot",
+      `start mixin-chatbot head=${target.slice(0, 7)}`]);
+  }
+});
+
+scenario("target upgrader: the operator is checked before any question and the service identity before any build; an unclear identity is refused", "target-upgrader-identity-", async fx => {
+  const { mock, upgrade, log, reset, old, target } = fx;
+  const unchanged = unchangedCheck(fx);
+  const root = process.platform !== "win32" && process.getuid!() === 0;
+  let result: { code: number; text: string };
+  // A rootful daemon needs root and a rootless one its own user: refused before any question, build or change.
+  await reset(old);
+  result = await upgrade([target], { FIXTURE_ROOTLESS: root ? "1" : "0", FIXTURE_UNMANAGED: "1" }, "y\n");
+  await unchanged(old, result); expect(await log()).toEqual([]); expect(result.text).not.toContain("?>");
+  expect(result.text).toContain(root ? "rootless 模式" : "sudo scripts/ops/ops.sh update");
+  // The service identity comes from the original container, checked before anything else; an unclear one is refused.
+  const refusedIdentity = async (message: string, extra: Record<string, string> = {}) => {
+    const refused = await upgrade([target], extra);
+    expect(refused.code, refused.text).toBe(1); expect(await log()).toEqual([]); expect(refused.text).toContain(message);
+    expect(refused.text).toContain("服务和数据未改动");
+  };
+  await reset(old, true, "appuser");
+  await refusedIdentity("不是数值 UID:GID（appuser）");
+  await reset(old, true, root ? "0:0" : "1000:1000");
+  await refusedIdentity(root ? "rootful Docker 下服务不应以 root（0:0）运行" : "rootless Docker 下服务应以映射为部署用户的 0:0 运行");
+  await reset(old);
+  await refusedIdentity("不是本项目的", { FIXTURE_DATA_MOUNT: "/elsewhere/data" });
+  await rm(join(mock, "containers/mixin-chatbot"));
+  await refusedIdentity("找不到原容器 mixin-chatbot");
+});
+
+scenario("target upgrader: a failed build, too little disk space or any input changed after the preview stops before the stop", "target-upgrader-recheck-", async fx => {
+  const { work, mock, upgrade, log, reset, candidateTags, officialTag, old, target } = fx;
+  const unchanged = unchangedCheck(fx);
+  let result: { code: number; text: string };
+  // A failed build and a disk too small to build stop before the preview; nothing is tagged or changed.
+  await reset(old);
+  result = await upgrade([target], { FIXTURE_BUILD: "fail" });
+  await unchanged(old, result); expect(result.text).toContain("镜像构建失败");
+  expect(await log()).toEqual([`build head=${old.slice(0, 7)} context=new`]); expect(await candidateTags()).toEqual([]);
+  // (upgrade() clears mock/disk-full, so this run starts the upgrader directly.)
+  await rm(join(fx.f.root, "events"), { force: true }); await writeFile(join(mock, "disk-full"), "");
+  result = await fx.run([bash!, posix(join(fx.stage, "scripts/deploy/upgrade.sh")), posix(work), target], fx.env());
+  await unchanged(old, result); expect(result.text).toContain("磁盘空间不足"); expect(result.text).toContain("需要");
+  expect(await log()).toEqual([]);
+  // The checkout must stay as it was checked when the upgrade started. Changes made while the image builds stop the upgrade
+  // before the stop: an edit to a file the target also changes, one the fast-forward would keep (the deploy script that
+  // runs after the stop), another branch, a new commit, and main moving while a detached HEAD is upgraded (confirmed).
+  for (const change of ["version", "deploy", "branch", "commit", "main"]) {
+    await reset(old);
+    if (change === "main") await fx.git("checkout", "--quiet", "--detach");
+    result = await upgrade([target], { FIXTURE_DURING_BUILD: change }, change === "main" ? "y\n" : undefined);
+    expect(result.code, result.text).toBe(1); expect(result.text, change).toContain("升级开始后检出发生了变化");
+    expect((await log()).filter(line => !/^(build|preview) /.test(line)), change).toEqual([]);
+    expect(await candidateTags()).toEqual([]); expect(existsSync(join(fx.state, "deploy-transaction"))).toBe(false);
+    expect(await fx.container("mixin-chatbot")).toBe("sha256:old true");
+    if (change === "branch") { await fx.git("checkout", "--quiet", "main"); await fx.git("branch", "--quiet", "-D", "hotfix"); }
+    if (change === "main") await fx.git("checkout", "--quiet", "main");
+  }
+  // Anything that changes between the preview and the stop stops the upgrade before the stop; the reserved tag is released.
+  for (const [change, message] of [["config", "预览之后配置或版本标记发生了变化"], ["container", "原容器 mixin-chatbot 在准备期间被删除、替换或改动"],
+    ["tag", "候选镜像核对未通过"], ["disk", "剩余空间不够写入停机后的快照"]] as const) {
+    await reset(old);
+    result = await upgrade([target], { FIXTURE_DURING_PREVIEW: change });
+    await unchanged(old, result); expect(result.text, change).toContain(message);
+    expect(await log()).toEqual([`build head=${old.slice(0, 7)} context=new`, `preview head=${old.slice(0, 7)}`]);
+    expect(await candidateTags()).toEqual([]); expect(await officialTag()).toBe("sha256:old");
+    await writeFile(join(work, "data/config/models.json"), "{}");
+  }
 });
 
 scenario("target upgrader: failures after the handoff roll back automatically, committed data keeps the new code, and a failed rollback waits for an explicit one", "target-upgrader-failures-", async fx => {
@@ -410,6 +644,14 @@ scenario("target upgrader: an upgrade interrupted before the checkout continues 
   result = await upgrade([target]);
   expect(result.code, result.text).toBe(1); expect(result.text).toContain("resume"); expect(result.text).toContain("未完成的升级");
   expect(await log()).toEqual([]);
+  // Continue does not switch a checkout with changes to tracked files: the fast-forward would keep them, and the deploy
+  // script that runs next would not be the target's.
+  await writeFile(join(fx.work, "scripts/deploy/deploy.sh"), "# hotfix\n", { flag: "a" });
+  result = await upgrade([target, "continue"]);
+  expect(result.code, result.text).toBe(1); expect(result.text).toContain("已跟踪文件有未提交的改动，不切换代码");
+  expect(result.text).toContain("scripts/deploy/deploy.sh"); expect(await log()).toEqual([]);
+  expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(true);
+  await git("checkout", "--", "scripts/deploy/deploy.sh");
   // Continue checks out the recorded target and hands over without a marker or token.
   result = await upgrade([target, "continue"]);
   expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级完成");
@@ -423,64 +665,209 @@ scenario("target upgrader: an upgrade interrupted before the checkout continues 
   result = await upgrade([target, "rollback"]);
   expect(result.code, result.text).toBe(1); expect(result.text).toContain("数据迁移已经开始");
   await rm(join(state, "migration.json"));
+  // Recovery reads the recorded image first: on another Docker daemon it refuses both ways before touching any container.
+  for (const action of ["continue", "rollback"]) {
+    result = await upgrade([target, action], { FIXTURE_DAEMON: "feb63570-4e9c-4408-bcc5-f4ddbfad1aa3" });
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("Docker daemon 与开始事务时不同"); expect(await log()).toEqual([]);
+  }
   await writeFile(join(state, "bot-port"), "3033");
   result = await upgrade([target, "rollback"]);
   expect(result.code, result.text).toBe(0);
   expect(await log()).toEqual(["rename mixin-chatbot-rollback mixin-chatbot", `start mixin-chatbot head=${oldShort}`]);
   expect(await readFile(join(state, "bot-port"), "utf8")).toBe("2022");
   expect(existsSync(join(state, "deploy-transaction"))).toBe(false); expect(await git("rev-parse", "HEAD")).toBe(old);
+  // The completed rollback released the candidate's reserved tag, and the official tag still names the old image.
+  expect(await fx.candidateTags()).toEqual([]); expect(await fx.officialTag()).toBe("sha256:old");
+  // A candidate image removed meanwhile (for example by image prune -a) cannot be rebuilt in its place: continuing is
+  // refused, while a rollback that never reached the migration needs no candidate and restores the original container.
+  await interrupted();
+  await rm(join(fx.mock, "images"), { recursive: true }); await mkdir(join(fx.mock, "images"));
+  await writeFile(join(fx.mock, "images/old"), "linux|amd64||||\n");
+  result = await upgrade([target, "continue"]);
+  expect(result.code, result.text).toBe(1); expect(result.text).toContain("重新构建的镜像不能代替"); expect(await log()).toEqual([]);
+  result = await upgrade([target, "rollback"]);
+  expect(result.code, result.text).toBe(0); expect(await git("rev-parse", "HEAD")).toBe(old);
+  expect(await fx.container("mixin-chatbot")).toBe("sha256:old true");
 });
 
-scenario("target upgrader: a new upgrade previews read-only, records every choice before the stop and hands over with stdin closed; rootless previews and low ports", "target-upgrader-new-", async fx => {
-  const { work, state, mock, stage, git, upgrade, log, record, reset, old, target } = fx;
+// Interrupts reach the upgrader's whole process group, as a terminal's Ctrl+C and hangup do, while it restores the code:
+// in the rollback before the handoff (after a TERM during the checkout) and after the deploy script has rolled back. Git
+// hooks send them at those points; git and the hooks run on and the code is restored. A hangup while the deploy script
+// runs is forwarded like TERM: the deploy script rolls back, then the upgrader restores the code. Windows cannot deliver
+// the signals to bash.
+scenario("target upgrader: interrupts reaching its process group while it restores the code, and a hangup after the handoff, still roll back completely", "target-upgrader-checkout-signal-", async fx => {
+  if (process.platform === "win32") return;
+  const { f, work, mock, state, stage, git, env, log, container, reset, candidateTags, processes, old, target } = fx;
+  const hooks = join(f.root, "hooks"), group = posix(join(mock, "group")), merged = posix(join(mock, "merged"));
+  await mkdir(hooks, { recursive: true });
+  await writeFile(join(hooks, "post-merge"), `#!/usr/bin/env bash\n: > '${merged}'\n[ "\${FIXTURE_MERGE_TERM:-0}" != 1 ] || kill -TERM "$(cat '${group}')"\n`);
+  await writeFile(join(hooks, "post-checkout"), `#!/usr/bin/env bash\n[ -f '${merged}' ] || exit 0\nrm -f '${merged}'\n` +
+    `for signal in INT TERM HUP; do kill -s $signal -- "-$(cat '${group}')"; done\nsleep 0.5\n`);
+  for (const name of ["post-merge", "post-checkout"]) await chmod(join(hooks, name), 0o755);
+  await git("config", "core.hooksPath", posix(hooks));
+  const upgrade = async (extra: Record<string, string>, hangupAfter?: string) => {
+    await reset(old); await rm(join(f.root, "events"), { force: true });
+    const held = processes.spawn([bash!, posix(join(stage, "scripts/deploy/upgrade.sh")), posix(work), target], { cwd: work, env: { ...process.env, ...env(extra) } });
+    // The upgrader leads its own process group, as the foreground job of a terminal would.
+    await writeFile(join(mock, "group"), String(held.pid));
+    if (hangupAfter) {
+      for (let waited = 0; !(await log()).includes(hangupAfter) && waited < 20000; waited += 50) await Bun.sleep(50);
+      process.kill(-held.pid, "SIGHUP");
+    }
+    const [code, { out, err }] = await Promise.all([held.exited, held.output()]);
+    const text = out + err;
+    expect(existsSync(join(mock, "merged")), text).toBe(false);
+    expect(await git("rev-parse", "HEAD"), text).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
+    expect(await container("mixin-chatbot")).toBe("sha256:old true"); expect(await container("mixin-chatbot-rollback")).toBe("absent");
+    return { code, text };
+  };
+  let result = await upgrade({ FIXTURE_MERGE_TERM: "1" });
+  expect(result.code, result.text).toBe(143); expect(result.text).toContain("已恢复配置、容器、网络入口和原运行状态");
+  expect((await log()).filter(line => !/^(build|preview)/.test(line))).toEqual([
+    `stop mixin-chatbot head=${old.slice(0, 7)}`, "rename mixin-chatbot mixin-chatbot-rollback",
+    "rename mixin-chatbot-rollback mixin-chatbot", `start mixin-chatbot head=${old.slice(0, 7)}`]);
+  expect(await candidateTags()).toEqual([]);
+  result = await upgrade({ FIXTURE_DEPLOY: "rolled-back" });
+  expect(result.code, result.text).toBe(1); expect(result.text).toContain("升级失败，已回滚");
+  result = await upgrade({ FIXTURE_DEPLOY: "hold" }, "deploy held");
+  expect(result.code, result.text).toBe(129); expect(result.text).toContain("升级失败，已回滚");
+  await git("config", "--unset", "core.hooksPath");
+});
+
+// The first upgrade to a version with candidate images starts from 98f1b4a: its recovery entry (ops.sh resume/rollback,
+// and the TUI that shows the transaction and runs them) reads the record with the checked-out old code and exports the
+// target's upgrader by its own UPGRADER_EXPORT_PATHS. The history must include that commit (CI checks out fetch-depth 0).
+const LEGACY_ENTRY = "98f1b4a94575ebeb0f4653e221ad6c701a00598e";
+const LEGACY_PATHS = ["scripts/ops/ops.sh", "scripts/lib", "scripts/ops/tui/transaction.ts", "scripts/ops/tui/platform.ts", "src/core/data-version.ts"];
+
+/**
+ * A commit after the fixture's old one whose recovery entry and libraries are those of 98f1b4a, and after it a target
+ * with the fixture target's tree, so that main fast-forwards to it.
+ */
+async function legacyCommits({ run, git, work, reset, old, target, processes }: Fixture) {
+  const available = await runCommand(processes, project, ["git", "cat-file", "-e", `${LEGACY_ENTRY}^{commit}`]);
+  expect(available.code, `需要包含 ${LEGACY_ENTRY} 的 git 历史（CI 的 checkout 使用 fetch-depth: 0）`).toBe(0);
+  await reset(old);
+  await rm(join(work, "scripts/lib"), { recursive: true });
+  const exported = await run([bash!, "-c", `git -C '${posix(project)}' archive ${LEGACY_ENTRY} ${LEGACY_PATHS.join(" ")} | tar -x -C .`]);
+  expect(exported.code, exported.text).toBe(0);
+  await git("add", "-A"); await git("commit", "-m", "legacy entry");
+  const legacy = await git("rev-parse", "HEAD");
+  return { legacy, next: await git("commit-tree", `${target}^{tree}`, "-p", legacy, "-m", "fixture-new") };
+}
+
+/** What the old TUI's maintenance view reads to offer continuing or rolling back. */
+async function legacyTui({ run, work }: Fixture) {
+  const module = JSON.stringify(pathToFileURL(join(work, "scripts/ops/tui/transaction.ts")).href);
+  const result = await run([process.execPath, "-e", `const { loadPendingTransaction: load } = await import(${module}); const p = load();
+    console.log(JSON.stringify(p && { operation: p.operation, target: p.targetSha, committed: p.committed, restore: p.codeRestorePending }));`]);
+  expect(result.code, result.text).toBe(0);
+  return JSON.parse(result.text.trim().split("\n").pop()!);
+}
+
+scenario("first transition: the 98f1b4a recovery entry continues or rolls back an upgrade the new upgrader left before the checkout", "target-upgrader-legacy-", async fx => {
+  const { state, git, upgrade, ops, log } = fx;
+  const { legacy, next } = await legacyCommits(fx);
+  // The new upgrader published the pointer and stopped the service; the code is still the old one.
+  const interrupted = async () => {
+    await fx.reset(legacy);
+    const failed = await upgrade([next], { FIXTURE_DEPLOY: "pending", FIXTURE_ROLLBACK: "fail" });
+    expect(failed.code, failed.text).toBe(1);
+    expect(existsSync(join(state, "deploy-transaction")), failed.text).toBe(true);
+    await git("reset", "--hard", legacy);
+    expect(await legacyTui(fx)).toEqual({ operation: "upgrade", target: next, committed: false, restore: false });
+  };
+  await interrupted();
+  // The TUI runs the old ops.sh; it exports the target's upgrader, which continues with the recorded image.
+  let result = await ops(["resume"], { MIXIN_OPS_TUI: "1" });
+  expect(result.text).toContain("升级完成");
+  expect(await log()).toEqual([`deploy action=continue handoff= token=none receipt=[] stdin= tty=no head=${next.slice(0, 7)}`]);
+  expect(await git("rev-parse", "HEAD")).toBe(next); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
+  await interrupted();
+  result = await ops(["rollback"], { MIXIN_OPS_TUI: "1" });
+  expect(result.code, result.text).toBe(0);
+  expect(await log()).toEqual(["rename mixin-chatbot-rollback mixin-chatbot", `start mixin-chatbot head=${legacy.slice(0, 7)}`]);
+  expect(await git("rev-parse", "HEAD")).toBe(legacy); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
+  expect(await fx.candidateTags()).toEqual([]); expect(await fx.officialTag()).toBe("sha256:old");
+  expect(await fx.container("mixin-chatbot")).toBe("sha256:old true");
+});
+
+scenario("first transition: the 98f1b4a recovery entry finishes a rollback whose code was restored before the pointer was cleared", "target-upgrader-legacy-restore-", async fx => {
+  const { work, state, git, upgrade, ops, log } = fx;
+  const { legacy, next } = await legacyCommits(fx);
+  // The data, configuration and container were rolled back and the code restore failed; then the old code came back
+  // without the pointer being cleared.
+  await fx.reset(legacy);
+  const failed = await upgrade([next], { FIXTURE_DEPLOY: "pending", FIXTURE_INDEX_LOCK: "1" });
+  expect(failed.code, failed.text).toBe(1); expect(failed.text).toContain("只恢复代码");
+  await rm(join(work, ".git/index.lock")); await git("reset", "--hard", legacy);
+  expect(await legacyTui(fx)).toEqual({ operation: "upgrade", target: next, committed: false, restore: true });
+  let result = await ops(["resume"], { MIXIN_OPS_TUI: "1" });
+  expect(result.code, result.text).toBe(1); expect(result.text).toContain("不能继续");
+  result = await ops(["rollback"], { MIXIN_OPS_TUI: "1" });
+  expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级已回滚");
+  expect(await log()).toEqual([]);
+  expect(await git("rev-parse", "HEAD")).toBe(legacy); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
+  expect(await fx.container("mixin-chatbot")).toBe("sha256:old true");
+});
+
+scenario("target upgrader: a new upgrade builds the target once, previews in that image as the original service identity, records every choice before the stop and hands over with stdin closed; low ports under rootless", "target-upgrader-new-", async fx => {
+  const { work, state, mock, stage, git, upgrade, log, record, reset, candidateTags, officialTag, sidecar, old, target } = fx;
   const short = target.slice(0, 7);
   const oldShort = old.slice(0, 7);
   const groups = posix(join(work, "data/groups"));
   const unchanged = unchangedCheck(fx);
-  // A new upgrade: preview in the target's Bun base image with data mounted read-only, record every choice, stop, check out,
-  // then hand over to the target deploy script with the snapshot as marker and stdin closed. Terminal overrides are ignored.
+  // Non-root test runs see a rootless daemon, whose service runs as the mapped 0:0. Root runs see a rootful daemon and an
+  // instance deployed by a docker group user: its 1000:1000 is kept, not replaced by the image's 1001.
+  const root = process.platform !== "win32" && process.getuid!() === 0;
+  const identity = root ? "1000:1000" : "0:0";
+  // A new upgrade builds the target commit (not the work tree, still at the old commit) once before the stop, previews in
+  // that image with data mounted read-only, records every choice with the image and the identity, stops, checks out, then
+  // hands over to the target deploy script with the snapshot as marker and stdin closed. Terminal overrides are ignored.
   await reset(old);
   let result = await upgrade([target], { BOT_PORT: "9999", DEPLOY_MODE: "cloudflare", GROUP_DATA_ROOT: "/elsewhere", BOT_DEBUG: "1" }, "leftover\n");
   expect(result.code, result.text).toBe(0); expect(result.text).toContain(`升级完成：${oldShort} -> ${short}`);
   expect(result.text).toContain("忽略当前终端的环境变量：BOT_PORT DEPLOY_MODE GROUP_DATA_ROOT BOT_DEBUG");
   expect(result.text).toContain("fixture-new");
   const snapshot = await readFile(join(mock, "snapshot"), "utf8");
-  expect(await log()).toEqual([`preview head=${oldShort}`, `stop mixin-chatbot head=${oldShort}`, "rename mixin-chatbot mixin-chatbot-rollback",
-    `deploy action=continue handoff=${snapshot} token=none receipt=[] stdin= tty=no head=${short}`]);
+  expect(await log()).toEqual([`build head=${oldShort} context=new`, `preview head=${oldShort}`, `stop mixin-chatbot head=${oldShort}`,
+    "rename mixin-chatbot mixin-chatbot-rollback", `deploy action=continue handoff=${snapshot} token=none receipt=[] stdin= tty=no head=${short}`]);
+  const candidate = await sidecar("candidate-image");
+  expect(candidate).toEqual({ format: "1", source: "commit", target_sha: target, image_id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+    image_tag: expect.stringMatching(/^mixin-chatbot:candidate-[0-9a-f]{12}-[0-9a-f]{16}$/), daemon_id: "5eec1de4-4518-46da-a461-80c0866ec11d",
+    project_id: expect.stringMatching(/^[0-9a-f]{12}$/), operation_id: expect.stringMatching(/^[0-9a-f]{16}$/) });
+  expect(await sidecar("service-user")).toEqual({ format: "1", user: identity, source: "container" });
+  // The reserved tag keeps the candidate until the deploy script finishes; the official tag moves only after the data commit.
+  expect(await candidateTags()).toEqual([candidate.image_tag.replace(":", "_")]);
+  expect(await officialTag()).toBe("sha256:old");
+  expect(existsSync(join(stage, "build-context"))).toBe(false);
   const args = (await readFile(join(mock, "preview-args"), "utf8")).trim().split("\n");
   const mounts = args.flatMap((arg, index) => args[index - 1] === "-v" ? [arg] : []);
-  expect(mounts).toEqual([`${posix(work)}/data:/app/data:ro`, `${posix(work)}/logs:/app/logs`, `${posix(stage)}:/upgrade:ro`, `${posix(stage)}/preview:/preview`]);
-  expect(args.slice(args.indexOf("oven/bun:1.4.2-debian"))).toEqual(["oven/bun:1.4.2-debian", "bun", "--no-install", "/upgrade/scripts/migrations/run.ts",
-    "preview", "--decisions-only", "--project", "/app", "--groups", "/app/data/groups", "--scratch", "/preview", "--plan", "/preview/migration-plan.json"]);
+  expect(mounts).toEqual([`${posix(work)}/data:/app/data:ro`, `${posix(work)}/logs:/app/logs`, `${posix(stage)}/preview:/preview`]);
+  expect(args.slice(args.indexOf(candidate.image_id))).toEqual([candidate.image_id, "bun", "run", "scripts/migrations/run.ts",
+    "preview", "--project", "/app", "--groups", "/app/data/groups", "--scratch", "/preview", "--plan", "/preview/migration-plan.json"]);
   expect(args).toContain("GROUP_DATA_ROOT=/app/data/groups");
+  expect(args[args.indexOf("--user") + 1]).toBe(identity); expect(args[args.indexOf("--network") + 1]).toBe("none");
   expect(await record()).toEqual({ format: "1", operation: "upgrade", snapshot, target_sha: target, original_sha: old, original_branch: "main",
     original_group_root: groups, target_group_root: groups, was_running: "1", bot_port: "2022", deploy_mode: "direct", bot_domain: "bot.example.com",
     domain_action: "persist", unmanaged_tunnel: "", platform_ip: expect.any(String), reconfigure_ai: "0" });
   expect(await readFile(join(mock, "plan"), "utf8")).toBe('{"format":1,"fixture":"plan"}');
   expect(await git("rev-parse", "HEAD")).toBe(target);
-  // The preview runs as the deploying user (root deploys drop to 1001). Rootless Docker maps other UIDs to the
-  // subordinate range, which cannot read the deploying user's files; there the container's root is that user.
-  const user = (list: string[]) => list[list.indexOf("--user") + 1];
-  const root = process.platform !== "win32" && process.getuid!() === 0;
-  if (process.platform !== "win32") expect(user(args)).toBe(root ? "1001:1001" : `${process.getuid!()}:${process.getgid!()}`);
-  expect(user(args)).not.toBe("0:0");
-  await reset(old);
-  result = await upgrade([target], { FIXTURE_ROOTLESS: "1" });
-  expect(result.code, result.text).toBe(0);
-  expect(user((await readFile(join(mock, "preview-args"), "utf8")).trim().split("\n"))).toBe(root ? "1001:1001" : "0:0");
   // Rootless Docker cannot publish a saved privileged port (rootlesskit listens as the deploying user): the upgrade
-  // stops before the preview and the stop instead of failing at the container start. Rootful Docker keeps upgrading.
+  // stops before the build and the stop instead of failing at the container start. Rootful Docker keeps upgrading.
   const kernel = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
   const start = process.platform !== "win32" && existsSync(kernel) ? Number((await readFile(kernel, "utf8")).trim()) : 1024;
   if (start > 1) {
     const low = String(Math.min(1011, start - 1));
     await writeFile(join(state, "bot-port"), low);
     await reset(old);
-    result = await upgrade([target], { FIXTURE_ROOTLESS: "1" });
-    await unchanged(old, result); expect(await log()).toEqual([]);
-    expect(result.text).toContain(`rootless Docker 不能发布低于 ${start} 的端口 ${low}`); expect(result.text).toContain("服务尚未停止");
     result = await upgrade([target]);
-    expect(result.code, result.text).toBe(0); expect((await record()).bot_port).toBe(low);
+    if (root) {
+      expect(result.code, result.text).toBe(0); expect((await record()).bot_port).toBe(low);
+    } else {
+      await unchanged(old, result); expect(await log()).toEqual([]);
+      expect(result.text).toContain(`rootless Docker 不能发布低于 ${start} 的端口 ${low}`); expect(result.text).toContain("服务尚未停止");
+    }
     await writeFile(join(state, "bot-port"), "2022");
   }
 });
@@ -509,18 +896,17 @@ scenario("target upgrader: a failed code restore keeps the transaction, marked s
   expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
 });
 
-scenario("target upgrader: an external group root is mounted read-only and a missing base image pulled; missing registered roots stop before any change", "target-upgrader-roots-", async fx => {
-  const { f, work, state, mock, upgrade, log, record, reset, old, target } = fx;
+scenario("target upgrader: an external group root is mounted read-only; missing registered roots stop before any change", "target-upgrader-roots-", async fx => {
+  const { f, work, state, mock, upgrade, record, reset, old, target } = fx;
   const groups = posix(join(work, "data/groups"));
   const unchanged = unchangedCheck(fx);
   let result: { code: number; text: string };
-  // An external group root is mounted read-only at the service path; a missing base image is pulled first.
+  // An external group root is mounted read-only at the service path.
   const external = join(f.root, "external groups");
   await mkdir(external); await writeFile(join(state, "group-data-root"), posix(external));
   await reset(old);
-  result = await upgrade([target], { FIXTURE_IMAGE: "missing" });
+  result = await upgrade([target]);
   expect(result.code, result.text).toBe(0);
-  expect((await log())[0]).toBe("pull oven/bun:1.4.2-debian");
   const externalArgs = (await readFile(join(mock, "preview-args"), "utf8")).trim().split("\n");
   expect(externalArgs).toContain(`${posix(external)}:/app/group-data:ro`); expect(externalArgs).toContain("/app/group-data");
   expect((await record()).target_group_root).toBe(posix(external));

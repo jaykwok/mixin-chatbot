@@ -15,7 +15,8 @@ for (const shell of ["powershell", "bash"] as const) {
   test.skipIf(shell === "powershell" ? process.platform !== "win32" : !bash || !existsSync(bash))(
     shell + " 运行参数预检后停机，保留停止状态，应用或健康检查失败恢复原配置和服务", async () => {
       for (const scenario of ["running", "stopped", "missing", "precheck-fail", "apply-fail", "stop-fail", "health-fail", "rollback-fail", "foreign",
-        ...(shell === "powershell" ? ["foreground"] : ["paused"])]) {
+        // "guarded": an unfinished deployment or upgrade, whose containers and tag may not match the data.
+        ...(shell === "powershell" ? ["foreground"] : ["paused", "guarded"])]) {
         const fixture = await tempFixture("runtime-ops-" + scenario + "-");
         try {
           const events = join(fixture.root, "events.txt"), state = join(fixture.root, "state.txt");
@@ -72,6 +73,7 @@ for (const shell of ["powershell", "bash"] as const) {
               "#!/usr/bin/env bash", "set -uo pipefail",
               'PROJECT_DIR="$FIXTURE_ROOT"; DATA_DIR="$PROJECT_DIR/data"; CONFIG_DIR="$DATA_DIR/config"; CONTAINER=fixture',
               'P() { :; }; OK() { :; }; ER() { printf "%s\\n" "$1"; }; acquire_deploy_lock() { :; }',
+              'guard_one_off_container() { [ "$FIXTURE_SCENARIO" != guarded ] || { ER "unfinished transaction"; return 1; }; }',
               'record() { printf "%s\\n" "$1" >> "$FIXTURE_EVENTS"; }',
               'fixture_config() {',
               '  local mode="§{@: -2:1}" name="§{@: -1}"',
@@ -122,7 +124,7 @@ for (const shell of ["powershell", "bash"] as const) {
           const success = ["running", "stopped", "missing"].includes(scenario);
           expect(code, scenario + "\n" + stdout + stderr).toBe(success ? 0 : 1);
           const recorded = (await readFile(events, "utf8")).trim().split(/\r?\n/).filter(Boolean);
-          const expected = scenario === "paused" || (scenario === "foreign" && shell === "bash") ? []
+          const expected = ["paused", "guarded"].includes(scenario) || (scenario === "foreign" && shell === "bash") ? []
             : ["precheck-fail", "foreground", "foreign"].includes(scenario) ? ["check:running"]
             : ["stopped", "missing"].includes(scenario) ? ["check:" + initial, "apply:" + initial]
             : scenario === "stop-fail" ? ["check:running", "stop", "start"]

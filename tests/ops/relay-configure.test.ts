@@ -13,7 +13,8 @@ const posixPath = (value: string) => value.replaceAll("\\", "/").replace(/^([A-Z
 for (const shell of ["powershell", "bash"] as const) {
   test.skipIf(shell === "powershell" ? process.platform !== "win32" : !bash || !existsSync(bash))(
     shell + " 外链配置仅确认后停机，成功或失败均恢复原运行状态，取消时无服务变更", async () => {
-      for (const scenario of ["running", "stopped", "cancel", "apply-fail", "stop-fail", "restart-fail", ...(shell === "powershell" ? ["foreground"] : [])]) {
+      // bash also guards the one-off containers: "guarded" is a deployment in progress or an unfinished transaction.
+      for (const scenario of ["running", "stopped", "cancel", "apply-fail", "stop-fail", "restart-fail", ...(shell === "powershell" ? ["foreground"] : ["guarded"])]) {
         const fixture = await tempFixture("relay-ops-" + scenario + "-");
         try {
           const events = join(fixture.root, "events.txt"), state = join(fixture.root, "state.txt");
@@ -73,10 +74,13 @@ for (const shell of ["powershell", "bash"] as const) {
               '    [ "$FIXTURE_SCENARIO" != apply-fail ] || return 1',
               '  else return 99; fi',
               '}',
+              'guard_one_off_container() { record guard; [ "$FIXTURE_SCENARIO" != guarded ]; }',
+              // The one-off containers run as the service container's identity.
+              'service_container_user() { echo 1234:1234; }',
               'docker() {',
               '  case "$1" in',
               '    ps) cat "$FIXTURE_STATE" ;;',
-              '    run) fixture_config "$@" ;;',
+              '    run) [[ " $* " == *" --user 1234:1234 "* ]] || return 98; fixture_config "$@" ;;',
               '    stop) record stop; [ "$FIXTURE_SCENARIO" != stop-fail ] || return 1; printf exited > "$FIXTURE_STATE" ;;',
               '    *) return 99 ;;',
               '  esac',
@@ -100,8 +104,10 @@ for (const shell of ["powershell", "bash"] as const) {
           const expected = scenario === "cancel" || scenario === "foreground" ? ["draft:running"]
             : scenario === "stopped" ? ["draft:exited", "apply:exited"]
               : scenario === "stop-fail" ? ["draft:running", "stop", "start"]
-                : ["draft:running", "stop", "apply:exited", "start"];
-          expect(recorded).toEqual(expected);
+                : scenario === "guarded" ? []
+                  : ["draft:running", "stop", "apply:exited", "start"];
+          // The guard comes before the draft and holds the deployment lock until the end.
+          expect(recorded).toEqual(shell === "bash" ? ["guard", ...expected] : expected);
           expect(await readFile(state, "utf8")).toBe(["stopped", "restart-fail"].includes(scenario) ? "exited" : "running");
           expect(await readdir(join(fixture.root, "data/config"))).toEqual([]);
         } finally { await fixture.cleanup(); }

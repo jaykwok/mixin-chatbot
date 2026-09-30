@@ -49,7 +49,7 @@ flowchart TD
 | 部署方式 | 需要准备 |
 | --- | --- |
 | Windows 原生 | Bun 1.4.2+、Git for Windows（含 GNU Bash）、原生 `uv.exe`；使用管理员 PowerShell |
-| Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；直连模式需要 UFW 及 root / sudo 权限 |
+| Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；rootful Docker 由 root 部署和升级（docker 组普通用户会被拒绝），rootless Docker 由其所属用户部署；直连模式需要 UFW 及 root / sudo 权限 |
 
 Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需安装 Bun；使用终端管理台时，宿主机另需 Bun 1.4.2+。Linux 需要可访问 `/proc`，不支持 macOS、Alpine/musl。安装链接见[环境要求](docs/deployment.md#选择部署方式)。
 
@@ -80,7 +80,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy/deploy.ps1
 bash scripts/deploy/deploy.sh
 ```
 
-脚本会准备依赖、保存配置、生成回调密钥并启动服务。模型配置由向导生成，通常无需手写 JSON；各项配置说明见[部署与配置](docs/deployment.md)。
+rootful Docker（默认安装）下用 root 运行（`sudo bash scripts/deploy/deploy.sh`），rootless Docker 下用其所属用户运行，见[选择部署方式](docs/deployment.md#选择部署方式)。脚本会准备依赖、保存配置、生成回调密钥并启动服务。模型配置由向导生成，通常无需手写 JSON；各项配置说明见[部署与配置](docs/deployment.md)。
 
 ### 3. 接入群聊并验证
 
