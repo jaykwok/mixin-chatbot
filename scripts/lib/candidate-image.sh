@@ -323,7 +323,9 @@ containerd_config_dump() {
     if [ -n "$2" ]; then "$1" --config "$2" config dump; else "$1" config dump; fi
 }
 
-# 从 config dump 中取四行：顶层 root、[grpc] 的 address、快照器 $1 的段是否存在（yes 或空）、该段的 root_path。
+# 从 config dump 中取四行：顶层 root、gRPC 地址、快照器 $1 的段是否存在（yes 或空）、该段的 root_path。
+# gRPC 地址按 dump 的配置版本取：版本 4 起（containerd 2.3）只认插件 io.containerd.server.v1.grpc 的段，文件里残留的顶层
+# [grpc] 段不起作用；之前的版本只认顶层 [grpc] 段。
 # 只接受单行字符串；其他写法取值为控制字符，之后按无效路径拒绝。
 containerd_dump_values() {
     awk -v plugin="plugins.io.containerd.snapshotter.v1.$1" -v q="'" '
@@ -335,11 +337,17 @@ containerd_dump_values() {
         /^[ \t]*\[/ { section = $0; gsub(/[][ \t"]/, "", section); gsub(q, "", section); if (section == plugin) found = "yes"; next }
         /=/ {
             key = $0; sub(/=.*/, "", key); gsub(/[ \t]/, "", key)
-            if (section == "" && key == "root") root = text($0)
-            else if (section == "grpc" && key == "address") address = text($0)
+            if (section == "" && key == "version") { version = $0; sub(/^[^=]*=[ \t]*/, "", version); sub(/[ \t]+$/, "", version) }
+            else if (section == "" && key == "root") root = text($0)
+            else if (section == "grpc" && key == "address") legacy = text($0)
+            else if (section == "plugins.io.containerd.server.v1.grpc" && key == "address") server = text($0)
             else if (section == plugin && key == "root_path") path = text($0)
         }
-        END { print root; print address; print found; print path }'
+        END {
+            address = legacy
+            if (version ~ /^[0-9]+$/ && version + 0 >= 4) address = server
+            print root; print address; print found; print path
+        }'
 }
 
 # 进程的有效 UID。

@@ -220,6 +220,13 @@ test.skipIf(!available)("存储位置只认本机 daemon，rootful 只让 root �
     expect(await message("storage-extra-disk")).toContain("还在另一个文件系统（8:3，xfs）上保存数据");
     expect(await message("storage-unknown-device")).toContain("在本机看不到的文件系统（0:99）上持有锁");
     expect({ code: results["storage-claimant"], paths: results["storage-claimant-paths"] }).toEqual({ code: "0", paths: `${docker} ${system}` });
+    // Version 4 dumps (containerd 2.3 and later) carry the address in the gRPC server plugin's section; the section the
+    // dump's version does not use never matches.
+    expect({ code: results["storage-version4"], paths: results["storage-version4-paths"] }).toEqual({ code: "0", paths: `${docker} ${system}` });
+    expect([results["storage-version4-leftover"], results["storage-version3-plugin"]]).toEqual(["1", "1"]);
+    const unserved = "找不到为 Docker 服务的 containerd（地址 /run/containerd/containerd.sock）";
+    expect(await message("storage-version4-leftover")).toContain(unserved);
+    expect(await message("storage-version3-plugin")).toContain(unserved);
 
     // Locations come from the mount table: a disk mounted on the content store counts without holding any lock, as does
     // one inside the Docker root; runtime overlay/tmpfs mounts and Docker volumes do not.

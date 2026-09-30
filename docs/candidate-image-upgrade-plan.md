@@ -94,7 +94,7 @@ Windows 原生部署和 TUI 的事务解析不变，不增加 Windows 镜像构�
   1. 取 Docker 报告的 containerd 地址（`docker info` 的 `Containerd.Address`）。
   2. 只看属于 root 或当前用户的 containerd 进程（rootful 的属于 root，rootless 的属于部署者本人）；其他用户的同名进程直接跳过，从不执行它们提供的程序。
   3. 解析配置要执行进程的程序（`config dump`），执行前核对该程序：解析符号链接后的文件和各级目录都属于 root 或当前用户，组和其他用户不可写（带粘滞位的目录除外）。其他用户能替换的程序一律不执行，不能等执行之后再按地址或锁拒绝。
-  4. 按进程的启动参数（`--config`、`--root`、`--address`）和 `containerd config dump` 得到的有效配置（由 containerd 自己合并 imports）算出 gRPC 地址；只有地址与 Docker 报告一致的进程才是候选。
+  4. 按进程的启动参数（`--config`、`--root`、`--address`）和 `containerd config dump` 得到的有效配置（由 containerd 自己合并 imports）算出 gRPC 地址；只有地址与 Docker 报告一致的进程才是候选。地址按 dump 的配置版本读取：版本 4 起（containerd 2.3）在插件 `io.containerd.server.v1.grpc` 的段里，文件中残留的顶层 `[grpc]` 不起作用；更早的版本在顶层 `[grpc]`。
   5. 位置按配置和挂载表列出，不从锁推断：根目录；Docker 所用快照器（overlayfs、native、btrfs、zfs）的 `root_path`（若有设置）；内容存储（`io.containerd.content.v1.content`）和默认快照目录被符号链接指到根目录以外时的真实位置；以及 `/proc/self/mountinfo` 中挂在这些目录内部的其他文件系统（例如单独挂载的内容盘，它空闲时没有常驻锁）。容器运行时的 overlay、tmpfs 等挂载不计。内部挂载点当前用户进不去时无法衡量，停止并提示用 root 运行。devmapper、blockfile 和代理快照器的数据不在可用 `df` 衡量的目录中，直接拒绝。
   6. 用 `/proc/locks` 只确认进程身份：候选进程必须持有根目录中元数据库（`io.containerd.metadata.v1.bolt/meta.db`）和自定义快照目录中 `metadata.db` 的锁，按设备号和 inode 核对；读不到数据库文件（例如当前用户进不去根目录）就无法核对，停止。它在上述位置以外的磁盘文件系统上持有锁，说明还有没识别出的位置，同样拒绝；tmpfs 上的锁是状态目录，不计。
   7. 恰好一组位置核对通过才采用；找不到、读不到配置或结果互相矛盾都停止，并列出每个 containerd 进程未通过的原因。

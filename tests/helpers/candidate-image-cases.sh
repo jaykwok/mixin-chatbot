@@ -273,6 +273,12 @@ dump() {
     printf "version = 3\nroot = '%s'\nstate = '/run/containerd'\nimports = ['/etc/containerd/conf.d/*.toml']\n\n[grpc]\n  address = '%s'\n\n[plugins]\n  [plugins.'io.containerd.snapshotter.v1.%s']\n    root_path = '%s'\n" \
         "$2" "$3" "${5:-overlayfs}" "${4:-}" > "$1"
 }
+# The shape containerd 2.3 and later print (configuration version 4): the address is in the gRPC server plugin's
+# section, and a top-level [grpc] table left in the file is printed last. dump4 <file> <root> <address> <leftover address>
+dump4() {
+    printf "version = 4\nroot = '%s'\nstate = '/run/containerd'\nimports = ['/etc/containerd/conf.d/*.toml']\n\n[plugins]\n  [plugins.'io.containerd.server.v1.grpc']\n    address = '%s'\n\n  [plugins.'io.containerd.snapshotter.v1.overlayfs']\n    root_path = ''\n\n[grpc]\n  address = '%s'\n" \
+        "$2" "$3" "$4" > "$1"
+}
 # A stand-in containerd program: records that it ran, then prints the file given with --config (default.toml without).
 fake_containerd() {
     mkdir -p "${1%/*}"
@@ -420,6 +426,17 @@ storage_cases() {
     check storage-claimant docker_storage_paths
     paths storage-claimant
     rm -rf "${PROC_ROOT:?}/400"
+    # The dump's configuration version decides which address containerd serves: from version 4 the gRPC server plugin's
+    # (a leftover top-level [grpc] table is ignored), before it the top-level [grpc] (a plugin section is ignored).
+    dump4 "$fixture/default.toml" "$system" "$sock" /run/other.sock
+    check storage-version4 docker_storage_paths
+    paths storage-version4
+    dump4 "$fixture/default.toml" "$system" /run/other.sock "$sock"
+    check storage-version4-leftover docker_storage_paths
+    dump "$fixture/default.toml" "$system" /run/other.sock
+    printf "  [plugins.'io.containerd.server.v1.grpc']\n    address = '%s'\n" "$sock" >> "$fixture/default.toml"
+    check storage-version3-plugin docker_storage_paths
+    dump "$fixture/default.toml" "$system" "$sock"
 
     # Locations come from the mount table, not from locks: a disk mounted on the content store holds no lock and still
     # counts, as does one inside the Docker root; container runtime mounts and Docker volumes do not.
