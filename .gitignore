@@ -25,3 +25,6 @@ node_modules/
 
 # Chromium/crashpad diagnostics may be emitted beside a previewed document.
 debug.log
+
+# 开发过程文档（实施方案、升级研判、迁移记录、审查材料）只留在本地；公开的开发说明在 docs/development.md。
+/docs/dev/

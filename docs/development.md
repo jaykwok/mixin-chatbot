@@ -2,13 +2,13 @@
 
 [返回 README](../README.md) · [部署与配置](deployment.md) · [运维手册](operations.md)
 
-**本页内容**：[工作原理](#工作原理) · [提示词与工具](#提示词与工具) · [资料解析](#资料索引与文档解析) · [缓存与费用统计](#缓存与费用统计) · [开发与检查](#开发与检查)
+**本页内容**：[工作原理](#工作原理) · [提示词与工具](#提示词与工具) · [资料解析](#资料索引与文档解析) · [文档加工](#文档加工) · [缓存与费用统计](#缓存与费用统计) · [开发与检查](#开发与检查) · [数据版本与升级](#数据版本与升级)
 
-只调整机器人的用途时，从 [prompt.ts](../src/agent/prompt.ts) 开始。修改代码后，按文末的开发检查流程验证。
+只调整机器人的用途时，从 [prompt.ts](../src/agent/prompt.ts) 开始。修改代码后，按[开发与检查](#开发与检查)验证。
 
 ## 工作原理
 
-基于 **Bun + Hono + Pi 0.87.1 本地 SDK**，支持 Windows 原生部署和 Linux / Docker。下面是任务处理与取消、交付之间的关系：
+基于 **Bun + Hono + Pi 本地 SDK**，支持 Windows 原生部署和 Linux / Docker。下面是任务处理与取消、交付之间的关系：
 
 ```mermaid
 flowchart TD
@@ -28,19 +28,15 @@ flowchart TD
 
 一轮任务覆盖准备、模型执行、工具调用和最终交付，完成收尾后才释放会话。同一群、同一用户按 FIFO 串行处理，不同用户可以并发；默认全局最多接收 32 个普通请求。
 
-停止与清理走独立控制路径，不受普通消息容量、入站限流或去重阻挡。相同的在途清理会合并，重复 `/stop` 仍会再次触发取消。图中虚线表示根级取消约束：关机先广播取消，进程和出站请求在统一期限内收尾。
+停止与清理走独立控制路径，不受普通消息容量、入站限流或去重阻挡。图中虚线表示根级取消约束：关机先广播取消，进程和出站请求在统一期限内收尾。
 
-最终文本和必要外链先持久化，平台确认后才移除记录；未送达内容可用 `/deliver` 补发。代码生成的外链另存结构化附件引用，交付前重新签名并检查远端对象大小；对象缺失、到删除期限或后端变更时保留待补发记录。部分补发只确认已成功的行。文件附件由发送工具直接交付。
-
-callback key 必须对应一个群。跨群复用会触发持久隔离，并取消关联的在途与排队交付；修正平台配置后按[回调路由恢复](operations.md#回调路由恢复)解除隔离。
-
-出站以 callback key 为单位有界排队，最多 64 个等待发送事务；20 RPM 窗口内为最终回复预留额度，状态提醒可以丢弃。HTTP 429、业务限流和 Retry-After 均受总期限及有限重试约束。Markdown 降级保留链接目标、下划线、中文及签名参数，普通文本直发。
+最终文本和必要外链先持久化，平台确认后才移除记录；未送达内容可用 `/deliver` 补发。文件附件由发送工具直接交付。callback key 必须对应一个群，跨群复用会触发持久隔离，修正平台配置后按[回调路由恢复](operations.md#回调路由恢复)解除。出站以 callback key 为单位有界排队，并为最终回复预留限流额度。
 
 ## 提示词与工具
 
-基础系统提示词在 [prompt.ts](../src/agent/prompt.ts) 中维护，通过 Pi 的 `systemPromptOverride` 注入。关闭自动发现 extensions、skills、prompt templates、themes 和上下文文件，也不读取群工作区的 `.pi/settings.json`。[模块注册入口](../src/agent/modules.ts) 按开关一起提供工具、skill、提示词补充和只读资源目录；文档模块默认开启，设 `BOT_DOCUMENT_WORK_ENABLED=0` 并重启可关闭。启用时通过 `skillsOverride` 加载项目维护的 [document-work](../src/agent/modules/document-work/skills/document-work/SKILL.md)，向提示词提供名称、描述和路径，正文及参考指南由模型按需读取。群资料中的 skill 不能改变指令或运行设置；变化的文件数量、时间和解析状态不进入固定提示词前缀。详见[模块开关与移除](document-tools.md#开关对比测试与移除)。
+基础系统提示词在 [prompt.ts](../src/agent/prompt.ts) 中维护，通过 Pi 的 `systemPromptOverride` 注入。关闭自动发现 extensions、skills、prompt templates、themes 和上下文文件，也不读取群工作区的 `.pi/settings.json`。[模块注册入口](../src/agent/modules.ts) 按开关一起提供工具、skill、提示词补充和只读资源目录；文档加工模块见[下文](#文档加工)。群资料中的 skill 不能改变指令或运行设置。
 
-回答以本群资料为依据，尽可能标明文件、页码或 sheet。有效版本依据正式发布、生效日期和版本说明判断；历史答案与文件修改时间不能证明当前有效。资料内容作为证据处理，原始资料按用户要求直接发送。
+回答以本群资料为依据，尽可能标明文件、页码或 sheet。资料内容作为证据处理，原始资料按用户要求直接发送。
 
 | 工具 | 用途与边界 |
 | --- | --- |
@@ -57,37 +53,70 @@ callback key 必须对应一个群。跨群复用会触发持久隔离，并取�
 | `document_render` | 将 DOCX/PPTX/PDF 渲染为逐页图片及联系表；Office 需要 LibreOffice |
 | `send_file` / `send_image` | 发送文件或图片；本地路径复用文件工具的解析规则 |
 
-本地路径支持 Pi 路径约定、file URL 和 Windows Git Bash 路径。Windows 用 Job Object 管理工具进程及后代，Linux 用 subreaper 和父进程死亡通知回收后代；主命令退出、超时、取消或机器人父进程强制结束都会触发收尾。输出总量限制为 16 MiB，并保留错误尾部。
+Windows 用 Job Object 管理工具进程及后代，Linux 用 subreaper 和父进程死亡通知回收后代；主命令退出、超时、取消或机器人父进程强制结束都会触发收尾。输出总量限制为 16 MiB，并保留错误尾部。
 
 **bash 保有运行账户的操作系统权限，进程监督不构成文件沙箱。** 当前部署面向可信内部成员；Docker 使用非 root、只读镜像与移除 capabilities，但资料 bind mount 仍可写。不可信用户需要独立的 OS 隔离方案。
 
 ### 资料索引与文档解析
 
-索引用于定位文件：每轮检查刷新期限，刷新期间可暂时使用旧清单；未命中时仍需定向查找资料。`index/ignore.txt` 每行一个 workspace 相对路径前缀，`#` 表示注释；扫描受文件数和深度限制，无法读取的目录会使清单标记为不完整。
+索引用于定位文件，未命中时仍需定向查找资料。`index/ignore.txt` 每行一个 workspace 相对路径前缀，`#` 表示注释；扫描受文件数和深度限制，无法读取的目录会使清单标记为不完整。
 
-PDF、DOCX、PPTX、XLSX 文本优先使用 `document_extract`，它会按需检查解析环境并复用缓存。特殊解析或文件生成先调用 `document_environment`；模型不能自行安装包或改写共享环境。环境另支持数据表及常用图片处理，不提供 OCR；文档工具只接受现代 Office 格式。三种文档工作方式、复用来源与限制见[文档加工设计](document-tools.md)。
+PDF、DOCX、PPTX、XLSX 文本优先使用 `document_extract`，它会按需检查解析环境，并按原件 SHA-256、解析器与依赖锁版本复用缓存：群共享资料的结果位于群 `index/parsed`，用户私有文件的结果只放本用户 tmp。特殊解析或文件生成先调用 `document_environment`；模型不能自行安装包或改写共享环境。不提供 OCR，文档工具只接受现代 Office 格式。
 
-Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) 管理，[.python-version](../.python-version) 选择 3.14 系列。通过 `UV_PROJECT_ENVIRONMENT` 指向群 venv，执行 `uv sync --locked --no-dev --no-install-project`；Docker 构建、原生准备和就绪检测共用 [document-manifest.ts](../scripts/runtime/document-manifest.ts)，marker 包含依赖锁摘要和 Python 版本。就绪检测同时运行离线 `uv sync --check` 和实际库导入。修改依赖后运行 `uv lock`，再按[文件回归说明](document-tools.md#开发验证)检查。
+Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) 管理，[.python-version](../.python-version) 选择 3.14 系列，各群默认使用自己的 `<群目录>/venv`。Docker 构建、原生准备和就绪检测共用 [document-manifest.ts](../scripts/runtime/document-manifest.ts)。修改依赖后运行 `uv lock`，再做[文档回归](#文档回归)。
 
-资料索引保存可验证的 manifest，重启后在 TTL 内复用；清单内容不变时不重写正文，目录扫描适度并发、失败后退避。文档环境成功校验缓存 5 分钟，解释器、marker、项目依赖声明、Python 版本文件或锁文件变化立即失效，并合并同一环境的并发检查。
+## 文档加工
 
-`document_extract` 优先处理重复的二进制资料：群共享资料的结果位于群 `index/parsed`，用户私有文件的结果只放本用户 `tmp/.document-cache`。键包含原件 SHA-256、解析器与依赖锁版本、格式及提取选项；命中时仍核对当前原件和缓存正文摘要。保留页码、幻灯片或 sheet/行号；XLSX 公式输出原文、不计算。单个原件上限 128 MiB，解析全局并发为 2，每个缓存目录最多保留约 128 项，支持取消、期限及自动淘汰。
+文档加工是默认开启的可选模块，覆盖修改 Word、选编和修改 PPT、整合资料或按模板生成新文档。原件提供可复用内容，正式资料提供事实，模板提供样式；内容取舍和版面由模型决定，工具负责把容易写错的文件操作做可靠。
 
-### 缓存与费用统计
+| 层次 | 负责什么 | 入口 |
+| --- | --- | --- |
+| Skill | 复用原则、工具选择和交付标准 | [SKILL.md](../src/agent/modules/document-work/skills/document-work/SKILL.md) |
+| 按需指南 | Word/PPT 编辑要点、Markdown 生成约定、流程图脚本和各类文档的内容要点 | [references](../src/agent/modules/document-work/skills/document-work/references) |
+| 工具 | 摘要校验、大纲、局改、组装、按模板生成、图片素材、渲染、来源记录 | [tools.ts](../src/agent/modules/document-work/tools.ts) |
+| 固定环境 | 各群按需 `uv sync`，统一 Python 与依赖锁 | [python-toolchain.ts](../src/agent/python-toolchain.ts) |
 
-模型缓存使用 Pi 原生 `PI_CACHE_RETENTION`（short/long，默认 short），环境变量优先于 runtime.json。机器人初始化时将配置映射到 Pi 环境，provider 和保温器读取同一策略；没有 streamSimple 补丁，SDK 摘要调用的显式 `none` 仍生效。`long` 的期限和收益取决于服务商。旧 `BOT_MODEL_CACHE_RETENTION` 已移除，升级前按[迁移说明](pi-0.87.1-migration.md)处理。
+**开关。** `BOT_DOCUMENT_WORK_ENABLED` 默认 `1`，设为 `0` 关闭：在 TUI 的「设置 → 高级运行参数 → 文档与诊断 → 文档加工模块」修改并应用，或在 `data/config/runtime.json` 中设置后重启；进程环境变量优先于文件。关闭会移除六个文档工具、skill、模块提示词及其额外 `read` 权限；资料索引、`document_extract`、`document_environment`、原文件发送和 `read/bash/edit/write` 保留，已有 venv 不卸载。
 
-`data/runtime/pi/settings.json` 的 `cacheWarming` 在本项目默认 **off**；可显式设 streaming 或 idle。保温是额外模型请求，与是否允许服务端缓存是两个选项。Pi 根据模型的原生 `promptCache` 元数据和费用判断是否刷新；日志记录模式、请求结束时的原生调度状态和独立 usage 费用。每个会话使用独立设置快照，reload 保留实例策略。`/stop`、任务超时会通过官方设置 API 取消当前保温计划；dispose 释放定时器。
+实现集中在 [document-work 模块目录](../src/agent/modules/document-work)，[modules.ts](../src/agent/modules.ts) 是唯一注册点。要从代码中移除，先关闭并重启，再删除模块目录和对应的注册分支，清理相关测试和专用依赖（`pptx-automizer`、`docxcompose`、`pypdfium2`），重新生成锁文件并运行 `bun run check`。
 
-原生 `compaction.modelOverrides` 可按 `provider/model` 调整 reserveTokens / keepRecentTokens；所选模型的预算在启动时由 Pi 校验。模型 `inputLimits.images.resize` 控制 read 图片的尺寸和 base64 大小。配置向导保留手填字段，但不会把原厂缓存寿命和图片限制盲目复制到未知代理。示例见[迁移说明](pi-0.87.1-migration.md)。
+所有来源先复制到本用户 tmp 中再处理，原资料不被覆盖；修改、组装与生成同时输出来源路径、摘要和选编信息。每次调用的中间文件在结束时删除，成功保留成品、预览图片和报告。
 
-提示词使用稳定的 `$PI_USER_TMP` 名称，避免用户绝对路径改变公共前缀；实际目录通过工具环境传入。会话 ID、工具顺序及 schema 保持稳定。资料查找、文档提取缓存和统计账本的增量入账改善的是本地工作量，不与服务商的模型缓存命中率混算。
+### 能力边界
 
-统计包含普通回复、历史压缩、分支摘要及 Pi 用量条目自带类型（例如缓存保温）的 input/output/cacheRead/cacheWrite，按模型、日期及调用类型分组。缓存读取比例按 `ΣcacheRead / Σ(input + cacheRead + cacheWrite)` 计算，无有效输入样本时显示“无样本”。费用是 SDK 根据配置价格的估算，缺失项单列，**不代表 Coding Plan 实际账单或套餐配额**。
+| 情形 | 当前行为 |
+| --- | --- |
+| Word 组装 | 第一份提供主样式与页眉页脚，后续来源的页眉页脚不导入；正文块范围包含边界 |
+| PPT 尺寸不同 | 拒绝直接组装，先按目标尺寸重排所需内容 |
+| 文字改长 | 局改保留原容器，不自动放大文本框；需要渲染后检查溢出 |
+| 模板推断 | PPT 标题样式取自模板样例页；模板没有内容页或版式差异大时用 `styleFrom` 指定样例页。行数按字宽估算，最终以渲染图为准 |
+| 自动图示 | 卡片、流程、分层、时间轴、指标、循环、金字塔只识别短段落和明确的标签模式，装不下时退回普通版式并提示；颜色取模板标题色或主题强调色 |
+| Mermaid 流程图 | 子集：节点形状、带标签的连线、虚线与粗线、`&` 汇合；subgraph、style、click 忽略并提示；最多 40 个节点、80 条连线。Word/PNG 需要中文字体，无字体时保留源码 |
+| 图片素材 | 只提取位图；EMF/WMF/SVG 和组合图示需用 `crops` 从渲染页截取 |
+| 域、修订记录 | 局改工具拒绝受影响段落，需要专门脚本处理副本 |
+| 复杂 PPT 对象 | 动画、SmartArt、媒体、外部链接及复杂图形需实际核对，不承诺全部无损 |
+| 外部关联 | 检查器提示关联数量，不访问其内容；结构检查不等同于完整 Office 校验或文件脱敏 |
+| 预览 | 默认前 20 页，单次最多 50 页。Office 预览依赖 LibreOffice，最终字体和分页以客户软件为准 |
 
-统计数据独立存放在使用统计账本 `<群数据根>/stats.sqlite`，CLI、TUI 和 HTML 报表都读这一份。入账由 [stats-ledger.ts](../src/agent/stats-ledger.ts) 负责：按「世代 × 自然日」聚合，`/clear` 后新会话是新世代，旧账目保留。[session-reader.ts](../src/agent/session-reader.ts) 在同一文件句柄上核对身份、校验旧前缀摘要并增量读取；读取期间身份、大小或修改时间变化则作废重试，截断或改写后的稳定内容才替换该世代。入账发生在每次任务结束（在该成员的任务队列里，与 `/clear` 串行）、归档前和每日兜底扫描；提交前核对这份文件在账本中的记录与读文件前完全一致（首次入账则仍不存在），被其他连接入账、重建或标记归档时作废重读，不会重复累加，也不会用较旧的读取覆盖新账。内容和尾行状态未变化时不写库，普通入账及重算都不撤销已有归档标记。`stat`、TUI 用只读连接读账本，不建库、不改日志模式，也能读只读快照。独立 usage 使用自身 provider/model，缺字段记 unknown，不改变主对话的模型归属；context_edit 不扣减真实消耗。**不得删库重建**：原件可能已删除，账本是仅存的历史。未知版本须停机备份并离线转换；历史归属错误可用定向修复工具处理。
+单来源最大 128 MiB，一次来源总量和 Office 解压总量各最大 256 MiB；组装最多 20 个来源、PPT 最多 200 页。文档操作全局并发 2，单次总期限 5 分钟，受任务取消与进程监督约束。
 
-每日兜底扫描逐个隔离文件和目录枚举错误，记录路径、原因与失败数；有失败就不标记当天完成。已成功读取的文件指纹暂存在账本 `meta` 中，同日重试（包括重启之后）只检查身份、大小和纳秒时间戳，未变化的文件不再读取或计算前缀摘要；失败或已变化的文件才重新入账。跨日或 `force` 会重扫全部文件，整轮完成后清掉临时进度，无需迁移账本 schema。
+### 参考项目与许可
+
+| 项目 | 用法 |
+| --- | --- |
+| [pptx-automizer](https://github.com/singerla/pptx-automizer)（MIT） | 以固定 npm 依赖复用跨文件页面、母版及关联资源导入；项目另做页序转换、输出清理与检查 |
+| [docxcompose](https://github.com/4teamwork/docxcompose)（MIT） | 以固定 Python 依赖复用 Word 组装，遵循首文档页眉页脚规则 |
+| [Anthropic document skills](https://github.com/anthropics/skills) | 查阅能力划分思路；其 [PPTX 许可](https://github.com/anthropics/skills/blob/main/skills/pptx/LICENSE.txt)包含复制与再分发限制，因此未复制其 skill 正文、脚本或素材 |
+
+本项目 skill 和胶水代码独立编写；第三方包保留自身许可证。Pi 路径适配代码的许可保留在对应源码中。
+
+## 缓存与费用统计
+
+模型缓存使用 Pi 原生 `PI_CACHE_RETENTION`（short/long，默认 short），环境变量优先于 runtime.json。`data/runtime/pi/settings.json` 的 `cacheWarming` 在本项目默认 **off**；保温是额外模型请求，与是否允许服务端缓存是两个选项。`compaction.modelOverrides` 可按 `provider/model` 调整压缩预算，模型 `inputLimits.images.resize` 控制图片尺寸。
+
+统计包含普通回复、历史压缩、分支摘要及缓存保温等调用的 input/output/cacheRead/cacheWrite，按模型、日期及调用类型分组。费用是 SDK 根据配置价格的估算，**不代表 Coding Plan 实际账单或套餐配额**。
+
+统计数据独立存放在 `<群数据根>/stats.sqlite`，CLI、TUI 和 HTML 报表都读这一份。入账由 [stats-ledger.ts](../src/agent/stats-ledger.ts) 在任务结束、归档前和每日兜底扫描时增量进行，不重复累加，也不会用较旧的读取覆盖新账；读取方只用只读连接。**不得删库重建**：原件可能已删除，账本是仅存的历史。
 
 ## 开发与检查
 
@@ -99,22 +128,18 @@ bun audit
 
 配置向导和配置变更需要先停止服务。已有模型配置与 webhook 密钥时，用 `bun run start` 前台运行、`bun run dev` 监听代码变化。仅隔离开发可显式设置 `ALLOW_INSECURE_WEBHOOK=1` 使用无密钥的 `/webhook`。
 
-`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。TypeScript 拒绝未使用变量、参数、标签及不可达语句；Knip 同时检查入口文件的未使用导出。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。每次运行的隔离 cwd 为工作根目录下的 `tests-*`，夹具和归档用的 `trash/` 都在其中。工作根目录由 `MIXIN_TEST_WORK_ROOT` 指定；未设置时 Windows 和一般 Linux 用项目 `tmp/`，WSL 用 Linux 文件系统中的 `/tmp/mixin-tests`：仓库在 `/mnt/<盘符>` 时，DrvFs 上 chmod 是否生效取决于挂载设置。Linux 运行前先检查工作根目录能否 `chmod 0600`，不能则直接报错，提示换目录。受限容器 CI 显式使用挂载的 `/app/tmp`。测试输出同时写入项目 `tmp/` 下同名的 `tests-*.log`。全部通过后删除 cwd 和日志；失败时保留现场并打印两者的绝对路径，不写入项目的 `backup/rm`。旧版本的测试会把夹具归档到项目的 `backup/rm`，名称为 `<夹具名>-<UUID>`；这些遗留条目用[历史归档清理](operations.md#历史归档清理)识别和删除。
+`bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。每次运行的隔离 cwd 是工作根目录下的 `tests-*`，工作根目录由 `MIXIN_TEST_WORK_ROOT` 指定；未设置时用项目 `tmp/`，WSL 用 Linux 文件系统中的 `/tmp/mixin-tests`。全部通过后删除，失败时保留现场并打印路径。
 
-`scripts/patches/knip@6.29.0.patch` 修复 Knip 对 Bun 脚本 production 入口标记的传递，仅影响开发检查。补丁随检查脚本维护；移除前需同步更新安装引用并通过普通和 production 两种 Knip 检查。
+`package.json` 的 overrides 把个别传递依赖固定到修复已知问题的版本，`scripts/patches` 中的 Knip 补丁只影响开发检查；升级依赖时同步检查这些覆盖、补丁和 `bun audit`。Pi 的包精确固定版本，依赖升级通过改版本、更新锁文件和回归检查完成。
 
-命令行入口放在 `scripts/{config,ops,runtime}` 下，由 `package.json` 和 `knip.json` 登记为生产入口。配置目录明确列出三个命令入口，辅助模块通过引用纳入检查。运维界面入口是 [tui.ts](../scripts/ops/tui.ts)，实现放在 `scripts/ops/tui/`；新增命令时同步更新入口声明，并通过普通和 production 两种 Knip 检查。
-
-`bun run tui:preview [页面] [列] [行]` 用固定的演示数据把任意页面渲染成文本，不读 `data/`，也不需要 TTY；加 `--plain` 去色，用来核对列宽。改动界面排版后用它比对同一份输入前后的样子，管理台截图也来自同一条渲染路径；图片核对与更新方式见[截图维护说明](assets/README.md)。渲染层的硬约束是「每个组件吐出的每一行显示宽度精确等于给它的宽度」——差一列不会报错，只会让右边所有东西错位，`tests/ops/tui-render.test.ts` 用中文、全角标点和带色文本压这条不变量。
-
-Pi 两个包精确固定为 0.87.1，使用官方本地 SDK。依赖升级通过改版本、更新锁文件和回归检查完成。会话上下文由 SessionManager 的持久化投影决定，禁止通过修改 agent.state.messages 模拟删除历史；官方重试/溢出恢复会追加 context_edit。原始 JSONL 版本仍是 3，不能据此原地降级。
+命令行入口放在 `scripts/{config,ops,runtime}` 下，由 `package.json` 和 `knip.json` 登记为生产入口；新增命令时同步更新入口声明。`bun run tui:preview [页面] [列] [行]` 用固定的演示数据把管理台页面渲染成文本（`--plain` 去色），用来核对排版；截图维护见[截图说明](assets/README.md)。
 
 | 工程入口 | 职责 |
 | --- | --- |
 | [index.ts](../src/server/index.ts)、[app.ts](../src/server/app.ts) | 轻量版本检查与服务生命周期；验证模式独立启动 |
 | [http-app.ts](../src/server/http-app.ts)、[webhook.ts](../src/server/webhook.ts) | HTTP 接入、鉴权与控制路径 |
 | [runtime.ts](../src/agent/runtime.ts)、[session-queue.ts](../src/agent/session-queue.ts) | Pi 接线、任务生命周期和会话 FIFO |
-| [session-factory.ts](../src/agent/session-factory.ts)、[session-events.ts](../src/agent/session-events.ts)、[session-control.ts](../src/agent/session-control.ts) | SDK 创建、事件进度与保温取消；不拥有第二套任务队列 |
+| [session-factory.ts](../src/agent/session-factory.ts)、[session-events.ts](../src/agent/session-events.ts)、[session-control.ts](../src/agent/session-control.ts) | SDK 创建、事件进度与保温取消 |
 | [prompt.ts](../src/agent/prompt.ts)、[local-tools.ts](../src/agent/local-tools.ts) | 资料助手提示词与本地工具边界 |
 | [process.ts](../src/core/process.ts)、[process-supervisor.ts](../src/core/process-supervisor.ts) | 工具进程执行与后代回收 |
 | [delivery-store.ts](../src/agent/delivery-store.ts)、[im.ts](../src/integrations/im.ts)、[relay.ts](../src/integrations/relay.ts) | 持久交付、平台发送与外链对象 |
@@ -123,15 +148,22 @@ Pi 两个包精确固定为 0.87.1，使用官方本地 SDK。依赖升级通过
 
 CI 配置了 Windows/Linux 检查及受限 Linux 镜像中的解析器与进程回收验证。部署验收还需检查目标机器的服务、入口和真实交付流程。
 
-常规测试里的 Docker 都是桩。真实 Docker 的部署和升级由可选测试 [real-docker.test.ts](../tests/ops/real-docker.test.ts) 验证，只能在没有真实服务的 Linux 测试机（WSL 发行版或虚拟机）上运行：`MIXIN_REAL_DOCKER=1 bun run test tests/ops/real-docker.test.ts`。测试用合成数据，在 `/var/tmp/mixin-real-docker-*` 下依次执行首次部署、升级、中断迁移预览（向进程组发 SIGINT、向 `ops.sh` 发 SIGTERM）、验证失败回滚以及回滚后再次升级，默认群根和外部群根各跑一遍；每一步都核对容器的运行身份、镜像 ID、预览容器和本次的保留标签已清理。运行身份决定覆盖的内容：
+常规测试里的 Docker 都是桩。真实 Docker 的部署和升级由可选测试 [real-docker.test.ts](../tests/ops/real-docker.test.ts) 验证，**只能在没有真实服务的 Linux 测试机**（WSL 发行版或虚拟机）上运行：`MIXIN_REAL_DOCKER=1 bun run test tests/ops/real-docker.test.ts`。测试用合成数据，只清理挂载源在其目录下的容器和本次测试项目的镜像，发现其他 `mixin-chatbot*` 容器时拒绝运行；失败或设置 `MIXIN_REAL_DOCKER_KEEP=1` 时保留现场。SELinux 强制模式尚未验证。
 
-- root（rootful）：上面的流程，之后还验证 docker 组用户用 98f1b4a 的脚本部署的实例：root 经旧版恢复入口升级、停机后被杀再继续、停机后被杀再回滚，都保留原容器的 UID/GID 和已有数据的属主。
-- rootless（设置 `DOCKER_HOST` 指向 rootless 守护进程，以其所属用户运行）：上面的流程；容器以映射为部署用户的 `0:0` 运行，已保存的特权端口在停机前拒绝，或在 rootlesskit 能绑定时使用。
-- docker 组普通用户（rootful）：部署和升级在任何提问、构建和停机之前被拒绝，不创建容器或镜像。
+### 文档回归
 
-它只清理挂载源在该目录下的容器和本次测试项目的镜像；发现其他 `mixin-chatbot*` 容器时拒绝运行。失败或设置 `MIXIN_REAL_DOCKER_KEEP=1` 时保留现场。已在 WSL Ubuntu（Docker 29，containerd 镜像存储）上以 root、docker 组普通用户和 rootless Docker 验证。SELinux 强制模式（bind mount 的 `:z` 标签）尚未验证：WSL 内核不提供 SELinux，需要另起 Fedora/RHEL 虚拟机。
+真实文件回归使用单独的测试 venv，不修改群环境或启动机器人。项目根目录的 PowerShell 示例：
 
-Pi 路径适配代码的许可保留在对应源码中，开发检查补丁位于 `scripts/patches`。
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = (Join-Path $PWD 'tmp/document-validation/group/venv')
+uv sync --locked --no-dev --no-install-project
+if ($LASTEXITCODE -ne 0) { throw 'uv sync failed' }
+bun scripts/runtime/document-manifest.ts . $env:UV_PROJECT_ENVIRONMENT
+bun tests/helpers/document-work-integration.ts $env:UV_PROJECT_ENVIRONMENT --office
+Remove-Item Env:UV_PROJECT_ENVIRONMENT
+```
+
+`--office` 要求可运行的 LibreOffice 并检查 Word/PPT 转 PDF；省略时仍验证 PDF 预览。产物和报告保留在 `tmp/document-validation/run-*` 供人工看图，自动检查不会声称已经看过图片。
 
 ## 数据版本与升级
 
