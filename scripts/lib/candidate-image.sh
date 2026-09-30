@@ -240,14 +240,17 @@ candidate_build_to() {
 # daemon，构建后按 ID 核对。source 为 commit（升级，context 是从 sha 导出的目录）或 workspace（独立部署）。
 # 构建被 INT/TERM/HUP 中断时返回 128+信号值；失败或中断后由调用方执行 release_candidate。
 prepare_candidate_image() {
-    local context="$1" sha="$2" source="$3" project="$4" project_id operation_id daemon tag idfile id status=0
+    local context="$1" sha="$2" source="$3" project="$4" project_id operation_id daemon tag idfile id status=0 started
     project_id="$(candidate_project_id "$project")" && operation_id="$(candidate_operation_id)" || return 1
     daemon="$(candidate_daemon_id)" || return 1
     tag="$(candidate_tag mixin-chatbot "$project_id" "$operation_id")"
     declare -gA CANDIDATE=([format]=1 [source]="$source" [target_sha]="$sha" [image_id]='' [image_tag]="$tag"
         [daemon_id]="$daemon" [project_id]="$project_id" [operation_id]="$operation_id")
     idfile="$(mktemp)" || return 1
+    started="$SECONDS"
     run_interruptible candidate_build_to "$idfile" "$context" "$tag" "$sha" "$project_id" "$operation_id" "$source" || status=$?
+    # 构建期间原服务照常运行；耗时与停机窗口（downtime_begins / downtime_ends）分别记录。
+    operation_event info "candidate build took $((SECONDS - started))s; exit=$status"
     id="$(tr -d '[:space:]' < "$idfile" 2>/dev/null)" || id=''
     rm -f -- "$idfile"
     [ "$status" = 0 ] || return "$status"

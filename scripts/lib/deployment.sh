@@ -163,6 +163,24 @@ verify_deployed_group_root() {
     fi
 }
 
+# 停机窗口写进运维日志：停止正在运行的服务时记下时刻（经环境交给同一次操作中的部署脚本），服务重新就绪时
+# （新版本通过健康检查，或回滚后原容器重新启动）记录时长。中断后在新进程中续做时开始时刻已不可知，只记录恢复。
+downtime_begins() {
+    BOT_DOWNTIME_STARTED="$(date +%s)"
+    export BOT_DOWNTIME_STARTED
+    operation_event info "service stopped; downtime begins"
+}
+downtime_ends() {
+    local now
+    now="$(date +%s)"
+    if [[ "${BOT_DOWNTIME_STARTED:-}" =~ ^[0-9]+$ ]]; then
+        operation_event info "service back ($1); downtime $((now - BOT_DOWNTIME_STARTED))s"
+    else
+        operation_event info "service back ($1); the stop happened in an earlier process"
+    fi
+    unset BOT_DOWNTIME_STARTED
+}
+
 # 新事务的目标提交默认取当前代码；升级器在切换代码前开始事务，传入目标提交。
 begin_deployment() {
     local target_sha="${1:-}"
@@ -205,7 +223,11 @@ begin_deployment() {
                 docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || return 1
             fi
         elif [ -n "$PREVIOUS_IMAGE" ]; then
+            # 指针发布后、停机前中断：原服务可能仍在运行，停机从这里开始。
+            local running_now
+            running_now="$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)"
             docker stop --time 30 mixin-chatbot >/dev/null || return 1
+            [ "$running_now" != true ] || downtime_begins
             docker rename mixin-chatbot "$ROLLBACK_CONTAINER" || return 1
             PREVIOUS_CONTAINER_SAVED=1; PREVIOUS_STOP_ATTEMPTED=1
         elif docker container inspect mixin-chatbot >/dev/null 2>&1; then
@@ -294,6 +316,7 @@ begin_deployment() {
         local running_now
         running_now="$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)"
         docker stop --time 30 mixin-chatbot >/dev/null
+        [ "$running_now" != true ] || downtime_begins
         docker rename mixin-chatbot "$ROLLBACK_CONTAINER"
         PREVIOUS_CONTAINER_SAVED=1
         if [ "$running_now" = true ]; then print_success "已停止机器人服务（容器 mixin-chatbot）；部署完成前不处理消息"; fi
@@ -341,7 +364,9 @@ rollback_deployment() {
 restore_deployment() {
     local status="$1" failed=0
     if [ "$DEPLOY_FILES_MUTATED" = 0 ]; then
-        if [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ]; then docker start mixin-chatbot >/dev/null; fi
+        if [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ] && docker start mixin-chatbot >/dev/null; then
+            downtime_ends 'previous version restarted'
+        fi
         return 1
     fi
     stop_tunnel_launcher || failed=1
@@ -392,7 +417,7 @@ restore_deployment() {
     fi
     if [ "$PREVIOUS_CONTAINER_SAVED" = 1 ]; then docker rename "$ROLLBACK_CONTAINER" mixin-chatbot || failed=1; fi
     if [ "$failed" = 0 ] && [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ]; then
-        docker start mixin-chatbot >/dev/null || failed=1
+        if docker start mixin-chatbot >/dev/null; then downtime_ends 'previous version restarted'; else failed=1; fi
     fi
     if [ "$PREVIOUS_TUNNEL_RUNNING" = 1 ] && ! managed_cloudflared_pid >/dev/null 2>&1; then
         if [ "${#TUNNEL_COMMAND[@]}" -gt 0 ]; then

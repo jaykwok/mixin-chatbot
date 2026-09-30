@@ -292,6 +292,21 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
     // Ordinary operations still refuse to run on broken settings.
     const doctor = await ops("doctor");
     expect(doctor.code).toBe(1); expect(doctor.output).toContain("端口无效");
+    // A damaged record, the record of another snapshot or a pointer whose snapshot is gone: continuing and rolling back both
+    // refuse before anything is dispatched, and the pointer and the record stay as they were for the operator to inspect.
+    const pointer = join(root, "data/state/deploy-transaction"), recorded = join(root, "backup/snapshots/deploy-abc123/transaction");
+    for (const [fault, message] of [["duplicate", "事务记录无效：bot_port"], ["foreign", "事务记录与指针不一致"], ["gone", "部署快照缺失"]] as const) {
+      await writeFile(recorded, fault === "duplicate" ? serialize(record) + "bot_port=2023\n" : serialize(fault === "foreign" ? { ...record, snapshot: "deploy-other" } : record));
+      await writeFile(pointer, fault === "gone" ? "deploy-gone" : "deploy-abc123");
+      const before = [await readFile(pointer, "utf8"), await readFile(recorded, "utf8")];
+      for (const command of ["resume", "rollback"]) {
+        const result = await ops(command);
+        expect(result.code, `${fault} ${command}\n${result.output}`).toBe(1);
+        expect(result.output).toContain("未完成事务的记录无法读取"); expect(result.output).toContain(message);
+        expect(result.output).not.toContain("DISPATCHED");
+        expect([await readFile(pointer, "utf8"), await readFile(recorded, "utf8")]).toEqual(before);
+      }
+    }
   } finally { await fixture.cleanup(); }
 }, 30000);
 

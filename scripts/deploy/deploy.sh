@@ -245,6 +245,7 @@ activate_committed_deployment() {
             print_error "数据已经提交，但业务实例未就绪；保留新版本，请检查日志后使用 $(ops_command_hint resume) 继续"
             exit 1
         fi
+        downtime_ends 'new version healthy'
     fi
     candidate_publish "$IMAGE_ID" mixin-chatbot || {
         print_error "数据已经提交，新版本已启用，但正式标签 mixin-chatbot 未能指向 ${IMAGE_ID}（原因见上方）；保留事务，处理后使用 $(ops_command_hint resume) 重试"

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fileHolderFunctions } from "../helpers/file-holder.ts";
@@ -1684,8 +1684,14 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
       return { ...output, docker: (await readFile(dockerLog, "utf8")).trim().split("\n") };
     };
     await record();
-    let activation = await committed({ FIXTURE_ROLLBACK_CONTAINER: "1" });
+    // The upgrader that stopped the service in the same operation passes the time of the stop: the operation log records
+    // the downtime until the new instance is healthy.
+    const operationLog = join(fixture.root, "operation.log");
+    await writeFile(operationLog, "");
+    let activation = await committed({ FIXTURE_ROLLBACK_CONTAINER: "1", BOT_OPERATION_LOG_PATH: posixPath(operationLog),
+      BOT_DOWNTIME_STARTED: String(Math.floor(Date.now() / 1000) - 7) });
     expect(activation.code, activation.output).toBe(0);
+    expect(Number(/service back \(new version healthy\); downtime (\d+)s/.exec(await readFile(operationLog, "utf8"))?.[1])).toBeGreaterThanOrEqual(7);
     // The new instance must run the recorded image. Once it is healthy the official tag names that image and is
     // verified; only then the transaction ends and the reserved tag, the rollback container and its tag are released.
     const publish = [`tag ${candidateId} mixin-chatbot`, "image inspect --format {{.Id}} mixin-chatbot"];
@@ -1718,17 +1724,25 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
     activation = await committed({ FIXTURE_CONTAINER_IMAGE: `sha256:${"d".repeat(64)}` });
     expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("不是记录的候选镜像");
     expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect --format {{.Image}} mixin-chatbot"]);
-    // Recovery reads the image and the identity first. Another Docker daemon, a missing record or an identity that does not
-    // fit the daemon refuses both ways before any container is touched.
-    for (const [change, message] of [["daemon", "Docker daemon 与开始事务时不同"], ["record", "缺少服务身份记录"], ["identity", "记录的服务身份与当前 Docker 的模式不符"]] as const) {
+    // Recovery reads the image and the identity first. Another Docker daemon, a missing record, a candidate recorded for
+    // another commit or an identity that does not fit the daemon refuses both ways before any container is touched; the
+    // pointer and the records stay for the operator.
+    for (const [change, message] of [["daemon", "Docker daemon 与开始事务时不同"], ["record", "缺少服务身份记录"], ["candidate", "缺少候选镜像记录"],
+      ["commit", "与事务的目标提交"], ["identity", "记录的服务身份与当前 Docker 的模式不符"]] as const) {
       await record();
       if (change === "record") await rm(join(snapshot, "service-user"));
+      if (change === "candidate") await rm(join(snapshot, "candidate-image"));
+      if (change === "commit") await writeFile(join(snapshot, "candidate-image"), (await readFile(join(snapshot, "candidate-image"), "utf8"))
+        .replace("source=workspace\n", "source=commit\n").replace("target_sha=\n", `target_sha=${"b".repeat(40)}\n`));
       if (change === "identity") await writeFile(join(snapshot, "service-user"), lines({ format: "1", user: "0:0", source: "container" }));
+      const records = async () => Promise.all(["transaction", "candidate-image", "service-user"].map(name => readFile(join(snapshot, name), "utf8").catch(() => null)));
+      const kept = await records();
       for (const action of ["continue", "rollback"]) {
         await writeFile(dockerLog, "");
         result = await run({ FIXTURE_ACTION: action, FIXTURE_COMMITTED: "1", FIXTURE_CANDIDATE: change === "daemon" ? "3" : "0" });
         expect(result.code, result.output).toBe(1); expect(result.output).toContain(message);
         expect(await readFile(dockerLog, "utf8")).toBe(""); expect(result.output).not.toContain("BEGIN");
+        expect(await readFile(join(state, "deploy-transaction"), "utf8")).toBe("deploy-fixture"); expect(await records()).toEqual(kept);
       }
     }
     // A removed candidate cannot be replaced by a rebuild: continuing is refused, and so is a rollback once this
@@ -1936,6 +1950,9 @@ exit 42
       const logs = await readdir(join(root, "logs/operations")); expect(logs).toHaveLength(1);
       const text = await readFile(join(root, "logs/operations", logs[0]!), "utf8");
       expect(text).toContain("rollback"); expect(text).toContain("已恢复配置"); expect(text).toContain(`operation finished; exit=${status}`);
+      // The downtime window: from stopping the running service until the old container runs again.
+      if (running) { expect(text).toContain("service stopped; downtime begins"); expect(text).toMatch(/service back \(previous version restarted\); downtime \d+s/); }
+      else expect(text).not.toContain("downtime");
       expect(existsSync(join(root, "mock/interrupt-rollback"))).toBe(false);
       expect(await readFile(join(root, "data/config/models.json"), "utf8")).toBe("old-config");
       expect(await readFile(join(root, "data/state/bot-port"), "utf8")).toBe("1011");
@@ -2115,13 +2132,32 @@ exit 42
     for (const dir of ["data/config", "data/state", "mock", "logs"]) await mkdir(join(fixture.root, dir), { recursive: true });
     await writeFile(join(fixture.root, "data/config/models.json"), "original");
     await writeFile(join(fixture.root, "mock/mixin-chatbot"), "old-image true\n");
-    const run = (phase: string) => execute([bash!, posixPath(script), posixPath(fixture.root), phase], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
+    const operationLog = join(fixture.root, "operation.log");
+    const run = (phase: string) => execute([bash!, posixPath(script), posixPath(fixture.root), phase], fixture.root,
+      { ...process.env, MSYS_NO_PATHCONV: "1", BOT_OPERATION_LOG_PATH: phase === "resume" ? posixPath(operationLog) : "" });
     const first = await run("initial"); expect(first.code, first.output).toBe(0);
     const refused = await run("committed");
     expect(refused.code, refused.output).toBe(0); expect(refused.output).toContain("已经提交"); expect(refused.output).not.toContain("REOPENED");
     expect(await readFile(join(fixture.root, "mock/mixin-chatbot"), "utf8")).toBe("new-image true\n");
+    await writeFile(operationLog, "");
     const second = await run("resume"); expect(second.code, second.output).toBe(42);
     expect(await readFile(join(fixture.root, "mock/mixin-chatbot"), "utf8")).toBe("old-image true\n");
     expect(existsSync(join(fixture.root, "data/state/deploy-transaction"))).toBe(false);
+    // The original service was stopped by the interrupted process; stopping the new instance does not start the window again.
+    let text = await readFile(operationLog, "utf8");
+    expect(text).toContain("resuming snapshot"); expect(text).not.toContain("downtime begins");
+    expect(text).toContain("service back (previous version restarted); the stop happened in an earlier process");
+    // Interrupted after the pointer was published but before the stop: the resumed process stops the original service,
+    // and the downtime runs from there until the old container is back.
+    await run("initial");
+    await rm(join(fixture.root, "mock/mixin-chatbot")); await rm(join(fixture.root, "restored-data"));
+    await rename(join(fixture.root, "mock/mixin-chatbot-rollback"), join(fixture.root, "mock/mixin-chatbot"));
+    await writeFile(join(fixture.root, "mock/mixin-chatbot"), "old-image true\n"); await writeFile(operationLog, "");
+    const third = await run("resume"); expect(third.code, third.output).toBe(42);
+    expect(await readFile(join(fixture.root, "mock/mixin-chatbot"), "utf8")).toBe("old-image true\n");
+    text = await readFile(operationLog, "utf8");
+    expect(text).toContain("resuming snapshot");
+    expect(text.indexOf("service stopped; downtime begins")).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf("service stopped; downtime begins")).toBeLessThan(text.search(/service back \(previous version restarted\); downtime \d+s/));
   } finally { await fixture.cleanup(); }
 }, 30000);

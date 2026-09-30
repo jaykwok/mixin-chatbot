@@ -109,14 +109,27 @@ choose_pending_action() {
 }
 
 # 已跟踪文件有改动时不切换：快进会保留目标提交没有改动的文件上的改动，执行的就不是目标版本。
-checkout_target() {
+tracked_files_clean() {
     local dirty
+    dirty="$(git_here status --porcelain --untracked-files=no 2>&1)" && [ -z "$dirty" ] && return 0
+    print_error "已跟踪文件有未提交的改动，不切换代码："
+    printf '%s\n' "$dirty" | sed 's/^/      /'
+    return 1
+}
+
+# 续做在停机之前确认切换能完成：已跟踪文件没有改动、main 能快进到目标提交、经 main 的两步切换不会覆盖未跟踪的内容。
+switch_ready() {
+    local main
+    tracked_files_clean || return 1
+    main="$(git_here rev-parse --verify --quiet 'refs/heads/main^{commit}')" || { print_error "本地 main 分支不存在，不切换代码"; return 1; }
+    git_here merge-base --is-ancestor "$main" "$TARGET_SHA" ||
+        { print_error "本地 main（${main:0:7}）无法快进到目标提交 ${TARGET_SHA:0:7}，不切换代码"; return 1; }
+    switch_preflight "$(git_here rev-parse HEAD)" "$main" "$TARGET_SHA" "$UPGRADER_DIR"
+}
+
+checkout_target() {
     operation_stage checkout
-    if ! dirty="$(git_here status --porcelain --untracked-files=no 2>&1)" || [ -n "$dirty" ]; then
-        print_error "已跟踪文件有未提交的改动，不切换代码："
-        printf '%s\n' "$dirty" | sed 's/^/      /'
-        return 1
-    fi
+    tracked_files_clean || return 1
     operation_capture_quiet git_here checkout --quiet main || return 1
     operation_capture_quiet git_here merge --ff-only --quiet "$TARGET_SHA" || return 1
     [ "$(git_here rev-parse HEAD)" = "$TARGET_SHA" ]
@@ -269,12 +282,17 @@ resume_upgrade() {
         exit 1
     fi
     if [ "$head" != "$TARGET_SHA" ]; then
+        # 停机之前先确认能切换过去：不能切换时服务和代码保持现状。
+        git_here cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null ||
+            { print_error "目标提交 ${TARGET_SHA:0:7} 在本地不存在；服务和代码保持现状，取回该提交后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
+        switch_ready || { print_error "不能切换到目标提交 ${TARGET_SHA:0:7}（原因见上方）；服务和代码保持现状，处理后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
         # 中断发生在停机完成之前时服务可能仍在运行；切换代码前先停止。
         if [ "$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then
             print_status "停止机器人服务后再切换代码..."
             operation_capture docker stop --time 30 mixin-chatbot || { print_error "旧容器停止失败，未切换代码；可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
+            downtime_begins
         fi
-        git_here cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null && checkout_target || {
+        checkout_target || {
             print_error "无法切换到目标提交 ${TARGET_SHA:0:7}；服务保持停止，处理后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
         print_success "代码已更新：${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}"
     fi
@@ -502,6 +520,8 @@ recheck_before_stop() {
         git_here status --short --branch --untracked-files=no 2>&1 | sed 's/^/      /' || true
         exit 1
     fi
+    switch_preflight "$ORIGINAL_SHA" "$ORIGINAL_MAIN" "$TARGET_SHA" "$UPGRADER_DIR" ||
+        { print_error "准备期间工作区出现了切换代码会覆盖的未跟踪内容（见上方）；服务尚未停止，请处理后重新运行升级"; exit 1; }
     [ "$(prepared_inputs)" = "$PREPARED_INPUTS" ] ||
         { print_error "预览之后配置或版本标记发生了变化；服务尚未停止，请重新运行升级"; exit 1; }
     original_service_container || status=$?
@@ -576,6 +596,9 @@ fresh_upgrade() {
         print_warning "请先推送或丢弃这些提交后重试"
         exit 1
     fi
+    # git 要到切换时才拒绝覆盖未跟踪的文件（被忽略的文件则直接覆盖），那时服务已经停止：先预演，构建之前列出冲突。
+    switch_preflight "$ORIGINAL_SHA" "$ORIGINAL_MAIN" "$TARGET_SHA" "$UPGRADER_DIR" ||
+        { print_error "切换代码会覆盖工作区中未跟踪的内容（见上方）；服务尚未停止，未构建镜像，请处理后重试"; exit 1; }
     if [ "$ORIGINAL_SHA" = "$TARGET_SHA" ]; then
         print_success "代码已经最新，仍检查数据版本并完成必要迁移"
     else

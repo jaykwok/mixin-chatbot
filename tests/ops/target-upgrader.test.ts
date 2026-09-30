@@ -63,6 +63,8 @@ case "$cmd" in
             branch) git -C "$FIXTURE_WORK" checkout --quiet -b hotfix ;;
             commit) git -C "$FIXTURE_WORK" commit --quiet --allow-empty -m hotfix ;;
             main) git -C "$FIXTURE_WORK" update-ref refs/heads/main "$(git -C "$FIXTURE_WORK" commit-tree 'HEAD^{tree}' -p HEAD -m hotfix)" ;;
+            # A local file where the target adds one: switching would overwrite it.
+            untracked) mkdir -p "$FIXTURE_WORK/release-notes"; printf 'local' > "$FIXTURE_WORK/release-notes/next.md" ;;
         esac
         # A build that is still running when the upgrader is interrupted; its tag already exists.
         if [ "\${FIXTURE_BUILD:-ok}" = hold ]; then echo "$$" > "$mock/build-pid"; exec sleep 30; fi
@@ -225,11 +227,14 @@ async function buildTemplate() {
     await git("init", "--initial-branch=main");
     await git("config", "user.name", "Fixture"); await git("config", "user.email", "fixture@example.invalid"); await git("config", "core.autocrlf", "false");
     await writeFile(join(f.root, "gitignore"), ""); await git("config", "core.excludesFile", join(f.root, "gitignore"));
-    // retired.txt exists only in the old commit: restoring it would overwrite an untracked file at that path.
+    // retired.txt exists only in the old commit: restoring it would overwrite an untracked file at that path. The target
+    // adds release-notes/next.md: switching to it would overwrite an untracked file there.
     await writeFile(join(work, "version.txt"), "old"); await writeFile(join(work, "retired.txt"), "old only");
     await git("add", "."); await git("commit", "-m", "old");
     const old = await git("rev-parse", "HEAD");
-    await writeFile(join(work, "version.txt"), "new"); await rm(join(work, "retired.txt")); await git("add", "-A"); await git("commit", "-m", "fixture-new");
+    await writeFile(join(work, "version.txt"), "new"); await rm(join(work, "retired.txt"));
+    await mkdir(join(work, "release-notes")); await writeFile(join(work, "release-notes/next.md"), "new");
+    await git("add", "-A"); await git("commit", "-m", "fixture-new");
     const target = await git("rev-parse", "HEAD");
     // Export exactly UPGRADER_EXPORT_PATHS from the target, as ops.sh update does.
     await mkdir(stage, { recursive: true });
@@ -435,23 +440,27 @@ scenario("target upgrader: refusals before the stop leave code, data and service
   // upgrader exits, so no Docker CLI or container is left behind, even when INT and TERM reach its whole process group
   // again during that cleanup; an interrupted build ends only this build's client. Windows cannot deliver the signal to bash.
   if (process.platform !== "win32") {
-    const interrupt = async (extra: Record<string, string>, started: string) => {
+    // `ready`: a file the stub writes last before it holds (the build logs its event first, then tags and holds).
+    const interrupt = async (extra: Record<string, string>, started: string, ready?: string) => {
       await rm(join(f.root, "events"), { force: true });
+      if (ready) await rm(ready, { force: true });
       const held = processes.spawn([bash!, posix(join(stage, "scripts/deploy/upgrade.sh")), posix(work), target],
         { cwd: work, env: { ...process.env, ...env(extra) } });
       await writeFile(join(fx.mock, "group"), String(held.pid));
-      for (let waited = 0; !(await log()).some(line => line.startsWith(started)) && waited < 20000; waited += 50) await Bun.sleep(50);
+      const holding = async () => (await log()).some(line => line.startsWith(started)) && (!ready || existsSync(ready));
+      for (let waited = 0; !(await holding()) && waited < 20000; waited += 50) await Bun.sleep(50);
       held.kill("SIGTERM");
       const [code, { out, err }] = await Promise.all([held.exited, held.output()]);
       expect(code, out + err).toBe(143);
       expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
-      expect(await candidateTags()).toEqual([]);
+      expect(await candidateTags()).toEqual([]); expect(await fx.officialTag()).toBe("sha256:old");
+      expect(await fx.container("mixin-chatbot")).toBe("sha256:old true");
       return out + err;
     };
     expect(await interrupt({ FIXTURE_PREVIEW: "hold", FIXTURE_RM_SIGNALS: "1" }, "preview")).toContain("迁移预览已中断并清理");
     expect((await log()).filter(line => !/^(build|preview)/.test(line))).toEqual([expect.stringMatching(/^rm -f mixin-chatbot-preview-[0-9a-f]{12}$/)]);
     // The build's tag exists before its ID is known: it is claimed by the operation label and released.
-    expect(await interrupt({ FIXTURE_BUILD: "hold" }, "build")).toContain("镜像构建已中断");
+    expect(await interrupt({ FIXTURE_BUILD: "hold" }, "build", join(fx.mock, "build-pid"))).toContain("镜像构建已中断");
     expect((await log()).filter(line => !line.startsWith("build"))).toEqual([]);
     const client = Number(await readFile(join(fx.mock, "build-pid"), "utf8"));
     const alive = () => { try { process.kill(client, 0); return true; } catch { return false; } };
@@ -506,6 +515,7 @@ scenario("ops update interrupted by Ctrl+C, TERM or a hangup cleans up before th
     expect(code, out + err).not.toBe(0);
     expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
     expect((await readdir(join(work, "tmp"))).filter(name => name.startsWith("upgrade-") && name !== "upgrade-fixture")).toEqual([]);
+    expect(await container("mixin-chatbot")).toBe("sha256:old true"); expect(await fx.officialTag()).toBe("sha256:old");
     return out + err;
   };
   for (const [signal, extra] of [["group", {}], ["ops", {}], ["ops", { FIXTURE_RM_SIGNALS: "1" }]] as const) {
@@ -587,6 +597,97 @@ scenario("target upgrader: a failed build, too little disk space or any input ch
     expect(await candidateTags()).toEqual([]); expect(await officialTag()).toBe("sha256:old");
     await writeFile(join(work, "data/config/models.json"), "{}");
   }
+});
+
+// The switch after the stop (checkout main, then fast-forward) would stop at local files on paths the target or the
+// intermediate main adds, or overwrite ignored ones. They are listed before the build, again before the stop (files may
+// appear while the image builds), and before a resumed upgrade stops the service. The upgrader never moves or rewrites
+// them and leaves the index as it was.
+scenario("target upgrader: untracked files on the switch route through main are refused before the build, before the stop and before a resumed upgrade stops the service", "target-upgrader-untracked-", async fx => {
+  const { work, state, stage, mock, git, upgrade, log, reset, container, candidateTags, old, target } = fx;
+  const notes = join(work, "release-notes/next.md"), pointer = join(state, "deploy-transaction");
+  const oldShort = old.slice(0, 7);
+  let result: { code: number; text: string };
+  /** Refused with the service, the code, the index and the operator's files as they were. */
+  const refused = async (head: string, files: Record<string, string>, index: string) => {
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("升级不移动、不删除这些文件");
+    expect(await git("rev-parse", "HEAD")).toBe(head); expect(await git("ls-files", "--stage")).toBe(index);
+    expect(existsSync(join(work, ".git/index.lock"))).toBe(false); expect(existsSync(join(stage, "switch-index"))).toBe(false);
+    for (const [path, content] of Object.entries(files)) expect(await readFile(join(work, path), "utf8")).toBe(content);
+    expect(await candidateTags()).toEqual([]);
+  };
+  // Before the build: a local file where the target adds one.
+  await reset(old);
+  let index = await git("ls-files", "--stage");
+  await mkdir(join(work, "release-notes")); await writeFile(notes, "local notes");
+  result = await upgrade([target]);
+  await refused(old, { "release-notes/next.md": "local notes" }, index);
+  expect(result.text).toContain("  - 未跟踪的文件会被目标版本覆盖：release-notes/next.md"); expect(result.text).toContain("服务尚未停止，未构建镜像");
+  expect(await log()).toEqual([]); expect(await container("mixin-chatbot")).toBe("sha256:old true"); expect(existsSync(pointer)).toBe(false);
+  await rm(join(work, "release-notes"), { recursive: true });
+
+  // From a detached HEAD the switch checks out main first: a file only main adds (the target removes it again) is listed,
+  // although switching straight to the target would keep it. Once it is moved away the same upgrade completes and keeps
+  // the operator's other files.
+  await reset(old);
+  await git("checkout", "-q", "--detach", old);
+  await writeFile(join(work, "mid.txt"), "main"); await git("add", "mid.txt"); await git("commit", "-qm", "mid");
+  const mid = await git("rev-parse", "HEAD");
+  const next = await git("commit-tree", `${target}^{tree}`, "-p", mid, "-m", "fixture-new");
+  await git("checkout", "-q", "--detach", old); await git("update-ref", "refs/heads/main", mid);
+  index = await git("ls-files", "--stage");
+  await writeFile(join(work, "mid.txt"), "local mid"); await writeFile(join(work, "operator.txt"), "kept");
+  result = await upgrade([next], {}, "y\n");
+  await refused(old, { "mid.txt": "local mid", "operator.txt": "kept" }, index);
+  expect(result.text).toContain(`切换代码（当前 ${oldShort} -> main ${mid.slice(0, 7)} -> 目标 ${next.slice(0, 7)}）`);
+  expect(result.text).toContain("  - 未跟踪的文件会被切换途经的 main 分支覆盖：mid.txt"); expect(result.text).not.toContain("release-notes");
+  expect(await log()).toEqual([]); expect(await git("rev-parse", "main")).toBe(mid);
+  await rm(join(work, "mid.txt"));
+  result = await upgrade([next], {}, "y\n");
+  expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级完成");
+  expect(await git("rev-parse", "HEAD")).toBe(next); expect(await git("rev-parse", "main")).toBe(next);
+  expect(await readFile(join(work, "operator.txt"), "utf8")).toBe("kept"); expect(existsSync(join(work, "mid.txt"))).toBe(false);
+  await rm(join(work, "operator.txt"));
+
+  // A file that appears while the image builds is found by the check before the stop.
+  await reset(old);
+  index = await git("ls-files", "--stage");
+  result = await upgrade([target], { FIXTURE_DURING_BUILD: "untracked" });
+  await refused(old, { "release-notes/next.md": "local" }, index);
+  expect(result.text).toContain("准备期间工作区出现了切换代码会覆盖的未跟踪内容");
+  expect(result.text).toContain("  - 未跟踪的文件会被目标版本覆盖：release-notes/next.md");
+  expect(await log()).toEqual([`build head=${oldShort} context=new`, `preview head=${oldShort}`]);
+  expect(await container("mixin-chatbot")).toBe("sha256:old true"); expect(existsSync(pointer)).toBe(false);
+  await rm(join(work, "release-notes"), { recursive: true });
+
+  // Resumed after the pointer was published but before the stop (the service still runs): the switch is checked before
+  // the service is stopped, for local files and for a main that no longer fast-forwards to the target.
+  await reset(old);
+  const failed = await upgrade([target], { FIXTURE_DEPLOY: "pending", FIXTURE_ROLLBACK: "fail" });
+  expect(failed.code, failed.text).toBe(1); expect(existsSync(pointer)).toBe(true);
+  await git("reset", "--hard", old);
+  await rm(join(mock, "containers/mixin-chatbot-rollback")); await writeFile(join(mock, "containers/mixin-chatbot"), "sha256:old true\n");
+  index = await git("ls-files", "--stage");
+  await mkdir(join(work, "release-notes")); await writeFile(notes, "local notes");
+  result = await upgrade([target, "continue"]);
+  expect(result.text).toContain("不能切换到目标提交"); expect(result.text).toContain("服务和代码保持现状");
+  expect(result.text).toContain("  - 未跟踪的文件会被目标版本覆盖：release-notes/next.md");
+  expect(await log()).toEqual([]); expect(await container("mixin-chatbot")).toBe("sha256:old true"); expect(existsSync(pointer)).toBe(true);
+  expect(result.code, result.text).toBe(1); expect(await git("rev-parse", "HEAD")).toBe(old); expect(await git("ls-files", "--stage")).toBe(index);
+  expect(await readFile(notes, "utf8")).toBe("local notes"); expect(existsSync(join(work, ".git/index.lock"))).toBe(false);
+  await rm(join(work, "release-notes"), { recursive: true });
+  await git("checkout", "-q", "--detach", old);
+  const side = await git("commit-tree", `${old}^{tree}`, "-p", old, "-m", "side");
+  await git("update-ref", "refs/heads/main", side);
+  result = await upgrade([target, "continue"]);
+  expect(result.code, result.text).toBe(1); expect(result.text).toContain(`本地 main（${side.slice(0, 7)}）无法快进到目标提交`);
+  expect(await log()).toEqual([]); expect(await container("mixin-chatbot")).toBe("sha256:old true");
+  await git("update-ref", "refs/heads/main", old); await git("checkout", "-q", "main");
+  // Nothing in the way: the resumed upgrade stops the service, switches and hands over.
+  result = await upgrade([target, "continue"]);
+  expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级完成");
+  expect(await log()).toEqual([`stop mixin-chatbot head=${oldShort}`, `deploy action=continue handoff= token=none receipt=[] stdin= tty=no head=${target.slice(0, 7)}`]);
+  expect(await git("rev-parse", "HEAD")).toBe(target);
 });
 
 scenario("target upgrader: failures after the handoff roll back automatically, committed data keeps the new code, and a failed rollback waits for an explicit one", "target-upgrader-failures-", async fx => {
@@ -688,6 +789,18 @@ scenario("target upgrader: an upgrade interrupted before the checkout continues 
   result = await upgrade([target, "rollback"]);
   expect(result.code, result.text).toBe(0); expect(await git("rev-parse", "HEAD")).toBe(old);
   expect(await fx.container("mixin-chatbot")).toBe("sha256:old true");
+  // Interrupted after the pointer was published but before the stop, so the service still runs: the rollback stops it,
+  // restores the snapshot and starts the original container again, clears the transaction and releases the reserved tag.
+  await interrupted();
+  await rm(join(fx.mock, "containers/mixin-chatbot-rollback")); await writeFile(join(fx.mock, "containers/mixin-chatbot"), "sha256:old true\n");
+  expect(await fx.candidateTags()).toHaveLength(1);
+  result = await upgrade([target, "rollback"]);
+  expect(result.code, result.text).toBe(0);
+  expect(await log()).toEqual([`stop mixin-chatbot head=${oldShort}`, "rename mixin-chatbot mixin-chatbot-rollback",
+    "rename mixin-chatbot-rollback mixin-chatbot", `start mixin-chatbot head=${oldShort}`]);
+  expect(await fx.container("mixin-chatbot")).toBe("sha256:old true"); expect(await fx.container("mixin-chatbot-rollback")).toBe("absent");
+  expect(existsSync(join(state, "deploy-transaction"))).toBe(false); expect(await git("rev-parse", "HEAD")).toBe(old);
+  expect(await fx.candidateTags()).toEqual([]); expect(await fx.officialTag()).toBe("sha256:old");
 });
 
 // Interrupts reach the upgrader's whole process group, as a terminal's Ctrl+C and hangup do, while it restores the code:
@@ -853,6 +966,11 @@ scenario("target upgrader: a new upgrade builds the target once, previews in tha
     domain_action: "persist", unmanaged_tunnel: "", platform_ip: expect.any(String), reconfigure_ai: "0" });
   expect(await readFile(join(mock, "plan"), "utf8")).toBe('{"format":1,"fixture":"plan"}');
   expect(await git("rev-parse", "HEAD")).toBe(target);
+  // The operation log records the build's duration and the start of the downtime (the deploy script records its end).
+  const operationLogs = (await readdir(join(work, "logs/operations"))).filter(name => name.startsWith("upgrade-")).sort();
+  const operationLog = await readFile(join(work, "logs/operations", operationLogs.at(-1)!), "utf8");
+  expect(operationLog).toMatch(/candidate build took \d+s; exit=0/); expect(operationLog).toContain("service stopped; downtime begins");
+  expect(operationLog.indexOf("candidate build took")).toBeLessThan(operationLog.indexOf("downtime begins"));
   // Rootless Docker cannot publish a saved privileged port (rootlesskit listens as the deploying user): the upgrade
   // stops before the build and the stop instead of failing at the container start. Rootful Docker keeps upgrading.
   const kernel = "/proc/sys/net/ipv4/ip_unprivileged_port_start";

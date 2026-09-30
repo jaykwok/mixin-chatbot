@@ -340,10 +340,9 @@ restore_checkout() {
 # restore_checkout 会丢弃工作区的改动（reset --hard / checkout --force）：恢复前检查升级后的人工改动。
 # 当前提交和要重置的原分支只能停在升级前或目标提交；已跟踪文件不能有改动。升级前有、当前提交没有的路径由恢复重建：
 # 路径本身已有的内容只能是目标版本跟踪的目录，且其中没有未跟踪或忽略的文件；各级父路径只能是目录、不存在，
-# 或目标版本跟踪的文件，否则 git 会删掉占位的文件或链接再建目录（或经链接写到别处）。有冲突时逐项列出并返回 1，调用方保留事务并停止。
+# 或目标版本跟踪的文件（含链接），否则 git 会删掉占位的文件或链接再建目录（或经链接写到别处）。有冲突时逐项列出并返回 1，调用方保留事务并停止。
 code_restore_safe() {
-    local branch="$1" original="$2" target="$3" head ref line path parent conflicts=()
-    local -A checked=()
+    local branch="$1" original="$2" target="$3" head ref line conflicts=()
     head="$(git_here rev-parse --verify --quiet 'HEAD^{commit}')" || head=''
     [ "$head" = "$original" ] || [ "$head" = "$target" ] ||
         conflicts+=("当前提交 ${head:0:7} 既不是升级前的 ${original:0:7}，也不是目标 ${target:0:7}：升级后有新的提交或切换")
@@ -356,31 +355,86 @@ code_restore_safe() {
         [ -z "$line" ] || conflicts+=("未提交的改动：$line")
     done < <(git_here status --porcelain --untracked-files=no 2>&1)
     if [ -n "$head" ] && git_here cat-file -e "${original}^{commit}" 2>/dev/null; then
-        while IFS= read -r -d '' path; do
-            if [ -e "$PROJECT_DIR/$path" ] || [ -L "$PROJECT_DIR/$path" ]; then
-                if [ ! -L "$PROJECT_DIR/$path" ] && [ -d "$PROJECT_DIR/$path" ] && [ "$(git_here cat-file -t "$head:$path" 2>/dev/null)" = tree ]; then
-                    while IFS= read -r -d '' line; do
-                        conflicts+=("未跟踪的文件会随目录删除（升级前的版本在 $path 是文件）：$line")
-                    done < <(git_here --literal-pathspecs ls-files -z --others -- "$path" 2>/dev/null)
-                else
-                    conflicts+=("未跟踪的文件会被升级前的版本覆盖：$path")
-                fi
-            fi
-            parent="$path"
-            while [[ "$parent" == */* ]]; do
-                parent="${parent%/*}"
-                [ -z "${checked[$parent]:-}" ] || break
-                checked[$parent]=1
-                if [ -L "$PROJECT_DIR/$parent" ] || { [ -e "$PROJECT_DIR/$parent" ] && [ ! -d "$PROJECT_DIR/$parent" ]; }; then
-                    [ "$(git_here cat-file -t "$head:$parent" 2>/dev/null)" = blob ] ||
-                        conflicts+=("未跟踪的文件或链接占着升级前版本的目录位置：$parent")
-                fi
-            done
-        done < <(git_here diff --name-only --no-renames -z --diff-filter=D "$original" "$head" 2>/dev/null)
+        untracked_switch_conflicts conflicts "$head" "$head" "$original" 升级前的版本 升级前版本
     fi
     [ "${#conflicts[@]}" -gt 0 ] || return 0
     echo "恢复升级前的代码会丢弃以下内容：" >&2
     printf '  - %s\n' "${conflicts[@]}" >&2
     operation_event error "code restore blocked by ${#conflicts[@]} local change(s)"
     return 1
+}
+
+# 把检出从 <from> 切换到 <to> 时会被覆盖或删除的未跟踪内容（包括被忽略的文件：git 切换时直接覆盖或随目录删除它们）
+# 追加到数组 <out>；<label> 是 <to> 在说明中的名称，<owner> 是“占着……的目录位置”中的写法（默认同 <label>）。
+# 只看 <from> 到 <to> 新增的路径：路径本身已有的内容只能是当前提交 <basis> 跟踪的文件或目录，目录中也不能有未跟踪
+# 或忽略的文件；各级父路径只能是目录、不存在，或 <basis> 跟踪的文件（含链接），否则 git 会删掉占位的文件或链接再建目录
+# （或经链接写到别处）。<basis> 跟踪的文件由调用方确认没有改动，经中间提交切换时（<from> 不是 <basis>），它们在
+# 前一步被删除或替换，不算冲突。父路径由外向内检查，第一个不是目录的父路径之下不再检查：工作区里没有这些路径，
+# 经链接看到的是别处的内容，git 删掉这个父路径再建目录，不经它写入。只读取工作区和对象库。
+untracked_switch_conflicts() {
+    local -n switch_conflicts="$1"
+    local basis="$2" from="$3" to="$4" label="$5" owner="${6:-$5}" path parent rest line kind
+    local -A occupied=()
+    while IFS= read -r -d '' path; do
+        parent='' rest="$path"
+        while [[ "$rest" == */* ]]; do
+            parent+="${parent:+/}${rest%%/*}" rest="${rest#*/}"
+            if [ -z "${occupied[$parent]:-}" ]; then
+                occupied[$parent]=no
+                if [ -L "$PROJECT_DIR/$parent" ] || { [ -e "$PROJECT_DIR/$parent" ] && [ ! -d "$PROJECT_DIR/$parent" ]; }; then
+                    occupied[$parent]=yes
+                    [ "$(git_here cat-file -t "$basis:$parent" 2>/dev/null)" = blob ] ||
+                        switch_conflicts+=("未跟踪的文件或链接占着${owner}的目录位置：$parent")
+                fi
+            fi
+            [ "${occupied[$parent]}" = no ] || continue 2
+        done
+        if [ -e "$PROJECT_DIR/$path" ] || [ -L "$PROJECT_DIR/$path" ]; then
+            kind="$(git_here cat-file -t "$basis:$path" 2>/dev/null)" || kind=''
+            if [ ! -L "$PROJECT_DIR/$path" ] && [ -d "$PROJECT_DIR/$path" ] && [ "$kind" = tree ]; then
+                while IFS= read -r -d '' line; do
+                    switch_conflicts+=("未跟踪的文件会随目录删除（${label}在 $path 是文件）：$line")
+                done < <(git_here --literal-pathspecs ls-files -z --others -- "$path" 2>/dev/null)
+            elif [ "$kind" != blob ]; then
+                switch_conflicts+=("未跟踪的文件会被${label}覆盖：$path")
+            fi
+        fi
+    done < <(git_here diff --name-only --no-renames -z --diff-filter=A "$from" "$to" 2>/dev/null)
+}
+
+# 升级切换代码的实际路径：当前提交 <head> -> main <main>（checkout），再快进到目标 <target>。停机前预演这两步，会被
+# 覆盖或删除的未跟踪内容逐项列出并返回 1；操作者移走后重试，脚本不移动、不删除它们。调用方已确认已跟踪文件没有
+# 改动、main 能快进到目标。规则之外再用 git 试运行能直接预演的两次切换（当前 -> main，当前 -> 目标：目标经 main
+# 新增的路径都在其中），git 拒绝而规则没有列出时同样停止。试运行用 <scratch> 中的索引副本：工作区的索引、
+# index.lock 和文件都不改动。
+switch_preflight() {
+    local head="$1" main="$2" target="$3" scratch="$4" output route conflicts=()
+    [ "$head" = "$main" ] || untracked_switch_conflicts conflicts "$head" "$head" "$main" '切换途经的 main 分支'
+    [ "$main" = "$target" ] || untracked_switch_conflicts conflicts "$head" "$main" "$target" 目标版本
+    if [ "${#conflicts[@]}" = 0 ]; then
+        if [ "$head" != "$main" ] && ! output="$(switch_dry_run "$head" "$main" "$scratch")"; then
+            conflicts+=("git 试运行切换到 main 失败：${output//$'\n'/ }")
+        elif [ "$head" != "$target" ] && ! output="$(switch_dry_run "$head" "$target" "$scratch")"; then
+            conflicts+=("git 试运行切换到目标提交失败：${output//$'\n'/ }")
+        fi
+    fi
+    [ "${#conflicts[@]}" -gt 0 ] || return 0
+    route="当前 ${head:0:7}"
+    [ "$head" = "$main" ] || route+=" -> main ${main:0:7}"
+    echo "切换代码（${route} -> 目标 ${target:0:7}）会覆盖或删除以下未跟踪的内容（包括被 .gitignore 忽略的文件），或因它们失败：" >&2
+    printf '  - %s\n' "${conflicts[@]}" >&2
+    echo "升级不移动、不删除这些文件；请把它们移出工作区（或提交到其他分支）后重试" >&2
+    operation_event error "code switch blocked by ${#conflicts[@]} untracked path(s)"
+    return 1
+}
+
+# git read-tree -n -m -u：检查从 <from> 切换到 <to> 会不会失败，不写入。它把被忽略的文件也当作会被覆盖的未跟踪文件。
+switch_dry_run() {
+    local from="$1" to="$2" index="$3/switch-index" real status=0
+    real="$(git_here rev-parse --git-path index)" || return 1
+    [[ "$real" == /* ]] || real="$PROJECT_DIR/$real"
+    rm -f -- "$index" "$index.lock" && cp -- "$real" "$index" || { echo "无法复制索引 $real"; return 1; }
+    GIT_INDEX_FILE="$index" git_here read-tree -n -m -u "$from" "$to" 2>&1 || status=$?
+    rm -f -- "$index" "$index.lock"
+    return "$status"
 }

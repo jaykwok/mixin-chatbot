@@ -14,11 +14,13 @@ const posix = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):
 const quotePS = (value: string) => `'${value.replaceAll("'", "''")}'`;
 type Engine = "bash" | "powershell";
 type Files = Record<string, string>;
+/** A commit's content: file contents, or symbolic links by their target. */
+type Tree = Record<string, string | { link: string }>;
 
 interface Scenario {
   name: string;
-  old: Files;
-  target: Files;
+  old: Tree;
+  target: Tree;
   /** Changes made after the upgrade, on top of the target checkout. */
   local?: (dir: string) => Promise<void>;
   /** Exact conflict list, or null when the restore is safe. */
@@ -27,7 +29,11 @@ interface Scenario {
   after: Files;
   /** A link that must still be a link afterwards. */
   link?: string;
+  /** Operator files in <dir>-elsewhere, outside the checkout, that neither the check nor the restore may change. */
+  outside?: Files;
   only?: Engine;
+  /** Tracked symbolic links: not on Windows, where Git for Windows checks them out as files by default. */
+  posixOnly?: boolean;
 }
 
 const parentTaken = "未跟踪的文件或链接占着升级前版本的目录位置：";
@@ -53,6 +59,15 @@ const scenarios: Scenario[] = [
     blocked: null, after: { "retired/seed.txt": "old", "retired/notes.txt": "notes" } },
   { name: "directory-became-tracked-file", old: { "docs/x.md": "old" }, target: { docs: "now a file" }, blocked: null, after: { "docs/x.md": "old" } },
   { name: "file-became-tracked-directory", old: { retired: "old file" }, target: { "retired/seed.txt": "new" }, blocked: null, after: { retired: "old file" } },
+  // The upgrade made a directory a tracked link: the restore deletes the link and recreates the directory. What the link
+  // points to (tracked files, or operator files outside the checkout) is not in the way and stays.
+  { name: "directory-became-tracked-link", old: { "kept/seed.txt": "kept", "retired/seed.txt": "old" },
+    target: { "kept/seed.txt": "kept", retired: { link: "kept" } }, posixOnly: true, blocked: null,
+    after: { "kept/seed.txt": "kept", "retired/seed.txt": "old" } },
+  { name: "directory-became-outside-link", old: { "retired/seed.txt": "old" },
+    target: { retired: { link: "../directory-became-outside-link-elsewhere" } }, posixOnly: true,
+    local: async dir => { await mkdir(`${dir}-elsewhere`); await writeFile(`${dir}-elsewhere/seed.txt`, "operator"); },
+    blocked: null, after: { "retired/seed.txt": "old" }, outside: { "seed.txt": "operator" } },
 ];
 
 async function run(command: string[], cwd: string, env: Record<string, string> = {}) {
@@ -68,11 +83,17 @@ async function git(dir: string, ...args: string[]): Promise<string> {
   return result.out;
 }
 
-async function write(dir: string, files: Files): Promise<void> {
+async function write(dir: string, files: Tree): Promise<void> {
   for (const [path, content] of Object.entries(files)) {
     await mkdir(dirname(join(dir, path)), { recursive: true });
-    await writeFile(join(dir, path), content);
+    if (typeof content === "string") await writeFile(join(dir, path), content);
+    else await symlink(content.link, join(dir, path));
   }
+}
+
+/** The files directly in <dir>-elsewhere with their contents. */
+function outsideFiles(dir: string): Files {
+  return Object.fromEntries(readdirSync(`${dir}-elsewhere`).map(name => [name, readFileSync(join(`${dir}-elsewhere`, name), "utf8")]));
 }
 
 // The old commit, the upgrade to the target on main, then the local changes.
@@ -142,7 +163,7 @@ for (const engine of ["bash", "powershell"] as const) {
   test.skipIf(!available)(`${engine} code restore check blocks local work on the old version's paths and their parents`, async () => {
     const fixture = await tempFixture(`code-restore-${engine}-`);
     try {
-      const selected = scenarios.filter(scenario => !scenario.only || scenario.only === engine);
+      const selected = scenarios.filter(scenario => (!scenario.only || scenario.only === engine) && (!scenario.posixOnly || process.platform !== "win32"));
       const cases = [];
       for (const scenario of selected) {
         const dir = join(fixture.root, scenario.name);
@@ -158,7 +179,9 @@ for (const engine of ["bash", "powershell"] as const) {
         expect(await git(dir, "rev-parse", "HEAD"), scenario.name).toBe(scenario.blocked ? target : original);
         for (const [path, content] of Object.entries(scenario.after)) expect(readFileSync(join(dir, path), "utf8"), `${scenario.name}: ${path}`).toBe(content);
         if (scenario.link) expect(lstatSync(join(dir, scenario.link)).isSymbolicLink(), scenario.name).toBe(true);
-        if (!scenario.blocked) continue;
+        if (scenario.outside) expect(outsideFiles(dir), scenario.name).toEqual(scenario.outside);
+        // A restore leaves the index matching the old commit.
+        if (!scenario.blocked) { expect(await git(dir, "status", "--porcelain", "--untracked-files=no"), scenario.name).toBe(""); continue; }
         // Each blocked case is a real loss: the unchecked restore destroys the local work the check protected. A linked
         // parent is either replaced by a directory or (Git for Windows follows junctions) written through to the link target.
         await git(dir, "reset", "-q", "--hard", original);
