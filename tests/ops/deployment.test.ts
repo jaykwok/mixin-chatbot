@@ -256,7 +256,16 @@ $body=$body.Replace('$PSScriptRoot', "'" + $PSScriptRoot.Replace("'", "''") + "'
 $run=[scriptblock]::Create($body)
 # The real conflict check runs against fixture-git: HEAD and the branch come from rev-parse, changes from status.
 $libraryAst=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/lib/deployment.ps1"))},[ref]$tokens,[ref]$errors)
-Invoke-Expression $libraryAst.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-CodeRestoreConflicts'},$true).Extent.Text
+foreach($name in @('Get-CodeRestoreConflicts','Get-UntrackedSwitchConflicts')) {
+    Invoke-Expression $libraryAst.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true).Extent.Text
+}
+# The switch check before the stop runs against real repositories in switch-preflight.test.ts. Here it reports a conflict
+# at the first check ('switch') or only at the recheck right before the stop ('switch-late'), and never runs after the stop.
+function Get-UpgradeSwitchConflicts {
+    if($script:stopped){throw 'switch checked after stop'}
+    $script:switchChecks++
+    if($script:failure -eq 'switch' -or ($script:failure -eq 'switch-late' -and $script:switchChecks -eq 2)){ '未跟踪的文件会被目标版本覆盖：added.txt' }
+}
 $BunPath='fixture-bun'; $GitPath='fixture-git'
 $Project=$PSScriptRoot; $OriginalSha='1111111111111111111111111111111111111111'; $TargetSha='2222222222222222222222222222222222222222'; $OriginalBranch='main'
 New-Item -ItemType Directory -Force -Path (Join-Path $Project 'data/state'),(Join-Path $Project 'data/groups') | Out-Null
@@ -307,18 +316,22 @@ function Start-ScheduledTask {
 function Register-ScheduledTask { }
 function Restore-DeploymentSnapshot { if(-not $script:codeRestored){throw 'old service before code restore'}; $script:restores++ }
 function Remove-CompletedBackup($path) { if(Test-Path -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction')){throw 'backup removed before the transaction closed'}; $script:cleanups++ }
-foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','preview','main-missing','diverged','task-missing','code','install','apply','health','commit','postcommit')) {
+foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','preview','main-missing','diverged','task-missing','switch','switch-late','code','install','apply','health','commit','postcommit')) {
     if(($script:failure -eq 'install' -and $script:reuse) -or ($script:failure -eq 'postcommit' -and -not $script:running)){continue}
     $script:stopped=$false; $script:applied=$false; $script:committed=$false; $script:dataRestored=$false; $script:codeRestored=$false
-    $script:backups=0; $script:installs=0; $script:starts=0; $script:verifications=0; $script:restores=0; $script:cleanups=0
+    $script:backups=0; $script:installs=0; $script:starts=0; $script:verifications=0; $script:restores=0; $script:cleanups=0; $script:switchChecks=0
     Remove-Item -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction') -Force -ErrorAction SilentlyContinue
-    $ok=$true
-    try { & $run } catch { $ok=$false; Write-Host $_.Exception.Message }
+    $ok=$true; $message=''
+    try { & $run } catch { $ok=$false; $message=$_.Exception.Message; Write-Host $message }
     if($ok -ne ($script:failure -eq 'none')){throw ('wrong result: '+$script:failure)}
     if($script:failure -eq 'code' -and ($script:installs -or $script:applied)){throw 'wrong release mutated data or dependencies'}
+    # Every upgrade that gets there checks the switch twice: in the preflight and again right before the stop.
+    if($script:failure -in @('none','switch-late') -and $script:switchChecks -ne 2){throw ('switch not rechecked before the stop: ' + $script:failure)}
+    if($script:failure -in @('switch','switch-late') -and $message -notmatch '本次升级没有停止服务[\\s\\S]*added\\.txt'){throw ('switch conflict not listed: ' + $message)}
+    if($script:failure -eq 'switch' -and (Test-Path -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction'))){throw 'snapshot taken despite the switch conflict'}
     # HEAD at a commit that is neither the original nor the target: the rollback never resets over it and keeps the transaction.
     if($script:failure -eq 'code') { if($script:codeRestored -or $script:restores){throw 'unknown commit overwritten'} }
-    elseif($script:failure -in @('preview','main-missing','diverged','task-missing')) { if($script:stopped -or $script:applied -or $script:installs){throw 'preflight failure mutated deployment'} }
+    elseif($script:failure -in @('preview','main-missing','diverged','task-missing','switch','switch-late')) { if($script:stopped -or $script:applied -or $script:installs){throw 'preflight failure mutated deployment'} }
     elseif($script:failure -in @('none','postcommit')) {
         if($script:restores -ne 0 -or -not $script:committed -or $script:starts -ne [int]$script:running){throw 'wrong committed state'}
         if($script:backups -ne [int](-not $script:reuse) -or $script:installs -ne $script:backups){throw 'dependency reuse failed'}
@@ -367,7 +380,7 @@ foreach($Rollback in @($true,$false)) {
   try {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
-    expect(result.output.match(/VERIFIED/g)).toHaveLength(42);
+    expect(result.output.match(/VERIFIED/g)).toHaveLength(50);
     expect(result.output.match(/ROLLBACK_VERIFIED/g)).toHaveLength(2);
     expect(result.output.match(/MANUAL_CHANGES_KEPT/g)).toHaveLength(2);
   } finally { await fixture.cleanup(); }

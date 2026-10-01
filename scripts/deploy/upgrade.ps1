@@ -38,6 +38,15 @@ function Invoke-Migration([string]$Action) {
     & $bun run $runner $Action --project $Project --groups $groups --plan $applyPlan
     if ($LASTEXITCODE -ne 0) { throw "数据迁移 $Action 失败 ($LASTEXITCODE)" }
 }
+# git 要到切换时才拒绝覆盖未跟踪的文件（被忽略的文件则直接覆盖或随目录删除），那时服务已经停止：停止服务之前预演
+# 当前提交 -> main -> 目标的切换，有冲突时列出并停止。新升级和续做都检查，准备之后、停止服务之前再复核一次。
+function Assert-SwitchReady {
+    $conflicts = @(Get-UpgradeSwitchConflicts $git $Project $TargetSha)
+    if (-not $conflicts.Count) { return }
+    throw ("本次升级没有停止服务，代码、数据和计划任务都未改动：切换代码（当前提交 -> main -> 目标 $($TargetSha.Substring(0, 7))）" +
+        "会覆盖或删除以下内容（包括被 .gitignore 忽略的文件），或因它们失败：`n  - " + ($conflicts -join "`n  - ") +
+        "`n升级不移动、不删除这些文件；请把它们移出工作区（或提交到其他分支）、撤销已跟踪文件的改动后重试。")
+}
 
 # This phase uses built-ins only, so even a changed Pi dependency cannot block decisions.
 try {
@@ -62,6 +71,7 @@ Set-OperationStage 'upgrade-preflight'
 if ((Invoke-OperationNative $git @('-C', $Project, 'show-ref', '--verify', '--quiet', 'refs/heads/main')) -ne 0) { throw '本地 main 分支不存在；旧服务尚未停止' }
 if ((Invoke-OperationNative $git @('-C', $Project, 'merge-base', '--is-ancestor', 'main', $TargetSha)) -ne 0) { throw '本地 main 无法快进到目标提交；旧服务尚未停止' }
 if (-not $pendingPath -and -not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) { throw '未安装计划任务，请先部署；旧服务尚未停止' }
+Assert-SwitchReady
 }
 Set-OperationStage 'deployment-snapshot'
 # 新升级沿用现有设置；端口、入口和域名只用于展示，不重新配置。续做和回滚只打开原快照，不读取这些设置。
@@ -108,6 +118,9 @@ try {
     Write-Host '回滚上次升级：恢复数据、代码、依赖、计划任务和原运行状态...'
     $mutated = $true
     } else {
+    # 快照和数据判定可能耗时，期间工作区可能出现新的冲突：停止服务之前再复核一次。
+    Set-OperationStage 'switch-recheck'
+    Assert-SwitchReady
     Set-OperationStage 'stop-service'
     if ($snapshot.WasRunning) { Write-Host "正在停止机器人服务（计划任务 $TaskName）..." }
     if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '机器人服务未能停止，升级未改动代码和数据' }

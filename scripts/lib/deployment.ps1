@@ -234,10 +234,128 @@ function Remove-UpgradeStage([string]$ProjectRoot, [string]$Stage) {
     Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
 }
 
+# 把检出从 <From> 切换到 <To> 时会被覆盖或删除的未跟踪内容（包括被忽略的文件：git 切换时直接覆盖或随目录删除它们），
+# 规则与 scripts/lib/common.sh 的 untracked_switch_conflicts 相同。<Label> 是 <To> 在说明中的名称，<Owner> 是“占着……的
+# 目录位置”中的写法。只看 <From> 到 <To> 新增的路径：路径本身已有的内容只能是当前提交 <Basis> 跟踪的文件或目录，目录中
+# 也不能有未跟踪或忽略的文件；各级父路径只能是目录、不存在，或 <Basis> 跟踪的文件（含链接），否则 git 会删掉占位的文件、
+# 链接或目录联接再建目录（或经它们写到别处）。<Basis> 跟踪的文件由调用方确认没有改动。父路径由外向内检查，第一个不是
+# 目录的父路径之下不再检查：工作区里没有这些路径，经链接看到的是别处的内容。只读取工作区和对象库。
+function Get-UntrackedSwitchConflicts([string]$GitPath, [string]$ProjectRoot, [string]$Basis, [string]$From, [string]$To, [string]$Label, [string]$Owner = $Label) {
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $conflicts = @()
+        # 属性不跟随链接；取不到（不存在）时为 $null。
+        $attributesOf = { param([string]$Path) try { [IO.File]::GetAttributes((Join-Path $ProjectRoot $Path)) } catch { $null } }
+        $realDirectory = { param($Attributes) $Attributes.HasFlag([IO.FileAttributes]::Directory) -and -not $Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) }
+        $trackedType = { param([string]$Path) "$(& $GitPath -C $ProjectRoot cat-file -t "${Basis}:$Path" 2>$null)".Trim() }
+        # -z 的输出被 PowerShell 按换行拆开：接回去再按 NUL 拆分，路径中的换行也保留。
+        $entries = { param($Lines) @((@($Lines) -join "`n").Split([char]0) | Where-Object { $_ }) }
+        $occupied = @{}
+        foreach ($path in (& $entries (& $GitPath -C $ProjectRoot diff --name-only --no-renames -z --diff-filter=A $From $To 2>$null))) {
+            $parent = ''
+            $covered = $false
+            $parts = $path.Split('/')
+            for ($index = 0; $index -lt $parts.Count - 1; $index++) {
+                $parent = if ($parent) { $parent + '/' + $parts[$index] } else { $parts[$index] }
+                if (-not $occupied.ContainsKey($parent)) {
+                    $occupied[$parent] = $false
+                    $attributes = & $attributesOf $parent
+                    if ($null -ne $attributes -and -not (& $realDirectory $attributes)) {
+                        $occupied[$parent] = $true
+                        if ((& $trackedType $parent) -ne 'blob') { $conflicts += "未跟踪的文件或链接占着${Owner}的目录位置：$parent" }
+                    }
+                }
+                if ($occupied[$parent]) { $covered = $true; break }
+            }
+            if ($covered) { continue }
+            $attributes = & $attributesOf $path
+            if ($null -eq $attributes) { continue }
+            $kind = & $trackedType $path
+            if ((& $realDirectory $attributes) -and $kind -eq 'tree') {
+                foreach ($other in (& $entries (& $GitPath -C $ProjectRoot --literal-pathspecs ls-files -z --others -- $path 2>$null))) {
+                    $conflicts += "未跟踪的文件会随目录删除（${Label}在 $path 是文件）：$other"
+                }
+            } elseif ($kind -ne 'blob') { $conflicts += "未跟踪的文件会被${Label}覆盖：$path" }
+        }
+        return $conflicts
+    } finally { $ErrorActionPreference = $previous }
+}
+
+# git read-tree -n -m -u：检查从 <From> 切换到 <To> 会不会失败，不写入；它把被忽略的文件也当作会被覆盖的未跟踪文件。
+# 在系统临时目录的索引副本上运行，工作区的索引、index.lock 和文件都不改动（--index-output 仍会锁住原索引）。
+# 能切换时返回 $null，否则返回 git 的说明。
+function Invoke-SwitchDryRun([string]$GitPath, [string]$ProjectRoot, [string]$From, [string]$To) {
+    $previous = $ErrorActionPreference
+    $previousIndex = $env:GIT_INDEX_FILE
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('mixin-switch-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $ErrorActionPreference = 'Continue'
+        $real = "$(& $GitPath -C $ProjectRoot rev-parse --git-path index 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $real) { return '无法定位索引' }
+        if (-not [IO.Path]::IsPathRooted($real)) { $real = Join-Path $ProjectRoot $real }
+        $copy = Join-Path $scratch 'index'
+        try { [void][IO.Directory]::CreateDirectory($scratch); [IO.File]::Copy($real, $copy) }
+        catch { return "无法复制索引 ${real}：$($_.Exception.Message)" }
+        $env:GIT_INDEX_FILE = $copy
+        $output = @(& $GitPath -C $ProjectRoot read-tree -n -m -u $From $To 2>&1 | ForEach-Object { "$_" })
+        if ($LASTEXITCODE -eq 0) { return $null }
+        return ($output -join ' ')
+    } finally {
+        if ($null -eq $previousIndex) { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue } else { $env:GIT_INDEX_FILE = $previousIndex }
+        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+        $ErrorActionPreference = $previous
+    }
+}
+
+# 升级切换代码的实际路径：当前提交 <Head> -> main <Main>（checkout），再快进到目标 <Target>。规则与 scripts/lib/common.sh
+# 的 switch_preflight 相同：两步新增的路径逐项检查；规则没有列出时，再用 git 试运行能直接预演的两次切换（当前 -> main，
+# 当前 -> 目标：目标经 main 新增的路径都在其中），git 拒绝时同样列出。调用方已确认已跟踪文件没有改动、main 能快进到目标。
+function Get-SwitchConflicts([string]$GitPath, [string]$ProjectRoot, [string]$Head, [string]$Main, [string]$Target) {
+    $conflicts = @()
+    if ($Head -ne $Main) { $conflicts += @(Get-UntrackedSwitchConflicts $GitPath $ProjectRoot $Head $Head $Main '切换途经的 main 分支') }
+    if ($Main -ne $Target) { $conflicts += @(Get-UntrackedSwitchConflicts $GitPath $ProjectRoot $Head $Main $Target '目标版本') }
+    if (-not $conflicts.Count) {
+        $output = if ($Head -ne $Main) { Invoke-SwitchDryRun $GitPath $ProjectRoot $Head $Main }
+        if ($null -ne $output) { $conflicts += "git 试运行切换到 main 失败：$output" }
+        elseif ($Head -ne $Target) {
+            $output = Invoke-SwitchDryRun $GitPath $ProjectRoot $Head $Target
+            if ($null -ne $output) { $conflicts += "git 试运行切换到目标提交失败：$output" }
+        }
+    }
+    return $conflicts
+}
+
+# 升级停止服务之前确认切换代码（checkout main，再快进到 <TargetSha>）能完成：已跟踪文件没有改动、本地 main 存在且能快进
+# 到目标、经 main 的两步切换不会覆盖或删除未跟踪的内容。返回冲突列表。当前提交和 main 都已是目标时（同版本升级、切换
+# 之后的续做）没有切换步骤，仍检查已跟踪文件：同一提交的 checkout 和快进会保留这些改动，运行的就不是目标版本。
+# 只读取：状态检查不刷新索引（--no-optional-locks），试运行用索引副本。
+function Get-UpgradeSwitchConflicts([string]$GitPath, [string]$ProjectRoot, [string]$TargetSha) {
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $short = { param([string]$Sha) if ($Sha.Length -gt 7) { $Sha.Substring(0, 7) } else { $Sha } }
+        $head = "$(& $GitPath -C $ProjectRoot rev-parse --verify --quiet 'HEAD^{commit}' 2>$null)".Trim()
+        $main = "$(& $GitPath -C $ProjectRoot rev-parse --verify --quiet 'refs/heads/main^{commit}' 2>$null)".Trim()
+        $conflicts = @()
+        foreach ($line in @(& $GitPath -C $ProjectRoot --no-optional-locks status --porcelain --untracked-files=no 2>&1)) {
+            if ("$line") { $conflicts += "未提交的改动：$line" }
+        }
+        if (-not $head) { $conflicts += '无法读取当前提交' }
+        if (-not $main) { $conflicts += '本地 main 分支不存在' }
+        else {
+            & $GitPath -C $ProjectRoot merge-base --is-ancestor $main $TargetSha 2>$null
+            if ($LASTEXITCODE -ne 0) { $conflicts += "本地 main（$(& $short $main)）无法快进到目标提交 $(& $short $TargetSha)" }
+        }
+        if ($conflicts.Count) { return $conflicts }
+        return @(Get-SwitchConflicts $GitPath $ProjectRoot $head $main $TargetSha)
+    } finally { $ErrorActionPreference = $previous }
+}
+
 # 恢复升级前的代码会丢弃工作区内容（reset --hard / checkout --force）：列出升级后的人工改动，调用方保留事务并停止。
 # 规则与 scripts/lib/common.sh 的 code_restore_safe 相同：当前提交和要重置的原分支只能停在升级前或目标提交；
-# 已跟踪文件不能有改动；升级前有、当前提交没有的路径由恢复重建，路径本身和各级父路径都不能被未跟踪或忽略的文件、
-# 目录或链接（含目录联接）占用。
+# 已跟踪文件不能有改动；升级前有、当前提交没有的路径由恢复重建，按 Get-UntrackedSwitchConflicts 检查路径本身和
+# 各级父路径：不能被未跟踪或忽略的文件、目录或链接（含目录联接）占用，恢复会替换的已跟踪链接之下不再检查。
 function Get-CodeRestoreConflicts([string]$GitPath, [string]$ProjectRoot, [string]$Branch, [string]$OriginalSha, [string]$TargetSha) {
     $previous = $ErrorActionPreference
     try {
@@ -257,33 +375,7 @@ function Get-CodeRestoreConflicts([string]$GitPath, [string]$ProjectRoot, [strin
         foreach ($line in @(& $GitPath -C $ProjectRoot status --porcelain --untracked-files=no)) {
             if ("$line") { $conflicts += "未提交的改动：$line" }
         }
-        if ($head) {
-            # 属性不跟随链接；取不到（不存在，或父路径不是目录）时为 $null。
-            $attributesOf = { param([string]$Path) try { [IO.File]::GetAttributes((Join-Path $ProjectRoot $Path)) } catch { $null } }
-            $realDirectory = { param($Attributes) $Attributes.HasFlag([IO.FileAttributes]::Directory) -and -not $Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) }
-            $trackedType = { param([string]$Path) "$(& $GitPath -C $ProjectRoot cat-file -t "${head}:$Path" 2>$null)".Trim() }
-            $checked = New-Object 'System.Collections.Generic.HashSet[string]'
-            foreach ($path in @(& $GitPath -C $ProjectRoot -c core.quotepath=off diff --name-only --no-renames --diff-filter=D $OriginalSha $head)) {
-                if (-not "$path") { continue }
-                $attributes = & $attributesOf $path
-                if ($null -ne $attributes) {
-                    if ((& $realDirectory $attributes) -and (& $trackedType $path) -eq 'tree') {
-                        foreach ($other in @(& $GitPath -C $ProjectRoot -c core.quotepath=off --literal-pathspecs ls-files --others -- $path)) {
-                            if ("$other") { $conflicts += "未跟踪的文件会随目录删除（升级前的版本在 $path 是文件）：$other" }
-                        }
-                    } else { $conflicts += "未跟踪的文件会被升级前的版本覆盖：$path" }
-                }
-                $parent = "$path"
-                while ($parent.Contains('/')) {
-                    $parent = $parent.Substring(0, $parent.LastIndexOf('/'))
-                    if (-not $checked.Add($parent)) { break }
-                    $attributes = & $attributesOf $parent
-                    if ($null -ne $attributes -and -not (& $realDirectory $attributes) -and (& $trackedType $parent) -ne 'blob') {
-                        $conflicts += "未跟踪的文件或链接占着升级前版本的目录位置：$parent"
-                    }
-                }
-            }
-        }
+        if ($head) { $conflicts += @(Get-UntrackedSwitchConflicts $GitPath $ProjectRoot $head $head $OriginalSha '升级前的版本' '升级前版本') }
         return $conflicts
     } finally { $ErrorActionPreference = $previous }
 }
