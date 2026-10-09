@@ -103,14 +103,18 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
         if (args[i] === "--keyword") i++;
         request.Target = args[i++] ?? "";
       }
-    } else if (["history-clear", "stat", "tunnel-logging", "tunnel-protocol", "runtime-configure"].includes(args[0] ?? "") && args[i] && !args[i]!.startsWith("--")) {
+    } else if (["update", "upgrade", "history-clear", "history-compact", "stat", "tunnel-logging", "tunnel-protocol", "runtime-configure"].includes(args[0] ?? "") && args[i] && !args[i]!.startsWith("--")) {
       request.Target = args[i++]!;
+      if (args[0] === "history-compact") {
+        if (!args[i]) throw new Error("压缩需要成员号码");
+        request.User = args[i++]!;
+      }
     }
     const switches: Record<string, string> = {
       all: "All", json: "Json", repair: "Repair", "restart-tunnel": "RestartTunnel",
       "storage-segment": "StorageSegment", "group-id": "GroupId",
     };
-    const values: Record<string, string> = { days: "Days", user: "User", group: "Group", since: "Since", until: "Until" };
+    const values: Record<string, string> = { days: "Days", user: "User", group: "Group", since: "Since", until: "Until", "confirmed-transaction": "ConfirmedTransaction" };
     // TUI passes argument values as opaque strings (including leading dashes).
     // Encode them with '=' before the standard parser, preserving that contract.
     const encodedArgs: string[] = [];
@@ -123,6 +127,7 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
       all: { type: "boolean" }, json: { type: "boolean" }, repair: { type: "boolean" }, "restart-tunnel": { type: "boolean" },
       "storage-segment": { type: "boolean" }, "group-id": { type: "boolean" },
       days: { type: "string" }, user: { type: "string" }, group: { type: "string" }, since: { type: "string" }, until: { type: "string" },
+      "confirmed-transaction": { type: "string" },
     });
     if (parsed.positionals.length) throw new Error("存在多余的运维参数");
     for (const [name, value] of Object.entries(parsed.values)) {

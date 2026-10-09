@@ -29,6 +29,75 @@ test("Docker COPY inputs and dependency patch paths exist in the checkout", asyn
   }
 });
 
+/** bun.lock is JSON with trailing commas; a Windows checkout (core.autocrlf) may give it CRLF line endings. */
+const parseLock = (text: string) => JSON.parse(text.replace(/,\s*([}\]])/g, "$1"));
+
+/**
+ * Pi publishes its packages together and declares caret ranges between them, so pinning only the direct dependencies
+ * can still resolve a newer agent-core/codemode/mcp next to them and nest a second pi-ai. Every lock entry is checked
+ * by the package name it resolves to, not by its key, so nested copies are found too.
+ */
+function piBaselineProblems(manifest: Record<string, any>, lock: Record<string, any>): string[] {
+  const scope = "@earendil-works/";
+  const pinned = (record: Record<string, string> = {}) => Object.entries(record).filter(([name]) => name.startsWith(scope));
+  const direct = pinned(manifest.dependencies);
+  const overrides = new Map(pinned(manifest.overrides));
+  const version = direct[0]?.[1];
+  const problems: string[] = [];
+  if (!version || !/^\d+\.\d+\.\d+$/.test(version)) problems.push(`direct Pi dependency is not an exact version: ${version}`);
+  for (const [name, value] of direct) {
+    if (value !== version) problems.push(`direct ${name}@${value} differs from ${version}`);
+    if (overrides.get(name) !== value) problems.push(`override for direct ${name} is ${overrides.get(name)}, expected ${value}`);
+  }
+  for (const [name, value] of overrides) if (value !== version) problems.push(`override ${name}@${value} differs from ${version}`);
+  if (JSON.stringify(lock.overrides) !== JSON.stringify(manifest.overrides)) problems.push("bun.lock overrides differ from package.json");
+  if (JSON.stringify(pinned(lock.workspaces?.[""]?.dependencies)) !== JSON.stringify(direct)) problems.push("bun.lock direct Pi dependencies differ from package.json");
+  const entries = new Map<string, string[]>();
+  for (const [key, value] of Object.entries(lock.packages ?? {}) as [string, unknown[]][]) {
+    const resolution = typeof value[0] === "string" ? value[0] : "";
+    const at = resolution.lastIndexOf("@");
+    if (at <= 0 || !resolution.startsWith(scope)) continue;
+    const name = resolution.slice(0, at);
+    entries.set(name, [...entries.get(name) ?? [], `${key} -> ${resolution}`]);
+    if (resolution.slice(at + 1) !== version) problems.push(`lock entry ${key} resolves ${resolution}, expected ${version}`);
+  }
+  for (const [name, found] of entries) if (found.length !== 1) problems.push(`${name} is locked ${found.length} times: ${found.join("; ")}`);
+  for (const name of entries.keys()) if (!overrides.has(name)) problems.push(`locked ${name} has no override`);
+  for (const name of overrides.keys()) if (!entries.has(name)) problems.push(`override ${name} is not in the lock`);
+  return problems;
+}
+
+test("Pi packages resolve to one pinned version, nested lock entries included", async () => {
+  const manifest = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
+  expect(piBaselineProblems(manifest, parseLock(await readFile(join(project, "bun.lock"), "utf8")))).toEqual([]);
+  const version = manifest.dependencies["@earendil-works/pi-coding-agent"];
+  for (const name of Object.keys(manifest.overrides).filter(name => name.startsWith("@earendil-works/"))) {
+    const installed = JSON.parse(await readFile(join(project, "node_modules", name, "package.json"), "utf8"));
+    expect(`${name}@${installed.version}`).toBe(`${name}@${version}`);
+  }
+});
+
+test.each([["LF", "\n"], ["CRLF", "\r\n"]])("the Pi lock check reads a %s lockfile and still sees split installs", async (_, eol) => {
+  const manifest = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
+  const lockText = (await readFile(join(project, "bun.lock"), "utf8")).replace(/\r?\n/g, eol);
+  expect(lockText.includes("\r\n")).toBe(eol === "\r\n");
+  const lock = parseLock(lockText);
+  expect(piBaselineProblems(manifest, lock)).toEqual([]);
+  // The check must see what a split install looks like: a nested second copy, a floating transitive version,
+  // and an override that no longer matches the direct dependency. Edit parsed copies, not the text, so the
+  // cases do not depend on how the lockfile was checked out.
+  const nested = structuredClone(lock);
+  nested.packages["@earendil-works/pi-agent-core/@earendil-works/pi-ai"] = lock.packages["@earendil-works/pi-ai"];
+  expect(piBaselineProblems(manifest, nested).join("\n")).toContain("@earendil-works/pi-ai is locked 2 times");
+  const floating = structuredClone(lock);
+  floating.packages["@earendil-works/pi-tui"][0] = "@earendil-works/pi-tui@9.9.9";
+  expect(piBaselineProblems(manifest, floating).join("\n")).toContain("resolves @earendil-works/pi-tui@9.9.9");
+  const stale = { ...manifest, overrides: { ...manifest.overrides, "@earendil-works/pi-ai": "0.0.1" } };
+  expect(piBaselineProblems(stale, lock).join("\n")).toContain("override for direct @earendil-works/pi-ai is 0.0.1");
+  const unpinned = { ...manifest, overrides: Object.fromEntries(Object.entries(manifest.overrides).filter(([name]) => name !== "@earendil-works/pi-mcp")) };
+  expect(piBaselineProblems(unpinned, lock).join("\n")).toContain("locked @earendil-works/pi-mcp has no override");
+});
+
 /** `group`: the command leads its own process group (POSIX only), as a terminal's foreground job would. */
 async function execute(args: string[], cwd: string, env = process.env, group = false) {
   const child = Bun.spawn(args, { cwd, env, stdout: "pipe", stderr: "pipe", windowsHide: true, detached: group });
@@ -256,7 +325,7 @@ $body=$body.Replace('$PSScriptRoot', "'" + $PSScriptRoot.Replace("'", "''") + "'
 $run=[scriptblock]::Create($body)
 # The real conflict check runs against fixture-git: HEAD and the branch come from rev-parse, changes from status.
 $libraryAst=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/lib/deployment.ps1"))},[ref]$tokens,[ref]$errors)
-foreach($name in @('Get-CodeRestoreConflicts','Get-UntrackedSwitchConflicts')) {
+foreach($name in @('Get-CodeRestoreConflicts','Get-UntrackedSwitchConflicts','Get-UpgradeCheckoutIdentity')) {
     Invoke-Expression $libraryAst.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true).Extent.Text
 }
 # The switch check before the stop runs against real repositories in switch-preflight.test.ts. Here it reports a conflict
@@ -277,7 +346,11 @@ function fixture-git {
     if($args -contains 'show-ref' -and $script:failure -eq 'main-missing'){$global:LASTEXITCODE=1}
     if($args -contains 'merge-base' -and $script:failure -eq 'diverged'){$global:LASTEXITCODE=1}
     if(($args -contains 'checkout' -or $args -contains 'merge') -and -not $script:stopped){throw 'live checkout changed before stop'}
-    if($args -contains 'rev-parse'){ if($script:failure -eq 'code'){'3333333333333333333333333333333333333333'}else{$TargetSha} }
+    if($args -contains 'rev-parse'){
+        if($args -contains '--abbrev-ref'){$OriginalBranch}
+        elseif(-not $script:stopped -or $args -contains 'refs/heads/main^{commit}'){$OriginalSha}
+        elseif($script:failure -eq 'code'){'3333333333333333333333333333333333333333'}else{$TargetSha}
+    }
     if($args -contains 'reset') { if($script:applied -and -not $script:dataRestored){throw 'code restored before data'}; $script:codeRestored=$true }
     if($args -contains 'status' -and $script:dirty) { ' M version.txt' }
 }
@@ -714,7 +787,8 @@ Case 'fresh-update' { Invoke-Update }
     expect(result.code, result.output).toBe(0);
     const line = (name: string) => result.output.split(/\r?\n/).find(item => item.startsWith(`CASE ${name} `)) ?? "";
     expect(line("idle-resume")).toMatch(/没有未完成的部署或升级 \/ True ## no upgrader ## git: $/);
-    expect(line("deploy-rollback")).toContain("DEPLOY resume=False rollback=True / True ## no upgrader");
+    expect(result.output).toContain("DEPLOY resume=False rollback=True");
+    expect(line("deploy-rollback")).toBe("CASE deploy-rollback => True ## no upgrader ## git: ");
     // Without a TTY the pending deployment must be resolved explicitly, before any git access.
     expect(line("deploy-update-undecided")).toMatch(/THROWN .*resume.*rollback.* ## git: $/);
     const recorded = "2".repeat(40), latest = "3".repeat(40);

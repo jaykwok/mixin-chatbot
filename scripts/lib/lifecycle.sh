@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+
+# Recovery runs in its own process group and finishes even after Ctrl+C or disconnect.
+run_shielded() {
+    local pid status=0
+    set -m
+    (SHIELDED_RUN=1; "$@") </dev/null &
+    pid=$!
+    set +m
+    trap '' INT TERM HUP
+    wait "$pid" || status=$?
+    return "$status"
+}
 # Shared filesystem and Linux process identity operations. Sourcing has no side effects.
 archive_project_path() {
     local source archive parent

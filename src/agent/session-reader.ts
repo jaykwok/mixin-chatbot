@@ -8,7 +8,16 @@ import { isSlashCommandMessage } from "./commands.ts";
 export interface StatsRecord {
   type?: string; timestamp?: string; provider?: string; modelId?: string; model?: string; kind?: string; usage?: Record<string, unknown>;
   message?: { role?: string; command?: boolean; provider?: string; model?: string; content?: { type: string; name?: string }[];
-    usage?: Record<string, unknown>; toolName?: string; isError?: boolean; details?: { fileId?: string } };
+    usage?: Record<string, unknown>; toolName?: string; isError?: boolean; details?: { fileId?: string };
+    /** 工具运行中发起的子调用（Pi 的 nestedCalls）：只留被调用的工具名和记录是否完整。 */
+    nested?: { names: string[]; complete: boolean } };
+}
+
+function nestedCalls(value: unknown): { names: string[]; complete: boolean } | undefined {
+  if (!value || typeof value !== "object" || !Array.isArray((value as { calls?: unknown }).calls)) return undefined;
+  const { calls, complete } = value as { calls: unknown[]; complete?: unknown };
+  return { names: calls.map((call) => typeof (call as { name?: unknown })?.name === "string" ? (call as { name: string }).name : "unknown"),
+    complete: complete === true };
 }
 
 /** 已入账前缀的位置与摘要；摘要只覆盖真正入账过的字节。 */
@@ -47,7 +56,8 @@ function project(line: string): StatsRecord {
     ...(m && { message: { role: m.role, provider: m.provider, model: m.model, usage: m.usage,
       command: m.role === "user" && isSlashCommandMessage(content.find((part: any) => part?.type === "text")?.text ?? ""),
       content: content.filter((part: any) => part?.type === "toolCall" && typeof part.name === "string").map((part: any) => ({ type: "toolCall", name: part.name })),
-      toolName: m.toolName, isError: m.isError, details: m.details?.fileId ? { fileId: "confirmed" } : undefined } }),
+      toolName: m.toolName, isError: m.isError, details: m.details?.fileId ? { fileId: "confirmed" } : undefined,
+      nested: m.role === "toolResult" ? nestedCalls(m.nestedCalls) : undefined } }),
   };
 }
 

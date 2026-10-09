@@ -35,7 +35,7 @@ describe("agent slash commands", () => {
   });
 
   test("advertises every supported command in help", () => {
-    expect([...SUPPORTED_COMMANDS.keys()]).toEqual(["/help", "/clear", "/stop", "/status", "/deliver"]);
+    expect([...SUPPORTED_COMMANDS.keys()]).toEqual(["/help", "/clear", "/stop", "/status", "/compact", "/deliver"]);
     for (const command of SUPPORTED_COMMANDS.keys()) {
       expect(HELP_TEXT).toContain(command);
     }

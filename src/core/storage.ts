@@ -19,6 +19,9 @@ export const WEBHOOK_SECRET_FILE = join(CONFIG_DIR, "webhook-secret");
 /** 可选：大文件外链分发的 WebDAV 后端；缺失即关闭该特性。 */
 export const RELAY_CONFIG_PATH = join(CONFIG_DIR, "relay.json");
 export const RUNTIME_CONFIG_PATH = join(CONFIG_DIR, "runtime.json");
+/** Trusted administrator configuration; missing files leave these capabilities disabled. */
+export const AUXILIARY_CONFIG_PATH = join(CONFIG_DIR, "auxiliary.json");
+export const MCP_CONFIG_PATH = join(CONFIG_DIR, "mcp.json");
 export const STATE_DATABASE_PATH = join(STATE_DIR, "agent.sqlite");
 
 /**

@@ -1,5 +1,6 @@
-// webhook 处理逻辑：字段校验、请求去重、入站速率限制、后台并发派发。
+// webhook 处理逻辑：字段校验、请求去重、入站速率限制、交给消息服务（src/durable/service.ts）。
 // 校验含安全约束：调用者/群标识、内容长度、callBackUrl 结构（防 SSRF/伪造）。
+// 普通消息写进成员的 inbox 之后才回执 200，重启后从 inbox 继续；控制命令在后台执行，结果直接回给成员。
 import { createHash } from "node:crypto";
 import { log } from "../core/log.ts";
 import {
@@ -11,7 +12,6 @@ import {
   MAX_CONTENT_LENGTH,
   MAX_DEDUP_SIZE,
   MAX_GROUP_ID_LENGTH,
-  MAX_ACTIVE_REQUESTS,
   MAX_RATE_LIMIT_KEYS,
   PHONE_PATTERN,
   RATE_LIMIT_MAX_REQUESTS,
@@ -23,20 +23,29 @@ import {
 import { HttpError } from "./http.ts";
 import { sendText } from "../integrations/im.ts";
 import { describeRequestFailure } from "../agent/failure.ts";
-import { canonicalCommand, isSlashCommandMessage } from "../agent/commands.ts";
+import { canonicalCommand } from "../agent/commands.ts";
 import { application } from "../core/lifecycle.ts";
-import {
-  handleUserMessage,
-  resolveSessionCallbackUrl,
-  stopUserTask,
-} from "../agent/runtime.ts";
+
+/** 接收消息的服务（src/durable/service.ts 的 DurableService），启动时绑定一次。 */
+export interface MessageService {
+  admit(phone: string, groupId: string, content: string, callbackUrl: string, deduplicate?: boolean): Promise<{ status: "accepted" } | { status: "full"; message: string; reason?: "capacity" }>;
+  hasUserRequestCapacity(): boolean;
+  control(phone: string, groupId: string, content: string, callbackUrl: string, onAdmitted?: () => void): Promise<string>;
+  callbackUrl(phone: string, groupId: string, fallback: string): string;
+}
+let messages: MessageService | undefined;
+export function bindMessageService(service: MessageService | undefined): void { messages = service; }
+function service(): MessageService {
+  if (!messages) throw new Error("消息服务尚未启动");
+  return messages;
+}
 
 // 已接收请求去重（Map 保持插入顺序，按序清过期）
 const recentRequests = new Map<string, { at: number }>();
 // 速率限制（每个群内用户在窗口内的时间戳列表）
 const rateLimits = new Map<string, number[]>();
 const activeRequests = new Set<Promise<void>>();
-const activeControls = new Map<string, Promise<void>>();
+const activeControls = new Map<string, { action: Promise<void>; admitted: Promise<boolean> }>();
 const activeNotices = new Map<string, Promise<void>>();
 
 export type WebhookData = Record<string, unknown>;
@@ -191,77 +200,78 @@ export function cleanupRateLimits(now = Date.now()): void {
   }
 }
 
-/** 后台派发由 runtime 的用户会话 FIFO 接管；失败回执有独立交付期限。 */
-async function processRequest(
-  content: string,
-  phone: string,
-  groupId: string,
-  callbackUrl: string,
-  clientIp: string,
-  invalidate?: () => void
-): Promise<void> {
-  const start = Date.now();
-  log.info(`请求处理开始 - 群: ${groupId}, 用户: ${phone}, IP: ${clientIp}`);
+/** 失败回执走 text：不能带「✅ 任务已完成」，报错原文里的 JSON 也不该被 Markdown 判定挑中再被转换改写。 */
+async function sendFailure(error: unknown, phone: string, groupId: string, callbackUrl: string): Promise<void> {
   try {
-    if (DEBUG) log.info(`[DEBUG] webhook 内容 - 用户: ${phone}, 内容: ${content}`);
-    await handleUserMessage(phone, groupId, content, callbackUrl, invalidate);
-  } catch (e) {
-    invalidate?.();
-    if (application.signal.aborted || (e instanceof Error && e.name === "AbortError")) return;
-    const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-    log.error(`请求处理失败 - 群: ${groupId}, 用户: ${phone}, 耗时: ${elapsed}秒, 错误: ${String(e)}`);
-    try {
-      // 失败回执走 text：不能带「✅ 任务已完成」，报错原文里的 JSON 也不该被
-      // Markdown 判定挑中再被转换改写。
-      const sent = await sendText(
-        describeRequestFailure(e),
-        groupId,
-        phone,
-        resolveSessionCallbackUrl(phone, groupId, callbackUrl)
-      );
-      if (!sent) log.error(`错误回复未送达 - 用户: ${phone}`);
-    } catch (sendErr) {
-      log.error(`错误回复发送失败 - 用户: ${phone}, 错误: ${String(sendErr)}`);
-    }
+    const sent = await sendText(describeRequestFailure(error), groupId, phone, messages?.callbackUrl(phone, groupId, callbackUrl) ?? callbackUrl);
+    if (!sent) log.error(`错误回复未送达 - 用户: ${phone}`);
+  } catch (sendErr) {
+    log.error(`错误回复发送失败 - 用户: ${phone}, 错误: ${String(sendErr)}`);
   }
 }
 
-/** 普通消息进入有界 FIFO；控制操作独立计数，重复 stop 仍立即生效。 */
-export function enqueueUserRequest(
-  content: string,
-  phone: string,
-  groupId: string,
-  callbackUrl: string,
-  clientIp: string
-): boolean {
-  if (isSlashCommandMessage(content)) {
-    const command = canonicalCommand(content);
-    if (command === "/stop") stopUserTask(phone, groupId);
-    const key = JSON.stringify([groupId, phone, command]);
-    if (activeControls.has(key)) return true;
-    if (activeControls.size >= 128) return command === "/stop";
-    if (command === "/clear") stopUserTask(phone, groupId);
-    const action = processRequest(content, phone, groupId, callbackUrl, clientIp);
-    activeControls.set(key, action);
-    void action.finally(() => activeControls.delete(key));
-    return true;
-  }
-  if (activeRequests.size >= MAX_ACTIVE_REQUESTS) return false;
+const aborted = (error: unknown) => application.signal.aborted || (error instanceof Error && error.name === "AbortError");
+
+/**
+ * 普通消息：写进成员的 inbox 后才结束（webhook 等它结束再回执 200），之后由成员的 worker 处理。
+ * 排队已满或写入失败时给成员发回执，并释放去重预约。没有容量时不接收，返回 undefined。
+ */
+export function admitUserRequest(content: string, phone: string, groupId: string, callbackUrl: string, clientIp: string): Promise<void> | undefined {
+  if (!hasUserRequestCapacity()) return undefined;
   const invalidate = rememberRequest(phone, groupId, content);
-  const request = processRequest(content, phone, groupId, callbackUrl, clientIp, invalidate);
-  activeRequests.add(request);
-  void request.then(
-    () => activeRequests.delete(request),
-    (error) => {
-      activeRequests.delete(request);
-      log.error(`后台处理异常 - 用户: ${phone}, 错误: ${String(error)}`);
+  const request = (async () => {
+    const start = Date.now();
+    log.info(`请求处理开始 - 群: ${groupId}, 用户: ${phone}, IP: ${clientIp}`);
+    if (DEBUG) log.info(`[DEBUG] webhook 内容 - 用户: ${phone}, 内容: ${content}`);
+    try {
+      const result = await service().admit(phone, groupId, content, callbackUrl, true);
+      if (result.status === "full") {
+        invalidate();
+        log.warn(`${result.reason === "capacity" ? "后台请求容量已满" : "成员排队已满"} - 群: ${groupId}, 用户: ${phone}`);
+        enqueueUserNotice(result.reason === "capacity" ? "capacity" : "queue-full", result.message, phone, groupId, callbackUrl);
+      }
+    } catch (e) {
+      invalidate();
+      if (aborted(e)) return;
+      const elapsed = ((Date.now() - start) / 1000).toFixed(2);
+      log.error(`请求接收失败 - 群: ${groupId}, 用户: ${phone}, 耗时: ${elapsed}秒, 错误: ${String(e)}`);
+      await sendFailure(e, phone, groupId, callbackUrl);
     }
-  );
-  return true;
+  })();
+  activeRequests.add(request);
+  void request.finally(() => activeRequests.delete(request));
+  return request;
+}
+
+/** 控制命令在后台执行，同一成员的同一命令执行完之前重复发送只算一次；结果由消息服务回给成员。 */
+export function enqueueUserControl(content: string, phone: string, groupId: string, callbackUrl: string, clientIp: string): Promise<boolean> {
+  const command = canonicalCommand(content);
+  const key = JSON.stringify([groupId, phone, command]);
+  const waiting = activeControls.get(key);
+  if (waiting) return waiting.admitted;
+  if (activeControls.size >= 128) return Promise.resolve(false);
+  const admitted = Promise.withResolvers<boolean>();
+  const action = (async () => {
+    log.info(`控制命令 ${command} - 群: ${groupId}, 用户: ${phone}, IP: ${clientIp}`);
+    try {
+      await service().control(phone, groupId, content, callbackUrl, () => admitted.resolve(true));
+      admitted.resolve(true);
+    } catch (e) {
+      admitted.reject(e);
+      if (aborted(e)) return;
+      log.error(`控制命令失败 - 群: ${groupId}, 用户: ${phone}, 命令: ${command}, 错误: ${String(e)}`);
+      await sendFailure(e, phone, groupId, callbackUrl);
+    }
+  })();
+  // Cleanup can remain blocked after admission; HTTP waits only for the persisted control receipt.
+  void admitted.promise.catch(() => {});
+  activeControls.set(key, { action, admitted: admitted.promise });
+  void action.finally(() => activeControls.delete(key));
+  return admitted.promise;
 }
 
 export function hasUserRequestCapacity(): boolean {
-  return activeRequests.size < MAX_ACTIVE_REQUESTS;
+  return messages?.hasUserRequestCapacity() ?? false;
 }
 
 /**
@@ -269,7 +279,7 @@ export function hasUserRequestCapacity(): boolean {
  * 同一群用户的同类通知在发送完成前合并，避免压力状态下继续堆积相同回执。
  */
 export function enqueueUserNotice(
-  kind: "capacity" | "rate-limit",
+  kind: "capacity" | "rate-limit" | "queue-full",
   message: string,
   phone: string,
   groupId: string,
@@ -298,7 +308,7 @@ export async function drainUserRequests(): Promise<void> {
     await Promise.allSettled([
       ...activeRequests,
       ...activeNotices.values(),
-      ...activeControls.values(),
+      ...[...activeControls.values()].map(control => control.action),
     ]);
   }
 }

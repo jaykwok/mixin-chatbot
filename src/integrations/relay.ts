@@ -520,7 +520,7 @@ export async function refreshRelayReference(reference: RelayReference, signal?: 
   if (!config || reference.backend !== relayReference(config, reference.url, reference.name, reference.size).backend ||
       !objectNameFromPublicUrl(config, reference.url)) throw new Error("附件后端已变更，待补发记录已保留，请联系管理员恢复原后端");
   const index = suppliedIndex ?? await getRelayIndex();
-  const entry = index.entries().find(item => item.url === reference.url && item.state === "uploaded");
+  const entry = index.findUploaded(reference.url);
   if (!entry || (reference.size >= 0 && entry.size !== reference.size)) throw new Error("附件已不在外链账本中，待补发记录已保留，请重新生成文件");
   const remaining = config.expireHours && !config.signSecret
     ? (Date.parse(entry.at) + config.expireHours * 3600000 - Date.now()) / 3600000 : undefined;
@@ -662,8 +662,7 @@ export async function listRelayObjects(options?: {
       size,
       at,
       state: state ?? "uploaded",
-    }))
-    .sort((a, b) => a.at.localeCompare(b.at));
+    }));
 }
 
 export interface RelayPurgeResult {

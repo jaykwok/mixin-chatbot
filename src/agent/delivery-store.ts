@@ -60,6 +60,26 @@ export class DeliveryStore {
     return rows.map(({ blocked_reason, attachments, ...row }) => ({ ...row,
       attachments: JSON.parse(attachments), ...(blocked_reason ? { blockedReason: blocked_reason } : {}) }));
   }
+  /** One row by id (the Durable engine's run rows have deterministic ids, D3). */
+  find(session: string, id: string): PendingDelivery | undefined {
+    return this.pending(session).find((item) => item.id === id);
+  }
+  /** Create or replace a row with a deterministic id, keeping its original time; no capacity check (checked at run start). */
+  put(session: string, id: string, text: string, attachments: DeliveryAttachment[] = []): void {
+    this.db.transaction(() => {
+      const owner = this.db.query("SELECT session FROM deliveries WHERE id = ?").get(id) as { session: string } | null;
+      if (owner && owner.session !== session) throw new Error("未送达记录不属于当前会话");
+      if (owner) this.db.query("UPDATE deliveries SET text = ?, attachments = ?, blocked_reason = NULL WHERE id = ?").run(text, JSON.stringify(attachments), id);
+      else this.db.query("INSERT INTO deliveries (id, session, text, at, attachments) VALUES (?, ?, ?, ?, ?)").run(id, session, text, new Date().toISOString(), JSON.stringify(attachments));
+    })();
+  }
+  /** Replace row `from` (if any) by row `to` in one transaction: a run's link notes become its final reply. */
+  finalize(session: string, from: string, to: string, text: string, attachments: DeliveryAttachment[]): void {
+    this.db.transaction(() => {
+      this.put(session, to, text, attachments);
+      this.db.query("DELETE FROM deliveries WHERE id = ? AND session = ?").run(from, session);
+    })();
+  }
   acknowledge(ids: string[]): void {
     this.db.transaction(() => {
       for (const id of ids) this.db.query("DELETE FROM deliveries WHERE id = ?").run(id);

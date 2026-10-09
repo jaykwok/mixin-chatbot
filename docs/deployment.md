@@ -27,6 +27,8 @@ rootful Docker（以 root 运行的默认安装）下，部署、升级、继续
 
 Cloudflare 模式会自动将官方 `cloudflared` 下载到项目根目录（Windows 为 `cloudflared.exe`，Linux 为 `cloudflared`），校验 SHA-256 后使用；已有可运行的根目录副本会直接复用。域名需先接入 Cloudflare DNS 并激活，再配置机器人子域名和隧道公开路由。隧道 token 从 Cloudflare 控制台获取，部署时可直接粘贴 token、填写文件路径，或预先保存到 `data/config/cloudflared-token` 后留空读取。输入会隐藏，默认输入与运行凭据统一使用这个文件。完整步骤见[隧道托管](operations.md#隧道托管)。
 
+部署完成后，可在 `bun run tui` 的 **系统 → 服务部署 → 更新 cloudflared** 主动更新到官方稳定版；先下载校验，再替换并恢复隧道原运行状态，失败恢复旧程序。首次安装的版本清单与这个主动更新入口分别维护，详见[更新 cloudflared](operations.md#更新-cloudflared)。
+
 ### Python 与文档预览
 
 Python 小版本范围固定为 `>=3.14,<3.15`，补丁版本由 uv 选择；依赖及传递依赖由 `uv.lock` 锁定。Windows 和 Docker 默认都使用 `<群目录>/venv/`，每群独立、首次使用时按需 `uv sync`；不会自动使用项目根目录 `.venv`。各群依赖从下载缓存复制安装，避免硬链接导致原地修改相互影响；基础 Python 解释器和下载缓存可以共用。
@@ -48,7 +50,7 @@ Linux 的同等操作为 `UV_PROJECT_ENVIRONMENT=/absolute/group/venv uv sync --
 
 Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffice.org/download/download-libreoffice/)安装，并将 `soffice` 加入服务账户的 PATH；工具也识别 `Program Files/LibreOffice/program/soffice.exe`。使用便携目录时将其 `program` 目录加入 PATH，变更后重启服务。PDF 预览直接使用 Python 库。预览字体取自运行主机，建议安装与客户模板一致的字体；Docker 提供 Noto CJK。缺少 LibreOffice 时仍可编辑和组装文件，工具会明确报告未完成视觉检查。
 
-只读 Docker 容器需要可写的 `/tmp`，例如 `--tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777`；部署脚本已提供该挂载。LibreOffice 的 Unix 进程通信文件使用 `/tmp`，仅设置 `TMPDIR` 无法代替它。Office 配置、缓存和输出另行放在本次任务临时目录；转换错误会保留 LibreOffice 的诊断输出。
+只读 Docker 容器需要可写的 `/tmp`，例如 `--tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777`；部署脚本已提供该挂载。LibreOffice 的 Unix 进程通信文件使用 `/tmp`，仅设置 `TMPDIR` 无法代替它。每次转换的 LibreOffice 用户配置（profile）放在系统临时目录下单独创建的目录（容器内即该 `/tmp`），任务结束、失败或取消后删除，文档工具同时最多两次转换；缓存和输出放在本次任务临时目录。Windows 上 profile 目录较深时曾出现 LibreOffice 退出码为 0 却不生成 PDF，因此不放在群目录下，服务账户的 TEMP 也应保持较短路径。转换错误会保留 LibreOffice 的诊断输出。
 
 ## 执行部署
 
@@ -136,6 +138,8 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 
 优先级：**显式环境变量 > `data/config/runtime.json` > 代码默认值**。
 
+Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原生预算、上下文缓存和可选辅助模型、MCP 的配置方式见[运行设置与可选工具](runtime-tools.md)。升级至数据版本 4 时由迁移工具转换旧引擎设置。
+
 部署脚本保存支持的设置，未显式指定的值沿用已存配置。仅在前台启动时设置环境变量不会自动落盘；停机后可运行 `bun run configure-runtime` 保存当前支持项。配置文件中的未知键、无效类型及越界值会阻止启动。
 
 日常调整可进入 **系统 → 设置 → 高级运行参数**，按“并发与附件、超时与退出、缓存与索引、文档与诊断”选择，共 14 项。Enter 修改，`d` 恢复选中项的默认值，`s` 预览并保存；默认值与机器人运行时共用定义。Esc 返回保留当前草稿，退出 TUI 前会提醒尚未保存的修改。端口、监听地址和群数据目录仍通过服务部署设置。
@@ -153,7 +157,7 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 | `BOT_RUN_TIMEOUT_SECONDS` | 1200 秒 | 10–7200 秒，覆盖准备、模型、工具与最终交付 |
 | `BOT_MODEL_IDLE_TIMEOUT_SECONDS` | 180 秒 | 10–7200 秒；模型等待或输出期间连续无有效进展的上限 |
 | `BOT_MODEL_RESPONSE_TIMEOUT_SECONDS` | 600 秒 | 10–7200 秒；单次模型响应的上限，持续输出也不续期 |
-| `PI_CACHE_RETENTION` | short | Pi 原生 short/long；模型请求与保温共用，服务商决定实际期限；不提供全局 none |
+| `PI_CACHE_RETENTION` | short | Pi 原生 short/long，服务商决定实际期限；不提供全局 none。Durable 引擎不做缓存保温 |
 | `BOT_ATTACHMENT_CONCURRENCY` | 2 | 1–8；在小附件读取前预约，覆盖读取与上传，限制内存峰值 |
 | `BOT_DELIVERY_TIMEOUT_SECONDS` | 180 秒 | 1–600 秒，包含出站排队和重试 |
 | `BOT_SHUTDOWN_TIMEOUT_SECONDS` | 20 秒 | 5–25 秒，覆盖 HTTP、任务、进程与租约收尾 |
@@ -165,7 +169,7 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 
 ### 数据目录
 
-从 Pi 0.85.1 升级时，配置迁移和版本登记由[升级事务](data-migrations.md)完成；Windows 首次过渡需要按该文档先停机，Docker 首次升级到本版需按该文档运行一次引导命令。保温默认关闭，历史无需格式转换。迁移程序随代码发布在 `scripts/migrations/`，升级不依赖 `tmp/` 中的工具。
+从 Pi 0.85.1 升级时，配置迁移和版本登记由[升级事务](data-migrations.md)完成；Windows 首次过渡需要按该文档先停机，Docker 首次升级到本版需按该文档运行一次引导命令。[数据版本 3](data-migrations.md#数据版本-3durable-引擎) 把每位成员的会话导入所在群的群库，缓存保温随之关闭。迁移程序随代码发布在 `scripts/migrations/`，升级不依赖 `tmp/` 中的工具。
 
 ```text
 data/
@@ -174,6 +178,8 @@ data/
 │   ├── runtime.json           持久运行设置
 │   ├── webhook-secret         入站鉴权密钥
 │   ├── relay.json             可选大文件分发配置
+│   ├── auxiliary.json         可选分类、图片模型引用与并发预算
+│   ├── mcp.json               可选 MCP 服务器、传输与工具白名单
 │   └── cloudflared-token      隧道 token：默认输入与运行共用，直接粘贴时自动保存
 ├── state/
 │   ├── agent.sqlite           待交付内容、路由隔离与路径身份
@@ -183,18 +189,20 @@ data/
 │   ├── instance.json          实例 PID、启动时间与关闭令牌
 │   └── ...                    部署状态与维护租约
 ├── runtime/
-│   ├── pi/settings.json       Pi 原生选型：服务商、模型与推理级别（需备份）
+│   ├── pi/settings.json       Pi 选型与 Durable 原生运行策略（需备份）
+│   ├── mcp/                   可选 MCP OAuth 凭证（按秘密配置备份）
 │   ├── models-store.json      模型目录缓存，动态目录服务商离线启动时需要
 │   └── ...                    其余 Pi 资源与启动脚本，可重建
 └── groups/
     ├── data-version.json      群根数据版本，与项目侧成对保存
     ├── stats.sqlite           使用统计账本：独立于会话历史，清空上下文不影响统计
     └── <group>/
+        ├── durable.sqlite     群库（Pi Durable）：成员的会话、排队消息、控制命令与运行记录（另有 -wal 等，需一起备份）
         ├── workspace/         外部同步的资料源
         ├── index/             materials.md、扫描 manifest；可选 ignore.txt、parsed/ 文档缓存
         ├── venv/              原生部署按需准备的解析环境
         └── users/<user>/
-            ├── session.jsonl  Pi 原生会话
+            ├── session.jsonl  数据版本 3 之前的 Pi 会话：已导入群库，原地保留供统计补账
             └── tmp/           生成文件、缓存与完整工具输出
 backup/                        为了能撤销某个操作而留的；清理用 backup-scan / backup-clean，别手动删
 ├── snapshots/                 部署、升级与连接器安装的回滚现场，以及数据迁移快照
@@ -210,6 +218,10 @@ logs/                          应用日志与可选的隧道日志
 历史、统计和临时目录命令支持 `--group-id`（原始群号）或 `--storage-segment`（已编码目录段），两者互斥；PowerShell 包装器对应 `-GroupId` / `-StorageSegment`。未指定时自动判断，遇到两个不同群同时匹配则拒绝操作。TUI 会传入明确的目录段。
 
 建议正常停机后备份整个 `data/`，并单独备份外置的 `GROUP_DATA_ROOT`。`data/runtime/pi/settings.json` 是必须保留的模型选型；`data/runtime/models-store.json` 也应随配置备份，动态目录服务商依赖它离线启动，移除后需重新运行向导联网刷新。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
+
+群库和群目录里的结果文件必须作为同一批数据备份；只有数据库不能恢复图片、附件或全文。停机后可运行 `bun scripts/ops/data-backup.ts backup <新目录>`：取得维护租约、检查并 checkpoint 所有数据库，再复制状态和群目录，写入逐文件 SHA-256 清单。配置、密钥、模型目录缓存和选型仍需另行备份。恢复命令 `bun scripts/ops/data-backup.ts restore <备份目录> <空暂存项目> [空群数据根]` 先验证全部摘要，再复制到空目录并检查 SQLite；配置补齐后运行 `bun scripts/migrations/validate.ts`，验收通过再切换数据根。恢复工具不会覆盖正在使用的数据。
+
+Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 999 次，正常退出不重试；停止机器人也会停止启动器。此退避让旧群租约有时间过期。修改代码后需按正常部署流程更新启动器；运行中的服务不会自动切换到这份代码。
 
 ### 大文件外链配置
 

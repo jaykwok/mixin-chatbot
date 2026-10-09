@@ -1,0 +1,36 @@
+diff --git a/dist/harness/compaction.js b/dist/harness/compaction.js
+index 38f9303..338f735 100644
+--- a/dist/harness/compaction.js
++++ b/dist/harness/compaction.js
+@@ -125,6 +125,11 @@ export const CompactionTask = defineTask({
+                 sessionId: await ensureProviderSessionId(runtime, context),
+                 ...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
+             };
++            // mixin-chatbot patch for Pi 1.1.0 (gap G4): before every summarize request attempt, as
++            // `beforeRequest` before every generation request; the request door registers the attempt's signal here.
++            await runtime.hooks.each("beforeSummarize", async (hook) => {
++                await hook({ attempt, model: ref, messages }, runtime, context);
++            });
+             const message = await runtime.models.completeSimple(model, { messages }, options);
+             // An abort mark or close: the abort invocation or the reopened task handles the committed state.
+             runtime.signal.throwIfAborted();
+diff --git a/dist/harness/types.d.ts b/dist/harness/types.d.ts
+index 7f56f20..650fa62 100644
+--- a/dist/harness/types.d.ts
++++ b/dist/harness/types.d.ts
+@@ -580,5 +580,14 @@ export interface CompactionHooks {
+     } | {
+         readonly summary: string;
+     }>;
++    /**
++     * mixin-chatbot patch (gap G4, option A): before every summarize request attempt, including retries and recovery,
++     * with the attempt's number, model and request messages; `context.abortSignal` is the signal the request carries.
++     */
++    beforeSummarize(request: {
++        readonly attempt: number;
++        readonly model: ModelRef;
++        readonly messages: readonly Message[];
++    }, api: HookApi, context: Context): void | Promise<void>;
+ }
+ //# sourceMappingURL=types.d.ts.map
+\ No newline at end of file

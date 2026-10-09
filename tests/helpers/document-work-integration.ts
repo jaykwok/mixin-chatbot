@@ -1,24 +1,43 @@
 /** Real, offline document operations against an explicitly supplied test venv. */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
 import { documentToolchainReady, venvPythonPath } from "../../src/agent/python-toolchain.ts";
 import { runProcess } from "../../src/core/process.ts";
 import { application } from "../../src/core/lifecycle.ts";
+import { configuredRootlessTasks, ISOLATED_PYTHON } from "../../src/core/rootless-tasks.ts";
 
 const environment = process.argv[2];
 if (!environment) throw new Error("Usage: bun tests/helpers/document-work-integration.ts <test venv> [--office]");
 const venvDir = resolve(environment), project = fileURLToPath(new URL("../../", import.meta.url));
-const root = join(project, "tmp", "document-validation", "run-" + crypto.randomUUID());
+const rootArgument = process.argv.indexOf("--root");
+const root = rootArgument > 0 ? resolve(process.argv[rootArgument + 1]!) : join(project, "tmp", "document-validation", "run-" + crypto.randomUUID());
 const workspace = join(root, "workspace"), tempDir = join(root, "user-tmp");
 await Promise.all([workspace, tempDir].map(p => mkdir(p, { recursive: true })));
 process.chdir(root);
-assert.equal(await documentToolchainReady(venvDir), true, "test venv must match uv.lock and Python 3.14");
+const backend = configuredRootlessTasks();
+if (!backend) assert.equal(await documentToolchainReady(venvDir), true, "test venv must match uv.lock and Python 3.14");
 const fixtureScript = fileURLToPath(new URL("./document-fixtures.py", import.meta.url));
 const python = async (...args: string[]) => {
+  if (backend) {
+    const task = await backend.create(tempDir);
+    try {
+      const prepare = args[0] === "prepare";
+      const target = join(task.path, "fixtures");
+      if (prepare) await mkdir(target); else await cp(workspace, target, { recursive: true });
+      const result = await task.run({ command: ISOLATED_PYTHON, args: [fixtureScript, args[0]!, target, ...args.slice(2)],
+        cwd: task.path, timeoutMs: 60_000, env: { PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1" } },
+        [dirname(fixtureScript), join(project, "src/agent/modules/document-work/scripts"),
+          join(project, "src/agent/modules/document-work/skills/document-work"), ...prepare ? [] : [args[2]!]]);
+      assert.equal(result.exitCode, 0, result.output);
+      if (prepare) await cp(target, workspace, { recursive: true });
+      return result.output;
+    } finally { await task.seal(); await backend.reclaim(task.id); }
+  }
   const result = await runProcess({ command: venvPythonPath(venvDir), args: [fixtureScript, ...args], cwd: root,
     env: { ...process.env, PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1" }, timeoutMs: 60000 });
   assert.equal(result.exitCode, 0, result.output);
@@ -31,8 +50,18 @@ for (const name of ["source.docx", "source.pptx", "supplement.docx", "supplement
 }
 const tools = buildDocumentWorkTools({ workspaceDir: workspace, tempDir, venvDir, indexPath: join(root, "index/materials.md") });
 const call = async (name: string, params: object): Promise<any> => {
-  const details = (await tools.find(t => t.name === name)!.execute("verify", params, undefined, undefined, {} as never)).details;
+  const tool = tools.find(t => t.name === name)!;
+  const result = await tool.execute("verify", params, undefined, undefined, {} as never);
+  const details = result.details;
+  // The real scripts' results must match the declared protocol exactly: pi-ai's validator coerces and cleans,
+  // so the validated copy has to equal the original.
+  const validated = validateToolArguments({ name, description: "", parameters: tool.outputSchema! },
+    { type: "toolCall", id: "verify", name, arguments: structuredClone(result.structuredContent) as never });
+  assert.equal(JSON.stringify(validated), JSON.stringify(result.structuredContent), `${name} result does not match its outputSchema`);
+  assert.deepEqual(details, result.structuredContent);
+  assert.deepEqual(JSON.parse((result.content[0] as { text: string }).text), result.structuredContent);
   for (const job of await readdir(tempDir)) {
+    if (backend && job === ".isolated-work" || job === ".office-jobs") continue;
     const files = await readdir(join(tempDir, job));
     assert(!files.includes(".work"), "completed job retained source copies or Office intermediates");
     assert(files.every(file => !file.endsWith(".request.json") && !file.startsWith("office-")));
@@ -72,6 +101,14 @@ await assert.rejects(call("document_compose", { items: [{ source: "source.pptx",
 await assert.rejects(call("document_patch", { source: "source.docx", digest: word.digest, edits: [
   { part: customer.part, paragraph: customer.paragraph, before: "原件不存在的文字", after: "不应修改" },
 ] }), /恰好出现一次/);
+// “客户” is bold and “A” italic: a different-length change across both cannot say which formatting the new text takes, so
+// the whole patch fails with guidance and, although the first edit was valid, publishes nothing.
+const jobsBeforeFailedPatch = await readdir(tempDir);
+await assert.rejects(call("document_patch", { source: "source.docx", digest: word.digest, edits: [
+  { part: table.part, paragraph: table.paragraph, before: "本地部署", after: "私有化部署" },
+  { part: customer.part, paragraph: customer.paragraph, before: "客户A", after: "甲方" },
+] }), /跨越格式.*拆成多项编辑/);
+if (!backend) assert.deepEqual(await readdir(tempDir), jobsBeforeFailedPatch);
 // Outline, Markdown builds on fixture templates and inline content inside compose.
 const outline = await call("document_inspect", { source: "source.pptx", outline: true });
 const wordOutline = await call("document_inspect", { source: "source.docx", outline: true });
@@ -92,6 +129,27 @@ const wordInline = await call("document_compose", { filename: "章节加新章.d
   { source: "source.docx", start: 1, end: 2 }, { content: "# 补充章节\n1. 第一步\n2. 第二步\n\n![图](product.png)" },
 ] });
 await assert.rejects(call("document_compose", { items: [{ content: "# 无文件" }] }), /第一项/);
+// compose reports its content pages at output page numbers: two content items around a page selected twice and another
+// source, one diagram drawn and two that fall back (an explicit timeline without segments is reported in warnings, three
+// ### sections too long for cards in attention). The titles prove the named pages are the new ones.
+const layoutCompose = await call("document_compose", { filename: "选编加图示.pptx", items: [
+  { source: "source.pptx", slides: [2, 2] },
+  { content: "## 选编卡片\n<!-- cards -->\n- 资产识别：自动发现实例\n- 风险检测：覆盖 12 类风险\n- 审计溯源：完整记录调用链" },
+  { source: "supplement.pptx", slides: [1] },
+  { content: "## 选编时间轴\n<!-- timeline -->\n只有一段文字，没有分段。\n\n## 选编三项\n### 甲\n" + "说明文字较长。".repeat(33) + "\n### 乙\n短。\n### 丙\n短。" },
+] });
+const titlesOf = async (source: string, pages: number[]) => {
+  const slides = (await call("document_inspect", { source, outline: true })).outline.slides;
+  return pages.map((page) => slides.find((slide: any) => slide.page === page)?.title);
+};
+assert.deepEqual(layoutCompose.build.generatedPages, [3, 5, 6], JSON.stringify(layoutCompose.build));
+assert.deepEqual(await titlesOf(layoutCompose.output, layoutCompose.build.generatedPages), ["选编卡片", "选编时间轴", "选编三项"]);
+assert.deepEqual(layoutCompose.build.layouts.map((entry: any) => [entry.page, entry.mode]), [[3, "cards"]]);
+assert.ok(layoutCompose.build.attention.some((entry: any) => entry.page === 6 && /未自动排成图示/.test(entry.reason)), JSON.stringify(layoutCompose.build));
+assert.ok(layoutCompose.warnings.some((warning: string) => /“timeline”指令所在页/.test(warning)), JSON.stringify(layoutCompose.warnings));
+assert.deepEqual(slideInline.build.generatedPages, [2]);
+assert.deepEqual(await titlesOf(slideInline.output, [2]), ["新增页面"]);
+assert.deepEqual([pptCompose.build, wordInline.build, wordCompose.build], [undefined, undefined, undefined]);
 await assert.rejects(call("document_build", { format: "pptx", template: "source.docx", content: "# x" }), /格式/);
 await assert.rejects(call("document_build", { format: "pptx", template: "source.pptx", content: "# x", keepSlides: [9] }), /页码不存在/);
 await assert.rejects(call("document_build", { format: "pptx", template: "source.pptx", content: "# x", keepSlides: [1], sequence: [2, "content"] }), /keepSlides/);
@@ -138,6 +196,7 @@ const overflowBuild = await call("document_build", { format: "pptx", content: [
 const shapeImages = await call("document_images", { source: "shapes.pptx" });
 const filteredImages = await call("document_images", { source: "shapes.pptx", minSize: 1000 });
 const bigImages = await call("document_images", { source: "big.pptx" });
+const manyImages = await call("document_images", { source: "many.pptx" });
 const wordFlow = await call("document_build", { format: "docx", template: "source.docx", filename: "流程.docx", title: "流程",
   content: "# 处理流程\n\n```mermaid\nflowchart TB\n  A([开始]) --> B{通过?}\n  B -- 是 --> C([结束])\n  B -- 否 --> A\n```\n\n后续说明。" });
 const pdfImages = await call("document_images", { source: "figure.pdf", crops: [{ page: 1, box: [0.1, 0.1, 0.6, 0.9] }] });
@@ -147,17 +206,31 @@ await assert.rejects(call("document_images", { source: "figure.pdf", pages: [9] 
 const preview = await call("document_render", { source: "pages.pdf", pages: [22, 1, 2] });
 const officePreviews: unknown[] = [];
 if (process.argv.includes("--office")) {
-  for (const source of [wordCompose.output, pptPatch.output, wordBuild.output, slideBuild.output, slideInline.output, overflowBuild.output]) {
+  for (const source of [wordCompose.output, pptPatch.output, wordBuild.output, slideBuild.output, slideInline.output, layoutCompose.output, overflowBuild.output]) {
     officePreviews.push(await call("document_render", { source }));
   }
   // The layout deck has grown past the 20-page render default, so ask for every generated page explicitly.
   officePreviews.push(await call("document_render", { source: layoutBuild.output, pages: layoutBuild.build.generatedPages }));
 }
-const results = { wordPatch, wordCompose, wordSelection, pptCompose, pptPatch, pptPatchPart: pptPart, preview, officePreviews, sourceDigests,
-  outline, wordOutline, wordBuild, wordDefault, slideBuild, slideDefault, slideInline, wordInline, layoutBuild, pdfImages, deckImages, wordImages, wordFlow,
-  sectionsBuild, linkedBuild, overflowBuild, shapeImages, filteredImages, bigImages };
+const previewCopies: string[] = [];
+if (backend) {
+  await mkdir(join(root, "previews"));
+  for (const value of officePreviews.slice(0, 3) as { contacts: string[] }[]) {
+    const source = value.contacts[0]; if (!source) continue;
+    const copy = join(root, "previews", `office-${previewCopies.length + 1}${extname(source)}`); await cp(source, copy); previewCopies.push(copy);
+  }
+}
+const results = { wordPatch, wordCompose, wordSelection, pptCompose, pptPatch, pptPatchPart: pptPart, preview, officePreviews, previewCopies, sourceDigests,
+  outline, wordOutline, wordBuild, wordDefault, slideBuild, slideDefault, slideInline, wordInline, layoutCompose, layoutBuild, pdfImages, deckImages, wordImages, wordFlow,
+  sectionsBuild, linkedBuild, overflowBuild, shapeImages, filteredImages, bigImages, manyImages };
 const report = join(root, "results.json");
 await writeFile(report, JSON.stringify(results, null, 2));
 console.log(await python("check", workspace, report));
 await application.drain();
 console.log(JSON.stringify({ status: "passed", report }));
+if (backend) {
+  const recovered = await backend.sweep(tempDir, Infinity, []);
+  assert(recovered.length > 0 && recovered.every(item => item.status === "removed"));
+  assert.deepEqual(await backend.sweep(tempDir, Infinity, []), []);
+  console.log(JSON.stringify({ physicalReclamation: true, tasks: recovered.length }));
+}

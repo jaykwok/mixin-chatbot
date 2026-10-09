@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
   access,
@@ -8,9 +7,7 @@ import {
   realpath,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { move } from "fs-extra";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   createBashToolDefinition,
   getShellConfig,
@@ -26,6 +23,8 @@ import { log } from "../core/log.ts";
 import { isPathInside } from "./paths.ts";
 import { venvPythonPath } from "./python-toolchain.ts";
 import { runProcess } from "../core/process.ts";
+import { moveSystemTempOutput } from "./system-temp.ts";
+import { assertTaskPathAllowed, configuredRootlessTasks, ISOLATED_PYTHON } from "../core/rootless-tasks.ts";
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
@@ -68,21 +67,35 @@ class AllowedPathGuard {
     this.assertInside(path);
   }
 
+  private assertWritable(path: string): void {
+    this.assertInside(path);
+    if (configuredRootlessTasks() && this.roots.some(root => [".isolated-work", ".office-jobs", "codemode", ".document-cache"]
+      .some(name => isPathInside(path, join(root, name))))) throw new Error("任务登记与结果目录只读，请在本次 bash 的 PI_USER_TMP 中写入");
+  }
+
+  private async refuseManagement(path: string): Promise<void> {
+    await assertTaskPathAllowed(path);
+  }
+
   /** 读取路径：可写根 + 只读根。 */
   async readable(path: string): Promise<string> {
     const canonical = await realpath(resolve(path));
+    await this.refuseManagement(canonical);
     this.assertReadable(canonical);
     return canonical;
   }
 
   async existing(path: string): Promise<string> {
     const canonical = await realpath(resolve(path));
-    this.assertInside(canonical);
+    await this.refuseManagement(canonical);
+    this.assertWritable(canonical);
     return canonical;
   }
 
   async writable(path: string): Promise<string> {
     const target = resolve(path);
+    await this.refuseManagement(target);
+    this.assertWritable(target);
     let cursor = target;
 
     while (true) {
@@ -91,10 +104,13 @@ class AllowedPathGuard {
         if (info.isSymbolicLink()) {
           const canonical = await realpath(cursor).catch(() => null);
           if (!canonical) throw new Error(`拒绝写入悬空符号链接: ${path}`);
-          this.assertInside(canonical);
+          await this.refuseManagement(canonical);
+          this.assertWritable(canonical);
           return target;
         }
-        this.assertInside(await realpath(cursor));
+        const canonical = await realpath(cursor);
+        await this.refuseManagement(canonical);
+        this.assertWritable(canonical);
         return target;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -106,25 +122,9 @@ class AllowedPathGuard {
   }
 }
 
-async function moveOfficialBashOutput(
-  source: string,
-  tempDir: string
-): Promise<string> {
-  if (!basename(source).startsWith("pi-bash-") || extname(source) !== ".log") {
-    return source;
-  }
-
-  const canonicalSource = await realpath(source);
-  const canonicalSystemTemp = await realpath(tmpdir());
-  const canonicalUserTemp = await realpath(tempDir);
-  if (!isPathInside(canonicalSource, canonicalSystemTemp)) return source;
-  if (isPathInside(canonicalSource, canonicalUserTemp)) return canonicalSource;
-
-  const stem = basename(source, ".log");
-  const destination = join(canonicalUserTemp, `${stem}-${randomUUID()}.log`);
-  await move(canonicalSource, destination, { overwrite: false });
-  return destination;
-}
+/** Added to the official bash description; the Durable tool catalogue (src/durable/tools.ts) shows the same text. */
+export const BASH_TOOL_NOTE = " Default timeout is " + BASH_DEFAULT_TIMEOUT +
+  " seconds, maximum 3600. The workspace is reference material: only write to your own temp directory. All child processes are stopped when this command completes or is cancelled.";
 
 function createBashTool(
   cwd: string,
@@ -132,7 +132,8 @@ function createBashTool(
   phone: string,
   groupId: string,
   venvDir: string,
-  materialsIndexPath: string
+  materialsIndexPath: string,
+  engine: Pick<LocalToolsOptions, "sessionEnvironment" | "onBashOutput">
 ) {
   const callerEnvironment = {
     TMPDIR: tempDir,
@@ -145,8 +146,8 @@ function createBashTool(
     UV_CACHE_DIR: join(tempDir, ".cache", "uv"),
     // 文档解析环境在 workspace 外：workspace 是同步盘镜像，往里建 .venv 会污染同步源，
     // 并被下一次同步删掉。
-    UV_PROJECT_ENVIRONMENT: venvDir,
-    VIRTUAL_ENV: venvDir,
+    UV_PROJECT_ENVIRONMENT: configuredRootlessTasks() ? "/app/.venv" : venvDir,
+    VIRTUAL_ENV: configuredRootlessTasks() ? "/app/.venv" : venvDir,
     PYTHONIOENCODING: "utf-8",
     // PYTHONIOENCODING 只管住 stdout/stderr；open() 的默认编码仍随系统 ANSI 代码页走，
     // 在中文 Windows 上就是 GBK，读写 UTF-8 中间文件会直接乱码或抛 UnicodeDecodeError。
@@ -164,7 +165,7 @@ function createBashTool(
     PI_USER_TMP: tempDir,
     // 解释器路径与索引位置都随群/平台变化，写死在提示词里迟早会过期；导出成变量后
     // 模型只要 "$PI_PYTHON"、"$PI_MATERIALS_INDEX" 即可，也不用再去探测 Scripts/ 还是 bin/。
-    PI_PYTHON: venvPythonPath(venvDir),
+    PI_PYTHON: configuredRootlessTasks() ? ISOLATED_PYTHON : venvPythonPath(venvDir),
     PI_MATERIALS_INDEX: materialsIndexPath,
     // Pi sets both markers itself, but only in its own CLI/RPC entrypoints. This
     // process embeds the SDK, so child commands need them exported explicitly.
@@ -182,11 +183,38 @@ function createBashTool(
         if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 3600) {
           throw new Error("bash timeout 必须大于 0 且不超过 3600 秒");
         }
-        return runProcess({ command: shell.shell, args: [...shell.args, command],
-          cwd: executionCwd, env, signal, timeoutMs: seconds * 1000, onData });
+        const tee = engine.onBashOutput;
+        try {
+          const backend = configuredRootlessTasks();
+          if (backend) {
+            const task = await backend.create(tempDir);
+            try {
+              const isolatedEnv = Object.fromEntries(Object.entries(callerEnvironment).map(([key, value]) =>
+                [key, value === tempDir || value.startsWith(tempDir + "/") ? task.path + value.slice(tempDir.length) : value]));
+              const exports = Object.entries(isolatedEnv).map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n");
+              const source = command.startsWith(shellExports + "\n") ? command.slice(shellExports.length + 1) : command;
+              const readOnly = [cwd, dirname(materialsIndexPath)];
+              return await task.run({ command: shell.shell, args: [...shell.args, exports + "\n" + source],
+                cwd: executionCwd, env: isolatedEnv, signal, timeoutMs: seconds * 1000,
+                onData: tee === undefined ? onData : (data) => { onData(data); tee(data); } }, readOnly);
+            } finally { await task.seal(); }
+          }
+          return await runProcess({ command: shell.shell, args: [...shell.args, command],
+            cwd: executionCwd, env, signal, timeoutMs: seconds * 1000,
+            onData: tee === undefined ? onData : (data) => { onData(data); tee(data); } });
+        } catch (error) {
+          // 官方 Bash 只认 "aborted" 与 "timeout:<秒>"：认出后才把已产生的输出和完整输出文件
+          // 写进错误，下面的包装再把文件搬进调用者 tmp；否则部分输出丢失、文件留在系统 TEMP。
+          if (signal?.aborted) throw new Error("aborted", { cause: error });
+          if (error instanceof Error && (error.message === `Command timed out after ${seconds} seconds`
+            || error.name === "TimeoutError" || error.cause instanceof Error && error.cause.name === "TimeoutError")) {
+            throw new Error(`timeout:${seconds}`, { cause: error });
+          }
+          throw error;
+        }
       },
     },
-    exposeSessionEnvironment: true,
+    exposeSessionEnvironment: engine.sessionEnvironment ?? true,
     spawnHook: (context) => ({
       ...context,
       // Git Bash can replace inherited TMPDIR while starting; export inside the
@@ -201,27 +229,39 @@ function createBashTool(
 
   const executeOfficial: typeof official.execute = async (...args) => {
     try {
+      // 非零退出码是带 isError 的正常结果，同样要搬移完整输出。
       const result = await official.execute(...args);
       const details = result.details as Record<string, unknown> | undefined;
-      const source = details?.fullOutputPath;
-      if (typeof source !== "string") return result;
+      // 展示截断时 details 带路径，超过 1 MiB 时结构化结果（codemode 脚本读取）也带同一路径；
+      // 两处与文本必须一起改写，否则脚本拿到的是已搬走的旧文件。
+      const structured = result.structuredContent as Record<string, unknown> | undefined;
+      const sources = [...new Set([details?.fullOutputPath, structured?.full_output_path])]
+        .filter((path): path is string => typeof path === "string");
+      if (!sources.length) return result;
 
-      try {
-        const destination = await moveOfficialBashOutput(source, tempDir);
-        if (destination === source) return result;
-        return {
-          ...result,
-          content: result.content.map((item) =>
-            item.type === "text"
-              ? { ...item, text: item.text.replaceAll(source, destination) }
-              : item
-          ),
-          details: { ...details, fullOutputPath: destination },
-        };
-      } catch (error) {
-        log.warn(`Pi bash 完整输出迁移失败: ${String(error)}`);
-        return result;
+      const moved = new Map<string, string>();
+      for (const source of sources) {
+        try {
+          const destination = await moveSystemTempOutput(source, tempDir, "pi-bash-", ".log");
+          if (destination !== source) moved.set(source, destination);
+        } catch (error) {
+          log.warn(`Pi bash 完整输出迁移失败: ${String(error)}`);
+        }
       }
+      if (!moved.size) return result;
+      const relocate = (path: unknown) => (typeof path === "string" ? moved.get(path) ?? path : path);
+      return {
+        ...result,
+        content: result.content.map((item) =>
+          item.type === "text"
+            ? { ...item, text: [...moved].reduce((text, [source, destination]) => text.replaceAll(source, destination), item.text) }
+            : item
+        ),
+        details: details?.fullOutputPath === undefined ? details : { ...details, fullOutputPath: relocate(details.fullOutputPath) },
+        ...(structured?.full_output_path !== undefined && {
+          structuredContent: { ...structured, full_output_path: relocate(structured.full_output_path) },
+        }),
+      } as typeof result;
     } catch (error) {
       if (!(error instanceof Error)) throw error;
       let message = error.message;
@@ -230,7 +270,7 @@ function createBashTool(
       );
       for (const source of paths) {
         try {
-          const destination = await moveOfficialBashOutput(source, tempDir);
+          const destination = await moveSystemTempOutput(source, tempDir, "pi-bash-", ".log");
           message = message.replaceAll(source, destination);
         } catch (moveError) {
           log.warn(`Pi bash 错误输出迁移失败: ${String(moveError)}`);
@@ -245,8 +285,7 @@ function createBashTool(
 
   return defineTool({
     ...official,
-    description: official.description + " Default timeout is " + BASH_DEFAULT_TIMEOUT +
-      " seconds, maximum 3600. The workspace is reference material: only write to your own temp directory. All child processes are stopped when this command completes or is cancelled.",
+    description: official.description + BASH_TOOL_NOTE,
     execute: executeOfficial,
   });
 }
@@ -264,6 +303,13 @@ export interface LocalToolsOptions {
   materialsIndexPath: string;
   /** Enabled modules may expose application-owned instructions for read only. */
   resourceReadDirs?: string[];
+  /**
+   * Pi's session variables for bash (PI_SESSION_ID, PI_SESSION_FILE, PI_PROVIDER, PI_MODEL, PI_REASONING_LEVEL), read
+   * from the AgentSession tool context. Default true; the Durable engine has no session object and turns them off.
+   */
+  sessionEnvironment?: boolean;
+  /** Raw bash output as it arrives, besides the official tool's own accumulation (Durable: the call's `api.output`). Must not throw. */
+  onBashOutput?: (data: Buffer) => void;
 }
 
 /** Pi 官方工具工厂 + 本项目的 workspace/tmp 边界和调用者环境。 */
@@ -304,7 +350,7 @@ export async function buildLocalTools(
   };
 
   const readTool = createReadToolDefinition(cwd, { operations: readOperations });
-  const bashTool = createBashTool(cwd, tempDir, phone, groupId, venvDir, indexPath);
+  const bashTool = createBashTool(cwd, tempDir, phone, groupId, venvDir, indexPath, options);
   const editTool = createEditToolDefinition(cwd, { operations: editOperations });
   const writeTool = createWriteToolDefinition(cwd, { operations: writeOperations });
 

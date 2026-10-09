@@ -12,6 +12,7 @@
     "configure-runtime": "bun run scripts/config/runtime-settings.ts",
     "relay": "bun run scripts/ops/relay-admin.ts",
     "routes": "bun run scripts/ops/route-admin.ts",
+    "mcp": "bun run scripts/ops/mcp-admin.ts",
     "tmp": "bun run scripts/ops/tmp-admin.ts",
     "history": "bun run scripts/ops/history-admin.ts",
     "stat": "bun run scripts/ops/stats-admin.ts",
@@ -22,8 +23,12 @@
   },
   "dependencies": {
     "@clack/prompts": "1.7.0",
-    "@earendil-works/pi-ai": "0.87.1",
-    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-codemode": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-durable": "1.1.0",
+    "@earendil-works/pi-mcp": "1.1.0",
     "fs-extra": "11.4.0",
     "hono": "4.13.7",
     "marked": "18.0.5",
@@ -34,15 +39,25 @@
     "@types/bun": "1.4.2",
     "@types/fs-extra": "11.0.4",
     "@types/proper-lockfile": "4.1.4",
-    "knip": "6.29.0",
+    "knip": "6.40.0",
     "typescript": "5.9.3"
   },
   "overrides": {
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-agent-core": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-codemode": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-durable": "1.1.0",
+    "@earendil-works/pi-mcp": "1.1.0",
+    "@earendil-works/pi-telemetry": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
     "brace-expansion": "5.0.12",
     "image-size": "2.0.4",
-    "smol-toml": "1.8.0"
+    "smol-toml": "1.9.0"
   },
   "patchedDependencies": {
-    "knip@6.29.0": "scripts/patches/knip@6.29.0.patch"
+    "@earendil-works/pi-durable@1.1.0": "scripts/patches/@earendil-works%2Fpi-durable@1.1.0.patch",
+    "knip@6.40.0": "scripts/patches/knip@6.40.0.patch"
   }
 }

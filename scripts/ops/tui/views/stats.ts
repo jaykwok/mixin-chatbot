@@ -300,11 +300,13 @@ export class StatsView implements View {
     );
   }
 
+  /** 模型直接发起的调用在前；脚本里的子调用另起一组，不和它们相加。 */
   private toolRows(theme: ViewContext["theme"], stats: GroupStats, size: number): string[] {
-    return [...stats.tools].sort((a, b) => b[1] - a[1] || byName(a[0], b[0])).map(([tool, count]) =>
-      pad(" " + truncate(tool, Math.max(1, size - 9)) +
-        pad(theme.c("muted", count + " 次"), Math.max(0, size - 1 - width(truncate(tool, Math.max(1, size - 9)))), "right"), size)
-    );
+    const rows = (tools: Map<string, number>, prefix = "") => [...tools].sort((a, b) => b[1] - a[1] || byName(a[0], b[0])).map(([tool, count]) => {
+      const name = truncate(prefix + tool, Math.max(1, size - 9));
+      return pad(" " + name + pad(theme.c("muted", count + " 次"), Math.max(0, size - 1 - width(name)), "right"), size);
+    });
+    return stats.nested.size ? [...rows(stats.tools), pad(" " + theme.c("muted", "脚本子调用"), size), ...rows(stats.nested, "↳ ")] : rows(stats.tools);
   }
 
   /**
@@ -326,6 +328,8 @@ export class StatsView implements View {
       stats.tokens.unknownCost ? "费用未知 " + stats.tokens.unknownCost + " 条" : "",
       stats.tokens.missingUsage ? "用量不完整 " + stats.tokens.missingUsage + " 条" : "",
       stats.skipped ? "跳过 " + stats.skipped + " 行无法解析的记录" : "",
+      stats.nestedIncomplete ? "子调用记录不完整 " + stats.nestedIncomplete + " 次，计数可能偏少" : "",
+      stats.legacySources ? "旧口径账目 " + stats.legacySources + " 个会话" : "",
     ].filter(Boolean);
 
     const listWidth = wide ? Math.floor(total * 0.6) : total;

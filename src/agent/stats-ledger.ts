@@ -1,7 +1,7 @@
 // 使用统计账本：唯一的统计来源，与会话文件的存亡无关。
 //
-// 会话历史随时可能被 /clear 或 history clear 归档，统计不能再从 session.jsonl 现算。
-// 入账按「世代 + 自然日」聚合：一份会话文件的每一次新建算一个世代（source），同一世代
+// 对话在 Durable 群库里，由 src/durable/projection.ts 按条目游标入账；升级前的旧会话文件 session.jsonl 原地保留，
+// 随时可能被 history clear 归档，由每日扫描补账。旧会话文件入账按「世代 + 自然日」聚合：一份会话文件的每一次新建算一个世代（source），同一世代
 // 整份重读时先清行再写，所以补跑、重跑、被改写后重读都不会把数字算两遍。
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
@@ -12,7 +12,17 @@ import { countUsageRecord, emptyUsage, type UsageTotals } from "../../scripts/li
 import { readSessionSlice, SessionFileChangedError, type SessionSlice, type StatsRecord } from "./session-reader.ts";
 import { SESSION_FILE } from "./paths.ts";
 
-const SCHEMA_VERSION = 1;
+/**
+ * 2：增加 `sources.projection`，账本含子调用（`nested`、`nested_incomplete`）和工具自身用量（`tool`）。
+ * 由数据迁移 v2 从 1 转换；旧代码把未知的工具 kind 当作已送附件，所以必须拒绝读新账本。
+ */
+const SCHEMA_VERSION = 2;
+/** 入账口径。1 只出现在迁移时原件无法核对、原样保留的旧世代上。 */
+const PROJECTION = 2;
+/** Durable projection: aborted entries are separate requests, and starts without an entry remain visible. */
+export const DURABLE_PROJECTION = 4;
+/** 工具自身用量不知道来自哪个模型，不能归到对话模型名下。 */
+const UNATTRIBUTED = { provider: "unknown", model: "unknown" };
 
 /** 账本跟着群数据走：群数据根可以指到别的磁盘，统计不能留在项目目录里对不上。 */
 export function statsLedgerPath(root: string): string {
@@ -30,9 +40,9 @@ const hasSchema = (db: Database) => !!db.query("SELECT 1 FROM sqlite_master WHER
 
 function assertSchemaVersion(db: Database): void {
   const version = (db.query("SELECT version FROM stats_schema WHERE id = 1").get() as { version: number } | null)?.version;
-  // 原始会话可能已归档或删除；账本必须保留，由离线工具转换未知版本。
+  // 原始会话可能已归档或删除；账本必须保留，由升级里的数据迁移转换旧版本。
   if (version !== SCHEMA_VERSION) {
-    throw new Error(`统计账本版本 ${version ?? "未知"} 与当前 ${SCHEMA_VERSION} 不一致；请停机备份并使用对应离线迁移工具，勿删除 stats.sqlite`);
+    throw new Error(`统计账本版本 ${version ?? "未知"} 与当前 ${SCHEMA_VERSION} 不一致；请通过 TUI“升级”或 ops update 完成数据迁移，勿删除 stats.sqlite`);
   }
 }
 
@@ -53,7 +63,7 @@ export function openStatsLedger(root: string): Database {
         identity TEXT NOT NULL, offset INTEGER NOT NULL, digest TEXT NOT NULL,
         bad_lines INTEGER NOT NULL, pending INTEGER NOT NULL,
         provider TEXT NOT NULL, model TEXT NOT NULL,
-        seen_at INTEGER NOT NULL, archived_at INTEGER)`);
+        seen_at INTEGER NOT NULL, archived_at INTEGER, projection INTEGER NOT NULL)`);
       db.exec("CREATE INDEX sources_location ON sources(group_segment, user_segment, identity)");
       db.exec(`CREATE TABLE activity (
         source TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE, day TEXT NOT NULL,
@@ -101,7 +111,7 @@ export function openExistingStatsLedger(root: string): Database | null {
 
 interface SourceRow {
   id: string; identity: string; offset: number; digest: string;
-  pending: number; provider: string; model: string;
+  pending: number; provider: string; model: string; projection: number;
 }
 
 interface Bucket { asks: number; replies: number; firstAt: number; lastAt: number }
@@ -119,6 +129,10 @@ function fold(records: StatsRecord[], state: { provider: string; model: string }
   const activity = new Map<string, Bucket>();
   const tools = new Map<string, number>();
   const usage = new Map<string, UsageBucket>();
+  const countTool = (day: string, kind: string, name: string) => {
+    const key = JSON.stringify([day, kind, name]);
+    tools.set(key, (tools.get(key) ?? 0) + 1);
+  };
   const touch = (day: string): Bucket => {
     const bucket = activity.get(day)
       ?? { asks: 0, replies: 0, firstAt: Number.POSITIVE_INFINITY, lastAt: Number.NEGATIVE_INFINITY };
@@ -170,15 +184,18 @@ function fold(records: StatsRecord[], state: { provider: string; model: string }
       touch(day).replies++;
       countUsage(day, "assistant", at, record.message.usage);
       for (const part of record.message.content ?? []) {
-        if (part?.type !== "toolCall" || !part.name) continue;
-        const key = JSON.stringify([day, "call", part.name]);
-        tools.set(key, (tools.get(key) ?? 0) + 1);
+        if (part?.type === "toolCall" && part.name) countTool(day, "call", part.name);
       }
     } else if (role === "toolResult") {
       const message = record.message;
       if (!message.isError && message.details?.fileId && ["send_file", "send_image"].includes(message.toolName ?? "")) {
-        const key = JSON.stringify([day, "delivered", message.toolName!]);
-        tools.set(key, (tools.get(key) ?? 0) + 1);
+        countTool(day, "delivered", message.toolName!);
+      }
+      // 工具自身的用量（含 SDK 并入的子调用用量）每条结果只计一次；子调用结果不落盘，不会重复。
+      if (message.usage && typeof message.usage === "object") countUsage(day, "tool", at, message.usage, UNATTRIBUTED);
+      if (message.nested) {
+        for (const name of message.nested.names) countTool(day, "nested", name);
+        if (!message.nested.complete) countTool(day, "nested_incomplete", message.toolName || "unknown");
       }
     } else continue;
     const bucket = touch(day);
@@ -265,9 +282,11 @@ async function ingestOnce(db: Database, path: string, group: string, user: strin
   const located = () => db.query(`SELECT * FROM sources WHERE group_segment = ? AND user_segment = ? AND identity = ?`)
     .get(group, user, identity) as SourceRow | null;
   const prior = located();
+  // 旧口径的世代只在原件仍在时才会续读到：整份重读，按当前口径重算后替换旧行。
+  const cursor = prior?.projection === PROJECTION ? { identity: prior.identity, offset: prior.offset, digest: prior.digest } : undefined;
   let slice: SessionSlice;
   try {
-    slice = await readSessionSlice(path, prior ? { identity: prior.identity, offset: prior.offset, digest: prior.digest } : undefined);
+    slice = await readSessionSlice(path, cursor);
   } catch (error) {
     if (error instanceof SessionFileChangedError) return "conflict";
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -275,7 +294,7 @@ async function ingestOnce(db: Database, path: string, group: string, user: strin
   }
   // 以实际读取句柄的身份为准；文件在打开前被换代时重新定位账本，不能套用旧世代游标。
   if (slice.cursor.identity !== identity) return "conflict";
-  const continued = !slice.reset && prior !== null;
+  const continued = !slice.reset && cursor !== undefined && prior !== null;
   // /clear 标记归档之后、移走文件之前仍可能被扫描。没有新增字节或尾行变化就不写库，
   // 保留原来的归档状态；返回 source 让归档调用方仍可标记已经入账过的会话。
   if (continued && slice.cursor.offset === prior.offset && slice.cursor.digest === prior.digest
@@ -299,14 +318,14 @@ async function ingestOnce(db: Database, path: string, group: string, user: strin
         db.query(`DELETE FROM ${table} WHERE source = ?`).run(id);
       }
       db.query(`INSERT INTO sources (id, group_segment, user_segment, identity, offset, digest,
-          bad_lines, pending, provider, model, seen_at, archived_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+          bad_lines, pending, provider, model, seen_at, archived_at, projection)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(id) DO UPDATE SET group_segment = excluded.group_segment, user_segment = excluded.user_segment,
           identity = excluded.identity, offset = excluded.offset, digest = excluded.digest,
           bad_lines = excluded.bad_lines, pending = excluded.pending, provider = excluded.provider,
-          model = excluded.model, seen_at = excluded.seen_at`)
+          model = excluded.model, seen_at = excluded.seen_at, projection = excluded.projection`)
         .run(id, group, user, slice.cursor.identity, slice.cursor.offset, slice.cursor.digest,
-          slice.badLines, slice.pending ? 1 : 0, state.provider, state.model, now);
+          slice.badLines, slice.pending ? 1 : 0, state.provider, state.model, now, PROJECTION);
     }
     apply(db, id, folded);
     return true;
@@ -315,7 +334,10 @@ async function ingestOnce(db: Database, path: string, group: string, user: strin
   return { source: id, records: slice.records.length, reset: slice.reset };
 }
 
-/** 一位成员当前会话的增量入账。机器人在该成员的任务队列里调用，与 `/clear` 天然串行。 */
+/**
+ * 一位成员旧会话文件的增量入账。
+ * @internal 数据版本 3 起服务不再写会话文件，只由每日扫描补账；测试用它入账单个文件。
+ */
 export async function ingestUserSession(root: string, group: string, user: string): Promise<IngestResult | null> {
   const db = openStatsLedger(root);
   try { return await ingestSessionFile(db, root, group, user); } finally { db.close(); }
@@ -333,6 +355,45 @@ export async function ingestBeforeArchive(root: string, group: string, user: str
     const result = await ingestSessionFile(db, root, group, user);
     if (result) db.query("UPDATE sources SET archived_at = ? WHERE id = ?").run(Date.now(), result.source);
   } finally { db.close(); }
+}
+
+/** 一段持久会话（Durable 引擎，D3）在账本里的世代：一个成员会话一个 source，游标是已入账的最新条目号。 */
+export interface ConversationSource { id: string; group: string; user: string; identity: string; digest?: string }
+
+/**
+ * 持久会话的增量入账：`records` 是条目号 `from` 之后、到 `to` 为止的记录，按条目顺序。
+ * 游标、跨行模型状态和聚合行在同一个事务里落盘；账本里的游标不等于 `from`（别处刚入过账）时
+ * 不写，返回 false，调用方重读后再来。`replace` 的那一类用量整类重算（压缩用量来自请求门的开始记录，
+ * 不随条目增长），先删后写，重复入账不会翻倍。`floor` 是还没有来源行时的起点：数据迁移导入的会话
+ * 从导入记录之后计起，导入的条目已由原会话文件入账。
+ */
+export function ingestConversationRecords(db: Database, source: ConversationSource, from: number, to: number,
+  records: StatsRecord[], replace?: { kind: string; records: StatsRecord[] } | { kind: string; records: StatsRecord[] }[],
+  floor = 0, expectedDigest?: string): boolean {
+  return db.transaction(() => {
+    const prior = db.query("SELECT * FROM sources WHERE id = ?").get(source.id) as SourceRow | null;
+    const reset = prior !== null && prior.projection !== DURABLE_PROJECTION;
+    if ((reset ? floor : prior?.offset ?? floor) !== from) return false;
+    if (expectedDigest !== undefined && (reset ? "" : prior?.digest ?? "") !== expectedDigest) return false;
+    if (reset) for (const table of ["activity", "tool_counts", "usage_totals"]) {
+      db.query(`DELETE FROM ${table} WHERE source = ?`).run(source.id);
+    }
+    const state = { provider: reset ? "unknown" : prior?.provider ?? "unknown", model: reset ? "unknown" : prior?.model ?? "unknown" };
+    const folded = fold(records, state);
+    const now = Date.now();
+    db.query(`INSERT INTO sources (id, group_segment, user_segment, identity, offset, digest,
+        bad_lines, pending, provider, model, seen_at, archived_at, projection)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, NULL, ?)
+      ON CONFLICT(id) DO UPDATE SET offset = excluded.offset, provider = excluded.provider, model = excluded.model,
+        digest = excluded.digest, projection = excluded.projection, seen_at = excluded.seen_at`)
+      .run(source.id, source.group, source.user, source.identity, to, source.digest ?? "", state.provider, state.model, now, DURABLE_PROJECTION);
+    apply(db, source.id, folded);
+    for (const replacement of replace ? Array.isArray(replace) ? replace : [replace] : []) {
+      db.query("DELETE FROM usage_totals WHERE source = ? AND kind = ?").run(source.id, replacement.kind);
+      apply(db, source.id, fold(replacement.records, { provider: "unknown", model: "unknown" }));
+    }
+    return true;
+  }).immediate();
 }
 
 export interface SweepResult { files: number; records: number; failed: number; skippedFiles: number; skippedDay: boolean }
@@ -431,6 +492,8 @@ export interface LedgerRows {
   skipped: Map<string, number>;
   /** 账本里记过的群，即使群目录已被删除也在内。 */
   groups: string[];
+  /** 每群区间内有账目、但按旧口径（投影 1，没有子调用和工具自身用量）原样保留的世代数。 */
+  legacy: Map<string, number>;
 }
 
 /** 统计区间按自然日裁剪：账本是日粒度的，比一天更细的边界会被扩到整天。 */
@@ -475,5 +538,12 @@ export function readLedger(db: Database, window: DayWindow = {}, group?: string)
   for (const row of totals) skipped.set(row.group, row.total);
   const groups = (db.query(`SELECT DISTINCT group_segment AS "group" FROM sources${sourceFilter}
     ORDER BY group_segment`).all(...sourceArgs) as { group: string }[]).map(row => row.group);
-  return { activity, tools, usage, skipped, groups };
+  const legacy = new Map<string, number>();
+  const old = rows(
+    `SELECT s.group_segment AS "group", COUNT(DISTINCT s.id) AS sources
+     FROM (SELECT source, day FROM activity UNION SELECT source, day FROM usage_totals) r
+     JOIN sources s ON s.id = r.source${clause ? clause + " AND" : " WHERE"} s.projection = 1
+     GROUP BY s.group_segment ORDER BY s.group_segment`) as { group: string; sources: number }[];
+  for (const row of old) legacy.set(row.group, row.sources);
+  return { activity, tools, usage, skipped, groups, legacy };
 }

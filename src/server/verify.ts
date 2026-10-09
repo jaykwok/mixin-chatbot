@@ -2,13 +2,16 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import { acquireLease } from "../core/maintenance.ts";
+import { acquireGroupRootLease, acquireLease } from "../core/maintenance.ts";
 import { validateCurrentData } from "../core/data-validation.ts";
 import { serviceGroupRoot, verificationPending } from "../core/data-version.ts";
 
-const release = await acquireLease("verification");
+const releaseService = await acquireLease("verification");
+let releaseGroups: (() => Promise<void>) | undefined;
+const release = async () => { await releaseGroups?.(); await releaseService(); };
 let server: ReturnType<typeof Bun.serve> | undefined;
 try {
+  releaseGroups = await acquireGroupRootLease("verification", serviceGroupRoot());
   if (!verificationPending(process.cwd(), serviceGroupRoot())) throw new Error("升级事务已提交或不再允许只验证启动");
   await validateCurrentData(process.cwd(), serviceGroupRoot());
   const { HOST, PORT } = await import("../core/config.ts");

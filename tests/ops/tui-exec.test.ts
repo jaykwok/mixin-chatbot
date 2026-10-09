@@ -14,11 +14,14 @@ afterAll(() => pool.stop());
 
 test("两平台查询都在后台启动，保留并发输出、输入、环境、失败和超时语义", async () => {
   const fixture = await tempFixture("tui-capture-");
+  const started = performance.now();
+  const phase = (name: string) => console.info("tui capture phase " + JSON.stringify({ name, elapsedMs: Math.round(performance.now() - started) }));
   const previous = process.env.TUI_CAPTURE_INHERITED;
   process.env.TUI_CAPTURE_INHERITED = "before-worker-start";
   // 此 mock 只作用于主线程；后台线程必须能独立启动真实的只读测试进程。
   const spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("查询不应在 UI 线程启动子进程"); });
   try {
+    phase("parallel-start");
     const [first, second] = await Promise.all([
       capture(process.execPath, ["-e", "console.error('测试警告'); console.log(JSON.stringify({input:await Bun.stdin.text(),marker:process.env.TUI_CAPTURE_TEST})); process.exit(7)"],
         { input: "中文输入", env: { TUI_CAPTURE_TEST: "first", FORCE_COLOR: "0" } }),
@@ -29,29 +32,37 @@ test("两平台查询都在后台启动，保留并发输出、输入、环境�
     expect(first.stderr.trim()).toBe("测试警告");
     expect(second.stdout.trim()).toBe("second");
     expect(second.code).toBe(0);
+    phase("parallel-complete");
     // 先 await 再断言：Bun 的 rejects matcher 同步等待时不会派发 Worker 消息。
     const failure = await capture(join(fixture.root, "missing.exe"), []).then(() => null, error => error);
     expect(failure).toBeInstanceOf(Error);
+    phase("missing-executable-complete");
     const timeout = await capture(process.execPath, ["-e", "console.log('超时前输出'); console.error('超时诊断'); await Bun.sleep(60000)"],
       { timeout: 1000, env: { FORCE_COLOR: "0" } });
     expect(timeout.timedOut).toBe(true);
     expect(timeout.code).not.toBe(0);
     expect(timeout.stdout.trim()).toBe("超时前输出");
     expect(timeout.stderr.trim()).toBe("超时诊断");
+    phase("one-second-timeout-and-reaping-complete");
     delete process.env.TUI_CAPTURE_INHERITED;
     const recovered = await capture(process.execPath, ["-e", "console.log(process.env.TUI_CAPTURE_INHERITED ?? 'still working')"]);
     expect(recovered.stdout.trim()).toBe("still working");
+    phase("recovered-query-complete");
     const hosts = [];
     for (let index = 0; index < 3; index++) hosts.push((await capture(process.execPath, ["-e", "console.log(process.ppid)"])).stdout.trim());
     expect(new Set(hosts).size).toBe(1); // 正常的短查询持续复用同一个宿主。
     expect(spawn).not.toHaveBeenCalled();
+    phase("host-reuse-verified");
   } finally {
     spawn.mockRestore();
     if (previous === undefined) delete process.env.TUI_CAPTURE_INHERITED;
     else process.env.TUI_CAPTURE_INHERITED = previous;
     await fixture.cleanup();
+    phase("cleanup-complete");
   }
-}, 45000);
+// Full Windows runs have taken 44.68 s for these sequential spawns. Keep the actual command timeout at 1 s;
+// the outer budget also covers cold Worker/host startup and reaping, whose elapsed phases are logged above.
+}, process.platform === "win32" ? 90000 : 45000);
 
 test("取消消息丢失时主线程仍能回收查询父进程和脱离进程组的孙进程", async () => {
   const fixture = await treeFixture();

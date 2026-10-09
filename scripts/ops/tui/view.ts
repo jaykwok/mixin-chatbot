@@ -31,6 +31,8 @@ export interface ConfirmSpec {
   /** 要求原样输入这段文字才放行；不给则回车即确认。 */
   typeToConfirm?: string;
   danger?: boolean;
+  /** 只解释阻止执行的原因；关闭确认框后仍不能运行操作。 */
+  blocked?: boolean;
 }
 
 /** 选择菜单只返回选择，不直接执行操作；调用方继续走原有确认与执行通道。 */

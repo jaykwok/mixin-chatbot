@@ -33,6 +33,18 @@ const key = (name: string, text?: string): Key => ({ name, raw: name, text, ctrl
 const plain = (lines: string[]) => lines.map(line => Bun.stripANSI(line)).join("\n");
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 
+test("管理台登记成员压缩，说明费用并保留历史；取消时不运行命令", async () => {
+  const history = new HistoryView(), { app, calls } = fakeApp();
+  Object.assign(history, { state: { kind: "ready", value: [{ group: "synthetic", users: [], bytes: 123, database: { bytes: 123 } }] } });
+  calls.answers.push("alice");
+  await history.onKey(key("p"), app);
+  expect(calls.commands[0]?.args).toEqual(["history-compact", "synthetic", "alice", "--storage-segment"]);
+  expect(calls.confirms[0]?.steps.join(" ")).toContain("产生模型用量");
+  expect(calls.toasts[0]).toContain("已登记");
+  calls.answers.push(null); await history.onKey(key("p"), app);
+  expect(calls.commands).toHaveLength(1);
+});
+
 function fakeApp(root = "unused") {
   const calls = {
     answers: [] as (string | null)[], prompts: [] as string[], confirms: [] as ConfirmSpec[],
@@ -620,15 +632,15 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
     app.runInteractive = async (title, args) => { interactive.push(args); calls.commands.push({ title, args }); return 0; };
     const view = new MaintainView();
     Object.assign(view, { platform, state: { kind: "ready", value: { sha: "123456789", behind: 1, dirty: false, incoming: [{ sha: "987654321", subject: "fixture" }] } } });
-    const expected = [["start"], ["restart"], ["stop"], ["update"], ["deploy"],
-      platform === "windows" ? ["doctor", "-Repair"] : ["deploy"], ...(platform === "windows" ? [["repair-tunnel"]] : []), ["uninstall"]];
+    const expected = [["start"], ["restart"], ["stop"], ["update", "987654321"], ["deploy"],
+      platform === "windows" ? ["doctor", "-Repair"] : ["deploy"], ["tunnel-update"], ...(platform === "windows" ? [["repair-tunnel"]] : []), ["uninstall"]];
     for (let i = 0; i < expected.length; i++) {
       fits(view.render(context(72, 20)), context(72, 20));
       await view.onKey(key("enter"), app);
       await view.onKey(key("down"), app);
     }
     expect(calls.commands.map(call => call.args)).toEqual(expected);
-    expect(interactive).toEqual([["update"], ["deploy"], ...(platform === "linux" ? [["deploy"]] : []), ["uninstall"]]);
+    expect(interactive).toEqual([["update", "987654321"], ["deploy"], ...(platform === "linux" ? [["deploy"]] : []), ["uninstall"]]);
     expect(calls.confirms.at(-1)?.typeToConfirm).toBe("卸载");
     const health = new HealthView();
     Object.assign(health, { platform, state: { kind: "ready", value: { pass: 0, warn: 0, fail: 1, checks: [{ name: "fixture", status: "fail", detail: "fixture" }] } } });
@@ -640,6 +652,7 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
 
 test.each([
   { args: ["doctor", "-Repair"], readOnly: false },
+  { args: ["tunnel-update"], readOnly: false },
   { args: ["routes", "list"], readOnly: true },
   { args: ["routes", "reset", "fixture", "--group", "group"], readOnly: false },
 ])("执行面板收到 Esc：只读列表可中止，维护写入等待完成（%j）", async ({ args, readOnly }) => {
@@ -735,7 +748,8 @@ test("未完成的事务只提供继续或回滚，确认页列出记录，数�
     bot_port: "2022", deploy_mode: "cloudflare", bot_domain: "bot.example.com", domain_action: "keep", unmanaged_tunnel: "",
     platform_ip: "203.0.113.17", reconfigure_ai: "0",
   };
-  const pending: tuiTransaction.PendingTransaction = { operation: "upgrade", snapshot: "deploy-fixture", record, targetSha: record.target_sha, committed: false, codeRestorePending: false };
+  const confirmation = { operation: "upgrade" as const, id: "deploy-fixture", digest: "a".repeat(64), text: () => null };
+  const pending: tuiTransaction.PendingTransaction = { confirmation, operation: "upgrade", snapshot: "deploy-fixture", record, targetSha: record.target_sha, committed: false, codeRestorePending: false };
   const load = spyOn(tuiTransaction, "loadPendingTransaction").mockReturnValue(pending);
   const git = spyOn(tuiData, "loadGit").mockResolvedValue({ branch: "main", sha: "1111111", subject: "fixture", dirty: false, ahead: 0, behind: 1, incoming: [] });
   const remote = spyOn(tuiData, "loadUpgrade");
@@ -749,12 +763,12 @@ test("未完成的事务只提供继续或回滚，确认页列出记录，数�
       await view.refresh(app);
       const actions = view.actions();
       expect(actions.slice(0, 2).map(action => action.label)).toEqual(["继续上次操作", "回滚上次操作"]);
-      expect(actions.filter(action => action.disabled).map(action => action.value).sort()).toEqual(["deploy", "repair", "update"]);
+      expect(actions.filter(action => action.disabled).map(action => action.value).sort()).toEqual(["deploy", "repair", "tunnel-update", "update"]);
       expect(actions.find(action => action.value === "deploy")?.label).toBe("部署 / 修改设置");
       expect(actions.find(action => action.value === "update")?.label).toBe("升级（保留设置）");
       for (const [width, rows] of [[72, 20], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
       // New deployments, upgrades and repairs are refused until the interrupted one is finished; no remote check starts.
-      for (const blocked of ["deploy", "update", "repair"]) await view.onKey(key(blocked), app);
+      for (const blocked of ["deploy", "update", "repair", "tunnel-update"]) await view.onKey(key(blocked), app);
       expect(calls.commands).toHaveLength(0); expect(calls.confirms).toHaveLength(0);
       expect(calls.toasts.at(-1)).toContain("继续上次操作");
       expect(remote).not.toHaveBeenCalled();
@@ -764,10 +778,10 @@ test("未完成的事务只提供继续或回滚，确认页列出记录，数�
       expect(resume.steps.join("\n")).toContain("/srv/new-groups（原 /srv/old-groups）");
       expect(resume.steps.join("\n")).toContain("端口 2022 · 入口 Cloudflare · bot.example.com");
       expect(resume.steps.join("\n")).toContain("原运行状态：运行");
-      expect(calls.commands.at(-1)?.args).toEqual(["resume"]);
+      expect(calls.commands.at(-1)?.args.slice(0, 2)).toEqual(["resume", "--confirmed-transaction"]);
       await view.onKey(key("rollback"), app);
       expect(calls.confirms.at(-1)?.danger).toBe(true);
-      expect(calls.commands.at(-1)?.args).toEqual(["rollback"]);
+      expect(calls.commands.at(-1)?.args.slice(0, 2)).toEqual(["rollback", "--confirmed-transaction"]);
       // Once the data is committed only continuing is possible; the rollback entry explains why and runs nothing.
       load.mockReturnValue({ ...pending, committed: true });
       await view.refresh(app);
@@ -786,7 +800,7 @@ test("未完成的事务只提供继续或回滚，确认页列出记录，数�
       expect(calls.commands).toHaveLength(before);
       await view.onKey(key("rollback"), app);
       expect(calls.confirms.at(-1)?.steps[0]).toBe("把代码恢复到升级前的提交");
-      expect(calls.commands.at(-1)?.args).toEqual(["rollback"]);
+      expect(calls.commands.at(-1)?.args.slice(0, 2)).toEqual(["rollback", "--confirmed-transaction"]);
       // Finishing the transaction restores the normal entries.
       load.mockReturnValue(null);
       await view.refresh(app);
@@ -827,7 +841,7 @@ test("选中升级先联网，后台检查不阻塞导航，预览与确认显�
     expect(preview).not.toContain("上次同步");
     await view.onKey(key("enter"), app);
     expect(calls.confirms.at(-1)?.subject).toBe("1111111 → 3333333，共 2 个提交");
-    expect(calls.commands.at(-1)?.args).toEqual(["update"]);
+    expect(calls.commands.at(-1)?.args).toEqual(["update", fresh.targetSha]);
   } finally { view.onLeave(); check.resolve(fresh); local.mockRestore(); remote.mockRestore(); }
 });
 
@@ -1094,7 +1108,7 @@ test("进入系统页时慢版本查询不隐藏菜单、不吞方向键，也�
     expect(plain(view.render(context()))).toContain("服务与部署");
     expect(plain(view.render(context()))).toContain("版本读取中");
     await app["handleKey"](key("down"));
-    expect(plain(view.render(context()))).toContain("2 / 7");
+    expect(plain(view.render(context()))).toContain("2 / 8");
     await app["handleKey"](key("update"));
     expect(commands).toEqual([]);
     await app["handleKey"](key("home"));

@@ -586,7 +586,7 @@ if [ "$DEPLOY_MODE" = "cloudflare" ]; then
     print_warning "请把 Cloudflare Tunnel 的 Published application 服务地址设为 http://127.0.0.1:${BOT_PORT}"
 fi
 
-# ---- Pi 群数据总根（<group>/workspace + <group>/users/<phone>/{tmp,session.jsonl}）----
+# ---- Pi 群数据总根（<group>/workspace + <group>/durable.sqlite + <group>/users/<phone>/tmp）----
 GROUP_DATA_ROOT_ENV="$(trim_input "${GROUP_DATA_ROOT:-}")"
 if [ -n "$GROUP_DATA_ROOT_ENV" ]; then
     GROUP_DATA_ROOT_DEFAULT="$GROUP_DATA_ROOT_ENV"

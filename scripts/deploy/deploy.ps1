@@ -6,7 +6,7 @@
 # 请在管理员 PowerShell 中运行：
 #   powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1
 # -Resume / -Rollback 处理中断的部署（ops resume / rollback 传入）；续做的设置全部来自事务记录。
-param([switch]$Resume, [switch]$Rollback)
+param([switch]$Resume, [switch]$Rollback, [string]$ConfirmedTransaction = '')
 $ErrorActionPreference = "Stop"
 $Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $Project
@@ -241,6 +241,7 @@ function Invoke-PendingDeploymentRollback($Snapshot) {
 # ---- 未完成的事务：先继续或回滚，再读取普通部署设置 ----
 # 续做和回滚只使用事务记录，不重新读取默认值或环境变量。
 if ($Resume -and $Rollback) { throw '-Resume 与 -Rollback 只能选择一个。' }
+if ($ConfirmedTransaction -and -not ($Resume -or $Rollback)) { throw '事务确认凭据只能用于继续或回滚' }
 $migrationRunner = Join-Path $Project 'scripts\migrations\run.ts'
 if (Test-Path -LiteralPath (Join-Path $StateDir 'upgrade-transaction')) {
     throw "发现未完成的升级；请使用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 回滚。"
@@ -248,7 +249,8 @@ if (Test-Path -LiteralPath (Join-Path $StateDir 'upgrade-transaction')) {
 $pendingSnapshot = $null
 $record = $null
 if (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) {
-    $pendingSnapshot = Open-DeploymentTransaction $Project
+    $confirmedAction = if ($Rollback) { 'rollback' } else { 'continue' }
+    $pendingSnapshot = Open-DeploymentTransaction $Project $ConfirmedTransaction $confirmedAction
     $record = $pendingSnapshot.Record
     Warn (Format-DeploymentTransaction $record)
     $transactionAction = if ($Resume) { 'continue' } elseif ($Rollback) { 'rollback' } else {
@@ -303,6 +305,7 @@ if (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) {
     }
     Step "继续上次部署：端口、入口模式、群数据总根、域名和隧道确认均取自事务记录"
 } elseif ($Resume -or $Rollback) {
+    if ($ConfirmedTransaction) { throw '确认后的部署事务已消失，请刷新预览' }
     Done '没有未完成的部署。'
     $operationExit = 0
     return
@@ -342,7 +345,7 @@ if (-not [int]::TryParse($BotMaxActiveRequests, [ref]$parsedMaxActiveRequests) -
     exit 1
 }
 
-# ---- 4b. Pi 群数据总根（<group>/workspace + <group>/users/<phone>/{tmp,session.jsonl}）----
+# ---- 4b. Pi 群数据总根（<group>/workspace + <group>/durable.sqlite + <group>/users/<phone>/tmp）----
 Step "配置 Pi 群数据总根"
 $savedGroupRoot = if (Test-Path -LiteralPath $GroupRootFile -PathType Leaf) {
     "$(Get-Content -LiteralPath $GroupRootFile -Raw)".Trim()
@@ -361,7 +364,7 @@ $groupRootDefault = if ($resuming) {
 Write-Host "  默认 data\groups；GROUP_DATA_ROOT 可覆盖到其他磁盘。"
 Write-Host "  部署成功后会记入 data\state\group-data-root，下次自动沿用。"
 Write-Host "  如需调整，可输入相对仓库路径或绝对路径。"
-Write-Host "  每个群使用 <root>\<group>\workspace；每个调用用户使用 <group>\users\<phone>\tmp 和 session.jsonl。"
+Write-Host "  每个群使用 <root>\<group>\workspace 和群库 durable.sqlite；每个调用用户使用 <group>\users\<phone>\tmp。"
 $groupRootChecked = $false
 while ($true) {
     # 续做只检查一次记录的群根，不可用时停止，不在停机期间提问。
@@ -801,9 +804,8 @@ $launcherBody = @"
 `$ErrorActionPreference = 'Stop'
 `$env:PATH = $(Sq ($UvDir + ";" + $BashDir + ";")) + `$env:PATH
 Set-Location $(Sq $Project)
-`$ErrorActionPreference = 'Continue'
-& $(Sq $bunPath) run $(Sq $Entry)
-`$botExitCode = `$LASTEXITCODE
+. $(Sq (Join-Path $Project 'scripts\lib\bot-supervisor.ps1'))
+`$botExitCode = Invoke-BotSupervision -BunPath $(Sq $bunPath) -Entry $(Sq $Entry)
 exit `$botExitCode
 "@
 $utf8WithBom = New-Object System.Text.UTF8Encoding($true)

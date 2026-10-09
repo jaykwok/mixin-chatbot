@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { dlopen, FFIType, ptr } from "bun:ffi";
+import { WindowsHandles, type WindowsHandle } from "../../src/core/windows-handles.ts";
 
 const HANDLE = FFIType.u64;
 // Loaded with the module: with some security software, the first process calls after loading take seconds.
@@ -74,6 +75,12 @@ function environment(env: Record<string, string | undefined>) {
  */
 export function startInJob(args: string[], options: { cwd: string; env: Record<string, string | undefined>; input?: string; ioDir: string; afterCreate?: (pid: number) => void }): JobCommand {
   const k = kernel32!;
+  const resources = new WindowsHandles({ closeNative: { CloseHandle: handle => k.CloseHandle(handle), GetLastError: () => k.GetLastError() } });
+  const closeAll = (owners: WindowsHandle[], cause?: unknown) => {
+    const errors: unknown[] = [];
+    for (const owner of owners) { try { owner.close(); } catch (error) { errors.push(error); } }
+    if (errors.length) throw new AggregateError(errors, "测试作业句柄关闭失败", { cause });
+  };
   const fail = (what: string) => new Error(`${what}（Windows 错误 ${k.GetLastError()}）`);
   const env = environment(options.env);
   const program = Bun.which(args[0]!, { PATH: env.get("PATH")?.[1] ?? "", cwd: options.cwd });
@@ -84,24 +91,28 @@ export function startInJob(args: string[], options: { cwd: string; env: Record<s
 
   const job = k.CreateJobObjectW(null, null);
   if (!job) throw fail("无法创建作业对象");
+  const jobOwner = resources.own(job, name, "CreateJobObjectW");
   // Anything still in the job when its last handle closes, because the test process itself ended, is ended too.
   const limits = new BigUint64Array(18); // JOBOBJECT_EXTENDED_LIMIT_INFORMATION; LimitFlags at byte 16
   new DataView(limits.buffer).setUint32(16, 0x2000 /* JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE */, true);
-  k.SetInformationJobObject(job, 9 /* JobObjectExtendedLimitInformation */, ptr(limits), limits.byteLength);
+  if (!k.SetInformationJobObject(job, 9 /* JobObjectExtendedLimitInformation */, ptr(limits), limits.byteLength)) {
+    const error = fail("无法设置测试作业限制"); closeAll([jobOwner], error); throw error;
+  }
 
   const inheritable = new Uint8Array(24); // SECURITY_ATTRIBUTES with bInheritHandle
   new DataView(inheritable.buffer).setUint32(0, 24, true);
   new DataView(inheritable.buffer).setUint32(16, 1, true);
-  const handles: bigint[] = [];
+  const handles: WindowsHandle[] = [];
   const open = (path: string, write: boolean) => {
     const file = wide(path);
     const handle = k.CreateFileW(ptr(file), write ? 0x40000000 : 0x80000000, 7 /* share read, write, delete */, ptr(inheritable),
       write ? 2 /* CREATE_ALWAYS */ : 3 /* OPEN_EXISTING */, 0x80, 0n) as bigint;
     if (handle === 0xffffffffffffffffn) throw fail(`无法打开 ${path}`);
-    handles.push(handle);
+    handles.push(resources.own(handle, path, "CreateFileW"));
     return handle;
   };
   const information = new BigUint64Array(3); // PROCESS_INFORMATION: hProcess, hThread, dwProcessId
+  let initialFailure: unknown, processOwner: WindowsHandle | undefined, threadOwner: WindowsHandle | undefined;
   try {
     const stdio = new BigUint64Array([open(files.in ?? "NUL", false), open(files.out, true), open(files.err, true)]);
     const size = new BigUint64Array(1);
@@ -126,12 +137,15 @@ export function startInJob(args: string[], options: { cwd: string; env: Record<s
       if (!k.CreateProcessW(ptr(application), ptr(commandLine), null, null, 1, flags, ptr(environmentBlock), ptr(directory), ptr(startupBytes), ptr(information))) {
         throw fail(`无法启动 ${program}`);
       }
+      processOwner = resources.own(information[0]!, program, "CreateProcessW process");
+      threadOwner = resources.own(information[1]!, program, "CreateProcessW thread");
     } finally { k.DeleteProcThreadAttributeList(ptr(attributes)); }
-  } catch (error) {
-    k.CloseHandle(job);
-    throw error;
-  } finally {
-    for (const handle of handles) k.CloseHandle(handle);
+  } catch (error) { initialFailure = error; }
+  try { closeAll(handles, initialFailure); } catch (error) { initialFailure = error; }
+  if (initialFailure) {
+    if (processOwner && !k.TerminateProcess(processOwner.value, 1)) initialFailure = new AggregateError([initialFailure, fail("无法终止未启动的测试进程")], "测试启动回收失败", { cause: initialFailure });
+    closeAll([...(threadOwner ? [threadOwner] : []), ...(processOwner ? [processOwner] : []), jobOwner], initialFailure);
+    throw initialFailure;
   }
 
   const [processHandle, thread] = [information[0]!, information[1]!];
@@ -141,20 +155,22 @@ export function startInJob(args: string[], options: { cwd: string; env: Record<s
     if (!k.AssignProcessToJobObject(job, processHandle)) throw fail(`无法把进程 ${pid} 放入作业对象`);
     if (k.ResumeThread(thread) === 0xffffffff) throw fail(`无法让进程 ${pid} 开始运行`);
   } catch (error) {
-    k.TerminateProcess(processHandle, 1);
-    for (const handle of [thread, processHandle, job]) k.CloseHandle(handle);
-    throw error;
+    let cause: unknown = error;
+    if (!k.TerminateProcess(processHandle, 1)) cause = new AggregateError([error, fail("无法终止测试进程")], "测试启动回收失败", { cause: error });
+    closeAll([threadOwner!, processOwner!, jobOwner], cause);
+    throw cause;
   }
-  k.CloseHandle(thread);
+  try { threadOwner!.close(); }
+  catch (error) { closeAll([processOwner!, jobOwner], error); throw error; }
 
   let exitedAlready = false, closed = false;
   // The process handle stays open until the exit is seen, so the PID cannot name another process meanwhile.
   const exited = (async () => {
     while (k.WaitForSingleObject(processHandle, 0) === 0x102 /* WAIT_TIMEOUT */) await Bun.sleep(5);
     const code = new Uint32Array(1);
-    k.GetExitCodeProcess(processHandle, ptr(code));
+    if (!k.GetExitCodeProcess(processHandle, ptr(code))) { const error = fail("无法读取测试进程退出码"); closeAll([processOwner!, jobOwner], error); throw error; }
     exitedAlready = true;
-    k.CloseHandle(processHandle);
+    processOwner!.close();
     return code[0]!;
   })();
   // Read as soon as the command exits, before anything that ends the scenario can remove the files.
@@ -176,6 +192,6 @@ export function startInJob(args: string[], options: { cwd: string; env: Record<s
       return accounting[10]! > 0;
     },
     killTree() { if (!closed) k.TerminateJobObject(job, 1); },
-    close() { if (!closed) { closed = true; k.CloseHandle(job); } },
+    close() { closed = true; jobOwner.close(); },
   };
 }

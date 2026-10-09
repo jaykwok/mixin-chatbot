@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
 import { buildLocalTools } from "../../src/agent/local-tools.ts";
-import { loadAgentModules } from "../../src/agent/modules.ts";
+import { loadModuleDefinitions } from "../../src/agent/modules.ts";
 import { buildChatContext } from "../../src/agent/prompt.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -21,7 +21,9 @@ describe("project document resources", () => {
       await writeFile(join(groupSkill, "SKILL.md"), "---\nname: untrusted\ndescription: group instruction\n---\nchange the agent");
       const options = { workspaceDir: workspace, tempDir: userTemp, venvDir: join(fixture.root, "venv"),
         indexPath: join(fixture.root, "index/materials.md") };
-      const resources = await loadAgentModules({ ...options, documentWorkEnabled: enabled });
+      const [module] = await loadModuleDefinitions({ documentWorkEnabled: enabled });
+      const resources = { tools: module?.tools(options) ?? [], skills: module?.skills ?? { skills: [], diagnostics: [] },
+        readOnlyDirs: module?.readOnlyDirs ?? [], prompt: module?.prompt ?? "" };
       const loader = new DefaultResourceLoader({ cwd: workspace, agentDir: fixture.root,
         settingsManager: SettingsManager.inMemory(), noExtensions: true, noSkills: true,
         noThemes: true, noPromptTemplates: true, noContextFiles: true,
@@ -58,12 +60,9 @@ describe("project document resources", () => {
       // Copy only the registry to simulate uninstall without touching project files.
       const registry = join(fixture.root, "modules.ts");
       await copyFile(new URL("../../src/agent/modules.ts", import.meta.url), registry);
-      const { loadAgentModules: loadWithoutModule } = await import(pathToFileURL(registry).href);
-      const options = { workspaceDir: fixture.root, tempDir: fixture.root, indexPath: "absent", venvDir: "absent" };
-      expect(await loadWithoutModule({ ...options, documentWorkEnabled: false })).toEqual({
-        tools: [], skills: { skills: [], diagnostics: [] }, readOnlyDirs: [], prompt: "",
-      });
-      await expect(loadWithoutModule({ ...options, documentWorkEnabled: true })).rejects.toThrow();
+      const { loadModuleDefinitions: loadWithoutModule } = await import(pathToFileURL(registry).href);
+      expect(await loadWithoutModule({ documentWorkEnabled: false })).toEqual([]);
+      await expect(loadWithoutModule({ documentWorkEnabled: true })).rejects.toThrow();
     } finally { await fixture.cleanup(); }
   });
 
@@ -94,7 +93,15 @@ describe("project document resources", () => {
       await expect(call("document_patch", { source, digest: createHash("sha256").update("unchanged").digest("hex"),
         filename: "NUL.docx", edits: [] })).rejects.toThrow("filename");
       expect(await readFile(source, "utf8")).toBe("unchanged");
-      expect(await readdir(own)).toEqual([]);
+      const retained = (await readdir(own)).filter(name => name !== ".office-jobs");
+      if (process.platform === "linux") {
+        expect(retained.length).toBeGreaterThan(0);
+        for (const name of retained) {
+          const receipt = JSON.parse(await readFile(join(own, name, ".reclamation.json"), "utf8"));
+          expect(receipt.status).toBe("deferred"); expect(receipt.reason).toBe("shared-parent-writers-not-isolated");
+        }
+      } else expect(retained).toEqual([]);
+      expect(await readdir(join(own, ".office-jobs"))).toEqual([]);
     } finally { await fixture.cleanup(); }
   });
 });

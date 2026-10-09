@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative } from "node:path";
+/** The AgentSession engine's history of a member (`<group>/users/<member>/session.jsonl`); kept in place since data version 3. */
 export const SESSION_FILE = "session.jsonl";
 
 const SAFE_GROUP_SEGMENT = /^[A-Za-z0-9_+\-]{1,64}$/;
@@ -60,17 +61,6 @@ export function groupVenvDir(root: string, groupId: string): string {
 /** Per-user scratch directory inside a group. */
 export function userTempDir(root: string, groupId: string, phone: string): string {
   return join(root, groupSegment(groupId), "users", userSegment(phone), "tmp");
-}
-
-/** Per-user conversation history inside a group. */
-export function sessionFilePath(root: string, groupId: string, phone: string): string {
-  return join(
-    root,
-    groupSegment(groupId),
-    "users",
-    userSegment(phone),
-    SESSION_FILE
-  );
 }
 
 /** True when path is root itself or one of its descendants. Both paths should be canonical. */

@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { DefaultResourceLoader, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { openSettings, resolveModelSelection } from "../../src/core/model-config.ts";
+import { enginePolicy } from "../../src/core/engine-policy.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 /** 用 Pi 真实的加载器建运行时，但凭证和目录缓存留在内存里，不碰仓库的 data/。 */
@@ -29,19 +30,19 @@ async function settingsAt(root: string, contents: string | undefined): Promise<s
 }
 
 describe("Pi 原生设置视图", () => {
-  test.each(["off", "streaming", "idle"] as const)("保留原生保温 %s 与分模型压缩预算，reload 不复原默认值", async mode => {
+  test.each([0, 600000])("保留原生上下文缓存 %s 与分模型压缩预算，reload 不复原默认值", async retention => {
     const files = await tempFixture("pi-native-settings-");
     try {
-      const path = await settingsAt(files.root, JSON.stringify({ cacheWarming: mode, compaction: {
+      const path = await settingsAt(files.root, JSON.stringify({ durable: { contextRetentionMs: retention, compaction: {
         reserveTokens: 1024, keepRecentTokens: 2048,
         modelOverrides: { "faux/small": { reserveTokens: 512 }, "faux/large": { keepRecentTokens: 8192 } },
-      } }));
+      } } }));
       const settings = openSettings(path);
       for (let i = 0; i < 2; i++) {
-        expect(settings.getCacheWarmingMode()).toBe(mode);
-        expect(settings.getCompactionSettings({ provider: "faux", id: "small" })).toEqual({ enabled: true, reserveTokens: 512, keepRecentTokens: 2048 });
-        expect(settings.getCompactionSettings({ provider: "faux", id: "large" })).toEqual({ enabled: true, reserveTokens: 1024, keepRecentTokens: 8192 });
-        expect(settings.getCompactionSettings({ provider: "faux", id: "other" })).toEqual({ enabled: true, reserveTokens: 1024, keepRecentTokens: 2048 });
+        const policy = enginePolicy((settings.getGlobalSettings() as { durable?: unknown }).durable);
+        expect(policy.contextRetentionMs).toBe(retention);
+        expect(policy.compaction).toMatchObject({ enabled: true, reserveTokens: 1024, keepRecentTokens: 2048,
+          modelOverrides: { "faux/small": { reserveTokens: 512 }, "faux/large": { keepRecentTokens: 8192 } } });
         settings.reload();
       }
       await settingsAt(files.root, JSON.stringify({ cacheWarming: "typo" }));
@@ -49,14 +50,13 @@ describe("Pi 原生设置视图", () => {
     } finally { await files.cleanup(); }
   });
 
-  test("真实 SDK 资源重载和设置写入后仍保留固定运行策略", async () => {
+  test("真实 SDK 资源重载和只读设置写入后仍保留原生 Durable 策略", async () => {
     const files = await tempFixture("pi-settings-");
     try {
       const path = await settingsAt(files.root, JSON.stringify({
         defaultProvider: "openai", defaultModel: "gpt-5.2", defaultThinkingLevel: "low",
-        retry: { enabled: false, maxRetries: 99, provider: { timeoutMs: 1 } },
-        compaction: { enabled: false, reserveTokens: 1024, keepRecentTokens: 2048 },
-        enableAnalytics: true, enableInstallTelemetry: true, enableSkillCommands: true,
+        durable: { retry: { enabled: false, maxRetries: 0 }, stream: { timeoutMs: 10000 },
+          compaction: { enabled: false, reserveTokens: 1024, keepRecentTokens: 2048 } },
       }));
       const settings = openSettings(path);
       expect(settings.getDefaultProvider()).toBe("openai");
@@ -67,14 +67,11 @@ describe("Pi 原生设置视图", () => {
         noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       });
       const checkPolicy = () => {
-        expect(settings.getRetrySettings()).toEqual({ enabled: true, maxRetries: 1, baseDelayMs: 1000, maxAgentDelayMs: 5000 });
-        expect(settings.getProviderRetrySettings()).toEqual({ timeoutMs: 120000, maxRetries: 1, maxRetryDelayMs: 5000 });
-        expect(settings.getCompactionSettings()).toEqual({ enabled: true, reserveTokens: 1024, keepRecentTokens: 2048 });
-        expect(settings.getGlobalSettings()).toMatchObject({
-          enableAnalytics: false, enableInstallTelemetry: false, enableSkillCommands: false,
-        });
+        const policy = enginePolicy((settings.getGlobalSettings() as { durable?: unknown }).durable);
+        expect(policy.retry).toEqual({ enabled: false, maxRetries: 0, baseDelayMs: 1000, maxAgentDelayMs: 5000 });
+        expect(policy.stream).toEqual({ timeoutMs: 10000, maxRetries: 0, maxRetryDelayMs: 5000 });
+        expect(policy.compaction).toEqual({ enabled: false, reserveTokens: 1024, keepRecentTokens: 2048 });
         expect(settings.isProjectTrusted()).toBe(false);
-        expect(settings.getCacheWarmingMode()).toBe("off");
       };
       checkPolicy();
       await loader.reload();
@@ -84,7 +81,7 @@ describe("Pi 原生设置视图", () => {
       checkPolicy();
       await Promise.all([loader.reload(), settings.reload()]);
       checkPolicy();
-      expect(JSON.parse(await Bun.file(path).text()).retry.maxRetries).toBe(99);
+      expect(JSON.parse(await Bun.file(path).text()).durable.retry.maxRetries).toBe(0);
     } finally {
       await files.cleanup();
     }

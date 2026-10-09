@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
+import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { runProcess } from "../../src/core/process.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -92,49 +93,74 @@ describe("supervised real subprocesses", () => {
     }
   }, 20000);
 
-  test("reaps detached descendants when the bot parent is forcibly killed", async () => {
+  test.each(["whole", "fragmented"])("reaps detached descendants when the bot parent is forcibly killed (%s READY frame)", async (frame) => {
     const fixture = await tempFixture("supervised-force-");
     const command = join(fixture.root, "command.cjs");
     const bot = join(fixture.root, "bot.ts");
-    await writeFile(command, `const {spawn}=require('child_process'); spawn(process.execPath,['-e',"console.log('READY:'+process.pid); setTimeout(()=>process.exit(0),8000)"],{detached:true,stdio:['ignore','inherit','inherit'],windowsHide:true}).unref(); setTimeout(()=>process.exit(0),10000);`);
+    const descendantPid = join(fixture.root, "descendant.pid");
+    const phases = join(fixture.root, "phases.jsonl");
+    const phase = (name: string) => "require('fs').appendFileSync(" + JSON.stringify(phases) + ",JSON.stringify({phase:" + JSON.stringify(name) + ",at:Date.now(),pid:process.pid})+String.fromCharCode(10)); ";
+    const ready = frame === "whole" ? "console.log('READY:'+process.pid);" :
+      "const parts=['RE','AD','Y:',String(process.pid).slice(0,1),String(process.pid).slice(1),String.fromCharCode(10)]; let i=0; const send=()=>{process.stdout.write(parts[i++]); if(i<parts.length)setTimeout(send,30)}; send();";
+    const announce = phase("descendant") + "require('fs').writeFileSync(" + JSON.stringify(descendantPid) + ",String(process.pid)); " + ready;
+    // They must stay alive until the bot is killed, rather than exit during a slow Windows startup.
+    await writeFile(command, `${phase("command")}const {spawn}=require('child_process'); spawn(process.execPath,['-e',${JSON.stringify(announce + " setInterval(()=>{},1000)")}],{detached:true,stdio:['ignore','inherit','inherit'],windowsHide:true}).unref(); setInterval(()=>{},1000);`);
     const module = fileURLToPath(new URL("../../src/core/process.ts", import.meta.url));
-    await writeFile(bot, `import {runProcess} from ${JSON.stringify(module)}; await runProcess({command:process.execPath,args:[${JSON.stringify(command)}],cwd:process.cwd(),timeoutMs:20000,onData:data=>process.stdout.write(data)});`);
+    // Startup measured 20.143 s before the command and another 3.132 s before READY on Windows.
+    // Readiness has a 30 s budget; the post-kill reclamation assertion remains 3 s.
+    await writeFile(bot, `import {runProcess} from ${JSON.stringify(module)}; import{appendFileSync}from'node:fs'; appendFileSync(${JSON.stringify(phases)},JSON.stringify({phase:'bot',at:Date.now(),pid:process.pid})+String.fromCharCode(10)); await runProcess({command:process.execPath,args:[${JSON.stringify(command)}],cwd:process.cwd(),timeoutMs:30000,onData:data=>process.stdout.write(data)});`);
     const parent = Bun.spawn([process.execPath, bot], { cwd: fixture.root, stdout: "pipe", stderr: "pipe", windowsHide: true });
     let pid = 0;
     let killedAt = 0;
     const stderr = new Response(parent.stderr).text();
-    const watchdog = setTimeout(() => parent.kill(), 22000);
+    const watchdog = setTimeout(() => parent.kill(), 32000);
     try {
+      let output = "";
       for await (const data of parent.stdout) {
-        const match = Buffer.from(data).toString().match(/READY:(\d+)/);
+        output += Buffer.from(data).toString();
+        const match = output.match(/READY:(\d+)\r?\n/);
         if (match) { pid = Number(match[1]); killedAt = Date.now(); parent.kill("SIGKILL"); break; }
       }
       await parent.exited;
-      expect(pid).toBeGreaterThan(0);
+      console.log(`forced kill ${frame} phases: ` + await readFile(phases, "utf8").catch(String));
+      const diagnostic = pid === 0 ? "stderr: " + await stderr + "\nphases: " + await readFile(phases, "utf8").catch(String) : "";
+      expect(pid, diagnostic).toBeGreaterThan(0);
+      expect(pid).toBe(Number(await readFile(descendantPid, "utf8")));
       const deadline = killedAt + 3000;
       while (alive(pid) && Date.now() < deadline) await Bun.sleep(30);
       expect(alive(pid)).toBe(false);
       expect(Date.now() - killedAt).toBeLessThan(4000);
       await stderr;
     } finally { clearTimeout(watchdog); parent.kill(); await parent.exited; await fixture.cleanup(); }
-  }, 30000);
+  }, 42000);
 
   test.each(["exit", "cancel"])("reaps a detached child on parent %s", async (mode) => {
     const fixture = await tempFixture("supervised-process-");
     const childFile = join(fixture.root, "child.cjs");
     const parentFile = join(fixture.root, "parent.cjs");
     const pidFile = join(fixture.root, "child.pid");
-    await writeFile(childFile, `require('fs').writeFileSync(process.argv[2],String(process.pid)); process.stdout.write('READY:'+process.pid+'\\n',()=>process.send?.('ready')); const tick=setInterval(()=>process.stdout.write('alive\\n'),30); setTimeout(()=>{clearInterval(tick);process.exit(0)},8000);`);
+    const phases = join(fixture.root, "phases.jsonl");
+    const phase = (name: string) => "require('fs').appendFileSync(" + JSON.stringify(phases) + ",JSON.stringify({phase:" + JSON.stringify(name) + ",at:Date.now(),pid:process.pid})+String.fromCharCode(10)); ";
+    // Stay alive through slow startup; the finite supervisor deadline owns failure cleanup.
+    await writeFile(childFile, `${phase("child-ready")}require('fs').writeFileSync(process.argv[2],String(process.pid)); process.stdout.write('READY:'+process.pid+String.fromCharCode(10),()=>process.send?.('ready')); setInterval(()=>process.stdout.write('alive'+String.fromCharCode(10)),30);`);
     // Exit only after READY is flushed; observing the PID file races buffered stdout.
-    await writeFile(parentFile, `const {spawn}=require('child_process'); const child=spawn(process.execPath,[process.argv[2],process.argv[3]],{detached:true,stdio:['ignore','inherit','inherit','ipc'],windowsHide:true}); child.on('message',message=>{if(message==='ready'&&process.argv[4]==='exit')process.exit(0)}); child.unref(); setTimeout(()=>process.exit(0),10000);`);
+    await writeFile(parentFile, `${phase("command")}const {spawn}=require('child_process'); const child=spawn(process.execPath,[process.argv[2],process.argv[3]],{detached:true,stdio:['ignore','inherit','inherit','ipc'],windowsHide:true}); child.on('message',message=>{if(message==='ready'&&process.argv[4]==='exit')process.exit(0)}); child.unref(); setInterval(()=>{},1000);`);
     const controller = new AbortController();
     let pid = 0;
     let readyAt = 0;
+    let running: ReturnType<typeof runProcess> | undefined;
     try {
-      const result = runProcess({ command: process.execPath, args: [parentFile, childFile, pidFile, mode], cwd: fixture.root,
-        timeoutMs: 20000, signal: controller.signal, onData: (data) => {
-          const match = String(data).match(/READY:(\d+)/);
-          if (match) { pid = Number(match[1]); readyAt = Date.now(); if (mode === "cancel") controller.abort(new DOMException("test stop", "AbortError")); }
+      let output = "";
+      const result = running = runProcess({ command: process.execPath, args: [parentFile, childFile, pidFile, mode], cwd: fixture.root,
+        // The recorded Windows readiness delay was 20.143 s; cleanup after READY still must take <4 s.
+        timeoutMs: 30000, signal: controller.signal, observe: event => appendFileSync(phases, JSON.stringify({ ...event, at: Date.now() }) + "\n"), onData: (data) => {
+          output += String(data);
+          const match = output.match(/READY:(\d+)\r?\n/);
+          if (match && pid === 0) {
+            pid = Number(match[1]); readyAt = Date.now();
+            appendFileSync(phases, JSON.stringify({ phase: "ready-observed", at: readyAt, pid }) + "\n");
+            if (mode === "cancel") controller.abort(new DOMException("test stop", "AbortError"));
+          }
         },
       });
       if (mode === "cancel") await expect(result).rejects.toThrow("test stop");
@@ -142,6 +168,10 @@ describe("supervised real subprocesses", () => {
       expect(pid).toBeGreaterThan(0);
       expect(Date.now() - readyAt).toBeLessThan(4000);
       expect(alive(pid)).toBe(false);
-    } finally { controller.abort(); await fixture.cleanup(); }
-  }, 30000);
+    } finally {
+      controller.abort(); await running?.catch(() => {});
+      console.log(`parent ${mode} phases: ` + await readFile(phases, "utf8").catch(String));
+      await fixture.cleanup();
+    }
+  }, 40000);
 });

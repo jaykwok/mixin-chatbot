@@ -1,13 +1,13 @@
-// 会话历史。列出各群的占用，并提供清空。
+// 会话历史。列出各群的占用（群库和升级前的旧会话文件），并提供清空。
 //
-// 清空这件事本身不在这里做：转交 ops 的 history-clear，它会自动停机、清理、再恢复到操作前
-// 的运行状态。那套顺序是有原因的（内存里的会话会把历史写回去），不该有第二份实现。
+// 清空这件事本身不在这里做：转交 ops 的 history-clear，它会自动停机、在群库里登记清空、归档旧会话文件，
+// 再恢复到操作前的运行状态。那套顺序是有原因的（运行中的机器人独占群库），不该有第二份实现。
 
 import { rule, table } from "../render/widgets.ts";
 import { pad } from "../render/width.ts";
 import { Viewport } from "../render/viewport.ts";
 import * as fmt from "../render/format.ts";
-import { loadHistory, type GroupHistory } from "../data.ts";
+import { lastActivity, loadHistory, type GroupHistory } from "../data.ts";
 import type { AppApi, Loading, View, ViewAction, ViewContext } from "../view.ts";
 import { gap, ListFilter, moveSelection, pending, windowStart } from "./common.ts";
 
@@ -22,8 +22,8 @@ export class HistoryView implements View {
   private scroll = new Viewport();
 
   hints(): [string, string][] {
-    return this.expanded ? [["Esc", "返回"], ["↑↓", "滚动"], ["c", "清空该群"]]
-      : [["↑↓", "选择"], ["Enter", "全部成员"], ["/", "筛选"], ["c", "清空该群"]];
+    return this.expanded ? [["Esc", "返回"], ["↑↓", "滚动"], ["p", "压缩成员"], ["c", "清空该群"]]
+      : [["↑↓", "选择"], ["Enter", "全部成员"], ["/", "筛选"], ["p", "压缩成员"], ["c", "清空该群"]];
   }
 
   actions(): ViewAction[] {
@@ -31,7 +31,8 @@ export class HistoryView implements View {
       ...(this.expanded ? [{ value: "escape", label: "返回群列表" }]
         : [{ value: "enter", label: "查看选中群的全部成员", disabled: !this.groups.length },
           { value: "/", label: "筛选群或成员", description: "按群名、成员号码或打码后的号码查找" }]),
-      { value: "c", label: "清空选中群的会话历史", description: "确认群名后，归档该群所有成员的历史并恢复运行状态", danger: true, disabled: !this.groups.length },
+      { value: "c", label: "清空选中群的会话历史", description: "确认群名后，清空该群所有成员的上下文并恢复运行状态", danger: true, disabled: !this.groups.length },
+      { value: "p", label: "压缩一位成员的上下文", description: "登记后由机器人生成摘要，产生模型用量", disabled: !this.groups[this.selected]?.database },
     ];
   }
 
@@ -88,14 +89,15 @@ export class HistoryView implements View {
       if (!target) return true;
       const ok = await app.confirm({
         title: "清空会话历史",
-        subject: `群 ${target.group} · ${target.users.length} 位成员 · ${fmt.bytes(target.bytes)}`,
+        subject: `群 ${target.group} · ${fmt.bytes(target.bytes)}`,
         steps: [
-          "停止机器人（否则内存里的会话会把历史写回去）",
-          `${target.users.length} 个 session.jsonl 移入 backup/rm`,
+          "停止机器人（运行中的机器人独占群库）",
+          ...(target.database ? ["在群库里为每位成员登记清空：机器人启动时先执行，排队中的消息一并取消"] : []),
+          ...(target.users.length ? [`${target.users.length} 个升级前的 session.jsonl 移入 backup/rm`] : []),
           "恢复到操作前的运行状态",
         ],
-        untouched: ["workspace", "tmp", "资料索引", "未交付消息"],
-        recovery: "可以，文件在 backup/rm 下，按原路径还原即可",
+        untouched: ["workspace", "tmp", "资料索引", "未交付消息", "使用统计"],
+        recovery: "旧上下文仍留在群库里，但清空后不再进入对话；旧会话文件在 backup/rm 下，可按原路径还原",
         typeToConfirm: target.group,
         danger: true,
       });
@@ -105,6 +107,21 @@ export class HistoryView implements View {
       }
       const code = await app.run(`清空 ${target.group} 的会话历史`, ["history-clear", target.group, "--storage-segment"]);
       app.toast(code === 0 ? "ok" : "danger", code === 0 ? "已清空并恢复运行状态" : "清空未完成，请看输出");
+      return true;
+    }
+    if (key.name === "p") {
+      const target = groups[this.selected];
+      if (!target?.database) { app.toast("idle", "该群尚无 Durable 群库"); return true; }
+      const phone = (await app.ask("要压缩的成员号码（摘要会产生模型用量）"))?.trim();
+      if (!phone) { app.toast("idle", "已取消"); return true; }
+      if (!await app.confirm({
+        title: "压缩成员上下文", subject: `群 ${target.group} · 成员 ${fmt.maskUser(phone)}`,
+        steps: ["停止机器人并登记压缩任务", "恢复原运行状态；机器人启动后生成摘要，产生模型用量"],
+        untouched: ["历史记录", "资料与结果文件", "待补发回复", "已累计费用"],
+        recovery: "压缩失败保留原上下文；成功后模型使用摘要继续对话",
+      })) { app.toast("idle", "已取消"); return true; }
+      const code = await app.run(`登记 ${target.group} 的成员压缩`, ["history-compact", target.group, phone, "--storage-segment"]);
+      app.toast(code === 0 ? "ok" : "danger", code === 0 ? "已登记压缩任务；机器人运行后执行" : "登记未完成，请看输出");
       return true;
     }
     return false;
@@ -136,10 +153,12 @@ export class HistoryView implements View {
       const visible = this.scroll.slice(members.slice(1), Math.max(1, height - 3));
       return [
         rule(theme, total, `会话 › ${selected.group}`,
-          `${selected.users.length} 位成员 · ${fmt.bytes(selected.bytes)} · ${this.scroll.label}`, "accent"),
+          `${fmt.bytes(selected.bytes)} · ${this.scroll.label}`, "accent"),
         members[0]!,
         ...visible,
-        pad(" " + theme.c("muted", "清空操作作用于整个群"), total),
+        pad(" " + theme.c("muted", selected.database
+          ? `群库 ${fmt.bytes(selected.database.bytes)} 保存全体成员的对话，上表只列升级前的旧会话文件；清空作用于整个群`
+          : "清空操作作用于整个群"), total),
       ];
     }
 
@@ -159,13 +178,13 @@ export class HistoryView implements View {
         selected: this.selected - start,
         columns: [
           { header: "群", flex: 1, render: (group) => group.group },
-          { header: "成员", size: 6, align: "right", render: (group) => `${group.users.length} 人` },
+          { header: "旧文件", size: 6, align: "right", render: (group) => group.users.length ? `${group.users.length} 份` : "—" },
           { header: "占用", size: 10, align: "right", render: (group) => fmt.bytes(group.bytes) },
           {
             header: "最后活动",
             size: 10,
             align: "right",
-            render: (group) => fmt.since(Math.max(...group.users.map((user) => user.modified))),
+            render: (group) => fmt.since(lastActivity(group)),
           },
         ],
       }),
@@ -176,7 +195,7 @@ export class HistoryView implements View {
     if (current && left >= 2) {
       const shown = current.users.slice(0, left - 1);
       out.push(gap(total));
-      out.push(rule(theme, total, `群 ${current.group} 的成员`, "Enter 看全部 · 已打码"));
+      out.push(rule(theme, total, `群 ${current.group} 的旧会话文件`, current.database ? `群库 ${fmt.bytes(current.database.bytes)} · Enter 看全部 · 已打码` : "Enter 看全部 · 已打码"));
       out.push(...shown.map((user) => pad(
         " " + pad(fmt.maskUser(user.user), Math.max(14, Math.floor(total * 0.3))) +
         pad(fmt.bytes(user.bytes), 10, "right") + pad(fmt.since(user.modified), 12, "right"), total)));

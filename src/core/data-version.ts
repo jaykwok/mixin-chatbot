@@ -2,9 +2,11 @@
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-export const DATA_VERSION = 1;
+export const DATA_VERSION = 4;
 export const VERSION_FILE = "data-version.json";
 export const MIGRATION_FILE = "migration.json";
+/** The group root lease's directory inside the group root (src/core/maintenance.ts); group and user segments never start with a dot. */
+export const GROUP_ROOT_LEASE = ".mixin-lease.lock";
 export interface DataVersion { dataVersion: number; transaction: string }
 export interface MigrationState { id: string; target: number; phase: string; groups: string; kind?: "migration" | "verification" | "registration" }
 

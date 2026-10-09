@@ -9,6 +9,8 @@ import { openOperationLog, operationError } from "../lib/operation-log.ts";
 import { cliArgs } from "../lib/cli.ts";
 
 let diagnostic: ReturnType<typeof openOperationLog> | undefined;
+const cancellation = new AbortController();
+const cancel = () => cancellation.abort(new Error("迁移收到取消信号"));
 
 const decisionOptions: Record<string, string> = { acceptNativeCache: "--accept-native-cache", model: "--provider <id> --model <id>" };
 function describePreview(summary: { target: number; kind?: string; pending: boolean; steps?: string[]; decisions: { key: string; message: string }[] }): string {
@@ -44,7 +46,7 @@ async function main() {
     if (diagnostic.ownsLog && diagnostic.path) console.error("本次操作日志：" + diagnostic.path);
   }
   const context: Context = { project: resolve(project), groups: groups ? resolve(project, groups) : serviceGroupRoot(project), decisions,
-    scratch: values.scratch ? resolve(values.scratch) : undefined,
+    scratch: values.scratch ? resolve(values.scratch) : undefined, signal: cancellation.signal,
     report: (stage, detail) => {
       diagnostic?.event("info", stage, detail);
       if (stage === "skip-migration") console.error(detail);
@@ -82,11 +84,15 @@ async function main() {
   else if (command === "rollback") { if (!await rollback(context, deployment || undefined)) { console.error("迁移已提交；保留新代码和数据，禁止自动回退"); process.exitCode = 42; } }
   else throw new Error("用法：bun run scripts/migrations/run.ts status|preview|apply|commit|rollback [--groups PATH] [--plan PATH] [--scratch DIR] [--interactive] [--json]");
 }
-if (import.meta.main) main().catch(error => {
+if (import.meta.main) {
+process.on("SIGINT", cancel); process.on("SIGTERM", cancel);
+main().catch(error => {
   diagnostic?.event("error", "migration", operationError(error));
   console.error((error as Error).message); process.exitCode = 1;
 }).finally(() => {
+  process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel);
   const code = Number(process.exitCode ?? 0);
   diagnostic?.event(code ? "error" : "info", "migration-finished", `exit=${code}`);
   if (code && diagnostic?.ownsLog && diagnostic.path) console.error("本次操作日志：" + diagnostic.path);
 });
+}

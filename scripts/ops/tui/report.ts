@@ -306,6 +306,11 @@ function detailSection(input: ReportInput, stats: GroupStats): string {
 
   const tools = [...stats.tools].sort((a, b) => b[1] - a[1] || byName(a[0], b[0]));
   const toolMax = Math.max(0, ...tools.map(([, count]) => count));
+  const nested = [...stats.nested].sort((a, b) => b[1] - a[1] || byName(a[0], b[0]));
+  const caveats = [
+    stats.nestedIncomplete ? `${stats.nestedIncomplete} 次调用的子调用记录不完整（超过 256 条的子调用不再记录），子调用计数可能偏少。` : "",
+    stats.legacySources ? `${stats.legacySources} 个会话按旧口径入账（升级前入账、原件无法核对），没有单列脚本子调用和工具自身用量。` : "",
+  ].filter(Boolean).join("");
 
   return `
       <section>
@@ -321,7 +326,7 @@ function detailSection(input: ReportInput, stats: GroupStats): string {
 
       <section>
         <h2>模型用量</h2>
-        <div class="section-note">当前区间内记录的 token 用量，包含历史压缩与分支摘要。费用是 SDK 按配置价格估算，不代表 Coding Plan 实际账单或套餐配额；未知项不视为免费。</div>
+        <div class="section-note">当前区间内记录的 token 用量，包含历史压缩、分支摘要和工具自身用量（类型 tool，来源模型未知，记在 unknown 名下）。费用是 SDK 按配置价格估算，不代表 Coding Plan 实际账单或套餐配额；未知项不视为免费。</div>
         <div class="tiles">
           ${tile("输入", fmt.count(stats.tokens.input), "token")}
           ${tile("输出", fmt.count(stats.tokens.output), "token")}
@@ -391,12 +396,21 @@ ${
     ? `
       <section>
         <h2>工具调用</h2>
-        <div class="section-note">合计 ${tools.reduce((sum, [, count]) => sum + count, 0)} 次。</div>
+        <div class="section-note">模型发出的调用合计 ${tools.reduce((sum, [, count]) => sum + count, 0)} 次；一个 codemode 脚本算一次。</div>
         ${tools
           .slice(0, 10)
           .map(([tool, count]) => hbar(tool, count, toolMax, fmt.grouped(count), `${tool}：${count} 次`))
           .join("")}
         ${tableView(["工具", "调用次数"], tools.map(([tool, count]) => [tool, String(count)]), "工具调用")}
+      </section>`
+    : ""
+}${
+  nested.length > 0 || caveats
+    ? `
+      <section>
+        <h2>脚本子调用</h2>
+        <div class="section-note">工具运行中（如 codemode 脚本里）发起的调用，合计 ${nested.reduce((sum, [, count]) => sum + count, 0)} 次，不含在上面的工具调用里。${esc(caveats)}</div>
+        ${tableView(["工具", "子调用次数"], nested.map(([tool, count]) => [tool, String(count)]), "脚本子调用")}
       </section>`
     : ""
 }`;
@@ -435,7 +449,7 @@ ${overviewSection(input)}
 ${input.detail ? detailSection(input, input.detail) : ""}
   <footer class="page">
     统计口径：一条发给机器人的消息算一次提问（含干活途中的插话），/help /clear 等指令不计入。<br>
-    数据来自保留的 session.jsonl；已归档的历史不计入。附件数只算带 fileId 的成功工具结果，生成链接不等于送达。<br>
+    数据来自使用统计账本，清空上下文或归档历史不影响已入账的数字。附件数只算带 fileId 的成功工具结果，生成链接不等于送达。<br>
     成员人次按群相加，同一个成员出现在两个群会计算两次。
   </footer>
 </main>

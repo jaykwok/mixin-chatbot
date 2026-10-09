@@ -24,6 +24,7 @@ ops_command_hint() {
             start) path='系统 → 服务部署 → 启动' ;;
             stop) path='系统 → 服务部署 → 停止' ;;
             restart) path='系统 → 服务部署 → 重启' ;;
+            tunnel-update) path='系统 → 服务部署 → 更新 cloudflared' ;;
             uninstall) path='系统 → 服务部署 → 卸载' ;;
             doctor) path='监控 → 体检（按 r 刷新）' ;;
             logs) path='监控 → 日志' ;;

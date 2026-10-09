@@ -1,23 +1,25 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, unlink } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import type { lock as acquireLock } from "proper-lockfile";
-import { spawn } from "node:child_process";
-import { DATA_VERSION, MIGRATION_FILE, VERSION_FILE, migrationCommitted, readDataVersion, type DataVersion } from "../../../src/core/data-version.ts";
+import { validateMigration } from "./validation.ts";
+import { DATA_VERSION, GROUP_ROOT_LEASE, MIGRATION_FILE, VERSION_FILE, migrationCommitted, readDataVersion, type DataVersion } from "../../../src/core/data-version.ts";
 import { bytes, digest, fileDigest, info, json, ordinaryPath, publish, publishFile, publishJson } from "./io.ts";
 import type { Context, Decisions } from "./types.ts";
 import { v1 } from "../v1.ts";
+import { v2 } from "../v2.ts";
+import { v3 } from "../v3.ts";
+import { v4 } from "../v4.ts";
 import { describeMigrations } from "./preview.ts";
 
-const migrations = [v1];
+const migrations = [v1, v2, v3, v4];
 interface FileCopy { path: string; saved: string; hash: string | null }
 type Kind = "migration" | "verification" | "registration";
 interface Journal { format: 1; id: string; target: number; steps: number[]; deployment?: string; groups: string; backup: string | null; phase: "applying" | "validated" | "committed"; kind?: Kind; marker?: DataVersion; decisions: Decisions; files: FileCopy[] }
 export interface Plan { format: 1; target: number; kind: Kind; groups: string; decisions: Decisions; inputs: Record<string, string | null>; steps: string[]; files: string[] }
 const statePath = (c: Context) => join(c.project, "data/state", MIGRATION_FILE);
-const configPaths = (project: string) => ["data/config/runtime.json", "data/config/models.json", "data/runtime/pi/settings.json", "data/runtime/models-store.json"].map(path => join(project, path));
+const configPaths = (project: string) => ["data/config/runtime.json", "data/config/models.json", "data/config/auxiliary.json", "data/config/mcp.json", "data/runtime/pi/settings.json", "data/runtime/models-store.json"].map(path => join(project, path));
 const markerPaths = (context: Context) => [join(context.project, "data/state", VERSION_FILE), join(context.groups, VERSION_FILE)];
 function pairedMarker(context: Context): DataVersion | null {
   const [local, group] = markerPaths(context).map(readDataVersion);
@@ -36,19 +38,8 @@ async function inputs(context: Context) {
 // schema before the migration, and a read-only data mount cannot open a live WAL database. apply and commit check both.
 async function validate(context: Context, projection?: string): Promise<void> {
   context.report?.("validate", projection ? `configuration=${projection}` : `project=${context.project}; groups=${context.groups}`);
-  const args = projection ? ["--config", projection] : [context.project, context.groups, context.project];
-  // Never block the event loop: the service lease heartbeat must run during validation.
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(process.execPath, [fileURLToPath(new URL("../validate.ts", import.meta.url)), ...args], {
-      cwd: context.project, timeout: 120_000, killSignal: "SIGKILL", windowsHide: true, stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, GROUP_DATA_ROOT: context.groups },
-    });
-    let errors = "";
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", chunk => { errors = (errors + chunk).slice(-8192); });
-    child.once("error", reject);
-    child.once("close", code => code === 0 ? resolve() : reject(new Error(`当前版本${projection ? "配置" : "完整"}校验失败：${errors || code}`)));
-  });
+  // Keep validation outside the lease owner, but supervise every writer until reaped.
+  await validateMigration(context, projection);
 }
 async function ensureRoots(context: Context) {
   for (const path of [context.project, context.groups]) {
@@ -130,7 +121,11 @@ async function withLease<T>(context: Context, run: () => Promise<T>): Promise<T>
   let release: () => Promise<void>;
   try { release = await lock(join(context.project, "data/state/service"), { realpath: false, stale: 30000, update: 5000, retries: 0 }); }
   catch (error) { throw new Error("无法取得维护租约；请先停机，异常退出后等待 35 秒再重试", { cause: error }); }
-  try { return await run(); } finally { await release(); }
+  // The group root lease (src/core/maintenance.ts): another checkout sharing the group root must not run meanwhile.
+  let releaseGroups: () => Promise<void>;
+  try { releaseGroups = await lock(context.groups, { realpath: false, lockfilePath: join(context.groups, GROUP_ROOT_LEASE), stale: 30000, update: 5000, retries: 0 }); }
+  catch (error) { await release(); throw new Error("无法取得群数据根的维护租约；可能有另一份部署正在使用同一群数据根，请先停止它，异常退出后等待 35 秒再重试", { cause: error }); }
+  try { return await run(); } finally { try { await releaseGroups(); } finally { await release(); } }
 }
 
 export async function apply(context: Context, plan?: Plan): Promise<void> {
@@ -151,6 +146,12 @@ export async function apply(context: Context, plan?: Plan): Promise<void> {
         for (const path of [...declared, ...configPaths(context.project)]) paths.add(path);
         const databases = new Set([join(state, "agent.sqlite"), join(state, "relay.sqlite"), join(context.groups, "stats.sqlite")]);
         for (const entry of await readdir(state)) if (entry.endsWith(".sqlite")) databases.add(join(state, entry));
+        // Every group's Durable database (data version 3 on); one a step creates is declared by its preview.
+        for (const entry of await readdir(context.groups, { withFileTypes: true })) {
+          if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+          const durable = join(context.groups, entry.name, "durable.sqlite");
+          if (await info(durable)) databases.add(durable);
+        }
         for (const db of databases) for (const suffix of ["", "-wal", "-shm", "-journal"]) paths.add(db + suffix);
       }
       const id = randomUUID(), backup = kind === "verification" ? null : `backup/snapshots/migration-${id}`;
@@ -186,6 +187,7 @@ export async function apply(context: Context, plan?: Plan): Promise<void> {
       const step = migrations.find(m => m.to === to)!; await step.apply(context); await step.validate(context);
     }
     await validate(context);
+    context.signal?.throwIfAborted();
     journal.phase = "validated";
     await publishJson(statePath(context), journal);
   });
@@ -202,6 +204,7 @@ export async function commit(context: Context): Promise<void> {
       return;
     }
     await validate(context);
+    context.signal?.throwIfAborted();
     if (journal.kind === "verification") {
       const marker = pairedMarker(context);
       if (!marker || marker.transaction !== journal.marker?.transaction) throw new Error("校验期间版本标记变化，请重新升级登记");

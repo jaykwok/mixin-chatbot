@@ -6,6 +6,7 @@ import type { StatusName } from "../render/theme.ts";
 import * as fmt from "../render/format.ts";
 import { loadGit, loadUpgrade, type GitState, type UpgradeState } from "../data.ts";
 import { describePendingTransaction, loadPendingTransaction } from "../transaction.ts";
+import { confirmTransaction } from "../../../lib/confirmed-transaction.ts";
 import type { AppApi, ConfirmSpec, Loading, View, ViewAction, ViewContext } from "../view.ts";
 import { actionWorkbench, moveSelection } from "./common.ts";
 import { LazySetting } from "./settings-state.ts";
@@ -20,7 +21,7 @@ interface Action {
   /** 该命令会向用户提问，必须拿到真正的 TTY（update 的升级器在停机前确认隧道和迁移决策）。 */
   interactive?: boolean | ((app: AppApi) => boolean);
   confirm(app: Pick<AppApi, "deployment">, git: GitState | null, targetSha?: string): ConfirmSpec | null;
-  args(app: AppApi): string[];
+  args(app: AppApi, targetSha?: string): string[];
 }
 
 const ACTIONS: Action[] = [
@@ -52,6 +53,7 @@ const ACTIONS: Action[] = [
         return {
           title: "升级（保留设置）",
           subject: "这份部署不是 git 仓库，无法自动升级",
+          blocked: true,
           steps: ["先通过 Git 获取项目，再进入「系统 → 服务部署 → 部署 / 修改设置」；之后即可在此升级"],
         };
       }
@@ -59,6 +61,7 @@ const ACTIONS: Action[] = [
         return {
           title: "升级（保留设置）",
           subject: "已跟踪文件有未提交改动，升级会被拒绝",
+          blocked: true,
           steps: ["先提交、撤销或备份本地代码改动，再进入「系统 → 服务部署 → 升级（保留设置）」"],
         };
       }
@@ -74,7 +77,7 @@ const ACTIONS: Action[] = [
               "按停机前确认的计划迁移；同版本且标记配对时跳过数据迁移和数据库备份",
               "以只验证模式检查新实例，提交数据版本后恢复原运行状态",
             ]
-          : ["重新核对远端版本", "停机前检查数据版本并预览迁移", "停止旧实例；同版本且标记配对时跳过迁移和数据库备份，需要迁移时先备份再执行", "以只验证模式检查新实例，通过后提交并恢复原运行状态"];
+          : ["核对本次确认的目标提交", "停机前检查数据版本并预览迁移", "停止旧实例；同版本且标记配对时跳过迁移和数据库备份，需要迁移时先备份再执行", "以只验证模式检查新实例，通过后提交并恢复原运行状态"];
       return {
         title: "升级（保留设置）",
         subject:
@@ -86,7 +89,10 @@ const ACTIONS: Action[] = [
         recovery: "提交前失败会恢复数据、代码和原服务；恢复失败保持停机。提交后保留新版本并报告启动问题",
       };
     },
-    args: () => ["update"],
+    args: (_app, targetSha) => {
+      if (!targetSha) throw new Error("升级缺少已确认的目标提交，请重新检查版本");
+      return ["update", targetSha];
+    },
   },
   {
     key: "restart",
@@ -159,6 +165,20 @@ const ACTIONS: Action[] = [
     args: () => ["repair-tunnel"],
   },
   {
+    key: "tunnel-update",
+    label: "更新 cloudflared",
+    summary: "更新本项目隧道连接器到官方稳定版，校验后切换，失败恢复旧版本",
+    status: "warn",
+    confirm: () => ({
+      title: "更新 cloudflared",
+      subject: "检查并更新本项目隧道连接器",
+      steps: ["查询官方稳定版，下载并校验 SHA-256；无更新时直接结束", "核对连接器归属和启动参数，替换项目中的程序",
+        "原来运行的隧道按原参数重启；原来停止的隧道保持停止"],
+      recovery: "正在运行的隧道会短暂中断公网访问；替换或启动失败时恢复旧程序及运行状态。Windows 服务更新需管理员权限",
+    }),
+    args: () => ["tunnel-update"],
+  },
+  {
     key: "uninstall",
     label: "卸载",
     summary: "删除容器/任务，可选删除镜像、隧道与数据",
@@ -181,12 +201,12 @@ const ACTIONS: Action[] = [
   },
 ];
 
-const ACTION_ORDER = ["resume", "rollback", "start", "restart", "stop", "update", "deploy", "repair", "repair-tunnel", "uninstall"];
+const ACTION_ORDER = ["resume", "rollback", "start", "restart", "stop", "update", "deploy", "repair", "tunnel-update", "repair-tunnel", "uninstall"];
 /** 有未完成的事务时，这些入口会开始新的部署或升级，必须先继续或回滚。 */
-const BLOCKED_BY_PENDING = new Set(["deploy", "update", "repair"]);
+const BLOCKED_BY_PENDING = new Set(["deploy", "update", "repair", "tunnel-update"]);
 const PENDING_NOTICE = "有未完成的部署或升级：请先「继续上次操作」或「回滚上次操作」";
 
-interface Pending { subject: string; record: string[]; committed: boolean; codeRestorePending: boolean }
+interface Pending { subject: string; record: string[]; committed: boolean; codeRestorePending: boolean; confirmation?: import("../../../lib/confirmed-transaction.ts").TransactionReadSet }
 
 /** 继续和回滚都只使用事务记录；确认页列出记录内容。 */
 function transactionActions(pending: Pending): Action[] {
@@ -198,9 +218,10 @@ function transactionActions(pending: Pending): Action[] {
       summary: pending.codeRestorePending ? "数据已经回滚，不能继续" : "沿用事务记录完成中断的部署或升级",
       status: "busy",
       interactive: true,
-      confirm: () => pending.codeRestorePending ? {
+      confirm: () => !pending.confirmation ? { title: "继续上次操作", subject: "事务记录无法读取，请刷新后重试", blocked: true, steps: record } : pending.codeRestorePending ? {
         title: "继续上次操作",
         subject: "数据、配置和容器已经回滚，不能继续",
+        blocked: true,
         steps: ["请使用「回滚上次操作」恢复升级前的代码"],
       } : ({
         title: "继续上次操作",
@@ -210,7 +231,7 @@ function transactionActions(pending: Pending): Action[] {
         untouched: ["会话历史", "群共享资料"],
         recovery: pending.committed ? "数据已提交，不能再回滚；启动失败时保留新版本并报告原因" : "失败时恢复到操作前；也可改用「回滚上次操作」",
       }),
-      args: () => ["resume"],
+      args: () => ["resume", "--confirmed-transaction", confirmTransaction(pending.confirmation!, "continue")],
     },
     {
       key: "rollback",
@@ -219,9 +240,10 @@ function transactionActions(pending: Pending): Action[] {
         : pending.codeRestorePending ? "只恢复升级前的代码（数据、配置和容器已经回滚）" : "恢复到操作前的代码、数据和运行状态",
       status: "warn",
       interactive: true,
-      confirm: () => pending.committed ? {
+      confirm: () => !pending.confirmation ? { title: "回滚上次操作", subject: "事务记录无法读取，请刷新后重试", blocked: true, steps: record } : pending.committed ? {
         title: "回滚上次操作",
         subject: "数据已经提交，不能回滚",
+        blocked: true,
         steps: ["请使用「继续上次操作」完成新实例启动"],
       } : pending.codeRestorePending ? {
         title: "完成回滚",
@@ -236,7 +258,7 @@ function transactionActions(pending: Pending): Action[] {
         recovery: "回滚失败时保持停机并保留快照，处理后可重试回滚或改为继续",
         danger: true,
       },
-      args: () => ["rollback"],
+      args: () => ["rollback", "--confirmed-transaction", confirmTransaction(pending.confirmation!, "rollback")],
     },
   ];
 }
@@ -260,7 +282,7 @@ export class MaintainView implements View {
     let pending: Pending | null;
     try {
       const value = loadPendingTransaction();
-      pending = value && { ...describePendingTransaction(value), committed: value.committed, codeRestorePending: value.codeRestorePending };
+      pending = value && { ...describePendingTransaction(value), committed: value.committed, codeRestorePending: value.codeRestorePending, confirmation: value.confirmation };
     } catch (error) {
       // 记录无法读取时仍提供两个入口，由脚本报告具体原因。
       pending = { subject: "未完成的部署或升级", record: [`事务记录无法读取：${(error as Error).message}`], committed: false, codeRestorePending: false };
@@ -380,19 +402,16 @@ export class MaintainView implements View {
       const git = action.key === "update" ? preview?.git ?? null : this.state.kind === "ready" ? this.state.value : null;
       const spec = action.confirm(app, git, preview?.targetSha);
       if (spec) {
-        // 没有可执行步骤的 spec（升级被工作区拦下这类）只是用来解释为什么不能做，
-        // 让它走同一个确认框，但确认后什么也不执行。
-        const blocked = spec.steps.length === 1 && spec.untouched === undefined;
         const ok = await app.confirm(spec);
-        if (!ok || blocked) {
+        if (!ok || spec.blocked) {
           if (!ok) app.toast("idle", "已取消");
           return true;
         }
       }
       const interactive = typeof action.interactive === "function" ? action.interactive(app) : action.interactive;
       const code = interactive
-        ? await app.runInteractive(action.label, action.args(app))
-        : await app.run(action.label, action.args(app));
+        ? await app.runInteractive(action.label, action.args(app, preview?.targetSha))
+        : await app.run(action.label, action.args(app, preview?.targetSha));
       app.toast(code === 0 ? "ok" : "danger", code === 0 ? `${action.label}完成` : `${action.label}未成功（退出码 ${code}）`);
       this.loadPending();
       return true;
@@ -408,7 +427,7 @@ export class MaintainView implements View {
     const actions = this.availableActions;
     const action = actions[this.selected]!;
     const spec = action.confirm(ctx, git, preview?.targetSha);
-    const blocked = action.key === "update" && (!git || git.dirty);
+    const blocked = spec?.blocked === true;
     const versionNotice = this.state.kind === "error" ? this.state.message : "版本读取中…（升级暂不可用）";
     const details = this.pending && BLOCKED_BY_PENDING.has(action.key) ? [
       theme.bold(action.summary),

@@ -38,16 +38,7 @@ release_transaction_candidate() {
 # 等它结束，返回它的状态；此后这些信号保持忽略，只用于收尾。终端的 Ctrl+C 和断线只发给前台进程组，到不了收尾中的
 # docker 客户端、复制、git 和管道。只让本 shell 忽略信号不够：子进程会重设处理（docker 客户端自己处理 INT/TERM），
 # 管道和命令替换的子 shell 也会恢复默认处理。后台进程组读终端会被停住，所以 sudo 在其中只用已缓存的凭据（见 run_ufw）。
-run_shielded() {
-    local pid status=0
-    set -m
-    (SHIELDED_RUN=1; "$@") </dev/null &
-    pid=$!
-    set +m
-    trap '' INT TERM HUP
-    wait "$pid" || status=$?
-    return "$status"
-}
+# run_shielded is shared with connector updates through lifecycle.sh.
 
 # 未完成事务的镜像和服务身份（快照中的 candidate-image 与 service-user）。恢复入口在 committed 检查、回滚或任何运行
 # 容器的操作之前调用；此后只按记录的 image ID 和 UID:GID 运行容器，不重新构建、拉取，也不按标签选择。设置 IMAGE_ID、
@@ -76,11 +67,12 @@ load_transaction_runtime() {
 }
 
 # 停机后写入 backup/ 的快照的预计大小（字节）：部署快照（配置和状态文件）与迁移备份（配置、版本标记、data/state
-# 和群根中的数据库）。只用来决定门槛，剩余空间以 df 实测为准。
+# 和群根中的数据库：统计账本和各群的 Durable 数据库）。只用来决定门槛，剩余空间以 df 实测为准。
 snapshot_size_estimate() {
     local group_root="$1" path files=()
     for path in "$PROJECT_DIR/data/config" "$PROJECT_DIR/data/runtime/pi/settings.json" "$PROJECT_DIR/data/runtime/models-store.json" \
-        "$PROJECT_DIR/data/state/data-version.json" "$group_root/data-version.json" "$PROJECT_DIR"/data/state/*.sqlite* "$group_root"/stats.sqlite*; do
+        "$PROJECT_DIR/data/state/data-version.json" "$group_root/data-version.json" "$PROJECT_DIR"/data/state/*.sqlite* "$group_root"/stats.sqlite* \
+        "$group_root"/*/durable.sqlite*; do
         [ ! -e "$path" ] || files+=("$path")
     done
     if [ "${#files[@]}" -eq 0 ]; then echo 0; return 0; fi

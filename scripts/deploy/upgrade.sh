@@ -258,6 +258,8 @@ resume_upgrade() {
         print_success "升级已回滚：代码恢复到 ${ORIGINAL_SHA:0:7}，数据、配置和原运行状态已恢复"
         exit 0
     fi
+    # 已在目标提交的续做仍会执行宿主工作区的部署脚本，不能跳过已跟踪改动检查。
+    if [ "$ACTION" = continue ]; then tracked_files_clean || exit 1; fi
     # 先读记录的镜像和服务身份，再停机、回滚或运行任何容器；只剩代码待恢复时（上方）不需要它们，镜像可能已释放。
     load_transaction_runtime || exit 1
     head="$(git_here rev-parse HEAD)"
@@ -296,6 +298,7 @@ resume_upgrade() {
             print_error "无法切换到目标提交 ${TARGET_SHA:0:7}；服务保持停止，处理后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
         print_success "代码已更新：${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}"
     fi
+    tracked_files_clean || exit 1
     print_status "继续上次升级 ${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}：设置和迁移计划取自事务记录，不再询问"
     run_deploy continue
     finish_after_deploy continue

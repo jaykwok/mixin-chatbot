@@ -580,7 +580,7 @@ tmp_admin() {
     group_data_admin scripts/ops/tmp-admin.ts "$@"
 }
 
-# 清历史先停服务，防止内存会话写回；归档后恢复调用前的运行或停止状态。
+# 清历史先停服务（运行中的机器人独占群库）；完成后恢复调用前的运行或停止状态。
 history_clear() (
     if [ -z "${1:-}" ]; then ER 'history-clear 需要群号'; return 1; fi
     local was_running=0 restored=0
@@ -600,7 +600,7 @@ history_clear() (
         stop_bot || return 1
     fi
     local code=0
-    group_data_admin scripts/ops/history-admin.ts clear "$@" || code=$?
+    group_data_admin scripts/ops/history-admin.ts "${HISTORY_OPERATION:-clear}" "$@" || code=$?
     if [ "$was_running" = 1 ]; then start_bot || return 1; fi
     restored=1
     return "$code"
@@ -631,7 +631,13 @@ choose_pending_action() {
 
 # 继续或回滚中断的部署或升级：与 update 共用未完成事务的处理；都没有时说明无需处理。
 transaction_command() {
-    UPDATE_TRANSACTION_ACTION="$1" update
+    local action="$1"; shift
+    local confirmation=''
+    if [ "$#" -gt 0 ]; then
+        [ "$#" = 2 ] && [ "$1" = --confirmed-transaction ] && [ -n "$2" ] || { ER '事务确认参数无效'; return 1; }
+        confirmation="$2"
+    fi
+    UPDATE_TRANSACTION_ACTION="$action" UPDATE_TRANSACTION_CONFIRMATION="$confirmation" update
 }
 
 require_git_checkout() {
@@ -809,14 +815,23 @@ legacy_update_recovery() {
 # 在主 shell 中运行（不是子 shell）：发给 ops.sh 的 TERM 才能由升级器转发处理，否则只杀掉父进程，升级在后台继续。
 # 升级是 ops.sh 的最后一个命令，退出陷阱在脚本结束时运行。
 update() {
+    local confirmed="${1:-}"
+    if [ -n "$confirmed" ] && ! [[ "$confirmed" =~ ^[0-9a-f]{40}$ ]]; then
+        ER '已确认的升级目标必须是完整提交 SHA；请重新检查版本'; return 1
+    fi
     operation_start upgrade
     UPGRADE_STAGE=''
     UPGRADER_PID=''
     trap 'status=$?; remove_upgrade_stage; operation_finish "$status"' EXIT
     acquire_deploy_lock || { ER "另一个部署或升级正在进行"; return 1; }
     local action="${UPDATE_TRANSACTION_ACTION:-}"
+    # The lock remains held across dispatch and the child deployer, including legacy record backfill.
+    if [ -n "${UPDATE_TRANSACTION_CONFIRMATION:-}" ]; then
+        bun "$PROJECT_DIR/scripts/lib/confirmed-transaction.ts" "$PROJECT_DIR" "$action" "$UPDATE_TRANSACTION_CONFIRMATION" || return 1
+    fi
     # 未完成的事务最先处理，早于检查改动和拉取：继续固定使用记录的目标提交（本地已有），离线也能继续或回滚。
     if [ -e "$STATE_DIR/update-transaction" ] || [ -e "$STATE_DIR/deploy-transaction" ]; then
+        if [ -n "$confirmed" ]; then ER '预览后出现未完成的事务，请刷新后继续或回滚'; return 1; fi
         if [ -e "$STATE_DIR/deploy-transaction" ]; then
             load_pending_transaction || { ER '未完成事务的记录无法读取（原因见上方），请人工检查 backup/snapshots'; return 1; }
             WA "$(describe_pending_transaction)"
@@ -847,13 +862,18 @@ update() {
         WA "请先提交、撤销（git restore <文件>）或备份这些改动，然后重试"
         return 1
     fi
-    P "拉取 origin/main..."
-    operation_stage fetch
-    if ! operation_capture git_here fetch --prune origin main; then
-        ER "git fetch 失败"
-        return 1
+    if [ -n "$confirmed" ]; then
+        target="$(git_here rev-parse --verify --quiet "${confirmed}^{commit}")" || { ER '已确认的提交在本地不存在，请重新检查版本'; return 1; }
+        [ "$target" = "$confirmed" ] || { ER '已确认的目标不是提交，请重新检查版本'; return 1; }
+    else
+        P "拉取 origin/main..."
+        operation_stage fetch
+        if ! operation_capture git_here fetch --prune origin refs/heads/main:refs/remotes/origin/main; then
+            ER "git fetch 失败"
+            return 1
+        fi
+        target="$(git_here rev-parse --verify --quiet 'origin/main^{commit}')" || { ER "无法解析 origin/main；请确认远端存在 main 分支"; return 1; }
     fi
-    target="$(git_here rev-parse --verify --quiet 'origin/main^{commit}')" || { ER "无法解析 origin/main；请确认远端存在 main 分支"; return 1; }
     operation_event info "original=$(git_here rev-parse HEAD 2>/dev/null) target=$target"
     # 停机前的预检、隧道确认和迁移预览，停机、切换代码和回滚都由目标版本的升级器负责。
     run_target_upgrader "$target" || return $?
@@ -934,7 +954,7 @@ uninstall() {
 # 新升级由升级器在停机前校验已保存设置。部署脚本自行校验设置；其余操作采用环境变量并先校验。
 case "${1:-}" in
     update|upgrade|resume|rollback) use_transaction_settings ;;
-    deploy) ;;
+    deploy|tunnel-update) ;;
     *)
         if [ -n "${BOT_PORT:-}" ]; then PORT="$BOT_PORT"; fi
         if [ -n "${BOT_DOMAIN:-}" ]; then DOMAIN="$BOT_DOMAIN"; fi
@@ -945,15 +965,16 @@ esac
 case "${1:-}" in
     deploy) exec bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" ;;
     doctor|status) doctor ;;
-    update|upgrade) update ;;
-    resume)    transaction_command continue ;;
-    rollback)  transaction_command rollback ;;
+    update|upgrade) update "${2:-}" ;;
+    resume)    transaction_command continue "${@:2}" ;;
+    rollback)  transaction_command rollback "${@:2}" ;;
     restart)   restart_bot ;;
     stop)      stop_bot ;;
     start)     start_bot ;;
     logs)      show_logs ;;
     tunnel-logging) configure_tunnel_logging "${2:-}" ;;
     tunnel-protocol) configure_tunnel_protocol "${2:-}" ;;
+    tunnel-update) . "$PROJECT_DIR/scripts/lib/cloudflared-update.sh"; update_cloudflared ;;
     relay-configure) relay_configure ;;
     runtime-configure) runtime_configure "${2:-}" ;;
     relay-ls)    relay_admin list ;;
@@ -964,6 +985,7 @@ case "${1:-}" in
     stat)          shift; group_data_admin scripts/ops/stats-admin.ts "$@" ;;
     history-ls)    shift; group_data_admin scripts/ops/history-admin.ts list "$@" ;;
     history-clear) shift; history_clear "$@" ;;
+    history-compact) shift; HISTORY_OPERATION=compact history_clear "$@" ;;
     # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具在容器内逐条重新检查。
     backup-scan)   group_data_admin scripts/ops/backup-cleanup.ts scan ;;
     backup-clean)  shift; group_data_admin scripts/ops/backup-cleanup.ts apply "$@" ;;
@@ -996,6 +1018,7 @@ case "${1:-}" in
         echo "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
         echo "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
         echo "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"
+        echo "  tunnel-update 更新本项目 cloudflared 到官方稳定版；校验后切换，失败恢复旧版本（需宿主机 Bun）"
         echo "  relay-ls   列出已发出、仍在册的大文件外链"
         echo "  relay-purge <关键字>|--all"
         echo "             删除匹配的外链对象并清掉索引记录"
@@ -1007,9 +1030,10 @@ case "${1:-}" in
         echo "  stat [群号] [--since <日期>] [--until <日期>]"
         echo "             使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
         echo "  routes     回调路由：list 查看绑定与冲突，reset/forget 需停机"
-        echo "  history-ls 列出各群的会话历史（成员数、占用、最后活动）"
+        echo "  history-ls 列出各群的会话历史（群库与旧会话文件的占用、最后活动）"
         echo "  history-clear <群号>"
-        echo "             归档该群会话；自动停机、清理，再恢复原运行或停止状态"
+        echo "  history-compact <群号> <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
+        echo "             清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         echo "             群选择可加 --group-id（原始群号）或 --storage-segment（目录段）"
         echo "  backup-scan 只读扫描 backup/rm 和 backup/snapshots，分类后在 backup/cleanup 生成清单，不删除"
         echo "  backup-clean <报告名> [--confirm <确认码>]"

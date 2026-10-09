@@ -1,6 +1,6 @@
 export interface Decisions { acceptNativeCache?: boolean; provider?: string; model?: string }
 /** scratch: preview staging outside the project, so a read-only data mount can be previewed. */
-export interface Context { project: string; groups: string; decisions: Decisions; scratch?: string; report?: (stage: string, detail: string) => void }
+export interface Context { project: string; groups: string; decisions: Decisions; scratch?: string; signal?: AbortSignal; report?: (stage: string, detail: string) => void }
 export interface PreviewContext {
   project: string;
   decisions: Decisions;

@@ -2,6 +2,7 @@
 // its descendants; killing a Windows host closes its KILL_ON_JOB_CLOSE handle.
 import { readFileSync } from "node:fs";
 import { dlopen, FFIType, ptr } from "bun:ffi";
+import { WindowsHandles, type WindowsHandle } from "../../../src/core/windows-handles.ts";
 
 export interface QueryOwner {
   stop(): Promise<void>;
@@ -38,6 +39,7 @@ export function ownQueryHost(pid: number, exited: Promise<void>, expectedBirth?:
   if (process.platform === "win32" && !expectedBirth) throw new Error("查询进程缺少身份信息");
   let api: ReturnType<typeof windowsApi> | undefined;
   let handle: ReturnType<ReturnType<typeof windowsApi>["OpenProcess"]>;
+  let owned: WindowsHandle | undefined, failure: unknown;
   const birth = process.platform === "linux" ? linuxIdentity(pid)?.birth : undefined;
   const alive = (): boolean => {
     if (process.platform === "linux") {
@@ -46,11 +48,15 @@ export function ownQueryHost(pid: number, exited: Promise<void>, expectedBirth?:
     }
     if (!api) {
       api = win ??= windowsApi();
+      const resources = new WindowsHandles({ closeNative: { CloseHandle: value => api!.CloseHandle(BigInt(value)), GetLastError: () => api!.GetLastError() } });
+      resources.record({ phase: "open", operation: "OpenProcess", path: `query:${pid}` });
       handle = api.OpenProcess(0x100000 | 0x1000 | 1, 0, pid); // SYNCHRONIZE | QUERY_LIMITED_INFORMATION | TERMINATE
       if (!handle) {
-        if (api.GetLastError() === 87) return false; // process already gone
-        throw new Error(`无法持有查询进程 (${api.GetLastError()})`);
+        const nativeError = api.GetLastError();
+        if (nativeError === 87) return false; // process already gone
+        throw new Error(`无法持有查询进程 (${nativeError})`);
       }
+      owned = resources.own(BigInt(handle), `query:${pid}`, "OpenProcess");
       const times = new BigUint64Array(4);
       if (!api.GetProcessTimes(handle, ptr(times), ptr(times, 8), ptr(times, 16), ptr(times, 24))) {
         throw new Error(`无法读取查询进程身份 (${api.GetLastError()})`);
@@ -80,7 +86,10 @@ export function ownQueryHost(pid: number, exited: Promise<void>, expectedBirth?:
         if (!alive()) return;
         if (!signalled) {
           if (api) {
-            if (!api.TerminateProcess(handle!, 130) && alive()) throw new Error(`无法终止查询进程 (${api.GetLastError()})`);
+            if (!api.TerminateProcess(handle!, 130)) {
+              const nativeError = api.GetLastError();
+              if (alive()) throw new Error(`无法终止查询进程 (${nativeError})`);
+            }
           } else {
             try { process.kill(pid, "SIGTERM"); } catch (error) {
               if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
@@ -92,6 +101,9 @@ export function ownQueryHost(pid: number, exited: Promise<void>, expectedBirth?:
         if (Date.now() >= deadline) throw new Error("等待查询进程树回收超时");
         await Bun.sleep(10);
       }
-    })().finally(() => { if (api && handle) api.CloseHandle(handle); }),
+    })().catch(error => { failure = error; throw error; }).finally(() => {
+      try { owned?.close(); }
+      catch (error) { throw new AggregateError([...(failure ? [failure] : []), error], "查询进程句柄关闭失败", { cause: failure }); }
+    }),
   };
 }

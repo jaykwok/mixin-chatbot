@@ -1,8 +1,21 @@
-// The current validator is intentionally outside historical migrations.
-// Usage: validate.ts <config project> <groups> [state project] — configuration and databases;
-//        validate.ts --config <config project> — configuration only (a preview's projection, before any migration).
-import { validateConfiguration, validateCurrentData } from "../../src/core/data-validation.ts";
+// A built-in-only entry: readiness precedes loading configuration/database modules.
+const id = process.env.MIXIN_VALIDATION_ID ?? "standalone";
+const started = performance.now();
+function report(phase: string, state: string, code?: number) {
+  process.stderr.write("migration-validation " + JSON.stringify({ id, phase, state, code, pid: process.pid, elapsedMs: performance.now() - started }) + "\n");
+}
+report("entry-ready", "end");
 try {
-  if (process.argv[2] === "--config") await validateConfiguration(process.argv[3]!);
-  else await validateCurrentData(process.argv[2]!, process.argv[3]!, process.argv[4]);
-} catch (error) { console.error((error as Error).message); process.exitCode = 1; }
+  report("imports-start", "start");
+  const { validateConfiguration, validateCurrentData } = await import("../../src/core/data-validation.ts");
+  report("imports-ready", "end");
+  const observe = (phase: string, state: "start" | "end" | "failed") => report(phase, state);
+  if (process.argv[2] === "--config") await validateConfiguration(process.argv[3]!, observe);
+  else await validateCurrentData(process.argv[2]!, process.argv[3]!, process.argv[4] ?? process.argv[2]!, observe);
+  report("result", "end", 0);
+} catch (error) {
+  report("result", "failed", 1);
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+}
+export {};

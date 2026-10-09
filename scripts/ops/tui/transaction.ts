@@ -1,16 +1,17 @@
 // 未完成的部署/升级事务：读取指针和快照中的 transaction 记录，供维护页和恢复菜单展示。
 // 只读；继续和回滚都交给 ops 脚本，脚本会再次校验记录。
 
-import { readFileSync } from "node:fs";
-import { join, posix, win32 } from "node:path";
-import { MIGRATION_FILE, migrationCommitted, readMetadata, type MigrationState } from "../../../src/core/data-version.ts";
+import { join, posix, resolve, win32 } from "node:path";
+import { MIGRATION_FILE, VERSION_FILE, type MigrationState } from "../../../src/core/data-version.ts";
 import { PROJECT_DIR, type Platform } from "./platform.ts";
+import { readTransaction, type TransactionReadSet } from "../../lib/confirmed-transaction.ts";
 
 const KEYS = ["format", "operation", "snapshot", "target_sha", "original_sha", "original_branch", "original_group_root",
   "target_group_root", "was_running", "bot_port", "deploy_mode", "bot_domain", "domain_action", "unmanaged_tunnel", "platform_ip", "reconfigure_ai"] as const;
 export type TransactionRecord = Record<(typeof KEYS)[number], string>;
 
 export interface PendingTransaction {
+  confirmation: TransactionReadSet;
   operation: "deploy" | "upgrade";
   /** Linux 升级在调用部署脚本前中断时还没有快照。 */
   snapshot: string | null;
@@ -70,26 +71,29 @@ export function parseTransactionRecord(text: string): TransactionRecord {
   return record as TransactionRecord;
 }
 
-function readText(path: string): string | null {
-  try { return readFileSync(path, "utf8").replace(/^\uFEFF/, ""); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
-}
-
-function readSnapshotName(path: string): string | null {
-  const name = readText(path)?.trim();
-  if (name === undefined) return null;
-  if (!SNAPSHOT.test(name)) throw new Error("事务快照名称无效");
-  return name;
-}
-
-function snapshotCommitted(project: string, snapshot: string | null): boolean {
+function snapshotCommitted(read: TransactionReadSet, snapshot: string | null): boolean {
   if (!snapshot) return false;
-  const journal = readMetadata(join(project, "data/state", MIGRATION_FILE)) as (MigrationState & { deployment?: string }) | null;
-  return !!journal && journal.deployment === snapshot && migrationCommitted(project, journal);
+  const journal = JSON.parse(read.text("data/state/" + MIGRATION_FILE) ?? "null") as (MigrationState & { deployment?: string }) | null;
+  if (!journal || journal.deployment !== snapshot) return false;
+  if (journal.phase === "committed") return true;
+  if (journal.kind === "verification") return false;
+  const local = JSON.parse(read.text("data/state/" + VERSION_FILE) ?? "null") as { dataVersion: number; transaction: string } | null;
+  return local?.dataVersion === journal.target && local?.transaction === journal.id;
 }
 
 /** 读取未完成的事务；没有时返回 null，指针或记录无效时抛出。 */
 export function loadPendingTransaction(project = PROJECT_DIR): PendingTransaction | null {
+  project = resolve(project);
+  const confirmation = readTransaction(project);
+  if (!confirmation) return null;
+  // Use exactly the captured bytes for both the preview and the confirmation fingerprint.
+  const readText = (path: string) => confirmation.text(path.slice(project.length + 1).replaceAll("\\", "/"));
+  const readSnapshotName = (path: string) => {
+    const name = readText(path)?.trim();
+    if (name === undefined) return null;
+    if (!SNAPSHOT.test(name)) throw new Error("事务快照名称无效");
+    return name;
+  };
   const state = join(project, "data/state");
   const deploySnapshot = readSnapshotName(join(state, "deploy-transaction"));
   // Windows 升级有独立指针；Linux 升级是停机记录加部署事务。
@@ -113,7 +117,7 @@ export function loadPendingTransaction(project = PROJECT_DIR): PendingTransactio
   // Linux 升级的部署事务结束后只剩提交回执：已提交就只能继续收尾。
   const receipt = linuxUpgrade !== null && !deploySnapshot && readText(join(state, "update-commit"))?.trim() === "committed";
   const codeRestorePending = !!deploySnapshot && readText(join(project, "backup/snapshots", deploySnapshot, "code-restore")) !== null;
-  return { operation, snapshot, record, targetSha, committed: receipt || snapshotCommitted(project, snapshot), codeRestorePending };
+  return { confirmation, operation, snapshot, record, targetSha, committed: receipt || snapshotCommitted(confirmation, snapshot), codeRestorePending };
 }
 
 const shortSha = (sha: string | null) => sha ? sha.slice(0, 7) : "（非 git 部署）";

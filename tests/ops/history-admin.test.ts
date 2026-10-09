@@ -5,8 +5,15 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, writeFile, symlink } from "node:fs/promises";
 
 import { join } from "node:path";
+import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import { createSession } from "@earendil-works/pi-durable";
 import { clearGroup, collect } from "../../scripts/ops/history-admin.ts";
+import { lastActivity } from "../../scripts/lib/history-scan.ts";
 import { groupSegment } from "../../src/agent/paths.ts";
+import { memberConversation } from "../../src/durable/identity.ts";
+import { ControlsDoc } from "../../src/durable/inbox.ts";
+import { openGroupStorage } from "../../src/durable/sqlite.ts";
+import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
 
 async function makeRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-history-"));
@@ -135,6 +142,54 @@ describe("history admin", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a group database: list shows it, clear queues a /clear per member for the next start and archives the old files", async () => {
+    const root = await makeRoot();
+    const { models, model } = fauxModels();
+    const database = join(root, "group-a", "durable.sqlite");
+    const group = await openGroupHarness(database, models, { group: "group-a", door: false });
+    try {
+      for (const phone of ["13800000000", "13900000000"]) await memberConversation(group.harness, "group-a", phone, { model }, context);
+    } finally { await group.close(); }
+    try {
+      const listed = (await collect(root)).find((entry) => entry.group === "group-a")!;
+      expect(listed.database!.bytes).toBeGreaterThan(0);
+      expect(listed.bytes).toBe(listed.database!.bytes + listed.users.reduce((total, user) => total + user.bytes, 0));
+      expect(lastActivity(listed)).toBeGreaterThanOrEqual(listed.database!.modified);
+      expect(await clearGroup("group-a", root)).toBe(0);
+      // The database stays (the old context is kept there); the old session files are archived.
+      const after = (await collect(root)).find((entry) => entry.group === "group-a")!;
+      expect(after.users).toEqual([]);
+      expect(after.database).toBeDefined();
+      const session = createSession(await openGroupStorage(database));
+      try {
+        const pending = (await session.snapshot(ControlsDoc, context))!.pending;
+        expect(pending.map((control) => [control.phone, control.command])).toEqual([["13800000000", "/clear"], ["13900000000", "/clear"]]);
+      } finally { await session.close(context); }
+      // The other group is untouched.
+      expect(await readFile(join(root, "group-b", "users", "13700000000", "session.jsonl"), "utf8")).toContain("13700000000");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses a group database that records another group", async () => {
+    const root = await makeRoot();
+    const { models } = fauxModels();
+    const group = await openGroupHarness(join(root, "group-b", "durable.sqlite"), models, { group: "group-a", door: false });
+    await group.close();
+    try {
+      expect(await clearGroup("group-b", root)).toBe(1);
+      // Nothing changed: the old session file stays too.
+      expect(await readFile(join(root, "group-b", "users", "13700000000", "session.jsonl"), "utf8")).toContain("13700000000");
+      const session = createSession(await openGroupStorage(join(root, "group-b", "durable.sqlite")));
+      try {
+        expect((await session.snapshot(ControlsDoc, context))?.pending ?? []).toEqual([]);
+      } finally { await session.close(context); }
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 

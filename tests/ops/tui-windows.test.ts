@@ -7,6 +7,14 @@ import { tempFixture } from "../helpers/temp.ts";
 
 const windowsTest = process.platform === "win32" ? test : test.skip;
 
+test("manual compaction selects the same member on both ops platforms", () => {
+  const args = ["history-compact", "synthetic", "member", "--storage-segment"];
+  const windows = opsCommand("windows", args);
+  const request = JSON.parse(Buffer.from(windows.args.at(-1)!, "base64").toString("utf8"));
+  expect(request).toEqual({ Command: "history-compact", Target: "synthetic", User: "member", StorageSegment: true });
+  expect(opsCommand("linux", args).args.slice(1)).toEqual(args);
+});
+
 // 从真实脚本提取函数和入口，只替换宿主机探测/写操作。
 // 测试不运行真实的 repair、purge、route-admin 或计划任务命令。
 const BUILD = String.raw`

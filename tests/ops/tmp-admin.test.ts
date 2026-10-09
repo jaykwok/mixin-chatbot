@@ -29,6 +29,18 @@ async function exists(path: string): Promise<boolean> {
 }
 
 describe("用户临时目录清理", () => {
+  test("Durable tmp is retained even by --all, because stopped tasks/history/outbox can still reference it", async () => {
+    const scoped = await mkdtemp(join(tmpdir(), "tmp-durable-protected-"));
+    const temp = join(scoped, "g1/users/u1/tmp");
+    try {
+      await mkdir(join(temp, "codemode/1-call"), { recursive: true });
+      await writeFile(join(temp, "codemode/1-call/output.txt"), "persistent reference");
+      await writeFile(join(scoped, "g1/durable.sqlite"), "database belongs to this group");
+      await age(join(temp, "codemode/1-call/output.txt"), 30);
+      expect(await purge(0, undefined, scoped)).toBe(0);
+      expect(await exists(join(temp, "codemode/1-call/output.txt"))).toBe(true);
+    } finally { await rm(scoped, { recursive: true, force: true }); }
+  });
   test("同时限定群和成员，同一手机号在其他群的内容保留，摘要目录可直接选中", async () => {
     const scoped = await mkdtemp(join(tmpdir(), "tmp-scope-"));
     try {

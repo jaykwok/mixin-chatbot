@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import {
   formatSize,
+  type ToolAnnotations,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -190,6 +191,10 @@ export interface OutboundNotes {
   clear(): void;
 }
 
+/**
+ * In-memory notes of one run.
+ * @internal The Durable service keeps its notes in the run's outbox row (src/durable/service.ts); tests use this one.
+ */
 export function createOutboundNotes(onAdd?: (note: string, attachment?: DeliveryAttachment) => void): OutboundNotes {
   let notes: string[] = [];
   let attachments: DeliveryAttachment[] = [];
@@ -223,6 +228,11 @@ export interface SendToolsOptions {
   notes: OutboundNotes;
 }
 
+// 消息发出就无法撤回：只允许模型逐条直接调用，脚本（codemode 等经 ctx.executeTool 的调用）拿不到这两个工具。
+// annotations 只是给权限扩展看的语义说明，实际约束仍是下面的路径、大小和上传检查。
+const SEND_EXPOSURE = "model-only";
+const SENDS: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
+
 export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
   const { getCallbackUrl, groupId, workspaceDir, tempDir, relay, relayIndex, notes } = options;
 
@@ -246,6 +256,8 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
     description:
       "向当前群聊发送一张图片。source 为 http(s) URL、本群 workspace 或当前调用用户 tmp 内的路径。",
     promptSnippet: "向群聊发送图片",
+    exposure: SEND_EXPOSURE,
+    annotations: SENDS,
     constrainedSampling: { type: "json_schema", strict: "prefer" },
     parameters: imageParams,
     async execute(_toolCallId, params, signal) {
@@ -298,6 +310,8 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
       "向当前群聊发送一个文件。source 为 http(s) URL、本群 workspace 或当前调用用户 tmp 内的路径。" +
       relayNote,
     promptSnippet: "向群聊发送文件",
+    exposure: SEND_EXPOSURE,
+    annotations: SENDS,
     constrainedSampling: { type: "json_schema", strict: "prefer" },
     parameters: fileParams,
     async execute(_toolCallId, params, signal) {

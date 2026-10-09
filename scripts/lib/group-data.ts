@@ -49,8 +49,9 @@ export async function assertDataDirectory(path: string, root: string): Promise<v
 export async function dataDirectoryNames(path: string, root: string): Promise<string[]> {
   try {
     await assertDataDirectory(path, root);
+    // Group and user segments never start with a dot (src/agent/paths.ts); the group root lease directory does.
     return (await readdir(path, { withFileTypes: true }))
-      .filter(entry => entry.isDirectory() && !entry.isSymbolicLink()).map(entry => entry.name);
+      .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith(".")).map(entry => entry.name);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     // Listing never follows an unsafe directory; a clear/purge rechecks before each archive.

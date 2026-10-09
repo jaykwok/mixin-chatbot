@@ -23,6 +23,13 @@ from lxml import etree
 from docx.oxml.ns import qn
 
 
+def patch_cases():
+    spec = importlib.util.spec_from_file_location("document_patch_cases", Path(__file__).resolve().parent / "document-patch-cases.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def check_edit_guards():
     script = Path(__file__).resolve().parents[2] / "src/agent/modules/document-work/scripts/document_ops.py"
     spec = importlib.util.spec_from_file_location("document_ops", script)
@@ -124,6 +131,19 @@ def add_edge_fixtures(root):
     for _ in range(51):
         prs.slides.add_slide(prs.slide_layouts[6])
     prs.save(root / "big.pptx")
+    # More distinct pictures than one images call returns (60).
+    prs = Presentation()
+    for page in range(3):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        for index in range(21):
+            number = page * 21 + index
+            picture = Image.new("RGB", (160, 120), (number * 4 % 256, 255 - number * 3 % 256, (number * 37) % 256))
+            ImageDraw.Draw(picture).text((10, 10), str(number), fill="white")
+            buffer = io.BytesIO()
+            picture.save(buffer, "PNG")
+            buffer.seek(0)
+            slide.shapes.add_picture(buffer, Inches(0.2 + (index % 7) * 1.4), Inches(0.3 + (index // 7) * 2.3), Inches(1.3), Inches(1))
+    prs.save(root / "many.pptx")
 
 
 def check_edge_cases(root, results):
@@ -161,6 +181,10 @@ def check_edge_cases(root, results):
     assert not filtered["images"] and filtered["skipped"]["small"] == 2, "minSize applies to PPT sources too"
     big = results["bigImages"]
     assert len(big["selectedPages"]) == 50 and big["pages"] == 51 and any("前 50 页" in w for w in big["warnings"]), big["warnings"]
+    assert big["truncated"] is False and big["skipped"]["limit"] == 0
+    many = results["manyImages"]
+    assert len(many["images"]) == 60 and many["skipped"]["limit"] == 3 and many["truncated"] is True, many["skipped"]
+    assert any("60 张上限" in w and "3 张" in w for w in many["warnings"]), many["warnings"]
 
 
 def check_office_errors(root):
@@ -170,12 +194,13 @@ def check_office_errors(root):
     spec.loader.exec_module(operations)
     source = root / "source.docx"
     for code, diagnostic in ((1, b"Read-only file system: /tmp/OSL_PIPE_fixture"), (0, b"Error: source file could not be loaded")):
-        folder = root / f"office-error-{code}"
+        folder, profile = root / f"office-error-{code}", root / f"office-profile-{code}"
         folder.mkdir()
+        profile.mkdir()
         result = subprocess.CompletedProcess([], code, stdout=b"", stderr=diagnostic)
         with patch.object(operations, "office_binary", return_value="fixture-soffice"), patch.object(operations.subprocess, "run", return_value=result) as run:
             try:
-                operations.convert_office(source, folder)
+                operations.convert_office(source, folder, profile)
                 raise AssertionError("conversion failure must be reported")
             except ValueError as error:
                 assert diagnostic.decode() in str(error), str(error)
@@ -183,11 +208,15 @@ def check_office_errors(root):
             for key in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "TMPDIR"):
                 target = Path(env[key])
                 assert target.is_dir() and target.is_relative_to(folder)
+            # The profile is the directory the caller supplied, not one inside the job folder.
+            assert "-env:UserInstallation=" + profile.as_uri() in run.call_args.args[0]
+            assert (profile / "user/registrymodifications.xcu").is_file() and not (folder / "office-profile").exists()
 
 
 def prepare(root):
     check_edit_guards()
     root.mkdir(parents=True, exist_ok=True)
+    patch_cases().main(root / "patch-cases")
     picture = Image.new("RGB", (480, 240), "#16324F")
     ImageDraw.Draw(picture).rectangle((40, 40, 440, 200), fill="#58C1B2")
     picture.save(root / "product.png")
@@ -271,13 +300,19 @@ def run_guide_examples(root, results):
 def check(root, results):
     patched = Document(results["wordPatch"]["output"])
     p = next(p for p in patched.paragraphs if "客户B" in p.text)
-    assert p.runs[0].bold and p.runs[1].italic
+    # “客户” bold, “A” italic: whole-match 客户A -> 客户B changes only A, so B stays italic and not bold.
+    assert [(r.text, r.bold, r.italic) for r in p.runs] == [("客户", True, None), ("B", None, True), (" 使用正式产品资料。", None, None)], [(r.text, r.bold, r.italic) for r in p.runs]
     assert len(patched.inline_shapes) == 1
     assert patched.tables[0].cell(1, 1).text == "私有化部署"
+    cases = patch_cases()
     with zipfile.ZipFile(root / "source.docx") as before, zipfile.ZipFile(results["wordPatch"]["output"]) as after:
         for name in before.namelist():
             if name != "word/document.xml":
                 assert before.read(name) == after.read(name), name
+        source = before.read("word/document.xml")
+        number = lambda text: cases.number_of("docx", {"part": source}, "part", text)
+        cases.check_part("docx", source, after.read("word/document.xml"), {
+            number("客户A 使用正式产品资料。"): [("客户", 0), ("B", 1), (" 使用正式产品资料。", 2)], number("本地部署"): [("私有化部署", 0)]})
     merged = Document(results["wordCompose"]["output"])
     assert any(p.text == "实施计划" for p in merged.paragraphs)
     assert len(merged.inline_shapes) == 2
@@ -299,11 +334,15 @@ def check(root, results):
         expected = "EFF7F0" if "补充" in slide.shapes.title.text else "F1F6FA"
         assert str(slide.slide_layout.slide_master.background.fill.fore_color.rgb) == expected
     changed = Presentation(results["pptPatch"]["output"])
-    assert any("客户B" in s.text for s in changed.slides[0].shapes if s.has_text_frame)
+    runs = next(p.runs for s in changed.slides[0].shapes if s.has_text_frame for p in s.text_frame.paragraphs if p.text == "客户B")
+    assert [(r.text, r.font.bold, r.font.italic, r.font.size) for r in runs] == [("客户", True, None, Pt(22)), ("B", None, True, Pt(22))], [(r.text, r.font.bold, r.font.italic, r.font.size) for r in runs]
     with zipfile.ZipFile(results["pptCompose"]["output"]) as before, zipfile.ZipFile(results["pptPatch"]["output"]) as after:
         for name in before.namelist():
             if name != results["pptPatchPart"]:
                 assert before.read(name) == after.read(name), name
+        source = before.read(results["pptPatchPart"])
+        number = cases.number_of("pptx", {"part": source}, "part", "客户A")
+        cases.check_part("pptx", source, after.read(results["pptPatchPart"]), {number: [("客户", 0), ("B", 1)]})
     assert results["preview"]["pages"] == 22
     assert results["preview"]["unrenderedPages"] == list(range(3, 22))
     assert [i["page"] for i in results["preview"]["images"]] == [22, 1, 2]

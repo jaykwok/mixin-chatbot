@@ -16,11 +16,36 @@ description: 基于本群资料修改 Word、选编和修改 PPT，或在产品�
 
 底稿提供结构，当前正式资料提供事实，模板提供样式；三者可来自不同文件，都从本群 `workspace` 检索。旧客户方案中的参数、客户名和承诺必须重新核对。
 
+## 调用方式
+
+下文的六个文档工具只能在 `codemode` 脚本里调用，拿到的就是工具声明里的对象，失败时抛出带原因的错误。`document_extract`、`document_environment`、`read`、`bash`、`send_file` 照常直接调用。
+
+- **互不依赖的读取放进一个脚本**：多份资料的大纲、摘取用 `Promise.all` 一次取回，在脚本里筛出需要的字段再 `return`。工具自己限制同时处理的文档数，不用手动分批。
+- **有先后依赖的步骤逐个 `await`**：patch 用 inspect 返回的 `digest`，render 用上一步返回的 `output`。前一步失败就停下，不要拿失败的结果往下用。
+- **看图和发送在脚本外**：脚本拿不到图片，用 `read` 读 `document_render` 返回的联系表和单页；成品用 `send_file` 发送，脚本里没有发送工具。
+- 内容清单、来源记录等大文件留在 tmp，脚本只返回路径和摘要，需要时再用 `read` 按需读取。
+
+```js
+// 比较两份方案：大纲并行取回，只返回每页标题
+const sources = ["方案/甲方案.pptx", "方案/乙方案.pptx"];
+const outlines = await Promise.all(sources.map((source) => tools.document_inspect({ source, outline: true })));
+return outlines.map((r) => ({ source: r.source, slides: r.outline.slides.map((s) => s.page + " " + s.title) }));
+```
+
+```js
+// 改稿再渲染：part、paragraph 来自读过的清单；patch 用最新摘要，render 用 patch 的输出
+const doc = await tools.document_inspect({ source: "交付/实施方案.docx" });
+const patched = await tools.document_patch({ source: doc.source, digest: doc.digest,
+  edits: [{ part: "word/document.xml", paragraph: 12, before: "客户A", after: "客户B" }] });
+const preview = await tools.document_render({ source: patched.output });
+return { output: patched.output, contacts: preview.contacts, unrenderedPages: preview.unrenderedPages, warnings: patched.warnings };
+```
+
 ## 工作原则
 
 - **先看大纲再选材**。`document_inspect` 加 `outline: true` 返回 PPT 每页标题、文字量、图片与表格数，以及 Word 标题层级和可用样式；用它决定复用哪几页、以哪份文件为模板，不要通读全部段落。
 - **复用优先于重写**。原页、原图、原表能直接用就用 `slides` / `start,end` 选进来；只有资料里没有的内容才用 Markdown 新写。新写内容放在 `content` 项里，工具会按第一份来源的母版和样式排版。打算把某页做成卡片、时间轴、指标、分层、流程、循环或金字塔时，在该页 `##` 标题后写对应注释（`<!-- timeline -->` 等），自动识别只是没写注释时的兜底；带判断和回退的流程图写 ```` ```mermaid ```` 代码块。资料里的架构图、流程图用 `document_images` 提取或按区域截取后在 Markdown 中引用。
-- **只报告实际生成的版式**。`build.layouts` 列出本次新生成的页（`generatedPages`）中真正排成图示的页和类型，`build.attention` 说明退回普通版式的原因。向用户描述某个新页是“时间轴”“数字指标”前先核对 `layouts`；新页没有列出就是普通版式，要么补注释重新生成，要么如实说明。`keepSlides` 保留的模板页不在 `layouts` 里，它们的版式以大纲和渲染图为准。
+- **只报告实际生成的版式**。`build.layouts` 列出本次新生成的页（`generatedPages`）中真正排成图示的页和类型，`build.attention` 说明退回普通版式的原因。向用户描述某个新页是“时间轴”“数字指标”前先核对 `layouts`；新页没有列出就是普通版式，要么补注释重新生成，要么如实说明。`keepSlides` 保留的模板页不在 `layouts` 里，它们的版式以大纲和渲染图为准。含 `content` 项的 PPT `document_compose` 也返回这三项，页码是组装后文件的页码，`slides` 选入的来源页不在其中；Word 不返回。
 - **一次组装成稿**。`document_compose` 的 `items` 可以混合 `{source, slides}`、`{source, start, end}` 和 `{content}`，输出一个文件和完整来源记录。不要先生成补充文件再二次组装。
 - **成品要看图**。生成或修改后调用 `document_render`，用 `read` 读联系表和需要放大的单页，检查溢出、遮挡、断表、占位文字、旧客户名和图片缺失。`build.attention` 列出的页优先检查。渲染失败或不能看图时如实说明未完成视觉检查。
 - **只写自己的临时目录**。所有工具只读资料、在当前用户 tmp 生成新文件；继续改稿以最近一次成品为底稿，操作前重新 `document_inspect` 取新摘要。

@@ -4,7 +4,7 @@ import { tempFixture } from "../helpers/temp.ts";
 
 test.each(["write", "edit"])("%s path keys match the installed Pi resolver in an isolated home", async name => {
   const files = await tempFixture("pi-path-");
-  // Pi 0.87 calls realpath before operations: probe home paths in a child with an isolated home.
+  // Pi's file mutation queue calls realpath before operations: probe home paths in a child with an isolated home.
   const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../helpers/tool-path-harness.ts", import.meta.url)), name], {
     cwd: files.root, env: { ...process.env, HOME: files.root, USERPROFILE: files.root },
     stdout: "pipe", stderr: "pipe", windowsHide: true,

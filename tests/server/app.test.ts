@@ -3,6 +3,7 @@ import { MAX_WEBHOOK_BODY_BYTES, REJECTION_LOG_DETAIL_LIMIT } from "../../src/co
 import { log } from "../../src/core/log.ts";
 import { createApp } from "../../src/server/http-app.ts";
 import { observeCallbackRoute } from "../../src/integrations/callback-route.ts";
+import { bindMessageService, drainUserRequests } from "../../src/server/webhook.ts";
 
 const secret = "a".repeat(64);
 let app: ReturnType<typeof createApp>;
@@ -25,6 +26,20 @@ let warnings: ReturnType<typeof spyOn<typeof log, "warn">>;
 afterEach(() => {
   controller.abort();
   warnings?.mockRestore();
+  bindMessageService(undefined);
+});
+
+test("a control HTTP 200 waits for durable admission, then returns while execution is still pending", async () => {
+  const receipt = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>(); let admitted: (() => void) | undefined, returned = false;
+  bindMessageService({ callbackUrl: (_phone, _group, fallback) => fallback, hasUserRequestCapacity: () => true, admit: async () => ({ status: "accepted" }), async control(_phone, _group, _content, _url, notify) {
+    admitted = notify; receipt.resolve(); await finish.promise; return "";
+  } });
+  const request = Promise.resolve(app.request(`/webhook/${secret}`, { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type: "text", textMsg: { content: "/clear" }, phone: "13800000999", groupId: "control-barrier",
+      callBackUrl: "https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=synthetic" }) })).then(value => { returned = true; return value; });
+  try {
+    await receipt.promise; expect(returned).toBe(false); admitted!(); expect((await request).status).toBe(200);
+  } finally { finish.resolve(); await drainUserRequests(); }
 });
 
 describe("HTTP rejection logging", () => {

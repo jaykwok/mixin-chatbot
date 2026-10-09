@@ -33,6 +33,7 @@ param(
     [switch]$GroupId,
     # backup-clean 的确认码（预演时给出）；不用 -Confirm，那是 PowerShell 的通用参数名。
     [string]$ConfirmCode = "",
+    [string]$ConfirmedTransaction = "",
     [string]$RequestBase64 = ""
 )
 
@@ -49,7 +50,7 @@ if ($RequestBase64) {
 if ($RequestBase64) {
     $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
     foreach ($property in $request.PSObject.Properties) {
-        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId')) {
+        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId', 'ConfirmedTransaction')) {
             throw "无效的运维请求字段"
         }
         Set-Variable -Name $property.Name -Value $property.Value
@@ -387,16 +388,20 @@ function Invoke-TmpAdmin([string[]]$TmpArgs) {
 
 # 清历史必须先把机器人停下来，不能只删文件：内存里已经建立的会话仍握着完整的消息列表，
 # 所以先停止实例，再归档会话，最后恢复调用前的运行或停止状态。
-function Clear-GroupHistory([string]$GroupValue) {
+function Clear-GroupHistory([string]$GroupValue, [string]$Operation = "clear") {
     if (-not $GroupValue) {
         Err "history-clear 需要群号：ops.ps1 history-clear <群号>"
         return $false
     }
-    Step "先停止机器人，确保内存中的会话不会把历史写回去"
+    if ($Operation -eq "compact" -and -not $User) { Err "history-compact 需要 -User <成员号码>"; return $false }
+    Step "先停止机器人：运行中的机器人独占群库"
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
     if (-not (Stop-Bot)) { return $false }
-    $historyArgs = @("clear", $GroupValue)
+    $historyArgs = @($Operation, $GroupValue)
+    if ($Operation -eq "compact") {
+        $historyArgs += $User
+    }
     if ($StorageSegment) { $historyArgs += "--storage-segment" }
     elseif ($GroupId) { $historyArgs += "--group-id" }
     try { $cleared = Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" $historyArgs }
@@ -603,7 +608,7 @@ if (-not $recovering) {
     if ($savedGroupRoot) { $DeployedGroupDataRoot = $savedGroupRoot }
 }
 # 部署脚本自行校验并提供修正。
-if (-not $recovering -and $Command -ne 'deploy') {
+if (-not $recovering -and $Command -notin @('deploy', 'tunnel-update')) {
     $portNumber = 0
     if (-not [int]::TryParse($Port, [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
         throw "BOT_PORT/data/state/bot-port 中的端口无效：$Port"
@@ -993,42 +998,51 @@ function Restart-Bot {
 
 
 # 部署事务由部署脚本自己继续或回滚；只使用事务记录，不重新提问。
-function Invoke-PendingDeployment([string]$Action) {
+function Invoke-PendingDeployment([string]$Action, [string]$Confirmation = '') {
     $deployHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $switch = if ($Action -eq 'rollback') { '-Rollback' } else { '-Resume' }
-    Invoke-WithUtf8Output { & $deployHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Project 'scripts\deploy\deploy.ps1') $switch }
-    return ($LASTEXITCODE -eq 0)
+    $confirmedArgs = @(if ($Confirmation) { '-ConfirmedTransaction'; $Confirmation })
+    # Native output must stay out of the Boolean return value; inspect the exit code in the scope that ran it.
+    return (Invoke-WithUtf8Output {
+        & $deployHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Project 'scripts\deploy\deploy.ps1') $switch @confirmedArgs | Out-Host
+        return ($LASTEXITCODE -eq 0)
+    })
 }
 
 # 继续或回滚未完成的部署/升级；Action 为空时交互选择。
-function Invoke-TransactionCommand([string]$Action) {
-    if (Test-Path -LiteralPath (Join-Path $Project 'data\state\upgrade-transaction')) { return (Invoke-Update $Action) }
+function Invoke-TransactionCommand([string]$Action, [string]$Confirmation = '') {
+    if (Test-Path -LiteralPath (Join-Path $Project 'data\state\upgrade-transaction')) { return (Invoke-Update $Action '' $Confirmation) }
     if (Test-Path -LiteralPath (Join-Path $Project 'data\state\deploy-transaction')) {
         if (-not (IsAdmin)) { Err "$Action 需要管理员 PowerShell"; return $false }
-        return (Invoke-PendingDeployment $Action)
+        return (Invoke-PendingDeployment $Action $Confirmation)
     }
+    if ($Confirmation) { Err '确认后的事务已消失，请刷新预览'; return $false }
     Done '没有未完成的部署或升级'
     return $true
 }
 
 # 获取目标提交并交给目标版本升级器；停机、迁移、回滚由升级器负责。
 # 有未完成的事务时先继续或回滚，使用记录的目标提交，不追随最新 main。
-function Invoke-Update([string]$Action = '') {
+function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [string]$Confirmation = '') {
     $operation = Start-OperationLog $Project 'upgrade'
     $operationExit = 1
     try {
     Set-OperationStage 'upgrade-preflight'
+    if ($ConfirmedTarget -and $ConfirmedTarget -cnotmatch '^[0-9a-f]{40}$') { Err '已确认的升级目标必须是完整提交 SHA；请重新检查版本'; return $false }
     if (-not (IsAdmin)) { Err 'update 需要管理员 PowerShell'; return $false }
     if (-not (Get-GitPath) -or -not (Get-BunPath)) { Err '需要 Git 和 Bun'; return $false }
     $pendingDeploy = Join-Path $Project 'data\state\deploy-transaction'
     $pendingUpgrade = Join-Path $Project 'data\state\upgrade-transaction'
+    if ($ConfirmedTarget -and ((Test-Path -LiteralPath $pendingUpgrade) -or (Test-Path -LiteralPath $pendingDeploy))) {
+        Err '预览后出现未完成的事务，请刷新后继续或回滚'; return $false
+    }
     if (-not (Test-Path -LiteralPath $pendingUpgrade) -and (Test-Path -LiteralPath $pendingDeploy)) {
         if (-not $Action) {
             Warn '发现未完成的部署，需先继续或回滚，再升级。'
             $Action = Read-TransactionAction
             if (-not $Action) { Warn '未处理上次操作，服务保持当前状态。'; return $false }
         }
-        $operationExit = if (Invoke-PendingDeployment $Action) { 0 } else { 1 }
+        $operationExit = if (Invoke-PendingDeployment $Action $Confirmation) { 0 } else { 1 }
         return ($operationExit -eq 0)
     }
     $dirty = Invoke-GitCapture @('status', '--porcelain', '--untracked-files=no')
@@ -1050,9 +1064,14 @@ function Invoke-Update([string]$Action = '') {
             if (-not $Action) { Warn '未处理上次操作，服务保持当前状态。'; return $false }
         }
     } elseif ($Action) {
+        if ($Confirmation) { Err '确认后的事务已消失，请刷新预览'; return $false }
         Done '没有未完成的部署或升级'
         $operationExit = 0
         return $true
+    } elseif ($ConfirmedTarget) {
+        $resolved = Invoke-GitCapture @('rev-parse', '--verify', ($ConfirmedTarget + '^{commit}'))
+        if ($resolved.ExitCode -ne 0 -or $resolved.Text -cne $ConfirmedTarget) { Err '已确认的提交在本地不存在，请重新检查版本'; return $false }
+        $target = $ConfirmedTarget
     } else {
         $fetch = Invoke-GitCapture @('fetch', 'origin', 'main:refs/remotes/origin/main')
         if ($fetch.ExitCode -ne 0) { Err $fetch.Text; return $false }
@@ -1077,6 +1096,7 @@ function Invoke-Update([string]$Action = '') {
         '-BunPath', (Get-BunPath), '-GitPath', (Get-GitPath))
     if ($RestartTunnel) { $arguments += '-RestartTunnel' }
     if ($Action -eq 'rollback') { $arguments += '-Rollback' }
+    if ($Confirmation) { $arguments += @('-ConfirmedTransaction', $Confirmation) }
     Set-OperationStage 'target-upgrader'
     & $shell @arguments | Out-Host
     $operationExit = $LASTEXITCODE
@@ -1334,10 +1354,10 @@ switch ($Command) {
         }
     }
     "status"    { if (-not (Show-Doctor)) { exit 1 } }
-    "update"    { if (-not (Invoke-Update)) { exit 1 } }
-    "upgrade"   { if (-not (Invoke-Update)) { exit 1 } }
-    "resume"    { if (-not (Invoke-TransactionCommand 'continue')) { exit 1 } }
-    "rollback"  { if (-not (Invoke-TransactionCommand 'rollback')) { exit 1 } }
+    "update"    { if (-not (Invoke-Update -ConfirmedTarget $Target)) { exit 1 } }
+    "upgrade"   { if (-not (Invoke-Update -ConfirmedTarget $Target)) { exit 1 } }
+    "resume"    { if (-not (Invoke-TransactionCommand 'continue' $ConfirmedTransaction)) { exit 1 } }
+    "rollback"  { if (-not (Invoke-TransactionCommand 'rollback' $ConfirmedTransaction)) { exit 1 } }
     "repair-tunnel" {
         if (-not (Invoke-TunnelRepair)) { exit 1 }
         Write-Host ""
@@ -1349,6 +1369,10 @@ switch ($Command) {
     }
     "tunnel-protocol" {
         try { Set-CloudflaredProtocol $Project $Target } catch { Err $_.Exception.Message; exit 1 }
+    }
+    "tunnel-update" {
+        . (Join-Path $Project 'scripts\lib\cloudflared-update.ps1')
+        try { Update-ProjectCloudflared $Project (Get-BunPath) } catch { Err $_.Exception.Message; exit 1 }
     }
     "restart"   { if (-not (Restart-Bot)) { exit 1 } }
     "stop"      {
@@ -1435,6 +1459,10 @@ switch ($Command) {
     "history-clear" {
         if (-not (Clear-GroupHistory $Target)) { exit 1 }
     }
+    "history-compact" {
+        if (-not $User) { Err "history-compact 需要 -User <成员号码>"; exit 2 }
+        if (-not (Clear-GroupHistory $Target "compact")) { exit 1 }
+    }
     # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具逐条重新检查。
     "backup-scan" {
         if (-not (Invoke-GroupDataAdmin "scripts\ops\backup-cleanup.ts" @("scan"))) { exit 1 }
@@ -1471,6 +1499,7 @@ switch ($Command) {
         Write-Host "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
         Write-Host "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
         Write-Host "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"
+        Write-Host "  tunnel-update 更新本项目 cloudflared 到官方稳定版；校验后切换，失败恢复旧版本（需宿主机 Bun）"
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
         Write-Host "  relay-purge <关键字>|-All"
         Write-Host "                  删除匹配的外链对象并清掉索引记录"
@@ -1481,9 +1510,10 @@ switch ($Command) {
         Write-Host "                  清理用户临时目录；-Days 只删这些天没改动过的条目"
         Write-Host "  stat [群号] [-Since <日期>] [-Until <日期>]"
         Write-Host "                  使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
-        Write-Host "  history-ls      列出各群的会话历史（成员数、占用、最后活动）"
+        Write-Host "  history-ls      列出各群的会话历史（群库与旧会话文件的占用、最后活动）"
         Write-Host "  history-clear <群号>"
-        Write-Host "                  归档该群会话；自动停机、清理，再恢复原运行或停止状态"
+        Write-Host "  history-compact <群号> -User <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
+        Write-Host "                  清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         Write-Host "                  群选择可加 -GroupId（原始群号）或 -StorageSegment（目录段）"
         Write-Host "  backup-scan     只读扫描 backup\rm 和 backup\snapshots，分类后在 backup\cleanup 生成清单，不删除"
         Write-Host "  backup-clean <报告名> [-ConfirmCode <确认码>]"

@@ -55,7 +55,7 @@ test("运维界面按指针读取事务，数据已提交只看本事务的迁�
     expect(loadPendingTransaction(root)).toBeNull();
     await writeFile(join(state, "deploy-transaction"), "deploy-abc123");
     await writeFile(join(snapshot, "transaction"), serialize(record));
-    expect(loadPendingTransaction(root)).toEqual({ operation: "deploy", snapshot: "deploy-abc123", record, targetSha: record.target_sha, committed: false, codeRestorePending: false });
+    expect(loadPendingTransaction(root)).toMatchObject({ operation: "deploy", snapshot: "deploy-abc123", record, targetSha: record.target_sha, committed: false, codeRestorePending: false });
     // An upgrade whose data was rolled back but whose code restore failed can only finish rolling back.
     await writeFile(join(snapshot, "code-restore"), "");
     expect(loadPendingTransaction(root)?.codeRestorePending).toBe(true);
@@ -93,7 +93,7 @@ test("运维界面按指针读取事务，数据已提交只看本事务的迁�
     await Bun.file(join(state, "deploy-transaction")).delete(); await Bun.file(join(state, "migration.json")).delete();
     await writeFile(join(state, "update-transaction"), ["1", "c".repeat(40), "main", "d".repeat(40), "-", "1", ""].join("\n"));
     await writeFile(join(state, "update-commit"), "");
-    expect(loadPendingTransaction(root)).toEqual({ operation: "upgrade", snapshot: null, record: null, targetSha: "d".repeat(40), committed: false, codeRestorePending: false });
+    expect(loadPendingTransaction(root)).toMatchObject({ operation: "upgrade", snapshot: null, record: null, targetSha: "d".repeat(40), committed: false, codeRestorePending: false });
     await writeFile(join(state, "update-commit"), "committed");
     expect(loadPendingTransaction(root)?.committed).toBe(true);
     // Legacy Windows upgrade keeps its target only in the Clixml snapshot.

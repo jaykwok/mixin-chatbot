@@ -341,7 +341,7 @@ test.skipIf(!available)("停机前复核：备份目录要放得下停机后的�
   const fixture = await tempFixture("candidate-snapshot-");
   try {
     const { results, message } = await scenarios("snapshot", fixture.root);
-    // Configuration, markers, state databases and group statistics (1,180,000 bytes plus directory entries); group
+    // Configuration, markers, state databases, group statistics and Durable databases (1,500,000 bytes plus directory entries); group
     // workspaces and other state files (5 MB each) are not copied.
     expect([results["estimate-at-least"], results["estimate-at-most"], results["estimate-empty"]]).toEqual(["yes", "yes", "0"]);
     const reserve = 1073741824;

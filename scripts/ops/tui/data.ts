@@ -5,7 +5,7 @@ import { matchesInstance } from "../../../src/core/health.ts";
 import { readdir, lstat, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { collectAll, type GroupStats, type Window } from "../stats-admin.ts";
-import { scanHistory, type GroupHistory } from "../../lib/history-scan.ts";
+import { lastActivity, scanHistory, type GroupHistory } from "../../lib/history-scan.ts";
 import { scanTmp, type UserTmp } from "../../lib/tmp-scan.ts";
 import { capture, parseJson, type RunResult } from "./exec.ts";
 import { LOG_FILE, PROJECT_DIR, opsCommand, type Deployment } from "./platform.ts";
@@ -241,6 +241,7 @@ export async function loadRecentStats(root: string, days: number, now = Date.now
 // ===== 会话历史与临时目录 =====
 
 export type { GroupHistory, UserTmp };
+export { lastActivity };
 
 export async function loadHistory(root: string): Promise<GroupHistory[]> {
   return scanHistory(root);

@@ -1,0 +1,12 @@
+diff --git a/dist/WorkspaceWorker.js b/dist/WorkspaceWorker.js
+--- a/dist/WorkspaceWorker.js
++++ b/dist/WorkspaceWorker.js
+@@ -265,7 +265,7 @@
+                 storeConfigFilePath(input.pluginName, { ...input, containingFilePath: inputContainingFilePath });
+             }
+             else if (!isProduction || (isProduction && (input.production || hasProductionInput(input)))) {
+-                inputs.push({ ...input, containingFilePath: inputContainingFilePath });
++                inputs.push({ ...input, production: input.production || !!hasProductionInput(input), containingFilePath: inputContainingFilePath });
+             }
+         }
+         const runPlugin = async (pluginName, patterns, isResolvedConfigFiles = false) => {

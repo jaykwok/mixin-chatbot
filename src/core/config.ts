@@ -22,9 +22,9 @@ function integerEnv(name: keyof typeof RUNTIME_RANGES): number {
 }
 
 /**
- * 群数据总根：agent 的 cwd 是 <GROUP_DATA_ROOT>/<group>/workspace，当前调用用户的
- * 临时目录和会话分别位于 <GROUP_DATA_ROOT>/<group>/users/<phone>/tmp 与
- * <GROUP_DATA_ROOT>/<group>/users/<phone>/session.jsonl。
+ * 群数据总根：agent 的 cwd 是 <GROUP_DATA_ROOT>/<group>/workspace，群内成员的对话在群库
+ * <GROUP_DATA_ROOT>/<group>/durable.sqlite，当前调用用户的临时目录位于
+ * <GROUP_DATA_ROOT>/<group>/users/<phone>/tmp（升级前的旧会话文件 session.jsonl 也在这一层，原地保留）。
  * 默认 data/groups。部署时可经 GROUP_DATA_ROOT 指向其他磁盘；配置、部署状态和 runtime
  * 仍固定在项目 data/ 的分类子目录中，避免运维脚本失去统一入口。
  */
@@ -132,10 +132,6 @@ export const DOCUMENT_TOOLCHAIN_PACKAGES: readonly string[] = documentPackages(r
 ));
 /** 建环境、装包与验证的总时限（ms）；失败由能力工具明确返回。 */
 export const DOCUMENT_TOOLCHAIN_TIMEOUT = 10 * 60_000;
-
-// ===== Session 缓存 =====
-/** 空闲会话从内存释放；历史仍保留在 jsonl，下次自动重开。 */
-export const SESSION_IDLE_TTL = 30 * 60_000;
 
 // ===== 日志 =====
 export const LOG_DIR = "logs";

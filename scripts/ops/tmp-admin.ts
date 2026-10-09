@@ -8,6 +8,8 @@ import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
 import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
 import { assertDataDirectory, type GroupSelection } from "../lib/group-data.ts";
 import { scanTmp, type UserTmp } from "../lib/tmp-scan.ts";
+import { lstat } from "node:fs/promises";
+import { join } from "node:path";
 
 const DAY = 24 * 60 * 60_000;
 
@@ -20,7 +22,7 @@ function usage(): void {
   console.log("");
   console.log("  list/purge 可加 --user <手机号> 和 --group <群号>，限定成员与群。");
   console.log("  --group-id / --storage-segment 明确群参数是原始群号或存储目录段，两者互斥。");
-  console.log("  停机后将选中内容移入 backup/rm；tmp 目录、workspace 和 session.jsonl 保留。");
+  console.log("  停机后将选中内容移入 backup/rm；tmp 目录、workspace 和会话历史保留。");
 }
 
 
@@ -85,7 +87,13 @@ export async function purge(
   let keptBytes = 0;
   let failed = 0;
   for (const user of users) {
+    const durable = await lstat(join(root, user.group, "durable.sqlite")).then(info => info.isFile(), error => {
+      if (error.code === "ENOENT") return false; throw error;
+    });
     for (const entry of user.entries) {
+      // A stopped Durable database may still reference any tmp entry (including outbox attachments).
+      // Offline purge has no current-context/task view: keep it rather than guessing from timestamps.
+      if (durable) { keptEntries++; keptBytes += entry.bytes; continue; }
       // 用整棵子树里最新的修改时间判断新旧，而不是目录自己的 mtime：目录 mtime 只反映
       // 直接子项的增删，一个几分钟前还在往深处写文件的 .cache 看上去可能是几个月前的。
       if (entry.newest > cutoff) {
@@ -113,7 +121,7 @@ export async function purge(
     console.log(`已归档 ${removed} 个条目、${formatSize(freed)} 到 backup/rm（尚未释放磁盘空间）。`);
   }
   if (keptEntries > 0) {
-    console.log(`保留 ${keptEntries} 个条目（${formatSize(keptBytes)}）：它们在 ${days} 天内有改动。`);
+    console.log(`保留 ${keptEntries} 个条目（${formatSize(keptBytes)}）：近期改动，或所属 Durable 群库可能仍有持久引用。`);
   }
   if (failed > 0) {
     console.log(`${failed} 个条目归档失败；检查文件占用及目录权限后重试。`);
@@ -145,7 +153,7 @@ async function main(args: string[]): Promise<number> {
       if (days === 0) {
         console.log("准备将所选范围的全部临时内容移入回收区；运行中的机器人会阻止本操作。");
       }
-      return withMaintenance(() => purge(days, userFilter, GROUP_DATA_ROOT, groupFilter, selection));
+      return withMaintenance(() => purge(days, userFilter, GROUP_DATA_ROOT, groupFilter, selection), GROUP_DATA_ROOT);
     default:
       usage();
       return command ? 1 : 0;

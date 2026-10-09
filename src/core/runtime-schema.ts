@@ -7,6 +7,7 @@ export const RUNTIME_KEYS = [
   "BOT_RUN_TIMEOUT_SECONDS", "BOT_MODEL_IDLE_TIMEOUT_SECONDS", "BOT_MODEL_RESPONSE_TIMEOUT_SECONDS",
   "BOT_SHUTDOWN_TIMEOUT_SECONDS", "BOT_DELIVERY_TIMEOUT_SECONDS",
   "BOT_DOCUMENT_ENV", "BOT_DOCUMENT_WORK_ENABLED", "PI_CACHE_RETENTION", "BOT_ATTACHMENT_CONCURRENCY",
+  "BOT_TASK_IMAGE", "BOT_TASK_CONTROL_ROOT",
 ] as const;
 export type RuntimeKey = typeof RUNTIME_KEYS[number];
 export type RuntimeConfig = Partial<Record<RuntimeKey, string>>;
@@ -28,6 +29,7 @@ export const RUNTIME_DEFAULTS = {
   BOT_RUN_TIMEOUT_SECONDS: "1200", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "180", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "600",
   BOT_SHUTDOWN_TIMEOUT_SECONDS: "20", BOT_DELIVERY_TIMEOUT_SECONDS: "180",
   BOT_DOCUMENT_ENV: "", BOT_DOCUMENT_WORK_ENABLED: "1", PI_CACHE_RETENTION: "short", BOT_ATTACHMENT_CONCURRENCY: "2",
+  BOT_TASK_IMAGE: "", BOT_TASK_CONTROL_ROOT: "",
 } satisfies Partial<Record<RuntimeKey, string>>;
 
 export function validateRuntimeConfig(value: unknown): RuntimeConfig {
@@ -46,6 +48,7 @@ export function validateRuntimeConfig(value: unknown): RuntimeConfig {
     if ((key === "BOT_DEBUG" || key === "BOT_DOCUMENT_WORK_ENABLED") && !["0", "1"].includes(text)) throw new Error(`${key} 只能是 0 或 1`);
     if (key === "PI_CACHE_RETENTION" && !["short", "long"].includes(text)) throw new Error("PI_CACHE_RETENTION 必须是 short 或 long");
     if (key === "BOT_HOST" && text !== "localhost" && !isIP(text)) throw new Error("BOT_HOST 必须是 IP 地址或 localhost");
+    if (key === "BOT_TASK_IMAGE" && !/^sha256:[a-f\d]{64}$/.test(text)) throw new Error("BOT_TASK_IMAGE 必须是完整 sha256 镜像 ID");
   }
   return result;
 }

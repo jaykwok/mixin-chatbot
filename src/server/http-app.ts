@@ -10,7 +10,7 @@ import { observeCallbackRoute } from "../integrations/callback-route.ts";
 import { constantTimeEqual, getClientIp, HttpError, isJsonContentType } from "./http.ts";
 import { RejectionLogger } from "./rejection-log.ts";
 import { randomUUID } from "node:crypto";
-import { enqueueUserRequest, enqueueUserNotice, hasUserRequestCapacity, isDuplicate,
+import { admitUserRequest, enqueueUserControl, enqueueUserNotice, hasUserRequestCapacity, isDuplicate,
   isRateLimited, validateWebhookData } from "./webhook.ts";
 
 export interface AppOptions {
@@ -91,7 +91,7 @@ async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
   return parsed as Record<string, unknown>;
 }
 
-/** webhook 业务处理：解析 + 校验 + 去重 + 限流 + 后台异步。 */
+/** webhook 业务处理：解析 + 校验 + 去重 + 限流 + 写进成员的 inbox 后回执（控制命令后台执行）。 */
 const webhookHandler = async (c: Context) => {
   if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试", "service_stopping");
 
@@ -127,7 +127,7 @@ const webhookHandler = async (c: Context) => {
 
   if (isSlashCommandMessage(content)) {
     if (options.isStopping()) throw new HttpError(503, "服务正在关闭", "service_stopping");
-    const accepted = enqueueUserRequest(content, phone, groupId, callbackUrl, clientIp);
+    const accepted = await enqueueUserControl(content, phone, groupId, callbackUrl, clientIp);
     if (!accepted) rejectionLog.record(c, 503, "request_capacity");
     return c.json({ status: accepted ? "success" : "busy" }, accepted ? 200 : 503);
   }
@@ -159,8 +159,9 @@ const webhookHandler = async (c: Context) => {
   }
   // readJsonBody 等 await 期间可能收到关闭信号；不再接收无法被关机流程追踪的新任务。
   if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试", "service_stopping");
-  // ack 200，后台异步处理；同一会话由 agent 层 FIFO 和控制屏障协调。
-  if (!enqueueUserRequest(content, phone, groupId, callbackUrl, clientIp)) {
+  // 写进成员的 inbox 之后才回执 200：此后重启也会处理它。同一成员的消息由消息服务按到达顺序逐条处理。
+  const admission = admitUserRequest(content, phone, groupId, callbackUrl, clientIp);
+  if (!admission) {
     // 单线程内无 await，正常不会在容量预检后命中；仍按不可重投平台处理。
     enqueueUserNotice(
       "capacity",
@@ -171,6 +172,8 @@ const webhookHandler = async (c: Context) => {
     );
     return c.json({ status: "success" });
   }
+  // 排队已满或写入失败时 admitUserRequest 已给成员发回执；平台不重投，仍回 200。
+  await admission;
   return c.json({ status: "success" });
 };
 

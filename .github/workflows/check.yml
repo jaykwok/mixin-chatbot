@@ -21,7 +21,11 @@ jobs:
         with:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
-      - run: bun run check
+      - run: bun run typecheck
+      - name: Isolated tests and JUnit report
+        run: bun run test --reporter=junit --reporter-outfile="${{ runner.temp }}/mixin-tests.xml"
+      - run: bun run deadcode
+      - run: bun run deadcode --production
       - name: Dependency vulnerability audit
         if: runner.os == 'Linux'
         run: bun audit
@@ -39,6 +43,16 @@ jobs:
       - name: Bash syntax
         if: runner.os == 'Linux'
         run: find scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
+      - name: Preserve failed test diagnostics
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-diagnostics-${{ matrix.os }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/mixin-tests.xml
+            tmp/tests-*.log
+          if-no-files-found: ignore
+          retention-days: 7
   container:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -74,3 +88,22 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/tests:/app/tests:ro" \
             mixin-chatbot-check bun run tests/helpers/document-work-integration.ts /app/.venv --office
+      - name: Test Office previews from deep group directories, side by side and cancelled
+        run: |
+          # LibreOffice profiles live in the /tmp tmpfs, as in production.
+          docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
+            --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/tests:/app/tests:ro" \
+            mixin-chatbot-check bun run tests/helpers/document-office-integration.ts /app/.venv
+      - name: Preserve document preview results
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: document-previews-${{ github.run_attempt }}
+          path: |
+            tmp/document-validation/*/results.json
+            tmp/document-validation/*/**/contact-*.jpg
+            tmp/document-validation/*/**/page-*.png
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 0

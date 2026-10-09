@@ -7,10 +7,31 @@
 //
 // Pi 把 provider 的报错写在 assistant 消息的
 // errorMessage 上，额度耗尽、key 失效、限流都长这样。
+import { isContextOverflow, type AssistantMessage } from "@earendil-works/pi-ai";
 import { redactSecrets } from "../../scripts/lib/redact.ts";
 
 /** 群聊里放不下 provider 动辄几千字的报文，原文只留够定位的一段。 */
 const MAX_DETAIL_CHARS = 300;
+
+const CONTEXT_OVERFLOW_HINT = "这次对话的内容太多，超出了模型能处理的长度。发送 /clear 开启新会话后，再发送你的问题。";
+
+/** 模型请求以错误结束；`reason` 来自产生这条错误的 assistant 原消息，而不是报错文本。 */
+export class ModelRequestError extends Error {
+  constructor(message: string, readonly reason?: "context_overflow") {
+    super(message);
+    this.name = "ModelRequestError";
+  }
+}
+
+/**
+ * 本轮的失败。上下文溢出交给 Pi 的 isContextOverflow 判定：各家报文（例如 Z.AI 国内端点的
+ * `Prompt exceeds max length`）由官方维护，这里不再复制正则；只认带这条错误的原消息，不拿文本拼一条。
+ */
+export function modelRequestError(errorMessage: string, messages: readonly unknown[], contextWindow?: number): ModelRequestError {
+  const source = messages.findLast((message): message is AssistantMessage =>
+    (message as AssistantMessage | undefined)?.role === "assistant" && (message as AssistantMessage).errorMessage === errorMessage);
+  return new ModelRequestError(errorMessage, source && isContextOverflow(source, contextWindow) ? "context_overflow" : undefined);
+}
 
 // pi-ai 的 formatProviderError 会把状态码拼成 `429: <body>` 或 `<provider> (429): <body>`；
 // 各家 SDK 自己的 message 则多是 `HTTP 401` / `403 status code (no body)` 这类写法。
@@ -108,7 +129,7 @@ const FAILURE_RULES: readonly FailureRule[] = [
   {
     pattern:
       /context[_ ]?length|maximum context|context window|too many tokens|prompt is too long|上下文(?:过长|超限)/i,
-    hint: "这次对话的内容太多，超出了模型能处理的长度。发送 /clear 开启新会话后，再发送你的问题。",
+    hint: CONTEXT_OVERFLOW_HINT,
   },
   {
     pattern:
@@ -176,7 +197,8 @@ function formatDetail(raw: string): string {
 /** 群里那条失败回执的正文：一句能照着动手的结论 + 报错原文。 */
 export function describeRequestFailure(error: unknown): string {
   const raw = errorText(error);
-  const hint = classifyFailure(raw, extractHttpStatus(raw));
+  const hint = error instanceof ModelRequestError && error.reason === "context_overflow"
+    ? CONTEXT_OVERFLOW_HINT : classifyFailure(raw, extractHttpStatus(raw));
   const reset = extractResetMoment(raw);
   const detail = formatDetail(raw);
   const lines = ["⚠️ 抱歉，处理您的请求时出错了。", hint];

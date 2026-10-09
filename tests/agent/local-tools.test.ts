@@ -190,6 +190,138 @@ describe("local Pi tool boundaries", () => {
     // Windows/Git Bash; the loop is what makes the output truncate at all.
   }, 20_000);
 
+  /** A bash tool for a fresh caller: workspace and tmp under a new root (removed by the test). */
+  async function structuredBash(prefix: string) {
+    const root = await mkdtemp(join(tmpdir(), prefix));
+    const workspace = join(root, "workspace");
+    const userTemp = join(root, "user-tmp");
+    await Promise.all([mkdir(workspace), mkdir(userTemp)]);
+    const tools = await toolsFor(root, workspace, userTemp);
+    const bash = tools.find((tool) => tool.name === "bash")!;
+    const context = {
+      sessionManager: { getSessionId: () => "session-test", getSessionFile: () => join(root, "session.jsonl") },
+      model: { provider: "provider-test", id: "model-test" },
+      thinkingLevel: "off",
+    } as never;
+    return { root, userTemp, bash, context, tmp: await realpath(userTemp) };
+  }
+  const textOf = (result: { content: { type: string; text?: string }[] }) =>
+    result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+  /** Each phase's time goes to the log, so a slow or failed run shows which phase took it. */
+  async function phase<T>(name: string, run: () => Promise<T>): Promise<T> {
+    const started = performance.now();
+    try {
+      return await run();
+    } finally {
+      console.log(`bash phase ${name}: ${Math.round(performance.now() - started)} ms`);
+    }
+  }
+
+  test("bash structured results keep the relocated full output and exit codes", async () => {
+    const { root, bash, context, tmp } = await structuredBash("mixin-chatbot-bash-structured-");
+    try {
+      type Structured = { output: string; truncated: boolean; full_output_path?: string; exit_code: number };
+      // 33 bytes x 40000 lines: above the 1 MiB limit of structuredContent.output, so both paths are set. The shell's
+      // builtin printf writes them: no process starts besides the shell (Git Bash starts each one slowly on this host).
+      const large = "printf '0123456789abcdef0123456789abcdef\\n%.0s' {1..40000}";
+
+      for (const [command, exitCode] of [[large, 0], [`${large}; exit 3`, 3]] as const) {
+        const result = await phase(`large output, exit ${exitCode}`, () => bash.execute(`bash-large-${exitCode}`, { command }, undefined, undefined, context));
+        const structured = result.structuredContent as Structured;
+        const displayed = (result.details as { fullOutputPath?: string }).fullOutputPath!;
+        expect(result.isError ?? false).toBe(exitCode !== 0);
+        expect(structured).toMatchObject({ truncated: true, exit_code: exitCode });
+        expect(structured.full_output_path).toBe(displayed);
+        expect(isPathInside(displayed, tmp)).toBe(true);
+        expect(textOf(result)).toContain(`Full output: ${displayed}`);
+        expect((await readFile(displayed, "utf8")).length).toBe(33 * 40000);
+      }
+
+      // Non-zero exit is an error result for the model, but scripts still get the structured exit code.
+      const failed = await phase("exit 7", () => bash.execute("bash-exit", { command: "echo partial; exit 7" }, undefined, undefined, context));
+      expect(failed.isError).toBe(true);
+      expect(failed.structuredContent).toMatchObject({ exit_code: 7, truncated: false });
+      expect(failed.structuredContent).not.toHaveProperty("full_output_path");
+      expect(textOf(failed)).toContain("Command exited with code 7");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("bash cancellation and a real timeout throw after the output was produced, with the relocated full output; the shell and its child stop", async () => {
+    const { root, userTemp, bash, context, tmp } = await structuredBash("mixin-chatbot-bash-stop-");
+    try {
+      const relocated = (message: string) => {
+        const path = message.match(/Full output: ([^\]\r\n]+)/)?.[1]?.trim();
+        expect(path, message).toBeString();
+        expect(isPathInside(path!, tmp)).toBe(true);
+        return path!;
+      };
+      // 3000 lines from the shell's builtin printf; a sleeping child; the shell's and the child's pids (Windows pids
+      // under Git Bash, whose own are MSYS pids) in the caller's tmp; then the ready mark, and the shell waits. The
+      // start and ready marks carry the shell's clock.
+      const producer = (tag: string) => [
+        'echo "start $EPOCHREALTIME"',
+        `printf '${tag}-line\\n%.0s' {1..3000}`,
+        "sleep 30 &",
+        'child=$!; [ -r "/proc/$child/winpid" ] && read -r child < "/proc/$child/winpid"',
+        'shell=$$; [ -r "/proc/$$/winpid" ] && read -r shell < "/proc/$$/winpid"',
+        `echo "$shell $child" > "$PI_USER_TMP/${tag}.pids"`,
+        'echo "ready $EPOCHREALTIME"',
+        "wait",
+      ].join("\n");
+      // EPERM: the process exists, this one may not signal it.
+      const alive = (pid: number) => {
+        try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+      };
+      const stopped = async (tag: string) => {
+        const pids = (await readFile(join(userTemp, `${tag}.pids`), "utf8")).trim().split(" ").map(Number);
+        expect(pids.every((pid) => pid > 0)).toBe(true);
+        const deadline = Date.now() + 15_000;
+        while (pids.some(alive) && Date.now() < deadline) await Bun.sleep(50);
+        expect(pids.filter(alive), `${tag}: the shell or its child still runs`).toEqual([]);
+      };
+      /** Run `tag`'s producer until it fails; the marks' times, and when the running output showed the ready mark. */
+      const run = async (tag: string, args: { timeout?: number }, signal?: AbortSignal, onReady?: () => void) => {
+        const started = Date.now();
+        let readySeenMs: number | undefined;
+        const error = await phase(tag, () => bash.execute(`bash-${tag}`, { command: producer(tag), ...args }, signal, (update) => {
+          if (readySeenMs === undefined && textOf(update as never).includes("ready ")) {
+            readySeenMs = Date.now() - started;
+            onReady?.();
+          }
+        }, context).then(() => { throw new Error(`${tag} resolved`); }, (error: Error) => error));
+        const full = error.message.match(/Full output: ([^\]\r\n]+)/)?.[1]?.trim();
+        const text = full === undefined ? error.message : await readFile(full, "utf8").catch(() => error.message);
+        const mark = (name: string) => Number(text.match(new RegExp(`^${name} ([0-9.]+)$`, "m"))?.[1] ?? NaN) * 1000 - started;
+        // When the shell started and finished the output, when the running output showed it, when the call failed.
+        const phases = { startMs: Math.round(mark("start")), readyMs: Math.round(mark("ready")), readySeenMs, failedMs: Date.now() - started };
+        console.log(`bash ${tag} phases: ${JSON.stringify(phases)}`);
+        return { error, phases };
+      };
+
+      // Cancelled once the output is there.
+      const controller = new AbortController();
+      const cancelled = await run("cancel", {}, controller.signal, () => controller.abort());
+      expect(cancelled.error.message, JSON.stringify(cancelled.phases)).toContain("Command aborted");
+      expect((await readFile(relocated(cancelled.error.message), "utf8")).split("cancel-line").length - 1).toBe(3000);
+      await stopped("cancel");
+
+      // A real timeout. The output must have been produced before it fires: a run where it was not fails as such,
+      // with the phases, instead of as a missing path. The timeout counts from the spawn, and on this Windows host the
+      // shell's start mark comes 3-6.5 s after it (the supervisor process and Git Bash start slowly; logged above), so
+      // 10 s left too little once the host was busy (round-2 review); the output itself takes some 30 ms.
+      const timedOut = await run("timeout", { timeout: 20 });
+      expect(timedOut.error.message, JSON.stringify(timedOut.phases)).toContain("Command timed out after 20 seconds");
+      expect(timedOut.phases.readySeenMs, `the output was not produced before the timeout: ${JSON.stringify(timedOut.phases)}`).toBeNumber();
+      expect((await readFile(relocated(timedOut.error.message), "utf8")).split("timeout-line").length - 1).toBe(3000);
+      expect(timedOut.phases.failedMs).toBeGreaterThanOrEqual(20_000);
+      await stopped("timeout");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("bash writes caller tmp without a custom mutation protocol", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-bash-tmp-"));
     const workspace = join(root, "workspace");

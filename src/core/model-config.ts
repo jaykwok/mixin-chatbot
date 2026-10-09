@@ -8,28 +8,13 @@ import {
 } from "@earendil-works/pi-ai";
 import { ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { MODELS_JSON_PATH, MODELS_STORE_PATH, PI_SETTINGS_PATH } from "./storage.ts";
+import { validateEngineSettings } from "./engine-policy.ts";
 
 // Pi 没有从包入口导出这两个类型，用它自己的方法签名取，避免抄一份结构定义出来。
-type PiSettings = Parameters<SettingsManager["applyOverrides"]>[0];
 type PiSettingsStorage = Parameters<typeof SettingsManager.fromStorage>[0];
 
 /** 与 Pi 的缺省值一致。服务端要在建会话前就把级别定下来并写进日志，所以显式取一次。 */
 const FALLBACK_THINKING_LEVEL: ModelThinkingLevel = "medium";
-
-/**
- * 运行策略，不进配置文件：这些值和任务超时、失败回执的行为绑在一起，改一个要连带改
- * 另一个，交给管理员单独调只会调出不一致的组合。
- */
-const AGENT_SETTINGS: PiSettings = {
-  retry: {
-    enabled: true, maxRetries: 1, baseDelayMs: 1000, maxAgentDelayMs: 5000,
-    provider: { timeoutMs: 120000, maxRetries: 1, maxRetryDelayMs: 5000 },
-  },
-  compaction: { enabled: true },
-  enableAnalytics: false,
-  enableInstallTelemetry: false,
-  enableSkillCommands: false,
-};
 
 interface OpenModelRuntimeOptions {
   signal?: AbortSignal;
@@ -84,12 +69,6 @@ function readOnlySettingsStorage(readGlobal: () => string | undefined): PiSettin
   };
 }
 
-/** 每个会话拥有独立的可变 SDK 视图，reload 仍回到实例启动时的只读策略。 */
-export function forkSettings(settings: SettingsManager): SettingsManager {
-  const snapshot = JSON.stringify(settings.getGlobalSettings());
-  return SettingsManager.fromStorage(readOnlySettingsStorage(() => snapshot), { projectTrusted: false });
-}
-
 /**
  * Pi 原生设置管理器，全局作用域读项目私有 agent 目录下的 settings.json。
  *
@@ -105,19 +84,9 @@ export function openSettings(path = PI_SETTINGS_PATH): SettingsManager {
   if (failures.length) {
     throw new Error(`${path}: ${failures.map((failure) => failure.error.message).join("; ")}`);
   }
-  // Pi 先解析原生设置，再固定本进程的全局视图。策略必须进入 storage 的内容：
-  // applyOverrides() 会被 SDK 的 resourceLoader.reload() 清掉，且单例会影响其他会话。
   const configured = settings.getGlobalSettings();
-  if (configured.cacheWarming !== undefined && !["off", "streaming", "idle"].includes(configured.cacheWarming)) {
-    throw new Error(`${path}: cacheWarming 必须是 off、streaming 或 idle`);
-  }
-  const snapshot = JSON.stringify({
-    ...configured,
-    ...AGENT_SETTINGS,
-    compaction: { ...configured.compaction, ...AGENT_SETTINGS.compaction },
-    // Pi 0.86 默认 streaming；服务器必须由管理员显式开启额外的模型请求。
-    cacheWarming: configured.cacheWarming ?? "off",
-  });
+  validateEngineSettings(configured);
+  const snapshot = JSON.stringify(configured);
   return SettingsManager.fromStorage(readOnlySettingsStorage(() => snapshot), { projectTrusted: false });
 }
 
@@ -144,8 +113,6 @@ export async function resolveModelSelection(
   if (!model) {
     throw new Error(`Pi 未提供 ${providerId}/${modelId}，请运行 bun run configure 重新选择`);
   }
-  // Let Pi validate native per-model budgets during startup, before accepting work.
-  settings.getCompactionSettings(model);
   const auth = await runtime.checkAuth(providerId, { signal: options.signal });
   if (!auth) {
     throw new Error(`provider ${providerId} 未配置可用凭证，请运行 bun run configure`);

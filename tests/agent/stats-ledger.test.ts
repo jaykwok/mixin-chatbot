@@ -246,3 +246,109 @@ test("账本版本不认时要求停机备份，禁止删除账本", async () =>
     expect(() => openStatsLedger(fixture.root)).toThrow(/勿删除 stats.sqlite/);
   } finally { await fixture.cleanup(); }
 });
+
+const toolResult = (at: string, toolName: string, extra: Record<string, unknown> = {}) => JSON.stringify({ type: "message", timestamp: at,
+  message: { role: "toolResult", toolCallId: "c-" + at, toolName, content: [{ type: "text", text: "ok" }], isError: false, ...extra } });
+const scripted = (at: string, names: string[]) => JSON.stringify({ type: "message", timestamp: at,
+  message: { role: "assistant", provider: "zai", model: "plan", content: names.map((name, i) => ({ type: "toolCall", id: `t${i}`, name, arguments: {} })),
+    usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } });
+
+test("子调用与工具自身用量：按被调用的工具计数，不完整单独标出，用量只计一次且不归到对话模型", async () => {
+  const fixture = await tempFixture("ledger-nested-");
+  const quarter = { input: 4, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0.25 } };
+  try {
+    const path = await writeSession(fixture.root, "g", "u", [
+      ask("2026-09-18T01:00:00Z"),
+      scripted("2026-09-18T01:00:01Z", ["codemode", "probe"]),
+      // SDK 已把子调用的用量并入发起调用的结果；子调用自己的结果不落盘。
+      toolResult("2026-09-18T01:00:02Z", "codemode", { usage: quarter, nestedCalls: { complete: true, calls: [
+        { id: "t0/1", name: "document_inspect", status: "ok" }, { id: "t0/2", name: "document_extract", status: "ok" },
+        { id: "t0/3", name: "document_extract", status: "error" }] } }),
+      toolResult("2026-09-18T01:00:03Z", "probe", { usage: quarter }),
+      scripted("2026-09-18T01:00:04Z", ["codemode"]),
+      toolResult("2026-09-18T01:00:05Z", "codemode", { nestedCalls: { complete: false, calls: [{ id: "t0/1", name: "document_patch", status: "unfinished" }] } }),
+      // 不带用量的普通结果不产生用量行；缺字段的用量算「用量不完整」。
+      toolResult("2026-09-18T01:00:06Z", "read"),
+      toolResult("2026-09-18T01:00:07Z", "probe", { usage: { input: 1 } }),
+    ]);
+    await ingestUserSession(fixture.root, "g", "u");
+    const db = openStatsLedger(fixture.root);
+    try {
+      expect(db.query("SELECT kind, tool, count FROM tool_counts ORDER BY kind, tool").all()).toEqual([
+        { kind: "call", tool: "codemode", count: 2 }, { kind: "call", tool: "probe", count: 1 },
+        { kind: "nested", tool: "document_extract", count: 2 }, { kind: "nested", tool: "document_inspect", count: 1 },
+        { kind: "nested", tool: "document_patch", count: 1 },
+        { kind: "nested_incomplete", tool: "codemode", count: 1 },
+      ]);
+      expect(db.query(`SELECT kind, provider, model, requests, input, missing_usage AS missing, unknown_cost AS unknown, cost
+        FROM usage_totals ORDER BY kind`).all()).toEqual([
+        { kind: "assistant", provider: "zai", model: "plan", requests: 2, input: 20, missing: 0, unknown: 0, cost: 0.02 },
+        { kind: "tool", provider: "unknown", model: "unknown", requests: 3, input: 9, missing: 1, unknown: 1, cost: 0.5 },
+      ]);
+      // 工具用量不改变后续记录的模型归属。
+      expect(db.query("SELECT provider, model, projection FROM sources").get()).toEqual({ provider: "zai", model: "plan", projection: 2 });
+    } finally { db.close(); }
+
+    // 续读只计新增部分。
+    await appendFile(path, toolResult("2026-09-19T01:00:00Z", "probe", { usage: quarter }) + "\n");
+    await ingestUserSession(fixture.root, "g", "u");
+    await ingestUserSession(fixture.root, "g", "u");
+    const stats = await collectGroup("g", fixture.root);
+    expect(stats.usage.kinds.get("tool")).toMatchObject({ requests: 4, cost: 0.75 });
+    expect(stats.usage.models.get(JSON.stringify(["unknown", "unknown"]))?.cost).toBeCloseTo(0.75, 10);
+    expect(stats.tokens.cost).toBeCloseTo(0.77, 10);
+    expect([...stats.tools]).toEqual([["codemode", 2], ["probe", 1]]);
+    expect([...stats.nested].sort()).toEqual([["document_extract", 2], ["document_inspect", 1], ["document_patch", 1]]);
+    expect(stats.nestedIncomplete).toBe(1);
+    // 新类别不能被当成附件。
+    expect(stats.delivered.size).toBe(0);
+    expect(stats.legacySources).toBe(0);
+  } finally { await fixture.cleanup(); }
+});
+
+test("旧口径世代续读时整份重读、按当前口径替换旧行；原件不在的旧口径世代原样保留并计数", async () => {
+  const fixture = await tempFixture("ledger-projection-");
+  const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.25 } };
+  try {
+    const lines = [ask("2026-09-18T01:00:00Z"), scripted("2026-09-18T01:00:01Z", ["codemode"]),
+      toolResult("2026-09-18T01:00:02Z", "codemode", { usage, nestedCalls: { complete: true, calls: [{ id: "t0/1", name: "read", status: "ok" }] } })];
+    const kept = await writeSession(fixture.root, "g", "u", lines, "gen-kept");
+    const gone = await writeSession(fixture.root, "g", "gone", lines, "gen-gone");
+    await sweepSessionStats(fixture.root, { force: true });
+    const rows = (db: Database, source: string) => ({
+      tools: db.query("SELECT day, kind, tool, count FROM tool_counts WHERE source = ? ORDER BY day, kind, tool").all(source),
+      usage: db.query("SELECT * FROM usage_totals WHERE source = ? ORDER BY day, kind, provider, model").all(source),
+      activity: db.query("SELECT * FROM activity WHERE source = ? ORDER BY day").all(source),
+    });
+    let db = openStatsLedger(fixture.root);
+    const expected = rows(db, "gen-kept");
+    // 迁移时原件无法核对的世代：只有投影 1 的行。
+    for (const source of ["gen-kept", "gen-gone"]) {
+      db.query("DELETE FROM tool_counts WHERE source = ? AND kind IN ('nested', 'nested_incomplete')").run(source);
+      db.query("DELETE FROM usage_totals WHERE source = ? AND kind = 'tool'").run(source);
+      db.query("UPDATE sources SET projection = 1 WHERE id = ?").run(source);
+    }
+    const legacyRows = rows(db, "gen-gone");
+    db.close();
+    await rm(gone);
+    expect((await collectGroup("g", fixture.root)).legacySources).toBe(2);
+
+    await appendFile(kept, toolResult("2026-09-19T01:00:00Z", "probe", { usage }) + "\n");
+    await ingestUserSession(fixture.root, "g", "u");
+    await ingestUserSession(fixture.root, "g", "gone");
+    db = openStatsLedger(fixture.root);
+    try {
+      const after = rows(db, "gen-kept");
+      // 整份重读：子调用行回来了，新增的工具结果只带用量，不增加调用次数。
+      expect(after.tools).toEqual(expected.tools);
+      expect((after.usage as { day: string; kind: string; cost: number }[]).filter((row) => row.kind === "tool")
+        .map((row) => [row.day, row.cost])).toEqual([["2026-09-18", 0.25], ["2026-09-19", 0.25]]);
+      expect(db.query("SELECT id, projection FROM sources ORDER BY id").all()).toEqual([
+        { id: "gen-gone", projection: 1 }, { id: "gen-kept", projection: 2 }]);
+      expect(rows(db, "gen-gone")).toEqual(legacyRows);
+    } finally { db.close(); }
+    const stats = await collectGroup("g", fixture.root);
+    expect(stats.legacySources).toBe(1);
+    expect(stats.nested.get("read")).toBe(1);
+  } finally { await fixture.cleanup(); }
+});

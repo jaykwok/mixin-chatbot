@@ -117,14 +117,19 @@ def paragraph_nodes(paragraph):
         pending.extend(reversed(node))
 
 
+TEXT = ("{" + NS["w"] + "}t", "{" + NS["a"] + "}t")
+TAB = "{" + NS["w"] + "}tab"
+BREAKS = ("{" + NS["w"] + "}br", "{" + NS["w"] + "}cr", "{" + NS["a"] + "}br")
+
+
 def visible_text(paragraph):
     pieces = []
     for node in paragraph_nodes(paragraph):
-        if node.tag in ("{" + NS["w"] + "}t", "{" + NS["a"] + "}t"):
+        if node.tag in TEXT:
             pieces.append(node.text or "")
-        elif node.tag == "{" + NS["w"] + "}tab":
+        elif node.tag == TAB:
             pieces.append("\t")
-        elif node.tag in ("{" + NS["w"] + "}br", "{" + NS["w"] + "}cr", "{" + NS["a"] + "}br"):
+        elif node.tag in BREAKS:
             pieces.append("\n")
     return "".join(pieces)
 
@@ -178,30 +183,110 @@ def inspect(path, outline=False):
     return result
 
 
+# Only these may sit between two text nodes whose characters a replacement merges: run wrappers, run properties (and their
+# contents) and proofing marks. Anything else (link, bookmark, comment range, picture, reference) is a boundary.
+PLAIN = {"{" + NS["w"] + "}" + name for name in ("r", "rPr", "t", "proofErr", "lastRenderedPageBreak")} | {"{" + NS["a"] + "}" + name for name in ("r", "rPr", "t")}
+RUN_PROPERTIES = ("{" + NS["w"] + "}rPr", "{" + NS["a"] + "}rPr")
+# PowerPoint keeps spelling and edit state on a:rPr; it does not change how the text looks.
+EDITOR_STATE = {"dirty", "err", "smtClean", "smtId"}
+
+
+def character_owners(paragraph):
+    """The paragraph's nodes in document order and, per character of visible_text, the (node index, offset) holding it;
+    None for tabs and breaks."""
+    nodes, owners = list(paragraph_nodes(paragraph)), []
+    for index, node in enumerate(nodes):
+        if node.tag in TEXT:
+            owners.extend((index, offset) for offset in range(len(node.text or "")))
+        elif node.tag == TAB or node.tag in BREAKS:
+            owners.append(None)
+    return nodes, owners
+
+
+def signature(node):
+    return (node.tag, tuple(sorted((k, v) for k, v in node.attrib.items() if k not in EDITOR_STATE)),
+            tuple(signature(child) for child in node if isinstance(child.tag, str)))
+
+
+def uniform(nodes, positions):
+    """Whether the characters at these positions look alike and share one container (paragraph, link, field...), with only
+    runs and proofing marks between them, so any of them can take new text without changing how the rest reads."""
+    indexes = sorted({index for index, _ in positions})
+    looks = []
+    for index in indexes:
+        run = nodes[index].getparent()
+        properties = next((child for child in run if child.tag in RUN_PROPERTIES), None)
+        looks.append((run.getparent(), ((), ()) if properties is None else signature(properties)[1:]))
+    if any(container is not looks[0][0] or form != looks[0][1] for container, form in looks):
+        return False
+    return all(not isinstance(node.tag, str) or node.tag in PLAIN or any(parent.tag in RUN_PROPERTIES for parent in node.iterancestors())
+               for node in nodes[indexes[0] + 1:indexes[-1]])
+
+
+def common_prefix(first, second):
+    size = 0
+    while size < min(len(first), len(second)) and first[size] == second[size]:
+        size += 1
+    return size
+
+
 def replace_text(paragraph, before, after):
+    """Replaces the single occurrence of before. Only the characters that differ change; the others keep their runs, so their
+    formatting, links and structure stay. Fails rather than guessing the formatting of new text. Returns whether the XML changed."""
     if not before or any(c in before + after for c in "\r\n\t"):
         raise ValueError("替换要求非空原文字，且不跨换行或制表符；结构修改请使用专门脚本")
     if paragraph.xpath(".//w:fldChar | .//w:fldSimple | .//w:instrText | .//w:ins | .//w:del | .//a:fld | ancestor::w:ins | ancestor::w:del | ancestor::w:fldSimple", namespaces=NS):
         raise ValueError("该段含域或修订记录，需专门处理")
     text = visible_text(paragraph)
-    if text.count(before) != 1:
+    start = text.find(before)
+    if start < 0 or text.find(before, start + 1) >= 0:
         raise ValueError("原文字必须在目标段落中恰好出现一次；请重新检查文件并精确定位")
-    start, end = text.index(before), text.index(before) + len(before)
-    position, inserted = 0, False
-    for node in paragraph_nodes(paragraph):
-        if node.tag in ("{" + NS["w"] + "}t", "{" + NS["a"] + "}t"):
-            value = node.text or ""
-            stop = position + len(value)
-            if position < end and stop > start:
-                left, right = max(0, start - position), min(len(value), end - position)
-                node.text = value[:left] + (after if not inserted else "") + value[right:]
-                node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-                inserted = True
-            position = stop
-        elif node.tag in ("{" + NS["w"] + "}tab", "{" + NS["w"] + "}br", "{" + NS["w"] + "}cr", "{" + NS["a"] + "}br"):
-            position += 1
-    if not inserted:
-        raise ValueError("未找到可修改文字")
+    if before == after:
+        return False
+    # Shrink the anchored match to the part that differs; the shortened text is never searched for again. Next to repeated
+    # characters an insertion or deletion can sit at several places (aab -> ab); all of them must then look the same.
+    head = common_prefix(before, after)
+    tail = common_prefix(before[head:][::-1], after[head:][::-1])
+    late_tail = common_prefix(before[::-1], after[::-1])
+    early_head = common_prefix(before[:len(before) - late_tail], after[:len(after) - late_tail])
+    nodes, owners = character_owners(paragraph)
+    if early_head < head and not uniform(nodes, owners[start + early_head:start + len(before) - tail]):
+        raise ValueError("修改位置不唯一（与相邻的相同文字重叠），且这些文字的格式或所属结构不同；请调整 before/after 的范围，使修改位置只有一种可能")
+    old, new = owners[start + head:start + len(before) - tail], after[head:len(after) - tail]
+    slots = {}
+
+    def characters(index):
+        return slots.setdefault(index, list(nodes[index].text or ""))
+
+    if len(old) == len(new):
+        # Same length: each new character takes the place, and the run, of the one it replaces.
+        for (index, offset), character in zip(old, new):
+            characters(index)[offset] = character
+    elif not new:
+        for index, offset in old:
+            characters(index)[offset] = ""
+    elif not old:
+        # Insertion: joins the neighbouring characters inside the match, which must agree.
+        left = owners[start + head - 1] if head else None
+        right = owners[start + head] if tail else None
+        if left and right and not uniform(nodes, [left, right]):
+            raise ValueError("插入位置两侧文字的格式或所属结构不同，无法确定新文字的格式；请缩小 before，只保留插入点一侧、要沿用其格式的文字")
+        if left:
+            characters(left[0])[left[1]] += new
+        else:
+            characters(right[0])[right[1]] = new + characters(right[0])[right[1]]
+    else:
+        if not uniform(nodes, old):
+            raise ValueError("要修改的文字跨越格式或所属结构（链接、书签、图片等）不同的片段，且新旧长度不同，无法确定新文字的格式；请按格式片段拆成多项编辑，每项只改同一格式内的文字")
+        for index, offset in old:
+            characters(index)[offset] = ""
+        characters(old[0][0])[old[0][1]] = new
+    for index, pieces in slots.items():
+        node = nodes[index]
+        node.text = "".join(pieces)
+        if node.tag == TEXT[0] and node.text != node.text.strip():
+            node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    return True
 
 
 def patch(request):
@@ -210,23 +295,29 @@ def patch(request):
         raise ValueError("原文件已变化，请重新 document_inspect")
     kind = Path(source).suffix.lower().lstrip(".")
     data, _ = package(source)
-    changed = {}
-    for edit in request["edits"]:
+    roots, changed, unchanged = {}, [], []
+    for number, edit in enumerate(request["edits"], 1):
         part = edit["part"]
         if not editable_part(part, kind) or part not in data:
             raise ValueError("不支持该编辑部件")
-        root = changed.setdefault(part, xml(data[part]))
-        items = paragraphs(root, kind)
-        number = edit["paragraph"]
-        if not isinstance(number, int) or not 1 <= number <= len(items):
+        if part not in roots:
+            roots[part] = xml(data[part])
+        items = paragraphs(roots[part], kind)
+        if not isinstance(edit["paragraph"], int) or not 1 <= edit["paragraph"] <= len(items):
             raise ValueError("段落位置不存在")
-        replace_text(items[number - 1], edit["before"], edit["after"])
+        if not replace_text(items[edit["paragraph"] - 1], edit["before"], edit["after"]):
+            unchanged.append(number)
+        elif part not in changed:
+            changed.append(part)
+    # Edits are applied in memory first: a failing edit leaves no output file. Parts without a real change keep their bytes.
     with zipfile.ZipFile(source) as original, zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED) as target:
         for item in original.infolist():
-            payload = etree.tostring(changed[item.filename], encoding="UTF-8", xml_declaration=True, standalone=True) if item.filename in changed else original.read(item)
+            payload = etree.tostring(roots[item.filename], encoding="UTF-8", xml_declaration=True, standalone=True) if item.filename in changed else original.read(item)
             target.writestr(item, payload)
     result = inspect(output)
-    result["changedParts"] = list(changed)
+    if unchanged:
+        result["warnings"].append("第 " + "、".join(map(str, unchanged)) + " 项编辑的 before 与 after 相同，没有修改")
+    result["changedParts"] = changed
     return result
 
 
@@ -307,13 +398,14 @@ def office_binary():
     return next((p for p in candidates if p and Path(p).is_file()), None)
 
 
-def convert_office(source, folder):
+def convert_office(source, folder, profile):
+    """Converts in `folder` (TEMP, HOME and output). `profile` is an empty directory the caller made for LibreOffice's
+    user profile, kept out of the job directory because a deep profile directory made LibreOffice write no PDF on Windows."""
     package(source)
     binary = office_binary()
     if not binary:
         raise ValueError("缺少 LibreOffice，无法渲染 Office 预览；安装后将 soffice 加入 PATH，Windows 也支持标准安装目录。文件编辑能力仍可用，不能声称已完成视觉检查。")
-    profile = folder / "office-profile"
-    (profile / "user").mkdir(parents=True)
+    (profile / "user").mkdir()
     # Dedicated profile isolates concurrent conversions and disables macro execution.
     (profile / "user/registrymodifications.xcu").write_text(
         '<?xml version="1.0" encoding="UTF-8"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
@@ -345,7 +437,7 @@ def render(request):
     from PIL import Image, ImageDraw
     source = Path(request["source"])
     folder = Path(request["directory"])
-    pdf = source if source.suffix.lower() == ".pdf" else convert_office(source, Path(request.get("workdir", folder)))
+    pdf = source if source.suffix.lower() == ".pdf" else convert_office(source, Path(request.get("workdir", folder)), Path(request["office"]))
     images, contacts = [], []
     with closing(pdfium.PdfDocument(str(pdf))) as document:
         total = len(document)
@@ -412,7 +504,7 @@ def images(request):
     if len(crops) > 20:
         raise ValueError("单次最多截取 20 个区域")
     results, warnings, unsupported = [], [], []
-    skipped = {"small": 0, "repeated": 0, "unsupported": 0}
+    skipped = {"small": 0, "repeated": 0, "unsupported": 0, "limit": 0}
     seen = {}
 
     def clamp(value):
@@ -434,6 +526,7 @@ def images(request):
             skipped["repeated"] += 1
             return
         if len(results) >= 60:
+            skipped["limit"] += 1
             picture.close()
             return
         if max(picture.size) > MAX_IMAGE_EDGE:
@@ -541,7 +634,7 @@ def images(request):
     crop_results = []
     if crops:
         import pypdfium2 as pdfium
-        pdf = source if kind == ".pdf" else convert_office(source, Path(request.get("workdir", request["directory"])))
+        pdf = source if kind == ".pdf" else convert_office(source, Path(request.get("workdir", request["directory"])), Path(request["office"]))
         with closing(pdfium.PdfDocument(str(pdf))) as document:
             for index, crop in enumerate(crops, 1):
                 number, box = crop.get("page"), crop.get("box")
@@ -561,6 +654,8 @@ def images(request):
                         picture.close()
     if unsupported:
         warnings.append("跳过了 %d 张矢量或不支持格式的图片（EMF/WMF/SVG 等），可用 crops 从渲染页面截取" % len(unsupported))
+    if skipped["limit"]:
+        warnings.append("超过单次 60 张上限，另有 %d 张未提取；用 pages 分批提取" % skipped["limit"])
     results.sort(key=lambda item: (item["page"], -(item["width"] * item["height"])))
     return {"pages": total, "selectedPages": selected, "images": results, "crops": crop_results, "skipped": skipped,
             "unsupported": unsupported[:40], "warnings": warnings, "directory": str(folder)}

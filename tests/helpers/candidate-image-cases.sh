@@ -648,7 +648,7 @@ snapshot_cases() {
     local groups="$fixture/groups" size
     mkdir -p "$PROJECT_DIR/data/config" "$PROJECT_DIR/data/state" "$PROJECT_DIR/data/runtime/pi" "$groups/g1"
     sized() { head -c "$2" /dev/zero > "$1"; }
-    # Counted: configuration, markers, the state databases and the group statistics.
+    # Counted: configuration, markers, the state databases, the group statistics and the groups' Durable databases.
     sized "$PROJECT_DIR/data/config/models.json" 100000
     sized "$PROJECT_DIR/data/runtime/pi/settings.json" 20000
     sized "$PROJECT_DIR/data/state/data-version.json" 3000
@@ -656,12 +656,14 @@ snapshot_cases() {
     sized "$PROJECT_DIR/data/state/bot.sqlite-wal" 50000
     sized "$groups/stats.sqlite" 600000
     sized "$groups/data-version.json" 7000
+    sized "$groups/g1/durable.sqlite" 300000
+    sized "$groups/g1/durable.sqlite-wal" 20000
     # Not in the snapshot: group workspaces and other state.
     sized "$groups/g1/big" 5000000
     sized "$PROJECT_DIR/data/state/other.log" 5000000
     size="$(snapshot_size_estimate "$groups")"
-    result estimate-at-least "$([ "$size" -ge 1180000 ] && echo yes || echo "no:$size")"
-    result estimate-at-most "$([ "$size" -lt 1400000 ] && echo yes || echo "no:$size")"
+    result estimate-at-least "$([ "$size" -ge 1500000 ] && echo yes || echo "no:$size")"
+    result estimate-at-most "$([ "$size" -lt 1700000 ] && echo yes || echo "no:$size")"
     result estimate-empty "$(PROJECT_DIR="$fixture/none"; snapshot_size_estimate "$fixture/empty-groups")"
     check_free_space() { printf '%s\n' "$*" | sed "s#$fixture#<f>#g" > "$fixture/free-args"; }
     snapshot_size_estimate() { echo 5000; }

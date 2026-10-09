@@ -4,7 +4,6 @@ import {
   groupSegment,
   groupWorkspaceDir,
   isPathInside,
-  sessionFilePath,
   userSegment,
   userTempDir,
 } from "../../src/agent/paths.ts";
@@ -24,7 +23,7 @@ describe("group-first agent paths", () => {
     expect(userSegment("NUL")).toMatch(/^sha256-user-[0-9a-f]{64}$/);
   });
 
-  test("puts shared work at group level and scratch/history under the user", () => {
+  test("puts shared work at group level and scratch under the user", () => {
     const root = join("data", "groups");
     const groupId = "group-a";
     const phone = "+8613800000000";
@@ -33,14 +32,8 @@ describe("group-first agent paths", () => {
     expect(userTempDir(root, groupId, phone)).toBe(
       join(root, groupId, "users", phone, "tmp")
     );
-    expect(sessionFilePath(root, groupId, phone)).toBe(
-      join(root, groupId, "users", phone, "session.jsonl")
-    );
     expect(userTempDir(root, groupId, "+8613900000000")).not.toBe(
       userTempDir(root, groupId, phone)
-    );
-    expect(sessionFilePath(root, groupId, "+8613900000000")).not.toBe(
-      sessionFilePath(root, groupId, phone)
     );
   });
 

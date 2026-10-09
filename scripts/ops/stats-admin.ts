@@ -2,7 +2,7 @@ import { byName, resolveGroupName, type GroupSelection } from "../lib/group-data
 import { cliArgs, groupOptions, groupSelection } from "../lib/cli.ts";
 import { emptyUsageBreakdown, formatCacheRate, mergeUsage, type UsageBreakdown, type UsageTotals } from "../lib/usage.ts";
 // 统计只读使用统计账本（<群数据根>/stats.sqlite），不再现算 session.jsonl：
-// 会话历史会被 /clear 与 history clear 归档，归档前机器人已把那段入账，数字照样在。
+// /clear 与 history clear 清空的上下文早已入账（回复前、清空时和维护时按条目入账），数字照样在。
 // 入账口径见 src/agent/stats-ledger.ts：指令不算提问、附件只认有 fileId 的成功结果。
 import { dayKey, dayWindow, openExistingStatsLedger, readLedger, type DayWindow, type LedgerRows } from "../../src/agent/stats-ledger.ts";
 import { groupSegment } from "../../src/agent/paths.ts";
@@ -23,7 +23,14 @@ export interface GroupStats {
   users: UserStats[];
   asks: number;
   replies: number;
+  /** 模型发出的工具调用；一个 codemode 脚本算一次。 */
   tools: Map<string, number>;
+  /** 工具运行中（如 codemode 脚本里）发起的子调用，按被调用的工具名。 */
+  nested: Map<string, number>;
+  /** 子调用记录不完整的工具结果数；超过 256 条的子调用不再记录，`nested` 可能偏少。 */
+  nestedIncomplete: number;
+  /** 区间内按旧口径原样保留的会话世代数：升级前入账，没有单列子调用和工具自身用量。 */
+  legacySources: number;
   delivered: Map<string, number>;
   tokens: UsageTotals;
   usage: UsageBreakdown;
@@ -84,6 +91,9 @@ function emptyGroup(group: string): GroupStats {
     asks: 0,
     replies: 0,
     tools: new Map(),
+    nested: new Map(),
+    nestedIncomplete: 0,
+    legacySources: 0,
     delivered: new Map(),
     tokens: usage.total,
     usage,
@@ -106,6 +116,7 @@ function emptyGroup(group: string): GroupStats {
 function foldGroup(group: string, rows: LedgerRows): GroupStats {
   const stats = emptyGroup(group);
   stats.skipped = rows.skipped.get(group) ?? 0;
+  stats.legacySources = rows.legacy.get(group) ?? 0;
   const users = new Map<string, UserStats>();
   const entryOf = (user: string): UserStats => {
     const existing = users.get(user);
@@ -143,10 +154,14 @@ function foldGroup(group: string, rows: LedgerRows): GroupStats {
     }
   }
   for (const row of rows.tools) {
-    if (row.kind === "call") {
-      stats.tools.set(row.tool, (stats.tools.get(row.tool) ?? 0) + row.count);
+    if (row.kind === "call" || row.kind === "nested") {
+      const target = row.kind === "call" ? stats.tools : stats.nested;
+      target.set(row.tool, (target.get(row.tool) ?? 0) + row.count);
       continue;
     }
+    if (row.kind === "nested_incomplete") { stats.nestedIncomplete += row.count; continue; }
+    // 只认已知的类别：以后新增的类别不能被当成附件算进来。
+    if (row.kind !== "delivered") continue;
     stats.delivered.set(row.tool, (stats.delivered.get(row.tool) ?? 0) + row.count);
     const daily = dailyOf(row.day);
     if (row.tool === "send_file") {
@@ -182,13 +197,14 @@ function rowsOf(rows: LedgerRows, group: string): LedgerRows {
     usage: rows.usage.filter(row => row.group === group),
     skipped: rows.skipped,
     groups: [group],
+    legacy: rows.legacy,
   };
 }
 
 /** 服务还没建账本时按空账处理。 */
 function readRows(root: string, window: DayWindow = {}, group?: string): LedgerRows {
   const db = openExistingStatsLedger(root);
-  if (!db) return { activity: [], tools: [], usage: [], skipped: new Map(), groups: [] };
+  if (!db) return { activity: [], tools: [], usage: [], skipped: new Map(), groups: [], legacy: new Map() };
   try { return readLedger(db, window, group); } finally { db.close(); }
 }
 
@@ -271,6 +287,19 @@ function printGroup(stats: GroupStats, window: Window): void {
     .map(([name, count]) => `${name} ${count}`)
     .join("、");
   console.log(`  工具调用    ${toolTotal} 次` + (topTools ? `（${topTools}）` : ""));
+  if (stats.nested.size > 0 || stats.nestedIncomplete > 0) {
+    const nestedTotal = [...stats.nested.values()].reduce((sum, n) => sum + n, 0);
+    const topNested = [...stats.nested]
+      .sort((a, b) => b[1] - a[1] || byName(a[0], b[0]))
+      .slice(0, 5)
+      .map(([name, count]) => `${name} ${count}`)
+      .join("、");
+    console.log(`  脚本子调用  ${nestedTotal} 次` + (topNested ? `（${topNested}）` : "") +
+      (stats.nestedIncomplete > 0 ? `；${stats.nestedIncomplete} 次调用的子调用记录不完整，计数可能偏少` : ""));
+  }
+  if (stats.legacySources > 0) {
+    console.log(`  旧口径账目  ${stats.legacySources} 个会话（升级前入账、原件无法核对，未单列脚本子调用和工具自身用量）`);
+  }
   console.log(
     `  模型用量    输入 ${formatCount(stats.tokens.input)}、输出 ${formatCount(stats.tokens.output)}、` +
       `缓存命中 ${formatCount(stats.tokens.cacheRead)} token`

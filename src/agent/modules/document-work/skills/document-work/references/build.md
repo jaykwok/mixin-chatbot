@@ -30,7 +30,7 @@
 - `styleFrom`：模板页较杂时，指定几页内容页作为标题样式与内容区域的推断依据。
 - `title` / `subtitle` / `cover`：有 `title` 时默认生成封面页。产品方案类 PPT 的封面元素通常画在第 1 页上而非版式里，此时生成的封面会是白页；应改用 `keepSlides: [1]`、`cover: false`，再用 `document_patch` 改封面上的客户名或标题。大纲中首页 `chars` 很少且版式名含“标题幻灯片”，一般表示版式自带封面设计，可直接 `cover: true`。
 
-结果中的 `build.layouts` 列出本次新生成页中实际排成图示的页（`mode` 为 cards / timeline / flow / layers / pyramid / cycle / stats / flowchart 和分段数），`build.attention` 列出自动缩小字号、自动续页、排成图示或图示退回普通版式的页码和原因，这些页需要重点看图。描述新页时只以 `layouts` 为准；`keepSlides` 保留的模板页不在其中。每页正文超过约 8 行时就应拆成两个 `##` 节，而不是依赖自动续页。
+结果中的 `build.layouts` 列出本次新生成页中实际排成图示的页（`mode` 为 cards / timeline / flow / layers / pyramid / cycle / stats / flowchart 和分段数），`build.attention` 列出自动缩小字号、自动续页、排成图示或图示退回普通版式的页码和原因，这些页需要重点看图。描述新页时只以 `layouts` 为准；`keepSlides` 保留的模板页不在其中。PPT 的 `document_compose` 有 `content` 项时同样返回 `build.generatedPages`、`layouts`、`attention`，页码是组装后文件的页码，复用的来源页不在其中。每页正文超过约 8 行时就应拆成两个 `##` 节，而不是依赖自动续页。
 
 ## PPT 版面：卡片、流程、架构等图示
 
@@ -56,7 +56,7 @@
 
 ## 从资料中取图
 
-`document_images` 从本群 PDF、PPT、Word 中把内嵌位图提取到 tmp，返回每张图的页码、像素尺寸和在页面中的位置比例（`box`，左上角为原点），重复出现的背景和 logo 只保留一次并标出 `pages`，整页大图标为 `fullPage`。返回的 `path` 可直接写进 Markdown 的 `![说明](path)`。
+`document_images` 从本群 PDF、PPT、Word 中把内嵌位图提取到 tmp，返回每张图的页码、像素尺寸和在页面中的位置比例（`box`，左上角为原点），重复出现的背景和 logo 只保留一次并标出 `pages`，整页大图标为 `fullPage`。返回的 `path` 可直接写进 Markdown 的 `![说明](path)`。单次最多返回 60 张；超出时 `truncated` 为 true，`warnings` 说明还有几张未提取，用 `pages` 分批再取。
 
 架构图常由多个形状或矢量图组成，无法作为单张图提取；先 `document_render` 看页面，再用 `crops: [{ page, box: [x0, y0, x1, y1] }]` 按比例截取该区域（PDF 直接可用，PPT/Word 需要 LibreOffice）。截图是位图，放大有限，宜用 `width=` 控制在页面一半以内。产品资料中的示意图属于正式资料，引用时保持原意，不要拼接改动。
 

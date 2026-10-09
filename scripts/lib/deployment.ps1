@@ -148,11 +148,21 @@ function Format-DeploymentTransaction($Record) {
 }
 
 # Reopen an interrupted deployment with its original snapshot, lock and recorded choices.
-function Open-DeploymentTransaction([string]$ProjectRoot) {
+function Assert-ConfirmedTransaction([string]$ProjectRoot, [string]$Action, [string]$Confirmation) {
+    if (-not $Confirmation) { return }
+    $checker = Join-Path $ProjectRoot 'scripts\lib\confirmed-transaction.ts'
+    $checkerBun = @(Get-ApplicationPaths 'bun.exe' | Select-Object -First 1)[0]
+    if (-not $checkerBun -or -not (Test-Path -LiteralPath $checker -PathType Leaf)) { throw '无法核对已确认事务，请刷新预览' }
+    & $checkerBun $checker $ProjectRoot $Action $Confirmation
+    if ($LASTEXITCODE -ne 0) { throw '确认后事务或记录已变化，本次动作未执行；请刷新预览' }
+}
+
+function Open-DeploymentTransaction([string]$ProjectRoot, [string]$Confirmation = '', [string]$Action = '') {
     try {
         $deploymentLock = [IO.File]::Open((Join-Path $ProjectRoot 'data\state\deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     } catch [IO.IOException] { throw '另一个部署或升级正在进行' }
     try {
+        Assert-ConfirmedTransaction $ProjectRoot $Action $Confirmation
         $name = "$(Get-Content -LiteralPath (Join-Path $ProjectRoot 'data\state\deploy-transaction') -Raw)".Trim()
         if ($name -notmatch '^deploy-[0-9a-f]{32}$') { throw '部署事务快照名称无效' }
         $path = Join-Path $ProjectRoot ('backup\snapshots\' + $name)
@@ -177,14 +187,15 @@ function Publish-DeploymentTransaction($Snapshot, [hashtable]$Record, [string]$P
 }
 
 # An interrupted upgrade reuses its original snapshot and original running state.
-function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha, [hashtable]$Record = $null, [string]$MigrationPlan = '') {
+function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha, [hashtable]$Record = $null, [string]$MigrationPlan = '', [string]$Confirmation = '', [string]$Action = '') {
     $pointer = Join-Path $ProjectRoot 'data\state\upgrade-transaction'
     if (Test-Path -LiteralPath $pointer) {
-        $name = "$(Get-Content -LiteralPath $pointer -Raw)".Trim()
-        if ($name -notmatch '^deploy-[0-9a-f]{32}$') { throw '升级事务快照名称无效' }
-        $path = Join-Path $ProjectRoot ('backup\snapshots\' + $name)
         $deploymentLock = [IO.File]::Open((Join-Path $ProjectRoot 'data\state\deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         try {
+            Assert-ConfirmedTransaction $ProjectRoot $Action $Confirmation
+            $name = "$(Get-Content -LiteralPath $pointer -Raw)".Trim()
+            if ($name -notmatch '^deploy-[0-9a-f]{32}$') { throw '升级事务快照名称无效' }
+            $path = Join-Path $ProjectRoot ('backup\snapshots\' + $name)
             $state = Import-Clixml -LiteralPath (Join-Path $path 'deployment.xml')
             if ($state.Project -ne $ProjectRoot -or $state.Path -ne $path -or $state.UpgradeTarget -ne $TargetSha) { throw '中断升级必须使用原项目与原目标提交继续' }
             $state | Add-Member -NotePropertyName Lock -NotePropertyValue $deploymentLock
@@ -193,6 +204,7 @@ function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$
             return $state
         } catch { $deploymentLock.Dispose(); throw }
     }
+    if ($Confirmation) { throw '确认后的升级事务已消失，请刷新预览' }
     $state = New-DeploymentSnapshot $ProjectRoot $TaskName
     try {
         $state | Add-Member -NotePropertyName UpgradeOriginal -NotePropertyValue $OriginalSha
@@ -330,6 +342,16 @@ function Get-SwitchConflicts([string]$GitPath, [string]$ProjectRoot, [string]$He
 # 到目标、经 main 的两步切换不会覆盖或删除未跟踪的内容。返回冲突列表。当前提交和 main 都已是目标时（同版本升级、切换
 # 之后的续做）没有切换步骤，仍检查已跟踪文件：同一提交的 checkout 和快进会保留这些改动，运行的就不是目标版本。
 # 只读取：状态检查不刷新索引（--no-optional-locks），试运行用索引副本。
+function Get-UpgradeCheckoutIdentity([string]$GitPath, [string]$ProjectRoot) {
+    $head = "$(& $GitPath --no-optional-locks -C $ProjectRoot rev-parse --verify 'HEAD^{commit}')".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $head) { throw '无法读取当前提交；服务尚未停止' }
+    $branch = "$(& $GitPath --no-optional-locks -C $ProjectRoot rev-parse --abbrev-ref HEAD)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $branch) { throw '无法读取当前分支；服务尚未停止' }
+    $main = "$(& $GitPath --no-optional-locks -C $ProjectRoot rev-parse --verify 'refs/heads/main^{commit}')".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $main) { throw '无法读取本地 main；服务尚未停止' }
+    return [pscustomobject]@{ Head = $head; Branch = $branch; Main = $main; Key = "$head`n$branch`n$main" }
+}
+
 function Get-UpgradeSwitchConflicts([string]$GitPath, [string]$ProjectRoot, [string]$TargetSha) {
     $previous = $ErrorActionPreference
     try {

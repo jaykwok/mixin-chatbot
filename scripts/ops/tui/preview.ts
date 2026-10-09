@@ -79,6 +79,7 @@ function group(name: string, asks: number, members: number, files: number): Grou
   return {
     group: name, users, asks, replies: asks + 756,
     tools: new Map([["send_file", 186], ["web_search", 92], ["send_image", 34], ["read_file", 17]]),
+    nested: new Map([["document_inspect", 41], ["document_extract", 27]]), nestedIncomplete: 0, legacySources: 0,
     delivered: new Map([["send_file", files], ["send_image", 34]]),
     tokens: usage(186_000, 42_000, 752_000, 14_000, 3.48),
     usage: { total: usage(186_000, 42_000, 752_000, 14_000, 3.48), kinds: {}, models: new Map(), days: new Map() } as GroupStats["usage"],

@@ -167,7 +167,7 @@ export class StorageView implements View {
             ? `保留 ${hit.keptEntries} 个近期改动过的条目（${fmt.bytes(hit.keptBytes)}）`
             : "没有条目会被保留",
         ],
-        untouched: ["tmp 目录本身", "workspace", "session.jsonl"],
+        untouched: ["tmp 目录本身", "workspace", "会话历史"],
         recovery: "可以，文件在 backup/rm 下，按原路径还原即可（磁盘空间此时还没释放）",
         typeToConfirm: this.days === 0 ? (all ? "全部清理" : "清理当前") : undefined,
         danger: this.days === 0,

@@ -22,6 +22,7 @@ function Get-OpsCommandHint([string]$Command) {
             'restart' = '系统 → 服务部署 → 重启'
             'doctor -Repair' = '系统 → 服务部署 → 修复部署'
             'repair-tunnel' = '系统 → 服务部署 → 修复隧道'
+            'tunnel-update' = '系统 → 服务部署 → 更新 cloudflared'
             'uninstall' = '系统 → 服务部署 → 卸载'
             'doctor' = '监控 → 体检（按 r 刷新）'
             'logs' = '监控 → 日志'
