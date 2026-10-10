@@ -47,27 +47,45 @@ try {
   [Console]::In.ReadLine() | Out-Null
 } finally { $heldFile.Dispose() }
 `], { env: { ...process.env, TEST_CONFIG_LOCK_PATH: path }, stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
-  const timeout = setTimeout(() => child.kill(), 10000);
-  let released = false;
-  const release = async () => {
-    if (released) return;
-    released = true;
-    child.stdin.write("\n");
-    child.stdin.end();
-    expect(await child.exited).toBe(0);
+  const stderr = new Response(child.stderr).text();
+  let timeout: ReturnType<typeof setTimeout>;
+  let phase = "startup", timedOut = false, ready = false, failed = false;
+  const armTimeout = (nextPhase: string, ms: number) => {
+    clearTimeout(timeout);
+    phase = nextPhase;
+    timeout = setTimeout(() => { timedOut = true; child.kill(); }, ms);
   };
+  const failure = async () => new Error(`Windows configuration lock ${phase} ${timedOut ? "timed out" : "failed"} (exit ${await child.exited}): ${await stderr}`);
+  // Cold PowerShell startup on CI has its own budget; it must not consume the time reserved for holding the lock.
+  armTimeout("startup", 30000);
+  let releasing: Promise<void> | undefined;
+  const release = () => releasing ??= (async () => {
+    if (!ready && !timedOut) child.kill();
+    else if (!timedOut && child.exitCode === null) {
+      try { child.stdin.write("\n"); child.stdin.end(); }
+      catch (error) { child.kill(); await child.exited; throw new Error("Could not release Windows configuration lock", { cause: error }); }
+    }
+    if (await child.exited !== 0 || timedOut) throw await failure();
+  })();
   const reader = child.stdout.getReader();
   try {
     let output = "";
     while (!output.includes("locked")) {
       const chunk = await reader.read();
-      if (chunk.done) throw new Error("Could not hold Windows configuration lock: " + await new Response(child.stderr).text());
+      if (chunk.done) throw await failure();
       output += new TextDecoder().decode(chunk.value);
     }
+    ready = true;
+    armTimeout("holding/release", 10000);
     await task(release);
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
     reader.releaseLock();
-    try { await release(); } finally { clearTimeout(timeout); }
+    try { await release(); }
+    catch (error) { if (!failed) throw error; console.warn("Windows lock cleanup:", error); }
+    finally { clearTimeout(timeout!); }
   }
 }
 
@@ -89,4 +107,4 @@ test.skipIf(process.platform !== "win32")("runtime settings tolerate brief Windo
       expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ BOT_BASH_TIMEOUT: "456" });
     });
   } finally { await fixture.cleanup(); }
-}, 15000);
+}, 90000);

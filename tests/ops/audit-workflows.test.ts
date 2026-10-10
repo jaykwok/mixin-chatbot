@@ -31,10 +31,14 @@ describe("deployment health requires a ready matching instance, including UUID w
     ps = join(fixture.root, "health.ps1");
     await writeFile(ps, "\ufeff" + [
       "$ErrorActionPreference='Stop'",
+      "[Console]::Out.WriteLine('HEALTH_FIXTURE_STARTED'); [Console]::Out.Flush()",
       ". " + quotePS(join(project, "scripts/lib/common.ps1")),
       functionLoader(join(project, "scripts/deploy/deploy.ps1"), ["Wait-BotHealth"]),
       "$Project=$env:FIXTURE_PROJECT",
-      "if(Wait-BotHealth $env:BOT_PORT 1 -AllowVerification:($env:ALLOW_VERIFICATION -eq '1')){exit 0}else{exit 1}",
+      "[Console]::Out.WriteLine('HEALTH_FIXTURE_LOADED'); [Console]::Out.Flush()",
+      "$healthy=Wait-BotHealth $env:BOT_PORT 1 -AllowVerification:($env:ALLOW_VERIFICATION -eq '1')",
+      "[Console]::Out.WriteLine(('HEALTH_RESULT ' + $healthy)); [Console]::Out.Flush()",
+      "if($healthy){exit 0}else{exit 1}",
     ].join("\n"));
   });
   afterAll(async () => { await server?.stop(true); await fixture?.cleanup(); });
@@ -53,16 +57,21 @@ describe("deployment health requires a ready matching instance, including UUID w
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect(code, variant + out + err).toBe(variant === "ready" ? 0 : variant === "verification" ? 3 : 1);
     if (process.platform === "win32") {
-      const result = await capture("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps],
-        { env: { FIXTURE_PROJECT: fixture.root, BOT_PORT: String(port) } });
-      expect(result.code, variant + result.stderr).toBe(variant === "ready" ? 0 : 1);
+      // This budget includes cold PowerShell/module startup; the production HTTP request still has its 3 s deadline.
+      const result = await capture("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps],
+        { timeout: 60000, env: { FIXTURE_PROJECT: fixture.root, BOT_PORT: String(port), ALLOW_VERIFICATION: "0" } });
+      const detail = JSON.stringify({ variant, ...result });
+      expect(result.timedOut, detail).toBe(false);
+      expect(result.code, detail).toBe(variant === "ready" ? 0 : 1);
       if (variant === "verification") {
-        const allowed = await capture("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps],
-          { env: { FIXTURE_PROJECT: fixture.root, BOT_PORT: String(port), ALLOW_VERIFICATION: "1" } });
-        expect(allowed.code, allowed.stderr).toBe(0);
+        const allowed = await capture("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps],
+          { timeout: 60000, env: { FIXTURE_PROJECT: fixture.root, BOT_PORT: String(port), ALLOW_VERIFICATION: "1" } });
+        const allowedDetail = JSON.stringify({ variant, allowVerification: true, ...allowed });
+        expect(allowed.timedOut, allowedDetail).toBe(false);
+        expect(allowed.code, allowedDetail).toBe(0);
       }
     }
-  }, 30000);
+  }, process.platform === "win32" ? 150000 : 30000);
 });
 
 test.skipIf(process.platform !== "win32")("TUI cancellation waits for real history maintenance to restore scheduled and foreground bots", async () => {
