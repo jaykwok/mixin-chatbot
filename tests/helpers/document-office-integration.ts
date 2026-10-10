@@ -19,6 +19,7 @@ import { application } from "../../src/core/lifecycle.ts";
 import { runProcess } from "../../src/core/process.ts";
 import { WindowsHandles } from "../../src/core/windows-handles.ts";
 import { launchOfficeAtBarrier } from "./office-start-gate.ts";
+import { checkDocumentReclamation, retainedOfficeProfiles } from "./document-reclamation.ts";
 
 const environment = process.argv[2];
 if (!environment) throw new Error("Usage: bun tests/helpers/document-office-integration.ts <test venv> [--root <run directory>]");
@@ -69,7 +70,15 @@ for (const name of ["source.pptx", "source.docx"]) await cp(join(hashed.workspac
 // LibreOffice profile directories this run created under the system temp.
 const systemTemp = tmpdir();
 const existing = new Set(await readdir(systemTemp));
-const ourProfiles = async () => (await readdir(systemTemp)).filter((name) => name.startsWith("mixin-office-") && !existing.has(name));
+const retired = new Set<string>();
+const createdProfiles = async () => (await readdir(systemTemp)).filter((name) => name.startsWith("mixin-office-") && !existing.has(name));
+const ourProfiles = async () => (await createdProfiles()).filter(name => !retired.has(name));
+async function checkRetiredProfiles() {
+  const recorded = await retainedOfficeProfiles([hashed.tempDir, longRoot.tempDir], systemTemp);
+  assert.deepEqual((await createdProfiles()).sort(), recorded, "all retained profiles must have matching fixture receipts");
+  recorded.forEach(name => retired.add(name));
+  assert.deepEqual(await ourProfiles(), [], "a completed conversion still has an unaccounted profile");
+}
 interface ProcessEntry { pid: number; parent: number; name: string }
 // Process listing without WMI, which a restricted session may refuse: Toolhelp snapshots on Windows, /proc on Linux.
 const toolhelp = process.platform === "win32" ? dlopen("kernel32.dll", {
@@ -144,7 +153,7 @@ async function checkPreview(member: any, preview: any, pages: number, landscape:
     assert.equal(size.width > size.height, landscape, `${image.path} is ${size.width}x${size.height}`);
   }
   const job = dirname(preview.report);
-  assert.ok(!(await readdir(job)).includes(".work"), "completed job kept its .work");
+  await checkDocumentReclamation(job, true);
   return job;
 }
 const results: Record<string, unknown> = { root, systemTemp, userTmpLength: USER_TMP_LENGTH,
@@ -185,7 +194,7 @@ for (const [key, { error, value, member }] of Object.entries(deep)) {
     assert.deepEqual(await pngSize(crop.path), { width: crop.width, height: crop.height });
   }
 }
-assert.deepEqual(await ourProfiles(), [], "profile directory left behind after deep renders");
+await checkRetiredProfiles();
 
 // 2. Two members at once: each LibreOffice run has its own profile directory and writes only into its member's tmp.
 const seen = new Set<string>();
@@ -245,12 +254,12 @@ assert.equal(simultaneous, 2, "the two conversions never ran with separate profi
 // A conversion may have several main processes during startup. Prove two separate supervised jobs, with no leftover.
 assert.equal(officeJobsAtOnce, 2, "the two conversions never ran LibreOffice in separate process trees at the same time");
 assert.deepEqual(remainingOffice, [], "a completed conversion left a LibreOffice process running");
-assert.deepEqual(await ourProfiles(), []);
+await checkRetiredProfiles();
 // The controlled read tool keeps members apart: own preview readable, the other member's refused.
 assert.ok((await hashed.read(hashedWord.images[0].path)).some((part: { type: string }) => part.type === "image"));
 await assert.rejects(hashed.read(longDeck.images[0].path), /仅允许当前用户 tmp/);
 
-// 3. Cancel while LibreOffice runs: the processes exit, the job and its profile are removed, earlier results stay readable.
+// 3. Cancel while LibreOffice runs: writers exit, cleanup is recorded, and earlier results stay readable.
 const jobsBefore = (await readdir(hashed.tempDir)).sort();
 // Child processes the helper has anyway (a console host, for one) are not the job's.
 const baseline = await ourProcesses();
@@ -282,8 +291,12 @@ assert.notEqual(reason, "resolved");
 assert.ok(job.some(isOffice) && job.some((entry) => /^python/i.test(entry.name)), "the job's Python and LibreOffice processes were not identified");
 assert.deepEqual(remaining, [], "processes of the cancelled job are still running");
 assert.deepEqual(leftOver, [], "the cancelled job left child processes behind");
-assert.deepEqual(await ourProfiles(), [], "the cancelled job's profile directory is still there");
-assert.deepEqual((await readdir(hashed.tempDir)).sort(), jobsBefore, "the cancelled job's directory is still there");
+await checkRetiredProfiles();
+if (process.platform === "linux") {
+  const added = (await readdir(hashed.tempDir)).filter(name => !jobsBefore.includes(name));
+  assert.deepEqual(added, [jobName!], "only the cancelled job may be retained");
+  await checkDocumentReclamation(join(hashed.tempDir, jobName!), false);
+} else assert.deepEqual((await readdir(hashed.tempDir)).sort(), jobsBefore, "the cancelled job's directory is still there");
 const earlier = deep[`${hashed.name} render source.pptx`].value;
 for (const file of [earlier.images[0].path, earlier.contacts[0], hashedWord.images[0].path]) {
   assert.ok((await hashed.read(file)).some((part: { type: string }) => part.type === "image"), file + " is no longer readable");
@@ -293,7 +306,8 @@ assert.ok(JSON.parse((await hashed.read(earlier.report))[0].text).pages === 3);
 // 4. The same member renders again after the cancellation.
 const again = await hashed.call("document_render", { source: "source.pptx" });
 await checkPreview(hashed, again, 3, true);
-assert.deepEqual(await ourProfiles(), []);
+await checkRetiredProfiles();
+results.retainedProfiles = [...retired];
 results.after = again;
 await save();
 await application.drain();

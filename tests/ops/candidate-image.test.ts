@@ -10,7 +10,8 @@ import { tempFixture } from "../helpers/temp.ts";
 // are in tests/helpers/candidate-image-cases.sh. tests/ops/real-docker-image.test.ts checks the same functions against a
 // real Docker Engine.
 const project = fileURLToPath(new URL("../../", import.meta.url));
-const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
+// Candidate images and daemon storage checks belong to the Linux Docker deployment path.
+const bash = process.platform === "linux" ? Bun.which("bash") : null;
 const available = !!bash && existsSync(bash);
 const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 const cases = posixPath(join(project, "tests/helpers/candidate-image-cases.sh"));

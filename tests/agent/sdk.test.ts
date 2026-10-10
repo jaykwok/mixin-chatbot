@@ -35,7 +35,8 @@ describe("installed Pi SDK integration", () => {
       expect(payload?.max_tokens).toBe(128);
       expect(payload).not.toHaveProperty("max_output_tokens");
     } finally { await files.cleanup(); }
-  });
+  // The first real provider call lazily loads its transport; this tests payload compatibility, not a 5s cold-load SLA.
+  }, 15000);
   // The official OpenAI endpoint chooses request fields by credential shape: `sk-` keys are API keys, anything else
   // sent there is a Sign in with ChatGPT token, which rejects cache options and output limits. Gateways are unaffected.
   const openAIPayload = async (id: string, apiKey: string, baseUrl?: string) => {

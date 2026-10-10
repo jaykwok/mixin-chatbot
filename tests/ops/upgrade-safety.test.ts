@@ -81,7 +81,7 @@ ${source.slice(start, end)}
   } finally { await fixture.cleanup(); }
 }, 120000);
 
-test("Bash resume at target rejects unstaged/staged deployment changes; clean resume still runs", async () => {
+test.skipIf(process.platform !== "linux")("Bash resume at target rejects unstaged/staged deployment changes; clean resume still runs", async () => {
   const fixture = await tempFixture("upgrade-resume-clean-");
   try {
     const repo = join(fixture.root, "repo"), { git, commit } = await repository(repo);

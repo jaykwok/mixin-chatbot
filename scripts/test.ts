@@ -3,12 +3,12 @@ import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { closeSync, existsSync, openSync, writeSync } from "node:fs";
-import { release } from "node:os";
+import { release, tmpdir } from "node:os";
 const project = fileURLToPath(new URL("../", import.meta.url));
 // 工作根目录：MIXIN_TEST_WORK_ROOT 优先；WSL 默认用 Linux 文件系统中的 /tmp/mixin-tests（仓库常在 /mnt/<盘符>，
-// DrvFs 上 chmod 是否生效取决于挂载元数据）；其余平台用项目 tmp/。
+// DrvFs 上 chmod 是否生效取决于挂载元数据）；Windows 用系统临时目录，避免工作区扫描打开后代目录干扰重命名；其余平台用项目 tmp/。
 const wsl = process.platform === "linux" && release().toLowerCase().includes("microsoft");
-const root = resolve(process.env.MIXIN_TEST_WORK_ROOT || (wsl ? "/tmp/mixin-tests" : join(project, "tmp")));
+const root = resolve(process.env.MIXIN_TEST_WORK_ROOT || (wsl ? "/tmp/mixin-tests" : process.platform === "win32" ? tmpdir() : join(project, "tmp")));
 await mkdir(root, { recursive: true });
 const cwd = await mkdtemp(join(root, "tests-"));
 

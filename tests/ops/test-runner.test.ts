@@ -7,10 +7,13 @@ import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 
-async function runTests(root: string, file: string) {
+async function runTests(root: string | undefined, file: string, overrides: NodeJS.ProcessEnv = {}) {
   const started = performance.now();
+  const env = { ...process.env, ...overrides };
+  if (root === undefined) delete env.MIXIN_TEST_WORK_ROOT;
+  else env.MIXIN_TEST_WORK_ROOT = root;
   const child = Bun.spawn([process.execPath, join(project, "scripts/test.ts"), file], {
-    env: { ...process.env, MIXIN_TEST_WORK_ROOT: root }, stdout: "pipe", stderr: "pipe", windowsHide: true });
+    env, stdout: "pipe", stderr: "pipe", windowsHide: true });
   let exitedAt = 0;
   const [code, out, err] = await Promise.all([child.exited.then(code => { exitedAt = Date.now(); return code; }),
     new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -24,6 +27,26 @@ async function until(file: string) {
     await Bun.sleep(20);
   }
 }
+
+test.skipIf(process.platform !== "win32")("the Windows default work root uses the system temporary directory and cleans only its own run", async () => {
+  const fixture = await tempFixture("test-runner-default-");
+  const cwdFile = join(fixture.root, "default-cwd"), sentinel = join(fixture.root, "keep.txt"), file = join(fixture.root, "default.test.ts");
+  try {
+    await writeFile(sentinel, "keep");
+    await writeFile(file, `import { test } from "bun:test";
+import { writeFileSync } from "node:fs";
+test("runner-default", () => { writeFileSync(${JSON.stringify(cwdFile)}, process.cwd()); });
+`);
+    const result = await runTests(undefined, file, { TEMP: fixture.root, TMP: fixture.root });
+    expect(result.code, result.output).toBe(0);
+    const cwd = await readFile(cwdFile, "utf8");
+    expect(dirname(cwd)).toBe(fixture.root);
+    expect(basename(cwd)).toMatch(/^tests-/);
+    expect(existsSync(cwd)).toBe(false);
+    expect(existsSync(join(project, "tmp", basename(cwd) + ".log"))).toBe(false);
+    expect(await readFile(sentinel, "utf8")).toBe("keep");
+  } finally { await fixture.cleanup(); }
+}, 30000);
 
 test("the test runner keeps a failed run and its log, removes a passed one and does not wait on a leaked output pipe", async () => {
   const fixture = await tempFixture("test-runner-");

@@ -59,7 +59,8 @@ test("MCP uses official member sessions, an allowlist, identity headers and a fi
   } finally { await manager.close(); await h.close(); }
 });
 
-test.each(["headers", "body"])("HTTP MCP tools can take more than 30 seconds before their %s arrive", async phase => {
+// Independent ports, clients and discovery directories; keep both real >30s transport boundaries while sharing the wait.
+test.concurrent.each(["headers", "body"])("HTTP MCP tools can take more than 30 seconds before their %s arrive", async phase => {
   let calls = 0;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 60, async fetch(request) {
     if (request.method === "DELETE") return new Response(null, { status: 204 });

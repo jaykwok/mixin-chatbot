@@ -20,7 +20,7 @@ async function execute(command: string[], cwd: string) {
   return { code, output: stdout + stderr };
 }
 
-for (const platform of ["linux", "windows"] as Platform[]) test.skipIf(platform === "windows" && process.platform !== "win32")(
+for (const platform of ["linux", "windows"] as Platform[]) test.skipIf(platform === "windows" ? process.platform !== "win32" : process.platform !== "linux")(
   `${platform}: TUI dispatch retains confirmed SHA after origin/main changes; plain CLI still fetches latest`, async () => {
     const fixture = await tempFixture("upgrade-target-");
     const spies: { mockRestore(): void }[] = [];

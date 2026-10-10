@@ -7,7 +7,8 @@ import { runCommand, scenarioRunner, ScenarioProcesses } from "../helpers/concur
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
-const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
+// This is the Linux Docker upgrader; Windows exercises upgrade.ps1 in deployment/upgrade-safety tests.
+const bash = process.platform === "linux" ? Bun.which("bash") : null;
 const posix = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 const token = "eyJhIjoiZml4dHVyZS1hY2NvdW50IiwidCI6ImZpeHR1cmUifQ";
 
@@ -193,8 +194,7 @@ esac
 const dfFunction = `() { case " $* " in *" --output=avail "*) if [ -e "$FIXTURE_MOCK/disk-full" ]; then printf 'Avail\\n1024\\n'; \
 else printf 'Avail\\n1099511627776\\n'; fi ;; *) command df "$@" ;; esac\n}`;
 
-// The upgrader is Linux-only shell code, and a single run starts about 150 processes: cheap on Linux, 20–45 ms each under
-// Git Bash on Windows. The scenarios below are independent, so they run concurrently, at most four at a time, each on its
+// The upgrader is Linux-only shell code. The scenarios below are independent, so they run concurrently, at most four at a time, each on its
 // own copy of a fixture built once per file (see concurrent-scenarios.ts for budgets and process cleanup). Bun's own
 // timeout also counts the wait for a slot and is only a backstop.
 const runScenario = scenarioRunner({ slots: 4, budgetMs: 150_000 });

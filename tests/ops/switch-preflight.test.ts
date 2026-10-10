@@ -13,7 +13,7 @@ import { symlinkUnavailable } from "../helpers/links.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
-const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
+const bash = process.platform === "linux" ? Bun.which("bash") : null;
 const posix = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 const quotePS = (value: string) => `'${value.replaceAll("'", "''")}'`;
 type Engine = "bash" | "powershell";

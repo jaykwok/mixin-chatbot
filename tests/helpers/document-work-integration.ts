@@ -10,6 +10,7 @@ import { documentToolchainReady, venvPythonPath } from "../../src/agent/python-t
 import { runProcess } from "../../src/core/process.ts";
 import { application } from "../../src/core/lifecycle.ts";
 import { configuredRootlessTasks, ISOLATED_PYTHON } from "../../src/core/rootless-tasks.ts";
+import { checkDocumentReclamation } from "./document-reclamation.ts";
 
 const environment = process.argv[2];
 if (!environment) throw new Error("Usage: bun tests/helpers/document-work-integration.ts <test venv> [--office]");
@@ -50,6 +51,7 @@ for (const name of ["source.docx", "source.pptx", "supplement.docx", "supplement
 }
 const tools = buildDocumentWorkTools({ workspaceDir: workspace, tempDir, venvDir, indexPath: join(root, "index/materials.md") });
 const call = async (name: string, params: object): Promise<any> => {
+  const before = new Set(await readdir(tempDir));
   const tool = tools.find(t => t.name === name)!;
   const result = await tool.execute("verify", params, undefined, undefined, {} as never);
   const details = result.details;
@@ -62,9 +64,7 @@ const call = async (name: string, params: object): Promise<any> => {
   assert.deepEqual(JSON.parse((result.content[0] as { text: string }).text), result.structuredContent);
   for (const job of await readdir(tempDir)) {
     if (backend && job === ".isolated-work" || job === ".office-jobs") continue;
-    const files = await readdir(join(tempDir, job));
-    assert(!files.includes(".work"), "completed job retained source copies or Office intermediates");
-    assert(files.every(file => !file.endsWith(".request.json") && !file.startsWith("office-")));
+    await checkDocumentReclamation(join(tempDir, job), before.has(job) ? undefined : true, !!backend);
   }
   if (name === "document_render") {
     const preview = details as { images: { path: string }[]; contacts: string[]; report: string; pdf?: string };
@@ -108,7 +108,11 @@ await assert.rejects(call("document_patch", { source: "source.docx", digest: wor
   { part: table.part, paragraph: table.paragraph, before: "本地部署", after: "私有化部署" },
   { part: customer.part, paragraph: customer.paragraph, before: "客户A", after: "甲方" },
 ] }), /跨越格式.*拆成多项编辑/);
-if (!backend) assert.deepEqual(await readdir(tempDir), jobsBeforeFailedPatch);
+if (!backend && process.platform === "linux") {
+  const retained = (await readdir(tempDir)).filter(name => !jobsBeforeFailedPatch.includes(name));
+  assert.equal(retained.length, 1, "the failed patch must retain exactly its own unproven job");
+  await checkDocumentReclamation(join(tempDir, retained[0]!), false);
+} else if (!backend) assert.deepEqual(await readdir(tempDir), jobsBeforeFailedPatch);
 // Outline, Markdown builds on fixture templates and inline content inside compose.
 const outline = await call("document_inspect", { source: "source.pptx", outline: true });
 const wordOutline = await call("document_inspect", { source: "source.docx", outline: true });

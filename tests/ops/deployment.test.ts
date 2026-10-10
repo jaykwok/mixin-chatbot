@@ -8,7 +8,8 @@ import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const quotePS = (text: string) => "'" + text.replaceAll("'", "''") + "'";
-const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
+// Exercise each deployment engine on its supported OS; PowerShell cases remain on Windows.
+const bash = process.platform === "linux" ? Bun.which("bash") : null;
 const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 
 test("Docker COPY inputs and dependency patch paths exist in the checkout", async () => {
