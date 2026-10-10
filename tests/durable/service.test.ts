@@ -29,6 +29,7 @@ import { SqliteClient } from "../../src/durable/sqlite-client.ts";
 import { DurableStorageFailure } from "../../src/durable/storage-failure.ts";
 import { fauxModels, openGroupHarness, TEST_PROGRESS } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import "../helpers/restore-spies.ts";
 
 const fixture = await tempFixture("durable-service-");
 afterAll(() => fixture.cleanup());
@@ -168,7 +169,7 @@ describe("durable service: admission order across asynchronous boundaries", () =
       await until(() => replies(out.sent).length === (failFirst ? 2 : 3), "ordered replies");
       expect(inputs.slice(1).map(value => value.includes("FIRST") ? "FIRST" : "SECOND")).toEqual(failFirst ? ["SECOND"] : ["FIRST", "SECOND"]);
       expect(reports).toEqual([]);
-    } finally { release.resolve(); await earlier; await later; spy.mockRestore(); await service.close(); }
+    } finally { release.resolve(); spy.mockRestore(); await earlier; await later; await service.close(); }
   });
 
   for (const command of ["/stop", "/clear"]) test(`${command} passes a slow admission and cancels only older arrivals`, async () => {
@@ -195,8 +196,9 @@ describe("durable service: admission order across asynchronous boundaries", () =
       await until(() => replies(out.sent).length === 1, "fresh reply");
       expect(inputs).toHaveLength(1); expect(inputs[0]).toContain("FRESH"); expect(inputs[0]).not.toContain("OLD");
       expect(reports).toEqual([]);
-    } finally { release.resolve(); await earlier; await later; spy.mockRestore(); await service.close(); }
-  });
+    } finally { release.resolve(); spy.mockRestore(); await earlier; await later; await service.close(); }
+    // The reply probe has a 10 s deadline. Let it report its label and run cleanup before Bun's forced timeout.
+  }, 15000);
 });
 
 describe("durable service: manual compaction receipt", () => {

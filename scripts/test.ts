@@ -1,5 +1,5 @@
 // Give tests an isolated cwd; never load a developer's data/config or write live state.
-import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { closeSync, existsSync, openSync, writeSync } from "node:fs";
@@ -8,8 +8,11 @@ const project = fileURLToPath(new URL("../", import.meta.url));
 // 工作根目录：MIXIN_TEST_WORK_ROOT 优先；WSL 默认用 Linux 文件系统中的 /tmp/mixin-tests（仓库常在 /mnt/<盘符>，
 // DrvFs 上 chmod 是否生效取决于挂载元数据）；Windows 用系统临时目录，避免工作区扫描打开后代目录干扰重命名；其余平台用项目 tmp/。
 const wsl = process.platform === "linux" && release().toLowerCase().includes("microsoft");
-const root = resolve(process.env.MIXIN_TEST_WORK_ROOT || (wsl ? "/tmp/mixin-tests" : process.platform === "win32" ? tmpdir() : join(project, "tmp")));
-await mkdir(root, { recursive: true });
+const requestedRoot = resolve(process.env.MIXIN_TEST_WORK_ROOT || (wsl ? "/tmp/mixin-tests" : process.platform === "win32" ? tmpdir() : join(project, "tmp")));
+await mkdir(requestedRoot, { recursive: true });
+// Windows TEMP may contain an 8.3 alias (RUNNER~1 on CI). Give cwd and every fixture environment variable
+// the same physical spelling used by realpath/native handles, before any test builds a path or an ownership receipt.
+const root = process.platform === "win32" ? await realpath(requestedRoot) : requestedRoot;
 const cwd = await mkdtemp(join(root, "tests-"));
 
 // 权限测试断言 0600；工作目录不支持 POSIX 权限时这些断言没有意义，运行前就拒绝。
