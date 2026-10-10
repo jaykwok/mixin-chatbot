@@ -676,14 +676,16 @@ test.each([
   } finally { spawn.mockRestore(); finish(0); tty.close(); }
 });
 
-async function history(root: string, group: string, user: string, days = ["2026-09-12"]) {
-  const dir = join(root, group, "users", user);
-  await mkdir(dir, { recursive: true });
-  await writeFile(join(dir, "session.jsonl"), days.flatMap(day => [
-    { type: "message", timestamp: day + "T12:00:00Z", message: { role: "user", content: [{ type: "text", text: "统计" }] } },
-    { type: "message", timestamp: day + "T12:01:00Z", message: { role: "assistant", content: [{ type: "toolCall", name: "fixture_tool" }] } },
-  ]).map(line => JSON.stringify(line)).join("\n") + "\n");
-  // 统计页读的是账本，不是会话文件本身。
+async function history(root: string, group: string, users: string | readonly string[], days = ["2026-09-12"]) {
+  for (const user of typeof users === "string" ? [users] : users) {
+    const dir = join(root, group, "users", user);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "session.jsonl"), days.flatMap(day => [
+      { type: "message", timestamp: day + "T12:00:00Z", message: { role: "user", content: [{ type: "text", text: "统计" }] } },
+      { type: "message", timestamp: day + "T12:01:00Z", message: { role: "assistant", content: [{ type: "toolCall", name: "fixture_tool" }] } },
+    ]).map(line => JSON.stringify(line)).join("\n") + "\n");
+  }
+  // 统计页读的是账本；整批会话写完后扫描一次，避免每新增成员都重新扫描已有会话。
   await sweepSessionStats(root, { force: true });
 }
 
@@ -1192,7 +1194,7 @@ test("交互操作和执行面板完成后，后台刷新不再锁住导航与�
 test("统计在 80×24 先显示成员，所有成员与月度、工具均可滚到；报表路径保留且显号离页重置", async () => {
   const fixture = await tempFixture("tui-stats-view-");
   try {
-    for (let i = 0; i < 24; i++) await history(fixture.root, "g1", String(13812345678 + i));
+    await history(fixture.root, "g1", Array.from({ length: 24 }, (_, i) => String(13812345678 + i)));
     const view = new StatsView(join(fixture.root, "reports"));
     const { app, calls } = fakeApp(fixture.root);
     await view.refresh(app);
@@ -1322,7 +1324,7 @@ test("群筛选控制统计导出范围，常用日期可选，会话全部成�
   const fixture = await tempFixture("tui-groups-filter-");
   try {
     await history(fixture.root, "other-group", "13912345678");
-    for (let i = 0; i < 24; i++) await history(fixture.root, "support-group", String(13812345678 + i));
+    await history(fixture.root, "support-group", Array.from({ length: 24 }, (_, i) => String(13812345678 + i)));
     const { app, calls } = fakeApp(fixture.root);
     const stats = new StatsView(join(fixture.root, "reports"));
     await stats.refresh(app);
