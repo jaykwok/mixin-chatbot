@@ -6,10 +6,14 @@ import { tempFixture } from "../helpers/temp.ts";
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
+// How long a process tree may take to start and record its PIDs. Started next to another process-heavy test file on
+// Windows, trees here have taken about 20 s (CI: well under one); one not ready by then fails as a startup failure.
+const STARTUP_MS = 30000;
+
 async function until(file: string) {
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + STARTUP_MS;
   while (!existsSync(file)) {
-    if (Date.now() > deadline) throw new Error("timed out waiting for " + file);
+    if (Date.now() > deadline) throw new Error(`process tree not ready within ${STARTUP_MS / 1000} s: no ${file}`);
     await Bun.sleep(20);
   }
 }
@@ -105,23 +109,56 @@ test("descendants that outlive their command are ended and waited for before the
 
 test("a scenario over its budget has its whole process tree ended before cleanup and cannot start new processes", async () => {
   const fixture = await treeFixture("concurrent-scenarios-budget-");
-  const run = scenarioRunner({ slots: 1, budgetMs: 12000 });
-  let late = "";
+  // The budget expires once the whole tree runs. A real timer would race the tree's startup, which on a busy machine
+  // can take longer than any budget that keeps this case short, and ending a tree still starting checks nothing here.
+  // The next case shows that the real timer covers the scenario from its setup on.
+  const budget = { ms: 0, armed: 0, cancelled: 0, expire: (): void => { throw new Error("the budget was never armed"); } };
+  const run = scenarioRunner({ slots: 1, budgetMs: 12000, scheduleBudget(expire, ms) {
+    Object.assign(budget, { ms, expire, armed: budget.armed + 1 });
+    return () => { budget.cancelled++; };
+  } });
+  let late = "", running: boolean[] = [];
   try {
     const outcome = await run("hung", fixture.setup, async fx => {
       const command = runCommand(fx.processes, fx.root, [process.execPath, "-e", tree(fx.pids)], {}, undefined, 120000);
       await until(fx.pids);
+      running = fixture.recorded().map(alive);
+      budget.expire();
       await command;
       // The budget ended the tree; the scenario can no longer start anything.
       try { fx.processes.spawn([process.execPath, "-e", ""], { cwd: fx.root, env: process.env }); late = "started"; }
       catch (error) { late = (error as Error).message; }
     }).then(() => "passed", (error: Error) => error.message);
     expect(outcome).toContain("超过 12 秒预算");
+    expect(running).toEqual([true, true]);
     expect(fixture.state.cleanedUp).toBe(true);
     expect(fixture.state.aliveAtCleanup).toEqual([false, false]);
     expect(late).toContain("不再启动新进程");
+    expect(budget).toMatchObject({ ms: 12000, armed: 1, cancelled: 1 });
   } finally { await fixture.dispose(); }
 }, 60000);
+
+test("the budget runs from the moment a scenario gets its slot, its setup included", async () => {
+  const run = scenarioRunner({ slots: 1, budgetMs: 100, settleMs: 5000 });
+  let entered!: () => void, release!: () => void;
+  const inSetup = new Promise<void>(done => { entered = done; });
+  const gate = new Promise<void>(done => { release = done; });
+  let late = "", cleanedUp = false;
+  const outcome = run("slow setup", async processes => {
+    entered();
+    await gate;
+    try { processes.spawn([process.execPath, "-e", ""], { cwd: process.cwd(), env: process.env }); late = "started"; }
+    catch (error) { late = (error as Error).message; }
+    return { cleanup: async () => { cleanedUp = true; } };
+  }, async () => {}).then(() => "passed", (error: Error) => error.message);
+  await inSetup;
+  // Well past the budget the setup still waits; the scenario has ended, but its fixture is not cleaned up under it.
+  try { await Bun.sleep(300); expect(cleanedUp).toBe(false); }
+  finally { release(); }
+  expect(await outcome).toContain("场景超过 0.1 秒预算");
+  expect(late).toContain("不再启动新进程");
+  expect(cleanedUp).toBe(true);
+});
 
 test("a failed assertion ends the processes a scenario still runs before its fixture is cleaned up", async () => {
   const fixture = await treeFixture("concurrent-scenarios-failure-");

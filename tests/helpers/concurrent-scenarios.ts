@@ -121,9 +121,17 @@ export async function runCommand(processes: ScenarioProcesses, cwd: string, args
  * process trees are ended and waited for, then its body must settle within settleMs; only then is its fixture cleaned
  * up. A body still unsettled keeps its fixture. The slot is freed in every case. The scenario's own failure is thrown;
  * one found while ending the scenario is added to its message, or thrown if there was none.
+ *
+ * `scheduleBudget` arms the budget (by default a timer) and returns what cancels it; a test of the runner itself can
+ * expire it at a chosen point instead, so that what it checks does not depend on how fast processes start.
  */
-export function scenarioRunner(options: { slots: number; budgetMs: number; settleMs?: number }) {
+export function scenarioRunner(options: { slots: number; budgetMs: number; settleMs?: number;
+  scheduleBudget?: (expire: () => void, ms: number) => () => void }) {
   const settleMs = options.settleMs ?? 30000;
+  const scheduleBudget = options.scheduleBudget ?? ((expire: () => void, ms: number) => {
+    const timer = setTimeout(expire, ms);
+    return () => clearTimeout(timer);
+  });
   let running = 0;
   const waiting: (() => void)[] = [];
   const acquire = async () => {
@@ -139,15 +147,15 @@ export function scenarioRunner(options: { slots: number; budgetMs: number; settl
     const processes = new ScenarioProcesses();
     let fixture: F | undefined;
     let failure: Error | undefined;
-    let budget: ReturnType<typeof setTimeout> | undefined;
+    let cancelBudget: (() => void) | undefined;
     const work = (async () => { fixture = await setup(processes); await body(fixture); })();
     try {
       await Promise.race([work, new Promise<never>((_, reject) => {
-        budget = setTimeout(() => reject(new Error(`场景超过 ${options.budgetMs / 1000} 秒预算，已结束其进程：${name}`)), options.budgetMs);
+        cancelBudget = scheduleBudget(() => reject(new Error(`场景超过 ${options.budgetMs / 1000} 秒预算，已结束其进程：${name}`)), options.budgetMs);
       })]);
     } catch (error) {
       failure = error instanceof Error ? error : new Error(String(error));
-    } finally { clearTimeout(budget); }
+    } finally { cancelBudget?.(); }
     try {
       await processes.stop();
       // The body can start no new process now. A body still awaiting something could write into the fixture after it
