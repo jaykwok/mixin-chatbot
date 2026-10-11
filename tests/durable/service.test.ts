@@ -550,11 +550,14 @@ describe("durable service: watchdog", () => {
     try {
       await service.admit(ALICE, GROUP, "慢任务", URL);
       await until(() => logs.filter((line) => line.startsWith("任务仍在运行")).length >= 2, "two heartbeats");
+      // On a busy machine the first heartbeat can still be in the preparation phase; the model is held, so one in its phase follows.
+      const waiting = (line: string) => line.startsWith("任务仍在运行") && line.endsWith("阶段: 等待或接收模型输出");
+      await until(() => logs.some(waiting), "a heartbeat while the model is held");
       held.open();
       await until(() => logs.some((line) => line.startsWith("任务结束")), "the end line");
       const task = /任务: ([0-9a-f]{8})/.exec(logs.find((line) => line.startsWith("任务开始"))!)![1];
       expect(logs.find((line) => line.startsWith("任务开始"))).toContain(`群: ${GROUP}, 用户: ${ALICE}, 任务: ${task}, 总时限: 60秒`);
-      expect(logs.find((line) => line.startsWith("任务仍在运行"))).toMatch(new RegExp(`任务: ${task}, 已用: \\d+秒, 阶段: 等待或接收模型输出`));
+      expect(logs.find(waiting)).toMatch(new RegExp(`任务: ${task}, 已用: \\d+秒, 阶段: 等待或接收模型输出`));
       expect(logs.find((line) => line.startsWith("任务结束"))).toContain(`任务: ${task}, 结果: done`);
     } finally { await service.close(); }
   });
