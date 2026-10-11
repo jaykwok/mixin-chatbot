@@ -16,7 +16,7 @@ export const DEFAULT_GROUP_DATA_ROOT = join(DATA_DIR, "groups");
  */
 export const MODELS_JSON_PATH = join(CONFIG_DIR, "models.json");
 export const WEBHOOK_SECRET_FILE = join(CONFIG_DIR, "webhook-secret");
-/** 可选：大文件外链分发的 WebDAV 后端；缺失即关闭该特性。 */
+/** 可选：大文件临时分发的 S3 对象存储；缺失即关闭该特性。 */
 export const RELAY_CONFIG_PATH = join(CONFIG_DIR, "relay.json");
 export const RUNTIME_CONFIG_PATH = join(CONFIG_DIR, "runtime.json");
 /** Trusted administrator configuration; missing files leave these capabilities disabled. */

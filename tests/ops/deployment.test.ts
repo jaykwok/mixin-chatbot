@@ -357,16 +357,19 @@ function fixture-git {
 }
 function fixture-bun {
     $global:LASTEXITCODE=0
-    if($args -contains 'preview') { $script:previews++; if($script:stopped){throw 'preview after stop'}; if($script:failure -eq 'preview'){ $global:LASTEXITCODE=2 } }
+    if($args -contains '--version') { if($script:failure -eq 'old-bun'){'1.4.2'}else{'1.4.3'} }
+    elseif($args -contains 'preview') { $script:previews++; if($script:stopped){throw 'preview after stop'}; if($script:failure -eq 'preview'){ $global:LASTEXITCODE=2 } }
     elseif($args -contains 'install') { if(-not $script:stopped){throw 'dependencies changed before stop'}; $script:installs++; if($script:failure -eq 'install'){$global:LASTEXITCODE=1} }
     elseif($args -contains 'apply') { $script:applied=$true; if($script:failure -eq 'apply'){$global:LASTEXITCODE=1} }
     elseif($args -contains 'committed') { if($script:stopped){throw 'commit check after stop'}; $global:LASTEXITCODE=[int](-not $script:committed) }
     elseif($args -contains 'commit') { if($script:failure -eq 'commit'){$global:LASTEXITCODE=1}else{$script:committed=$true} }
+    elseif($args -contains 'finalize') { if(-not $script:normalHealthy){throw 'migration backup cleaned before healthy'}; $script:finalizes++ }
     elseif($args -contains 'rollback') { if($script:committed){$global:LASTEXITCODE=42}else{$script:dataRestored=$true} }
     else {
         $verifying=Test-Path -LiteralPath (Join-Path $Project 'data/state/verify-only')
         if($verifying -ne ($args -contains '--allow-verification')){throw 'wrong verification health policy'}
         if($script:failure -eq 'health'){throw 'health failure'}
+        if(-not $verifying){$script:normalHealthy=$true}
     }
 }
 function New-DeploymentSnapshot { [pscustomobject]@{WasRunning=$script:running;TaskXml='<Task/>';Path=$Project;Lock=(New-Object IO.MemoryStream);PreviousBackupId='previous'} }
@@ -390,10 +393,11 @@ function Start-ScheduledTask {
 function Register-ScheduledTask { }
 function Restore-DeploymentSnapshot { if(-not $script:codeRestored){throw 'old service before code restore'}; $script:restores++ }
 function Remove-CompletedBackup($path) { if(Test-Path -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction')){throw 'backup removed before the transaction closed'}; $script:cleanups++ }
-foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','preview','main-missing','diverged','task-missing','switch','switch-late','code','install','apply','health','commit','postcommit')) {
+foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$false)) { foreach($script:failure in @('none','old-bun','preview','main-missing','diverged','task-missing','switch','switch-late','code','install','apply','health','commit','postcommit')) {
     if(($script:failure -eq 'install' -and $script:reuse) -or ($script:failure -eq 'postcommit' -and -not $script:running)){continue}
     $script:stopped=$false; $script:applied=$false; $script:committed=$false; $script:dataRestored=$false; $script:codeRestored=$false
     $script:backups=0; $script:installs=0; $script:starts=0; $script:verifications=0; $script:restores=0; $script:cleanups=0; $script:switchChecks=0
+    $script:normalHealthy=$false; $script:finalizes=0
     Remove-Item -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction') -Force -ErrorAction SilentlyContinue
     $ok=$true; $message=''
     try { & $run } catch { $ok=$false; $message=$_.Exception.Message; Write-Host $message }
@@ -405,13 +409,14 @@ foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$
     if($script:failure -eq 'switch' -and (Test-Path -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction'))){throw 'snapshot taken despite the switch conflict'}
     # HEAD at a commit that is neither the original nor the target: the rollback never resets over it and keeps the transaction.
     if($script:failure -eq 'code') { if($script:codeRestored -or $script:restores){throw 'unknown commit overwritten'} }
-    elseif($script:failure -in @('preview','main-missing','diverged','task-missing','switch','switch-late')) { if($script:stopped -or $script:applied -or $script:installs){throw 'preflight failure mutated deployment'} }
+    elseif($script:failure -in @('old-bun','preview','main-missing','diverged','task-missing','switch','switch-late')) { if($script:stopped -or $script:applied -or $script:installs){throw 'preflight failure mutated deployment'} }
     elseif($script:failure -in @('none','postcommit')) {
         if($script:restores -ne 0 -or -not $script:committed -or $script:starts -ne [int]$script:running){throw 'wrong committed state'}
         if($script:backups -ne [int](-not $script:reuse) -or $script:installs -ne $script:backups){throw 'dependency reuse failed'}
     } elseif($script:restores -ne 1) { throw 'rollback missing' }
     # Only a completed upgrade discards its own snapshot and archive; every other outcome keeps them for recovery.
     if($script:cleanups -ne [int]($script:failure -eq 'none')){throw ('wrong backup cleanup: ' + $script:failure)}
+    if($script:finalizes -ne [int]($script:failure -eq 'none' -and $script:running)){throw ('wrong migration cleanup: ' + $script:failure)}
     Write-Output 'VERIFIED'
 } } }
 # Explicit rollback of an interrupted upgrade: no preview or preflight, committed data is refused before the stop.
@@ -454,7 +459,7 @@ foreach($Rollback in @($true,$false)) {
   try {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0);
-    expect(result.output.match(/VERIFIED/g)).toHaveLength(50);
+    expect(result.output.match(/VERIFIED/g)).toHaveLength(54);
     expect(result.output.match(/ROLLBACK_VERIFIED/g)).toHaveLength(2);
     expect(result.output.match(/MANUAL_CHANGES_KEPT/g)).toHaveLength(2);
   } finally { await fixture.cleanup(); }
@@ -630,7 +635,7 @@ Write-Output 'FELL THROUGH'
     // Committed data: applying again would start a new migration journal, so only the new instance is started.
     let result = await run("1");
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toContain("CALLS bun committed|stop|enable|start|health 2022|cleanup pointer=False verify=False lock=False backup=previous");
+    expect(result.output).toContain("CALLS bun committed|stop|enable|start|health 2022|bun finalize|cleanup pointer=False verify=False lock=False backup=previous");
     expect(result.output).toContain("DONE 上次部署已完成"); expect(result.output).not.toContain("FELL THROUGH");
     // An instance that does not become healthy keeps the transaction, so continuing again retries only the activation.
     result = await run("1", "1");
@@ -672,6 +677,8 @@ Write-Output ('ORDINARY_SETTINGS_READ debug=' + $BotDebug + ' active=' + $BotMax
     const finish = join(f.root, "finish.ps1");
     await writeFile(finish, `\ufeff$ErrorActionPreference='Stop'
 $transactionPointer=Join-Path $PSScriptRoot 'deploy-transaction'; $snapshot=[pscustomobject]@{ Path='deploy-fixture' }; $Project=$PSScriptRoot
+$bunPath='fixture-bun'; $migrationRunner='fixture-runner'; $GroupDataRoot=$PSScriptRoot
+function fixture-bun { if(-not $deploymentActivated){throw 'cleanup before activation'}; $global:LASTEXITCODE=0; Write-Output 'FINALIZE' }
 function Remove-CompletedBackup { Write-Output 'CLEANUP' }; function Write-OperationEvent {}; function Warn {}
 foreach ($activated in @($false, $true)) {
     Set-Content -LiteralPath $transactionPointer 'deploy-fixture'
@@ -682,7 +689,7 @@ ${source.slice(cleanupStart, cleanupEnd)}
 `);
     result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", finish], f.root);
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toMatch(/^ACTIVATED=False pointer=True\r?\nCLEANUP\r?\nACTIVATED=True pointer=False/m);
+    expect(result.output).toMatch(/^ACTIVATED=False pointer=True\r?\nFINALIZE\r?\nCLEANUP\r?\nACTIVATED=True pointer=False/m);
     result = await run("0");
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain("STEP 继续上次部署"); expect(result.output).toContain("FELL THROUGH");
@@ -1683,7 +1690,14 @@ load_tunnel_token(){
     if [ -z "\${1:-}" ]; then [ "\${FIXTURE_SAVED_TOKEN:-0}" = 1 ]; return; fi
     [ "$1" = handed-over ]
 }
-migration_docker(){ [ "$1" = committed ] || { echo "MIGRATION $1" >&2; exit 93; }; [ "\${FIXTURE_COMMITTED:-0}" = 1 ]; }
+migration_docker(){
+    if [ "$1" = finalize ]; then
+        grep -q 'exec mixin-chatbot bun run scripts/ops/health-check.ts' '${posixPath(dockerLog)}' || { echo 'finalize before health' >&2; exit 94; }
+        echo "FINALIZE $*"
+        return "\${FIXTURE_CLEANUP_FAIL:-0}"
+    fi
+    [ "$1" = committed ] || { echo "MIGRATION $1" >&2; exit 93; }; [ "\${FIXTURE_COMMITTED:-0}" = 1 ]
+}
 begin_deployment(){ echo "BEGIN rollback=\${ROLLBACK_REQUESTED:-0} root=$HOST_GROUP_DATA_ROOT mount=$GROUP_ROOT_ENV_VAL"; }
 docker(){
     echo "$*" >> '${posixPath(dockerLog)}'
@@ -1788,13 +1802,19 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
       "stop --time 30 mixin-chatbot", "start mixin-chatbot", "exec mixin-chatbot bun run scripts/ops/health-check.ts", ...publish, ...released,
       "rm mixin-chatbot-rollback", "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
     expect(activation.output).toContain(`CLEANUP ${posixPath(snapshot)}`); expect(activation.output).toContain("机器人已启动");
+    expect(activation.output).toContain("FINALIZE finalize --deployment deploy-fixture");
     expect(activation.output).not.toContain("BEGIN"); expect(activation.output).not.toContain("RESULT"); expect(activation.output).not.toContain("MIGRATION");
     expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
     expect(await readFile(receipt, "utf8")).toBe("committed\n");
+    activation = await committed({ FIXTURE_CLEANUP_FAIL: "1" });
+    expect(activation.code, activation.output).toBe(0);
+    expect(activation.output).toContain("迁移备份清理未完成");
+    expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
     // An upgrade that found the service stopped keeps it stopped; the official tag still moves, for the maintenance commands.
     await record({ was_running: "0" });
     activation = await committed({});
     expect(activation.code, activation.output).toBe(0); expect(activation.output).toContain("保持停止");
+    expect(activation.output).not.toContain("FINALIZE");
     expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect --format {{.Image}} mixin-chatbot",
       "stop --time 30 mixin-chatbot", ...publish, ...released, "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
     // An unhealthy instance, or an official tag that cannot be moved, keeps the transaction: continuing again retries only
@@ -1803,6 +1823,7 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
     activation = await committed({ FIXTURE_UNHEALTHY: "1" });
     expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("业务实例未就绪"); expect(activation.output).toContain("resume");
     expect(existsSync(join(state, "deploy-transaction"))).toBe(true);
+    expect(activation.output).not.toContain("FINALIZE");
     expect(activation.output).not.toContain("CLEANUP"); expect(activation.docker.filter(line => line.startsWith("tag"))).toEqual([]);
     activation = await committed({ FIXTURE_TAG_FAIL: "1" });
     expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("正式标签 mixin-chatbot 未能指向");

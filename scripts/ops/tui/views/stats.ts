@@ -7,7 +7,8 @@ import { pad, truncate, width } from "../render/width.ts";
 import { Viewport } from "../render/viewport.ts";
 import * as fmt from "../render/format.ts";
 import { loadStatsOverview, type GroupStats, type Window } from "../data.ts";
-import { parseDate } from "../../stats-admin.ts";
+import { collectComparisons, parseDate } from "../../stats-admin.ts";
+import { change, comparisons, describeStatsWindow, PERIODS, periodWindow, summarize, trend, type ComparisonData, type Grain } from "../../stats-summary.ts";
 import { PROJECT_DIR } from "../platform.ts";
 import { writeReport } from "../report.ts";
 import type { AppApi, Loading, View, ViewAction, ViewContext } from "../view.ts";
@@ -21,6 +22,9 @@ export class StatsView implements View {
   private detail: GroupStats | null = null;
   private selected = 0;
   private window: Window = {};
+  private comparisonData: ComparisonData | null = null;
+  private grain: Grain = "day";
+  private showTrend = false;
   private unmasked = false;
   private scroll = new Viewport();
   private lastReport: { path: string; unmasked: boolean } | null = null;
@@ -42,6 +46,7 @@ export class StatsView implements View {
       ? [["Esc", "返回"], ["↑↓", "滚动"], ["m", this.unmasked ? "打码" : "显号"]]
       : [["↑↓", "选择"], ["Enter", "明细"], ["/", "筛选"], ["w", "日期"]];
     keys.push(["e", this.exporting ? "导出中" : "导出"]);
+    keys.push(["t", "汇总趋势"], ["g", "日/周/月"]);
     if (this.lastReport) keys.push(["o", this.opening ? "打开中" : "打开"]);
     return keys;
   }
@@ -52,7 +57,9 @@ export class StatsView implements View {
         ? [{ value: "escape", label: "返回群列表" }, { value: "m", label: this.unmasked ? "恢复成员号码打码" : "临时显示成员完整号码", description: "仅当前明细有效；导出的报表会沿用当前打码状态" }]
         : [{ value: "enter", label: "查看选中群的明细", disabled: !this.groups.length },
           { value: "/", label: "筛选群或成员", description: "按群名、成员号码或打码后的号码查找" }]),
-      { value: "w", label: "选择日期范围", description: "今天、近 7 天、近 30 天、本月、全部或自定义" },
+      { value: "w", label: "选择日期范围", description: "今天、昨天、本周、上周、本月、上月、近 7/30 天、全部或自定义" },
+      { value: "t", label: "切换汇总趋势", description: "查看筛选群的合计趋势" },
+      { value: "g", label: "切换日/周/月粒度", description: "统计区间不变，切换趋势聚合粒度" },
       { value: "d", label: "自定义起止日期", description: this.describeWindow() },
       { value: "e", label: "导出当前范围的 HTML 报表", description: "导出所列群；在群明细中还会附上当前群的明细", disabled: this.exporting || this.overview.kind !== "ready" },
       { value: "o", label: "打开最近的报表", disabled: this.opening || !this.lastReport },
@@ -82,8 +89,9 @@ export class StatsView implements View {
     if (reset || this.overview.kind !== "ready") this.overview = { kind: "loading" };
     app.redraw();
     try {
-      const groups = await loadStatsOverview(app.deployment.groupDataRoot, this.window);
+      const [groups, comparisonData] = await Promise.all([loadStatsOverview(app.deployment.groupDataRoot, this.window), collectComparisons(app.deployment.groupDataRoot, this.window)]);
       if (revision !== this.revision) return;
+      this.comparisonData = comparisonData;
       this.overview = { kind: "ready", value: groups };
       this.selected = Math.min(this.selected, Math.max(0, this.groups.length - 1));
       if (this.detail) {
@@ -97,6 +105,9 @@ export class StatsView implements View {
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
+    if (key.name === "t" && !this.detail) { this.showTrend = !this.showTrend; this.scroll.reset(); return true; }
+    if (key.name === "g") { this.grain = this.grain === "day" ? "week" : this.grain === "week" ? "month" : "day"; this.scroll.reset(); return true; }
+    if (key.name === "escape" && this.showTrend && !this.detail) { this.showTrend = false; this.scroll.reset(); return true; }
     if (key.name === "escape" && this.detail) {
       this.detail = null;
       this.unmasked = false;
@@ -114,6 +125,7 @@ export class StatsView implements View {
     if (key.name === "e") { void this.export(app); return true; }
     if (key.name === "o" && this.lastReport) { void this.openReport(app); return true; }
     if (this.overview.kind !== "ready") return false;
+    if (this.showTrend && !this.detail) return this.scroll.onKey(key.name);
     if (this.detail) return this.scroll.onKey(key.name);
     const groups = this.groups;
     const moved = moveSelection(key.name, this.selected, groups.length);
@@ -131,23 +143,12 @@ export class StatsView implements View {
     const value = await app.choose({
       title: "统计日期范围", description: "按本地自然日统计；自定义区间可只填写起始或结束日期。",
       choices: [
-        { value: "all", label: "全部区间" }, { value: "today", label: "今天" },
-        { value: "7", label: "近 7 天" }, { value: "30", label: "近 30 天" },
-        { value: "month", label: "本月" }, { value: "custom", label: "自定义起止日期" },
+        ...PERIODS.map(([value, label]) => ({ value, label })), { value: "custom", label: "自定义起止日期" },
       ],
     });
     if (value === null) return;
     if (value === "custom") { await this.pickWindow(app); return; }
-    if (value === "all") this.window = {};
-    else {
-      const since = new Date();
-      since.setHours(0, 0, 0, 0);
-      if (value === "month") since.setDate(1);
-      else if (value === "7" || value === "30") since.setDate(since.getDate() - Number(value) + 1);
-      const until = new Date();
-      until.setHours(23, 59, 59, 999);
-      this.window = { since: since.getTime(), until: until.getTime() };
-    }
+    this.window = periodWindow(value);
     this.reloadWindow(app);
   }
 
@@ -187,6 +188,8 @@ export class StatsView implements View {
       if (this.detail && !groups.some(group => group.group === this.detail!.group)) groups.push(this.detail);
       const path = await writeReport({
         groups, detail: this.detail, window: this.window,
+        comparisons: this.comparisonData,
+        comparisonScope: this.filter.value ? groups.map(group => group.group) : undefined,
         deployment: app.deployment, unmasked, dir: this.reportDir,
       });
       this.lastReport = { path, unmasked };
@@ -217,10 +220,10 @@ export class StatsView implements View {
       ...wrap(relative(PROJECT_DIR, this.lastReport.path), total - 2).map(line => pad(" " + theme.c("muted", line), total)),
     ] : [];
     const innerCtx = { ...ctx, height: ctx.height - report.length };
-    const waiting = pending(theme, total, this.overview, "该区间内没有使用记录");
+    const waiting = this.overview.kind === "ready" ? null : pending(theme, total, this.overview, "该区间内没有使用记录");
     if (waiting) return [...report, ...waiting];
     const groups = this.groups;
-    if (groups.length === 0 && !this.detail) return [...report, gap(total),
+    if (groups.length === 0 && this.filter.value && !this.detail) return [...report, gap(total),
       pad(this.filter.value ? `  没有匹配「${this.filter.value}」的群或成员；/ 修改，Esc 清除` : "  该区间内没有使用记录；按 w 选择日期", total)];
     return [...report, ...(this.detail ? this.renderDetail(innerCtx, this.detail) : this.renderOverview(innerCtx, groups))];
   }
@@ -234,33 +237,40 @@ export class StatsView implements View {
    */
   private renderOverview(ctx: ViewContext, groups: GroupStats[]): string[] {
     const { theme, width: total, height } = ctx;
-    const people = groups.reduce((sum, group) => sum + group.users.length, 0);
-    const asks = groups.reduce((sum, group) => sum + group.asks, 0);
+    const summary = summarize(groups);
+    const { people, asks } = summary;
+    const scope = this.filter.value ? new Set(groups.map(group => group.group)) : undefined;
+    const notes = [
+      pad(` 覆盖提问 ${people} 人（跨群去重） · 人均 ${summary.average.toFixed(1)} 次 · ${summary.activeDays} 天活跃`, total),
+      pad(" 提问最多 · " + (summary.ranking.slice(0, 3).map(user => `${fmt.maskUser(user.user)} ${user.asks} 次`).join(" · ") || "无提问记录"), total),
+      ...this.comparisonLines(groups, total, scope),
+    ];
     const max = Math.max(...groups.map(group => group.asks));
-    const room = Math.max(1, height - 3);
+    const room = Math.max(1, height - 3 - notes.length);
     const start = windowStart(this.selected, groups.length, room);
     const nameSize = Math.min(30, Math.max(12, Math.floor(total * 0.28)));
     const barSize = Math.max(1, total - 2 - nameSize - 26 - 10);
     const loaded = this.overview.kind === "ready" ? this.overview.value.length : 0;
     const body = [
       rule(theme, total, "统计 · " + this.describeWindow(),
-        groups.length + " 群 · " + people + " 成员人次 · " + asks + " 次提问", "accent"),
-      ...table(theme, {
+        groups.length + " 群 · " + asks + " 次提问", "accent"),
+      ...notes,
+      ...(this.showTrend ? this.scroll.slice(this.trendRows(theme, groups, total), room + 1) : table(theme, {
         width: total, rows: groups.slice(start, start + room), selected: this.selected - start,
         columns: [
           { header: "群", size: nameSize, render: group => group.group },
-          { header: "人数", size: 5, align: "right", render: group => String(group.users.length) },
+          { header: "人数", size: 5, align: "right", render: group => String(summarize([group]).people) },
           { header: "提问", size: 6, align: "right", render: group => String(group.asks) },
           { header: "", size: barSize, render: group => bar(theme, group.asks, max, barSize) },
           { header: "附件", size: 5, align: "right", render: group => String(group.delivered.get("send_file") ?? 0) },
           { header: "最后活动", size: 10, align: "right", render: group => fmt.since(group.lastAt) },
         ],
-      }),
+      })),
     ];
     // 状态行钉在正文最后一行，不跟在表格屁股后面：群少的时候它会停在半空中，
     // 下面又空着十来行，看起来像页面没加载完。
     while (body.length < height - 1) body.push(gap(total));
-    body.push(pad(" " + theme.c("muted", this.filter.value
+    body.push(pad(" " + theme.c("muted", this.showTrend ? `${this.grainLabel} · ${this.scroll.label} · g 日/周/月 · t 返回群列表` : this.filter.value
       ? this.filter.describe(groups.length, loaded)
       : (start + 1) + "–" + Math.min(start + room, groups.length) + " / " + groups.length + " · / 筛选 · w 日期"), total));
     return body;
@@ -274,7 +284,7 @@ export class StatsView implements View {
     const specs = [
       { label: "提问", value: fmt.count(stats.asks) + " 次", trend: months.map(([, month]) => month.asks),
         foot: stats.replies + " 轮处理" },
-      { label: "活跃成员", value: stats.users.length + " 人", foot: stats.days.size + " 天活跃" },
+      { label: "提问人数", value: summarize([stats]).people + " 人", foot: stats.days.size + " 天活跃" },
       { label: "已送附件", value: (stats.delivered.get("send_file") ?? 0) + " 份",
         foot: "图片 " + (stats.delivered.get("send_image") ?? 0) + " 张" },
       // 缓存读率是个比例，用仪表而不是又一个百分数——它解释了左边那笔开销为什么是这个数。
@@ -289,15 +299,24 @@ export class StatsView implements View {
       .map(line => pad(" " + line, total));
   }
 
-  /** 按月提问量。五六个点用横条比柱状图省地方，也不需要一条轴来读量级。 */
-  private monthlyBars(theme: ViewContext["theme"], stats: GroupStats, size: number): string[] {
-    const months = [...stats.months].sort((a, b) => a[0].localeCompare(b[0]));
-    const max = Math.max(0, ...months.map(([, month]) => month.asks));
-    const barSize = Math.max(4, size - 22);
-    return months.map(([month, value]) =>
-      pad(" " + theme.c("muted", month) + " " + bar(theme, value.asks, max, barSize) +
-        pad(String(value.asks), 6, "right") + pad(theme.c("muted", value.users.size + " 人"), 6, "right"), size)
-    );
+  private get grainLabel(): string { return this.grain === "day" ? "按日" : this.grain === "week" ? "按周（周一）" : "按月"; }
+
+  private comparisonLines(groups: GroupStats[], size: number, scope?: Set<string>): string[] {
+    const current = summarize(groups);
+    return comparisons(this.comparisonData, scope).map(period => pad(
+      ` ${period.label} ${describeStatsWindow(period.window)} · 提问 ${change(current.asks, period.asks)} · 人数 ${change(current.people, period.people)}`, size));
+  }
+
+  private trendRows(theme: ViewContext["theme"], groups: GroupStats[], size: number): string[] {
+    return [rule(theme, size, this.grainLabel + " · g 切换粒度"), ...table(theme, {
+      width: size, rows: trend(groups, this.window, this.grain),
+      columns: [
+        { header: "日期", flex: 1, render: row => row.date },
+        { header: "提问", size: 6, align: "right", render: row => String(row.asks) },
+        { header: "人数", size: 5, align: "right", render: row => String(row.askers.size) },
+        { header: "文件", size: 5, align: "right", render: row => String(row.files) },
+      ],
+    })];
   }
 
   /** 模型直接发起的调用在前；脚本里的子调用另起一组，不和它们相加。 */
@@ -321,6 +340,7 @@ export class StatsView implements View {
     const out = [
       rule(theme, total, "统计 › " + stats.group, this.describeWindow(), "accent"),
       ...this.detailTiles(ctx, stats),
+      ...this.comparisonLines([stats], total, new Set([stats.group])),
       gap(total),
     ];
     // 数据本身有缺口时必须说出来，否则上面那笔开销看起来比实际更确定。
@@ -350,29 +370,20 @@ export class StatsView implements View {
 
     // 窄窗口没有第二栏可用，按月和工具就接在成员表后面进同一个滚动区——它们必须始终滚得到，
     // 放不下不等于可以不给。宽窗口才把它们挪到右栏，两边同时落在第一屏。
-    const scrolling = wide ? rows.slice(1) : [
-      ...rows.slice(1), gap(total),
-      rule(theme, total, "按月"), ...this.monthlyBars(theme, stats, total), gap(total),
-      rule(theme, total, "工具调用"), ...this.toolRows(theme, stats, total),
+    const side = [
+      ...this.trendRows(theme, [stats], wide ? sideWidth : total), gap(wide ? sideWidth : total),
+      rule(theme, wide ? sideWidth : total, "工具调用"), ...this.toolRows(theme, stats, wide ? sideWidth : total),
     ];
+    // Scroll both columns together so long daily histories never disappear below the member list.
+    const scrolling = wide ? sideBySide([rows.slice(1), side], [listWidth, sideWidth], 2) : [...rows.slice(1), gap(total), ...side];
     // 先切片再取 label：Viewport 的计数是在 slice 里算出来的，顺序反了会一直显示上一帧的数。
     const visible = this.scroll.slice(scrolling, Math.max(1, room - 2));
     const members = [
-      rule(theme, listWidth, this.unmasked ? "成员 · 完整号码" : "成员 · 已打码", this.scroll.label),
-      header, ...visible,
+      rule(theme, total, this.unmasked ? "成员 · 完整号码" : "成员 · 已打码", this.scroll.label),
+      pad(header, total), ...visible,
     ];
 
-    if (!wide) out.push(...members);
-    else {
-      const side = [
-        rule(theme, sideWidth, "按月"),
-        ...this.monthlyBars(theme, stats, sideWidth),
-        gap(sideWidth),
-        rule(theme, sideWidth, "工具调用"),
-        ...this.toolRows(theme, stats, sideWidth),
-      ].slice(0, members.length);
-      out.push(...sideBySide([members, side], [listWidth, sideWidth], 2));
-    }
+    out.push(...members);
     if (caveats.length) out.push(pad(" " + status(theme, "warn", caveats.join(" · ")), total));
     return out;
   }

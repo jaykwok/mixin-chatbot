@@ -8,6 +8,8 @@ import { mcpOAuth } from "./mcp-oauth.ts";
 export interface McpMember { groupId: string; phone: string; workspaceDir: string; tempDir: string }
 export type ExternalGate = <T>(dispatch: () => Promise<T>, signal: AbortSignal) => Promise<T>;
 export interface McpCatalogueTool { server: McpServerConfig; tool: Tool }
+/** Every request except tools/call ends after requestMs; a tools/call after callMs. */
+export interface McpTimeouts { requestMs: number; callMs: number }
 const supervisor = fileURLToPath(new URL("../core/process-supervisor.ts", import.meta.url));
 const sameSchema = (a: Tool, b: Tool) => JSON.stringify(a.inputSchema) === JSON.stringify(b.inputSchema) && JSON.stringify(a.outputSchema) === JSON.stringify(b.outputSchema);
 
@@ -19,7 +21,10 @@ export class McpTools {
   readonly #closing = new AbortController();
   readonly #scope = new AsyncLocalStorage<{ signal: AbortSignal; gate?: ExternalGate }>();
   readonly #auth = new Map<string, AuthProvider>();
-  constructor(private readonly config: McpConfig, private readonly discoveryDir = "data/runtime/mcp/discovery") {
+  readonly #timeouts: McpTimeouts;
+  constructor(private readonly config: McpConfig, private readonly discoveryDir = "data/runtime/mcp/discovery",
+    timeouts: Partial<McpTimeouts> = {}) {
+    this.#timeouts = { requestMs: 30000, callMs: 120000, ...timeouts };
     for (const server of config.servers) if (server.oauth) this.#auth.set(server.name, mcpOAuth(server).auth);
   }
 
@@ -27,7 +32,7 @@ export class McpTools {
     try {
       await mkdir(this.discoveryDir, { recursive: true, mode: 0o700 });
       for (const server of this.config.servers) {
-        const tools = await this.#use(server, undefined, signal, undefined, client => client.listTools({ signal, timeoutMs: 30000 }));
+        const tools = await this.#use(server, undefined, signal, undefined, client => client.listTools({ signal, timeoutMs: this.#timeouts.requestMs }));
         const names = new Set<string>();
         for (const tool of tools) {
           if (names.has(tool.name)) throw new Error(`MCP ${server.name} 返回重复工具名称`);
@@ -41,11 +46,11 @@ export class McpTools {
 
   async call(entry: McpCatalogueTool, member: McpMember, args: Record<string, unknown>, signal: AbortSignal, gate: ExternalGate): Promise<CallToolResult> {
     return this.#use(entry.server, member, signal, gate, async client => {
-      const current = (await client.listTools({ signal, timeoutMs: 30000 })).find(tool => tool.name === entry.tool.name);
+      const current = (await client.listTools({ signal, timeoutMs: this.#timeouts.requestMs })).find(tool => tool.name === entry.tool.name);
       if (!current || !sameSchema(current, entry.tool)) throw new Error("MCP 工具目录变化，请由管理员检查并重启后重新发现；本次工具未执行");
       signal.throwIfAborted();
-      const callSignal = AbortSignal.any([signal, this.#closing.signal, AbortSignal.timeout(120000)]);
-      return this.#scope.run({ signal: callSignal, gate }, () => client.callTool(entry.tool.name, args, { signal: callSignal, timeoutMs: 120000 }));
+      const callSignal = AbortSignal.any([signal, this.#closing.signal, AbortSignal.timeout(this.#timeouts.callMs)]);
+      return this.#scope.run({ signal: callSignal, gate }, () => client.callTool(entry.tool.name, args, { signal: callSignal, timeoutMs: this.#timeouts.callMs }));
     });
   }
 
@@ -55,7 +60,7 @@ export class McpTools {
     const requestSignal = AbortSignal.any([signal, this.#closing.signal]);
     return this.#scope.run({ signal: requestSignal, gate }, async () => {
       requestSignal.throwIfAborted();
-      const client = new McpClient({ name: "mixin-chatbot", version: "1.1.0", requestTimeoutMs: 30000,
+      const client = new McpClient({ name: "mixin-chatbot", version: "1.1.0", requestTimeoutMs: this.#timeouts.requestMs,
         roots: member ? [{ uri: pathToFileURL(member.workspaceDir).href, name: "workspace (read only)" }, { uri: pathToFileURL(member.tempDir).href, name: "member tmp" }] : [],
       });
       this.#clients.add(client);
@@ -114,7 +119,7 @@ export class McpTools {
           try { method = JSON.parse(init.body).method; } catch { /* The official transport owns protocol validation. */ }
         }
         const signal = AbortSignal.any([this.#closing.signal, ...(scope ? [scope.signal] : []), ...(init?.signal ? [init.signal] : []),
-          ...(method === "tools/call" ? [] : [AbortSignal.timeout(30000)])]);
+          ...(method === "tools/call" ? [] : [AbortSignal.timeout(this.#timeouts.requestMs)])]);
         const dispatch = () => { signal.throwIfAborted(); return fetch(url, { ...init, signal }); };
         return init?.method === "DELETE" || method === "notifications/cancelled" ? fetch(url, { ...init, signal: AbortSignal.timeout(5000) }) : scope?.gate ? scope.gate(dispatch, signal) : dispatch();
       },

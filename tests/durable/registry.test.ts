@@ -30,9 +30,10 @@ const GROUP = "group-a";
 const ALICE = "+8613800000001";
 const BOB = "+8613800000002";
 const RELAY: RelayConfig = {
-  webdavUrl: "https://dav.example.test/remote.php/dav/files/bot", username: "bot", password: "secret",
-  publicBaseUrl: "https://files.example.test", expireHours: 24, signing: false,
-} as unknown as RelayConfig;
+  provider: "s3", endpoint: "https://s3.example.test", region: "test-region", bucket: "test-bucket",
+  accessKeyId: "bot", secretAccessKey: "secret", prefix: "relay/", forcePathStyle: false,
+  maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30,
+};
 const callback = (phone: string) => `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=key-${phone.slice(-1)}`;
 
 const [documentWork] = await loadModuleDefinitions({ documentWorkEnabled: true }) as [AgentModuleDefinition];

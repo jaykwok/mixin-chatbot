@@ -3,7 +3,7 @@
 // Migrations write a group database only through here: pi-durable's official Session/Tx interfaces over the service's
 // storage facade (src/durable/sqlite.ts, the one place this module reaches into production code: the storage format
 // must be the one the service opens). The documents are frozen copies of the service's definitions (same kind, version
-// and semantics; tests/ops/migrations.test.ts compares them), so a later change to the service's documents does not
+// and semantics; tests/ops/migration-v3.test.ts compares them), so a later change to the service's documents does not
 // change what an old migration writes. A Harness is opened paused, with an empty registry and no model providers, only
 // so that creating a conversation writes the built-in `pi.*` documents; nothing resumes it, submits or waits, so no
 // task, tool or request can run. Should the storage format or these interfaces ever change, freeze a copy here.

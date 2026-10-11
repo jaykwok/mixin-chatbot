@@ -112,21 +112,22 @@ json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
 }
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; CHECK_WARN=0
 check() {
     local name="$1" ok="$2" detail="$3" fix="${4:-}"
     [ "$ok" = "1" ] && fix=""
     if [ "$JSON_OUTPUT" = "1" ]; then
         # status 用 pass/warn/fail 三态而不是布尔：Windows 那边的体检本来就分三档，
-        # 两个平台吐同一个 schema，界面才不用写两套解析。这边目前只产生 pass 和 fail。
+        # 两个平台吐同一个 schema，尚未验证的检查明确显示 warn。
         local row status
-        status="$([ "$ok" = "1" ] && echo pass || echo fail)"
+        case "$ok" in 1) status=pass ;; warn) status=warn ;; *) status=fail ;; esac
         row="{\"name\":\"$(json_escape "$name")\",\"status\":\"${status}\",\"detail\":\"$(json_escape "$detail")\",\"fix\":\"$(json_escape "$fix")\"}"
         JSON_ROWS="${JSON_ROWS:+${JSON_ROWS},}${row}"
     fi
-    if [ "$ok" = "1" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+    case "$ok" in 1) PASS=$((PASS+1)) ;; warn) CHECK_WARN=$((CHECK_WARN+1)) ;; *) FAIL=$((FAIL+1)) ;; esac
     [ "$JSON_OUTPUT" = "1" ] && return 0
     if [ "$ok" = "1" ]; then OK "$(printf '%-30s %s' "$name" "$detail")"
+    elif [ "$ok" = "warn" ]; then WA "$(printf '%-30s %s' "$name" "$detail")"
     else ER "$(printf '%-30s %s' "$name" "$detail")"; fi
 }
 
@@ -167,85 +168,28 @@ has_rollback_container() {
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${ROLLBACK_CONTAINER}$"
 }
 
-# 大文件外链分发的体检。relay.json 不存在时该特性关闭，一行都不占——它是可选的，没配
-# 不是问题。配置了就要验到底：写错会让服务拒绝启动，后端不通会让大文件发送失败，公开
-# 基址不通会让群成员拿到死链，三种都不该等到有人真发了个大文件才发现。
+# S3 credentials are never sent to curl or placed on the command line.
+# Full configuration validation occurs in the runtime; this check is intentionally read-only.
 check_relay() {
     [ -f "$RELAY_CONFIG_FILE" ] || return 0
-
     if ! command -v jq >/dev/null 2>&1; then
-        check "data/config/relay.json" "1" "已启用（缺少 jq，跳过连通性探测）"
+        check "S3 外链" "warn" "配置已存在；缺少 jq，尚未校验" "启动时执行完整格式校验；请使用测试文件验收实际云端配置。"
         return 0
     fi
-    if ! jq -e . "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
-        check "data/config/relay.json" "0" "不是有效 JSON（服务拒绝启动）"
+    if ! jq -e 'type == "object" and .provider == "s3" and
+        ([.endpoint,.region,.bucket,.accessKeyId,.secretAccessKey] | all(type == "string" and length > 0)) and
+        ([has("webdavUrl"),has("publicBaseUrl"),has("username"),has("password"),has("signSecret"),has("signPathPrefix")] | any | not)' "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
+        check "data/config/relay.json" "0" "S3 必填项不全或仍使用已移除的旧配置，请重新运行外链向导"
         return 0
     fi
-
-    local dav_url public_url user pass
-    dav_url="$(jq -r '.webdavUrl // empty' "$RELAY_CONFIG_FILE")"
-    public_url="$(jq -r '.publicBaseUrl // empty' "$RELAY_CONFIG_FILE")"
-    if [ -z "$dav_url" ] || [ -z "$public_url" ]; then
-        check "data/config/relay.json" "0" "缺少 webdavUrl 或 publicBaseUrl（服务拒绝启动）"
-        return 0
-    fi
-    # 到期是删文件还是只让链接失效，是这个特性最容易被记错的一件事，写进体检结果里。
-    local expire_hours sign_secret expiry_label
-    expire_hours="$(jq -r '.expireHours // empty' "$RELAY_CONFIG_FILE")"
-    sign_secret="$(jq -r '.signSecret // empty' "$RELAY_CONFIG_FILE")"
-    if [ -z "$expire_hours" ]; then
-        expiry_label="永不过期"
-    elif [ -n "$sign_secret" ]; then
-        expiry_label="签名 ${expire_hours}h 后失效，文件保留"
-    else
-        expiry_label="${expire_hours}h 后删除文件"
-    fi
-    check "data/config/relay.json" "1" "已启用 -> $public_url（$expiry_label）"
-
-    user="$(jq -r '.username // empty' "$RELAY_CONFIG_FILE")"
-    pass="$(jq -r '.password // empty' "$RELAY_CONFIG_FILE")"
-
-    # 凭证经 --netrc-file 传入而不是 -u：同机其他用户能从 /proc/<pid>/cmdline 读到完整
-    # 命令行，WebDAV 密码不该出现在那里。netrc 用 mktemp 建在仅本人可读的目录里，用完即删。
-    local dav_code="000" netrc="" host
-    if [ -n "$user" ]; then
-        mkdir -p "$PROJECT_DIR/tmp"
-        netrc="$(mktemp "$PROJECT_DIR/tmp/relay-auth-XXXXXXXX")"
-        chmod 600 "$netrc"
-        host="$(printf '%s' "$dav_url" | sed -e 's#^[a-zA-Z]*://##' -e 's#[:/].*##')"
-        printf 'machine %s login %s password %s\n' "$host" "$user" "$pass" > "$netrc"
-        dav_code="$(curl -s -o /dev/null -w '%{http_code}' -m 8 --noproxy '*' \
-            -X PROPFIND -H 'Depth: 0' --netrc-file "$netrc" "$dav_url" 2>/dev/null || true)"
-        archive_project_path "$netrc"
-    else
-        dav_code="$(curl -s -o /dev/null -w '%{http_code}' -m 8 --noproxy '*' \
-            -X PROPFIND -H 'Depth: 0' "$dav_url" 2>/dev/null || true)"
-    fi
-
-    case "$dav_code" in
-        200|204|207) check "外链 WebDAV 上传端点" "1" "HTTP $dav_code（可达且凭证有效）" ;;
-        401|403)     check "外链 WebDAV 上传端点" "0" "HTTP $dav_code（认证失败，核对 username/password）" ;;
-        404)         check "外链 WebDAV 上传端点" "0" "HTTP 404（webdavUrl 指向的目录不存在）" ;;
-        000|"")      check "外链 WebDAV 上传端点" "0" "无法连接 $dav_url" ;;
-        *)           check "外链 WebDAV 上传端点" "0" "HTTP $dav_code（未预期的状态）" ;;
-    esac
-
-    # 公开基址只判断「服务是否在应答」：这类文件服务惯于用 HTTP 200 + JSON 业务码表达
-    # 错误，对目录请求返回 200 属于正常行为，所以除了连不上，任何状态码都算通。
-    local public_code
-    public_code="$(code_of "$public_url")"
-    if [ -z "$public_code" ] || [ "$public_code" = "000" ]; then
-        check "外链公开下载基址" "0" "无法连接 $public_url"
-    else
-        check "外链公开下载基址" "1" "HTTP $public_code（服务有应答）"
-    fi
+    check "S3 外链配置必填项" "1" "必填项齐全，未发现旧字段；启动时执行完整格式校验" "此项不检测云端权限、私有访问和签名；云端设置变化后请用测试文件验收。"
 }
 
 doctor() {
     local mode_label="直连"
     [ "$DEPLOY_MODE" = "cloudflare" ] && mode_label="Cloudflare"
     P "mixin-chatbot 健康检查（模式=$mode_label，端口=$PORT）"
-    PASS=0; FAIL=0
+    PASS=0; FAIL=0; CHECK_WARN=0; JSON_ROWS=""
 
     local resolved_group_root=""
     resolved_group_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null || true)"
@@ -316,14 +260,14 @@ doctor() {
     check_relay
 
     if [ "$JSON_OUTPUT" = "1" ]; then
-        printf '{"pass":%s,"warn":0,"fail":%s,"mode":"%s","port":%s,"domain":"%s","checks":[%s]}\n' \
-            "$PASS" "$FAIL" "$DEPLOY_MODE" "$PORT" "$(json_escape "$DOMAIN")" "$JSON_ROWS"
+        printf '{"pass":%s,"warn":%s,"fail":%s,"mode":"%s","port":%s,"domain":"%s","checks":[%s]}\n' \
+            "$PASS" "$CHECK_WARN" "$FAIL" "$DEPLOY_MODE" "$PORT" "$(json_escape "$DOMAIN")" "$JSON_ROWS"
         [ "$FAIL" -gt 0 ] && return 1
         return 0
     fi
 
     echo ""
-    echo -e "结果：${GREEN}${PASS} 项通过${NC}，${RED}${FAIL} 项失败${NC}"
+    echo -e "结果：${GREEN}${PASS} 项通过${NC}，${YELLOW}${CHECK_WARN} 项待核验${NC}，${RED}${FAIL} 项失败${NC}"
     if [ "$FAIL" -gt 0 ]; then
         [ "$group_root_ok" = "1" ] || WA "       群数据根失败 -> 使用 $(ops_command_hint deploy) 并确认目录；"
         if [ "$DEPLOY_MODE" = "cloudflare" ]; then
@@ -333,7 +277,7 @@ doctor() {
         WA "       secret 缺少 -> 使用 $(ops_command_hint deploy)"
         return 1
     else
-        OK "全部检查通过"
+        if [ "$CHECK_WARN" -gt 0 ]; then WA "基础检查完成，请处理待核验项"; else OK "全部检查通过"; fi
         return 0
     fi
 }
@@ -382,12 +326,12 @@ deployment_in_progress() {
 
 # 外链运维交给容器里的 bun 脚本执行，shell 这边只负责把它跑起来。
 #
-# 删一个对象要先从公开地址反推对象名、再拼 WebDAV 地址并带上 Basic 凭据，这些知识全在
+# 对象签名和精确删除由 TypeScript 管理，shell 不接触凭据。
 # src/integrations/relay.ts；在 shell 里抄一遍等于把它维护成两份，而且凭据会出现在命令行
 # 参数里，同机器上任何用户都能从 /proc/<pid>/cmdline 读到。
 #
 # 优先 exec 进正在运行的容器：网络命名空间、挂载和运行身份都与机器人自己完全一致，
-# webdavUrl 里的 127.0.0.1 才能指向宿主机上的后端（容器用的是 --network host）。
+# 对象存储端点需同时可被机器人和群成员访问。
 # rootless Docker 下两种容器都在 rootlesskit 的网络里，到不了宿主机的 127.0.0.1（见部署文档）。
 relay_admin() {
     if [ ! -f "$RELAY_CONFIG_FILE" ]; then
@@ -574,6 +518,27 @@ group_data_admin() {
         "${group_root_args[@]}" \
         -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
         mixin-chatbot bun run "$script" "$@"
+}
+
+# 清理清单始终落到宿主机 tmp/；运行中服务的只读容器没有该目录的可写挂载。
+backup_admin() {
+    command -v docker >/dev/null 2>&1 || { ER "找不到 docker"; return 1; }
+    guard_one_off_container || return 1
+    local user directory reports="$PROJECT_DIR/tmp/backup-cleanup"
+    user="$(service_container_user)" || return 1
+    for directory in "$PROJECT_DIR/tmp" "$reports"; do
+        if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then
+            ER "报告目录是链接或不是目录：$directory"; return 1
+        fi
+    done
+    if [ ! -d "$reports" ]; then
+        mkdir -p -- "$reports" || return 1
+        if [ "$(id -u)" = 0 ]; then chown "$user" "$reports" || return 1; fi
+    fi
+    docker run --rm --user "$user" -e HOME=/app/data/runtime/home \
+        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
+        -v "$reports:/app/tmp/backup-cleanup" \
+        mixin-chatbot bun run scripts/ops/backup-cleanup.ts "$@"
 }
 
 tmp_admin() {
@@ -987,8 +952,8 @@ case "${1:-}" in
     history-clear) shift; history_clear "$@" ;;
     history-compact) shift; HISTORY_OPERATION=compact history_clear "$@" ;;
     # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具在容器内逐条重新检查。
-    backup-scan)   group_data_admin scripts/ops/backup-cleanup.ts scan ;;
-    backup-clean)  shift; group_data_admin scripts/ops/backup-cleanup.ts apply "$@" ;;
+    backup-scan)   backup_admin scan ;;
+    backup-clean)  shift; backup_admin apply "$@" ;;
     uninstall) uninstall ;;
     *)
         # 空参和显式 help 是「我要看帮助」，退 0；其余都是打错了的命令，必须退非零。
@@ -1027,7 +992,8 @@ case "${1:-}" in
         echo "  tmp-purge --days <天数>|--all [--user <手机号>] [--group <群号>]"
         echo "             清理用户临时目录；--days 只删这些天没改动过的条目"
         echo "             --user 与 --group 可组合，把范围限到某个群里的某个成员"
-        echo "  stat [群号] [--since <日期>] [--until <日期>]"
+        echo "  stat [群号] [--period today|yesterday|week|last-week|month|last-month|7d|30d|all]"
+        echo "              或 [--since <日期>] [--until <日期>]"
         echo "             使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
         echo "  routes     回调路由：list 查看绑定与冲突，reset/forget 需停机"
         echo "  history-ls 列出各群的会话历史（群库与旧会话文件的占用、最后活动）"
@@ -1035,7 +1001,7 @@ case "${1:-}" in
         echo "  history-compact <群号> <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
         echo "             清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         echo "             群选择可加 --group-id（原始群号）或 --storage-segment（目录段）"
-        echo "  backup-scan 只读扫描 backup/rm 和 backup/snapshots，分类后在 backup/cleanup 生成清单，不删除"
+        echo "  backup-scan 只读扫描 backup/rm 和 backup/snapshots，分类后在 tmp/backup-cleanup 生成清单，不删除"
         echo "  backup-clean <报告名> [--confirm <确认码>]"
         echo "             不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"
         echo "  uninstall  删除容器（可选镜像、cloudflared、data/、logs/）"

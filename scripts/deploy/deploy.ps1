@@ -194,7 +194,7 @@ Done "bun 版本：$bunVersion"
 # 从此处开始才允许修改持久配置、依赖、服务和网络入口。
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { throw "部署需要管理员权限；请在管理员终端中使用 $(Get-OpsCommandHint 'deploy')。" }
-if ([Version]($bunVersion -replace '-.*$', '') -lt [Version]'1.4.2') { throw '需要 Bun 1.4.2 或更高版本（Windows FFI 进程监督）。' }
+if ([Version]($bunVersion -replace '-.*$', '') -lt [Version]'1.4.3') { throw '需要 Bun 1.4.3 或更高版本。' }
 $UvPath = @(Get-ApplicationPaths 'uv.exe' | Where-Object { Test-VersionedApplication $_ '^uv ' } | Select-Object -First 1)
 if ($UvPath.Count -ne 1) { throw '缺少原生 uv.exe，请先安装 uv 并加入 PATH。' }
 $UvDir = Split-Path $UvPath[0] -Parent
@@ -291,6 +291,8 @@ if (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) {
             Enable-ScheduledTask -TaskName $TaskName | Out-Null
             Start-ScheduledTask -TaskName $TaskName
             if (-not (Wait-BotHealth $record.bot_port)) { throw "数据已提交，但业务实例未就绪；保留新版本，请使用 $(Get-OpsCommandHint 'logs') 检查后使用 $(Get-OpsCommandHint 'resume') 继续。" }
+            & $bunPath run $migrationRunner finalize --project $Project --groups $record.target_group_root --deployment $pendingName
+            if ($LASTEXITCODE -ne 0) { Warn '部署已完成，迁移备份清理未完成；修复日志中的问题后运行 migrations cleanup 重试。' }
             Remove-Item -LiteralPath (Join-Path $StateDir 'deploy-transaction') -Force
             try { Remove-CompletedBackup $pendingSnapshot.Path $Project }
             catch { Warn ('部署已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }
@@ -1013,6 +1015,8 @@ Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 �
             Write-Host "处理后可用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 重试回滚。" -ForegroundColor Red
         }
     } elseif ($deploymentActivated) {
+        & $bunPath run $migrationRunner finalize --project $Project --groups $GroupDataRoot --deployment (Split-Path $snapshot.Path -Leaf)
+        if ($LASTEXITCODE -ne 0) { Warn '部署已完成，迁移备份清理未完成；修复日志中的问题后运行 migrations cleanup 重试。' }
         Remove-Item -LiteralPath $transactionPointer -Force -ErrorAction SilentlyContinue
         try { Remove-CompletedBackup $snapshot.Path $Project }
         catch { Warn ('部署已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, unlink } from "node:fs/promises";
+import { mkdir, readdir, rmdir, unlink } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { createRequire } from "node:module";
 import type { lock as acquireLock } from "proper-lockfile";
@@ -16,10 +16,13 @@ import { describeMigrations } from "./preview.ts";
 const migrations = [v1, v2, v3, v4];
 interface FileCopy { path: string; saved: string; hash: string | null }
 type Kind = "migration" | "verification" | "registration";
-interface Journal { format: 1; id: string; target: number; steps: number[]; deployment?: string; groups: string; backup: string | null; phase: "applying" | "validated" | "committed"; kind?: Kind; marker?: DataVersion; decisions: Decisions; files: FileCopy[] }
+interface Journal { format: 1; id: string; target: number; steps: number[]; deployment?: string; groups: string; backup: string | null; phase: "applying" | "validated" | "committed"; kind?: Kind; marker?: DataVersion; decisions: Decisions; files: FileCopy[]; cleanup?: "pending" | "complete" }
+interface CleanupReceipt { format: 1; ready: boolean; journal: Journal }
 export interface Plan { format: 1; target: number; kind: Kind; groups: string; decisions: Decisions; inputs: Record<string, string | null>; steps: string[]; files: string[] }
 const statePath = (c: Context) => join(c.project, "data/state", MIGRATION_FILE);
-const configPaths = (project: string) => ["data/config/runtime.json", "data/config/models.json", "data/config/auxiliary.json", "data/config/mcp.json", "data/runtime/pi/settings.json", "data/runtime/models-store.json"].map(path => join(project, path));
+const cleanupRoot = (c: Context) => join(c.project, "data/state/migration-cleanup");
+const cleanupPath = (c: Context, id: string) => join(cleanupRoot(c), id + ".json");
+const configPaths = (project: string) => ["data/config/runtime.json", "data/config/relay.json", "data/config/models.json", "data/config/auxiliary.json", "data/config/mcp.json", "data/runtime/pi/settings.json", "data/runtime/models-store.json"].map(path => join(project, path));
 const markerPaths = (context: Context) => [join(context.project, "data/state", VERSION_FILE), join(context.groups, VERSION_FILE)];
 function pairedMarker(context: Context): DataVersion | null {
   const [local, group] = markerPaths(context).map(readDataVersion);
@@ -61,24 +64,134 @@ function selected(context: Context) {
 async function readJournal(context: Context): Promise<Journal | null> {
   const journal = await json(statePath(context)) as Journal | null;
   if (!journal) return null;
-  if (journal.format !== 1 || !Number.isSafeInteger(journal.target) || journal.target < 1 || journal.target > DATA_VERSION || typeof journal.groups !== "string" || !/^[\da-f-]{36}$/.test(journal.id) || !Array.isArray(journal.files) || !Array.isArray(journal.steps) || !["applying", "validated", "committed"].includes(journal.phase) || ![undefined, "migration", "verification", "registration"].includes(journal.kind)) throw new Error("迁移状态无法识别");
-  if (journal.kind === "verification") {
-    if (journal.backup !== null || journal.files.length || journal.steps.length || journal.marker?.dataVersion !== journal.target || !journal.marker.transaction) throw new Error("只校验事务状态无效");
-  } else if (journal.backup !== `backup/snapshots/migration-${journal.id}`) throw new Error("迁移备份路径无效");
+  validateJournal(journal);
   // A committed receipt prevents rollback; it does not bind future deployments to
   // its old mount or require that old mount and backups to remain accessible.
   if (committed(context, journal)) return journal;
   if (journal.groups !== context.groups) throw new Error("群挂载与未提交迁移的原事务不同，请先使用原群根完成或回滚迁移");
   for (const file of journal.files) {
-    if (!/^\d+$/.test(file.saved)) throw new Error("迁移备份条目无效");
     await ordinaryPath(file.path.startsWith(context.groups + "/") || file.path.startsWith(context.groups + "\\") ? context.groups : context.project, file.path);
   }
   if (journal.backup) await ordinaryPath(context.project, join(context.project, journal.backup));
   if (journal.target !== DATA_VERSION || journal.steps.some(to => !migrations.some(m => m.to === to))) throw new Error(`请先使用数据版本 ${journal.target} 的代码完成中断迁移`);
   return journal;
 }
+function validateJournal(journal: Journal): void {
+  if (journal.format !== 1 || !Number.isSafeInteger(journal.target) || journal.target < 1 || journal.target > DATA_VERSION || typeof journal.groups !== "string" || !/^[\da-f-]{36}$/.test(journal.id) || !Array.isArray(journal.files) || !Array.isArray(journal.steps) || !["applying", "validated", "committed"].includes(journal.phase) || ![undefined, "migration", "verification", "registration"].includes(journal.kind)) throw new Error("迁移状态无法识别");
+  if (journal.kind === "verification") {
+    if (journal.backup !== null || journal.files.length || journal.steps.length || journal.marker?.dataVersion !== journal.target || !journal.marker.transaction) throw new Error("只校验事务状态无效");
+  } else if (journal.backup !== `backup/snapshots/migration-${journal.id}`) throw new Error("迁移备份路径无效");
+  for (const file of journal.files) {
+    if (!file || !/^\d+$/.test(file.saved) || typeof file.path !== "string" ||
+        !(file.hash === null || typeof file.hash === "string" && /^[a-f0-9]{64}$/.test(file.hash))) throw new Error("迁移备份条目无效");
+  }
+  if (new Set(journal.files.map(file => file.saved)).size !== journal.files.length) throw new Error("迁移备份条目重复");
+}
 function committed(context: Context, journal: Journal) {
   return migrationCommitted(context.project, journal);
+}
+
+/** Only new transactions opt in. Never sweep historical snapshots or the container's backup bind mount. */
+async function cleanupCommitted(context: Context, receipt: CleanupReceipt): Promise<void> {
+  const journal = receipt.journal;
+  if (!receipt.ready || journal.cleanup !== "pending" || journal.phase !== "committed") return;
+  if (journal.backup) {
+    const snapshot = join(context.project, journal.backup);
+    await ordinaryPath(context.project, snapshot);
+    if (await info(snapshot)) {
+      const names = await readdir(snapshot);
+      const expected = new Set(journal.files.filter(file => file.hash !== null).map(file => file.saved));
+      if (journal.files.some(file => !/^\d+$/.test(file.saved)) || names.some(name => name !== "manifest.json" && !expected.has(name))) {
+        throw new Error(`迁移备份含清单外条目，保留待检查：${snapshot}`);
+      }
+      const manifestPath = join(snapshot, "manifest.json");
+      for (const name of names) {
+        const path = join(snapshot, name);
+        await ordinaryPath(context.project, path);
+        if (!(await info(path))?.isFile()) throw new Error(`迁移备份条目不是普通文件：${path}`);
+      }
+      const manifest = await json(manifestPath);
+      // An empty directory can remain if interrupted between unlink(manifest) and rmdir.
+      if (names.length && (!manifest || manifest.id !== journal.id || manifest.backup !== journal.backup || JSON.stringify(manifest.files) !== JSON.stringify(journal.files))) {
+        throw new Error(`迁移备份清单不匹配，保留待检查：${snapshot}`);
+      }
+      // Preflight every remaining file before deleting any; partial cleanup is safe to retry.
+      for (const file of journal.files) if (names.includes(file.saved) && await fileDigest(join(snapshot, file.saved)) !== file.hash) {
+        throw new Error(`迁移备份内容变化，保留待检查：${snapshot}`);
+      }
+      for (const name of names) if (name !== "manifest.json") await unlink(join(snapshot, name));
+      if (names.includes("manifest.json")) await unlink(manifestPath);
+      await rmdir(snapshot);
+    }
+  }
+  journal.cleanup = "complete";
+  await publishJson(cleanupPath(context, journal.id), receipt);
+  context.report?.("backup-cleaned", `transaction=${journal.id}; backup=${journal.backup ?? "none"}`);
+}
+
+// Independent from the service lease: cleanup runs after the business instance is healthy.
+async function withCleanupLock<T>(context: Context, run: () => Promise<T>): Promise<T> {
+  await ordinaryPath(context.project, cleanupRoot(context));
+  await mkdir(cleanupRoot(context), { recursive: true });
+  const { lock } = createRequire(import.meta.url)("proper-lockfile") as { lock: typeof acquireLock };
+  const release = await lock(cleanupRoot(context), { realpath: false, stale: 30000, update: 5000, retries: 0 });
+  try { return await run(); } finally { await release(); }
+}
+async function readCleanupReceipt(context: Context, id: string): Promise<CleanupReceipt | null> {
+  const path = cleanupPath(context, id);
+  await ordinaryPath(context.project, path);
+  const receipt = await json(path) as CleanupReceipt | null;
+  if (!receipt) return null;
+  if (receipt.format !== 1 || typeof receipt.ready !== "boolean" || !receipt.journal) throw new Error(`迁移清理回执无效：${path}`);
+  validateJournal(receipt.journal);
+  if (receipt.journal.id !== id || receipt.journal.phase !== "committed") throw new Error(`迁移清理回执不匹配：${path}`);
+  return receipt;
+}
+async function retainCleanupReceipt(context: Context, journal: Journal, ready: boolean): Promise<void> {
+  if (journal.cleanup !== "pending" || !journal.backup) return;
+  const existing = await readCleanupReceipt(context, journal.id);
+  if (existing && (existing.journal.backup !== journal.backup || JSON.stringify(existing.journal.files) !== JSON.stringify(journal.files))) throw new Error("迁移清理回执内容冲突");
+  if (!existing || ready && !existing.ready) await publishJson(cleanupPath(context, journal.id), {
+    format: 1, ready, journal: { ...journal, phase: "committed" },
+  } satisfies CleanupReceipt);
+}
+async function cleanupReady(context: Context): Promise<boolean> {
+  let complete = true;
+  for (const name of await readdir(cleanupRoot(context))) {
+    if (!/^[\da-f-]{36}\.json$/.test(name)) continue;
+    try {
+      const receipt = await readCleanupReceipt(context, name.slice(0, -5));
+      if (receipt) await cleanupCommitted(context, receipt);
+    } catch (error) {
+      complete = false;
+      const message = `迁移临时备份清理未完成，不影响升级；回执 ${name} 已保留。修复日志所列的权限或清单异常后，运行 migrations cleanup 重试；不要直接删除快照或回执：${(error as Error).message}`;
+      context.report?.("backup-cleanup-pending", message);
+      console.warn(message);
+    }
+  }
+  return complete;
+}
+
+/** Retry only snapshots whose deployment has already completed successfully. */
+export async function cleanupBackups(context: Context): Promise<boolean> {
+  return withCleanupLock(context, () => cleanupReady(context));
+}
+
+/** The orchestrator calls this only after activation; manual callers explicitly name the checked transaction. */
+export async function finalize(context: Context, owner: { deployment?: string; transaction?: string }): Promise<boolean> {
+  return withCleanupLock(context, async () => {
+    let journal = await readJournal(context);
+    if (owner.transaction && journal?.id !== owner.transaction) {
+      if (!/^[\da-f-]{36}$/.test(owner.transaction)) throw new Error("迁移事务标识无效");
+      journal = (await readCleanupReceipt(context, owner.transaction))?.journal ?? null;
+    }
+    if (!journal || !committed(context, journal) || (!owner.deployment && !owner.transaction) ||
+        (owner.deployment && journal.deployment !== owner.deployment) || (owner.transaction && journal.id !== owner.transaction)) {
+      throw new Error("只有正式启动成功的已提交事务才能完成备份清理；事务标识不匹配");
+    }
+    await retainCleanupReceipt(context, journal, true);
+    return cleanupReady(context);
+  });
 }
 
 export async function committedDeployment(context: Context, deployment: string): Promise<boolean> {
@@ -132,7 +245,11 @@ export async function apply(context: Context, plan?: Plan): Promise<void> {
   await withLease(context, async () => {
     let journal = await readJournal(context);
     // Keep the last commit receipt on disk until the new journal is ready to publish.
-    if (journal && committed(context, journal)) journal = null;
+    if (journal && committed(context, journal)) {
+      // Preserve ownership separately; a locked or changed backup must not block a new upgrade.
+      await withCleanupLock(context, () => retainCleanupReceipt(context, journal!, false));
+      journal = null;
+    }
     if (!journal) {
       if (!plan || plan.format !== 1 || plan.target !== DATA_VERSION || plan.groups !== context.groups || JSON.stringify(plan.inputs) !== JSON.stringify(await inputs(context))) throw new Error("配置在预览后变化或预览缺失，请重新预览；未迁移");
       context = { ...context, decisions: plan.decisions };
@@ -174,7 +291,7 @@ export async function apply(context: Context, plan?: Plan): Promise<void> {
       }
       if (JSON.stringify(plan.inputs) !== JSON.stringify(await inputs(context))) throw new Error("备份期间配置被修改，请重新预览");
       journal = { format: 1, id, target: DATA_VERSION, steps: steps.map(m => m.to), kind, marker: marker ?? undefined, deployment: process.env.BOT_DEPLOY_BACKUP_ID,
-        groups: context.groups, backup, phase: "applying", decisions: context.decisions, files };
+        groups: context.groups, backup, phase: "applying", decisions: context.decisions, files, cleanup: "pending" };
       if (backup) await publishJson(join(context.project, backup, "manifest.json"), journal);
       await publishJson(statePath(context), journal);
     }

@@ -26,7 +26,7 @@ export async function validateMigration(context: Context, projection?: string, e
         const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
         if (!line.startsWith("migration-validation ")) continue;
         const message = JSON.parse(line.slice("migration-validation ".length));
-        if (message.id === id && /^(entry-ready|imports-start|imports-ready|config|stats|delivery|result)$/.test(message.phase)) {
+        if (message.id === id && /^(entry-ready|imports-start|imports-ready|config|stats|delivery|relay|result)$/.test(message.phase)) {
           report(message.phase, `state=${message.state}; code=${message.code ?? ""}; pid=${message.pid}`);
         }
       }

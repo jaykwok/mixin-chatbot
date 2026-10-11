@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runCommand, scenarioRunner, ScenarioProcesses } from "../helpers/concurrent-scenarios.ts";
@@ -46,13 +46,21 @@ test("a command over its limit has its whole process tree ended and waited for, 
   const fixture = await treeFixture("concurrent-scenarios-limit-");
   const processes = new ScenarioProcesses();
   try {
-    // Room for the grandchild to start first: with some security software a process's first spawn takes seconds.
-    const command = runCommand(processes, fixture.root, [process.execPath, "-e", tree(fixture.pids)], {}, undefined, 10000);
+    // This case checks timeout/reaping, not startup speed. Start the real tree
+    // first so slow grandchild creation cannot consume the command's limit.
+    const args = [process.execPath, "-e", tree(fixture.pids)];
+    const child = processes.spawn(args, { cwd: fixture.root, env: { ...process.env } });
     await until(fixture.pids);
-    const { text, limited } = await command;
-    expect(text).toContain("命令超过 10 秒，已结束其进程树");
-    expect(limited).toBe(true);
-    expect(fixture.recorded().map(alive)).toEqual([false, false]);
+    expect(fixture.recorded().map(alive)).toEqual([true, true]);
+    // Hand the already owned process to runCommand; its timer, output and
+    // termination use the real implementation. The next case covers startup.
+    const spawn = spyOn(processes, "spawn").mockReturnValueOnce(child);
+    try {
+      const { text, limited } = await runCommand(processes, fixture.root, args, {}, undefined, 1000);
+      expect(text).toContain("命令超过 1 秒，已结束其进程树");
+      expect(limited).toBe(true);
+      expect(fixture.recorded().map(alive)).toEqual([false, false]);
+    } finally { spawn.mockRestore(); }
   } finally { await processes.stop(); await fixture.dispose(); }
 }, 60000);
 

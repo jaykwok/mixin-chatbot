@@ -30,7 +30,7 @@ export class SettingsView implements View {
   actions(): ViewAction[] {
     if (this.editingRuntime) return this.runtime.actions();
     return [
-      { value: "e", label: "外链配置", description: "启用、修改或停用外链，填写 WebDAV 与公开下载地址" },
+      { value: "e", label: "外链配置", description: "配置私有 S3 存储桶、限时下载和延后清理" },
       { value: "l", label: "Cloudflared 日志", description: "关闭 / 开启，默认关闭" },
       { value: "p", label: "Cloudflared 连接模式", description: "自动 / HTTP2 / QUIC，默认自动" },
       { value: "a", label: "高级运行参数", description: "并发、超时、缓存索引、文档与诊断" },
@@ -148,15 +148,15 @@ export class SettingsView implements View {
     return actionWorkbench(ctx, {
       title: "设置", selected: this.selected,
       items: [
-        { label: "外链配置", summary: "WebDAV 与公开下载地址", status: "idle" },
+        { label: "外链配置", summary: "S3 私有桶与限时下载", status: "idle" },
         { label: "Cloudflared 日志", summary: current, status: this.state.kind === "error" ? "warn" : "idle" },
         { label: "Cloudflared 连接模式", summary: connection, status: protocol.kind === "error" ? "warn" : "idle" },
         { label: "高级运行参数", summary: this.runtime.summary, status: this.runtime.dirty ? "warn" : "idle" },
       ],
       details: this.selected === 0 ? [
         "可选的大文件外链：启用、修改或停用。",
-        "向导含 Alist 示例：上传填到挂载目录，下载可只填域名。",
-        "文件上限、有效期和兼容签名放在高级设置。",
+        "填写 S3 端点、区域、桶名及凭据，群成员直接下载。",
+        "默认链接有效 2 小时，额外保留 30 分钟后清理。",
         "保存前预览并确认，取消不修改配置。",
         "确认后重启原本运行中的机器人，已停止时保持停止。",
       ] : this.selected === 1 ? [

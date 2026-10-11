@@ -1,6 +1,6 @@
 // 历史归档清理：扫描 backup/rm 和 backup/snapshots 的顶层条目，分类后写出清单；只按清单列出的精确路径删除。
 //
-//   scan（默认）                    只读扫描，写出 backup/cleanup/<报告名>/manifest.json 和便于查看的 manifest.tsv
+//   scan（默认）                    只读扫描，写出 tmp/backup-cleanup/<报告名>/manifest.json 和便于查看的 manifest.tsv
 //   apply <报告名>                  预演：逐条重新检查选为删除的条目，列出结果和确认码，不删除任何内容
 //   apply <报告名> --confirm <码>   执行：删除前再逐条检查路径、链接和内容指纹，结果写入同一报告目录
 //
@@ -127,6 +127,20 @@ function readText(path: string): string | null {
 /** 当前不能删除的条目：未完成事务的快照和归档，以及迁移日志引用的快照和事务。每次使用时重新读取。 */
 function protectedPaths(project: string): Map<string, string> {
   const paths = new Map<string, string>();
+  const ready = new Set<string>();
+  const receipts = join(project, "data/state/migration-cleanup");
+  if (realDirectory(receipts, "data/state/migration-cleanup")) for (const name of readdirSync(receipts)) {
+    if (!/^[\da-f-]{36}\.json$/.test(name)) continue;
+    const path = join(receipts, name), stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`迁移清理回执不是普通文件：${path}`);
+    const receipt = JSON.parse(readFileSync(path, "utf8"));
+    const journal = receipt?.journal;
+    if (receipt?.format !== 1 || typeof receipt.ready !== "boolean" || journal?.format !== 1 || journal?.id + ".json" !== name ||
+        !["pending", "complete"].includes(journal?.cleanup) || journal?.phase !== "committed" ||
+        journal?.backup !== `backup/snapshots/migration-${journal?.id}`) throw new Error(`迁移清理回执无效：${path}`);
+    if (receipt.ready) ready.add(journal.id);
+    else paths.set(journal.backup, `正式实例尚未确认就绪（data/state/migration-cleanup/${name}），先完成启动和 finalize`);
+  }
   for (const pointer of ["deploy-transaction", "upgrade-transaction"]) {
     const name = readText(join(project, "data/state", pointer))?.trim();
     if (!name || !TRANSACTION_NAME.test(name)) continue;
@@ -134,11 +148,11 @@ function protectedPaths(project: string): Map<string, string> {
   }
   const text = readText(join(project, "data/state", MIGRATION_FILE));
   if (text !== null) {
-    let journal: { backup?: unknown; deployment?: unknown };
+    let journal: { id?: string; backup?: unknown; deployment?: unknown };
     try { journal = JSON.parse(stripBom(text)); }
     catch { throw new Error(`迁移日志 data/state/${MIGRATION_FILE} 无法解析，无法判断哪些快照仍在使用；请先检查该文件`); }
-    if (typeof journal.backup === "string") paths.set(journal.backup, `当前迁移日志 data/state/${MIGRATION_FILE} 引用的迁移快照`);
-    if (typeof journal.deployment === "string" && TRANSACTION_NAME.test(journal.deployment)) {
+    if (typeof journal.backup === "string" && !ready.has(journal.id ?? "")) paths.set(journal.backup, `当前迁移日志 data/state/${MIGRATION_FILE} 引用的迁移快照`);
+    if (!ready.has(journal.id ?? "") && typeof journal.deployment === "string" && TRANSACTION_NAME.test(journal.deployment)) {
       for (const area of AREAS) paths.set(`backup/${area}/${journal.deployment}`, `当前迁移日志 data/state/${MIGRATION_FILE} 引用的事务`);
     }
   }
@@ -150,7 +164,7 @@ const pendingPointer = (project: string) => POINTERS.find(name => {
   catch (error) { if (code(error) === "ENOENT") return false; throw error; }
 });
 
-/** backup/ 及其下的目录必须是真实目录：工具不经过链接或目录联接。缺失返回 false。 */
+/** 备份及报告目录必须是真实目录：工具不经过链接或目录联接。缺失返回 false。 */
 function realDirectory(path: string, label: string): boolean {
   let stat;
   try { stat = lstatSync(path); }
@@ -238,20 +252,22 @@ function publish(path: string, content: string): void {
 function reportDirectory(project: string, report: string): string {
   if (!REPORT_NAME.test(report)) throw new Error(`报告名无效：${report}`);
   realDirectory(join(project, "backup"), "backup");
-  const directory = join(project, "backup/cleanup", report);
-  if (!realDirectory(join(project, "backup/cleanup"), "backup/cleanup") || !realDirectory(directory, `backup/cleanup/${report}`)) {
-    throw new Error(`找不到报告 backup/cleanup/${report}`);
+  realDirectory(join(project, "tmp"), "tmp");
+  const directory = join(project, "tmp/backup-cleanup", report);
+  if (!realDirectory(join(project, "tmp/backup-cleanup"), "tmp/backup-cleanup") || !realDirectory(directory, `tmp/backup-cleanup/${report}`)) {
+    throw new Error(`找不到报告 tmp/backup-cleanup/${report}`);
   }
   return directory;
 }
 
 export interface ScanReport { report: string | null; entries: Entry[]; skipped: string[] }
 
-/** 只读扫描；唯一的写入是 backup/cleanup/<报告名>/ 下的清单。 */
+/** 只读扫描；唯一的写入是 tmp/backup-cleanup/<报告名>/ 下的清单。 */
 export function scan(project: string, progress?: (done: number, total: number) => void): ScanReport {
   if (!realDirectory(join(project, "backup"), "backup")) return { report: null, entries: [], skipped: [] };
-  realDirectory(join(project, "backup/cleanup"), "backup/cleanup");
-  const skipped = readdirSync(join(project, "backup")).filter(name => name !== "cleanup" && !(AREAS as readonly string[]).includes(name)).sort();
+  realDirectory(join(project, "tmp"), "tmp");
+  realDirectory(join(project, "tmp/backup-cleanup"), "tmp/backup-cleanup");
+  const skipped = readdirSync(join(project, "backup")).filter(name => !(AREAS as readonly string[]).includes(name)).sort();
   const protect = protectedPaths(project);
   const names = AREAS.flatMap(area => realDirectory(join(project, "backup", area), `backup/${area}`)
     ? readdirSync(join(project, "backup", area)).sort().map(name => [area, name] as const) : []);
@@ -261,7 +277,7 @@ export function scan(project: string, progress?: (done: number, total: number) =
   });
   const created = new Date();
   const report = `${timestamp(created)}-${randomBytes(3).toString("hex")}`;
-  const directory = join(project, "backup/cleanup", report);
+  const directory = join(project, "tmp/backup-cleanup", report);
   mkdirSync(directory, { recursive: true });
   const manifest: Manifest = { format: 2, created: created.toISOString(), integrity: integrity(created.toISOString(), entries), entries };
   publish(join(directory, "manifest.json"), manifestText(manifest));
@@ -404,7 +420,7 @@ function printScan(scanned: ScanReport): void {
   }
   if (scanned.skipped.length) console.log(`backup/ 下未扫描：${scanned.skipped.join("、")}`);
   console.log("");
-  console.log(`清单：backup/cleanup/${scanned.report}/manifest.json（查看用 manifest.tsv）`);
+  console.log(`清单：tmp/backup-cleanup/${scanned.report}/manifest.json（查看用 manifest.tsv）`);
   console.log("建议动作：只删除可确认测试数据；其余保留。要删除某个业务归档，先另行备份，再把 manifest.json 中该条的 action 改为 delete。");
   console.log("下一步预演（不删除）：");
   console.log(`  Linux：./scripts/ops/ops.sh backup-clean ${scanned.report}`);
@@ -458,7 +474,7 @@ async function main(args: string[]): Promise<number> {
       printScan(scan(project, progress));
       return 0;
     case "apply":
-      if (!report) throw new Error("apply 需要报告名（backup/cleanup 下的目录名）");
+      if (!report) throw new Error("apply 需要报告名（tmp/backup-cleanup 下的目录名）");
       return printApply(report, apply(project, report, values.confirm, progress), values.confirm !== undefined);
     default:
       usage();

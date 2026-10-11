@@ -30,21 +30,15 @@ async function list(): Promise<number> {
     const status = object.state === "planned" ? "上传未确认" : "已上传";
     console.log(`${object.name}（${formatSize(object.size)}，${status}，最后更新于 ${describeAge(object.at)}）`);
     console.log(`  ${object.url}`);
+    console.log(`  链接到期：${object.expiresAt ?? "未确认"}；计划删除：${object.deleteAfter ?? "上传超时后回收"}`);
   }
   console.log("");
   console.log(`共 ${objects.length} 条。`);
   if (!config) {
     console.log("未配置外链后端；仅展示账本原始地址，无法验证下载或执行清理。");
-  } else if (!config.expireHours) {
-    console.log("未配置 expireHours，本项目不主动过期已上传对象或链接。");
-  } else if (config.signSecret) {
-    // 上面打印的地址是刚签出来的，跟当初发进群里那条不是同一个 sign，别让人以为链接变了。
-    console.log(
-      `链接有效期 ${config.expireHours} 小时（上面列出的地址是刚签发的，从现在起算）；` +
-        "到期只是签名失效，文件仍留在后端，不会被自动回收——要腾空间用 purge。"
-    );
   } else {
-    console.log(`有效期 ${config.expireHours} 小时，从上面的时间起算；到期后对象会被自动删除。`);
+    console.log("链接和删除时间分别固定保存在账本；查看列表不会续期。过期或未确认的对象只展示存储地址，不能据此下载。");
+    console.log("到计划删除时间后由后台扫描清理；停机期间需依赖云端生命周期兜底。");
   }
   if (config) console.log("未完成的上传计划超过 31 分钟后可被回收；以上规则仅适用于当前后端。");
   return 0;
@@ -62,14 +56,14 @@ async function purge(match: string | undefined): Promise<number> {
   console.log(`匹配 ${result.matched} 条，已删除 ${result.deleted} 个对象。`);
   if (result.orphaned > 0) {
     console.log(
-      `${result.orphaned} 条记录的地址与当前 publicBaseUrl 对不上（换过后端或目录），` +
-        "记录已保留；请使用原后端配置处理这些对象。"
+      `${result.orphaned} 条记录不属于当前 S3 后端（换过端点、区域、桶或目录），` +
+        "记录已保留；请使用匹配的 S3 配置处理这些对象。"
     );
   }
   if (result.failed > 0) {
     console.log(
       `${result.failed} 条删除失败，索引记录已保留可以重试；` +
-        "常见原因是后端不可达或挂载的网盘授权已过期。"
+        "请检查对象存储连通性和删除权限。"
     );
     return 1;
   }

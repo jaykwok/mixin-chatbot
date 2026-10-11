@@ -135,6 +135,19 @@ bun audit
 
 `bun run check` 包含 TypeScript、隔离 cwd 的 Bun 测试、普通 Knip 和 production Knip。单独运行测试也使用 `bun run test`，以免直接 `bun test` 读取开发者的真实配置。每次运行的隔离 cwd 是工作根目录下的 `tests-*`，工作根目录由 `MIXIN_TEST_WORK_ROOT` 指定；未设置时 Windows 用系统临时目录，WSL 用 Linux 文件系统中的 `/tmp/mixin-tests`，其余平台用项目 `tmp/`。Windows 在创建工作目录前用 `realpath` 展开 TEMP 或指定根目录的短路径、目录联接等别名，cwd、夹具环境变量和回执统一使用完整物理路径。默认夹具放在工作区之外，减少编辑器目录扫描对重命名的干扰。全部通过后删除，失败时保留现场并打印路径，诊断日志仍在项目 `tmp/`。
 
+`bun run test` 默认把测试文件按耗时分组并行。组数为 CPU 核数减一，Windows 最多 4 组，其他平台最多 6 组，可用 `--jobs=<组数>` 或环境变量 `MIXIN_TEST_JOBS` 指定，`--jobs=1` 即串行。
+
+Windows 使用标准安装位置的 Git Bash 时，最外层运行器会先启动一个等待进程，在整次测试期间保持 `/tmp` 映射。嵌套运行器通过内部环境变量复用仍存活的等待进程，避免重复启动。Git Bash 的同时运行进程共享这个映射，不能让它指向随时可能归档的测试夹具。各组和各用例的 `TMP`、`TEMP`、`TMPDIR` 仍指向各自的临时目录；最外层测试结束后关闭等待进程，不修改 Git Bash 或系统配置。
+
+- **隔离**：每组都是上面那样一次完整的隔离运行，有自己的 `tests-*` 工作目录、夹具和诊断日志。
+- **输出**：各组结束时依次输出，最后汇总通过、跳过和失败数，失败的组保留现场。
+- **JUnit**：指定 `--reporter=junit` 时，各组的报告合并写到 `--reporter-outfile`。
+- **按一组运行**：只给一个测试文件，或者给了不是路径的文件名筛选时，按一组运行，输出实时显示。
+- **耗时表**：分组依据 `tests/timings/<平台>.json` 中的逐文件耗时。本机多组运行后实测的耗时记在 `tmp/test-timings-<平台>.json`，并优先使用。只更新报告中已完成且通过的文件；失败、超时、全部跳过或未生成完整报告的文件保留已有权重，同一失败组中通过的其他文件仍可更新。记录时会生成临时 JUnit 报告核对结果，不依赖终端的通过/失败文字。耗时表只影响各组是否均衡，不影响运行哪些测试。
+- **记录耗时**：`--record-timings=<文件>` 按同样的格式写出本次的逐文件耗时。CI 用它上传产物，可以直接替换仓库中对应平台的耗时表。
+- **不能直接传入的选项**：Bun 自带的 `--parallel`、`--shard`、`--timings` 和 `--update-timings` 由运行器接管。`--parallel` 的 worker 共用一个工作目录，而测试里相对工作目录的路径会互相干扰。
+- **默认超时**：没有自带超时的测试，默认超时为 20 秒（Bun 的默认是 5 秒），因为启动子进程的测试在多组同时运行时会变慢。命令行给了 `--timeout` 时以它为准。
+
 `package.json` 的 overrides 把个别传递依赖固定到修复已知问题的版本。`scripts/patches` 保留两处构建期补丁：Knip 传播 Bun 脚本入口的 production 标记；Pi Durable 的 `beforeSummarize` 钩子让压缩请求也经过请求门与用量记账。Knip 6.40.0 原版仍会排除这个生产入口，即使在配置中显式声明；`tests/ops/knip.test.ts` 同时验证已用代码不误报、无用文件和依赖仍会报错。依赖均精确固定版本，升级时同步检查覆盖、补丁、锁文件和 `bun audit`，并跑普通与 production 两种死代码检查。
 
 命令行入口放在 `scripts/{config,ops,runtime}` 下，由 `package.json` 和 `knip.json` 登记为生产入口；新增命令时同步更新入口声明。`bun run tui:preview [页面] [列] [行]` 用固定的演示数据把管理台页面渲染成文本（`--plain` 去色），用来核对排版；截图维护见[截图说明](assets/README.md)。

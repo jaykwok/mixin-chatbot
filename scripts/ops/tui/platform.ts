@@ -114,7 +114,7 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
       all: "All", json: "Json", repair: "Repair", "restart-tunnel": "RestartTunnel",
       "storage-segment": "StorageSegment", "group-id": "GroupId",
     };
-    const values: Record<string, string> = { days: "Days", user: "User", group: "Group", since: "Since", until: "Until", "confirmed-transaction": "ConfirmedTransaction" };
+    const values: Record<string, string> = { days: "Days", user: "User", group: "Group", since: "Since", until: "Until", period: "Period", "confirmed-transaction": "ConfirmedTransaction" };
     // TUI passes argument values as opaque strings (including leading dashes).
     // Encode them with '=' before the standard parser, preserving that contract.
     const encodedArgs: string[] = [];
@@ -127,7 +127,7 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
       all: { type: "boolean" }, json: { type: "boolean" }, repair: { type: "boolean" }, "restart-tunnel": { type: "boolean" },
       "storage-segment": { type: "boolean" }, "group-id": { type: "boolean" },
       days: { type: "string" }, user: { type: "string" }, group: { type: "string" }, since: { type: "string" }, until: { type: "string" },
-      "confirmed-transaction": { type: "string" },
+      "confirmed-transaction": { type: "string" }, period: { type: "string" },
     });
     if (parsed.positionals.length) throw new Error("存在多余的运维参数");
     for (const [name, value] of Object.entries(parsed.values)) {

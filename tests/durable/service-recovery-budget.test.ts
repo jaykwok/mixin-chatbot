@@ -118,16 +118,19 @@ test("parallel safe tools of one ordinary request reuse its slot", async () => {
   } finally { tools.release(); await service.close(); f.stateDb.close(); }
 }, 60000);
 
+// The service keeps an idle member for DEDUP_TTL (30 s); a shorter window keeps the real clock without the wait.
 test("maintenance does not renew idle member activity or resurrect expired callbacks", async () => {
   const f = setup(); f.faux.setResponses([fauxAssistantMessage("answer"), fauxAssistantMessage("new answer")]);
-  const service = new DurableService({ ...f.common, limits: f.limits });
+  const idle = 6000;
+  expect(idle).toBeLessThan(DEDUP_TTL);
+  const service = new DurableService({ ...f.common, limits: { ...f.limits, memberIdleMs: idle } });
   try {
     await service.admit("1001", "a", "first", URL);
     await until(() => f.replies() === 1 && service.hasUserRequestCapacity(), "reply and cleanup"); await Bun.sleep(100);
-    await Bun.sleep(DEDUP_TTL / 2);
+    await Bun.sleep(idle / 2);
     await service.maintain(); await Bun.sleep(100);
     expect(service.callbackUrl("1001", "a", "fallback")).toBe(URL);
-    await Bun.sleep(DEDUP_TTL / 2 + 300);
+    await Bun.sleep(idle / 2 + 300);
     await service.maintain(); await Bun.sleep(100);
     console.log(JSON.stringify({ probe: "idle-member-pruning", callback: service.callbackUrl("1001", "a", "fallback") }));
     expect(service.callbackUrl("1001", "a", "fallback")).toBe("fallback");

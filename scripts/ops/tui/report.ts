@@ -20,6 +20,7 @@ import { join } from "node:path";
 import * as fmt from "./render/format.ts";
 import { PROJECT_DIR, describeMode, type Deployment } from "./platform.ts";
 import type { GroupStats, Window } from "./data.ts";
+import { change, comparisons, describeStatsWindow, engagement, STATS_NOTE, summarize, trend, type ComparisonData } from "../stats-summary.ts";
 
 export interface ReportInput {
   groups: GroupStats[];
@@ -29,8 +30,11 @@ export interface ReportInput {
   deployment: Deployment;
   /** 是否输出完整手机号。默认打码，与界面一致。 */
   unmasked: boolean;
-  /** 输出目录；默认 backup/reports。测试用它写进自己的临时目录。 */
+  /** 输出目录；默认 tmp/reports。测试用它写进自己的临时目录。 */
   dir?: string;
+  comparisons?: ComparisonData | null;
+  /** When filtering, compare the same selected groups in both periods. Absent means all groups. */
+  comparisonScope?: string[];
 }
 
 /** HTML 转义。群号可以带任意 Unicode，成员标识来自外部输入，一律当不可信文本处理。 */
@@ -50,7 +54,7 @@ function esc(text: string): string {
  * 间隔，不画边框去分隔）。数值直接标在条尾，不依赖悬浮提示。
  */
 function hbar(label: string, value: number, max: number, display: string, tip: string): string {
-  const ratio = max > 0 ? Math.max(0.004, value / max) : 0;
+  const ratio = max > 0 && value > 0 ? Math.max(0.004, value / max) : 0;
   return `
         <div class="row">
           <div class="row-label" title="${esc(label)}">${esc(label)}</div>
@@ -63,7 +67,7 @@ function hbar(label: string, value: number, max: number, display: string, tip: s
 
 /** 纵向柱。值标在柱顶，横轴标签在下方——容器高度含轴标签，不让它被裁掉。 */
 function column(label: string, value: number, max: number, display: string, tip: string): string {
-  const ratio = max > 0 ? Math.max(0.004, value / max) : 0;
+  const ratio = max > 0 && value > 0 ? Math.max(0.004, value / max) : 0;
   return `
           <div class="col">
             <div class="col-value">${esc(display)}</div>
@@ -85,9 +89,9 @@ function tile(label: string, value: string, note = ""): string {
 }
 
 /** 表格视图。每张图都配一份，保证任何数值都不只能靠悬浮读到。 */
-function tableView(headers: string[], rows: string[][], caption: string): string {
+function tableView(headers: string[], rows: string[][], caption: string, open = false): string {
   return `
-        <details class="table-view">
+        <details class="table-view"${open ? " open" : ""}>
           <summary>表格视图 · ${esc(caption)}</summary>
           <table>
             <thead><tr>${headers.map((head) => `<th>${esc(head)}</th>`).join("")}</tr></thead>
@@ -187,7 +191,7 @@ const STYLE = `
   .row { display: grid; grid-template-columns: minmax(80px, 22%) 1fr auto; align-items: center; gap: 12px; margin-bottom: 10px; }
   .row-label { color: var(--text-secondary); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .track { border-left: 1px solid var(--baseline); padding-left: 0; height: 16px; display: flex; align-items: center; }
-  .fill { background: var(--series-1); height: 16px; border-radius: 0 4px 4px 0; min-width: 2px; position: relative; }
+  .fill { background: var(--series-1); height: 16px; border-radius: 0 4px 4px 0; position: relative; }
   .row-value { color: var(--text-secondary); font-size: 13px; font-variant-numeric: tabular-nums; }
 
   /* 纵向柱：容器高度含轴标签，柱顶 4px 圆角、底边见方。 */
@@ -195,7 +199,9 @@ const STYLE = `
   .col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; }
   .col-value { color: var(--text-secondary); font-size: 12px; font-variant-numeric: tabular-nums; }
   .col-track { height: 128px; width: 100%; max-width: 24px; display: flex; align-items: flex-end; }
-  .col-fill { background: var(--series-1); width: 100%; border-radius: 4px 4px 0 0; min-height: 2px; position: relative; }
+  .col-fill { background: var(--series-1); width: 100%; border-radius: 4px 4px 0 0; position: relative; }
+  .trend-cols { overflow-x: auto; padding-top: 36px; }
+  .trend-cols .col { min-width: 76px; }
   .col-label { color: var(--text-muted); font-size: 11px; padding-top: 4px; }
   .axis-labels { display: flex; }
 
@@ -210,7 +216,7 @@ const STYLE = `
   }
   .col-fill[data-tip]:hover::after { left: 50%; top: 0; transform: translate(-50%, -120%); }
 
-  .table-view { margin-top: 16px; }
+  .table-view { margin-top: 16px; max-height: 520px; overflow: auto; }
   .table-view summary { color: var(--text-muted); font-size: 12px; cursor: pointer; }
   table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
@@ -230,6 +236,7 @@ const STYLE = `
     .toggle { display: none; }
     section { break-inside: avoid; border-color: #ddd; }
     .table-view[open] summary { display: none; }
+    .table-view { max-height: none; overflow: visible; }
   }
 `;
 
@@ -245,7 +252,7 @@ const SCRIPT = `
 function overviewSection(input: ReportInput): string {
   const { groups } = input;
   const asks = groups.reduce((sum, group) => sum + group.asks, 0);
-  const people = groups.reduce((sum, group) => sum + group.users.length, 0);
+  const summary = summarize(groups);
   const files = groups.reduce((sum, group) => sum + (group.delivered.get("send_file") ?? 0), 0);
   const images = groups.reduce((sum, group) => sum + (group.delivered.get("send_image") ?? 0), 0);
   const days = new Set(groups.flatMap((group) => [...group.days])).size;
@@ -260,7 +267,8 @@ function overviewSection(input: ReportInput): string {
         <div class="section-note">${esc(describeWindow(input.window))}</div>
         <div class="tiles">
           ${tile("使用群数", String(groups.length))}
-          ${tile("成员人次", String(people), "同一人出现在两个群算两次")}
+          ${tile("覆盖提问人数", String(summary.people), "跨群去重，不代表群总人数")}
+          ${tile("人均提问", summary.average.toFixed(1), "次 / 提问成员")}
           ${tile("已送附件", String(files), images > 0 ? `另有 ${images} 张图片` : "")}
           ${tile("活跃天数", String(days))}
         </div>
@@ -276,15 +284,15 @@ function overviewSection(input: ReportInput): string {
               group.asks,
               max,
               fmt.grouped(group.asks),
-              `${group.group}：${group.asks} 次提问 · ${group.users.length} 人`
+              `${group.group}：${group.asks} 次提问 · ${summarize([group]).people} 人提问`
             )
           )
           .join("")}
         ${tableView(
-          ["群", "人数", "提问", "处理轮次", "附件", "活跃天数", "首次", "最后"],
+          ["群", "提问人数", "提问", "处理轮次", "附件", "活跃天数", "首次", "最后"],
           groups.map((group) => [
             group.group,
-            String(group.users.length),
+            String(summarize([group]).people),
             String(group.asks),
             String(group.replies),
             String(group.delivered.get("send_file") ?? 0),
@@ -295,6 +303,37 @@ function overviewSection(input: ReportInput): string {
           "各群汇总"
         )}
       </section>`;
+}
+
+function analysisSections(input: ReportInput, groups: GroupStats[], title: string, scope?: Set<string>): string {
+  const summary = summarize(groups);
+  const activity = engagement(groups, input.window);
+  const unmasked = input.unmasked && !!input.detail && groups.length === 1 && scope?.size === 1 && scope.has(input.detail.group);
+  const name = (user: string) => unmasked ? user : fmt.maskUser(user);
+  const periods = comparisons(input.comparisons, scope);
+  const comparison = periods.length ? tableView(
+    ["对比", "基期区间", "本期提问", "基期提问", "提问变化", "本期人数", "基期人数", "人数变化"],
+    periods.map(period => [period.label, describeStatsWindow(period.window), String(summary.asks), String(period.asks), change(summary.asks, period.asks), String(summary.people), String(period.people), change(summary.people, period.people)]),
+    "同比与环比", true) : `<div class="section-note">全部或单边区间不计算同比环比，请选择日、周、月或完整自定义区间。</div>`;
+  const charts = ([ ["day", "每日"], ["week", "每周（周一为起点）"], ["month", "每月"] ] as const).map(([grain, label]) => {
+    const points = trend(groups, input.window, grain);
+    const shown = points.slice(-90);
+    const max = Math.max(0, ...shown.map(point => point.asks));
+    return `<section><h2>${esc(title)} · ${label}明细</h2>
+      <div class="section-note">无记录日期补 0；周、月首尾只统计所选区间内的日期。${points.length > 90 ? "图中展示最后 90 个周期，表格保留完整数据。" : ""}</div>
+      <div class="cols trend-cols">${shown.map(point => column(point.date, point.asks, max, String(point.asks), `${point.date}：${point.asks} 次提问 · ${point.askers.size} 人`)).join("")}</div>
+      ${tableView(["日期", "提问", "提问人数", "人均提问", "处理轮次", "文件", "图片", "已知估算费用", "费用未知记录", "用量缺失记录"], points.map(point => [point.date, String(point.asks), String(point.askers.size), point.askers.size ? (point.asks / point.askers.size).toFixed(1) : "0.0", String(point.replies), String(point.files), String(point.images), "$" + point.cost.toFixed(6), String(point.unknownCost), String(point.missingUsage)]), label, grain === "day")}
+    </section>`;
+  }).join("");
+  return `<section><h2>${esc(title)} · 同比与环比</h2>
+    <div class="section-note">${esc(STATS_NOTE)}</div>${comparison}</section>
+    <section><h2>${esc(title)} · 使用频率</h2><div class="section-note">日均包含无提问的日期；不限日期时，以首末有记录的日期为范围。费用仅为已有价格记录的估算。</div>
+    <div class="tiles">${tile("日均提问", activity.dailyAverage.toFixed(1), `${activity.days} 个自然日`)}${tile("活跃天数占比", (activity.activeRate * 100).toFixed(1) + "%", `${summary.activeDays} 天有提问`)}${tile("提问高峰日", activity.peak?.date ?? "—", activity.peak ? `${activity.peak.asks} 次；并列峰值取最早一天` : "无提问记录")}${tile("前五名提问占比", (activity.topFiveShare * 100).toFixed(1) + "%", "观察提问是否集中于少数成员")}</div></section>
+    <section><h2>${esc(title)} · 提问排行</h2>
+    <div class="tiles">${tile("提问最多", summary.ranking[0] ? name(summary.ranking[0].user) : "—", summary.ranking[0] ? `${summary.ranking[0].asks} 次；并列者见下表` : "区间内无提问")}${tile("总提问数", String(summary.asks))}${tile("覆盖提问人数", String(summary.people))}${tile("人均提问", summary.average.toFixed(1))}</div>
+    <div class="section-note">按提问次数降序，跨群合并；图表显示前 20 位，完整排行见表格。${unmasked ? "含当前群完整手机号。" : "手机号已打码。"}</div>
+    ${summary.ranking.slice(0, 20).map(user => hbar(name(user.user), user.asks, summary.ranking[0]!.asks, String(user.asks), `${name(user.user)}：${user.asks} 次`)).join("")}
+    ${tableView(["排名", "成员", "提问", "占比", "活跃天数", "参与群数"], summary.ranking.map((user, index) => [String(index + 1), name(user.user), String(user.asks), (100 * user.asks / summary.asks).toFixed(1) + "%", String(user.days.size), String(user.groups.size)]), "完整提问排行")}</section>${charts}`;
 }
 
 function detailSection(input: ReportInput, stats: GroupStats): string {
@@ -419,11 +458,11 @@ ${
 /**
  * 生成报表并返回文件路径。
  *
- * 落在 backup/reports 下：backup/ 已经在 .gitignore 里，报表含群号和使用情况，不该被顺手
+ * 落在 tmp/reports 下：tmp/ 已经在 .gitignore 里，报表含群号和使用情况，不该被顺手
  * 提交进仓库。文件名带时间戳，同一天导出多次不会互相覆盖。
  */
 export async function writeReport(input: ReportInput): Promise<string> {
-  const dir = input.dir ?? join(PROJECT_DIR, "backup", "reports");
+  const dir = input.dir ?? join(PROJECT_DIR, "tmp", "reports");
   await mkdir(dir, { recursive: true });
   const now = new Date();
   const stamp = `${fmt.day(now.getTime())}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
@@ -446,11 +485,13 @@ export async function writeReport(input: ReportInput): Promise<string> {
     <div class="meta">导出于 ${esc(fmt.day(now.getTime()))} ${esc(fmt.clock(now.getTime()))} · ${esc(describeMode(input.deployment))}</div>
   </header>
 ${overviewSection(input)}
+${analysisSections({ ...input, unmasked: false }, input.groups, "所选群汇总", input.comparisonScope ? new Set(input.comparisonScope) : undefined)}
 ${input.detail ? detailSection(input, input.detail) : ""}
+${input.detail ? analysisSections(input, [input.detail], "群 " + input.detail.group, new Set([input.detail.group])) : ""}
   <footer class="page">
     统计口径：一条发给机器人的消息算一次提问（含干活途中的插话），/help /clear 等指令不计入。<br>
     数据来自使用统计账本，清空上下文或归档历史不影响已入账的数字。附件数只算带 fileId 的成功工具结果，生成链接不等于送达。<br>
-    成员人次按群相加，同一个成员出现在两个群会计算两次。
+    ${esc(STATS_NOTE)}
   </footer>
 </main>
 <script>${SCRIPT}</script>

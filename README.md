@@ -48,10 +48,10 @@ flowchart TD
 
 | 部署方式 | 需要准备 |
 | --- | --- |
-| Windows 原生 | Bun 1.4.2+、Git for Windows（含 GNU Bash）、原生 `uv.exe`；使用管理员 PowerShell |
+| Windows 原生 | Bun 1.4.3+、Git for Windows（含 GNU Bash）、原生 `uv.exe`；使用管理员 PowerShell |
 | Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；rootful Docker 由 root 部署和升级（docker 组普通用户会被拒绝），rootless Docker 由其所属用户部署；直连模式需要 UFW 及 root / sudo 权限 |
 
-Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需安装 Bun；使用终端管理台时，宿主机另需 Bun 1.4.2+。Linux 需要可访问 `/proc`，不支持 macOS、Alpine/musl。安装链接见[环境要求](docs/deployment.md#选择部署方式)。
+Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需安装 Bun；使用终端管理台时，宿主机另需 Bun 1.4.3+。Linux 需要可访问 `/proc`，不支持 macOS、Alpine/musl。安装链接见[环境要求](docs/deployment.md#选择部署方式)。
 
 同时准备：
 

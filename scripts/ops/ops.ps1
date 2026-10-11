@@ -26,6 +26,7 @@ param(
     # stat 的统计区间（YYYY-MM-DD），同样翻译成脚本的 --since/--until。
     [string]$Since = "",
     [string]$Until = "",
+    [string]$Period = "",
     # routes 的目标；Group 也可用于限定 tmp-ls/tmp-purge 的群。
     [string]$Fingerprint = "",
     [string]$Group = "",
@@ -50,7 +51,7 @@ if ($RequestBase64) {
 if ($RequestBase64) {
     $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
     foreach ($property in $request.PSObject.Properties) {
-        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId', 'ConfirmedTransaction')) {
+        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Period', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId', 'ConfirmedTransaction')) {
             throw "无效的运维请求字段"
         }
         Set-Variable -Name $property.Name -Value $property.Value
@@ -197,7 +198,7 @@ function Get-BunPath {
 
 # 外链运维交给 scripts\ops\relay-admin.ts 执行，这边只负责把 bun 跑起来。
 #
-# 删一个对象要先从公开地址反推对象名、再拼 WebDAV 地址并带上 Basic 凭据，这些知识全在
+# 对象签名和精确删除由 TypeScript 管理，shell 不接触凭据。这些知识全在
 # src\integrations\relay.ts；在 PowerShell 里抄一遍等于把它维护成两份，而且凭据会出现在
 # 命令行参数里，同机器上任何用户都能用 WMI 读到别人进程的完整命令行。
 function Invoke-RelayAdmin([string[]]$RelayArgs) {
@@ -510,71 +511,22 @@ function Invoke-HttpProbe {
     }
 }
 
-# 大文件外链分发的体检。relay.json 不存在时该特性关闭，一行都不占——它是可选的，
-# 没配置不是问题。配置了就要验到底：写错会让服务拒绝启动，后端不通会让大文件发送失败，
-# 公开基址不通会让群成员拿到死链，三种都不该等到有人真发了个大文件才发现。
+# 这里只读检查 S3 必填项；完整格式由运行时校验，凭据不传入 curl 或命令行。
 function Get-RelayDoctorRows {
     if (-not (Test-Path -LiteralPath $RelayConfigFile -PathType Leaf)) { return @() }
-
-    $config = $null
     try {
-        $config = Get-Content -LiteralPath $RelayConfigFile -Raw | ConvertFrom-Json
+        $config = Get-Content -LiteralPath $RelayConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($config.provider -ne "s3") { throw "obsolete" }
+        foreach ($field in @("webdavUrl", "publicBaseUrl", "username", "password", "signSecret", "signPathPrefix")) {
+            if ($config.PSObject.Properties.Name -contains $field) { throw "obsolete" }
+        }
+        foreach ($field in @("endpoint", "region", "bucket", "accessKeyId", "secretAccessKey")) {
+            if ($config.$field -isnot [string] -or -not $config.$field.Trim()) { throw "missing" }
+        }
     } catch {
-        return @(New-DoctorRow "data/config/relay.json" "fail" "不是有效 JSON（服务拒绝启动）" `
-            "修正 JSON 语法，或删除该文件以关闭大文件外链分发。")
+        return @(New-DoctorRow "data/config/relay.json" "fail" "S3 必填项不全或仍使用已移除的旧配置" "请重新运行外链配置向导；不支持旧外链迁移。")
     }
-
-    $webdavUrl = "$($config.webdavUrl)".Trim()
-    $publicBaseUrl = "$($config.publicBaseUrl)".Trim()
-    if (-not $webdavUrl -or -not $publicBaseUrl) {
-        return @(New-DoctorRow "data/config/relay.json" "fail" "缺少 webdavUrl 或 publicBaseUrl（服务拒绝启动）" `
-            "补齐这两个字段，或删除该文件以关闭大文件外链分发。")
-    }
-
-    # 到期是删文件还是只让链接失效，是这个特性最容易被记错的一件事，写进体检结果里。
-    $expireHours = "$($config.expireHours)".Trim()
-    $signSecret = "$($config.signSecret)".Trim()
-    if (-not $expireHours) {
-        $expiryLabel = "永不过期"
-    } elseif ($signSecret) {
-        $expiryLabel = "签名 ${expireHours}h 后失效，文件保留"
-    } else {
-        $expiryLabel = "${expireHours}h 后删除文件"
-    }
-
-    $rows = @(New-DoctorRow "data/config/relay.json" "pass" "已启用 -> $publicBaseUrl（$expiryLabel）")
-
-    $davCode = Invoke-HttpProbe -Url $webdavUrl -Method "PROPFIND" -TimeoutSec 8 `
-        -Username $config.username -Password $config.password `
-        -Headers @{ "Depth" = "0" }
-
-    if ($null -eq $davCode) {
-        $rows += New-DoctorRow "外链 WebDAV 上传端点" "fail" "无法连接 $webdavUrl" `
-            "确认后端服务正在运行且监听该地址；回环地址要求它与机器人在同一台机器。"
-    } elseif ($davCode -in @(200, 204, 207)) {
-        $rows += New-DoctorRow "外链 WebDAV 上传端点" "pass" "HTTP $davCode（可达且凭证有效）"
-    } elseif ($davCode -in @(401, 403)) {
-        $rows += New-DoctorRow "外链 WebDAV 上传端点" "fail" "HTTP $davCode（认证失败）" `
-            "核对 relay.json 的 username/password，以及该账号对目标目录的写权限。"
-    } elseif ($davCode -eq 404) {
-        $rows += New-DoctorRow "外链 WebDAV 上传端点" "fail" "HTTP 404（目录不存在）" `
-            "在后端创建 webdavUrl 指向的目录，或修正 relay.json 里的路径。"
-    } else {
-        $rows += New-DoctorRow "外链 WebDAV 上传端点" "warn" "HTTP $davCode（未预期的状态）" `
-            "手动执行一次 PROPFIND 确认后端行为。"
-    }
-
-    # 公开基址只判断「服务是否在应答」。这类文件服务惯于用 HTTP 200 + JSON 业务码表达
-    # 错误，对目录请求返回 200 属于正常行为，所以除了连不上，任何状态码都算通。
-    $publicCode = Invoke-HttpProbe -Url $publicBaseUrl -Method "HEAD" -TimeoutSec 10
-    if ($null -eq $publicCode) {
-        $rows += New-DoctorRow "外链公开下载基址" "fail" "无法连接 $publicBaseUrl" `
-            "检查该域名的 DNS、隧道与 WAF；群成员拿到的下载链接都指向这个基址。"
-    } else {
-        $rows += New-DoctorRow "外链公开下载基址" "pass" "HTTP $publicCode（服务有应答）"
-    }
-
-    return $rows
+    return @(New-DoctorRow "S3 外链配置必填项" "pass" "必填项齐全，未发现旧字段；启动时执行完整格式校验" "此项不检测云端权限、私有访问和签名；云端设置变化后请用测试文件验收。")
 }
 
 function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]$Fix = "") {
@@ -1448,6 +1400,7 @@ switch ($Command) {
         $statArgs = @()
         if ($Since)  { $statArgs += @("--since", $Since) }
         if ($Until)  { $statArgs += @("--until", $Until) }
+        if ($Period) { $statArgs += @("--period", $Period) }
         if ($StorageSegment) { $statArgs += "--storage-segment" }
         elseif ($GroupId) { $statArgs += "--group-id" }
         if ($Target) { $statArgs += @("--", $Target) }
@@ -1468,7 +1421,7 @@ switch ($Command) {
         if (-not (Invoke-GroupDataAdmin "scripts\ops\backup-cleanup.ts" @("scan"))) { exit 1 }
     }
     "backup-clean" {
-        if (-not $Target) { Err "backup-clean 需要报告名（backup\cleanup 下的目录名）"; exit 2 }
+        if (-not $Target) { Err "backup-clean 需要报告名（tmp\backup-cleanup 下的目录名）"; exit 2 }
         $cleanArgs = @("apply", $Target)
         if ($ConfirmCode) { $cleanArgs += @("--confirm", $ConfirmCode) }
         if (-not (Invoke-GroupDataAdmin "scripts\ops\backup-cleanup.ts" $cleanArgs)) { exit 1 }
@@ -1508,14 +1461,15 @@ switch ($Command) {
         Write-Host "                  列出各用户临时目录的占用（缓存、中间产物、截断日志）"
         Write-Host "  tmp-purge -Days <天数> | -All [-User <手机号>] [-Group <群号>]"
         Write-Host "                  清理用户临时目录；-Days 只删这些天没改动过的条目"
-        Write-Host "  stat [群号] [-Since <日期>] [-Until <日期>]"
+        Write-Host "  stat [群号] [-Period today|yesterday|week|last-week|month|last-month|7d|30d|all]"
+        Write-Host "              或 [-Since <日期>] [-Until <日期>]"
         Write-Host "                  使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
         Write-Host "  history-ls      列出各群的会话历史（群库与旧会话文件的占用、最后活动）"
         Write-Host "  history-clear <群号>"
         Write-Host "  history-compact <群号> -User <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
         Write-Host "                  清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         Write-Host "                  群选择可加 -GroupId（原始群号）或 -StorageSegment（目录段）"
-        Write-Host "  backup-scan     只读扫描 backup\rm 和 backup\snapshots，分类后在 backup\cleanup 生成清单，不删除"
+        Write-Host "  backup-scan     只读扫描 backup\rm 和 backup\snapshots，分类后在 tmp\backup-cleanup 生成清单，不删除"
         Write-Host "  backup-clean <报告名> [-ConfirmCode <确认码>]"
         Write-Host "                  不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"
         Write-Host "  uninstall       清理任务/进程/防火墙/launcher，可选清理隧道、data 和 logs"

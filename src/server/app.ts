@@ -34,6 +34,7 @@ let releaseLease: (() => Promise<void>) | undefined;
 let releaseGroupLease: (() => Promise<void>) | undefined;
 let timer: ReturnType<typeof setInterval> | undefined;
 let maintenance: Promise<unknown> | undefined;
+let relayMaintenance: Promise<void> | undefined;
 let messages: DurableService | undefined;
 let mcp: McpTools | undefined;
 const instanceFile = join(STATE_DIR, "instance.json");
@@ -104,7 +105,7 @@ try {
     `thinkingLevel=${selection.thinkingLevel}, 群数据总根=${GROUP_DATA_ROOT}）`);
   application.signal.throwIfAborted();
   // The relay configuration is read once here: the group registries shape send_file and the prompt by it.
-  initializeRelay();
+  await initializeRelay();
   const modules = await loadModuleDefinitions({
     documentWorkEnabled: (runtimeSetting("BOT_DOCUMENT_WORK_ENABLED") ?? RUNTIME_DEFAULTS.BOT_DOCUMENT_WORK_ENABLED) === "1" });
   const documentEnv = runtimeSetting("BOT_DOCUMENT_ENV");
@@ -148,10 +149,17 @@ try {
     }
   };
   const maintain = () => {
-    if (maintenance || stopping) return;
+    if (stopping) return;
+    // Object cleanup keeps its own guard: lengthy stats/session maintenance must not defer it.
+    if (!relayMaintenance) {
+      relayMaintenance = application.track(sweepExpiredRelayObjects());
+      void relayMaintenance.catch(error => log.error("外链清理失败: " + String(error)))
+        .finally(() => { relayMaintenance = undefined; });
+    }
+    if (maintenance) return;
     cleanupRateLimits();
     cleanupCallbackRoutes();
-    maintenance = application.track(Promise.allSettled([messages!.maintain(), sweepExpiredRelayObjects(), sweepStats()]));
+    maintenance = application.track(Promise.allSettled([messages!.maintain(), sweepStats()]));
     void maintenance.then((results) => {
       for (const result of results as PromiseSettledResult<unknown>[]) {
         if (result.status === "rejected") log.error("后台维护失败: " + String(result.reason));

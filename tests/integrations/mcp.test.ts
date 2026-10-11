@@ -59,31 +59,38 @@ test("MCP uses official member sessions, an allowlist, identity headers and a fi
   } finally { await manager.close(); await h.close(); }
 });
 
-// Independent ports, clients and discovery directories; keep both real >30s transport boundaries while sharing the wait.
-test.concurrent.each(["headers", "body"])("HTTP MCP tools can take more than 30 seconds before their %s arrive", async phase => {
-  let calls = 0;
+// Independent ports, clients and discovery directories, both transport boundaries sharing the wait. The request
+// timeout (30 s in service) is shortened here: a tools/call slower than it still finishes, while a tools/list
+// equally slow is ended by it, so the call really outlived the timeout.
+const REQUEST_MS = 3000, SLOW_MS = 4500;
+test.concurrent.each(["headers", "body"])("HTTP MCP tools can take longer than the request timeout before their %s arrive", async phase => {
+  let calls = 0, slowList = false;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 60, async fetch(request) {
     if (request.method === "DELETE") return new Response(null, { status: 204 });
     const rpc = await request.json() as { id?: number; method: string; params?: { protocolVersion: string } };
     if (rpc.id === undefined) return new Response(null, { status: 202 });
     let result: unknown;
     if (rpc.method === "initialize") result = { protocolVersion: rpc.params!.protocolVersion, serverInfo: { name: "slow", version: "1" }, capabilities: { tools: {} } };
-    else if (rpc.method === "tools/list") result = { tools: [{ name: "slow", inputSchema: { type: "object", properties: {} } }] };
+    else if (rpc.method === "tools/list") { if (slowList) await Bun.sleep(SLOW_MS); result = { tools: [{ name: "slow", inputSchema: { type: "object", properties: {} } }] }; }
     else {
       calls++; result = { content: [{ type: "text", text: "finished" }] };
-      if (phase === "headers") await Bun.sleep(35000);
+      if (phase === "headers") await Bun.sleep(SLOW_MS);
       else return new Response(new ReadableStream({ async start(controller) {
-        controller.enqueue(new TextEncoder().encode(" ")); await Bun.sleep(35000);
+        controller.enqueue(new TextEncoder().encode(" ")); await Bun.sleep(SLOW_MS);
         try { controller.enqueue(new TextEncoder().encode(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result }))); controller.close(); } catch { /* The failing version aborts the reader. */ }
       } }), { headers: { "content-type": "application/json", "mcp-session-id": "slow-session" } });
     }
     return Response.json({ jsonrpc: "2.0", id: rpc.id, result }, { headers: { "mcp-session-id": "slow-session" } });
   } });
-  const manager = new McpTools({ format: 1, servers: [{ name: `slow${++n}`, tools: ["slow"], transport: "http", url: `http://127.0.0.1:${server.port}/mcp` }] }, join(f.root, `slow-${n}`));
+  const manager = new McpTools({ format: 1, servers: [{ name: `slow${++n}`, tools: ["slow"], transport: "http", url: `http://127.0.0.1:${server.port}/mcp` }] },
+    join(f.root, `slow-${n}`), { requestMs: REQUEST_MS });
   try {
     await manager.initialize(new AbortController().signal);
     const output = await manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work());
     expect(output.content).toEqual([{ type: "text", text: "finished" }]); expect(calls).toBe(1);
+    slowList = true;
+    await expect(manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work())).rejects.toThrow();
+    expect(calls).toBe(1);
   } finally { await manager.close(); await server.stop(true); }
 }, 60000);
 
@@ -169,7 +176,8 @@ test("stdio MCP inherits only selected environment and uses the member's cwd", a
     const output = await manager.call(manager.catalogue[0]!, member, { text: "hello" }, new AbortController().signal, work => work());
     expect(JSON.parse((output.content![0] as { text: string }).text)).toMatchObject({ group: member.groupId, phone: member.phone, cwd: member.tempDir, secret: null });
   } finally { await manager.close(); if (previous === undefined) delete process.env.MIXIN_TEST_AMBIENT_SECRET; else process.env.MIXIN_TEST_AMBIENT_SECRET = previous; }
-}, 30000);
+  // Supervisor and server are two Bun processes: alone about 13 s on this Windows host, past 30 s beside parallel test groups.
+}, 60000);
 
 test.each(["eof", "force"])("stdio supervisor reaps detached descendants when the parent ends by %s", async mode => {
   const pidPath = join(f.root, `descendant-${++n}.pid`);

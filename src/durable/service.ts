@@ -105,6 +105,8 @@ export interface ServiceLimits {
   heartbeatMs: number;
   /** Codemode result directories older than this are removed by maintenance (idle members only). */
   resultRetentionMs: number;
+  /** An idle member of an open group keeps its state (callback address) this long after its last activity. */
+  memberIdleMs: number;
 }
 
 export interface DurableServiceOptions {
@@ -115,7 +117,7 @@ export interface DurableServiceOptions {
   auxiliary?: AuxiliaryConfig;
   mcp?: McpTools;
   venvDir?: string;
-  limits: Omit<ServiceLimits, "activeRequests" | "queue" | "tickMs" | "heartbeatMs" | "resultRetentionMs"> & Partial<ServiceLimits>;
+  limits: Omit<ServiceLimits, "activeRequests" | "queue" | "tickMs" | "heartbeatMs" | "resultRetentionMs" | "memberIdleMs"> & Partial<ServiceLimits>;
   outbound?: Outbound;
   deliveries?: DeliveryStore;
   /** The storage identity table (src/core/state.ts by default). */
@@ -213,7 +215,8 @@ export class DurableService {
   constructor(options: DurableServiceOptions) {
     this.#options = options;
     this.#auxiliaryBudget = new AuxiliaryBudget(options.auxiliary?.maxConcurrent ?? 2);
-    this.#limits = { activeRequests: MAX_ACTIVE_REQUESTS, queue: 8, tickMs: 1000, heartbeatMs: 60_000, resultRetentionMs: 7 * 24 * 3600_000, ...options.limits };
+    this.#limits = { activeRequests: MAX_ACTIVE_REQUESTS, queue: 8, tickMs: 1000, heartbeatMs: 60_000, resultRetentionMs: 7 * 24 * 3600_000,
+      memberIdleMs: DEDUP_TTL, ...options.limits };
     if (!Number.isSafeInteger(this.#limits.activeRequests) || this.#limits.activeRequests < 1) throw new Error("普通请求总容量必须是正整数");
     this.#outbound = options.outbound ?? IM;
     this.#deliveries = options.deliveries ?? new DeliveryStore(options.stateDb);
@@ -1217,7 +1220,7 @@ export class DurableService {
       || member.workerRetry || member.controlRetry || member.attempted.size || this.#deliveries.pending(member.key).length
       || [...this.#requests.values()].some(request => request.key === member.key)
       || [...this.#receipts.values()].some(receipt => receipt.groupId === member.groupId && receipt.phone === member.phone)) return;
-    if (this.#runtimes.has(member.groupId) && now - member.lastUsed < DEDUP_TTL) return;
+    if (this.#runtimes.has(member.groupId) && now - member.lastUsed < this.#limits.memberIdleMs) return;
     if (this.#members.get(member.key) === member) this.#members.delete(member.key);
   }
 

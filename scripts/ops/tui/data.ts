@@ -32,7 +32,7 @@ export interface Health {
 /**
  * 跑一次体检。
  *
- * 超时给到 90 秒：隧道模式下这一步要打公网、探 WebDAV，几次 curl 叠起来很容易超过默认值，
+ * 超时给到 90 秒：隧道模式下这一步要打公网，几次 curl 叠起来很容易超过默认值，
  * 而超时被当成「体检失败」比真失败更难排查。
  */
 export async function loadHealth(deployment: Deployment, signal?: AbortSignal): Promise<Health> {
@@ -186,7 +186,7 @@ export async function loadStatsOverview(root: string, window: Window = {}): Prom
   return collectAll(root, window);
 }
 
-/** 每日一格的指标；成员按「人次」计，同一个人在两个群里活跃算两次，与今日口径一致。 */
+/** 每日一格的指标；成员按账本身份跨群去重，与今日口径一致。 */
 export interface DailyPoint {
   day: string;
   asks: number;
@@ -218,17 +218,21 @@ export async function loadRecentStats(root: string, days: number, now = Date.now
     byDay.set(day(date.getTime()), { day: day(date.getTime()), asks: 0, people: 0, files: 0 });
   }
   const today = { asks: 0, people: 0, files: 0, images: 0, groups: 0 };
+  const people = new Map<string, Set<string>>();
   for (const group of groups) {
     for (const [date, daily] of group.daily) {
       const point = byDay.get(date);
       if (point) {
         point.asks += daily.asks;
-        point.people += daily.users.size;
+        let users = people.get(date);
+        if (!users) people.set(date, users = new Set());
+        for (const user of daily.users) users.add(user);
+        point.people = users.size;
         point.files += daily.files;
       }
       if (date === day(now)) {
         today.asks += daily.asks;
-        today.people += daily.users.size;
+        today.people = people.get(date)?.size ?? 0;
         today.files += daily.files;
         today.images += daily.images;
         if (daily.users.size > 0 || daily.files > 0 || daily.images > 0) today.groups++;

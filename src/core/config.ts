@@ -54,11 +54,9 @@ export const IM_HTTP_TIMEOUT = 15_000; // 单次 webhook 发送超时
 /** 官方 textMsg.content 单条上限。 */
 export const IM_TEXT_MAX_LENGTH = 5000;
 export const ATTACHMENT_HTTP_TIMEOUT = 60_000;
-export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+export { MAX_ATTACHMENT_BYTES } from "./transfer-limits.ts";
 /** 外链分发总预算，包含快照、等锁、探测和 PUT；同时受整轮任务和 /stop 取消约束。 */
-export const RELAY_HTTP_TIMEOUT = 30 * 60_000;
-/** 复用去重索引里的地址前，探测它是否还活着的超时。 */
-export const RELAY_PROBE_TIMEOUT = 15_000;
+export { RELAY_HTTP_TIMEOUT } from "./transfer-limits.ts";
 /** 机器人出站发送滑动窗口（按 callback key 全局统计，多用户共享）。 */
 export const IM_RATE_LIMIT_WINDOW = 60_000; // ms
 export const IM_RATE_LIMIT_MAX_MESSAGES = 20;

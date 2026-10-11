@@ -1,6 +1,6 @@
 # Bun 运行时镜像
 FROM ghcr.io/astral-sh/uv:0.11.29 AS uv
-FROM oven/bun:1.4.2-debian
+FROM oven/bun:1.4.3-debian
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer libreoffice-impress fonts-noto-cjk fonts-liberation && \
     rm -rf /var/lib/apt/lists/*

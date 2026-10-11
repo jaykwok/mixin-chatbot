@@ -6,12 +6,13 @@ import { chown, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import { archiveFile, replaceFile, withMaintenance } from "../../src/core/maintenance.ts";
-import { RELAY_CONFIG_PATH } from "../../src/core/storage.ts";
-import { DEFAULT_RELAY_MAX_BYTES, validateRelayConfig, type RelayConfig } from "../../src/integrations/relay.ts";
+import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../../src/core/storage.ts";
+import { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, relayBackendId, validateRelayConfig, type RelayConfig } from "../../src/integrations/relay.ts";
+import { readRelayIndex, RelayIndexFormatError } from "../../src/integrations/relay-index.ts";
 import { normalizeRelayUrlInput } from "./relay-url.ts";
 
 const MIB = 1024 ** 2;
-const CONFIG_FIELDS = ["webdavUrl", "publicBaseUrl", "username", "password", "maxBytes", "expireHours", "signSecret", "signPathPrefix"];
+const CONFIG_FIELDS = ["provider", "endpoint", "region", "bucket", "accessKeyId", "secretAccessKey", "sessionToken", "prefix", "forcePathStyle", "maxBytes", "expireHours", "cleanupGraceMinutes"];
 
 function bail<T>(value: T | symbol): T {
   if (isCancel(value)) throw new DOMException("配置已取消", "AbortError");
@@ -27,14 +28,9 @@ function fingerprint(raw: string | null): string | null {
   return raw === null ? null : createHash("sha256").update(raw).digest("hex");
 }
 
-function requireUrl(value: string | undefined, kind: "webdav" | "public", webdavUrl?: string): string | undefined {
-  try { normalizeRelayUrlInput(value, kind, webdavUrl); }
-  catch (error) { return error instanceof Error ? error.message : "请输入有效的目录地址"; }
-}
-
-async function askUrl(message: string, previous: string, kind: "webdav" | "public", webdavUrl?: string): Promise<string> {
-  const initial = requireUrl(previous, kind, webdavUrl) ? "" : normalizeRelayUrlInput(previous, kind, webdavUrl);
-  return normalizeRelayUrlInput(await askText(message, initial, value => requireUrl(value, kind, webdavUrl)), kind, webdavUrl);
+function requireUrl(value: string | undefined): string | undefined {
+  try { normalizeRelayUrlInput(value); }
+  catch (error) { return error instanceof Error ? error.message : "请输入有效的 S3 服务端点"; }
 }
 
 async function askText(message: string, initialValue: string, validate?: (value: string | undefined) => string | undefined): Promise<string> {
@@ -65,9 +61,21 @@ function displayUrl(value: string): string {
   return url.href;
 }
 
+function checkLedger(enabling: boolean) {
+  try { return readRelayIndex(RELAY_INDEX_PATH); }
+  catch (error) {
+    if (enabling && error instanceof RelayIndexFormatError) {
+      throw new Error("拒绝保存 S3 外链配置：" + error.message, { cause: error });
+    }
+    log.warn("外链账本无法只读核验；请检查账本和旧后端是否仍有对象。" +
+      (enabling ? "保存配置不代表账本可用或服务能够启动。" : "停用将保留账本和远端对象。"));
+    return [];
+  }
+}
+
 async function prepare(draftPath: string): Promise<void> {
   intro("可选的大文件外链配置");
-  note("超过 25 MiB 的本地文件可上传到 WebDAV，再向群里发送下载链接。\n" +
+  note("超过 25 MiB 的本地文件可上传到私有 S3 存储桶，再向群里发送限时下载链接。\n" +
     "填写期间机器人继续运行；确认保存后，原本运行中的机器人会短暂重启以应用配置。", "配置方式");
   const raw = await currentFile();
   let fields: Record<string, unknown> = {};
@@ -97,86 +105,74 @@ async function prepare(draftPath: string): Promise<void> {
       "远端文件和外链账本会保留；停用期间机器人不会执行到期清理，后端签名仍按自身期限失效。", "停用预览");
   } else {
     note([
-      "1) 在 Alist 挂载可写存储，示例挂载路径为 /relay，账号基本路径为 /。",
-      "   账号需有 WebDAV 读取、管理、创建目录或上传、删除权限。",
-      "2) 将 example.com 的 DNS 接入 Cloudflare 并激活；在隧道 Published application 新增",
-      "   files.example.com，服务指向 http://127.0.0.1:5244（Alist 所在地址）。",
-      "   5244 仅为示例，隧道和上传地址均请填写 Alist 实际端口；源站地址须从连接器可达。",
-      "3) 填写上传目录，再填写公开下载域名：",
-      "   WebDAV 上传：http://127.0.0.1:5244/dav/relay/",
-      "   公开下载填 files.example.com，自动补成 https://files.example.com/d/relay/",
-      "上传地址填写到 Alist 挂载目录，例如 127.0.0.1:5244/dav/relay，",
-      "此处挂载目录为 relay；请替换为实际挂载目录，也可填写挂载内的子目录。",
-      "只填目录，不带日期子目录和文件名。127.0.0.1 适用于机器人与 Alist 可在本机互访；",
-      "公开下载填写接收者能访问的域名。DNS 和隧道路由需在 Cloudflare 控制台配置。",
-    ].join("\n"), "Alist + Cloudflare 子域名示例");
-    note("http://、https:// 和末尾 / 均可省略，保存前会显示完整地址。\n" +
-      "WebDAV 的 localhost、回环及私有 IP 默认补 http://；其他地址（含公开下载）默认补 https://。\n" +
-      "上传地址需包含 /dav/ 和挂载目录；公开下载只填域名时，由上传地址推导 /d/ 下的目录。\n" +
-      "显式填写的协议和下载目录会保留；其他 WebDAV 后端请填写完整公开下载地址。", "地址填写方式");
-    const next: RelayConfig = { ...(previous ?? { maxBytes: DEFAULT_RELAY_MAX_BYTES, webdavUrl: "", publicBaseUrl: "" }) };
-    next.webdavUrl = await askUrl("WebDAV 上传目录 URL（填写到 Alist 挂载目录）", next.webdavUrl, "webdav");
-    next.publicBaseUrl = await askUrl("公开下载目录 URL（Alist 可只填域名，如 files.example.com；也可填完整目录地址）",
-      next.publicBaseUrl, "public", next.webdavUrl);
-    const auth = bail<string>(await select({
-      message: "WebDAV 认证方式", initialValue: previous?.username !== undefined ? "basic" : "none",
-      options: [{ value: "basic", label: "用户名和密码" }, { value: "none", label: "无需认证" }],
+      "使用兼容 S3 Signature V4 的私有桶，关闭公共访问，授予专用凭据对象读、写、删除权限。",
+      "Endpoint 填服务地址（不含桶名或对象路径），下载直接访问这个端点，不经过机器人或隧道。",
+      "阿里云 OSS 使用 S3 兼容端点，例如 s3.oss-cn-hangzhou.aliyuncs.com。",
+      "腾讯 COS 桶名包含 APPID；天翼云端点和区域按所选产品、资源池的 S3 文档填写。",
+      "云端另设生命周期兜底；关闭版本控制、对象锁及复制，避免删除后仍保留历史副本。",
+      "默认下载有效 2 小时，额外保留 30 分钟后清理。查看和补发不延长期限。",
+      "此向导只校验配置，不上传文件，也不修改云端权限或生命周期。",
+    ].join("\n"), "对象存储准备");
+    const next: RelayConfig = { ...(previous ?? {
+      provider: "s3", endpoint: "", region: "", bucket: "", accessKeyId: "", secretAccessKey: "",
+      prefix: "relay/", forcePathStyle: false, maxBytes: DEFAULT_RELAY_MAX_BYTES,
+      expireHours: DEFAULT_RELAY_EXPIRE_HOURS, cleanupGraceMinutes: DEFAULT_RELAY_CLEANUP_GRACE_MINUTES,
+    }) };
+    next.endpoint = normalizeRelayUrlInput(await askText("S3 服务端点 Endpoint", next.endpoint, requireUrl));
+    next.region = await askText("S3 区域 Region", next.region, value => value?.trim() ? undefined : "不能为空");
+    next.bucket = await askText("私有存储桶 Bucket", next.bucket, value => value?.trim() ? undefined : "不能为空");
+    const style = bail<string>(await select({
+      message: "S3 寻址方式", initialValue: next.forcePathStyle ? "path" : "virtual",
+      options: [
+        { value: "virtual", label: "桶名在域名中（Virtual hosted）", hint: "多数公有云；例如 bucket.endpoint/object" },
+        { value: "path", label: "桶名在路径中（Path style）", hint: "按厂商要求选择；IP、localhost、MinIO 常用" },
+      ],
     }));
-    if (auth === "basic") {
-      next.username = await askText("WebDAV 用户名", previous?.username ?? "", value => value?.trim() ? undefined : "不能为空");
-      const sameAccount = previous?.username === next.username && !requireUrl(previous?.webdavUrl, "webdav") &&
-        normalizeRelayUrlInput(previous?.webdavUrl, "webdav") === next.webdavUrl;
-      next.password = await askSecret("WebDAV 密码", sameAccount ? previous?.password : undefined);
-    } else {
-      delete next.username;
-      delete next.password;
-    }
+    next.forcePathStyle = style === "path";
+    next.accessKeyId = await askSecret("Access Key ID", previous?.endpoint === next.endpoint ? previous.accessKeyId : undefined);
+    const sameAccount = previous?.endpoint === next.endpoint && previous.accessKeyId === next.accessKeyId;
+    next.secretAccessKey = await askSecret("Secret Access Key", sameAccount ? previous?.secretAccessKey : undefined);
+    // An endpoint/account switch must never silently carry a token to a different service.
+    if (!sameAccount) delete next.sessionToken;
+    const tokenMode = bail<string>(await select({
+      message: "临时凭据 Session Token", initialValue: next.sessionToken ? "keep" : "none",
+      options: [
+        ...(next.sessionToken ? [{ value: "keep", label: "沿用已保存的 Token" }] : []),
+        { value: "none", label: "不使用临时 Token" }, { value: "set", label: "填写新的 Token" },
+      ],
+    }));
+    if (tokenMode === "set") next.sessionToken = await askSecret("Session Token");
+    else if (tokenMode === "none") delete next.sessionToken;
     const advanced = bail<boolean>(await confirm({
-      message: "调整高级设置（文件上限、有效期、下载签名）？", initialValue: false,
+      message: "调整高级设置（目录、文件上限、有效期、删除余量）？", initialValue: false,
     }));
     if (advanced) {
-      const limit = await askText("单文件外链上限（MiB，须大于 " + MAX_ATTACHMENT_BYTES / MIB + "）",
-        String(next.maxBytes / MIB), value => validationError({ ...next, maxBytes: Number(value) * MIB }));
-      next.maxBytes = Number(limit) * MIB;
-      const expiry = await askText("链接有效期（小时，留空表示不自动过期）", next.expireHours?.toString() ?? "",
-        value => validationError({ ...next, expireHours: value?.trim() ? Number(value) : undefined }));
-      if (expiry) next.expireHours = Number(expiry); else delete next.expireHours;
-      const signing = bail<string>(await select({
-        message: "公开下载签名", initialValue: next.signSecret ? "alist" : "none",
-        options: [
-          { value: "none", label: "不使用签名", hint: "通用 WebDAV；设置有效期后，到期会删除远端文件" },
-          { value: "alist", label: "Alist / OpenList 兼容签名", hint: "后端须支持并开启相同签名规则；到期只让链接失效" },
-        ],
-      }));
-      if (signing === "alist") {
-        next.signSecret = await askSecret("下载签名密钥", previous?.signSecret);
-        const prefix = await askText("签名路径前缀（如 /relay/；留空从公开 URL 推导）", previous?.signPathPrefix ?? "",
-          value => validationError({ ...next, signPathPrefix: value?.trim() || undefined }));
-        if (prefix) next.signPathPrefix = prefix; else delete next.signPathPrefix;
-      } else {
-        delete next.signSecret;
-        delete next.signPathPrefix;
-      }
+      next.prefix = await askText("对象目录 Prefix", next.prefix,
+        value => validationError({ ...next, prefix: value }));
+      next.maxBytes = Number(await askText("单文件外链上限（MiB，须大于 " + MAX_ATTACHMENT_BYTES / MIB + "，最大 5120）",
+        String(next.maxBytes / MIB), value => validationError({ ...next, maxBytes: Number(value) * MIB }))) * MIB;
+      next.expireHours = Number(await askText("链接有效期（小时，最多 168）", String(next.expireHours),
+        value => validationError({ ...next, expireHours: Number(value) })));
+      next.cleanupGraceMinutes = Number(await askText("删除余量（分钟，链接到期后额外保留）", String(next.cleanupGraceMinutes),
+        value => validationError({ ...next, cleanupGraceMinutes: Number(value) })));
     }
     const validated = validateRelayConfig(next);
-    // 向导未涉及的手写字段保留；明确关闭的可选项不会从旧配置重新带回来。
     config = { ...fields };
     for (const field of CONFIG_FIELDS) delete config[field];
     Object.assign(config, validated);
-    const expiryDescription = validated.expireHours === undefined
-      ? "不自动过期"
-      : validated.signSecret
-        ? validated.expireHours + " 小时后签名失效，远端文件保留"
-        : validated.expireHours + " 小时后删除远端文件（不可恢复）";
     note([
-      "上传目录：" + displayUrl(validated.webdavUrl),
-      "公开目录：" + displayUrl(validated.publicBaseUrl),
-      "认证：" + (validated.username === undefined ? "无需认证" : "已设置用户名和密码（密码隐藏）"),
+      "服务端点：" + displayUrl(validated.endpoint),
+      "区域：" + validated.region + "；桶：" + validated.bucket + "；目录：" + validated.prefix,
+      "寻址：" + (validated.forcePathStyle ? "Path style" : "Virtual hosted"),
+      "凭据：已设置（隐藏）" + (validated.sessionToken ? "，含临时 Token（需自行续期）" : ""),
       "单文件上限：" + validated.maxBytes / MIB + " MiB",
-      "有效期：" + expiryDescription,
-      "下载签名：" + (validated.signSecret ? "已设置（密钥隐藏），路径 " + validated.signPathPrefix : "未启用"),
+      "下载有效期：" + validated.expireHours + " 小时（仅授权 GET 下载）",
+      "计划删除：链接到期后再保留 " + validated.cleanupGraceMinutes + " 分钟；后台扫描删除，失败重试",
     ].join("\n"), "保存预览");
   }
+  const nextBackend = config ? relayBackendId(validateRelayConfig(config)) : null;
+  const stranded = checkLedger(config !== null).filter(entry => !nextBackend || !entry.key.startsWith(nextBackend + ":"));
+  if (stranded.length) log.warn(`账本仍有 ${stranded.length} 个对象不属于新设置；切换或停用后无法自动删除这些对象。建议取消并先在原后端清理；也可保存后在云端清理，或切回原设置重试。`);
   if (!bail<boolean>(await confirm({ message: "保存并应用以上外链设置？", initialValue: action !== "disable" }))) {
     throw new DOMException("配置已取消", "AbortError");
   }
@@ -203,6 +199,8 @@ async function apply(draftPath: string): Promise<void> {
       console.log("外链已停用，原配置已归档到 backup/rm；远端文件和账本已保留。");
       return;
     }
+    // Recheck under the service lease: the ledger may have changed since the draft was confirmed.
+    checkLedger(true);
     await mkdir(dirname(RELAY_CONFIG_PATH), { recursive: true });
     const temporary = join(dirname(RELAY_CONFIG_PATH), ".relay-" + randomUUID() + ".tmp");
     try {

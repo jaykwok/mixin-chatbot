@@ -2,7 +2,7 @@
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { DATA_VERSION, inspectDataVersion, serviceGroupRoot } from "../../src/core/data-version.ts";
-import { apply, commit, committedDeployment, preview, rollback, type Plan } from "./lib/runner.ts";
+import { apply, cleanupBackups, commit, committedDeployment, finalize, preview, rollback, type Plan } from "./lib/runner.ts";
 import { json, publishJson } from "./lib/io.ts";
 import type { Context } from "./lib/types.ts";
 import { openOperationLog, operationError } from "../lib/operation-log.ts";
@@ -28,7 +28,7 @@ function describePreview(summary: { target: number; kind?: string; pending: bool
 
 async function main() {
   const { values, positionals } = cliArgs(process.argv.slice(2), {
-    project: { type: "string" }, groups: { type: "string" }, plan: { type: "string" }, deployment: { type: "string" }, scratch: { type: "string" },
+    project: { type: "string" }, groups: { type: "string" }, plan: { type: "string" }, deployment: { type: "string" }, transaction: { type: "string" }, scratch: { type: "string" },
     provider: { type: "string" }, model: { type: "string" }, interactive: { type: "boolean" },
     "decisions-only": { type: "boolean" }, "accept-native-cache": { type: "boolean" }, json: { type: "boolean" },
   });
@@ -81,8 +81,10 @@ async function main() {
   }
   if (command === "apply") await apply(context, planPath ? await json(planPath) as Plan : undefined);
   else if (command === "commit") await commit(context);
+  else if (command === "finalize") { if (!await finalize(context, { deployment, transaction: values.transaction })) process.exitCode = 1; }
+  else if (command === "cleanup") { if (!await cleanupBackups(context)) process.exitCode = 1; }
   else if (command === "rollback") { if (!await rollback(context, deployment || undefined)) { console.error("迁移已提交；保留新代码和数据，禁止自动回退"); process.exitCode = 42; } }
-  else throw new Error("用法：bun run scripts/migrations/run.ts status|preview|apply|commit|rollback [--groups PATH] [--plan PATH] [--scratch DIR] [--interactive] [--json]");
+  else throw new Error("用法：bun run scripts/migrations/run.ts status|preview|apply|commit|finalize|cleanup|rollback [--groups PATH] [--plan PATH] [--deployment ID | --transaction ID] [--scratch DIR] [--interactive] [--json]");
 }
 if (import.meta.main) {
 process.on("SIGINT", cancel); process.on("SIGTERM", cancel);

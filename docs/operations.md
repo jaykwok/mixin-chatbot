@@ -59,7 +59,7 @@ bash scripts/ops/ops.sh doctor
 
 Windows `update` 会显示更新前后的提交 hash。依赖清单、锁文件、安装配置和补丁未变，且已安装的直接依赖版本匹配时，会保留 `node_modules` 并跳过安装；缺包、版本不匹配或依赖输入发生变化时，才备份旧依赖并按锁文件安装。版本更高也不视为匹配，避免偏离经过验证的依赖组合。
 
-部署、升级和连接器安装的备份放在 `backup/snapshots/<快照名>`，操作期间被替换的旧文件放在 `backup/rm/<快照名>`；旧会话文件、用户 tmp 等日常归档直接放在 `backup/rm` 下。两个平台的部署、升级和连接器安装成功后，只删除本次操作自己的快照和 `backup/rm/<快照名>`。新建快照时会避开 `backup/rm` 中已有同名目录的名称，保证这个目录只属于本次操作；快照或归档目录本身、或它们的上级目录是链接时拒绝清理。其他快照、历史事务目录、散落文件、手动清理的会话归档，以及 `migration-*` 数据迁移快照都保留，由[历史归档清理](#历史归档清理)处理。旧版本在部署成功后会清空整个 `backup/rm`，现在不再这样做。操作失败时保留回滚现场。Windows 会移除空的 `backup` 目录；Linux 保留空的容器挂载目录，避免运行中的容器丢失后续归档。部署锁保存在 `data/state/deploy.lock`。Docker 部署和升级在构建新镜像前，先给原容器使用的镜像打上 `mixin-chatbot:previous` 标签，事务提交或回滚完成后再移除。Docker 29 起新装默认使用 containerd 镜像存储，它会删除失去最后一个标签的镜像，回滚要靠这个标签恢复原镜像。
+部署、升级和连接器安装的备份放在 `backup/snapshots/<快照名>`，操作期间被替换的旧文件放在 `backup/rm/<快照名>`；旧会话文件、用户 tmp 等日常归档直接放在 `backup/rm` 下。成功后只删除本次操作自己的快照和 `backup/rm/<快照名>`；迁移副本在正式业务实例通过健康检查后按清单清理，详见[事务边界](data-migrations.md#事务边界)。清理失败不阻断后续升级，独立回执供重试；启动失败或保持停止的实例保留迁移副本。新建快照时会避开 `backup/rm` 中已有同名目录的名称，快照、归档或其上级目录是链接时拒绝清理。没有自动清理标记的历史迁移快照、其他事务目录和散落归档保留，由[历史归档清理](#历史归档清理)审查处理，不清空整个 `backup/rm`。操作失败时保留回滚现场。Windows 会移除空的 `backup` 目录；Linux 保留空的容器挂载目录，避免运行中的容器丢失后续归档。部署锁保存在 `data/state/deploy.lock`。Docker 部署和升级在构建新镜像前，先给原容器使用的镜像打上 `mixin-chatbot:previous` 标签，事务提交或回滚完成后再移除。Docker 29 起新装默认使用 containerd 镜像存储，它会删除失去最后一个标签的镜像，回滚要靠这个标签恢复原镜像。
 
 关闭服务使用 `stop`：Windows 验证实例身份后先请求优雅关闭，超时再复核归属并终止进程树；Linux 使用 Docker 停止期限。
 
@@ -136,6 +136,9 @@ Linux 使用 Bash、awk 和 GNU coreutils；Windows 支持 PowerShell 5.1+。
 
 ```sh
 bun run stat
+bun run stat --period week
+bun run stat "<群号>" --period last-month
+bun run stat --since 2026-10-01 --until 2026-10-07
 bun run history list
 bun run tmp list
 bun run relay list
@@ -149,6 +152,12 @@ bun run relay purge "<关键字>"
 ```
 
 `stat` 读使用统计账本 `<群数据根>/stats.sqlite`，区分模型轮次和成功资料工具结果；链接生成不等于用户收到。群库里的对话在每次回复前、`/clear` 时和每轮维护时按条目入账；升级前的旧会话文件（含当时的缓存保温用量）由每日兜底扫描补入。账本与会话历史相互独立：清空上下文不影响已统计的数字，群目录被删掉后账本里的历史也还在。
+
+`--period` 支持 `today`、`yesterday`、`week`、`last-week`、`month`、`last-month`、`7d`、`30d`、`all`；与 `--since/--until` 互斥。统计输出总提问数、跨群去重的提问人数、人均和日均提问、活跃天数占比、高峰日、前五名提问占比、提问排行，以及逐日、逐周、逐月的提问、人数、处理轮次、文件、图片与已知估算费用。每一天都会列出，无记录填 0；周、月人数在周期内重新去重，不累加每日人数。覆盖人数指实际提问的账本成员身份，不代表群总人数或覆盖率；仅有回复的人仍可出现在原有使用成员表中。
+
+Linux 运维入口示例：`bash scripts/ops/ops.sh stat --period week`；Windows：`scripts\ops\ops.ps1 stat -Period week`，自定义日期使用 `-Since` / `-Until`。HTML 从 TUI 导出到 `tmp/reports/`。
+
+完整起止区间提供同比、环比，并打印基期日期和数值。周一开周；本周、本月比较上周、上月相同已到达日数（遇短月截到月末），上月比较完整前月；其他区间比较前一等长区间。同比取去年同日期，闰日截到月末。包含今天时数据仍在增长，账本只有日粒度，不与基期按小时对齐。基期为 0 时显示“新增（基期无记录）”，不计算无限增长；无历史记录不能证明当时没有使用。全部或只有一侧日期时不比较。日期沿用服务本地时区，应保持服务与运维环境时区一致。
 
 `history clear` 在群库里为该群每位成员登记一次清空，机器人下次启动时、处理任何消息之前先执行：与成员自己发 `/clear` 相同，排队中的消息一并取消，旧上下文留在群库里，不释放磁盘空间；升级前的旧会话文件同时移入 `backup/rm`。群库记录的群与目录不符时拒绝，整个群不做改动。`history list` 列出各群群库和旧会话文件的占用。统计区间按自然日裁剪。维护写操作与服务通过 proper-lockfile 租约互斥，异常退出后约 35 秒可恢复陈旧锁。服务、升级验证实例、数据迁移以及 `history clear`、`tmp purge` 还在群数据根内持有 `.mixin-lease.lock` 租约：共享同一群数据根的两份部署不能同时运行，群数据根不存在时拒绝启动而不会自动创建。服务的心跳一旦发现任一租约丢失（例如已被另一进程接管），立即以退出码 1 退出，不再走正常关机的入账、归档和等待；没来得及入账的用量由之后的投影补入，已记入群库的 `/stop`、`/clear` 在下次启动时重新执行，尚未记入的需要重发，工具进程由各自的监督进程回收。运维包装器的 `history-clear` 会自动停机并恢复原运行状态，其他写操作先 `stop`，完成后按需 `start`。
 
@@ -225,10 +234,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 | 群库 | `<群目录>/durable.sqlite`（及 `-wal` 等）持久保存成员的对话、排队消息和控制命令，纳入停机备份；`/clear` 和 `history clear` 只开启新上下文，不删除旧上下文，也不释放空间 |
 | 旧会话文件、用户 tmp | 升级前的 `session.jsonl` 原地保留（已导入群库）；清理时归档到 `backup/rm`，不自动删除，用[历史归档清理](#历史归档清理)处理；归档前机器人已把该段历史入账 |
 | 部署备份 | 部署、升级和连接器安装成功后只删除本次快照和 `backup/rm/<快照名>`；失败操作保留现场，其余快照和归档用历史归档清理处理 |
-| 数据版本迁移备份 | 有格式迁移时创建 `backup/snapshots/migration-*`；同版本升级不复制 SQLite、不新增迁移快照。已有快照保留，确认业务验收通过且不再需要人工恢复后，用历史归档清理删除（当前迁移日志引用的快照不会被删除）；已提交事务不能执行 `rollback` |
+| 数据版本迁移备份 | 有格式迁移时创建 `backup/snapshots/migration-*`；正式业务实例就绪后 finalize 按清单清理，保留提交及清理回执。失败后可运行 migrations cleanup，下一次成功部署也会重试，快照异常不阻断新升级。未提交、启动失败、保持停止或回滚失败的备份保留。同版本且标记配对时不复制 SQLite、不新增迁移快照。历史事务没有自动清理标记的快照不追溯删除；已提交事务不能执行 `rollback` |
 | 历史账本迁移备份 | 按当时工具的保留规则处理，确认数据转换及新实例验收完成后再清理 |
 | 测试与诊断现场 | 放在顶层 `tmp/`，确认没有测试、诊断或维护任务使用后可清理 |
-| TUI 统计报表 | 每次导出独立保存在 `backup/reports`，按需保留或手动清理 |
+| TUI 统计报表 | 每次导出独立保存在 `tmp/reports`，需要长期保存时另行保留 |
 | 上传快照 | 完成、失败或取消后直接删除 |
 | 应用日志 | 约 5 MiB 轮转，当前文件加 3 份备份，最旧备份直接删除 |
 | 升级、迁移与启动诊断 | `logs/operations/` 保留最近 20 份，每份约 2 MiB；命令输出约 1 MiB 后为后续阶段与错误保留空间，回滚保留日志 |
@@ -239,7 +248,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 tmp-purg
 
 `backup/rm` 和 `backup/snapshots` 中不属于某次成功操作的内容不会自动删除，用专门的入口分两步处理：
 
-1. `ops.sh backup-scan`（Windows：`ops.ps1 backup-scan`）只读扫描这两处的顶层条目，在 `backup/cleanup/<报告名>/` 写出 `manifest.json` 和便于查看的 `manifest.tsv`，列出每条的路径、大小、分类、分类依据和建议动作，不删除任何内容。`backup/reports` 等其他目录不扫描，会在输出中列出。
+1. `ops.sh backup-scan`（Windows：`ops.ps1 backup-scan`）只读扫描这两处的顶层条目，在 `tmp/backup-cleanup/<报告名>/` 写出 `manifest.json` 和便于查看的 `manifest.tsv`，列出每条的路径、大小、分类、分类依据和建议动作，不删除任何内容。`backup/` 中其他目录不扫描，会在输出中列出。旧 `backup/cleanup`、`backup/reports` 保持原状；新版清理工具只读取新目录里的报告，旧报告需要重新扫描生成。
 2. `ops.sh backup-clean <报告名>`（Windows：`ops.ps1 backup-clean <报告名>`）预演：逐条重新检查清单中选为删除的条目，列出将删除、扫描后有变化、拒绝等结果，并给出确认码，不删除任何内容。确认后加 `--confirm <确认码>`（Windows：`-ConfirmCode <确认码>`）执行，结果写入同一报告目录的 `result-*.json`；`result-*.tsv` 逐条追加，进程中断时也留有已处理条目的记录。
 
 | 分类 | 判断依据 | 建议动作 |
@@ -328,46 +337,23 @@ Windows 修改已安装的服务需要管理员权限。连接器必须使用当
 
 ## 配置可选的大文件外链
 
-运行 `bun run tui`，进入 **系统 → 设置 → 外链配置**；已有外链的查看与清理在 **数据 → 外链**。部署向导只提示配置入口，不要求填写外链配置。基础设置为 WebDAV 上传目录、指向同一目录的公开下载地址，以及可选认证；高级设置可调整文件上限、有效期和 [OpenList](https://github.com/OpenListTeam/OpenList) 兼容签名。
+运行 `bun run tui`，进入 **系统 → 设置 → 外链配置**；查看与清理在 **数据 → 外链**。使用兼容 S3 的私有桶及限时 GET 下载链接，默认下载有效 2 小时，额外保留 30 分钟后清理。配置项、厂商参考及云端准备见[大文件外链配置](deployment.md#大文件外链配置)。
 
-填写时保持机器人运行，密码与签名密钥隐藏输入，已有密码可留空沿用。向导先展示保存预览；确认后才停止原本运行中的机器人，复用启动校验来提交 `data/config/relay.json`，随后恢复运行并检查本地健康。原本停止的服务保持停止，取消不修改配置也不停机。Windows 前台实例若没有计划任务可供恢复，须先手动停止再配置；Linux 使用已部署镜像内的 Bun 和依赖。
-
-停用会将配置归档到 `backup/rm`，保留外链账本和远端文件；停用期间机器人不再清理过期对象，后端签名仍按自己的期限失效。设置有效期但不启用签名时，到期会删除远端文件；启用兼容签名后，到期只使签名失效。保存预览会显示具体规则。这里校验配置格式，不会向远端上传测试文件；两个地址是否映射同一目录、后端权限及签名规则需按存储服务配置。
+填写期间机器人继续运行，访问密钥和临时 Token 均隐藏输入；保存预览确认后，原本运行中的服务才短暂停止、写入配置并恢复。原本停止的服务保持停止，取消不变更配置和服务。这里仅校验配置格式，不上传测试文件，不修改云端桶权限。`doctor` 只读检查 S3 必填项，并明确提示尚未验证云端权限；不能凭此认定下载和删除已可用。
 
 ### 查看并验证下载链接
 
-在部署机的项目目录运行 `bun run relay list`，或在 TUI 中进入 **数据 → 外链 → 列出在册外链**。启用签名时，列表会按当前配置为账本内的文件重新签发带 `?sign=...` 的地址，有效期从查看时起算；列表本身不验证下载是否成功。机器人最终交付的链接也会重新签名，而“外链上传完成”日志打印的是存储地址，不含签名。
+在部署目录运行 `bun run relay list`，或进入 **数据 → 外链 → 列出在册外链**。列表展示上传状态、下载到期时间和计划删除时间。未过期对象可重新签发剩余期限内的链接；查看与补发不会续期。过期、上传未确认或不属于当前后端的记录只显示存储地址，不是可用下载链接。
 
-下载验证应使用完整的带签名链接。部分网盘直链拒绝 `HEAD`，但允许正常的 `GET` 下载；机器人在 `HEAD` 无法核验文件大小时，会从公开链接重新发起 `Range: bytes=0-0` 的 GET 请求，核对响应中的文件总大小后取消响应体。无法确认大小的错误响应仍会阻止交付。
+验证下载使用完整的 GET 预签名 URL。不要把它直接改为 HEAD 请求：S3 V4 签名绑定请求方法，机器人探测文件大小时会单独签发 HEAD。发生 403 时检查凭据、区域、时间同步及签名/权限配置；发生重定向时修正 endpoint，本实现不跟随重定向。日志不打印预签名 URL 或云端原始错误响应，避免泄露临时访问授权。对象设置 `Cache-Control: private, no-store, max-age=0`，并保留原文件名作为下载附件名。
 
-排查时分别查看公开域名和最终网盘域名的状态码。若公开域名返回 302、最终 OSS 直链对 HEAD 返回 403，而同一链接的 GET 成功，应检查最终响应的 `x-oss-ec`：例如 `0002-00000201` 表示 [OSS V4 签名不匹配](https://help.aliyun.com/zh/oss/user-guide/0002-00000201)。[OSS 签名包含 HTTP 请求方法](https://help.aliyun.com/zh/oss/developer-reference/recommend-to-use-signature-version-4)，按 GET 签发的下载链接不能直接改用 HEAD 验证；它与机器人公开链接中的 [OpenList](https://github.com/OpenListTeam/OpenList) `sign` 是两层签名。
+实际接入新厂商时，用非敏感测试文件验证：上传成功且下载字节一致；无签名访问失败；修改请求方法失败；短期限链接过期后不能重新发起下载；删除余量内对象仍存在、随后可被清理。云端权限和访问策略最终以这项验收为准。链接到期不会召回已下载的数据；到期前已建立的连接是否继续传输由对象存储服务决定。
 
-公开链接保留原始文件名及扩展名。若链接会跳转到网盘，浏览器采用的下载名称还取决于最终响应的 `Content-Disposition`；中文文件名应由后端通过 `filename*=UTF-8''...` 返回。排查时同时检查最终下载响应和浏览器保存的名称。
+### 清理对象
 
-### [OpenList](https://github.com/OpenListTeam/OpenList) 与 Cloudflare 子域名示例
+运行 `bun run relay purge --keyword <关键字>` 或 `bun run relay purge --all`，也可使用 TUI 的清理操作。手动清理要求服务停止并取得维护租约，会提前使匹配的链接不可用；只删除账本中明确归属当前后端的精确对象，不按前缀递归删除桶内内容。删除失败、不匹配记录均保留。
 
-以 [OpenList](https://github.com/OpenListTeam/OpenList) 监听本机 `5244` 端口、对外挂载路径为 `/relay`、文件子域名为 `files.example.com` 为例。以下 `5244` 均需替换为 [OpenList](https://github.com/OpenListTeam/OpenList) 实际监听端口；外链设置会保留填写的端口：
-
-1. 在 [OpenList](https://github.com/OpenListTeam/OpenList) 中挂载支持上传、建目录和删除的存储，挂载路径填 `/relay`。这里指 [OpenList](https://github.com/OpenListTeam/OpenList) 对外展示的虚拟路径；它也可以是某个挂载下的子目录，例如 `/网盘/relay`，不必和磁盘物理目录同名。示例账号基本路径为 `/`，需有该目录的 **WebDAV 读取、WebDAV 管理、创建目录或上传、删除** 权限。使用受限账号时，以该账号实际可访问的 WebDAV 目录为准，确保它与公开下载地址映射到同一存储目录。
-2. 按[隧道托管](#隧道托管)的方式，将根域名 `example.com` 的 DNS 接入 Cloudflare 并等待激活。在已有 Cloudflared 隧道中新增 **Published application** 路由：子域名 `files`、域名 `example.com`，Path 留空，服务类型选 **HTTP**，URL 填 `127.0.0.1:5244`（完整服务地址为 `http://127.0.0.1:5244`）。这里的服务地址应从运行连接器的位置可达；机器人与 [OpenList](https://github.com/OpenListTeam/OpenList) 使用各自的子域名和路由。
-3. 在 **系统 → 设置 → 外链配置** 中，上传地址填写到 [OpenList](https://github.com/OpenListTeam/OpenList) 挂载目录，例如 `127.0.0.1:5244/dav/relay`，此处挂载目录为 `relay`。公开下载项可以只填文件域名，向导会推导对应目录。DNS 和隧道路由在 Cloudflare 控制台完成；外链向导只保存机器人配置。
-
-| 用途 | 完整地址 | 向导也接受的输入 |
-| --- | --- | --- |
-| WebDAV 上传目录 `webdavUrl` | `http://127.0.0.1:5244/dav/relay/` | `127.0.0.1:5244/dav/relay` |
-| 公开下载目录 `publicBaseUrl` | `https://files.example.com/d/relay/` | `files.example.com`（自动推导），也可填 `files.example.com/d/relay` |
-
-`/dav/` 是 WebDAV 入口，`/d/` 是下载入口，后面均接实际挂载目录。例如上传地址填 `127.0.0.1:5244/dav/网盘/relay`，公开下载只填 `files.example.com`，即可推导为 `https://files.example.com/d/网盘/relay/`；向导会将中文路径编码为有效 URL。
-
-只填域名、带协议的域名或末尾带 `/` 的域名时，均从上传地址的 `/dav/` 后提取挂载目录，拼到下载域名的 `/d/` 下。若已填写完整下载目录（例如 `https://files.example.com/custom/relay/`），则保留填写的目录。自动推导仅识别标准 [OpenList](https://github.com/OpenListTeam/OpenList) 上传路径；其他 WebDAV 后端、反代子路径或不同的目录映射，请填写实际公开下载地址。
-
-浏览页面地址 `http://127.0.0.1:5244/relay/` 可帮助确认挂载路径，但上传时应使用 `/dav/relay/`，公开下载时使用 `/d/relay/`。不要把已生成文件的 `<日期>-<UUID>/<文件名>` 或 `?sign=...` 填进目录配置。
-
-省略协议时，WebDAV 的 `localhost`、回环及私有 IP 自动补 `http://`；其余地址（包括公开下载目录）自动补 `https://`。显式填写的 HTTP/HTTPS 会保留，末尾 `/` 自动补齐，保存预览可核对最终地址；配置文件始终保存完整 URL。
-
-隧道源站使用 `127.0.0.1` 的前提是连接器能通过本机 IPv4 回环访问 [OpenList](https://github.com/OpenListTeam/OpenList)；上传地址使用 `127.0.0.1` 的前提是机器人能通过该地址访问 [OpenList](https://github.com/OpenListTeam/OpenList)。在其他主机或独立容器网络中，两者分别填写连接器、机器人实际可达的 [OpenList](https://github.com/OpenListTeam/OpenList) 地址和端口。公开下载需要填写接收者能访问的域名。[OpenList](https://github.com/OpenListTeam/OpenList) 若对该目录开启签名，需在高级设置中配置匹配的签名密钥和规则。
-
-路径及权限依据：[WebDAV 文档](https://doc.oplist.org/guide/advanced/webdav)、[挂载路径说明](https://doc.oplist.org/guide/drivers/common#挂载路径)、[官方下载路由](https://github.com/OpenListTeam/OpenList/blob/main/server/router.go)。
+自动清理在服务启动时和每 5 分钟尝试运行，按账本的计划删除时间处理，失败重试。停机或停用外链期间依赖云端生命周期兜底；切换存储后旧端点对象不会交给新配置删除。停止使用一个桶前，先用原配置完成清理。不要直接丢弃账本：它是失败上传及未删对象的回收依据。
 
 ## 重新配置模型
 

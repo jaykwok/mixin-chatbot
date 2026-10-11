@@ -11,7 +11,7 @@ test("the SQLite ledger retains more than 20,000 live objects and commits deleti
   const index = await openRelayIndex(path);
   const connection = openState(path);
   try {
-    const insert = connection.query("INSERT INTO objects VALUES (?, ?, ?, ?, ?, ?)");
+    const insert = connection.query("INSERT INTO objects (key, url, name, size, at, state) VALUES (?, ?, ?, ?, ?, ?)");
     connection.transaction(() => {
       for (let i = 0; i < 20003; i++) insert.run(String(i), "https://files/" + i + "/a.pdf", "a.pdf", 1, "2026-09-01T00:00:00Z", "uploaded");
     })();
@@ -33,10 +33,10 @@ test("the SQLite ledger retains more than 20,000 live objects and commits deleti
 test("URL lookup preserves at/key order, planned uploads and updates in an existing ledger", async () => {
   const fixture = await tempFixture("relay-url-");
   const path = join(fixture.root, "relay.sqlite"), url = "https://files/shared/a.pdf";
-  // A database created by the earlier schema, without the URL index.
+  // A current database without the lookup index.
   const previous = openState(path);
-  previous.exec("CREATE TABLE objects (key TEXT PRIMARY KEY, url TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, at TEXT NOT NULL, state TEXT NOT NULL)");
-  const insert = previous.query("INSERT INTO objects VALUES (?, ?, 'a.pdf', 1, ?, ?)");
+  previous.exec("CREATE TABLE objects (key TEXT PRIMARY KEY, url TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, at TEXT NOT NULL, state TEXT NOT NULL, expiresAt TEXT, deleteAfter TEXT)");
+  const insert = previous.query("INSERT INTO objects (key, url, name, size, at, state) VALUES (?, ?, 'a.pdf', 1, ?, ?)");
   insert.run("b", url, "2026-09-02T00:00:00Z", "uploaded");
   insert.run("a", url, "2026-09-02T00:00:00Z", "uploaded");
   insert.run("c", url, "2026-09-03T00:00:00Z", "uploaded");
@@ -65,4 +65,43 @@ test("a corrupt SQLite ledger fails closed without replacing its contents", asyn
     await expect(openRelayIndex(path)).rejects.toThrow();
     expect(await readFile(path)).toEqual(contents);
   } finally { await fixture.cleanup(); }
+});
+
+test.each([false, true])("old ledger accepts only an empty table (populated=%s)", async populated => {
+  const fixture = await tempFixture("relay-old-");
+  const path = join(fixture.root, "relay.sqlite");
+  const db = openState(path);
+  db.exec("CREATE TABLE objects (key TEXT PRIMARY KEY, url TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, at TEXT NOT NULL, state TEXT NOT NULL)");
+  if (populated) db.exec("INSERT INTO objects VALUES ('old', 'https://old.invalid/a', 'a', 1, '2026-01-01', 'uploaded')");
+  try {
+    if (populated) {
+      await expect(openRelayIndex(path)).rejects.toThrow("不支持迁移");
+      expect(db.query("SELECT key FROM objects").all()).toEqual([{ key: "old" }]);
+      expect(db.query("PRAGMA table_info(objects)").all()).toHaveLength(6);
+    } else {
+      const index = await openRelayIndex(path);
+      try {
+        expect(index.entries()).toEqual([]);
+        expect(db.query("PRAGMA table_info(objects)").all()).toHaveLength(8);
+      } finally { index.close(); }
+    }
+  } finally { db.close(); await fixture.cleanup(); }
+});
+
+test("retiring an expired generation and recording the next plan is one transaction", async () => {
+  const fixture = await tempFixture("relay-rotate-");
+  const path = join(fixture.root, "relay.sqlite"), index = await openRelayIndex(path), db = openState(path);
+  const old = { key: "same-content", url: "https://s3.invalid/old", name: "a", size: 1, at: "2026-01-01", state: "uploaded" as const,
+    expiresAt: "2026-01-01T02:00:00Z", deleteAfter: "2026-01-01T02:30:00Z" };
+  const plan = { ...old, url: "https://s3.invalid/new", state: "planned" as const, expiresAt: null, deleteAfter: null };
+  try {
+    await index.remember(old);
+    db.exec("CREATE TRIGGER reject_insert BEFORE INSERT ON objects BEGIN SELECT RAISE(ABORT, 'disk failure'); END");
+    await expect(index.remember(plan, "same-content:retired")).rejects.toThrow("disk failure");
+    expect(index.entries()).toEqual([old]);
+    db.exec("DROP TRIGGER reject_insert");
+    await index.remember(plan, "same-content:retired");
+    expect(index.get(old.key)).toEqual(plan);
+    expect(index.get("same-content:retired")).toEqual({ ...old, key: "same-content:retired" });
+  } finally { db.close(); index.close(); await fixture.cleanup(); }
 });

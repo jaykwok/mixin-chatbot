@@ -14,6 +14,9 @@ $TaskName = 'mixin-chatbot'
 $bun = if ($BunPath) { $BunPath } else { @(Get-ApplicationPaths 'bun.exe' | Select-Object -First 1)[0] }
 $git = if ($GitPath) { $GitPath } else { @(Get-ApplicationPaths 'git.exe' | Select-Object -First 1)[0] }
 if (-not $bun -or -not $git) { throw '缺少 Bun 或 Git' }
+$bunVersion = [string](& $bun --version)
+if ($LASTEXITCODE -ne 0 -or $bunVersion.Trim() -notmatch '^\d+\.\d+\.\d+(?:-.*)?$') { throw 'bun --version 执行失败或版本无法识别' }
+if ([Version]($bunVersion.Trim() -replace '-.*$', '') -lt [Version]'1.4.3') { throw '需要 Bun 1.4.3 或更高版本；升级尚未停止服务。' }
 # 未完成的升级固定使用事务记录中的群根；续做和回滚不重新读取默认值。
 $pendingPointer = Join-Path $Project 'data\state\upgrade-transaction'
 $pendingPath = $null
@@ -192,8 +195,12 @@ try {
         if (-not $ready) { throw "数据已经提交，但业务实例未就绪；保留新版本，请检查日志后使用 $(Get-OpsCommandHint 'resume') 继续" }
         Write-Host '机器人已启动。'
     } else { Write-Host '机器人服务保持停止（升级前未运行）。' }
+    # 正式实例就绪后才清理迁移副本；清理失败不影响本次升级，独立回执供以后重试。
+    if ($snapshot.WasRunning) {
+        & $bun run $runner finalize --project $Project --groups $groups --deployment (Split-Path $snapshot.Path -Leaf)
+        if ($LASTEXITCODE -ne 0) { Write-Warning '升级已完成，迁移备份清理未完成；修复日志中的问题后运行 migrations cleanup 重试。' }
+    } else { Write-Warning '服务保持停止，迁移备份保留；首次正式启动并通过健康检查后，按数据迁移文档执行 finalize。' }
     Remove-Item -LiteralPath $transactionPointer -Force
-    # 与部署相同：成功后只删除本次快照和本次归档；迁移快照、其他归档和历史事务留给明确的清理入口。
     try { Remove-CompletedBackup $snapshot.Path $Project }
     catch { Write-Warning ('升级已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }
     Write-Host ('升级完成：' + $OriginalSha.Substring(0, 7) + ' -> ' + $TargetSha.Substring(0, 7))
@@ -235,7 +242,7 @@ try {
     $snapshot.Lock.Dispose()
     $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId
     }
-    # A failed, refused or rolled-back upgrade keeps its snapshot for recovery; migration snapshots always stay.
+    # Failed activation retains migration snapshots; successful activation finalizes only owned snapshots.
 }
 } finally {
     Remove-Item -LiteralPath $plan -Force -ErrorAction SilentlyContinue

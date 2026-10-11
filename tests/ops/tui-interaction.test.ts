@@ -965,7 +965,7 @@ test("统计切换日期在后台加载，仍可改日期和切页，过期结�
     const second = Promise.withResolvers<tuiData.GroupStats[]>();
     const read = spyOn(tuiData, "loadStatsOverview").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     const app = new App([view, { id: "other", label: "其他", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
-    const choose = spyOn(app, "choose").mockResolvedValueOnce("today").mockResolvedValueOnce("7");
+    const choose = spyOn(app, "choose").mockResolvedValueOnce("today").mockResolvedValueOnce("7d");
     const ask = spyOn(app, "ask").mockResolvedValueOnce("2026-08-01").mockResolvedValueOnce("2026-08-31")
       .mockResolvedValueOnce("2026-09-01").mockResolvedValueOnce("2026-09-12");
     tty.screen.start(() => {}, () => {});
@@ -1207,8 +1207,12 @@ test("统计在 80×24 先显示成员，所有成员与月度、工具均可滚
       await view.onKey(key("down"), app);
     }
     for (let i = 0; i < 24; i++) expect(seen.join("\n")).toContain("138****" + String(13812345678 + i).slice(-4));
-    expect(seen.join("\n")).toContain("按月");
+    expect(seen.join("\n")).toContain("按日");
     expect(seen.join("\n")).toContain("fixture_tool");
+    await view.onKey(key("g"), app);
+    expect(view["grain"]).toBe("week");
+    await view.onKey(key("g"), app);
+    expect(view["grain"]).toBe("month");
     await view.onKey(key("home"), app);
     await view.onKey(key("m"), app);
     expect(plain(view.render(context()))).toContain("13812345678");
@@ -1247,6 +1251,34 @@ test("日期仅设上限有效，取消第二次输入保留原区间，非法�
     await view.onKey(key("d"), app);
     expect(plain(view.render(context()))).toContain("最早 ~ 2026-08-31");
     expect(calls.toasts.at(-1)).toContain("日期");
+  } finally { await fixture.cleanup(); }
+});
+
+test("统计汇总逐日补零，可切换周月粒度，基期比较在窄窗口也不越界", async () => {
+  const fixture = await tempFixture("tui-stats-trend-");
+  try {
+    await history(fixture.root, "g1", "13812345678", ["2026-08-01", "2026-08-03"]);
+    await history(fixture.root, "g2", "13812345678", ["2026-08-03"]);
+    const view = new StatsView();
+    const { app, calls } = fakeApp(fixture.root);
+    await view.refresh(app);
+    calls.answers.push("2026-08-01", "2026-08-03");
+    await view.onKey(key("d"), app);
+    await waitFor(() => view["overview"].kind !== "loading", "统计比较加载", 2000);
+    expect(plain(view.render(context()))).toContain("覆盖提问 1 人");
+    expect(plain(view.render(context()))).toContain("环比");
+    expect(plain(view.render(context()))).toContain("同比");
+    await view.onKey(key("t"), app);
+    expect(plain(view.render(context()))).toContain("2026-08-02");
+    for (const grain of ["day", "week", "month"] as const) {
+      expect(view["grain"]).toBe(grain);
+      for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
+      await view.onKey(key("g"), app);
+    }
+    await view.onKey(key("escape"), app);
+    expect(view["showTrend"]).toBe(false);
+    await view.onKey(key("enter"), app);
+    fits(view.render(context(72, 20)), context(72, 20));
   } finally { await fixture.cleanup(); }
 });
 
@@ -1338,7 +1370,7 @@ test("群筛选控制统计导出范围，常用日期可选，会话全部成�
     const report = await Bun.file(calls.opened[0]!).text();
     expect(report).toContain("support-group");
     expect(report).not.toContain("other-group");
-    calls.choices.push("7");
+    calls.choices.push("7d");
     await stats.onKey(key("w"), app);
     await waitFor(() => stats["overview"].kind !== "loading", "统计日期范围加载", 2000);
     const start = new Date();

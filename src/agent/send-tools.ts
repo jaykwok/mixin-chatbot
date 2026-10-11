@@ -328,9 +328,8 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
           index: relayIndex,
           tempDir,
         });
-        // 有效期必须写进群消息本身：群成员只有提前知道期限才会及时下载。措辞随后端机制
-        // 变化（删文件 / 只失效签名），交给 relay 层拼，见 describeRelayExpiry。
-        const expiry = describeRelayExpiry(relay);
+        // 群消息显示本次签名的实际到期时间；复用对象不会延长原期限。
+        const expiry = describeRelayExpiry(relay, url);
         // 交给运行时并入本轮回复，而不是在这里单独发一条：URL 必须逐字正确，所以不能让
         // 模型复述；但也不值得为它多花一条出站配额。
         const note = `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发：\n${url}${expiry}`;

@@ -15,6 +15,13 @@ test("manual compaction selects the same member on both ops platforms", () => {
   expect(opsCommand("linux", args).args.slice(1)).toEqual(args);
 });
 
+test("统计周期通过两个平台运维入口完整传递", () => {
+  const args = ["stat", "support", "--period", "last-month"];
+  const command = opsCommand("windows", args);
+  expect(JSON.parse(Buffer.from(command.args.at(-1)!, "base64").toString("utf8"))).toEqual({ Command: "stat", Target: "support", Period: "last-month" });
+  expect(opsCommand("linux", args).args.slice(1)).toEqual(["stat", "--period", "last-month", "--", "support"]);
+});
+
 // 从真实脚本提取函数和入口，只替换宿主机探测/写操作。
 // 测试不运行真实的 repair、purge、route-admin 或计划任务命令。
 const BUILD = String.raw`
@@ -220,6 +227,7 @@ windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 C
       { input: ["tmp-purge", "--all", "--group", "g1", "--user", "13812345678"], argv: ["purge", "--all", "--user=13812345678", "--group=g1"], script: "tmp" },
       { input: ["tmp-ls", "--group", "-Repair", "--group-id"], argv: ["list", "--group=-Repair", "--group-id"], script: "tmp" },
       { input: ["stat", "-Repair", "--group-id"], argv: ["--group-id", "--", "-Repair"], script: "scripts\\ops\\stats-admin.ts" },
+      { input: ["stat", "support", "--period", "last-month"], argv: ["--period", "last-month", "--", "support"], script: "scripts\\ops\\stats-admin.ts" },
     ];
     for (const { input, argv, script } of cases) {
       const result = await fixture.run(input);

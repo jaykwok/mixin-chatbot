@@ -74,7 +74,8 @@ function group(name: string, asks: number, members: number, files: number): Grou
   const daily = new Map(Array.from({ length: 14 }, (_, i) => {
     const date = new Date(NOW - (13 - i) * DAY);
     const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-    return [key, { asks: 40 + ((i * 37) % 90), users: new Set(users.slice(0, 3 + (i % 6)).map(u => u.user)), files: 2 + (i % 5), images: 1 + (i % 3) }] as const;
+    const askers = new Set(users.slice(0, 3 + (i % 6)).map(u => u.user));
+    return [key, { asks: 40 + ((i * 37) % 90), replies: 50 + i, askers, users: askers, files: 2 + (i % 5), images: 1 + (i % 3) }] as const;
   }));
   return {
     group: name, users, asks, replies: asks + 756,

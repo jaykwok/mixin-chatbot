@@ -19,11 +19,13 @@ jobs:
           fetch-depth: 0
       - uses: oven-sh/setup-bun@v2.2.0
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
+      # scripts/test.ts runs timing-balanced groups in parallel, one isolated run each (one per spare core, at most four on Windows and six elsewhere).
+      # The recorded per-file times have the format of tests/timings/<platform>.json, which they can replace.
       - name: Isolated tests and JUnit report
-        run: bun run test --reporter=junit --reporter-outfile="${{ runner.temp }}/mixin-tests.xml" --timings="${{ runner.temp }}/mixin-test-timings.json" --update-timings
+        run: bun run test --reporter=junit --reporter-outfile="${{ runner.temp }}/mixin-tests.xml" --record-timings="${{ runner.temp }}/mixin-test-timings.json"
       - run: bun run deadcode
       - run: bun run deadcode --production
       - name: Dependency vulnerability audit
@@ -81,7 +83,8 @@ jobs:
           docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/backup:/app/backup" -v "$PWD/tests:/app/tests:ro" \
             -v "$PWD/scripts/ops/tui:/app/scripts/ops/tui:ro" -e MIXIN_TEST_WORK_ROOT=/app/tmp \
-            mixin-chatbot-check bun run test tests/ops/migrations.test.ts
+            mixin-chatbot-check bun run test tests/ops/migrations.test.ts tests/ops/migration-group-roots.test.ts \
+              tests/ops/migration-verification.test.ts tests/ops/migration-v2.test.ts
       - name: Test editable documents and Office previews in the restricted image
         run: |
           # Match production: LibreOffice's Unix socket uses /tmp, not TMPDIR.

@@ -14,11 +14,9 @@ const CALLBACK_URL =
   "https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=send-tools-test";
 
 const RELAY: RelayConfig = {
-  webdavUrl: "http://127.0.0.1:5244/dav/relay/",
-  publicBaseUrl: "https://files.example.com/d/relay/",
-  username: "bot",
-  password: "secret",
-  maxBytes: 2 * 1024 ** 3,
+  provider: "s3", endpoint: "https://s3.example.test", region: "test-region", bucket: "test-bucket",
+  accessKeyId: "bot", secretAccessKey: "secret", prefix: "relay/", forcePathStyle: false,
+  maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30,
 };
 
 /** 一个刚好越过 IM 单条附件上限的文件，用来触发外链分支。 */
@@ -84,9 +82,9 @@ describe("attachment send tools", () => {
         method: init?.method,
         auth: headers.get("authorization") ?? undefined,
       });
-      // WebDAV PUT / 去重探测
+      // S3 上传后必须核验对象大小。
       if (init?.method === "PUT") return new Response(null, { status: 201 });
-      if (init?.method === "HEAD") return new Response(null, { status: 302 });
+      if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "Content-Length": String(MAX_ATTACHMENT_BYTES + 1024) } });
       return new Response(JSON.stringify({ ok: true, code: 200 }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -117,15 +115,16 @@ describe("attachment send tools", () => {
 
       const put = requests.find((r) => r.method === "PUT")!;
       expect(put).toBeDefined();
-      expect(put.url.startsWith(RELAY.webdavUrl)).toBe(true);
+      expect(new URL(put.url).hostname).toBe("test-bucket.s3.example.test");
       // 对象名不可枚举，且保留原文件名便于人辨认。
       expect(put.url).toContain("report.bin");
-      expect(put.url).not.toBe(`${RELAY.webdavUrl}report.bin`);
-      expect(put.auth).toBe(`Basic ${Buffer.from("bot:secret").toString("base64")}`);
+      expect(new URL(put.url).pathname).toMatch(/^\/relay\/\d{8}-[0-9a-f-]+\/report.bin$/);
+      expect(new URL(put.url).searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
+      expect(put.auth).toBeUndefined();
 
       const details = result.details as { url: string; mode: string };
       expect(details.mode).toBe("relay");
-      expect(details.url.startsWith(RELAY.publicBaseUrl)).toBe(true);
+      expect(new URL(details.url).hostname).toBe("test-bucket.s3.example.test");
 
       // 链接交给运行时并入那条唯一的回复，工具自己不再单独发一条消息——否则一次发送
       // 要吃掉两条出站配额。
@@ -135,8 +134,7 @@ describe("attachment send tools", () => {
       expect(requests.some((r) => r.method === "POST" || r.url.includes("webhook"))).toBe(false);
       // 附件上传端点不该被碰过——大文件根本没进 IM 的通道。
       expect(requests.some((r) => r.url.includes("upload"))).toBe(false);
-      // 没配有效期就不该凭空承诺一个期限。
-      expect(drained[0]).not.toContain("失效");
+      expect(drained[0]).toContain("链接有效至");
       // 工具结果里不再重复给出 URL，免得模型照抄一遍、同一条消息出现两个地址。
       const text = (result.content[0] as { text: string }).text;
       expect(text).not.toContain(details.url);
@@ -158,7 +156,7 @@ describe("attachment send tools", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       if (init?.method === "PUT") return new Response(null, { status: 201 });
-      if (init?.method === "HEAD") return new Response(null, { status: 302 });
+      if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "Content-Length": String(MAX_ATTACHMENT_BYTES + 1024) } });
       return new Response(JSON.stringify({ ok: true, code: 200 }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -188,8 +186,8 @@ describe("attachment send tools", () => {
 
       // 到期时文件会被删掉，事后没有补救途径；群里必须当场看到期限。
       const announcement = notes.peek()[0]!;
-      expect(announcement).toContain("8 小时后失效");
-      expect(announcement).toContain("删除");
+      expect(announcement).toContain("链接有效至");
+      expect(announcement).toContain("到期后文件将被清理");
     } finally {
       for (const index of opened) index.close();
       globalThis.fetch = originalFetch;
@@ -197,7 +195,7 @@ describe("attachment send tools", () => {
     }
   }, 20_000);
 
-  test("promises a signed link instead of a deadline when signing is on", async () => {
+  test("announces a signed GET link with a fixed expiry and persists only its unsigned identity", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-relay-sign-"));
     const workspace = join(root, "workspace");
     const userTemp = join(root, "user-tmp");
@@ -206,10 +204,10 @@ describe("attachment send tools", () => {
     const opened: RelayIndex[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-      if (init?.method === "PUT" || init?.method === "MKCOL") {
+      if (init?.method === "PUT") {
         return new Response(null, { status: 201 });
       }
-      return new Response(null, { status: 302 });
+      return new Response(null, { status: 200, headers: { "Content-Length": String(MAX_ATTACHMENT_BYTES + 1024) } });
     }) as unknown as typeof fetch;
 
     try {
@@ -221,17 +219,18 @@ describe("attachment send tools", () => {
         notes,
         workspaceDir: workspace,
         tempDir: userTemp,
-        relay: { ...RELAY, expireHours: 8, signSecret: "s", signPathPrefix: "/relay/" },
+        relay: { ...RELAY, expireHours: 8 },
         relayIndex: await indexFor(root, opened),
       }).find((tool) => tool.name === "send_file")!;
 
       await fileTool.execute("send-signed", { source: "report.bin" }, undefined, undefined, {} as never);
 
       const announcement = notes.peek()[0]!;
-      expect(announcement).toContain("sign=");
-      expect(announcement).toContain("8 小时后失效");
-      // 文件还在就不该吓唬用户「过期就没了」，也不必解释后端留没留——群里只需要知道期限。
-      expect(announcement).not.toContain("删除");
+      expect(announcement).toContain("X-Amz-Signature=");
+      expect(announcement).toContain("链接有效至");
+      expect(announcement).toContain("到期后文件将被清理");
+      expect(notes.references()).toHaveLength(1);
+      expect(notes.references()[0]!.reference.url).not.toContain("X-Amz-");
     } finally {
       for (const index of opened) index.close();
       globalThis.fetch = originalFetch;

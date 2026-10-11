@@ -251,6 +251,11 @@ activate_committed_deployment() {
         print_error "数据已经提交，新版本已启用，但正式标签 mixin-chatbot 未能指向 ${IMAGE_ID}（原因见上方）；保留事务，处理后使用 $(ops_command_hint resume) 重试"
         exit 1
     }
+    if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
+        migration_docker finalize --deployment "$(basename -- "$DEPLOY_SNAPSHOT")" || print_warning "部署已完成，迁移备份清理未完成；修复日志中的问题后运行 migrations cleanup 重试。"
+    else
+        print_warning "服务保持停止，迁移备份保留；首次正式启动并通过健康检查后，按数据迁移文档执行 finalize。"
+    fi
     rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
     release_transaction_candidate
     cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，但备份清理未完成，请检查 $DEPLOY_SNAPSHOT 和 $PROJECT_DIR/backup/rm"

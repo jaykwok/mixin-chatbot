@@ -21,18 +21,18 @@ async function put(root: string, path: string, content: string | Buffer): Promis
 const base = (name: string) => name.slice(0, -37);
 const almostFiller = () => { const data = Buffer.alloc(1024 * 1024); data[data.length - 1] = 1; return data; };
 
-/** Every path below root (except skip) with size and modification time, for proving that a scan changes nothing. */
-async function listing(root: string, skip: string): Promise<string[]> {
+/** Every path below root with size and modification time, for proving that a scan changes nothing. */
+async function listing(root: string): Promise<string[]> {
   const lines: string[] = [];
   async function children(path: string) {
-    for (const child of await readdir(path)) if (join(path, child) !== skip) await visit(join(path, child));
+    for (const child of await readdir(path)) await visit(join(path, child));
   }
   async function visit(path: string) {
     const stat = await lstat(path);
     lines.push(`${relative(root, path)} ${stat.isSymbolicLink() ? "link" : stat.size} ${stat.mtimeMs}`);
     if (stat.isDirectory() && !stat.isSymbolicLink()) await children(path);
   }
-  // backup/ itself gains the cleanup directory; everything else must stay as it was.
+  // Reports are outside backup/, so the entire backup tree must remain unchanged.
   await children(root);
   return lines.sort();
 }
@@ -78,7 +78,7 @@ async function backupProject(root: string) {
 }
 
 async function editActions(root: string, report: string, actions: Record<string, "delete" | "keep">): Promise<void> {
-  const path = join(root, "backup/cleanup", report, "manifest.json");
+  const path = join(root, "tmp/backup-cleanup", report, "manifest.json");
   const manifest = JSON.parse(await readFile(path, "utf8"));
   for (const entry of manifest.entries as Entry[]) if (entry.path in actions) entry.action = actions[entry.path]!;
   await writeFile(path, JSON.stringify(manifest));
@@ -88,9 +88,9 @@ test("backup scan classifies archives by name and content evidence without chang
   const fixture = await tempFixture("backup-scan-");
   try {
     const root = fixture.root, { names, migration } = await backupProject(root);
-    const before = await listing(join(root, "backup"), join(root, "backup/cleanup"));
+    const before = await listing(join(root, "backup"));
     const scanned = scan(root);
-    expect(await listing(join(root, "backup"), join(root, "backup/cleanup"))).toEqual(before);
+    expect(await listing(join(root, "backup"))).toEqual(before);
     const entry = (path: string) => scanned.entries.find(item => item.path === path)!;
     const category = (name: string) => entry(`backup/rm/${name}`)?.category;
     for (const name of [names.self, names.testRoot, names.filler, names.domain, names.file, names.changed, names.replaced, names.swapped]) {
@@ -112,7 +112,7 @@ test("backup scan classifies archives by name and content evidence without chang
     expect(scanned.entries.filter(item => item.action === "delete").every(item => item.category === "confirmed-test")).toBe(true);
     expect(scanned.entries.some(item => !/^backup\/(rm|snapshots)\//.test(item.path))).toBe(false);
     expect(scanned.skipped).toEqual(["reports"]);
-    const tsv = await readFile(join(root, "backup/cleanup", scanned.report!, "manifest.tsv"), "utf8");
+    const tsv = await readFile(join(root, "tmp/backup-cleanup", scanned.report!, "manifest.tsv"), "utf8");
     expect(tsv).toContain("可确认测试数据"); expect(tsv).toContain("疑似测试数据"); expect(tsv).toContain("业务归档"); expect(tsv).toContain("无法判断");
   } finally { await fixture.cleanup(); }
 }, 30000);
@@ -173,12 +173,25 @@ test("backup cleanup deletes only entries the manifest selects, after rechecking
   } finally { await fixture.cleanup(); }
 }, 30000);
 
+test.each(["tmp", "tmp/backup-cleanup"])("backup cleanup refuses a redirected report ancestor: %s", async ancestor => {
+  const fixture = await tempFixture("backup-report-boundary-");
+  try {
+    const root = fixture.root;
+    await backupProject(root);
+    const { report } = scan(root);
+    await rename(join(root, ancestor), join(root, "saved-reports"));
+    await link(join(root, "saved-reports"), join(root, ancestor));
+    expect(() => scan(root)).toThrow("链接");
+    expect(() => apply(root, report!)).toThrow("链接");
+  } finally { await fixture.cleanup(); }
+});
+
 test("backup cleanup rejects a tampered manifest, a pending transaction and a redirected recycle area", async () => {
   const fixture = await tempFixture("backup-refuse-");
   try {
     const root = fixture.root, { names } = await backupProject(root);
     const { report } = scan(root);
-    const manifestPath = join(root, "backup/cleanup", report!, "manifest.json");
+    const manifestPath = join(root, "tmp/backup-cleanup", report!, "manifest.json");
     const original = await readFile(manifestPath, "utf8");
     const target = `backup/rm/${names.self}`;
     const tamper = async (change: (entries: Entry[]) => void) => {
@@ -338,22 +351,26 @@ test.skipIf(!bash || !existsSync(bash))("ops.sh backup-scan and backup-clean han
   try {
     await cp(join(project, "scripts/lib"), join(root, "scripts/lib"), { recursive: true });
     await mkdir(join(root, "scripts/ops"), { recursive: true }); await copyFile(join(project, "scripts/ops/ops.sh"), join(root, "scripts/ops/ops.sh"));
-    // An exported function, not a PATH stub (the Windows CI runner skipped PATH stubs): the bot container is running.
-    const docker = `() { echo "$*" >> '${posixPath(log)}'; [ "$1" != ps ] || echo mixin-chatbot\n}`;
+    // Even with the service running, a one-off container binds the reports onto the host.
+    const docker = `() { echo "$*" >> '${posixPath(log)}'; case "$1" in ps) echo mixin-chatbot ;; container) echo 1001:1001 ;; esac\n}`;
     const ops = async (...args: string[]) => {
       const child = Bun.spawn([bash!, posixPath(join(root, "scripts/ops/ops.sh")), ...args], { cwd: root, stdout: "pipe", stderr: "pipe", windowsHide: true,
-        env: { ...process.env, MSYS_NO_PATHCONV: "1", "BASH_FUNC_docker%%": docker, BOT_PORT: "", BOT_DOMAIN: "" } });
+        env: { ...process.env, MSYS_NO_PATHCONV: "1", "BASH_FUNC_docker%%": docker,
+          "BASH_FUNC_flock%%": "() { return 0;\n}", "BASH_FUNC_id%%": "() { echo 1000;\n}", BOT_PORT: "", BOT_DOMAIN: "" } });
       const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
       expect(code, out + err).toBe(0);
     };
     // Each ops.sh start costs seconds under Git Bash; the preview differs from the confirmed call only by the passed-through code.
     await ops("backup-scan");
     await ops("backup-clean", "20260928T000000Z-abcdef", "--confirm", "0123456789abcdef");
-    const calls = (await readFile(log, "utf8")).split("\n").filter(line => line.startsWith("exec "));
-    expect(calls).toEqual([
-      "exec mixin-chatbot bun run scripts/ops/backup-cleanup.ts scan",
-      "exec mixin-chatbot bun run scripts/ops/backup-cleanup.ts apply 20260928T000000Z-abcdef --confirm 0123456789abcdef",
-    ]);
+    const calls = (await readFile(log, "utf8")).split("\n").filter(line => /^(exec|run) /.test(line));
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call).toStartWith("run --rm --user 1001:1001");
+      expect(call).toContain(`-v ${posixPath(root)}/tmp/backup-cleanup:/app/tmp/backup-cleanup`);
+    }
+    expect(calls[0]).toEndWith("mixin-chatbot bun run scripts/ops/backup-cleanup.ts scan");
+    expect(calls[1]).toEndWith("mixin-chatbot bun run scripts/ops/backup-cleanup.ts apply 20260928T000000Z-abcdef --confirm 0123456789abcdef");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -369,7 +386,7 @@ test("backup-cleanup command scans by default, previews with a confirmation code
     const scanned = await run();
     expect(scanned.code, scanned.text).toBe(0);
     expect(scanned.text).toContain("没有删除任何内容");
-    const report = /backup\/cleanup\/(\S+)\/manifest\.json/.exec(scanned.text)![1]!;
+    const report = /tmp\/backup-cleanup\/(\S+)\/manifest\.json/.exec(scanned.text)![1]!;
     const preview = await run("apply", report);
     expect(preview.code, preview.text).toBe(0);
     const code = /确认码：([0-9a-f]{16})/.exec(preview.text)![1]!;

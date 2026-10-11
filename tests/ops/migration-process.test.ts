@@ -17,7 +17,8 @@ test.each(["normal", "invalid"])("synthetic validator %s preserves exit and all 
   } finally { await f.cleanup(); }
 }, 40_000);
 
-test.each(["entry-delay", "block"])("validator timeout during %s is classified and reaped", async mode => {
+// Both wait out the 12 s timeout; independent fixtures and processes let them share the wait.
+test.concurrent.each(["entry-delay", "block"])("validator timeout during %s is classified and reaped", async mode => {
   const f = await tempFixture("migration-timeout-"); const phases: ProcessEvent[] = [];
   try {
     const failure = await executeProcess({ command: process.execPath, args: [helper, mode], cwd: f.root, timeoutMs: 12_000, observe: phase => phases.push(phase) }).then(() => undefined, error => error as ProcessFailure);
@@ -26,7 +27,8 @@ test.each(["entry-delay", "block"])("validator timeout during %s is classified a
     if (mode === "block") expect(failure!.result.stderr).toContain('"phase":"config","state":"start"');
     else expect(failure!.result.stderr).not.toContain('"phase":"entry-ready"');
   } finally { await f.cleanup(); }
-}, 25_000);
+  // Alone about 15 s on this Windows host; with parallel test groups starting processes too, past 25 s.
+}, 45_000);
 
 test("startup failure, cancellation and signal exit remain distinct", async () => {
   const f = await tempFixture("migration-failures-");

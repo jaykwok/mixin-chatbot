@@ -404,7 +404,7 @@ function Set-OperationStage([string]$Stage) { $script:stages += $Stage }
 function Get-ScheduledTask { [pscustomobject]@{State='Ready'} }
 function Get-SavedGroupDataRoot { Join-Path $Project 'data\\groups' }; function Get-PlatformIp { '203.0.113.17' }
 function Read-DeploymentTransaction { @{ target_group_root = (Join-Path $Project 'data\\groups') } }
-function fixture-bun { $global:LASTEXITCODE=0; if($script:stopped){throw 'Bun ran after the stop'}; if($args -contains 'committed'){ $global:LASTEXITCODE=1 } }
+function fixture-bun { $global:LASTEXITCODE=0; if($script:stopped){throw 'Bun ran after the stop'}; if($args -contains '--version'){ '1.4.3' }; if($args -contains 'committed'){ $global:LASTEXITCODE=1 } }
 function Open-UpgradeSnapshot($root,$task,$original,$branch,$target) {
     $script:opened=$true
     if($script:during){ [IO.File]::WriteAllText((Join-Path $root $script:during[0]), $script:during[1]) }

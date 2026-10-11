@@ -7,13 +7,15 @@ import { openExistingStatsLedger } from "../agent/stats-ledger.ts";
 import { assertDeliverySchema } from "../agent/delivery-store.ts";
 import { readAuxiliaryConfig } from "./auxiliary-config.ts";
 import { readMcpConfig } from "./mcp-config.ts";
+import { validateRelayConfig } from "../integrations/relay-s3.ts";
+import { readRelayIndex } from "../integrations/relay-index.ts";
 
 /**
  * Configuration only: runtime.json, models and the selected model under `project`, which may be a preview's
  * projection. Opens no database, so it can run before a migration and against read-only data.
  */
-type ValidationObserver = (phase: "config" | "stats" | "delivery", state: "start" | "end" | "failed") => void;
-async function stage(phase: "config" | "stats" | "delivery", observe: ValidationObserver | undefined, run: () => Promise<void>) {
+type ValidationObserver = (phase: "config" | "stats" | "delivery" | "relay", state: "start" | "end" | "failed") => void;
+async function stage(phase: "config" | "stats" | "delivery" | "relay", observe: ValidationObserver | undefined, run: () => Promise<void>) {
   observe?.(phase, "start");
   try { await run(); observe?.(phase, "end"); }
   catch (error) { observe?.(phase, "failed"); throw error; }
@@ -23,6 +25,8 @@ export async function validateConfiguration(project: string, observe?: Validatio
   if (process.env.BOT_MODEL_CACHE_RETENTION?.trim()) throw new Error("请移除 BOT_MODEL_CACHE_RETENTION 环境变量");
   const path = join(project, "data/config/runtime.json");
   validateRuntimeConfig(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {});
+  const relayPath = join(project, "data/config/relay.json");
+  if (existsSync(relayPath)) validateRelayConfig(JSON.parse(readFileSync(relayPath, "utf8")), relayPath);
   const runtime = await openModelRuntime({ modelsPath: join(project, "data/config/models.json"), modelsStorePath: join(project, "data/runtime/models-store.json") });
   await resolveModelSelection(runtime, openSettings(join(project, "data/runtime/pi/settings.json")));
   const auxiliary = readAuxiliaryConfig(join(project, "data/config/auxiliary.json"));
@@ -37,6 +41,9 @@ export async function validateConfiguration(project: string, observe?: Validatio
 /** Used by the service and migration runner. No database creation, migrations or requests. */
 export async function validateCurrentData(project: string, groups: string, stateProject = project, observe?: ValidationObserver): Promise<void> {
   await validateConfiguration(project, observe);
+  await stage("relay", observe, async () => {
+    if (existsSync(join(project, "data/config/relay.json"))) readRelayIndex(join(stateProject, "data/state/relay.sqlite"));
+  });
   await stage("stats", observe, async () => {
   const stats = openExistingStatsLedger(groups);
   try {

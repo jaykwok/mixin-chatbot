@@ -216,7 +216,7 @@ export class OverviewView implements View {
       // 峰值不在这里标：下面趋势图的标题里已经有一个，同一个数字在一屏上出现两次没有意义。
       { label: "今日提问", value: snapshot.today ? `${fmt.count(asks)} 次` : placeholder("stats"), delta: change(asks, yesterday?.asks),
         trend: trend.map(point => point.asks) },
-      { label: "活跃成员", value: snapshot.today ? `${fmt.count(people)} 人次` : placeholder("stats"), delta: change(people, yesterday?.people),
+      { label: "活跃成员", value: snapshot.today ? `${fmt.count(people)} 人` : placeholder("stats"), delta: change(people, yesterday?.people),
         trend: trend.map(point => point.people) },
       { label: "已送附件", value: snapshot.today ? `${fmt.count(files)} 份` : placeholder("stats"), delta: change(files, yesterday?.files),
         trend: trend.map(point => point.files) },

@@ -152,7 +152,7 @@ export function createRelayView(): View {
           steps: [
             "要求维护租约，运行中的机器人会阻止本操作",
             "逐个删除后端对象并清掉索引记录",
-            "地址与当前 publicBaseUrl 对不上的记录会保留",
+            "不属于当前 S3 后端的记录会保留",
           ],
           untouched: ["群里已发出的消息本身"],
           recovery: "不可恢复：群成员点已发出的链接会得到失效地址",

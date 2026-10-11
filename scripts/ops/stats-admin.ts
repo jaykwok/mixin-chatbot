@@ -7,6 +7,8 @@ import { emptyUsageBreakdown, formatCacheRate, mergeUsage, type UsageBreakdown, 
 import { dayKey, dayWindow, openExistingStatsLedger, readLedger, type DayWindow, type LedgerRows } from "../../src/agent/stats-ledger.ts";
 import { groupSegment } from "../../src/agent/paths.ts";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
+import { maskUser } from "./tui/render/format.ts";
+import { change, comparisons, comparisonWindows, describeStatsWindow, engagement, periodWindow, STATS_NOTE, summarize, trend, type ComparisonData, type StatsPeriod } from "./stats-summary.ts";
 
 export interface UserStats {
   user: string;
@@ -35,7 +37,7 @@ export interface GroupStats {
   tokens: UsageTotals;
   usage: UsageBreakdown;
   months: Map<string, { asks: number; users: Set<string> }>;
-  daily: Map<string, { asks: number; users: Set<string>; files: number; images: number }>;
+  daily: Map<string, { asks: number; replies: number; askers: Set<string>; users: Set<string>; files: number; images: number }>;
   days: Set<string>;
   firstAt: number;
   lastAt: number;
@@ -45,13 +47,15 @@ export interface GroupStats {
 export interface Window {
   since?: number;
   until?: number;
+  period?: StatsPeriod;
 }
 
 function usage(): void {
   console.log("用法：bun run stat [群号] [选项]");
   console.log("");
   console.log("  不带群号          列出各群的使用概览");
-  console.log("  <群号>            该群的详细统计（按月、按成员）");
+  console.log("  <群号>            该群的详细统计（每日、每周、每月、提问排行）");
+  console.log("  --period <范围>   today / yesterday / week / last-week / month / last-month / 7d / 30d / all");
   console.log("  --since <日期>    只统计该日期当天及之后（YYYY-MM-DD）");
   console.log("  --until <日期>    只统计该日期当天及之前（YYYY-MM-DD）");
   console.log("  --group-id / --storage-segment  明确使用原始群号或存储目录段，两者互斥");
@@ -129,7 +133,7 @@ function foldGroup(group: string, rows: LedgerRows): GroupStats {
   const dailyOf = (day: string) => {
     const existing = stats.daily.get(day);
     if (existing) return existing;
-    const created = { asks: 0, users: new Set<string>(), files: 0, images: 0 };
+    const created = { asks: 0, replies: 0, askers: new Set<string>(), users: new Set<string>(), files: 0, images: 0 };
     stats.daily.set(day, created);
     return created;
   };
@@ -142,6 +146,8 @@ function foldGroup(group: string, rows: LedgerRows): GroupStats {
     entry.lastAt = Math.max(entry.lastAt, row.lastAt);
     const daily = dailyOf(row.day);
     daily.asks += row.asks;
+    daily.replies += row.replies;
+    if (row.asks > 0) daily.askers.add(row.user);
     if (row.asks > 0 || row.replies > 0) daily.users.add(row.user);
     if (row.asks > 0) {
       entry.days.add(row.day);
@@ -205,7 +211,7 @@ function rowsOf(rows: LedgerRows, group: string): LedgerRows {
 function readRows(root: string, window: DayWindow = {}, group?: string): LedgerRows {
   const db = openExistingStatsLedger(root);
   if (!db) return { activity: [], tools: [], usage: [], skipped: new Map(), groups: [], legacy: new Map() };
-  try { return readLedger(db, window, group); } finally { db.close(); }
+  try { return db.transaction(() => readLedger(db, window, group))(); } finally { db.close(); }
 }
 
 export async function collectGroup(
@@ -223,8 +229,15 @@ export async function collectAll(
   const rows = readRows(root, dayWindow(window));
   return rows.groups
     .map(group => foldGroup(group, rowsOf(rows, group)))
-    .filter(stats => stats.users.length > 0 || stats.usage.total.requests > 0)
+    .filter(stats => stats.users.length > 0 || stats.usage.total.requests > 0 || stats.delivered.size > 0 || stats.tools.size > 0 || stats.nested.size > 0)
     .sort((a, b) => b.asks - a.asks || byName(a.group, b.group));
+}
+
+export async function collectComparisons(root: string, window: Window): Promise<ComparisonData | null> {
+  const ranges = comparisonWindows(window);
+  if (!ranges) return null;
+  const [previous, yearAgo] = await Promise.all([collectAll(root, ranges.previous), collectAll(root, ranges.yearAgo)]);
+  return { previous: { window: ranges.previous, groups: previous }, yearAgo: { window: ranges.yearAgo, groups: yearAgo } };
 }
 
 /** 群目录可能已经被删掉，但账本里还有它的历史：按群号或目录段在账本里再找一次。 */
@@ -251,6 +264,7 @@ function describeWindow(window: Window): string {
 }
 
 function printFootnote(): void {
+  console.log(STATS_NOTE);
   console.log(
     "统计口径：一条发给机器人的消息算一次提问（含干活途中的插话），/help /clear 等指令不计入。"
   );
@@ -335,16 +349,27 @@ function printGroup(stats: GroupStats, window: Window): void {
   printFootnote();
 }
 
+function printAnalysis(groups: GroupStats[], window: Window, data: ComparisonData | null, scope?: Set<string>): void {
+  const summary = summarize(groups);
+  console.log(`总提问数 ${summary.asks} 次 · 覆盖提问人数 ${summary.people} 人（跨群去重） · 人均 ${summary.average.toFixed(1)} 次 · 活跃 ${summary.activeDays} 天`);
+  const activity = engagement(groups, window);
+  console.log(`日均 ${activity.dailyAverage.toFixed(1)} 次 · 活跃天数占比 ${(activity.activeRate * 100).toFixed(1)}% · 前五名提问占比 ${(activity.topFiveShare * 100).toFixed(1)}% · 高峰日 ${activity.peak?.date ?? "—"}（${activity.peak?.asks ?? 0} 次）`);
+  for (const period of comparisons(data, scope)) {
+    console.log(`${period.label}（${describeStatsWindow(period.window)}）：基期 ${period.asks} 次 / ${period.people} 人；提问 ${change(summary.asks, period.asks)}，人数 ${change(summary.people, period.people)}`);
+  }
+  for (const [grain, label] of [["day", "每日"], ["week", "每周（周一为起点）"], ["month", "每月"]] as const) {
+    console.log(`\n${label}：日期 / 提问 / 提问人数 / 处理轮次 / 文件 / 图片 / 已知估算费用 / 费用未知 / 用量缺失`);
+    for (const row of trend(groups, window, grain)) console.log(`  ${row.date}  ${row.asks} 次  ${row.askers.size} 人  ${row.replies} 轮  ${row.files} 份  ${row.images} 张  $${row.cost.toFixed(6)}  ${row.unknownCost} 条  ${row.missingUsage} 条`);
+  }
+  console.log("\n提问排行（跨群合并，前 20 位）：");
+  for (const [index, user] of summary.ranking.slice(0, 20).entries()) console.log(`  ${index + 1}. ${scope ? user.user : maskUser(user.user)}  ${user.asks} 次  占比 ${(100 * user.asks / summary.asks).toFixed(1)}%  ${user.days.size} 天  ${user.groups.size} 个群`);
+}
+
 async function overview(root: string, window: Window): Promise<number> {
   const groups = await collectAll(root, window);
-  if (groups.length === 0) {
-    console.log(`没有找到任何使用记录（群数据总根：${root}）${describeWindow(window)}。`);
-    return 0;
-  }
-  const people = groups.reduce((sum, group) => sum + group.users.length, 0);
-  const asks = groups.reduce((sum, group) => sum + group.asks, 0);
-  // 人数按群相加：同一个人出现在两个群里算两次，跨群去重需要手机号，这里不做。
-  console.log(`共 ${groups.length} 个群、${people} 位成员、${asks} 次提问${describeWindow(window)}`);
+  console.log(`共 ${groups.length} 个有记录的群${describeWindow(window)}`);
+  if (!groups.length) console.log(`没有找到任何使用记录（群数据总根：${root}）。`);
+  printAnalysis(groups, window, await collectComparisons(root, window));
   console.log("");
   for (const group of groups) {
     const files = group.delivered.get("send_file") ?? 0;
@@ -361,9 +386,10 @@ async function overview(root: string, window: Window): Promise<number> {
 }
 
 async function main(args: string[]): Promise<number> {
-  const window: Window = {};
-  const { values, positionals: positional } = cliArgs(args, { ...groupOptions, help: { type: "boolean", short: "h" }, since: { type: "string" }, until: { type: "string" } });
+  const { values, positionals: positional } = cliArgs(args, { ...groupOptions, help: { type: "boolean", short: "h" }, period: { type: "string" }, since: { type: "string" }, until: { type: "string" } });
   if (values.help) { usage(); return 0; }
+  if (values.period && (values.since || values.until)) throw new Error("--period 与 --since/--until 不能同时使用");
+  const window: Window = values.period ? periodWindow(values.period) : {};
   if (values.since) window.since = parseDate(values.since, false);
   if (values.until) window.until = parseDate(values.until, true);
   const selection = groupSelection(values, positional[0]);
@@ -389,8 +415,8 @@ async function main(args: string[]): Promise<number> {
   const stats = await collectGroup(group, root, window);
   if (stats.users.length === 0 && stats.usage.total.requests === 0) {
     console.log(`群 ${group} 在该区间内没有使用记录 ${describeWindow(window)}。`);
-    return 0;
   }
+  printAnalysis([stats], window, await collectComparisons(root, window), new Set([group]));
   printGroup(stats, window);
   console.log("缓存写入: " + stats.tokens.cacheWrite + "；加权缓存读率: " + formatCacheRate(stats.tokens));
   console.log("已知估算费用: $" + stats.tokens.cost.toFixed(6) + "；费用未知记录: " + stats.tokens.unknownCost + "；用量不完整记录: " + stats.tokens.missingUsage);
