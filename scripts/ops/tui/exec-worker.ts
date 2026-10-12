@@ -1,9 +1,11 @@
-import { parentPort, workerData } from "node:worker_threads";
+import { parentPort, workerData, type MessagePort } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { PROJECT_DIR } from "./platform.ts";
-import type { CaptureRequest, FromWorker, ToHost, ToWorker } from "./exec-protocol.ts";
+import type { CaptureRequest, FromWorker, ReaperToSpawner, SpawnerToReaper, ToHost, ToWorker } from "./exec-protocol.ts";
 import { observeQueryProcess } from "./exec-observe.ts";
 
+// Spawner thread. Bun.spawn blocks this thread, for seconds under endpoint security, so nothing time-critical
+// depends on it: the reclaim thread grants ownership and can terminate any host while a spawn is in progress.
 const shutdown = new Int32Array(workerData.shutdown as SharedArrayBuffer);
 const queue: CaptureRequest[] = [];
 type Child = Bun.Subprocess<"pipe", "pipe", "pipe">;
@@ -14,16 +16,26 @@ interface Host {
   ready: boolean;
   initialized: boolean;
   retiring: boolean;
+  /** Asked to exit. A host that leaves otherwise (failed start, broken channel, lost grant) is a fault. */
+  dismissed: boolean;
   request?: CaptureRequest;
+  /** The command was sent to the host; only then can a cancellation leave a process tree behind. */
+  executing: boolean;
 }
 const hosts = new Map<number, Host>();
 let hostId = 0;
 let growth: ReturnType<typeof setTimeout> | undefined;
+let reaper: MessagePort | undefined;
 const stopping = () => Atomics.load(shutdown, 0) !== 0;
 const cancelled = (request: CaptureRequest) => stopping() || Atomics.load(new Int32Array(request.cancelled), 0) !== 0;
 const send = (message: FromWorker) => parentPort!.postMessage(message);
+const toReaper = (message: SpawnerToReaper) => reaper!.postMessage(message);
 function write(host: Host, message: ToHost): void { host.child.stdin.write(JSON.stringify(message) + "\n"); }
 
+function dismiss(host: Host): void {
+  host.dismissed = true;
+  retire(host);
+}
 function retire(host: Host): void {
   if (host.retiring) return;
   host.retiring = true;
@@ -66,9 +78,8 @@ function createHost(): void {
     cwd: PROJECT_DIR, env: process.env, stdin: "pipe", stdout: "pipe", stderr: "pipe",
     windowsHide: true, detached: process.platform !== "win32",
   });
-  const host: Host = { id: ++hostId, child, owned: false, ready: false, initialized: false, retiring: false };
+  const host: Host = { id: ++hostId, child, owned: false, ready: false, initialized: false, retiring: false, dismissed: false, executing: false };
   hosts.set(host.id, host);
-  if (process.platform !== "win32") send({ type: "host", host: host.id, pid: child.pid });
   // spawn can block. Recheck the shared flag before doing anything with its result.
   if (stopping()) retire(host);
   void observe(host).catch(() => { parentPort!.close(); });
@@ -79,16 +90,16 @@ async function observe(host: Host): Promise<void> {
   try {
     error = await observeQueryProcess(host.child, message => {
       if (message.type === "ready") {
-        if (process.platform === "win32") send({ type: "host", host: host.id, pid: host.child.pid, birth: message.birth });
         host.ready = true;
-        pump();
+        // The reclaim thread records the host (and can terminate it) before it may execute anything.
+        if (!host.retiring && !stopping()) toReaper({ type: "own", host: host.id, pid: host.child.pid, birth: message.birth });
       } else if (host.request?.id === message.id) {
         if (message.type === "started") {
           host.initialized = true;
           send({ ...message, host: host.id });
           pump();
         } else {
-          if (message.type === "result") { clearTimeout(growth); growth = undefined; }
+          if (message.type === "result") { clearTimeout(growth); growth = undefined; host.executing = false; }
           send({ ...message, host: host.id });
         }
       }
@@ -96,28 +107,51 @@ async function observe(host: Host): Promise<void> {
   } catch (cause) { error = String(cause); }
   finally {
     hosts.delete(host.id);
-    send({ type: "retired", host: host.id, error });
+    toReaper({ type: "exited", host: host.id });
+    send({ type: "retired", host: host.id, error, expected: host.dismissed || stopping() });
     pump();
   }
 }
+function fromReaper(message: ReaperToSpawner): void {
+  const host = hosts.get(message.host);
+  if (!host) return;
+  if (message.type === "owned") {
+    if (!host.retiring && !stopping()) { host.owned = true; write(host, { type: "owned" }); }
+  } else {
+    dismiss(host);
+    // Refused ownership while running normally: no host can ever execute, so fail the queued work.
+    if (!stopping()) send({ type: "fault", error: message.error });
+  }
+  pump();
+}
 parentPort!.on("message", (message: ToWorker) => {
+  if (message.type === "reaper") {
+    reaper = message.port;
+    reaper.on("message", (event: ReaperToSpawner) => fromReaper(event));
+    return;
+  }
   if (message.type === "capture") queue.push(message.request);
   else if (message.type === "shutdown") Atomics.store(shutdown, 0, 1);
   else if (message.type === "cancel") {
-    for (const host of hosts.values()) if (host.request?.id === message.id) retire(host);
+    for (const host of hosts.values()) {
+      if (host.request?.id !== message.id) continue;
+      if (host.executing) dismiss(host);
+      else { host.request = undefined; send({ type: "cancelled", id: message.id }); }
+    }
   } else {
     const host = hosts.get(message.host);
     if (!host) return;
-    if (message.type === "retire") retire(host);
-    else if (message.type === "owned") {
-      if (!host.retiring && !stopping()) { host.owned = true; write(host, { type: "owned" }); }
-    } else if (host.request?.id === message.id) {
-      if (message.type === "release") host.request = undefined;
-      else if (cancelled(host.request) || host.retiring) {
+    if (message.type === "retire") dismiss(host);
+    else if (host.request?.id === message.id) {
+      if (message.type === "release") {
+        if (message.requeue && !host.executing && !cancelled(host.request)) queue.unshift(host.request);
+        host.request = undefined;
+      } else if (cancelled(host.request) || host.retiring) {
         send({ type: "cancelled", id: message.id });
-        retire(host);
+        host.request = undefined;
       } else {
         const { cancelled: _flag, ...request } = host.request;
+        host.executing = true;
         write(host, { type: "capture", request });
       }
     }

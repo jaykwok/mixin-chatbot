@@ -80,22 +80,40 @@ managed_cloudflared_pid() {
     printf '%s' "$pid"
 }
 
-stop_managed_cloudflared() {
-    local pid attempt
-    pid="$(managed_cloudflared_pid)" || return 1
-    kill -TERM "$pid" || return 1
-    for ((attempt=0; attempt<10; attempt++)); do
-        if ! managed_cloudflared_pid >/dev/null; then archive_project_path "$TUNNEL_PID_FILE"; return $?; fi
+# Waits up to $1 seconds for the recorded process to go away. The check after the last sleep
+# counts: an exit during the final second is a completed stop, not a timeout.
+wait_managed_cloudflared_exit() {
+    local attempt
+    for ((attempt=0; ; attempt++)); do
+        managed_cloudflared_pid >/dev/null || return 0
+        [ "$attempt" -lt "$1" ] || return 1
         sleep 1
     done
-    # Revalidate the birth time immediately before escalation; a PID alone is not ownership.
-    [ "$(managed_cloudflared_pid)" = "$pid" ] || return 1
-    kill -KILL "$pid" || return 1
-    for ((attempt=0; attempt<5; attempt++)); do
-        if ! managed_cloudflared_pid >/dev/null; then archive_project_path "$TUNNEL_PID_FILE"; return $?; fi
-        sleep 1
-    done
+}
+
+# A process that exited after it was looked up no longer needs the signal.
+signal_managed_cloudflared() {
+    local error
+    error="$(kill "-$2" "$1" 2>&1)" && return 0
+    managed_cloudflared_pid >/dev/null || return 0
+    printf '%s\n' "$error" >&2
     return 1
+}
+
+stop_managed_cloudflared() {
+    local pid current
+    # Gone before or during the stop is a successful stop; callers look the process up first, so it
+    # may exit in between. The PID file then only describes a finished process and is archived.
+    if pid="$(managed_cloudflared_pid)"; then
+        signal_managed_cloudflared "$pid" TERM || return 1
+        if ! wait_managed_cloudflared_exit 10 && current="$(managed_cloudflared_pid)"; then
+            # Revalidate the birth time immediately before escalation; a PID alone is not ownership.
+            [ "$current" = "$pid" ] || return 1
+            signal_managed_cloudflared "$pid" KILL || return 1
+            wait_managed_cloudflared_exit 5 || return 1
+        fi
+    fi
+    archive_project_path "$TUNNEL_PID_FILE"
 }
 
 stop_tunnel_launcher() {

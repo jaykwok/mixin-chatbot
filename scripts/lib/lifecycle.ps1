@@ -107,12 +107,13 @@ function Stop-ProjectBot([string]$ProjectRoot, [string]$TaskName = 'mixin-chatbo
             }
         }
         if ($task) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
-        for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        # Check once more after the last sleep: an instance that ends during the final interval has stopped.
+        for ($attempt = 0; ; $attempt++) {
             $current = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
             if (@(Get-ProjectBotPids $ProjectRoot).Count -eq 0 -and (!$current -or $current.State -ne 'Running')) { $stopped = $true; return $true }
+            if ($attempt -ge 10) { return $false }
             Start-Sleep -Milliseconds 500
         }
-        return $false
     } catch { Write-Warning "停止机器人失败：$($_.Exception.Message)"; return $false }
     finally {
         if ($wasEnabled -and (-not $KeepDisabled -or -not $stopped)) { Enable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null }

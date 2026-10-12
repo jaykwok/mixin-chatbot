@@ -49,6 +49,33 @@ test("startup failure, cancellation and signal exit remain distinct", async () =
   } finally { await f.cleanup(); }
 }, 100_000);
 
+// The helper is killed 2 s after a cancellation. One that has not reported readiness by then never received the
+// command, so nothing can be left behind: the result is the cancellation, not a reaping failure.
+test("cancellation before the helper is ready stays a cancellation when the helper is killed", async () => {
+  const f = await tempFixture("migration-cancel-early-");
+  const slow = join(f.root, "slow-helper.ts");
+  await writeFile(slow, "Bun.sleepSync(4000);\n");
+  const controller = new AbortController(); const phases: string[] = [];
+  const previous = process.env.BUN_OPTIONS;
+  try {
+    // The helper inherits this environment; the preload holds it back past the kill. BUN_OPTIONS takes no quotes, so
+    // the path is relative to the helper's cwd. The spawn is synchronous, so the variable is restored right after.
+    process.env.BUN_OPTIONS = "--preload ./slow-helper.ts";
+    const run = executeProcess({ command: process.execPath, args: [helper, "normal"], cwd: f.root, signal: controller.signal, timeoutMs: 30_000,
+      observe: event => phases.push(event.phase) }).catch(error => error as ProcessFailure);
+    if (previous === undefined) delete process.env.BUN_OPTIONS; else process.env.BUN_OPTIONS = previous;
+    controller.abort(new Error("synthetic early cancellation"));
+    const failure = await run;
+    expect(failure).toBeInstanceOf(ProcessFailure);
+    expect((failure as ProcessFailure).kind, (failure as ProcessFailure).message).toBe("cancelled");
+    expect(phases).not.toContain("supervisor-ready");
+    expect((failure as ProcessFailure).result.commandExitCode).toBeNull();
+  } finally {
+    if (previous === undefined) delete process.env.BUN_OPTIONS; else process.env.BUN_OPTIONS = previous;
+    await f.cleanup();
+  }
+}, 30_000);
+
 test("successful validator exits with inherited pipes still held; detached writer is reaped", async () => {
   const f = await tempFixture("migration-pipe-"); let output = "";
   try {

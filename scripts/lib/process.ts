@@ -43,7 +43,7 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
     stdio: ["pipe", "pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
   result.pid = child.pid;
   let failure: { kind: ProcessFailure["kind"]; message: string; cause?: unknown } | undefined;
-  let job: ReturnType<typeof monitorJob> | undefined, bytes = 0, protocol = "", commandExited = false, reaped = false, pipesClosed = false;
+  let job: ReturnType<typeof monitorJob> | undefined, bytes = 0, protocol = "", commandExited = false, reaped = false, pipesClosed = false, requested = false;
   let escalation: ReturnType<typeof setTimeout> | undefined, drain: ReturnType<typeof setTimeout> | undefined;
   const fail = (kind: ProcessFailure["kind"], message: string, cause?: unknown) => {
     failure ??= { kind, message, cause }; child.stdin?.end();
@@ -71,7 +71,10 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
       try {
         const message = JSON.parse(line) as ProcessEvent;
         if (message.phase === "supervisor-ready" && process.platform === "win32") job = monitorJob(jobName);
-        if (message.phase === "supervisor-ready" && !failure) child.stdin?.write(JSON.stringify({ command: options.command, args: options.args, cwd: options.cwd, env: options.env ?? process.env }) + "\n");
+        if (message.phase === "supervisor-ready" && !failure) {
+          child.stdin?.write(JSON.stringify({ command: options.command, args: options.args, cwd: options.cwd, env: options.env ?? process.env }) + "\n");
+          requested = true;
+        }
         if (message.phase === "command-exit") { commandExited = true; result.commandExitCode = message.code ?? null; result.commandSignal = message.signal ?? null; }
         if (message.phase === "spawn-error") fail("startup", message.detail ?? "Command spawn failed");
         if (message.phase === "reaped") reaped = true;
@@ -97,6 +100,9 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
       if (job.active() !== 0) throw new Error("Windows job still has active writers");
       reaped = true;
     }
+    // The helper starts nothing before it receives the command. Cancelled or timed out before that, it can be
+    // killed before it reports readiness (no job, no reaped event), yet it has exited and left nothing behind.
+    if (!requested) reaped = true;
     if (!reaped) failure = { kind: "reaping", message: "监督进程未确认全部子孙回收" + (failure ? `；原错误：${failure.message}` : ""), cause: failure?.cause };
     if (!pipesClosed) event("stdio-drain-deadline");
     if (reaped) event("reaped");

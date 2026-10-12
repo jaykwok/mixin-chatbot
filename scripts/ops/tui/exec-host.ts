@@ -88,8 +88,10 @@ process.stdin.on("end", stop);
 process.stdin.on("error", stop);
 
 // A Worker which dies between spawn and publishing the PID leaves only this idle
-// host; it self-exits without ever having permission to start a query.
-const ownershipDeadline = setTimeout(stop, 5000);
+// host; it self-exits without ever having permission to start a query. The grant
+// passes through the spawner and the reaper, either of which can be busy for
+// seconds (a blocking spawn, a slow OpenProcess), so this is only a last resort.
+const ownershipDeadline = setTimeout(stop, 60_000);
 let owned = false;
 let busy = false;
 const send = (message: FromHost): void => { process.stdout.write(JSON.stringify(message) + "\n"); };

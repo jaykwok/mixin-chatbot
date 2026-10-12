@@ -12,4 +12,12 @@ try {
     if (reason) await recoveryMenu(reason);
     else process.exitCode = await (await import("./tui/full.ts")).main(args);
   }
-} catch (error) { console.error((error as Error).message); process.exitCode = 1; }
+} catch (error) {
+  // 汇总错误的标题只说明类别，逐条列出原因才看得出是哪一步失败。
+  const report = (value: unknown, indent: string): void => {
+    console.error(indent + (value instanceof Error ? value.message : String(value)));
+    if (value instanceof AggregateError) for (const inner of value.errors) report(inner, indent + "  ");
+  };
+  report(error, "");
+  process.exitCode = 1;
+}

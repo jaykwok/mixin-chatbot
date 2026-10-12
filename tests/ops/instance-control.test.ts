@@ -31,6 +31,35 @@ test.skipIf(process.platform !== "win32")("Windows instance identity accepts a s
   } finally { await fixture.cleanup(); }
 }, 30000);
 
+// The scheduled task and the instance are stubbed; the instance goes away during the last wait interval.
+test.skipIf(process.platform !== "win32")("Windows stop checks once more after its last wait before reporting failure", async () => {
+  const fixture = await tempFixture("instance-stop-wait-");
+  const script = join(fixture.root, "stop-wait.ps1");
+  await writeFile(script, "\ufeff" + [
+    "$ErrorActionPreference='Stop'",
+    ". " + quote(library),
+    "$script:sleeps=0; $script:stopRequested=$false; $script:exitAfter=0",
+    "function Get-ScheduledTask { [pscustomobject]@{ State = $(if ($script:stopRequested -and $script:sleeps -lt $script:exitAfter) { 'Running' } else { 'Ready' }) } }",
+    "function Disable-ScheduledTask { } function Enable-ScheduledTask { }",
+    "function Stop-ScheduledTask { $script:stopRequested=$true }",
+    "function Get-ProjectBotInstance { $null }",
+    // A live instance only after the task stop request, so the forced fallback never meets a stub PID.
+    "function Get-ProjectBotPids { if ($script:stopRequested -and $script:sleeps -lt $script:exitAfter) { 4242 } }",
+    "function Start-Sleep { $script:sleeps++ }",
+    "foreach ($exitAfter in @(10, 11)) {",
+    "  $script:sleeps=0; $script:stopRequested=$false; $script:exitAfter=$exitAfter",
+    "  Write-Output ('' + $exitAfter + '=' + (Stop-ProjectBot " + quote(fixture.root) + " 'fixture-task') + '/' + $script:sleeps)",
+    "}",
+  ].join("\n"));
+  try {
+    const control = Bun.spawn(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], { stdout: "pipe", stderr: "pipe", windowsHide: true });
+    const [code, stdout, stderr] = await Promise.all([control.exited, new Response(control.stdout).text(), new Response(control.stderr).text()]);
+    expect(code, stderr).toBe(0);
+    // Gone after the 10th wait: stopped. Still there after it: a failure, after the same ten waits.
+    expect(stdout.trim().split(/\r?\n/), stderr).toEqual(["10=True/10", "11=False/10"]);
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
 test.skipIf(process.platform !== "win32")("Windows ops gracefully stop an owned Bun instance launched with a relative path", async () => {
   const fixture = await tempFixture("instance-control-");
   const childFile = join(fixture.root, "bot.ts");
