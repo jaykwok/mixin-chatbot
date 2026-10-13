@@ -20,7 +20,7 @@ import {
   type ProgressPolicy, type Storage, type ToolExecutionApi, type ToolRegistration, UsageDoc,
 } from "@earendil-works/pi-durable";
 import { openModelRuntime } from "../../src/core/model-config.ts";
-import { isPathInside } from "../../src/agent/paths.ts";
+import { isPathInside } from "../../src/contracts/paths.ts";
 import { type CallableTool, type CodemodeDetails, codemodeExtension, CodemodeStoreDoc } from "../../src/durable/codemode/index.ts";
 import { PREVIEW_LIMIT, removeCodemodeResults, resultsDirName, resultsRoot } from "../../src/durable/codemode/results.ts";
 import { toCodemodeDeclaration } from "../../src/durable/codemode/upstream.ts";

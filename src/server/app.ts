@@ -24,6 +24,7 @@ import { DurableService } from "../durable/service.ts";
 import { readAuxiliaryConfig } from "../core/auxiliary-config.ts";
 import { readMcpConfig } from "../core/mcp-config.ts";
 import { McpTools } from "../integrations/mcp.ts";
+import { configuredRootlessTasks } from "../core/task-backend.ts";
 
 import { assertDataVersion } from "../core/data-version.ts";
 import { validateCurrentData } from "../core/data-validation.ts";
@@ -87,6 +88,7 @@ try {
   releaseGroupLease = await application.track(acquireGroupRootLease("service", GROUP_DATA_ROOT, { onLost }));
   assertDataVersion(process.cwd(), GROUP_DATA_ROOT);
   await validateCurrentData(process.cwd(), GROUP_DATA_ROOT);
+  await configuredRootlessTasks()?.verify();
   application.signal.throwIfAborted();
   let webhookSecret: string | null = null;
   try {

@@ -3,7 +3,10 @@ import { join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import { stateDatabase } from "../core/state.ts";
 import { groupSegment, userSegment } from "./paths.ts";
+const initialized = new WeakSet<Database>();
 
+/** Lists the parent on every call. A directory's stat stamp is not proof its entries are unchanged: on Windows it often
+ * stays the same right after a child is created, and coarse Linux timestamps can miss a creation in the same tick. */
 async function checkExistingSpelling(parent: string, segment: string): Promise<void> {
   let names: string[];
   try { names = await readdir(parent); }
@@ -18,7 +21,10 @@ export async function ensureStorageIdentity(root: string, groupId: string, phone
   const user = userSegment(phone);
   await checkExistingSpelling(root, group);
   await checkExistingSpelling(join(root, group, "users"), user);
-  db.exec("CREATE TABLE IF NOT EXISTS storage_identity (path TEXT PRIMARY KEY COLLATE NOCASE, identity TEXT NOT NULL)");
+  if (!initialized.has(db)) {
+    db.exec("CREATE TABLE IF NOT EXISTS storage_identity (path TEXT PRIMARY KEY COLLATE NOCASE, identity TEXT NOT NULL)");
+    initialized.add(db);
+  }
   db.transaction(() => {
     for (const [path, identity] of [
       [resolve(root, group), groupId],

@@ -17,7 +17,7 @@ import {
   UsageDoc,
 } from "@earendil-works/pi-durable";
 import { AttemptsDoc, isNotSent, NOT_SENT } from "../../src/durable/attempts.ts";
-import { compactionCost } from "../../src/durable/compaction.ts";
+import { compactionCost } from "../helpers/compaction-cost.ts";
 import { type DoorOptions, RequestDoor } from "../../src/durable/door.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";

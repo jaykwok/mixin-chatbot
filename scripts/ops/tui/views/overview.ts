@@ -27,8 +27,6 @@ import { gap, moveSelection, pending, windowStart } from "./common.ts";
 import { join } from "node:path";
 
 const TREND_DAYS = 14;
-/** 超过这些天没动过的 tmp 条目算「可以清了」，与 tmp-purge --days 的默认建议一致。 */
-const STALE_DAYS = 30;
 /** 趋势图矮于这个行数就不画了——两三行的柱子分不出高低，指标块里的火花线反而更诚实。 */
 const MIN_CHART_ROWS = 3;
 /** 左右两栏之间的空列。一列不够：待办那栏的文字会和右边的标签连成一句话。 */
@@ -146,15 +144,9 @@ export class OverviewView implements View {
       });
     }
 
-    const { stale, total } = this.tmpBytes(snapshot);
-    if (stale > 0) {
-      list.push({
-        status: "warn",
-        text: `tmp 占用 ${fmt.bytes(total)}，其中 ${fmt.bytes(stale)} 超过 ${STALE_DAYS} 天未改动`,
-        hint: "数据",
-        target: "storage",
-      });
-    }
+    // File age does not establish that current conversations or pending deliveries released it.
+    // Offer inspection without repeatedly presenting retained data as a cleanup warning.
+    if (this.tmpBytes(snapshot).total > 0) list.push({ status: "idle", text: "查看临时文件占用与可归档清单", hint: "数据", target: "storage" });
 
     list.push({ status: "idle", text: "查看服务、隧道与配置的逐项体检", hint: "监控", target: "health" });
     const severity: Record<string, number> = { danger: 0, serious: 1, warn: 2, idle: 3 };
@@ -171,14 +163,9 @@ export class OverviewView implements View {
     return this.todos(snapshot).filter(todo => todo.status !== "idle").length;
   }
 
-  /** 临时目录的总占用，以及其中超过 STALE_DAYS 没动过、可以归档的那部分。 */
-  private tmpBytes(snapshot: Snapshot): { total: number; stale: number } {
-    const cutoff = Date.now() - STALE_DAYS * 86_400_000;
-    let stale = 0;
-    for (const user of snapshot.tmp ?? []) {
-      for (const entry of user.entries) if (entry.newest <= cutoff) stale += entry.bytes;
-    }
-    return { total: (snapshot.tmp ?? []).reduce((sum, user) => sum + user.bytes, 0), stale };
+  /** Occupancy is independent of whether an offline plan can reclaim any of it. */
+  private tmpBytes(snapshot: Snapshot): { total: number } {
+    return { total: (snapshot.tmp ?? []).reduce((sum, user) => sum + user.bytes, 0) };
   }
 
   onKey(key: { name: string }, app: AppApi): boolean {

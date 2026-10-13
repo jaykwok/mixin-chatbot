@@ -6,7 +6,8 @@ import { appendFile, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promi
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectGroup } from "../../scripts/ops/stats-admin.ts";
-import { ingestBeforeArchive, ingestUserSession, openStatsLedger, statsLedgerPath, sweepSessionStats } from "../../src/agent/stats-ledger.ts";
+import { ingestBeforeArchive, openStatsLedger, statsLedgerPath, sweepSessionStats } from "../../src/agent/stats-ledger.ts";
+import { ingestUserSession } from "../helpers/ingest-user-session.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const ask = (at: string, text = "在吗") => JSON.stringify({ type: "message", timestamp: at,

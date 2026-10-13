@@ -21,6 +21,9 @@ const SCHEMA_VERSION = 2;
 const PROJECTION = 2;
 /** Durable projection: aborted entries are separate requests, and starts without an entry remain visible. */
 export const DURABLE_PROJECTION = 4;
+/** Frozen usage of retired requests (`settled:<source>`): never re-projected, so it has no entry projector version.
+ * Kept apart from 1, which marks unverifiable pre-upgrade sources in the report. */
+const SETTLED_PROJECTION = 0;
 /** 工具自身用量不知道来自哪个模型，不能归到对话模型名下。 */
 const UNATTRIBUTED = { provider: "unknown", model: "unknown" };
 
@@ -335,15 +338,6 @@ async function ingestOnce(db: Database, path: string, group: string, user: strin
 }
 
 /**
- * 一位成员旧会话文件的增量入账。
- * @internal 数据版本 3 起服务不再写会话文件，只由每日扫描补账；测试用它入账单个文件。
- */
-export async function ingestUserSession(root: string, group: string, user: string): Promise<IngestResult | null> {
-  const db = openStatsLedger(root);
-  try { return await ingestSessionFile(db, root, group, user); } finally { db.close(); }
-}
-
-/**
  * 归档前的最后一次入账，并记下归档时间。
  *
  * 定时扫描只是兜底：`/clear` 是群成员随时能发的指令，两次扫描之间清掉的那段历史一旦
@@ -357,8 +351,39 @@ export async function ingestBeforeArchive(root: string, group: string, user: str
   } finally { db.close(); }
 }
 
-/** 一段持久会话（Durable 引擎，D3）在账本里的世代：一个成员会话一个 source，游标是已入账的最新条目号。 */
+/** 一段持久会话在账本里的世代：一个成员会话一个 source，游标是已入账的最新条目号。 */
 export interface ConversationSource { id: string; group: string; user: string; identity: string; digest?: string }
+
+/** Retired starts cannot reconstruct the original timestamps or confirmed usage of older entries.
+ * Keep their aggregate and cursor across projector upgrades; any future conversion must migrate
+ * this finalized source explicitly instead of silently rebuilding it from incomplete evidence. */
+export function hasRetiredConversation(db: Database, source: string): boolean {
+  return db.query("SELECT 1 FROM meta WHERE key = ?").get("durable_retired:" + source) !== null;
+}
+
+export function finalizeConversationProjection(db: Database, source: string): void {
+  db.query("INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')").run("durable_retired:" + source);
+}
+
+/** Final usage has no replayable starts. Its format version is independent of the entry projector. */
+export function settleConversationUsage(db: Database, source: ConversationSource, records: StatsRecord[]): void {
+  if (!records.length) return;
+  if (records.some(record => record.type !== "usage")) throw new Error("最终用量只能包含已结算请求");
+  const id = "settled:" + source.id, identity = source.identity + ":settled";
+  db.transaction(() => {
+    const prior = db.query("SELECT group_segment, user_segment, identity, projection FROM sources WHERE id = ?").get(id) as
+      { group_segment: string; user_segment: string; identity: string; projection: number } | null;
+    if (prior && (prior.group_segment !== source.group || prior.user_segment !== source.user || prior.identity !== identity || prior.projection !== SETTLED_PROJECTION)) {
+      throw new Error("最终用量的归属或格式不符，请保留账本并检查");
+    }
+    db.query(`INSERT INTO sources (id, group_segment, user_segment, identity, offset, digest,
+        bad_lines, pending, provider, model, seen_at, archived_at, projection)
+      VALUES (?, ?, ?, ?, 1, '', 0, 0, 'unknown', 'unknown', ?, NULL, ?)
+      ON CONFLICT(id) DO UPDATE SET offset = offset + 1, seen_at = excluded.seen_at`)
+      .run(id, source.group, source.user, identity, Date.now(), SETTLED_PROJECTION);
+    apply(db, id, fold(records, { provider: "unknown", model: "unknown" }));
+  }).immediate();
+}
 
 /**
  * 持久会话的增量入账：`records` 是条目号 `from` 之后、到 `to` 为止的记录，按条目顺序。
@@ -372,7 +397,7 @@ export function ingestConversationRecords(db: Database, source: ConversationSour
   floor = 0, expectedDigest?: string): boolean {
   return db.transaction(() => {
     const prior = db.query("SELECT * FROM sources WHERE id = ?").get(source.id) as SourceRow | null;
-    const reset = prior !== null && prior.projection !== DURABLE_PROJECTION;
+    const reset = prior !== null && prior.projection !== DURABLE_PROJECTION && !hasRetiredConversation(db, source.id);
     if ((reset ? floor : prior?.offset ?? floor) !== from) return false;
     if (expectedDigest !== undefined && (reset ? "" : prior?.digest ?? "") !== expectedDigest) return false;
     if (reset) for (const table of ["activity", "tool_counts", "usage_totals"]) {

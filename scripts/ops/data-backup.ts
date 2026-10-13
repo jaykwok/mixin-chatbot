@@ -5,19 +5,24 @@ import { constants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
 import { withMaintenance } from "../../src/core/maintenance.ts";
-import { isPathInside } from "../../src/agent/paths.ts";
+import { isPathInside } from "../../src/contracts/paths.ts";
 import { hashFile } from "../../src/core/file-hash.ts";
 
 type FileRecord = { area: "state" | "groups"; path: string; bytes: number; sha256: string };
 type Manifest = { format: 1; at: string; files: FileRecord[] };
-async function files(root: string, prefix = ""): Promise<string[]> {
+/** Moved-out tmp entries are already a copy outside the live data; their plans (`.tmp-plans`) stay in the backup.
+ * Diagnostic snapshots (`.reclamation/snapshots`) are disposable copies of a group database. */
+const ARCHIVE = ".reclamation/backup/rm";
+async function files(root: string, prefix = "", skipArchive = false): Promise<string[]> {
   let names;
   try { names = await readdir(root); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
   const found: string[] = [];
   for (const name of names.sort()) {
-    const relative = prefix ? `${prefix}/${name}` : name, path = join(root, name), info = await lstat(path);
+    const relative = prefix ? `${prefix}/${name}` : name, path = join(root, name);
+    if (skipArchive && (prefix === ARCHIVE && name !== ".tmp-plans" || prefix === ".reclamation" && name === "snapshots")) continue;
+    const info = await lstat(path);
     if (info.isSymbolicLink()) throw new Error(`备份拒绝链接：${path}`);
-    if (info.isDirectory()) found.push(...await files(path, relative));
+    if (info.isDirectory()) found.push(...await files(path, relative, skipArchive));
     else if (info.isFile()) found.push(relative);
     else throw new Error(`备份拒绝特殊文件：${path}`);
   }
@@ -34,7 +39,8 @@ async function ordinaryAncestors(path: string): Promise<void> {
   }
 }
 async function syncFile(path: string) { const file = await open(path, "r+"); try { await file.sync(); } finally { await file.close(); } }
-/** Caller holds maintenance leases. Includes every member tmp, index, attachment and their ownership journals. */
+/** Caller holds maintenance leases. Includes every member tmp, index, attachment and their ownership journals,
+ * but not the tmp archive under the group root (`tmp discard` frees it; backing it up would double its space). */
 export async function createDataBackup(project: string, groups: string, destination: string): Promise<Manifest> {
   const roots = { state: resolve(project, "data/state"), groups: resolve(groups) };
   destination = resolve(destination);
@@ -43,7 +49,7 @@ export async function createDataBackup(project: string, groups: string, destinat
     if (isPathInside(destination, root) || isPathInside(root, destination)) throw new Error("备份目录与数据目录不能包含彼此");
     await checkedRoot(root);
   }
-  const entries = await Promise.all(Object.entries(roots).map(async ([area, root]) => ({ area: area as FileRecord["area"], root, names: await files(root) })));
+  const entries = await Promise.all(Object.entries(roots).map(async ([area, root]) => ({ area: area as FileRecord["area"], root, names: await files(root, "", area === "groups") })));
   for (const { root, names } of entries) for (const name of names.filter(name => name.endsWith(".sqlite"))) {
     const db = new Database(join(root, name), { strict: true });
     try {
@@ -55,7 +61,7 @@ export async function createDataBackup(project: string, groups: string, destinat
   await mkdir(dirname(destination), { recursive: true });
   await mkdir(destination, { mode: 0o700 }); // Never overwrite another backup.
   const manifest: Manifest = { format: 1, at: new Date().toISOString(), files: [] };
-  for (const { area, root } of entries) for (const name of await files(root)) {
+  for (const { area, root } of entries) for (const name of await files(root, "", area === "groups")) {
     if (/\.sqlite-(wal|shm|journal)$/.test(name)) continue;
     const source = join(root, name), target = join(destination, area, name), prior = await hashFile(source);
     await mkdir(dirname(target), { recursive: true, mode: 0o700 });

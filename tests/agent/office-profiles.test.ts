@@ -35,6 +35,19 @@ test("SIGKILL leaves a receipt; supervision stops the descendant; cold recovery 
     expect((await readdir(join(fixture.root, ".office-jobs"))).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(process.platform === "linux" ? 1 : 0);
   } finally { child.kill("SIGKILL"); await child.exited; await rm(unowned, { recursive: true, force: true }); await fixture.cleanup(); }
 }, 90_000);
+
+test.skipIf(process.platform !== "linux")("a reused container PID does not hide a retired Office owner", async () => {
+  const fixture = await tempFixture("office-pid-reuse-"), profile = await createOfficeProfile(fixture.root);
+  try {
+    const marker = join(profile.path, ".mixin-office-owner.json"), record = JSON.parse(await readFile(marker, "utf8"));
+    record.owner = "a".repeat(32); record.incarnation += ":previous-start";
+    const journal = join(fixture.root, ".office-jobs");
+    await writeFile(marker, JSON.stringify(record)); await writeFile(join(journal, record.id + ".json"), JSON.stringify(record));
+    expect(await recoverOfficeProfiles(fixture.root)).toBe(0);
+    // Linux still requires an isolated writer permit; the old owner is now eligible for offline recovery.
+    expect(JSON.parse(await readFile(join(journal, record.id + ".deferred.json"), "utf8")).result.status).toBe("deferred");
+  } finally { await rm(profile.path, { recursive: true, force: true }); await fixture.cleanup(); }
+});
 test("a replaced or unmarked nonempty profile is refused, while a restored foreign-root receipt grants no deletion authority", async () => {
   const fixture = await tempFixture("office-proof-"), journal = join(fixture.root, ".office-jobs");
   await mkdir(journal); const id = "abcdefabcdefabcd", receipt = { version: 1, id, owner: "a".repeat(32), pid: 2147483647,

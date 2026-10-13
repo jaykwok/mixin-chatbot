@@ -45,9 +45,10 @@ with Image.open(root / "sample.png") as image:
 extractor = Path(__file__).with_name("extract_document.py").resolve()
 def extract(extension, limit=250000):
     target = root / (extension + "-" + str(limit) + ".txt")
-    run = subprocess.run([sys.executable, str(extractor), str(root / ("sample." + extension)),
-                          "." + extension, str(target), str(limit)], check=True, capture_output=True, text=True, encoding="utf-8")
-    metadata = json.loads(run.stdout)
+    report = target.with_suffix(".json")
+    subprocess.run([sys.executable, str(extractor), str(root / ("sample." + extension)),
+                   "." + extension, str(target), str(limit), str(report)], check=True, capture_output=True, text=True, encoding="utf-8")
+    metadata = json.loads(report.read_text(encoding="utf-8"))
     content = target.read_text(encoding="utf-8")
     assert metadata["characters"] == len(content)
     assert metadata["units"] > 0

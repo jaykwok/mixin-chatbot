@@ -114,7 +114,7 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
       all: "All", json: "Json", repair: "Repair", "restart-tunnel": "RestartTunnel",
       "storage-segment": "StorageSegment", "group-id": "GroupId",
     };
-    const values: Record<string, string> = { days: "Days", user: "User", group: "Group", since: "Since", until: "Until", period: "Period", "confirmed-transaction": "ConfirmedTransaction" };
+    const values: Record<string, string> = { days: "Days", user: "User", group: "Group", since: "Since", until: "Until", period: "Period", "confirmed-transaction": "ConfirmedTransaction", plan: "Plan", digest: "Digest" };
     // TUI passes argument values as opaque strings (including leading dashes).
     // Encode them with '=' before the standard parser, preserving that contract.
     const encodedArgs: string[] = [];
@@ -128,6 +128,7 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
       "storage-segment": { type: "boolean" }, "group-id": { type: "boolean" },
       days: { type: "string" }, user: { type: "string" }, group: { type: "string" }, since: { type: "string" }, until: { type: "string" },
       "confirmed-transaction": { type: "string" }, period: { type: "string" },
+      plan: { type: "string" }, digest: { type: "string" },
     });
     if (parsed.positionals.length) throw new Error("存在多余的运维参数");
     for (const [name, value] of Object.entries(parsed.values)) {
@@ -143,9 +144,9 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
     };
   }
   const commandArgs = [...args];
-  if (["tmp-ls", "tmp-purge"].includes(args[0] ?? "")) {
+  if (["tmp-ls", "tmp-purge", "tmp-preview", "tmp-reclaim", "tmp-discard"].includes(args[0] ?? "")) {
     for (let i = 1; i < commandArgs.length; i++) {
-      if (["--group", "--user", "--days"].includes(commandArgs[i]!) && commandArgs[i + 1] !== undefined) {
+      if (["--group", "--user", "--days", "--plan", "--digest"].includes(commandArgs[i]!) && commandArgs[i + 1] !== undefined) {
         commandArgs.splice(i, 2, commandArgs[i] + "=" + commandArgs[i + 1]);
       }
     }

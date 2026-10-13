@@ -226,6 +226,11 @@ windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 C
       })),
       { input: ["tmp-purge", "--all", "--group", "g1", "--user", "13812345678"], argv: ["purge", "--all", "--user=13812345678", "--group=g1"], script: "tmp" },
       { input: ["tmp-ls", "--group", "-Repair", "--group-id"], argv: ["list", "--group=-Repair", "--group-id"], script: "tmp" },
+      { input: ["tmp-preview", "--days", "30", "--plan", "a-plan"], argv: ["preview", "--days", "30", "--plan", "a-plan"], script: "tmp" },
+      { input: ["tmp-purge", "--plan", "a-plan", "--digest", "a-digest"], argv: ["purge", "--plan", "a-plan", "--digest", "a-digest"], script: "tmp" },
+      { input: ["tmp-reclaim", "--plan", "a-plan", "--digest", "a-digest"], argv: ["reclaim", "--plan", "a-plan", "--digest", "a-digest"], script: "tmp" },
+      { input: ["tmp-discard", "--plan", "a-plan"], argv: ["discard", "--plan", "a-plan"], script: "tmp" },
+      { input: ["tmp-discard", "--plan", "a-plan", "--digest", "a-digest"], argv: ["discard", "--plan", "a-plan", "--digest", "a-digest"], script: "tmp" },
       { input: ["stat", "-Repair", "--group-id"], argv: ["--group-id", "--", "-Repair"], script: "scripts\\ops\\stats-admin.ts" },
       { input: ["stat", "support", "--period", "last-month"], argv: ["--period", "last-month", "--", "support"], script: "scripts\\ops\\stats-admin.ts" },
     ];

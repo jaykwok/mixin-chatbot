@@ -189,6 +189,8 @@ rollback_data_migration() {
 record_deployment_transaction() {
     local snapshot="$1" domain_action=keep unmanaged=''
     write_candidate_record "$snapshot" && write_service_user_record "$snapshot" || return 1
+    task_runtime_record "$snapshot/task-runtime" || return 1
+    task_runtime_record_previous "$snapshot" || return 1
     if [ "$PERSIST_BOT_DOMAIN" = 1 ]; then domain_action=persist
     elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = 1 ]; then domain_action=clear; fi
     if [ "$UNMANAGED_TUNNEL_CONFIRMED" = 1 ]; then unmanaged="$DEPLOY_MODE"; fi
@@ -232,6 +234,12 @@ rollback_pending_deployment() {
 # 数据提交后启动正式实例（原本停止的升级保持停止），把正式标签 mixin-chatbot 指向本次镜像并核对，之后才清理事务、
 # 旧回滚容器和临时标签：停机状态下的运维命令按这个标签运行。实例未就绪或标签发布失败时保留事务指针，可再次继续。
 activate_committed_deployment() {
+    if [ -f "$PROJECT_DIR/data/config/task-deployment.json" ]; then
+        task_runtime_retire_previous "$DEPLOY_SNAPSHOT" || {
+            print_error "数据已提交，但旧写者撤销未确认；保留事务并保持业务实例停止，请修复后继续"; exit 1;
+        }
+        PREVIOUS_CONTAINER_SAVED=0
+    fi
     rm -f -- "$PROJECT_DIR/data/state/verify-only" "$PROJECT_DIR/data/state/migration-plan.json"
     if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
         print_status "启动机器人并等待健康检查..."
@@ -703,6 +711,9 @@ if ! verify_container_storage; then
 fi
 print_success "持久化目录权限正常"
 
+print_status "验证任务隔离、固定镜像与宿主目录映射..."
+task_runtime_prepare || { print_error "任务隔离预检失败，原服务未因本次预检停止"; exit 1; }
+
 MIGRATION_PLANNED=0
 if [ "$RECORDED" = 1 ] && [ -f "$TRANSACTION_SNAPSHOT/migration-plan.json" ]; then
     # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
@@ -860,6 +871,7 @@ if [ "$RECORDED" != 1 ]; then
         { print_error "剩余空间不够写入停机后的快照（原因见上方）；服务尚未停止，未做任何改动"; exit 1; }
 fi
 begin_deployment
+if [ ! -f "$DEPLOY_SNAPSHOT/task-runtime" ]; then task_runtime_record "$DEPLOY_SNAPSHOT/task-runtime"; fi
 if [ "$MIGRATION_PLANNED" = 1 ]; then
     # The upgrader keeps the target code on this receipt after abrupt termination;
     # a completed rollback clears it before the upgrader restores the original code.
@@ -1025,6 +1037,9 @@ docker run --rm --user "$SERVICE_USER" \
 
 # ---- 启动容器 ----
 
+task_runtime_manifest write
+task_runtime_record "$STATE_DIR/task-runtime"
+grant_service_access "$STATE_DIR/task-runtime"
 print_status "启动容器..."
 # rootless Docker 的 host 网络连不到宿主机，平台回调和隧道都到不了：改为把端口发布到原监听地址，容器内监听所有接口。
 network_args=(--network host)
@@ -1037,6 +1052,7 @@ NEW_CONTAINER_ATTEMPTED=1
 if docker run -d \
   --init \
   --user "$SERVICE_USER" \
+  "${TASK_RUNTIME_ARGS[@]}" \
   "${network_args[@]}" \
   -e HOME=/app/data/runtime/home \
   -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \

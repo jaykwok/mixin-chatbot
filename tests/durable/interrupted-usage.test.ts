@@ -43,6 +43,13 @@ let counter = 0;
 function world(starts: Record<string, AttemptStart>, entries: EntryRecord[], floor = 0) {
   const reads: number[] = [], ledger = openStatsLedger(join(fixture.root, `root-${++counter}`));
   const harness = {
+    async commit(work: (tx: unknown) => unknown) { return work({
+      doc: async (doc: unknown) => doc === AttemptsDoc ? { starts } : { starts: {} },
+      task: async () => ({ state: { status: "running" }, conversationId: 1 }),
+      scanEntries: async (filter: { minEntryId: number }) => {
+        reads.push(filter.minEntryId); return { items: entries.filter(entry => entry.id >= filter.minEntryId) };
+      },
+    }); },
     async snapshot(doc: unknown) {
       if (doc === AttemptsDoc) return { starts };
       if (doc === LegacyImportDoc) return { through: floor };

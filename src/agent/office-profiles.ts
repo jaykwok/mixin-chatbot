@@ -1,6 +1,6 @@
 // Only a durable job receipt authorizes cleanup. Never scan system TEMP by prefix or age.
 import { randomBytes } from "node:crypto";
-import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, readlink, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { holdDirectory, type DirectoryRemoval } from "../core/held-directory.ts";
@@ -8,9 +8,25 @@ import { publishJson } from "../../scripts/migrations/lib/io.ts";
 
 const owner = randomBytes(16).toString("hex");
 const marker = ".mixin-office-owner.json";
-type Receipt = { version: 1; id: string; owner: string; pid: number; tempRoot: string; systemRoot: string };
+type Receipt = { version: 1; id: string; owner: string; pid: number; incarnation?: string; tempRoot: string; systemRoot: string };
 const retryAfter = new Map<string, number>();
 const announced = new Map<string, number>();
+
+async function linuxIncarnation(pid: number): Promise<string> {
+  const [boot, namespace, raw] = await Promise.all([readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+    readlink(`/proc/${pid}/ns/pid`), readFile(`/proc/${pid}/stat`, "utf8")]);
+  const start = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+  if (!/^\d+$/.test(start ?? "")) throw new Error("无法读取 Office 所有者的进程世代");
+  return `${boot.trim()}:${namespace}:${start}`;
+}
+
+async function ownerLive(receipt: Receipt): Promise<boolean> {
+  try {
+    if (process.platform === "linux" && receipt.incarnation !== undefined) return await linuxIncarnation(receipt.pid) === receipt.incarnation;
+    // Old receipts lack a start identity; retain them when the PID is still present.
+    process.kill(receipt.pid, 0); return true;
+  } catch (error) { return !["ESRCH", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? ""); }
+}
 async function readRecord(root: string, name: string) {
   const held = await holdDirectory(root, [], false);
   try { return await held.use(entries => entries.read(name)); } finally { await held.release(); }
@@ -69,6 +85,7 @@ async function removeOwned(root: string, receipt: Receipt) {
 export async function createOfficeProfile(tempDir: string): Promise<{ path: string; close(): Promise<DirectoryRemoval> }> {
   const { temp, root } = await journalRoot(tempDir);
   const receipt: Receipt = { version: 1, id: randomBytes(8).toString("hex"), owner, pid: process.pid,
+    ...(process.platform === "linux" ? { incarnation: await linuxIncarnation(process.pid) } : {}),
     tempRoot: temp, systemRoot: await realpath(tmpdir()) };
   await writeNew(join(root, receipt.id + ".json"), receipt);
   const path = join(receipt.systemRoot, `mixin-office-${receipt.id}`);
@@ -92,14 +109,14 @@ export async function recoverOfficeProfiles(tempDir: string, report?: (deferred:
     if (raw === undefined) throw new Error("Office 清理记录已变化，保留目录");
     const receipt: Receipt = JSON.parse(raw);
     if (receipt.version !== 1 || receipt.id + ".json" !== name || !/^[a-f0-9]{32}$/.test(receipt.owner)
-      || !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0) {
+      || !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0
+      || receipt.incarnation !== undefined && (typeof receipt.incarnation !== "string" || !receipt.incarnation || receipt.incarnation.length > 256)) {
       throw new Error("Office 清理记录身份不匹配，拒绝删除");
     }
     // A restored backup can carry a receipt from a different machine/root. Keep it; it grants no authority here.
     if (receipt.tempRoot !== temp || receipt.systemRoot !== systemRoot) continue;
     if (receipt.owner === owner) { if (retryAfter.has(join(root, receipt.id))) deferred++; continue; }
-    try { process.kill(receipt.pid, 0); continue; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") continue; }
+    if (await ownerLive(receipt)) continue;
     const key = join(root, receipt.id);
     if ((retryAfter.get(key) ?? 0) > Date.now()) { deferred++; continue; }
     try {

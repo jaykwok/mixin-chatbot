@@ -23,6 +23,8 @@ param(
     [int]$Days = -1,
     [switch]$All,
     [string]$User = "",
+    [string]$Plan = "",
+    [string]$Digest = "",
     # stat 的统计区间（YYYY-MM-DD），同样翻译成脚本的 --since/--until。
     [string]$Since = "",
     [string]$Until = "",
@@ -51,7 +53,7 @@ if ($RequestBase64) {
 if ($RequestBase64) {
     $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
     foreach ($property in $request.PSObject.Properties) {
-        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Period', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId', 'ConfirmedTransaction')) {
+        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Period', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId', 'ConfirmedTransaction', 'Plan', 'Digest')) {
             throw "无效的运维请求字段"
         }
         Set-Variable -Name $property.Name -Value $property.Value
@@ -384,14 +386,46 @@ function Invoke-GroupDataAdmin([string]$Script, [string[]]$TmpArgs) {
 }
 
 function Invoke-TmpAdmin([string[]]$TmpArgs) {
-    return (Invoke-GroupDataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs)
+    # 预览只读取数据并保存清单，服务照常运行；执行清单（--digest）和一步完成的 purge 才停机。
+    if ($TmpArgs[0] -eq 'list' -or ($TmpArgs[0] -ne 'purge' -and $TmpArgs -notcontains '--digest')) {
+        return (Invoke-GroupDataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs)
+    }
+    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    $lock = [IO.File]::Open((Join-Path $StateDir 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $wasRunning = $false
+    $stopAttempted = $false
+    $completed = $false
+    $started = $true
+    try {
+        foreach ($record in @('deploy-transaction', 'upgrade-transaction', 'update-transaction')) {
+            if (Test-Path -LiteralPath (Join-Path $StateDir $record)) {
+                throw '存在未完成的部署或升级事务，请先继续或回滚，再维护临时文件'
+            }
+        }
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($task -and (@($task.Actions).Count -ne 1 -or -not $task.Actions[0].WorkingDirectory -or
+            [IO.Path]::GetFullPath($task.Actions[0].WorkingDirectory) -ne [IO.Path]::GetFullPath($Project))) {
+            throw '计划任务不属于当前项目，未开始临时文件维护'
+        }
+        $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
+        if ($wasRunning -and -not $task) { throw '机器人以前台方式运行，无法自动恢复；请先停止前台实例，再执行临时文件维护' }
+        if ($wasRunning) {
+            $stopAttempted = $true
+            if (-not (Stop-Bot)) { throw '无法停止机器人，未开始临时文件维护' }
+        }
+        $completed = Invoke-GroupDataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs
+    } finally {
+        try { if ($wasRunning -and $stopAttempted) { $started = Start-Bot } }
+        finally { $lock.Dispose() }
+    }
+    return ($completed -and $started)
 }
 
 # 清历史必须先把机器人停下来，不能只删文件：内存里已经建立的会话仍握着完整的消息列表，
 # 所以先停止实例，再归档会话，最后恢复调用前的运行或停止状态。
 function Clear-GroupHistory([string]$GroupValue, [string]$Operation = "clear") {
     if (-not $GroupValue) {
-        Err "history-clear 需要群号：ops.ps1 history-clear <群号>"
+        Err "history-$Operation 需要群号：ops.ps1 history-$Operation <群号>"
         return $false
     }
     if ($Operation -eq "compact" -and -not $User) { Err "history-compact 需要 -User <成员号码>"; return $false }
@@ -1383,13 +1417,15 @@ switch ($Command) {
         elseif ($GroupId) { $tmpArgs += "--group-id" }
         if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
     }
-    "tmp-purge" {
-        if (-not $All -and $Days -lt 0) {
-            Err "tmp-purge 需要 -Days <天数>，或用 -All 表示不看时间全部清理"
+    { $_ -in @("tmp-purge", "tmp-preview", "tmp-reclaim", "tmp-discard") } {
+        if ($Command -ne "tmp-discard" -and -not $Digest -and -not $All -and $Days -lt 0) {
+            Err "$Command 需要 -Days <天数>、-All，或 -Plan <ID> -Digest <摘要>"
             exit 1
         }
-        $tmpArgs = @("purge")
-        if ($All) { $tmpArgs += "--all" } else { $tmpArgs += @("--days", "$Days") }
+        $tmpArgs = @($Command.Substring(4))
+        if ($All) { $tmpArgs += "--all" } elseif ($Days -ge 0) { $tmpArgs += @("--days", "$Days") }
+        if ($Plan) { $tmpArgs += @("--plan", $Plan) }
+        if ($Digest) { $tmpArgs += @("--digest", $Digest) }
         if ($User) { $tmpArgs += "--user=$User" }
         if ($Group) { $tmpArgs += "--group=$Group" }
         if ($StorageSegment) { $tmpArgs += "--storage-segment" }
@@ -1459,15 +1495,18 @@ switch ($Command) {
         Write-Host "  routes list | reset -Fingerprint <指纹> -Group <群号> | forget -Fingerprint <指纹>"
         Write-Host "  tmp-ls [-User <手机号>] [-Group <群号>]"
         Write-Host "                  列出各用户临时目录的占用（缓存、中间产物、截断日志）"
+        Write-Host "  tmp-preview -Days <天数> | -All  核对引用并保存清单（服务照常运行）"
+        Write-Host "  tmp-purge -Plan <ID> -Digest <摘要>  停机执行或继续归档清单，再恢复原状态"
+        Write-Host "  tmp-reclaim -Days <天数> | -All  预览物理回收，再用 -Plan/-Digest 确认"
+        Write-Host "  tmp-discard     预览可永久删除的归档，再用 -Plan/-Digest 确认，释放磁盘空间"
         Write-Host "  tmp-purge -Days <天数> | -All [-User <手机号>] [-Group <群号>]"
         Write-Host "                  清理用户临时目录；-Days 只删这些天没改动过的条目"
         Write-Host "  stat [群号] [-Period today|yesterday|week|last-week|month|last-month|7d|30d|all]"
         Write-Host "              或 [-Since <日期>] [-Until <日期>]"
         Write-Host "                  使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
         Write-Host "  history-ls      列出各群的会话历史（群库与旧会话文件的占用、最后活动）"
-        Write-Host "  history-clear <群号>"
+        Write-Host "  history-clear <群号>  清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         Write-Host "  history-compact <群号> -User <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
-        Write-Host "                  清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         Write-Host "                  群选择可加 -GroupId（原始群号）或 -StorageSegment（目录段）"
         Write-Host "  backup-scan     只读扫描 backup\rm 和 backup\snapshots，分类后在 tmp\backup-cleanup 生成清单，不删除"
         Write-Host "  backup-clean <报告名> [-ConfirmCode <确认码>]"

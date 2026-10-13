@@ -34,7 +34,7 @@ mock.module("node:fs/promises", () => ({ ...fs,
     return handle;
   },
 }));
-const ledger = await import("../../src/agent/stats-ledger.ts");
+const ledger = { ...await import("../../src/agent/stats-ledger.ts"), ...await import("./ingest-user-session.ts") };
 const root = process.argv[2]!;
 const ask = (text: string) => JSON.stringify({ type: "message", timestamp: "2026-09-23T01:00:00Z",
   message: { role: "user", content: [{ type: "text", text }] } }) + "\n";

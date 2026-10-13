@@ -16,7 +16,7 @@ import { buildLocalTools } from "../../src/agent/local-tools.ts";
 import { type AgentModuleDefinition, loadModuleDefinitions } from "../../src/agent/modules.ts";
 import { groupWorkspaceDir } from "../../src/agent/paths.ts";
 import { buildChatContext } from "../../src/agent/prompt.ts";
-import { createOutboundNotes } from "../../src/agent/send-tools.ts";
+import { createOutboundNotes } from "../helpers/outbound-notes.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { groupExtensions } from "../../src/durable/registry.ts";
 import { memberPlaces, type Member } from "../../src/durable/tools.ts";

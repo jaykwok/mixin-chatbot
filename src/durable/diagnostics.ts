@@ -1,55 +1,107 @@
 import { Database } from "bun:sqlite";
-import { lstat } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai";
-import { createRegistry, Harness, type ConversationId, type EntryId, type Storage } from "@earendil-works/pi-durable";
+import { createRegistry, createSession, Harness, type ConversationId, type EntryId, type Storage, type Tx } from "@earendil-works/pi-durable";
 import { CURRENT_SQLITE_SCHEMA_VERSION, SqliteStorage, type SqliteDatabase, type SqliteExecutor } from "@earendil-works/pi-durable/storage/sqlite";
 import { MemberDirectory } from "./identity.ts";
 
-/** Read the source connection only; official migrations/recovery run against a disposable memory snapshot. */
-export async function withGroupSnapshot<T>(path: string, read: (harness: Harness, storage: Storage) => Promise<T>): Promise<T> {
+/** Larger group databases are snapshotted into a private file instead of memory (the service container's /tmp is small). */
+const MEMORY_SNAPSHOT_BYTES = 256 * 1024 * 1024;
+
+/** Read the source connection only; official migrations/recovery run against a disposable snapshot (memory, or a private file
+ * under the group data root's `.reclamation/snapshots` for large databases). */
+export async function withGroupSnapshot<T>(path: string, read: (harness: Harness, storage: Storage, liveWork: boolean,
+  commit?: (work: (tx: Tx) => Promise<void>) => Promise<void>) => Promise<T>, exclusive = false, memoryLimit = MEMORY_SNAPSHOT_BYTES): Promise<T> {
   const info = await lstat(path);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("诊断只接受普通群数据库文件");
-  if (info.size > 256 * 1024 * 1024) throw new Error("群库超过 256 MiB，请先使用离线快照做诊断");
-  const source = new Database(path, { readonly: true, strict: true });
-  let memory: Database;
+  // Offline reclamation keeps a write reservation until its reference checks and physical
+  // operations finish. Opening/recovering the Harness still only changes the memory copy.
+  const source = new Database(path, { readonly: !exclusive, strict: true });
+  let memory: Database, scratch: string | undefined;
   try {
-    source.exec("BEGIN");
+    source.exec(exclusive ? "BEGIN IMMEDIATE" : "BEGIN");
     const version = (source.query("SELECT version FROM durable_schema WHERE singleton = 1").get() as { version: number } | null)?.version;
     if (version !== CURRENT_SQLITE_SCHEMA_VERSION) throw new Error("群库 SQLite 版本不匹配，请先升级");
-    const bytes = source.serialize();
-    if (bytes.length > 256 * 1024 * 1024) throw new Error("群库快照超过诊断内存限额");
-    // sqlite3_deserialize cannot read WAL images; only the private snapshot changes its journal header.
-    bytes[18] = 1; bytes[19] = 1;
-    memory = Database.deserialize(bytes, { strict: true });
-  } finally { source.close(); }
+    const pages = source.query("SELECT page_count * page_size AS bytes FROM pragma_page_count(), pragma_page_size()").get() as { bytes: number };
+    if (pages.bytes > memoryLimit) {
+      // VACUUM INTO cannot run inside the source transaction. Under its write reservation (exclusive) a second
+      // connection reads exactly that state; a read-only preview just needs any consistent state.
+      scratch = await mkdtemp(join(await snapshotRoot(path), "snapshot-"));
+      const file = join(scratch, "group.sqlite"), copier = new Database(path, { readonly: true, strict: true });
+      try { copier.query("VACUUM INTO ?").run(file); } finally { copier.close(); }
+      memory = new Database(file, { strict: true });
+      memory.exec("PRAGMA journal_mode = DELETE");
+    } else {
+      const bytes = source.serialize();
+      // sqlite3_deserialize cannot read WAL images; only the private snapshot changes its journal header.
+      bytes[18] = 1; bytes[19] = 1;
+      memory = Database.deserialize(bytes, { strict: true });
+    }
+  } catch (error) { source.close(); await discard(scratch); throw error; }
+  const adapter = snapshotAdapter(memory, false);
+  let harness: Harness;
+  let storage: Storage;
+  let liveWork = false;
+  try {
+    storage = await SqliteStorage.open(adapter);
+    // Recovery may change interrupted tasks. Decide protection from the source state first.
+    for (const status of ["pending", "running", "waiting", "completing"] as const) {
+      if ((await storage.scanTasks({ status }, 1, undefined, context)).items.length) liveWork = true;
+    }
+    for (const status of ["queued", "placed"] as const) {
+      if ((await storage.scanSubmissions({ status }, 1, undefined, context)).items.length) liveWork = true;
+    }
+    harness = await Harness.open(storage, { models: createModels(), registry: createRegistry() }, context);
+  } catch (error) { try { await adapter.close(); } finally { source.close(); await discard(scratch); } throw error; }
+  try {
+    // Only explicit offline settlement uses the source session. Harness recovery remains in memory.
+    // SAVEPOINTs stay inside the source write reservation; failed callbacks roll back all settlements.
+    const session = exclusive ? createSession(await SqliteStorage.open(snapshotAdapter(source, true))) : undefined;
+    try {
+      const result = await read(harness, storage, liveWork, session ? work => session.commit(work, context) : undefined);
+      if (exclusive) source.exec("COMMIT");
+      return result;
+    } finally { await session?.close(context); }
+  } finally { try { await harness.close(context); } finally { source.close(); await discard(scratch); } }
+}
+
+/** Private (0700) scratch space on the data volume; each snapshot gets its own directory, removed afterwards. */
+async function snapshotRoot(path: string): Promise<string> {
+  const groups = await realpath(dirname(dirname(resolve(path)))), root = join(groups, ".reclamation", "snapshots");
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const info = await lstat(root);
+  if (!info.isDirectory() || info.isSymbolicLink() || await realpath(root) !== root) throw new Error("快照目录不是原位普通目录");
+  return root;
+}
+async function discard(scratch: string | undefined): Promise<void> {
+  if (scratch) await rm(scratch, { recursive: true, force: true });
+}
+
+function snapshotAdapter(database: Database, nested: boolean): SqliteDatabase {
   let line: Promise<unknown> = Promise.resolve();
   const queue = <R>(work: () => Promise<R>): Promise<R> => {
     const result = line.then(work); line = result.catch(() => {}); return result;
   };
   const executor: SqliteExecutor = {
-    exec: async sql => { memory.exec(sql); },
-    run: async (sql, ...params) => { memory.query(sql).run(...params); },
-    get: async <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => (memory.query(sql).get(...params) ?? undefined) as R | undefined,
-    all: async <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => memory.query(sql).all(...params) as R[],
+    exec: async sql => { database.exec(sql); },
+    run: async (sql, ...params) => { database.query(sql).run(...params); },
+    get: async <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => (database.query(sql).get(...params) ?? undefined) as R | undefined,
+    all: async <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => database.query(sql).all(...params) as R[],
   };
-  const adapter: SqliteDatabase = {
+  return {
     exec: sql => queue(() => executor.exec(sql)), run: (sql, ...params) => queue(() => executor.run(sql, ...params)),
     get: <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => queue(() => executor.get<R>(sql, ...params)),
     all: <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => queue(() => executor.all<R>(sql, ...params)),
     transaction: work => queue(async () => {
-      memory.exec("BEGIN");
-      try { const result = await work(executor); memory.exec("COMMIT"); return result; }
-      catch (error) { memory.exec("ROLLBACK"); throw error; }
-    }), close: () => queue(async () => { memory.close(true); }),
+      database.exec(nested ? "SAVEPOINT reclamation_settlement" : "BEGIN");
+      try { const result = await work(executor); database.exec(nested ? "RELEASE reclamation_settlement" : "COMMIT"); return result; }
+      catch (error) {
+        database.exec(nested ? "ROLLBACK TO reclamation_settlement; RELEASE reclamation_settlement" : "ROLLBACK"); throw error;
+      }
+    }), close: () => queue(async () => { if (!nested) database.close(true); }),
   };
-  let harness: Harness;
-  let storage: Storage;
-  try {
-    storage = await SqliteStorage.open(adapter);
-    harness = await Harness.open(storage, { models: createModels(), registry: createRegistry() }, context);
-  } catch (error) { await adapter.close(); throw error; }
-  try { return await read(harness, storage); } finally { await harness.close(context); }
 }
 
 async function memberId(harness: Harness, phone: string): Promise<ConversationId> {

@@ -1,4 +1,4 @@
-// Start records of generation and summarize requests (contract 3, review R2-4 of D0; summarize requests since D2-5).
+// Start records of generation and summarize requests.
 //
 // The `pi.generation` request phase keeps only the latest attempt number in `pi.live`, and a recovered invocation reuses
 // the checkpoint's attempt, so the Harness keeps no trace of a request that died before its first partial. The request
@@ -7,7 +7,7 @@
 // (a crash between the commit and the call, or a held request whose withdraw failed, counts once more), never lower.
 // The `pi.compaction` summarize phase behaves the same way; its starts carry `kind: "compaction"`, so background and
 // overflow compaction cost stays separate from the conversation's turns.
-// Projecting starts into usage facts and reconciling them with `pi.usage` belongs to D3.
+// projection.ts reconciles starts with `pi.usage`; projection/retirement.ts retires settled records after accounting.
 import { defineDoc } from "@earendil-works/pi-durable";
 
 /** pi-ai `Usage` as JSON (an interface does not satisfy the document's JSON constraint). */

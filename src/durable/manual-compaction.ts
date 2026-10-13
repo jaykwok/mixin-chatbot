@@ -1,4 +1,4 @@
-// Atomic enqueue via public tokens/Tx, matching Pi 1.0.4 createCompaction's small admission step.
+// Atomic enqueue via public tokens/Tx, matching Pi's createCompaction admission step.
 // The official CompactionTask retains selection, retry, provider identity, placement and cancellation.
 import { CompactionEntry, CompactionTask, type ConversationId, InboxDoc, LiveDoc, type Tx } from "@earendil-works/pi-durable";
 

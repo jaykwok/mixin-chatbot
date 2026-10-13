@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "path": "/srv/mixin/groups/group-a/users/alice/tmp/old-share",
+  "parent": "/srv/mixin/groups/group-a/users/alice/tmp",
+  "proof": {
+    "dev": "2049",
+    "ino": "131074",
+    "uid": 1000,
+    "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+    "bytes": 5,
+    "files": 1,
+    "newest": 1760000000000
+  },
+  "phase": "deleting",
+  "directories": [
+    { "relative": "..", "dev": "2049", "ino": "131073", "uid": 1000, "gid": 1000, "mode": 448 },
+    { "relative": "", "dev": "2049", "ino": "131074", "uid": 1000, "gid": 1000, "mode": 493 },
+    { "relative": "inner", "dev": "2049", "ino": "131075", "uid": 1000, "gid": 1000, "mode": 493 }
+  ]
+}

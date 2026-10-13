@@ -1,6 +1,6 @@
 // 群共享资料清单写在 workspace 之外，避免被外部同步覆盖。
 // 提示词只提供清单路径；概览和正文按需检索，不随扫描结果改变缓存前缀。
-import { readFile, readdir, rename, lstat as stat, writeFile, rm } from "node:fs/promises";
+import { readFile, readdir, rename, lstat, writeFile, rm } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
@@ -98,7 +98,7 @@ export async function scanWorkspace(
     }
     let children;
     try {
-      const info = await stat(dir);
+      const info = await lstat(dir);
       if (!info.isDirectory() || info.isSymbolicLink()) { truncated = true; return; }
       children = await readdir(dir, { withFileTypes: true });
     } catch (e) {
@@ -126,7 +126,7 @@ export async function scanWorkspace(
         return;
       }
       pending.push((async () => { try {
-        const info = await stat(childPath);
+        const info = await lstat(childPath);
         if (!info.isFile() || info.isSymbolicLink()) return;
         entries.push({ path: childRel, size: info.size, mtime: info.mtimeMs });
       } catch (e) {
@@ -243,7 +243,7 @@ interface CacheEntry {
 interface Manifest extends CacheEntry { version: 1; digest: string; }
 async function fileStamp(path: string): Promise<string> {
   try {
-    const info = await stat(path);
+    const info = await lstat(path);
     if (!info.isFile() || info.isSymbolicLink()) throw new Error("索引文件不是普通文件");
     return JSON.stringify([info.size, info.mtimeMs, info.ctimeMs]);
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing"; throw error; }

@@ -1,7 +1,11 @@
 name: Agent checks
 on:
   push:
+    branches: [main]
   pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -13,11 +17,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The first-transition tests run the recovery entry of an earlier commit (see target-upgrader.test.ts).
           fetch-depth: 0
-      - uses: oven-sh/setup-bun@v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.3
       - run: bun install --frozen-lockfile
@@ -47,7 +51,7 @@ jobs:
         run: find scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
       - name: Preserve test diagnostics and timings
         if: always()
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-diagnostics-${{ matrix.os }}-${{ github.run_attempt }}
           path: |
@@ -60,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: docker build -t mixin-chatbot-check .
       - name: Test parsers in the restricted image
         run: |
@@ -101,7 +105,7 @@ jobs:
             mixin-chatbot-check bun run tests/helpers/document-office-integration.ts /app/.venv
       - name: Preserve document preview results
         if: always()
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: document-previews-${{ github.run_attempt }}
           path: |

@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { move } from "fs-extra";
-import { isPathInside } from "../../src/agent/paths.ts";
+import { isPathInside } from "../../src/contracts/paths.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const fixtures = resolve(process.env.TEST_TEMP_ROOT ?? join(project, "tmp/test-fixtures"));

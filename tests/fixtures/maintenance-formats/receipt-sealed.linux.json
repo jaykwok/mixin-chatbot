@@ -1,0 +1,36 @@
+{
+  "keys": [
+    "payload",
+    "signature"
+  ],
+  "signature": "<HEX64>",
+  "payload": {
+    "version": 2,
+    "id": "<ID0>",
+    "nonce": "<HEX64>",
+    "manager": "<ID1>",
+    "daemon": "formats-fixture",
+    "image": "sha256:<HEX64>",
+    "temp": "<ROOT0>/groups/group-a/users/alice/tmp",
+    "createdAt": "<number>",
+    "pid": "<number>",
+    "ownerEpoch": "<ID2>",
+    "phase": "writers-reaped",
+    "allocation": {
+      "step": "work-created"
+    },
+    "containers": [],
+    "pendingNames": [],
+    "mounts": {},
+    "role": "results",
+    "resultName": "1-result",
+    "parentIdentity": {
+      "dev": "<string>",
+      "ino": "<string>"
+    },
+    "identity": {
+      "dev": "<string>",
+      "ino": "<string>"
+    }
+  }
+}

@@ -1,7 +1,7 @@
-// Usage facts of the Durable engine into the stats ledger (D3; src/agent/stats-ledger.ts).
+// Usage facts of the Durable engine into the stats ledger (src/agent/stats-ledger.ts).
 //
-// The ledger stays the only source of the statistics, so the admin tools (stat, TUI) read the same tables for both
-// engines. One member conversation is one ledger source; its cursor is the newest entry already counted. Entries are
+// The ledger stays the only source of the statistics, so the admin tools (stat, TUI) read the same tables.
+// One member conversation is one ledger source; its cursor is the newest entry already counted. Entries are
 // read oldest first after the cursor and folded into daily rows by their message time (the attempt start: entries
 // carry no commit time), so a run across midnight counts on the day each message started, and re-running a
 // projection never counts an entry twice. The request door's NOT_SENT entries are not replies and are skipped.
@@ -13,12 +13,15 @@
 // imported entries were counted from the session file, which the old ledger source keeps covering.
 import type { Database } from "bun:sqlite";
 import type { Context } from "@earendil-works/chord";
-import { AssistantEntry, type ConversationId, defineDoc, type EntryRecord, type Harness, ToolResultEntry, UserEntry } from "@earendil-works/pi-durable";
+import { AssistantEntry, type ConversationId, defineDoc, type EntryRecord, type Harness, type TaskId, ToolResultEntry, UserEntry, type Tx } from "@earendil-works/pi-durable";
 import { groupSegment, userSegment } from "../agent/paths.ts";
 import type { StatsRecord } from "../agent/session-reader.ts";
-import { type ConversationSource, DURABLE_PROJECTION, ingestConversationRecords } from "../agent/stats-ledger.ts";
+import { type ConversationSource, DURABLE_PROJECTION, hasRetiredConversation, ingestConversationRecords } from "../agent/stats-ledger.ts";
 import { type AttemptStart, AttemptsDoc, isNotSent } from "./attempts.ts";
 import { AuxiliaryDoc } from "./auxiliary-records.ts";
+import { recoverProjectionRetirement, retireProjectedRequests } from "./projection/retirement.ts";
+import { pendingUsage, type ProjectionCheckpoint } from "./projection/usage.ts";
+import { KeyedQueue } from "../core/lifecycle.ts";
 
 const PAGE = 200;
 
@@ -65,13 +68,11 @@ function records(entry: EntryRecord, start?: AttemptStart): StatsRecord[] {
 }
 
 /** The conversation's entries after `after`, oldest first. */
-async function entriesAfter(harness: Harness, conversationId: number, after: number, context: Context): Promise<EntryRecord[]> {
-  const conversation = await harness.conversation(conversationId as ConversationId, context);
-  if (conversation === undefined) return [];
+async function entriesAfter(tx: Tx, conversationId: number, after: number): Promise<EntryRecord[]> {
   const entries: EntryRecord[] = [];
-  let cursor: Parameters<typeof conversation.entries>[2];
+  let cursor: Parameters<typeof tx.scanEntries>[2];
   for (;;) {
-    const page = await conversation.entries({ minEntryId: (after + 1) as never, order: "ascending" }, PAGE, cursor, context);
+    const page = await tx.scanEntries({ conversationId: conversationId as ConversationId, minEntryId: (after + 1) as never, order: "ascending" }, PAGE, cursor);
     entries.push(...page.items);
     if (page.next === undefined) break;
     cursor = page.next;
@@ -79,30 +80,42 @@ async function entriesAfter(harness: Harness, conversationId: number, after: num
   return entries.filter((entry) => (entry.id as number) > after);
 }
 
-type Link = { through: number; entryId?: number; interrupted?: boolean };
-type Checkpoint = { version: 1; links: Record<string, Link>; orphans: Record<string, StatsRecord> };
-const checkpoint = (digest: string): Checkpoint => digest ? JSON.parse(digest) as Checkpoint : { version: 1, links: {}, orphans: {} };
-const usageRecord = (start: AttemptStart, kind: string): StatsRecord => ({ type: "usage", kind, timestamp: at(start.startedAt),
-  provider: start.provider, model: start.model, ...(start.usage === undefined ? {} : { usage: start.usage as unknown as Record<string, unknown> }) });
+const checkpoint = (digest: string): ProjectionCheckpoint => digest ? JSON.parse(digest) as ProjectionCheckpoint : { version: 1, links: {}, orphans: {} };
+const projections = new KeyedQueue();
 
 /** The entry cursor and start-to-entry links are committed together in the existing ledger source. */
 export async function projectConversation(db: Database, harness: Harness, member: { groupId: string; phone: string; conversationId: number },
   context: Context): Promise<number> {
   const source = conversationSource(member.groupId, member.phone, member.conversationId);
-  const floor = (await harness.snapshot(LegacyImportDoc, member.conversationId as ConversationId, context))?.through ?? 0;
+  return projections.run(db.filename + ":" + source.id, () => project(db, harness, member.conversationId as ConversationId, source, context), context.abortSignal);
+}
+
+async function project(db: Database, harness: Harness, conversation: ConversationId, source: ConversationSource, context: Context): Promise<number> {
+  await recoverProjectionRetirement(db, harness, source, conversation, context);
+  const floor = (await harness.snapshot(LegacyImportDoc, conversation, context))?.through ?? 0;
   for (let attempt = 1; ; attempt++) {
     const row = db.query("SELECT offset, digest, projection FROM sources WHERE id = ?").get(source.id) as
       { offset: number; digest: string; projection: number } | null;
-    const current = row?.projection === DURABLE_PROJECTION;
+    const current = row !== null && (row.projection === DURABLE_PROJECTION || hasRetiredConversation(db, source.id));
     const prior = current ? row.offset : floor, digest = current ? row.digest : "", links = checkpoint(digest);
-    const doc = await harness.snapshot(AttemptsDoc, member.conversationId as ConversationId, context);
-    const starts = Object.entries(doc?.starts ?? {}).filter(([, start]) => start.withdrawn !== true && start.afterEntry >= floor);
-    const generations = starts.filter(([, start]) => start.kind !== "compaction")
-      .sort(([, a], [, b]) => a.afterEntry - b.afterEntry || a.taskId - b.taskId || a.attempt - b.attempt || a.k - b.k);
-    // An old unmatched start is checked only through new entries, not by rescanning all history every heartbeat.
-    const after = generations.reduce((after, [key, start]) => links.links[key]?.entryId !== undefined
-      ? after : Math.min(after, links.links[key]?.through ?? start.afterEntry), prior);
-    const entries = await entriesAfter(harness, member.conversationId, after, context);
+    const { attempts, auxiliary, terminal, generations, entries } = await harness.commit(async tx => {
+      // One group transaction prevents a new entry from racing its request's start snapshot.
+      const attempts = JSON.parse(JSON.stringify((await tx.doc(AttemptsDoc, conversation)).starts)) as Record<string, AttemptStart>;
+      const auxiliary = JSON.parse(JSON.stringify((await tx.doc(AuxiliaryDoc, conversation)).starts)) as Record<string, import("./auxiliary-records.ts").AuxiliaryRequest>;
+      // Only tasks already terminal in this snapshot can retire. A later terminal transition may commit
+      // an assistant entry after this cursor; settling its start early would charge that request twice.
+      const terminal = new Set<number>();
+      for (const id of new Set([...Object.values(attempts), ...Object.values(auxiliary)].map(start => start.taskId))) {
+        const task = await tx.task(id as TaskId);
+        if (task?.conversationId === conversation && task.state.status === "terminal") terminal.add(id);
+      }
+      const generations = Object.entries(attempts).filter(([, start]) => !start.withdrawn && start.afterEntry >= floor && start.kind !== "compaction")
+        .sort(([, a], [, b]) => a.afterEntry - b.afterEntry || a.taskId - b.taskId || a.attempt - b.attempt || a.k - b.k);
+      // An unmatched start only checks entries after its last projected cursor.
+      const after = generations.reduce((after, [key, start]) => links.links[key]?.entryId !== undefined
+        ? after : Math.min(after, links.links[key]?.through ?? start.afterEntry), prior);
+      return { attempts, auxiliary, terminal, generations, entries: await entriesAfter(tx, conversation, after) };
+    }, context);
     const to = Math.max(prior, (entries.at(-1)?.id as number | undefined) ?? prior);
     const byEntry = new Map<number, AttemptStart>();
     for (const [key, start] of generations) {
@@ -124,7 +137,7 @@ export async function projectConversation(db: Database, harness: Harness, member
         links.links[key] = { through: to, entryId: entry.id as number, ...(message.stopReason === "aborted" ? { interrupted: true } : {}) };
         delete links.orphans[String(entry.id)];
         byEntry.set(entry.id as number, start);
-      } else if (message.stopReason === "aborted" && message.content?.length && Number.isFinite(message.timestamp)) {
+      } else if ((entry.id as number) > prior && message.stopReason === "aborted" && message.content?.length && Number.isFinite(message.timestamp)) {
         // Old partials with no start record still show missing usage; empty unsent aborts do not add requests.
         links.orphans[String(entry.id)] = { type: "usage", kind: "interrupted", timestamp: at(message.timestamp),
           provider: message.provider, model: message.model };
@@ -133,23 +146,11 @@ export async function projectConversation(db: Database, harness: Harness, member
     for (const [key] of generations) links.links[key] ??= { through: to };
     for (const [key] of generations) if (links.links[key]!.entryId === undefined) links.links[key]!.through = to;
     const added = entries.filter((entry) => (entry.id as number) > prior).flatMap((entry) => records(entry, byEntry.get(entry.id as number)));
-    const whole = new Map<string, StatsRecord[]>(["compaction", "interrupted", "generation_unconfirmed", "generation_unsettled"].map((kind) => [kind, []]));
-    for (const [key, start] of starts) {
-      let kind: string;
-      if (start.kind === "compaction") kind = "compaction";
-      else if (links.links[key]?.interrupted || (links.links[key]?.entryId === undefined && start.outcome === "aborted")) kind = "interrupted";
-      else if (links.links[key]?.entryId !== undefined) continue;
-      else kind = start.usage === undefined ? "generation_unconfirmed" : "generation_unsettled";
-      whole.get(kind)!.push(usageRecord(start, kind));
-    }
-    whole.get("interrupted")!.push(...Object.values(links.orphans));
-    const auxiliary = await harness.snapshot(AuxiliaryDoc, member.conversationId as ConversationId, context);
-    whole.set("auxiliary", Object.values(auxiliary?.starts ?? {}).filter(start => start.withdrawn !== true).map(start => ({
-      type: "usage", kind: "auxiliary", timestamp: at(start.startedAt), provider: start.provider, model: start.model,
-      ...(start.usage === undefined ? {} : { usage: start.usage as unknown as Record<string, unknown> }),
-    })));
     if (ingestConversationRecords(db, { ...source, digest: JSON.stringify(links) }, prior, to, added,
-      [...whole].map(([kind, records]) => ({ kind, records })), floor, digest)) return added.length;
+      pendingUsage(attempts, auxiliary, links, floor), floor, digest)) {
+      await retireProjectedRequests(db, harness, source, conversation, { attempts, auxiliary, terminal, checkpoint: links }, to, floor, context);
+      return added.length;
+    }
     if (attempt >= 3) throw new Error("统计入账冲突：同一会话正被反复入账，稍后由下次入账补上");
   }
 }

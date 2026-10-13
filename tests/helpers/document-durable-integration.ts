@@ -17,7 +17,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { loadModuleDefinitions } from "../../src/agent/modules.ts";
 import { groupWorkspaceDir } from "../../src/agent/paths.ts";
 import { documentToolchainReady, venvPythonPath } from "../../src/agent/python-toolchain.ts";
-import { createOutboundNotes } from "../../src/agent/send-tools.ts";
+import { createOutboundNotes } from "./outbound-notes.ts";
 import { runProcess } from "../../src/core/process.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { groupExtensions } from "../../src/durable/registry.ts";

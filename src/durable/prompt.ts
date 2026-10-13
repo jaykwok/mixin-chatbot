@@ -1,13 +1,12 @@
-// `mixin.prompt`: the system prompt for the Durable engine (D2-4). It renders the same sections the AgentSession engine
-// sent (src/agent/session-factory.ts, removed at data version 3), so a group's model saw the same prompt text after the switch:
+// `mixin.prompt`: the system prompt sections for the Durable engine.
 //
-// - coding-agent 1.0.4 `buildSystemPromptSections` with the project's own prompt (`systemPromptOverride`) keeps only
+// - coding-agent `buildSystemPromptSections` with the project's own prompt (`systemPromptOverride`) keeps only
 //   `preamble` (untagged: the project prompt with the enabled module's text), `skills` (the module's skills, as
 //   `formatSkillsForPrompt` lists them for the read tool) and `cwd` (the group workspace, forward slashes). It leaves
 //   out the tool snippets and guidelines, the rules and the Pi documentation that its default prompt would carry, and
 //   adds nothing else here (no appended prompt, context files or extension sections).
 // - Durable renders sections in this order and tags all but `preamble` as `<key>\n...\n</key>`, the shape
-//   coding-agent stores; pi-ai joins them the same way for both engines.
+//   coding-agent stores; pi-ai joins them before sending the request.
 //
 // The sections follow what the conversation selects: a module's text and skills appear only while its extension
 // (`mixin.<name>`) is selected. Nothing depends on the member: the member's tmp is named through $PI_USER_TMP.

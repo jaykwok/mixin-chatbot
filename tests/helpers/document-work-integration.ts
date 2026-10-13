@@ -9,7 +9,8 @@ import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/to
 import { documentToolchainReady, venvPythonPath } from "../../src/agent/python-toolchain.ts";
 import { runProcess } from "../../src/core/process.ts";
 import { application } from "../../src/core/lifecycle.ts";
-import { configuredRootlessTasks, ISOLATED_PYTHON } from "../../src/core/rootless-tasks.ts";
+import { configuredRootlessTasks, ISOLATED_PYTHON } from "../../src/core/task-backend.ts";
+import { resultReferences } from "../../src/durable/results/references.ts";
 import { checkDocumentReclamation } from "./document-reclamation.ts";
 
 const environment = process.argv[2];
@@ -30,10 +31,12 @@ const python = async (...args: string[]) => {
       const prepare = args[0] === "prepare";
       const target = join(task.path, "fixtures");
       if (prepare) await mkdir(target); else await cp(workspace, target, { recursive: true });
+      const inputs = prepare ? [] : (await readdir(join(tempDir, ".isolated-work")))
+        .filter(id => id !== task.id).map(id => join(tempDir, ".isolated-work", id, "work"));
       const result = await task.run({ command: ISOLATED_PYTHON, args: [fixtureScript, args[0]!, target, ...args.slice(2)],
         cwd: task.path, timeoutMs: 60_000, env: { PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1" } },
         [dirname(fixtureScript), join(project, "src/agent/modules/document-work/scripts"),
-          join(project, "src/agent/modules/document-work/skills/document-work"), ...prepare ? [] : [args[2]!]]);
+          join(project, "src/agent/modules/document-work/skills/document-work"), ...prepare ? [] : [args[2]!]], { paths: inputs });
       assert.equal(result.exitCode, 0, result.output);
       if (prepare) await cp(target, workspace, { recursive: true });
       return result.output;
@@ -233,8 +236,8 @@ console.log(await python("check", workspace, report));
 await application.drain();
 console.log(JSON.stringify({ status: "passed", report }));
 if (backend) {
-  const recovered = await backend.sweep(tempDir, Infinity, []);
+  const recovered = await backend.sweep(tempDir, Infinity, resultReferences([]));
   assert(recovered.length > 0 && recovered.every(item => item.status === "removed"));
-  assert.deepEqual(await backend.sweep(tempDir, Infinity, []), []);
+  assert.deepEqual(await backend.sweep(tempDir, Infinity, resultReferences([])), []);
   console.log(JSON.stringify({ physicalReclamation: true, tasks: recovered.length }));
 }

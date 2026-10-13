@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "digest": "<HEX64>",
+  "started": [],
+  "outcomes": {
+    "0": {
+      "status": "deferred",
+      "bytes": 0,
+      "reason": "旧共享身份的归档项需要宿主特权离线后端（--legacy --journal）"
+    },
+    "1": {
+      "status": "deferred",
+      "bytes": 0,
+      "reason": "旧共享身份的归档项需要宿主特权离线后端（--legacy --journal）"
+    },
+    "2": {
+      "status": "deferred",
+      "bytes": 0,
+      "reason": "旧共享身份的归档项需要宿主特权离线后端（--legacy --journal）"
+    }
+  }
+}

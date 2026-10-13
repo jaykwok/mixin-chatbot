@@ -5,7 +5,8 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
-import { buildSendTools, createOutboundNotes } from "../../src/agent/send-tools.ts";
+import { buildSendTools } from "../../src/agent/send-tools.ts";
+import { createOutboundNotes } from "../helpers/outbound-notes.ts";
 import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
 import type { RelayConfig } from "../../src/integrations/relay.ts";
 import { openRelayIndex, type RelayIndex } from "../../src/integrations/relay-index.ts";

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { isPathInside } from "../../src/agent/paths.ts";
+import { isPathInside } from "../../src/contracts/paths.ts";
 import { stubDocumentPython } from "./document-python-stub.ts";
 
 const root = process.cwd(), systemTemp = join(root, "system-temp");

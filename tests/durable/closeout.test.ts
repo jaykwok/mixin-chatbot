@@ -1,7 +1,7 @@
 // Migration closeout: durable receipts, offline/manual compaction, reference-aware expiry and backup/reopen.
 import { afterAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdir, readFile, readdir, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createSession } from "@earendil-works/pi-durable";
@@ -14,7 +14,8 @@ import { groupDatabasePath } from "../../src/durable/groups.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { queueMemberCompaction } from "../../src/durable/offline.ts";
 import { readLedger, openStatsLedger } from "../../src/agent/stats-ledger.ts";
-import { ResultsDoc } from "../../src/durable/result-lifecycle.ts";
+import { ReclamationItems } from "../../src/durable/results/queue.ts";
+import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { createDataBackup, restoreDataBackup } from "../../scripts/ops/data-backup.ts";
 import { fauxModels, gatedResponse, TEST_PROGRESS } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -120,7 +121,10 @@ test("cold maintenance finishes an expiry receipt left after bytes were already 
     service = w.open(); await service.control(phone, group, "/status", url);
     if (process.platform === "linux") {
       await service.maintain();
-      await database(w.root, async session => { expect((await session.snapshot(ResultsDoc, context))!.calls["1-deleted-before-crash"]!.expiredAt).toBeUndefined(); });
+      await database(w.root, async session => {
+        expect((await session.snapshot(ResultsDoc, context))!.calls["1-deleted-before-crash"]).toBeUndefined();
+        expect((await session.snapshot(ReclamationItems, "1-deleted-before-crash", context))!.call.expiredAt).toBeUndefined();
+      });
       return; // A missing shared pathname is not a physical deletion receipt.
     }
     await until(async () => {
@@ -145,14 +149,22 @@ test("current history and pending attachments survive retention/clear, unknown d
     const old = new Date(0); await utimes(join(root, name, "index.txt"), old, old); await utimes(join(root, name), old, old);
     await mkdir(join(root, "9-unknown")); await writeFile(join(root, "9-unknown", "keep"), "unowned");
     await service.maintain(); expect(await readFile(file, "utf8")).toContain("synthetic");
-    w.deliveries.put(memberKey(group, phone), "pending", `read ${file}`, [{ original: file, reference: {} as never }]);
+    w.deliveries.put(memberKey(group, "13800000002"), "pending", `read ${file}`, [{ original: file, reference: {} as never }]);
     await service.control(phone, group, "/clear", url); expect(await readFile(file, "utf8")).toContain("synthetic");
-    w.deliveries.acknowledge(["pending"]); await service.maintain();
+    // A different member's outbox protects the path even after this member clears its context.
+    await service.maintain(); expect(await readFile(file, "utf8")).toContain("synthetic");
+    w.deliveries.acknowledge(["pending"]);
+    await until(async () => {
+      await service.maintain();
+      // The expiry is listed from /clear on; wait for the maintenance outcome itself.
+      return process.platform === "linux" ? (await service.control(phone, group, "/status", url)).includes("待物理回收")
+        : !(await readdir(root)).includes(name);
+    });
     expect((await readdir(root)).sort()).toEqual(process.platform === "linux" ? [name, "9-unknown"].sort() : ["9-unknown"]);
     expect(await service.control(phone, group, "/status", url)).toContain("已过期结果");
     await service.close();
     await database(w.root, async session => {
-      const call = (await session.snapshot(ResultsDoc, context))!.calls[name]!;
+      const call = process.platform === "linux" ? (await session.snapshot(ReclamationItems, name, context))!.call : (await session.snapshot(ResultsDoc, context))!.calls[name]!;
       expect(call.expiryRequestedAt).toBeGreaterThan(0);
       if (process.platform === "linux") { expect(call.expiredAt).toBeUndefined(); expect(call.reclamation?.status).toBe("deferred"); }
       else expect(call.expiredAt).toBeGreaterThan(0);
@@ -166,8 +178,16 @@ test("closed DB and external-result hash manifest restores exactly; tampered fil
   const db = new Database(join(groups, group, "durable.sqlite"));
   db.exec("PRAGMA journal_mode=WAL; CREATE TABLE proof(value TEXT); INSERT INTO proof VALUES ('persisted')"); db.close();
   await writeFile(join(groups, group, "users", phone, "tmp", "codemode", "1-call", "output.txt"), "exact bytes");
+  // Archived tmp entries are not copied again (a link inside one would even refuse the whole backup); their plans are.
+  const archive = join(groups, ".reclamation", "backup", "rm");
+  await mkdir(join(archive, "tmp-plan-0"), { recursive: true }); await mkdir(join(archive, ".tmp-plans"));
+  await writeFile(join(archive, "tmp-plan-0", "old.bin"), "archived"); await writeFile(join(archive, ".tmp-plans", "plan.json"), "{}");
+  if (process.platform !== "win32") await symlink("/", join(archive, "tmp-plan-0", "link"));
+  await mkdir(join(groups, ".reclamation", "snapshots", "snapshot-x"), { recursive: true });
+  await writeFile(join(groups, ".reclamation", "snapshots", "snapshot-x", "group.sqlite"), "copy");
   const manifest = await createDataBackup(project, groups, snapshot);
   expect(manifest.files.some(file => file.path.endsWith("output.txt") && file.bytes === 11)).toBe(true);
+  expect(manifest.files.filter(file => file.path.startsWith(".reclamation/")).map(file => file.path)).toEqual([".reclamation/backup/rm/.tmp-plans/plan.json"]);
   const restored = join(root, "restored"); await restoreDataBackup(snapshot, restored, join(restored, "data/groups"));
   const read = new Database(join(restored, "data/groups", group, "durable.sqlite"), { readonly: true });
   try { expect(read.query("SELECT value FROM proof").get()).toEqual({ value: "persisted" }); } finally { read.close(); }

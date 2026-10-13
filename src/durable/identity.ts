@@ -1,4 +1,4 @@
-// Identity documents of the Durable store (D0 contract 2.2): the group is decided by which database, the member by the
+// Identity documents of the Durable store: the group is decided by which database, the member by the
 // directory; tools and prompt sections read the identity document, never model arguments or a changeable cwd.
 import type { Context } from "@earendil-works/chord";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";

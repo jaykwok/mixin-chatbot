@@ -9,8 +9,9 @@ import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { type AssistantMessage, type Message, type Models, Type } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, type FauxResponseFactory, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { type ConversationId, createSession, defineExtension, type Harness, type ModelRef } from "@earendil-works/pi-durable";
-import { ResultsDoc } from "../../src/durable/result-lifecycle.ts";
+import { type ConversationId, createSession, defineExtension, type Harness, LiveDoc, type ModelRef } from "@earendil-works/pi-durable";
+import { ReclamationItems } from "../../src/durable/results/queue.ts";
+import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { DeliveryStore } from "../../src/agent/delivery-store.ts";
 import { userTempDir } from "../../src/agent/paths.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
@@ -422,7 +423,7 @@ describe("durable service: controls", () => {
     } finally { await database.close(context); }
   });
 
-  test("/clear waits for the run to end, starts a new context and removes codemode results; a message sent meanwhile runs in the new context", async () => {
+  test("/clear waits for the run to end, starts a new context and schedules idle reclamation; a message sent meanwhile runs in the new context", async () => {
     const { faux, models, model } = fauxModels();
     const where = place();
     const out = recordingOutbound();
@@ -448,12 +449,22 @@ describe("durable service: controls", () => {
       expect(text).toContain("清空之后");
       expect(text).not.toContain("第一轮");
       expect(text).not.toContain("第二轮");
+      // /status lists the expiry as soon as /clear requests it; wait for the maintenance outcome itself (the first pass
+      // may still find the group busy finishing the reply).
+      await until(async () => {
+        await service.maintain();
+        return process.platform === "linux" ? (await service.control(ALICE, GROUP, "/status", URL)).includes("待物理回收")
+          : (await readdir(resultsRoot(userTempDir(where.root, GROUP, ALICE)))).length === 0;
+      }, "idle result reclamation");
+      expect(await service.control(ALICE, GROUP, "/status", URL)).toContain("已过期结果：1");
       expect(await readdir(resultsRoot(userTempDir(where.root, GROUP, ALICE)))).toEqual(process.platform === "linux" ? ["1-call_a"] : []);
       if (process.platform === "linux") expect(await readFile(join(results, "index.txt"), "utf8")).toBe("x");
     } finally { await service.close(); }
     const database = createSession(await openGroupStorage(groupDatabasePath(where.root, GROUP)));
     try {
-      const receipt = (await database.snapshot(ResultsDoc, context))!.calls["1-call_a"]!;
+      const receipt = process.platform === "linux"
+        ? (await database.snapshot(ReclamationItems, "1-call_a", context))!.call
+        : (await database.snapshot(ResultsDoc, context))!.calls["1-call_a"]!;
       expect(receipt.expiryRequestedAt).toBeDefined();
       if (process.platform === "linux") { expect(receipt.expiredAt).toBeUndefined(); expect(receipt.reclamation?.status).toBe("deferred"); }
       else expect(receipt.expiredAt).toBeDefined();
@@ -863,7 +874,7 @@ test("a control waits for a start that passed its gate, before looking up/aborti
   }
 });
 
-test.skipIf(process.getuid?.() === 0)("a clear blocked by a real directory/file hold retries itself, preserves later messages and resets once", async () => {
+test.skipIf(process.getuid?.() === 0)("a held result defers idle reclamation without blocking clear or later messages", async () => {
   const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
   faux.setResponses([fauxAssistantMessage("seed"), fauxAssistantMessage("after the failed cleanup")]);
   let resets = 0;
@@ -878,7 +889,7 @@ test.skipIf(process.getuid?.() === 0)("a clear blocked by a real directory/file 
     } });
   });
   await registeredResult(where, models, model, "1-locked");
-  const { service, reports } = open(where, models, model, out.outbound);
+  const { service } = open(where, models, model, out.outbound);
   const temp = userTempDir(where.root, GROUP, ALICE), locked = join(resultsRoot(temp), "1-locked");
   let held: HeldDirectory | undefined, command: Promise<string> | undefined;
   try {
@@ -888,26 +899,21 @@ test.skipIf(process.getuid?.() === 0)("a clear blocked by a real directory/file 
     if (process.platform === "win32") held = await holdDirectory(temp, ["codemode", "1-locked"]);
     else await chmod(locked, 0o555);
     command = service.control(ALICE, GROUP, "/clear", URL);
-    if (process.platform === "linux") {
-      expect(await command).toContain("开启新会话");
-      await service.admit(ALICE, GROUP, "later question", URL);
-      await until(() => replies(out.sent).length === 2, "new context proceeds with deferred physical reclamation");
-      expect(replies(out.sent)).toEqual(["seed", "after the failed cleanup"]);
-      expect(resets).toBe(1); expect(await readFile(join(locked, "index.txt"), "utf8")).toBe("synthetic");
-      expect(await service.control(ALICE, GROUP, "/status", URL)).toContain("待物理回收");
-      return;
-    }
-    await until(() => reports.length > 0, "actual filesystem cleanup failure");
-    await service.admit(ALICE, GROUP, "later question", URL);
-    expect(faux.state.callCount).toBe(1);
-    expect(await service.control(ALICE, GROUP, "/status", URL)).toContain("自动重试");
-    // Keep it locked through multiple real retries; no second reset is allowed.
-    await until(() => reports.length >= 2, "second cleanup failure");
-    expect(resets).toBe(1);
-    if (held) { await held.release(); held = undefined; } else await chmod(locked, 0o755);
     expect(await command).toContain("开启新会话");
-    await until(() => replies(out.sent).length === 2, "later message resumed automatically");
+    await service.admit(ALICE, GROUP, "later question", URL);
+    await until(() => replies(out.sent).length === 2, "new context proceeds with deferred physical reclamation");
     expect(replies(out.sent)).toEqual(["seed", "after the failed cleanup"]);
+    await until(async () => {
+      await service.maintain();
+      return (await service.control(ALICE, GROUP, "/status", URL)).includes("待物理回收");
+    }, "held result remains recorded for maintenance");
+    expect(resets).toBe(1);
+    expect(await readFile(join(locked, "index.txt"), "utf8")).toBe("synthetic");
+    if (process.platform === "linux") return;
+    if (held) { await held.release(); held = undefined; } else await chmod(locked, 0o755);
+    const later = Date.now() + 61_000, clock = spyOn(Date, "now").mockReturnValue(later);
+    try { await until(async () => { await service.maintain(later); return !(await readdir(resultsRoot(temp))).includes("1-locked"); }, "unlocked result reclaimed"); }
+    finally { clock.mockRestore(); }
     expect(resets).toBe(1); expect(await readdir(resultsRoot(temp))).toEqual([]);
   } finally {
     await held?.release(); await chmod(locked, 0o755).catch(() => {}); await command?.catch(() => {});
@@ -1090,4 +1096,43 @@ test("replaying an earlier-epoch stop preserves a later-epoch input after the cl
     expect(seen.join("")).toContain("later epoch input");
     expect(seen.join("")).not.toContain("must never reach model");
   } finally { await service.close(); }
+});
+
+test("a message arriving during maintenance waits for one member, not the whole group; the next pass resumes with the next member", async () => {
+  const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
+  faux.setResponses([fauxAssistantMessage("answer during maintenance")]);
+  const opened = await openGroupHarness(groupDatabasePath(where.root, GROUP), models, { group: GROUP });
+  const ids = new Map<number, string>();
+  try {
+    for (const phone of [ALICE, BOB]) ids.set((await memberConversation(opened.harness, GROUP, phone, { model }, context)).conversation.id, phone);
+  } finally { await opened.close(); }
+  const visits: string[] = [], entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let block = true;
+  const prototype = await harnessPrototype(models), originalSnapshot = prototype.snapshot;
+  // Maintenance reads each member's live document once while it holds the group gate.
+  const spy = spyOn(prototype, "snapshot").mockImplementation(async function (this: Harness, ...args: unknown[]) {
+    if (args[0] === LiveDoc && ids.has(args[1] as number)) {
+      visits.push(ids.get(args[1] as number)!);
+      if (block) { block = false; entered.resolve(); await release.promise; }
+    }
+    return Reflect.apply(originalSnapshot, this, args);
+  } as Harness["snapshot"]);
+  const { service } = open(where, models, model, out.outbound);
+  try {
+    await service.start();
+    const maintenance = service.maintain();
+    await entered.promise;
+    const first = visits[0]!;
+    let admitted = false;
+    const message = service.admit(first === ALICE ? BOB : ALICE, GROUP, "question", URL).then(result => { admitted = true; return result; });
+    await Bun.sleep(50);
+    expect(admitted).toBe(false);
+    release.resolve();
+    expect(await message).toEqual({ status: "accepted" });
+    await maintenance;
+    expect(visits).toEqual([first]);
+    await until(() => replies(out.sent).length === 1, "the answer");
+    await until(async () => { await service.maintain(); return visits.length > 1; }, "the next maintenance pass");
+    expect(visits[1]).not.toBe(first);
+  } finally { release.resolve(); await service.close(); spy.mockRestore(); }
 });

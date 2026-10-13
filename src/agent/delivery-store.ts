@@ -1,10 +1,12 @@
-import { randomUUID } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { stateDatabase } from "../core/state.ts";
 import type { RelayReference } from "../integrations/relay.ts";
 
 export interface DeliveryAttachment { original: string; reference: RelayReference; }
 export interface PendingDelivery { id: string; text: string; at: string; attachments: DeliveryAttachment[]; blockedReason?: string; }
+type DeliveryRow = { id: string; text: string; at: string; attachments: string; blocked_reason: string | null };
+const delivery = ({ blocked_reason, attachments, ...row }: DeliveryRow): PendingDelivery => ({ ...row,
+  attachments: JSON.parse(attachments), ...(blocked_reason ? { blockedReason: blocked_reason } : {}) });
 
 /** Shared read-only schema check; absent tables are initialized by the normal service. */
 export function assertDeliverySchema(db: Database): void {
@@ -39,30 +41,22 @@ export class DeliveryStore {
     const { count } = this.db.query("SELECT count(*) AS count FROM deliveries WHERE session = ?").get(session) as { count: number };
     if (count >= 64) throw new Error("待补发回复已达 64 条，请先发送 /deliver 补发，再发送新的问题");
   }
-  /** One row per run: early links survive a crash, and the final answer updates that row. */
-  save(session: string, text: string, id?: string, attachments: DeliveryAttachment[] = []): string {
-    return this.db.transaction(() => {
-      if (id) {
-        const result = this.db.query("UPDATE deliveries SET text = ?, attachments = ?, blocked_reason = NULL WHERE id = ? AND session = ?").run(text, JSON.stringify(attachments), id, session);
-        if (result.changes !== 1) throw new Error("未送达记录不存在或不属于当前会话");
-        return id;
-      }
-      this.assertCapacity(session);
-      const newId = randomUUID();
-      this.db.query("INSERT INTO deliveries (id, session, text, at, attachments) VALUES (?, ?, ?, ?, ?)").run(newId, session, text, new Date().toISOString(), JSON.stringify(attachments));
-      return newId;
-    })();
-  }
   pending(session: string): PendingDelivery[] {
-    const rows = this.db.query("SELECT id, text, at, attachments, blocked_reason FROM deliveries WHERE session = ? ORDER BY at, rowid").all(session) as {
-      id: string; text: string; at: string; attachments: string; blocked_reason: string | null;
-    }[];
-    return rows.map(({ blocked_reason, attachments, ...row }) => ({ ...row,
-      attachments: JSON.parse(attachments), ...(blocked_reason ? { blockedReason: blocked_reason } : {}) }));
+    const rows = this.db.query("SELECT id, text, at, attachments, blocked_reason FROM deliveries WHERE session = ? ORDER BY at, rowid").all(session) as DeliveryRow[];
+    return rows.map(delivery);
   }
-  /** One row by id (the Durable engine's run rows have deterministic ids, D3). */
+  /** Include other members: a forwarded file can reference another member's result. */
+  groupReferences(groupId: string): PendingDelivery[] {
+    const rows = this.db.query("SELECT id, text, at, attachments, blocked_reason FROM deliveries WHERE json_extract(session, '$[0]') = ? ORDER BY at, rowid").all(groupId) as DeliveryRow[];
+    return rows.map(delivery);
+  }
+  hasPending(session: string): boolean {
+    return this.db.query("SELECT 1 FROM deliveries WHERE session = ? LIMIT 1").get(session) !== null;
+  }
+  /** One row by its deterministic run id and owner. */
   find(session: string, id: string): PendingDelivery | undefined {
-    return this.pending(session).find((item) => item.id === id);
+    const row = this.db.query("SELECT id, text, at, attachments, blocked_reason FROM deliveries WHERE session = ? AND id = ?").get(session, id) as DeliveryRow | null;
+    return row ? delivery(row) : undefined;
   }
   /** Create or replace a row with a deterministic id, keeping its original time; no capacity check (checked at run start). */
   put(session: string, id: string, text: string, attachments: DeliveryAttachment[] = []): void {

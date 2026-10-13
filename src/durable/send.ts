@@ -1,12 +1,12 @@
-// `mixin.send`: send_image and send_file for the Durable engine (D2-4; contract 2.4). The AgentSession engine's tools
+// `mixin.send`: send_image and send_file for the Durable engine. The send tools
 // (src/agent/send-tools.ts) built for the calling member, through the same `memberTool` entry as the base tools: the
 // identity decides the member, and the member's places decide which files may be sent.
 //
 // Model-only: the definitions say `exposure: "model-only"`, so codemode never lets a script call them (a message cannot
 // be taken back); the model calls them one by one. Replay unsafe: an interrupted send is never repeated on recovery.
 //
-// Where a send goes is the service's part (D3): the member's IM callback URL and where a relay link note waits for the
-// member's reply (the outbox, contract 2.6) come from `SendDelivery`. Until then only tests provide one.
+// The service provides `SendDelivery`: the member's IM callback URL and the outbox where relay link notes wait
+// for the member's reply.
 import type { RelayConfig } from "../integrations/relay.ts";
 import { buildSendTools, type OutboundNotes } from "../agent/send-tools.ts";
 import { type BaseToolsOptions, type Member, memberTool, type MemberTool } from "./tools.ts";

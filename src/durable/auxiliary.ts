@@ -3,7 +3,7 @@ import { Type, type ClassifierContext, type ClassifierResult, type ImageContent 
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import type { AuxiliaryConfig } from "../core/auxiliary-config.ts";
 import type { RequestDoor } from "./door.ts";
-import { ResultsDoc } from "./result-lifecycle.ts";
+import { resultRegistration } from "./results/ownership.ts";
 import { SubCallFiles, resultsDirName } from "./codemode/results.ts";
 import { resolveMember, type BaseToolsOptions, type MemberCall, type MemberTool } from "./tools.ts";
 
@@ -108,13 +108,7 @@ export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoo
       if (result.stopReason !== "stop") return { content: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, details: undefined };
       await mkdir(places.tempDir, { recursive: true });
       const name = resultsDirName(call.api.taskId as number, `image-${call.callId}`);
-      const files = new SubCallFiles(places.tempDir, name, () => call.api.commit(async tx => {
-        const doc = await tx.doc(ResultsDoc);
-        if (!doc.calls[name]) {
-          if (Object.keys(doc.calls).length >= 4096) throw new Error("结果归属记录已达上限，请先清理");
-          doc.calls[name] = { phone, createdAt: Date.now() };
-        }
-      }, call.context));
+      const files = new SubCallFiles(places.tempDir, name, resultRegistration(call.api, call.context, phone, name));
       try {
         const content: ({ type: "text"; text: string } | ImageContent)[] = [];
         let index = 0;

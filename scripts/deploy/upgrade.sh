@@ -542,6 +542,7 @@ recheck_before_stop() {
 record_deployment_transaction() {
     local snapshot="$1"
     write_candidate_record "$snapshot" && write_service_user_record "$snapshot" || return 1
+    task_runtime_record "$snapshot/task-runtime" && task_runtime_record_previous "$snapshot" || return 1
     declare -gA TRANSACTION=([format]=1 [operation]=upgrade [snapshot]="$(basename -- "$snapshot")" [target_sha]="$TARGET_SHA"
         [original_sha]="$ORIGINAL_SHA" [original_branch]="$ORIGINAL_BRANCH" [original_group_root]="$GROUP_ROOT" [target_group_root]="$GROUP_ROOT"
         [was_running]="$PREVIOUS_RUNNING" [bot_port]="$BOT_PORT" [deploy_mode]="$DEPLOY_MODE" [bot_domain]="$PUBLIC_DOMAIN"
@@ -627,6 +628,10 @@ fresh_upgrade() {
     trap cleanup_before_pointer EXIT
     trap_preparation_signals
     build_candidate
+    HOST_GROUP_DATA_ROOT="$GROUP_ROOT"
+    GROUP_ROOT_ARGS=()
+    if [ "$GROUP_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then GROUP_ROOT_ARGS=(-v "$GROUP_ROOT:/app/group-data"); fi
+    task_runtime_prepare || { print_error "任务隔离预检失败，原服务保持运行状态"; exit 1; }
     PREPARED_INPUTS="$(prepared_inputs)"
     preview_migration
     recheck_before_stop

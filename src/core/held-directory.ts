@@ -1,5 +1,5 @@
-// A directory held while a codemode call writes in it, so that a change of its path cannot send the writes elsewhere
-// (D23-R2-1). A process with the member's file-system rights (its own bash) may rename the directory, or one above
+// A directory held while a codemode call writes in it, so that a change of its path cannot send the writes elsewhere.
+// A process with the member's file-system rights (its own bash) may rename it, or one above
 // it, remove it, or turn it into a link in place, and a path resolved after that leads wherever the link points. So
 // each directory below the base is made and opened through its held parent, and every file is created, renamed and
 // removed through the held directory, never through a path resolved again:
@@ -22,12 +22,13 @@
 // Errors name entries by their path below the base, not by /proc/self/fd or a handle. A directory is released only
 // after the operations running through it: a closed descriptor's number is reused, and /proc/self/fd/<fd> would then
 // name another file. A handle or descriptor is owned from the moment it is open, before any check of it, so a failure
-// anywhere while holding closes every one opened so far (D23-R4-1: a failed metadata read used to leave one open).
+// anywhere while holding closes every one opened so far, including when a metadata read fails.
 import { ptr } from "bun:ffi";
 import { constants } from "node:fs";
 import { type FileHandle, lstat, mkdir, open, readdir, realpath, rename, rm, rmdir, stat, unlink } from "node:fs/promises";
-import { join } from "node:path";
-import { finishWindows, type WindowsHandle, WindowsHandles } from "./windows-handles.ts";
+import { basename, dirname, join, resolve } from "node:path";
+import type { WindowsTreeEntry } from "../contracts/maintenance.ts";
+import { finishWindows, type WindowsHandle, WindowsHandles, WIN32_CODES } from "./windows-handles.ts";
 import type { RemovalPermit } from "./reclamation.ts";
 
 /** Device and inode (Windows: volume serial and file index) as Bun reports them with `bigint: true`. */
@@ -66,8 +67,12 @@ export interface Entries {
 export interface DirectoryRemoval {
   name: string; status: "removed" | "deferred" | "refused";
   identity?: { dev: string; ino: string }; reason?: string;
+  /** Already removed when this call began (by an earlier run or another list): it only finished the bookkeeping. */
+  completedEarlier?: true;
 }
 type RemovalPolicy = {
+  /** An already enumerated subset; callers cannot escape the held parent. */
+  candidates?: readonly string[];
   /** Keep the caller's recovery record if the held root was moved and cannot be unlinked by its original entry. */
   requireRemoval?: boolean;
   /** Only the isolated management backend issues this after all writers have exited. Never inferred from mode 0700. */
@@ -237,7 +242,8 @@ async function unlinkLinuxDirectory(path: string, held: FileHandle): Promise<boo
 
 async function removeLinuxDirectories(root: FileHandle, directory: string, policy: RemovalPolicy): Promise<DirectoryRemoval[]> {
   const removed: DirectoryRemoval[] = [], entry = (name: string) => `/proc/self/fd/${root.fd}/${name}`;
-  for (const name of (await readdir(`/proc/self/fd/${root.fd}`)).sort()) {
+  for (const name of policy.candidates ?? (await readdir(`/proc/self/fd/${root.fd}`)).sort()) {
+    if (!name || name === "." || name === ".." || /[\\/\0]/.test(name)) throw new Error("Invalid removal candidate");
     if (!policy.select(name)) continue;
     const child = await existingLinuxDirectory(entry(name));
     if (!child) { removed.push({ name, status: "refused", reason: "entry-is-not-the-held-directory" }); continue; }
@@ -295,10 +301,6 @@ async function createLinux(entry: (name: string) => string, directory: string, n
   }
 }
 
-// Windows.
-
-/** FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE. */
-const DIRECTORY_ACCESS = 0x1 | 0x20 | 0x80 | 0x100000;
 async function readLinux(path: string): Promise<string | undefined> {
   // Obtain the handle without waiting for a FIFO writer, then check and read that same entity.
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(error => {
@@ -312,6 +314,10 @@ async function readLinux(path: string): Promise<string | undefined> {
   } finally { await file.close(); }
 }
 
+// Windows.
+
+/** FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE. */
+const DIRECTORY_ACCESS = 0x1 | 0x20 | 0x80 | 0x100000;
 /** GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE: written through Bun, renamed and removed through this handle. */
 const FILE_ACCESS = 0x80000000 | 0x40000000 | 0x10000 | 0x100000;
 /** FILE_SHARE_READ | FILE_SHARE_WRITE: not FILE_SHARE_DELETE. */
@@ -339,13 +345,7 @@ const FILE_DISPOSITION_INFORMATION = 13;
 const FILE_INFORMATION_BYTES = 52;
 const STATUS_REPARSE_POINT_NOT_RESOLVED = 0xc0000280;
 const STATUS_NOT_A_DIRECTORY = 0xc0000103;
-/** Win32 errors as Bun reports them. */
-const WIN32_CODES: Record<number, string> = {
-  2: "ENOENT", 3: "ENOENT", 5: "EPERM", 32: "EBUSY", 33: "EBUSY", 80: "EEXIST", 112: "ENOSPC", 145: "ENOTEMPTY",
-  183: "EEXIST", 267: "ENOTDIR", 1921: "ELOOP",
-};
-
-const defaultWindows = new WindowsHandles();
+const defaultWindows = new WindowsHandles({ observe: () => {} });
 
 /** UTF-16LE bytes of `text` in their own buffer (never a pooled slice: its address goes to the system). */
 function utf16(text: string): Buffer {
@@ -430,7 +430,7 @@ function openBase(path: string, owned: WindowsHandle[], resources: WindowsHandle
 }
 
 /** NtCreateFile of `name` relative to the directory `root`; returns the status and the handle. */
-function createAt(root: WindowsHandle, name: string, access: number, disposition: number, options: number): { status: number; handle?: WindowsHandle } {
+function createAt(root: WindowsHandle, name: string, access: number, disposition: number, options: number, share = SHARE_READ_WRITE): { status: number; handle?: WindowsHandle } {
   const resources = root.resources, path = join(root.path, name);
   resources.record({ phase: "open", operation: "NtCreateFile", path });
   const text = utf16(name);
@@ -445,7 +445,7 @@ function createAt(root: WindowsHandle, name: string, access: number, disposition
   attributes.writeUInt32LE(OBJ_CASE_INSENSITIVE, 24);
   const out = Buffer.alloc(8);
   const status = resources.native.NtCreateFile(ptr(out), access, ptr(attributes), ptr(Buffer.alloc(16)), null, FILE_ATTRIBUTE_NORMAL,
-    SHARE_READ_WRITE, disposition, options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, null, 0);
+    share, disposition, options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, null, 0);
   if (status >= 0) return { status, handle: resources.own(out.readBigInt64LE(), path, "NtCreateFile", status >>> 0) };
   const win32 = resources.native.RtlNtStatusToDosError(status);
   resources.record({ phase: "result", operation: "NtCreateFile", path, success: false, ntstatus: status >>> 0, win32 });
@@ -463,11 +463,11 @@ function openChild(parent: WindowsHandle, name: string, path: string, owned: Win
 }
 
 /** Rename the file open as `file` to `name` in the directory `root`, over whatever has that name. */
-function renameAt(file: WindowsHandle, root: WindowsHandle, name: string): number {
+function renameAt(file: WindowsHandle, root: WindowsHandle, name: string, replace = true): number {
   const text = utf16(name);
   // FILE_RENAME_INFORMATION: ReplaceIfExists, RootDirectory, FileNameLength, FileName.
   const information = Buffer.alloc(Math.max(24, 20 + text.length));
-  information[0] = 1;
+  information[0] = replace ? 1 : 0;
   information.writeBigInt64LE(root.value, 8);
   information.writeUInt32LE(text.length, 16);
   text.copy(information, 20);
@@ -483,6 +483,22 @@ function removeOnClose(file: WindowsHandle): void {
   file.record("result", "NtSetInformationFile(remove)", { success: status >= 0, ntstatus: status >>> 0,
     win32: status < 0 ? file.resources.native.RtlNtStatusToDosError(status) : undefined });
   if (status < 0) throw ntFailed(file.resources, `remove ${file.path}`, status);
+}
+
+/** Archive exactly the opened entry. Both parents and the entry stay held; never replace a target. */
+export async function archiveWindowsEntry(source: string, destination: string, expected: Identity): Promise<void> {
+  const handles: WindowsHandle[] = [];
+  try {
+    const from = openBase(await realpath(dirname(source)), handles, defaultWindows);
+    const to = openBase(await realpath(dirname(destination)), handles, defaultWindows);
+    const entry = existingWindowsEntry(from, basename(source), source, true);
+    if (!entry) throw Object.assign(new Error("归档源不存在"), { code: "ENOENT" });
+    handles.push(entry);
+    if (!sameIdentity(describe(entry, source).identity, expected)) throw new Error("归档源实体已变化");
+    if (describe(to, destination).identity.dev !== expected.dev) throw new Error("归档目标不在同一文件系统；请指定同盘的 backup/rm");
+    const status = renameAt(entry, to, basename(destination), false);
+    if (status < 0) throw ntFailed(defaultWindows, `archive ${source} to ${destination}`, status);
+  } finally { await defaultWindows.closeAll(handles); }
 }
 
 async function holdWindows(base: string, names: readonly string[], create: boolean, resources: WindowsHandles): Promise<HeldDirectory> {
@@ -509,6 +525,40 @@ async function holdWindows(base: string, names: readonly string[], create: boole
     await resources.closeAll(handles, error);
     throw error;
   }
+}
+
+/** Pin every reviewed entry before committing deletion. New names are never included after the intent is durable. */
+export async function removeWindowsTree(path: string, expected: Identity,
+  authorize: (manifest: WindowsTreeEntry[]) => Promise<void>, previous?: readonly WindowsTreeEntry[]): Promise<void> {
+  if (process.platform !== "win32" || resolve(path) !== path) throw new Error("Windows 回收需要绝对路径");
+  const handles: WindowsHandle[] = [], selected: WindowsHandle[] = [], manifest: WindowsTreeEntry[] = [];
+  const previousEntries = previous && new Map(previous.map(entry => [entry.path, entry]));
+  const resources = defaultWindows;
+  try {
+    // The parent is canonicalized and checked against its native final path before relative opens.
+    const parent = openBase(await realpath(dirname(path)), handles, resources);
+    const visit = async (owner: WindowsHandle, name: string, itemPath: string, key: string, depth: number): Promise<void> => {
+      if (depth > 64 || manifest.length >= 100_000) throw new Error("Windows 回收超过 100000 条目或 64 层");
+      // No write or delete sharing: existing writers refuse the operation, and new ones cannot change held contents.
+      const opened = createAt(owner, name, DIRECTORY_ACCESS | 0x10000, FILE_OPEN, 0, 0x1);
+      if (opened.status < 0) throw ntFailed(resources, `hold reclamation entry ${itemPath}`, opened.status);
+      const handle = opened.handle!; handles.push(handle);
+      const info = describe(handle, itemPath), entry = { path: key, dev: String(info.identity.dev), ino: String(info.identity.ino), attributes: info.attributes };
+      if (info.identity.dev !== expected.dev || (key === "" && !sameIdentity(info.identity, expected))) throw new Error("Windows 回收实体已变化或跨设备");
+      if (previousEntries) {
+        const saved = previousEntries.get(key);
+        if (!saved || saved.dev !== entry.dev || saved.ino !== entry.ino || saved.attributes !== entry.attributes) throw new Error("Windows 回收续做发现未登记或换入实体，保留现场");
+      }
+      manifest.push(entry);
+      if ((info.attributes & FILE_ATTRIBUTE_DIRECTORY) && !(info.attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        for (const child of (await readdir(itemPath)).sort()) await visit(handle, child, join(itemPath, child), key ? key + "/" + child : child, depth + 1);
+      }
+      selected.push(handle);
+    };
+    await visit(parent, basename(path), path, "", 0);
+    await authorize(manifest);
+    for (const handle of selected) { removeOnClose(handle); handle.close(); }
+  } finally { await resources.closeAll(handles); }
 }
 
 function existingWindowsEntry(parent: WindowsHandle, name: string, path: string, remove: boolean): WindowsHandle | undefined {
@@ -539,7 +589,8 @@ async function emptyWindowsDirectory(directory: WindowsHandle, path: string): Pr
 
 async function removeWindowsDirectories(root: WindowsHandle, path: string, policy: RemovalPolicy): Promise<DirectoryRemoval[]> {
   const removed: DirectoryRemoval[] = [];
-  for (const name of (await readdir(path)).sort()) {
+  for (const name of policy.candidates ?? (await readdir(path)).sort()) {
+    if (!name || name === "." || name === ".." || /[\\/:\0]/.test(name)) throw new Error("Invalid removal candidate");
     if (!policy.select(name)) continue;
     const childPath = join(path, name), child = existingWindowsEntry(root, name, childPath, true);
     if (child === undefined) continue;

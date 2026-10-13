@@ -3,8 +3,9 @@
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/candidate-image.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/service-user.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/task-runtime.sh"
 # 服务商、选型和动态目录缓存一起恢复，保证回滚后的实例仍能离线解析出原模型。
-DEPLOY_FILES=(data/config data/runtime/pi/settings.json data/runtime/models-store.json data/state/bot-port data/state/deploy-mode data/state/bot-domain data/state/group-data-root)
+DEPLOY_FILES=(data/config data/runtime/pi/settings.json data/runtime/models-store.json data/state/bot-port data/state/deploy-mode data/state/bot-domain data/state/group-data-root data/state/task-runtime)
 
 # archive_project_path is shared with ops and tunnel scripts.
 

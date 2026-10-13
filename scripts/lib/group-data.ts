@@ -1,6 +1,7 @@
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { groupSegment, isPathInside } from "../../src/agent/paths.ts";
+import { groupSegment } from "../../src/agent/paths.ts";
+import { isPathInside } from "../../src/contracts/paths.ts";
 
 export type GroupSelection = "auto" | "id" | "segment";
 class UnsafeDataDirectoryError extends Error {}

@@ -833,7 +833,6 @@ class SlideBuilder:
 
     def add_text_block(self, slide, lines, left, top, width, height):
         """Fill a region with paragraphs; returns the lines that did not fit."""
-        from pptx.util import Pt
         self.text_width_pt = width / EMU_PER_PT - 14
         size = 18
         while size > 14 and self.estimate_height(lines, size) > height:

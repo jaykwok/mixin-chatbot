@@ -3,10 +3,10 @@ import { join } from "node:path";
 import {
   groupSegment,
   groupWorkspaceDir,
-  isPathInside,
   userSegment,
   userTempDir,
 } from "../../src/agent/paths.ts";
+import { isPathInside } from "../../src/contracts/paths.ts";
 
 describe("group-first agent paths", () => {
   test("uses readable safe group ids", () => {

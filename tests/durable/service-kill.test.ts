@@ -153,10 +153,9 @@ test("a service killed while the answer streams: after restart the run resumes w
   const session = createSession(storage);
   try {
     const conversationId = (await session.snapshot(MemberDirectory, ALICE, context))!.conversationId as ConversationId;
-    // Both processes committed a start before their request: the killed one's is on record.
+    // Both starts are now accounted above (one interrupted, one successful) and can be retired.
     const starts = Object.values((await session.snapshot(AttemptsDoc, conversationId, context))?.starts ?? {});
-    expect(starts.map(({ attempt, k, kind, withdrawn }) => ({ attempt, k, kind, withdrawn }))
-      .sort((a, b) => a.k - b.k)).toEqual([{ attempt: 1, k: 1, kind: undefined, withdrawn: undefined }, { attempt: 1, k: 2, kind: undefined, withdrawn: undefined }]);
+    expect(starts).toEqual([]);
     expect((await session.snapshot(InboxDoc, conversationId, context))?.items).toEqual([]);
     // The partial answer stays in the conversation, marked aborted, before the recovered answer.
     const entries = (await storage.scanEntries({ conversationId }, 100, undefined, context)).items

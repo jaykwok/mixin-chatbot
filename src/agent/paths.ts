@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isAbsolute, join, relative } from "node:path";
+import { join } from "node:path";
 /** The AgentSession engine's history of a member (`<group>/users/<member>/session.jsonl`); kept in place since data version 3. */
 export const SESSION_FILE = "session.jsonl";
 
@@ -61,15 +61,4 @@ export function groupVenvDir(root: string, groupId: string): string {
 /** Per-user scratch directory inside a group. */
 export function userTempDir(root: string, groupId: string, phone: string): string {
   return join(root, groupSegment(groupId), "users", userSegment(phone), "tmp");
-}
-
-/** True when path is root itself or one of its descendants. Both paths should be canonical. */
-export function isPathInside(path: string, root: string): boolean {
-  const fromRoot = relative(root, path);
-  return !(
-    fromRoot === ".." ||
-    fromRoot.startsWith(`..\\`) ||
-    fromRoot.startsWith("../") ||
-    isAbsolute(fromRoot)
-  );
 }

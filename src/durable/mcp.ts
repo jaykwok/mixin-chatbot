@@ -7,7 +7,7 @@ import type { McpTools } from "../integrations/mcp.ts";
 import type { RequestDoor } from "./door.ts";
 import { resolveMember, type BaseToolsOptions, type MemberTool } from "./tools.ts";
 import { SubCallFiles, resultsDirName } from "./codemode/results.ts";
-import { ResultsDoc } from "./result-lifecycle.ts";
+import { resultRegistration } from "./results/ownership.ts";
 
 export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, door: RequestDoor): MemberTool[] {
   return manager.catalogue.map(entry => {
@@ -31,15 +31,10 @@ export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, doo
         call.signal.throwIfAborted();
         const content = toLlmContent(result);
         const directoryName = resultsDirName(call.api.taskId as number, `mcp-${call.callId}`);
-        const files = new SubCallFiles(places.tempDir, directoryName, () => call.api.commit(async tx => {
-          const doc = await tx.doc(ResultsDoc);
-          if (!doc.calls[directoryName]) {
-            if (Object.keys(doc.calls).length >= 4096) throw new Error("结果归属记录已达上限，请先清理");
-            doc.calls[directoryName] = { phone, createdAt: Date.now() };
-          }
-        }, call.context));
+        const files = new SubCallFiles(places.tempDir, directoryName, resultRegistration(call.api, call.context, phone, directoryName));
         try {
           let image = 0;
+          const text = content.filter(item => item.type === "text").map(item => item.text).join("\n");
           const imagePaths: string[] = [];
           for (const item of [...content]) if (item.type === "image") {
             if (++image > 4) throw new Error("MCP 返回图片超限");
@@ -47,11 +42,11 @@ export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, doo
             imagePaths.push(path);
             content.push({ type: "text", text: `Image saved to ${path}` });
           }
-          const text = content.filter(item => item.type === "text").map(item => item.text).join("\n");
           if (Buffer.byteLength(text) > 24000) {
             const path = await files.saveOutputText(JSON.stringify(result));
             const pictures = content.filter(item => item.type === "image");
-            content.splice(0, content.length, { type: "text", text: `${text.slice(0, 8000)}\n[Full MCP result saved to ${path}]\n${imagePaths.map(path => `Image saved to ${path}`).join("\n")}` }, ...pictures);
+            const preview = text.slice(0, 8000).replace(/[\ud800-\udbff]$/, "");
+            content.splice(0, content.length, { type: "text", text: `${preview}\n[Full MCP result saved to ${path}]\n${imagePaths.map(path => `Image saved to ${path}`).join("\n")}` }, ...pictures);
           }
           if ((await files.recheck()).size) throw new Error("MCP 结果目录变化，结果路径已撤回");
           return { content, details: { server: entry.server.name, tool: entry.tool.name },

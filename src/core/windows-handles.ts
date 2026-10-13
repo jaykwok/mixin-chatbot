@@ -10,7 +10,7 @@ export type HandleEvent = {
   success?: boolean; win32?: number; ntstatus?: number;
 };
 
-const WIN32_CODES: Record<number, string> = {
+export const WIN32_CODES: Readonly<Record<number, string>> = {
   2: "ENOENT", 3: "ENOENT", 5: "EPERM", 6: "EBADF", 32: "EBUSY", 33: "EBUSY", 80: "EEXIST", 112: "ENOSPC",
   145: "ENOTEMPTY", 183: "EEXIST", 267: "ENOTDIR", 1921: "ELOOP",
 };

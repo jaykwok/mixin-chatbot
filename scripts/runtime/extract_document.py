@@ -1,9 +1,10 @@
-"""Bounded text extraction. Outputs UTF-8 text and a small JSON result on stdout."""
+"""Bounded text extraction. The optional report file is independent of diagnostic streams."""
 import json
 import sys
 import zipfile
 
-source, extension, destination, limit_text = sys.argv[1:]
+source, extension, destination, limit_text = sys.argv[1:5]
+report = sys.argv[5] if len(sys.argv) > 5 else None
 limit = int(limit_text)
 units = 0
 truncated = False
@@ -99,4 +100,9 @@ with open(destination, "w", encoding="utf-8", newline="\n") as output:
     except LimitReached:
         truncated = True
 
-print(json.dumps({"units": units, "truncated": truncated, "characters": written}, ensure_ascii=False))
+metadata = {"units": units, "truncated": truncated, "characters": written}
+if report:
+    with open(report, "x", encoding="utf-8") as result:
+        json.dump(metadata, result, ensure_ascii=False)
+else:
+    print(json.dumps(metadata, ensure_ascii=False))

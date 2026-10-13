@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "id": "33333333-3333-4333-8333-333333333333",
+  "root": "<ROOT0>/groups",
+  "recordedRoot": "<ROOT0>/groups",
+  "rootIdentity": "<string>",
+  "legacy": false,
+  "createdAt": "<number>",
+  "before": "<number>",
+  "items": [
+    {
+      "group": "group-a",
+      "user": "alice",
+      "path": "<ROOT0>/groups/group-a/users/alice/tmp/codemode/1-result",
+      "result": "1-result",
+      "owner": {
+        "phone": "alice",
+        "createdAt": "<number>"
+      },
+      "token": "[\"1-result\",\"alice\",1]",
+      "status": "deferred",
+      "reason": "旧共享目录需要宿主特权离线回收",
+      "evidence": {
+        "dev": "<string>",
+        "ino": "<string>",
+        "uid": "<number>",
+        "fingerprint": "<HEX64>",
+        "bytes": 6,
+        "files": 1,
+        "newest": "<number>"
+      }
+    }
+  ],
+  "digest": "<HEX64>"
+}

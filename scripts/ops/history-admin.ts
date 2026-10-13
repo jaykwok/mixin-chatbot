@@ -1,4 +1,5 @@
 import { describeAge } from "../lib/age.ts";
+import { redactSecrets } from "../lib/redact.ts";
 // 查看各群会话占用；停机后清空指定群：在群库里为每位成员登记 /clear（机器人下次启动时先执行），
 // 并把升级前的旧会话文件归档到 backup/rm。未交付记录独立保留；目录遍历使用实际存储段并拒绝链接。
 import { lstat } from "node:fs/promises";
@@ -200,5 +201,8 @@ async function main(args: string[]): Promise<number> {
 
 // 直接运行时才执行；测试要 import 这些函数，不能顺带把整个 CLI 跑起来。
 if (import.meta.main) {
-  process.exit(await main(process.argv.slice(2)));
+  process.exit(await main(process.argv.slice(2)).catch(error => {
+    console.error(redactSecrets(error instanceof Error ? error.message : String(error)));
+    return 1;
+  }));
 }

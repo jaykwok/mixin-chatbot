@@ -78,11 +78,11 @@ export interface GroupHarnessesOptions {
   /** Options for each Harness opened (a fresh registry and models view per Harness), for the group it serves. */
   harnessOptions: (groupId: string) => HarnessOptions | Promise<HarnessOptions>;
   /**
-   * Runs after the group is claimed and before anyone gets the Harness (the startup gate, D3); a throw closes it. Its
+   * Runs after the group is claimed and before anyone gets the Harness; a throw closes it. Its
    * context is cancelled by `closeAll()`, which closes the Harness without waiting for the callback (see there).
    */
   prepare?: (harness: Harness, groupId: string, context: Context) => Promise<void>;
-  /** Durable work of the application that Harness inspection does not show (admissions, outbox; D3). Context as `prepare`. */
+  /** Durable work that Harness inspection does not show (admissions, outbox). Context as `prepare`. */
   pendingWork?: (harness: Harness, groupId: string, context: Context) => Promise<boolean>;
   /** Idle groups without work kept open; default 16. */
   maxIdle?: number;
@@ -124,6 +124,7 @@ export class GroupHarnesses {
   readonly #cleanup: Context;
   readonly #maxIdle: number;
   readonly #entries = new Map<string, Entry>();
+  readonly #known = new Set<string>();
   readonly #connections = new Set<Connection>();
   #stopped: Error | undefined;
   #uses = 0;
@@ -144,6 +145,9 @@ export class GroupHarnesses {
   get openGroups(): string[] {
     return [...this.#entries.keys()].sort();
   }
+
+  /** Validated identities survive connection eviction, so cold groups still receive maintenance. */
+  get knownGroups(): string[] { return [...this.#known].sort(); }
 
   /** The group's Harness, opened (paused) and claimed on first use. Release the handle when done. */
   async acquire(groupId: string): Promise<GroupHandle> {
@@ -342,6 +346,7 @@ export class GroupHarnesses {
       }
       const harness = await this.#openHarness(connection, groupId);
       if (recorded === undefined) await claimGroup(harness, groupId, this.#context);
+      this.#known.add(groupId);
       await this.#options.prepare?.(harness, groupId, this.#context);
       this.#assertOpen(connection);
       return harness;
@@ -361,6 +366,7 @@ export class GroupHarnesses {
       groupId = await this.#recordedGroup(connection, storage);
       if (groupId !== undefined) {
         if (groupSegment(groupId) !== segment) throw new Error(`群数据库登记的群与所在目录不符，已拒绝：${path}`);
+        this.#known.add(groupId);
         const harness = await this.#openHarness(connection, groupId);
         if (await this.#hasWork(harness, groupId)) {
           this.#assertOpen(connection);
@@ -418,7 +424,9 @@ export class GroupHarnesses {
         } finally { await this.#discard(check); }
         if (work && !this.#stopped) {
           this.#entries.delete(entry.groupId);
-          this.#openEntry(entry.groupId).lastUsed = ++this.#uses;
+          const reopened = this.#openEntry(entry.groupId);
+          reopened.lastUsed = ++this.#uses;
+          await reopened.opening;
         }
       } catch (error) {
         if (error !== this.#stopped) this.#options.onReport?.(error);

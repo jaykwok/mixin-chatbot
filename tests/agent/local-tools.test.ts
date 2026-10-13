@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises"
 import { isAbsolute, join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { buildLocalTools } from "../../src/agent/local-tools.ts";
-import { isPathInside } from "../../src/agent/paths.ts";
+import { isPathInside } from "../../src/contracts/paths.ts";
 import { venvPythonPath } from "../../src/agent/python-toolchain.ts";
 
 /** venv 与资料索引都住在 workspace 外面，和线上 <group>/ 下的布局保持一致。 */
@@ -123,7 +123,7 @@ describe("local Pi tool boundaries", () => {
     }
   });
 
-  test("bash receives Pi/caller metadata and relocates truncated output", async () => {
+  test("bash receives caller metadata without obsolete session fields and relocates truncated output", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-bash-"));
     const workspace = join(root, "workspace");
     const userTemp = join(root, "user-tmp");
@@ -156,7 +156,7 @@ describe("local Pi tool boundaries", () => {
       expect(envResult.content[0]).toMatchObject({ type: "text" });
       // 验证子进程实际收到的值，避免 Git Bash 启动时的 stderr 提示混入断言。
       expect(await readFile(join(userTemp, "caller-env.txt"), "utf8")).toBe(
-        `+8613800000000|${groupId}|session-test|${join(root, "session.jsonl")}|provider-test|model-test|off|${userTemp}|${userTemp}|${venvDirFor(root)}|${venvDirFor(root)}|${venvPythonPath(venvDirFor(root))}|${indexPathFor(root)}|utf-8|1|C.UTF-8|1|pi|true`
+        `+8613800000000|${groupId}||||||${userTemp}|${userTemp}|${venvDirFor(root)}|${venvDirFor(root)}|${venvPythonPath(venvDirFor(root))}|${indexPathFor(root)}|utf-8|1|C.UTF-8|1|pi|true`
       );
       expect(isPathInside(venvDirFor(root), workspace)).toBe(false);
       expect(isPathInside(indexPathFor(root), workspace)).toBe(false);

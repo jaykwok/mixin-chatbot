@@ -4,6 +4,7 @@ import { tempFixture } from "../helpers/temp.ts";
 const cases = [
   { kind: "document", script: new URL("../helpers/document-cache-harness.ts", import.meta.url) },
   { kind: "readiness", script: new URL("../helpers/readiness-cache-harness.ts", import.meta.url) },
+  { kind: "isolated", script: new URL("../helpers/document-isolated-cache.ts", import.meta.url) },
 ];
 test.each(cases)("$kind cache invalidates changed inputs and coalesces cancellable work", async ({ kind, script }) => {
   const fixture = await tempFixture(kind + "-cache-");

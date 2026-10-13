@@ -1,166 +1,158 @@
+// User tmp inspection and offline maintenance. Plans preserve exact paths, identities and outcomes.
+import { join, resolve } from "node:path";
+import { formatSize } from "@earendil-works/pi-coding-agent";
 import { describeAge } from "../lib/age.ts";
 import { cliArgs, groupOptions, groupSelection } from "../lib/cli.ts";
-// 查看用户 tmp 占用，停机后将选中的内容归档到 backup/rm。
-// tmp 包含缓存、完整工具输出及生成的交付物，不能假设全部可以重建。
-// 目录边界由共享解析器验证；扫描和归档均不跟随目录链接。
-import { formatSize } from "@earendil-works/pi-coding-agent";
-import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
-import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
-import { assertDataDirectory, type GroupSelection } from "../lib/group-data.ts";
+import { type GroupSelection } from "../lib/group-data.ts";
 import { scanTmp, type UserTmp } from "../lib/tmp-scan.ts";
-import { lstat } from "node:fs/promises";
-import { join } from "node:path";
-
-const DAY = 24 * 60 * 60_000;
+import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
+import { STATE_DATABASE_PATH } from "../../src/core/storage.ts";
+import { withMaintenance } from "../../src/core/maintenance.ts";
+import { configuredRootlessTasks } from "../../src/core/task-backend.ts";
+import type { ArchiveRemovalPlan } from "../../src/contracts/maintenance.ts";
+import { durableMemberScope } from "../../src/durable/maintenance-view.ts";
+import { applyArchiveRemoval, applyTmpArchive, previewArchiveRemoval, previewTmpArchive } from "../../src/maintenance/archive.ts";
+import { applyReclamation, previewReclamation } from "../../src/maintenance/reclaim.ts";
 
 function usage(): void {
   console.log("用法：bun run tmp <命令>");
-  console.log("");
-  console.log("  list                     列出每个用户临时目录的占用（大的排在前面）");
-  console.log("  purge --days <天数>      只清理这些天内没有改动过的条目");
-  console.log("  purge --all              清空全部用户临时目录（等价于 --days 0）");
-  console.log("");
-  console.log("  list/purge 可加 --user <手机号> 和 --group <群号>，限定成员与群。");
-  console.log("  --group-id / --storage-segment 明确群参数是原始群号或存储目录段，两者互斥。");
-  console.log("  停机后将选中内容移入 backup/rm；tmp 目录、workspace 和会话历史保留。");
+  console.log("  list                         列出成员临时目录占用");
+  console.log("  preview --days <天数>|--all   保存可归档清单，核对全群上下文、待交付内容和可恢复任务");
+  console.log("  purge --plan <ID> --digest <摘要>  执行或继续原归档清单");
+  console.log("  purge --days <天数>|--all     预览后归档；运行时仍须停机并持有维护租约");
+  console.log("  reclaim --days <天数>|--all   预览物理回收清单");
+  console.log("  reclaim --plan <ID> --digest <摘要>  确认或继续物理回收");
+  console.log("  discard                      预览可永久删除的归档（以归档清单证明，内容须与归档时一致）");
+  console.log("  discard --plan <ID> --digest <摘要>  永久删除清单中的归档，释放磁盘空间");
+  console.log("  --user <成员> --group <群号> 可限定预览；--group-id / --storage-segment 明确群参数含义");
+  console.log("  预览只读取数据并保存清单，可在服务运行时进行；执行清单须停机并持有维护租约");
+  console.log("  归档保存在群根/.reclamation/backup/rm，用 discard 释放空间；--archive 可指定同挂载的 backup/rm");
+  console.log("  Linux 旧共享目录物理回收或删除归档目录需宿主维护身份显式传 --legacy --journal <私有事务目录> --recorded-root <原服务内群根>；不会自动 sudo");
 }
 
-
-/**
- * 扫描本身在 scripts/lib/tmp-scan.ts，宿主机上的运维界面直接调那一份。
- *
- * root 显式传入而不是直接用 GROUP_DATA_ROOT：那个常量在模块加载时就定死了，测试没法
- * 在导入之后再改环境变量，而这个命令删文件，必须能在真实目录树上测。
- */
-export async function collect(
-  userFilter?: string,
-  root: string = GROUP_DATA_ROOT,
-  groupFilter?: string,
-  selection: GroupSelection = "auto"
-): Promise<UserTmp[]> {
-  return scanTmp(root, userFilter, groupFilter, selection);
+export async function collect(user?: string, root = GROUP_DATA_ROOT, group?: string, selection: GroupSelection = "auto"): Promise<UserTmp[]> {
+  return scanTmp(root, user, group, selection);
 }
 
-async function list(userFilter?: string, groupFilter?: string, selection: GroupSelection = "auto"): Promise<number> {
-  const users = await collect(userFilter, GROUP_DATA_ROOT, groupFilter, selection);
-  if (users.length === 0) {
-    console.log(`没有找到任何用户临时目录（群数据总根：${GROUP_DATA_ROOT}）。`);
-    return 0;
+async function list(user?: string, group?: string, selection: GroupSelection = "auto"): Promise<number> {
+  const users = await collect(user, GROUP_DATA_ROOT, group, selection);
+  for (const member of users) {
+    console.log(`${member.user}（群 ${member.group}）：${formatSize(member.bytes)}，${member.files} 个文件，最后改动于 ${describeAge(member.newest)}`);
+    for (const entry of member.entries.slice(0, 3)) console.log(`  ${entry.name}  ${formatSize(entry.bytes)}（${describeAge(entry.newest)}）`);
+    if (member.entries.length > 3) console.log(`  …… 另有 ${member.entries.length - 3} 个条目`);
   }
-  let bytes = 0;
-  for (const user of users) {
-    bytes += user.bytes;
-    console.log(
-      `${user.user}（群 ${user.group}）：${formatSize(user.bytes)}，${user.files} 个文件，最后改动于 ${describeAge(user.newest)}`
-    );
-    // 只列最大的几个，一个 uv 缓存能有上千个条目，全打出来没人看得完。
-    for (const entry of user.entries.slice(0, 3)) {
-      console.log(`  ${entry.name}  ${formatSize(entry.bytes)}（${describeAge(entry.newest)}）`);
-    }
-    if (user.entries.length > 3) {
-      console.log(`  …… 另有 ${user.entries.length - 3} 个条目`);
-    }
-  }
-  console.log("");
-  console.log(`共 ${users.length} 个用户，合计 ${formatSize(bytes)}。`);
-  console.log("包含缓存、完整工具输出和用户生成的交付物；清理会移入 backup/rm，可按原路径恢复。");
+  console.log(`共 ${users.length} 个成员，合计 ${formatSize(users.reduce((sum, member) => sum + member.bytes, 0))}。`);
+  console.log("年龄只用于筛选候选；执行前还会核对持久引用、运行状态、内容和实体。");
   return 0;
 }
 
-export async function purge(
-  days: number,
-  userFilter?: string,
-  root: string = GROUP_DATA_ROOT,
-  groupFilter?: string,
-  selection: GroupSelection = "auto"
-): Promise<number> {
-  const cutoff = Date.now() - days * DAY;
-  const users = await collect(userFilter, root, groupFilter, selection);
-  if (users.length === 0) {
-    console.log(`没有找到任何用户临时目录（群数据总根：${root}）。`);
-    return 0;
-  }
+function options(root: string, archive?: string, legacy = false) {
+  return { root: resolve(root), state: resolve(STATE_DATABASE_PATH), archive: resolve(archive ?? join(root, ".reclamation/backup/rm")), scope: durableMemberScope, backend: legacy ? undefined : configuredRootlessTasks() };
+}
 
-  let freed = 0;
-  let removed = 0;
-  let keptEntries = 0;
-  let keptBytes = 0;
-  let failed = 0;
-  for (const user of users) {
-    const durable = await lstat(join(root, user.group, "durable.sqlite")).then(info => info.isFile(), error => {
-      if (error.code === "ENOENT") return false; throw error;
-    });
-    for (const entry of user.entries) {
-      // A stopped Durable database may still reference any tmp entry (including outbox attachments).
-      // Offline purge has no current-context/task view: keep it rather than guessing from timestamps.
-      if (durable) { keptEntries++; keptBytes += entry.bytes; continue; }
-      // 用整棵子树里最新的修改时间判断新旧，而不是目录自己的 mtime：目录 mtime 只反映
-      // 直接子项的增删，一个几分钟前还在往深处写文件的 .cache 看上去可能是几个月前的。
-      if (entry.newest > cutoff) {
-        keptEntries++;
-        keptBytes += entry.bytes;
-        continue;
-      }
-      try {
-        await assertDataDirectory(user.dir, root);
-        await archiveFile(entry.path);
-        freed += entry.bytes;
-        removed++;
-        console.log(`已移入 backup/rm：${entry.path}（${formatSize(entry.bytes)}）`);
-      } catch (error) {
-        failed++;
-        console.error(`归档失败 ${entry.path}：${String(error)}`);
-      }
-    }
+function reportPlan(plan: { id: string; digest: string; items: { status: string; source?: string; path?: string; reason?: string; evidence?: { bytes: number } }[] }): void {
+  for (const item of plan.items) console.log(`[${item.status}] ${item.source ?? item.path}（${formatSize(item.evidence?.bytes ?? 0)}）${item.reason ? "：" + item.reason : ""}`);
+  for (const status of ["ready", "kept", "deferred"]) {
+    const items = plan.items.filter(item => item.status === status);
+    console.log(`${status}：${items.length} 项、${formatSize(items.reduce((sum, item) => sum + (item.evidence?.bytes ?? 0), 0))}`);
   }
+  console.log(`清单：${plan.id}\n摘要：${plan.digest}`);
+}
 
-  console.log("");
-  if (removed === 0 && failed === 0) {
-    console.log(`没有符合条件的条目（${days} 天内改动过的都保留了）。`);
-  } else {
-    console.log(`已归档 ${removed} 个条目、${formatSize(freed)} 到 backup/rm（尚未释放磁盘空间）。`);
+const LABELS = { archived: "已归档", removed: "已物理回收", discarded: "已永久删除归档" } as const;
+const ARCHIVED_NOTE = "归档尚未释放磁盘空间；原路径、目标路径和每项结果保存在清单中。用 discard 预览并确认后永久删除归档。";
+const MESSAGES = {
+  oneCommand: "只能指定一个命令",
+  allAndDays: "--all 和 --days 不能同时使用",
+  days: "--days 需要一个不小于 0 的天数",
+  confirmScope: "执行清单只接受 --plan 和 --digest，不重新选择范围",
+  discardScope: "discard 按已完成的归档清单处理，不接受 --days/--all/--user/--group",
+  previewScope: "预览需要 --days <天数> 或 --all；执行原清单需要 --plan 和 --digest",
+  previewOnly: "preview 不执行清单",
+  legacyOnly: "--legacy/--journal 只用于物理回收或删除归档",
+  recordedOnly: "--recorded-root 只用于旧共享目录的宿主维护",
+  recordedRoot: "旧共享目录回收必须用 --recorded-root 指定原服务看到的绝对群根，以核对容器路径引用",
+  journal: "旧共享目录回收必须指定宿主私有 --journal",
+  reclaimNext: (id: string, digest: string) => `核对清单后，使用 reclaim --plan ${id} --digest ${digest}（保留本次 --legacy/--journal/--recorded-root 参数）。`,
+  discardNext: (id: string, digest: string) => `删除不可撤销。核对清单后，使用 discard --plan ${id} --digest ${digest} 永久删除（保留本次 --legacy/--journal/--recorded-root 参数）。`,
+};
+
+/** Totals of the whole list (every run so far), so printing it again never means more was freed. */
+function reportProgress(progress: { outcomes: Record<string, { status: string; bytes: number; reason?: string; finishing?: true }> }, done: "archived" | "removed" | "discarded"): number {
+  const outcomes = Object.entries(progress.outcomes);
+  for (const [index, outcome] of outcomes) if (outcome.reason) console.log(`清单项 ${Number(index) + 1}：${outcome.finishing ? "收尾" : outcome.status}；${outcome.reason}`);
+  const finished = outcomes.filter(([, item]) => item.status === (done === "archived" ? "archived" : "removed") && !item.finishing);
+  const count = (status: string) => outcomes.filter(([, item]) => item.status === status).length;
+  const deferred = count("deferred"), failed = count("failed"), missing = count("missing"), finishing = outcomes.filter(([, item]) => item.finishing).length;
+  console.log(`本清单累计${LABELS[done]} ${finished.length} 项、${formatSize(finished.reduce((sum, [, item]) => sum + item.bytes, 0))}${finishing ? `；收尾 ${finishing} 项（此前已删除，不计入）` : ""}；保留 ${count("kept")} 项，待处置 ${deferred} 项，失败 ${failed} 项${missing ? `，已不存在 ${missing} 项` : ""}。`);
+  if (done === "archived") console.log(ARCHIVED_NOTE);
+  return deferred || failed ? 1 : 0;
+}
+
+function reportRemoval(plan: ArchiveRemovalPlan): void {
+  for (const item of plan.items) console.log(`[${item.status}] ${item.destination}（${formatSize(item.evidence.bytes)}）${item.reason ? "：" + item.reason : ""}`);
+  for (const skipped of plan.skipped) console.log(`[skipped] 归档清单 ${skipped.plan}：${skipped.reason}`);
+  for (const status of ["ready", "kept", "deferred"]) {
+    const items = plan.items.filter(item => item.status === status);
+    console.log(`${status}：${items.length} 项、${formatSize(items.reduce((sum, item) => sum + item.evidence.bytes, 0))}`);
   }
-  if (keptEntries > 0) {
-    console.log(`保留 ${keptEntries} 个条目（${formatSize(keptBytes)}）：近期改动，或所属 Durable 群库可能仍有持久引用。`);
-  }
-  if (failed > 0) {
-    console.log(`${failed} 个条目归档失败；检查文件占用及目录权限后重试。`);
-    return 1;
-  }
-  return 0;
+  console.log(`清单：${plan.id}\n摘要：${plan.digest}`);
+}
+
+/** Caller holds maintenance leases. This compatibility entry also uses the saved exact plan. */
+export async function purge(days: number, user?: string, root = GROUP_DATA_ROOT, group?: string, selection: GroupSelection = "auto", archive?: string, planId?: string): Promise<number> {
+  const input = options(root, archive), plan = await previewTmpArchive(input, days, user, group, selection, planId);
+  reportPlan(plan);
+  return reportProgress(await applyTmpArchive(input, plan.id, plan.digest), "archived");
 }
 
 async function main(args: string[]): Promise<number> {
-  const { values, positionals } = cliArgs(args, { ...groupOptions, all: { type: "boolean" }, days: { type: "string" }, user: { type: "string" }, group: { type: "string" } });
-  if (positionals.length > 1) throw new Error("只能指定一个命令");
-  const command = positionals[0], userFilter = values.user, groupFilter = values.group;
-  const selection = groupSelection(values, groupFilter);
-  if (values.all && values.days !== undefined) throw new Error("--all 和 --days 不能同时使用");
+  const { values, positionals } = cliArgs(args, { ...groupOptions, all: { type: "boolean" }, days: { type: "string" },
+    user: { type: "string" }, group: { type: "string" }, plan: { type: "string" }, digest: { type: "string" },
+    archive: { type: "string" }, journal: { type: "string" }, legacy: { type: "boolean" }, "recorded-root": { type: "string" } });
+  if (positionals.length > 1) throw new Error(MESSAGES.oneCommand);
+  const command = positionals[0], selection = groupSelection(values, values.group);
+  if (values.all && values.days !== undefined) throw new Error(MESSAGES.allAndDays);
   const days = values.all ? 0 : values.days === undefined ? undefined : Number(values.days);
-  if (days !== undefined && (!Number.isFinite(days) || days < 0)) throw new Error("--days 需要一个不小于 0 的天数");
-
-  switch (command) {
-    case "list":
-    case "ls":
-      return list(userFilter, groupFilter, selection);
-    case "purge":
-      // 跟 relay purge 一样，范围必须显式给出：一条不带参数的 purge 太容易在手滑时
-      // 把某个正在跑的任务的中间产物一起端掉。
-      if (days === undefined) {
-        console.error("purge 需要 --days <天数>，或用 --all 表示不看时间全部清理。");
-        return 1;
-      }
-      if (days === 0) {
-        console.log("准备将所选范围的全部临时内容移入回收区；运行中的机器人会阻止本操作。");
-      }
-      return withMaintenance(() => purge(days, userFilter, GROUP_DATA_ROOT, groupFilter, selection), GROUP_DATA_ROOT);
-    default:
-      usage();
-      return command ? 1 : 0;
+  if (days !== undefined && (!Number.isFinite(days) || days < 0)) throw new Error(MESSAGES.days);
+  if (command === "list" || command === "ls") return list(values.user, values.group, selection);
+  if (!["preview", "purge", "reclaim", "discard"].includes(command ?? "")) { usage(); return command ? 1 : 0; }
+  const confirming = values.digest !== undefined;
+  if (confirming && (!values.plan || days !== undefined || values.group || values.user)) throw new Error(MESSAGES.confirmScope);
+  if (command === "discard" && (days !== undefined || values.group || values.user)) throw new Error(MESSAGES.discardScope);
+  if (command !== "discard" && !confirming && days === undefined) throw new Error(MESSAGES.previewScope);
+  if (command === "preview" && confirming) throw new Error(MESSAGES.previewOnly);
+  if (!["reclaim", "discard"].includes(command!) && (values.legacy || values.journal)) throw new Error(MESSAGES.legacyOnly);
+  if (values["recorded-root"] && !values.legacy) throw new Error(MESSAGES.recordedOnly);
+  if (values.legacy && (!values["recorded-root"] || !values["recorded-root"].startsWith("/") || resolve(values["recorded-root"]) !== values["recorded-root"])) {
+    throw new Error(MESSAGES.recordedRoot);
   }
+  if (values.legacy && !values.journal) throw new Error(MESSAGES.journal);
+  const run = async () => {
+    const input = options(GROUP_DATA_ROOT, values.archive, values.legacy);
+    if (command === "reclaim") {
+      const reclaim = { root: input.root, state: input.state, scope: input.scope, directory: resolve(values.journal ?? join(GROUP_DATA_ROOT, ".reclamation/plans")),
+        backend: values.legacy ? undefined : input.backend, legacy: values.legacy, recordedRoot: values["recorded-root"] };
+      if (confirming) return reportProgress(await applyReclamation(reclaim, values.plan!, values.digest!), "removed");
+      const plan = await previewReclamation(reclaim, days!, values.user, values.group, selection, values.plan); reportPlan(plan);
+      console.log(MESSAGES.reclaimNext(plan.id, plan.digest));
+      return 0;
+    }
+    if (command === "discard") {
+      const discard = { ...input, legacy: values.legacy, ...(values.journal ? { journal: resolve(values.journal) } : {}),
+        ...(values["recorded-root"] ? { recordedRoot: values["recorded-root"] } : {}) };
+      if (confirming) return reportProgress(await applyArchiveRemoval(discard, values.plan!, values.digest!), "discarded");
+      const plan = await previewArchiveRemoval(discard, values.plan); reportRemoval(plan);
+      console.log(MESSAGES.discardNext(plan.id, plan.digest));
+      return 0;
+    }
+    if (confirming) return reportProgress(await applyTmpArchive(input, values.plan!, values.digest!), "archived");
+    if (command === "purge") return purge(days!, values.user, GROUP_DATA_ROOT, values.group, selection, values.archive, values.plan);
+    const plan = await previewTmpArchive(input, days!, values.user, values.group, selection, values.plan); reportPlan(plan);
+    return 0;
+  };
+  // Previews only read and save their plan, so they run beside the service; every confirmation rechecks under the lease.
+  return confirming || command === "purge" ? withMaintenance(run, GROUP_DATA_ROOT) : run();
 }
 
-// 直接运行时才执行；测试要 import 这些函数，不能顺带把整个 CLI 跑起来。
-if (import.meta.main) {
-  process.exit(await main(process.argv.slice(2)).catch(error => { console.error((error as Error).message); return 1; }));
-}
+if (import.meta.main) process.exit(await main(process.argv.slice(2)).catch(error => { console.error((error as Error).message); return 1; }));

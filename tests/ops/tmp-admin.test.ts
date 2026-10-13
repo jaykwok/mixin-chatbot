@@ -1,6 +1,5 @@
 import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
-// 这个命令会递归删除文件，而它要删的目录就紧挨着 workspace 和 session.jsonl，
-// 所以边界必须有测试盯着：删对了什么、更重要的是没碰什么。
+// 归档使用同挂载的原子移动，保护紧邻 tmp 的 workspace 和历史。
 import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, stat, utimes, writeFile } from "node:fs/promises";
 
@@ -29,7 +28,7 @@ async function exists(path: string): Promise<boolean> {
 }
 
 describe("用户临时目录清理", () => {
-  test("Durable tmp is retained even by --all, because stopped tasks/history/outbox can still reference it", async () => {
+  test("an unreadable Durable ledger fails closed and reports incomplete maintenance", async () => {
     const scoped = await mkdtemp(join(tmpdir(), "tmp-durable-protected-"));
     const temp = join(scoped, "g1/users/u1/tmp");
     try {
@@ -37,7 +36,7 @@ describe("用户临时目录清理", () => {
       await writeFile(join(temp, "codemode/1-call/output.txt"), "persistent reference");
       await writeFile(join(scoped, "g1/durable.sqlite"), "database belongs to this group");
       await age(join(temp, "codemode/1-call/output.txt"), 30);
-      expect(await purge(0, undefined, scoped)).toBe(0);
+      expect(await purge(0, undefined, scoped)).toBe(1);
       expect(await exists(join(temp, "codemode/1-call/output.txt"))).toBe(true);
     } finally { await rm(scoped, { recursive: true, force: true }); }
   });

@@ -18,12 +18,14 @@ import { sendFile, sendImage, uploadAttachment } from "../integrations/im.ts";
 import { describeRelayExpiry, relayFile, relayReference, type RelayConfig } from "../integrations/relay.ts";
 import type { DeliveryAttachment } from "./delivery-store.ts";
 import type { RelayIndex } from "../integrations/relay-index.ts";
-import { isPathInside } from "./paths.ts";
+import { isPathInside } from "../contracts/paths.ts";
 import { resolveToolPath } from "./tool-path.ts";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
 import { application } from "../core/lifecycle.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
+import { assertTaskPathAllowed, configuredRootlessTasks } from "../core/task-backend.ts";
+import { downloadPublicBytes } from "../core/public-download.ts";
 
 const attachmentSlots = new AsyncSemaphore(Number(runtimeSetting("BOT_ATTACHMENT_CONCURRENCY") ?? RUNTIME_DEFAULTS.BOT_ATTACHMENT_CONCURRENCY));
 
@@ -60,6 +62,7 @@ async function resolveSource(
   ]);
   const requestedPath = resolveToolPath(source, roots[0]!);
   const path = await realpath(requestedPath);
+  await assertTaskPathAllowed(path);
   if (!roots.some((root) => isPathInside(path, root))) {
     throw new Error("只能发送本群 workspace 或当前调用用户 tmp 目录内的文件");
   }
@@ -83,6 +86,10 @@ async function fetchRemoteBytes(
   url: string,
   signal?: AbortSignal
 ): Promise<Uint8Array> {
+  if (configuredRootlessTasks()) {
+    const budget = AbortSignal.any([AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT), ...(signal ? [signal] : [])]);
+    return downloadPublicBytes(url, MAX_ATTACHMENT_BYTES, budget);
+  }
   const r = await fetch(url, {
     signal: signal
       ? AbortSignal.any([signal, AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT)])
@@ -189,28 +196,6 @@ export interface OutboundNotes {
   references(): DeliveryAttachment[];
   /** 重置本轮内存附注；未交付内容独立保存在 DeliveryStore。 */
   clear(): void;
-}
-
-/**
- * In-memory notes of one run.
- * @internal The Durable service keeps its notes in the run's outbox row (src/durable/service.ts); tests use this one.
- */
-export function createOutboundNotes(onAdd?: (note: string, attachment?: DeliveryAttachment) => void): OutboundNotes {
-  let notes: string[] = [];
-  let attachments: DeliveryAttachment[] = [];
-  return {
-    add: (note, attachment) => {
-      onAdd?.(note, attachment);
-      notes.push(note);
-      if (attachment) attachments.push(attachment);
-    },
-    peek: () => [...notes],
-    references: () => [...attachments],
-    clear: () => {
-      notes = [];
-      attachments = [];
-    },
-  };
 }
 
 export interface SendToolsOptions {

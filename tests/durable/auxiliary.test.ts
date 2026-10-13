@@ -13,11 +13,12 @@ import { removeCodemodeResults } from "../../src/durable/codemode/results.ts";
 import { claimGroup, memberConversation } from "../../src/durable/identity.ts";
 import { groupDoor } from "../../src/durable/models.ts";
 import { projectConversation } from "../../src/durable/projection.ts";
-import { ResultsDoc } from "../../src/durable/result-lifecycle.ts";
+import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { memberPlaces, memberRegistration } from "../../src/durable/tools.ts";
 import { fauxModels } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { handoffFullResults, stubResultsBackend } from "../helpers/results-backend.ts";
 
 const f = await tempFixture("durable-auxiliary-");
 afterAll(() => f.cleanup());
@@ -70,14 +71,16 @@ async function invoke(g: Awaited<ReturnType<typeof setup>>, conversation: Conver
 }
 async function receipts(g: Awaited<ReturnType<typeof setup>>) { return Object.values((await g.harness.snapshot(AuxiliaryDoc, g.conversation.id, context))?.starts ?? {}); }
 
-test("native auxiliary retries have independent starts, confirmed fees count once, images belong to the caller", async () => {
+test.each(process.platform === "linux" ? [false, true] : [false])("native auxiliary retries keep fees and owned images (isolated=%s)", async isolated => {
   let calls = 0;
   const g = await setup({ retry: 1, classify: async request => {
     expect(request.apiKey).toBe("fixture-secret"); expect(request.headers).toMatchObject({ "x-fixture": "private" });
     return ++calls === 1 ? result({ stopReason: "error", errorMessage: "server_busy", usage: undefined }) : result();
   } });
   const ledger = openStatsLedger(g.root);
+  const runtime = isolated ? stubResultsBackend(join(f.root, `control-${n}`)) : undefined;
   try {
+    if (isolated) await handoffFullResults(g.harness);
     const classified = await invoke(g, g.conversation, "document_route", { text: "scanned page", images: [{ type: "image", data: PNG, mimeType: "image/png" }] });
     expect(classified.isError).toBe(false); expect(JSON.parse((classified.content[0] as { text: string }).text)).toMatchObject({ route: "ocr" }); expect(classified.usage).toBeUndefined();
     expect(g.state.classifications).toBe(2); expect(g.state.maxRetries).toBe(0);
@@ -89,7 +92,7 @@ test("native auxiliary retries have independent starts, confirmed fees count onc
     const imagePath = (path as { text: string }).text.slice("Image saved to ".length);
     expect(await readFile(imagePath)).toEqual(Buffer.from(PNG, "base64"));
     expect(imagePath.startsWith(memberPlaces(g.members, g.members.groupId, "alice").tempDir)).toBe(true);
-    expect(Object.values((await g.harness.snapshot(ResultsDoc, context))!.calls)).toMatchObject([{ phone: "alice" }]);
+    expect(Object.values((await g.harness.snapshot(ResultsDoc, context))!.calls).filter(call => call.phone === "alice")).toMatchObject([{ phone: "alice" }]);
     const starts = await receipts(g); expect(starts).toHaveLength(3); expect(starts.filter(start => start.usage)).toHaveLength(2);
     const member = { groupId: "group-a", phone: "alice", conversationId: g.conversation.id };
     await projectConversation(ledger, g.harness, member, context); await projectConversation(ledger, g.harness, member, context);
@@ -97,12 +100,19 @@ test("native auxiliary retries have independent starts, confirmed fees count onc
     expect(billed.reduce((sum, row) => sum + row.requests, 0)).toBe(3);
     expect(billed.reduce((sum, row) => sum + row.missingUsage, 0)).toBe(1);
     expect(billed.reduce((sum, row) => sum + row.cost, 0)).toBeCloseTo(.04);
-    const names = Object.keys((await g.harness.snapshot(ResultsDoc, context))!.calls);
-    expect(await removeCodemodeResults(memberPlaces(g.members, g.members.groupId, "alice").tempDir, Infinity, {
-      registered: new Set(names), protected: new Set(), expire: async () => {},
-    })).toEqual(process.platform === "linux" ? [] : names);
+    const calls = (await g.harness.snapshot(ResultsDoc, context))!.calls, names = Object.keys(calls).filter(name => calls[name]!.phone === "alice");
+    const mapping = new Map(names.flatMap(name => calls[name]!.isolatedTask ? [[name, calls[name]!.isolatedTask!] as const] : []));
+    if (isolated) expect(mapping.size).toBe(1);
+    const tempDir = memberPlaces(g.members, g.members.groupId, "alice").tempDir;
+    const policy = { registered: new Set(names), protected: new Set(names), isolated: mapping, expire: async () => {} };
+    expect(await removeCodemodeResults(tempDir, Infinity, policy)).toEqual([]);
+    expect(await readFile(imagePath)).toEqual(Buffer.from(PNG, "base64"));
+    policy.protected.clear();
+    expect(await removeCodemodeResults(tempDir, Infinity, policy)).toEqual(process.platform === "linux" && !isolated ? [] : names);
+    if (runtime) for (const id of mapping.values()) expect((await runtime.backend.describe(id, tempDir)).phase).toBe("removed");
+    if (isolated) expect((await g.harness.snapshot(ResultsDoc, context))!.calls["999999-protected"]!.phone).toBe("protected-member");
     expect(g.reports).toEqual([]);
-  } finally { ledger.close(); await g.close(); }
+  } finally { runtime?.restore(); ledger.close(); await g.close(); }
 }, 15000);
 
 test.each(["credentials", "image-capability"])("auxiliary setup failure (%s) sends no provider request and no start", async failure => {

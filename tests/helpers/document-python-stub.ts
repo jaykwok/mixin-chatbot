@@ -146,10 +146,11 @@ export async function stubDocumentPython(options: { delayMs?: number } = {}): Pr
       });
       if (kind === "extract") {
         calls.push("extract");
-        const [snapshot, , output, limit] = rest;
+        const [snapshot, , output, limit, report] = rest;
         const text = await readFile(snapshot!, "utf8");
         await writeFile(output!, text);
-        return { exitCode: 0, output: JSON.stringify({ units: 2, truncated: Number(limit) <= 1000, characters: text.length }) };
+        await writeFile(report!, JSON.stringify({ units: 2, truncated: Number(limit) <= 1000, characters: text.length }));
+        return { exitCode: 0, output: "UserWarning: recovered document\n" };
       }
       const [operation, , report] = rest;
       calls.push(operation!);

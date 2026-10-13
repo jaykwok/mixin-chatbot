@@ -6,6 +6,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { type ConversationId, createSession, defineExtension } from "@earendil-works/pi-durable";
 import { DeliveryStore } from "../../src/agent/delivery-store.ts";
+import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { AttemptsDoc } from "../../src/durable/attempts.ts";
 import { groupDatabasePath } from "../../src/durable/groups.ts";
 import { MemberDirectory } from "../../src/durable/identity.ts";
@@ -127,7 +128,10 @@ for (const phase of ["model", "safe-tool"] as const) test(`offline expiry cancel
     expect(f.faux.state.callCount).toBe(2); expect(f.texts).toContain("new answer");
     await resumed.close();
     const starts = await stored(f.common.root, async (session, id) => Object.values((await session.snapshot(AttemptsDoc, id, context))?.starts ?? {}));
-    expect(starts.filter(start => !start.withdrawn)).toHaveLength(2);
+    expect(starts).toHaveLength(0);
+    const ledger = openStatsLedger(f.common.root);
+    try { expect(readLedger(ledger).usage.reduce((sum, row) => sum + row.requests, 0)).toBe(2); }
+    finally { ledger.close(); }
   } finally { first.open(); await resumed?.close(); await original.close(); f.stateDb.close(); }
 }, 30000);
 
@@ -163,6 +167,8 @@ test("a deadline crossed during auth is checked at final dispatch and the unsent
     expect(f.faux.state.callCount).toBe(0); expect(f.texts.some(text => text.includes("任务总时限 0.5 秒已到"))).toBe(true);
     await service.close();
     const starts = await stored(f.common.root, async (session, id) => Object.values((await session.snapshot(AttemptsDoc, id, context))?.starts ?? {}));
-    expect(starts).toHaveLength(1); expect(starts[0]!.withdrawn).toBe(true);
+    expect(starts).toHaveLength(0);
+    const ledger = openStatsLedger(f.common.root);
+    try { expect(readLedger(ledger).usage).toEqual([]); } finally { ledger.close(); }
   } finally { release.resolve(); await service.close(); f.stateDb.close(); }
 }, 30000);

@@ -1,8 +1,10 @@
-// The extensions of a group's registry (D2-4), in install order after the request door's (src/durable/models.ts):
+// The extensions of a group's registry, in install order after the request door's (src/durable/models.ts):
 //
 // - `mixin.prompt`: the system prompt sections (./prompt.ts);
 // - `mixin.base`: read, bash, edit, write, document_environment, document_extract (./tools.ts);
 // - `mixin.send`: send_image, send_file, model-only (./send.ts);
+// - `mixin.auxiliary`: configured classifier and image tools (./auxiliary.ts);
+// - `mixin.mcp`: configured remote MCP tools (./mcp.ts);
 // - `mixin.<module>` for each enabled module: no Durable tools of its own (its tools are script-only, reached through
 //   codemode), but selecting it turns the module on for the conversation: its tools become callable from scripts and its
 //   prompt text and skills appear;

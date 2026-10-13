@@ -13,6 +13,7 @@ import { databaseGroup, IdentityDoc } from "./identity.ts";
 import { ControlsDoc } from "./inbox.ts";
 import { queueManualCompaction } from "./manual-compaction.ts";
 import { openGroupStorage } from "./sqlite.ts";
+import { conversationIds } from "./conversations.ts";
 
 export interface QueuedClear {
   /** The group the database records. */
@@ -43,16 +44,7 @@ export async function queueGroupClear(path: string, now = Date.now()): Promise<Q
     const groupId = await databaseGroup(session, context);
     if (groupId === undefined) throw new Error(`${path} 没有记录所属的群，拒绝修改`);
     if (groupSegment(groupId) !== basename(dirname(path))) throw new Error(`${path} 记录的群不是这个目录的群，拒绝修改`);
-    const ids = await session.commit(async (tx) => {
-      const found: number[] = [];
-      let cursor: Parameters<typeof tx.scanConversations>[2];
-      for (;;) {
-        const page = await tx.scanConversations({}, 200, cursor);
-        for (const record of page.items) if (record.owner === undefined) found.push(record.id as number);
-        if (page.next === undefined) return found;
-        cursor = page.next;
-      }
-    }, context);
+    const ids = await conversationIds(session, context, true);
     const phones: string[] = [];
     for (const id of ids) {
       const identity = await session.snapshot(IdentityDoc, id as ConversationId, context);
@@ -92,16 +84,7 @@ export async function queueMemberCompaction(path: string, phone: string): Promis
   try {
     const groupId = await databaseGroup(session, context);
     if (groupId === undefined || groupSegment(groupId) !== basename(dirname(path))) throw new Error("群库身份与目录不符，拒绝修改");
-    const ids = await session.commit(async tx => {
-      const found: ConversationId[] = [];
-      let cursor: Parameters<typeof tx.scanConversations>[2];
-      for (;;) {
-        const page = await tx.scanConversations({}, 200, cursor);
-        for (const record of page.items) if (record.owner === undefined) found.push(record.id);
-        if (page.next === undefined) return found;
-        cursor = page.next;
-      }
-    }, context);
+    const ids = await conversationIds(session, context, true);
     for (const id of ids) {
       const identity = await session.snapshot(IdentityDoc, id, context);
       if (identity?.groupId === groupId && identity.phone === phone) {

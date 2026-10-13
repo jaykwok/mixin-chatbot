@@ -16,7 +16,7 @@ mock.module(readerPath, () => ({ ...reader, async readSessionSlice(...args: Para
   if (gate) { gate.read(); await gate.release; }
   return slice;
 } }));
-const ledger = await import("../../src/agent/stats-ledger.ts");
+const ledger = { ...await import("../../src/agent/stats-ledger.ts"), ...await import("./ingest-user-session.ts") };
 
 const root = process.argv[2]!;
 // 两个用例是不同会话，不能复用账本主键，否则后一个会覆写前一个的归档世代。

@@ -1,4 +1,6 @@
 import { constants } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { Type } from "@earendil-works/pi-ai";
 import {
   access,
   lstat,
@@ -20,11 +22,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
 import { log } from "../core/log.ts";
-import { isPathInside } from "./paths.ts";
+import { isPathInside } from "../contracts/paths.ts";
 import { venvPythonPath } from "./python-toolchain.ts";
 import { runProcess } from "../core/process.ts";
 import { moveSystemTempOutput } from "./system-temp.ts";
-import { assertTaskPathAllowed, configuredRootlessTasks, ISOLATED_PYTHON } from "../core/rootless-tasks.ts";
+import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../core/task-backend.ts";
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
@@ -122,9 +124,29 @@ class AllowedPathGuard {
   }
 }
 
-/** Added to the official bash description; the Durable tool catalogue (src/durable/tools.ts) shows the same text. */
-export const BASH_TOOL_NOTE = " Default timeout is " + BASH_DEFAULT_TIMEOUT +
+const BASH_NOTE = " Default timeout is " + BASH_DEFAULT_TIMEOUT +
   " seconds, maximum 3600. The workspace is reference material: only write to your own temp directory. All child processes are stopped when this command completes or is cancelled.";
+const ISOLATED_BASH_NOTE = " Each command runs isolated with a fresh PI_USER_TMP. List existing temp files or directories in input_paths to read them at their original paths; no temp history is copied by default. Workspace and materials remain readable without input_paths.";
+
+/** Isolated commands only exist with Linux rootless tasks; elsewhere neither the isolation note nor input_paths is shown. */
+function isolatedBash(): boolean { return configuredRootlessTasks() !== undefined; }
+
+/** Added to the official bash description; the Durable tool catalogue (src/durable/tools.ts) shows the same text. */
+export function bashToolNote(isolated = isolatedBash()): string { return BASH_NOTE + (isolated ? ISOLATED_BASH_NOTE : ""); }
+
+/** Shared schema for the catalogue and the executing tool. */
+const bashSchemas = new WeakMap<object, ReturnType<typeof buildBashInputParameters>>();
+export function bashInputParameters(official: ReturnType<typeof createBashToolDefinition>, isolated = isolatedBash()) {
+  if (!isolated) return official.parameters;
+  let schema = bashSchemas.get(official.parameters);
+  if (!schema) { schema = buildBashInputParameters(official); bashSchemas.set(official.parameters, schema); }
+  return schema;
+}
+function buildBashInputParameters(official: ReturnType<typeof createBashToolDefinition>) {
+  return Type.Object({ ...official.parameters.properties, input_paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+    maxItems: 128, description: "Existing inputs under your own tmp, as absolute paths or paths relative to that tmp. Only these inputs are copied into an isolated command; do not select the whole tmp."
+  })) });
+}
 
 function createBashTool(
   cwd: string,
@@ -133,8 +155,9 @@ function createBashTool(
   groupId: string,
   venvDir: string,
   materialsIndexPath: string,
-  engine: Pick<LocalToolsOptions, "sessionEnvironment" | "onBashOutput">
+  engine: Pick<LocalToolsOptions, "onBashOutput">
 ) {
+  const inputScope = new AsyncLocalStorage<readonly string[]>();
   const callerEnvironment = {
     TMPDIR: tempDir,
     TMP: tempDir,
@@ -196,8 +219,8 @@ function createBashTool(
               const readOnly = [cwd, dirname(materialsIndexPath)];
               return await task.run({ command: shell.shell, args: [...shell.args, exports + "\n" + source],
                 cwd: executionCwd, env: isolatedEnv, signal, timeoutMs: seconds * 1000,
-                onData: tee === undefined ? onData : (data) => { onData(data); tee(data); } }, readOnly);
-            } finally { await task.seal(); }
+                onData: tee === undefined ? onData : (data) => { onData(data); tee(data); } }, readOnly, { paths: inputScope.getStore() ?? [] });
+            } finally { await finishTask(backend, task, "keep"); }
           }
           return await runProcess({ command: shell.shell, args: [...shell.args, command],
             cwd: executionCwd, env, signal, timeoutMs: seconds * 1000,
@@ -214,7 +237,7 @@ function createBashTool(
         }
       },
     },
-    exposeSessionEnvironment: engine.sessionEnvironment ?? true,
+    exposeSessionEnvironment: false,
     spawnHook: (context) => ({
       ...context,
       // Git Bash can replace inherited TMPDIR while starting; export inside the
@@ -285,8 +308,9 @@ function createBashTool(
 
   return defineTool({
     ...official,
-    description: official.description + BASH_TOOL_NOTE,
-    execute: executeOfficial,
+    parameters: bashInputParameters(official),
+    description: official.description + bashToolNote(),
+    execute: (...args) => inputScope.run((args[1] as { input_paths?: string[] }).input_paths ?? [], () => executeOfficial(...args)),
   });
 }
 
@@ -303,11 +327,6 @@ export interface LocalToolsOptions {
   materialsIndexPath: string;
   /** Enabled modules may expose application-owned instructions for read only. */
   resourceReadDirs?: string[];
-  /**
-   * Pi's session variables for bash (PI_SESSION_ID, PI_SESSION_FILE, PI_PROVIDER, PI_MODEL, PI_REASONING_LEVEL), read
-   * from the AgentSession tool context. Default true; the Durable engine has no session object and turns them off.
-   */
-  sessionEnvironment?: boolean;
   /** Raw bash output as it arrives, besides the official tool's own accumulation (Durable: the call's `api.output`). Must not throw. */
   onBashOutput?: (data: Buffer) => void;
 }

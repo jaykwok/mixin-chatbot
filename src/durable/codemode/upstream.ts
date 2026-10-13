@@ -1,5 +1,5 @@
-// Pure parts of coding-agent's codemode, ported for the Durable engine (gap G2: pi-coding-agent exports only
-// `createCodemodeExtension`, whose executor needs an AgentSession). Ported from @earendil-works/pi-coding-agent 1.1.0:
+// Pure parts of coding-agent's codemode, ported for the Durable engine (pi-coding-agent exports only
+// `createCodemodeExtension`, whose executor needs the upstream session object). Ported from @earendil-works/pi-coding-agent 1.1.0:
 //   dist/extensions/codemode/tool.js        description, catalogue budget, script-call line
 //   dist/extensions/codemode/execute.js     previews, script values, output budget, image files, error text, discovery
 //                                           globals
@@ -13,11 +13,11 @@
 //   rather than exposing provider calls to scripts.
 // - `truncateOutput` and `saveImages` take the place to write to (the caller saves into the call's results directory in
 //   the member's tmp, src/durable/codemode/results.ts) instead of creating output files in the shared system temp
-//   directory (coding-agent `writeOutputFile`), which the AgentSession engine moved afterwards (src/agent/codemode.ts).
+//   directory (coding-agent `writeOutputFile`).
 // - Namespaces come from the tool definitions (`ToolDefinition.namespace`), as `getToolNamespace` returned them.
 // - `describeScriptCall` takes the description and output schema separately: a Durable registration has no output schema.
 // - The discovery globals take the callable tools with their namespaces instead of a lookup callback.
-// - Prompt guidelines (1.0.4) come from the tool definitions: the description lists them as AgentSession's loadout gives
+// - Prompt guidelines come from the tool definitions: the description lists them as coding-agent's loadout gives
 //   them (`normalizeGuidelines`), the samples of `ALL_TOOLS` and `describeTool()` as the definitions have them
 //   (coding-agent's `getToolGuidelines`).
 import {
@@ -81,7 +81,7 @@ export function toCodemodeDeclaration(tool: CodemodeToolInfo, guidelines: readon
   };
 }
 
-/** A tool's prompt guidelines as AgentSession's loadout gives them: trimmed, without empty ones or repeats. */
+/** A tool's prompt guidelines as the upstream loadout gives them: trimmed, without empty ones or repeats. */
 export function normalizeGuidelines(guidelines: readonly string[] | undefined): string[] {
   return [...new Set((guidelines ?? []).map((guideline) => guideline.trim()).filter((guideline) => guideline.length > 0))];
 }

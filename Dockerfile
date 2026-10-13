@@ -1,10 +1,12 @@
 # Bun 运行时镜像
 FROM ghcr.io/astral-sh/uv:0.11.29 AS uv
+FROM docker:29.1.3-cli AS docker_cli
 FROM oven/bun:1.4.3-debian
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer libreoffice-impress fonts-noto-cjk fonts-liberation && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=uv /uv /usr/local/bin/uv
+COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker
 ENV UV_PYTHON_INSTALL_DIR=/opt/python
 COPY pyproject.toml uv.lock .python-version /opt/doc-environment/
 COPY scripts/runtime/document-manifest.ts /opt/doc-environment/document-manifest.ts

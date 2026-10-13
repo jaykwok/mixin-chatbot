@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "id": "<ID>",
+  "nonce": "<NONCE>",
+  "manager": "<MANAGER>",
+  "daemon": "<DAEMON>",
+  "image": "<IMAGE>",
+  "temp": "<TEMP>",
+  "createdAt": 1,
+  "pid": 1,
+  "phase": "removed",
+  "containers": [],
+  "pendingNames": [],
+  "mounts": {}
+}

@@ -1,4 +1,4 @@
-// The service's own durable state in a group database (D3): each member's inbox and the group's control stream.
+// The service's own durable state in a group database: each member's inbox and the group's control stream.
 //
 // Inbox. A webhook message is admitted by one commit to the member conversation's `mixin.inbox` before the webhook is
 // acknowledged; the member's worker (src/durable/service.ts) submits the head item to Durable with the item's requestId,
@@ -16,9 +16,9 @@ import { type ConversationId, defineDoc, type Harness } from "@earendil-works/pi
 export type InboxItem = {
   requestId: string;
   content: string;
-  receivedAt: number;
   // Together with epoch this is the persisted strictly increasing arrival order. The service reserves
   // the member's admission turn before any await, so later arrivals cannot commit or run ahead of it.
+  receivedAt: number;
   /** Persisted group-open generation. Missing on older development data means 0. */
   epoch?: number;
   /** When the worker first submitted it (the total deadline counts from here, across restarts). */

@@ -3,7 +3,7 @@ import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { move } from "fs-extra";
-import { isPathInside } from "./paths.ts";
+import { isPathInside } from "../contracts/paths.ts";
 
 /**
  * Pi writes the full output of a truncated result to the shared system temp directory (bash: pi-bash-*.log,

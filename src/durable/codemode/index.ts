@@ -1,7 +1,7 @@
-// The codemode tool for the Durable engine (D2-3; D0 contract 2.4 and 2.8). Layers: Durable tool task -> this
+// The codemode tool for the Durable engine. Layers: Durable tool task -> this
 // registration -> the official sandbox (pi-codemode `CodemodeSandbox`) -> one controlled entry for every sub-call.
 // The pure catalogue, search and output logic is ported from coding-agent (./upstream.ts); this file replaces
-// coding-agent's executor, which needs an AgentSession.
+// coding-agent's executor, which needs the upstream session object.
 //
 // Scope, as coding-agent's mode `on` with `models` off: a script calls the registry's direct tools the conversation is
 // offered (the model sees their descriptions with one "Codemode: ..." line, added by this extension's wraps) and the
@@ -13,7 +13,7 @@
 // runs the tool through the same `MemberTool.run` as a model's call (identity check, member places), and makes the
 // value durable before the script gets it. A value that cannot be recorded fails the sub-call instead.
 //
-// Durability (contract 2.8, adjusted): each sub-call event is one line in the call's running output and in the index
+// Durability: each sub-call event is one line in the call's running output and in the index
 // file, and its compact record goes in the details; `api.details` commits output and details together, so a start is
 // committed before the tool runs and a result before the script sees it. An interrupted or aborted codemode result is
 // built from that output (Durable `fromSlot`): the model sees which sub-calls started and what the finished ones
@@ -46,7 +46,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { type BaseToolsOptions, type MemberTool, resolveMember } from "../tools.ts";
 import { describeResult, resultsDirName, SubCallFiles } from "./results.ts";
-import { ResultsDoc } from "../result-lifecycle.ts";
+import { resultRegistration } from "../results/ownership.ts";
 import {
   CODEMODE_MEMORY_LIMIT_BYTES, CODEMODE_TOOL_NAME, combineUsage, createCodemodeDescription, createDiscoveryGlobals,
   DEFAULT_CODEMODE_INLINE_BUDGET, DEFAULT_MAX_OUTPUT_TOKENS, describeScriptCall, ERROR_PREVIEW_CHARS, formatError, formatOutput,
@@ -191,13 +191,7 @@ async function runScript(options: CodemodeOptions, input: string, api: ToolExecu
   const samples = new Map(callable.map(({ tool: { definition } }) =>
     [definition.name, renderToolSample(toCodemodeDeclaration(definition, definition.promptGuidelines))]));
   const directoryName = resultsDirName(api.taskId as number, api.callId);
-  const files = new SubCallFiles(places.tempDir, directoryName, (isolatedTask) => api.commit(async tx => {
-    const doc = await tx.doc(ResultsDoc);
-    if (!doc.calls[directoryName]) {
-      if (Object.keys(doc.calls).length >= 4096) throw new Error("结果归属记录已达上限，请先清理不再引用的结果");
-      doc.calls[directoryName] = { phone, createdAt: Date.now(), ...(isolatedTask ? { isolatedTask } : {}) };
-    }
-  }, context));
+  const files = new SubCallFiles(places.tempDir, directoryName, resultRegistration(api, context, phone, directoryName));
   // Released whatever happens: on Windows a held directory cannot be renamed or removed.
   try {
     const run = new ScriptRun(api, context, files);
@@ -299,7 +293,7 @@ type Recorded = { text: string; structured: boolean; images: readonly ImageConte
 
 /**
  * What a sub-call's files and line record of the value the script gets (the script gets the value itself either way).
- * A structured value is recorded as its JSON, except two shapes read returns (coding-agent 1.0.4): a string (a text
+ * A structured value is recorded as its JSON, except two shapes read returns: a string (a text
  * file) is recorded as that text, and an image block (an image file) as its note with the image saved once as an image
  * file, not as base64 inside JSON.
  */
@@ -313,7 +307,7 @@ function recordOf(value: unknown, structured: boolean, images: readonly ImageCon
   return { text: JSON.stringify(value), structured: true, images };
 }
 
-/** Exactly read's value for an image file (coding-agent 1.0.4 `readOutputSchema`): these four strings, nothing else. */
+/** Exactly read's value for an image file (coding-agent `readOutputSchema`): these four strings, nothing else. */
 function isImageBlock(value: unknown): value is { type: "image"; data: string; mimeType: string; note: string } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const block = value as Record<string, unknown>;

@@ -13,7 +13,8 @@ mock.module("../../src/core/process.ts", () => ({ runProcess: async (options: an
     options.signal.throwIfAborted();
     const text = await readFile(options.args[1], "utf8");
     await writeFile(options.args[3], text);
-    return { exitCode: 0, output: JSON.stringify({ units: 1, characters: text.length, truncated: false }) };
+    await writeFile(options.args[5], JSON.stringify({ units: 1, characters: text.length, truncated: false }));
+    return { exitCode: 0, output: "incorrect startxref pointer(3)\nparsing for Object Streams\n" };
   } finally { active--; }
 } }));
 const { extractDocument } = await import("../../src/agent/document-extract.ts");

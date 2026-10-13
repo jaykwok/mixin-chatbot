@@ -10,31 +10,31 @@ import { readMcpConfig } from "./mcp-config.ts";
 import { validateRelayConfig } from "../integrations/relay-s3.ts";
 import { readRelayIndex } from "../integrations/relay-index.ts";
 
-/**
- * Configuration only: runtime.json, models and the selected model under `project`, which may be a preview's
- * projection. Opens no database, so it can run before a migration and against read-only data.
- */
 type ValidationObserver = (phase: "config" | "stats" | "delivery" | "relay", state: "start" | "end" | "failed") => void;
 async function stage(phase: "config" | "stats" | "delivery" | "relay", observe: ValidationObserver | undefined, run: () => Promise<void>) {
   observe?.(phase, "start");
   try { await run(); observe?.(phase, "end"); }
   catch (error) { observe?.(phase, "failed"); throw error; }
 }
+/**
+ * Configuration only: runtime.json, models and the selected model under `project`, which may be a preview's
+ * projection. Opens no database, so it can run before a migration and against read-only data.
+ */
 export async function validateConfiguration(project: string, observe?: ValidationObserver): Promise<void> {
   return stage("config", observe, async () => {
-  if (process.env.BOT_MODEL_CACHE_RETENTION?.trim()) throw new Error("请移除 BOT_MODEL_CACHE_RETENTION 环境变量");
-  const path = join(project, "data/config/runtime.json");
-  validateRuntimeConfig(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {});
-  const relayPath = join(project, "data/config/relay.json");
-  if (existsSync(relayPath)) validateRelayConfig(JSON.parse(readFileSync(relayPath, "utf8")), relayPath);
-  const runtime = await openModelRuntime({ modelsPath: join(project, "data/config/models.json"), modelsStorePath: join(project, "data/runtime/models-store.json") });
-  await resolveModelSelection(runtime, openSettings(join(project, "data/runtime/pi/settings.json")));
-  const auxiliary = readAuxiliaryConfig(join(project, "data/config/auxiliary.json"));
-  readMcpConfig(join(project, "data/config/mcp.json"));
-  for (const type of ["classifier", "image"] as const) {
-    const ref = auxiliary?.[type];
-    if (ref && !runtime.getModelOfType(type, ref.provider, ref.modelId)) throw new Error(`auxiliary.json：没有 ${type} 模型 ${ref.provider}/${ref.modelId}`);
-  }
+    if (process.env.BOT_MODEL_CACHE_RETENTION?.trim()) throw new Error("请移除 BOT_MODEL_CACHE_RETENTION 环境变量");
+    const path = join(project, "data/config/runtime.json");
+    validateRuntimeConfig(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {});
+    const relayPath = join(project, "data/config/relay.json");
+    if (existsSync(relayPath)) validateRelayConfig(JSON.parse(readFileSync(relayPath, "utf8")), relayPath);
+    const runtime = await openModelRuntime({ modelsPath: join(project, "data/config/models.json"), modelsStorePath: join(project, "data/runtime/models-store.json") });
+    await resolveModelSelection(runtime, openSettings(join(project, "data/runtime/pi/settings.json")));
+    const auxiliary = readAuxiliaryConfig(join(project, "data/config/auxiliary.json"));
+    readMcpConfig(join(project, "data/config/mcp.json"));
+    for (const type of ["classifier", "image"] as const) {
+      const ref = auxiliary?.[type];
+      if (ref && !runtime.getModelOfType(type, ref.provider, ref.modelId)) throw new Error(`auxiliary.json：没有 ${type} 模型 ${ref.provider}/${ref.modelId}`);
+    }
   });
 }
 
@@ -45,24 +45,24 @@ export async function validateCurrentData(project: string, groups: string, state
     if (existsSync(join(project, "data/config/relay.json"))) readRelayIndex(join(stateProject, "data/state/relay.sqlite"));
   });
   await stage("stats", observe, async () => {
-  const stats = openExistingStatsLedger(groups);
-  try {
-    if (stats) {
-      for (const table of ["sources", "activity", "tool_counts", "usage_totals", "meta"]) stats.query(`SELECT * FROM ${table} LIMIT 0`).all();
-      // Schema 2 adds the projection column; continuing a source reads it.
-      stats.query("SELECT projection FROM sources LIMIT 0").all();
-    } else if (existsSync(join(groups, "stats.sqlite"))) {
-      const db = new Database(join(groups, "stats.sqlite"), { readonly: true });
-      try { if (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().length) throw new Error("统计账本缺少 schema，拒绝登记"); }
-      finally { db.close(); }
-    }
-  } finally { stats?.close(); }
+    const stats = openExistingStatsLedger(groups);
+    try {
+      if (stats) {
+        for (const table of ["sources", "activity", "tool_counts", "usage_totals", "meta"]) stats.query(`SELECT * FROM ${table} LIMIT 0`).all();
+        // Schema 2 adds the projection column; continuing a source reads it.
+        stats.query("SELECT projection FROM sources LIMIT 0").all();
+      } else if (existsSync(join(groups, "stats.sqlite"))) {
+        const db = new Database(join(groups, "stats.sqlite"), { readonly: true });
+        try { if (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().length) throw new Error("统计账本缺少 schema，拒绝登记"); }
+        finally { db.close(); }
+      }
+    } finally { stats?.close(); }
   });
   await stage("delivery", observe, async () => {
-  const state = join(stateProject, "data/state/agent.sqlite");
-  if (existsSync(state)) {
-    const db = new Database(state, { readonly: true, strict: true });
-    try { assertDeliverySchema(db); } finally { db.close(); }
-  }
+    const state = join(stateProject, "data/state/agent.sqlite");
+    if (existsSync(state)) {
+      const db = new Database(state, { readonly: true, strict: true });
+      try { assertDeliverySchema(db); } finally { db.close(); }
+    }
   });
 }

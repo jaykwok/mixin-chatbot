@@ -1,4 +1,4 @@
-// Durable records of a codemode script's sub-calls (D0 contract 2.8; D2-3 adjustments in docs/dev/pi-1.0.2-d2-3-*.md).
+// Durable records of a codemode script's sub-calls.
 //
 // Each codemode call that makes a sub-call gets a directory in the calling member's tmp, `codemode/<task>-<call>/`,
 // which the member's read tool can open and no other member can: `index.txt` (one line per sub-call event, appended and
@@ -6,7 +6,7 @@
 // structured value) exceeds PREVIEW_LIMIT characters is saved whole as `<n>.txt` / `<n>.json`; images as
 // `<n>-<i>.<ext>`. `n` is fixed when the sub-call starts, so parallel calls never share a file. The script's own output
 // goes to the same directory: its full text when it exceeds the output budget (`output.txt`), and each distinct image
-// it showed with `image()` (`output-<k>.<ext>`; coding-agent 1.0.3 saves them so the model can reach their bytes). A
+// it showed with `image()` (`output-<k>.<ext>`; coding-agent saves them so the model can reach their bytes). A
 // call with neither sub-calls nor such output has no directory. A file is written to a
 // temporary name, synced and renamed into place, so a reference never names a partial file; references carry the size
 // and a sha256 prefix, so a reader can tell whether the file still holds that result.
@@ -16,18 +16,18 @@
 // call directory is held from its first file until the call ends (./directory.ts): `codemode/` and the call directory
 // are made below the member's tmp through their held parents, a link or junction in their place is refused, and every
 // file is created, renamed into place and, after a failure, removed through the held directory, never through a path
-// resolved again (D23-R2-1). A directory swapped for a link meanwhile never receives a file: on Windows the held
+// resolved again. A directory swapped for a link meanwhile never receives a file: on Windows the held
 // directories cannot be renamed or removed, and one made a junction in place cannot be created in; on Linux the writes
 // stay in the moved directory. The index and temporary files are created new, never through an entry that is already
 // there; a result file is renamed over whatever has its name (a link is replaced, not followed).
 //
 // A path is only given out (in a reference, the details or an index line's commit) while it names the file written
-// and is in the member's real tmp, as read requires (D23-R3-3): the directory's path is checked before each write, a
+// and is in the member's real tmp, as read requires: the directory's path is checked before each write, a
 // file's after it is in place, the index's after each line. Once a check finds the directory moved, nothing more is
 // written or given out for the call: its result no longer names the index. The script's own output files are checked
-// once more after the last of them, and a result names only those still in place (D23-R3-2). Files are 0600 and
-// directories 0700 (as coding-agent 1.0.3 writes its output files; on Windows the mode sets only the read-only flag).
-// The member's tmp itself is the member's storage identity, checked by the service (D3).
+// once more after the last of them, and a result names only those still in place. Files are 0600 and
+// directories 0700 (on Windows the mode sets only the read-only flag).
+// The member's tmp itself is the member's storage identity, checked by the service.
 //
 // The model-visible line of a finished sub-call (also the index line): its whole result up to PREVIEW_LIMIT
 // characters, or a preview with the file of the full text; image files at the end.
@@ -35,10 +35,11 @@ import { createHash, randomBytes } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { isPathInside } from "../../agent/paths.ts";
+import { isPathInside } from "../../contracts/paths.ts";
 import { type Entries, type HeldDirectory, holdDirectory, type Identity, type NewFile, sameIdentity } from "./directory.ts";
 import type { DirectoryRemoval } from "../../core/held-directory.ts";
-import { configuredRootlessTasks, type IsolatedTask, type TaskReservation } from "../../core/rootless-tasks.ts";
+import type { IsolatedTask, TaskReservation } from "../../core/rootless-tasks.ts";
+import { configuredRootlessTasks } from "../../core/task-backend.ts";
 
 export const PREVIEW_LIMIT = 300;
 /** sha256 hex characters shown in references. */
@@ -96,7 +97,7 @@ export class SubCallFiles {
   #isolated: IsolatedTask | undefined;
 
   constructor(private readonly tempDir: string, private readonly name: string, private readonly register?: (taskId?: string) => Promise<void>) {
-    this.#reservation = configuredRootlessTasks()?.reserve(tempDir, "results");
+    this.#reservation = configuredRootlessTasks()?.reserve(tempDir, "results", name);
     this.dir = this.#reservation?.path ?? join(resultsRoot(tempDir), name);
     this.index = join(this.dir, "index.txt");
   }
@@ -353,19 +354,26 @@ export async function removeCodemodeResults(tempDir: string, before: number, pol
     throw error;
   }
   try {
-    results.push(...await root.use((entries) => entries.removeDirectories({
-      select: (name) => {
+    await root.use(async entries => {
+      for (const name of await entries.names()) {
         seen.add(name);
-        return /^\d+-[A-Za-z0-9_.-]+$/.test(name)
-          && (!policy || policy.registered.has(name) && !policy.protected.has(name) && !policy.isolated?.has(name));
-      },
-      beforeRemove: async (name, changedAt) => {
-        if (changedAt >= before) return false;
-        // The child stays held across the expiry commit and deletion, even if its path changes in the meantime.
-        await policy?.expire([name]);
-        return true;
-      },
-    })));
+        if (!/^\d+-[A-Za-z0-9_.-]+$/.test(name)
+          || policy && (!policy.registered.has(name) || policy.protected.has(name) || policy.isolated?.has(name))) continue;
+        try {
+          results.push(...await entries.removeDirectories({ candidates: [name], select: candidate => candidate === name,
+            beforeRemove: async (_name, changedAt) => {
+              if (changedAt >= before) return false;
+              // Keep expiry commit failures outside the recoverable filesystem-error path.
+              await policy?.expire([name]);
+              return true;
+            } }));
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (!code || !["EBUSY", "EPERM", "EACCES", "ENOENT", "ENOTDIR", "ENOTEMPTY"].includes(code)) throw error;
+          results.push({ name, status: "deferred", reason: String(error) });
+        }
+      }
+    });
     return finish();
   } finally { await root.release(); }
 }

@@ -10,11 +10,12 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { application, waitFor } from "../core/lifecycle.ts";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
 import { runProcess } from "../core/process.ts";
-import { assertTaskPathAllowed, configuredRootlessTasks, ISOLATED_PYTHON, type IsolatedTask } from "../core/rootless-tasks.ts";
+import type { IsolatedTask } from "../core/rootless-tasks.ts";
+import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../core/task-backend.ts";
 import { log } from "../core/log.ts";
 import { hashFile } from "../core/file-hash.ts";
 import { ensureDocumentToolchain, venvPythonPath } from "./python-toolchain.ts";
-import { isPathInside } from "./paths.ts";
+import { isPathInside } from "../contracts/paths.ts";
 import { resolveToolPath } from "./tool-path.ts";
 import { structuredResult } from "./structured-result.ts";
 
@@ -26,6 +27,9 @@ interface Extracted { path: string; digest: string; units: number; truncated: bo
 type Format = "pdf" | "docx" | "pptx" | "xlsx";
 interface Flight { promise: Promise<Extracted>; controller: AbortController; consumers: number; done: boolean; }
 const flights = new Map<string, Flight>();
+// Private cache pointers are bounded and disposable. The signed task receipt owns the bytes;
+// normal reference-aware maintenance reclaims them even after this process has restarted.
+const isolatedCaches = new Map<string, string>();
 export interface DocumentOptions { workspaceDir: string; tempDir: string; indexPath: string; venvDir: string; }
 
 async function validCache(dir: string, digest: string, signal?: AbortSignal): Promise<Extracted | null> {
@@ -82,17 +86,23 @@ export async function extractDocument(options: DocumentOptions, source: string, 
   const digest = await sourceDigest(path, signal);
   const parserIdentity = createHash("sha256").update(await readFile(script)).update(await readFile(lock)).digest("hex");
   const key = createHash("sha256").update(JSON.stringify([digest, extension, parserIdentity, maxChars])).digest("hex");
+  const backend = configuredRootlessTasks();
   // Only shared source material has a group cache. Private generated documents stay in the user's tmp.
   const parent = isPathInside(path, workspace) ? await realpath(dirname(options.indexPath)) : temp;
   const root = join(parent, isPathInside(path, workspace) ? "parsed" : ".document-cache");
-  await mkdir(root, { recursive: true });
-  if ((await lstat(root)).isSymbolicLink() || !isPathInside(await realpath(root), parent)) throw new Error("解析缓存目录越界");
-  const dir = join(root, key);
-  try { if ((await lstat(dir)).isSymbolicLink()) throw new Error("解析缓存目录不能是链接"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const cached = await validCache(dir, digest, signal);
+  if (!backend) {
+    await mkdir(root, { recursive: true });
+    if ((await lstat(root)).isSymbolicLink() || !isPathInside(await realpath(root), parent)) throw new Error("解析缓存目录越界");
+  }
+  const flightKey = backend ? join(temp, ".isolated-cache", key) : join(root, key);
+  let dir = backend ? isolatedCaches.get(flightKey) : flightKey;
+  if (dir) {
+    try { if ((await lstat(dir)).isSymbolicLink()) throw new Error("解析缓存目录不能是链接"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+  const cached = dir ? await validCache(dir, digest, signal) : null;
   if (cached) return { ...cached, ...located };
-  let flight = flights.get(dir);
+  let flight = flights.get(flightKey);
   if (!flight || flight.controller.signal.aborted) {
     const controller = new AbortController();
     const budget = AbortSignal.any([application.signal, controller.signal, AbortSignal.timeout(180000)]);
@@ -100,15 +110,17 @@ export async function extractDocument(options: DocumentOptions, source: string, 
     const owner = flight;
     owner.promise = application.track((async () => {
       const release = await parserSlots.acquire(budget);
-      const backend = configuredRootlessTasks();
       let isolated: IsolatedTask | undefined;
-      let snapshot: string | undefined, output: string | undefined;
+      let snapshot: string | undefined, output: string | undefined, report: string | undefined, retained = false;
       try {
-        const existing = await validCache(dir, digest, budget);
+        const existing = dir ? await validCache(dir, digest, budget) : null;
         if (existing) return existing;
         if (!backend && !await ensureDocumentToolchain(options.venvDir, budget)) throw new Error("文档解析环境不可用");
         isolated = await backend?.create(temp);
-        snapshot = join(isolated?.path ?? temp, ".document-" + randomUUID());
+        if (isolated) { dir = isolated.path; await mkdir(join(dir, ".work")); }
+        const scratch = isolated ? join(isolated.path, ".work") : temp;
+        snapshot = join(scratch, ".document-" + randomUUID());
+        report = join(scratch, ".extract-report-" + randomUUID());
         output = join(isolated?.path ?? temp, ".extracted-" + randomUUID());
         let bytes = 0;
         await pipeline(createReadStream(path), new Transform({ transform(chunk: Buffer, _encoding, next) {
@@ -116,31 +128,41 @@ export async function extractDocument(options: DocumentOptions, source: string, 
           next(bytes > MAX_SOURCE_BYTES ? new Error("文档在读取时增长超过上限") : null, chunk);
         } }), createWriteStream(snapshot, { flags: "wx", mode: 0o600 }), { signal: budget });
         if (await hashFile(snapshot, budget) !== digest) throw new Error("文档在同步过程中发生变化，请重新调用解析工具");
-        const scratch = isolated?.path ?? temp;
-        const execution = { command: isolated ? ISOLATED_PYTHON : venvPythonPath(options.venvDir), args: [script, snapshot, extension, output, String(maxChars)],
+        const execution = { command: isolated ? ISOLATED_PYTHON : venvPythonPath(options.venvDir), args: [script, snapshot, extension, output, String(maxChars), report],
           cwd: scratch, timeoutMs: 120000, signal: budget,
           env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8", PYTHONDONTWRITEBYTECODE: "1", TMP: scratch, TEMP: scratch, TMPDIR: scratch } };
         const result = isolated ? await isolated.run(execution, [dirname(script)]) : await runProcess(execution);
         if (result.exitCode !== 0) throw new Error("文档解析失败：" + result.output.slice(-1200));
-        const metadata = JSON.parse(result.output.trim());
+        const reportInfo = await lstat(report);
+        if (!reportInfo.isFile() || reportInfo.isSymbolicLink() || reportInfo.size > 4096) throw new Error("文档解析结果文件无效");
+        const metadata = JSON.parse(await readFile(report, "utf8"));
+        if (!Number.isInteger(metadata.units) || metadata.units < 0 || typeof metadata.truncated !== "boolean" ||
+          !Number.isInteger(metadata.characters) || metadata.characters < 0 || metadata.characters > maxChars) throw new Error("文档解析结果格式无效");
+        if (!dir) throw new Error("解析输出目录未建立");
         await mkdir(dir, { recursive: true });
-        if ((await lstat(dir)).isSymbolicLink() || !isPathInside(await realpath(dir), root)) throw new Error("解析缓存目录已改变");
+        if ((await lstat(dir)).isSymbolicLink() || !isPathInside(await realpath(dir), isolated ? temp : root)) throw new Error("解析缓存目录已改变");
         const textHash = await hashFile(output, budget);
         await rename(output, join(dir, "text.txt"));
         const manifest = join(dir, ".metadata-" + randomUUID());
         await writeFile(manifest, JSON.stringify({ ...metadata, digest, textHash, parserIdentity }), { mode: 0o600 });
         await rename(manifest, join(dir, "metadata.json"));
-        await pruneCache(root, dir).catch(error => log.warn("解析缓存清理延后: " + String(error)));
+        if (isolated) {
+          await finishTask(backend!, isolated, "keep-outputs"); retained = true;
+          isolatedCaches.delete(flightKey); isolatedCaches.set(flightKey, dir);
+          while (isolatedCaches.size > 128) isolatedCaches.delete(isolatedCaches.keys().next().value!);
+        } else await pruneCache(root, dir).catch(error => log.warn("解析缓存清理延后: " + String(error)));
         return { path: join(dir, "text.txt"), digest, ...metadata, cacheHit: false } as Extracted;
       } finally {
         try {
-          if (isolated) { await isolated.seal(); await backend!.reclaim(isolated.id); }
-          else if (process.platform !== "linux") await Promise.allSettled([snapshot && rm(snapshot, { force: true }), output && rm(output, { force: true })]);
+          if (isolated) {
+            if (!retained) await finishTask(backend!, isolated, "discard");
+          }
+          else if (process.platform !== "linux") await Promise.allSettled([snapshot && rm(snapshot, { force: true }), output && rm(output, { force: true }), report && rm(report, { force: true })]);
           else if (snapshot) log.warn("共享解析临时文件保留待物理回收：" + snapshot + " / " + output);
         } finally { release(); }
       }
-    })()).finally(() => { owner.done = true; if (flights.get(dir) === owner) flights.delete(dir); });
-    flights.set(dir, owner);
+    })()).finally(() => { owner.done = true; if (flights.get(flightKey) === owner) flights.delete(flightKey); });
+    flights.set(flightKey, owner);
   }
   flight.consumers++;
   try { return { ...await waitFor(flight.promise, signal), ...located }; }
@@ -178,7 +200,7 @@ export function buildDocumentEnvironmentTool(venvDir: string): ToolDefinition {
             cwd: task.path, timeoutMs: 30_000, signal: toolSignal });
           if (result.exitCode !== 0) throw new Error("镜像中的文档环境不可用：" + result.output.slice(-1200));
           return { content: [{ type: "text" as const, text: "解析环境已验证，PI_PYTHON=" + ISOLATED_PYTHON }], details: {} };
-        } finally { await task.seal(); await backend.reclaim(task.id); }
+        } finally { await finishTask(backend, task, "discard"); }
       }
       const ready = await ensureDocumentToolchain(venvDir, toolSignal);
       if (!ready) throw new Error("文档解析环境不可用，请联系管理员检查 uv、网络或部署依赖");

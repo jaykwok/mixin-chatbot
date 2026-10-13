@@ -1,6 +1,6 @@
-// The message lifecycle on the Durable engine (D3): admission, the member workers, controls, replies, the watchdog,
+// The message lifecycle on the Durable engine admission, the member workers, controls, replies, the watchdog,
 // usage projection and maintenance. The webhook (src/server/webhook.ts) hands every message and command to it; it replaced
-// the AgentSession engine at data version 3.
+// the previous session engine at data version 3.
 //
 // Admission. A webhook message is committed to the member's inbox (src/durable/inbox.ts) before `admit` returns, so the
 // webhook is acknowledged only after it is durable. The storage identity of the member's directories is checked first
@@ -20,14 +20,14 @@
 //
 // Watchdog. The total deadline counts from the item's first submission (stored, so it survives restarts); model
 // progress is the committed partial of the current attempt (`pi.live`): no change for the idle limit, or one attempt
-// running longer than the response limit, aborts the run like the AgentSession engine's limits. Tool rounds, retry
+// running longer than the response limit, aborts the run like the previous engine's limits. Tool rounds, retry
 // backoff, deferred polls and compactions are not model idleness.
 //
 // Startup. Groups with work are opened by discovery; before scheduling resumes, the door gets the waiting controls and
 // every member's storage identity is checked; then the controls run again and the workers start.
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
@@ -51,7 +51,6 @@ import { waitFor } from "../core/lifecycle.ts";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
 import { getOutboundRateStatus, sendReplyWithMention, sendText } from "../integrations/im.ts";
 import type { RelayConfig } from "../integrations/relay.ts";
-import { removeCodemodeResults } from "./codemode/results.ts";
 import { RequestDoor, type ControlTicket } from "./door.ts";
 import { groupDatabasePath, GroupHarnesses } from "./groups.ts";
 import { IdentityDoc, memberConversation, MemberDirectory } from "./identity.ts";
@@ -62,14 +61,16 @@ import { AuxiliaryBudget } from "./auxiliary.ts";
 import type { McpTools } from "../integrations/mcp.ts";
 import { queueManualCompaction } from "./manual-compaction.ts";
 import { recoverOfficeProfiles } from "../agent/office-profiles.ts";
-import { configuredRootlessTasks } from "../core/rootless-tasks.ts";
 import { log } from "../core/log.ts";
-import { referencedResults, ResultsDoc } from "./result-lifecycle.ts";
+import { memberResultStatus, ResultMaintenance } from "./results/maintenance.ts";
+import { requestMemberExpiry } from "./results/ownership.ts";
+import { resultReferences } from "./results/references.ts";
 import { projectConversation } from "./projection.ts";
 import { groupExtensions } from "./registry.ts";
 import type { SendDelivery } from "./send.ts";
 import type { DurableStorageFailure } from "./storage-failure.ts";
 import { memberPlaces } from "./tools.ts";
+import { conversationIds, idleGroupReferences } from "./conversations.ts";
 
 export const STATUS_TEXT = "收到，正在处理🤔💭";
 const QUEUE_FULL = "本会话已有 8 条消息排队，请稍后重发";
@@ -185,6 +186,8 @@ type MemberState = {
 
 type GroupRuntime = { door: RequestDoor; holder: { harness?: Harness }; refreshed: Map<number, Promise<void>>; epoch: number };
 type ControlReceipt = { groupId: string; phone: string; requestId: string; ticket?: ControlTicket };
+/** Held while maintenance reclaims a group's results. A waiting message or command sets `yield`. */
+type ReclamationGate = { promise: Promise<void>; resolve: () => void; yield: boolean };
 
 export type AdmitResult = { status: "accepted" } | { status: "full"; message: string; reason?: "capacity" };
 
@@ -207,10 +210,16 @@ export class DurableService {
   readonly #groups: GroupHarnesses;
   readonly #background = new Set<Promise<unknown>>();
   readonly #requests = new Map<string, { key: string; retired: boolean }>();
+  readonly #memberRequests = new Map<string, number>();
   readonly #running = new Set<string>();
   readonly #capacityWaiters = new Set<() => void>();
+  readonly #reclaiming = new Map<string, ReclamationGate>();
+  readonly #memberCursors = new Map<string, number>();
+  readonly #results: ResultMaintenance;
   #lastArrival = 0;
+  #maintenanceCursor = 0;
   #fatalError?: DurableStorageFailure;
+  #statsLedger?: Database;
 
   constructor(options: DurableServiceOptions) {
     this.#options = options;
@@ -223,6 +232,7 @@ export class DurableService {
     const cancellable = withCancel(options.context ?? BACKGROUND_CONTEXT);
     this.#context = cancellable.context;
     this.#cancel = cancellable.cancel;
+    this.#results = new ResultMaintenance({ context: this.#context, signal: this.#closing.signal, warn: line => log.warn(line) });
     this.#groups = new GroupHarnesses({
       root: options.root,
       harnessOptions: (groupId) => this.#harnessOptions(groupId),
@@ -254,11 +264,13 @@ export class DurableService {
 
   /** Commit a message to the member's inbox; resolves once it is durable. */
   async admit(phone: string, groupId: string, content: string, callbackUrl: string, deduplicate = false): Promise<AdmitResult> {
+    // Re-checked synchronously after every wait: no await may separate the check from reserving member.uses.
+    for (let gate; (gate = this.#reclaiming.get(groupId));) { gate.yield = true; await waitFor(gate.promise, this.#closing.signal); }
     this.#assertRunning();
     const requestId = `msg:${randomUUID()}`;
     const key = memberKey(groupId, phone);
     // Reserve synchronously, before identity/open/commit awaits. A duplicate may still be acknowledged when full.
-    if (this.hasUserRequestCapacity()) this.#requests.set(requestId, { key, retired: false });
+    if (this.hasUserRequestCapacity()) this.#addRequest(requestId, key);
     else if (!deduplicate) return { status: "full", reason: "capacity", message: CAPACITY_FULL };
     const receivedAt = this.#arrival();
     const member = this.#member(groupId, phone);
@@ -289,7 +301,7 @@ export class DurableService {
           // Opening a previously unknown group may have recovered older work after the reservation.
           if (!this.#requests.has(requestId)) {
             if (!this.hasUserRequestCapacity()) return "capacity-full" as const;
-            this.#requests.set(requestId, { key, retired: false });
+            this.#addRequest(requestId, key);
           } else if (this.#requests.size > this.#limits.activeRequests) return "capacity-full" as const;
           const inbox = await tx.doc(InboxDoc, conversation.id);
           if (inbox.items.filter((item) => item.cancelled !== true).length > this.#limits.queue) return "queue-full" as const;
@@ -309,7 +321,7 @@ export class DurableService {
       this.#track(this.#recovered(member).catch((error) => this.#report(error)));
       return { status: "accepted" };
     } finally {
-      if (!retained) this.#requests.delete(requestId);
+      if (!retained) this.#dropRequest(requestId);
       member.uses--;
       release?.();
       this.#wakeCapacity();
@@ -321,6 +333,7 @@ export class DurableService {
 
   /** A slash command; its receipt is sent to the member (best effort) once it has run. */
   async control(phone: string, groupId: string, content: string, callbackUrl: string, onAdmitted?: () => void): Promise<string> {
+    for (let gate; (gate = this.#reclaiming.get(groupId));) { gate.yield = true; await waitFor(gate.promise, this.#closing.signal); }
     const member = this.#member(groupId, phone);
     member.uses++;
     try { return await this.#controlMessage(phone, groupId, content, callbackUrl, onAdmitted); }
@@ -356,7 +369,7 @@ export class DurableService {
       reply = command === "/stop"
         ? "⏹ 已停止你在本群的当前任务，并取消排队中的消息。已发出的内容不会撤回。"
         : "🧹 已为你在本群开启新会话，下条消息从新会话开始，之前的聊天记录留在群库里。其他人的聊天记录不受影响。";
-      if (this.#deliveries.pending(member.key).length) {
+      if (this.#deliveries.hasPending(member.key)) {
         reply += command === "/stop" ? "\n已生成但尚未发完的回复已保留，发送 /deliver 可补发。" : "\n之前已生成但尚未发完的回复仍保留，发送 /deliver 可补发。";
       }
     } else if (command === "/compact") {
@@ -477,42 +490,42 @@ export class DurableService {
     await waitFor(member.starting ?? Promise.resolve(), this.#closing.signal);
     const pending = (await pendingControls(harness, this.#context)).find((control) => control.requestId === requestId);
     if (pending === undefined) { door.controlExecuted(requestId); return; }
-      const conversation = member.conversationId === undefined ? undefined
-        : await harness.conversation(member.conversationId as ConversationId, this.#context);
-      if (conversation !== undefined) {
-        await harness.commit(async (tx) => {
-          const inbox = await tx.doc(InboxDoc, conversation.id);
-          for (const item of inbox.items) if (receivedBefore(item, pending)) item.cancelled = true;
-        }, this.#context);
-        // Resolves once the conversation is idle: the run, its tools and codemode sub-calls have ended.
-        await conversation.abort(this.#context, { background: true });
-        // abort() withdraws queued inputs, but passive summary writes survive it. Cancel those through the public
-        // submission lifecycle as part of the replayable control, so waiting compact commands can settle truthfully.
-        const queued = (await harness.snapshot(PiInboxDoc, conversation.id, this.#context))?.items ?? [];
-        for (const item of queued) if (item.mode === "write" && item.entry.kind === CompactionEntry.kind) {
-          const summary = await harness.submission(item.id, this.#context);
-          await summary?.abort(this.#context);
-        }
-        if (command === "/clear") {
-          if (pending.resetDone !== true) {
-            await conversation.reset(undefined, this.#context);
-            await conversation.waitForIdle(this.#context);
-            await harness.commit(async (tx) => {
-              const stored = (await tx.doc(ControlsDoc)).pending.find((control) => control.requestId === requestId);
-              if (stored) stored.resetDone = true;
-            }, this.#context);
-          }
-          const places = memberPlaces({ root: this.#options.root, ...(this.#options.venvDir === undefined ? {} : { venvDir: this.#options.venvDir }) },
-            member.groupId, member.phone);
-          await this.#removeResults(harness, member, places.tempDir, Number.POSITIVE_INFINITY, false);
-          await this.#project(harness, member);
-        }
-      }
+    const conversation = member.conversationId === undefined ? undefined
+      : await harness.conversation(member.conversationId as ConversationId, this.#context);
+    if (conversation !== undefined) {
       await harness.commit(async (tx) => {
-        const controls = await tx.doc(ControlsDoc);
-        controls.pending = controls.pending.filter((control) => control.requestId !== requestId);
+        const inbox = await tx.doc(InboxDoc, conversation.id);
+        for (const item of inbox.items) if (receivedBefore(item, pending)) item.cancelled = true;
       }, this.#context);
-      door.controlExecuted(requestId);
+      // Resolves once the conversation is idle: the run, its tools and codemode sub-calls have ended.
+      await conversation.abort(this.#context, { background: true });
+      // abort() withdraws queued inputs, but passive summary writes survive it. Cancel those through the public
+      // submission lifecycle as part of the replayable control, so waiting compact commands can settle truthfully.
+      const queued = (await harness.snapshot(PiInboxDoc, conversation.id, this.#context))?.items ?? [];
+      for (const item of queued) if (item.mode === "write" && item.entry.kind === CompactionEntry.kind) {
+        const summary = await harness.submission(item.id, this.#context);
+        await summary?.abort(this.#context);
+      }
+      if (command === "/clear") {
+        if (pending.resetDone !== true) {
+          await conversation.reset(undefined, this.#context);
+          await conversation.waitForIdle(this.#context);
+          await harness.commit(async (tx) => {
+            const stored = (await tx.doc(ControlsDoc)).pending.find((control) => control.requestId === requestId);
+            if (stored) stored.resetDone = true;
+          }, this.#context);
+        }
+        // A clear can overlap another member's run. Record expiry here; an idle group sweep checks
+        // every member/fork and the outbox before touching bytes.
+        await harness.commit(tx => requestMemberExpiry(tx, member.phone), this.#context);
+        await this.#project(harness, member);
+      }
+    }
+    await harness.commit(async (tx) => {
+      const controls = await tx.doc(ControlsDoc);
+      controls.pending = controls.pending.filter((control) => control.requestId !== requestId);
+    }, this.#context);
+    door.controlExecuted(requestId);
   }
 
   /** Hold the member's worker until the returned release is called (several holds stack). */
@@ -538,6 +551,7 @@ export class DurableService {
 
   #kick(member: MemberState): void {
     if (this.#closing.signal.aborted || member.conversationId === undefined) return;
+    if (this.#reclaiming.has(member.groupId)) return;
     if (member.worker !== undefined) { member.again = true; return; }
     member.again = false;
     const worker = this.#work(member).catch((error) => { if (!this.#closing.signal.aborted) this.#report(error); })
@@ -606,7 +620,7 @@ export class DurableService {
             if (member.starting === started) member.starting = undefined;
             startedDone();
             member.lastUsed = Date.now();
-            if (this.#requests.get(head.requestId)?.retired) this.#requests.delete(head.requestId);
+            if (this.#requests.get(head.requestId)?.retired) this.#dropRequest(head.requestId);
           }
         } finally { this.#leaveRun(member); }
       } finally { handle.release(); }
@@ -786,7 +800,7 @@ export class DurableService {
     }
   }
 
-  /** The model error of an unanswered input, as the AgentSession engine reports it. */
+  /** The model error of an unanswered input, for a member reply. */
   async #failure(conversation: Conversation, settled: SettledSubmissionRecord): Promise<Error> {
     const page = await conversation.entries({}, 20, undefined, this.#context);
     const last = page.items.find((entry) => AssistantEntry.is(entry))?.model?.[0] as AssistantMessage | undefined;
@@ -809,7 +823,9 @@ export class DurableService {
       const pending = this.#deliveries.pending(member.key);
       if (pending.some(item => item.id.startsWith("reply:")) && member.conversationId !== undefined) {
         const handle = await this.#groups.acquire(member.groupId);
-        try { await this.#project(handle.harness, member); } finally { handle.release(); }
+        // Usage projection is serialized per conversation. A worker may already be projecting
+        // this finalized answer; delivery must not wait for that independent bookkeeping.
+        this.#track(this.#project(handle.harness, member).finally(() => handle.release()));
       }
       for (const item of pending) {
         if (!item.id.startsWith("reply:") || member.attempted.has(item.id) || this.#deliveries.find(member.key, item.id) === undefined) continue;
@@ -912,10 +928,9 @@ export class DurableService {
     if (member.conversationId !== undefined) {
       const handle = await this.#groups.acquire(member.groupId);
       try {
-        const expired = Object.entries((await handle.harness.snapshot(ResultsDoc, this.#context))?.calls ?? {})
-          .filter(([, call]) => call.phone === member.phone && call.expiryRequestedAt !== undefined).map(([name]) => name);
+        const { expired, backlog, pending } = await memberResultStatus(handle.harness, member.phone, this.#context);
         if (expired.length) text += `\n已过期结果：${expired.length} 个（最近记录最多 256 个）：${expired.slice(-8).join("、")}`;
-        const pending = Object.values((await handle.harness.snapshot(ResultsDoc, this.#context))?.calls ?? {}).filter(call => call.phone === member.phone && call.reclamation !== undefined).length;
+        if (backlog) text += `\n已过期结果：${backlog} 个已转入持久回收账本，等待物理处置`;
         if (pending) text += `\n待物理回收：${pending} 个`;
       } finally { handle.release(); }
     }
@@ -930,75 +945,61 @@ export class DurableService {
 
   // ---- maintenance ----------------------------------------------------------------------------------------------------
 
-  async #removeResults(harness: Harness, member: MemberState, tempDir: string, before: number, history = true): Promise<void> {
-    const doc = await harness.snapshot(ResultsDoc, this.#context);
-    const names = Object.entries(doc?.calls ?? {}).filter(([, call]) => call.phone === member.phone).map(([name]) => name);
-    const conversation = member.conversationId === undefined ? undefined : await harness.conversation(member.conversationId as ConversationId, this.#context);
-    const references: unknown[] = this.#deliveries.pending(member.key);
-    if (history && conversation) references.push((await conversation.context(this.#context)).messages);
-    const eligible = names.filter(name => doc!.calls[name]!.createdAt < before && (doc!.calls[name]!.reclamation?.nextAttemptAt ?? 0) <= Date.now());
-    const isolated = new Map(names.flatMap(name => doc!.calls[name]!.isolatedTask ? [[name, doc!.calls[name]!.isolatedTask!] as const] : []));
-    const removed = await removeCodemodeResults(tempDir, before, { isolated, registered: new Set(eligible), protected: referencedResults(tempDir, names, references, isolated),
-      expire: async expired => { await harness.commit(async tx => {
-        const records = (await tx.doc(ResultsDoc)).calls;
-        for (const name of expired) if (records[name]) records[name].expiryRequestedAt ??= Date.now();
-      }, this.#context); },
-      record: async results => { if (results.some(item => item.status !== "removed")) await harness.commit(async tx => {
-        const records = (await tx.doc(ResultsDoc)).calls, attemptedAt = Date.now();
-        for (const item of results) if (item.status !== "removed" && records[item.name]) records[item.name]!.reclamation = {
-          status: item.status, ...(item.reason ? { reason: item.reason } : {}), ...(item.identity ? { identity: item.identity } : {}), attemptedAt, nextAttemptAt: attemptedAt + 60_000,
-        };
-      }, this.#context); },
-    });
-    // Reconcile a crash after deletion but before its completion receipt was committed.
-    for (const name of names) {
-      if (process.platform === "linux") continue; // An absent shared name does not prove physical deletion.
-      if (!/^\d+-[A-Za-z0-9_.-]+$/.test(name) || doc!.calls[name]!.expiryRequestedAt === undefined || doc!.calls[name]!.expiredAt !== undefined || removed.includes(name)) continue;
-      try { await lstat(join(tempDir, "codemode", name)); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") removed.push(name); else throw error; }
-    }
-    // Only successful removals may be pruned. A failed deletion remains registered for the next sweep/clear retry.
-    if (removed.length) await harness.commit(async tx => {
-        const records = (await tx.doc(ResultsDoc)).calls;
-        for (const name of removed) if (records[name]) { records[name].expiredAt = Date.now(); delete records[name].reclamation; }
-        // Expired receipts remain visible (latest 256); live ownership is never pruned by time alone.
-        const old = Object.entries(records).filter(([, call]) => call.expiredAt !== undefined)
-          .sort((a, b) => a[1].expiredAt! - b[1].expiredAt!);
-        for (const [name] of old.slice(0, Math.max(0, old.length - 256))) delete records[name];
-      }, this.#context);
-    const pending = (await configuredRootlessTasks()?.sweep(tempDir, before, references, new Set(isolated.values())))?.filter(item => item.status !== "removed") ?? [];
-    if (pending.length) log.warn(`隔离任务物理回收待办：${pending.length} 个；` + pending.map(item => `${item.name}: ${item.reason}`).join("；"));
-  }
-
-  /** Close idle groups, project usage of open groups' members, remove old codemode results of idle members. */
+  /** Visit a bounded rotation of known groups, including idle groups evicted from the connection cache. */
   async maintain(now = Date.now()): Promise<void> {
     await this.#groups.sweep();
-    for (const groupId of this.#groups.openGroups) {
+    const groups = this.#groups.knownGroups;
+    const selected = Array.from({ length: Math.min(8, groups.length) }, (_, i) => groups[(this.#maintenanceCursor + i) % groups.length]!);
+    this.#maintenanceCursor = groups.length ? (this.#maintenanceCursor + selected.length) % groups.length : 0;
+    for (const groupId of selected) {
       if (this.#closing.signal.aborted) return;
       const handle = await this.#groups.acquire(groupId);
       try {
-        for (const member of await this.#memberList(handle.harness)) {
-          // A persisted member visited only for maintenance has no new user activity.
-          const state = this.#member(groupId, member.phone, 0);
-          state.uses++;
-          try {
-            state.conversationId = member.conversationId;
-            await this.#project(handle.harness, state);
-            const live = await handle.harness.snapshot(LiveDoc, member.conversationId as ConversationId, this.#context);
-            const busy = state.worker !== undefined || state.gate !== undefined || state.current !== undefined
-              || (await inboxItems(handle.harness, member.conversationId, this.#context)).length > 0
-              || live?.run !== undefined || !!live?.compactions?.length;
-            if (busy) continue;
-            const release = this.#hold(state, false);
+        // No await between the idle check and publishing the gate. Admissions reserve member.uses
+        // synchronously, and worker/control replay state covers work already admitted.
+        if (this.#reclaiming.has(groupId) || [...this.#members.values()].some(state => state.groupId === groupId
+          && (state.uses || state.worker || state.gate || state.starting || state.replaying || state.current))) continue;
+        const gate: ReclamationGate = { ...Promise.withResolvers<void>(), yield: false };
+        this.#reclaiming.set(groupId, gate);
+        try {
+          const values = await idleGroupReferences(handle.harness, this.#context);
+          if (!values) continue;
+          values.push(...this.#deliveries.groupReferences(groupId));
+          // The gate keeps this snapshot of the whole group's references valid; it is searched, never rescanned per member.
+          const references = resultReferences(values);
+          const members = await this.#memberList(handle.harness);
+          const start = (this.#memberCursors.get(groupId) ?? 0) % Math.max(1, members.length);
+          let visited = 0;
+          for (const member of [...members.slice(start), ...members.slice(0, start)]) {
+            // A waiting admission ends the pass between members; the next pass resumes with the next member.
+            if (gate.yield || this.#closing.signal.aborted) break;
+            visited++;
+            // A persisted member visited only for maintenance has no new user activity.
+            const state = this.#member(groupId, member.phone, 0);
+            state.uses++;
             try {
-              // The hold precedes the context read: a newly admitted message cannot start a call during deletion.
-              if (state.starting || state.current || state.worker) continue;
-              const places = memberPlaces({ root: this.#options.root, ...(this.#options.venvDir === undefined ? {} : { venvDir: this.#options.venvDir }) },
-                groupId, member.phone);
-              await recoverOfficeProfiles(places.tempDir, deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error));
-              await this.#removeResults(handle.harness, state, places.tempDir, now - this.#limits.resultRetentionMs).catch((error) => this.#report(error));
-            } finally { release(); }
-          } finally { state.uses--; this.#pruneMember(state, now); }
+              state.conversationId = member.conversationId;
+              await this.#project(handle.harness, state);
+              const live = await handle.harness.snapshot(LiveDoc, member.conversationId as ConversationId, this.#context);
+              const busy = state.worker !== undefined || state.gate !== undefined || state.current !== undefined
+                || (await inboxItems(handle.harness, member.conversationId, this.#context)).length > 0
+                || live?.run !== undefined || !!live?.compactions?.length;
+              if (busy) continue;
+              const release = this.#hold(state, false);
+              try {
+                // The hold precedes the context read: a newly admitted message cannot start a call during deletion.
+                if (state.starting || state.current || state.worker) continue;
+                const places = memberPlaces({ root: this.#options.root, ...(this.#options.venvDir === undefined ? {} : { venvDir: this.#options.venvDir }) },
+                  groupId, member.phone);
+                await recoverOfficeProfiles(places.tempDir, deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error));
+                await this.#results.member(handle.harness, state.phone, places.tempDir, now - this.#limits.resultRetentionMs, references).catch((error) => this.#report(error));
+              } finally { release(); }
+            } finally { state.uses--; this.#pruneMember(state, now); }
+          }
+          if (members.length) this.#memberCursors.set(groupId, (start + visited) % members.length);
+          else this.#memberCursors.delete(groupId);
+        } finally {
+          this.#reclaiming.delete(groupId); gate.resolve();
         }
       } finally { handle.release(); }
     }
@@ -1014,8 +1015,11 @@ export class DurableService {
       await this.#groups.closeAll();
     } finally {
       await Promise.allSettled([...this.#background]);
+      this.#statsLedger?.close();
+      this.#statsLedger = undefined;
       this.#members.clear();
       this.#requests.clear();
+      this.#memberRequests.clear();
       this.#running.clear();
       this.#wakeCapacity();
     }
@@ -1072,7 +1076,7 @@ export class DurableService {
       const member = this.#member(groupId, phone);
       member.conversationId = conversationId;
       const items = await inboxItems(harness, conversationId, context);
-      for (const item of items) if (!this.#requests.has(item.requestId)) this.#requests.set(item.requestId, { key: member.key, retired: false });
+      for (const item of items) this.#addRequest(item.requestId, member.key);
       const head = items[0];
       if (head?.startedAt !== undefined && head.cancelled !== true) member.current = { requestId: head.requestId, startedAt: head.startedAt };
       if (head !== undefined) kicks.push(member);
@@ -1105,16 +1109,7 @@ export class DurableService {
 
   /** Member conversations of a group: ownerless conversations with an identity. */
   async #memberList(harness: Harness): Promise<{ phone: string; conversationId: number }[]> {
-    const ids = await harness.commit(async (tx) => {
-      const found: number[] = [];
-      let cursor: Parameters<typeof tx.scanConversations>[2];
-      for (;;) {
-        const page = await tx.scanConversations({}, 200, cursor);
-        for (const record of page.items) if (record.owner === undefined) found.push(record.id as number);
-        if (page.next === undefined) return found;
-        cursor = page.next;
-      }
-    }, this.#context);
+    const ids = await conversationIds(harness, this.#context, true);
     const members: { phone: string; conversationId: number }[] = [];
     for (const id of ids) {
       const identity = await harness.snapshot(IdentityDoc, id as ConversationId, this.#context);
@@ -1150,7 +1145,7 @@ export class DurableService {
     };
   }
 
-  /** Refresh the group's materials index once per run, before its first request (as the AgentSession engine did). */
+  /** Refresh the group's materials index once per run, before its first request. */
   #materials(groupId: string, runtime: GroupRuntime): Extension {
     const root = this.#options.root;
     return defineExtension({
@@ -1178,19 +1173,18 @@ export class DurableService {
     });
   }
 
-/**
+  /**
    * Count the member's new usage into the ledger. Best effort: the cursor stays where it was on failure and the next
    * projection catches up; a failure because the service is closing is not reported.
    */
   async #project(harness: Harness, member: MemberState): Promise<void> {
-    if (member.conversationId === undefined) return;
-    let db: ReturnType<typeof openStatsLedger> | undefined;
+    if (member.conversationId === undefined || this.#closing.signal.aborted) return;
     try {
-      db = openStatsLedger(this.#options.root);
+      const db = this.#statsLedger ??= openStatsLedger(this.#options.root);
       await projectConversation(db, harness, { groupId: member.groupId, phone: member.phone, conversationId: member.conversationId }, this.#context);
     } catch (error) {
       if (!this.#closing.signal.aborted) this.#report(error);
-    } finally { db?.close(); }
+    }
   }
 
   #member(groupId: string, phone: string, lastUsed = Date.now()): MemberState {
@@ -1216,10 +1210,10 @@ export class DurableService {
   }
 
   #pruneMember(member: MemberState, now = Date.now()): void {
+    // A control receipt always holds this member's gate and uses count until its ticket is released.
     if (member.uses || member.worker || member.gate || member.starting || member.replaying || member.current
-      || member.workerRetry || member.controlRetry || member.attempted.size || this.#deliveries.pending(member.key).length
-      || [...this.#requests.values()].some(request => request.key === member.key)
-      || [...this.#receipts.values()].some(receipt => receipt.groupId === member.groupId && receipt.phone === member.phone)) return;
+      || member.workerRetry || member.controlRetry || member.attempted.size || this.#deliveries.hasPending(member.key)
+      || this.#memberRequests.has(member.key)) return;
     if (this.#runtimes.has(member.groupId) && now - member.lastUsed < this.#limits.memberIdleMs) return;
     if (this.#members.get(member.key) === member) this.#members.delete(member.key);
   }
@@ -1234,8 +1228,23 @@ export class DurableService {
   #leaveRun(member: MemberState): void { this.#running.delete(member.key); this.#wakeCapacity(); }
 
   async #waitForRun(key: string, signal: AbortSignal): Promise<void> {
-    while (!this.#running.has(key) && [...this.#requests.values()].some(request => request.key === key)) await this.#capacityChanged(signal);
+    while (!this.#running.has(key) && this.#memberRequests.has(key)) await this.#capacityChanged(signal);
     signal.throwIfAborted();
+  }
+
+  #addRequest(id: string, key: string): void {
+    if (this.#requests.has(id)) return;
+    this.#requests.set(id, { key, retired: false });
+    this.#memberRequests.set(key, (this.#memberRequests.get(key) ?? 0) + 1);
+  }
+
+  #dropRequest(id: string): void {
+    const request = this.#requests.get(id);
+    if (!request) return;
+    this.#requests.delete(id);
+    const remaining = this.#memberRequests.get(request.key)! - 1;
+    if (remaining) this.#memberRequests.set(request.key, remaining);
+    else this.#memberRequests.delete(request.key);
   }
 
   #capacityChanged(signal: AbortSignal): Promise<void> {
@@ -1289,7 +1298,7 @@ export class DurableService {
   }
 }
 
-/** The DeliveryStore session of a member, as the AgentSession engine keys it (pending replies carry over). */
+/** The DeliveryStore session of a member, shared with persisted pending replies. */
 export function memberKey(groupId: string, phone: string): string {
   return JSON.stringify([groupId, phone]);
 }
@@ -1307,7 +1316,6 @@ function retryWait(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/** The model's current attempt when the model is what the run waits for, with its committed progress. */
 /**
  * The task number of a message: the first 8 hex digits of its request id. Logs write it as `任务: <number>`, the form
  * the log extraction scripts (scripts/ops/task-logs.*) and the TUI search for; /status and failure details show it.
@@ -1331,6 +1339,7 @@ function livePhase(live: Readonly<LiveState> | undefined): string {
   return "准备中";
 }
 
+/** The model's current attempt when the model is what the run waits for, with its committed progress. */
 function modelActivity(live: Readonly<LiveState> | undefined): { key: string; progress: string } | undefined {
   const generation = live?.generation;
   if (live?.run === undefined || generation === undefined) return undefined;

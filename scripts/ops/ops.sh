@@ -12,6 +12,7 @@ if [ ! -f "$COMMON_LIB" ]; then
 fi
 # shellcheck source=../lib/common.sh
 . "$COMMON_LIB"
+. "${PROJECT_DIR}/scripts/lib/task-runtime.sh"
 CONTAINER="mixin-chatbot"
 ROLLBACK_CONTAINER="${CONTAINER}-rollback"
 DATA_DIR="${PROJECT_DIR}/data"
@@ -501,8 +502,13 @@ group_data_admin() {
     guard_one_off_container || return 1
     WA "容器未在运行，改用一次性容器执行"
     local resolved_root="" group_root_env="/app/data/groups" user
-    local group_root_args=()
+    local group_root_args=() TASK_RUNTIME_ARGS=() TASK_DOCKER_ENDPOINT='' TASK_DOCKER_ID='' task_rootless=0
+    # 任务 socket 必须属于服务身份，先确定身份再核对。
     user="$(service_container_user)" || return 1
+    if [ -f "$PROJECT_DIR/data/config/task-deployment.json" ]; then
+        if docker_rootless; then task_rootless=1; fi
+        task_runtime_read "$PROJECT_DIR/data/state/task-runtime" && task_runtime_check_endpoint "$user" "$task_rootless" || return 1
+    fi
     if ! resolved_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null)"; then
         ER "群数据总根路径无效：$DEPLOYED_GROUP_DATA_ROOT"
         return 1
@@ -514,6 +520,7 @@ group_data_admin() {
     docker run --rm \
         --user "$user" \
         -e HOME=/app/data/runtime/home \
+        "${TASK_RUNTIME_ARGS[@]}" \
         -e GROUP_DATA_ROOT="$group_root_env" \
         "${group_root_args[@]}" \
         -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
@@ -541,13 +548,44 @@ backup_admin() {
         mixin-chatbot bun run scripts/ops/backup-cleanup.ts "$@"
 }
 
-tmp_admin() {
-    group_data_admin scripts/ops/tmp-admin.ts "$@"
-}
+tmp_admin() (
+    local argument
+    for argument in "$@"; do
+        case "$argument" in --legacy|--legacy=*) ER '旧共享目录回收必须在宿主独立停机维护中执行；ops 不自动恢复该操作'; return 1 ;; esac
+    done
+    # 预览只读取数据并保存清单，服务照常运行；执行清单（--digest）和一步完成的 purge 才停机。
+    local confirming=0
+    for argument in "$@"; do
+        case "$argument" in --digest|--digest=*) confirming=1 ;; esac
+    done
+    if [ "${1:-}" = list ] || { [ "$confirming" = 0 ] && [ "${1:-}" != purge ]; }; then
+        group_data_admin scripts/ops/tmp-admin.ts "$@"; return $?
+    fi
+    local was_running=0 restored=0
+    restore_tmp_service() {
+        local code=$?
+        trap - EXIT INT TERM
+        if [ "$was_running" = 1 ] && [ "$restored" = 0 ]; then start_bot || code=1; fi
+        exit "$code"
+    }
+    trap restore_tmp_service EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    guard_one_off_container || return 1
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
+        was_running=1
+        stop_bot || return 1
+    fi
+    local code=0
+    group_data_admin scripts/ops/tmp-admin.ts "$@" || code=$?
+    if [ "$was_running" = 1 ]; then start_bot || return 1; fi
+    restored=1
+    return "$code"
+)
 
 # 清历史先停服务（运行中的机器人独占群库）；完成后恢复调用前的运行或停止状态。
 history_clear() (
-    if [ -z "${1:-}" ]; then ER 'history-clear 需要群号'; return 1; fi
+    if [ -z "${1:-}" ]; then ER "history-${HISTORY_OPERATION:-clear} 需要群号"; return 1; fi
     local was_running=0 restored=0
     restore_history_service() {
         local code=$?
@@ -946,6 +984,9 @@ case "${1:-}" in
     relay-purge) shift; relay_admin purge "$@" ;;
     tmp-ls)      shift; tmp_admin list "$@" ;;
     tmp-purge)   shift; tmp_admin purge "$@" ;;
+    tmp-preview) shift; tmp_admin preview "$@" ;;
+    tmp-reclaim) shift; tmp_admin reclaim "$@" ;;
+    tmp-discard) shift; tmp_admin discard "$@" ;;
     routes)        shift; group_data_admin scripts/ops/route-admin.ts "$@" ;;
     stat)          shift; group_data_admin scripts/ops/stats-admin.ts "$@" ;;
     history-ls)    shift; group_data_admin scripts/ops/history-admin.ts list "$@" ;;
@@ -991,6 +1032,10 @@ case "${1:-}" in
         echo "             列出各用户临时目录的占用（缓存、中间产物、截断日志）"
         echo "  tmp-purge --days <天数>|--all [--user <手机号>] [--group <群号>]"
         echo "             清理用户临时目录；--days 只删这些天没改动过的条目"
+        echo "  tmp-preview --days <天数>|--all  核对引用并保存归档清单（服务照常运行）"
+        echo "  tmp-purge --plan <ID> --digest <摘要>  停机执行或继续归档清单，再恢复原状态"
+        echo "  tmp-reclaim --days <天数>|--all  预览物理回收；核对后用 --plan/--digest 确认"
+        echo "  tmp-discard  预览可永久删除的归档；核对后用 --plan/--digest 确认，释放磁盘空间"
         echo "             --user 与 --group 可组合，把范围限到某个群里的某个成员"
         echo "  stat [群号] [--period today|yesterday|week|last-week|month|last-month|7d|30d|all]"
         echo "              或 [--since <日期>] [--until <日期>]"
@@ -998,9 +1043,9 @@ case "${1:-}" in
         echo "  routes     回调路由：list 查看绑定与冲突，reset/forget 需停机"
         echo "  history-ls 列出各群的会话历史（群库与旧会话文件的占用、最后活动）"
         echo "  history-clear <群号>"
-        echo "  history-compact <群号> <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
         echo "             清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         echo "             群选择可加 --group-id（原始群号）或 --storage-segment（目录段）"
+        echo "  history-compact <群号> <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
         echo "  backup-scan 只读扫描 backup/rm 和 backup/snapshots，分类后在 tmp/backup-cleanup 生成清单，不删除"
         echo "  backup-clean <报告名> [--confirm <确认码>]"
         echo "             不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"

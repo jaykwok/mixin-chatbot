@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { App } from "../../scripts/ops/tui/app.ts";
@@ -58,7 +58,17 @@ function fakeApp(root = "unused") {
     async ask(label) { calls.prompts.push(label); return calls.answers.shift() ?? null; },
     async choose(spec) { calls.menus.push(spec); return calls.choices.shift() ?? null; },
     async confirm(spec) { calls.confirms.push(spec); return true; },
-    async run(title, args) { calls.commands.push({ title, args }); return 0; },
+    async run(title, args) {
+      calls.commands.push({ title, args });
+      if (args[0] === "tmp-preview") {
+        const value = (flag: string) => args[args.indexOf(flag) + 1];
+        const { previewTmpArchive } = await import("../../src/maintenance/archive.ts"), { durableMemberScope } = await import("../../src/durable/maintenance-view.ts");
+        await previewTmpArchive({ root, state: join(root, "absent-state.sqlite"), archive: join(root, ".reclamation/backup/rm"), scope: durableMemberScope },
+          args.includes("--all") ? 0 : Number(value("--days")), args.includes("--user") ? value("--user") : undefined,
+          args.includes("--group") ? value("--group") : undefined, "segment", value("--plan"));
+      }
+      return 0;
+    },
     async runInteractive() { throw new Error("测试不得执行真实运维命令"); },
     async openFile(path) { calls.opened.push(path); },
   };
@@ -581,7 +591,7 @@ test("总览的待办与常用入口可直接进入具体功能", () => {
     tmp: [{ bytes: 10, entries: [{ newest: 0, bytes: 10 }] }],
   } } });
   for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
-  // 告警在前（未提交改动 danger 排在陈旧 tmp warn 前面），常用入口固定在后，回车都是「去处理」。
+  // 未提交改动在前，临时文件是常驻入口，回车均进入对应页面。
   view.onKey(key("enter"), app);
   view.onKey(key("down"), app);
   view.onKey(key("enter"), app);
@@ -590,8 +600,8 @@ test("总览的待办与常用入口可直接进入具体功能", () => {
   expect(calls.destinations).toEqual(["maintain", "storage", "maintain"]);
   const shown = plain(view.render(context()));
   expect(shown).toContain("查看运行日志");
-  // 分隔线右端只数需要关注的条数，不把四个常驻入口算进去。
-  expect(shown).toContain("2 项待关注");
+  // 分隔线只数需要关注的条数，不把常驻入口算进去。
+  expect(shown).toContain("1 项待关注");
   view.onKey(key("health"), app);
   expect(calls.destinations.at(-1)).toBe("health");
   const maintain = new MaintainView();
@@ -1282,6 +1292,90 @@ test("统计汇总逐日补零，可切换周月粒度，基期比较在窄窗�
   } finally { await fixture.cleanup(); }
 });
 
+test("临时文件预览失败、零候选及取消都不执行归档；结果按实际进度报告", async () => {
+  const fixture = await tempFixture("tui-storage-outcomes-");
+  try {
+    const dir = join(fixture.root, "g1/users/u1/tmp"); await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "sample.txt"), "fixture");
+    const { app, calls } = fakeApp(fixture.root), view = new StorageView(), run = app.run;
+    await view.refresh(app);
+    // Default retention keeps the fresh file, although the directory is visible.
+    await view.onKey(key("p"), app);
+    expect(calls.commands.map(call => call.args[0])).toEqual(["tmp-preview"]);
+    expect(calls.confirms).toHaveLength(0); expect(calls.toasts.at(-1)).toContain("可归档 0 项；保留 1 项");
+    app.run = async (title, args) => { calls.commands.push({ title, args }); return 1; };
+    await view.onKey(key("p"), app);
+    expect(calls.toasts.at(-1)).toContain("预览失败"); expect(calls.confirms).toHaveLength(0);
+    app.run = run; calls.choices.push("0"); await view.onKey(key("d"), app);
+    app.confirm = async () => false;
+    await view.onKey(key("p"), app);
+    expect(calls.toasts.at(-1)).toBe("已取消"); expect(calls.commands.every(call => call.args[0] === "tmp-preview")).toBe(true);
+    app.confirm = async () => true;
+    app.run = async (title, args) => {
+      if (args[0] !== "tmp-purge") return run(title, args);
+      calls.commands.push({ title, args });
+      await writeFile(join(fixture.root, ".reclamation/backup/rm/.tmp-plans", args[2] + ".progress.json"), JSON.stringify({
+        version: 1, digest: args[4], outcomes: { "0": { status: "failed", bytes: 0, reason: "synthetic failure" } },
+      }));
+      return 1;
+    };
+    await view.onKey(key("p"), app);
+    expect(calls.toasts.at(-1)).toContain("已归档 0 项，保留 0 项，待处置 0 项，失败 1 项");
+    expect(calls.toasts.at(-1)).toContain("操作未完成");
+  } finally { await fixture.cleanup(); }
+});
+
+test("归档后 r 预览并永久删除归档，x 预览物理回收；都要输入确认词，结果按实际进度报告", async () => {
+  const fixture = await tempFixture("tui-storage-discard-");
+  try {
+    const dir = join(fixture.root, "g1/users/u1/tmp"); await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "sample.txt"), "fixture");
+    const core = await import("../../src/maintenance/archive.ts"), reclamation = await import("../../src/maintenance/reclaim.ts"), { durableMemberScope } = await import("../../src/durable/maintenance-view.ts");
+    const options = { root: fixture.root, state: join(fixture.root, "absent-state.sqlite"), archive: join(fixture.root, ".reclamation/backup/rm"), scope: durableMemberScope };
+    const { app, calls } = fakeApp(fixture.root), view = new StorageView(), run = app.run;
+    app.run = async (title, args) => {
+      const value = (flag: string) => args[args.indexOf(flag) + 1]!;
+      if (args[0] === "tmp-purge") await core.applyTmpArchive(options, value("--plan"), value("--digest"));
+      else if (args[0] === "tmp-discard" && args.includes("--digest")) await core.applyArchiveRemoval(options, value("--plan"), value("--digest"));
+      else if (args[0] === "tmp-discard") await core.previewArchiveRemoval(options, value("--plan"));
+      else if (args[0] === "tmp-reclaim") await reclamation.previewReclamation({ ...options, directory: join(fixture.root, ".reclamation/plans") }, 0, undefined, undefined, "auto", value("--plan"));
+      else return run(title, args);
+      calls.commands.push({ title, args }); return 0;
+    };
+    await view.refresh(app);
+    calls.choices.push("0"); await view.onKey(key("d"), app);
+    await view.onKey(key("a"), app);
+    expect(calls.toasts.at(-1)).toContain("已归档 1 项");
+    const archived = await readdir(options.archive);
+    expect(archived.filter(name => name.startsWith("tmp-"))).toHaveLength(1);
+    const archiveConfirms = calls.confirms.length;
+    await view.onKey(key("r"), app);
+    if (process.platform === "win32") {
+      const preview = calls.commands.at(-2)!, removal = calls.commands.at(-1)!;
+      expect(preview.args).toEqual(["tmp-discard", "--plan", expect.any(String)]);
+      expect(removal.args).toEqual(["tmp-discard", "--plan", preview.args[2], "--digest", expect.any(String)]);
+      expect(calls.confirms.at(-1)!.typeToConfirm).toBe("永久删除");
+      expect(calls.toasts.at(-1)).toContain("已删除 1 项");
+      expect((await readdir(options.archive)).filter(name => name.startsWith("tmp-"))).toEqual([]);
+    } else {
+      // Linux: an archived shared-identity file needs the privileged backend (IA-1); the view only previews it as pending.
+      expect(calls.commands.at(-1)!.args).toEqual(["tmp-discard", "--plan", expect.any(String)]);
+      expect(calls.confirms).toHaveLength(archiveConfirms);
+      expect(calls.toasts.at(-1)).toContain("可删除 0 项"); expect(calls.toasts.at(-1)).toContain("待处置 1 项");
+      expect((await readdir(options.archive)).filter(name => name.startsWith("tmp-"))).toHaveLength(1);
+    }
+    // Nothing left to discard: no confirmation, no deletion command.
+    const confirms = calls.confirms.length;
+    await view.onKey(key("r"), app);
+    expect(calls.toasts.at(-1)).toContain("可删除 0 项"); expect(calls.confirms).toHaveLength(confirms);
+    expect(calls.commands.at(-1)!.args).not.toContain("--digest");
+    // Physical reclamation previews all groups with the selected range; without the state ledger nothing is ready.
+    await view.onKey(key("x"), app);
+    expect(calls.commands.at(-1)!.args).toEqual(["tmp-reclaim", "--all", "--plan", expect.any(String)]);
+    expect(calls.toasts.at(-1)).toContain("可删除 0 项"); expect(calls.confirms).toHaveLength(confirms);
+  } finally { await fixture.cleanup(); }
+});
+
 test("存储清当前会同时传群与成员，清所有则明确显示范围", async () => {
   const fixture = await tempFixture("tui-storage-view-");
   try {
@@ -1301,10 +1395,12 @@ test("存储清当前会同时传群与成员，清所有则明确显示范围",
     expect(plain(view.render(context()))).toContain("a 全部");
     expect(plain(view.render(context()))).toContain("所有群与成员，忽略筛选");
     await view.onKey(key("p"), app);
-    expect(calls.commands[0]!.args).toEqual(["tmp-purge", "--all", "--group", "g1", "--user", "13812345678", "--storage-segment"]);
+    expect(calls.commands[0]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String), "--group", "g1", "--user", "13812345678", "--storage-segment"]);
+    expect(calls.commands[1]!.args).toEqual(["tmp-purge", "--plan", calls.commands[0]!.args[3]!, "--digest", expect.any(String)]);
     expect(calls.confirms[0]!.subject).toContain("群 g1");
     await view.onKey(key("a"), app);
-    expect(calls.commands[1]!.args).toEqual(["tmp-purge", "--all"]);
+    expect(calls.commands[2]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String)]);
+    expect(calls.commands[3]!.args[0]).toBe("tmp-purge");
     expect(calls.confirms[1]!.subject).toContain("所有群的所有成员");
   } finally { await fixture.cleanup(); }
 });
@@ -1330,9 +1426,9 @@ test("筛选临时文件后只清选中成员，全量清理仍明确覆盖所�
     expect(plain(view.render(context()))).toContain("1 / 2");
     expect(plain(view.render(context()))).not.toContain("支持 一群");
     await view.onKey(key("p"), app);
-    expect(calls.commands[0]!.args).toEqual(["tmp-purge", "--all", "--group", "支持 二群", "--user", "13812345678", "--storage-segment"]);
+    expect(calls.commands[0]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String), "--group", "支持 二群", "--user", "13812345678", "--storage-segment"]);
     await view.onKey(key("a"), app);
-    expect(calls.commands[1]!.args).toEqual(["tmp-purge", "--all"]);
+    expect(calls.commands[2]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String)]);
     expect(calls.confirms[1]!.subject).toContain("不受列表筛选影响");
     expect(calls.confirms[1]!.subject).toContain("35 个条目");
     await view.onKey(key("enter"), app);
@@ -1347,7 +1443,7 @@ test("筛选临时文件后只清选中成员，全量清理仍明确覆盖所�
     calls.answers.push("没有这个群");
     await view.onKey(key("/"), app);
     await view.onKey(key("p"), app);
-    expect(calls.commands).toHaveLength(2);
+    expect(calls.commands).toHaveLength(4);
     expect(plain(view.render(context()))).toContain("没有匹配");
   } finally { await fixture.cleanup(); }
 });

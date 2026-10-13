@@ -1,4 +1,4 @@
-// Model access for the Durable engine (D2-1). One ModelRuntime and model selection per process, as today
+// Model access for the Durable engine. One ModelRuntime and model selection per process,
 // (src/core/model-config.ts: models.json, read-only model catalogue, in-memory credentials, no catalogue network); one
 // request door per group Harness, since controls hold the requests of members of one group.
 //

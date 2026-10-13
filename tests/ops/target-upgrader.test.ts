@@ -19,6 +19,8 @@ const token = "eyJhIjoiZml4dHVyZS1hY2NvdW50IiwidCI6ImZpeHR1cmUifQ";
 const dockerStub = `#!/usr/bin/env bash
 mock="$FIXTURE_MOCK"
 printf '%s\n' "$*" >> "$mock/docker.log"
+task_daemon=0
+if [ "$1" = --host ]; then task_daemon=1; shift 2; fi
 if [ "$1" = container ]; then shift; elif [ "$1" = inspect ]; then echo "ambiguous docker inspect: $*" >&2; exit 97; fi
 current_head() { git -C "$FIXTURE_WORK" rev-parse --short HEAD; }
 # Rootless unless the tests run as root: a rootful daemon needs a root operator.
@@ -39,6 +41,7 @@ case "$cmd" in
             '') ;;
             '{{.ID}}') echo "\${FIXTURE_DAEMON:-5eec1de4-4518-46da-a461-80c0866ec11d}" ;;
             '{{.SecurityOptions}}') echo "$options" ;;
+            '{{json .SecurityOptions}}') if [ "$task_daemon" = 1 ]; then echo '["name=rootless"]'; else echo '[]'; fi ;;
             *) printf '%s|%s|overlay2|[[Backing Filesystem extfs]]|%s\n' "$(uname -n)" "$mock/docker-root" "$options" ;;
         esac ;;
     version) echo amd64 ;;
@@ -123,7 +126,7 @@ case "$cmd" in
             '{{.State.Running}}') echo "$running" ;;
             '{{.State.Status}}') if [ "$running" = true ]; then echo running; else echo exited; fi ;;
             '{{.Config.User}}') echo "$user" ;;
-            '{{.Id}}|'*) printf '%s|%s|%s|%s|\n' "\${id:-c0ffee}" "$user" "$image" "\${FIXTURE_DATA_MOUNT:-$FIXTURE_WORK/data}" ;;
+            '{{.Id}}|'*) printf '%s|%s|%s|%s|\n' "\${id:-${"c".repeat(64)}}" "$user" "$image" "\${FIXTURE_DATA_MOUNT:-$FIXTURE_WORK/data}" ;;
         esac ;;
     stop|start)
         name="\${!#}"; read -r image running user id < "$mock/containers/$name"
@@ -264,6 +267,8 @@ async function upgraderFixture(prefix: string, processes: ScenarioProcesses) {
   const f = await tempFixture(prefix), work = join(f.root, "work"), state = join(work, "data/state");
   const bin = join(f.root, "bin"), mock = join(f.root, "mock"), events = join(f.root, "events"), stage = join(work, "tmp/upgrade-fixture");
   const { old, target } = source;
+  const socket = join(f.root, "task.sock");
+  const taskSocket = Bun.listen({ unix: socket, socket: { data() {} } });
   const run = (args: string[], env: Record<string, string> = {}, input?: string) => runCommand(processes, work, args, env, input);
   const git = async (...args: string[]) => {
     const result = await run(["git", ...args]); expect(result.code, result.text).toBe(0); return result.text.trim();
@@ -276,7 +281,9 @@ async function upgraderFixture(prefix: string, processes: ScenarioProcesses) {
   // would see another project than the stub's container mounts. PWD pins the form the stubs use, for every entry.
   const env = (extra: Record<string, string> = {}) => ({ PATH: `${posix(bin)}:${process.env.PATH}`, PWD: posix(work),
     FIXTURE_EVENTS: posix(events), FIXTURE_MOCK: posix(mock), FIXTURE_WORK: posix(work), FIXTURE_TOKEN: token,
-    DOCKER_HOST: "unix:///var/run/docker.sock", "BASH_FUNC_df%%": dfFunction, ...extra });
+    DOCKER_HOST: "unix:///var/run/docker.sock", BOT_TASK_DOCKER_HOST: `unix://${socket}`, "BASH_FUNC_df%%": dfFunction,
+    // Socket ownership is part of the synthetic daemon's fixture, including root-operated UID 1000 scenarios.
+    "BASH_FUNC_stat%%": `() { if [ "$*" = '-c %u -- ${socket}' ]; then if [ "\${FIXTURE_ROOTLESS:-$([ "$(id -u)" = 0 ] && echo 0 || echo 1)}" = 1 ]; then id -u; else printf '%s' "\${FIXTURE_TASK_UID:-1000}"; fi; else command stat "$@"; fi\n}`, ...extra });
   const clearEvents = async () => {
     for (const name of ["record", "preview-args", "candidate-image", "service-user", "disk-full"]) await rm(join(mock, name), { force: true });
     await rm(events, { force: true });
@@ -308,12 +315,12 @@ async function upgraderFixture(prefix: string, processes: ScenarioProcesses) {
     await rm(join(state, "deploy-transaction"), { force: true });
   };
   const fixture = { f, work, state, mock, stage, run, git, env, upgrade, ops, log, record, container, reset, old, target, processes,
-    candidateTags, officialTag, sidecar, cleanup: () => f.cleanup() };
+    candidateTags, officialTag, sidecar, cleanup: () => { taskSocket.stop(true); return f.cleanup(); } };
   try {
     await cp(source.work, work, { recursive: true }); await cp(source.bin, bin, { recursive: true });
     // The copied Git settings still name the template's exclude file; this copy gets its own.
     await writeFile(join(f.root, "gitignore"), ""); await git("config", "core.excludesFile", join(f.root, "gitignore"));
-  } catch (error) { await f.cleanup(); throw error; }
+  } catch (error) { taskSocket.stop(true); await f.cleanup(); throw error; }
   return fixture;
 }
 type Fixture = Awaited<ReturnType<typeof upgraderFixture>>;

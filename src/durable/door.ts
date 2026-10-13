@@ -1,6 +1,5 @@
-// Request door: the one place where a generation request reaches the provider (D0 reviews R2-1, R2-4, R3-1; contract
-// 2.6). Ported from the accepted D0 probe (tmp/pi100-d0/probes-102/lib/door.ts, Pi 1.0.2) without its mutation switches
-// and the arguments only they used; absorbed errors go to `onReport` instead of an ever-growing list.
+// Request door: the one place where a generation request reaches the provider.
+// Absorbed errors go to `onReport` instead of an ever-growing list.
 //
 // Serial boundary. A control command (/clear, /stop) is marked in the door's in-memory registry synchronously when it is
 // received, before its admission commit; a generation request is handed to the provider only by the door, right after a
@@ -10,7 +9,7 @@
 // handed over (the control's abort ends the hold). Every await of the request path (identity read, credential
 // resolution, task read, start-record commit, the hold itself) lies before the final check. The registry is loaded from
 // the pending admissions at startup, before scheduling, and a control leaves it only after its removal from the stream
-// is committed (D3 wires the admission side).
+// is committed by the service.
 //
 // Registration ownership. Each admission attempt of a control holds its own ticket from receipt until that attempt is
 // resolved, and a control waiting in the admission stream holds one stream registration under its requestId. Every
@@ -20,13 +19,13 @@
 // Where. Durable calls `models.streamSimple`; Models (coding-agent `ModelRuntime`) awaits credential resolution before it
 // calls the provider, so the door does not delegate generation requests to it. It implements `streamSimple` itself on the
 // public `Models` interface: `getProvider(id)` and `getAuth(model, ...)` (which also adds the models.json headers), merged
-// into the provider options as pi-ai `Models.applyAuth` / `ModelRuntime.prepareRequest` do (1.0.2, the same in 1.0.3 and 1.0.4),
+// into the provider options as pi-ai `Models.applyAuth` / `ModelRuntime.prepareRequest` do,
 // then, after the final check, `provider.streamSimple` synchronously. A `beforeRequest` hook registers the generation's
 // abort signal with its conversation and task, synchronously, without I/O; the door looks the registration up by signal
 // identity (the hook context's `abortSignal` is the invocation controller's signal). The door fails closed: a request
 // without a registration is not sent.
 //
-// Compaction (gap G4, option A; D2-5). The summarize request (`models.completeSimple`) takes the same path: the
+// Compaction. The summarize request (`models.completeSimple`) takes the same path: the
 // project's pi-durable patch (scripts/patches/) adds a `beforeSummarize` hook before every summarize attempt, which
 // registers the compaction's signal as `beforeRequest` does for a generation; the door then holds it for a pending
 // control, commits its start record (kind "compaction") and hands it over after the same final check. pi-ai's
@@ -63,7 +62,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { AttemptsDoc, NOT_SENT, type UsageRecord } from "./attempts.ts";
 
-/** coding-agent `VIRTUAL_MODEL_API` (core/virtual-models.js, 1.0.2 to 1.0.4; not exported from the package). */
+/** coding-agent `VIRTUAL_MODEL_API` (core/virtual-models.js; not exported from the package). */
 export const VIRTUAL_MODEL_API = "pi-virtual";
 
 type Registration = { kind: "generation" | "compaction"; conversationId: number; taskId: number; context: Context };
@@ -110,7 +109,7 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/** pi-ai `mergeHeaders` (models.js, 1.0.2 to 1.0.4): an override replaces a header of any case. */
+/** pi-ai `mergeHeaders` (models.js): an override replaces a header of any case. */
 function mergeHeaders(base: Record<string, string> | undefined, override: Record<string, string> | undefined) {
   if (!base && !override) return undefined;
   const merged: Record<string, string> = { ...base };
@@ -153,7 +152,7 @@ export class RequestDoor {
     this.#options = options;
   }
 
-  // ---- controls (admission side, wired in D3) -------------------------------------------------------------------------
+  // ---- controls (registered by the service on admission) -------------------------------------------------------------
 
   /** Synchronous, before the control's admission commit: the attempt's own registration. */
   controlReceived(phone: string, requestId: string): ControlTicket {
@@ -420,9 +419,7 @@ export class RequestDoor {
       const blockedAtDispatch = this.#options.dispatchError?.(phone);
       if (!blockedAtDispatch && !requestSignal.aborted && this.pendingControls(phone) === 0) {
         this.dispatched++;
-        let work: Promise<T>;
-        try { work = dispatch(); }
-        catch (error) { throw error; }
+        const work = dispatch();
         this.#options.onDispatch?.(registration.conversationId);
         const result = await work;
         // After shutdown retain the durable start as unknown, like generation; never attempt a new receipt write.
@@ -514,8 +511,8 @@ export class RequestDoor {
 
   /**
    * Provider and provider options, as `ModelRuntime.streamSimple` / `prepareRequest` and pi-ai `Models.applyAuth` build
-   * them (1.0.2, the same in 1.0.3 and 1.0.4; same checks and messages; credentials resolved now, before the final check).
-   * From pi-ai 1.0.3 an OAuth refresh that has started runs on its own signal and its result is stored even when the
+   * them (same checks and messages; credentials resolved now, before the final check).
+   * An OAuth refresh that has started runs on its own signal and its result is stored even when the
    * request's signal aborts; `getAuth` still returns at the abort, so the request ends aborted without waiting for it.
    */
   async #prepare(models: Models, model: Model<never>, options: StreamOptions | undefined): Promise<Prepared> {

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { RootlessTasks, type TaskDriver } from "../../src/core/rootless-tasks.ts";
 import { executeProcess } from "../../scripts/lib/process.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { resultReferences } from "../../src/durable/results/references.ts";
 
 const enabled = process.platform === "linux" && process.env.MIXIN_REAL_TASKS === "1";
 test.skipIf(!enabled)("real daemon rejects a delayed start after sealing, before scratch and work reclamation", async () => {
@@ -36,7 +37,7 @@ test.skipIf(!enabled)("real rootless bash and codemode front doors preserve refe
     expect(JSON.parse(result.stdout.trim())).toMatchObject({ bash: true, protectedWrite: true, sealedInputs: true, activeCodemodeInput: true, privateControl: true, privateDocuments: true, codemode: true, references: true, expiry: true });
   } finally {
     const recovery = new RootlessTasks(join(f.root, "control"), process.env.MIXIN_TASK_TEST_IMAGE!);
-    const results = await recovery.sweep(join(f.root, "caller"), Infinity, []);
+    const results = await recovery.sweep(join(f.root, "caller"), Infinity, resultReferences([]));
     expect(results.every(item => item.status === "removed")).toBe(true);
     await f.cleanup();
   }

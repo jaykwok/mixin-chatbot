@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
@@ -75,4 +75,21 @@ test("historical diagnostics reject invalid cuts, absent members and future sche
   await expect(historicalContext(future, "alice")).rejects.toThrow("版本不匹配"); expect(await readFile(future)).toEqual(bytes);
   const ordinary = join(f.root, "not-database"); await writeFile(ordinary, "fixture");
   await expect(conversationTimings(ordinary, "alice")).rejects.toThrow();
+});
+
+test("a group database above the memory limit is snapshotted into a private file on the data volume, then removed", async () => {
+  const groups = join(f.root, "groups-large"), large = join(groups, "group-a/durable.sqlite");
+  await mkdir(join(groups, "group-a"), { recursive: true });
+  const { models, model } = fauxModels(), opened = await openGroupHarness(large, models, { group: "group-a" });
+  try { await memberConversation(opened.harness, "group-a", "alice", { model }, context); } finally { await opened.close(); }
+  const before = await digest(large), snapshots = join(groups, ".reclamation/snapshots");
+  for (const exclusive of [false, true]) {
+    const seen = await withGroupSnapshot(large, async harness => {
+      expect(await harness.inspect(context)).toMatchObject({ scheduling: "paused" });
+      return readdir(snapshots);
+    }, exclusive, 1);
+    expect(seen).toHaveLength(1);
+    expect(await readdir(snapshots)).toEqual([]);
+  }
+  expect(await digest(large)).toBe(before);
 });

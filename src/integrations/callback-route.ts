@@ -1,5 +1,6 @@
 // Bind callback keys to groups and quarantine conflicts before every outbound request.
 import { createHash } from "node:crypto";
+import type { Database } from "bun:sqlite";
 import { CALLBACK_ROUTE_TTL, GROUP_ID_PATTERN, MAX_CALLBACK_ROUTES, MAX_GROUP_ID_LENGTH } from "../core/config.ts";
 import { stateDatabase } from "../core/state.ts";
 
@@ -11,9 +12,13 @@ interface CallbackRouteEntry {
   fingerprint: string; groupId: string; conflictingGroupId: string | null; seenAt: number;
 }
 const controllers = new Map<string, AbortController>();
+const initialized = new WeakSet<Database>();
 function db() {
   const db = stateDatabase();
-  db.exec("CREATE TABLE IF NOT EXISTS callback_routes (hash TEXT PRIMARY KEY, group_id TEXT NOT NULL, conflict TEXT, seen INTEGER NOT NULL)");
+  if (!initialized.has(db)) {
+    db.exec("CREATE TABLE IF NOT EXISTS callback_routes (hash TEXT PRIMARY KEY, group_id TEXT NOT NULL, conflict TEXT, seen INTEGER NOT NULL)");
+    initialized.add(db);
+  }
   return db;
 }
 function hash(url: string): string {

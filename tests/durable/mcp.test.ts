@@ -11,16 +11,19 @@ import { removeCodemodeResults } from "../../src/durable/codemode/results.ts";
 import { claimGroup, memberConversation } from "../../src/durable/identity.ts";
 import { mcpMemberTools } from "../../src/durable/mcp.ts";
 import { groupDoor } from "../../src/durable/models.ts";
-import { ResultsDoc } from "../../src/durable/result-lifecycle.ts";
+import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { memberPlaces } from "../../src/durable/tools.ts";
 import { fauxModels } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { handoffFullResults, stubResultsBackend } from "../helpers/results-backend.ts";
 
 const f = await tempFixture("durable-mcp-"); afterAll(() => f.cleanup());
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=";
 
-test("deferred MCP in codemode keeps long results and images in each member's owned, sweepable tmp", async () => {
+test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP in codemode keeps owned, sweepable results (isolated=%s)", async isolated => {
+  const root = join(f.root, String(isolated)); await mkdir(root);
+  const runtime = isolated ? stubResultsBackend(join(root, "control")) : undefined;
   const identities: string[] = [];
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     if (request.method === "DELETE") return new Response(null, { status: 204 });
@@ -35,9 +38,9 @@ test("deferred MCP in codemode keeps long results and images in each member's ow
     } else throw new Error("unexpected RPC");
     return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
   } });
-  const manager = new McpTools({ format: 1, servers: [{ name: "reports", tools: ["report"], transport: "http", url: `http://127.0.0.1:${server.port}/mcp` }] }, join(f.root, "discovery"));
+  const manager = new McpTools({ format: 1, servers: [{ name: "reports", tools: ["report"], transport: "http", url: `http://127.0.0.1:${server.port}/mcp` }] }, join(root, "discovery"));
   const { models, faux, model } = fauxModels(), holder: { harness?: Harness } = {};
-  const door = groupDoor(holder, { startTries: 1 }), members = { root: join(f.root, "root"), groupId: "group-a" };
+  const door = groupDoor(holder, { startTries: 1 }), members = { root: join(root, "root"), groupId: "group-a" };
   let harness: Harness | undefined;
   try {
     await mkdir(members.root); await manager.initialize(new AbortController().signal);
@@ -45,8 +48,9 @@ test("deferred MCP in codemode keeps long results and images in each member's ow
     expect(tools[0]!.definition.exposure).toBe("deferred"); expect(tools[0]!.replay).toBe("unsafe");
     registry.install(defineExtension({ name: "mixin.mcp" }));
     registry.install(codemodeExtension({ members, tools: tools.map(tool => ({ extension: "mixin.mcp", tool })) }));
-    harness = await Harness.open(await openGroupStorage(join(f.root, "group.sqlite")), { registry, models: door.wrap(models), settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);
+    harness = await Harness.open(await openGroupStorage(join(root, "group.sqlite")), { registry, models: door.wrap(models), settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);
     holder.harness = harness; await claimGroup(harness, "group-a", context);
+    if (isolated) await handoffFullResults(harness);
     for (const phone of ["alice", "bob"]) {
       const { conversation } = await memberConversation(harness, "group-a", phone, { model }, context);
       const callId = `report-${phone}`;
@@ -59,13 +63,22 @@ test("deferred MCP in codemode keeps long results and images in each member's ow
       const owned = Object.entries(calls).filter(([, owner]) => owner.phone === phone).map(([name]) => name);
       expect(owned.some(name => /^\d+-mcp-/.test(name))).toBe(true);
       const tempDir = memberPlaces(members, members.groupId, phone).tempDir;
-      const mcpDir = join(tempDir, "codemode", owned.find(name => /^\d+-mcp-/.test(name))!);
+      const mcpName = owned.find(name => /^\d+-mcp-/.test(name))!;
+      const mapping = new Map(owned.flatMap(name => calls[name]!.isolatedTask ? [[name, calls[name]!.isolatedTask!] as const] : []));
+      if (isolated) expect(mapping.size).toBe(owned.length);
+      const mcpDir = isolated ? join(tempDir, ".isolated-work", mapping.get(mcpName)!, "work") : join(tempDir, "codemode", mcpName);
       expect(await readFile(join(mcpDir, "output-1.png"))).toEqual(Buffer.from(png, "base64"));
       const full = JSON.parse(await readFile(join(mcpDir, "output.txt"), "utf8"));
       expect(full.structuredContent).toEqual({ member: phone }); expect(full.content[0].text).toHaveLength(phone.length + 30000);
       expect(JSON.stringify(output.content)).toContain(tempDir.replaceAll("\\", "\\\\"));
-      expect(await removeCodemodeResults(tempDir, Infinity, { registered: new Set(owned), protected: new Set(), expire: async () => {} })).toEqual(process.platform === "linux" ? [] : [...owned].sort());
+      const policy = { registered: new Set(owned), protected: new Set(owned), isolated: mapping, expire: async () => {} };
+      expect(await removeCodemodeResults(tempDir, Infinity, policy)).toEqual([]);
+      expect(await readFile(join(mcpDir, "output-1.png"))).toEqual(Buffer.from(png, "base64"));
+      policy.protected.clear();
+      expect((await removeCodemodeResults(tempDir, Infinity, policy)).sort()).toEqual(process.platform === "linux" && !isolated ? [] : [...owned].sort());
+      if (runtime) for (const id of mapping.values()) expect((await runtime.backend.describe(id, tempDir)).phase).toBe("removed");
     }
     expect(identities).toEqual(["alice", "bob"]);
-  } finally { await manager.close(); await door.close(); await harness?.close(context); await server.stop(true); }
+    if (isolated) expect((await harness.snapshot(ResultsDoc, context))!.calls["999999-protected"]!.phone).toBe("protected-member");
+  } finally { await manager.close(); await door.close(); await harness?.close(context); await server.stop(true); runtime?.restore(); }
 }, 20000);

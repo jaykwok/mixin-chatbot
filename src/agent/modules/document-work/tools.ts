@@ -11,9 +11,10 @@ import { AsyncSemaphore } from "../../../core/async-semaphore.ts";
 import { application } from "../../../core/lifecycle.ts";
 import { log } from "../../../core/log.ts";
 import { runProcess } from "../../../core/process.ts";
-import { assertTaskPathAllowed, configuredRootlessTasks, ISOLATED_PYTHON, type IsolatedTask } from "../../../core/rootless-tasks.ts";
+import type { IsolatedTask } from "../../../core/rootless-tasks.ts";
+import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../../../core/task-backend.ts";
 import { holdDirectory } from "../../../core/held-directory.ts";
-import { isPathInside } from "../../paths.ts";
+import { isPathInside } from "../../../contracts/paths.ts";
 import { resolveToolPath } from "../../tool-path.ts";
 import { ensureDocumentToolchain, venvPythonPath } from "../../python-toolchain.ts";
 import type { DocumentOptions } from "../../document-extract.ts";
@@ -160,10 +161,8 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
     try {
       // Only directories created by this invocation are removed. Successful jobs
       // retain their outputs/reports; failed or cancelled jobs have no deliverable.
-      if (isolated) {
-        await isolated.seal({ discardScratch: succeeded });
-        if (!succeeded) await backend!.reclaim(isolated.id);
-      } else if (directory && process.platform === "linux") {
+      if (isolated) await finishTask(backend!, isolated, succeeded ? "keep-outputs" : "discard");
+      else if (directory && process.platform === "linux") {
         const held = await holdDirectory(directory, [], false);
         try { await held.use(async entries => {
           const receipt = await entries.create(".reclamation.json");
@@ -325,7 +324,7 @@ const NAMESPACE: ToolNamespace = {
   ].join("\n\n"),
 };
 const SKILL_POINTER = "Markdown 写法、图示注释和参数细节见 document-work skill 的 references/build.md。";
-// 六个工具不直接声明给模型，只出现在 codemode 的工具清单里（Pi 1.0.0 按每 4 个字符 1 token 估算合计约 1600，
+// 六个工具不直接声明给模型，只出现在 codemode 的工具清单里（Pi 按每 4 个字符 1 token 估算合计约 1600，
 // 在默认 3000 的清单预算内；超出预算的工具不列出，只在命名空间标题上标注）。
 const SCRIPT_ONLY: ToolExposure = "codemode";
 // 只读资料、只在当前用户 tmp 写新文件；不覆盖已有文件，也不访问外部。

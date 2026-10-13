@@ -1,23 +1,29 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createHmac } from "node:crypto";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { RootlessTasks, type TaskDriver, type TaskStorage } from "../../src/core/rootless-tasks.ts";
 import { RemovalPermit } from "../../src/core/reclamation.ts";
 import { holdDirectory } from "../../src/core/held-directory.ts";
 import { publishJson } from "../../scripts/migrations/lib/io.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { resultReferences } from "../../src/durable/results/references.ts";
 
 const image = "sha256:" + "a".repeat(64);
 test("a different-device subtree cannot receive a removal permit", () => {
   expect(() => new RemovalPermit({ dev: 1n, ino: 2n }, { dev: 3n, ino: 4n })).toThrow("不同设备");
 });
-function syntheticDriver() {
+function syntheticDriver(managerPath: (source: string) => string = source => source) {
   const containers = new Map<string, any>(), calls: string[][] = []; let index = 0;
   const driver: TaskDriver = { async run(args) {
     calls.push(args);
     if (args[0] === "info") return { exitCode: 0, output: JSON.stringify({ ID: "synthetic-daemon", SecurityOptions: ["name=rootless"] }) };
     if (args[0] === "image") return { exitCode: 0, output: JSON.stringify([{ Id: image, Os: "linux" }]) };
+    if (args[0] === "run") {
+      const source = args[args.indexOf("--mount") + 1]!.split(",").find(value => value.startsWith("src="))!.slice(4);
+      return { exitCode: 0, output: await readFile(managerPath(source), "utf8") };
+    }
     if (args[0] === "create") {
       const values = (key: string) => args.flatMap((value, i) => value === key ? [args[i + 1]!] : []);
       const cid = String(++index).padStart(64, "0");
@@ -26,7 +32,7 @@ function syntheticDriver() {
         Mounts: values("--mount").map(value => { const fields = value.split(","); return { Type: "bind", Source: fields.find(x => x.startsWith("src="))!.slice(4), Destination: fields.find(x => x.startsWith("dst="))!.slice(4), RW: !fields.includes("readonly") }; }),
       }); return { exitCode: 0, output: cid };
     }
-    if (args[0] === "start") { const container = containers.get(args[2]!)!; await writeFile(join(container.Mounts.find((m: any) => m.RW).Source, "output"), "owned"); return { exitCode: 0, output: "complete" }; }
+    if (args[0] === "start") { const container = containers.get(args[2]!)!; await writeFile(join(managerPath(container.Mounts.find((m: any) => m.RW).Source), "output"), "owned"); return { exitCode: 0, output: "complete" }; }
     const container = containers.get(args[2]!) ?? [...containers.values()].find(value => value.Name === args[2]);
     if (args[1] === "inspect") return { exitCode: container ? 0 : 1, output: container ? JSON.stringify([container]) : `Error response from daemon: No such container: ${args[2]}` };
     if (args[1] === "kill") container.State.Running = false;
@@ -39,12 +45,199 @@ function syntheticDriver() {
 async function savedReceipt(control: string, id: string) {
   return JSON.parse(JSON.parse(await readFile(join(control, "receipts", id + ".json"), "utf8")).payload);
 }
+
+test.skipIf(process.platform !== "linux")("explicit document inputs bypass unrelated tmp and sealed tasks release input snapshots", async () => {
+  const f = await tempFixture("task-explicit-inputs-"), temp = join(f.root, "caller"), control = join(f.root, "control");
+  await mkdir(temp); await writeFile(join(temp, "unrelated"), "must not copy");
+  const backend = syntheticDriver(), tasks = new RootlessTasks(control, image, backend.driver), task = await tasks.create(temp);
+  try {
+    await mkdir(join(task.path, ".work")); await writeFile(join(task.path, ".work/source"), "document");
+    await task.run({ command: "bun", args: [], cwd: task.path, timeoutMs: 1000 });
+    const snapshot = join(control, "snapshots", task.id, "temp");
+    expect(await readdir(snapshot)).toEqual([".isolated-work"]);
+    await task.seal({ discardScratch: true });
+    expect(await readdir(join(control, "snapshots"))).toEqual([]);
+    expect(await readFile(join(task.path, "output"), "utf8")).toBe("owned");
+    expect(await readdir(task.path)).toEqual(["output"]);
+    expect((await tasks.reclaim(task.id)).status).toBe("removed");
+  } finally { await task.seal(); await tasks.reclaim(task.id); await f.cleanup(); }
+});
+
+test.skipIf(process.platform !== "linux")("a mount path the CLI cannot carry fails before a pending name is saved", async () => {
+  const f = await tempFixture("task-mount-syntax-"), temp = join(f.root, "caller"), control = join(f.root, "control"), shared = join(f.root, "a,b");
+  await mkdir(temp); await mkdir(shared);
+  const backend = syntheticDriver(), tasks = new RootlessTasks(control, image, backend.driver), task = await tasks.create(temp);
+  try {
+    await expect(task.run({ command: "bun", args: [], cwd: task.path, timeoutMs: 1000 }, [shared])).rejects.toThrow("逗号");
+    const saved = await savedReceipt(control, task.id);
+    expect([saved.phase, saved.pendingNames, saved.mounts]).toEqual(["active", [], {}]);
+    expect(backend.calls.filter(args => args[0] === "create")).toEqual([]);
+    await task.seal();
+    expect((await tasks.reclaim(task.id)).status).toBe("removed");
+  } finally { await task.seal(); await tasks.reclaim(task.id); await f.cleanup(); }
+});
+
+test.skipIf(process.platform !== "linux")("large unrelated history and a damaged receipt do not prevent explicit bash inputs", async () => {
+  const f = await tempFixture("task-large-history-"), temp = join(f.root, "caller"), control = join(f.root, "control");
+  await mkdir(temp); await writeFile(join(temp, "selected.txt"), "read me");
+  const large = await open(join(temp, "history.bin"), "wx");
+  try { await large.truncate(300 * 1024 * 1024); } finally { await large.close(); }
+  const backend = syntheticDriver(), tasks = new RootlessTasks(control, image, backend.driver), task = await tasks.create(temp);
+  try {
+    await writeFile(join(control, "receipts", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json"), "broken receipt");
+    await task.run({ command: "bun", args: [], cwd: task.path, timeoutMs: 1000 }, [], { paths: [join(temp, "selected.txt")] });
+    const snapshot = join(control, "snapshots", task.id, "temp");
+    expect(await readFile(join(snapshot, "selected.txt"), "utf8")).toBe("read me");
+    expect((await readdir(snapshot)).sort()).toEqual([".isolated-work", "selected.txt"]);
+    const rejected = await tasks.create(temp);
+    try {
+      await expect(rejected.run({ command: "bun", args: [], cwd: rejected.path, timeoutMs: 1000 }, [], { paths: ["history.bin"] })).rejects.toThrow("128 MiB");
+    } finally { await rejected.seal(); await tasks.reclaim(rejected.id); }
+  } finally { await task.seal(); await tasks.reclaim(task.id); await f.cleanup(); }
+});
+
+test.skipIf(process.platform !== "linux")("selected inputs cannot expose another active worker, receipt, symlink or whole tmp", async () => {
+  const f = await tempFixture("task-selected-boundary-"), temp = join(f.root, "caller"), control = join(f.root, "control");
+  await mkdir(temp); await writeFile(join(f.root, "secret"), "private"); await symlink(f.root, join(temp, "link"));
+  const backend = syntheticDriver(), tasks = new RootlessTasks(control, image, backend.driver), active = await tasks.create(temp);
+  try {
+    for (const path of [temp, "../secret", "link/secret", active.path, join(temp, ".office-jobs"), join(temp, ".isolated-work", active.id)]) {
+      const task = await tasks.create(temp);
+      try {
+        await expect(task.run({ command: "bun", args: [], cwd: task.path, timeoutMs: 1000 }, [], { paths: [path] })).rejects.toThrow();
+      } finally { await task.seal(); await tasks.reclaim(task.id); }
+    }
+    expect(backend.calls.some(args => args[0] === "create")).toBe(false);
+  } finally { await active.seal(); await tasks.reclaim(active.id); await f.cleanup(); }
+});
+
+test.skipIf(process.platform !== "linux")("paused controller keeps its kernel lock; after exit a reused PID cannot block recovery", async () => {
+  const f = await tempFixture("task-owner-epoch-"), temp = join(f.root, "caller"), control = join(f.root, "control");
+  await mkdir(temp);
+  const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../helpers/task-owner.ts", import.meta.url)), control, temp],
+    { cwd: f.root, stdout: "pipe", stderr: "pipe" });
+  try {
+    const reader = child.stdout.getReader();
+    const first = await reader.read(); reader.releaseLock();
+    const record = JSON.parse(new TextDecoder().decode(first.value));
+    process.kill(child.pid, "SIGSTOP");
+    const backend = syntheticDriver(), tasks = new RootlessTasks(control, image, backend.driver);
+    await expect(tasks.reclaim(record.id)).rejects.toThrow("仍持有内核锁");
+    expect(backend.calls).toHaveLength(0);
+    process.kill(child.pid, "SIGKILL"); await child.exited;
+    const receiptPath = join(control, "receipts", record.id + ".json"), receipt = await savedReceipt(control, record.id);
+    // Simulate PID reuse by another process (the new manager itself); the signed epoch remains old.
+    receipt.pid = process.pid;
+    const manager = JSON.parse(await readFile(join(control, "manager.json"), "utf8")), payload = JSON.stringify(receipt);
+    await writeFile(receiptPath, JSON.stringify({ payload, signature: createHmac("sha256", Buffer.from(manager.key, "hex")).update(payload).digest("hex") }));
+    expect((await tasks.reclaim(record.id, temp)).status).toBe("removed");
+    expect((await tasks.reclaim(record.id, temp)).status).toBe("removed");
+  } finally { child.kill("SIGKILL"); await child.exited; await f.cleanup(); }
+});
+
+test.skipIf(process.platform !== "linux")("container manager records daemon-side sources, keeps output paths and refuses changed deployment recovery", async () => {
+  const f = await tempFixture("task-deployment-mapped-"), temp = join(f.root, "caller"), control = join(f.root, "control"), code = join(f.root, "image-code");
+  await mkdir(temp); await mkdir(code);
+  const deployment = { version: 1 as const, image, mounts: [{ manager: temp, daemon: "/synthetic/caller" }, { manager: control, daemon: "/synthetic/control" }], imagePaths: [code] };
+  const backend = syntheticDriver(path => path.replace("/synthetic/", f.root + "/"));
+  const tasks = new RootlessTasks(control, image, backend.driver, undefined, deployment), task = await tasks.create(temp);
+  try {
+    expect(task.path.startsWith(temp + "/")).toBe(true);
+    expect((await task.run({ command: "bun", args: [], cwd: task.path, timeoutMs: 1000 }, [code])).exitCode).toBe(0);
+    const container = [...backend.containers.values()][0];
+    expect(container.Mounts).toHaveLength(2);
+    expect(container.Mounts.find((item: any) => item.RW)).toMatchObject({ Source: task.path.replace(temp, "/synthetic/caller"), Destination: task.path });
+    expect(container.Mounts.find((item: any) => !item.RW).Source).toStartWith("/synthetic/control/snapshots/");
+    expect(await readFile(join(task.path, "output"), "utf8")).toBe("owned");
+    expect((await savedReceipt(control, task.id)).deployment).toMatch(/^[a-f\d]{64}$/);
+    await task.seal();
+    const changed = new RootlessTasks(control, image, backend.driver, undefined, { ...deployment, mounts: deployment.mounts.map(item => ({ ...item, daemon: item.daemon + "-changed" })) });
+    const calls = backend.calls.length;
+    await expect(changed.reclaim(task.id, temp)).rejects.toThrow("部署映射已变化");
+    expect(backend.calls.slice(calls).some(args => args[0] === "container")).toBe(false);
+    expect(await readFile(join(task.path, "output"), "utf8")).toBe("owned");
+    await expect(new RootlessTasks(control, image, backend.driver).reclaim(task.id)).rejects.toThrow("部署映射已变化");
+    const upgradedImage = "sha256:" + "b".repeat(64);
+    const upgradedDriver: TaskDriver = { run: (args, options) => args[0] === "image" && args[2] === upgradedImage
+      ? Promise.resolve({ exitCode: 0, output: JSON.stringify([{ Id: upgradedImage, Os: "linux" }]) }) : backend.driver.run(args, options) };
+    expect((await new RootlessTasks(control, upgradedImage, upgradedDriver, undefined, { ...deployment, image: upgradedImage }).reclaim(task.id, temp)).status).toBe("removed");
+  } finally { await task.seal(); await tasks.reclaim(task.id); await f.cleanup(); }
+});
+
+test.skipIf(process.platform !== "linux")("container manager refuses unmapped inputs and mismatched inspected mount sources before starting a writer", async () => {
+  const f = await tempFixture("task-deployment-refused-"), temp = join(f.root, "caller"), control = join(f.root, "control"), foreign = join(f.root, "foreign");
+  await mkdir(temp); await mkdir(foreign);
+  const deployment = { version: 1 as const, image, mounts: [{ manager: temp, daemon: "/synthetic/caller" }, { manager: control, daemon: "/synthetic/control" }], imagePaths: [] };
+  const backend = syntheticDriver(path => path.replace("/synthetic/", f.root + "/"));
+  let swap = false;
+  const driver: TaskDriver = { async run(args, options) {
+    const result = await backend.driver.run(args, options);
+    if (swap && args[0] === "create") [...backend.containers.values()].at(-1)!.Mounts.find((item: any) => item.RW).Source = "/foreign";
+    return result;
+  } };
+  const tasks = new RootlessTasks(control, image, driver, undefined, deployment), task = await tasks.create(temp);
+  try {
+    await expect(task.run({ command: "bun", args: [], cwd: task.path, timeoutMs: 1000 }, [foreign])).rejects.toThrow("没有登记宿主挂载");
+    expect(backend.calls.some(args => args[0] === "create")).toBe(false);
+    swap = true;
+    await expect(task.run({ command: "bun", args: [], cwd: task.path, timeoutMs: 1000 })).rejects.toThrow("挂载边界变化");
+    expect(backend.calls.some(args => args[0] === "start")).toBe(false);
+  } finally {
+    for (const container of backend.containers.values()) container.Mounts.find((item: any) => item.RW).Source = task.path.replace(temp, "/synthetic/caller");
+    await task.seal(); await tasks.reclaim(task.id); await f.cleanup();
+  }
+});
+
+test.skipIf(process.platform !== "linux")("a wrong physical mount fails before allocating work and a repaired mapping can retry", async () => {
+  const f = await tempFixture("task-mapping-proof-"), temp = join(f.root, "caller"), control = join(f.root, "control");
+  await mkdir(temp);
+  const deployment = { version: 1 as const, image, mounts: [{ manager: f.root, daemon: "/daemon" }], imagePaths: [] };
+  const backend = syntheticDriver(source => source.replace("/daemon", f.root)); let wrong = true;
+  const driver: TaskDriver = { run: (args, options) => wrong && args[0] === "run"
+    ? Promise.resolve({ exitCode: 0, output: "a different physical directory" }) : backend.driver.run(args, options) };
+  const tasks = new RootlessTasks(control, image, driver, undefined, deployment);
+  try {
+    await expect(tasks.create(temp)).rejects.toThrow("不指向同一实体");
+    expect(await readdir(join(control, "receipts"))).toEqual([]);
+    expect((await readdir(f.root)).some(name => name.startsWith(".task-mapping-"))).toBe(false);
+    wrong = false;
+    const task = await tasks.create(temp);
+    await task.seal(); expect((await tasks.reclaim(task.id)).status).toBe("removed");
+  } finally { await f.cleanup(); }
+});
 function allocationStorage(overrides: Partial<TaskStorage> = {}): TaskStorage {
   return { holdDirectory, async saveReceipt(path, envelope, first) {
     if (first) await writeFile(path, JSON.stringify(envelope), { flag: "wx", mode: 0o600 });
     else await publishJson(path, envelope);
   }, ...overrides };
 }
+
+test.skipIf(process.platform !== "linux")("reclamation saves its deletion intent before removal; a deferred sweep attempt waits before retrying", async () => {
+  const f = await tempFixture("rootless-intent-order-"), temp = join(f.root, "caller"), control = join(f.root, "control"); await mkdir(temp);
+  const backend = syntheticDriver(), normal = allocationStorage(), saved: [string, string][] = [];
+  const storage = allocationStorage({ async saveReceipt(path, envelope, first) {
+    const receipt = JSON.parse(envelope.payload);
+    // The removal must not have started when the intent is saved.
+    saved.push([receipt.phase, receipt.phase === "reclaiming" ? (await readdir(dirname(dirname(workPath(receipt))))).join(",") : ""]);
+    await normal.saveReceipt(path, envelope, first);
+  } });
+  const workPath = (receipt: { temp: string; id: string }) => join(receipt.temp, ".isolated-work", receipt.id, "work");
+  const tasks = new RootlessTasks(control, image, backend.driver, storage), sealed = await tasks.create(temp), live = await tasks.create(temp);
+  try {
+    await sealed.seal();
+    expect((await tasks.reclaim(sealed.id, temp)).status).toBe("removed");
+    const intent = saved.findIndex(([phase]) => phase === "reclaiming");
+    expect(saved.slice(intent - 1).map(([phase]) => phase)).toEqual(["writers-reaped", "reclaiming", "removed"]);
+    expect(saved[intent]![1].split(",")).toContain(sealed.id);
+    const first = await tasks.sweep(temp, Infinity, resultReferences([]));
+    expect(first).toEqual([{ name: live.id, status: "deferred", reason: "task-owner-live" }]);
+    const retry = (await savedReceipt(control, live.id)).reclamation;
+    expect([retry.reason, retry.nextAttemptAt - retry.attemptedAt]).toEqual(["task-owner-live", 60_000]);
+    const calls = backend.calls.length;
+    expect(await tasks.sweep(temp, Infinity, resultReferences([]))).toEqual([]);
+    expect(backend.calls.length).toBe(calls);
+  } finally { await live.seal(); await tasks.reclaim(live.id); await f.cleanup(); }
+});
 
 test.skipIf(process.platform !== "linux")("a completed first receipt write with lost acknowledgement enters failed allocation instead of a live allocator", async () => {
   const f = await tempFixture("rootless-first-receipt-"), temp = join(f.root, "caller"), control = join(f.root, "control"); await mkdir(temp);
@@ -57,7 +250,7 @@ test.skipIf(process.platform !== "linux")("a completed first receipt write with 
     await expect(reservation.create()).rejects.toBe(failure);
     const receipt = await savedReceipt(control, reservation.id); expect(receipt.phase).toBe("allocation-failed"); expect(receipt.allocation.step).toBe("reserved");
     expect(await tasks.reclaim(reservation.id)).toMatchObject({ status: "deferred", reason: "allocation-entity-unconfirmed" });
-    expect((await tasks.sweep(temp, Infinity, []))[0]).toMatchObject({ status: "deferred", reason: "allocation-entity-unconfirmed" });
+    expect((await tasks.sweep(temp, Infinity, resultReferences([])))[0]).toMatchObject({ status: "deferred", reason: "allocation-entity-unconfirmed" });
     expect((await savedReceipt(control, reservation.id)).phase).toBe("allocation-failed");
     await expect(readdir(join(temp, ".isolated-work"))).rejects.toThrow("ENOENT");
     expect(backend.calls.some(args => args[0] === "create")).toBe(false);
@@ -206,7 +399,7 @@ for (const stage of ["parent-open", "entity-save", "marker-write", "work-created
       if (stage === "parent-open" || stage === "entity-save") {
         expect(reclaimed).toMatchObject({ status: "deferred", reason: stage === "parent-open" ? "allocation-entity-unconfirmed" : "allocation-marker-unconfirmed" });
         expect((await savedReceipt(control, reservation.id)).phase).toBe("allocation-failed");
-        const sweep = await tasks.sweep(temp, Infinity, []); expect(sweep).toHaveLength(1); expect(sweep[0]!.reason).toBe(reclaimed.reason);
+        const sweep = await tasks.sweep(temp, Infinity, resultReferences([])); expect(sweep).toHaveLength(1); expect(sweep[0]!.reason).toBe(reclaimed.reason);
       } else {
         expect(reclaimed.status).toBe("removed"); expect((await tasks.reclaim(reservation.id)).status).toBe("removed");
         await expect(readdir(dirname(reservation.path))).rejects.toThrow("ENOENT");
@@ -224,7 +417,7 @@ test.skipIf(process.platform !== "linux" || process.getuid?.() === 0)("real mark
     await expect(reservation.create()).rejects.toThrow("EACCES"); await chmod(taskRoot, 0o700);
     const receipt = await savedReceipt(control, reservation.id); expect(receipt.phase).toBe("allocation-failed"); expect(receipt.pid).toBe(process.pid);
     expect(await tasks.reclaim(reservation.id)).toMatchObject({ status: "deferred", reason: "allocation-marker-unconfirmed" });
-    expect((await tasks.sweep(temp, Infinity, []))[0]).toMatchObject({ status: "deferred", reason: "allocation-marker-unconfirmed" });
+    expect((await tasks.sweep(temp, Infinity, resultReferences([])))[0]).toMatchObject({ status: "deferred", reason: "allocation-marker-unconfirmed" });
     expect(await readFile(join(taskRoot, "unproven"), "utf8")).toBe("keep original bytes");
     expect((await savedReceipt(control, reservation.id)).phase).toBe("allocation-failed"); expect(await readdir(taskRoot)).toEqual(["unproven"]);
   } finally { await chmod(taskRoot, 0o700); await f.cleanup(); }
@@ -281,7 +474,7 @@ test.skipIf(process.platform !== "linux")("only signed manager results can be re
     await writeFile(join(producer.path, "result"), "active result"); await writeFile(join(hidden.path, "private"), "private worker");
     await expect(producer.run({ command: "bun", args: [], cwd: producer.path, timeoutMs: 1000 })).rejects.toThrow("不能启动工作进程");
     expect(backend.calls.some(args => args[0] === "create")).toBe(false);
-    await consumer.run({ command: "bun", args: [], cwd: consumer.path, timeoutMs: 1000 });
+    await consumer.run({ command: "bun", args: [], cwd: consumer.path, timeoutMs: 1000 }, [], { paths: [producer.path] });
     const container = [...backend.containers.values()][0]!;
     const snapshot = container.Mounts.find((mount: any) => mount.Destination === temp);
     expect(snapshot.RW).toBe(false);

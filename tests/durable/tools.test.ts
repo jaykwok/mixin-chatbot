@@ -13,8 +13,9 @@ import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import {
   configure, type Conversation, DEFAULT_PROGRESS_POLICY, LiveDoc, type ModelRef, type ProgressPolicy, type Storage,
 } from "@earendil-works/pi-durable";
-import { BASH_TOOL_NOTE, buildLocalTools } from "../../src/agent/local-tools.ts";
-import { isPathInside } from "../../src/agent/paths.ts";
+import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
+import { bashInputParameters, bashToolNote, buildLocalTools } from "../../src/agent/local-tools.ts";
+import { isPathInside } from "../../src/contracts/paths.ts";
 import { IdentityDoc, memberConversation } from "../../src/durable/identity.ts";
 import { baseExtension, baseTools, type BaseToolsOptions, memberPlaces } from "../../src/durable/tools.ts";
 import { type GroupHarness, openGroupHarness, PROJECT_PROGRESS as PROGRESS } from "../helpers/durable.ts";
@@ -140,7 +141,7 @@ describe("Durable base tools", () => {
     for (const dir of [places.workspaceDir, places.tempDir]) await mkdir(dir, { recursive: true });
     const own = await buildLocalTools({
       workspaceDir: places.workspaceDir, tempDir: places.tempDir, phone: ALICE, groupId: GROUP, venvDir: places.venvDir,
-      materialsIndexPath: places.indexPath, sessionEnvironment: false,
+      materialsIndexPath: places.indexPath,
     });
     const shape = (tool: (typeof registered)[number] | (typeof own)[number]) => ({
       name: tool.name, description: tool.description, parameters: JSON.parse(JSON.stringify(tool.parameters)),
@@ -148,7 +149,12 @@ describe("Durable base tools", () => {
     });
     expect(registered.map(shape)).toEqual(own.map(shape));
     expect(registered.map((tool) => tool.constrainedSampling)).toEqual(registered.map(() => ({ type: "json_schema", strict: "prefer" })));
-    expect(registered[1]!.description.endsWith(BASH_TOOL_NOTE)).toBe(true);
+    expect(registered[1]!.description.endsWith(bashToolNote())).toBe(true);
+    // Without rootless tasks nothing is isolated: no isolation note and no input_paths; with them, both.
+    expect(registered[1]!.description).not.toContain("input_paths");
+    expect(JSON.stringify(registered[1]!.parameters)).not.toContain("input_paths");
+    expect(bashToolNote(true)).toContain("input_paths");
+    expect(JSON.stringify(bashInputParameters(createBashToolDefinition(places.workspaceDir), true))).toContain("input_paths");
     // edit repairs the legacy single-replacement form the same way.
     const legacy = { path: "a.txt", oldText: "甲", newText: "乙" };
     expect(registered[2]!.prepareArguments!(legacy)).toEqual(own[2]!.prepareArguments!(legacy) as never);

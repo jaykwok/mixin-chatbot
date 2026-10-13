@@ -24,7 +24,7 @@ test("preserves structured references and migration holds across reopen", async 
   try {
     let store = new DeliveryStore(db);
     const attachments = [{ original: "generated note", reference: { backend: "hash", url: "https://files.invalid/a/b", name: "b", size: 5 } }];
-    const id = store.save("session", "generated note", undefined, attachments);
+    const id = "run:1"; store.put("session", id, "generated note", attachments);
     db.query("UPDATE deliveries SET blocked_reason = ? WHERE id = ?").run("旧附件无法确认归属", id);
     db.close(); db = openState(path); store = new DeliveryStore(db);
     expect(store.pending("session")[0]!.attachments).toEqual(attachments);
@@ -39,17 +39,21 @@ test("pending links and final text survive restart until acknowledgement", async
   let db = openState(path);
   try {
     let store = new DeliveryStore(db);
-    const id = store.save("session-a", "https://files/a_b");
-    store.save("session-a", "final\nhttps://files/a_b", id);
+    const id = "answer:1";
+    store.put("session-a", "run:1", "https://files/a_b");
+    store.finalize("session-a", "run:1", id, "final\nhttps://files/a_b", []);
     db.close(); db = openState(path); store = new DeliveryStore(db);
     expect(store.pending("session-a").map(row => row.text)).toEqual(["final\nhttps://files/a_b"]);
     expect(store.pending("session-b")).toEqual([]);
-    expect(() => store.save("session-b", "wrong owner", id)).toThrow();
+    expect(() => store.put("session-b", id, "wrong owner")).toThrow();
+    expect(store.find("session-b", id)).toBeUndefined();
+    expect(store.hasPending("session-a")).toBe(true);
     db.exec("CREATE TRIGGER reject_ack BEFORE DELETE ON deliveries BEGIN SELECT RAISE(ABORT, 'disk failure'); END");
     expect(() => store.acknowledge([id])).toThrow("disk failure");
     expect(store.pending("session-a")).toHaveLength(1);
     db.exec("DROP TRIGGER reject_ack"); store.acknowledge([id]);
     expect(store.pending("session-a")).toEqual([]);
+    expect(store.hasPending("session-a")).toBe(false);
   } finally { db.close(); await fixture.cleanup(); }
 });
 
@@ -66,5 +70,12 @@ test("storage identities reject case aliases before or after restart", async () 
     await mkdir(join(fixture.root, "LegacyGroup", "users", "LegacyUser"), { recursive: true });
     await expect(ensureStorageIdentity(fixture.root, "legacygroup", "LegacyUser", db)).rejects.toThrow("已有目录");
     await ensureStorageIdentity(fixture.root, "LegacyGroup", "LegacyUser", db);
+    // A directory created right after a check is seen by the next one. Repeated, because a parent's stat stamp often
+    // stays unchanged after such a creation (Windows), so a stamp-keyed listing cache would accept the alias.
+    for (let index = 0; index < 100; index++) {
+      await ensureStorageIdentity(fixture.root, "LegacyGroup", `Member${index}`, db);
+      await mkdir(join(fixture.root, "LegacyGroup", "users", `Late${index}`));
+      await expect(ensureStorageIdentity(fixture.root, "LegacyGroup", `late${index}`, db)).rejects.toThrow("已有目录");
+    }
   } finally { db.close(); await fixture.cleanup(); }
 });

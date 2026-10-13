@@ -1,4 +1,4 @@
-// Bun 1.4.2's promise matchers spin their own wait loop, which does not deliver node Worker messages.
+// Bun's promise matchers (also reproduced on 1.4.3) spin a wait loop that does not deliver node Worker messages.
 // Await the value in ordinary JS first, then run the unchanged Bun matcher on an already settled promise.
 // Assertion semantics/counts and failures stay Bun's; no production polling or timeout relaxation is needed.
 import { expect } from "bun:test";

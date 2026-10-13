@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "plan": "<HEX64>",
+  "outcomes": {
+    "0": {
+      "status": "deferred",
+      "bytes": 0,
+      "reason": "旧共享目录需要宿主特权离线回收"
+    }
+  },
+  "started": []
+}

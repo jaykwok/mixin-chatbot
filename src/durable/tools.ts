@@ -1,20 +1,17 @@
-// The four official tools (read, bash, edit, write) for the Durable engine (D2-2; contract 2.4). Ported from the D0
-// adapter (tmp/pi100-d0/probes-102/lib/adapt.ts, Pi 1.0.2).
+// The four official tools (read, bash, edit, write) adapted to the Durable engine.
 //
 // One registry serves a group and its tools serve every member. Each call reads the calling conversation's identity
-// (`mixin.identity`, src/durable/identity.ts), computes the member's places on the server, and runs the AgentSession
-// engine's tools built for that member (src/agent/local-tools.ts: the official factories behind the workspace/tmp path
+// (`mixin.identity`, src/durable/identity.ts), computes the member's places on the server, and runs the tools
+// built for that member (src/agent/local-tools.ts: the official factories behind the workspace/tmp path
 // guard, the caller environment for bash, full output moved into the member's tmp). Model arguments never choose the
 // member, the group or a root, and one member's call never sees another member's tmp as writable.
 //
-// Adapter rules (checked against pi-coding-agent 1.0.2; the tool files are the same in 1.0.3, where bash's output
-// accumulator creates the full-output file private, 0600, which the move into the member's tmp keeps; in 1.0.4 read also
-// declares an output schema and gives scripts its text, or an image block for an image file):
+// Adapter rules: bash's full-output file is private (0600); read gives scripts text or an image block.
 // - The tools get only `{ cwd, model }`: the four official tools read nothing else once bash's session environment is
-//   off (it reads an AgentSession `sessionManager`). Pi's session variables (PI_SESSION_ID, PI_MODEL, ...) are therefore
+//   off (it reads the upstream session manager). Pi's session variables (PI_SESSION_ID, PI_MODEL, ...) are therefore
 //   not exported to bash; nothing in the project reads them.
 // - Bash's raw output is also appended to `api.output`, keeping its tail, so an aborted or interrupted result carries
-//   the output committed so far (gap G5).
+//   the output committed so far.
 // - A throw other than an abort becomes an error result and the tool task completes, as in coding-agent. An abort is
 //   rethrown: Durable writes the aborted result from what was committed before the abort mark, after which the call
 //   can commit nothing. The full-output file still moves into the member's tmp, but that result does not name it.
@@ -23,10 +20,9 @@
 // - `structuredContent` (bash's exit code and full output for scripts) is dropped: Durable results have no such field.
 //   Codemode scripts get it through the same entry (`MemberTool.run`, src/durable/codemode/index.ts).
 // - Replay: read is safe (read-only), the rest unsafe. Output limits 64 KB / 2200 lines lie above the official
-//   truncation (50 KB / 2000 lines plus its notice), so the Harness does not truncate again (gap G6).
+//   truncation (50 KB / 2000 lines plus its notice), so the Harness does not truncate again.
 // - Registrations carry the pi-ai Tool fields (name, description, parameters, constrainedSampling) plus executionMode
-//   and prepareArguments. The definitions' prompt snippets and guidelines stay out of the system prompt, as in the
-//   AgentSession engine, whose own prompt replaces the part coding-agent would put them in (src/durable/prompt.ts);
+//   and prepareArguments. The project's prompt replaces the default tool snippets and guidelines (src/durable/prompt.ts);
 //   codemode shows a script-only tool's guidelines in its description.
 //
 // A model's call and a codemode script's sub-call run the same `MemberTool.run`: identity check, the member's places
@@ -40,7 +36,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { defineExtension, type Extension, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration } from "@earendil-works/pi-durable";
 import { buildDocumentEnvironmentTool, buildDocumentTool } from "../agent/document-extract.ts";
-import { BASH_TOOL_NOTE, buildLocalTools } from "../agent/local-tools.ts";
+import { bashInputParameters, bashToolNote, buildLocalTools } from "../agent/local-tools.ts";
 import { groupIndexDir, groupVenvDir, groupWorkspaceDir, materialsIndexPath, userTempDir } from "../agent/paths.ts";
 import { IdentityDoc } from "./identity.ts";
 
@@ -51,7 +47,7 @@ export interface BaseToolsOptions {
   groupId: string;
   /** Document environment (`BOT_DOCUMENT_ENV`); default the group's venv. */
   venvDir?: string;
-  /** Read-only resource directories of the enabled modules (D2-4). */
+  /** Read-only resource directories of the enabled modules. */
   resourceReadDirs?: readonly string[];
 }
 
@@ -76,8 +72,8 @@ const POLICY: Record<string, Policy> = {
   write: { replay: "unsafe", outputLimits: LIMITS },
 };
 /**
- * Every other tool (document_extract, document_environment, the modules' and the send tools): unsafe, as contract 2.4
- * says until a tool is shown idempotent. document_extract writes a content-addressed cache and document_environment may
+ * Every other tool (document_extract, document_environment, the modules' and the send tools): unsafe until proven
+ * idempotent. document_extract writes a content-addressed cache and document_environment may
  * download; the module tools write new files; a send cannot be taken back.
  */
 const OTHER_POLICY: Policy = { replay: "unsafe", outputLimits: LIMITS };
@@ -110,7 +106,7 @@ export interface MemberTool extends Policy {
  */
 export function catalogueDefinitions(cwd: string): ToolDefinition[] {
   const bash = createBashToolDefinition(cwd, { exposeSessionEnvironment: false });
-  return [createReadToolDefinition(cwd), { ...bash, description: bash.description + BASH_TOOL_NOTE },
+  return [createReadToolDefinition(cwd), { ...bash, parameters: bashInputParameters(bash), description: bash.description + bashToolNote() },
     createEditToolDefinition(cwd), createWriteToolDefinition(cwd)] as ToolDefinition[];
 }
 
@@ -166,14 +162,14 @@ function localTool(definition: ToolDefinition, options: BaseToolsOptions): Membe
   return memberTool(definition, options, ({ phone, places }, call) => buildLocalTools({
     workspaceDir: places.workspaceDir, tempDir: places.tempDir, phone, groupId: options.groupId,
     venvDir: places.venvDir, materialsIndexPath: places.indexPath, resourceReadDirs: [...options.resourceReadDirs ?? []],
-    sessionEnvironment: false, ...(call.onBashOutput === undefined ? {} : { onBashOutput: call.onBashOutput }),
+    ...(call.onBashOutput === undefined ? {} : { onBashOutput: call.onBashOutput }),
   }));
 }
 
 /** Places that only fill a definition's builder; nothing runs there. */
 const CATALOGUE_PLACES: MemberPlaces = { workspaceDir: "catalogue", tempDir: "catalogue", indexPath: "catalogue", venvDir: "catalogue" };
 
-/** document_environment and document_extract (contract 2.4 `mixin.base`), built per call for the member's places. */
+/** document_environment and document_extract (`mixin.base`), built per call for the member's places. */
 export function documentMemberTools(options: BaseToolsOptions): MemberTool[] {
   const build = ({ places }: Member) => [buildDocumentEnvironmentTool(places.venvDir), buildDocumentTool(places)];
   return build({ phone: "", places: CATALOGUE_PLACES, conversationId: 0 as Member["conversationId"] })
@@ -187,7 +183,7 @@ export function memberRegistration(tool: MemberTool): ToolRegistration {
     name: definition.name,
     description: definition.description,
     parameters: definition.parameters,
-    // A pi-ai Tool field: it enters the transcript declaration and the request, as the AgentSession wrapper passes it.
+    // A pi-ai Tool field: it enters the transcript declaration and the request.
     ...(definition.constrainedSampling === undefined ? {} : { constrainedSampling: definition.constrainedSampling }),
     replay: tool.replay,
     outputLimits: tool.outputLimits,
@@ -215,12 +211,12 @@ export function memberRegistration(tool: MemberTool): ToolRegistration {
   } as ToolRegistration;
 }
 
-/** The four tools for the group's members, in the catalogue order the AgentSession engine shows. */
+/** The four tools for the group's members, in catalogue order. */
 export function baseMemberTools(options: BaseToolsOptions): MemberTool[] {
   return catalogueDefinitions(resolve(groupWorkspaceDir(options.root, options.groupId))).map((definition) => localTool(definition, options));
 }
 
-/** The registrations, in the catalogue order the AgentSession engine shows. */
+/** The registrations, in catalogue order. */
 export function baseTools(options: BaseToolsOptions): ToolRegistration[] {
   return baseMemberTools(options).map(memberRegistration);
 }

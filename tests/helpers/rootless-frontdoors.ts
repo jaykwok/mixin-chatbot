@@ -3,8 +3,8 @@ import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { buildLocalTools } from "../../src/agent/local-tools.ts";
 import { SubCallFiles, removeCodemodeResults } from "../../src/durable/codemode/results.ts";
-import { configuredRootlessTasks } from "../../src/core/rootless-tasks.ts";
-import { referencedResults } from "../../src/durable/result-lifecycle.ts";
+import { configuredRootlessTasks } from "../../src/core/task-backend.ts";
+import { referencedResults, resultReferences } from "../../src/durable/results/references.ts";
 import { extractDocument } from "../../src/agent/document-extract.ts";
 import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
 
@@ -12,7 +12,7 @@ const root = process.argv[2]!, temp = join(root, "caller"), workspace = join(roo
 await Promise.all([temp, workspace, index].map(path => mkdir(path)));
 await mkdir(join(root, "control"), { mode: 0o700 });
 await writeFile(join(index, "materials.md"), "synthetic reference");
-const tools = await buildLocalTools({ workspaceDir: workspace, tempDir: temp, phone: "synthetic", groupId: "synthetic", venvDir: join(root, "absent-venv"), materialsIndexPath: join(index, "materials.md"), resourceReadDirs: [join(root, "control")], sessionEnvironment: false });
+const tools = await buildLocalTools({ workspaceDir: workspace, tempDir: temp, phone: "synthetic", groupId: "synthetic", venvDir: join(root, "absent-venv"), materialsIndexPath: join(index, "materials.md"), resourceReadDirs: [join(root, "control")] });
 const call = (name: string, args: object) => tools.find(tool => tool.name === name)!.execute(name, args, undefined, undefined, {} as never);
 const first = await call("bash", { command: 'printf owned > "$PI_USER_TMP/output"; printf "TASK_PATH:%s\\n" "$PI_USER_TMP"' });
 const text = first.content.filter(item => item.type === "text").map(item => item.text).join("\n");
@@ -29,28 +29,28 @@ for (const [workspaceDir, source] of [[root, "control/private.docx"], [workspace
 }
 assert.equal(await readFile(join(root, "control/private.docx"), "utf8"), "synthetic private input");
 await assert.rejects(call("write", { path: join(path, "foreign"), content: "bad" }), /只读/);
-const second = await call("bash", { command: `cat '${join(path, "output").replaceAll("'", "'\\''")}'` });
+const second = await call("bash", { command: `cat '${join(path, "output").replaceAll("'", "'\\''")}'`, input_paths: [join(path, "output")] });
 assert(second.content.some(item => item.type === "text" && item.text.includes("owned")), JSON.stringify(second));
 let id: string | undefined;
 const files = new SubCallFiles(temp, "1-synthetic", async registered => { id = registered; });
 await files.open("active codemode");
 const bound = await files.bound(1, "active sub-call result ".repeat(30), false, []);
 const activePath = bound.files[0]!.path;
-const active = await call("bash", { command: `cat '${activePath}'` });
+const active = await call("bash", { command: `cat '${activePath}'`, input_paths: [activePath] });
 assert(active.content.some(item => item.type === "text" && item.text.includes("active sub-call result")), JSON.stringify(active));
-const denied = await call("bash", { command: `printf bad > '${activePath}'` });
+const denied = await call("bash", { command: `printf bad > '${activePath}'`, input_paths: [activePath] });
 assert(denied.content.some(item => item.type === "text" && /Read-only/.test(item.text)), JSON.stringify(denied));
 assert.equal(await readFile(activePath, "utf8"), "active sub-call result ".repeat(30));
 await files.append("producer remains active after the snapshot");
 await files.saveOutputText("preserved result"); await files.release(); assert(id);
 const mapping = new Map([["1-synthetic", id]]), values = [{ path: files.dir }];
-assert(referencedResults(temp, ["1-synthetic"], values, mapping).has("1-synthetic"));
+assert(referencedResults(temp, ["1-synthetic"], resultReferences(values), mapping).has("1-synthetic"));
 const expired: string[] = [], receipts: unknown[] = [];
 const policy = { registered: new Set(["1-synthetic"]), protected: new Set(["1-synthetic"]), isolated: mapping,
   expire: async (names: string[]) => { expired.push(...names); }, record: async (rows: unknown[]) => { receipts.push(...rows); } };
 assert.deepEqual(await removeCodemodeResults(temp, Infinity, policy), []); assert.deepEqual(expired, []);
 policy.protected.clear(); assert.deepEqual(await removeCodemodeResults(temp, Infinity, policy), ["1-synthetic"]); assert.deepEqual(expired, ["1-synthetic"]);
-const reclaimed = await configuredRootlessTasks()!.sweep(temp, Infinity, []);
+const reclaimed = await configuredRootlessTasks()!.sweep(temp, Infinity, resultReferences([]));
 assert.equal(reclaimed.length, 4); assert(reclaimed.every(item => item.status === "removed"));
-assert.deepEqual(await configuredRootlessTasks()!.sweep(temp, Infinity, []), []);
+assert.deepEqual(await configuredRootlessTasks()!.sweep(temp, Infinity, resultReferences([])), []);
 console.log(JSON.stringify({ bash: true, protectedWrite: true, sealedInputs: true, activeCodemodeInput: true, privateControl: true, privateDocuments: true, codemode: true, references: true, expiry: true, recorded: receipts.length }));

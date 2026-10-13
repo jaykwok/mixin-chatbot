@@ -277,3 +277,13 @@ Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 9
 ## 数据版本与升级
 
 参见[数据版本与升级事务](data-migrations.md)。业务入口 `src/server/index.ts` 和 TUI 入口在加载配置前检查项目与群根的版本；历史迁移集中在 `scripts/migrations/`。升级由目标版本的升级器执行（Docker 为 `scripts/deploy/upgrade.sh`，由 `ops update` 从目标提交导出后运行），在停机前完成迁移预览和全部确认；提交前仅启动验证实例，提交后恢复正常业务。旧版 `ops.sh` 升级到本版时会被拒绝并打印一次性引导命令，见[第一次升级](data-migrations.md#第一次升级)。
+
+## 任务隔离部署
+
+Linux Docker 的新部署和升级需要与服务宿主 UID 匹配的本机 rootless Docker daemon，用于执行 bash、文档处理与解析。rootless 服务可复用自己的 daemon；rootful 服务沿用原数字 UID/GID，首次部署默认 UID 1001，因此需要属于 UID 1001 的 rootless socket。默认位置是 `/run/user/<UID>/docker.sock`，首次配置可通过 `BOT_TASK_DOCKER_HOST=unix:///绝对路径/docker.sock` 指定。脚本在停机前检查 socket 属主、daemon 身份、固定镜像与路径映射；缺少条件时停止，不安装 daemon、不改变服务身份或自动 sudo。
+
+部署把同一不可变镜像同步到任务 daemon，并保存 `data/state/task-runtime` 和私有的 `data/config/task-deployment.json`。控制面获得 socket；任务容器只获得自己的可写目录及只读输入，使用 `--network none`。升级提交后按快照中的固定容器 ID 撤销旧业务容器，确认其不能被迟到的启动请求重新启动后才恢复业务。不能手工改映射或换 daemon 绕过检查：原回执绑定旧映射，须先在原环境中完成处置。
+
+每次 bash 的 `PI_USER_TMP` 是新任务目录。要读之前的临时产物，在 `input_paths` 中显式列出；workspace 和资料索引仍只读可见。Windows 原生部署不隔离 bash，工具说明里也不出现隔离提示和 `input_paths` 参数。输入继续受单文件 128 MiB、总计 256 MiB 和 20000 条目限制，无关的历史 tmp 不再进入快照。隔离文档使用镜像内 `/app/.venv`；每个工作容器的 Office profile 位于自身 `/tmp`，工作容器退出并撤销后释放，不在服务容器的 64 MiB `/tmp` 中累积。
+
+隔离模式下 `send_image`、`send_file` 只下载公网 HTTP(S) 地址：拒绝私网、回环、链路本地、特殊用途地址、带凭据的 URL 和所有重定向；DNS 全部结果通过后固定连接地址。需要下载跳转后的资源时应提供最终公网地址。管理端模型、MCP 与已配置的外链后端仍属于可信控制面。
