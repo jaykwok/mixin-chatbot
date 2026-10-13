@@ -59,28 +59,37 @@ async function databaseFiles(dir: string): Promise<DatabaseFiles | undefined> {
   return { bytes, modified };
 }
 
-/** 按占用从大到小列出各群的会话历史；没说过话的成员不出现，既没有群库也没有旧会话文件的群不出现。 */
+/**
+ * 一个群（实际目录段）的会话历史；既没有群库也没有旧会话文件时为 null。没说过话的成员不出现。
+ * 成员目录无法读取（例如 EACCES）时抛错，由调用方决定只让这个群失败。
+ */
+export async function scanGroupHistory(root: string, group: string): Promise<GroupHistory | null> {
+  const dir = join(root, group);
+  const entries = await mapConcurrent(await dataDirectoryNames(join(dir, "users"), root), async user => {
+    const path = join(dir, "users", user, SESSION_FILE);
+    try {
+      await assertDataDirectory(dirname(path), root);
+      const info = await lstat(path);
+      if (!info.isFile() || info.isSymbolicLink()) return null;
+      return { user, path, bytes: info.size, modified: info.mtimeMs };
+    } catch {
+      return null; // 这位成员还没说过话。
+    }
+  });
+  const users = entries.filter((entry): entry is UserHistory => entry !== null);
+  const database = await databaseFiles(dir);
+  if (users.length === 0 && database === undefined) return null;
+  const bytes = users.reduce((total, user) => total + user.bytes, database?.bytes ?? 0);
+  users.sort((a, b) => b.bytes - a.bytes || byName(a.user, b.user));
+  return { group, dir, users, ...(database ? { database } : {}), bytes };
+}
+
+/** 按占用从大到小列出各群的会话历史；既没有群库也没有旧会话文件的群不出现。 */
 export async function scanHistory(root: string): Promise<GroupHistory[]> {
   const groups: GroupHistory[] = [];
   for (const group of await dataDirectoryNames(root, root)) {
-    const dir = join(root, group);
-    const entries = await mapConcurrent(await dataDirectoryNames(join(dir, "users"), root), async user => {
-      const path = join(dir, "users", user, SESSION_FILE);
-      try {
-        await assertDataDirectory(dirname(path), root);
-        const info = await lstat(path);
-        if (!info.isFile() || info.isSymbolicLink()) return null;
-        return { user, path, bytes: info.size, modified: info.mtimeMs };
-      } catch {
-        return null; // 这位成员还没说过话。
-      }
-    });
-    const users = entries.filter((entry): entry is UserHistory => entry !== null);
-    const database = await databaseFiles(dir);
-    if (users.length === 0 && database === undefined) continue;
-    const bytes = users.reduce((total, user) => total + user.bytes, database?.bytes ?? 0);
-    users.sort((a, b) => b.bytes - a.bytes || byName(a.user, b.user));
-    groups.push({ group, dir, users, ...(database ? { database } : {}), bytes });
+    const history = await scanGroupHistory(root, group);
+    if (history) groups.push(history);
   }
   return groups.sort((a, b) => b.bytes - a.bytes || byName(a.group, b.group));
 }

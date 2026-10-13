@@ -1444,7 +1444,12 @@ switch ($Command) {
         if (-not (Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" @("list"))) { exit 1 }
     }
     "history-clear" {
-        if (-not (Clear-GroupHistory $Target)) { exit 1 }
+        # -All 清空所有群（history-admin 的 clear --all）；与群号或群选择参数同用时拒绝，漏写群号只报错。
+        if ($All) {
+            if ($Target -or $StorageSegment -or $GroupId) { Err "history-clear -All 不能再指定群或群选择参数"; exit 2 }
+            if (-not (Clear-GroupHistory "--all")) { exit 1 }
+        }
+        elseif (-not (Clear-GroupHistory $Target)) { exit 1 }
     }
     "history-compact" {
         if (-not $User) { Err "history-compact 需要 -User <成员号码>"; exit 2 }
@@ -1507,6 +1512,7 @@ switch ($Command) {
         Write-Host "  history-clear <群号>  清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         Write-Host "  history-compact <群号> -User <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
         Write-Host "                  群选择可加 -GroupId（原始群号）或 -StorageSegment（目录段）"
+        Write-Host "  history-clear -All  清空所有群全部成员的上下文；一次停机完成，某个群失败时其余群照常清空"
         Write-Host "  backup-scan     只读扫描 backup\rm 和 backup\snapshots，分类后在 tmp\backup-cleanup 生成清单，不删除"
         Write-Host "  backup-clean <报告名> [-ConfirmCode <确认码>]"
         Write-Host "                  不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"

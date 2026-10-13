@@ -10,8 +10,8 @@ import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
 import { ingestBeforeArchive } from "../../src/agent/stats-ledger.ts";
 import { GROUP_DATABASE } from "../../src/durable/groups.ts";
 import { queueGroupClear, queueMemberCompaction } from "../../src/durable/offline.ts";
-import { assertDataDirectory, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
-import { lastActivity, scanHistory, type GroupHistory } from "../lib/history-scan.ts";
+import { assertDataDirectory, byName, dataDirectoryNames, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
+import { lastActivity, scanGroupHistory, scanHistory, type GroupHistory } from "../lib/history-scan.ts";
 import { conversationTimings, historicalContext } from "../../src/durable/diagnostics.ts";
 
 function usage(): void {
@@ -19,6 +19,7 @@ function usage(): void {
   console.log("");
   console.log("  list                 列出各群的会话历史（群库与旧会话文件的占用、最后活动）");
   console.log("  clear <群号>         清空该群全部成员的会话历史");
+  console.log("  clear --all          清空所有群全部成员的会话历史；某个群失败时其余群照常清空");
   console.log("  compact <群号> <成员号码>  登记手动压缩，启动后执行并产生模型用量");
   console.log("  context <群号> <成员号码> [条目编号]  只读查看当前或历史模型上下文");
   console.log("  timings <群号> <成员号码>  只读统计官方响应/工具耗时及任务跨度");
@@ -45,20 +46,28 @@ async function resolveGroupDir(groupId: string, root: string, kind: GroupSelecti
 
 /**
  * 清空本群历史：群库登记清空，旧会话文件归档。CLI 调用方须先持有维护租约（机器人已停止）。
+ * notes 为 false 时不打印每群都相同的说明，由清空全部群时统一打印一次。
  */
 export async function clearGroup(
   groupId: string,
   root: string = GROUP_DATA_ROOT,
-  kind: GroupSelection = "auto"
+  kind: GroupSelection = "auto",
+  notes = true
 ): Promise<number> {
-  const dir = await resolveGroupDir(groupId, root, kind);
-  if (!dir) {
+  const name = await resolveGroupName(groupId, root, kind);
+  if (!name) {
     console.error(`在 ${root} 下找不到群 ${groupId}。用 list 查看现有的群。`);
     return 1;
   }
+  const dir = join(root, name);
 
-  const groups = await collect(root);
-  const target = groups.find((group) => join(root, group.group) === dir);
+  // 只扫描目标群：别的群目录读不了不影响这个群。
+  let target: GroupHistory | null;
+  try { target = await scanGroupHistory(root, name); }
+  catch (error) {
+    console.error(`群 ${name} 的会话历史无法读取，本群未做任何改动：${String(error)}`);
+    return 1;
+  }
   if (!target) {
     console.log(`群 ${groupId} 下没有任何会话历史，无需清理。`);
     return 0;
@@ -71,7 +80,7 @@ export async function clearGroup(
       if (queued) {
         const waiting = queued.waiting.length ? `，${queued.waiting.length} 位已有等待中的清空` : "";
         console.log(`群 ${target.group}：已在群库里为 ${queued.queued.length} 位成员登记清空${waiting}，机器人下次启动时先执行。`);
-        console.log("旧上下文留在群库里，不释放空间；排队中的消息一并取消，与成员自己发 /clear 相同。");
+        if (notes) console.log(DATABASE_NOTE);
       }
     } catch (error) {
       console.error(`群库登记清空失败，本群未做任何改动：${String(error)}`);
@@ -104,11 +113,58 @@ export async function clearGroup(
 
   console.log("");
   if (target.users.length) console.log(`已归档 ${removed} 位成员的旧会话文件，${formatSize(freed)} 移入 backup/rm。`);
-  console.log("每位成员的下一条消息都会开启全新会话；workspace、tmp、资料索引均未改动。");
+  if (notes) console.log(RESULT_NOTE);
   if (failed > 0) {
     console.log(`${failed} 项清空失败，常见原因是机器人仍在占用这些文件——停下来再试一次。`);
     return 1;
   }
+  return 0;
+}
+
+const DATABASE_NOTE = "旧上下文留在群库里，不释放空间；排队中的消息一并取消，与成员自己发 /clear 相同。";
+const RESULT_NOTE = "每位成员的下一条消息都会开启全新会话；workspace、tmp、资料索引均未改动。";
+
+/**
+ * 清空所有有会话历史的群：在同一维护租约内逐群执行 clearGroup。某个群无法读取、被拒绝或失败时其余群照常清空，最后汇总；
+ * 重新执行是安全的，已登记的清空不会重复登记。CLI 调用方须先持有维护租约（机器人已停止）。
+ */
+export async function clearAllGroups(root: string = GROUP_DATA_ROOT): Promise<number> {
+  // 先只列出群目录，每个群的扫描各自兜底：一个群读不了只让这个群失败，不挡住其余群。
+  const groups: GroupHistory[] = [];
+  const failed: string[] = [];
+  for (const name of await dataDirectoryNames(root, root)) {
+    try {
+      const history = await scanGroupHistory(root, name);
+      if (history) groups.push(history);
+    } catch (error) {
+      console.error(`群 ${name} 的会话历史无法读取，跳过：${String(error)}`);
+      failed.push(name);
+    }
+  }
+  const total = groups.length + failed.length;
+  if (total === 0) {
+    console.log(`没有找到任何会话历史（群数据总根：${root}），无需清理。`);
+    return 0;
+  }
+  groups.sort((a, b) => b.bytes - a.bytes || byName(a.group, b.group));
+  console.log(`即将清空 ${groups.length} 个群的会话历史` + (failed.length ? `（另有 ${failed.length} 个群无法读取，未处理）。` : "。"));
+  for (const group of groups) {
+    console.log("");
+    // 扫描结果是实际目录段，按目录段选择，不会与另一个群的原始群号混淆。
+    const code = await clearGroup(group.group, root, "segment", false).catch((error) => {
+      console.error(`群 ${group.group} 清空失败：${String(error)}`);
+      return 1;
+    });
+    if (code !== 0) failed.push(group.group);
+  }
+  console.log("");
+  if (groups.some((group) => group.database)) console.log(DATABASE_NOTE);
+  console.log(RESULT_NOTE);
+  if (failed.length) {
+    console.log(`${total - failed.length}/${total} 个群已清空；未完成：${failed.join("、")}。处理原因后可重新执行，已登记的清空不会重复。`);
+    return 1;
+  }
+  console.log(`${total} 个群已全部清空。`);
   return 0;
 }
 
@@ -130,7 +186,7 @@ async function list(root: string = GROUP_DATA_ROOT): Promise<number> {
     }
   }
   console.log("");
-  console.log("清空某个群：bun run history clear <群号>");
+  console.log("清空某个群：bun run history clear <群号>；清空所有群：bun run history clear --all");
   return 0;
 }
 
@@ -179,9 +235,16 @@ async function main(args: string[]): Promise<number> {
       return list();
     case "clear": {
       const groupId = args[1];
-      // 群号必须显式给出：没有「清空全部群」这个入口，它只会在手滑时出现。
+      // 清空全部群必须明确写 --all：漏写群号只报错，不会变成全部。
+      if (groupId === "--all") {
+        if (args[2] !== undefined) {
+          console.error(`--all 不能再指定群或其他参数：${args[2]}`);
+          return 1;
+        }
+        return withMaintenance(() => clearAllGroups(GROUP_DATA_ROOT), GROUP_DATA_ROOT);
+      }
       if (!groupId || groupId.startsWith("--")) {
-        console.error("clear 需要群号：bun run history clear <群号>");
+        console.error("clear 需要群号，或用 --all 清空所有群：bun run history clear <群号> | --all");
         return 1;
       }
       const selection = args[2];

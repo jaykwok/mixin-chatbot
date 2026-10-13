@@ -45,6 +45,60 @@ test("管理台登记成员压缩，说明费用并保留历史；取消时不�
   expect(calls.commands).toHaveLength(1);
 });
 
+test("清空所有群需输入「全部清空」，范围不受筛选影响；取消时不运行命令", async () => {
+  const history = new HistoryView(), { app, calls } = fakeApp();
+  Object.assign(history, { state: { kind: "ready", value: [
+    { group: "support", users: [{ user: "13800000000", bytes: 10, modified: 0, path: "unused" }], bytes: 110, database: { bytes: 100, modified: 0 } },
+    { group: "sales", users: [], bytes: 200, database: { bytes: 200, modified: 0 } },
+  ] } });
+  expect(history.actions().find(action => action.value === "a")).toMatchObject({ danger: true, disabled: false });
+  calls.answers.push("support");
+  await history.onKey(key("/"), app);
+  await history.onKey(key("a"), app);
+  const spec = calls.confirms[0]!;
+  expect(spec.typeToConfirm).toBe("全部清空");
+  expect(spec.subject).toContain("2 个群");
+  expect(spec.steps.join(" ")).toContain("2 个群库");
+  expect(spec.steps.join(" ")).toContain("1 个升级前的 session.jsonl 先计入使用统计");
+  expect(spec.steps.join(" ")).toContain("使用统计不受影响");
+  expect(calls.commands).toEqual([{ title: "清空所有群的会话历史", args: ["history-clear", "--all"] }]);
+  expect(calls.toasts.at(-1)).toContain("所有群已清空");
+  app.confirm = async (spec) => { calls.confirms.push(spec); return false; };
+  await history.onKey(key("a"), app);
+  expect(calls.commands).toHaveLength(1);
+  expect(calls.toasts.at(-1)).toBe("已取消");
+  Object.assign(history, { state: { kind: "ready", value: [] } });
+  expect(history.actions().find(action => action.value === "a")?.disabled).toBe(true);
+});
+
+test("会话页底部固定显示清空入口并说明不影响统计；临时文件页可直接跳到会话页", async () => {
+  const history = new HistoryView(), { app, calls } = fakeApp();
+  Object.assign(history, { state: { kind: "ready", value: [
+    { group: "support", users: [], bytes: 100, database: { bytes: 100, modified: 0 } },
+    { group: "sales", users: [{ user: "13800000000", bytes: 10, modified: 0, path: "unused" }], bytes: 210, database: { bytes: 200, modified: 0 } },
+  ] } });
+  for (const [width, rows] of [[72, 20], [100, 24], [120, 35]] as const) {
+    const lines = history.render(context(width, rows));
+    fits(lines, context(width, rows));
+    expect(lines).toHaveLength(context(width, rows).height);
+    const tail = plain(lines.slice(-3));
+    expect(tail).toContain("不影响使用统计");
+    expect(tail).toContain("c 当前群  support");
+    expect(tail).toContain("a 全部群  2 个群");
+  }
+  expect(history.hints().slice(0, 2).map(([name]) => name)).toEqual(["c", "a"]);
+  expect(history.actions().slice(0, 2).map(action => action.value)).toEqual(["c", "a"]);
+  await history.onKey(key("c"), app);
+  expect(calls.confirms[0]!.typeToConfirm).toBe("support");
+  expect(calls.confirms[0]!.steps.join(" ")).toContain("使用统计不受影响");
+  expect(calls.commands).toEqual([{ title: "清空 support 的会话历史", args: ["history-clear", "support", "--storage-segment"] }]);
+
+  const storage = new StorageView();
+  expect(storage.actions().find(action => action.value === "h")?.description).toContain("数据 → 会话");
+  expect(await storage.onKey(key("h"), app)).toBe(true);
+  expect(calls.destinations).toEqual(["history"]);
+});
+
 function fakeApp(root = "unused") {
   const calls = {
     answers: [] as (string | null)[], prompts: [] as string[], confirms: [] as ConfirmSpec[],

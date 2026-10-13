@@ -15,6 +15,13 @@ test("manual compaction selects the same member on both ops platforms", () => {
   expect(opsCommand("linux", args).args.slice(1)).toEqual(args);
 });
 
+test("清空所有群在两个运维平台都只以 --all / -All 传递，不带群号", () => {
+  const args = ["history-clear", "--all"];
+  const request = JSON.parse(Buffer.from(opsCommand("windows", args).args.at(-1)!, "base64").toString("utf8"));
+  expect(request).toEqual({ Command: "history-clear", All: true });
+  expect(opsCommand("linux", args).args.slice(1)).toEqual(args);
+});
+
 test("统计周期通过两个平台运维入口完整传递", () => {
   const args = ["stat", "support", "--period", "last-month"];
   const command = opsCommand("windows", args);
@@ -36,7 +43,7 @@ foreach ($name in @('Invoke-WithUtf8Output', 'Get-OpsCommandHint')) {
     $definition = $common.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     $parts += $definition.Extent.Text
 }
-foreach ($name in @('Show-Doctor', 'Step', 'Done', 'Warn', 'New-DoctorRow', 'Get-DeployModeLabel')) {
+foreach ($name in @('Show-Doctor', 'Step', 'Done', 'Warn', 'New-DoctorRow', 'Get-DeployModeLabel', 'Clear-GroupHistory')) {
     $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     if (-not $definition) { throw "missing function $name" }
     $parts += $definition.Extent.Text
@@ -68,6 +75,7 @@ function Get-Service { param($Name, $ErrorAction) }
 function Test-Public { return '530' }
 function Err($message) { [Console]::Error.WriteLine($message) }
 function Start-Bot { Step $env:TUI_TEST_PROGRESS; [Console]::Error.WriteLine($env:TUI_TEST_DIAGNOSTIC); return $true }
+function Stop-Bot { return $true }
 function Wait-Local { return 200 }
 function Write-Captured([string]$Script, [string[]]$CliArgs) {
     $payload = [pscustomobject]@{ script = $Script; argv = @($CliArgs) }
@@ -242,6 +250,21 @@ windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 C
       expect(JSON.parse(result.stdout)).toEqual({ script, argv });
     }
     expect((await fixture.run(["routes", "reset", "abcdef123456"])).code).toBe(2);
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+windowsTest("Windows 清空所有群经 -All 交给 history-admin clear --all，同时指定群时拒绝", async () => {
+  const fixture = await fixtureWrapper();
+  try {
+    // 停止和启动是桩；"fail" 让 Get-BotPids 报告未运行，输出只剩进度行和捕获的参数。
+    const all = await fixture.run(["history-clear", "--all"], "fail");
+    expect(all.code, all.stderr).toBe(0);
+    expect(JSON.parse(all.stdout.trim().split(/\r?\n/).at(-1)!)).toEqual({ script: "scripts\\ops\\history-admin.ts", argv: ["clear", "--all"] });
+    for (const input of [["history-clear", "support", "--all"], ["history-clear", "--all", "--storage-segment"]]) {
+      const refused = await fixture.run(input, "fail");
+      expect(refused.code).toBe(2);
+      expect(refused.stdout).not.toContain("history-admin");
+    }
   } finally { await fixture.cleanup(); }
 }, 30000);
 

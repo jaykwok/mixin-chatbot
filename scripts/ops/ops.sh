@@ -1046,6 +1046,7 @@ case "${1:-}" in
         echo "  history-clear <群号>"
         echo "             清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         echo "             群选择可加 --group-id（原始群号）或 --storage-segment（目录段）"
+        echo "  history-clear --all  清空所有群全部成员的上下文；一次停机完成，某个群失败时其余群照常清空"
         echo "  history-compact <群号> <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
         echo "  backup-scan 只读扫描 backup/rm 和 backup/snapshots，分类后在 tmp/backup-cleanup 生成清单，不删除"
         echo "  backup-clean <报告名> [--confirm <确认码>]"
