@@ -32,6 +32,21 @@ test("runtime settings retain previous values and validate explicit overrides", 
     await expect(saveRuntimeSettings(path, { BOT_MODEL_CACHE_RETENTION: "none" })).rejects.toThrow(/已移除/);
     for (const value of [1, 2, 8]) expect(validateRuntimeConfig({ BOT_ATTACHMENT_CONCURRENCY: value })).toHaveProperty("BOT_ATTACHMENT_CONCURRENCY", String(value));
     for (const value of [0, 9, 1.5]) expect(() => validateRuntimeConfig({ BOT_ATTACHMENT_CONCURRENCY: value })).toThrow();
+    const absolute = join(fixture.root, "公司", "模板.POTX");
+    for (const value of ["模板/默认.potx", "默认.PPTX", absolute]) {
+      expect(validateRuntimeConfig({ BOT_DOCUMENT_PPTX_TEMPLATE: value })).toHaveProperty("BOT_DOCUMENT_PPTX_TEMPLATE", value);
+    }
+    for (const value of ["模板\\公司.dotx", "公司.docx"]) {
+      expect(validateRuntimeConfig({ BOT_DOCUMENT_DOCX_TEMPLATE: value })).toHaveProperty("BOT_DOCUMENT_DOCX_TEMPLATE", value);
+    }
+    expect(() => validateRuntimeConfig({ BOT_DOCUMENT_PPTX_TEMPLATE: "默认.dotx" })).toThrow(/\.pptx 或 \.potx/);
+    expect(() => validateRuntimeConfig({ BOT_DOCUMENT_DOCX_TEMPLATE: "默认.pptx" })).toThrow(/\.docx 或 \.dotx/);
+    for (const value of ["../共享/默认.potx", "模板/../../默认.potx", "模板\\..\\..\\默认.potx"]) {
+      expect(() => validateRuntimeConfig({ BOT_DOCUMENT_PPTX_TEMPLATE: value })).toThrow(/不能包含 \.\./);
+    }
+    expect(() => validateRuntimeConfig({ BOT_DOCUMENT_PPTX_TEMPLATE: "" })).toThrow();
+    await saveRuntimeSettings(path, { BOT_DOCUMENT_PPTX_TEMPLATE: "模板/默认.potx" });
+    expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_DOCUMENT_PPTX_TEMPLATE", "模板/默认.potx");
     await expect(saveRuntimeSettings(path, { BOT_INDEX_MAX_DEPTH: "0" })).rejects.toThrow();
     expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_INDEX_MAX_DEPTH", "4");
   } finally { await fixture.cleanup(); }

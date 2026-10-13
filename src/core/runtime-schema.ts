@@ -1,13 +1,14 @@
 // 运行时与运维界面共用的纯配置定义；导入时不读取磁盘或加载机器人。
 import { isIP } from "node:net";
+import { isAbsolute } from "node:path";
 
 export const RUNTIME_KEYS = [
   "BOT_PORT", "BOT_HOST", "BOT_DEBUG", "GROUP_DATA_ROOT", "BOT_MAX_ACTIVE_REQUESTS",
   "BOT_BASH_TIMEOUT", "BOT_INDEX_TTL_MINUTES", "BOT_INDEX_MAX_FILES", "BOT_INDEX_MAX_DEPTH",
   "BOT_RUN_TIMEOUT_SECONDS", "BOT_MODEL_IDLE_TIMEOUT_SECONDS", "BOT_MODEL_RESPONSE_TIMEOUT_SECONDS",
   "BOT_SHUTDOWN_TIMEOUT_SECONDS", "BOT_DELIVERY_TIMEOUT_SECONDS",
-  "BOT_DOCUMENT_ENV", "BOT_DOCUMENT_WORK_ENABLED", "PI_CACHE_RETENTION", "BOT_ATTACHMENT_CONCURRENCY",
-  "BOT_TASK_IMAGE", "BOT_TASK_CONTROL_ROOT",
+  "BOT_DOCUMENT_ENV", "BOT_DOCUMENT_WORK_ENABLED", "BOT_DOCUMENT_PPTX_TEMPLATE", "BOT_DOCUMENT_DOCX_TEMPLATE",
+  "PI_CACHE_RETENTION", "BOT_ATTACHMENT_CONCURRENCY", "BOT_TASK_IMAGE", "BOT_TASK_CONTROL_ROOT",
 ] as const;
 export type RuntimeKey = typeof RUNTIME_KEYS[number];
 export type RuntimeConfig = Partial<Record<RuntimeKey, string>>;
@@ -28,7 +29,8 @@ export const RUNTIME_DEFAULTS = {
   BOT_BASH_TIMEOUT: "600", BOT_INDEX_TTL_MINUTES: "5", BOT_INDEX_MAX_FILES: "50000", BOT_INDEX_MAX_DEPTH: "12",
   BOT_RUN_TIMEOUT_SECONDS: "1200", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "180", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "600",
   BOT_SHUTDOWN_TIMEOUT_SECONDS: "20", BOT_DELIVERY_TIMEOUT_SECONDS: "180",
-  BOT_DOCUMENT_ENV: "", BOT_DOCUMENT_WORK_ENABLED: "1", PI_CACHE_RETENTION: "short", BOT_ATTACHMENT_CONCURRENCY: "2",
+  BOT_DOCUMENT_ENV: "", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_DOCUMENT_PPTX_TEMPLATE: "", BOT_DOCUMENT_DOCX_TEMPLATE: "",
+  PI_CACHE_RETENTION: "short", BOT_ATTACHMENT_CONCURRENCY: "2",
   BOT_TASK_IMAGE: "", BOT_TASK_CONTROL_ROOT: "",
 } satisfies Partial<Record<RuntimeKey, string>>;
 
@@ -49,6 +51,16 @@ export function validateRuntimeConfig(value: unknown): RuntimeConfig {
     if (key === "PI_CACHE_RETENTION" && !["short", "long"].includes(text)) throw new Error("PI_CACHE_RETENTION 必须是 short 或 long");
     if (key === "BOT_HOST" && text !== "localhost" && !isIP(text)) throw new Error("BOT_HOST 必须是 IP 地址或 localhost");
     if (key === "BOT_TASK_IMAGE" && !/^sha256:[a-f\d]{64}$/.test(text)) throw new Error("BOT_TASK_IMAGE 必须是完整 sha256 镜像 ID");
+    if (key === "BOT_DOCUMENT_PPTX_TEMPLATE" || key === "BOT_DOCUMENT_DOCX_TEMPLATE") validateTemplatePath(key, text);
   }
   return result;
+}
+
+/** Default document templates: a path relative to each group's workspace, or an absolute path shared by all groups. */
+const TEMPLATE_EXTENSIONS = { BOT_DOCUMENT_PPTX_TEMPLATE: [".pptx", ".potx"], BOT_DOCUMENT_DOCX_TEMPLATE: [".docx", ".dotx"] } as const;
+
+function validateTemplatePath(key: keyof typeof TEMPLATE_EXTENSIONS, text: string) {
+  const extensions = TEMPLATE_EXTENSIONS[key];
+  if (!extensions.some(extension => text.toLowerCase().endsWith(extension))) throw new Error(`${key} 必须是 ${extensions.join(" 或 ")} 文件`);
+  if (!isAbsolute(text) && text.split(/[\\/]/).some(segment => segment === "..")) throw new Error(`${key} 的相对路径不能包含 ..`);
 }

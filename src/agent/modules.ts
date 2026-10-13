@@ -14,11 +14,14 @@ export interface AgentModuleDefinition {
   prompt: string;
 }
 
+/** Default templates for document_build when a call names none (runtime settings BOT_DOCUMENT_PPTX/DOCX_TEMPLATE). */
+export interface DocumentTemplates { pptx?: string; docx?: string }
+
 /** The enabled modules, in registration order. Disabled modules are not imported or read from disk. */
-export async function loadModuleDefinitions(options: { documentWorkEnabled: boolean }): Promise<AgentModuleDefinition[]> {
+export async function loadModuleDefinitions(options: { documentWorkEnabled: boolean; documentTemplates?: DocumentTemplates }): Promise<AgentModuleDefinition[]> {
   // Single registration point.
   if (!options.documentWorkEnabled) return [];
   const { documentWorkModule } = await import("./modules/document-work/index.ts");
-  return [documentWorkModule()];
+  return [documentWorkModule(options.documentTemplates)];
 }
 

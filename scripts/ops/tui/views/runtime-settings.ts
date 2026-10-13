@@ -16,6 +16,8 @@ interface RuntimeOption {
   description: string;
   unit?: string;
   choices?: Choice[];
+  /** Shown for the empty default; a blank answer restores it. */
+  empty?: string;
 }
 const groups: { label: string; description: string; options: RuntimeOption[] }[] = [
   { label: "并发与附件", description: "请求数量与附件上传并发", options: [
@@ -38,11 +40,13 @@ const groups: { label: string; description: string; options: RuntimeOption[] }[]
       { value: "short", label: "短期（默认）" }, { value: "long", label: "长期" },
     ] },
   ] },
-  { label: "文档与诊断", description: "文档解析环境与机器人详细日志", options: [
+  { label: "文档与诊断", description: "文档解析环境、默认模板与机器人详细日志", options: [
     { key: "BOT_DOCUMENT_WORK_ENABLED", label: "文档加工模块", description: "统一启停文档 skill、编辑/组装/渲染工具及其提示词；基础检索、解析和原文件发送仍可用。应用后重启生效。", choices: [
       { value: "1", label: "开启" }, { value: "0", label: "关闭" },
     ] },
-    { key: "BOT_DOCUMENT_ENV", label: "共享文档环境覆盖", description: "留空时每群独立使用 <群目录>/venv，首次按需 uv sync。填写路径会让所有群改用同一个环境；通常保持默认。Linux 填容器内路径。" },
+    { key: "BOT_DOCUMENT_ENV", label: "共享文档环境覆盖", empty: "每群独立 venv", description: "留空时每群独立使用 <群目录>/venv，首次按需 uv sync。填写路径会让所有群改用同一个环境；通常保持默认。Linux 填容器内路径。" },
+    { key: "BOT_DOCUMENT_PPTX_TEMPLATE", label: "默认 PPT 模板", empty: "内置版式", description: "生成 PPT 未指定模板时套用，支持 .pptx/.potx。相对路径在各群 workspace 中查找，某群没有该文件时用内置版式；绝对路径所有群共用，Linux 填容器内路径。应用后重启生效。" },
+    { key: "BOT_DOCUMENT_DOCX_TEMPLATE", label: "默认 Word 模板", empty: "内置版式", description: "生成 Word 未指定模板时套用，支持 .docx/.dotx。相对路径在各群 workspace 中查找，某群没有该文件时用内置版式；绝对路径所有群共用，Linux 填容器内路径。应用后重启生效。" },
     { key: "BOT_DEBUG", label: "机器人详细日志", description: "开启后机器人日志会记录用户消息正文，分享前请脱敏。与 Cloudflared 日志分别控制。", choices: [
       { value: "0", label: "关闭" }, { value: "1", label: "开启" },
     ] },
@@ -52,7 +56,7 @@ const groups: { label: string; description: string; options: RuntimeOption[] }[]
 function display(option: RuntimeOption, saved?: string | null): string {
   const value = saved ?? RUNTIME_DEFAULTS[option.key];
   const choice = option.choices?.find(item => item.value === value);
-  return choice?.label ?? (value ? value + (option.unit ? " " + option.unit : "") : "每群独立 venv");
+  return choice?.label ?? (value ? value + (option.unit ? " " + option.unit : "") : option.empty ?? "");
 }
 
 export class RuntimeSettingsEditor {
@@ -149,11 +153,11 @@ export class RuntimeSettingsEditor {
     });
     else {
       const range = RUNTIME_RANGES[option.key as keyof typeof RUNTIME_RANGES];
-      const rule = range ? "（" + range.join("–") + (option.unit ?? "") + "，整数）" : "（留空恢复每群独立 venv）";
+      const rule = range ? "（" + range.join("–") + (option.unit ?? "") + "，整数）" : "（留空恢复" + option.empty + "）";
       value = await app.ask(option.label + rule, current ?? RUNTIME_DEFAULTS[option.key]);
     }
     if (value === null) return true;
-    if (!value.trim() && option.key === "BOT_DOCUMENT_ENV") { this.set(option, null, app); return true; }
+    if (!value.trim() && option.empty !== undefined) { this.set(option, null, app); return true; }
     try { this.set(option, validateRuntimeConfig({ [option.key]: value })[option.key]!, app); }
     catch (error) { app.toast("warn", error instanceof Error ? error.message : String(error)); }
     return true;

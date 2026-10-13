@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, join } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,7 @@ import { isPathInside } from "../../../contracts/paths.ts";
 import { resolveToolPath } from "../../tool-path.ts";
 import { ensureDocumentToolchain, venvPythonPath } from "../../python-toolchain.ts";
 import type { DocumentOptions } from "../../document-extract.ts";
+import type { DocumentTemplates } from "../../modules.ts";
 import { structuredResult } from "../../structured-result.ts";
 import { createOfficeProfile, recoverOfficeProfiles } from "../../office-profiles.ts";
 import { markdownToBlocks, type Block } from "./markdown.ts";
@@ -28,6 +29,8 @@ const slidesScript = fileURLToPath(new URL("./scripts/compose_slides.ts", import
 const slots = new AsyncSemaphore(2);
 const MAX_BYTES = 128 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
+// Office template files are accepted only as document_build templates; Python opens them as ordinary documents.
+const TEMPLATE_EXTENSIONS = { pptx: [".pptx", ".potx"], docx: [".docx", ".dotx"] };
 interface Inspection {
   digest: string; format: "docx" | "pptx"; warnings: string[]; truncated: boolean;
   paragraphs: unknown[]; blocks?: unknown[];
@@ -39,6 +42,7 @@ interface Inspection {
 interface BuildResult {
   generatedPages?: number[]; keptPages?: number[]; attention?: { page: number; reason: string }[];
   layouts?: { page: number; mode: string; segments: number }[]; titleStyle?: unknown; layout?: string; headings?: number; templated?: boolean;
+  defaultTemplate?: "used" | "missing";
 }
 interface Rendered { pages: number; images: { page: number; path: string }[]; contacts: string[]; unrenderedPages: number[]; }
 interface ImageExtraction {
@@ -54,6 +58,10 @@ interface BuildRequest {
 interface Job {
   directory: string; scratch: string; signal: AbortSignal;
   snapshot(source: string, expected?: string, pdf?: boolean): Promise<Source>;
+  /** A template named by the call (workspace or tmp); Office template files (.potx/.dotx) are accepted too. */
+  template(source: string, format: "docx" | "pptx"): Promise<Source>;
+  /** The administrator's default template; undefined when a relative one is not in this group's workspace. */
+  defaultTemplate(configured: string, format: "docx" | "pptx"): Promise<Source | undefined>;
   assets(paths: string[]): Promise<Record<string, string>>;
   python<T>(operation: string, request: object): Promise<{ result: T; report: string }>;
   run(command: string, args: string[]): Promise<void>;
@@ -88,26 +96,50 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
       if (![workspace, temp].some(root => isPathInside(original, root))) throw new Error("只能读取本群 workspace 或当前用户 tmp 中的文件");
       return original;
     };
+    const copy = async (original: string, expected?: string): Promise<Source> => {
+      const info = await stat(original);
+      if (!info.isFile() || info.size > MAX_BYTES) throw new Error("文档必须是不超过 128 MiB 的普通文件");
+      const source = join(scratch, randomUUID() + extname(original).toLowerCase());
+      const hash = createHash("sha256");
+      let bytes = 0;
+      await pipeline(createReadStream(original), new Transform({ transform(chunk: Buffer, _encoding, next) {
+        bytes += chunk.length; totalBytes += chunk.length;
+        if (bytes > MAX_BYTES || totalBytes > MAX_BYTES * 2) { next(new Error("单文件超过 128 MiB 或本次来源总量超过 256 MiB")); return; }
+        hash.update(chunk); next(null, chunk);
+      } }), createWriteStream(source, { flags: "wx" }), { signal: budget });
+      const digest = hash.digest("hex");
+      if (expected && expected !== digest) throw new Error("原文件已变化，请重新 document_inspect");
+      return { source, original, digest };
+    };
+    const templateFormat = (original: string, format: "docx" | "pptx") => {
+      if (!TEMPLATE_EXTENSIONS[format].includes(extname(original).toLowerCase())) throw new Error("模板格式必须与 format 一致");
+    };
     const job: Job = {
       directory: output, scratch, signal: budget, run,
       async snapshot(value, expected, pdf = false) {
         budget.throwIfAborted();
         const original = await locate(value);
-        const extension = extname(original).toLowerCase();
-        if (!(pdf ? [".docx", ".pptx", ".pdf"] : [".docx", ".pptx"]).includes(extension)) throw new Error("仅支持 DOCX/PPTX，渲染另支持 PDF");
-        const info = await stat(original);
-        if (!info.isFile() || info.size > MAX_BYTES) throw new Error("文档必须是不超过 128 MiB 的普通文件");
-        const source = join(scratch, randomUUID() + extension);
-        const hash = createHash("sha256");
-        let bytes = 0;
-        await pipeline(createReadStream(original), new Transform({ transform(chunk: Buffer, _encoding, next) {
-          bytes += chunk.length; totalBytes += chunk.length;
-          if (bytes > MAX_BYTES || totalBytes > MAX_BYTES * 2) { next(new Error("单文件超过 128 MiB 或本次来源总量超过 256 MiB")); return; }
-          hash.update(chunk); next(null, chunk);
-        } }), createWriteStream(source, { flags: "wx" }), { signal: budget });
-        const digest = hash.digest("hex");
-        if (expected && expected !== digest) throw new Error("原文件已变化，请重新 document_inspect");
-        return { source, original, digest };
+        if (!(pdf ? [".docx", ".pptx", ".pdf"] : [".docx", ".pptx"]).includes(extname(original).toLowerCase())) throw new Error("仅支持 DOCX/PPTX，渲染另支持 PDF");
+        return copy(original, expected);
+      },
+      async template(value, format) {
+        budget.throwIfAborted();
+        const original = await locate(value);
+        templateFormat(original, format);
+        return copy(original);
+      },
+      async defaultTemplate(configured, format) {
+        budget.throwIfAborted();
+        // An absolute path is the administrator's shared file; a relative one must stay inside this group's workspace.
+        let original: string;
+        try { original = await realpath(isAbsolute(configured) ? configured : resolve(workspace, configured)); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+        if (!isAbsolute(configured)) {
+          await assertTaskPathAllowed(original);
+          if (!isPathInside(original, workspace)) throw new Error("默认模板的相对路径必须位于本群 workspace 内");
+        }
+        templateFormat(original, format);
+        return copy(original);
       },
       async assets(paths) {
         // Images referenced by Markdown are copied beside the job so Python never reads outside it.
@@ -204,6 +236,8 @@ const attentionEntries = Type.Array(Type.Object({ page: Type.Integer(), reason: 
 const buildSchema = Type.Object({
   generatedPages: Type.Optional(pages), keptPages: Type.Optional(pages),
   layouts: Type.Optional(layoutEntries), attention: Type.Optional(attentionEntries),
+  defaultTemplate: Type.Optional(Type.Union([Type.Literal("used"), Type.Literal("missing")],
+    { description: "未传 template 而管理员配置了默认模板时出现：used 已套用，missing 本群没有该文件，使用了默认版式" })),
 });
 const composedSchema = Type.Object({ generatedPages: pages, layouts: layoutEntries, attention: attentionEntries },
   { additionalProperties: false, description: "PPT 含 content 项时返回：content 新生成的页，页码为输出文件的页码；复用的来源页不在其中" });
@@ -331,7 +365,7 @@ const SCRIPT_ONLY: ToolExposure = "codemode";
 const READS: ToolAnnotations = { readOnlyHint: true, openWorldHint: false };
 const WRITES_COPY: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 
-export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition[] {
+export function buildDocumentWorkTools(options: DocumentOptions, templates: DocumentTemplates = {}): ToolDefinition[] {
   const inspect = defineTool({
     name: "document_inspect", label: "检查文档结构", namespace: NAMESPACE, exposure: SCRIPT_ONLY, annotations: READS, outputSchema: inspectOutput,
     description: "检查 DOCX/PPTX 内部引用，返回内容清单路径、摘要和数量。清单包含可定位的段落、Word 正文块、PPT 实际页序。outline=true 时直接返回大纲：PPT 每页标题、文字量、图片/表格数与版式，Word 标题层级与可用样式，用于选页、选章节或选模板；完整段落仍在清单文件中，用 read 按需读取。",
@@ -443,11 +477,11 @@ export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition
   });
   const build = defineTool({
     name: "document_build", label: "按模板生成文档", namespace: NAMESPACE, exposure: SCRIPT_ONLY, annotations: WRITES_COPY, outputSchema: buildOutput,
-    description: "用 Markdown 内容在本群模板（任意同格式 DOCX/PPTX）的母版、版式与样式上生成可编辑的新 Word 或 PPT；无模板时使用默认中文版式。PPT 中 #/## 起新页，keepSlides 保留模板指定页（封面、封底等），sequence 决定保留页与新页顺序。build.layouts 列出新生成页中实际排成图示的页，描述新页版式时以它为准；build.attention 列出需要重点看图的页。生成后仍需 document_render 检查。" + SKILL_POINTER,
+    description: "用 Markdown 内容在本群模板（任意同格式 DOCX/PPTX）的母版、版式与样式上生成可编辑的新 Word 或 PPT；无模板时用管理员默认模板，未配置则用默认中文版式。PPT 中 #/## 起新页，keepSlides 保留模板指定页（封面、封底等），sequence 决定保留页与新页顺序。build.layouts 列出新生成页中实际排成图示的页，描述新页版式时以它为准；build.attention 列出需要重点看图的页。生成后仍需 document_render 检查。" + SKILL_POINTER,
     parameters: Type.Object({
       format: Type.Union([Type.Literal("docx"), Type.Literal("pptx")]),
       content: Type.String({ minLength: 1, maxLength: 200000 }),
-      template: Type.Optional(Type.String({ description: "本群 workspace 或本用户 tmp 中同格式的模板或样例文件" })),
+      template: Type.Optional(Type.String({ description: "本群 workspace 或本用户 tmp 中同格式的模板或样例文件（DOCX/DOTX、PPTX/POTX）；省略时使用默认模板" })),
       title: Type.Optional(Type.String({ maxLength: 200 })), subtitle: Type.Optional(Type.String({ maxLength: 300 })),
       filename: Type.Optional(Type.String()),
       keepSlides: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { maxItems: 50, description: "PPT：保留模板中的这些页（实际页码）" })),
@@ -460,13 +494,11 @@ export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition
       return withJob(options, signal, async job => {
         const extension = "." + params.format;
         const sources: Source[] = [];
-        let template: string | undefined;
-        if (params.template) {
-          const source = await job.snapshot(params.template);
-          if (extname(source.source) !== extension) throw new Error("模板格式必须与 format 一致");
-          template = source.source;
-          sources.push(source);
-        }
+        const configured = params.template ? undefined : templates[params.format];
+        const chosen = params.template ? await job.template(params.template, params.format)
+          : configured ? await job.defaultTemplate(configured, params.format) : undefined;
+        const template = chosen?.source;
+        if (chosen) sources.push(chosen);
         const content = await prepareContent(job, params.content);
         const output = outputPath(job.directory, params.filename, extension);
         const keep = params.keepSlides ?? [];
@@ -476,8 +508,11 @@ export function buildDocumentWorkTools(options: DocumentOptions): ToolDefinition
         const request: BuildRequest = { format: params.format, output, blocks: content.blocks, assets: content.assets, template,
           title: params.title, subtitle: params.subtitle, cover: params.cover ?? true, sequence, styleFrom: params.styleFrom };
         const { result, report } = await job.python<Inspection>("build", request);
-        result.warnings = [...new Set([...result.warnings, ...content.warnings])];
-        const record = await provenance(job, "build", sources, output, { template: params.template, keepSlides: keep, sequence, images: Object.keys(content.assets) });
+        result.warnings = [...new Set([...result.warnings, ...content.warnings,
+          ...configured && !chosen ? [`${isAbsolute(configured) ? "" : "本群 workspace 中"}没有默认模板 ${configured}，已使用默认版式`] : []])];
+        if (configured) result.build = { ...result.build, defaultTemplate: chosen ? "used" : "missing" };
+        const record = await provenance(job, "build", sources, output,
+          { template: params.template ?? chosen?.original, defaultTemplate: configured !== undefined, keepSlides: keep, sequence, images: Object.keys(content.assets) });
         return produced(result, report, output, record);
       });
     },

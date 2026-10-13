@@ -108,8 +108,10 @@ try {
   application.signal.throwIfAborted();
   // The relay configuration is read once here: the group registries shape send_file and the prompt by it.
   await initializeRelay();
+  const pptxTemplate = runtimeSetting("BOT_DOCUMENT_PPTX_TEMPLATE"), docxTemplate = runtimeSetting("BOT_DOCUMENT_DOCX_TEMPLATE");
   const modules = await loadModuleDefinitions({
-    documentWorkEnabled: (runtimeSetting("BOT_DOCUMENT_WORK_ENABLED") ?? RUNTIME_DEFAULTS.BOT_DOCUMENT_WORK_ENABLED) === "1" });
+    documentWorkEnabled: (runtimeSetting("BOT_DOCUMENT_WORK_ENABLED") ?? RUNTIME_DEFAULTS.BOT_DOCUMENT_WORK_ENABLED) === "1",
+    documentTemplates: { ...(pptxTemplate ? { pptx: pptxTemplate } : {}), ...(docxTemplate ? { docx: docxTemplate } : {}) } });
   const documentEnv = runtimeSetting("BOT_DOCUMENT_ENV");
   const mcpConfig = readMcpConfig();
   if (mcpConfig?.servers.length) { mcp = new McpTools(mcpConfig); await mcp.initialize(application.signal); }

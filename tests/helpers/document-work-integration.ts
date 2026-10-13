@@ -49,13 +49,16 @@ const python = async (...args: string[]) => {
 };
 await python("prepare", workspace);
 const sourceDigests: Record<string, string> = {};
-for (const name of ["source.docx", "source.pptx", "supplement.docx", "supplement.pptx"]) {
+for (const name of ["source.docx", "source.pptx", "supplement.docx", "supplement.pptx", "company.potx", "company.dotx"]) {
   sourceDigests[name] = createHash("sha256").update(await readFile(join(workspace, name))).digest("hex");
 }
-const tools = buildDocumentWorkTools({ workspaceDir: workspace, tempDir, venvDir, indexPath: join(root, "index/materials.md") });
-const call = async (name: string, params: object): Promise<any> => {
+const options = { workspaceDir: workspace, tempDir, venvDir, indexPath: join(root, "index/materials.md") };
+const tools = buildDocumentWorkTools(options);
+// The administrator's default templates, as Office template files in the group's workspace.
+const defaults = buildDocumentWorkTools(options, { pptx: "company.potx", docx: "company.dotx" });
+const call = async (name: string, params: object, list = tools): Promise<any> => {
   const before = new Set(await readdir(tempDir));
-  const tool = tools.find(t => t.name === name)!;
+  const tool = list.find(t => t.name === name)!;
   const result = await tool.execute("verify", params, undefined, undefined, {} as never);
   const details = result.details;
   // The real scripts' results must match the declared protocol exactly: pi-ai's validator coerces and cleans,
@@ -136,6 +139,9 @@ const wordInline = await call("document_compose", { filename: "章节加新章.d
   { source: "source.docx", start: 1, end: 2 }, { content: "# 补充章节\n1. 第一步\n2. 第二步\n\n![图](product.png)" },
 ] });
 await assert.rejects(call("document_compose", { items: [{ content: "# 无文件" }] }), /第一项/);
+const templateSlides = await call("document_build", { format: "pptx", content: "# 第一节\n- 要点", title: "公司模板", filename: "默认模板.pptx" }, defaults);
+const templateWord = await call("document_build", { format: "docx", content: "# 第一节\n正文。", filename: "默认模板.docx" }, defaults);
+const namedPotx = await call("document_build", { format: "pptx", template: "company.potx", content: "## 指定模板", cover: false, filename: "指定模板.pptx" });
 // compose reports its content pages at output page numbers: two content items around a page selected twice and another
 // source, one diagram drawn and two that fall back (an explicit timeline without segments is reported in warnings, three
 // ### sections too long for cards in attention). The titles prove the named pages are the new ones.
@@ -213,7 +219,8 @@ await assert.rejects(call("document_images", { source: "figure.pdf", pages: [9] 
 const preview = await call("document_render", { source: "pages.pdf", pages: [22, 1, 2] });
 const officePreviews: unknown[] = [];
 if (process.argv.includes("--office")) {
-  for (const source of [wordCompose.output, pptPatch.output, wordBuild.output, slideBuild.output, slideInline.output, layoutCompose.output, overflowBuild.output]) {
+  for (const source of [wordCompose.output, pptPatch.output, wordBuild.output, slideBuild.output, slideInline.output, layoutCompose.output, overflowBuild.output,
+    templateSlides.output, templateWord.output]) {
     officePreviews.push(await call("document_render", { source }));
   }
   // The layout deck has grown past the 20-page render default, so ask for every generated page explicitly.
@@ -229,7 +236,7 @@ if (backend) {
 }
 const results = { wordPatch, wordCompose, wordSelection, pptCompose, pptPatch, pptPatchPart: pptPart, preview, officePreviews, previewCopies, sourceDigests,
   outline, wordOutline, wordBuild, wordDefault, slideBuild, slideDefault, slideInline, wordInline, layoutCompose, layoutBuild, pdfImages, deckImages, wordImages, wordFlow,
-  sectionsBuild, linkedBuild, overflowBuild, shapeImages, filteredImages, bigImages, manyImages };
+  sectionsBuild, linkedBuild, overflowBuild, shapeImages, filteredImages, bigImages, manyImages, templateSlides, templateWord, namedPotx };
 const report = join(root, "results.json");
 await writeFile(report, JSON.stringify(results, null, 2));
 console.log(await python("check", workspace, report));

@@ -146,6 +146,61 @@ def add_edge_fixtures(root):
     prs.save(root / "many.pptx")
 
 
+def save_as_office_template(document, path, document_type, template_type):
+    """Save a python-docx/python-pptx document as an Office template (.dotx/.potx): same package, main part retyped."""
+    scratch = path.with_name(path.name + ".part")
+    document.save(scratch)
+    with zipfile.ZipFile(scratch) as source, zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            data = source.read(info)
+            if info.filename == "[Content_Types].xml":
+                assert data.count(document_type.encode()) == 1
+                data = data.replace(document_type.encode(), template_type.encode())
+            target.writestr(info, data)
+    scratch.unlink()
+
+
+def add_office_templates(root):
+    """Default-template fixtures: a slide-less .potx with its own master background and a .dotx with its own header."""
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333333), Inches(7.5)
+    background = etree.fromstring(
+        ('<p:bg xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+         'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+         '<p:bgPr><a:solidFill><a:srgbClr val="FCEFE3"/></a:solidFill><a:effectLst/></p:bgPr></p:bg>').encode())
+    prs.slide_masters[0].element.find("{http://schemas.openxmlformats.org/presentationml/2006/main}cSld").insert(0, background)
+    save_as_office_template(prs, root / "company.potx",
+                            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+                            "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml")
+    document = Document()
+    document.sections[0].header.paragraphs[0].text = "公司模板页眉"
+    document.add_paragraph("模板说明，生成时应被清空")
+    save_as_office_template(document, root / "company.dotx",
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml")
+
+
+def check_office_templates(root, results):
+    """Builds on the default .potx/.dotx: their master and header are used, and the outputs are ordinary documents."""
+    for key, kind in (("templateSlides", "presentationml"), ("templateWord", "wordprocessingml")):
+        assert results[key]["build"]["defaultTemplate"] == "used", results[key]["build"]
+        with zipfile.ZipFile(results[key]["output"]) as archive:
+            types = archive.read("[Content_Types].xml").decode()
+        assert kind + ".template.main+xml" not in types and ("presentation.main+xml" in types or "document.main+xml" in types), types
+    deck = Presentation(results["templateSlides"]["output"])
+    assert len(deck.slides) == 2 and [first_text(s) for s in deck.slides] == ["公司模板", "第一节"], [first_text(s) for s in deck.slides]
+    assert all(str(s.slide_layout.slide_master.background.fill.fore_color.rgb) == "FCEFE3" for s in deck.slides)
+    named = Presentation(results["namedPotx"]["output"])
+    assert "defaultTemplate" not in results["namedPotx"]["build"]
+    assert all(str(s.slide_layout.slide_master.background.fill.fore_color.rgb) == "FCEFE3" for s in named.slides)
+    word = Document(results["templateWord"]["output"])
+    assert word.sections[0].header.paragraphs[0].text == "公司模板页眉"
+    assert not any("模板说明" in p.text for p in word.paragraphs), "template body must be cleared"
+    assert [p.text for p in word.paragraphs if p.style.name == "Heading 1"] == ["第一节"]
+    for name in ("company.potx", "company.dotx"):
+        assert hashlib.sha256((root / name).read_bytes()).hexdigest() == results["sourceDigests"][name], name + " must not change"
+
+
 def check_edge_cases(root, results):
     sections = Document(results["sectionsBuild"]["output"])
     assert sections.sections[0].header.paragraphs[0].text == "共享页眉", "inherited header must survive body clearing"
@@ -266,6 +321,7 @@ def prepare(root):
         prs.save(root / name)
     add_tag_fixture(root / "supplement.pptx")
     add_edge_fixtures(root)
+    add_office_templates(root)
     pdf = PdfWriter()
     for _ in range(22):
         pdf.add_blank_page(width=600, height=400)
@@ -427,6 +483,7 @@ def check_builds(root, results):
     assert merged.sections[0].header.paragraphs[0].text == "客户 A 内部资料"
     assert [p.text for p in merged.paragraphs if p.style.name == "List Number"] == ["第一步", "第二步"]
     assert len(merged.inline_shapes) == 1
+    check_office_templates(root, results)
     check_layouts_and_images(root, results)
 
 

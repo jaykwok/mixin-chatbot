@@ -272,6 +272,37 @@ test("文档模块开关默认开启，选择关闭后只保存对应运行参�
   } finally { view.onLeave(); read.mockRestore(); write.mockRestore(); discard.mockRestore(); run.mockRestore(); }
 });
 
+test("默认 PPT/Word 模板按扩展名校验，留空恢复内置版式", async () => {
+  const { app, choices, answers, messages } = stub(), view = new SettingsView();
+  const saved = { hash: null, values: { BOT_DOCUMENT_DOCX_TEMPLATE: "公司.dotx" } };
+  const read = spyOn(data, "loadRuntimeSettings").mockResolvedValue(saved);
+  const write = spyOn(settings, "writeRuntimeDraft").mockResolvedValue("template-draft");
+  const discard = spyOn(settings, "discardRuntimeDraft").mockResolvedValue();
+  const run = spyOn(app, "run").mockResolvedValue(0);
+  try {
+    await view.onKey(key("a"), app); await view.refresh(app);
+    await view.onKey(key("end"), app); await view.onKey(key("enter"), app);
+    await view.onKey(key("down"), app); await view.onKey(key("down"), app);
+    expect(plain(view.render(ctx()))).toContain("默认 PPT 模板");
+    expect(plain(view.render(ctx()))).toContain("内置版式（默认）");
+    choices.push("edit"); answers.push("默认.dotx");
+    await view.onKey(key("enter"), app);
+    expect(messages.at(-1)).toContain(".pptx 或 .potx");
+    expect(view.hasUnsavedChanges()).toBe(false);
+    choices.push("edit"); answers.push("模板/默认.potx");
+    await view.onKey(key("enter"), app);
+    expect(plain(view.render(ctx()))).toContain("模板/默认.potx（待保存）");
+    await view.onKey(key("down"), app);
+    expect(plain(view.render(ctx()))).toContain("默认 Word 模板");
+    expect(plain(view.render(ctx()))).toContain("公司.dotx（已保存）");
+    choices.push("edit"); answers.push("  ");
+    await view.onKey(key("enter"), app);
+    expect(plain(view.render(ctx()))).toContain("内置版式（待保存）");
+    await view.onKey(key("s"), app);
+    expect(write.mock.calls[0]!.slice(0, 2)).toEqual([saved, { BOT_DOCUMENT_PPTX_TEMPLATE: "模板/默认.potx", BOT_DOCUMENT_DOCX_TEMPLATE: null }]);
+  } finally { view.onLeave(); read.mockRestore(); write.mockRestore(); discard.mockRestore(); run.mockRestore(); }
+});
+
 test("分类、默认值和开关在宽窄窗口完整可达；退出 TUI 前提醒未保存草稿", async () => {
   const { app, choices } = stub(), view = new SettingsView(), tty = terminal();
   const read = spyOn(data, "loadRuntimeSettings").mockResolvedValue({ hash: null, values: { BOT_DEBUG: "1" } });

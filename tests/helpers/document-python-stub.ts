@@ -100,8 +100,11 @@ async function answer(operation: string, request: any): Promise<unknown> {
   throw new Error("unexpected document operation " + operation);
 }
 
-/** A document_ops.py request as the stub received it, with whether its `office` directory existed and held anything. */
-export interface StubRequest { operation: string; request: any; office?: { existed: boolean; entries: number } }
+/**
+ * A document_ops.py request as the stub received it, with whether its `office` directory existed and held anything and
+ * the text of its `template` copy (the job's scratch is gone once the tool returns).
+ */
+export interface StubRequest { operation: string; request: any; office?: { existed: boolean; entries: number }; template?: string }
 
 /**
  * `delayMs` keeps each stubbed Python run busy that long, or until the run is cancelled; `peak` records how many ran
@@ -137,7 +140,8 @@ export async function stubDocumentPython(options: { delayMs?: number } = {}): Pr
         request = JSON.parse(await readFile(rest[1]!, "utf8"));
         const office = typeof request.office === "string"
           ? await readdir(request.office).then(entries => ({ existed: true, entries: entries.length }), () => ({ existed: false, entries: 0 })) : undefined;
-        requests.push({ operation: rest[0]!, request, ...(office ? { office } : {}) });
+        const template = typeof request.template === "string" ? await readFile(request.template, "utf8") : undefined;
+        requests.push({ operation: rest[0]!, request, ...(office ? { office } : {}), ...(template === undefined ? {} : { template }) });
       }
       options.signal?.throwIfAborted();
       if (delayMs) await new Promise((resolve, reject) => {

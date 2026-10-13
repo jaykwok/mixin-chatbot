@@ -474,8 +474,40 @@ def render(request):
             "unrenderedPages": [i for i in range(1, total + 1) if i not in selected], "visuallyReviewed": False}
 
 
+# An Office template (.potx/.dotx) differs from a document only in its main part's content type.
+TEMPLATE_TYPES = {
+    ".potx": ("application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+              "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml", ".pptx"),
+    ".dotx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml", ".docx"),
+}
+
+
+def template_as_document(path, workdir):
+    """Copy an Office template into workdir as an ordinary document; other files are returned unchanged."""
+    suffix = Path(path).suffix.lower()
+    if suffix not in TEMPLATE_TYPES:
+        return path
+    template_type, document_type, extension = TEMPLATE_TYPES[suffix]
+    package(path)
+    target = Path(workdir) / (Path(path).stem + extension)
+    with zipfile.ZipFile(path) as archive:
+        types = xml(archive.read("[Content_Types].xml"))
+        main = [node for node in types if etree.QName(node).localname == "Override" and node.get("ContentType") == template_type]
+        if len(main) != 1:
+            raise ValueError("模板文件没有唯一的主文档部件，无法作为模板")
+        main[0].set("ContentType", document_type)
+        with zipfile.ZipFile(target, "x", zipfile.ZIP_DEFLATED) as output:
+            for info in archive.infolist():
+                output.writestr(info, etree.tostring(types, encoding="UTF-8", xml_declaration=True, standalone=True)
+                                if info.filename == "[Content_Types].xml" else archive.read(info))
+    return str(target)
+
+
 def build(request):
     import document_build
+    if request.get("template"):
+        request["template"] = template_as_document(request["template"], request["workdir"])
     for path in [request.get("template"), *request.get("assets", {}).values()]:
         if path and Path(path).suffix.lower() in (".docx", ".pptx"):
             package(path)

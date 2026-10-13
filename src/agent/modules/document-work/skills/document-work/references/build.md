@@ -2,6 +2,8 @@
 
 `document_build` 与 `document_compose` 的 `content` 项都接受同一种 Markdown。内容由你写，排版由工具按模板完成：Word 继承页面设置、页眉页脚、主题字体和样式；PPT 继承母版和版式，并从模板样例页推断标题位置、字体、字号与颜色。
 
+**默认模板**：管理员可为 PPT、Word 各配置一份默认模板。`document_build` 不传 `template` 时自动套用，结果的 `build.defaultTemplate` 为 `used`；本群没有该文件时为 `missing`，`warnings` 会说明并改用内置版式，此时不要声称用了公司模板。用户要求沿用某份文件的样式时才传 `template`，它优先于默认模板。`document_compose` 的 `content` 项沿用组装来源的版式，不套默认模板。
+
 ## Markdown 约定
 
 | 写法 | Word | PPT |
@@ -25,7 +27,7 @@
 
 ## PPT 参数
 
-- `template`：任意本群 PPT，通常选产品介绍或客户方案原件，它的母版和标题风格会被沿用。没有合适模板时省略，用默认 16:9 版式。
+- `template`：任意本群 PPT 或 PowerPoint 模板（.potx），通常选产品介绍或客户方案原件，它的母版和标题风格会被沿用。没有合适模板时省略：管理员配置了默认 PPT 模板就套用它，否则用默认 16:9 版式。
 - `keepSlides` + `sequence`：保留模板的封面、目录、封底等页，并指定新页插入位置。例如 `keepSlides: [1, 45]`，`sequence: [1, "content", 45]`。
 - `styleFrom`：模板页较杂时，指定几页内容页作为标题样式与内容区域的推断依据。
 - `title` / `subtitle` / `cover`：有 `title` 时默认生成封面页。产品方案类 PPT 的封面元素通常画在第 1 页上而非版式里，此时生成的封面会是白页；应改用 `keepSlides: [1]`、`cover: false`，再用 `document_patch` 改封面上的客户名或标题。大纲中首页 `chars` 很少且版式名含“标题幻灯片”，一般表示版式自带封面设计，可直接 `cover: true`。
@@ -62,7 +64,7 @@
 
 ## Word 参数
 
-- `template`：任意本群 Word，通常是同类正式文档或历史方案。工具清空其正文，保留节设置、页眉页脚、样式与主题；如需保留原正文的一部分，用 `document_compose` 的 `start,end` 复用正文块，再跟一个 `content` 项。
+- `template`：任意本群 Word 或 Word 模板（.dotx），通常是同类正式文档或历史方案；省略时同样先用管理员配置的默认 Word 模板。工具清空其正文，保留节设置、页眉页脚、样式与主题；如需保留原正文的一部分，用 `document_compose` 的 `start,end` 复用正文块，再跟一个 `content` 项。
 - `title` / `subtitle`：写入 Title / Subtitle 样式；模板没有这些样式时退回加粗大字。
 - 页眉页脚随模板保留，包括其中的文档名和页码域；需要改页眉文字时对成品用 `document_patch`（含页码域的段落会被拒绝，改相邻段落或用脚本）。
 

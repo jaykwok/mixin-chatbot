@@ -2,13 +2,13 @@
 // outputSchema exactly and equals the model-facing text and details; failures throw. Also checks the namespace,
 // descriptions and annotations that P1-B moved, and that the send tools are model-only.
 import assert from "node:assert/strict";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { extname, join } from "node:path";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { stubDocumentPython } from "./document-python-stub.ts";
 
-const { calls, controls } = await stubDocumentPython();
+const { calls, controls, requests } = await stubDocumentPython();
 const { buildDocumentTool } = await import("../../src/agent/document-extract.ts");
 const { buildDocumentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
 const { buildSendTools } = await import("../../src/agent/send-tools.ts");
@@ -32,8 +32,8 @@ function conforms(tool: ToolDefinition, value: unknown): boolean {
 }
 
 const results: Record<string, any> = {};
-async function call(name: string, params: Record<string, unknown>, label = name) {
-  const tool = tools.find((candidate) => candidate.name === name)!;
+async function call(name: string, params: Record<string, unknown>, label = name, list = tools) {
+  const tool = list.find((candidate) => candidate.name === name)!;
   assert.ok(tool.outputSchema, `${name} declares no outputSchema`);
   const result = await tool.execute("call", params as never, undefined, undefined, {} as never);
   const structured = result.structuredContent as Record<string, unknown>;
@@ -94,6 +94,48 @@ assert.deepEqual(built.build.layouts, [{ page: 2, mode: "cards", segments: 3 }])
 assert.ok(built.warnings.includes("图片不存在，已跳过：missing.png"));
 const plain = await call("document_build", { format: "docx", content: "# 标题\n正文" }, "build-docx");
 assert.deepEqual(plain.build, { headings: 2, templated: false });
+
+// Default templates: used when a call names none, while a named template still wins. A relative default is looked up in
+// each group's workspace (absent: the default layout and a warning); an absolute one is shared and may lie outside it.
+await mkdir(join(workspace, "模板"));
+await writeFile(join(workspace, "模板", "默认.potx"), "fixture potx");
+const shared = join(root, "shared", "公司.dotx");
+await mkdir(join(root, "shared"));
+await writeFile(shared, "fixture dotx");
+const defaults = buildDocumentWorkTools(options, { pptx: "模板/默认.potx", docx: shared });
+const lastTemplate = () => {
+  const { request, template } = requests.at(-1)!;
+  return template === undefined ? undefined : { extension: extname(request.template), content: template };
+};
+const selection = async (result: { provenance: string }) => JSON.parse(await readFile(result.provenance, "utf8")).selection;
+const usedDeck = await call("document_build", { format: "pptx", content: "## 新页", keepSlides: [1] }, "build-default-pptx", defaults);
+assert.deepEqual([usedDeck.build.defaultTemplate, lastTemplate()], ["used", { extension: ".potx", content: "fixture potx" }]);
+assert.deepEqual([(await selection(usedDeck)).template, (await selection(usedDeck)).defaultTemplate],
+  [await realpath(join(workspace, "模板", "默认.potx")), true]);
+const usedWord = await call("document_build", { format: "docx", content: "# 标题" }, "build-default-docx", defaults);
+assert.deepEqual([usedWord.build.defaultTemplate, lastTemplate()], ["used", { extension: ".dotx", content: "fixture dotx" }]);
+const named = await call("document_build", { format: "pptx", template: "方案.pptx", content: "## 新页" }, "build-named-over-default", defaults);
+assert.deepEqual([named.build.defaultTemplate, lastTemplate()], [undefined, { extension: ".pptx", content: "fixture 方案.pptx" }]);
+const namedTemplate = await call("document_build", { format: "pptx", template: "模板/默认.potx", content: "## 新页" }, "build-named-potx");
+assert.deepEqual([namedTemplate.build.defaultTemplate, lastTemplate()], [undefined, { extension: ".potx", content: "fixture potx" }]);
+const otherGroup = join(root, "other-workspace");
+await mkdir(otherGroup);
+const elsewhere = buildDocumentWorkTools({ ...options, workspaceDir: otherGroup }, { pptx: "模板/默认.potx" });
+const absent = await call("document_build", { format: "pptx", content: "## 新页" }, "build-default-missing", elsewhere);
+assert.deepEqual([absent.build.defaultTemplate, lastTemplate()], ["missing", undefined]);
+assert.ok(absent.warnings.includes("本群 workspace 中没有默认模板 模板/默认.potx，已使用默认版式"));
+const run = (list: ToolDefinition[], params: Record<string, unknown>) =>
+  list.find((tool) => tool.name === "document_build")!.execute("call", params as never, undefined, undefined, {} as never);
+await assert.rejects(run(elsewhere, { format: "pptx", content: "## 新页", keepSlides: [1] }), /需要指定模板/);
+await assert.rejects(run(moduleTools, { format: "docx", template: "模板/默认.potx", content: "# 标题" }), /模板格式必须与 format 一致/);
+// A relative default reached through a link out of the workspace is refused, not used and not reported missing.
+const linked = join(root, "linked-workspace"), outside = join(root, "outside");
+await mkdir(join(outside, "模板"), { recursive: true });
+await writeFile(join(outside, "模板", "默认.potx"), "outside potx");
+await mkdir(linked);
+await symlink(join(outside, "模板"), join(linked, "模板"), "junction");
+const escaping = buildDocumentWorkTools({ ...options, workspaceDir: linked }, { pptx: "模板/默认.potx" });
+await assert.rejects(run(escaping, { format: "pptx", content: "## 新页" }), /本群 workspace 内/);
 // outline comes only from document_inspect, build only from document_build (always) and document_compose (PPT with
 // content, only the three page lists), so only they declare it.
 const toolNamed = (name: string) => tools.find((tool) => tool.name === name)!;
@@ -148,7 +190,7 @@ for (const phrase of ["digest", "恰好出现一次", "第一项必须是文件"
   assert.ok(namespace.instructions!.includes(phrase), `namespace instructions lack ${phrase}`);
 }
 const guide = await readFile(new URL("../../src/agent/modules/document-work/skills/document-work/references/build.md", import.meta.url), "utf8");
-for (const phrase of ["<!-- notes:", "<!-- cards -->", "<!-- timeline -->", "```mermaid", "width=8cm", "`---`", "build.layouts", "build.attention", "keepSlides"]) {
+for (const phrase of ["<!-- notes:", "<!-- cards -->", "<!-- timeline -->", "```mermaid", "width=8cm", "`---`", "build.layouts", "build.attention", "keepSlides", "build.defaultTemplate"]) {
   assert.ok(guide.includes(phrase), `references/build.md lacks ${phrase}`);
 }
 assert.equal(tools[0]!.namespace, undefined, "document_extract stays outside the module namespace");
