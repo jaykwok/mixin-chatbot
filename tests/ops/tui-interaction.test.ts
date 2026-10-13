@@ -1543,6 +1543,7 @@ test("日志设置只显示关闭和开启，取消或选择当前值不执行�
   const view = new SettingsView();
   let saved: tuiData.TunnelLogging = "off";
   const read = spyOn(tuiData, "loadTunnelLogging").mockImplementation(async () => saved);
+  const relay = spyOn(tuiData, "loadRelaySummary").mockResolvedValue({ enabled: false });
   const confirm = spyOn(app, "confirm").mockResolvedValue(false);
   const run = spyOn(app, "run").mockImplementation(async (_title, args) => { saved = args[1] as tuiData.TunnelLogging; return 0; });
   try {
@@ -1569,7 +1570,7 @@ test("日志设置只显示关闭和开启，取消或选择当前值不执行�
     await view.onKey(key("v"), app);
     expect(calls.destinations).toEqual(["tunnel-logs"]);
     expect(createRelayView().actions!().map(action => action.label)).not.toContain("配置外链");
-  } finally { read.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
+  } finally { view.onLeave(); read.mockRestore(); relay.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
 });
 
 test("连接模式默认自动，三种选择可保存；取消、原值和恢复后的失败都正确显示", async () => {
@@ -1697,9 +1698,23 @@ test("外链配置在两个平台接管真实终端，不通过普通弹窗或�
   } finally { settings.mockRestore(); }
 });
 
+test("测试外链不需确认，直接交给 relay-test 并说明会上传后删除测试对象", async () => {
+  const { app, calls } = fakeApp();
+  const relay = createRelayView();
+  expect(relay.actions!().map(action => action.label)).toEqual(["列出在册外链", "测试外链", "按关键字清理", "清理全部外链"]);
+  await relay.onKey!(key("down"), app);
+  expect(plain(relay.render(context(120, 35)))).toContain("在线检查 · 测试对象检查完即删除");
+  await relay.onKey!(key("enter"), app);
+  expect(calls.confirms).toHaveLength(0);
+  expect(calls.prompts).toHaveLength(0);
+  expect(calls.commands).toEqual([{ title: "测试外链", args: ["relay-test"] }]);
+  expect(calls.toasts).toEqual(["测试外链完成"]);
+});
+
 test("必填输入为空会停止，路由群名中的空格完整传递", async () => {
   const { app, calls } = fakeApp();
   const relay = createRelayView();
+  await relay.onKey!(key("down"), app);
   await relay.onKey!(key("down"), app);
   calls.answers.push(" ");
   await relay.onKey!(key("enter"), app);

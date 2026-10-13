@@ -11,6 +11,7 @@ export interface RelayConfig {
   accessKeyId: string;
   secretAccessKey: string;
   sessionToken?: string;
+  /** "" for the bucket root, otherwise a directory ending in "/". */
   prefix: string;
   forcePathStyle: boolean;
   maxBytes: number;
@@ -32,9 +33,6 @@ function required(value: unknown, field: string, path: string): string {
 export function validateRelayConfig(doc: unknown, path = "data/config/relay.json"): RelayConfig {
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) throw new Error(`${path} 必须是 JSON 对象`);
   const f = doc as Record<string, unknown>;
-  if (["webdavUrl", "publicBaseUrl", "username", "password", "signSecret", "signPathPrefix"].some(k => k in f)) {
-    throw new Error(`${path} 使用已移除的 WebDAV / OpenList 配置；请从外链配置向导重新配置 S3，不支持旧外链迁移。`);
-  }
   if (f.provider !== "s3") throw new Error(`${path} 的 provider 必须是 s3`);
   const raw = required(f.endpoint, "endpoint", path);
   let endpoint: URL;
@@ -47,13 +45,19 @@ export function validateRelayConfig(doc: unknown, path = "data/config/relay.json
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket) || bucket.includes("..")) throw new Error(`${path} 的 bucket 格式无效`);
   const region = required(f.region, "region", path);
   if (!/^[a-zA-Z0-9_-]+$/.test(region)) throw new Error(`${path} 的 region 格式无效`);
-  const prefix = f.prefix === undefined ? "relay/" : required(f.prefix, "prefix", path).replace(/\/+$/, "") + "/";
+  // Objects sit at the bucket root unless a directory is configured; "/" also means the root.
+  const directory = f.prefix === undefined || f.prefix === "" ? "" : required(f.prefix, "prefix", path).replace(/\/+$/, "");
+  const prefix = directory && directory + "/";
   if (prefix.startsWith("/") || prefix.split("/").slice(0, -1).some(p => !p || p === "." || p === "..") ||
-      /[\\?#%]/.test(prefix) || Buffer.byteLength(prefix) > 256) throw new Error(`${path} 的 prefix 必须是非空对象目录，不能包含路径穿越、反斜杠、?、# 或 %`);
+      /[\\?#%]/.test(prefix) || Buffer.byteLength(prefix) > 256) throw new Error(`${path} 的 prefix 必须为空（桶根目录）或对象目录，不能包含空段、路径穿越、反斜杠、?、# 或 %`);
   if (f.forcePathStyle !== undefined && typeof f.forcePathStyle !== "boolean") throw new Error(`${path} 的 forcePathStyle 必须是布尔值`);
   const forcePathStyle = f.forcePathStyle === true;
   if (!forcePathStyle && (endpoint.hostname === "localhost" || endpoint.hostname.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(endpoint.hostname))) {
     throw new Error(`${path} 的 IP / localhost 端点需要 forcePathStyle: true`);
+  }
+  // Consoles often show the bucket domain; virtual-hosted signing would prepend the bucket a second time.
+  if (!forcePathStyle && endpoint.hostname.startsWith(bucket + ".")) {
+    throw new Error(`${path} 的 endpoint 已包含桶名；Virtual hosted 会自动在服务端点前加桶名，请填写 ${endpoint.protocol}//${endpoint.hostname.slice(bucket.length + 1)}`);
   }
   const maxBytes = f.maxBytes === undefined ? DEFAULT_RELAY_MAX_BYTES : f.maxBytes;
   // Single PUT is intentionally bounded: no multipart uploads to strand or abort on another API.
@@ -92,7 +96,7 @@ export function objectBaseUrl(config: RelayConfig): string {
   return url.href.slice(0, -"identity".length);
 }
 
-/** Decode only our random two-segment object layout, never a prefix, directory, or old WebDAV URL. */
+/** Decode only our random two-segment object layout, never a prefix, directory or foreign URL. */
 export function objectNameFromUrl(config: RelayConfig, storedUrl: string): string | null {
   const base = objectBaseUrl(config);
   if (!storedUrl.startsWith(base)) return null;

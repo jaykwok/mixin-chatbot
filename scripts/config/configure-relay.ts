@@ -9,7 +9,7 @@ import { archiveFile, replaceFile, withMaintenance } from "../../src/core/mainte
 import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../../src/core/storage.ts";
 import { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, relayBackendId, validateRelayConfig, type RelayConfig } from "../../src/integrations/relay.ts";
 import { readRelayIndex, RelayIndexFormatError } from "../../src/integrations/relay-index.ts";
-import { normalizeRelayUrlInput } from "./relay-url.ts";
+import { normalizeRelayUrlInput, suggestRelayRegion } from "./relay-url.ts";
 
 const MIB = 1024 ** 2;
 const CONFIG_FIELDS = ["provider", "endpoint", "region", "bucket", "accessKeyId", "secretAccessKey", "sessionToken", "prefix", "forcePathStyle", "maxBytes", "expireHours", "cleanupGraceMinutes"];
@@ -108,17 +108,21 @@ async function prepare(draftPath: string): Promise<void> {
       "使用兼容 S3 Signature V4 的私有桶，关闭公共访问，授予专用凭据对象读、写、删除权限。",
       "Endpoint 填服务地址（不含桶名或对象路径），下载直接访问这个端点，不经过机器人或隧道。",
       "阿里云 OSS 使用 S3 兼容端点，例如 s3.oss-cn-hangzhou.aliyuncs.com。",
-      "腾讯 COS 桶名包含 APPID；天翼云端点和区域按所选产品、资源池的 S3 文档填写。",
+      "腾讯 COS 桶名包含 APPID，端点形如 cos.ap-chengdu.myqcloud.com（不含桶名）；天翼云端点和区域按所选产品、资源池的 S3 文档填写。",
+      "对象默认放在桶根目录，路径为 日期-UUID/原文件名，建议使用专用桶；高级设置可改放子目录。",
       "云端另设生命周期兜底；关闭版本控制、对象锁及复制，避免删除后仍保留历史副本。",
       "默认下载有效 2 小时，额外保留 30 分钟后清理。查看和补发不延长期限。",
       "此向导只校验配置，不上传文件，也不修改云端权限或生命周期。",
     ].join("\n"), "对象存储准备");
     const next: RelayConfig = { ...(previous ?? {
       provider: "s3", endpoint: "", region: "", bucket: "", accessKeyId: "", secretAccessKey: "",
-      prefix: "relay/", forcePathStyle: false, maxBytes: DEFAULT_RELAY_MAX_BYTES,
+      prefix: "", forcePathStyle: false, maxBytes: DEFAULT_RELAY_MAX_BYTES,
       expireHours: DEFAULT_RELAY_EXPIRE_HOURS, cleanupGraceMinutes: DEFAULT_RELAY_CLEANUP_GRACE_MINUTES,
     }) };
     next.endpoint = normalizeRelayUrlInput(await askText("S3 服务端点 Endpoint", next.endpoint, requireUrl));
+    // A new endpoint starts from the region it names; the same endpoint keeps the saved region.
+    const region = suggestRelayRegion(next.endpoint);
+    if (region && previous?.endpoint !== next.endpoint) next.region = region;
     next.region = await askText("S3 区域 Region", next.region, value => value?.trim() ? undefined : "不能为空");
     next.bucket = await askText("私有存储桶 Bucket", next.bucket, value => value?.trim() ? undefined : "不能为空");
     const style = bail<string>(await select({
@@ -129,6 +133,15 @@ async function prepare(draftPath: string): Promise<void> {
       ],
     }));
     next.forcePathStyle = style === "path";
+    // Consoles often show the bucket domain; virtual-hosted style would add the bucket again. Fix it before credentials.
+    const endpoint = new URL(next.endpoint);
+    if (!next.forcePathStyle && endpoint.hostname.startsWith(next.bucket + ".")) {
+      endpoint.hostname = endpoint.hostname.slice(next.bucket.length + 1);
+      if (!bail<boolean>(await confirm({
+        message: "服务端点已包含桶名，Virtual hosted 会自动加桶名；改用 " + endpoint.origin + "？", initialValue: true,
+      }))) throw new Error("服务端点不能包含桶名；请重新运行外链配置向导");
+      next.endpoint = endpoint.origin;
+    }
     next.accessKeyId = await askSecret("Access Key ID", previous?.endpoint === next.endpoint ? previous.accessKeyId : undefined);
     const sameAccount = previous?.endpoint === next.endpoint && previous.accessKeyId === next.accessKeyId;
     next.secretAccessKey = await askSecret("Secret Access Key", sameAccount ? previous?.secretAccessKey : undefined);
@@ -147,8 +160,9 @@ async function prepare(draftPath: string): Promise<void> {
       message: "调整高级设置（目录、文件上限、有效期、删除余量）？", initialValue: false,
     }));
     if (advanced) {
-      next.prefix = await askText("对象目录 Prefix", next.prefix,
-        value => validationError({ ...next, prefix: value }));
+      // No defaultValue: clack would turn a cleared field back into the old directory, leaving no way to choose the root.
+      next.prefix = bail<string>(await text({ message: "对象目录 Prefix（清空表示桶根目录）", initialValue: next.prefix,
+        validate: value => validationError({ ...next, prefix: value ?? "" }) })).trim();
       next.maxBytes = Number(await askText("单文件外链上限（MiB，须大于 " + MAX_ATTACHMENT_BYTES / MIB + "，最大 5120）",
         String(next.maxBytes / MIB), value => validationError({ ...next, maxBytes: Number(value) * MIB }))) * MIB;
       next.expireHours = Number(await askText("链接有效期（小时，最多 168）", String(next.expireHours),
@@ -162,7 +176,8 @@ async function prepare(draftPath: string): Promise<void> {
     Object.assign(config, validated);
     note([
       "服务端点：" + displayUrl(validated.endpoint),
-      "区域：" + validated.region + "；桶：" + validated.bucket + "；目录：" + validated.prefix,
+      "区域：" + validated.region + "；桶：" + validated.bucket,
+      "对象路径：" + validated.prefix + "日期-UUID/原文件名" + (validated.prefix ? "" : "（桶根目录）"),
       "寻址：" + (validated.forcePathStyle ? "Path style" : "Virtual hosted"),
       "凭据：已设置（隐藏）" + (validated.sessionToken ? "，含临时 Token（需自行续期）" : ""),
       "单文件上限：" + validated.maxBytes / MIB + " MiB",
@@ -172,7 +187,8 @@ async function prepare(draftPath: string): Promise<void> {
   }
   const nextBackend = config ? relayBackendId(validateRelayConfig(config)) : null;
   const stranded = checkLedger(config !== null).filter(entry => !nextBackend || !entry.key.startsWith(nextBackend + ":"));
-  if (stranded.length) log.warn(`账本仍有 ${stranded.length} 个对象不属于新设置；切换或停用后无法自动删除这些对象。建议取消并先在原后端清理；也可保存后在云端清理，或切回原设置重试。`);
+  if (stranded.length) log.warn(`账本仍有 ${stranded.length} 个对象不属于新设置；切换或停用后无法自动删除这些对象。` +
+    "建议取消，先在原设置下执行「数据 → 外链 → 清理全部外链」（命令行 relay-purge）；也可保存后在云端清理，或切回原设置再清理。");
   if (!bail<boolean>(await confirm({ message: "保存并应用以上外链设置？", initialValue: action !== "disable" }))) {
     throw new DOMException("配置已取消", "AbortError");
   }
@@ -216,6 +232,7 @@ async function apply(draftPath: string): Promise<void> {
       await replaceFile(temporary, RELAY_CONFIG_PATH);
     } finally { await rm(temporary, { force: true }); }
     console.log("外链配置已保存到 " + RELAY_CONFIG_PATH);
+    console.log("云端权限或设置有变化时，请在「数据 → 外链 → 测试外链」（命令行 relay-test）上传测试文件验收。");
   });
 }
 

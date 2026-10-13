@@ -13,3 +13,12 @@ export function normalizeRelayUrlInput(value: string | undefined): string {
   }
   return url.origin;
 }
+
+/** Region named by well-known endpoints; only a wizard default, never a validation rule. */
+export function suggestRelayRegion(endpoint: string): string | undefined {
+  const host = new URL(endpoint).hostname;
+  // COS regions always contain a dash, which excludes service hosts such as cos.accelerate.myqcloud.com.
+  return /(?:^|\.)cos\.([a-z]+-[a-z0-9-]+)\.myqcloud\.com$/.exec(host)?.[1]
+    ?? /^s3[.-]([a-z]+-[a-z0-9-]+)\.amazonaws\.com$/.exec(host)?.[1]
+    ?? (host.endsWith(".r2.cloudflarestorage.com") ? "auto" : undefined);
+}

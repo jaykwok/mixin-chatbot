@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { openRelayIndex } from "../../src/integrations/relay-index.ts";
+import { openRelayIndex, readRelayIndex } from "../../src/integrations/relay-index.ts";
 import { openState } from "../../src/core/state.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -67,24 +67,17 @@ test("a corrupt SQLite ledger fails closed without replacing its contents", asyn
   } finally { await fixture.cleanup(); }
 });
 
-test.each([false, true])("old ledger accepts only an empty table (populated=%s)", async populated => {
-  const fixture = await tempFixture("relay-old-");
+test.each([false, true])("a table without the deadline columns is invalid and left untouched (populated=%s)", async populated => {
+  const fixture = await tempFixture("relay-columns-");
   const path = join(fixture.root, "relay.sqlite");
   const db = openState(path);
   db.exec("CREATE TABLE objects (key TEXT PRIMARY KEY, url TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, at TEXT NOT NULL, state TEXT NOT NULL)");
-  if (populated) db.exec("INSERT INTO objects VALUES ('old', 'https://old.invalid/a', 'a', 1, '2026-01-01', 'uploaded')");
+  if (populated) db.exec("INSERT INTO objects VALUES ('row', 'https://s3.invalid/a', 'a', 1, '2026-01-01', 'uploaded')");
   try {
-    if (populated) {
-      await expect(openRelayIndex(path)).rejects.toThrow("不支持迁移");
-      expect(db.query("SELECT key FROM objects").all()).toEqual([{ key: "old" }]);
-      expect(db.query("PRAGMA table_info(objects)").all()).toHaveLength(6);
-    } else {
-      const index = await openRelayIndex(path);
-      try {
-        expect(index.entries()).toEqual([]);
-        expect(db.query("PRAGMA table_info(objects)").all()).toHaveLength(8);
-      } finally { index.close(); }
-    }
+    await expect(openRelayIndex(path)).rejects.toThrow("外链账本结构无效");
+    expect(() => readRelayIndex(path)).toThrow("外链账本结构无效");
+    expect(db.query("SELECT key FROM objects").all()).toEqual(populated ? [{ key: "row" }] : []);
+    expect(db.query("PRAGMA table_info(objects)").all()).toHaveLength(6);
   } finally { db.close(); await fixture.cleanup(); }
 });
 

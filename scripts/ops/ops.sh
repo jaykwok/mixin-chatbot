@@ -174,16 +174,15 @@ has_rollback_container() {
 check_relay() {
     [ -f "$RELAY_CONFIG_FILE" ] || return 0
     if ! command -v jq >/dev/null 2>&1; then
-        check "S3 外链" "warn" "配置已存在；缺少 jq，尚未校验" "启动时执行完整格式校验；请使用测试文件验收实际云端配置。"
+        check "S3 外链" "warn" "配置已存在；缺少 jq，尚未校验" "启动时执行完整格式校验；请用 relay-test 验收实际云端配置。"
         return 0
     fi
     if ! jq -e 'type == "object" and .provider == "s3" and
-        ([.endpoint,.region,.bucket,.accessKeyId,.secretAccessKey] | all(type == "string" and length > 0)) and
-        ([has("webdavUrl"),has("publicBaseUrl"),has("username"),has("password"),has("signSecret"),has("signPathPrefix")] | any | not)' "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
-        check "data/config/relay.json" "0" "S3 必填项不全或仍使用已移除的旧配置，请重新运行外链向导"
+        ([.endpoint,.region,.bucket,.accessKeyId,.secretAccessKey] | all(type == "string" and length > 0))' "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
+        check "data/config/relay.json" "0" "S3 必填项不全，请重新运行外链向导"
         return 0
     fi
-    check "S3 外链配置必填项" "1" "必填项齐全，未发现旧字段；启动时执行完整格式校验" "此项不检测云端权限、私有访问和签名；云端设置变化后请用测试文件验收。"
+    check "S3 外链配置必填项" "1" "必填项齐全；启动时执行完整格式校验" "此项不检测云端权限、私有访问和签名；云端设置变化后请用 relay-test 验收。"
 }
 
 doctor() {
@@ -981,6 +980,7 @@ case "${1:-}" in
     relay-configure) relay_configure ;;
     runtime-configure) runtime_configure "${2:-}" ;;
     relay-ls)    relay_admin list ;;
+    relay-test)  relay_admin test ;;
     relay-purge) shift; relay_admin purge "$@" ;;
     tmp-ls)      shift; tmp_admin list "$@" ;;
     tmp-purge)   shift; tmp_admin purge "$@" ;;
@@ -1026,6 +1026,7 @@ case "${1:-}" in
         echo "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"
         echo "  tunnel-update 更新本项目 cloudflared 到官方稳定版；校验后切换，失败恢复旧版本（需宿主机 Bun）"
         echo "  relay-ls   列出已发出、仍在册的大文件外链"
+        echo "  relay-test 上传并删除一个随机测试文件，验收外链签名、私有访问和删除权限"
         echo "  relay-purge <关键字>|--all"
         echo "             删除匹配的外链对象并清掉索引记录"
         echo "  tmp-ls [--user <手机号>] [--group <群号>]"

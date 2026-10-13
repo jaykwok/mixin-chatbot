@@ -41,7 +41,8 @@ for (const shell of ["powershell", "bash"] as const) {
             "check_relay", "printf '[%s]\\n' \"$JSON_ROWS\"",
           ].join("\n"));
         }
-        for (const state of ["missing", "webdavUrl", "publicBaseUrl", "username", "password", "signSecret", "signPathPrefix", "s3"] as const) {
+        // Each non-s3 state empties one required field (provider included); only "s3" is complete.
+        for (const state of ["missing", "provider", "endpoint", "region", "bucket", "accessKeyId", "secretAccessKey", "s3"] as const) {
           if (state !== "missing") await writeFile(configPath, JSON.stringify({
             provider: "s3", endpoint: "https://s3.example.test", region: "test", bucket: "bucket", accessKeyId: "do-not-print-ak", secretAccessKey: "do-not-print-secret",
             ...(state === "s3" ? {} : { [state]: "" }),

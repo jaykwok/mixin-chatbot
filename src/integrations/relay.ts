@@ -1,7 +1,7 @@
 // Temporary S3 distribution for local files above the IM attachment limit.
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync, createReadStream, createWriteStream } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
@@ -62,7 +62,7 @@ function isExpired(entry: RelayIndexEntry): boolean {
 export async function refreshRelayReference(reference: RelayReference, signal?: AbortSignal,
   config = getRelayConfig(), suppliedIndex?: RelayIndex): Promise<{ url: string; expiry: string }> {
   if (!config || reference.backend !== backend(config) || !objectNameFromUrl(config, reference.url)) {
-    throw new Error("附件后端已变更，待补发记录已保留，请联系管理员；旧 WebDAV 附件需重新发送");
+    throw new Error("附件后端已变更，待补发记录已保留，请联系管理员");
   }
   const index = suppliedIndex ?? await getRelayIndex();
   const entry = index.findUploaded(reference.url);
@@ -167,6 +167,87 @@ export async function purgeRelayObjects(options?: { match?: string; config?: Rel
     await withUploadLock(entry.key, async () => { result[await deleteIndexedObject(config, index, entry.key, application.signal)]++; });
   }
   return result;
+}
+
+export type RelayCheckStatus = "pass" | "warn" | "fail";
+export const RELAY_CHECK_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Operator acceptance with a random object: upload and size check, signed download, private access,
+ * method binding and deletion. relayFile records the object before PUT, so an interrupted check is
+ * still reclaimed by the sweep. Reports never include signed URLs or raw provider responses.
+ */
+export async function checkRelayBackend(report: (status: RelayCheckStatus, text: string) => void,
+  options?: { config?: RelayConfig | null; index?: RelayIndex; tempDir?: string; bytes?: number }): Promise<boolean> {
+  const config = options?.config === undefined ? getRelayConfig() : options.config;
+  if (!config) throw new Error("未配置外链分发（data/config/relay.json 不存在），无法测试");
+  const index = options?.index ?? await getRelayIndex();
+  const tempDir = resolve(options?.tempDir ?? "data/runtime/tmp/relay");
+  const payload = randomBytes(options?.bytes ?? RELAY_CHECK_BYTES);
+  const filename = "外链自检-" + randomUUID().slice(0, 8) + ".bin";
+  const source = join(tempDir, ".relay-check-" + randomUUID());
+  let passed = true, cleaned = false;
+  const step = (status: RelayCheckStatus, text: string) => { if (status === "fail") passed = false; report(status, text); };
+  const probe = async (url: string, method: "GET" | "DELETE") => {
+    try {
+      const response = await fetch(url, { method, redirect: "error", signal: AbortSignal.any([application.signal, AbortSignal.timeout(RELAY_HTTP_TIMEOUT)]) });
+      const body = response.ok && method === "GET" ? Buffer.from(await response.arrayBuffer()) : null;
+      if (!body) await response.body?.cancel().catch(() => {});
+      return { status: response.status, body };
+    } catch {
+      application.signal.throwIfAborted();
+      return { status: 0, body: null };
+    }
+  };
+  const http = (status: number) => status ? "HTTP " + status : "网络错误或重定向";
+  // Only a definite refusal or absence (4xx other than 408/429) proves a property. 5xx, 408, 429 and network
+  // errors show that this request failed, not that access is denied, so they fail the check as unproven.
+  const expectRefusal = (status: number, refused: string, allowed: string, unclear: string) => {
+    if (status >= 400 && status < 500 && status !== 408 && status !== 429) step("pass", refused.replace("%s", http(status)));
+    else step("fail", status && status < 400 ? allowed : unclear.replace("%s", http(status)) + "，请稍后重试");
+  };
+  await mkdir(tempDir, { recursive: true });
+  try {
+    await writeFile(source, payload, { flag: "wx", mode: 0o600 });
+    const started = performance.now();
+    let url: string;
+    try { url = await relayFile({ config, index, tempDir, localPath: source, size: payload.length, filename }); }
+    catch (error) {
+      application.signal.throwIfAborted();
+      step("fail", "上传：" + (error instanceof Error ? error.message : String(error)));
+      return false;
+    }
+    const seconds = Math.max(0.001, (performance.now() - started) / 1000);
+    step("pass", `上传并核验大小：${formatSize(payload.length)}，用时 ${seconds.toFixed(1)} 秒`);
+    const minutes = config.maxBytes / (payload.length / seconds) / 60;
+    step(minutes <= RELAY_HTTP_TIMEOUT / 60_000 ? "pass" : "warn", `按本次速度粗估，上传 ${formatSize(config.maxBytes)} 约需 ${Math.ceil(minutes)} 分钟；` +
+      `单次上传限时 ${RELAY_HTTP_TIMEOUT / 60_000} 分钟` + (minutes <= RELAY_HTTP_TIMEOUT / 60_000 ? "" : "，接近上限的文件可能超时，可调低单文件上限"));
+    const download = await probe(url, "GET");
+    step(download.body?.equals(payload) ? "pass" : "fail", download.body?.equals(payload) ? "签名链接下载成功，内容一致"
+      : download.body ? "签名链接下载的内容与上传不一致" : "签名链接无法下载（" + http(download.status) + "）：请检查读取权限、区域和系统时钟");
+    const unsigned = new URL(url);
+    unsigned.search = "";
+    expectRefusal((await probe(unsigned.href, "GET")).status, "去掉签名后访问被拒绝（%s），桶未公开",
+      "去掉签名也能下载：请关闭桶和对象的公共读取", "未签名访问没有得到明确答复（%s），无法判断桶是否公开");
+    expectRefusal((await probe(url, "DELETE")).status, "下载链接不能用于删除（%s）",
+      "下载链接可以删除对象：服务端未校验签名中的请求方法", "用下载链接发起删除没有得到明确答复（%s），无法判断服务端是否校验请求方法");
+    cleaned = true;
+    const removed = (await purgeRelayObjects({ config, index, match: filename })).deleted === 1;
+    step(removed ? "pass" : "fail", removed ? "删除对象并移除账本记录"
+      : "删除失败：请检查删除权限；账本记录已保留，后台会在计划时间重试");
+    if (removed) {
+      expectRefusal((await probe(url, "GET")).status, "删除后链接已失效（%s）",
+        "删除后仍能下载：请检查版本控制、对象锁或复制设置", "删除后复查没有得到明确答复（%s），无法确认链接已失效");
+    }
+    return passed;
+  } finally {
+    // Upload failures and aborted checks leave a planned record; remove it now when the backend allows.
+    if (!cleaned) {
+      const leftover = await purgeRelayObjects({ config, index, match: filename }).catch(() => null);
+      if (leftover?.matched && leftover.deleted !== leftover.matched) report("warn", "测试对象未能清理，账本记录已保留，后台会按计划重试");
+    }
+    await rm(source, { force: true });
+  }
 }
 
 const uploadLocks = new KeyedQueue();

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadRelayConfig, validateRelayConfig } from "../../src/integrations/relay.ts";
@@ -47,7 +47,9 @@ async function run(root: string, mode: "--draft" | "--apply", answers: Record<st
     "  if (String(options.message).includes(faults.cancelAt ?? '\\0')) return cancelled;",
     '  if (secret && (options.initialValue || options.defaultValue)) throw new Error("secret prefilled visibly");',
     "  const match = Object.entries(answers).find(([key]) => options.message.includes(key));",
-    '  const value = match ? match[1] : secret ? "" : options.initialValue ?? options.defaultValue;',
+    // 与 clack 一致：清空后提交会换回 defaultValue。
+    '  const value = match ? (match[1] === "" && options.defaultValue !== undefined ? options.defaultValue : match[1])',
+    '    : secret ? "" : options.initialValue ?? options.defaultValue;',
     '  const error = options.validate?.(value); if (error) throw new Error(error);',
     '  return value;',
     "}",
@@ -79,30 +81,31 @@ async function seed(root: string, contents: unknown) {
   return readFile(file(root), "utf8");
 }
 
-async function seedLedger(root: string, kind: "legacy" | "empty" | "invalid" | "corrupt") {
+async function seedLedger(root: string, kind: "empty" | "invalid" | "corrupt") {
   await mkdir(join(root, "data/state"), { recursive: true });
   const path = join(root, "data/state/relay.sqlite");
   if (kind === "corrupt") await writeFile(path, "invalid SQLite content: preserve for recovery");
   else {
     const db = new Database(path);
     try {
-      db.exec(kind === "invalid" ? "CREATE TABLE objects (key TEXT)"
-        : "CREATE TABLE objects (key TEXT PRIMARY KEY, url TEXT, name TEXT, size INTEGER, at TEXT, state TEXT)");
-      if (kind === "legacy") db.exec("INSERT INTO objects VALUES ('legacy-orphan', 'https://old.invalid/file', 'private.pdf', 4, '2026-01-01', 'uploaded')");
+      // The invalid table has rows but lacks the deadline columns.
+      db.exec(kind === "invalid" ? "CREATE TABLE objects (key TEXT PRIMARY KEY, url TEXT, name TEXT, size INTEGER, at TEXT, state TEXT)"
+        : "CREATE TABLE objects (key TEXT PRIMARY KEY, url TEXT, name TEXT, size INTEGER, at TEXT, state TEXT, expiresAt TEXT, deleteAfter TEXT)");
+      if (kind === "invalid") db.exec("INSERT INTO objects VALUES ('row', 'https://s3.invalid/file', 'private.pdf', 4, '2026-01-01', 'uploaded')");
     } finally { db.close(); }
   }
   return { path, bytes: await readFile(path) };
 }
 
-for (const kind of ["legacy", "invalid", "corrupt"] as const) {
-  test("账本保存门禁：没有 relay.json 时拒绝不兼容账本，直接提交也不能绕过：" + kind, async () => {
+for (const kind of ["invalid", "corrupt"] as const) {
+  test("账本保存门禁：没有 relay.json 时拒绝无效账本，直接提交也不能绕过：" + kind, async () => {
     const fixture = await tempFixture("relay-gate-" + kind + "-");
     try {
       const ledger = await seedLedger(fixture.root, kind);
       const prepared = await run(fixture.root, "--draft", answers);
       expect(prepared.code, prepared.output).toBe(1);
       expect(prepared.output).toContain("拒绝保存 S3 外链配置");
-      if (kind === "legacy") expect(prepared.output).toContain("旧格式记录");
+      expect(prepared.output).toContain(kind === "invalid" ? "外链账本结构无效" : "外链账本已损坏");
       expect(prepared.output).not.toContain("PROMPT 保存并应用");
       expect(existsSync(draft(fixture.root))).toBe(false);
       expect(existsSync(file(fixture.root))).toBe(false);
@@ -119,22 +122,22 @@ for (const kind of ["legacy", "invalid", "corrupt"] as const) {
   }, FLOW_BUDGET_MS);
 }
 
-test("账本保存门禁：草稿确认后出现旧记录，维护锁内复核拒绝覆盖原配置", async () => {
+test("账本保存门禁：草稿确认后账本变为无效，维护锁内复核拒绝覆盖原配置", async () => {
   const fixture = await tempFixture("relay-gate-changed-");
   try {
     const original = await seed(fixture.root, base);
     expect((await run(fixture.root, "--draft", { "私有存储桶": "new-bucket" })).code).toBe(0);
-    const ledger = await seedLedger(fixture.root, "legacy");
+    const ledger = await seedLedger(fixture.root, "invalid");
     const applied = await run(fixture.root, "--apply");
     expect(applied.code, applied.output).toBe(1);
-    expect(applied.output).toContain("旧格式记录");
+    expect(applied.output).toContain("外链账本结构无效");
     expect(await readFile(file(fixture.root), "utf8")).toBe(original);
     expect(await readFile(ledger.path)).toEqual(ledger.bytes);
     expect((await readdir(join(fixture.root, "data/config"))).some(name => name.endsWith(".tmp"))).toBe(false);
   } finally { await fixture.cleanup(); }
 }, FLOW_BUDGET_MS);
 
-test("账本保存门禁：空旧表允许启用，向导和提交均不修改账本", async () => {
+test("账本保存门禁：空账本允许启用，向导和提交均不修改账本", async () => {
   const fixture = await tempFixture("relay-gate-empty-");
   try {
     const ledger = await seedLedger(fixture.root, "empty");
@@ -160,11 +163,11 @@ test("账本保存门禁：读取权限错误仍提示警告，允许确认保�
   } finally { await fixture.cleanup(); }
 }, FLOW_BUDGET_MS);
 
-test("账本保存门禁：旧记录不阻止停用，原账本完整保留", async () => {
+test("账本保存门禁：无效账本不阻止停用，原账本完整保留", async () => {
   const fixture = await tempFixture("relay-gate-disable-");
   try {
     await seed(fixture.root, base);
-    const ledger = await seedLedger(fixture.root, "legacy");
+    const ledger = await seedLedger(fixture.root, "invalid");
     const prepared = await run(fixture.root, "--draft", { "外链设置": "disable", "保存并应用": true });
     expect(prepared.code, prepared.output).toBe(0);
     const applied = await run(fixture.root, "--apply");
@@ -182,6 +185,7 @@ test("S3 向导先形成草稿，保存后使用默认两小时下载和独立�
     expect(prepared.output).toContain("保存预览");
     expect(prepared.output).toContain("下载有效期：2 小时");
     expect(prepared.output).toContain("再保留 30 分钟");
+    expect(prepared.output).toContain("对象路径：日期-UUID/原文件名（桶根目录）");
     expect(prepared.output).not.toContain(base.accessKeyId);
     expect(prepared.output).not.toContain(base.secretAccessKey);
     expect(existsSync(file(fixture.root))).toBe(false);
@@ -221,15 +225,60 @@ test("高级设置支持 Path style、中文目录、有限期与删除余量，
     expect(prepared.code, prepared.output).toBe(0);
     expect(prepared.output).toContain("下载有效期：3 小时");
     expect(prepared.output).toContain("再保留 60 分钟");
+    expect(prepared.output).toContain("对象路径：临时/分发/日期-UUID/原文件名");
     expect((await run(fixture.root, "--apply")).code).toBe(0);
     expect(loadRelayConfig(file(fixture.root))).toEqual({ ...base, forcePathStyle: true, prefix: "临时/分发/", maxBytes: 512 * 1024 ** 2, expireHours: 3, cleanupGraceMinutes: 60 });
   } finally { await fixture.cleanup(); }
 }, FLOW_BUDGET_MS);
 
-test("旧 WebDAV 配置必须重新填写，保存后不带回旧字段或凭据", async () => {
+test("腾讯 COS 端点预填区域；粘贴桶域名时先确认改用服务端点，拒绝则不留草稿", async () => {
+  const fixture = await tempFixture("relay-configure-cos-");
+  const cos = { "S3 服务端点": "bot-1250000000.cos.ap-chengdu.myqcloud.com", "私有存储桶": "bot-1250000000",
+    "Access Key ID": "fixture-ak", "Secret Access Key": "fixture-sk" };
+  try {
+    const declined = await run(fixture.root, "--draft", { ...cos, "服务端点已包含桶名": false });
+    expect(declined.code, declined.output).toBe(1);
+    expect(declined.output).toContain("PROMPT 服务端点已包含桶名，Virtual hosted 会自动加桶名；改用 https://cos.ap-chengdu.myqcloud.com？");
+    expect(declined.output).toContain("服务端点不能包含桶名");
+    expect(declined.output).not.toContain("PROMPT Access Key ID");
+    expect(existsSync(draft(fixture.root))).toBe(false);
+    const prepared = await run(fixture.root, "--draft", { ...cos, "服务端点已包含桶名": true });
+    expect(prepared.code, prepared.output).toBe(0);
+    const applied = await run(fixture.root, "--apply");
+    expect(applied.code, applied.output).toBe(0);
+    expect(applied.output).toContain("数据 → 外链 → 测试外链");
+    expect(loadRelayConfig(file(fixture.root))).toEqual({ ...base, endpoint: "https://cos.ap-chengdu.myqcloud.com",
+      region: "ap-chengdu", bucket: "bot-1250000000" });
+    // 同一端点再次配置时沿用已保存的区域，不被预填覆盖。
+    // 运维包装器提交后会删除草稿，这里手工删除。
+    await rm(draft(fixture.root));
+    await seed(fixture.root, { ...base, endpoint: "https://cos.ap-chengdu.myqcloud.com", region: "custom-region", bucket: "bot-1250000000" });
+    const again = await run(fixture.root, "--draft");
+    expect(again.code, again.output).toBe(0);
+    expect((await run(fixture.root, "--apply")).code).toBe(0);
+    expect(loadRelayConfig(file(fixture.root))!.region).toBe("custom-region");
+  } finally { await fixture.cleanup(); }
+}, FLOW_BUDGET_MS * 2);
+
+test("高级设置清空已有对象目录即改用桶根目录", async () => {
+  const fixture = await tempFixture("relay-configure-root-");
+  try {
+    await seed(fixture.root, { ...base, prefix: "relay/" });
+    const prepared = await run(fixture.root, "--draft", { "调整高级": true, "对象目录": "" });
+    expect(prepared.code, prepared.output).toBe(0);
+    expect(prepared.output).toContain("PROMPT 对象目录 Prefix（清空表示桶根目录）");
+    expect(prepared.output).toContain("对象路径：日期-UUID/原文件名（桶根目录）");
+    expect((await run(fixture.root, "--apply")).code).toBe(0);
+    expect(JSON.parse(await readFile(file(fixture.root), "utf8")).prefix).toBe("");
+    expect(loadRelayConfig(file(fixture.root))).toEqual(base);
+  } finally { await fixture.cleanup(); }
+}, FLOW_BUDGET_MS);
+
+test("无法通过校验的配置必须重新填写，保存后不带回原字段或凭据", async () => {
   const fixture = await tempFixture("relay-configure-replace-");
   try {
-    const before = await seed(fixture.root, { webdavUrl: "http://dav.invalid/", publicBaseUrl: "https://files.invalid/", username: "old", password: "old-secret" });
+    const before = await seed(fixture.root, { provider: "s3", endpoint: "ftp://old.invalid/", region: "old", bucket: "old-bucket",
+      accessKeyId: "old", secretAccessKey: "old-secret", note: "old-field" });
     const prepared = await run(fixture.root, "--draft", answers);
     expect(prepared.code, prepared.output).toBe(0);
     expect(prepared.output).toContain("重新填写");
@@ -237,6 +286,7 @@ test("旧 WebDAV 配置必须重新填写，保存后不带回旧字段或凭据
     expect((await run(fixture.root, "--apply")).code).toBe(0);
     expect(loadRelayConfig(file(fixture.root))).toEqual(base);
     expect(await readFile(file(fixture.root), "utf8")).not.toContain("old-secret");
+    expect(await readFile(file(fixture.root), "utf8")).not.toContain("old-field");
   } finally { await fixture.cleanup(); }
 }, FLOW_BUDGET_MS);
 

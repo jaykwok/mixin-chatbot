@@ -1,5 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
-import { join } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { App } from "../../scripts/ops/tui/app.ts";
 import { SettingsView } from "../../scripts/ops/tui/views/settings.ts";
@@ -11,6 +12,7 @@ import * as data from "../../scripts/ops/tui/data.ts";
 import * as execution from "../../scripts/ops/tui/exec.ts";
 import * as settings from "../../scripts/config/runtime-settings.ts";
 import { waitFor } from "../helpers/tui-process.ts";
+import { tempFixture } from "../helpers/temp.ts";
 
 const deployment: Deployment = {
   platform: "linux", runtime: "docker", mode: "direct", port: 1011, domain: "",
@@ -50,14 +52,17 @@ test("设置仅加载选中项，重复选择复用在途读取；离页丢弃�
   let tunnelSignal: AbortSignal | undefined, runtimeSignal: AbortSignal | undefined;
   const readTunnel = spyOn(data, "loadTunnelLogging").mockImplementation((_project, signal) => { tunnelSignal = signal; return tunnel.promise; });
   const readProtocol = spyOn(data, "loadTunnelProtocol").mockResolvedValue("auto");
+  const readRelay = spyOn(data, "loadRelaySummary").mockResolvedValue({ enabled: false });
   const readRuntime = spyOn(data, "loadRuntimeSettings").mockImplementationOnce((_project, signal) => {
     runtimeSignal = signal; return old.promise;
   }).mockReturnValue(fresh.promise);
   try {
     await view.refresh(app);
+    expect(readRelay).toHaveBeenCalledTimes(1);
     expect(readTunnel).not.toHaveBeenCalled(); expect(readRuntime).not.toHaveBeenCalled();
     expect(readProtocol).not.toHaveBeenCalled();
     await view.onKey(key("down"), app);
+    expect(readRelay).toHaveBeenCalledTimes(1);
     expect(readTunnel).toHaveBeenCalledTimes(1);
     await view.onKey(key("down"), app);
     expect(tunnelSignal?.aborted).toBe(true);
@@ -80,14 +85,76 @@ test("设置仅加载选中项，重复选择复用在途读取；离页丢弃�
     expect(plain(view.render(ctx()))).toContain("0 项自定义");
   } finally {
     tunnel.resolve("off"); old.resolve(snapshot); fresh.resolve(snapshot);
-    view.onLeave(); readTunnel.mockRestore(); readProtocol.mockRestore(); readRuntime.mockRestore();
+    view.onLeave(); readTunnel.mockRestore(); readProtocol.mockRestore(); readRelay.mockRestore(); readRuntime.mockRestore();
   }
+});
+
+test("外链配置项显示当前状态、桶根目录和期限，不显示凭据；读取失败只给说明", async () => {
+  const { app } = stub(), view = new SettingsView();
+  const enabled: data.RelaySummary = {
+    enabled: true, endpoint: "https://cos.ap-chengdu.myqcloud.com", region: "ap-chengdu", bucket: "bot-1250000000", prefix: "",
+    pathStyle: false, maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30, sessionToken: true,
+  };
+  const read = spyOn(data, "loadRelaySummary").mockResolvedValue(enabled);
+  try {
+    expect(plain(view.render(ctx()))).not.toContain("当前：");
+    await view.refresh(app);
+    const shown = plain(view.render(ctx(120, 30)));
+    for (const text of ["当前：已启用 · 桶 bot-1250000000 · 区域 ap-chengdu", "https://cos.ap-chengdu.myqcloud.com · Virtual hosted",
+      "对象路径：日期-UUID/原文件名（桶根目录）", "下载有效 2 小时，再保留 30 分钟后清理；单文件上限 2.00 GB", "使用临时 Token"]) {
+      expect(shown).toContain(text);
+    }
+    // 窄窗口的菜单列出各项摘要。
+    expect(plain(view.render(ctx(80, 24)))).toContain("已启用 · bot-1250000000");
+    read.mockResolvedValue({ ...enabled, prefix: "relay/", sessionToken: false });
+    await view.refresh(app);
+    expect(plain(view.render(ctx(120, 30)))).toContain("对象路径：relay/日期-UUID/原文件名");
+    expect(plain(view.render(ctx(120, 30)))).not.toContain("临时 Token");
+    read.mockResolvedValue({ enabled: false });
+    await view.refresh(app);
+    expect(plain(view.render(ctx()))).toContain("当前：未启用");
+    read.mockRejectedValue(new Error("relay.json 不是有效 JSON，请重新运行外链配置"));
+    await view.refresh(app);
+    expect(plain(view.render(ctx()))).toContain("当前：relay.json 不是有效 JSON");
+    expect(plain(view.render(ctx(80, 24)))).toContain("配置无效或无法读取");
+    for (const [width, height] of [[72, 15], [80, 19], [120, 30]]) {
+      read.mockResolvedValue(enabled);
+      await view.refresh(app);
+      const lines = view.render(ctx(width, height));
+      expect(lines.length).toBeLessThanOrEqual(height);
+      expect(lines.every(line => Bun.stringWidth(line) === width)).toBe(true);
+    }
+  } finally { view.onLeave(); read.mockRestore(); }
+});
+
+test("外链摘要直接读取配置文件：未配置、有效、无效均不带出凭据或文件原文", async () => {
+  const fixture = await tempFixture("tui-relay-summary-");
+  const path = join(fixture.root, "data", "config", "relay.json");
+  try {
+    expect(await data.loadRelaySummary(fixture.root)).toEqual({ enabled: false });
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, JSON.stringify({ provider: "s3", endpoint: "https://cos.ap-chengdu.myqcloud.com", region: "ap-chengdu",
+      bucket: "bot-1250000000", accessKeyId: "fixture-private-ak", secretAccessKey: "fixture-private-sk", sessionToken: "fixture-private-token" }));
+    const summary = await data.loadRelaySummary(fixture.root);
+    expect(summary).toEqual({ enabled: true, endpoint: "https://cos.ap-chengdu.myqcloud.com", region: "ap-chengdu", bucket: "bot-1250000000",
+      prefix: "", pathStyle: false, maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30, sessionToken: true });
+    expect(JSON.stringify(summary)).not.toContain("fixture-private");
+    await writeFile(path, '{"secretAccessKey": fixture-private-sk');
+    const invalid = await data.loadRelaySummary(fixture.root).then(() => "", (error: Error) => error.message);
+    expect(invalid).toBe("relay.json 不是有效 JSON，请重新运行外链配置");
+    await writeFile(path, JSON.stringify({ provider: "s3", endpoint: "https://bot-1250000000.cos.ap-chengdu.myqcloud.com", region: "ap-chengdu",
+      bucket: "bot-1250000000", accessKeyId: "fixture-private-ak", secretAccessKey: "fixture-private-sk" }));
+    const rejected = await data.loadRelaySummary(fixture.root).then(() => "", (error: Error) => error.message);
+    expect(rejected).toContain("endpoint 已包含桶名");
+    expect(rejected).not.toContain("fixture-private");
+  } finally { await fixture.cleanup(); }
 });
 
 test("设置读取使用现有 App 动画，提示过期后仍持续转动，分类和页面导航不等待 I/O", async () => {
   const tty = terminal(), view = new SettingsView();
   const old = Promise.withResolvers<settings.RuntimeSnapshot>(), fresh = Promise.withResolvers<settings.RuntimeSnapshot>();
   const read = spyOn(data, "loadRuntimeSettings").mockReturnValueOnce(old.promise).mockReturnValue(fresh.promise);
+  const relay = spyOn(data, "loadRelaySummary").mockResolvedValue({ enabled: false });
   const render = spyOn(tty.screen, "render");
   const app = new App([view, { id: "other", label: "其他", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
   app["refreshChrome"] = async () => { app["service"] = { state: "unreachable" }; };
@@ -114,7 +181,7 @@ test("设置读取使用现有 App 动画，提示过期后仍持续转动，分
   } finally {
     old.resolve(snapshot); fresh.resolve(snapshot);
     await app["handleKey"](key("q")); await running;
-    read.mockRestore(); render.mockRestore(); tty.close();
+    read.mockRestore(); relay.mockRestore(); render.mockRestore(); tty.close();
   }
 });
 

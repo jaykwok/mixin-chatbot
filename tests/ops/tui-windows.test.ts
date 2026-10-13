@@ -220,6 +220,7 @@ windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 C
       { input: ["routes", "list"], argv: ["list"], script: "scripts\\ops\\route-admin.ts" },
       { input: ["routes", "reset", "abcdef123456", "--group", "技术 支持群"], argv: ["reset", "abcdef123456", "--group", "技术 支持群"], script: "scripts\\ops\\route-admin.ts" },
       { input: ["routes", "forget", "abcdef123456"], argv: ["forget", "abcdef123456"], script: "scripts\\ops\\route-admin.ts" },
+      { input: ["relay-test"], argv: ["test"], script: "relay" },
       { input: ["relay-purge", "--all"], argv: ["purge", "--all"], script: "relay" },
       ...["-All", "-all", "-A", "--all", "--group", "含 空格与'引号"].map(keyword => ({
         input: ["relay-purge", "--keyword", keyword], argv: ["purge", "--keyword", keyword], script: "relay",

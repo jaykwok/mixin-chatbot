@@ -11,6 +11,7 @@ import { capture, parseJson, type RunResult } from "./exec.ts";
 import { LOG_FILE, PROJECT_DIR, opsCommand, type Deployment } from "./platform.ts";
 import { day } from "./render/format.ts";
 import { readRuntimeSettings } from "../../config/runtime-settings.ts";
+import { validateRelayConfig } from "../../../src/integrations/relay-s3.ts";
 
 // ===== 体检 =====
 
@@ -321,6 +322,33 @@ export async function loadTunnelLogging(project = PROJECT_DIR, signal?: AbortSig
   }
   if (value !== "off" && value !== "on") throw new Error("cloudflared-logging 只接受 off 或 on");
   return value;
+}
+
+/** 设置页展示的外链状态：只含可显示字段，凭据不离开配置文件。 */
+export type RelaySummary = { enabled: false } | {
+  enabled: true; endpoint: string; region: string; bucket: string; prefix: string; pathStyle: boolean;
+  maxBytes: number; expireHours: number; cleanupGraceMinutes: number; sessionToken: boolean;
+};
+
+export async function loadRelaySummary(project = PROJECT_DIR, signal?: AbortSignal): Promise<RelaySummary> {
+  let raw: string;
+  try {
+    raw = await readFile(join(project, "data", "config", "relay.json"), { encoding: "utf8", signal });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { enabled: false };
+    if (code === "ABORT_ERR") throw error;
+    throw new Error("relay.json 无法读取" + (code ? `（${code}）` : ""));
+  }
+  let doc: unknown;
+  // 解析错误的原文可能带出配置片段（含密钥），只给固定说明。
+  try { doc = JSON.parse(raw); } catch { throw new Error("relay.json 不是有效 JSON，请重新运行外链配置"); }
+  const config = validateRelayConfig(doc, "relay.json");
+  return {
+    enabled: true, endpoint: config.endpoint, region: config.region, bucket: config.bucket, prefix: config.prefix,
+    pathStyle: config.forcePathStyle, maxBytes: config.maxBytes, expireHours: config.expireHours,
+    cleanupGraceMinutes: config.cleanupGraceMinutes, sessionToken: config.sessionToken !== undefined,
+  };
 }
 
 export function loadRuntimeSettings(project = PROJECT_DIR, signal?: AbortSignal) {

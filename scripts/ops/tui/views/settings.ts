@@ -1,4 +1,5 @@
-import { loadTunnelLogging, loadTunnelProtocol, type TunnelLogging, type TunnelProtocol } from "../data.ts";
+import { loadRelaySummary, loadTunnelLogging, loadTunnelProtocol, type RelaySummary, type TunnelLogging, type TunnelProtocol } from "../data.ts";
+import { bytes } from "../render/format.ts";
 import { spinner } from "../render/widgets.ts";
 import type { AppApi, View, ViewAction, ViewContext } from "../view.ts";
 import { actionWorkbench, moveSelection } from "./common.ts";
@@ -12,6 +13,7 @@ export class SettingsView implements View {
   readonly label = "设置";
   private readonly tunnel = new LazySetting<TunnelLogging>(signal => loadTunnelLogging(undefined, signal));
   private readonly protocol = new LazySetting<TunnelProtocol>(signal => loadTunnelProtocol(undefined, signal));
+  private readonly relay = new LazySetting<RelaySummary>(signal => loadRelaySummary(undefined, signal));
   private readonly runtime = new RuntimeSettingsEditor();
   private editingRuntime = false;
   private selected = 0;
@@ -24,6 +26,7 @@ export class SettingsView implements View {
   activity(): string | null {
     if (this.editingRuntime || this.selected === 3) return this.runtime.activity();
     if (this.selected === 2 && this.protocol.state.kind === "loading") return "正在读取隧道连接模式…";
+    if (this.selected === 0 && this.relay.state.kind === "loading") return "正在读取外链配置…";
     return this.selected === 1 && this.state.kind === "loading" ? "正在读取隧道日志设置…" : null;
   }
 
@@ -38,19 +41,20 @@ export class SettingsView implements View {
     ];
   }
 
-  invalidate(): void { this.tunnel.invalidate(); this.protocol.invalidate(); this.runtime.invalidate(); }
+  invalidate(): void { this.tunnel.invalidate(); this.protocol.invalidate(); this.relay.invalidate(); this.runtime.invalidate(); }
   onLeave(): boolean {
     const pending = this.tunnel.onLeave();
     const protocolPending = this.protocol.onLeave();
+    const relayPending = this.relay.onLeave();
     const runtimePending = this.runtime.onLeave();
-    return pending || protocolPending || runtimePending;
+    return pending || protocolPending || relayPending || runtimePending;
   }
 
   refresh(app: AppApi): Promise<void> {
     if (this.editingRuntime || this.selected === 3) return this.runtime.load(app, true);
     if (this.selected === 2) return this.protocol.load(app, true);
     if (this.selected === 1) return this.tunnel.load(app, true);
-    return Promise.resolve();
+    return this.relay.load(app, true);
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
@@ -62,6 +66,7 @@ export class SettingsView implements View {
     const selected = moveSelection(key.name, this.selected, 4);
     if (selected !== null) {
       this.selected = selected;
+      if (selected === 0) void this.relay.load(app); else this.relay.onLeave();
       if (selected === 1) void this.tunnel.load(app); else this.tunnel.onLeave();
       if (selected === 2) void this.protocol.load(app); else this.protocol.onLeave();
       if (selected === 3) void this.runtime.load(app); else this.runtime.onLeave();
@@ -70,18 +75,20 @@ export class SettingsView implements View {
     const action = key.name === "enter" ? ["e", "l", "p", "a"][this.selected] : key.name;
     if (action === "v") { app.go("tunnel-logs"); return true; }
     if (action === "a") {
-      this.selected = 3; this.editingRuntime = true; this.tunnel.onLeave(); this.protocol.onLeave();
+      this.selected = 3; this.editingRuntime = true; this.tunnel.onLeave(); this.protocol.onLeave(); this.relay.onLeave();
       void this.runtime.load(app);
       return true;
     }
     if (action === "e") {
+      // 结束后 App 统一失效并刷新当前项，选中外链才能看到新状态。
+      this.selected = 0; this.tunnel.onLeave(); this.protocol.onLeave(); this.runtime.onLeave();
       const code = await app.runInteractive("外链配置", ["relay-configure"]);
       if (code === 0) app.toast("ok", "外链配置向导已结束");
       return true;
     }
     if (action === "p") return this.configureProtocol(app);
     if (action !== "l") return false;
-    this.selected = 1; this.runtime.onLeave(); this.protocol.onLeave();
+    this.selected = 1; this.runtime.onLeave(); this.protocol.onLeave(); this.relay.onLeave();
     void this.tunnel.load(app);
     if (this.state.kind !== "ready") { app.toast("warn", "请等待设置读取完成，读取失败可按 r 重试"); return true; }
     const value = await app.choose({
@@ -109,7 +116,7 @@ export class SettingsView implements View {
   }
 
   private async configureProtocol(app: AppApi): Promise<boolean> {
-    this.selected = 2; this.tunnel.onLeave(); this.runtime.onLeave();
+    this.selected = 2; this.tunnel.onLeave(); this.runtime.onLeave(); this.relay.onLeave();
     void this.protocol.load(app);
     const state = this.protocol.state;
     if (state.kind !== "ready") { app.toast("warn", "请等待设置读取完成，读取失败可按 r 重试"); return true; }
@@ -145,18 +152,34 @@ export class SettingsView implements View {
     const protocol = this.protocol.state;
     const connection = protocol.kind === "ready" ? protocolLabels[protocol.value]
       : protocol.kind === "error" ? "读取失败" : protocol.kind === "loading" ? "读取中" : "选中后读取";
+    const relay = this.relay.state;
+    const relayStatus = relay.kind === "ready" ? (relay.value.enabled ? "已启用 · " + relay.value.bucket : "未启用")
+      : relay.kind === "error" ? "配置无效或无法读取" : relay.kind === "loading" ? "读取中" : "选中后读取";
+    const relayCurrent = relay.kind === "loading" ? [spinner(ctx.theme) + " 正在读取外链配置…"]
+      : relay.kind === "error" ? ["当前：" + relay.message]
+        : relay.kind !== "ready" ? []
+          : !relay.value.enabled ? ["当前：未启用；超过 25 MiB 的文件发送时报错。"]
+            : [
+              `当前：已启用 · 桶 ${relay.value.bucket} · 区域 ${relay.value.region}`,
+              `端点：${relay.value.endpoint} · ${relay.value.pathStyle ? "Path style" : "Virtual hosted"}`,
+              `对象路径：${relay.value.prefix}日期-UUID/原文件名${relay.value.prefix ? "" : "（桶根目录）"}`,
+              `下载有效 ${relay.value.expireHours} 小时，再保留 ${relay.value.cleanupGraceMinutes} 分钟后清理；单文件上限 ${bytes(relay.value.maxBytes)}`,
+              ...(relay.value.sessionToken ? ["使用临时 Token，需自行续期"] : []),
+            ];
     return actionWorkbench(ctx, {
       title: "设置", selected: this.selected,
       items: [
-        { label: "外链配置", summary: "S3 私有桶与限时下载", status: "idle" },
+        { label: "外链配置", summary: relayStatus, status: relay.kind === "error" ? "warn" : "idle" },
         { label: "Cloudflared 日志", summary: current, status: this.state.kind === "error" ? "warn" : "idle" },
         { label: "Cloudflared 连接模式", summary: connection, status: protocol.kind === "error" ? "warn" : "idle" },
         { label: "高级运行参数", summary: this.runtime.summary, status: this.runtime.dirty ? "warn" : "idle" },
       ],
       details: this.selected === 0 ? [
+        ...relayCurrent,
+        ...(relayCurrent.length ? [""] : []),
         "可选的大文件外链：启用、修改或停用。",
         "填写 S3 端点、区域、桶名及凭据，群成员直接下载。",
-        "默认链接有效 2 小时，额外保留 30 分钟后清理。",
+        "对象默认放在桶根目录；高级设置可改目录、上限和期限。",
         "保存前预览并确认，取消不修改配置。",
         "确认后重启原本运行中的机器人，已停止时保持停止。",
       ] : this.selected === 1 ? [
@@ -182,7 +205,7 @@ export class SettingsView implements View {
         "Enter 进入；修改后按 s 预览并保存。",
         "当前：" + this.runtime.summary,
       ],
-      note: this.selected === 0 ? "查看与清理已生成的外链：数据 → 外链"
+      note: this.selected === 0 ? "测试、查看与清理外链：数据 → 外链"
         : this.selected === 1 ? "查看隧道日志：监控 → 隧道日志（v）；界面显示本机时间，原始文件使用 UTC"
           : this.selected === 2 ? "模式决定隧道传输协议；是否经过代理由系统及代理路由决定"
           : "设置按需读取；显式环境变量优先于保存值，保存时检查冲突",

@@ -3,15 +3,18 @@ import { withMaintenance } from "../../src/core/maintenance.ts";
 // 外链账本只读展示与停机清理；复用 relay 的后端协议，凭据不传入 shell 参数。
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import {
+  checkRelayBackend,
   getRelayConfig,
   listRelayObjects,
   purgeRelayObjects,
+  RELAY_CHECK_BYTES,
 } from "../../src/integrations/relay.ts";
 
 function usage(): void {
   console.log("用法：bun run relay <命令>");
   console.log("");
   console.log("  list                列出索引里仍在册的外链（旧的排在前面）");
+  console.log("  test                上传并删除一个随机测试文件，验收签名、私有访问和删除权限");
   console.log("  purge --all         停机后删除当前后端的全部在册对象，失败或不匹配记录保留");
   console.log("  purge <关键字>      只删除文件名或地址包含该关键字的对象");
 }
@@ -42,6 +45,21 @@ async function list(): Promise<number> {
   }
   if (config) console.log("未完成的上传计划超过 31 分钟后可被回收；以上规则仅适用于当前后端。");
   return 0;
+}
+
+// 不需要停机：机器人照常运行时检查的正是它实际使用的网络和配置。测试对象先登记账本，中断也会被后台回收。
+async function test(): Promise<number> {
+  const config = getRelayConfig();
+  if (!config) {
+    console.error("未配置外链分发（data/config/relay.json 不存在），无法测试。");
+    return 1;
+  }
+  console.log(`正在用 ${formatSize(RELAY_CHECK_BYTES)} 随机测试文件检查外链后端：桶 ${config.bucket}，对象路径 ${config.prefix}日期-UUID/外链自检-*.bin`);
+  const labels = { pass: "[通过]", warn: "[注意]", fail: "[失败]" } as const;
+  const passed = await checkRelayBackend((status, text) => console.log(`${labels[status]} ${text}`), { config });
+  console.log("");
+  console.log(passed ? "外链后端检查通过。" : "外链后端检查未通过：请按上面的提示修正云端设置后重试。");
+  return passed ? 0 : 1;
 }
 
 async function purge(match: string | undefined): Promise<number> {
@@ -77,6 +95,9 @@ switch (command) {
   case "list":
   case "ls":
     exitCode = await list();
+    break;
+  case "test":
+    exitCode = argument === undefined ? await test() : (usage(), 1);
     break;
   case "purge":
     if (extra.length || (keyword !== undefined && argument !== "--keyword") || (argument === "--keyword" && !keyword)) {

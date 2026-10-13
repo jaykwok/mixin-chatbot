@@ -550,17 +550,14 @@ function Get-RelayDoctorRows {
     if (-not (Test-Path -LiteralPath $RelayConfigFile -PathType Leaf)) { return @() }
     try {
         $config = Get-Content -LiteralPath $RelayConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($config.provider -ne "s3") { throw "obsolete" }
-        foreach ($field in @("webdavUrl", "publicBaseUrl", "username", "password", "signSecret", "signPathPrefix")) {
-            if ($config.PSObject.Properties.Name -contains $field) { throw "obsolete" }
-        }
+        if ($config.provider -ne "s3") { throw "provider" }
         foreach ($field in @("endpoint", "region", "bucket", "accessKeyId", "secretAccessKey")) {
             if ($config.$field -isnot [string] -or -not $config.$field.Trim()) { throw "missing" }
         }
     } catch {
-        return @(New-DoctorRow "data/config/relay.json" "fail" "S3 必填项不全或仍使用已移除的旧配置" "请重新运行外链配置向导；不支持旧外链迁移。")
+        return @(New-DoctorRow "data/config/relay.json" "fail" "S3 必填项不全" "请重新运行外链配置向导。")
     }
-    return @(New-DoctorRow "S3 外链配置必填项" "pass" "必填项齐全，未发现旧字段；启动时执行完整格式校验" "此项不检测云端权限、私有访问和签名；云端设置变化后请用测试文件验收。")
+    return @(New-DoctorRow "S3 外链配置必填项" "pass" "必填项齐全；启动时执行完整格式校验" "此项不检测云端权限、私有访问和签名；云端设置变化后请用 relay-test 验收。")
 }
 
 function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]$Fix = "") {
@@ -1385,6 +1382,7 @@ switch ($Command) {
         try { Invoke-RuntimeConfiguration $Target } catch { Err $_.Exception.Message; exit 1 }
     }
     "relay-ls" { if (-not (Invoke-RelayAdmin @("list"))) { exit 1 } }
+    "relay-test" { if (-not (Invoke-RelayAdmin @("test"))) { exit 1 } }
     "relay-purge" {
         if (-not $All -and -not $Target) {
             Err "relay-purge 需要一个关键字，或用 -All 表示清理全部"
@@ -1490,6 +1488,7 @@ switch ($Command) {
         Write-Host "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"
         Write-Host "  tunnel-update 更新本项目 cloudflared 到官方稳定版；校验后切换，失败恢复旧版本（需宿主机 Bun）"
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
+        Write-Host "  relay-test      上传并删除一个随机测试文件，验收外链签名、私有访问和删除权限"
         Write-Host "  relay-purge <关键字>|-All"
         Write-Host "                  删除匹配的外链对象并清掉索引记录"
         Write-Host "  routes list | reset -Fingerprint <指纹> -Group <群号> | forget -Fingerprint <指纹>"

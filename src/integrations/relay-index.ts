@@ -29,25 +29,22 @@ export function relayCacheKey(digest: string, filename: string, namespace: strin
 export class RelayIndexFormatError extends Error {
   override name = "RelayIndexFormatError";
 }
-function assertRelaySchema(db: Database): string[] {
+function assertRelaySchema(db: Database): void {
   const columns = new Set((db.query("PRAGMA table_info(objects)").all() as { name: string }[]).map(column => column.name));
-  if (["key", "url", "name", "size", "at", "state"].some(column => !columns.has(column))) throw new RelayIndexFormatError("外链账本结构无效");
-  const missing = ["expiresAt", "deleteAfter"].filter(column => !columns.has(column));
-  if (missing.length && (db.query("SELECT COUNT(*) AS count FROM objects").get() as { count: number }).count > 0) {
-    throw new RelayIndexFormatError("外链账本仍含旧格式记录，不支持迁移；请使用原版本完成清理后重新启动");
+  if (["key", "url", "name", "size", "at", "state", "expiresAt", "deleteAfter"].some(column => !columns.has(column))) {
+    throw new RelayIndexFormatError("外链账本结构无效");
   }
-  return missing;
 }
 
-/** Validation and configuration previews must neither create nor migrate a ledger. */
+/** Validation and configuration previews must not create a ledger. */
 export function readRelayIndex(path: string): RelayIndexEntry[] {
   if (!existsSync(path)) return [];
   let db: Database | undefined;
   try {
     db = new Database(path, { readonly: true, strict: true });
     if (!db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().length) return [];
-    const missing = assertRelaySchema(db);
-    return missing.length ? [] : db.query("SELECT * FROM objects ORDER BY at, key").all() as RelayIndexEntry[];
+    assertRelaySchema(db);
+    return db.query("SELECT * FROM objects ORDER BY at, key").all() as RelayIndexEntry[];
   } catch (error) {
     const code = (error as { code?: string })?.code;
     if (code === "SQLITE_NOTADB" || code?.startsWith("SQLITE_CORRUPT")) {
@@ -60,10 +57,7 @@ export async function openRelayIndex(path: string): Promise<RelayIndex> {
   const db = openState(path);
   try {
     db.exec("CREATE TABLE IF NOT EXISTS objects (key TEXT PRIMARY KEY, url TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, at TEXT NOT NULL, state TEXT NOT NULL, expiresAt TEXT, deleteAfter TEXT)");
-    const missing = assertRelaySchema(db);
-    if (missing.length) {
-      db.transaction(() => { for (const column of missing) db.exec("ALTER TABLE objects ADD COLUMN " + column + " TEXT"); })();
-    }
+    assertRelaySchema(db);
     db.exec("CREATE INDEX IF NOT EXISTS objects_uploaded_url ON objects(url, at, key) WHERE state = 'uploaded'");
     const insert = db.query("INSERT OR REPLACE INTO objects (key, url, name, size, at, state, expiresAt, deleteAfter) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
     const uploaded = db.query("SELECT * FROM objects WHERE url = ? AND state = 'uploaded' ORDER BY at, key LIMIT 1");
