@@ -13,7 +13,7 @@ import {
 import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { fauxAssistantMessage, fauxProvider, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
 import {
-  AssistantEntry, type Conversation, createSession, defineDoc, type Harness, type HarnessSettings, ProviderDoc, type Storage, StorageRejected,
+  AssistantEntry, type Conversation, createSession, defineDoc, type Harness, type HarnessSettings, ProviderDoc, SessionFailed, type Storage,
   UsageDoc,
 } from "@earendil-works/pi-durable";
 import { AttemptsDoc, isNotSent, NOT_SENT } from "../../src/durable/attempts.ts";
@@ -605,7 +605,7 @@ describe("request door: control registrations (D0 q01)", () => {
 describe("request door: a commit settles only after storage did (D0 q02, project storage)", () => {
   const Doc = defineDoc<{ pending: boolean; seq: number }>({ kind: "test.settlement", version: 1, scope: "session", initial: () => ({ pending: false, seq: 0 }) });
 
-  for (const mode of ["success", "rejected", "landed-error"] as const) {
+  for (const mode of ["success", "landed-error"] as const) {
     test(mode, async () => {
       const path = join(fixture.root, `settlement-${mode}.sqlite`);
       const backing = await openGroupStorage(path);
@@ -622,11 +622,10 @@ describe("request door: a commit settles only after storage did (D0 q02, project
             if (!armed) return target.commit(...args);
             armed = false;
             storageSignal = args[1].abortSignal !== undefined;
-            const seq = mode === "rejected" ? undefined : await target.commit(...args);
+            const seq = await target.commit(...args);
             entered.resolve();
             await release.promise;
             storageSettled = true;
-            if (mode === "rejected") throw new StorageRejected("synthetic rejection: no writes admitted");
             if (mode === "landed-error") throw new Error("synthetic reply failure after the SQLite commit");
             return seq!;
           };
@@ -657,14 +656,10 @@ describe("request door: a commit settles only after storage did (D0 q02, project
           expect(state).toBe("fulfilled");
           gate.controlAdmitted(ticket, (await read())!);
           expect(gate.controls("m")).toEqual({ tickets: [], stream: ["ctl"] });
-        } else if (mode === "rejected") {
-          expect(state).toBe("rejected");
-          expect(await gate.controlUncertain(ticket, read)).toBe("resolved");
-          expect(gate.pendingControls("m")).toBe(0);
         } else {
           expect(state).toBe("rejected");
-          // The session is poisoned: reads fail, so the ticket stays until a later read or the execution resolves it.
-          await expect(read()).rejects.toThrow("poisoned");
+          // The Session failed: reads fail, so the ticket stays until a later read or the execution resolves it.
+          await expect(read()).rejects.toBeInstanceOf(SessionFailed);
           expect(await gate.controlUncertain(ticket, read)).toBe("retrying");
           expect(gate.controls("m")).toEqual({ tickets: ["ctl"], stream: [] });
         }
@@ -676,7 +671,7 @@ describe("request door: a commit settles only after storage did (D0 q02, project
           const durable = await reopened.snapshot(Doc, context);
           const recovered = new RequestDoor({}, { memberOf: async () => "m" });
           recovered.loadControls(durable?.pending ? [{ phone: "m", requestId: "ctl", seq: durable.seq }] : []);
-          expect(recovered.pendingControls("m")).toBe(mode === "rejected" ? 0 : 1);
+          expect(recovered.pendingControls("m")).toBe(1);
         } finally { await reopened.close(context); }
       } finally {
         release.resolve();

@@ -107,7 +107,7 @@ for (const phase of ["model", "safe-tool"] as const) test(`offline expiry cancel
         if (signal.aborted) reject(signal.reason);
         else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
       });
-      return { content: [] };
+      return { output: [] };
     },
   }] })] : undefined;
   f.faux.setResponses([phase === "model" ? first.step : fauxAssistantMessage([fauxToolCall("safe_wait", {}, { id: "read" })], { stopReason: "toolUse" }),

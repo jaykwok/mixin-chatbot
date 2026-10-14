@@ -247,6 +247,10 @@ def check_office_errors(root):
     spec = importlib.util.spec_from_file_location("document_ops", script)
     operations = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(operations)
+    cases_spec = importlib.util.spec_from_file_location("document_office_path_cases", Path(__file__).resolve().parent / "document-office-path-cases.py")
+    cases = importlib.util.module_from_spec(cases_spec)
+    cases_spec.loader.exec_module(cases)
+    cases.check(operations, root / "office-path-cases")
     source = root / "source.docx"
     for code, diagnostic in ((1, b"Read-only file system: /tmp/OSL_PIPE_fixture"), (0, b"Error: source file could not be loaded")):
         folder, profile = root / f"office-error-{code}", root / f"office-profile-{code}"

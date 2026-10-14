@@ -12,16 +12,17 @@
 // A conversation the data migration imported (scripts/migrations/v3.ts) starts counting after its import record: the
 // imported entries were counted from the session file, which the old ledger source keeps covering.
 import type { Database } from "bun:sqlite";
-import type { Context } from "@earendil-works/chord";
+import { copyJson, type Context } from "@earendil-works/chord";
 import { AssistantEntry, type ConversationId, defineDoc, type EntryRecord, type Harness, type TaskId, ToolResultEntry, UserEntry, type Tx } from "@earendil-works/pi-durable";
 import { groupSegment, userSegment } from "../agent/paths.ts";
 import type { StatsRecord } from "../agent/session-reader.ts";
-import { type ConversationSource, DURABLE_PROJECTION, hasRetiredConversation, ingestConversationRecords } from "../agent/stats-ledger.ts";
+import { type ConversationSource, DURABLE_PROJECTION, finalizeConversationProjection, hasRetiredConversation, ingestConversationRecords } from "../agent/stats-ledger.ts";
 import { type AttemptStart, AttemptsDoc, isNotSent } from "./attempts.ts";
 import { AuxiliaryDoc } from "./auxiliary-records.ts";
 import { recoverProjectionRetirement, retireProjectedRequests } from "./projection/retirement.ts";
 import { pendingUsage, type ProjectionCheckpoint } from "./projection/usage.ts";
 import { KeyedQueue } from "../core/lifecycle.ts";
+import { NestedUsageDoc } from "./codemode/usage.ts";
 
 const PAGE = 200;
 
@@ -50,11 +51,18 @@ function records(entry: EntryRecord, start?: AttemptStart): StatsRecord[] {
   if (message === undefined || !Number.isFinite(message.timestamp)) return [];
   if (UserEntry.is(entry)) return [{ type: "message", timestamp: at(message.timestamp), message: message as StatsRecord["message"] }];
   if (ToolResultEntry.is(entry)) {
-    const details = message.details as { calls?: { name?: unknown }[]; complete?: unknown } | undefined;
-    const nested = message.toolName === "codemode" && Array.isArray(details?.calls)
-      ? { names: details.calls.map(call => typeof call?.name === "string" ? call.name : "unknown"), complete: details.complete === true }
-      : undefined;
-    // Charge the parent result's combined usage once; the child list contributes counts, never another bill.
+    const details = message.details as { calls?: { name?: unknown }[]; complete?: unknown; partial?: unknown; usage?: unknown } | undefined;
+    const codemode = message.toolName === "codemode" && Array.isArray(details?.calls) ? details : undefined;
+    // Results of the project's own codemode (before Pi 1.2.0) say `complete` and carry the combined usage on the result.
+    // The official codemode's say `partial` while the script ran (a result built from its slot) and carry the nested
+    // calls' usage in the details: Durable counts it under each nested tool, never on the codemode result.
+    const legacy = codemode !== undefined && "complete" in codemode;
+    const nested = codemode === undefined ? undefined : {
+      names: codemode.calls!.map(call => typeof call?.name === "string" ? call.name : "unknown"),
+      complete: legacy ? codemode.complete === true : codemode.partial !== true,
+    };
+    // Official codemode details are display snapshots. Its ordinary children have independent atomic receipts;
+    // AuxiliaryDoc already owns auxiliary charges. Legacy result usage remains on the message.
     return [{ type: "message", timestamp: at(message.timestamp),
       message: { ...message, ...(nested === undefined ? {} : { nested }) } as StatsRecord["message"] }];
   }
@@ -98,10 +106,12 @@ async function project(db: Database, harness: Harness, conversation: Conversatio
       { offset: number; digest: string; projection: number } | null;
     const current = row !== null && (row.projection === DURABLE_PROJECTION || hasRetiredConversation(db, source.id));
     const prior = current ? row.offset : floor, digest = current ? row.digest : "", links = checkpoint(digest);
-    const { attempts, auxiliary, terminal, generations, entries } = await harness.commit(async tx => {
+    const { attempts, auxiliary, terminal, generations, entries, nested } = await harness.commit(async tx => {
       // One group transaction prevents a new entry from racing its request's start snapshot.
       const attempts = JSON.parse(JSON.stringify((await tx.doc(AttemptsDoc, conversation)).starts)) as Record<string, AttemptStart>;
       const auxiliary = JSON.parse(JSON.stringify((await tx.doc(AuxiliaryDoc, conversation)).starts)) as Record<string, import("./auxiliary-records.ts").AuxiliaryRequest>;
+      const nestedDoc = await tx.doc(NestedUsageDoc, conversation);
+      const nested = copyJson(nestedDoc) as typeof nestedDoc;
       // Only tasks already terminal in this snapshot can retire. A later terminal transition may commit
       // an assistant entry after this cursor; settling its start early would charge that request twice.
       const terminal = new Set<number>();
@@ -114,7 +124,7 @@ async function project(db: Database, harness: Harness, conversation: Conversatio
       // An unmatched start only checks entries after its last projected cursor.
       const after = generations.reduce((after, [key, start]) => links.links[key]?.entryId !== undefined
         ? after : Math.min(after, links.links[key]?.through ?? start.afterEntry), prior);
-      return { attempts, auxiliary, terminal, generations, entries: await entriesAfter(tx, conversation, after) };
+      return { attempts, auxiliary, terminal, generations, nested, entries: await entriesAfter(tx, conversation, after) };
     }, context);
     const to = Math.max(prior, (entries.at(-1)?.id as number | undefined) ?? prior);
     const byEntry = new Map<number, AttemptStart>();
@@ -146,8 +156,26 @@ async function project(db: Database, harness: Harness, conversation: Conversatio
     for (const [key] of generations) links.links[key] ??= { through: to };
     for (const [key] of generations) if (links.links[key]!.entryId === undefined) links.links[key]!.through = to;
     const added = entries.filter((entry) => (entry.id as number) > prior).flatMap((entry) => records(entry, byEntry.get(entry.id as number)));
-    if (ingestConversationRecords(db, { ...source, digest: JSON.stringify(links) }, prior, to, added,
-      pendingUsage(attempts, auxiliary, links, floor), floor, digest)) {
+    const nestedCharges: StatsRecord[] = Object.values(nested.receipts).filter(receipt => receipt.sequence > (links.nestedThrough ?? 0))
+      .map(receipt => ({ type: "usage", kind: "tool", timestamp: at(receipt.startedAt), usage: receipt.usage }));
+    if (nested.sequence > 0) links.nestedThrough = nested.sequence;
+    const ingested = db.transaction(() => {
+      if (!ingestConversationRecords(db, { ...source, digest: JSON.stringify(links) }, prior, to, [...added, ...nestedCharges],
+        pendingUsage(attempts, auxiliary, links, floor), floor, digest)) return false;
+      // Once receipts may be pruned, a future projector upgrade must preserve these already settled aggregates.
+      if (nestedCharges.length) finalizeConversationProjection(db, source.id);
+      return true;
+    }).immediate();
+    if (ingested) {
+      // Ledger first. A crash before pruning re-reads receipts but the committed sequence suppresses every old bill.
+      // Active parents retain stable keys for replay; after terminal settlement no child can settle again.
+      await harness.commit(async tx => {
+        const doc = await tx.doc(NestedUsageDoc, conversation);
+        for (const [key, receipt] of Object.entries(doc.receipts)) {
+          if (receipt.sequence > nested.sequence) continue;
+          if ((await tx.task(receipt.parentTaskId as TaskId))?.state.status === "terminal") delete doc.receipts[key];
+        }
+      }, context);
       await retireProjectedRequests(db, harness, source, conversation, { attempts, auxiliary, terminal, checkpoint: links }, to, floor, context);
       return added.length;
     }

@@ -42,7 +42,7 @@ const resources = new WindowsHandles({ observe: event => events.push(event), nat
     return done;
   },
 } });
-const { holdDirectory } = await import("../../src/durable/codemode/directory.ts");
+const { holdDirectory } = await import("../../src/core/held-directory.ts");
 
 type Case = { name: string; info?: number; final?: boolean; create?: boolean; junction?: boolean };
 const cases: Case[] = [

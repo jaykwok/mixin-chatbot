@@ -70,7 +70,9 @@ export function enginePolicy(value: unknown): EnginePolicy {
 /** Selection still uses Pi's manager; only selection fields and native policy belong to this service. */
 export function validateEngineSettings(value: unknown): void {
   const settings = object(value, "settings.json");
-  keys(settings, ["format", "defaultProvider", "defaultModel", "defaultThinkingLevel", "modelThinkingLevels", "durable"], "settings.json（旧配置请通过升级迁移）");
+  keys(settings, ["$schema", "format", "defaultProvider", "defaultModel", "defaultThinkingLevel", "modelThinkingLevels", "durable"], "settings.json（旧配置请通过升级迁移）");
+  // An editor's schema reference (Pi 1.2.0 accepts it in its own files); not read otherwise.
+  if (settings.$schema !== undefined && typeof settings.$schema !== "string") throw new Error("settings.json.$schema 必须是字符串");
   if (settings.format !== undefined && settings.format !== 1) throw new Error("settings.json.format 不受支持");
   for (const name of ["defaultProvider", "defaultModel"]) if (settings[name] !== undefined
     && (typeof settings[name] !== "string" || !settings[name].trim())) throw new Error(`settings.json.${name} 必须是非空字符串`);

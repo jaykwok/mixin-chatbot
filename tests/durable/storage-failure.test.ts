@@ -2,7 +2,7 @@ import { afterAll, test } from "bun:test";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { createSession, defineDoc, StorageRejected, type Storage } from "@earendil-works/pi-durable";
+import { createSession, defineDoc, SessionFailed, StorageRequestError, type Storage } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openGroupDatabase } from "../../src/durable/sqlite.ts";
 import { DurableStorageFailure, guardStorage } from "../../src/durable/storage-failure.ts";
@@ -34,7 +34,7 @@ test("actual SQLITE_FULL fences the Session and requires a cold reopen; callback
     expect((original as { code?: string }).code).toBe("SQLITE_FULL");
     expect(failures).toHaveLength(1);
     await expect(guarded.scanConversations({}, 1, undefined, context)).rejects.toBe(failures[0]);
-    await expect(session.commit(async (tx) => { (await tx.doc(Counter)).value++; }, context)).rejects.toThrow("poisoned");
+    await expect(session.commit(async (tx) => { (await tx.doc(Counter)).value++; }, context)).rejects.toBeInstanceOf(SessionFailed);
   } finally { await session.close(context); }
   const freshDb = await openGroupDatabase(path), fresh = createSession(await SqliteStorage.open(freshDb));
   try { expect((await fresh.snapshot(Counter, context))?.value).toBe(1); } finally { await fresh.close(context); }
@@ -56,20 +56,48 @@ test("a committed batch whose acknowledgement is lost is fatal, and a cold reope
   try { expect((await fresh.snapshot(Counter, context))?.value).toBe(7); } finally { await fresh.close(context); }
 });
 
-test("StorageRejected proves rollback and does not fence a usable Session", async () => {
+test("a commit's StorageRequestError still fences: whether an admitted batch committed is unknown", async () => {
   const { path, storage, failures } = await open();
-  let reject = true;
+  const invalid = new StorageRequestError("synthetic invalid batch");
   const wrapped = new Proxy(storage, { get(target, key) {
-    if (key === "commit") return async (...args: Parameters<Storage["commit"]>) => {
-      if (reject) { reject = false; throw new StorageRejected("batch rejected without effect"); }
-      return target.commit(...args);
-    };
+    if (key === "commit") return async () => { throw invalid; };
     const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
   } });
   const session = createSession(guardStorage(wrapped, path, (error) => failures.push(error)));
   try {
-    await expect(session.commit(async (tx) => { (await tx.doc(Counter)).value = 1; }, context)).rejects.toBeInstanceOf(StorageRejected);
-    await session.commit(async (tx) => { (await tx.doc(Counter)).value = 2; }, context);
-    expect((await session.snapshot(Counter, context))?.value).toBe(2); expect(failures).toEqual([]);
+    await expect(session.commit(async (tx) => { (await tx.doc(Counter)).value = 1; }, context)).rejects.toBeDefined();
+    expect(failures).toHaveLength(1); expect(failures[0]!.cause).toBe(invalid);
+    await expect(session.snapshot(Counter, context)).rejects.toBeInstanceOf(SessionFailed);
   } finally { await session.close(context); }
+});
+
+test("a read's StorageRequestError or a cancelled read fails that call only; any other read error fences", async () => {
+  const { path, storage, failures } = await open();
+  let mode: "invalid" | "cancelled" | "broken" | undefined;
+  const broken = new Error("synthetic read failure");
+  const wrapped = new Proxy(storage, { get(target, key) {
+    const value = Reflect.get(target, key, target);
+    if (key === "scanConversations") return async (...args: Parameters<Storage["scanConversations"]>) => {
+      if (mode === "invalid") throw new StorageRequestError("synthetic invalid query");
+      if (mode === "cancelled") throw new Error("synthetic cancelled read");
+      if (mode === "broken") throw broken;
+      return target.scanConversations(...args);
+    };
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  const guarded = guardStorage(wrapped, path, (error) => failures.push(error));
+  mode = "invalid";
+  await expect(guarded.scanConversations({}, 1, undefined, context)).rejects.toBeInstanceOf(StorageRequestError);
+  mode = "cancelled";
+  const cancelled = new AbortController(); cancelled.abort();
+  await expect(guarded.scanConversations({}, 1, undefined, { ...context, abortSignal: cancelled.signal })).rejects.toThrow("synthetic cancelled read");
+  expect(failures).toEqual([]);
+  mode = undefined;
+  expect((await guarded.scanConversations({}, 1, undefined, context)).items).toEqual([]);
+  mode = "broken";
+  await expect(guarded.scanConversations({}, 1, undefined, context)).rejects.toBeInstanceOf(DurableStorageFailure);
+  expect(failures).toHaveLength(1); expect(failures[0]!.cause).toBe(broken); expect(failures[0]!.message).toContain("读取失败");
+  mode = undefined;
+  await expect(guarded.scanConversations({}, 1, undefined, context)).rejects.toBe(failures[0]);
+  await guarded.close(context);
 });

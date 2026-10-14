@@ -259,7 +259,11 @@ test("the migration's frozen documents match the service's definitions", () => {
   expect(shape(frozen.GroupDoc)).toEqual(shape(GroupDoc));
   expect(shape(frozen.MemberDirectory)).toEqual(shape(MemberDirectory));
   expect(shape(frozen.IdentityDoc)).toEqual(shape(IdentityDoc));
-  expect(shape(frozen.CodemodeStoreDoc)).toEqual(shape(CodemodeStoreDoc));
+  // The project's own store document (data versions 3 and 4) is no longer defined by the service: it stays as it was.
+  expect(shape(frozen.CodemodeStoreDoc)).toMatchObject({
+    kind: "mixin.codemode-store", version: 1, scope: "conversation", history: "latest", fork: "initial", initial: '{"values":{}}',
+  });
+  expect(shape(frozen.OfficialCodemodeStoreDoc)).toEqual(shape(CodemodeStoreDoc));
   expect(shape(frozen.LegacyImportDoc)).toEqual(shape(LegacyImportDoc));
 });
 

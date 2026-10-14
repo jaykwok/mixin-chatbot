@@ -4,13 +4,14 @@
 // - `mixin.base`: read, bash, edit, write, document_environment, document_extract (./tools.ts);
 // - `mixin.send`: send_image, send_file, model-only (./send.ts);
 // - `mixin.auxiliary`: configured classifier and image tools (./auxiliary.ts);
-// - `mixin.mcp`: configured remote MCP tools (./mcp.ts);
-// - `mixin.<module>` for each enabled module: no Durable tools of its own (its tools are script-only, reached through
-//   codemode), but selecting it turns the module on for the conversation: its tools become callable from scripts and its
-//   prompt text and skills appear;
+// - `mixin.mcp`: configured remote MCP tools, deferred: scripts find them with `searchTools()` (./mcp.ts);
+// - `mixin.<module>` for each enabled module: its tools, script-only; selecting it turns the module on for the
+//   conversation: its tools become callable from scripts and its prompt text and skills appear;
 // - `mixin.codemode`: the codemode tool over all of the above (./codemode/index.ts).
 //
-// The model sees the tools in that order. Every tool runs through `memberTool`: the conversation's identity decides the
+// Every tool is registered (./tools.ts `memberRegistration`), with who may call it from its exposure: the model sees
+// the ones it may call, in that order; scripts call the others through `executeTool()`, so the request door's wraps and
+// the Harness's checks apply to both. Every tool runs through `memberTool`: the conversation's identity decides the
 // member and the member's places. The relay setting is fixed per registry (it shapes send_file's description and the
 // prompt); the relay configuration is read once at service start (src/integrations/relay.ts), so a change needs a
 // restart anyway.
@@ -22,7 +23,7 @@ import type { RequestDoor } from "./door.ts";
 import type { McpTools } from "../integrations/mcp.ts";
 import { mcpMemberTools } from "./mcp.ts";
 import type { RelayConfig } from "../integrations/relay.ts";
-import { type CallableTool, codemodeExtension } from "./codemode/index.ts";
+import { codemodeExtension } from "./codemode/index.ts";
 import { moduleExtensionName, promptExtension } from "./prompt.ts";
 import { type SendDelivery, sendMemberTools } from "./send.ts";
 import { baseExtension, baseMemberTools, documentMemberTools, memberRegistration, memberTool, type MemberTool } from "./tools.ts";
@@ -60,24 +61,13 @@ export function groupExtensions(options: GroupRegistryOptions): Extension[] {
     tools: module.tools({ workspaceDir: "catalogue", tempDir: "catalogue", indexPath: "catalogue", venvDir: "catalogue" })
       .map((definition): MemberTool => memberTool(definition, members, ({ places }) => module.tools(places))),
   }));
-  const callable: CallableTool[] = [
-    ...[...base, ...documents].map((tool) => ({ extension: "mixin.base", tool })),
-    ...send.map((tool) => ({ extension: "mixin.send", tool })),
-    ...auxiliary.map(tool => ({ extension: "mixin.auxiliary", tool })),
-    ...mcp.map(tool => ({ extension: "mixin.mcp", tool })),
-    ...modules.flatMap(({ module, tools }) => tools.map((tool) => ({ extension: moduleExtensionName(module), tool }))),
-  ];
   return [
     promptExtension({ root: options.root, groupId: options.groupId, modules: options.modules, relayEnabled: options.relay !== null }),
     baseExtension(members, documents),
     defineExtension({ name: "mixin.send", tools: send.map(memberRegistration) }),
     ...(auxiliary.length ? [defineExtension({ name: "mixin.auxiliary", tools: auxiliary.map(memberRegistration) })] : []),
-    ...(mcp.length ? [defineExtension({ name: "mixin.mcp" })] : []),
-    // A module's tools that the model may call directly would be registered here; the current module has none.
-    ...modules.map(({ module, tools }) => defineExtension({
-      name: moduleExtensionName(module),
-      tools: tools.filter((tool) => (tool.definition.exposure ?? "direct") === "direct").map(memberRegistration),
-    })),
-    codemodeExtension({ members, tools: callable }),
+    ...(mcp.length ? [defineExtension({ name: "mixin.mcp", tools: mcp.map(memberRegistration) })] : []),
+    ...modules.map(({ module, tools }) => defineExtension({ name: moduleExtensionName(module), tools: tools.map(memberRegistration) })),
+    codemodeExtension({ members, tools: [...base, ...documents, ...send, ...auxiliary, ...mcp, ...modules.flatMap(({ tools }) => tools)] }),
   ];
 }

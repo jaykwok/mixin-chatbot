@@ -245,12 +245,13 @@ async function reloadProvider(runtime: ModelRuntime, providerId: string): Promis
   if (failure) log.warn(`模型目录刷新失败，改用随包目录和本地缓存：${failure.message}`);
 }
 
-async function loadProviders(path: string): Promise<Record<string, JsonObject>> {
+/** The providers of models.json, and its editor schema reference (kept when the file is written again). */
+async function loadProviders(path: string): Promise<{ providers: Record<string, JsonObject>; schema?: string }> {
   try {
-    const parsed = JSON.parse(await readFile(path, "utf8")) as { providers?: Record<string, JsonObject> };
-    return parsed.providers ?? {};
+    const parsed = JSON.parse(await readFile(path, "utf8")) as { $schema?: unknown; providers?: Record<string, JsonObject> };
+    return { providers: parsed.providers ?? {}, ...(typeof parsed.$schema === "string" ? { schema: parsed.$schema } : {}) };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { providers: {} };
     throw new Error(`${MODELS_JSON_PATH} 无法读取或不是有效 JSON`, { cause: error });
   }
 }
@@ -270,7 +271,7 @@ async function main(draft: ModelConfigurationDraft): Promise<void> {
   const settings = SettingsManager.create(".", draft.agentDir, { projectTrusted: false });
   const initialErrors = settings.drainErrors();
   if (initialErrors.length) throw new Error(`${PI_SETTINGS_PATH}: ${initialErrors.map((item) => item.error.message).join("; ")}`);
-  const previousProviders = await loadProviders(draft.modelsPath);
+  const { providers: previousProviders, schema } = await loadProviders(draft.modelsPath);
   const previousProviderId = settings.getDefaultProvider() ?? Object.keys(previousProviders)[0];
   const previousModelId = settings.getDefaultModel();
 
@@ -318,7 +319,7 @@ async function main(draft: ModelConfigurationDraft): Promise<void> {
     providers[providerId] = { ...preserved(previousEntry), api, baseUrl, apiKey, models: [model] };
   }
 
-  await writeFile(draft.modelsPath, JSON.stringify({ providers }, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  await writeFile(draft.modelsPath, JSON.stringify({ ...(schema === undefined ? {} : { $schema: schema }), providers }, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
   await reloadProvider(runtime, providerId);
   const modelId = declaredModelId ?? await selectBuiltinModel(runtime, providerId, previousModelId);
 

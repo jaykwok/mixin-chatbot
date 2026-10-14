@@ -48,6 +48,15 @@ async function storedData(storage: Storage, context: Context): Promise<boolean> 
   return (await storage.scanDocuments({ scope: { kind: "session" }, at: "current" }, 1, undefined, context)).items.length > 0;
 }
 
+/**
+ * The error that failed the Harness's Session, if one did. pi-durable 1.2.0 marks `failure` internal on the Session but
+ * documents it as what close listeners read when a failure closes the Session (session.d.ts `fail`, `subscribeClose`);
+ * the fail-stop test in tests/durable/groups.test.ts depends on it.
+ */
+function sessionFailure(harness: Harness): { readonly error: unknown } | undefined {
+  return (harness as unknown as { readonly failure?: { readonly error: unknown } }).failure;
+}
+
 const missing = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 
 /**
@@ -106,6 +115,8 @@ export interface GroupHandle {
 type Connection = {
   groupId?: string;
   storage?: Storage;
+  /** The database file, once opening began. */
+  path?: string;
   harness?: Harness;
   /** The internal step in progress (opening or reading the database, opening the Harness); closing waits for it. */
   step: Promise<unknown>;
@@ -294,6 +305,7 @@ export class GroupHarnesses {
   }
 
   async #openStorage(connection: Connection, path: string): Promise<Storage> {
+    connection.path = path;
     await this.#step(connection, async () => {
       const storage = await openGroupStorage(path, (error) => this.#fatal(new DurableStorageFailure(path, error)));
       connection.storage = guardStorage(storage, path, (error) => this.#fatal(error));
@@ -308,9 +320,13 @@ export class GroupHarnesses {
     try { this.#options.onFatal?.(error); } catch {}
   }
 
-  /** The recorded group, read without a Harness: a bare Session only reads (closing it would close the storage). */
+  /**
+   * The recorded group, read without a Harness: a bare Session only reads (closing it would close the storage). It is
+   * never closed, so it keeps no document: with the default retention (pi-durable 1.2.0, ten minutes) its eviction
+   * timer would hold the Session, and through the storage's failure callback the evicted Harness.
+   */
   #recordedGroup(connection: Connection, storage: Storage): Promise<string | undefined> {
-    return this.#step(connection, () => databaseGroup(createSession(storage), this.#context));
+    return this.#step(connection, () => databaseGroup(createSession(storage, { documentRetentionMs: 0 }), this.#context));
   }
 
   /** The options come from the application and may take any time; closing meanwhile closes the database under them. */
@@ -318,7 +334,20 @@ export class GroupHarnesses {
     connection.groupId = groupId;
     const options = await this.#options.harnessOptions(groupId);
     await this.#step(connection, async () => { connection.harness = await Harness.open(connection.storage!, options, this.#context); });
-    return connection.harness!;
+    // A Session that failed (a storage error, or a throw in the Harness's own bookkeeping) never runs or commits again:
+    // the process stops, as for a storage failure the guard saw first (./storage-failure.ts). The stop is decided when
+    // the failure closes the Session (its close listeners run synchronously, the failure already set), not when `closed`
+    // settles: that waits for the running tools to end, which may take any time, and meanwhile other groups would open.
+    // `closed` still reports a failure that comes later, such as a Storage that cannot close.
+    const harness = connection.harness!;
+    const path = connection.path ?? groupId;
+    const failed = (error: unknown) => this.#fatal(new DurableStorageFailure(path, error, "session"));
+    harness.subscribeClose(() => {
+      const failure = sessionFailure(harness);
+      if (failure !== undefined) failed(failure.error);
+    });
+    void harness.closed.then((end) => { if (end.reason === "failed") failed(end.error); }, () => {});
+    return harness;
   }
 
   #openEntry(groupId: string): Entry {

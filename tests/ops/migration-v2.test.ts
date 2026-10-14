@@ -106,8 +106,8 @@ test("v2 只给原件仍在且核对一致的会话补记新口径；中途改�
     expect(before).toEqual(schema1(current));
     const plan = (await preview(c)).plan!;
     expect(plan.kind).toBe("migration");
-    // v2 两步，再是 v3 两步（tests/ops/migration-v3.test.ts）。
-    expect(plan.steps).toHaveLength(6); expect(plan.steps[0]).toContain("统计账本升到 schema 2");
+    // v2 两步，再是 v3、v4、v5 各两步（tests/ops/migration-v3.test.ts 等）。
+    expect(plan.steps).toHaveLength(8); expect(plan.steps[0]).toContain("统计账本升到 schema 2");
     expect(plan.files).toContain(join(c.groups, "stats.sqlite"));
     // 核对原件之后、写入之前账本被改动：整个账本事务放弃，schema 1 原样保留。
     const reports: string[] = [];

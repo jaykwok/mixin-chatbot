@@ -79,11 +79,13 @@ async function member(group: Group, phone = ALICE): Promise<Conversation> {
   return (await memberConversation(group.opened.harness, GROUP, phone, { model: group.model }, context)).conversation;
 }
 
-type Seen = { prompt: string; tools: string[]; descriptions: Record<string, string> };
+/** `prompt` without the official codemode section (pi-durable/codemode), which `section` holds. */
+type Seen = { prompt: string; section: string; tools: string[]; descriptions: Record<string, string> };
 const seen = (messages: readonly Message[]): Seen => {
   const tools = getCurrentTools(messages as Message[]);
+  const full = getCurrentSystemPrompt(messages as Message[]) ?? "", at = full.indexOf("\n\n<codemode>\n");
   return {
-    prompt: getCurrentSystemPrompt(messages as Message[]) ?? "",
+    prompt: at < 0 ? full : full.slice(0, at), section: at < 0 ? "" : full.slice(at + 2),
     tools: tools.map((tool) => tool.name),
     descriptions: Object.fromEntries(tools.map((tool) => [tool.name, tool.description])),
   };
@@ -171,22 +173,26 @@ describe("Durable group registry", () => {
         expect(durable.prompt.endsWith(`<cwd>\n${resolve(groupWorkspaceDir(group.root, GROUP)).replace(/\\/g, "/")}\n</cwd>`)).toBe(true);
         expect(durable.prompt).not.toContain("Guidelines:");
         expect(durable.prompt).not.toContain("expert coding assistant");
+        // The Durable engine appends the official codemode section: the tools scripts can call, never the send tools.
+        expect(durable.section.startsWith("<codemode>\n")).toBe(true); expect(durable.section.endsWith("</codemode>")).toBe(true);
+        expect(durable.section).toContain("### `read`"); expect(durable.section).not.toContain("send_file");
+        expect(durable.section.includes("### `document_inspect`")).toBe(modules.length > 0);
       } finally { await group.opened.close(); }
     });
   }
 
-  test("declares the tools in registry order; codemode lists the module's tools; send tools are model-only", async () => {
+  test("declares the tools in registry order; the codemode section lists the module's tools; send tools are model-only", async () => {
     const group = await openGroup();
     try {
       const seenBy = await turn(group, await member(group));
       expect(seenBy.tools).toEqual(["read", "bash", "edit", "write", "document_environment", "document_extract", "send_image", "send_file", "codemode"]);
-      for (const name of ["read", "bash", "edit", "write", "document_environment", "document_extract"]) {
-        expect(seenBy.descriptions[name]).toContain("Codemode:");
+      // CODEMODE_INLINE_BUDGET keeps every declaration of the registry's own tools in the section.
+      for (const name of ["read", "bash", "edit", "write", "document_environment", "document_extract",
+        "document_inspect", "document_patch", "document_compose", "document_build", "document_render", "document_images"]) {
+        expect(seenBy.section).toContain(`### \`${name}\``);
       }
-      for (const name of ["send_image", "send_file"]) expect(seenBy.descriptions[name]).not.toContain("Codemode:");
-      for (const name of ["document_inspect", "document_patch", "document_compose", "document_build", "document_render", "document_images"]) {
-        expect(seenBy.descriptions.codemode).toContain(name);
-      }
+      expect(seenBy.section).not.toContain("not listed");
+      expect(seenBy.section).not.toContain("send_image"); expect(seenBy.section).not.toContain("send_file");
       expect(seenBy.descriptions.codemode).not.toContain("send_file");
     } finally { await group.opened.close(); }
   });
@@ -210,9 +216,9 @@ describe("Durable group registry", () => {
       const prompt = await turn(group, alice);
       expect(prompt.prompt).not.toContain(documentWork.prompt);
       expect(prompt.prompt).not.toContain("<skills>");
-      // Known since D2-3 (contract 2.4): the codemode description comes from the registry, so it still lists the
-      // deselected module's tools; scripts cannot call them (above).
-      expect(prompt.descriptions.codemode).toContain("document_inspect");
+      // The official section is built from the conversation's callable tools each turn (the old description came from
+      // the registry and still listed a deselected module's tools).
+      expect(prompt.section).toContain("### `document_extract`"); expect(prompt.section).not.toContain("document_inspect");
     } finally { await group.opened.close(); }
   });
 

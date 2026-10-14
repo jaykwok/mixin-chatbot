@@ -12,6 +12,8 @@ export type ProjectionCheckpoint = {
   version: 1;
   links: Record<string, { through: number; entryId?: number; interrupted?: boolean }>;
   orphans: Record<string, StatsRecord>;
+  /** Last independently charged nested usage receipt. Committed with the bill, never the parent result. */
+  nestedThrough?: number;
   retiring?: Retirement;
 };
 export const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");

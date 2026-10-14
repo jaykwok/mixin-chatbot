@@ -47,6 +47,7 @@ const groups: { label: string; description: string; options: RuntimeOption[] }[]
     { key: "BOT_DOCUMENT_ENV", label: "共享文档环境覆盖", empty: "每群独立 venv", description: "留空时每群独立使用 <群目录>/venv，首次按需 uv sync。填写路径会让所有群改用同一个环境；通常保持默认。Linux 填容器内路径。" },
     { key: "BOT_DOCUMENT_PPTX_TEMPLATE", label: "默认 PPT 模板", empty: "内置版式", description: "生成 PPT 未指定模板时套用，支持 .pptx/.potx。相对路径在各群 workspace 中查找，某群没有该文件时用内置版式；绝对路径所有群共用，Linux 填容器内路径。应用后重启生效。" },
     { key: "BOT_DOCUMENT_DOCX_TEMPLATE", label: "默认 Word 模板", empty: "内置版式", description: "生成 Word 未指定模板时套用，支持 .docx/.dotx。相对路径在各群 workspace 中查找，某群没有该文件时用内置版式；绝对路径所有群共用，Linux 填容器内路径。应用后重启生效。" },
+    { key: "BOT_DOCUMENT_OFFICE_PATH", label: "LibreOffice 程序路径", empty: "自动查找", description: "Word/PPT 预览和页面截图使用。填程序的绝对路径，例如 C:/Program Files/LibreOffice/program/soffice.exe 或 /usr/bin/soffice，不填目录、引号或参数。Linux 隔离任务填任务容器内路径。留空先查 PATH，Windows 再查标准安装目录；指定路径无效时会报错。应用后重启生效。" },
     { key: "BOT_DEBUG", label: "机器人详细日志", description: "开启后机器人日志会记录用户消息正文，分享前请脱敏。与 Cloudflared 日志分别控制。", choices: [
       { value: "0", label: "关闭" }, { value: "1", label: "开启" },
     ] },

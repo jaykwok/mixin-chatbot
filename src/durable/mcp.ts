@@ -6,7 +6,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { McpTools } from "../integrations/mcp.ts";
 import type { RequestDoor } from "./door.ts";
 import { resolveMember, type BaseToolsOptions, type MemberTool } from "./tools.ts";
-import { SubCallFiles, resultsDirName } from "./codemode/results.ts";
+import { ResultFiles, resultsDirName } from "./results/files.ts";
 import { resultRegistration } from "./results/ownership.ts";
 
 export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, door: RequestDoor): MemberTool[] {
@@ -31,7 +31,7 @@ export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, doo
         call.signal.throwIfAborted();
         const content = toLlmContent(result);
         const directoryName = resultsDirName(call.api.taskId as number, `mcp-${call.callId}`);
-        const files = new SubCallFiles(places.tempDir, directoryName, resultRegistration(call.api, call.context, phone, directoryName));
+        const files = new ResultFiles(places.tempDir, directoryName, resultRegistration(call.api, call.context, phone, directoryName));
         try {
           let image = 0;
           const text = content.filter(item => item.type === "text").map(item => item.text).join("\n");
@@ -50,7 +50,7 @@ export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, doo
           }
           if ((await files.recheck()).size) throw new Error("MCP 结果目录变化，结果路径已撤回");
           return { content, details: { server: entry.server.name, tool: entry.tool.name },
-            ...(result.structuredContent ? { structuredContent: copyJson(result.structuredContent) } : {}), ...(result.isError ? { isError: true } : {}) };
+            ...(result.structuredContent !== undefined ? { structuredContent: copyJson(result.structuredContent) } : {}), ...(result.isError ? { isError: true } : {}) };
         } finally { await files.release(); }
       },
     } satisfies MemberTool;

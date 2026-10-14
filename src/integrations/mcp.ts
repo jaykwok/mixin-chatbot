@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { McpClient, StdioTransport, StreamableHttpTransport, type AuthProvider, type CallToolResult, type McpTransport, type Tool } from "@earendil-works/pi-mcp";
+import { McpClient, StdioTransport, StreamableHttpTransport, type AuthProvider, type CallToolResult, type McpTransport, type McpTransportSendOptions, type Tool } from "@earendil-works/pi-mcp";
 import type { McpConfig, McpServerConfig } from "../core/mcp-config.ts";
 import { mcpOAuth } from "./mcp-oauth.ts";
 
@@ -92,10 +92,18 @@ export class McpTools {
       const transport = new StdioTransport({ command: process.execPath, args: [supervisor, "--stdio", server.command!, ...server.args ?? []],
         cwd: member?.tempDir ?? this.discoveryDir, env, inheritEnv: false, maxMessageBytes: 8 * 1024 * 1024, maxStderrBytes: 65536, closeTimeoutMs: 2000 });
       return new Proxy(transport, { get: (target, property) => {
-        if (property === "send") return (message: Parameters<McpTransport["send"]>[0]) => {
+        // A tools/call waits for the request door. pi-mcp aborts the send signal once the request ended (answered, timed
+        // out or cancelled); StdioTransport.send ignores it, so the gate waits on it too and, when it lets the call
+        // through, sends nothing for a request that ended meanwhile.
+        if (property === "send") return (message: Parameters<McpTransport["send"]>[0], options?: McpTransportSendOptions) => {
           const scope = this.#scope.getStore();
-          return "method" in message && message.method === "tools/call" && scope?.gate
-            ? scope.gate(() => target.send(message), scope.signal) : target.send(message);
+          if (!("method" in message && message.method === "tools/call" && scope?.gate)) return target.send(message);
+          const ended = options?.signal;
+          return scope.gate(async () => {
+            ended?.throwIfAborted();
+            scope.signal.throwIfAborted();
+            return target.send(message);
+          }, ended ? AbortSignal.any([scope.signal, ended]) : scope.signal);
         };
         const value = Reflect.get(target, property, target);
         return typeof value === "function" ? value.bind(target) : value;

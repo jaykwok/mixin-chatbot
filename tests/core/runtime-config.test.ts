@@ -52,6 +52,23 @@ test("runtime settings retain previous values and validate explicit overrides", 
   } finally { await fixture.cleanup(); }
 });
 
+test("LibreOffice program path is absolute and survives runtime settings persistence", async () => {
+  const fixture = await tempFixture("runtime-office-");
+  const path = join(fixture.root, "runtime.json"), program = join(fixture.root, "Office files", "soffice.exe");
+  try {
+    for (const value of [program, "/usr/bin/soffice", "/opt/libreoffice/program/soffice"]) {
+      expect(validateRuntimeConfig({ BOT_DOCUMENT_OFFICE_PATH: value })).toHaveProperty("BOT_DOCUMENT_OFFICE_PATH", value);
+    }
+    for (const value of ["soffice", "Office/program/soffice", '"' + program + '"', "", program + "\n--headless"]) {
+      expect(() => validateRuntimeConfig({ BOT_DOCUMENT_OFFICE_PATH: value })).toThrow();
+    }
+    await saveRuntimeSettings(path, { BOT_DOCUMENT_OFFICE_PATH: program });
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ BOT_DOCUMENT_OFFICE_PATH: program });
+    await saveRuntimeSettings(path, { BOT_DEBUG: "1" });
+    expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_DOCUMENT_OFFICE_PATH", program);
+  } finally { await fixture.cleanup(); }
+});
+
 async function withWindowsReadLock(path: string, task: (release: () => Promise<void>) => Promise<void>): Promise<void> {
   const child = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", `
 $ErrorActionPreference = 'Stop'

@@ -4,7 +4,7 @@ import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import type { AuxiliaryConfig } from "../core/auxiliary-config.ts";
 import type { RequestDoor } from "./door.ts";
 import { resultRegistration } from "./results/ownership.ts";
-import { SubCallFiles, resultsDirName } from "./codemode/results.ts";
+import { ResultFiles, resultsDirName } from "./results/files.ts";
 import { resolveMember, type BaseToolsOptions, type MemberCall, type MemberTool } from "./tools.ts";
 
 /** One instance per service, shared by all groups; queued calls are bounded and abort without a request. */
@@ -108,7 +108,7 @@ export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoo
       if (result.stopReason !== "stop") return { content: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, details: undefined };
       await mkdir(places.tempDir, { recursive: true });
       const name = resultsDirName(call.api.taskId as number, `image-${call.callId}`);
-      const files = new SubCallFiles(places.tempDir, name, resultRegistration(call.api, call.context, phone, name));
+      const files = new ResultFiles(places.tempDir, name, resultRegistration(call.api, call.context, phone, name));
       try {
         const content: ({ type: "text"; text: string } | ImageContent)[] = [];
         let index = 0;

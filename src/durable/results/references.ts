@@ -1,7 +1,7 @@
 // Whether a result directory is still referenced by any context, fork or pending delivery of the group.
 import { resolve, sep } from "node:path";
 import { ReferenceText } from "../../core/reference-text.ts";
-import { resultsRoot } from "../codemode/results.ts";
+import { resultsRoot } from "./files.ts";
 
 const fold = (value: string) => process.platform === "win32" ? value.toLowerCase() : value;
 

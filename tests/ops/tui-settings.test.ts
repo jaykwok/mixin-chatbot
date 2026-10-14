@@ -303,6 +303,45 @@ test("默认 PPT/Word 模板按扩展名校验，留空恢复内置版式", asyn
   } finally { view.onLeave(); read.mockRestore(); write.mockRestore(); discard.mockRestore(); run.mockRestore(); }
 });
 
+test("LibreOffice 程序路径可编辑保存，留空恢复自动查找", async () => {
+  const { app, choices, answers, messages } = stub(), view = new SettingsView();
+  const program = join(process.cwd(), "Office files", "soffice.exe");
+  const read = spyOn(data, "loadRuntimeSettings").mockResolvedValue(snapshot);
+  const write = spyOn(settings, "writeRuntimeDraft").mockResolvedValue("office-draft");
+  const discard = spyOn(settings, "discardRuntimeDraft").mockResolvedValue();
+  const run = spyOn(app, "run").mockResolvedValue(0);
+  try {
+    const enterOffice = async (target: SettingsView) => {
+      await target.onKey(key("a"), app); await target.refresh(app);
+      await target.onKey(key("end"), app); await target.onKey(key("enter"), app);
+      for (let i = 0; i < 4; i++) await target.onKey(key("down"), app);
+    };
+    await enterOffice(view);
+    expect(plain(view.render(ctx()))).toContain("LibreOffice 程序路径");
+    expect(plain(view.render(ctx()))).toContain("自动查找（默认）");
+    choices.push("edit"); answers.push("soffice");
+    await view.onKey(key("enter"), app);
+    expect(messages.at(-1)).toContain("绝对路径");
+    expect(view.hasUnsavedChanges()).toBe(false);
+    choices.push("edit"); answers.push(program);
+    await view.onKey(key("enter"), app);
+    expect(view.hasUnsavedChanges()).toBe(true);
+    await view.onKey(key("s"), app);
+    expect(write.mock.calls[0]!.slice(0, 2)).toEqual([snapshot, { BOT_DOCUMENT_OFFICE_PATH: program }]);
+    view.onLeave();
+    const saved = { hash: "a".repeat(64), values: { BOT_DOCUMENT_OFFICE_PATH: program } };
+    read.mockResolvedValue(saved);
+    const reset = new SettingsView();
+    await enterOffice(reset);
+    choices.push("edit"); answers.push("  ");
+    await reset.onKey(key("enter"), app);
+    expect(plain(reset.render(ctx()))).toContain("自动查找（待保存）");
+    await reset.onKey(key("s"), app);
+    expect(write.mock.calls[1]!.slice(0, 2)).toEqual([saved, { BOT_DOCUMENT_OFFICE_PATH: null }]);
+    reset.onLeave();
+  } finally { view.onLeave(); read.mockRestore(); write.mockRestore(); discard.mockRestore(); run.mockRestore(); }
+});
+
 test("分类、默认值和开关在宽窄窗口完整可达；退出 TUI 前提醒未保存草稿", async () => {
   const { app, choices } = stub(), view = new SettingsView(), tty = terminal();
   const read = spyOn(data, "loadRuntimeSettings").mockResolvedValue({ hash: null, values: { BOT_DEBUG: "1" } });

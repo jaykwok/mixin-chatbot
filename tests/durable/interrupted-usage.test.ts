@@ -7,6 +7,7 @@ import type { EntryRecord, Harness } from "@earendil-works/pi-durable";
 import { dayKey, ingestConversationRecords, openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { type AttemptStart, AttemptsDoc, NOT_SENT, type UsageRecord } from "../../src/durable/attempts.ts";
 import { AuxiliaryDoc } from "../../src/durable/auxiliary-records.ts";
+import { NestedUsageDoc } from "../../src/durable/codemode/usage.ts";
 import { conversationSource, LegacyImportDoc, projectConversation } from "../../src/durable/projection.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -44,7 +45,8 @@ function world(starts: Record<string, AttemptStart>, entries: EntryRecord[], flo
   const reads: number[] = [], ledger = openStatsLedger(join(fixture.root, `root-${++counter}`));
   const harness = {
     async commit(work: (tx: unknown) => unknown) { return work({
-      doc: async (doc: unknown) => doc === AttemptsDoc ? { starts } : { starts: {} },
+      doc: async (doc: unknown) => doc === AttemptsDoc ? { starts }
+        : doc === NestedUsageDoc ? { sequence: 0, receipts: {} } : { starts: {} },
       task: async () => ({ state: { status: "running" }, conversationId: 1 }),
       scanEntries: async (filter: { minEntryId: number }) => {
         reads.push(filter.minEntryId); return { items: entries.filter(entry => entry.id >= filter.minEntryId) };

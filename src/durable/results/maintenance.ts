@@ -16,7 +16,7 @@ import { join } from "node:path";
 import type { ResultOwnership } from "../../contracts/maintenance.ts";
 import type { ReferenceText } from "../../core/reference-text.ts";
 import { configuredRootlessTasks } from "../../core/task-backend.ts";
-import { removeCodemodeResults } from "../codemode/results.ts";
+import { removeResultDirectories } from "./files.ts";
 import { RESULT_PRESSURE, ResultsDoc } from "./ownership.ts";
 import { handoffResults, reclamationBatch, ReclamationItems, ReclamationQueues, settleReclamation } from "./queue.ts";
 import { referencedResults } from "./references.ts";
@@ -91,7 +91,7 @@ export class ResultMaintenance {
   /** Step 2: each expiry is committed before its removal; failures record their retry delay. Returns the removed names. */
   async #removeDue(harness: Harness, tempDir: string, due: ReturnType<typeof dueResults>, protectedNames: ReadonlySet<string>): Promise<string[]> {
     const context = this.options.context;
-    return removeCodemodeResults(tempDir, Infinity, { isolated: due.isolated, registered: new Set(due.eligible), protected: protectedNames,
+    return removeResultDirectories(tempDir, Infinity, { isolated: due.isolated, registered: new Set(due.eligible), protected: protectedNames,
       expire: async expired => { await harness.commit(async tx => {
         const records = (await tx.doc(ResultsDoc)).calls;
         for (const name of expired) if (records[name]) records[name].expiryRequestedAt ??= Date.now();
@@ -107,7 +107,9 @@ export class ResultMaintenance {
   async #reconcileRemoved(calls: Readonly<Record<string, ResultOwnership>>, tempDir: string, names: readonly string[], removed: string[]): Promise<void> {
     if (process.platform === "linux") return; // An absent shared name does not prove physical deletion.
     for (const name of names) {
-      if (!/^\d+-[A-Za-z0-9_.-]+$/.test(name) || calls[name]!.expiryRequestedAt === undefined || calls[name]!.expiredAt !== undefined || removed.includes(name)) continue;
+      // An isolated result is never under `codemode/`: its task's receipt says whether it is gone (step 2).
+      if (!/^\d+-[A-Za-z0-9_.-]+$/.test(name) || calls[name]!.isolatedTask !== undefined || calls[name]!.expiryRequestedAt === undefined
+        || calls[name]!.expiredAt !== undefined || removed.includes(name)) continue;
       try { await lstat(join(tempDir, "codemode", name)); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") removed.push(name); else throw error; }
     }
@@ -131,7 +133,7 @@ export class ResultMaintenance {
       const protectedNames = referencedResults(tempDir, [item.name], references, isolated);
       let removed = false, retry: ResultOwnership["reclamation"];
       if (!protectedNames.size && (item.call.reclamation?.nextAttemptAt ?? 0) <= Date.now()) {
-        const outcome = await removeCodemodeResults(tempDir, Infinity, { isolated, registered: new Set([item.name]), protected: protectedNames,
+        const outcome = await removeResultDirectories(tempDir, Infinity, { isolated, registered: new Set([item.name]), protected: protectedNames,
           expire: async () => {}, record: async results => {
             const result = results.find(result => result.name === item.name);
             if (result && result.status !== "removed") retry = retryRecord(result.status, result, Date.now());

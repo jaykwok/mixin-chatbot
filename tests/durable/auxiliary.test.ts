@@ -9,7 +9,7 @@ import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { AuxiliaryBudget, auxiliaryMemberTools } from "../../src/durable/auxiliary.ts";
 import { AuxiliaryDoc } from "../../src/durable/auxiliary-records.ts";
 import { codemodeExtension } from "../../src/durable/codemode/index.ts";
-import { removeCodemodeResults } from "../../src/durable/codemode/results.ts";
+import { removeResultDirectories } from "../../src/durable/results/files.ts";
 import { claimGroup, memberConversation } from "../../src/durable/identity.ts";
 import { groupDoor } from "../../src/durable/models.ts";
 import { projectConversation } from "../../src/durable/projection.ts";
@@ -54,7 +54,7 @@ async function setup(options: { credentials?: boolean; vision?: boolean; budget?
   });
   const registry = createRegistry(); registry.install(door.extension());
   registry.install(defineExtension({ name: "mixin.auxiliary", tools: tools.map(memberRegistration) }));
-  registry.install(codemodeExtension({ members, tools: tools.map(tool => ({ extension: "mixin.auxiliary", tool })) }));
+  registry.install(codemodeExtension({ members, tools }));
   const view = door.wrap(models), path = join(f.root, `db-${n}.sqlite`);
   const harness = await Harness.open(await openGroupStorage(path), { registry, models: view, settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);
   holder.harness = harness; await claimGroup(harness, "group-a", context);
@@ -105,10 +105,10 @@ test.each(process.platform === "linux" ? [false, true] : [false])("native auxili
     if (isolated) expect(mapping.size).toBe(1);
     const tempDir = memberPlaces(g.members, g.members.groupId, "alice").tempDir;
     const policy = { registered: new Set(names), protected: new Set(names), isolated: mapping, expire: async () => {} };
-    expect(await removeCodemodeResults(tempDir, Infinity, policy)).toEqual([]);
+    expect(await removeResultDirectories(tempDir, Infinity, policy)).toEqual([]);
     expect(await readFile(imagePath)).toEqual(Buffer.from(PNG, "base64"));
     policy.protected.clear();
-    expect(await removeCodemodeResults(tempDir, Infinity, policy)).toEqual(process.platform === "linux" && !isolated ? [] : names);
+    expect(await removeResultDirectories(tempDir, Infinity, policy)).toEqual(process.platform === "linux" && !isolated ? [] : names);
     if (runtime) for (const id of mapping.values()) expect((await runtime.backend.describe(id, tempDir)).phase).toBe("removed");
     if (isolated) expect((await g.harness.snapshot(ResultsDoc, context))!.calls["999999-protected"]!.phone).toBe("protected-member");
     expect(g.reports).toEqual([]);
@@ -205,11 +205,20 @@ test("shared auxiliary budget bounds active work; a queued cancellation sends no
 
 test("codemode calls the same bounded model tool and does not add its usage to the parent again", async () => {
   const g = await setup();
+  const ledger = openStatsLedger(g.root);
   try {
     const value = await invoke(g, g.conversation, "codemode", { code: 'return await tools.document_route({text:"fixture"});' });
     expect(value.isError).toBe(false); expect(JSON.stringify(value.content)).toContain("ocr");
     expect(value.usage).toBeUndefined(); expect(g.state.classifications).toBe(1); expect(await receipts(g)).toHaveLength(1);
-  } finally { await g.close(); }
+    const identity = { groupId: "group-a", phone: "alice", conversationId: g.conversation.id };
+    for (let repeat = 0; repeat < 2; repeat++) {
+      await projectConversation(ledger, g.harness, identity, context);
+      const rows = readLedger(ledger).usage;
+      expect(rows.filter(row => row.kind === "tool")).toEqual([]);
+      expect(rows.filter(row => row.kind === "auxiliary").map(row => ({ requests: row.requests, cost: row.cost })))
+        .toEqual([{ requests: 1, cost: .02 }]);
+    }
+  } finally { ledger.close(); await g.close(); }
 });
 
 test("finishing codemode cancels an unawaited auxiliary child while the parent conversation remains live", async () => {
@@ -227,9 +236,9 @@ test("finishing codemode cancels an unawaited auxiliary child while the parent c
     const value = await invoke(g, g.conversation, "codemode", { code:
       'void tools.document_route({text:"fixture"}).catch(() => {}); await tools.wait_for_auxiliary_start({}); return "finished";' });
     expect(value.isError).toBe(false); expect(cancelled).toBe(true);
-    expect(value.details).toMatchObject({ complete: true, calls: [
+    expect(value.details).toMatchObject({ calls: [
       { name: "document_route", status: "cancelled" }, { name: "wait_for_auxiliary_start", status: "ok" },
-    ] });
+    ] }); expect((value.details as { partial?: true }).partial).toBeUndefined();
     expect(g.state.classifications).toBe(1);
     expect(await receipts(g)).toMatchObject([{ outcome: "aborted" }]);
     expect((await receipts(g))[0]!.usage).toBeUndefined(); expect(g.reports).toEqual([]);

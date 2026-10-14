@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { removeCodemodeResults } from "../../src/durable/codemode/results.ts";
+import { removeResultDirectories } from "../../src/durable/results/files.ts";
 import { junctionInPlace } from "../helpers/junction-in-place.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -21,7 +21,7 @@ for (const level of ["parent", "call"] as const) for (const replacement of ["lin
       await mkdir(join(sentinel, ".."), { recursive: true });
       await writeFile(join(call, "index.txt"), "owned result"); await writeFile(sentinel, "keep");
       let swapped = false;
-      const removed = await removeCodemodeResults(member, Infinity, {
+      const removed = await removeResultDirectories(member, Infinity, {
         registered: new Set([name]), protected: new Set(),
         expire: async () => {
           try { await rename(attacked, moved); }
@@ -54,12 +54,12 @@ test("cleanup removes nested owned files and links themselves, preserves unregis
   try {
     const member = join(fixture.root, "member"), root = join(member, "codemode"), outside = join(fixture.root, "unrelated");
     const call = join(root, name), sentinel = join(outside, "keep.txt");
-    expect(await removeCodemodeResults(member, Infinity)).toEqual([]); expect(existsSync(member)).toBe(false);
+    expect(await removeResultDirectories(member, Infinity)).toEqual([]); expect(existsSync(member)).toBe(false);
     for (const path of [join(call, "nested", "deeper"), join(root, "43-protected"), join(root, "44-unknown"), outside]) await mkdir(path, { recursive: true });
     await writeFile(sentinel, "keep"); await writeFile(join(call, "nested", "deeper", "owned.txt"), "owned");
     await link(outside, join(call, "nested", "link")); await link(outside, join(root, "45-link"));
     const expired: string[] = [];
-    expect(await removeCodemodeResults(member, Infinity, {
+    expect(await removeResultDirectories(member, Infinity, {
       registered: new Set([name, "43-protected", "45-link"]), protected: new Set(["43-protected"]),
       expire: async (names) => { expired.push(...names); },
     })).toEqual(process.platform === "linux" ? [] : [name]);
@@ -68,7 +68,7 @@ test("cleanup removes nested owned files and links themselves, preserves unregis
     for (const remaining of ["43-protected", "44-unknown", "45-link"]) expect(existsSync(join(root, remaining))).toBe(true);
     expect(await readFile(sentinel, "utf8")).toBe("keep");
     await rename(root, join(member, "old")); await link(outside, root);
-    expect(await removeCodemodeResults(member, Infinity)).toEqual([]); expect(await readFile(sentinel, "utf8")).toBe("keep");
+    expect(await removeResultDirectories(member, Infinity)).toEqual([]); expect(await readFile(sentinel, "utf8")).toBe("keep");
   } finally { await fixture.cleanup(); }
 });
 
@@ -76,7 +76,7 @@ test.skipIf(process.platform !== "linux")("missing shared names keep logical exp
   const fixture = await tempFixture("cleanup-missing-");
   try {
     const expired: string[] = [], records: { name: string; status: string; reason?: string }[] = [];
-    expect(await removeCodemodeResults(fixture.root, Infinity, {
+    expect(await removeResultDirectories(fixture.root, Infinity, {
       registered: new Set([name, "43-protected"]), protected: new Set(["43-protected"]),
       expire: async names => { expired.push(...names); }, record: async rows => { records.push(...rows); },
     })).toEqual([]);
@@ -90,11 +90,11 @@ test("failed expiry leaves all bytes intact and releases handles for a retry", a
   try {
     const call = join(fixture.root, "codemode", name); await mkdir(call, { recursive: true });
     await writeFile(join(call, "index.txt"), "owned");
-    await expect(removeCodemodeResults(fixture.root, Infinity, {
+    await expect(removeResultDirectories(fixture.root, Infinity, {
       registered: new Set([name]), protected: new Set(), expire: async () => { throw new Error("receipt failed"); },
     })).rejects.toThrow("receipt failed");
     expect(await readFile(join(call, "index.txt"), "utf8")).toBe("owned");
-    expect(await removeCodemodeResults(fixture.root, Infinity)).toEqual(process.platform === "linux" ? [] : [name]);
+    expect(await removeResultDirectories(fixture.root, Infinity)).toEqual(process.platform === "linux" ? [] : [name]);
   } finally { await fixture.cleanup(); }
 });
 
@@ -104,13 +104,13 @@ test.skipIf(process.platform !== "win32")("cleanup refuses an empty held call ma
     const call = join(fixture.root, "codemode", name), outside = join(fixture.root, "unrelated");
     await mkdir(call, { recursive: true }); await mkdir(outside);
     await writeFile(join(call, "index.txt"), "owned"); await writeFile(join(outside, "keep.txt"), "keep");
-    await expect(removeCodemodeResults(fixture.root, Infinity, {
+    await expect(removeResultDirectories(fixture.root, Infinity, {
       registered: new Set([name]), protected: new Set(), expire: async () => {
         await unlink(join(call, "index.txt"));
         expect(junctionInPlace(call, outside)).toEqual({ set: true });
       },
     })).rejects.toThrow("its directory was made a link");
     expect(await readFile(join(outside, "keep.txt"), "utf8")).toBe("keep");
-    expect(await removeCodemodeResults(fixture.root, Infinity)).toEqual([]);
+    expect(await removeResultDirectories(fixture.root, Infinity)).toEqual([]);
   } finally { await fixture.cleanup(); }
 });

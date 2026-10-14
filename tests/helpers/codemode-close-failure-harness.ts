@@ -32,7 +32,7 @@ mock.module("node:fs/promises", () => ({ ...actual,
     });
   },
 }));
-const { holdDirectory } = await import("../../src/durable/codemode/directory.ts");
+const { holdDirectory } = await import("../../src/core/held-directory.ts");
 
 /** Paths in the fixture that descriptors of this process name. */
 async function openInFixture(): Promise<string[]> {

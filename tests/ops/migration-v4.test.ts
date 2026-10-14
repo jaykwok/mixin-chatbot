@@ -36,7 +36,8 @@ test("v4 previews the effective retry budget, preserves per-model compaction and
   try {
     const original = await readFile(f.settingsPath), bill = await readFile(f.bill);
     const plan = (await preview(f.context)).plan!;
-    expect(plan.target).toBe(4); expect(DATA_VERSION).toBe(4);
+    // v4 and v5 (no group database here: v5 copies nothing).
+    expect(plan.target).toBe(5); expect(DATA_VERSION).toBe(5);
     expect(plan.steps.join("\n")).toContain("retry、cacheWarming、enableSkillCommands");
     expect(await readFile(f.settingsPath)).toEqual(original);
     await apply(f.context, plan);

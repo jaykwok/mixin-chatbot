@@ -1,24 +1,24 @@
-// D23-R2-1, D23-R3-2, D23-R3-3: codemode result files go only into the call directory that was checked, whatever
-// another writer with the member's rights does to its path meanwhile, and a result names only paths that still name
-// what was written, in the member's real tmp. The interleavings run in a child process
-// (tests/helpers/codemode-path-race-harness.ts): at the first index open, before each kind of file's temporary file
-// (sub-call text, JSON and image; the script's full output and its own image), before the rename, before a failed
-// save's cleanup, between making a directory and holding it, between two index lines, and between the output files,
-// the call directory (or `codemode/`) is renamed or removed and a junction (a symlink on Linux) to Bob's tmp put in its
-// place, moved into Bob's tmp and linked back (on Linux also the full output file alone), or (Windows) made a junction
-// in place. The full output is also removed once saved, and its write made to fail (a full disk, permission denied).
+// D23-R2-1, D23-R3-2, D23-R3-3: codemode result files (the official codemode's full output `output.txt` and images
+// `image-<k>.<ext>`) go only into the call directory that was checked, whatever another writer with the member's
+// rights does to its path meanwhile, and a result names only paths that still name what was written, in the member's
+// real tmp. The interleavings run in a child process (tests/helpers/codemode-path-race-harness.ts): before each kind of
+// file's temporary file, before the rename, before a failed save's cleanup, between making a directory and holding it,
+// and between the output files, the call directory (or `codemode/`) is renamed or removed and a junction (a symlink on
+// Linux) to Bob's tmp put in its place, moved into Bob's tmp and linked back (on Linux also the full output file alone),
+// or (Windows) made a junction in place. The full output is also removed once saved, and its write made to fail (a
+// full disk, permission denied).
 //
 // Everywhere: Bob's tmp is unchanged, every path the result gives out names what was written there, in Alice's real
 // tmp, and no temporary file is left. Once the directory is held, Windows refuses renames and removals (the call goes
 // on as normal) and, while it is empty, lets it become a junction in place, which no write then goes through; Linux
-// lets the swaps happen, the files go on into the moved directory, and the call fails closed where it would have given
-// out a path. A swap before the directory is held is refused by the hold on both.
+// lets the swaps happen, the files go on into the moved directory, and the result withdraws every path it would have
+// given out. A swap before the directory is held is refused by the hold on both.
 import { test } from "bun:test";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
 import { mkdir, readdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type HeldDirectory, holdDirectory } from "../../src/durable/codemode/directory.ts";
+import { type HeldDirectory, holdDirectory } from "../../src/core/held-directory.ts";
 import { junctionInPlace } from "../helpers/junction-in-place.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { type HandleEvent, WindowsHandles } from "../../src/core/windows-handles.ts";
@@ -30,7 +30,6 @@ type Observed = {
   last: string;
   texts: string[];
   aliceTmp: string;
-  index: boolean;
   fullOutputPath: boolean;
   bobChanges: string[];
   pathProblems: string[];
@@ -39,121 +38,86 @@ type Observed = {
   movedEntries?: string[];
 };
 
-const NOT_STARTED = "Tool probe_long was not started: the call could not be recorded (";
 const GONE = "no longer names what this call wrote there (moved or replaced): results are only written inside the caller's tmp";
 const LINKED = "is a link or not a directory: results are only written inside the caller's tmp";
 const MADE_LINK = "its directory was made a link (NTSTATUS 0xc0000280): results are only written inside the caller's tmp";
 const NO_FULL_OUTPUT = "[Could not save the full output: ";
+const NO_IMAGE = "[Image (image/gif, 42 bytes) could not be saved: ";
 
 /** What a scenario shows on one system: the other writer's outcomes, the result, what is in the moved directory. */
 type Outcome = { attacks: string[]; result: (o: Observed) => void; moved?: string[] };
-const subCall = (o: Observed) => { expect(o.last).toBe("400"); expect(o.index).toBe(true); };
-const notStarted = (why: string) => (o: Observed) => { expect(o.last).toStartWith(NOT_STARTED); expect(o.last).toContain(why); expect(o.index).toBe(false); };
-const fullOutput = (o: Observed) => { expect(o.texts[0]).toContain("[Full output: "); expect(o.fullOutputPath).toBe(true); };
+const all = (o: Observed) => o.texts.join("\n");
+const fullOutput = (o: Observed) => { expect(all(o)).toContain("[Full output: "); expect(o.fullOutputPath).toBe(true); };
 const noFullOutput = (why: string) => (o: Observed) => {
-  expect(o.texts[0]).toContain(`${NO_FULL_OUTPUT}`);
-  expect(o.texts[0]).toContain(why);
-  expect(o.texts[0]).not.toContain("[Full output: ");
+  expect(all(o)).toContain(`${NO_FULL_OUTPUT}`);
+  expect(all(o)).toContain(why);
+  expect(all(o)).not.toContain("[Full output: ");
   expect(o.fullOutputPath).toBe(false);
 };
-const notRecorded = (o: Observed) => {
-  expect(o.last).toStartWith("The result of probe_attack could not be recorded: ");
-  expect(o.last).toContain(`index.txt ${GONE}`);
-  expect(o.index).toBe(false);
+const imageSaved = (o: Observed) => expect(all(o)).toMatch(/\[Image saved to .+image-1\.gif \(image\/gif, 42 bytes\)\]/);
+const noImage = (why: string) => (o: Observed) => {
+  expect(all(o)).toContain(`${NO_IMAGE}`);
+  expect(all(o)).toContain(why);
+  expect(all(o)).not.toContain("[Image saved to ");
 };
+const both = (...checks: ((o: Observed) => void)[]) => (o: Observed) => { for (const check of checks) check(o); };
 /**
  * The full output's write failed with `code` (injected): the result says so with the entry's path below Alice's tmp
  * (Windows: the open by path after the create; Linux: the create through /proc/self/fd, which is never shown).
  */
 const failedWrite = (code: string, platform: "win32" | "linux"): Outcome => ({ attacks: ["failed"], result: (o) => {
   noFullOutput(code)(o);
-  expect(o.texts[0]).toContain(`${NO_FULL_OUTPUT}could not ${platform === "win32" ? "open" : "create"} ${o.aliceTmp}`);
-  expect(o.texts[0]).not.toContain("/proc/self/fd");
+  expect(all(o)).toContain(`${NO_FULL_OUTPUT}could not ${platform === "win32" ? "open" : "create"} ${o.aliceTmp}`);
+  expect(all(o)).not.toContain("/proc/self/fd");
 } });
 const BUSY = ["refused:EBUSY"];
 /** The held directory holds a file of the call: NTFS refuses to make it a junction (ERROR_DIR_NOT_EMPTY). */
 const NOT_EMPTY = ["refused:145"];
 
 const expected: Record<string, Partial<Record<"win32" | "linux", Outcome>>> = {
-  "control: every kind of file": {
-    // The index, the full output, the image and the three sub-call files (text, JSON, image) named in the index.
-    win32: { attacks: [], result: (o) => expect([o.isError, o.index, o.fullOutputPath, o.pathsChecked]).toEqual([false, true, true, 6]) },
-    linux: { attacks: [], result: (o) => expect([o.isError, o.index, o.fullOutputPath, o.pathsChecked]).toEqual([false, true, true, 6]) },
+  "control: full output and image": {
+    // A nested call's value goes to the script only; the full output and the image are the call's files.
+    win32: { attacks: [], result: (o) => expect([o.isError, o.fullOutputPath, o.pathsChecked]).toEqual([false, true, 2]) },
+    linux: { attacks: [], result: (o) => expect([o.isError, o.fullOutputPath, o.pathsChecked]).toEqual([false, true, 2]) },
   },
-  "index first open: call directory renamed": {
-    win32: { attacks: BUSY, result: subCall },
-    linux: { attacks: ["done"], result: notStarted(`index.txt ${GONE}`), moved: ["index.txt"] },
+  "first file: call directory renamed before its temporary file": {
+    win32: { attacks: BUSY, result: fullOutput },
+    linux: { attacks: ["done"], result: noFullOutput(`output.txt ${GONE}`), moved: ["output.txt"] },
   },
-  "index first open: call directory removed": {
-    // Windows: the index is already created and held, so the removal stops at it.
-    win32: { attacks: BUSY, result: subCall },
+  "first file: call directory removed before its temporary file": {
+    win32: { attacks: BUSY, result: fullOutput },
     // The held directory was removed: nothing can be created in it.
-    linux: { attacks: ["done"], result: notStarted("index.txt: ENOENT") },
+    linux: { attacks: ["done"], result: noFullOutput(".tmp: ENOENT") },
   },
-  "index first open: codemode/ renamed": {
-    win32: { attacks: BUSY, result: subCall },
-    linux: { attacks: ["done"], result: notStarted(`index.txt ${GONE}`), moved: ["index.txt"] },
+  "first file: codemode/ renamed before its temporary file": {
+    win32: { attacks: BUSY, result: fullOutput },
+    linux: { attacks: ["done"], result: noFullOutput(`output.txt ${GONE}`), moved: ["output.txt"] },
   },
   "call directory swapped after mkdir, before it is held": {
-    linux: { attacks: ["done"], result: notStarted(LINKED) },
+    linux: { attacks: ["done"], result: noFullOutput(LINKED), moved: [] },
   },
   "codemode/ swapped after mkdir, before it is held": {
-    linux: { attacks: ["done"], result: notStarted(LINKED) },
+    linux: { attacks: ["done"], result: noFullOutput(`codemode ${LINKED}`), moved: [] },
   },
   "codemode/ made a junction in place before it is held": {
-    win32: { attacks: ["done"], result: notStarted(`codemode ${LINKED}`) },
-  },
-  "index first create: empty call directory made a junction in place": {
-    win32: { attacks: ["done"], result: notStarted(`index.txt: ${MADE_LINK}`) },
+    win32: { attacks: ["done"], result: noFullOutput(`codemode ${LINKED}`) },
   },
   "output-only full text: empty call directory made a junction in place": {
     win32: { attacks: ["done"], result: noFullOutput(MADE_LINK) },
   },
   "standalone image: empty call directory made a junction in place": {
     win32: { attacks: ["done"], result: (o) => {
-      expect(o.texts[0]).toStartWith("[Image (image/gif, 42B) could not be saved: could not create ");
+      expect(o.texts[0]).toStartWith(`${NO_IMAGE}could not create `);
       expect(o.texts[0]).toContain(MADE_LINK);
       expect(o.last).toBe("done");
     } },
   },
-  "sub-call text: call directory holding the index made a junction in place": {
-    win32: { attacks: NOT_EMPTY, result: subCall },
-  },
-  "index opened for writing: call directory made a junction in place": {
-    win32: { attacks: NOT_EMPTY, result: subCall },
-  },
-  "sub-call text before its temporary file": {
-    win32: { attacks: BUSY, result: (o) => expect(o.last).toBe("400") },
-    linux: { attacks: ["done"], moved: ["1.txt", "index.txt"], result: (o) => {
-      expect(o.last).toStartWith("The result of probe_long could not be saved: ");
-      expect(o.last).toContain(`1.txt ${GONE}`);
-    } },
-  },
-  "sub-call JSON before its temporary file": {
-    win32: { attacks: BUSY, result: (o) => expect(o.last).toBe("412") },
-    linux: { attacks: ["done"], moved: ["1.json", "index.txt"], result: (o) => {
-      expect(o.last).toStartWith("The result of probe_json could not be saved: ");
-      expect(o.last).toContain(`1.json ${GONE}`);
-    } },
-  },
-  "sub-call image before its temporary file": {
-    win32: { attacks: BUSY, result: (o) => expect(o.last).toBe("1") },
-    linux: { attacks: ["done"], moved: ["1-1.png", "index.txt"], result: (o) => {
-      expect(o.last).toStartWith("The result of probe_image could not be saved: ");
-      expect(o.last).toContain(`1-1.png ${GONE}`);
-    } },
-  },
-  "output-only full text before its temporary file": {
-    win32: { attacks: BUSY, result: fullOutput },
-    linux: { attacks: ["done"], result: noFullOutput(`output.txt ${GONE}`), moved: ["output.txt"] },
+  "full output, then image: call directory holding the full output made a junction in place": {
+    win32: { attacks: NOT_EMPTY, result: both(fullOutput, imageSaved) },
   },
   "standalone image before its temporary file": {
-    win32: { attacks: BUSY, result: (o) => { expect(o.texts[0]).toMatch(/^\[Image saved to .+output-1\.gif \(image\/gif, 42B\)\]$/); expect(o.last).toBe("done"); } },
-    linux: { attacks: ["done"], moved: ["output-1.gif"], result: (o) => {
-      expect(o.texts[0]).toStartWith("[Image (image/gif, 42B) could not be saved: ");
-      expect(o.texts[0]).toContain(`output-1.gif ${GONE}`);
-      expect(o.last).toBe("done");
-    } },
+    win32: { attacks: BUSY, result: (o) => { expect(o.texts[0]).toMatch(/^\[Image saved to .+image-1\.gif \(image\/gif, 42 bytes\)\]$/); expect(o.last).toBe("done"); } },
+    linux: { attacks: ["done"], moved: ["image-1.gif"], result: (o) => { noImage(`image-1.gif ${GONE}`)(o); expect(o.last).toBe("done"); } },
   },
   "output-only full text before the rename": {
     linux: { attacks: ["done"], result: noFullOutput(`output.txt ${GONE}`), moved: ["output.txt"] },
@@ -163,61 +127,35 @@ const expected: Record<string, Partial<Record<"win32" | "linux", Outcome>>> = {
     win32: { attacks: ["prepared", ...BUSY], result: noFullOutput("could not rename ") },
     linux: { attacks: ["prepared", "done"], result: noFullOutput("could not rename "), moved: ["output.txt"] },
   },
-  "later index line: call directory renamed during a sub-call": {
-    win32: { attacks: BUSY, result: (o) => { expect(o.last).toBe("1"); expect(o.index).toBe(true); } },
-    linux: { attacks: ["done"], result: notRecorded, moved: ["index.txt"] },
-  },
-  "later index line: call directory removed during a sub-call": {
-    // Windows: the held index stops the removal.
-    win32: { attacks: BUSY, result: (o) => { expect(o.last).toBe("1"); expect(o.index).toBe(true); } },
-    linux: { attacks: ["done"], result: notRecorded },
-  },
-  // D23-R3-2: once a save found the directory moved, the result names no index.
-  "sub-call, then full output: call directory renamed before its temporary file": {
-    win32: { attacks: BUSY, result: (o) => { fullOutput(o); expect(o.index).toBe(true); } },
-    linux: { attacks: ["done"], moved: ["1.txt", "index.txt", "output.txt"], result: (o) => {
-      noFullOutput(`output.txt ${GONE}`)(o);
-      expect(o.index).toBe(false);
-    } },
-  },
   // D23-R3-2: the full output, saved first, is withdrawn once the image's save found the directory gone.
   "full output, then image: call directory renamed before the image": {
-    linux: { attacks: ["done"], moved: ["output-1.gif", "output.txt"], result: (o) => {
-      noFullOutput(GONE)(o);
-      expect(o.texts.join("\n")).toContain("[Image (image/gif, 42B) could not be saved: ");
-    } },
+    win32: { attacks: BUSY, result: both(fullOutput, imageSaved) },
+    linux: { attacks: ["done"], moved: ["image-1.gif", "output.txt"], result: both(noFullOutput(GONE), noImage(`image-1.gif ${GONE}`)) },
   },
   "full output, then image: call directory emptied and made a junction in place before the image": {
-    win32: { attacks: ["done"], result: (o) => {
-      noFullOutput(GONE)(o);
-      expect(o.texts.join("\n")).toContain("[Image (image/gif, 42B) could not be saved: could not create ");
-      expect(o.texts.join("\n")).toContain(MADE_LINK);
-    } },
+    win32: { attacks: ["done"], result: both(noFullOutput(GONE), noImage(MADE_LINK)) },
   },
   // D23-R3-3: written into the same directory, but its path now resolves outside Alice's tmp: not given out.
   "full output: call directory moved into Bob's tmp and linked back": {
     win32: { attacks: BUSY, result: fullOutput },
     linux: { attacks: ["done"], result: noFullOutput(`output.txt ${GONE}`), moved: ["output.txt"] },
   },
-  "during a sub-call: call directory moved into Bob's tmp and linked back": {
-    win32: { attacks: BUSY, result: (o) => { fullOutput(o); expect(o.index).toBe(true); } },
-    // Nothing more is written into the moved directory: only the index is there.
-    linux: { attacks: ["done"], moved: ["index.txt"], result: (o) => { noFullOutput(GONE)(o); expect(o.index).toBe(false); } },
+  // ... moved between the files: the directory's check stops the image's write, and the full output is withdrawn.
+  "full output, then image: call directory moved into Bob's tmp and linked back before the image's check": {
+    win32: { attacks: BUSY, result: both(fullOutput, imageSaved) },
+    linux: { attacks: ["done"], moved: ["image-1.gif", "output.txt"], result: both(noFullOutput(GONE), noImage(GONE)) },
   },
   "full output, then image: the full output moved into Bob's tmp and linked back": {
-    linux: { attacks: ["done"], result: (o) => {
-      noFullOutput(`output.txt ${GONE}`)(o);
-      expect(o.texts.join("\n")).toContain("[Image saved to ");
-    } },
+    linux: { attacks: ["done"], moved: ["moved-alice"], result: both(noFullOutput(`output.txt ${GONE}`), imageSaved) },
   },
   "full output, then image: the full output removed before the image": {
-    win32: { attacks: ["done"], result: (o) => { noFullOutput(`output.txt ${GONE}`)(o); expect(o.texts.join("\n")).toContain("[Image saved to "); } },
-    linux: { attacks: ["done"], result: (o) => { noFullOutput(`output.txt ${GONE}`)(o); expect(o.texts.join("\n")).toContain("[Image saved to "); } },
+    win32: { attacks: ["done"], result: both(noFullOutput(`output.txt ${GONE}`), imageSaved) },
+    linux: { attacks: ["done"], result: both(noFullOutput(`output.txt ${GONE}`), imageSaved) },
   },
   "full output: the disk is full": { win32: failedWrite("ENOSPC", "win32"), linux: failedWrite("ENOSPC", "linux") },
   "full output: permission denied": { win32: failedWrite("EACCES", "win32"), linux: failedWrite("EACCES", "linux") },
   "no /proc: nothing is held": {
-    linux: { attacks: ["failed"], result: notStarted("codemode result files need /proc mounted (procfs)") },
+    linux: { attacks: ["failed"], result: noFullOutput("codemode result files need /proc mounted (procfs)") },
   },
 };
 

@@ -152,6 +152,50 @@ test("OAuth discovery observes cancellation through the official transport and s
   } finally { await manager.close(); await h.close(); }
 });
 
+// A call cancelled while the official provider refreshes after a 401: the refresh request is cancelled with the call,
+// the call never reaches the server again, and the stored grant survives for the next call, which refreshes and retries.
+test("HTTP MCP cancelled during a 401 refresh sends no retry and keeps the grant for the next call", async () => {
+  const toolCalls: (string | null)[] = [], refreshes: string[] = [], refreshing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let hold = true;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request): Promise<Response> {
+    const origin = `http://127.0.0.1:${server.port}`, path = new URL(request.url).pathname;
+    if (request.method === "DELETE") return new Response(null, { status: 204 });
+    if (path === "/.well-known/oauth-protected-resource") return Response.json({ resource: `${origin}/mcp`, authorization_servers: [origin] });
+    if (path === "/.well-known/oauth-authorization-server") return Response.json({ issuer: origin, authorization_endpoint: `${origin}/authorize`,
+      token_endpoint: `${origin}/token`, response_types_supported: ["code"] });
+    if (path === "/token") {
+      refreshes.push(new URLSearchParams(await request.text()).get("refresh_token") ?? "");
+      if (hold) { refreshing.resolve(); await Promise.race([release.promise, new Promise(resolve => request.signal.addEventListener("abort", resolve, { once: true }))]); }
+      return Response.json({ access_token: "fresh", token_type: "Bearer", refresh_token: "refresh-1" });
+    }
+    if (path !== "/mcp") return new Response(null, { status: 404 });
+    const rpc = await request.json() as { id?: number; method: string; params?: { protocolVersion: string } };
+    if (rpc.id === undefined) return new Response(null, { status: 202 });
+    const headers = { "mcp-session-id": "refresh-session" };
+    if (rpc.method === "initialize") return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { protocolVersion: rpc.params!.protocolVersion, serverInfo: { name: "refresh", version: "1" }, capabilities: { tools: {} } } }, { headers });
+    if (rpc.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { tools: [{ name: "echo", inputSchema: { type: "object", properties: {} } }] } }, { headers });
+    toolCalls.push(request.headers.get("authorization"));
+    if (request.headers.get("authorization") !== "Bearer fresh") return new Response(null, { status: 401, headers: { "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"` } });
+    return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: "ok" }] } }, { headers });
+  } });
+  const config: McpServerConfig = { name: `refresh${++n}`, transport: "http", url: `http://127.0.0.1:${server.port}/mcp`, tools: ["echo"], oauth: { port: 43132, clientId: "fixture-client" } };
+  const { provider } = mcpOAuth(config);
+  await provider.saveTokens({ access_token: "stale", token_type: "Bearer", refresh_token: "refresh-1" });
+  const manager = new McpTools({ format: 1, servers: [config] }, join(f.root, `discovery-${n}`)), controller = new AbortController();
+  try {
+    await manager.initialize(new AbortController().signal);
+    const failed = expect(manager.call(manager.catalogue[0]!, member, {}, controller.signal, work => work())).rejects.toThrow();
+    await refreshing.promise; controller.abort(new Error("cancelled during refresh")); await failed;
+    expect(toolCalls).toEqual(["Bearer stale"]); expect(refreshes).toEqual(["refresh-1"]);
+    expect(await provider.tokens()).toMatchObject({ access_token: "stale", refresh_token: "refresh-1" });
+    hold = false;
+    const output = await manager.call(manager.catalogue[0]!, member, {}, new AbortController().signal, work => work());
+    expect(output.content).toEqual([{ type: "text", text: "ok" }]);
+    expect(toolCalls).toEqual(["Bearer stale", "Bearer stale", "Bearer fresh"]); expect(refreshes).toEqual(["refresh-1", "refresh-1"]);
+    expect((await provider.tokens())!.access_token).toBe("fresh");
+  } finally { release.resolve(); await manager.close(); await server.stop(true); }
+});
+
 test("administrator OAuth login aborts its discovery and scopes persisted credentials to the exact server", async () => {
   const state = join(f.root, "auth"), controller = new AbortController(), started = Promise.withResolvers<void>();
   const server: McpServerConfig = { name: "login", transport: "http", tools: ["echo"], url: "http://127.0.0.1:43129/mcp", oauth: { port: 43130, clientId: "fixture" } };
@@ -178,6 +222,35 @@ test("stdio MCP inherits only selected environment and uses the member's cwd", a
   } finally { await manager.close(); if (previous === undefined) delete process.env.MIXIN_TEST_AMBIENT_SECRET; else process.env.MIXIN_TEST_AMBIENT_SECRET = previous; }
   // Supervisor and server are two Bun processes: alone about 13 s on this Windows host, past 30 s beside parallel test groups.
 }, 60000);
+
+// The gate lets the tools/call through only after the request ended (timed out, or its caller cancelled): stdio sends
+// nothing then, even though StdioTransport.send itself ignores the signal pi-mcp aborts. A timeout leaves the session
+// open, so only the check in the send proxy stops it; a cancel also closes the session (checked here all the same).
+test.each(["timeout", "cancel"])("stdio MCP sends no tools/call the gate releases after the request's %s", async mode => {
+  const log = join(f.root, `stdio-log-${++n}.txt`);
+  const config: McpServerConfig = { name: `stdio${n}`, transport: "stdio", command: process.execPath, args: [fixtureServer, "log", log], tools: ["echo"] };
+  const manager = new McpTools({ format: 1, servers: [config] }, join(f.root, `discovery-${n}`), mode === "timeout" ? { callMs: 500 } : {});
+  const caller = new AbortController(), held = Promise.withResolvers<void>(), released = Promise.withResolvers<unknown>();
+  try {
+    await manager.initialize(new AbortController().signal);
+    // The gate admits the call the moment its signal says the request ended, while the session is still open.
+    const work = manager.call(manager.catalogue[0]!, member, { text: "late" }, caller.signal, async (dispatch, signal) => {
+      held.resolve();
+      await new Promise<void>(resolve => { signal.addEventListener("abort", () => resolve(), { once: true }); if (signal.aborted) resolve(); });
+      try { const sent = await dispatch(); released.resolve(undefined); return sent; } catch (error) { released.resolve(error); throw error; }
+    });
+    const failed = expect(work).rejects.toThrow();
+    await held.promise;
+    if (mode === "cancel") caller.abort(new Error("synthetic cancel"));
+    await failed;
+    expect(await released.promise).toBeInstanceOf(Error);
+    // An answered request after it shows the server is reading.
+    const output = await manager.call(manager.catalogue[0]!, member, { text: "next" }, new AbortController().signal, work => work());
+    expect(JSON.parse((output.content![0] as { text: string }).text)).toMatchObject({ args: { text: "next" } });
+    const methods = (await readFile(log, "utf8")).trim().split("\n");
+    expect(methods.filter(method => method === "tools/call")).toEqual(["tools/call"]);
+  } finally { await manager.close(); }
+}, 90000);
 
 test.each(["eof", "force"])("stdio supervisor reaps detached descendants when the parent ends by %s", async mode => {
   const pidPath = join(f.root, `descendant-${++n}.pid`);

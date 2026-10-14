@@ -17,16 +17,17 @@
 //   can commit nothing. The full-output file still moves into the member's tmp, but that result does not name it.
 // - Running updates are not forwarded as `api.details`: they would carry the full-output path before it is moved into
 //   the member's tmp, and Durable would keep the last of them as the details of a result without its own.
-// - `structuredContent` (bash's exit code and full output for scripts) is dropped: Durable results have no such field.
-//   Codemode scripts get it through the same entry (`MemberTool.run`, src/durable/codemode/index.ts).
+// - `structuredContent` (bash's exit code and full output, read's text or image block) is the result's
+//   `structuredOutput`, declared by the tool's `outputSchema`: scripts get it (src/durable/codemode/index.ts).
 // - Replay: read is safe (read-only), the rest unsafe. Output limits 64 KB / 2200 lines lie above the official
 //   truncation (50 KB / 2000 lines plus its notice), so the Harness does not truncate again.
-// - Registrations carry the pi-ai Tool fields (name, description, parameters, constrainedSampling) plus executionMode
-//   and prepareArguments. The project's prompt replaces the default tool snippets and guidelines (src/durable/prompt.ts);
-//   codemode shows a script-only tool's guidelines in its description.
+// - Registrations carry the pi-ai Tool fields (name, description, parameters, constrainedSampling) plus callers (from
+//   the exposure), executionMode and prepareArguments. The project's prompt replaces the default tool snippets and
+//   guidelines (src/durable/prompt.ts).
 //
-// A model's call and a codemode script's sub-call run the same `MemberTool.run`: identity check, the member's places
-// and the official tool. Only the Harness validates a model's arguments; codemode validates a sub-call's itself.
+// A model's call and a script's nested call (Durable `executeTool()`) run the same registration: the Harness resolves,
+// repairs and validates the arguments and runs the tool hooks (the request door) for both, then `MemberTool.run`
+// checks the identity, computes the member's places and runs the official tool.
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { copyJson, type Context, type JsonValue } from "@earendil-works/chord";
@@ -176,28 +177,84 @@ export function documentMemberTools(options: BaseToolsOptions): MemberTool[] {
     .map((definition) => memberTool(definition, options, build));
 }
 
-/** The Durable registration of a member tool: what the model calls. */
+/**
+ * Who may call a tool, from its coding-agent exposure: direct tools both the model and scripts (`executeTool()`),
+ * model-only tools (send_*) only the model, script-only tools only scripts. A deferred tool is script-only and left out
+ * of the codemode section's declarations: scripts find it with `searchTools()`.
+ */
+export function callersOf(definition: Pick<ToolDefinition, "name" | "exposure">): Pick<ToolRegistration, "callers" | "deferred"> {
+  switch (definition.exposure ?? "direct") {
+    case "direct": return {};
+    case "model-only": return { callers: ["model"] };
+    case "codemode": return { callers: ["tools"] };
+    case "deferred": return { callers: ["tools"], deferred: true };
+    default: throw new Error(`tool ${definition.name}: exposure ${definition.exposure} has no Durable registration`);
+  }
+}
+
+/** The call ID of the tool call a nested call belongs to (`<parent>/<key>`), or undefined for a model's call. */
+function parentCallOf(callId: string): string | undefined {
+  const slash = callId.lastIndexOf("/");
+  return slash === -1 ? undefined : callId.slice(0, slash);
+}
+
+/**
+ * Sequential tools within one calling tool call (a codemode script), one at a time in call order. Durable runs nested
+ * calls at once whatever their `executionMode`; a call cancelled while it waits never runs.
+ */
+const sequentialQueues = new Map<string, Promise<void>>();
+async function sequentialTurn(key: string, signal: AbortSignal | undefined): Promise<() => void> {
+  const previous = sequentialQueues.get(key) ?? Promise.resolve();
+  const { promise: done, resolve: release } = Promise.withResolvers<void>();
+  const turn = previous.then(() => done);
+  sequentialQueues.set(key, turn);
+  const finish = () => { release(); if (sequentialQueues.get(key) === turn) sequentialQueues.delete(key); };
+  try {
+    await new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) { reject(signal.reason); return; }
+      const abort = () => reject(signal!.reason);
+      signal?.addEventListener("abort", abort, { once: true });
+      void previous.then(() => { signal?.removeEventListener("abort", abort); resolve(); });
+    });
+  } catch (error) { finish(); throw error; }
+  return finish;
+}
+
+/**
+ * The Durable registration of a member tool: what the model and scripts call. A tool's `outputSchema` is its
+ * `structuredOutputSchema` and its `structuredContent` the `structuredOutput` scripts get (bash's exit code and output,
+ * read's text or image block, an MCP tool's declared value); a schema-less tool's scripts get its output.
+ */
 export function memberRegistration(tool: MemberTool): ToolRegistration {
   const { definition } = tool;
+  const schema = definition.outputSchema;
+  const sequential = definition.executionMode === "sequential";
   return {
     name: definition.name,
     description: definition.description,
     parameters: definition.parameters,
     // A pi-ai Tool field: it enters the transcript declaration and the request.
     ...(definition.constrainedSampling === undefined ? {} : { constrainedSampling: definition.constrainedSampling }),
+    ...callersOf(definition),
     replay: tool.replay,
     outputLimits: tool.outputLimits,
+    ...(schema === undefined ? {} : { structuredOutputSchema: schema }),
     ...(definition.executionMode === undefined ? {} : { executionMode: definition.executionMode }),
     ...(definition.prepareArguments === undefined ? {} : { prepareArguments: definition.prepareArguments }),
     async execute(args: unknown, api: ToolExecutionApi, context: Context): Promise<ToolExecutionResult> {
       const signal = context.abortSignal;
+      const parent = sequential ? parentCallOf(api.callId) : undefined;
+      const release = parent === undefined ? undefined : await sequentialTurn(`${api.conversationId}:${parent}`, signal);
       // Output arriving after the call settled is dropped (`api.output` rejects then); a throw here would stop the command.
       const output = (data: string | Uint8Array) => { try { api.output(data); } catch {} };
       try {
+        signal?.throwIfAborted();
         const result = await tool.run(args, { api, context, callId: api.callId, signal, onBashOutput: output });
         const details = json(result.details);
+        const structured = schema === undefined ? undefined : json(result.structuredContent);
         return {
-          content: result.content,
+          output: result.content,
+          ...(structured === undefined ? {} : { structuredOutput: structured }),
           ...(details === undefined ? {} : { details }),
           ...(result.isError ? { isError: true } : {}),
           ...(result.usage === undefined ? {} : { usage: result.usage }),
@@ -205,8 +262,8 @@ export function memberRegistration(tool: MemberTool): ToolRegistration {
         };
       } catch (error) {
         if (signal?.aborted) throw error;
-        return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true };
-      }
+        return { output: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true };
+      } finally { release?.(); }
     },
   } as ToolRegistration;
 }

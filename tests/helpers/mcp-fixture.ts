@@ -1,16 +1,19 @@
 // Minimal synthetic protocol server. No network or production files.
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 
 if (process.argv[2] === "descendant") {
   writeFileSync(process.argv[3]!, String(process.pid));
   setInterval(() => {}, 1000);
 } else {
   if (process.argv[2] === "spawn") spawn(process.execPath, [import.meta.path, "descendant", process.argv[3]!], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+  // "log <file>": every request's method is appended to the file as it arrives.
+  const log = process.argv[2] === "log" ? process.argv[3]! : undefined;
   const lines = createInterface({ input: process.stdin });
   lines.on("line", line => {
     const request = JSON.parse(line);
+    if (log !== undefined) appendFileSync(log, `${request.method}\n`);
     if (request.id === undefined) return;
     let result;
     if (request.method === "initialize") result = { protocolVersion: request.params.protocolVersion, serverInfo: { name: "synthetic", version: "1" }, capabilities: { tools: {} } };

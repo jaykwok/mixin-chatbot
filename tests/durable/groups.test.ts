@@ -4,8 +4,9 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, symlinkSync
 import { join, resolve } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
-import { createSession, Harness, type HarnessInspection, type SubmissionId } from "@earendil-works/pi-durable";
+import { Type } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { createRegistry, createSession, defineExtension, Harness, type HarnessInspection, type SubmissionId } from "@earendil-works/pi-durable";
 import { groupSegment } from "../../src/agent/paths.ts";
 import { GROUP_ROOT_LEASE } from "../../src/core/data-version.ts";
 import { GROUP_DATABASE, GroupHarnesses, groupDatabasePath, type GroupHarnessesOptions } from "../../src/durable/groups.ts";
@@ -485,5 +486,67 @@ describe("discovery skips only databases that do not exist", () => {
 
     const absent = new GroupHarnesses({ root: join(fixture.root, "no-such-root"), harnessOptions: harnessOptions(fauxModels().models) });
     expect(await absent.discover()).toEqual([]);
+  });
+});
+
+describe("a failed Session", () => {
+  test("a Session that fails without a storage error (the Harness's own bookkeeping) stops the process as a storage failure does", async () => {
+    const fatal: Error[] = [];
+    const { groups, root } = setup({ onFatal: (error) => fatal.push(error) });
+    try {
+      const handle = await groups.acquire("g1");
+      // Internal to Durable (SessionImpl.fail): what the scheduler calls for a throw in its own commits.
+      (handle.harness as unknown as { fail(error: unknown): void }).fail(new Error("synthetic bookkeeping failure"));
+      await handle.harness.closed;
+      await Bun.sleep(0);
+      expect(fatal.map((error) => error.message)).toEqual([`群数据库会话已失败，需重启服务：${groupDatabasePath(root, "g1")}`]);
+      expect((fatal[0]!.cause as Error).message).toBe("synthetic bookkeeping failure");
+      handle.release();
+      await expect(groups.acquire("g2")).rejects.toBe(fatal[0]);
+    } finally { await groups.closeAll(); }
+  });
+
+  test("the stop is decided when the failure closes the Session, while a running tool still holds its close", async () => {
+    const fatal: Error[] = [];
+    const { promise: held, resolve: release } = Promise.withResolvers<void>();
+    const { promise: started, resolve: start } = Promise.withResolvers<void>();
+    const { faux, models, model } = fauxModels();
+    const hold = { name: "hold", description: "Waits until the test releases it.", parameters: Type.Object({}), replay: "unsafe" as const,
+      execute: async () => { start(); await held; return { output: [{ type: "text" as const, text: "done" }] }; } };
+    const { groups, root } = setup({ onFatal: (error) => fatal.push(error), harnessOptions: () => {
+      const registry = createRegistry();
+      registry.install(defineExtension({ name: "test.hold", tools: [hold] }));
+      return { models, registry, settings: { retry: { baseDelayMs: 5, maxAgentDelayMs: 20 } } };
+    } });
+    try {
+      const handle = await groups.acquire("g1");
+      const { conversation } = await memberConversation(handle.harness, "g1", "m1", { model }, context);
+      faux.setResponses([fauxAssistantMessage([fauxToolCall("hold", {}, { id: "hold-1" })], { stopReason: "toolUse" })]);
+      await conversation.submit({ type: "input", content: "运行" }, context);
+      await started;
+      let closed = false;
+      void handle.harness.closed.then(() => { closed = true; });
+      (handle.harness as unknown as { fail(error: unknown): void }).fail(new Error("synthetic bookkeeping failure"));
+      // Synchronously, before the tool ends: the owner knows, and no group opens.
+      expect(fatal.map((error) => error.message)).toEqual([`群数据库会话已失败，需重启服务：${groupDatabasePath(root, "g1")}`]);
+      await expect(groups.acquire("g2")).rejects.toBe(fatal[0]);
+      await Bun.sleep(50);
+      expect(closed).toBe(false);
+      handle.release();
+      release();
+      await handle.harness.closed;
+      expect(fatal).toHaveLength(1);
+    } finally { release(); await groups.closeAll(); }
+  });
+
+  test("closing idle groups and shutting down is no failure", async () => {
+    const fatal: Error[] = [];
+    const { groups } = setup({ onFatal: (error) => fatal.push(error), maxIdle: 0 });
+    const handle = await groups.acquire("g1");
+    handle.release();
+    await groups.sweep();
+    (await groups.acquire("g2")).release();
+    await groups.closeAll();
+    expect(fatal).toEqual([]);
   });
 });

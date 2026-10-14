@@ -15,10 +15,31 @@ export const RESULT_CAPACITY = 4096;
 /** From this many active records maintenance expires unreferenced results before their retention deadline. */
 export const RESULT_PRESSURE = 3072;
 
-/** Record a result's owner, with its isolated task when it has one. An existing record (a repeated registration) stays. */
+/**
+ * Record a result's owner, with its isolated task when it has one. A repeated registration of the same directory leaves
+ * the record as it is.
+ *
+ * A rerun of the call after a restart (a replay-safe tool such as codemode) writes into a new isolated task when the
+ * earlier attempt's outcome was not stored: each attempt reserves its own. Then the record moves to the new task in
+ * this commit, before any file in it is visible, so the record names the directory the result will name. A requested
+ * expiry (/clear) stays. The task it named before keeps its manager receipt, the task's ownership evidence; no record
+ * claims it any more, which is what the receipt sweep (maintenance.ts step 7) and the offline reclamation take as the
+ * owner's hand-over: it is reclaimed once due and unreferenced. A shared directory has no evidence besides its record,
+ * so a record of one is never moved.
+ */
 export async function registerResult(tx: Tx, name: string, phone: string, isolatedTask?: string): Promise<void> {
   const doc = await tx.doc(ResultsDoc);
-  if (doc.calls[name]) return;
+  const existing = doc.calls[name];
+  if (existing) {
+    if (existing.isolatedTask === isolatedTask) return;
+    if (existing.phone !== phone) throw new Error("结果归属记录属于另一成员，拒绝改登记");
+    if (existing.isolatedTask === undefined) throw new Error("结果目录已登记为共享目录，拒绝改登记到其他目录");
+    doc.calls[name] = {
+      phone, createdAt: Date.now(), ...(isolatedTask ? { isolatedTask } : {}),
+      ...(existing.expiredAt === undefined && existing.expiryRequestedAt !== undefined ? { expiryRequestedAt: existing.expiryRequestedAt } : {}),
+    };
+    return;
+  }
   if (Object.keys(doc.calls).length >= RESULT_CAPACITY) throw new Error("结果归属记录已达上限，请先清理不再引用的结果");
   doc.calls[name] = { phone, createdAt: Date.now(), ...(isolatedTask ? { isolatedTask } : {}) };
 }

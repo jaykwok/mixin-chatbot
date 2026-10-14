@@ -8,13 +8,17 @@ import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { stubDocumentPython } from "./document-python-stub.ts";
 
+const root = process.cwd(), configuredOffice = join(root, "Office files", "soffice.exe");
+await mkdir(join(root, "data/config"), { recursive: true });
+await writeFile(join(root, "data/config/runtime.json"), JSON.stringify({ BOT_DOCUMENT_OFFICE_PATH: configuredOffice }));
+delete process.env.BOT_DOCUMENT_OFFICE_PATH;
 const { calls, controls, requests } = await stubDocumentPython();
 const { buildDocumentTool } = await import("../../src/agent/document-extract.ts");
 const { buildDocumentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
 const { buildSendTools } = await import("../../src/agent/send-tools.ts");
 const { application } = await import("../../src/core/lifecycle.ts");
 
-const root = process.cwd(), workspace = join(root, "workspace"), tempDir = join(root, "user-tmp"), other = join(root, "other-tmp");
+const workspace = join(root, "workspace"), tempDir = join(root, "user-tmp"), other = join(root, "other-tmp");
 await Promise.all([workspace, tempDir, other, join(root, "index")].map((path) => mkdir(path, { recursive: true })));
 for (const name of ["资料.docx", "方案.pptx", "补充.pptx", "页面.pdf", "many.pdf"]) await writeFile(join(workspace, name), "fixture " + name);
 await writeFile(join(other, "私有.docx"), "another member's file");
@@ -150,6 +154,13 @@ assert.deepEqual(Object.keys(properties("document_compose").build.properties), [
 assert.equal(conforms(toolNamed("document_compose"), { ...slides, build: { ...slides.build, keptPages: [1] } }), false, "compose build with keptPages");
 const preview = await call("document_render", { source: "页面.pdf", pages: [2] });
 assert.deepEqual([preview.pages, preview.unrenderedPages, preview.visuallyReviewed, preview.warnings], [3, [1, 3], false, []]);
+await call("document_render", { source: "资料.docx", pages: [1] }, "render-office");
+assert.equal(requests.at(-1)!.request.officeBinary, configuredOffice, "saved Office path reaches Python");
+const overrideOffice = join(root, "another office", "soffice.exe");
+process.env.BOT_DOCUMENT_OFFICE_PATH = overrideOffice;
+await call("document_images", { source: "方案.pptx", crops: [{ page: 1, box: [0.1, 0.1, 0.5, 0.5] }] }, "crop-office");
+assert.equal(requests.at(-1)!.request.officeBinary, overrideOffice, "explicit environment overrides saved Office path");
+delete process.env.BOT_DOCUMENT_OFFICE_PATH;
 const pictures = await call("document_images", { source: "页面.pdf", crops: [{ page: 1, box: [0.1, 0.1, 0.5, 0.5] }] });
 assert.deepEqual([pictures.truncated, pictures.images.length, pictures.crops.length, pictures.skipped.limit], [false, 2, 1, 0]);
 const many = await call("document_images", { source: "many.pdf" }, "images-many");

@@ -776,7 +776,7 @@ export class DurableService {
           [reply.body, notes?.text].filter(Boolean).join("\n\n"), notes?.attachments ?? []);
       }
     } else if (settled.status === "unanswered" && settled.reason !== "aborted" && item.cancelled !== true) {
-      failure = describeRequestFailure(await this.#failure(conversation, settled));
+      failure = describeRequestFailure(await this.#failure(harness, conversation, settled));
     }
     await this.#remove(harness, conversation.id, item.requestId);
     await this.#project(harness, member);
@@ -801,11 +801,21 @@ export class DurableService {
   }
 
   /** The model error of an unanswered input, for a member reply. */
-  async #failure(conversation: Conversation, settled: SettledSubmissionRecord): Promise<Error> {
+  async #failure(harness: Harness, conversation: Conversation, settled: SettledSubmissionRecord): Promise<Error> {
+    const reason = "reason" in settled ? settled.reason : "unknown";
+    // A blocking compaction that did not complete ends the run before any model request: Durable settles the input
+    // `model_error` with "Compaction failed: …" (or "… was aborted") as its detail, and keeps the newest failure, with its
+    // task and kind, in the live document. Checked first: the newest assistant entry then belongs to an earlier turn.
+    const detail = "detail" in settled && typeof settled.detail === "string" ? settled.detail : undefined;
+    if (reason === "model_error" && detail?.startsWith("Compaction ")) {
+      const compaction = (await harness.snapshot(LiveDoc, conversation.id, this.#context))?.compactionFailure;
+      const which = compaction === undefined ? "" : `任务 ${compaction.taskId}，${compactionReasonText(compaction.reason)}；`;
+      return new Error(`模型未能回答：会话历史压缩未完成（${which}${detail}）`);
+    }
     const page = await conversation.entries({}, 20, undefined, this.#context);
     const last = page.items.find((entry) => AssistantEntry.is(entry))?.model?.[0] as AssistantMessage | undefined;
     if (last?.errorMessage) return modelRequestError(last.errorMessage, [last], this.#options.selection.model.contextWindow);
-    return new Error(`模型未能回答（${"reason" in settled ? settled.reason : "unknown"}）`);
+    return new Error(`模型未能回答（${reason}）`);
   }
 
   /** Replies stored by an earlier process and never tried: sent once a callback URL is known; a failure leaves them for /deliver. */
@@ -903,6 +913,7 @@ export class DurableService {
     let waiting = 0;
     let tools = "暂无";
     let taskSpan: string | undefined;
+    let compaction: string | undefined;
     if (member.conversationId !== undefined) {
       const handle = await this.#groups.acquire(member.groupId);
       try {
@@ -913,9 +924,11 @@ export class DurableService {
         else if (live?.run !== undefined) phase = live.tools?.some((slot) => slot.status === "running") ? "执行工具中" : "执行中";
         else if (items.length) phase = "准备中";
         waiting = Math.max(0, items.length - (member.current === undefined ? 0 : 1));
-        const running = live?.tools?.filter((slot) => slot.status === "running").map((slot) => slot.name) ?? [];
+        const running = runningTools(live);
         if (running.length) tools = running.join("、");
         if (live?.compactions?.length) phase = "压缩会话历史";
+        const failed = live?.compactionFailure;
+        if (failed !== undefined) compaction = `任务 ${failed.taskId}，${compactionReasonText(failed.reason)}：${failed.error.slice(0, 300)}`;
         if (live?.run) {
           const task = await handle.harness.getTask(live.run.taskId, this.#context);
           taskSpan = task?.startedAt === undefined ? "未知" : `${Math.max(0, Math.floor((Date.now() - task.startedAt) / 1000))} 秒（含等待/重试）`;
@@ -925,6 +938,7 @@ export class DurableService {
     let text = "状态：" + phase + "\n等待处理的消息：" + waiting + "\n正在运行的工具：" + tools +
       "\n待补发回复：" + this.#deliveries.pending(member.key).length + "\n机器人近1分钟发送额度用量：" + rate.used + "/" + rate.limit;
     if (taskSpan !== undefined) text += "\nDurable 任务跨度：" + taskSpan;
+    if (compaction !== undefined) text += "\n最近一次会话历史压缩失败：" + compaction;
     if (member.conversationId !== undefined) {
       const handle = await this.#groups.acquire(member.groupId);
       try {
@@ -1328,9 +1342,22 @@ function taskText(member: Pick<MemberState, "groupId" | "phone">, requestId: str
   return `群: ${member.groupId}, 用户: ${member.phone}, 任务: ${taskNumber(requestId)}`;
 }
 
+function compactionReasonText(reason: string): string {
+  return reason === "overflow" ? "上下文溢出时压缩" : reason === "threshold" ? "达到阈值时压缩" : reason === "manual" ? "手动压缩" : reason;
+}
+
+/** The running tool calls, each with the nested calls it runs (a script's tool calls): `codemode（read、bash）`. */
+function runningTools(live: Readonly<LiveState> | undefined): string[] {
+  const nested = live?.nestedTools?.filter((slot) => slot.status === "running") ?? [];
+  return (live?.tools?.filter((slot) => slot.status === "running") ?? []).map((slot) => {
+    const children = nested.filter((child) => child.parentTaskId === slot.taskId).map((child) => child.name);
+    return children.length ? `${slot.name}（${children.join("、")}）` : slot.name;
+  });
+}
+
 /** What a running task is doing, for the heartbeat log. */
 function livePhase(live: Readonly<LiveState> | undefined): string {
-  const running = live?.tools?.filter((slot) => slot.status === "running").map((slot) => slot.name) ?? [];
+  const running = runningTools(live);
   if (running.length) return "执行工具 " + running.join("、");
   if (live?.compactions?.some((compaction) => compaction.blocking)) return "压缩会话历史";
   const generation = live?.generation;

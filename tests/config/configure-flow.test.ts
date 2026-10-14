@@ -205,6 +205,27 @@ test("向导的推理级别替换所选模型的覆盖，保留其他模型的�
   } finally { await files.cleanup(); }
 }, 30000);
 
+test("向导保存后两个配置文件的 $schema 和本项目运行策略原样保留，只读校验通过", async () => {
+  const files = await tempFixture("pi-configure-schema-");
+  try {
+    await existingConfiguration(files.root);
+    const MODELS_SCHEMA = "https://pi.dev/schemas/models.schema.json", SETTINGS_SCHEMA = "./settings.schema.json";
+    await writeFile(join(files.root, MODELS_JSON), JSON.stringify({ $schema: MODELS_SCHEMA, providers: { openai: { apiKey: "original-fixture-key" } } }));
+    const durable = { retry: { maxRetries: 2 }, progress: { outputIntervalMs: 50 } };
+    await writeFile(join(files.root, PI_SETTINGS), JSON.stringify({
+      $schema: SETTINGS_SCHEMA, format: 1, defaultProvider: "openai", defaultModel: "gpt-5.2", defaultThinkingLevel: "low", durable,
+    }));
+    const result = await runConfigure(files.root, {
+      "模型接入方式": "builtin", "内置服务商": "zai-coding-cn", "模型": "glm-5.3-flash", "thinkingLevel": "high",
+    });
+    expect({ code: result.code, stderr: result.stderr }).toEqual({ code: 0, stderr: "" });
+    const settings = JSON.parse(await readFile(join(files.root, PI_SETTINGS), "utf8"));
+    expect(settings).toMatchObject({ $schema: SETTINGS_SCHEMA, format: 1, defaultProvider: "zai-coding-cn", defaultModel: "glm-5.3-flash", defaultThinkingLevel: "high", durable });
+    expect(JSON.parse(await readFile(join(files.root, MODELS_JSON), "utf8")).$schema).toBe(MODELS_SCHEMA);
+    expect((await runValidate(files.root)).code).toBe(0);
+  } finally { await files.cleanup(); }
+}, 30000);
+
 test("只读校验从缓存恢复动态目录，不创建锁或读取磁盘 auth.json", async () => {
   const files = await tempFixture("pi-configure-readonly-");
   try {

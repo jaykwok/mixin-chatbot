@@ -15,8 +15,8 @@ import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { DeliveryStore } from "../../src/agent/delivery-store.ts";
 import { userTempDir } from "../../src/agent/paths.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
-import { resultsRoot } from "../../src/durable/codemode/results.ts";
-import { holdDirectory, type HeldDirectory } from "../../src/durable/codemode/directory.ts";
+import { resultsRoot } from "../../src/durable/results/files.ts";
+import { holdDirectory, type HeldDirectory } from "../../src/core/held-directory.ts";
 import { GroupHarnesses, groupDatabasePath } from "../../src/durable/groups.ts";
 import { RequestDoor } from "../../src/durable/door.ts";
 import { memberConversation, MemberDirectory } from "../../src/durable/identity.ts";
@@ -481,7 +481,7 @@ describe("durable service: controls", () => {
     let started = false;
     const slow = defineExtension({ name: "test.slow", tools: [{
       name: "slow", description: "Wait until the test releases it.", parameters: Type.Object({}),
-      async execute() { started = true; await released; return { content: [{ type: "text", text: "done" }] }; },
+      async execute() { started = true; await released; return { output: [{ type: "text", text: "done" }] }; },
     }] });
     faux.setResponses([fauxAssistantMessage([fauxToolCall("slow", {}, { id: "call_slow" })], { stopReason: "toolUse" }),
       fauxAssistantMessage("新会话回答")]);
@@ -628,6 +628,33 @@ describe("durable service: threshold compaction", () => {
         expect(kinds).toEqual([{ kind: "assistant", requests: 2 }, { kind: "compaction", requests: 1 }]);
       } finally { ledger.close(); }
       expect(reports).toEqual([]);
+    } finally { await service.close(); }
+  });
+
+  test("a blocking compaction that fails: the member is told the history could not be compacted, /status shows the failure", async () => {
+    const { faux, models, model } = fauxModels();
+    const where = place();
+    const out = recordingOutbound();
+    const long = "x".repeat(48_000);
+    // Every summarize request fails (with each retry the harness allows); the second turn is never asked.
+    const failed = () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "400 synthetic summarize refusal" });
+    faux.setResponses([fauxAssistantMessage(long), ...Array.from({ length: 8 }, failed)]);
+    const base = selection(models, model);
+    const { service } = open(where, models, model, out.outbound, {
+      selection: { ...base, harnessSettings: { ...base.harnessSettings,
+        compaction: { enabled: true, reserveTokens: 128_000 - 8_000, keepRecentTokens: 100, backgroundTokens: 0 } } },
+    });
+    try {
+      await service.admit(ALICE, GROUP, "第一轮", URL);
+      await until(() => replies(out.sent).length === 1, "the first reply");
+      await service.admit(ALICE, GROUP, "第二轮", URL);
+      await until(() => out.sent.some((item) => item.kind === "text" && item.text.includes("会话历史压缩未完成")), "the failure text");
+      const text = out.sent.find((item) => item.kind === "text" && item.text.includes("会话历史压缩未完成"))!.text;
+      expect(text).toStartWith("⚠️ 抱歉，处理您的请求时出错了。");
+      expect(text).toMatch(/会话历史压缩未完成（任务 \d+，达到阈值时压缩；Compaction failed: /);
+      expect(text).toContain("400 synthetic summarize refusal");
+      expect(replies(out.sent)).toHaveLength(1);
+      expect(await service.control(ALICE, GROUP, "/status", URL)).toMatch(/\n最近一次会话历史压缩失败：任务 \d+，达到阈值时压缩：.*400 synthetic summarize refusal/);
     } finally { await service.close(); }
   });
 });

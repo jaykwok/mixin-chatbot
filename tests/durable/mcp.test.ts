@@ -7,13 +7,13 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/provid
 import { createRegistry, defineExtension, Harness } from "@earendil-works/pi-durable";
 import { McpTools } from "../../src/integrations/mcp.ts";
 import { codemodeExtension } from "../../src/durable/codemode/index.ts";
-import { removeCodemodeResults } from "../../src/durable/codemode/results.ts";
+import { removeResultDirectories } from "../../src/durable/results/files.ts";
 import { claimGroup, memberConversation } from "../../src/durable/identity.ts";
 import { mcpMemberTools } from "../../src/durable/mcp.ts";
 import { groupDoor } from "../../src/durable/models.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
-import { memberPlaces } from "../../src/durable/tools.ts";
+import { memberPlaces, memberRegistration } from "../../src/durable/tools.ts";
 import { fauxModels } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { handoffFullResults, stubResultsBackend } from "../helpers/results-backend.ts";
@@ -46,8 +46,8 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
     await mkdir(members.root); await manager.initialize(new AbortController().signal);
     const tools = mcpMemberTools(members, manager, door), registry = createRegistry(); registry.install(door.extension());
     expect(tools[0]!.definition.exposure).toBe("deferred"); expect(tools[0]!.replay).toBe("unsafe");
-    registry.install(defineExtension({ name: "mixin.mcp" }));
-    registry.install(codemodeExtension({ members, tools: tools.map(tool => ({ extension: "mixin.mcp", tool })) }));
+    registry.install(defineExtension({ name: "mixin.mcp", tools: tools.map(memberRegistration) }));
+    registry.install(codemodeExtension({ members, tools }));
     harness = await Harness.open(await openGroupStorage(join(root, "group.sqlite")), { registry, models: door.wrap(models), settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);
     holder.harness = harness; await claimGroup(harness, "group-a", context);
     if (isolated) await handoffFullResults(harness);
@@ -72,10 +72,10 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
       expect(full.structuredContent).toEqual({ member: phone }); expect(full.content[0].text).toHaveLength(phone.length + 30000);
       expect(JSON.stringify(output.content)).toContain(tempDir.replaceAll("\\", "\\\\"));
       const policy = { registered: new Set(owned), protected: new Set(owned), isolated: mapping, expire: async () => {} };
-      expect(await removeCodemodeResults(tempDir, Infinity, policy)).toEqual([]);
+      expect(await removeResultDirectories(tempDir, Infinity, policy)).toEqual([]);
       expect(await readFile(join(mcpDir, "output-1.png"))).toEqual(Buffer.from(png, "base64"));
       policy.protected.clear();
-      expect((await removeCodemodeResults(tempDir, Infinity, policy)).sort()).toEqual(process.platform === "linux" && !isolated ? [] : [...owned].sort());
+      expect((await removeResultDirectories(tempDir, Infinity, policy)).sort()).toEqual(process.platform === "linux" && !isolated ? [] : [...owned].sort());
       if (runtime) for (const id of mapping.values()) expect((await runtime.backend.describe(id, tempDir)).phase).toBe("removed");
     }
     expect(identities).toEqual(["alice", "bob"]);

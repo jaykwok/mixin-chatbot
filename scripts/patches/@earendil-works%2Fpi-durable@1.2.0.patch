@@ -1,0 +1,204 @@
+diff --git a/dist/harness/types.d.ts b/dist/harness/types.d.ts
+index ea3adc9..a320ad9 100644
+--- a/dist/harness/types.d.ts
++++ b/dist/harness/types.d.ts
+@@ -695,46 +695,59 @@ export interface GenerationHooks {
+     /** Every terminal provider message, before classification. */
+     afterResponse(message: AssistantMessage, api: HookApi, context: Context): void | Promise<void>;
+     /** A final answer; the first `continue` appends a user message and continues the run. */
+     onYield(answer: AssistantMessage, api: HookApi, context: Context): HookResult<{
+         readonly continue: UserInput;
+     }>;
+     /** After every tool of the round is terminal; `results` are the round's result entries in call order. */
+     afterTools(assistant: EntryId, results: readonly EntryId[], api: HookApi, context: Context): void | Promise<void>;
+ }
+ /** A call as tool hooks see it; `parent` is set for a nested call, one a running tool made through `executeTool()`. */
+ export type ToolHookCall = ToolCall & {
+     readonly parent?: {
+         readonly taskId: TaskId;
+         readonly callId: string;
+     };
+ };
+ /** Hooks of the built-in tool task, for model-issued and nested calls. */
+ export interface ToolHooks {
+     /** Before intent; the first `block` wins, otherwise `arguments` replace the call's arguments. A throw blocks. */
+     beforeTool(call: ToolHookCall, api: HookApi, context: Context): HookResult<{
+         readonly arguments?: JsonObject;
+         readonly block?: string;
+     }>;
+     /** After execution, before the result is committed; replaces the result. */
+     afterTool(call: ToolHookCall, result: ToolExecutionResult, api: HookApi, context: Context): HookResult<ToolExecutionResult>;
++    /** mixin-chatbot: inside the nested call's terminal transaction. Only transaction-local
++     * reads/writes; a throw rolls back the result and its usage together. Also runs on abort/recovery. */
++    settleNestedTool(call: ToolHookCall, key: string, result: NestedToolExecutionResult,
++        tx: Tx, context: Context): void | Promise<void>;
+ }
+ /** Hooks of the built-in compaction task. */
+ export interface CompactionHooks {
+     /**
+      * After range selection, before summarizing; the first decision wins. `entries` are the active entries the summary
+      * replaces, the head marker first, and `messages` their model context, the summarizer's source; `firstKept` is the
+      * first entry kept verbatim.
+      */
+     beforeCompact(compaction: {
+         readonly reason: CompactionReason;
+         readonly entries: readonly EntryRecord[];
+         readonly messages: readonly Message[];
+         readonly firstKept: EntryId;
+         readonly instructions?: string;
+     }, api: HookApi, context: Context): HookResult<{
+         readonly decline: true;
+     } | {
+         readonly summary: string;
+     }>;
++    /**
++     * mixin-chatbot patch (gap G4, option A): before every summarize request attempt, including retries and recovery,
++     * with the attempt's number, model and request messages; `context.abortSignal` is the signal the request carries.
++     */
++    beforeSummarize(request: {
++        readonly attempt: number;
++        readonly model: ModelRef;
++        readonly messages: readonly Message[];
++    }, api: HookApi, context: Context): void | Promise<void>;
+ }
+ //# sourceMappingURL=types.d.ts.map
+\ No newline at end of file
+diff --git a/dist/harness/tool.js b/dist/harness/tool.js
+index 97788e5..d2e6ffd 100644
+--- a/dist/harness/tool.js
++++ b/dist/harness/tool.js
+@@ -460,66 +460,74 @@ function structuredOutputError(tool, result) {
+         structuredValidators.set(schema, validator);
+     }
+     if (validator.Check(value))
+         return undefined;
+     const [first] = validator.Errors(value);
+     const path = first?.instancePath.replace(/^\//, "").replace(/\//g, ".") || "root";
+     return `Tool ${tool.name} returned structuredOutput that does not match its schema: ${path}: ${first?.message ?? "invalid"}`;
+ }
+ /**
+  * Commit the tool's terminal state and mark its slot done. A model-issued call appends its result entry and ends with
+  * the entry ID; a nested call writes its result to the caller's `NestedCallDoc`, records its usage, and ends with a
+  * small receipt. Nested calls this call left running are aborted first, so they report into their slots before the
+  * slots below the call leave `pi.live`. `build` receives the slot so interruption and abort can report the durable
+  * partial output.
+  */
+ async function settle(runtime, input, call, ending, build, context, durationMs) {
+     // A crash in between leaves the call in `execute`: a safe rerun reattaches to the calls, an interruption ends here.
+     // Every live nested call the task owns, also those an earlier attempt made and this one never called again.
+     const nestedIds = (await runtime.ownedTasks(context))
+         .filter((record) => record.kind === ToolTask.definition.name && record.input.kind === "nested")
+         .map((record) => record.id);
+     // Read before the settling commit: no admission starts after `ended`, and those underway were awaited.
+     const madeNested = (await runtime.memo(MADE_NESTED_CALLS, context)) === true;
+     // Mark them all before waiting for any: one may run until a sibling is cancelled.
+     await Promise.all(nestedIds.map((id) => runtime.abortOwned(id, context)));
++    // Resolve outside the transaction: hook resolution may read the Session. Invoke inside it directly,
++    // since ordinary hooks.each reports and absorbs handler errors, which would allow an unreceipted charge.
++    const settleHooks = [];
++    if (input.kind === "nested") {
++        await runtime.hooks.each("settleNestedTool", (hook) => { settleHooks.push(hook); });
++    }
+     await runtime.commit(async (tx) => {
+         const conversationId = runtime.conversationId;
+         const live = await tx.doc(LiveDoc, conversationId);
+         const slot = toolSlot(live, runtime.taskId);
+         const result = build(slot);
+         let settled;
+         if (input.kind === "nested") {
+             const nested = nestedResult(runtime.taskId, result, durationMs);
+             if (nested.usage !== undefined)
+                 await recordUsage(tx, conversationId, "tools", call.name, nested.usage);
+             // The caller is never terminal before its owned nested calls, so its document is open; another task in it is a
+             // bug, not a race.
+             const state = await tx.doc(NestedCallDoc, input.parent, input.key, null);
+             if (state.taskId !== runtime.taskId)
+                 throw new Error(`Nested call ${call.id} is not in its caller's index`);
+             state.result = nested;
++            // The receipt and the official result/usage commit or roll back together.
++            for (const hook of settleHooks) await hook(call, input.key, nested, tx, context);
+             if (slot !== undefined && "parentTaskId" in slot) {
+                 finishSlot(slot);
+                 slot.summary = summaryOf(nested, result.output ?? []);
+             }
+             settled = { kind: "nested" };
+         }
+         else {
+             const timing = { timestamp: runtime.now(), durationMs };
+             const entry = await appendToolResult(tx, conversationId, call, result, timing);
+             if (slot !== undefined && !("parentTaskId" in slot)) {
+                 finishSlot(slot);
+                 slot.entry = entry.id;
+             }
+             // Tools build control objects freely; drop keys set to undefined so the task result is strict JSON.
+             const control = result.control === undefined || ending.status !== "completed"
+                 ? {}
+                 : { control: copyJson(result.control, { omitUndefinedProperties: true }) };
+             settled = { kind: "model", entryId: entry.id, ...control };
+         }
+         // A call that made no nested calls, in any attempt, has no slots below it; skipping the scan keeps many leaves
+         // linear. Committed before the read: no nested call is admitted after `ended`.
+         if (madeNested)
+             removeNestedSlots(live, runtime.taskId);
+         if (ending.status === "aborted")
+             return { status: "terminal", outcome: { status: "aborted", result: settled } };
+diff --git a/dist/harness/compaction.js b/dist/harness/compaction.js
+index c3fb798..34b526a 100644
+--- a/dist/harness/compaction.js
++++ b/dist/harness/compaction.js
+@@ -103,50 +103,55 @@ export const CompactionTask = defineTask({
+             const { model: ref, thinkingLevel, streamOptions, maxTokens, tail, firstKept, attempt } = request;
+             const model = runtime.models.getModel(ref.provider, ref.modelId);
+             if (model === undefined)
+                 return failNoModel(runtime, ref, context);
+             // The context at `tail` is immutable, so this is the range `select` chose.
+             const view = await runtime.context(runtime.conversationId, context, { at: tail });
+             const cut = view.entries.findIndex((entry) => entry.id === firstKept);
+             const now = runtime.now();
+             const messages = [
+                 { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
+                 {
+                     role: "user",
+                     content: [{ type: "text", text: summaryPrompt(summarizedMessages(view, cut), task.input.instructions) }],
+                     timestamp: now,
+                 },
+             ];
+             const { deferred: _deferred, ...forwarded } = streamOptions;
+             const options = {
+                 ...forwarded,
+                 cacheRetention: "none",
+                 maxTokens,
+                 signal: runtime.signal,
+                 sessionId: await ensureProviderSessionId(runtime, context),
+                 ...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
+             };
++            // mixin-chatbot patch for Pi 1.2.0 (gap G4): before every summarize request attempt, as
++            // `beforeRequest` before every generation request; the request door registers the attempt's signal here.
++            await runtime.hooks.each("beforeSummarize", async (hook) => {
++                await hook({ attempt, model: ref, messages }, runtime, context);
++            });
+             const message = await runtime.models.completeSimple(model, { messages }, options);
+             // An abort mark or close: the abort invocation or the reopened task handles the committed state.
+             runtime.signal.throwIfAborted();
+             const summary = summaryText(message);
+             const policy = runtime.settings.retry;
+             const retry = message.stopReason === "error" &&
+                 isRetryableAssistantError(message) &&
+                 policy.enabled &&
+                 attempt <= policy.maxRetries;
+             const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
+             await runtime.commit(async (tx, current) => {
+                 await recordUsage(tx, runtime.conversationId, "models", `${message.provider}/${message.model}`, message.usage);
+                 const live = await tx.doc(LiveDoc, runtime.conversationId);
+                 if (summary !== undefined)
+                     return placeSummary(tx, runtime, current, live, firstKept, summary);
+                 if (retry) {
+                     const status = compactionStatus(live, runtime.taskId);
+                     if (status !== undefined)
+                         status.retry = { at: until, error: message.errorMessage ?? "" };
+                     return { status: "running", checkpoint: { phase: "retry", ...request, until } };
+                 }
+                 const text = summaryFailure(message);
+                 failCompactionStatus(live, runtime.taskId, text);
+                 return {
+                     status: "terminal",

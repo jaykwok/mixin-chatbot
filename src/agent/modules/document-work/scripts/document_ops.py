@@ -389,22 +389,27 @@ def finalize_slides(request):
     return result
 
 
-def office_binary():
+def office_binary(configured=None):
+    if configured:
+        binary = Path(configured)
+        if not binary.is_absolute() or not binary.is_file():
+            raise ValueError(f"配置的 LibreOffice 程序路径无效：{configured}；请在设置中填写程序的绝对路径，或留空恢复自动查找")
+        return str(binary)
     candidates = [shutil.which("soffice"), shutil.which("libreoffice")]
     if os.name == "nt":
-        for folder in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        for folder in (os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
             if folder:
                 candidates.append(str(Path(folder) / "LibreOffice/program/soffice.exe"))
     return next((p for p in candidates if p and Path(p).is_file()), None)
 
 
-def convert_office(source, folder, profile):
+def convert_office(source, folder, profile, configured=None):
     """Converts in `folder` (TEMP, HOME and output). `profile` is an empty directory the caller made for LibreOffice's
     user profile, kept out of the job directory because a deep profile directory made LibreOffice write no PDF on Windows."""
     package(source)
-    binary = office_binary()
+    binary = office_binary(configured)
     if not binary:
-        raise ValueError("缺少 LibreOffice，无法渲染 Office 预览；安装后将 soffice 加入 PATH，Windows 也支持标准安装目录。文件编辑能力仍可用，不能声称已完成视觉检查。")
+        raise ValueError("缺少 LibreOffice，无法渲染 Office 预览；请在设置中填写 LibreOffice 程序路径，或安装后将 soffice 加入 PATH，Windows 也支持标准安装目录。文件编辑能力仍可用，不能声称已完成视觉检查。")
     (profile / "user").mkdir()
     # Dedicated profile isolates concurrent conversions and disables macro execution.
     (profile / "user/registrymodifications.xcu").write_text(
@@ -437,7 +442,7 @@ def render(request):
     from PIL import Image, ImageDraw
     source = Path(request["source"])
     folder = Path(request["directory"])
-    pdf = source if source.suffix.lower() == ".pdf" else convert_office(source, Path(request.get("workdir", folder)), Path(request["office"]))
+    pdf = source if source.suffix.lower() == ".pdf" else convert_office(source, Path(request.get("workdir", folder)), Path(request["office"]), request.get("officeBinary"))
     images, contacts = [], []
     with closing(pdfium.PdfDocument(str(pdf))) as document:
         total = len(document)
@@ -666,7 +671,7 @@ def images(request):
     crop_results = []
     if crops:
         import pypdfium2 as pdfium
-        pdf = source if kind == ".pdf" else convert_office(source, Path(request.get("workdir", request["directory"])), Path(request["office"]))
+        pdf = source if kind == ".pdf" else convert_office(source, Path(request.get("workdir", request["directory"])), Path(request["office"]), request.get("officeBinary"))
         with closing(pdfium.PdfDocument(str(pdf))) as document:
             for index, crop in enumerate(crops, 1):
                 number, box = crop.get("page"), crop.get("box")

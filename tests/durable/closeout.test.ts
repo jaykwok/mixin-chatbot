@@ -140,13 +140,13 @@ test("cold maintenance finishes an expiry receipt left after bytes were already 
 test("current history and pending attachments survive retention/clear, unknown directories stay; released references expire durably", async () => {
   const w = setup(); let service = w.open();
   const temp = userTempDir(w.root, group, phone), workspace = join(w.root, group, "workspace");
-  await mkdir(workspace, { recursive: true }); await writeFile(join(workspace, "long.txt"), "synthetic ".repeat(100));
+  await mkdir(workspace, { recursive: true }); await writeFile(join(workspace, "long.txt"), "synthetic ".repeat(4500));
   w.faux.setResponses([fauxAssistantMessage([fauxToolCall("codemode", { code: 'text(await tools.read({path:"long.txt"}));' })], { stopReason: "toolUse" }), fauxAssistantMessage("saved")]);
   try {
     await service.admit(phone, group, "save output", url); await until(() => w.replies.length === 1);
-    const root = join(temp, "codemode"), names = await readdir(root).catch(error => { throw new Error(`${error}; reports=${JSON.stringify(w.reports)}; replies=${JSON.stringify(w.replies)}`); }), name = names[0]!, file = join(root, name, "1.txt");
+    const root = join(temp, "codemode"), names = await readdir(root).catch(error => { throw new Error(`${error}; reports=${JSON.stringify(w.reports)}; replies=${JSON.stringify(w.replies)}`); }), name = names[0]!, file = join(root, name, "output.txt");
     expect(await readFile(file, "utf8")).toContain("synthetic");
-    const old = new Date(0); await utimes(join(root, name, "index.txt"), old, old); await utimes(join(root, name), old, old);
+    const old = new Date(0); await utimes(join(root, name), old, old);
     await mkdir(join(root, "9-unknown")); await writeFile(join(root, "9-unknown", "keep"), "unowned");
     await service.maintain(); expect(await readFile(file, "utf8")).toContain("synthetic");
     w.deliveries.put(memberKey(group, "13800000002"), "pending", `read ${file}`, [{ original: file, reference: {} as never }]);

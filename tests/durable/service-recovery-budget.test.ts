@@ -51,7 +51,7 @@ function safeTools() {
           releases.set(key, () => { cleanup(); resolve(); });
           if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
         });
-        return { content: [{ type: "text" as const, text: "finished" }] };
+        return { output: [{ type: "text" as const, text: "finished" }] };
       } finally { count.active--; }
     },
     }] });

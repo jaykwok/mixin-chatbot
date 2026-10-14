@@ -11,6 +11,7 @@ import { AsyncSemaphore } from "../../../core/async-semaphore.ts";
 import { application } from "../../../core/lifecycle.ts";
 import { log } from "../../../core/log.ts";
 import { runProcess } from "../../../core/process.ts";
+import { runtimeSetting } from "../../../core/runtime-config.ts";
 import type { IsolatedTask } from "../../../core/rootless-tasks.ts";
 import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../../../core/task-backend.ts";
 import { holdDirectory } from "../../../core/held-directory.ts";
@@ -166,7 +167,9 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
           ready = true;
         }
         const id = randomUUID(), input = join(scratch, id + ".request.json"), report = join(output, id + ".json");
-        await writeFile(input, JSON.stringify({ ...request, workdir: scratch }), { flag: "wx" });
+        // Carry the administrator's program path in the request so isolated workers need no extra environment access.
+        await writeFile(input, JSON.stringify({ ...request, workdir: scratch,
+          officeBinary: runtimeSetting("BOT_DOCUMENT_OFFICE_PATH") }), { flag: "wx" });
         const office = (request as Record<string, unknown>).office;
         const args = isolated && typeof office === "string" ? ["-c",
           "import os,runpy,sys; os.mkdir(sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')", office, pythonScript, operation, input, report]

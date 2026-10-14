@@ -11,9 +11,10 @@ import { v1 } from "../v1.ts";
 import { v2 } from "../v2.ts";
 import { v3 } from "../v3.ts";
 import { v4 } from "../v4.ts";
+import { v5 } from "../v5.ts";
 import { describeMigrations } from "./preview.ts";
 
-const migrations = [v1, v2, v3, v4];
+const migrations = [v1, v2, v3, v4, v5];
 interface FileCopy { path: string; saved: string; hash: string | null }
 type Kind = "migration" | "verification" | "registration";
 interface Journal { format: 1; id: string; target: number; steps: number[]; deployment?: string; groups: string; backup: string | null; phase: "applying" | "validated" | "committed"; kind?: Kind; marker?: DataVersion; decisions: Decisions; files: FileCopy[]; cleanup?: "pending" | "complete" }

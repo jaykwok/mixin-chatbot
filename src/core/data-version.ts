@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-export const DATA_VERSION = 4;
+export const DATA_VERSION = 5;
 export const VERSION_FILE = "data-version.json";
 export const MIGRATION_FILE = "migration.json";
 /** The group root lease's directory inside the group root (src/core/maintenance.ts); group and user segments never start with a dot. */

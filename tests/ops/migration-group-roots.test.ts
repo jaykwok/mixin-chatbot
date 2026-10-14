@@ -44,8 +44,8 @@ test("a committed migration can initialize a completely empty replacement group 
     const result = await preview(next);
     expect(result.decisions).toEqual([]);
     expect(result.plan?.kind).toBe("migration");
-    // 未登记的群根从头走一遍：v1 三步、v2 两步、v3 两步（没有会话可导入，也没有保温设置要改）。
-    expect(result.plan?.steps).toHaveLength(9);
+    // 未登记的群根从头走一遍：v1 三步，v2、v3、v4、v5 各两步（没有会话可导入，也没有保温设置或脚本 store 要改）。
+    expect(result.plan?.steps).toHaveLength(11);
     expect(await readdir(next.groups)).toEqual([]);
     await apply(next, result.plan!); await commit(next);
     expect(inspectDataVersion(next.project, next.groups).current).toBe(true);

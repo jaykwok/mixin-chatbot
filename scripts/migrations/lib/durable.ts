@@ -7,7 +7,7 @@
 // change what an old migration writes. A Harness is opened paused, with an empty registry and no model providers, only
 // so that creating a conversation writes the built-in `pi.*` documents; nothing resumes it, submits or waits, so no
 // task, tool or request can run. Should the storage format or these interfaces ever change, freeze a copy here.
-import type { Context } from "@earendil-works/chord";
+import { type Context, copyJson } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels, type Message } from "@earendil-works/pi-ai";
 import {
@@ -32,9 +32,22 @@ export const IdentityDoc = defineDoc<{ groupId: string; phone: string; version: 
   kind: "mixin.identity", version: 1, scope: "conversation", history: "latest", fork: "initial",
   initial: () => ({ groupId: "", phone: "", version: 1 }),
 });
-/** Frozen copy of src/durable/codemode/index.ts `CodemodeStoreDoc`. */
+/** Frozen copy of src/durable/codemode/index.ts `CodemodeStoreDoc` up to data version 4 (the project's own codemode). */
 export const CodemodeStoreDoc = defineDoc<{ values: Record<string, JsonValue> }>({
   kind: "mixin.codemode-store", version: 1, scope: "conversation", history: "latest", fork: "initial", initial: () => ({ values: {} }),
+});
+/** Frozen copy of pi-durable 1.2.0 `@earendil-works/pi-durable/codemode` `CodemodeStoreDoc` (data version 5 on). */
+export const OfficialCodemodeStoreDoc = defineDoc<{ values: Record<string, JsonValue> }>({
+  kind: "pi.codemode.store", version: 1, scope: "conversation", history: "rewindable", fork: "asOf", initial: () => ({ values: {} }),
+});
+/**
+ * Data version 5's boundary of a copied store: `through` is the conversation's newest entry when its values were copied
+ * (0 when it had none), `copiedAt` the time. The old store kept no history, so the official store has none before the
+ * copy: read as of an entry up to `through`, or forked there, it is empty, not the copied values. Written only by v5.
+ */
+export const CodemodeStoreBoundaryDoc = defineDoc<{ version: 1; through: number; copiedAt: number }>({
+  kind: "mixin.codemode-store-boundary", version: 1, scope: "conversation", history: "latest", fork: "initial",
+  initial: () => ({ version: 1, through: 0, copiedAt: 0 }),
 });
 
 /** What the import of one legacy session wrote; src/durable/projection.ts reads `through`. */
@@ -140,6 +153,83 @@ export async function readGroupImports(path: string, phones: string[]): Promise<
       imports.set(phone, id ? (await session.snapshot(LegacyImportDoc, id as ConversationId, context)) as LegacyImport | undefined : undefined);
     }
     return { groupId, imports };
+  } finally { await storage.close(context); }
+}
+
+/** Every conversation of a group database, oldest first. */
+async function conversations(storage: Storage): Promise<ConversationId[]> {
+  const ids: ConversationId[] = [];
+  let cursor;
+  do {
+    const page = await storage.scanConversations({}, 200, cursor, context);
+    ids.push(...page.items.map((conversation) => conversation.id));
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return ids;
+}
+
+const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+const sorted = (values: Record<string, JsonValue>) => Object.fromEntries(Object.entries(values).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+
+export type StoreCopy = { conversationId: number; keys: number; through: number; outcome: "copied" | "already-copied" };
+
+/**
+ * Data version 5: copy each conversation's script store (`store()`/`load()`) from the project's document
+ * (`mixin.codemode-store`) to the official one (`pi.codemode.store`), one commit per conversation, through a bare Session:
+ * no Harness, so no task recovers or runs. The old document stays (old code reads it after a rollback). A conversation
+ * whose official store already holds these values is left as is (a repeated run); one holding other values, or the same
+ * values without this step's boundary record, stops the migration: only this step writes it before the service runs data
+ * version 5. The commit that copies also records the boundary (`CodemodeStoreBoundaryDoc`). A conversation without
+ * stored values is only read (`tx.doc` would create the document it names).
+ */
+export async function copyCodemodeStores(path: string): Promise<StoreCopy[]> {
+  const storage = await openGroupStorage(path);
+  try {
+    // Never closed (closing would close the storage), so it keeps no document past a call.
+    const session = createSession(storage, { documentRetentionMs: 0 });
+    const copies: StoreCopy[] = [];
+    for (const id of await conversations(storage)) {
+      if (Object.keys((await session.snapshot(CodemodeStoreDoc, id, context))?.values ?? {}).length === 0) continue;
+      const recorded = await session.snapshot(CodemodeStoreBoundaryDoc, id, context);
+      const outcome = await session.commit(async (tx) => {
+        const old = (await tx.doc(CodemodeStoreDoc, id)).values;
+        if (Object.keys(old).length === 0) return undefined;
+        const official = await tx.doc(OfficialCodemodeStoreDoc, id);
+        if (Object.keys(official.values).length === 0) {
+          // A draft is a proxy: copied as JSON (structuredClone refuses it).
+          official.values = copyJson(old) as Record<string, JsonValue>;
+          const through = (await tx.scanEntries({ conversationId: id }, 1)).items[0]?.id ?? 0;
+          Object.assign(await tx.doc(CodemodeStoreBoundaryDoc, id), { version: 1, through, copiedAt: Date.now() });
+          return "copied" as const;
+        }
+        if (sameJson(sorted(official.values), sorted(old))) {
+          if (!recorded?.copiedAt) throw new Error(`会话 ${id} 的官方 codemode store 已有值但没有迁移边界记录，拒绝继续：${path}`);
+          return "already-copied" as const;
+        }
+        throw new Error(`会话 ${id} 的官方 codemode store 已有不同的值，拒绝覆盖：${path}`);
+      }, context);
+      if (outcome) copies.push({ conversationId: id as number, keys: Object.keys((await session.snapshot(CodemodeStoreDoc, id, context))?.values ?? {}).length,
+        through: (await session.snapshot(CodemodeStoreBoundaryDoc, id, context))!.through, outcome });
+    }
+    return copies;
+  } finally { await storage.close(context); }
+}
+
+/** Read-only check of a group database: conversations whose official store does not hold their old store's values, or
+ * whose boundary is not recorded. */
+export async function uncopiedCodemodeStores(path: string): Promise<number[]> {
+  const storage = await openGroupStorage(path);
+  try {
+    const session = createSession(storage, { documentRetentionMs: 0 });
+    const missing: number[] = [];
+    for (const id of await conversations(storage)) {
+      const old = (await session.snapshot(CodemodeStoreDoc, id, context))?.values ?? {};
+      if (Object.keys(old).length === 0) continue;
+      const official = (await session.snapshot(OfficialCodemodeStoreDoc, id, context))?.values ?? {};
+      const recorded = (await session.snapshot(CodemodeStoreBoundaryDoc, id, context))?.copiedAt;
+      if (!recorded || !sameJson(sorted(official as Record<string, JsonValue>), sorted(old as Record<string, JsonValue>))) missing.push(id as number);
+    }
+    return missing;
   } finally { await storage.close(context); }
 }
 
