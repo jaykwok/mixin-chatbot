@@ -317,7 +317,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
         const expiry = describeRelayExpiry(relay, url);
         // 交给运行时并入本轮回复，而不是在这里单独发一条：URL 必须逐字正确，所以不能让
         // 模型复述；但也不值得为它多花一条出站配额。
-        const note = `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发：\n${url}${expiry}`;
+        const note = `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发，请点击链接并点击“继续前往”下载文件：\n${url}${expiry}`;
         notes.add(note, { original: note, reference: relayReference(relay, url, name, resolved.size) });
         return {
           content: [
