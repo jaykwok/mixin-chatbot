@@ -289,16 +289,20 @@ resume_upgrade() {
         git_here cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null ||
             { print_error "目标提交 ${TARGET_SHA:0:7} 在本地不存在；服务和代码保持现状，取回该提交后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
         switch_ready || { print_error "不能切换到目标提交 ${TARGET_SHA:0:7}（原因见上方）；服务和代码保持现状，处理后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
-        # 中断发生在停机完成之前时服务可能仍在运行；切换代码前先停止。
+    fi
+    DEPLOY_SNAPSHOT="$TRANSACTION_SNAPSHOT"
+    GROUP_ROOT="${TRANSACTION[target_group_root]}"
+    # Code may already be current while its data still needs reset. Resume the freeze independently of checkout.
+    if [ "$head" != "$TARGET_SHA" ] || { [ -d "$DEPLOY_SNAPSHOT/reset-config" ] && [ ! -f "$DEPLOY_SNAPSHOT/reset.json" ]; }; then
+        # 中断发生在停机完成之前时服务可能仍在运行；冻结统计或切换代码前先停止。
         if [ "$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then
             print_status "停止机器人服务后再切换代码..."
             operation_capture docker stop --time 30 mixin-chatbot || { print_error "旧容器停止失败，未切换代码；可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
             downtime_begins
         fi
-        DEPLOY_SNAPSHOT="$TRANSACTION_SNAPSHOT"
-        GROUP_ROOT="${TRANSACTION[target_group_root]}"
-        PREVIOUS_IMAGE="$(cat "$DEPLOY_SNAPSHOT/previous-image")"
-        freeze_reset_stats || { print_error '旧版统计补账未完成；请处理后继续或回滚'; exit 1; }
+        freeze_reset_stats || { print_error '现有统计账本核对失败；请处理后继续或回滚'; exit 1; }
+    fi
+    if [ "$head" != "$TARGET_SHA" ]; then
         checkout_target || {
             print_error "无法切换到目标提交 ${TARGET_SHA:0:7}；服务保持停止，处理后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
         print_success "代码已更新：${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}"
@@ -481,7 +485,7 @@ preview_data_preparation() {
         -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" "$IMAGE_ID" \
         bun run scripts/runtime/data-current.ts probe --project /app --groups "$groups" || status=$?
     if [ "$status" = 20 ]; then
-        ask_yes_no '数据版本不兼容。保留完整统计与 webhook/Cloudflare 入口，清理旧会话和资料并重新配置；成功后自动删除旧会话备份。继续？[y/N] ' || {
+        ask_yes_no '数据版本不兼容。原样保留现有统计账本与 webhook/Cloudflare 入口，清理旧会话、未入账消息、待处理任务和资料，不再补算；重新配置并在成功后删除旧会话备份。继续？[y/N] ' || {
             print_warning '已取消；旧服务、配置和数据未改动'; exit 1;
         }
         docker run --rm -i --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp \
@@ -576,17 +580,17 @@ record_deployment_transaction() {
     if [ -n "$RESET_CONFIG" ]; then cp -a -- "$RESET_CONFIG" "$snapshot/reset-config"; fi
 }
 
-# Run the final projection in the old image. The new runtime contains no old-session decoder.
+# Freeze the existing ledger with the target image, without reading discarded session formats.
 freeze_reset_stats() {
     [ -d "$DEPLOY_SNAPSHOT/reset-config" ] || return 0
     [ ! -f "$DEPLOY_SNAPSHOT/reset.json" ] || return 0
-    grant_service_access "$DEPLOY_SNAPSHOT" "$UPGRADER_DIR" || return 1
+    grant_service_access "$DEPLOY_SNAPSHOT" || return 1
     local groups=/app/data/groups mounts=()
     if [ "$GROUP_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then groups=/app/group-data; mounts=(-v "$GROUP_ROOT:/app/group-data"); fi
-    print_status '旧版离线补齐统计；不调用模型或外部服务...'
+    print_status '核对并冻结现有统计账本；不读取或补算旧会话...'
     docker run --rm --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp -e GROUP_DATA_ROOT="$groups" \
-        -v "$PROJECT_DIR/data:/app/data" "${mounts[@]}" -v "$PROJECT_DIR/backup:/app/backup" -v "$UPGRADER_DIR:/upgrade:ro" \
-        "$PREVIOUS_IMAGE" bun run /upgrade/scripts/runtime/stats-freeze.ts --groups "$groups" \
+        -v "$PROJECT_DIR/data:/app/data" "${mounts[@]}" -v "$PROJECT_DIR/backup:/app/backup" \
+        "$IMAGE_ID" bun run scripts/runtime/stats-freeze.ts --groups "$groups" \
         --receipt "/app/backup/snapshots/$(basename -- "$DEPLOY_SNAPSHOT")/stats-frozen.json"
 }
 
@@ -682,7 +686,7 @@ fresh_upgrade() {
     HOST_GROUP_DATA_ROOT="$GROUP_ROOT"
     begin_deployment "$TARGET_SHA"
     trap abort_before_handoff EXIT
-    freeze_reset_stats || { print_error '旧版统计补账未完成，恢复原服务；未清理旧会话'; exit 1; }
+    freeze_reset_stats || { print_error '现有统计账本核对失败，恢复原服务；未清理旧会话'; exit 1; }
     if [ "$PREVIOUS_RUNNING" = 0 ]; then print_status "机器人服务升级前未运行，升级后保持停止"; fi
     checkout_target || { print_error "切换到目标提交 ${TARGET_SHA:0:7} 失败，正在恢复升级前的状态"; exit 1; }
     [ "$ORIGINAL_SHA" = "$TARGET_SHA" ] || print_success "代码已更新：${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}"

@@ -48,9 +48,11 @@ export function inspectDataVersion(project: string, groups: string): { current: 
     const local = readDataVersion(join(project, "data/state", VERSION_FILE));
     const group = readDataVersion(join(groups, VERSION_FILE));
     if (!local && !group) return { current: false, detail: "数据尚未登记，请按 docs/data-migrations.md 准备当前格式，再部署" };
-    if (!local || !group || local.dataVersion !== DATA_VERSION || group.dataVersion !== DATA_VERSION || local.transaction !== group.transaction) {
-      return { current: false, detail: "项目和群根标记不成对或格式不匹配；旧版请通过 update 确认保留统计并重置，不成对时先恢复一致状态。参见 docs/data-migrations.md" };
+    if (!local || !group || local.dataVersion !== group.dataVersion || local.transaction !== group.transaction) {
+      return { current: false, detail: "项目和群根的数据版本标记不成对，请先恢复一致状态。参见 docs/data-migrations.md" };
     }
+    if (local.dataVersion < DATA_VERSION) return { current: false, detail: `数据版本 ${local.dataVersion}，当前程序要求 ${DATA_VERSION}；请通过 update 确认保留现有统计账本并重置旧会话。参见 docs/data-migrations.md` };
+    if (local.dataVersion > DATA_VERSION) return { current: false, detail: `数据版本 ${local.dataVersion} 高于当前程序 ${DATA_VERSION}，禁止降级清理。参见 docs/data-migrations.md` };
     return { current: true, detail: `数据版本 ${DATA_VERSION}` };
   } catch (error) { return { current: false, detail: (error as Error).message }; }
 }

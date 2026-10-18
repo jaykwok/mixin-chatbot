@@ -1,4 +1,4 @@
-// A release boundary, not a chain of historical converters. Old readers run in the source release.
+// A release boundary: preserve the existing ledger and entrance credentials; discard old session formats.
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { cp, mkdir, rename, rm } from "node:fs/promises";
@@ -155,7 +155,7 @@ export async function applyReset(project: string, groups: string, deployment: st
     if (!plan || JSON.stringify(makeResetPlan(project, groups, p.draft)) !== JSON.stringify(plan)) throw new Error("重置预览后配置、凭证或版本已变化，拒绝清理");
     const freeze = readMetadata(join(p.snapshot, "stats-frozen.json")) as { digest?: string; timezone?: string } | null;
     const stats = statsDigest(join(groups, "stats.sqlite"));
-    if (freeze?.digest !== stats) throw new Error("缺少旧版完成补账的冻结凭据，或统计在冻结后变化");
+    if (freeze?.digest !== stats) throw new Error("缺少现有统计账本的冻结凭据，或统计在冻结后变化");
     if (freeze.timezone !== Intl.DateTimeFormat().resolvedOptions().timeZone) throw new Error(`新旧统计时区不同（${freeze.timezone} → ${Intl.DateTimeFormat().resolvedOptions().timeZone}），拒绝切换`);
     await mkdir(p.permanent, { recursive: true, mode: 0o700 });
     const backup = join(p.permanent, "stats.sqlite");

@@ -215,7 +215,7 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 
 ## 数据版本与升级
 
-当前应用数据格式为 6，只支持当前配置和新会话。历史迁移器、JSONL 导入和旧字段别名已删除；切换步骤见[自动重置升级](data-migrations.md)。统计 schema 2 原样保留，新增来源包含持久群库代际，成员去重身份不变。`scripts/runtime/data-current.ts` 负责版本探测、当前格式验证与发布提交；跨代时调用 `data-reset.ts` 的可恢复清理事务。`stats-freeze.ts` 在切换代码/依赖之前运行旧发布的读者和投影器完成补账，目标运行时不含旧格式解析。schema 2 整库核对和独立备份是清理前提，统计格式变化另做一次性工具。只有不兼容的数据变化才递增 `DATA_VERSION`，一般升级不触发清理。
+当前应用数据格式为 6，只支持当前配置和新会话。历史迁移器、JSONL 导入和旧字段别名已删除；切换步骤见[自动重置升级](data-migrations.md)。统计 schema 2 原样保留，新增来源包含持久群库代际，成员去重身份不变。`scripts/runtime/data-current.ts` 负责版本探测、当前格式验证与发布提交；跨代时调用 `data-reset.ts` 的可恢复清理事务。`stats-freeze.ts` 使用目标发布的依赖核对并冻结现有统计账本，不导入旧读者、不打开旧群库或补算消息，未入账内容随旧会话清理。schema 2 整库核对和独立备份是清理前提，统计格式变化另做一次性工具。只有不兼容的数据变化才递增 `DATA_VERSION`，一般升级不触发清理。
 
 六个直接 Pi 依赖精确锁为 1.3.0，内部包使用官方精确依赖和 Bun 锁文件，不重复设置 Pi overrides。仍保留两处 Durable 补丁：`beforeSummarize` 逐次请求准入，以及 `settleNestedTool` 在子调用终结事务内写原子费用回执。普通 afterTool 无法替代原子结算。升级时需要重新验证取消、恢复和回滚语义。
 

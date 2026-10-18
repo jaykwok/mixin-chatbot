@@ -61,7 +61,7 @@ function Assert-SwitchReady {
         "`n升级不移动、不删除这些文件；请把它们移出工作区（或提交到其他分支）、撤销已跟踪文件的改动后重试。")
 }
 
-# This phase uses built-ins only, so even a changed Pi dependency cannot block decisions.
+# Version probing uses built-ins; reset configuration and statistics use isolated target dependencies.
 try {
 Write-OperationEvent 'info' ("original=$OriginalSha target=$TargetSha rollback=$([bool]$Rollback)")
 if (-not $Rollback) {
@@ -79,7 +79,7 @@ if ($recordedPlan -and (Test-Path -LiteralPath $recordedPlan -PathType Leaf)) {
     $previewOptions = @()
     if ($probeCode -eq 20) {
         if ($pendingPath) { throw '未完成事务缺少已确认的重置计划；请回滚后重试' }
-        Write-Host '保留完整统计与 webhook/Cloudflare 入口；旧会话、资料和其他配置将清理。成功后自动删除旧会话回滚副本。'
+        Write-Host '原样保留现有统计账本与 webhook/Cloudflare 入口；旧会话、未入账消息、待处理任务、资料和其他配置将清理，不再补算。成功后自动删除旧会话回滚副本。'
         if ((Read-Host '确认按此方式升级并重新配置？输入 RESET 继续') -cne 'RESET') { throw '已取消；旧服务和数据未改动' }
         if ($stageRoot -eq [IO.Path]::GetFullPath($Project)) { throw '重置必须通过目标版本导出的升级入口执行' }
         $resetConfig = Join-Path $stageRoot 'reset-config'
@@ -102,6 +102,13 @@ if ($recordedPlan -and (Test-Path -LiteralPath $recordedPlan -PathType Leaf)) {
     }
 }
 Set-OperationStage 'upgrade-preflight'
+# A fresh export used to resume an unfinished freeze needs its own target dependencies.
+if ($pendingPath -and (Test-Path -LiteralPath (Join-Path $pendingPath 'reset-config')) -and
+    -not (Test-Path -LiteralPath (Join-Path $pendingPath 'stats-frozen.json'))) {
+    Push-Location -LiteralPath $stageRoot
+    try { & $bun install --frozen-lockfile; if ($LASTEXITCODE -ne 0) { throw '目标版本统计核对依赖安装失败；原升级事务保留，请重试或回滚' } }
+    finally { Pop-Location }
+}
 if ((Invoke-OperationNative $git @('-C', $Project, 'show-ref', '--verify', '--quiet', 'refs/heads/main')) -ne 0) { throw '本地 main 分支不存在；旧服务尚未停止' }
 if ((Invoke-OperationNative $git @('-C', $Project, 'merge-base', '--is-ancestor', 'main', $TargetSha)) -ne 0) { throw '本地 main 无法快进到目标提交；旧服务尚未停止' }
 if (-not $pendingPath -and -not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) { throw '未安装计划任务，请先部署；旧服务尚未停止' }
@@ -170,11 +177,9 @@ try {
     $mutated = $true
     if ((Test-Path -LiteralPath (Join-Path $snapshot.Path 'reset-config')) -and
         -not (Test-Path -LiteralPath (Join-Path $snapshot.Path 'stats-frozen.json'))) {
-        $sourceHead = [string](& $git -C $Project rev-parse HEAD)
-        if ($sourceHead.Trim() -ne $OriginalSha) { throw '缺少旧版统计冻结凭据，不能在新版代码中补算旧会话；请回滚后重试' }
-        Set-OperationStage 'freeze-source-statistics'
+        Set-OperationStage 'freeze-statistics'
         & $bun run (Join-Path $PSScriptRoot '..\runtime\stats-freeze.ts') --groups $groups --receipt (Join-Path $snapshot.Path 'stats-frozen.json')
-        if ($LASTEXITCODE -ne 0) { throw '旧版统计补账失败；旧会话尚未清理' }
+        if ($LASTEXITCODE -ne 0) { throw '现有统计账本核对失败；旧会话尚未清理' }
     }
     Set-OperationStage 'checkout'
     if ((Invoke-OperationNative $git @('-C', $Project, 'checkout', '--quiet', 'main') -Quiet) -ne 0) { throw '切换 main 失败' }

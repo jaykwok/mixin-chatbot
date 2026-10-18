@@ -143,7 +143,7 @@ bun run tui
 
 详细键位与报表预览见[管理台与报表](docs/tui.md)。TUI 与命令行升级共用同一流程；首次从旧版升级若提示“无法导出升级器”，请执行[一次性引导](docs/data-migrations.md#第一次从旧版升级)，不要先切换旧代码或替换依赖。不用管理台时，可将上面命令中的 `doctor` 替换为 `start`、`stop`、`restart`、`logs` 或 `update`；升级条件与备份清理规则见[命令行运维](docs/operations.md#命令行运维)。
 
-Pi 1.3.0 使用数据版本 6。普通更新直接升级；数据版本不兼容时提示重新配置，自动补账、核对并保留统计和 webhook / Cloudflare 凭证，再清理旧会话。统计 schema 2 不变，无需转换，步骤见[数据版本与自动重置升级](docs/data-migrations.md)。
+Pi 1.3.0 使用数据版本 6。普通更新直接升级；数据版本不兼容时提示重新配置，原样保留并核对现有统计账本和 webhook / Cloudflare 凭证，再清理旧会话及未入账消息，不再补算。统计 schema 2 不变，无需转换，步骤见[数据版本与自动重置升级](docs/data-migrations.md)。
 
 ## 详细文档
 

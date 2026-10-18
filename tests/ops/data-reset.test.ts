@@ -1,20 +1,16 @@
 import { expect, test } from "bun:test";
-import { mkdir, writeFile, readFile, cp, rename, symlink } from "node:fs/promises";
+import { mkdir, writeFile, readFile, cp, rename, symlink, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
-import { DATA_VERSION } from "../../src/core/data-version.ts";
+import { DATA_VERSION, inspectDataVersion } from "../../src/core/data-version.ts";
 import { openStatsLedger, ingestConversationRecords } from "../../src/agent/stats-ledger.ts";
 import { prepareResetDraft, makeResetPlan, statsDigest, resetVersion, applyReset, rollbackReset, verifyReset, finishReset } from "../../scripts/runtime/data-reset.ts";
 import { writeCurrentConfig } from "../helpers/current-config.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import { freezeSourceStats } from "../../scripts/runtime/stats-freeze.ts";
+import { freezeStats } from "../../scripts/runtime/stats-freeze.ts";
 import { acquireLease, acquireGroupRootLease } from "../../src/core/maintenance.ts";
-import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
-import { memberConversation } from "../../src/durable/identity.ts";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
-import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 
 const runner = fileURLToPath(new URL("../../scripts/runtime/data-current.ts", import.meta.url));
 const id = "deploy-reset123";
@@ -57,14 +53,20 @@ test("data-version equality bypasses reset; only a lower matched pair offers res
   const f = await fixture();
   try {
     expect((await f.run("probe")).code).toBe(20);
+    expect(inspectDataVersion(f.project, f.groups).detail).toContain("通过 update");
+    expect(inspectDataVersion(f.project, f.groups).detail).not.toContain("不成对");
     for (const version of [DATA_VERSION, DATA_VERSION + 1]) {
       for (const path of [join(f.project, "data/state/data-version.json"), join(f.groups, "data-version.json")])
         await writeFile(path, JSON.stringify({ dataVersion: version, transaction: "same" }));
       if (version === DATA_VERSION) { expect(resetVersion(f.project, f.groups)).toBeNull(); expect((await f.run("probe")).code).toBe(0); }
-      else expect(() => resetVersion(f.project, f.groups)).toThrow("降级");
+      else {
+        expect(() => resetVersion(f.project, f.groups)).toThrow("降级");
+        expect(inspectDataVersion(f.project, f.groups).detail).toContain("降级");
+      }
     }
     await writeFile(join(f.groups, "data-version.json"), JSON.stringify({ dataVersion: DATA_VERSION - 1, transaction: "different" }));
     expect(() => resetVersion(f.project, f.groups)).toThrow("不成对");
+    expect(inspectDataVersion(f.project, f.groups).detail).toContain("不成对");
     expect(await readFile(join(f.groups, "g/durable.sqlite"), "utf8")).toBe("old-session");
   } finally { await f.cleanup(); }
 }, 60000);
@@ -122,7 +124,7 @@ test("reset rollback restores configuration, session, outbox and markers and can
   } finally { await f.cleanup(); }
 });
 
-test("changed configuration or unaccounted statistics block reset before any old data is moved", async () => {
+test("configuration or ledger changes after preview block reset before any old data is moved", async () => {
   const f = await fixture();
   try {
     await writeFile(join(f.project, "data/config/obsolete.json"), "changed");
@@ -171,47 +173,37 @@ test("committed archive cleanup runs while the activated service owns its leases
   } finally { await releaseGroups?.(); await release?.(); await f.cleanup(); }
 });
 
-async function sourceReaders(project: string) {
-  const repo = fileURLToPath(new URL("../../", import.meta.url));
-  await mkdir(join(project, "data/state"), { recursive: true });
-  await writeFile(join(project, "package.json"), '{"type":"module"}');
-  await symlink(join(repo, "node_modules"), join(project, "node_modules"), process.platform === "win32" ? "junction" : "dir");
-  for (const name of ["src/core/maintenance.ts", "scripts/lib/group-data.ts", "src/agent/stats-ledger.ts", "src/agent/paths.ts", "src/durable/diagnostics.ts",
-    "src/durable/identity.ts", "src/durable/projection.ts", "src/integrations/relay-index.ts", "src/durable/sqlite.ts", "src/durable/inbox.ts"]) {
-    const path = join(project, name); await mkdir(join(path, ".."), { recursive: true });
-    await writeFile(path, `export * from ${JSON.stringify(pathToFileURL(join(repo, name)).href)};\n`);
-  }
-}
-
-test("source-release freeze projects previously uncounted Durable entries and is repeatable without model requests", async () => {
-  const f = await tempFixture("source-freeze-"), project = f.root, groups = join(project, "groups");
+test("target freeze and reset discard unreadable old sessions and task state without importing source readers", async () => {
+  const f = await fixture(true);
   try {
-    await sourceReaders(project); await mkdir(join(groups, "group-a"), { recursive: true });
-    const { faux, models, model } = fauxModels();
-    const opened = await openGroupHarness(join(groups, "group-a/durable.sqlite"), models, { group: "group-a" });
-    try {
-      const { conversation } = await memberConversation(opened.harness, "group-a", "13800000001", { model }, context);
-      faux.setResponses([fauxAssistantMessage("counted later")]);
-      expect((await (await conversation.submit({ type: "input", content: "question", requestId: "before-upgrade" }, context)).wait(context)).status).toBe("done");
-    } finally { await opened.close(); }
-    const receipt = join(project, "frozen.json");
-    await expect(freezeSourceStats(project, groups, receipt)).rejects.toThrow("统计库缺失");
-    openStatsLedger(groups).close();
-    await freezeSourceStats(project, groups, receipt);
-    const digest = statsDigest(join(groups, "stats.sqlite"));
-    const db = new Database(join(groups, "stats.sqlite"), { readonly: true });
-    try { expect(db.query("SELECT SUM(asks) AS asks, SUM(replies) AS replies FROM activity").get()).toEqual({ asks: 1, replies: 1 }); }
-    finally { db.close(); }
-    await freezeSourceStats(project, groups, receipt);
-    expect(statsDigest(join(groups, "stats.sqlite"))).toBe(digest);
-    expect(JSON.parse(await readFile(receipt, "utf8")).digest).toBe(digest);
+    // Neither these invalid old databases nor source-release code/dependencies are needed.
+    await writeFile(join(f.project, "data/state/relay.sqlite"), "unreadable old relay state");
+    await mkdir(join(f.project, "src/durable"), { recursive: true });
+    await writeFile(join(f.project, "src/durable/identity.ts"), 'throw new Error("old reader must not run");');
+    const receipt = join(f.snapshot, "stats-frozen.json"); await rm(receipt);
+    const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../../scripts/runtime/stats-freeze.ts", import.meta.url)),
+      "--groups", f.groups, "--receipt", receipt], { cwd: f.project, env: { ...process.env, BOT_OPERATION_LOG: "", TZ: Intl.DateTimeFormat().resolvedOptions().timeZone }, stdout: "pipe", stderr: "pipe", windowsHide: true });
+    const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code, out + err).toBe(0);
+    await freezeStats(f.project, f.groups, receipt);
+    expect(JSON.parse(await readFile(receipt, "utf8")).digest).toBe(f.before);
+    for (const action of ["apply", "validate", "commit", "finish-reset"]) {
+      const result = await f.run(action); expect(result.code, result.text).toBe(0);
+    }
+    expect(statsDigest(join(f.groups, "stats.sqlite"))).toBe(f.before);
+    expect(statsDigest(join(f.project, "backup/statistics", id, "stats.sqlite"))).toBe(f.before);
+    expect(await readFile(join(f.project, "data/config/webhook-secret"), "utf8")).toBe("a".repeat(64));
+    expect(await readFile(join(f.project, "data/config/cloudflared-token"), "utf8")).toBe("private-test-token");
+    expect(existsSync(join(f.groups, "g"))).toBe(false);
+    expect(existsSync(join(f.project, "data/state/relay.sqlite"))).toBe(false);
+    expect(existsSync(join(f.project, "data/state/agent.sqlite"))).toBe(false);
   } finally { await f.cleanup(); }
 });
 
-test("freeze discards incomplete JSONL tails regardless of archival, preserving complete statistics and skipped counts", async () => {
+test("freeze preserves existing statistics and source flags without reading or backfilling any JSONL", async () => {
   const f = await tempFixture("freeze-jsonl-"), project = f.root, groups = join(project, "groups"), receipt = join(project, "frozen.json");
   try {
-    await sourceReaders(project);
+    await mkdir(join(project, "data/state"), { recursive: true });
     const db = openStatsLedger(groups);
     try {
       for (const user of ["present", "archived", "missing"]) {
@@ -220,23 +212,40 @@ test("freeze discards incomplete JSONL tails regardless of archival, preserving 
       }
       db.exec("UPDATE sources SET pending = 1, projection = 2; UPDATE sources SET archived_at = 123, projection = 1 WHERE id = 'archived'");
       await mkdir(join(groups, "g/users/present"), { recursive: true });
-      await writeFile(join(groups, "g/users/present/session.jsonl"), '{"unfinished":');
-      // An unexplained marker on another source type is not an authorized JSONL-tail discard.
+      await writeFile(join(groups, "g/users/present/session.jsonl"), '{"type":"message","timestamp":"2026-10-17T02:00:00Z","message":{"role":"user","content":[{"type":"text","text":"never backfill"}]}}\n{"unfinished":');
+      // Old projection versions and pending markers are retained as opaque ledger data.
       db.exec("UPDATE sources SET projection = 99 WHERE id = 'missing'");
-      await expect(freezeSourceStats(project, groups, receipt)).rejects.toThrow("非 JSONL");
-      expect(existsSync(receipt)).toBe(false);
-      db.exec("UPDATE sources SET projection = 2 WHERE id = 'missing'");
     } finally { db.close(); }
     const before = statsDigest(join(groups, "stats.sqlite"));
-    await freezeSourceStats(project, groups, receipt);
-    await freezeSourceStats(project, groups, receipt);
+    await freezeStats(project, groups, receipt);
+    await freezeStats(project, groups, receipt);
     expect(statsDigest(join(groups, "stats.sqlite"))).toBe(before);
     // Freeze itself does not destroy any rollback material.
-    expect(await readFile(join(groups, "g/users/present/session.jsonl"), "utf8")).toBe('{"unfinished":');
+    expect(await readFile(join(groups, "g/users/present/session.jsonl"), "utf8")).toEndWith('{"unfinished":');
     const frozen = new Database(join(groups, "stats.sqlite"), { readonly: true });
     try {
       expect(frozen.query("SELECT SUM(asks) AS asks FROM activity").get()).toEqual({ asks: 3 });
       expect(frozen.query("SELECT SUM(pending) AS skipped, COUNT(DISTINCT user_segment) AS users FROM sources").get()).toEqual({ skipped: 3, users: 3 });
     } finally { frozen.close(); }
+  } finally { await f.cleanup(); }
+});
+
+test("freeze refuses a missing or unsupported ledger and rejects changes after freezing", async () => {
+  const f = await tempFixture("freeze-integrity-"), project = f.root, groups = join(project, "groups"), receipt = join(project, "frozen.json");
+  try {
+    await mkdir(join(project, "data/state"), { recursive: true }); await mkdir(groups);
+    await expect(freezeStats(project, groups, receipt)).rejects.toThrow("统计库缺失");
+    expect(existsSync(join(groups, "stats.sqlite"))).toBe(false);
+    const db = openStatsLedger(groups);
+    try {
+      db.exec("UPDATE stats_schema SET version = 1");
+      await expect(freezeStats(project, groups, receipt)).rejects.toThrow("schema 2");
+      expect(existsSync(receipt)).toBe(false);
+      db.exec("UPDATE stats_schema SET version = 2");
+      await freezeStats(project, groups, receipt);
+      ingestConversationRecords(db, { id: "later", group: "g", user: "u", identity: "member" }, 0, 1,
+        [{ type: "message", timestamp: "2026-10-17T01:00:00Z", message: { role: "user", content: [{ type: "text" }] } }]);
+      await expect(freezeStats(project, groups, receipt)).rejects.toThrow("统计冻结后发生变化");
+    } finally { db.close(); }
   } finally { await f.cleanup(); }
 });

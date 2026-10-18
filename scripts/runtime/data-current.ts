@@ -61,7 +61,7 @@ async function main(): Promise<void> {
   if (action === "probe") {
     const from = resetVersion(project, groups);
     if (from !== null) {
-      console.log(`数据格式 ${from} → ${DATA_VERSION}：需要重新配置并清理旧会话；保留全部统计和 webhook / Cloudflare 入口凭证。`);
+      console.log(`数据格式 ${from} → ${DATA_VERSION}：需要重新配置并清理旧会话；原样保留现有统计账本和 webhook / Cloudflare 入口凭证。`);
       process.exitCode = 20;
     } else console.log(`数据格式兼容 ${DATA_VERSION}，正常升级，不清理会话。`);
     return;
@@ -82,7 +82,7 @@ async function main(): Promise<void> {
       await validateConfiguration(resolve(resetDraft));
       if (!planPath) throw new Error("重置预览必须保存计划");
       await publishJson(resolve(planPath), { format: 1, dataVersion: DATA_VERSION, reset });
-      console.log("新配置已验证；停机后补账并备份统计，再重置会话。核对失败会回滚。"); return;
+      console.log("新配置已验证；停机后核对并备份现有统计账本，再重置会话，不再补算旧消息。核对失败会回滚。"); return;
     }
     const state = inspect();
     const { validateConfiguration } = await import("../../src/core/data-validation.ts");

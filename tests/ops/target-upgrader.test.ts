@@ -103,7 +103,8 @@ case "$cmd" in
                 *' probe '*) exit 20 ;;
                 *' prepare-reset '*) mkdir -p "$preview/reset-config/data/config"; printf 'draft' > "$preview/reset-config/data/config/models.json"; exit 0 ;;
                 *' bun run configure '*) printf 'configure head=%s\n' "$(current_head)" >> "$FIXTURE_EVENTS"; exit 0 ;;
-                *'/upgrade/scripts/runtime/stats-freeze.ts '*)
+                *' bun run scripts/runtime/stats-freeze.ts '*)
+                    printf '%s\n' "$@" > "$mock/freeze-args"
                     printf 'freeze head=%s\n' "$(current_head)" >> "$FIXTURE_EVENTS"
                     [ "\${FIXTURE_FREEZE:-ok}" = ok ] || exit 1
                     snapshot="$(cat "$FIXTURE_WORK/data/state/deploy-transaction")"
@@ -986,14 +987,14 @@ scenario("target upgrader: an external group root is mounted read-only; missing 
   await rm(join(state, "group-data-root"));
 });
 
-scenario("target upgrader: reset consent and configuration precede stop, source freeze precedes checkout, freeze failure restores old service", "target-upgrader-reset-", async fx => {
+scenario("target upgrader: reset consent precedes stop, target image freezes the ledger, freeze failure restores old service", "target-upgrader-reset-", async fx => {
   const { work, mock, reset, upgrade, old, target, log, git, container } = fx;
   await reset(old);
   const cancelled = await upgrade([target], { FIXTURE_RESET: "1" }, "n\n");
   await unchangedCheck(fx)(old, cancelled);
   const failed = await upgrade([target], { FIXTURE_RESET: "1", FIXTURE_FREEZE: "failed" }, "y\n");
   expect(failed.code, failed.text).toBe(1);
-  expect(failed.text).toContain("旧版统计补账未完成");
+  expect(failed.text).toContain("现有统计账本核对失败");
   expect(await git("rev-parse", "HEAD")).toBe(old);
   expect((await container("mixin-chatbot")).split(" ").slice(0, 2)).toEqual(["sha256:old", "true"]);
   await reset(old);
@@ -1002,8 +1003,24 @@ scenario("target upgrader: reset consent and configuration precede stop, source 
   const events = await log(), configure = events.indexOf(`configure head=${old.slice(0, 7)}`), stop = events.indexOf(`stop mixin-chatbot head=${old.slice(0, 7)}`);
   const freeze = events.indexOf(`freeze head=${old.slice(0, 7)}`), deploy = events.findIndex(line => line.startsWith("deploy action=continue"));
   expect(configure).toBeGreaterThan(-1); expect(stop).toBeGreaterThan(configure); expect(freeze).toBeGreaterThan(stop); expect(deploy).toBeGreaterThan(freeze);
+  const freezeArgs = (await readFile(join(mock, "freeze-args"), "utf8")).trim().split("\n");
+  const previewArgs = (await readFile(join(mock, "preview-args"), "utf8")).trim().split("\n");
+  expect(freezeArgs[freezeArgs.indexOf("bun") - 1]).toBe(previewArgs[previewArgs.indexOf("bun") - 1]);
+  expect(freezeArgs).not.toContain("sha256:old");
+  expect(freezeArgs.some(arg => arg.includes(":/upgrade"))).toBe(false);
   const snapshot = await readFile(join(mock, "snapshot"), "utf8");
   expect(await readFile(join(work, "backup/snapshots", snapshot, "stats-frozen.json"), "utf8")).toBe("frozen");
+
+  // Same-code reset can be interrupted before the freeze, with HEAD already at the target.
+  await reset(target);
+  const pending = await upgrade([target], { FIXTURE_RESET: "1", FIXTURE_DEPLOY: "pending", FIXTURE_ROLLBACK: "fail" }, "y\n");
+  expect(pending.code, pending.text).toBe(1);
+  const pendingSnapshot = await readFile(join(mock, "snapshot"), "utf8");
+  await rm(join(work, "backup/snapshots", pendingSnapshot, "stats-frozen.json"));
+  const resumed = await upgrade([target, "continue"], { FIXTURE_RESET: "1" });
+  expect(resumed.code, resumed.text).toBe(0);
+  expect((await log())[0]).toBe(`freeze head=${target.slice(0, 7)}`);
+  expect(await readFile(join(work, "backup/snapshots", pendingSnapshot, "stats-frozen.json"), "utf8")).toBe("frozen");
 });
 
 scenario("target upgrader: a Cloudflare token is asked before the stop and handed over only in memory", "target-upgrader-token-", async fx => {

@@ -100,7 +100,8 @@ test.skipIf(process.platform !== "linux")("Bash resume at target rejects unstage
 set -euo pipefail
 PROJECT_DIR=${quote(repo)}
 TARGET_SHA=${quote(target)}; ORIGINAL_SHA=${quote(original)}; ORIGINAL_BRANCH=main; ACTION=continue
-declare -A TRANSACTION=([target_sha]="$TARGET_SHA" [original_sha]="$ORIGINAL_SHA" [original_branch]=main)
+declare -A TRANSACTION=([target_sha]="$TARGET_SHA" [original_sha]="$ORIGINAL_SHA" [original_branch]=main [target_group_root]=${quote(join(repo, "groups"))})
+TRANSACTION_SNAPSHOT=${quote(join(fixture.root, "snapshot"))}
 DEPLOY_RECEIPT=${quote(join(fixture.root, "receipt"))}
 TUNNEL_INPUT=''; DEPLOY_PID=''; INTERRUPTED=0
 git_here() { git -C "$PROJECT_DIR" "$@"; }
