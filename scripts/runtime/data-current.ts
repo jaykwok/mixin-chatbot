@@ -32,7 +32,9 @@ function inspect(): { fresh: boolean; markers: (string | null)[] } {
   if ((local || group) && !interruptedFresh) {
     if (!local || !group || local.dataVersion !== DATA_VERSION || group.dataVersion !== DATA_VERSION || local.transaction !== group.transaction)
       throw new Error(`仅支持当前数据格式 ${DATA_VERSION}。旧版请通过 update 确认保留统计并重置；标记不成对时先恢复一致状态。参见 docs/data-migrations.md。`);
-  } else if (existsSync(groups)) {
+  // A verified reset carries user material in place; only its explicit runtime paths must be empty.
+  } else if (existsSync(groups) && !(pending?.phase === "prepared" && pending.deployment === deployment
+    && resolve(pending.groups) === groups && verifyReset(project, groups, deployment))) {
     for (const entry of readdirSync(groups, { withFileTypes: true })) {
       if (entry.isSymbolicLink()) throw new Error("群根不能包含链接");
       if (["stats.sqlite", "stats.sqlite-wal", "stats.sqlite-shm", ...(interruptedFresh ? [VERSION_FILE] : [])].includes(entry.name) && entry.isFile() || entry.name === GROUP_ROOT_LEASE) continue;

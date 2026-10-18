@@ -180,7 +180,7 @@ Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原�
 
 ### 数据目录
 
-当前格式只保存新一代 Durable 群库。跨数据版本更新按[自动重置升级](data-migrations.md)保留统计 schema 2 与入口凭证，重新配置并清理旧会话及群资料；普通更新沿用原数据。
+当前格式只保存新一代 Durable 群库。跨数据版本更新按[自动重置升级](data-migrations.md)保留统计 schema 2 与入口凭证，重新配置并按明确路径清理旧会话、数据库、索引和用户 tmp，原位保留 workspace 及其他资料；普通更新沿用原数据。
 
 ```text
 data/

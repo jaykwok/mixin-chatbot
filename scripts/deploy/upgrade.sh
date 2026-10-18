@@ -485,7 +485,7 @@ preview_data_preparation() {
         -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" "$IMAGE_ID" \
         bun run scripts/runtime/data-current.ts probe --project /app --groups "$groups" || status=$?
     if [ "$status" = 20 ]; then
-        ask_yes_no '数据版本不兼容。原样保留现有统计账本与 webhook/Cloudflare 入口，清理旧会话、未入账消息、待处理任务和资料，不再补算；重新配置并在成功后删除旧会话备份。继续？[y/N] ' || {
+        ask_yes_no '数据版本不兼容。保留 stats.sqlite、workspace 和其他资料、webhook/Cloudflare 入口；仅清理各群直属的其他 SQLite 数据库、index、成员 session.jsonl 和 tmp，重新配置模型及可选功能。未入账消息和待处理任务不再补算；成功后删除本次回滚副本。继续？[y/N] ' || {
             print_warning '已取消；旧服务、配置和数据未改动'; exit 1;
         }
         docker run --rm -i --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp \

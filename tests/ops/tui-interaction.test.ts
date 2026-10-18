@@ -709,7 +709,7 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
     expect(upgrade.steps.join("\n")).toContain("与 ops update 相同的目标升级器");
     expect(upgrade.steps.join("\n")).toContain("数据版本一致时直接升级");
     expect(upgrade.steps.join("\n")).toContain("确认后才停机");
-    expect(upgrade.untouched).toEqual(["已入账统计（含提问次数、人数）", "webhook 密钥和 Cloudflare 隧道凭证"]);
+    expect(upgrade.untouched).toEqual(["已入账统计（含提问次数、人数）", "workspace 和其他资料目录", "webhook 密钥和 Cloudflare 隧道凭证"]);
     expect(upgrade.recovery).toContain("继续上次操作");
     expect(calls.confirms.at(-1)?.typeToConfirm).toBe("卸载");
     const health = new HealthView();

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, writeFile, readFile, cp, rename, symlink, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
 import { DATA_VERSION, inspectDataVersion } from "../../src/core/data-version.ts";
@@ -11,6 +11,7 @@ import { writeCurrentConfig } from "../helpers/current-config.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { freezeStats } from "../../scripts/runtime/stats-freeze.ts";
 import { acquireLease, acquireGroupRootLease } from "../../src/core/maintenance.ts";
+import { holdDirectory } from "../../src/core/held-directory.ts";
 
 const runner = fileURLToPath(new URL("../../scripts/runtime/data-current.ts", import.meta.url));
 const id = "deploy-reset123";
@@ -29,6 +30,15 @@ async function fixture(incompleteJsonl = false) {
   await writeFile(join(project, "data/state/agent.sqlite"), "old-outbox");
   await writeFile(join(groups, "g/workspace/old.txt"), "old-reference");
   await writeFile(join(groups, "g/durable.sqlite"), "old-session");
+  const kept = ["g/workspace/资料/reference.sqlite", "g/other-materials/book.pdf", "g/stats.sqlite", "g/venv/keep.txt",
+    "g/users/u/notes.txt", "g/users/u/materials/reference.sqlite", "2081562792700661761/workspace/资料.docx",
+    "2081562792700661761/notes.txt", ".reclamation/backup/rm/previous.txt", "root-materials.sqlite"];
+  const cleared = ["g/index/nested/materials.md", "g/users/u/session.jsonl", "g/users/u/tmp/output.docx",
+    "g/durable.sqlite-wal", "g/durable.sqlite-shm", "g/durable.sqlite-journal", "g/other.sqlite", "g/other.sqlite-wal",
+    "2081562792700661761/durable.sqlite", "2081562792700661761/users/u/tmp/old.pdf"];
+  for (const name of [...kept, ...cleared]) {
+    const path = join(groups, name); await mkdir(dirname(path), { recursive: true }); await writeFile(path, name);
+  }
   const db = openStatsLedger(groups);
   ingestConversationRecords(db, { id: "old-source", group: "g", user: "u", identity: "member" }, 0, 1,
     [{ type: "message", timestamp: "2026-10-17T01:00:00Z", message: { role: "user", content: [{ type: "text" }] } }]);
@@ -46,7 +56,7 @@ async function fixture(incompleteJsonl = false) {
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     return { code, text: out + err };
   };
-  return { ...f, project, groups, snapshot, draft, plan, before, run };
+  return { ...f, project, groups, snapshot, draft, plan, before, run, kept, cleared };
 }
 
 test("data-version equality bypasses reset; only a lower matched pair offers reset", async () => {
@@ -74,20 +84,24 @@ test("data-version equality bypasses reset; only a lower matched pair offers res
 test("reset preserves all stats rows and entrance credentials, commits and deletes only temporary session backups", async () => {
   const f = await fixture(true);
   try {
+    const directory = lstatSync(join(f.groups, "g/workspace"));
     for (const action of ["apply", "apply", "validate", "commit", "commit", "finish-reset", "finish-reset"]) {
       const result = await f.run(action); expect(result.code, result.text).toBe(0);
+      for (const name of f.kept) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
+      expect(await readFile(join(f.groups, "g/workspace/old.txt"), "utf8")).toBe("old-reference");
+      expect(lstatSync(join(f.groups, "g/workspace")).ino).toBe(directory.ino);
     }
     expect(statsDigest(join(f.groups, "stats.sqlite"))).toBe(f.before);
     expect(statsDigest(join(f.project, "backup/statistics", id, "stats.sqlite"))).toBe(f.before);
     expect(JSON.parse(await readFile(join(f.project, "backup/statistics", id, "baseline.json"), "utf8")).incompleteJsonl).toEqual({ sources: 1, lines: 1 });
     expect(await readFile(join(f.project, "data/config/webhook-secret"), "utf8")).toBe("a".repeat(64));
     expect(await readFile(join(f.project, "data/config/cloudflared-token"), "utf8")).toBe("private-test-token");
-    for (const path of ["g/durable.sqlite", "g/workspace", ".reset-" + id]) expect(existsSync(join(f.groups, path))).toBe(false);
+    for (const path of ["g/durable.sqlite", ...f.cleared, ".reset-" + id]) expect(existsSync(join(f.groups, path))).toBe(false);
     expect(existsSync(join(f.project, "data/config/obsolete.json"))).toBe(false);
     expect(await readFile(join(f.project, "data/runtime/bot-launcher.ps1"), "utf8")).toBe("generated-host-launcher");
     expect((await f.run("rollback")).code).toBe(42);
   } finally { await f.cleanup(); }
-});
+}, 60000);
 
 test("an actual reset journal still enforces link boundaries, deployment identity and valid content", async () => {
   const f = await fixture();
@@ -108,6 +122,65 @@ test("an actual reset journal still enforces link boundaries, deployment identit
   } finally { await f.cleanup(); }
 });
 
+test("reset refuses journals that could move whole groups, materials or statistics", async () => {
+  const f = await fixture();
+  try {
+    await applyReset(f.project, f.groups, id, f.plan);
+    const path = join(f.snapshot, "reset.json"), journal = JSON.parse(await readFile(path, "utf8"));
+    for (const name of ["g", "g/workspace", "g/users/u", "g/users/u/materials", "stats.sqlite", "g/stats.sqlite", "g/workspace/reference.sqlite", "g/../outside.sqlite"]) {
+      await writeFile(path, JSON.stringify({ ...journal, moves: [...journal.moves, { area: "groups", name, existed: true }] }));
+      await expect(applyReset(f.project, f.groups, id, f.plan)).rejects.toThrow();
+      await expect(rollbackReset(f.project, f.groups, id)).rejects.toThrow();
+      await expect(finishReset(f.project, f.groups, id)).rejects.toThrow();
+      for (const item of f.kept) expect(await readFile(join(f.groups, item), "utf8")).toBe(item);
+    }
+    await writeFile(path, JSON.stringify({ ...journal, format: 1 }));
+    await expect(finishReset(f.project, f.groups, id)).rejects.toThrow("记录无效");
+    await writeFile(path, JSON.stringify(journal));
+    await rollbackReset(f.project, f.groups, id);
+  } finally { await f.cleanup(); }
+});
+
+test("reset archive cleanup preserves unexpected material instead of recursively deleting it", async () => {
+  const f = await fixture();
+  try {
+    await applyReset(f.project, f.groups, id, f.plan);
+    const unexpected = join(f.groups, ".reset-" + id, "g/workspace");
+    await mkdir(unexpected, { recursive: true }); await writeFile(join(unexpected, "keep.txt"), "do not discard");
+    await expect(finishReset(f.project, f.groups, id)).rejects.toThrow("未列入清单");
+    expect(await readFile(join(unexpected, "keep.txt"), "utf8")).toBe("do not discard");
+    for (const name of f.kept) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
+  } finally { await f.cleanup(); }
+});
+
+test("reset refuses database-shaped directories and linked cleanup paths without touching materials", async () => {
+  const f = await fixture();
+  try {
+    const fake = join(f.groups, "g/not-a-database.sqlite");
+    await mkdir(fake); await writeFile(join(fake, "material.txt"), "keep");
+    await expect(applyReset(f.project, f.groups, id, f.plan)).rejects.toThrow("不是普通文件");
+    expect(await readFile(join(fake, "material.txt"), "utf8")).toBe("keep");
+    await rename(fake, join(f.groups, "g/material-folder"));
+    const index = join(f.groups, "g/index"); await rename(index, join(f.groups, "g/old-index"));
+    await symlink(join(f.groups, "g/workspace"), index, process.platform === "win32" ? "junction" : "dir");
+    await expect(applyReset(f.project, f.groups, id, f.plan)).rejects.toThrow("链接");
+    expect(await readFile(join(f.groups, "g/durable.sqlite"), "utf8")).toBe("old-session");
+    for (const name of f.kept) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
+  } finally { await f.cleanup(); }
+});
+
+test.skipIf(process.platform !== "win32")("reset never moves a group or workspace even when a material directory is held open", async () => {
+  const f = await fixture();
+  let held: Awaited<ReturnType<typeof holdDirectory>> | undefined;
+  try {
+    held = await holdDirectory(join(f.groups, "g/workspace"), [], false);
+    for (const action of ["apply", "commit", "finish-reset"]) {
+      const result = await f.run(action); expect(result.code, result.text).toBe(0);
+    }
+    expect(await readFile(join(f.groups, "g/workspace/old.txt"), "utf8")).toBe("old-reference");
+  } finally { await held?.release(); await f.cleanup(); }
+}, 60000);
+
 test("reset rollback restores configuration, session, outbox and markers and can be retried", async () => {
   const f = await fixture();
   try {
@@ -115,7 +188,15 @@ test("reset rollback restores configuration, session, outbox and markers and can
     // Configuration renames must remain inside data/, which is a separate Docker mount from backup/.
     expect(await readFile(join(f.project, "data/.reset-" + id, "config/obsolete.json"), "utf8")).toBe("old-config");
     expect((await f.run("finish-reset")).code).toBe(1);
+    await writeFile(join(f.groups, "g/workspace/during-reset.txt"), "new reference must survive rollback");
+    await mkdir(join(f.groups, "new-group/workspace"), { recursive: true });
+    await writeFile(join(f.groups, "new-group/workspace/keep.txt"), "new group material");
+    await writeFile(join(f.groups, "new-group/durable.sqlite"), "new-runtime");
     for (const action of ["rollback", "rollback"]) { const r = await f.run(action); expect(r.code, r.text).toBe(0); }
+    for (const name of [...f.kept, ...f.cleared]) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
+    expect(await readFile(join(f.groups, "g/workspace/during-reset.txt"), "utf8")).toBe("new reference must survive rollback");
+    expect(await readFile(join(f.groups, "new-group/workspace/keep.txt"), "utf8")).toBe("new group material");
+    expect(existsSync(join(f.groups, "new-group/durable.sqlite"))).toBe(false);
     expect(await readFile(join(f.groups, "g/durable.sqlite"), "utf8")).toBe("old-session");
     expect(await readFile(join(f.project, "data/state/agent.sqlite"), "utf8")).toBe("old-outbox");
     expect(await readFile(join(f.project, "data/config/obsolete.json"), "utf8")).toBe("old-config");
@@ -123,6 +204,53 @@ test("reset rollback restores configuration, session, outbox and markers and can
     expect(statsDigest(join(f.groups, "stats.sqlite"))).toBe(f.before);
   } finally { await f.cleanup(); }
 });
+
+for (const action of ["apply", "rollback"] as const) test.skipIf(process.platform !== "win32")(
+  `Windows reset ${action} waits for a real directory handle to close before moving it`, async () => {
+    const f = await fixture();
+    let held: Awaited<ReturnType<typeof holdDirectory>> | undefined;
+    let released: Promise<void> | undefined;
+    try {
+      if (action === "rollback") await applyReset(f.project, f.groups, id, f.plan);
+      const group = join(f.groups, ...(action === "rollback" ? [".reset-" + id] : []), "g/index");
+      held = await holdDirectory(join(group, "nested"), [], false);
+      // A handle inside the directory also prevents renaming its ancestor on Windows.
+      const blocked = await rename(group, group + "-probe").then(() => null, error => error as NodeJS.ErrnoException);
+      expect(["EPERM", "EACCES", "EBUSY"]).toContain(blocked?.code ?? "rename unexpectedly succeeded");
+      released = Bun.sleep(700).then(() => held!.release());
+      if (action === "apply") await applyReset(f.project, f.groups, id, f.plan);
+      else await rollbackReset(f.project, f.groups, id);
+      await released;
+      expect(statsDigest(join(f.groups, "stats.sqlite"))).toBe(f.before);
+      const finalGroup = join(f.groups, ...(action === "apply" ? [".reset-" + id] : []), "g");
+      expect(await readFile(join(finalGroup, "durable.sqlite"), "utf8")).toBe("old-session");
+      expect(await readFile(join(f.project, "data/config/webhook-secret"), "utf8")).toBe("a".repeat(64));
+    } finally { await released; await held?.release(); await f.cleanup(); }
+  }, 30000);
+
+test.skipIf(process.platform !== "win32")("Windows reset refuses a persistently held directory with actionable diagnostics and remains rollbackable", async () => {
+  const f = await fixture();
+  let held: Awaited<ReturnType<typeof holdDirectory>> | undefined;
+  try {
+    held = await holdDirectory(join(f.groups, "g/index/nested"), [], false);
+    const started = performance.now();
+    const failure = await applyReset(f.project, f.groups, id, f.plan).then(() => null, error => error as Error);
+    expect(failure?.message).toContain("重置路径移动失败");
+    expect(failure?.message).toContain(join(f.groups, "g"));
+    expect(failure?.message).toContain("占用");
+    expect(failure?.message).toMatch(/错误码 (EPERM|EACCES|EBUSY).*尝试 \d+ 次.*耗时 \d+ ms/);
+    expect(performance.now() - started).toBeGreaterThanOrEqual(9000);
+    expect(performance.now() - started).toBeLessThan(20000);
+    expect(await readFile(join(f.groups, "g/durable.sqlite"), "utf8")).toBe("old-session");
+    expect(statsDigest(join(f.groups, "stats.sqlite"))).toBe(f.before);
+    expect(statsDigest(join(f.project, "backup/statistics", id, "stats.sqlite"))).toBe(f.before);
+    await held.release();
+    await rollbackReset(f.project, f.groups, id);
+    expect(resetVersion(f.project, f.groups)).toBe(DATA_VERSION - 1);
+    expect(await readFile(join(f.project, "data/config/cloudflared-token"), "utf8")).toBe("private-test-token");
+    expect(existsSync(join(f.groups, ".reset-" + id))).toBe(false);
+  } finally { await held?.release(); await f.cleanup(); }
+}, 30000);
 
 test("configuration or ledger changes after preview block reset before any old data is moved", async () => {
   const f = await fixture();
@@ -153,7 +281,7 @@ test("interrupted rename journal resumes apply and rollback without adopting the
     const path = join(f.snapshot, "reset.json"), journal = JSON.parse(await readFile(path, "utf8"));
     journal.phase = "moving"; await writeFile(path, JSON.stringify(journal));
     // Simulate a crash before the final original group rename and before draft publication.
-    await rename(join(f.groups, ".reset-" + id, "g"), join(f.groups, "g"));
+    await rename(join(f.groups, ".reset-" + id, "g/durable.sqlite"), join(f.groups, "g/durable.sqlite"));
     await applyReset(f.project, f.groups, id, f.plan);
     await rollbackReset(f.project, f.groups, id);
     expect(await readFile(join(f.groups, "g/durable.sqlite"), "utf8")).toBe("old-session");
@@ -194,7 +322,8 @@ test("target freeze and reset discard unreadable old sessions and task state wit
     expect(statsDigest(join(f.project, "backup/statistics", id, "stats.sqlite"))).toBe(f.before);
     expect(await readFile(join(f.project, "data/config/webhook-secret"), "utf8")).toBe("a".repeat(64));
     expect(await readFile(join(f.project, "data/config/cloudflared-token"), "utf8")).toBe("private-test-token");
-    expect(existsSync(join(f.groups, "g"))).toBe(false);
+    expect(existsSync(join(f.groups, "g/durable.sqlite"))).toBe(false);
+    for (const name of f.kept) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
     expect(existsSync(join(f.project, "data/state/relay.sqlite"))).toBe(false);
     expect(existsSync(join(f.project, "data/state/agent.sqlite"))).toBe(false);
   } finally { await f.cleanup(); }

@@ -79,8 +79,8 @@ if ($recordedPlan -and (Test-Path -LiteralPath $recordedPlan -PathType Leaf)) {
     $previewOptions = @()
     if ($probeCode -eq 20) {
         if ($pendingPath) { throw '未完成事务缺少已确认的重置计划；请回滚后重试' }
-        Write-Host '原样保留现有统计账本与 webhook/Cloudflare 入口；旧会话、未入账消息、待处理任务、资料和其他配置将清理，不再补算。成功后自动删除旧会话回滚副本。'
-        if ((Read-Host '确认按此方式升级并重新配置？输入 RESET 继续') -cne 'RESET') { throw '已取消；旧服务和数据未改动' }
+        Write-Host '保留 stats.sqlite、workspace 和其他资料、webhook/Cloudflare 入口；仅清理各群直属的其他 SQLite 数据库、index、成员 session.jsonl 和 tmp，重新配置模型及可选功能。未入账消息和待处理任务不再补算；成功后删除本次回滚副本。'
+        if (([string](Read-Host '确认按此方式升级并重新配置？输入 RESET 继续（不区分大小写）')).Trim() -ine 'RESET') { throw '已取消；旧服务和数据未改动' }
         if ($stageRoot -eq [IO.Path]::GetFullPath($Project)) { throw '重置必须通过目标版本导出的升级入口执行' }
         $resetConfig = Join-Path $stageRoot 'reset-config'
         & $bun run $previewRunner prepare-reset --project $Project --groups $groups --reset-config $resetConfig

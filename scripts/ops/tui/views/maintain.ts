@@ -68,7 +68,7 @@ const ACTIONS: Action[] = [
       const steps = [
         "交给与 ops update 相同的目标升级器；停机前核对数据版本",
         "数据版本一致时直接升级，保留设置、会话和资料",
-        "跨数据版本时，升级器先提示清理旧会话和资料、重新配置；确认后才停机",
+        "跨数据版本时先提示清理群直属数据库（保留 stats.sqlite）、index、成员会话和 tmp，重新配置；确认后才停机",
         "跨代更新原样保留并备份现有统计账本；旧会话、未入账消息及待处理任务直接清理，不再补算",
         git.behind > 0 ? `快进到 origin/main ${targetSha ? fmt.shortSha(targetSha) : ""}（${git.behind} 个提交）` : "核对本次确认的目标提交",
         app.deployment.runtime === "docker" ? "准备目标镜像，按已保存计划切换数据" : "安装目标依赖，按已保存计划切换数据",
@@ -81,7 +81,7 @@ const ACTIONS: Action[] = [
             ? `${fmt.shortSha(git.sha)} → ${targetSha ? fmt.shortSha(targetSha) : "origin/main"}，共 ${git.behind} 个提交`
             : `当前 ${fmt.shortSha(git.sha)}；origin/main ${targetSha ? fmt.shortSha(targetSha) : "待检查"}`,
         steps,
-        untouched: ["已入账统计（含提问次数、人数）", "webhook 密钥和 Cloudflare 隧道凭证"],
+        untouched: ["已入账统计（含提问次数、人数）", "workspace 和其他资料目录", "webhook 密钥和 Cloudflare 隧道凭证"],
         recovery: "提交前失败恢复数据、代码和原服务；提交后启动或清理失败，使用「继续上次操作」收尾。旧版入口无法导出升级器时，按 docs/data-migrations.md 首次引导",
       };
     },

@@ -1,10 +1,11 @@
 // A release boundary: preserve the existing ledger and entrance credentials; discard old session formats.
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
-import { cp, mkdir, rename, rm } from "node:fs/promises";
+import { cp, mkdir, rename, rm, rmdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { Database } from "bun:sqlite";
-import { DATA_VERSION, GROUP_ROOT_LEASE, VERSION_FILE, readDataVersion, readMetadata } from "../../src/core/data-version.ts";
+import { DATA_VERSION, VERSION_FILE, readDataVersion, readMetadata } from "../../src/core/data-version.ts";
 import { digest, publishJson } from "../lib/atomic-file.ts";
 
 const credentials = ["webhook-secret", "cloudflared-token"];
@@ -14,10 +15,55 @@ const stateKept = new Set(["service.lock", "deploy.lock", "deploy-transaction", 
   "verify-only", "bot-port", "bot-domain", "deploy-mode", "group-data-root", "task-runtime", "cloudflared.pid", "cloudflared-managed"]);
 export interface ResetPlan { from: number; markers: (string | null)[]; inputs: string; draft: string }
 interface Move { area: "project" | "groups"; name: string; existed: boolean }
-interface Journal { format: 1; deployment: string; groups: string; phase: "moving" | "prepared" | "restoring" | "restored";
+interface Journal { format: 2; deployment: string; groups: string; phase: "moving" | "prepared" | "restoring" | "restored";
   moves: Move[]; stats: string; draft: string; credentials: Record<string, string | null> }
 const hash = (path: string) => digest(existsSync(path) ? readFileSync(path) : null);
 const markers = (project: string, groups: string) => [hash(join(project, "data/state", VERSION_FILE)), hash(join(groups, VERSION_FILE))];
+
+const segment = (name: string) => !!name && !name.startsWith(".") && !/[\\/\x00-\x1f:]/.test(name);
+const groupDatabase = (name: string) => /\.sqlite(?:-wal|-shm|-journal)?$/i.test(name) && !/^stats\.sqlite(?:-wal|-shm|-journal)?$/i.test(name);
+/** Explicit depths only: never traverse workspace, whole groups or arbitrary material folders. */
+function resetGroupEntry(name: string): boolean {
+  if (name === VERSION_FILE) return true;
+  const parts = name.split("/");
+  if (!parts.every(segment)) return false;
+  return parts.length === 2 && (parts[1] === "index" || groupDatabase(parts[1]!))
+    || parts.length === 4 && parts[1] === "users" && ["session.jsonl", "tmp"].includes(parts[3]!);
+}
+function groupResetMoves(groups: string): Move[] {
+  const names = new Set([VERSION_FILE]);
+  for (const group of readdirSync(groups, { withFileTypes: true })) {
+    if (group.name.startsWith(".")) continue;
+    const root = join(groups, group.name); plain(root);
+    if (!group.isDirectory()) continue;
+    if (!segment(group.name)) throw new Error(`群目录名称无效：${root}`);
+    names.add(group.name + "/index");
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) names.add(group.name + "/durable.sqlite" + suffix);
+    for (const entry of readdirSync(root)) if (groupDatabase(entry)) names.add(group.name + "/" + entry);
+    const users = join(root, "users"); plain(users);
+    if (!existsSync(users)) continue;
+    for (const user of readdirSync(users, { withFileTypes: true })) {
+      const path = join(users, user.name); plain(path);
+      if (!user.isDirectory()) continue;
+      if (!segment(user.name)) throw new Error(`成员目录名称无效：${path}`);
+      for (const name of ["session.jsonl", "tmp"]) names.add(`${group.name}/users/${user.name}/${name}`);
+    }
+  }
+  return [...names].map(name => {
+    const path = join(groups, name); plain(path);
+    return { area: "groups", name, existed: existsSync(path) };
+  });
+}
+/** Only empty archive scaffolding can be discarded; unlisted files must never be recursively deleted. */
+async function removeEmptyArchive(path: string): Promise<void> {
+  plain(path);
+  if (!existsSync(path)) return;
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`重置归档含未列入清单的内容，保留待核查：${join(path, entry.name)}`);
+    await removeEmptyArchive(join(path, entry.name));
+  }
+  await rmdir(path);
+}
 
 /** Malformed, half-written and newer pairs must never be interpreted as consent to reset. */
 export function resetVersion(project: string, groups: string): number | null {
@@ -35,6 +81,34 @@ function plain(path: string): void {
     try { if (lstatSync(p).isSymbolicLink()) throw new Error(`重置路径不能经过链接：${p}`); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (dirname(p) === p) return;
+  }
+}
+
+/** Windows denies a directory rename while any descendant is held without delete sharing. */
+async function moveResetEntry(source: string, target: string): Promise<void> {
+  const started = performance.now(), budget = process.platform === "win32" ? 10000 : 0;
+  let attempts = 0;
+  for (;;) {
+    // Recheck boundaries after every wait; a retry must not follow a newly introduced link or overwrite an entry.
+    plain(source); plain(target);
+    if (existsSync(target)) throw new Error(`重置移动目标已存在，拒绝覆盖：${target}`);
+    try {
+      attempts++;
+      await rename(source, target);
+      if (attempts > 1) console.error(`重置路径重试后移动成功：${source} → ${target}（尝试 ${attempts} 次，耗时 ${Math.round(performance.now() - started)} ms）`);
+      return;
+    } catch (cause) {
+      const code = (cause as NodeJS.ErrnoException).code ?? "unknown", elapsed = performance.now() - started;
+      if (budget && ["EPERM", "EACCES", "EBUSY"].includes(code) && elapsed < budget) {
+        if (attempts === 1) console.error(`Windows 拒绝移动重置路径（${code}），等待并重试，最多 10 秒：${source} → ${target}`);
+        await sleep(Math.min(100 * 2 ** Math.min(attempts - 1, 4), 1000, budget - elapsed));
+        continue;
+      }
+      const hint = process.platform === "win32" && ["EPERM", "EACCES", "EBUSY"].includes(code)
+        ? "；请关闭占用此目录或其子目录的程序/终端，并检查目录权限后重试；原件与回滚记录已保留"
+        : "；事务保留供继续或回滚";
+      throw new Error(`重置路径移动失败（错误码 ${code}，尝试 ${attempts} 次，耗时 ${Math.round(elapsed)} ms）：${source} → ${target}${hint}`, { cause });
+    }
   }
 }
 function treeHash(path: string): string {
@@ -120,11 +194,14 @@ function movePaths(project: string, groups: string, projectArchive: string, arch
   const root = move.area === "groups" ? groups : project;
   const target = resolve(root, move.name);
   if (!relative(root, target) || isAbsolute(relative(root, target)) || relative(root, target).startsWith("..") || resolve(target) === resolve(root)) throw new Error("重置条目越界");
-  if (move.area === "groups" && (move.name.includes("/") || move.name.includes("\\") || [".", "..", GROUP_ROOT_LEASE].includes(move.name) || move.name.startsWith(".reset-") || /^stats\.sqlite(?:-wal|-shm|-journal)?$/.test(move.name))) throw new Error("重置群条目无效");
+  if (move.area === "groups" && !resetGroupEntry(move.name)) throw new Error("重置群条目无效：只能清理群直属数据库、索引、成员会话和 tmp");
   if (move.area === "project" && !/^data\/(config|runtime|state\/[^/\\]+)$/.test(move.name)) throw new Error("重置项目条目无效");
   if (move.area === "project" && move.name.startsWith("data/state/") && stateKept.has(move.name.slice(11))) throw new Error("重置不能移动发布资源");
   const saved = move.area === "groups" ? join(archive, move.name) : join(projectArchive, move.name.slice("data/".length));
   plain(target); plain(saved);
+  if (move.area === "groups" && move.name.split("/").length === 2 && groupDatabase(move.name.split("/")[1]!)) {
+    for (const path of [target, saved]) if (existsSync(path) && !lstatSync(path).isFile()) throw new Error(`群数据库路径不是普通文件，拒绝清理：${path}`);
+  }
   return { live: target, saved };
 }
 function readJournal(project: string, groups: string, deployment: string): Journal | null {
@@ -133,7 +210,7 @@ function readJournal(project: string, groups: string, deployment: string): Journ
   try { lstatSync(join(snapshotPath(project, deployment), "reset.json")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
   const p = paths(project, groups, deployment), journal = readMetadata(p.journal) as Journal | null;
-  if (!journal || journal.format !== 1 || journal.deployment !== deployment || journal.groups !== resolve(groups)
+  if (!journal || journal.format !== 2 || journal.deployment !== deployment || journal.groups !== resolve(groups)
     || !["moving", "prepared", "restoring", "restored"].includes(journal.phase) || !/^[a-f\d]{64}$/.test(journal.stats)
     || !/^[a-f\d]{64}$/.test(journal.draft) || !journal.credentials || !Array.isArray(journal.moves)) throw new Error("重置事务记录无效");
   const seen = new Set<string>();
@@ -170,16 +247,12 @@ export async function applyReset(project: string, groups: string, deployment: st
       await publishJson(join(p.permanent, "baseline.json"), { schema: 2, digest: stats, timezone: freeze.timezone,
         incompleteJsonl: incomplete, at: new Date().toISOString() });
     } finally { baseline.close(); }
-    const moves: Move[] = [];
-    for (const name of readdirSync(groups)) {
-      if (name === GROUP_ROOT_LEASE || /^stats\.sqlite(?:-wal|-shm|-journal)?$/.test(name)) continue;
-      if (name.startsWith(".reset-")) throw new Error(`群根含未完成的重置 ${name}，请先继续或回滚`);
-      moves.push({ area: "groups", name, existed: true });
-    }
+    if (readdirSync(groups).some(name => name.startsWith(".reset-"))) throw new Error("群根含未完成的重置，请先继续或回滚");
+    const moves: Move[] = groupResetMoves(groups);
     for (const name of ["data/config", "data/runtime", ...readdirSync(join(project, "data/state")).filter(name => !stateKept.has(name)).map(name => "data/state/" + name)])
       moves.push({ area: "project", name, existed: existsSync(join(project, name)) });
     for (const move of moves) movePaths(project, groups, p.projectArchive, p.archive, move);
-    journal = { format: 1, deployment, groups: resolve(groups), phase: "moving", moves, stats, draft: plan.draft, credentials: secretHashes(project) };
+    journal = { format: 2, deployment, groups: resolve(groups), phase: "moving", moves, stats, draft: plan.draft, credentials: secretHashes(project) };
     // Durable intent precedes every rename. A retry sees either the source or its own saved copy.
     await publishJson(p.journal, journal);
   }
@@ -192,7 +265,7 @@ export async function applyReset(project: string, groups: string, deployment: st
   await mkdir(p.projectArchive, { recursive: true, mode: 0o700 });
   for (const move of journal.moves) {
     const { live, saved } = movePaths(project, groups, p.projectArchive, p.archive, move);
-    if (move.existed && !existsSync(saved)) { await mkdir(dirname(saved), { recursive: true }); await rename(live, saved); }
+    if (move.existed && !existsSync(saved)) { await mkdir(dirname(saved), { recursive: true }); await moveResetEntry(live, saved); }
   }
   // Copying an interrupted draft is repeatable; no service runs until this phase completes.
   for (const name of ["config", "runtime"]) await cp(join(p.draft, "data", name), join(project, "data", name), { recursive: true, force: true });
@@ -205,11 +278,13 @@ export async function applyReset(project: string, groups: string, deployment: st
   verifyReset(project, groups, deployment);
 }
 
-export function verifyReset(project: string, groups: string, deployment: string): void {
+export function verifyReset(project: string, groups: string, deployment: string): boolean {
   const journal = readJournal(project, groups, deployment);
-  if (!journal) return;
+  if (!journal) return false;
   if (journal.phase !== "prepared" || statsDigest(join(groups, "stats.sqlite")) !== journal.stats) throw new Error("重置前后统计不一致，禁止提交");
   if (JSON.stringify(secretHashes(project)) !== JSON.stringify(journal.credentials)) throw new Error("入口凭证在重置后变化，禁止提交");
+  if (groupResetMoves(groups).some(move => move.name !== VERSION_FILE && move.existed)) throw new Error("重置后仍有会话、索引或 tmp，禁止提交");
+  return true;
 }
 
 export async function rollbackReset(project: string, groups: string, deployment: string): Promise<void> {
@@ -222,14 +297,14 @@ export async function rollbackReset(project: string, groups: string, deployment:
   for (const move of [...journal.moves].reverse()) {
     const { live, saved } = movePaths(project, groups, p.projectArchive, p.archive, move);
     if (existsSync(saved)) {
-      await rm(live, { recursive: true, force: true }); await mkdir(dirname(live), { recursive: true }); await rename(saved, live);
+      await rm(live, { recursive: true, force: true }); await mkdir(dirname(live), { recursive: true }); await moveResetEntry(saved, live);
     } else if (!move.existed) await rm(live, { recursive: true, force: true });
   }
-  // New empty group databases created by verification cannot be mixed into the restored generation.
+  // Discard only listed runtime paths created during verification, never their group or user parents.
   const original = new Set(journal.moves.filter(m => m.area === "groups").map(m => m.name));
-  for (const name of readdirSync(groups)) if (!original.has(name) && !name.startsWith(".") && !/^stats\.sqlite(?:-wal|-shm|-journal)?$/.test(name))
-    await rm(join(groups, name), { recursive: true, force: true });
-  await rm(p.archive, { recursive: true, force: true });
+  for (const move of groupResetMoves(groups)) if (!original.has(move.name) && move.existed)
+    await rm(movePaths(project, groups, p.projectArchive, p.archive, move).live, { recursive: true, force: true });
+  await removeEmptyArchive(p.archive);
   await rm(p.projectArchive, { recursive: true, force: true });
   journal.phase = "restored"; await publishJson(p.journal, journal);
 }
@@ -240,7 +315,9 @@ export async function finishReset(project: string, groups: string, deployment: s
   if (!journal) return;
   const p = paths(project, groups, deployment);
   if (journal.phase !== "prepared" || journal.groups !== resolve(groups)) throw new Error("重置清理身份不符");
-  await rm(p.archive, { recursive: true, force: true });
+  for (const move of journal.moves.filter(m => m.area === "groups"))
+    await rm(movePaths(project, groups, p.projectArchive, p.archive, move).saved, { recursive: true, force: true });
+  await removeEmptyArchive(p.archive);
   await rm(p.projectArchive, { recursive: true, force: true });
 }
 
