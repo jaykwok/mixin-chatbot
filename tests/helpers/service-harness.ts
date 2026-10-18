@@ -3,9 +3,8 @@
 // (a faux provider instead of models.json), IM sends and the relay are substituted. Synthetic data in the current
 // directory, no network.
 //
-// Three pieces of work wait at one gate, released by creating ./gate.open: a member's run inside its model call, the
-// startup maintenance before it records the old session files' statistics, and a /clear of another member before it
-// projects that member's conversation into the ledger. A supervised tool process appends a timestamp to a file in the
+// Two pieces of work wait at one gate, released by creating ./gate.open: a member's run inside its model call, and
+// a /clear of another member before it projects that member's conversation into the ledger. A supervised tool process appends a timestamp to a file in the
 // group's workspace every 20 ms. Prints SERVICE_READY=<json> once all of them are in place, BLOCKED_ABORTED when the
 // waiting model call sees its abort, then keeps serving until the test stops it.
 import assert from "node:assert/strict";
@@ -77,16 +76,6 @@ mock.module("../../src/integrations/relay.ts", () => ({ ...relay, getRelayConfig
 const im = await import("../../src/integrations/im.ts");
 let replies = 0;
 mock.module("../../src/integrations/im.ts", () => ({ ...im, sendReplyWithMention: async () => { replies++; return true; }, sendText: async () => true }));
-const ledger = await import("../../src/agent/stats-ledger.ts");
-// mock.module rewrites the imported namespace too: keep the real functions before replacing them.
-const { sweepSessionStats } = ledger;
-mock.module("../../src/agent/stats-ledger.ts", () => ({ ...ledger,
-  sweepSessionStats: async (...args: Parameters<typeof sweepSessionStats>) => {
-    waiting.add("maintenance");
-    await gate();
-    return sweepSessionStats(...args);
-  },
-}));
 // The projection is gated as a whole: the ledger write inside it is synchronous, on a database the service closes after it.
 const projection = await import("../../src/durable/projection.ts");
 const { projectConversation } = projection;
@@ -132,6 +121,6 @@ void runProcess({ command: process.execPath, args: [resolve("tool.ts"), heartbea
   .catch(() => {});
 
 const beats = () => existsSync(heartbeat) ? readFileSync(heartbeat, "utf8").split("\n").filter(Boolean).length : 0;
-await until(() => prompts.some((text) => text.includes("block")) && waiting.has("maintenance") && waiting.has("projection")
+await until(() => prompts.some((text) => text.includes("block")) && waiting.has("projection")
   && existsSync(pidFile) && beats() >= 2, () => ({ prompts, waiting: [...waiting], tool: existsSync(pidFile), beats: beats() }));
 console.log("SERVICE_READY=" + JSON.stringify({ tool: Number(readFileSync(pidFile, "utf8")), heartbeat }));

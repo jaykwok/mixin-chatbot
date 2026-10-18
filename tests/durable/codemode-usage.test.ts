@@ -8,7 +8,7 @@ import { defineExtension, hook, NestedCallDoc, ToolTask, UsageDoc, type Harness,
 import { codemodeExtension } from "../../src/durable/codemode/index.ts";
 import { NestedUsageDoc, recordNestedUsage } from "../../src/durable/codemode/usage.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
-import { memberRegistration, type MemberTool } from "../../src/durable/tools.ts";
+import { memberRegistration, type AdaptedMemberTool } from "../../src/durable/tools.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { projectConversation } from "../../src/durable/projection.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
@@ -19,7 +19,7 @@ afterAll(() => fixture.cleanup());
 const usage = (n: number): Usage => ({ input: n, output: 2 * n, cacheRead: 0, cacheWrite: 0, totalTokens: 3 * n,
   cost: { input: n / 1000, output: n / 500, cacheRead: 0, cacheWrite: 0, total: 3 * n / 1000 } });
 const text = (value: string) => ({ content: [{ type: "text" as const, text: value }], details: undefined });
-const tool = (name: string, run: MemberTool["run"]): MemberTool => ({
+const tool = (name: string, run: AdaptedMemberTool["run"]): AdaptedMemberTool => ({
   definition: { name, label: name, description: name, exposure: "codemode", parameters: Type.Object({}),
     execute: async () => { throw new Error("not used"); } },
   replay: "safe", outputLimits: { maxBytes: 64 * 1024, maxLines: 2200 }, run,

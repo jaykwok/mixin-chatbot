@@ -299,7 +299,7 @@ const echo = probe("probe_echo", ({ text: value }) => {
 const send = probe("send_probe", () => text("sent"), { exposure: "model-only", description: "Send something (model only)." });
 const sendModule: Module = { name: "fixture.send", tools: [send] };
 
-test("parallel codemode children project nested counts once across cursor replay and projection upgrade", async () => {
+test("parallel codemode children project nested counts once across cursor replay and rejects incompatible projection without rewriting history", async () => {
   const group = await openGroup({ modules: [module(echo)] }), alice = await member(group);
   const ledger = openStatsLedger(group.base.root);
   try {
@@ -311,8 +311,9 @@ test("parallel codemode children project nested counts once across cursor replay
     expect(rows()).toEqual([{ tool: "probe_echo", count: 2 }]);
     await projectConversation(ledger, group.opened.harness, identity, context); expect(rows()).toEqual([{ tool: "probe_echo", count: 2 }]);
     const before = readLedger(ledger).usage;
-    ledger.query("UPDATE sources SET projection = 3 WHERE identity = ?").run(`durable:${alice.id}`);
-    await projectConversation(ledger, group.opened.harness, identity, context); expect(rows()).toEqual([{ tool: "probe_echo", count: 2 }]);
+    ledger.query("UPDATE sources SET projection = 3 WHERE projection = 4").run();
+    await expect(projectConversation(ledger, group.opened.harness, identity, context)).rejects.toThrow("统计投影格式不匹配");
+    expect(rows()).toEqual([{ tool: "probe_echo", count: 2 }]);
     expect(readLedger(ledger).usage).toEqual(before);
   } finally { ledger.close(); await group.close(); }
 });
@@ -522,16 +523,16 @@ try { await tools.bash({ command: "sleep 30", timeout: 1 }); timeout = "resolved
 const ok = await tools.bash({ command: "echo 好" });
 return { exit, timeout, ok };`);
       const value = returned(run.result);
-      expect(value.exit).toMatchObject({ exit_code: 3, truncated: false });
+      expect(value.exit).toMatchObject({ exitCode: 3, truncated: false });
       expect(value.exit.output).toContain("失败前");
-      expect(value.ok).toMatchObject({ exit_code: 0, truncated: false });
+      expect(value.ok).toMatchObject({ exitCode: 0, truncated: false });
       expect(value.ok.output).toContain("好");
       expect(JSON.stringify(value.timeout)).toContain("timed out");
       expect(run.result.details!.calls.map((call) => call.name)).toEqual(["bash", "bash", "bash"]);
     } finally { await group.close(); }
   }, 90_000);
 
-  test("read: a text file's value is its text; an image file's value is an image block the script can show with image()", async () => {
+  test("read: scripts get native schema-less text and images remain model attachments", async () => {
     const group = await openGroup();
     try {
       const tmp = places(group).tempDir;
@@ -549,18 +550,13 @@ return { whole, part, shot };`);
       expect(run.result.isError).toBe(false);
       const value = returned(run.result);
       expect(value.whole).toBe(rows.join("\n"));
-      expect(value.part).toStartWith(`${rows[1]}\n`);
-      expect(value.part).toContain("offset=3");
+      expect(value.part).toBe(rows[1]);
       expect(value.part).not.toContain(rows[2]!);
-      expect(value.shot).toEqual({ type: "image", data: png(3, 2).toString("base64"), mimeType: "image/png", note: "Read image file [image/png]" });
+      // Official Codemode omits images from schema-less values. Direct read still delivers model images.
+      expect(value.shot).toBe("");
       // Nothing was saved for the call.
       expect(existsSync(resultsRoot(tmp))).toBe(false);
 
-      const shown = await script(group, await member(group), `image(await tools.read({ path: ${JSON.stringify(imageFile)} }));`);
-      expect(shown.result.isError).toBe(false);
-      const label = shown.result.content.find((item) => item.text?.startsWith("[Image saved to "))!;
-      expect(label.text).toMatch(new RegExp(`image-1\\.png \\(image/png, ${png(3, 2).length} bytes\\)\\]$`));
-      expect(shown.result.content.at(-1)).toMatchObject({ type: "image", mimeType: "image/png", data: png(3, 2).toString("base64") });
     } finally { await group.close(); }
   }, 60_000);
 

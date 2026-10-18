@@ -1,14 +1,15 @@
+import { GroupDoc } from "../../src/durable/identity.ts";
 // Projection crash windows: real ledger transactions, controlled immutable entry/start snapshots; no model/network.
 import { afterAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
 import type { EntryRecord, Harness } from "@earendil-works/pi-durable";
-import { dayKey, ingestConversationRecords, openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
+import { dayKey, openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { type AttemptStart, AttemptsDoc, NOT_SENT, type UsageRecord } from "../../src/durable/attempts.ts";
 import { AuxiliaryDoc } from "../../src/durable/auxiliary-records.ts";
 import { NestedUsageDoc } from "../../src/durable/codemode/usage.ts";
-import { conversationSource, LegacyImportDoc, projectConversation } from "../../src/durable/projection.ts";
+import { projectConversation } from "../../src/durable/projection.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const fixture = await tempFixture("interrupted-usage-");
@@ -30,7 +31,7 @@ const assistant = (id: number, reason: "stop" | "aborted" | "error", byTaskId?: 
 test("an incomplete durable child list reports its known children and incompleteness without multiplying usage", async () => {
   const w = world({}, [{ id: 1 as never, conversationId: 1 as never, kind: "pi.tool-result", model: [{ role: "toolResult",
     toolCallId: "code", toolName: "codemode", content: [], isError: true, timestamp: before,
-    details: { calls: [{ name: "read" }, { name: "write" }], complete: false }, usage: bill } as never] }]);
+    details: { calls: [{ name: "read" }, { name: "write" }], partial: true }, usage: bill } as never] }]);
   try {
     await w.project(); await w.project();
     const rows = readLedger(w.ledger);
@@ -41,7 +42,7 @@ test("an incomplete durable child list reports its known children and incomplete
   } finally { w.ledger.close(); }
 });
 let counter = 0;
-function world(starts: Record<string, AttemptStart>, entries: EntryRecord[], floor = 0) {
+function world(starts: Record<string, AttemptStart>, entries: EntryRecord[]) {
   const reads: number[] = [], ledger = openStatsLedger(join(fixture.root, `root-${++counter}`));
   const harness = {
     async commit(work: (tx: unknown) => unknown) { return work({
@@ -54,7 +55,7 @@ function world(starts: Record<string, AttemptStart>, entries: EntryRecord[], flo
     }); },
     async snapshot(doc: unknown) {
       if (doc === AttemptsDoc) return { starts };
-      if (doc === LegacyImportDoc) return { through: floor };
+      if (doc === GroupDoc) return { generation: "test-generation" };
       if (doc === AuxiliaryDoc) return undefined;
       throw new Error("unexpected document");
     },
@@ -139,26 +140,5 @@ test("withdrawn/NOT_SENT requests are omitted; compaction starts are not paired 
     expect(readLedger(w.ledger).activity.map(({ asks, replies }) => ({ asks, replies }))).toEqual([{ asks: 1, replies: 1 }]);
     expect(readLedger(w.ledger).usage.map(({ kind, requests, missingUsage }) => ({ kind, requests, missingUsage })))
       .toEqual([{ kind: "assistant", requests: 1, missingUsage: 0 }, { kind: "compaction", requests: 1, missingUsage: 1 }]);
-  } finally { w.ledger.close(); }
-});
-
-test("old Durable projections rebuild after the import floor, preserve other sources and compare the pairing checkpoint", async () => {
-  const w = world({ first: start({ afterEntry: 2 }) }, [user(), assistant(2, "stop"), assistant(3, "aborted")], 2);
-  const source = conversationSource(member.groupId, member.phone, member.conversationId);
-  try {
-    const record = { type: "message", timestamp: new Date(before).toISOString(), message: { role: "assistant" } };
-    expect(ingestConversationRecords(w.ledger, source, 2, 3, [record], undefined, 2)).toBe(true);
-    expect(ingestConversationRecords(w.ledger, { ...source, id: "legacy-preserved" }, 0, 1, [record])).toBe(true);
-    w.ledger.query("UPDATE sources SET projection = 2 WHERE id = ?").run(source.id);
-    await w.project();
-    const rows = readLedger(w.ledger);
-    expect(rows.activity.map(({ replies }) => replies)).toEqual([1]);
-    expect(rows.usage.map(({ kind, requests }) => ({ kind, requests }))).toEqual([
-      { kind: "assistant", requests: 1 }, { kind: "interrupted", requests: 1 },
-    ]);
-    const old = w.ledger.query("SELECT offset, digest FROM sources WHERE id = ?").get(source.id) as { offset: number; digest: string };
-    expect(ingestConversationRecords(w.ledger, { ...source, digest: "new-checkpoint" }, old.offset, old.offset, [], undefined, 2, old.digest)).toBe(true);
-    expect(ingestConversationRecords(w.ledger, source, old.offset, old.offset, [], undefined, 2, old.digest)).toBe(false);
-    expect(w.reads).toEqual([3]);
   } finally { w.ledger.close(); }
 });

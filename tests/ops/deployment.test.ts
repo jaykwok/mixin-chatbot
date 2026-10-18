@@ -1,3 +1,4 @@
+import { writeCurrentConfig } from "../helpers/current-config.ts";
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
@@ -8,6 +9,10 @@ import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const quotePS = (text: string) => "'" + text.replaceAll("'", "''") + "'";
+const psFixtureTransaction = `function Write-FixtureTransaction($Directory, $Root, $Target = '') {
+  Write-DeploymentTransaction $Directory @{format='1';operation='upgrade';snapshot=(Split-Path $Directory -Leaf);target_sha=$Target;original_sha='';original_branch='main';original_group_root=$Root;target_group_root=$Root
+    was_running='1';bot_port='1011';deploy_mode='direct';bot_domain='';domain_action='keep';unmanaged_tunnel='';platform_ip='203.0.113.1';reconfigure_ai='0'}
+}`;
 // Exercise each deployment engine on its supported OS; PowerShell cases remain on Windows.
 const bash = process.platform === "linux" ? Bun.which("bash") : null;
 const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
@@ -48,7 +53,7 @@ function piBaselineProblems(manifest: Record<string, any>, lock: Record<string, 
   if (!version || !/^\d+\.\d+\.\d+$/.test(version)) problems.push(`direct Pi dependency is not an exact version: ${version}`);
   for (const [name, value] of direct) {
     if (value !== version) problems.push(`direct ${name}@${value} differs from ${version}`);
-    if (overrides.get(name) !== value) problems.push(`override for direct ${name} is ${overrides.get(name)}, expected ${value}`);
+    if (overrides.has(name) && overrides.get(name) !== value) problems.push(`override for direct ${name} is ${overrides.get(name)}, expected ${value}`);
   }
   for (const [name, value] of overrides) if (value !== version) problems.push(`override ${name}@${value} differs from ${version}`);
   if (JSON.stringify(lock.overrides) !== JSON.stringify(manifest.overrides)) problems.push("bun.lock overrides differ from package.json");
@@ -63,7 +68,7 @@ function piBaselineProblems(manifest: Record<string, any>, lock: Record<string, 
     if (resolution.slice(at + 1) !== version) problems.push(`lock entry ${key} resolves ${resolution}, expected ${version}`);
   }
   for (const [name, found] of entries) if (found.length !== 1) problems.push(`${name} is locked ${found.length} times: ${found.join("; ")}`);
-  for (const name of entries.keys()) if (!overrides.has(name)) problems.push(`locked ${name} has no override`);
+
   for (const name of overrides.keys()) if (!entries.has(name)) problems.push(`override ${name} is not in the lock`);
   return problems;
 }
@@ -72,7 +77,7 @@ test("Pi packages resolve to one pinned version, nested lock entries included", 
   const manifest = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
   expect(piBaselineProblems(manifest, parseLock(await readFile(join(project, "bun.lock"), "utf8")))).toEqual([]);
   const version = manifest.dependencies["@earendil-works/pi-coding-agent"];
-  for (const name of Object.keys(manifest.overrides).filter(name => name.startsWith("@earendil-works/"))) {
+  for (const name of Object.keys(manifest.dependencies).filter(name => name.startsWith("@earendil-works/"))) {
     const installed = JSON.parse(await readFile(join(project, "node_modules", name, "package.json"), "utf8"));
     expect(`${name}@${installed.version}`).toBe(`${name}@${version}`);
   }
@@ -95,8 +100,7 @@ test.each([["LF", "\n"], ["CRLF", "\r\n"]])("the Pi lock check reads a %s lockfi
   expect(piBaselineProblems(manifest, floating).join("\n")).toContain("resolves @earendil-works/pi-tui@9.9.9");
   const stale = { ...manifest, overrides: { ...manifest.overrides, "@earendil-works/pi-ai": "0.0.1" } };
   expect(piBaselineProblems(stale, lock).join("\n")).toContain("override for direct @earendil-works/pi-ai is 0.0.1");
-  const unpinned = { ...manifest, overrides: Object.fromEntries(Object.entries(manifest.overrides).filter(([name]) => name !== "@earendil-works/pi-mcp")) };
-  expect(piBaselineProblems(unpinned, lock).join("\n")).toContain("locked @earendil-works/pi-mcp has no override");
+  expect(Object.keys(manifest.overrides).some(name => name.startsWith("@earendil-works/"))).toBe(false);
 });
 
 /** `group`: the command leads its own process group (POSIX only), as a terminal's foreground job would. */
@@ -114,6 +118,7 @@ test.skipIf(process.platform !== "win32")("Windows update reuses matching depend
   const script = join(fixture.root, "reuse.ps1");
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+${psFixtureTransaction}
 $root=Join-Path $PSScriptRoot 'repo'
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 Set-Location $root
@@ -172,6 +177,7 @@ test.skipIf(process.platform !== "win32")("Windows deployment rollback restores 
 Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 . ${quotePS(join(project, "scripts/lib/lifecycle.ps1"))}
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+${psFixtureTransaction}
 ${await fileHolderFunctions(fixture.root)}
 # Every host control API is replaced; only the fixture filesystem is real.
 function Get-ProjectBotPids { @() }
@@ -267,6 +273,7 @@ test.skipIf(process.platform !== "win32")("Windows continue keeps the original d
 Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 . ${quotePS(join(project, "scripts/lib/lifecycle.ps1"))}
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+${psFixtureTransaction}
 function Get-ProjectBotPids { @() }
 function Stop-ProjectBot { return $true }
 function Get-ScheduledTask { [pscustomobject]@{State='Ready'} }
@@ -358,12 +365,13 @@ function fixture-git {
 function fixture-bun {
     $global:LASTEXITCODE=0
     if($args -contains '--version') { if($script:failure -eq 'old-bun'){'1.4.2'}else{'1.4.3'} }
+    elseif($args -contains 'probe') { if($script:stopped){throw 'probe after stop'} }
     elseif($args -contains 'preview') { $script:previews++; if($script:stopped){throw 'preview after stop'}; if($script:failure -eq 'preview'){ $global:LASTEXITCODE=2 } }
     elseif($args -contains 'install') { if(-not $script:stopped){throw 'dependencies changed before stop'}; $script:installs++; if($script:failure -eq 'install'){$global:LASTEXITCODE=1} }
     elseif($args -contains 'apply') { $script:applied=$true; if($script:failure -eq 'apply'){$global:LASTEXITCODE=1} }
     elseif($args -contains 'committed') { if($script:stopped){throw 'commit check after stop'}; $global:LASTEXITCODE=[int](-not $script:committed) }
     elseif($args -contains 'commit') { if($script:failure -eq 'commit'){$global:LASTEXITCODE=1}else{$script:committed=$true} }
-    elseif($args -contains 'finalize') { if(-not $script:normalHealthy){throw 'migration backup cleaned before healthy'}; $script:finalizes++ }
+    elseif($args -contains 'finish-reset') { if(-not $script:committed -or ($script:running -and -not $script:normalHealthy)){throw 'reset backup cleaned before healthy'}; $script:finalizes++ }
     elseif($args -contains 'rollback') { if($script:committed){$global:LASTEXITCODE=42}else{$script:dataRestored=$true} }
     else {
         $verifying=Test-Path -LiteralPath (Join-Path $Project 'data/state/verify-only')
@@ -416,7 +424,7 @@ foreach($script:reuse in @($true,$false)) { foreach($script:running in @($true,$
     } elseif($script:restores -ne 1) { throw 'rollback missing' }
     # Only a completed upgrade discards its own snapshot and archive; every other outcome keeps them for recovery.
     if($script:cleanups -ne [int]($script:failure -eq 'none')){throw ('wrong backup cleanup: ' + $script:failure)}
-    if($script:finalizes -ne [int]($script:failure -eq 'none' -and $script:running)){throw ('wrong migration cleanup: ' + $script:failure)}
+    if($script:finalizes -ne [int]($script:failure -eq 'none')){throw ('wrong reset cleanup: ' + $script:failure)}
     Write-Output 'VERIFIED'
 } } }
 # Explicit rollback of an interrupted upgrade: no preview or preflight, committed data is refused before the stop.
@@ -426,7 +434,7 @@ function Get-OpsCommandHint($name) { 'ops ' + $name }
 function Get-PlatformIp { throw 'ordinary settings read during rollback' }
 foreach($name in @('bot-port','deploy-mode','bot-domain')) { Set-Content -LiteralPath (Join-Path $Project ('data/state/' + $name)) '' -NoNewline }
 $Rollback=$true; $script:failure='none'; $script:running=$true
-Set-Content -LiteralPath (Join-Path $Project 'data/state/migration.json') '{}'
+Set-Content -LiteralPath (Join-Path $Project 'data/state/release-data.json') (@{deployment=(Split-Path $Project -Leaf)} | ConvertTo-Json)
 foreach($script:committedBefore in @($true,$false)) {
     Set-Content -LiteralPath (Join-Path $Project 'data/state/upgrade-transaction') ('deploy-' + ('a' * 32))
     $script:stopped=$false; $script:applied=$true; $script:committed=$script:committedBefore; $script:dataRestored=$false; $script:codeRestored=$false
@@ -490,7 +498,7 @@ function fixture-bun {
     $script:previews++; $global:LASTEXITCODE=0
 }
 ${source.slice(start, end)}
-if($script:previews -ne 1 -or $migrationGroups -ne $newRoot){throw 'missing selected-root preview'}
+if($script:previews -ne 1 -or $dataPreparationGroups -ne $newRoot){throw 'missing selected-root preview'}
 Write-Output 'ROOT_SELECTED'
 `);
     let result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
@@ -514,6 +522,7 @@ test.skipIf(process.platform !== "win32")("Windows redeployment collects every a
     const script = join(f.root, "preflight.ps1");
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
+${psFixtureTransaction}
 $Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data/state'
 $ModelsFile=Join-Path $Project 'data/config/models.json'; $DomainFile=Join-Path $StateDir 'bot-domain'
 $PortFile=Join-Path $StateDir 'bot-port'; $ModeFile=Join-Path $StateDir 'deploy-mode'
@@ -563,6 +572,7 @@ test.skipIf(process.platform !== "win32")("Windows deployment continue takes eve
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
+${psFixtureTransaction}
 $Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data\\state'; $RuntimeDir=Join-Path $Project 'data\\runtime'
 $DefaultGroupDataRoot=Join-Path $Project 'data\\groups'; $GroupRootFile=Join-Path $StateDir 'group-data-root'
 $ModelsFile=Join-Path $Project 'data\\config\\models.json'; $DomainFile=Join-Path $StateDir 'bot-domain'
@@ -605,10 +615,11 @@ test.skipIf(process.platform !== "win32")("Windows deployment continue after com
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
+${psFixtureTransaction}
 $Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data\\state'; $TaskName='fixture'
 $Resume=$true; $Rollback=$false; $bunPath='fixture-bun'; $gitPath='fixture-git'; $target=Join-Path $PSScriptRoot 'target'
 New-Item -ItemType Directory -Force -Path $StateDir,$target | Out-Null
-foreach ($name in @('deploy-transaction', 'verify-only', 'migration.json')) { Set-Content -LiteralPath (Join-Path $StateDir $name) '{}' }
+foreach ($name in @('deploy-transaction', 'verify-only', 'release-data.json')) { Set-Content -LiteralPath (Join-Path $StateDir $name) '{}' }
 $env:BOT_DEPLOY_BACKUP_ID='deploy-fixture'; $lock=New-Object IO.MemoryStream; $script:calls=@()
 function Open-DeploymentTransaction { [pscustomobject]@{ Path=(Join-Path $PSScriptRoot 'deploy-fixture'); Lock=$lock; PreviousBackupId='previous'
     Record=@{ target_sha=('a' * 40); target_group_root=$target; bot_port='2022' } } }
@@ -635,7 +646,7 @@ Write-Output 'FELL THROUGH'
     // Committed data: applying again would start a new migration journal, so only the new instance is started.
     let result = await run("1");
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toContain("CALLS bun committed|stop|enable|start|health 2022|bun finalize|cleanup pointer=False verify=False lock=False backup=previous");
+    expect(result.output).toContain("CALLS bun committed|stop|enable|start|health 2022|cleanup pointer=False verify=False lock=False backup=previous");
     expect(result.output).toContain("DONE 上次部署已完成"); expect(result.output).not.toContain("FELL THROUGH");
     // An instance that does not become healthy keeps the transaction, so continuing again retries only the activation.
     result = await run("1", "1");
@@ -648,6 +659,7 @@ Write-Output 'FELL THROUGH'
     await writeFile(gate, `\ufeff$ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
+${psFixtureTransaction}
 $Project=Join-Path $PSScriptRoot 'gate'; $StateDir=Join-Path $Project 'data\\state'; $ConfigDir=Join-Path $Project 'data\\config'; $TaskName='fixture'
 $Resume=$env:FIXTURE_RESUME -eq '1'; $Rollback=$env:FIXTURE_ROLLBACK -eq '1'; $bunPath='fixture-bun'; $gitPath='fixture-git'
 New-Item -ItemType Directory -Force -Path $StateDir,$ConfigDir | Out-Null
@@ -677,7 +689,7 @@ Write-Output ('ORDINARY_SETTINGS_READ debug=' + $BotDebug + ' active=' + $BotMax
     const finish = join(f.root, "finish.ps1");
     await writeFile(finish, `\ufeff$ErrorActionPreference='Stop'
 $transactionPointer=Join-Path $PSScriptRoot 'deploy-transaction'; $snapshot=[pscustomobject]@{ Path='deploy-fixture' }; $Project=$PSScriptRoot
-$bunPath='fixture-bun'; $migrationRunner='fixture-runner'; $GroupDataRoot=$PSScriptRoot
+$bunPath='fixture-bun'; $dataPreparationRunner='fixture-runner'; $GroupDataRoot=$PSScriptRoot
 function fixture-bun { if(-not $deploymentActivated){throw 'cleanup before activation'}; $global:LASTEXITCODE=0; Write-Output 'FINALIZE' }
 function Remove-CompletedBackup { Write-Output 'CLEANUP' }; function Write-OperationEvent {}; function Warn {}
 foreach ($activated in @($false, $true)) {
@@ -689,7 +701,7 @@ ${source.slice(cleanupStart, cleanupEnd)}
 `);
     result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", finish], f.root);
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toMatch(/^ACTIVATED=False pointer=True\r?\nFINALIZE\r?\nCLEANUP\r?\nACTIVATED=True pointer=False/m);
+    expect(result.output).toMatch(/^ACTIVATED=False pointer=True\r?\nCLEANUP\r?\nACTIVATED=True pointer=False/m);
     result = await run("0");
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain("STEP 继续上次部署"); expect(result.output).toContain("FELL THROUGH");
@@ -707,8 +719,9 @@ test.skipIf(process.platform !== "win32")("Windows deployment rollback refuses c
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
+${psFixtureTransaction}
 $Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data\\state'; $TaskName='fixture'
-$bunPath='fixture-bun'; $migrationRunner='run.ts'; $target=Join-Path $PSScriptRoot 'target'
+$bunPath='fixture-bun'; $dataPreparationRunner='run.ts'; $target=Join-Path $PSScriptRoot 'target'
 New-Item -ItemType Directory -Force -Path $StateDir,$target | Out-Null
 function Step {}; function Done($message) { Write-Output $message }; function Set-OperationStage {}; function Write-OperationEvent {}
 function fixture-bun { $script:calls += ,($args -join ' '); $global:LASTEXITCODE = if ($args -contains 'committed') { [int]($script:case -ne 'committed') } elseif ($script:case -eq 'refused') { 42 } else { 0 } }
@@ -718,7 +731,7 @@ ${rollback}
 foreach ($script:case in @('committed', 'refused', 'original-missing', 'rolled-back')) {
     $script:calls=@()
     Set-Content -LiteralPath (Join-Path $StateDir 'deploy-transaction') 'deploy-fixture'
-    Set-Content -LiteralPath (Join-Path $StateDir 'migration.json') '{}'
+    Set-Content -LiteralPath (Join-Path $StateDir 'release-data.json') '{}'
     $original = if ($script:case -eq 'original-missing') { Join-Path $PSScriptRoot 'unmounted' } else { $target }
     $lock = New-Object IO.MemoryStream
     $snapshot=[pscustomobject]@{ Path=(Join-Path $PSScriptRoot 'deploy-fixture'); Lock=$lock; PreviousBackupId='previous'; WasRunning=$true
@@ -750,6 +763,7 @@ test.skipIf(process.platform !== "win32")("Windows resume and rollback dispatch 
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
+${psFixtureTransaction}
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/ops/ops.ps1"))},[ref]$tokens,[ref]$errors)
 foreach ($name in @('Invoke-PendingDeployment', 'Invoke-TransactionCommand', 'Invoke-Update')) {
@@ -785,6 +799,7 @@ Remove-Item -LiteralPath (Join-Path $state 'deploy-transaction')
 $snapshot=Join-Path $Project ('backup\\snapshots\\deploy-' + ('b' * 32))
 New-Item -ItemType Directory -Force -Path $snapshot | Out-Null
 [pscustomobject]@{ UpgradeTarget=$recorded } | Export-Clixml -LiteralPath (Join-Path $snapshot 'deployment.xml')
+Write-FixtureTransaction $snapshot $Project $recorded
 Set-Content -LiteralPath (Join-Path $state 'upgrade-transaction') ('deploy-' + ('b' * 32))
 Case 'upgrade-rollback' { Invoke-TransactionCommand 'rollback' }
 Case 'upgrade-resume' { Invoke-TransactionCommand 'continue' }
@@ -829,6 +844,7 @@ test.skipIf(process.platform !== "win32")("Windows Cloudflare deployment install
     const script = join(f.root, "tunnel.ps1");
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
+${psFixtureTransaction}
 function Get-Definition([string]$path,[scriptblock]$match) { $t=$null; $e=$null; $ast=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$t,[ref]$e); if($e.Count){throw ($e | Out-String)}; (@($ast.FindAll($match,$true)) | ForEach-Object { $_.Extent.Text }) -join [Environment]::NewLine }
 $deploySource=${quotePS(join(project, "scripts/deploy/deploy.ps1"))}; $tunnelSource=${quotePS(join(project, "scripts/tunnel/start-tunnel.ps1"))}
 . ([scriptblock]::Create((Get-Definition $deploySource { param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Wait-BotHealth' })))
@@ -836,7 +852,7 @@ $deploySource=${quotePS(join(project, "scripts/deploy/deploy.ps1"))}; $tunnelSou
 $gate=Get-Definition $tunnelSource { param($n) ($n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-LocalBot') -or ($n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$allowVerification') }
 $Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data/state'; $TunnelManagedFile=Join-Path $StateDir 'cloudflared-managed'
 $verifyOnly=Join-Path $StateDir 'verify-only'; $Port=$env:FIXTURE_PORT; $TaskName='mixin-chatbot'; $mode='cloudflare'
-$bunPath='fixture-bun'; $migrationRunner='fixture-runner'; $GroupDataRoot=Join-Path $Project 'groups'; $WindowsPowerShell='Invoke-FixtureInstaller'
+$bunPath='fixture-bun'; $dataPreparationRunner='fixture-runner'; $GroupDataRoot=Join-Path $Project 'groups'; $WindowsPowerShell='Invoke-FixtureInstaller'
 $taskUsesS4U=$true; $taskStartDescription='fixture'; $cleanupFirewallAfterHealth=$false
 function Step {}; function Done {}; function Warn {}; function Fail {}
 function Read-Host { throw 'prompted while the bot service was stopped' }
@@ -888,6 +904,7 @@ test.skipIf(process.platform !== "win32")("Windows upgrade replaces the existing
   const script = join(fixture.root, "replace.ps1");
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+${psFixtureTransaction}
 $root=Join-Path $PSScriptRoot 'project with spaces'
 New-Item -ItemType Directory -Force -Path (Join-Path $root 'data/state') | Out-Null
 function New-DeploymentSnapshot($projectRoot,$taskName) {
@@ -923,6 +940,7 @@ for (const [name, shell] of [["Windows PowerShell 5.1", "powershell.exe"], ["Pow
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+${psFixtureTransaction}
 # Host discovery is stubbed; pointers, snapshots and the exclusive deployment lock are real.
 function Save-DeploymentFiles([string]$ProjectRoot,[string]$Snapshot) { New-Item -ItemType Directory -Force -Path $Snapshot | Out-Null; return @() }
 function Get-ScheduledTask { return $null }
@@ -941,6 +959,7 @@ function New-DeploymentSnapshot([string]$ProjectRoot,[string]$TaskName) {
         $b=Open-UpgradeSnapshot $ProjectRoot $TaskName ('a'*40) 'main' ('b'*40)
         $b.WasRunning=$true; $b.DependenciesAttempted=$true
         Save-DeploymentSnapshot $b
+        Write-FixtureTransaction $b.Path $ProjectRoot ('b'*40)
         $script:b=Split-Path $b.Path -Leaf
         # B ran in its own process: its lock and environment end with it.
         $b.Lock.Dispose(); $env:BOT_DEPLOY_BACKUP_ID=$null
@@ -998,6 +1017,7 @@ test.skipIf(process.platform !== "win32")("Windows upgrade snapshot survives res
   const script = join(fixture.root, "resume.ps1");
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+${psFixtureTransaction}
 $root=Join-Path $PSScriptRoot 'project'
 New-Item -ItemType Directory -Force -Path (Join-Path $root 'data/state') | Out-Null
 function New-DeploymentSnapshot($projectRoot,$taskName) {
@@ -1008,6 +1028,7 @@ function New-DeploymentSnapshot($projectRoot,$taskName) {
 }
 $first=Open-UpgradeSnapshot $root 'fixture' 'original' 'main' 'target'
 $first.Lock.Dispose()
+Write-FixtureTransaction $first.Path $root
 $second=Open-UpgradeSnapshot $root 'fixture' 'wrong-current' 'HEAD' 'target'
 try {
     if($second.Path -ne $first.Path -or -not $second.WasRunning -or $second.UpgradeOriginal -ne 'original' -or $second.UpgradeBranch -ne 'main'){throw 'lost original transaction'}
@@ -1039,8 +1060,8 @@ for (const [name, shell] of [["Windows PowerShell 5.1", "powershell.exe"], ["Pow
       // function stubs hide the string-splatting bug, so these calls must cross the real executable boundary.
       await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 $bun=$bunPath=${quotePS(process.execPath)}
-$previewRunner=$migrationRunner=${quotePS(probe)}
-$Project=${quotePS(root)}; $groups=$migrationGroups=$GroupDataRoot=${quotePS(groups)}; $plan=$migrationPlan=${quotePS(plan)}
+$previewRunner=$dataPreparationRunner=${quotePS(probe)}
+$Project=${quotePS(root)}; $groups=$dataPreparationGroups=$GroupDataRoot=${quotePS(groups)}; $plan=$dataPreparationPlan=${quotePS(plan)}
 foreach($file in @(${quotePS(join(project, "scripts/deploy/upgrade.ps1"))},${quotePS(join(project, "scripts/deploy/deploy.ps1"))})) {
     $tokens=$null; $errors=$null
     $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]$errors)
@@ -1049,10 +1070,9 @@ foreach($file in @(${quotePS(join(project, "scripts/deploy/upgrade.ps1"))},${quo
     $commands=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.CommandAst] -and
         $node.CommandElements.Count -gt 3 -and $node.CommandElements[0].Extent.Text -in @('$bun','$bunPath') -and
         $node.CommandElements[3].Extent.Text -eq 'preview'},$true))
-    if(-not $mode -or -not $commands.Count){throw 'preview calls not found'}
+    if(-not $commands.Count){throw 'preview calls not found'}
     foreach($resuming in @($false,$true)) {
         $pendingPath=if($resuming){'recorded-snapshot'}else{$null}
-        Invoke-Expression $mode.Extent.Text
         foreach($command in $commands) {
             Invoke-Expression $command.Extent.Text
             if($LASTEXITCODE -ne 0){throw 'native argv recorder failed'}
@@ -1064,11 +1084,8 @@ foreach($file in @(${quotePS(join(project, "scripts/deploy/upgrade.ps1"))},${quo
       expect(result.code, result.output).toBe(0);
       const actual = result.output.trim().split(/\r?\n/).map(line => JSON.parse(line));
       const expected: string[][] = [];
-      for (const decisionsOnly of [[true], [true, false]]) {
-        for (const resuming of [false, true]) {
-          for (const decisions of decisionsOnly) expected.push(["preview", ...(decisions ? ["--decisions-only"] : []),
-            ...(resuming ? [] : ["--interactive"]), "--project", root, "--groups", groups, "--plan", plan]);
-        }
+      for (const count of [1, 2]) for (const _resuming of [false, true]) {
+        for (let i = 0; i < count; i++) expected.push(["preview", "--project", root, "--groups", groups, "--plan", plan]);
       }
       expect(actual).toEqual(expected);
     } finally { await fixture.cleanup(); }
@@ -1085,13 +1102,13 @@ test.skipIf(process.platform !== "win32")("Windows target upgrade really boots a
       "-BunPath", process.execPath, "-GitPath", Bun.which("git")!];
     const result = await execute(command, fixture.root);
     expect(result.code, result.output).toBe(1);
-    expect(result.output).toContain("模型选型缺失");
+    expect(result.output).toContain("未记录 defaultProvider/defaultModel");
     expect(result.output).not.toContain("只能指定一个迁移命令");
     expect(result.output).toContain("迁移预览未完成");
     expect(existsSync(join(fixture.root, "data/state/upgrade-transaction"))).toBe(false);
     const logs = await readdir(join(fixture.root, "logs/operations")); expect(logs).toHaveLength(1);
     const text = await readFile(join(fixture.root, "logs/operations", logs[0]!), "utf8");
-    expect(text).toContain("migration-preview"); expect(text).toContain("迁移预览未完成");
+    expect(text).toContain("data-preparation-preview"); expect(text).toContain("迁移预览未完成");
     expect(text).toContain("upgrade.ps1"); expect(text).toContain("exit=1");
     // A valid configuration must complete the real preview before the deliberate missing-main refusal. Use a
     // separate empty repository so Git cannot discover the surrounding developer checkout or reach service control.
@@ -1100,6 +1117,7 @@ test.skipIf(process.platform !== "win32")("Windows target upgrade really boots a
     await mkdir(join(fixture.root, "data/runtime/pi"), { recursive: true });
     const settings = join(fixture.root, "data/runtime/pi/settings.json");
     const original = JSON.stringify({ defaultProvider: "fixture", defaultModel: "test" });
+    await writeCurrentConfig(fixture.root);
     await writeFile(settings, original);
     const ready = await execute(command, fixture.root);
     expect(ready.code, ready.output).toBe(1);
@@ -1107,7 +1125,7 @@ test.skipIf(process.platform !== "win32")("Windows target upgrade really boots a
     expect(ready.output).not.toContain("迁移预览未完成");
     const allLogs = await readdir(join(fixture.root, "logs/operations")); expect(allLogs).toHaveLength(2);
     const readyLog = await readFile(join(fixture.root, "logs/operations", allLogs.find(name => name !== logs[0])!), "utf8");
-    expect(readyLog).toContain("preview-result"); expect(readyLog).toContain("migration-finished: exit=0");
+    expect(readyLog).toContain("action=preview"); expect(readyLog).toContain("data-finished: exit=0");
     expect(readyLog).not.toContain("stop-service");
     expect(await readFile(settings, "utf8")).toBe(original);
     expect(await readdir(join(fixture.root, "data/groups"))).toEqual([]);
@@ -1120,6 +1138,7 @@ test.skipIf(process.platform !== "win32")("Windows upgrade removes only its own 
   const script = join(fixture.root, "cleanup.ps1");
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+${psFixtureTransaction}
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/ops/ops.ps1"))},[ref]$tokens,[ref]$errors)
 if($errors.Count){throw ($errors | Out-String)}
@@ -1328,6 +1347,7 @@ test.skipIf(process.platform !== "win32")("Windows snapshots never adopt a name 
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/lifecycle.ps1"))}
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
+${psFixtureTransaction}
 $root=Join-Path $PSScriptRoot 'project'
 New-Item -ItemType Directory -Force -Path (Join-Path $root 'backup/rm/deploy-taken1'),(Join-Path $root 'backup/snapshots/deploy-taken3'),(Join-Path $PSScriptRoot 'gone') | Out-Null
 # A dangling junction still occupies its name.
@@ -1620,9 +1640,9 @@ test.skipIf(!bash || !existsSync(bash))("Docker deployment refuses the legacy up
     expect(result.code, result.output).toBe(1);
     expect(result.output).toContain("旧版运维脚本不能直接升级到此版本");
     expect(result.output).toContain("本次未改动数据和配置");
-    const bootstrap = ["git fetch origin main", "rm -rf tmp/upgrade-bootstrap && mkdir -p tmp/upgrade-bootstrap",
-      "git archive origin/main scripts/deploy/upgrade.sh scripts/lib scripts/migrations src/core/data-version.ts Dockerfile | tar -x -C tmp/upgrade-bootstrap",
-      'bash tmp/upgrade-bootstrap/scripts/deploy/upgrade.sh "$PWD" origin/main', "rm -rf tmp/upgrade-bootstrap"];
+    const bootstrap = ["git fetch origin main", "mkdir -p tmp", 'stage=$(mktemp -d "$PWD/tmp/upgrade-XXXXXXXX")',
+      'git archive origin/main scripts/deploy/upgrade.sh scripts/lib scripts/runtime src/core/data-version.ts Dockerfile | tar -x -C "$stage"',
+      'bash "$stage/scripts/deploy/upgrade.sh" "$PWD" origin/main'];
     for (const line of bootstrap) expect(result.output).toContain(`      ${line}\n`);
     // The documented command is the one printed (a Windows checkout may have CRLF line endings).
     expect((await readFile(join(project, "docs/data-migrations.md"), "utf8")).replaceAll("\r\n", "\n")).toContain("```bash\n" + bootstrap.join("\n") + "\n```");
@@ -1675,7 +1695,7 @@ test.skipIf(!bash || !existsSync(bash))("Docker continue and rollback use only t
 set -euo pipefail
 . '${posixPath(join(project, "scripts/lib/deployment.sh"))}'
 PROJECT_DIR="$1"; RECORDED=0; DOCKER_ROOTLESS=0; IMAGE_ID=''; SERVICE_USER=''; SERVICE_USER_SOURCE=''; CANDIDATE_PRESENT=1
-TRANSACTION_ACTION="\${FIXTURE_ACTION:-}"; MIGRATION_PREVIEW_MODE=(--interactive)
+TRANSACTION_ACTION="\${FIXTURE_ACTION:-}"; DATA_PREPARATION_PREVIEW_MODE=(--interactive)
 # The recorded image as the daemon reports it: 0 present, 3 another daemon, 4 removed (see candidate_verify).
 candidate_verify(){ return "\${FIXTURE_CANDIDATE:-0}"; }
 DATA_DIR="$PROJECT_DIR/data"; CONFIG_DIR="$DATA_DIR/config"; STATE_DIR="$DATA_DIR/state"; RUNTIME_HOME_DIR="$DATA_DIR/runtime/home"
@@ -1690,10 +1710,10 @@ load_tunnel_token(){
     if [ -z "\${1:-}" ]; then [ "\${FIXTURE_SAVED_TOKEN:-0}" = 1 ]; return; fi
     [ "$1" = handed-over ]
 }
-migration_docker(){
-    if [ "$1" = finalize ]; then
-        grep -q 'exec mixin-chatbot bun run scripts/ops/health-check.ts' '${posixPath(dockerLog)}' || { echo 'finalize before health' >&2; exit 94; }
-        echo "FINALIZE $*"
+data_preparation_docker(){
+    if [ "$1" = finish-reset ]; then
+        [ "\${TRANSACTION[was_running]}" = 0 ] || grep -q 'exec mixin-chatbot bun run scripts/ops/health-check.ts' '${posixPath(dockerLog)}' || { echo 'cleanup before health' >&2; exit 94; }
+        echo "RESET-CLEANUP $*"
         return "\${FIXTURE_CLEANUP_FAIL:-0}"
     fi
     [ "$1" = committed ] || { echo "MIGRATION $1" >&2; exit 93; }; [ "\${FIXTURE_COMMITTED:-0}" = 1 ]
@@ -1768,7 +1788,7 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
     expect(existsSync(missing)).toBe(false);
     // Rollback: committed data is refused before any container change; otherwise the snapshot is restored against the target root.
     await record();
-    await writeFile(join(state, "migration.json"), "{}");
+    await writeFile(join(state, "release-data.json"), "{}");
     result = await run({ FIXTURE_ACTION: "rollback", FIXTURE_COMMITTED: "1" });
     expect(result.code, result.output).toBe(1); expect(result.output).toContain("已经提交，不能回滚");
     expect(result.output).not.toContain("BEGIN");
@@ -1802,19 +1822,15 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
       "stop --time 30 mixin-chatbot", "start mixin-chatbot", "exec mixin-chatbot bun run scripts/ops/health-check.ts", ...publish, ...released,
       "rm mixin-chatbot-rollback", "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
     expect(activation.output).toContain(`CLEANUP ${posixPath(snapshot)}`); expect(activation.output).toContain("机器人已启动");
-    expect(activation.output).toContain("FINALIZE finalize --deployment deploy-fixture");
+    expect(activation.output).toContain("RESET-CLEANUP finish-reset --deployment deploy-fixture");
     expect(activation.output).not.toContain("BEGIN"); expect(activation.output).not.toContain("RESULT"); expect(activation.output).not.toContain("MIGRATION");
     expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
     expect(await readFile(receipt, "utf8")).toBe("committed\n");
-    activation = await committed({ FIXTURE_CLEANUP_FAIL: "1" });
-    expect(activation.code, activation.output).toBe(0);
-    expect(activation.output).toContain("迁移备份清理未完成");
-    expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
     // An upgrade that found the service stopped keeps it stopped; the official tag still moves, for the maintenance commands.
     await record({ was_running: "0" });
     activation = await committed({});
     expect(activation.code, activation.output).toBe(0); expect(activation.output).toContain("保持停止");
-    expect(activation.output).not.toContain("FINALIZE");
+    expect(activation.output).toContain("RESET-CLEANUP finish-reset --deployment deploy-fixture");
     expect(activation.docker).toEqual(["container inspect mixin-chatbot-rollback", "container inspect --format {{.Image}} mixin-chatbot",
       "stop --time 30 mixin-chatbot", ...publish, ...released, "image inspect mixin-chatbot:previous", "image rm mixin-chatbot:previous"]);
     // An unhealthy instance, or an official tag that cannot be moved, keeps the transaction: continuing again retries only
@@ -1823,12 +1839,15 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
     activation = await committed({ FIXTURE_UNHEALTHY: "1" });
     expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("业务实例未就绪"); expect(activation.output).toContain("resume");
     expect(existsSync(join(state, "deploy-transaction"))).toBe(true);
-    expect(activation.output).not.toContain("FINALIZE");
+    expect(activation.output).not.toContain("RESET-CLEANUP");
     expect(activation.output).not.toContain("CLEANUP"); expect(activation.docker.filter(line => line.startsWith("tag"))).toEqual([]);
     activation = await committed({ FIXTURE_TAG_FAIL: "1" });
     expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("正式标签 mixin-chatbot 未能指向");
     expect(existsSync(join(state, "deploy-transaction"))).toBe(true); expect(activation.output).not.toContain("CLEANUP");
     expect(activation.docker.filter(line => line.startsWith("image rm"))).toEqual([]);
+    activation = await committed({ FIXTURE_CLEANUP_FAIL: "1" });
+    expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("旧会话副本清理未完成");
+    expect(existsSync(join(state, "deploy-transaction"))).toBe(true); expect(activation.output).not.toContain("CLEANUP " + posixPath(snapshot));
     // The container left by the interrupted operation must run the recorded image; another one is not activated.
     activation = await committed({ FIXTURE_CONTAINER_IMAGE: `sha256:${"d".repeat(64)}` });
     expect(activation.code, activation.output).toBe(1); expect(activation.output).toContain("不是记录的候选镜像");
@@ -1856,13 +1875,13 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
     }
     // A removed candidate cannot be replaced by a rebuild: continuing is refused, and so is a rollback once this
     // transaction's migration started; a rollback that never reached the migration restores the original container.
-    await record(); await rm(join(state, "migration.json"), { force: true });
+    await record(); await rm(join(state, "release-data.json"), { force: true });
     result = await run({ FIXTURE_ACTION: "continue", FIXTURE_SAVED_TOKEN: "1", FIXTURE_CANDIDATE: "4" });
     expect(result.code, result.output).toBe(1); expect(result.output).toContain("重新构建的镜像不能代替"); expect(result.output).not.toContain("RESULT");
-    await writeFile(join(state, "migration.json"), `{\n  "deployment": "deploy-fixture"\n}\n`);
+    await writeFile(join(state, "release-data.json"), `{\n  "deployment": "deploy-fixture"\n}\n`);
     result = await run({ FIXTURE_ACTION: "rollback", FIXTURE_CANDIDATE: "4" });
     expect(result.code, result.output).toBe(1); expect(result.output).toContain("数据迁移已经开始"); expect(result.output).not.toContain("BEGIN");
-    await rm(join(state, "migration.json"));
+    await rm(join(state, "release-data.json"));
     result = await run({ FIXTURE_ACTION: "rollback", FIXTURE_CANDIDATE: "4" });
     expect(result.output).toContain(`BEGIN rollback=1 root=${posixPath(target)}`);
     // Without a transaction the ordinary environment is validated before any setting is read.
@@ -1881,43 +1900,43 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
 test.skipIf(!bash || !existsSync(bash))("Docker continue applies the migration plan confirmed before the stop instead of previewing again", async () => {
   const fixture = await tempFixture("deployment-docker-plan-");
   const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
-  const block = source.split("\nMIGRATION_PLANNED=0\n")[1]?.split("# ---- 停机前的交互选择")[0];
+  const block = source.split("\nDATA_PREPARATION_PLANNED=0\n")[1]?.split("# ---- 停机前的交互选择")[0];
   expect(block).toBeDefined();
   const root = fixture.root, state = join(root, "state"), snapshot = join(root, "snapshot");
   for (const dir of [state, snapshot, join(root, "runtime/pi")]) await mkdir(dir, { recursive: true });
   await writeFile(join(root, "models.json"), "{}"); await writeFile(join(root, "runtime/pi/settings.json"), "{}");
-  await writeFile(join(snapshot, "migration-plan.json"), "confirmed-before-stop");
+  await writeFile(join(snapshot, "data-plan.json"), "confirmed-before-stop");
   const script = join(root, "plan.sh");
   await writeFile(script, `#!/usr/bin/env bash
 set -euo pipefail
 PROJECT_DIR="$1"; STATE_DIR="$PROJECT_DIR/state"; TRANSACTION_SNAPSHOT="$PROJECT_DIR/snapshot"; RECORDED="$FIXTURE_RECORDED"
-MODELS_FILE="$PROJECT_DIR/models.json"; RUNTIME_DIR="$PROJECT_DIR/runtime"; MIGRATION_PLAN=/app/data/state/migration-plan.json; MIGRATION_PREVIEW_MODE=()
+MODELS_FILE="$PROJECT_DIR/models.json"; RUNTIME_DIR="$PROJECT_DIR/runtime"; DATA_PREPARATION_PLAN=/app/data/state/data-plan.json; DATA_PREPARATION_PREVIEW_MODE=()
 print_error(){ echo "$*" >&2; }; settings_fixed_hint(){ echo hint; }; grant_service_access(){ echo "GRANT $*"; }
-migration_docker(){ echo "PREVIEW $*"; }
-MIGRATION_PLANNED=0
+data_preparation_docker(){ echo "PREVIEW $*"; }
+DATA_PREPARATION_PLANNED=0
 ${block}
-echo "PLANNED=$MIGRATION_PLANNED"
+echo "PLANNED=$DATA_PREPARATION_PLANNED"
 `);
   const run = (recorded: string) => execute([bash!, posixPath(script), posixPath(root)], root, { ...process.env, MSYS_NO_PATHCONV: "1", FIXTURE_RECORDED: recorded });
   try {
-    await writeFile(join(state, "migration-plan.json"), "stale");
+    await writeFile(join(state, "data-plan.json"), "stale");
     // The snapshot is readable only by the deploying user; the plan is copied back where the container reads it.
     let result = await run("1");
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain("PLANNED=1"); expect(result.output).not.toContain("PREVIEW");
-    expect(await readFile(join(state, "migration-plan.json"), "utf8")).toBe("confirmed-before-stop");
+    expect(await readFile(join(state, "data-plan.json"), "utf8")).toBe("confirmed-before-stop");
     // The copy belongs to the deploying user; the migration container reads it as the service identity.
-    expect(result.output).toContain(`GRANT ${posixPath(state)}/migration-plan.json`);
+    expect(result.output).toContain(`GRANT ${posixPath(state)}/data-plan.json`);
     result = await run("0");
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toContain("PREVIEW preview --plan /app/data/state/migration-plan.json"); expect(result.output).toContain("PLANNED=1");
+    expect(result.output).toContain("PREVIEW preview --plan /app/data/state/data-plan.json"); expect(result.output).toContain("PLANNED=1");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
 test.skipIf(!bash || !existsSync(bash))("Docker migration passes the service identity, mounted group root and native cache environment", async () => {
   const fixture = await tempFixture("deployment-migration-env-");
   const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
-  const migration = source.match(/^migration_docker\(\) \{[\s\S]*?^\}/m)?.[0];
+  const migration = source.match(/^data_preparation_docker\(\) \{[\s\S]*?^\}/m)?.[0];
   expect(migration).toBeDefined();
   const script = join(fixture.root, "environment.sh");
   await writeFile(script, `#!/usr/bin/env bash
@@ -1938,13 +1957,13 @@ docker(){
     done
 }
 ${migration}
-migration_docker preview --decisions-only
+data_preparation_docker preview --decisions-only
 echo DONE
 # Without the recorded image nothing runs: nothing of this transaction can be committed, and there is nothing to undo.
 CANDIDATE_PRESENT=0
-if migration_docker committed --deployment deploy-fixture; then echo COMMITTED; fi
-migration_docker rollback --deployment deploy-fixture && echo ROLLBACK_SKIPPED
-migration_docker apply --plan plan || echo APPLY_REFUSED
+if data_preparation_docker committed --deployment deploy-fixture; then echo COMMITTED; fi
+data_preparation_docker rollback --deployment deploy-fixture && echo ROLLBACK_SKIPPED
+data_preparation_docker apply --plan plan || echo APPLY_REFUSED
 `);
   try {
     const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
@@ -1957,7 +1976,7 @@ migration_docker apply --plan plan || echo APPLY_REFUSED
     expect(result.output).toContain("external groups:/app/group-data");
     expect(result.output).toContain("GROUP_DATA_ROOT=/app/group-data");
     // The transaction's image by ID, never the mutable mixin-chatbot tag.
-    expect(result.output).toContain(`sha256:${"c".repeat(64)}\nbun\nrun\nscripts/migrations/run.ts\npreview\n`);
+    expect(result.output).toContain(`sha256:${"c".repeat(64)}\nbun\nrun\nscripts/runtime/data-current.ts\npreview\n`);
     expect(result.output).not.toContain("\nmixin-chatbot\n");
     const after = result.output.slice(result.output.indexOf("DONE"));
     expect(after).not.toContain("COMMITTED"); expect(after).toContain("ROLLBACK_SKIPPED"); expect(after).toContain("APPLY_REFUSED");
@@ -2226,11 +2245,11 @@ if [ "$phase" = initial ]; then
 fi
 if [ "$phase" = committed ]; then
     # Committed data is activated by deploy.sh before any settings are read; the transaction is never reopened here.
-    migration_docker(){ [ "$1" = committed ]; }
+    data_preparation_docker(){ [ "$1" = committed ]; }
     if begin_deployment; then echo REOPENED; fi
     exit 0
 fi
-rollback_data_migration(){ printf yes > restored-data; }
+rollback_current_data(){ printf yes > restored-data; }
 begin_deployment
 test "$DEPLOY_SNAPSHOT" = "$(cat original-snapshot)"
 test "$PREVIOUS_RUNNING" = 1

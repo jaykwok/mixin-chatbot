@@ -44,7 +44,7 @@ test.skipIf(process.platform !== "win32")("Windows recheck refuses independent H
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
 $Project = ${quotePS(repo)}; $git = 'git'; $TaskName = 'synthetic'
 $OriginalSha = ${quotePS(original)}; $OriginalBranch = 'operator-work'; $TargetSha = ${quotePS(target)}
-$snapshot = [pscustomobject]@{ WasRunning = $false }; $pendingPath = $null
+$snapshot = [pscustomobject]@{ WasRunning = $false; Path = ${quotePS(join(fixture.root, "snapshot"))} }; $pendingPath = $null
 function Set-OperationStage {}
 function Stop-ProjectBot { $script:stopped = $true; return $true }
 ${definition}

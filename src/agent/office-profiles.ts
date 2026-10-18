@@ -4,7 +4,7 @@ import { lstat, mkdir, open, readdir, readFile, readlink, realpath, rm } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { holdDirectory, type DirectoryRemoval } from "../core/held-directory.ts";
-import { publishJson } from "../../scripts/migrations/lib/io.ts";
+import { publishJson } from "../../scripts/lib/atomic-file.ts";
 
 const owner = randomBytes(16).toString("hex");
 const marker = ".mixin-office-owner.json";

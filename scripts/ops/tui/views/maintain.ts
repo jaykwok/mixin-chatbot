@@ -18,7 +18,7 @@ interface Action {
   /** 只在这些平台上出现；不给表示两个平台都有。 */
   only?: "windows" | "linux";
   status: StatusName;
-  /** 该命令会向用户提问，必须拿到真正的 TTY（update 的升级器在停机前确认隧道和迁移决策）。 */
+  /** 该命令会向用户提问，必须拿到真正的 TTY（update 在跨数据版本时确认清理并重新配置）。 */
   interactive?: boolean | ((app: AppApi) => boolean);
   confirm(app: Pick<AppApi, "deployment">, git: GitState | null, targetSha?: string): ConfirmSpec | null;
   args(app: AppApi, targetSha?: string): string[];
@@ -44,14 +44,14 @@ const ACTIONS: Action[] = [
   },
   {
     key: "update",
-    label: "升级（保留设置）",
-    summary: "同步 origin/main，停机前预览迁移，停机后切换代码并验证新实例",
+    label: "升级",
+    summary: "同步 origin/main，由目标升级器检查数据版本并执行升级",
     status: "busy",
     interactive: true,
     confirm: (app, git, targetSha) => {
       if (!git) {
         return {
-          title: "升级（保留设置）",
+          title: "升级",
           subject: "这份部署不是 git 仓库，无法自动升级",
           blocked: true,
           steps: ["先通过 Git 获取项目，再进入「系统 → 服务部署 → 部署 / 修改设置」；之后即可在此升级"],
@@ -59,34 +59,30 @@ const ACTIONS: Action[] = [
       }
       if (git.dirty) {
         return {
-          title: "升级（保留设置）",
+          title: "升级",
           subject: "已跟踪文件有未提交改动，升级会被拒绝",
           blocked: true,
-          steps: ["先提交、撤销或备份本地代码改动，再进入「系统 → 服务部署 → 升级（保留设置）」"],
+          steps: ["先提交、撤销或备份本地代码改动，再进入「系统 → 服务部署 → 升级」"],
         };
       }
-      const steps =
-        git.behind > 0
-          ? [
-              "停机前由目标版本预览迁移并确认所需选择，写入事务记录",
-              "停止旧实例，确认退出后才切换代码和更新依赖",
-              `快进到 origin/main ${targetSha ? fmt.shortSha(targetSha) : ""}（${git.behind} 个提交）`,
-              app.deployment.runtime === "docker"
-                ? "保持停机，沿用现有配置重建镜像（改配置请用服务部署）"
-                : "保持停机，按需安装依赖",
-              "按停机前确认的计划迁移；同版本且标记配对时跳过数据迁移和数据库备份",
-              "以只验证模式检查新实例，提交数据版本后恢复原运行状态",
-            ]
-          : ["核对本次确认的目标提交", "停机前检查数据版本并预览迁移", "停止旧实例；同版本且标记配对时跳过迁移和数据库备份，需要迁移时先备份再执行", "以只验证模式检查新实例，通过后提交并恢复原运行状态"];
+      const steps = [
+        "交给与 ops update 相同的目标升级器；停机前核对数据版本",
+        "数据版本一致时直接升级，保留设置、会话和资料",
+        "跨数据版本时，升级器先提示清理旧会话和资料、重新配置；确认后才停机",
+        "跨代更新先用旧版补账并备份全部统计，不完整 JSONL 尾行随旧会话丢弃",
+        git.behind > 0 ? `快进到 origin/main ${targetSha ? fmt.shortSha(targetSha) : ""}（${git.behind} 个提交）` : "核对本次确认的目标提交",
+        app.deployment.runtime === "docker" ? "准备目标镜像，按已保存计划切换数据" : "安装目标依赖，按已保存计划切换数据",
+        "验证新实例，提交后恢复原运行状态；跨代更新成功后清理本次旧会话副本",
+      ];
       return {
-        title: "升级（保留设置）",
+        title: "升级",
         subject:
           git.behind > 0
             ? `${fmt.shortSha(git.sha)} → ${targetSha ? fmt.shortSha(targetSha) : "origin/main"}，共 ${git.behind} 个提交`
             : `当前 ${fmt.shortSha(git.sha)}；origin/main ${targetSha ? fmt.shortSha(targetSha) : "待检查"}`,
         steps,
-        untouched: ["会话历史", "群共享资料"],
-        recovery: "提交前失败会恢复数据、代码和原服务；恢复失败保持停机。提交后保留新版本并报告启动问题",
+        untouched: ["已入账统计（含提问次数、人数）", "webhook 密钥和 Cloudflare 隧道凭证"],
+        recovery: "提交前失败恢复数据、代码和原服务；提交后启动或清理失败，使用「继续上次操作」收尾。旧版入口无法导出升级器时，按 docs/data-migrations.md 首次引导",
       };
     },
     args: (_app, targetSha) => {
@@ -227,9 +223,9 @@ function transactionActions(pending: Pending): Action[] {
         title: "继续上次操作",
         subject,
         steps: ["沿用事务记录继续：不拉取新的 origin/main，不重新提问", ...record,
-          pending.committed ? "数据已经提交：只启动新实例" : "完成迁移、验证和提交，再按原运行状态恢复服务"],
-        untouched: ["会话历史", "群共享资料"],
-        recovery: pending.committed ? "数据已提交，不能再回滚；启动失败时保留新版本并报告原因" : "失败时恢复到操作前；也可改用「回滚上次操作」",
+          pending.committed ? "数据已经提交：完成新实例启动及本次旧会话副本清理" : "按已确认计划准备数据、验证并提交，再恢复原运行状态；跨代更新成功后清理旧会话副本"],
+        untouched: ["已入账统计", "webhook 密钥和 Cloudflare 隧道凭证"],
+        recovery: pending.committed ? "数据已提交，不能再回滚；启动或清理失败时保留事务，可再次继续" : "失败时恢复到操作前；也可改用「回滚上次操作」",
       }),
       args: () => ["resume", "--confirmed-transaction", confirmTransaction(pending.confirmation!, "continue")],
     },
@@ -244,7 +240,7 @@ function transactionActions(pending: Pending): Action[] {
         title: "回滚上次操作",
         subject: "数据已经提交，不能回滚",
         blocked: true,
-        steps: ["请使用「继续上次操作」完成新实例启动"],
+        steps: ["请使用「继续上次操作」完成新实例启动和清理"],
       } : pending.codeRestorePending ? {
         title: "完成回滚",
         subject,
@@ -254,7 +250,7 @@ function transactionActions(pending: Pending): Action[] {
       } : {
         title: "回滚上次操作",
         subject,
-        steps: ["停止当前实例，恢复迁移前的数据", "恢复操作前的代码、配置、依赖和网络入口", ...record, "按原运行状态恢复服务"],
+        steps: ["停止当前实例，恢复操作前的数据", "恢复操作前的代码、配置、依赖和网络入口", ...record, "按原运行状态恢复服务"],
         recovery: "回滚失败时保持停机并保留快照，处理后可重试回滚或改为继续",
         danger: true,
       },

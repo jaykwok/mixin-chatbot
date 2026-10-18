@@ -12,7 +12,7 @@ import { withGroupSnapshot } from "../../src/durable/diagnostics.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
-import * as io from "../../scripts/migrations/lib/io.ts";
+import * as io from "../../scripts/lib/atomic-file.ts";
 import { describeUnfinished, legacyBlocker, LegacyReclamationPending, reclaimLegacy } from "../../src/maintenance/legacy.ts";
 import { reclamationEvidence } from "../../src/core/reclamation-files.ts";
 import { applyArchiveRemoval, applyTmpArchive, previewArchiveRemoval, previewTmpArchive } from "../../src/maintenance/archive.ts";

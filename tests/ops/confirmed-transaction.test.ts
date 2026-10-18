@@ -21,12 +21,17 @@ async function synthetic(root: string) {
   await mkdir(state, { recursive: true });
   for (const [name, sha] of [[first, "1".repeat(40)], [second, "2".repeat(40)]]) {
     const directory = join(root, "backup/snapshots", name!);
-    await mkdir(directory, { recursive: true }); await writeFile(join(directory, "target-sha"), sha!);
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "transaction"), Object.entries({
+      format: "1", operation: "deploy", snapshot: name!, target_sha: sha!, original_sha: "", original_branch: "",
+      original_group_root: root, target_group_root: root, was_running: "0", bot_port: "2022", deploy_mode: "direct",
+      bot_domain: "", domain_action: "keep", unmanaged_tunnel: "", platform_ip: "203.0.113.17", reconfigure_ai: "0",
+    }).map(([key, value]) => `${key}=${value}`).join("\n") + "\n");
   }
   await writeFile(join(state, "deploy-transaction"), first);
 }
 
-for (const action of ["continue", "rollback"] as const) test(`confirmation binds ${action} to identity, bytes and action, including legacy snapshots`, async () => {
+for (const action of ["continue", "rollback"] as const) test(`confirmation binds ${action} to identity, bytes and action, for current release records`, async () => {
   const fixture = await tempFixture("confirmed-state-");
   try {
     await synthetic(fixture.root);
@@ -37,12 +42,12 @@ for (const action of ["continue", "rollback"] as const) test(`confirmation binds
       const state = join(fixture.root, "data/state"), directory = join(fixture.root, "backup/snapshots", first);
       await synthetic(fixture.root);
       if (change === "pointer") await writeFile(join(state, "deploy-transaction"), second);
-      if (change === "same-id") await writeFile(join(directory, "target-sha"), "3".repeat(40));
+      if (change === "same-id") await writeFile(join(directory, "transaction"), (await readFile(join(directory, "transaction"), "utf8")).replace("1".repeat(40), "3".repeat(40)));
       if (change === "missing") await rm(join(state, "deploy-transaction"));
-      if (change === "committed") await writeFile(join(state, "migration.json"), '{"phase":"committed"}');
+      if (change === "committed") await writeFile(join(state, "release-data.json"), '{"phase":"committed"}');
       if (change === "restore") await writeFile(join(directory, "code-restore"), "pending");
       expect(() => assertConfirmedTransaction(fixture.root, action, token), change).toThrow("变化");
-      await rm(join(state, "migration.json"), { force: true }); await rm(join(directory, "code-restore"), { force: true });
+      await rm(join(state, "release-data.json"), { force: true }); await rm(join(directory, "code-restore"), { force: true });
     }
   } finally { await fixture.cleanup(); }
 });

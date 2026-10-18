@@ -22,7 +22,7 @@ import { RequestDoor } from "../../src/durable/door.ts";
 import { memberConversation, MemberDirectory } from "../../src/durable/identity.ts";
 import { ControlsDoc, InboxDoc, type InboxItem, type StoredControl } from "../../src/durable/inbox.ts";
 import { queueGroupClear } from "../../src/durable/offline.ts";
-import { LegacyImportDoc } from "../../src/durable/projection.ts";
+import { GroupDoc } from "../../src/durable/identity.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import type { ModelSelection } from "../../src/durable/models.ts";
 import { DurableService, type DurableServiceOptions, type Outbound, STATUS_TEXT } from "../../src/durable/service.ts";
@@ -962,7 +962,7 @@ test("a callback arriving during finalization sends the recovered answer once ac
   const release = Promise.withResolvers<void>();
   let atProjection = false, held = false;
   const spy = spyOn(prototype, "snapshot").mockImplementation(async function (this: Harness, ...args: unknown[]) {
-    if (!held && args[0] === LegacyImportDoc && where.deliveries.pending(JSON.stringify([GROUP, ALICE])).some((item) => item.text === "recovered answer")) {
+    if (!held && args[0] === GroupDoc && where.deliveries.pending(JSON.stringify([GROUP, ALICE])).some((item) => item.text === "recovered answer")) {
       held = true; atProjection = true;
       await release.promise;
     }

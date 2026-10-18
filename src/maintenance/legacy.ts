@@ -23,7 +23,7 @@
 import { type BigIntStats, constants } from "node:fs";
 import { type FileHandle, lstat, mkdir, open, readdir, readFile, realpath, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { publishJson } from "../../scripts/migrations/lib/io.ts";
+import { publishJson } from "../../scripts/lib/atomic-file.ts";
 import { holdDirectory, sameIdentity } from "../core/held-directory.ts";
 import { RemovalPermit } from "../core/reclamation.ts";
 import { decodeLegacyJournal, validTreeEvidence, type FrozenDirectory as Frozen, type LegacyJournal as Journal,

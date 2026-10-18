@@ -18,7 +18,7 @@ async function stage(phase: "config" | "stats" | "delivery" | "relay", observe: 
 }
 /**
  * Configuration only: runtime.json, models and the selected model under `project`, which may be a preview's
- * projection. Opens no database, so it can run before a migration and against read-only data.
+ * projection. Opens no database, so it can run before release preparation and against read-only data.
  */
 export async function validateConfiguration(project: string, observe?: ValidationObserver): Promise<void> {
   return stage("config", observe, async () => {
@@ -38,7 +38,7 @@ export async function validateConfiguration(project: string, observe?: Validatio
   });
 }
 
-/** Used by the service and migration runner. No database creation, migrations or requests. */
+/** Used by the service and current-format release gate. No database creation, migrations or requests. */
 export async function validateCurrentData(project: string, groups: string, stateProject = project, observe?: ValidationObserver): Promise<void> {
   await validateConfiguration(project, observe);
   await stage("relay", observe, async () => {

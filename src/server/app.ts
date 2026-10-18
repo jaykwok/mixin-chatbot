@@ -16,11 +16,11 @@ import { abortOutboundRequests } from "../integrations/im.ts";
 import { getRelayConfig, initializeRelay, sweepExpiredRelayObjects } from "../integrations/relay.ts";
 import { bindMessageService, cleanupRateLimits, drainUserRequests } from "./webhook.ts";
 import { loadModuleDefinitions } from "../agent/modules.ts";
-import { sweepSessionStats } from "../agent/stats-ledger.ts";
 import { runtimeSetting } from "../core/runtime-config.ts";
 import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
 import { openModelSelection } from "../durable/models.ts";
 import { DurableService } from "../durable/service.ts";
+import { codemodeWorkers } from "../durable/codemode/workers.ts";
 import { readAuxiliaryConfig } from "../core/auxiliary-config.ts";
 import { readMcpConfig } from "../core/mcp-config.ts";
 import { McpTools } from "../integrations/mcp.ts";
@@ -46,6 +46,7 @@ const startedAt = Date.now() - process.uptime() * 1000;
 async function shutdown(reason: string, code = 0): Promise<void> {
   if (stopping) return;
   stopping = true;
+  codemodeWorkers.stop();
   if (timer) clearInterval(timer);
   application.abort();
   // Sends waiting for the rate limit or in flight end now, so the service can close in time.
@@ -61,6 +62,7 @@ async function shutdown(reason: string, code = 0): Promise<void> {
       server?.stop(), drainUserRequests(), messages?.close(), mcp?.close(), application.drain(),
     ]);
     if (results.some((result) => result.status === "rejected")) code = 1;
+    await codemodeWorkers.drain();
     await releaseGroupLease?.();
     if (releaseLease) {
       await archiveFile(instanceFile);
@@ -136,22 +138,6 @@ try {
   await application.track(writeFile(instanceFile, JSON.stringify({ pid: process.pid, port: server.port, token: adminToken,
     host: HOST, cwd: process.cwd(), instanceId, startedAt }), { mode: 0o600 }));
   application.signal.throwIfAborted();
-  /**
-   * 旧会话文件的入账：一天一次全量扫 AgentSession 引擎留下的会话文件。
-   *
-   * 数据版本 3 起对话在 Durable 群库里，用量由消息服务在每次回复后和维护时投影入账；
-   * 原会话文件原地保留，这里只补它们尚未入账的尾部，所以没必要每轮维护都把所有文件摸一遍。
-   */
-  const sweepStats = async () => {
-    const result = await sweepSessionStats(GROUP_DATA_ROOT, {
-      onError: (path, error) => log.warn(`统计账本扫描失败 - 路径: ${path}, 错误: ${String(error)}`),
-    });
-    if (!result.skippedDay) {
-      const detail = `${result.files} 份会话、${result.records} 条新记录，跳过当天已完成且未变化的 ${result.skippedFiles} 份`;
-      if (result.failed) log.warn(`统计账本扫描未完成：${detail}，${result.failed} 项失败，下轮维护重试`);
-      else log.info(`统计账本入账完成：${detail}`);
-    }
-  };
   const maintain = () => {
     if (stopping) return;
     // Object cleanup keeps its own guard: lengthy stats/session maintenance must not defer it.
@@ -163,7 +149,7 @@ try {
     if (maintenance) return;
     cleanupRateLimits();
     cleanupCallbackRoutes();
-    maintenance = application.track(Promise.allSettled([messages!.maintain(), sweepStats()]));
+    maintenance = application.track(Promise.allSettled([messages!.maintain()]));
     void maintenance.then((results) => {
       for (const result of results as PromiseSettledResult<unknown>[]) {
         if (result.status === "rejected") log.error("后台维护失败: " + String(result.reason));

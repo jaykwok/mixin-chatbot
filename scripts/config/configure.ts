@@ -9,7 +9,7 @@
 // 填地址和 Key，向导按端点自己返回的清单列出模型；选中的 id 如果在 Pi 目录里有资料，就用
 // 它预填上下文、能力和价格，管理员核对后落盘。
 //
-// models.json 里向导没问过的官方字段（headers、compat、authHeader、modelOverrides）在重新
+// models.json 里向导没问过的官方字段（headers、compat、authHeader）在重新
 // 配置时原样保留。部署脚本在停止旧实例后调用；本地停机时也可运行 bun run configure。
 import {
   cancel,
@@ -42,7 +42,7 @@ import { withModelConfigurationDraft, type ModelConfigurationDraft } from "./mod
 
 type JsonObject = Record<string, unknown>;
 /** 向导之外手工调过的官方 provider 字段，重新配置时按原样带回。 */
-const PRESERVED_PROVIDER_FIELDS = ["headers", "compat", "authHeader", "modelOverrides"] as const;
+const PRESERVED_PROVIDER_FIELDS = ["headers", "compat", "authHeader"] as const;
 /** 列模型清单的等待上限；失败就退回手填 id，不阻塞配置。 */
 const DISCOVERY_TIMEOUT_MS = 15_000;
 
@@ -295,7 +295,7 @@ async function main(draft: ModelConfigurationDraft): Promise<void> {
       initialValue: candidates.find((item) => item.id === previousProviderId)?.id ?? "openai",
       options: candidates.map((item) => ({ value: item.id, label: `${item.name} (${item.id})` })),
     }));
-    providers[providerId] = { ...preserved(previousProviders[providerId]), apiKey: await askApiKey() };
+    providers[providerId] = { apiKey: await askApiKey() };
   } else {
     providerId = await askText("自定义 provider id（如 custom-gateway）", previousProviderId, requireText);
     const previousEntry = previousProviders[providerId];

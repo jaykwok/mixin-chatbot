@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import * as io from "../../scripts/migrations/lib/io.ts";
+import * as io from "../../scripts/lib/atomic-file.ts";
 import * as evidence from "../../src/core/reclamation-files.ts";
 import { applyArchiveRemoval, applyTmpArchive, previewArchiveRemoval, previewTmpArchive } from "../../src/maintenance/archive.ts";
 import type { MemberScope } from "../../src/maintenance/scope.ts";

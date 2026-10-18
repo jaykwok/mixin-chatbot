@@ -153,8 +153,8 @@ group_root_mount() {
     fi
 }
 
-# The target image owns migration semantics, including the first unversioned upgrade.
-migration_docker() {
+# The target image owns data_preparation semantics, including the first unversioned upgrade.
+data_preparation_docker() {
     # 候选镜像已不存在时只允许回滚本事务从未开始迁移的操作（见 rollback_pending_deployment）：没有本事务的迁移可查或撤销。
     if [ "$CANDIDATE_PRESENT" = 0 ]; then
         case "$1" in
@@ -166,17 +166,17 @@ migration_docker() {
     docker run --rm -i --user "$SERVICE_USER" \
       -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -e BOT_OPERATION_LOG -e PI_CACHE_RETENTION -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
       "${GROUP_ROOT_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" -v "$PROJECT_DIR/backup:/app/backup" -v "$PROJECT_DIR/logs:/app/logs" \
-      "$IMAGE_ID" bun run scripts/migrations/run.ts "$@" --groups "$GROUP_ROOT_ENV_VAL"
+      "$IMAGE_ID" bun run scripts/runtime/data-current.ts "$@" --groups "$GROUP_ROOT_ENV_VAL"
 }
-MIGRATION_APPLY_ATTEMPTED=0
-MIGRATION_PLAN=/app/data/state/migration-plan.json
-MIGRATION_PREVIEW_MODE=(--interactive)
-rollback_data_migration() {
-    [ "$MIGRATION_APPLY_ATTEMPTED" = 1 ] || return 0
+DATA_PREPARATION_APPLY_ATTEMPTED=0
+DATA_PREPARATION_PLAN=/app/data/state/data-plan.json
+DATA_PREPARATION_PREVIEW_MODE=()
+rollback_current_data() {
+    [ "$DATA_PREPARATION_APPLY_ATTEMPTED" = 1 ] || return 0
     # Without a journal there is nothing to restore, and the image may never have been built.
-    [ -e "$STATE_DIR/migration.json" ] || return 0
+    [ -e "$STATE_DIR/release-data.json" ] || [ -e "$DEPLOY_SNAPSHOT/reset.json" ] || return 0
     local result=0
-    migration_docker rollback --deployment "$BOT_DEPLOY_BACKUP_ID" || result=$?
+    data_preparation_docker rollback --deployment "$BOT_DEPLOY_BACKUP_ID" || result=$?
     if [ "$result" = 42 ]; then
         commit_deployment
         print_error "数据已经提交，保留新代码；请检查服务状态后启动。"
@@ -200,7 +200,7 @@ record_deployment_transaction() {
         [bot_port]="$BOT_PORT" [deploy_mode]="$DEPLOY_MODE" [bot_domain]="$PUBLIC_DOMAIN" [domain_action]="$domain_action"
         [unmanaged_tunnel]="$unmanaged" [platform_ip]="$PLATFORM_IP" [reconfigure_ai]="$RECONFIGURE_AI")
     write_transaction_record "$snapshot" || return 1
-    if [ "$MIGRATION_PLANNED" = 1 ]; then cp -- "$STATE_DIR/migration-plan.json" "$snapshot/migration-plan.json" || return 1; fi
+    if [ "$DATA_PREPARATION_PLANNED" = 1 ]; then cp -- "$STATE_DIR/data-plan.json" "$snapshot/data-plan.json" || return 1; fi
 }
 
 # 回滚未完成的事务。数据已提交时拒绝，只能继续完成新实例启动；判定在改动任何容器之前。
@@ -212,13 +212,13 @@ rollback_pending_deployment() {
     esac
     group_root_mount "$target"
     # 候选镜像已不存在：本事务从未开始迁移时不需要撤销数据，用原容器回滚；否则需要完全相同的镜像，不能重新构建代替。
-    if [ "$CANDIDATE_PRESENT" = 0 ] && migration_mentions_deployment "${TRANSACTION[snapshot]}"; then
+    if [ "$CANDIDATE_PRESENT" = 0 ] && data_preparation_mentions_deployment "${TRANSACTION[snapshot]}"; then
         print_error "上次操作的数据迁移已经开始，查看或撤销它需要记录的候选镜像 ${IMAGE_ID}，但它已不存在；请恢复完全相同的镜像（同一 image ID）后重试，重新构建的镜像不能代替；服务和数据保持现状"
         exit 1
     fi
-    if [ -e "$STATE_DIR/migration.json" ]; then
+    if [ -e "$STATE_DIR/release-data.json" ]; then
         [ -d "$target" ] || { print_error "本次操作的群数据总根不存在：$target；恢复迁移前的数据需要它，请恢复挂载后再回滚"; exit 1; }
-        if migration_docker committed --deployment "${TRANSACTION[snapshot]}"; then
+        if data_preparation_docker committed --deployment "${TRANSACTION[snapshot]}"; then
             print_error "上次操作的数据已经提交，不能回滚；请选择继续（$(ops_command_hint resume)）完成新实例启动"
             exit 1
         fi
@@ -240,7 +240,7 @@ activate_committed_deployment() {
         }
         PREVIOUS_CONTAINER_SAVED=0
     fi
-    rm -f -- "$PROJECT_DIR/data/state/verify-only" "$PROJECT_DIR/data/state/migration-plan.json"
+    rm -f -- "$PROJECT_DIR/data/state/verify-only" "$PROJECT_DIR/data/state/data-plan.json"
     if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
         print_status "启动机器人并等待健康检查..."
         docker start mixin-chatbot >/dev/null
@@ -259,11 +259,9 @@ activate_committed_deployment() {
         print_error "数据已经提交，新版本已启用，但正式标签 mixin-chatbot 未能指向 ${IMAGE_ID}（原因见上方）；保留事务，处理后使用 $(ops_command_hint resume) 重试"
         exit 1
     }
-    if [ "${DEPLOY_PRESERVE_STOPPED:-0}" != 1 ] || [ "$PREVIOUS_RUNNING" = 1 ]; then
-        migration_docker finalize --deployment "$(basename -- "$DEPLOY_SNAPSHOT")" || print_warning "部署已完成，迁移备份清理未完成；修复日志中的问题后运行 migrations cleanup 重试。"
-    else
-        print_warning "服务保持停止，迁移备份保留；首次正式启动并通过健康检查后，按数据迁移文档执行 finalize。"
-    fi
+    data_preparation_docker finish-reset --deployment "$(basename -- "$DEPLOY_SNAPSHOT")" || {
+        print_error '新版本已启用，但旧会话副本清理未完成；保留事务，请使用 resume 重试'; exit 1;
+    }
     rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
     release_transaction_candidate
     cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，但备份清理未完成，请检查 $DEPLOY_SNAPSHOT 和 $PROJECT_DIR/backup/rm"
@@ -455,8 +453,6 @@ if [ -e "$STATE_DIR/deploy-transaction" ]; then
     fi
     # 容器以记录的身份写入本次操作日志（由部署用户创建）。
     grant_operation_log_access || true
-    # 旧版事务继续前在终端确认并补录记录；运维入口转交时（标准输入已关闭）应已补录。
-    if [ "$TRANSACTION_ACTION" = continue ]; then backfill_legacy_transaction || exit 1; fi
     RECORDED=1
     [ "$TRANSACTION_ACTION" != rollback ] || rollback_pending_deployment
     if [ -n "${TRANSACTION[target_sha]}" ] && [ "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null)" != "${TRANSACTION[target_sha]}" ]; then
@@ -476,12 +472,20 @@ if [ -e "$STATE_DIR/deploy-transaction" ]; then
     # 只有同一次升级的升级器知道快照名：交接标记一致才采用它在停机前确认的 token。
     # 重启后的续做（ops resume、新终端）没有标记，只接受已保存的 token 来源。
     if [ -z "$TRANSACTION_HANDOFF" ] || [ "$TRANSACTION_HANDOFF" != "${TRANSACTION[snapshot]}" ]; then PREPARED_TUNNEL_INPUT=""; fi
-    MIGRATION_PREVIEW_MODE=()
+    DATA_PREPARATION_PREVIEW_MODE=()
     # 升级沿用原运行状态；部署完成后总是启动。
     [ "${TRANSACTION[operation]}" != upgrade ] || DEPLOY_PRESERVE_STOPPED=1
     group_root_mount "${TRANSACTION[target_group_root]}"
-    if [ -e "$STATE_DIR/migration.json" ] && migration_docker committed --deployment "${TRANSACTION[snapshot]}"; then
+    if [ -e "$STATE_DIR/release-data.json" ] && data_preparation_docker committed --deployment "${TRANSACTION[snapshot]}"; then
         finish_committed_transaction
+    fi
+    if [ -d "$TRANSACTION_SNAPSHOT/reset-config" ]; then
+        # Resume a partial reset before any preflight reads old/half-replaced user configuration.
+        begin_deployment
+        cp -- "$TRANSACTION_SNAPSHOT/data-plan.json" "$STATE_DIR/data-plan.json"
+        grant_service_access "$STATE_DIR/data-plan.json"
+        DATA_PREPARATION_APPLY_ATTEMPTED=1
+        data_preparation_docker apply --plan "$DATA_PREPARATION_PLAN"
     fi
     print_status "继续上次操作：端口、入口模式、群数据总根、域名、平台 IP 和隧道确认均取自事务记录，运行参数沿用 runtime.json"
 elif [ -n "$TRANSACTION_ACTION" ]; then
@@ -714,20 +718,20 @@ print_success "持久化目录权限正常"
 print_status "验证任务隔离、固定镜像与宿主目录映射..."
 task_runtime_prepare || { print_error "任务隔离预检失败，原服务未因本次预检停止"; exit 1; }
 
-MIGRATION_PLANNED=0
-if [ "$RECORDED" = 1 ] && [ -f "$TRANSACTION_SNAPSHOT/migration-plan.json" ]; then
+DATA_PREPARATION_PLANNED=0
+if [ "$RECORDED" = 1 ] && [ -f "$TRANSACTION_SNAPSHOT/data-plan.json" ]; then
     # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
     # 快照目录仅部署用户可读，计划复制回容器可读的状态目录。
-    cp -- "$TRANSACTION_SNAPSHOT/migration-plan.json" "$STATE_DIR/migration-plan.json" || { print_error "无法恢复停机前确认的迁移计划"; exit 1; }
+    cp -- "$TRANSACTION_SNAPSHOT/data-plan.json" "$STATE_DIR/data-plan.json" || { print_error "无法恢复停机前确认的迁移计划"; exit 1; }
     # root 复制出的文件属 root；迁移容器以服务身份读取它。
-    grant_service_access "$STATE_DIR/migration-plan.json"
-    MIGRATION_PLANNED=1
+    grant_service_access "$STATE_DIR/data-plan.json"
+    DATA_PREPARATION_PLANNED=1
 elif [ -f "$MODELS_FILE" ] && [ -f "$RUNTIME_DIR/pi/settings.json" ]; then
-    if ! migration_docker preview "${MIGRATION_PREVIEW_MODE[@]}" --plan "$MIGRATION_PLAN"; then
+    if ! data_preparation_docker preview "${DATA_PREPARATION_PREVIEW_MODE[@]}" --plan "$DATA_PREPARATION_PLAN"; then
         if [ "$RECORDED" = 1 ]; then print_error "续做无法沿用迁移确认（原因见上方）；$(settings_fixed_hint)"; fi
         exit 1
     fi
-    MIGRATION_PLANNED=1
+    DATA_PREPARATION_PLANNED=1
 fi
 # ---- 停机前的交互选择：只读取和校验，全部答完才停止机器人服务 ----
 RECONFIGURE_AI=0
@@ -872,12 +876,12 @@ if [ "$RECORDED" != 1 ]; then
 fi
 begin_deployment
 if [ ! -f "$DEPLOY_SNAPSHOT/task-runtime" ]; then task_runtime_record "$DEPLOY_SNAPSHOT/task-runtime"; fi
-if [ "$MIGRATION_PLANNED" = 1 ]; then
+if [ "$DATA_PREPARATION_PLANNED" = 1 ]; then
     # The upgrader keeps the target code on this receipt after abrupt termination;
     # a completed rollback clears it before the upgrader restores the original code.
     if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
-    MIGRATION_APPLY_ATTEMPTED=1
-    migration_docker apply --plan "$MIGRATION_PLAN"
+    DATA_PREPARATION_APPLY_ATTEMPTED=1
+    data_preparation_docker apply --plan "$DATA_PREPARATION_PLAN"
 fi
 
 # ---- AI 配置（容器内 TUI 写 data/config/models.json）----
@@ -1016,11 +1020,11 @@ fi
 
 # 旧容器和配置已在 begin_deployment 中保存。
 
-if [ "$MIGRATION_PLANNED" = 0 ]; then
-    migration_docker preview "${MIGRATION_PREVIEW_MODE[@]}" --plan "$MIGRATION_PLAN"
+if [ "$DATA_PREPARATION_PLANNED" = 0 ]; then
+    data_preparation_docker preview "${DATA_PREPARATION_PREVIEW_MODE[@]}" --plan "$DATA_PREPARATION_PLAN"
     if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
-    MIGRATION_APPLY_ATTEMPTED=1
-    migration_docker apply --plan "$MIGRATION_PLAN"
+    DATA_PREPARATION_APPLY_ATTEMPTED=1
+    data_preparation_docker apply --plan "$DATA_PREPARATION_PLAN"
 fi
 # The scheduled/container entry reads this flag; readiness cannot accept messages.
 printf 'verify\n' > "$PROJECT_DIR/data/state/verify-only"
@@ -1198,7 +1202,7 @@ fi
 
 # Stop the verification-only process before committing. Normal work starts after commit.
 docker stop --time 30 mixin-chatbot >/dev/null
-migration_docker commit
+data_preparation_docker commit
 commit_deployment
 activate_committed_deployment
 

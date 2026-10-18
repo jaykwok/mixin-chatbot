@@ -1,7 +1,5 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-/** The AgentSession engine's history of a member (`<group>/users/<member>/session.jsonl`); kept in place since data version 3. */
-export const SESSION_FILE = "session.jsonl";
 
 const SAFE_GROUP_SEGMENT = /^[A-Za-z0-9_+\-]{1,64}$/;
 const WINDOWS_RESERVED_SEGMENT = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;

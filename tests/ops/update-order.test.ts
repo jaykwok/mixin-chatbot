@@ -60,14 +60,14 @@ update
     await mkdir(state, { recursive: true });
     await writeFile(join(work, ".gitignore"), "data/\nlogs/\ntmp/\nbackup/\n");
     // Every path of UPGRADER_EXPORT_PATHS exists in each commit; the Dockerfile content names the version.
-    await mkdir(join(work, "scripts/deploy"), { recursive: true }); await mkdir(join(work, "scripts/lib")); await mkdir(join(work, "scripts/migrations"));
+    await mkdir(join(work, "scripts/deploy"), { recursive: true }); await mkdir(join(work, "scripts/lib")); await mkdir(join(work, "scripts/runtime"));
     await mkdir(join(work, "src/core"), { recursive: true });
-    await writeFile(join(work, "scripts/lib/fixture.sh"), ""); await writeFile(join(work, "scripts/migrations/fixture.ts"), "");
+    await writeFile(join(work, "scripts/lib/fixture.sh"), ""); await writeFile(join(work, "scripts/runtime/fixture.ts"), "");
     await writeFile(join(work, "src/core/data-version.ts"), "");
     await writeFile(join(work, "scripts/deploy/upgrade.sh"), `#!/usr/bin/env bash
 set -euo pipefail
 here="$(cd "$(dirname "\${BASH_SOURCE[0]}")/../.." && pwd)"
-[ -f "$here/src/core/data-version.ts" ] && [ -f "$here/scripts/lib/fixture.sh" ] && [ -f "$here/scripts/migrations/fixture.ts" ] || exit 44
+[ -f "$here/src/core/data-version.ts" ] && [ -f "$here/scripts/lib/fixture.sh" ] && [ -f "$here/scripts/runtime/fixture.ts" ] || exit 44
 input=''; IFS= read -r input || true
 printf 'upgrader version=%s dir=%s args=%s stdin=%s\\n' "$(cat "$here/Dockerfile")" "\${here#"$1"/}" "\${*:2}" "$input" >> "$FIXTURE_EVENTS"
 if [ "\${FIXTURE_UPGRADER_HOLD:-0}" = 1 ]; then
@@ -190,59 +190,14 @@ esac
     result = await update({ UPDATE_TRANSACTION_ACTION: "continue" });
     expect(result.code, result.text).toBe(0); expect(result.text).toContain("没有未完成的部署或升级"); expect(await events_()).toEqual([]);
 
-    // Legacy update records written by the previous ops.sh remain recoverable.
-    await git("reset", "--hard", target);
-    const legacy = async (deployment: boolean) => {
-      await writeFile(join(state, "update-transaction"), ["1", old, "main", target, "1".padStart(64, "0"), "1", ""].join("\n"));
-      await writeFile(join(state, "update-commit"), ""); await writeFile(join(state, "running"), "false");
-      await rm(join(snapshot, "transaction"), { force: true });
-      if (deployment) {
-        await writeFile(join(state, "deploy-transaction"), "deploy-fixture");
-        await writeFile(join(snapshot, "target-sha"), target); await writeFile(join(snapshot, "was-running"), "1"); await writeFile(join(snapshot, "group-root"), groups);
-      } else await rm(join(state, "deploy-transaction"), { force: true });
-    };
-    await legacy(true);
-    // Its deployment transaction has no record: continuing needs the synthesized values confirmed in a terminal
-    // and written once (see transaction-record.test.ts); without a terminal nothing runs. Rolling back needs no record.
-    result = await update({ UPDATE_TRANSACTION_ACTION: "continue" });
-    expect(result.code, result.text).toBe(1); expect(result.text).toContain("逐项确认并补录");
-    expect(await events_()).toEqual([]); expect(existsSync(join(snapshot, "transaction"))).toBe(false);
-    expect(existsSync(join(state, "update-transaction"))).toBe(true);
-    await record();
-    result = await update({ UPDATE_TRANSACTION_ACTION: "continue", FIXTURE_DEPLOY: "fail" });
-    expect(result.code, result.text).toBe(1); expect(result.text).toContain("部署事务尚未完成");
-    expect(existsSync(join(state, "update-transaction"))).toBe(true); expect(await git("rev-parse", "HEAD")).toBe(target);
-    result = await update({ UPDATE_TRANSACTION_ACTION: "continue", FIXTURE_DEPLOY: "commit" });
-    expect(result.code, result.text).toBe(0); expect(result.text).toContain("中断的升级已完成");
-    expect(await events_()).toEqual(["deploy action=continue receipt=update-commit stdin= version=new"]);
-    expect(await git("rev-parse", "HEAD")).toBe(target);
-    expect(existsSync(join(state, "update-transaction"))).toBe(false); expect(existsSync(join(state, "update-commit"))).toBe(false);
-    await legacy(true);
-    result = await update({ UPDATE_TRANSACTION_ACTION: "rollback", FIXTURE_DEPLOY: "rollback" });
-    expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级已回滚");
-    expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "update-transaction"))).toBe(false);
-    // A failed code restore after the data rollback keeps both records; the retry restores only the code, continuing is refused.
-    await git("reset", "--hard", target); await legacy(true);
-    await writeFile(join(work, ".git/index.lock"), "");
-    result = await update({ UPDATE_TRANSACTION_ACTION: "rollback", FIXTURE_DEPLOY: "restore-data" });
-    expect(result.code, result.text).toBe(1); expect(result.text).toContain("只恢复代码");
-    expect(existsSync(join(state, "deploy-transaction"))).toBe(true); expect(existsSync(join(state, "update-transaction"))).toBe(true);
-    await rm(join(work, ".git/index.lock"));
-    result = await update({ UPDATE_TRANSACTION_ACTION: "continue" });
-    expect(result.code, result.text).toBe(1); expect(result.text).toContain("不能继续"); expect(await git("rev-parse", "HEAD")).toBe(target);
-    result = await update({ UPDATE_TRANSACTION_ACTION: "rollback" });
-    expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级已回滚"); expect(await events_()).toEqual([]);
-    expect(await git("rev-parse", "HEAD")).toBe(old);
-    for (const file of ["deploy-transaction", "update-transaction", "update-commit"]) expect(existsSync(join(state, file)), file).toBe(false);
-    // Stopped before the old deploy began: only rollback (original code and container) is possible.
-    await git("reset", "--hard", target); await legacy(false);
-    result = await update({ UPDATE_TRANSACTION_ACTION: "continue" });
-    expect(result.code, result.text).toBe(1); expect(result.text).toContain("部署开始前中断"); expect(await git("rev-parse", "HEAD")).toBe(target);
-    result = await update({ UPDATE_TRANSACTION_ACTION: "rollback" });
-    expect(result.code, result.text).toBe(0); expect(result.text).toContain("原容器已重新启动");
-    expect(await git("rev-parse", "HEAD")).toBe(old); expect(await readFile(join(state, "running"), "utf8")).toBe("true");
-    expect(await events_()).toEqual(["docker inspect", "docker start"]);
-    expect(existsSync(join(state, "update-transaction"))).toBe(false); expect(existsSync(join(state, "update-commit"))).toBe(false);
+    // A former stop record is opaque: no old recovery engine or snapshot reconstruction remains.
+    await writeFile(join(state, "update-transaction"), "old-format-record");
+    for (const action of ["continue", "rollback"]) {
+      result = await update({ UPDATE_TRANSACTION_ACTION: action });
+      expect(result.code, result.text).toBe(1); expect(result.text).toContain("事务格式不匹配");
+      expect(await events_()).toEqual([]);
+      expect(await readFile(join(state, "update-transaction"), "utf8")).toBe("old-format-record");
+    }
     expect(await exports()).toEqual([]);
   } finally { await f.cleanup(); }
 }, 150000);

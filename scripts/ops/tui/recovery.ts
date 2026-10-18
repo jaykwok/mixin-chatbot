@@ -25,7 +25,7 @@ export function recoveryReason(): string | null {
   return state.current ? null : state.detail;
 }
 
-/** 有未完成的事务时先继续或回滚；否则由升级完成迁移。 */
+/** 有未完成的事务时先继续或回滚；否则由目标升级器检查并准备当前数据版本。 */
 function menu(): { prompt: string; commands: Record<string, string> } {
   let pending: ReturnType<typeof loadPendingTransaction>;
   try { pending = loadPendingTransaction(); }
@@ -33,7 +33,7 @@ function menu(): { prompt: string; commands: Record<string, string> } {
     console.log(`事务记录无法读取：${(error as Error).message}`);
     return { prompt: "1 继续上次操作  2 回滚  3 诊断  0 退出", commands: { "1": "resume", "2": "rollback", "3": "doctor" } };
   }
-  if (!pending) return { prompt: "1 升级（含迁移）  2 诊断  0 退出", commands: { "1": "update", "2": "doctor" } };
+  if (!pending) return { prompt: "1 升级（检查数据版本）  2 诊断  0 退出", commands: { "1": "update", "2": "doctor" } };
   const { subject, record } = describePendingTransaction(pending);
   console.log([subject, ...record].join("\n"));
   if (pending.codeRestorePending) {
@@ -41,7 +41,7 @@ function menu(): { prompt: string; commands: Record<string, string> } {
     return { prompt: "2 完成回滚（只恢复代码）  3 诊断  0 退出", commands: { "2": "rollback", "3": "doctor" } };
   }
   if (pending.committed) {
-    console.log("数据已经提交：只能继续完成新实例启动");
+    console.log("数据已经提交：只能继续完成新实例启动和清理");
     return { prompt: "1 继续上次操作  3 诊断  0 退出", commands: { "1": "resume", "3": "doctor" } };
   }
   return { prompt: "1 继续上次操作  2 回滚  3 诊断  0 退出", commands: { "1": "resume", "2": "rollback", "3": "doctor" } };

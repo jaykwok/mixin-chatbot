@@ -2,22 +2,14 @@
 // cancelled migration preview, rollback after a failed verification and a later successful upgrade.
 // It builds the mixin-chatbot image and uses the fixed container names, so run it only on a disposable
 // Docker host (a WSL distro or VM): MIXIN_REAL_DOCKER=1 bun run test tests/ops/real-docker.test.ts
-// Run it as root against the rootful daemon, as the owner of a rootless daemon (DOCKER_HOST), and as an ordinary
-// docker-group user against the rootful daemon:
-// - root: the lifecycle above with the image's default identity, then an instance that a docker-group user deployed with
-//   the 98f1b4a scripts is upgraded, resumed and rolled back by root through its old recovery entry, keeping the
-//   original container's UID/GID and the owners of its existing data.
-// - rootless: the lifecycle; the container runs as the mapped 0:0 and ports are published; a privileged saved port is
-//   refused before the stop, or used when rootlesskit has CAP_NET_BIND_SERVICE. An instance its owner deployed with the
-//   98f1b4a scripts goes through the same first transition.
-// - docker-group user: deploying and upgrading are refused before any question, build or stop.
+// Run only current-format deployments; historical instances must be prepared manually.
 // With the default group root both operators also check the preparation before the stop: a slowed build while the original
 // service keeps answering (host load recorded), a single build with every container on the candidate's ID, work-tree files
 // kept out of the image, and tags moved while the preview waits.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, chownSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync,
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync,
   realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,8 +17,6 @@ import { fileURLToPath } from "node:url";
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const enabled = process.env.MIXIN_REAL_DOCKER === "1" && process.platform === "linux";
 const ROOT_PREFIX = "/var/tmp/mixin-real-docker-";
-// The first upgrade to a version with candidate images starts from this commit's scripts.
-const LEGACY_ENTRY = "98f1b4a94575ebeb0f4653e221ad6c701a00598e";
 const baseImage = /^FROM\s+(oven\/bun:\S+)/m.exec(readFileSync(join(project, "Dockerfile"), "utf8"))?.[1] ?? "";
 // Scripts must take the Docker path of a host without Bun (validate-models falls back to the image).
 const hostPath = (process.env.PATH ?? "").split(":").filter(dir => dir && !existsSync(join(dir, "bun"))).join(":");
@@ -118,28 +108,6 @@ function digest(paths: string[]): Record<string, string> {
   };
   for (const path of paths) walk(path);
   return result;
-}
-
-// The owner of every file and directory below the paths.
-function owners(paths: string[]): Record<string, string> {
-  const result: Record<string, string> = {};
-  const walk = (path: string) => {
-    const info = lstatSync(path);
-    result[path] = `${info.uid}:${info.gid}`;
-    if (info.isDirectory()) for (const entry of readdirSync(path)) walk(join(path, entry));
-  };
-  for (const path of paths) if (existsSync(path)) walk(path);
-  return result;
-}
-/** Paths from before that still exist and now have another owner. */
-function changedOwners(before: Record<string, string>): Record<string, string> {
-  const changed: Record<string, string> = {};
-  for (const [path, owner] of Object.entries(before)) {
-    if (!existsSync(path)) continue;
-    const info = lstatSync(path), now = `${info.uid}:${info.gid}`;
-    if (now !== owner) changed[path] = `${owner} -> ${now}`;
-  }
-  return changed;
 }
 
 async function until<T>(what: string, probe: () => T | undefined | false, timeout: number): Promise<T> {
@@ -531,7 +499,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       // Tags are not identities. This upgrade's reserved tag moved to another image while the preview waits: the check
       // before the stop refuses, the service keeps running, and the moved tag is kept and reported, not removed.
       if (layout === "default") step("moving the reserved tag while the upgrade previews stops it before the stop; the moved tag is kept", async () => {
-        const runPath = join(upstream, "scripts/migrations/run.ts"), gate = join(work, "data/preview-gate");
+        const runPath = join(upstream, "scripts/runtime/data-current.ts"), gate = join(work, "data/preview-gate");
         publish(upstream, "preview gate", () => prepend(runPath, previewGate));
         const before = bot(), count = snapshots(), other = decoy();
         writeFileSync(gate, "");
@@ -666,7 +634,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       // The target's preview is held open so the interruption lands while the preview container runs.
       for (const signal of ["SIGINT to the process group", "SIGTERM to ops.sh"] as const) {
         step(`cancelling the preview (${signal}) leaves the running service, code and data untouched`, async () => {
-          const runPath = join(upstream, "scripts/migrations/run.ts");
+          const runPath = join(upstream, "scripts/runtime/data-current.ts");
           if (!readFileSync(runPath, "utf8").includes("fixture: hold preview")) {
             publish(upstream, "hold preview", () => prepend(runPath, 'if (process.argv.includes("preview")) await Bun.sleep(600_000); // fixture: hold preview'));
           }
@@ -698,7 +666,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       step("a target that fails verification rolls back to the previous image, code and data, with Ctrl+C reaching its process group meanwhile", async () => {
         const verify = join(upstream, "src/server/verify.ts");
         publish(upstream, "broken verification", () => {
-          const runPath = join(upstream, "scripts/migrations/run.ts");
+          const runPath = join(upstream, "scripts/runtime/data-current.ts");
           writeFileSync(runPath, readFileSync(runPath, "utf8").replace(/^if \(process\.argv\.includes\("preview"\)\).*fixture: hold preview\n/m, ""));
           prepend(verify, 'throw new Error("fixture: verification failure");');
           writeFileSync(join(upstream, "src/upgrade-marker.txt"), "B");
@@ -745,147 +713,4 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
     });
   }
 
-  // An instance deployed with the 98f1b4a scripts, upgraded through its old recovery entry (first transition); then an
-  // upgrade interrupted after the stop is resumed and another is rolled back. Root: a docker-group user deployed it (its
-  // container runs as that user's UID:GID and owns its data). Rootless: the daemon's owner deployed it (the container runs
-  // as the mapped 0:0; its data belongs to the owner). The identity stays and no existing file changes owner.
-  if (operator === "root" || operator === "rootless") describe(operator === "root" ? "instance deployed by a docker-group user" : "instance deployed by the rootless owner", () => {
-    let work = "", upstream = "", port = 0, user = "", owner = "";
-    let fixture: string[] = [], baseline: Record<string, string> = {}, before: Record<string, string> = {};
-    let accepted = "";
-    // The operator trusts the other user's checkout once (git config --global --add safe.directory), as documented.
-    const env = () => ({ BOT_PORT: String(port), ALLOW_UNMANAGED_FIREWALL: "1", GIT_CONFIG_GLOBAL: join(root, "legacy/gitconfig") });
-    const head = () => git(work, "rev-parse", "HEAD");
-    const bot = () => {
-      const [running = "", image = "", configured = ""] = docker("inspect", "--format", "{{.State.Running}} {{.Image}} {{.Config.User}}", "mixin-chatbot").out.split(" ");
-      return { running: running === "true", image, user: configured };
-    };
-    const marker = () => docker("exec", "mixin-chatbot", "cat", "/app/src/upgrade-marker.txt").out;
-    const healthy = () => docker("exec", "mixin-chatbot", "bun", "run", "scripts/ops/health-check.ts").code === 0 &&
-      spawnSync("curl", ["--noproxy", "*", "--max-time", "3", "-fsS", `http://127.0.0.1:${port}/health`]).status === 0;
-    const pending = () => existsSync(join(work, "data/state/deploy-transaction"));
-    const kept = () => { expect(changedOwners(before)).toEqual({}); expect(digest(fixture)).toEqual(baseline); };
-    // The migration apply of targets with this hook waits while data/hold-apply exists, after the stop and the checkout.
-    const hold = 'if (process.argv.includes("apply") && (await import("node:fs")).existsSync("/app/data/hold-apply")) { (await import("node:fs")).writeFileSync("/app/data/apply-held", ""); await Bun.sleep(600_000); } // fixture: hold apply';
-    const interrupted = async (name: string, marker: string) => {
-      const target = publish(upstream, `target ${marker}`, () => {
-        const runPath = join(upstream, "scripts/migrations/run.ts");
-        if (!readFileSync(runPath, "utf8").includes("fixture: hold apply")) prepend(runPath, hold);
-        writeFileSync(join(upstream, "src/upgrade-marker.txt"), marker);
-      });
-      writeFileSync(join(work, "data/hold-apply"), "");
-      const upgrade = start(root, name, ["scripts/ops/ops.sh", "update"], work, env(), [], true);
-      await until("the held migration", () => existsSync(join(work, "data/apply-held")), 900_000);
-      process.kill(-upgrade.child.pid!, "SIGKILL");
-      await upgrade.done;
-      // The killed client leaves its migration container; nothing else of the upgrade runs.
-      for (const item of containers()) if (ours(item) && !item.name.startsWith("mixin-chatbot")) docker("rm", "-f", item.id);
-      rmSync(join(work, "data/hold-apply")); rmSync(join(work, "data/apply-held"));
-      expect({ pending: pending(), head: head(), service: bot().running }).toEqual({ pending: true, head: target, service: false });
-      return target;
-    };
-
-    step(`${operator === "root" ? "a docker-group user" : "the rootless owner"} deploys with the 98f1b4a scripts`, async () => {
-      removeOurContainers();
-      const base = join(root, "legacy");
-      ({ work, upstream } = repository(base, target => {
-        spawnSync("bash", ["-c", `git -c safe.directory='*' -C '${project}' archive ${LEGACY_ENTRY} | tar -x -C '${target}'`], { stdio: "inherit" });
-        if (!existsSync(join(target, "scripts/deploy/deploy.sh"))) throw new Error(`cannot export ${LEGACY_ENTRY}; the history must include it`);
-      }));
-      projects.push(projectId(work));
-      writeFileSync(join(base, "gitconfig"), `[safe]\n\tdirectory = ${work}\n`);
-      port = await freePort();
-      fixture = syntheticData(root, work, join(work, "data/groups"));
-      let prefix: string[] = [], account: Record<string, string> = {};
-      if (operator === "root") {
-        const member = must("getent", ["group", "docker"]).split(":")[3]?.split(",").find(name => name && name !== "root");
-        if (!member) throw new Error("this check needs an ordinary user in the docker group");
-        const [uid = "", gid = ""] = [must("id", ["-u", member]), must("id", ["-g", member])];
-        user = owner = `${uid}:${gid}`;
-        // The user's own clone and data.
-        spawnSync("chown", ["-R", user, work]);
-        chownSync(base, Number(uid), Number(gid));
-        account = { HOME: must("getent", ["passwd", member]).split(":")[5] ?? "/tmp", USER: member };
-        prefix = ["setpriv", "--reuid", uid, "--regid", gid, "--init-groups", "--"];
-      } else {
-        // The container's root is the daemon's owner on the host.
-        user = "0:0"; owner = `${process.getuid!()}:${process.getgid!()}`;
-      }
-      // The old scripts build without labels; an identical earlier build has the same ID and is not this run's to remove.
-      const existing = new Set(docker("image", "ls", "-aq", "--no-trunc").out.split("\n"));
-      const deploy = start(root, "legacy-deploy", ["scripts/deploy/deploy.sh"], work, { ...env(), ...account }, deployAnswers, false, prefix);
-      const result = await deploy.done;
-      expect({ code: result.code, tail: result.output.slice(-3000) }).toMatchObject({ code: 0 });
-      expect(bot()).toMatchObject({ running: true, user });
-      if (!existing.has(bot().image)) unlabelled.push(bot().image);
-      expect(await until("the deployed service", () => healthy(), 60_000)).toBe(true);
-      baseline = digest(fixture);
-      before = owners([join(work, "data"), join(work, "logs")]);
-      expect(Object.values(before).every(value => value === owner), JSON.stringify(before)).toBe(true);
-      accepted = head();
-    }, 1_800_000);
-
-    step(`${operator} upgrades it through the old recovery entry and keeps the identity`, async () => {
-      const target = publish(upstream, "current", () => {
-        git(upstream, "rm", "-rq", ".");
-        exportWorkingTree(upstream);
-        writeFileSync(join(upstream, "src/upgrade-marker.txt"), "A");
-      });
-      if (operator === "root") {
-        // Without the operator's trust the old entry cannot read the checkout at all.
-        const untrusted = await start(root, "legacy-untrusted", ["scripts/ops/ops.sh", "update"], work, { ...env(), GIT_CONFIG_GLOBAL: "/dev/null" }).done;
-        expect(untrusted.code === 0).toBe(false);
-        expect(head()).toBe(accepted);
-      }
-      const result = await start(root, "legacy-upgrade", ["scripts/ops/ops.sh", "update"], work, env()).done;
-      // The upgrade completes. Under root the old entry's own check afterwards still runs its one-off container as
-      // 1001:1001, which cannot read the service identity's 600 configuration, so only its model check fails; the new doctor
-      // passes. Under rootless that check runs as the mapped 0:0 and passes.
-      const plain = result.output.replace(/\x1b\[[0-9;]*m/g, "");
-      expect({ code: result.code, done: plain.includes("升级完成："), models: plain.includes("[x] 模型配置（models.json + Pi 设置） 缺少或无效"),
-        failed: /结果：\d+ 项通过，1 项失败/.test(plain) }, plain.slice(-3000))
-        .toEqual(operator === "root" ? { code: 1, done: true, models: true, failed: true } : { code: 0, done: true, models: false, failed: false });
-      const doctor = await start(root, "legacy-doctor", ["scripts/ops/ops.sh", "doctor"], work, env()).done;
-      expect({ code: doctor.code, tail: doctor.output.slice(-3000) }).toMatchObject({ code: 0 });
-      expect(result.output).toContain(`沿用原容器的运行身份 ${user}`);
-      expect(head()).toBe(target);
-      expect(bot()).toMatchObject({ running: true, user });
-      expect(marker()).toBe("A");
-      expect(await until("the upgraded service", () => healthy(), 60_000)).toBe(true);
-      expect(pending()).toBe(false);
-      kept();
-      accepted = target;
-    }, 1_800_000);
-
-    step(`an upgrade killed after the stop is resumed by ${operator} with the recorded image and identity`, async () => {
-      const target = await interrupted("legacy-kill-resume", "B");
-      expect(readFileSync(join(work, `backup/snapshots/${readFileSync(join(work, "data/state/deploy-transaction"), "utf8").trim()}/service-user`), "utf8"))
-        .toBe(`format=1\nuser=${user}\nsource=container\n`);
-      const result = await start(root, "legacy-resume", ["scripts/ops/ops.sh", "resume"], work, env()).done;
-      expect({ code: result.code, tail: result.output.slice(-3000) }).toMatchObject({ code: 0 });
-      expect(result.output).toContain("不重新构建"); expect(result.output).not.toContain("构建目标版本");
-      expect({ head: head(), pending: pending() }).toEqual({ head: target, pending: false });
-      expect(bot()).toMatchObject({ running: true, user });
-      expect(marker()).toBe("B");
-      expect(await until("the resumed service", () => healthy(), 60_000)).toBe(true);
-      kept();
-      accepted = target;
-    }, 1_800_000);
-
-    step(`an upgrade killed after the stop is rolled back by ${operator} to the previous image, code and identity`, async () => {
-      const previous = bot().image;
-      await interrupted("legacy-kill-rollback", "C");
-      const result = await start(root, "legacy-rollback", ["scripts/ops/ops.sh", "rollback"], work, env()).done;
-      expect({ code: result.code, tail: result.output.slice(-3000) }).toMatchObject({ code: 0 });
-      expect({ head: head(), pending: pending() }).toEqual({ head: accepted, pending: false });
-      expect(bot()).toMatchObject({ running: true, image: previous, user });
-      expect(docker("image", "inspect", "--format", "{{.Id}}", "mixin-chatbot").out).toBe(previous);
-      expect(marker()).toBe("B");
-      expect(await until("the restored service", () => healthy(), 60_000)).toBe(true);
-      kept();
-      expect(docker("image", "ls", "--format", "{{.Tag}}", "--filter", `label=org.mixin-chatbot.project=${projectId(work)}`).out)
-        .not.toContain("candidate-");
-      removeOurContainers();
-    }, 1_800_000);
-  });
 });

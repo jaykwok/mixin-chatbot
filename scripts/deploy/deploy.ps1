@@ -204,7 +204,7 @@ $env:PATH = $UvDir + ';' + $BashDir + ';' + $env:PATH
 function Invoke-PendingDeploymentRollback($Snapshot) {
     $record = $Snapshot.Record
     $name = Split-Path $Snapshot.Path -Leaf
-    $journal = Join-Path $StateDir 'migration.json'
+    $journal = Join-Path $StateDir 'release-data.json'
     try {
         $original = $record.original_group_root
         if (-not $original.StartsWith($Project.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -and
@@ -215,14 +215,14 @@ function Invoke-PendingDeploymentRollback($Snapshot) {
             if (-not (Test-Path -LiteralPath $record.target_group_root -PathType Container)) {
                 throw "本次部署的群数据总根不存在：$($record.target_group_root)；恢复迁移前的数据需要它，请恢复后再回滚。"
             }
-            & $bunPath run $migrationRunner committed --project $Project --groups $record.target_group_root --deployment $name
+            & $bunPath run $dataPreparationRunner committed --project $Project --groups $record.target_group_root --deployment $name
             if ($LASTEXITCODE -eq 0) { throw "上次操作的数据已经提交，不能回滚；请选择继续（$(Get-OpsCommandHint 'resume')）完成新实例启动。" }
         }
         Set-OperationStage 'rollback'
         Step "回滚上次部署：恢复数据、配置、依赖、计划任务、网络入口和原运行状态..."
         if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '机器人进程未停止，拒绝恢复数据。' }
         if (Test-Path -LiteralPath $journal) {
-            & $bunPath run $migrationRunner rollback --project $Project --groups $record.target_group_root --deployment $name
+            & $bunPath run $dataPreparationRunner rollback --project $Project --groups $record.target_group_root --deployment $name
             if ($LASTEXITCODE -eq 42) { throw "上次操作的数据已经提交，不能回滚；请选择继续（$(Get-OpsCommandHint 'resume')）完成新实例启动。" }
             if ($LASTEXITCODE -ne 0) { throw '数据恢复失败；保持停机，保留快照和迁移备份。' }
         }
@@ -242,7 +242,7 @@ function Invoke-PendingDeploymentRollback($Snapshot) {
 # 续做和回滚只使用事务记录，不重新读取默认值或环境变量。
 if ($Resume -and $Rollback) { throw '-Resume 与 -Rollback 只能选择一个。' }
 if ($ConfirmedTransaction -and -not ($Resume -or $Rollback)) { throw '事务确认凭据只能用于继续或回滚' }
-$migrationRunner = Join-Path $Project 'scripts\migrations\run.ts'
+$dataPreparationRunner = Join-Path $Project 'scripts\runtime\data-current.ts'
 if (Test-Path -LiteralPath (Join-Path $StateDir 'upgrade-transaction')) {
     throw "发现未完成的升级；请使用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 回滚。"
 }
@@ -277,8 +277,8 @@ if (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) {
         }
         $pendingName = Split-Path $pendingSnapshot.Path -Leaf
         $pendingCommitted = $false
-        if (Test-Path -LiteralPath (Join-Path $StateDir 'migration.json')) {
-            & $bunPath run $migrationRunner committed --project $Project --groups $record.target_group_root --deployment $pendingName
+        if (Test-Path -LiteralPath (Join-Path $StateDir 'release-data.json')) {
+            & $bunPath run $dataPreparationRunner committed --project $Project --groups $record.target_group_root --deployment $pendingName
             $pendingCommitted = $LASTEXITCODE -eq 0
         }
         if ($pendingCommitted) {
@@ -291,8 +291,6 @@ if (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) {
             Enable-ScheduledTask -TaskName $TaskName | Out-Null
             Start-ScheduledTask -TaskName $TaskName
             if (-not (Wait-BotHealth $record.bot_port)) { throw "数据已提交，但业务实例未就绪；保留新版本，请使用 $(Get-OpsCommandHint 'logs') 检查后使用 $(Get-OpsCommandHint 'resume') 继续。" }
-            & $bunPath run $migrationRunner finalize --project $Project --groups $record.target_group_root --deployment $pendingName
-            if ($LASTEXITCODE -ne 0) { Warn '部署已完成，迁移备份清理未完成；修复日志中的问题后运行 migrations cleanup 重试。' }
             Remove-Item -LiteralPath (Join-Path $StateDir 'deploy-transaction') -Force
             try { Remove-CompletedBackup $pendingSnapshot.Path $Project }
             catch { Warn ('部署已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }
@@ -413,25 +411,25 @@ while ($true) {
 }
 Done "群数据总根：$GroupDataRoot"
 
-$migrationPlan = Join-Path $Project ('tmp\migration-plan-' + [Guid]::NewGuid().ToString('N') + '.json')
-$migrationPlanned = $false
-$migrationAttempted = $resuming -and (Test-Path -LiteralPath (Join-Path $StateDir 'migration.json'))
-$migrationGroups = $GroupDataRoot
-$recordedMigrationPlan = if ($resuming) { Join-Path $pendingSnapshot.Path 'migration-plan.json' } else { '' }
+$dataPreparationPlan = Join-Path $Project ('tmp\data-plan-' + [Guid]::NewGuid().ToString('N') + '.json')
+$dataPreparationPlanned = $false
+$dataPreparationAttempted = $resuming -and (Test-Path -LiteralPath (Join-Path $StateDir 'release-data.json'))
+$dataPreparationGroups = $GroupDataRoot
+$recordedDataPreparationPlan = if ($resuming) { Join-Path $pendingSnapshot.Path 'data-plan.json' } else { '' }
 # 续做不能提问：迁移预览不带 --interactive，需要确认时停止。
 # 外层 @() 保留数组；if 的单元素输出会变成字符串，传给原生程序时被 splat 拆成逐个字符。
-$previewMode = @(if (-not $resuming) { '--interactive' })
-if ($recordedMigrationPlan -and (Test-Path -LiteralPath $recordedMigrationPlan -PathType Leaf)) {
+
+if ($recordedDataPreparationPlan -and (Test-Path -LiteralPath $recordedDataPreparationPlan -PathType Leaf)) {
     # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
-    $migrationPlan = $recordedMigrationPlan
-    $migrationPlanned = $true
+    $dataPreparationPlan = $recordedDataPreparationPlan
+    $dataPreparationPlanned = $true
 } elseif ((Test-Path -LiteralPath $ModelsFile) -and (Test-Path -LiteralPath (Join-Path $RuntimeDir 'pi\settings.json'))) {
-    & $bunPath run $migrationRunner preview --decisions-only @previewMode --project $Project --groups $migrationGroups --plan $migrationPlan
+    & $bunPath run $dataPreparationRunner preview --project $Project --groups $dataPreparationGroups --plan $dataPreparationPlan
     if ($LASTEXITCODE -ne 0) {
         if ($resuming) { throw '续做无法沿用迁移确认（原因见上方）；服务保持停止，请回滚后重新部署。' }
         throw '迁移预览未完成；旧服务尚未停止'
     }
-    $migrationPlanned = $true
+    $dataPreparationPlanned = $true
 }
 # ---- 停机前的交互选择：只读取和校验，全部答完才停止机器人服务 ----
 $reconfigureAi = $false
@@ -662,7 +660,7 @@ if ($resuming) {
             was_running = $(if ($snapshot.WasRunning) { '1' } else { '0' }); bot_port = $Port; deploy_mode = $mode; bot_domain = [string]$publicDomain
             domain_action = $domainAction; unmanaged_tunnel = $(if ($unmanagedTunnelConfirmed) { $mode } else { '' })
             platform_ip = $platformIp; reconfigure_ai = $(if ($reconfigureAi) { '1' } else { '0' })
-        } $transactionPointer $(if ($migrationPlanned) { $migrationPlan } else { '' })
+        } $transactionPointer $(if ($dataPreparationPlanned) { $dataPreparationPlan } else { '' })
     } catch { $snapshot.Lock.Dispose(); $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId; throw }
 }
 Write-OperationEvent 'info' ('snapshot=' + $snapshot.Path)
@@ -682,9 +680,9 @@ try {
 Step "安装依赖（bun install --frozen-lockfile）..."
 $bunInstallExitCode = Invoke-OperationNative $bunPath @('install', '--frozen-lockfile')
 if ($bunInstallExitCode -ne 0) { Fail "bun install 执行失败（退出码 $bunInstallExitCode）。"; exit 1 }
-if ($migrationPlanned) {
-    $migrationAttempted = $true
-    & $bunPath run $migrationRunner apply --project $Project --groups $migrationGroups --plan $migrationPlan
+if ($dataPreparationPlanned) {
+    $dataPreparationAttempted = $true
+    & $bunPath run $dataPreparationRunner apply --project $Project --groups $dataPreparationGroups --plan $dataPreparationPlan
     if ($LASTEXITCODE -ne 0) { throw '数据迁移失败' }
 }
 
@@ -792,11 +790,11 @@ $env:BOT_PORT = $Port
 $env:BOT_HOST = $BotHost
 $env:BOT_DEBUG = $BotDebug
 $env:BOT_MAX_ACTIVE_REQUESTS = $BotMaxActiveRequests
-if (-not $migrationPlanned) {
-    & $bunPath run $migrationRunner preview @previewMode --project $Project --groups $GroupDataRoot --plan $migrationPlan
+if (-not $dataPreparationPlanned) {
+    & $bunPath run $dataPreparationRunner preview --project $Project --groups $GroupDataRoot --plan $dataPreparationPlan
     if ($LASTEXITCODE -ne 0) { throw '迁移预览失败' }
-    $migrationAttempted = $true
-    & $bunPath run $migrationRunner apply --project $Project --groups $GroupDataRoot --plan $migrationPlan
+    $dataPreparationAttempted = $true
+    & $bunPath run $dataPreparationRunner apply --project $Project --groups $GroupDataRoot --plan $dataPreparationPlan
     if ($LASTEXITCODE -ne 0) { throw '数据迁移失败' }
 }
 Set-Content -LiteralPath (Join-Path $StateDir 'verify-only') -Value 'verify' -Encoding ASCII
@@ -980,7 +978,7 @@ Step "提交部署..."
 Save-DeploymentState
 Done "部署状态已写入 data\state。"
 if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止' }
-& $bunPath run $migrationRunner commit --project $Project --groups $GroupDataRoot
+& $bunPath run $dataPreparationRunner commit --project $Project --groups $GroupDataRoot
 if ($LASTEXITCODE -ne 0) { throw '迁移提交失败' }
 $deploymentCommitted = $true
 Remove-Item -LiteralPath (Join-Path $StateDir 'verify-only') -Force
@@ -996,10 +994,10 @@ Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 �
     if (-not $deploymentCommitted -and $deploymentMutated) {
         Set-OperationStage 'rollback'
         try {
-            if ($migrationAttempted) {
+            if ($dataPreparationAttempted) {
                 if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止，拒绝恢复数据' }
-                $rollbackGroups = if ($migrationPlanned) { $migrationGroups } else { $GroupDataRoot }
-                & $bunPath run $migrationRunner rollback --project $Project --groups $rollbackGroups --deployment (Split-Path $snapshot.Path -Leaf)
+                $rollbackGroups = if ($dataPreparationPlanned) { $dataPreparationGroups } else { $GroupDataRoot }
+                & $bunPath run $dataPreparationRunner rollback --project $Project --groups $rollbackGroups --deployment (Split-Path $snapshot.Path -Leaf)
                 if ($LASTEXITCODE -ne 0) { throw '数据已提交或恢复失败；保持停机，保留备份' }
             }
             Remove-Item -LiteralPath (Join-Path $StateDir 'verify-only') -Force -ErrorAction SilentlyContinue
@@ -1015,8 +1013,6 @@ Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 �
             Write-Host "处理后可用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 重试回滚。" -ForegroundColor Red
         }
     } elseif ($deploymentActivated) {
-        & $bunPath run $migrationRunner finalize --project $Project --groups $GroupDataRoot --deployment (Split-Path $snapshot.Path -Leaf)
-        if ($LASTEXITCODE -ne 0) { Warn '部署已完成，迁移备份清理未完成；修复日志中的问题后运行 migrations cleanup 重试。' }
         Remove-Item -LiteralPath $transactionPointer -Force -ErrorAction SilentlyContinue
         try { Remove-CompletedBackup $snapshot.Path $Project }
         catch { Warn ('部署已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }

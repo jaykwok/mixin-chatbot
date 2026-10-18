@@ -18,7 +18,7 @@ ops_command_hint() {
     if [ "${MIXIN_OPS_TUI:-}" = "1" ]; then
         case "$command" in
             deploy) path='系统 → 服务部署 → 部署 / 修改设置' ;;
-            update) path='系统 → 服务部署 → 升级（保留设置）' ;;
+            update) path='系统 → 服务部署 → 升级' ;;
             resume) path='系统 → 服务部署 → 继续上次操作' ;;
             rollback) path='系统 → 服务部署 → 回滚上次操作' ;;
             start) path='系统 → 服务部署 → 启动' ;;
@@ -286,17 +286,17 @@ acquire_deploy_lock() {
 # 部署时从环境写入 runtime.json 的运行参数。升级、续做和回滚沿用 runtime.json，不采用当前终端的这些值。
 RUNTIME_ENV_KEYS=(BOT_DEBUG BOT_MAX_ACTIVE_REQUESTS BOT_BASH_TIMEOUT BOT_INDEX_TTL_MINUTES BOT_INDEX_MAX_FILES BOT_INDEX_MAX_DEPTH BOT_RUN_TIMEOUT_SECONDS BOT_MODEL_IDLE_TIMEOUT_SECONDS BOT_MODEL_RESPONSE_TIMEOUT_SECONDS BOT_SHUTDOWN_TIMEOUT_SECONDS BOT_DELIVERY_TIMEOUT_SECONDS BOT_DOCUMENT_ENV BOT_DOCUMENT_WORK_ENABLED BOT_DOCUMENT_PPTX_TEMPLATE BOT_DOCUMENT_DOCX_TEMPLATE PI_CACHE_RETENTION BOT_ATTACHMENT_CONCURRENCY)
 
-# 升级器从目标提交导出的文件。旧版运维脚本按它自己的这份列表导出新版升级器，所以列表只增不减；当前升级器只用
-# upgrade.sh 和 scripts/lib，镜像另从目标提交完整导出构建上下文（见 candidate_export_context）。
-UPGRADER_EXPORT_PATHS=(scripts/deploy/upgrade.sh scripts/lib scripts/migrations src/core/data-version.ts Dockerfile)
+# 当前升级器的引导依赖。列表发生不兼容变化时用下方一次性引导；不为旧版导出列表保留历史目录。
+# 镜像另从目标提交完整导出构建上下文（见 candidate_export_context）。
+UPGRADER_EXPORT_PATHS=(scripts/deploy/upgrade.sh scripts/lib scripts/runtime src/core/data-version.ts Dockerfile)
 
 # 旧版运维脚本升级到新版时需在项目目录运行一次的引导命令；之后 ops.sh update 自行导出目标升级器。
 upgrade_bootstrap_command() {
     printf '%s\n' 'git fetch origin main' \
-        'rm -rf tmp/upgrade-bootstrap && mkdir -p tmp/upgrade-bootstrap' \
-        "git archive origin/main ${UPGRADER_EXPORT_PATHS[*]} | tar -x -C tmp/upgrade-bootstrap" \
-        'bash tmp/upgrade-bootstrap/scripts/deploy/upgrade.sh "$PWD" origin/main' \
-        'rm -rf tmp/upgrade-bootstrap'
+        'mkdir -p tmp' \
+        'stage=$(mktemp -d "$PWD/tmp/upgrade-XXXXXXXX")' \
+        "git archive origin/main ${UPGRADER_EXPORT_PATHS[*]} | tar -x -C \"\$stage\"" \
+        'bash "$stage/scripts/deploy/upgrade.sh" "$PWD" origin/main'
 }
 
 # git 只经这里调用：GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。

@@ -2,7 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { runCommand, scenarioRunner, ScenarioProcesses } from "../helpers/concurrent-scenarios.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -98,6 +98,19 @@ case "$cmd" in
             if [ "$previous" = -v ] && [[ "$arg" == *:/preview ]]; then preview="\${arg%:/preview}"; fi
             previous="$arg"
         done
+        if [ "\${FIXTURE_RESET:-0}" = 1 ]; then
+            case " $* " in
+                *' probe '*) exit 20 ;;
+                *' prepare-reset '*) mkdir -p "$preview/reset-config/data/config"; printf 'draft' > "$preview/reset-config/data/config/models.json"; exit 0 ;;
+                *' bun run configure '*) printf 'configure head=%s\n' "$(current_head)" >> "$FIXTURE_EVENTS"; exit 0 ;;
+                *'/upgrade/scripts/runtime/stats-freeze.ts '*)
+                    printf 'freeze head=%s\n' "$(current_head)" >> "$FIXTURE_EVENTS"
+                    [ "\${FIXTURE_FREEZE:-ok}" = ok ] || exit 1
+                    snapshot="$(cat "$FIXTURE_WORK/data/state/deploy-transaction")"
+                    test -s "$FIXTURE_WORK/backup/snapshots/$snapshot/reset-config/data/config/models.json" || exit 1
+                    printf 'frozen' > "$FIXTURE_WORK/backup/snapshots/$snapshot/stats-frozen.json"; exit 0 ;;
+            esac
+        fi
         # Only the preview is a one-off container of the upgrader; others (the model check after ops update) succeed.
         [ -n "$preview" ] || exit 0
         printf '%s\n' "$@" > "$mock/preview-args"
@@ -113,7 +126,7 @@ case "$cmd" in
             tag) rm -f "$mock"/tags/mixin-chatbot_candidate-* ;;
             disk) : > "$mock/disk-full" ;;
         esac
-        printf '{"format":1,"fixture":"plan"}' > "$preview/migration-plan.json" ;;
+        printf '{"format":1,"fixture":"plan"}' > "$preview/data-plan.json" ;;
     ps) for file in "$mock"/containers/*; do [ -f "$file" ] && basename "$file"; done ;;
     inspect)
         format=''; if [ "$1" = --format ]; then format="$2"; fi
@@ -155,7 +168,7 @@ printf 'deploy action=%s handoff=%s token=%s receipt=[%s] stdin=%s tty=%s head=%
 if [ -n "$snapshot" ]; then
     printf '%s' "$snapshot" > "$FIXTURE_MOCK/snapshot"
     cp "backup/snapshots/$snapshot/transaction" "$FIXTURE_MOCK/record"
-    cp "backup/snapshots/$snapshot/migration-plan.json" "$FIXTURE_MOCK/plan" 2>/dev/null || true
+    cp "backup/snapshots/$snapshot/data-plan.json" "$FIXTURE_MOCK/plan" 2>/dev/null || true
     for sidecar in candidate-image service-user; do cp "backup/snapshots/$snapshot/$sidecar" "$FIXTURE_MOCK/$sidecar" 2>/dev/null || true; done
 fi
 mode="\${FIXTURE_DEPLOY:-success}"
@@ -222,7 +235,7 @@ async function buildTemplate() {
     await writeFile(join(bin, "pgrep"), '#!/usr/bin/env bash\n[ "${FIXTURE_UNMANAGED:-0}" = 1 ] && echo 4242\n');
     for (const name of ["docker", "flock", "pgrep"]) await chmod(join(bin, name), 0o755);
     // The fixture repository carries the real upgrader files at both commits and a stub target deploy script.
-    for (const path of ["scripts/deploy/upgrade.sh", "scripts/lib", "scripts/migrations", "scripts/ops/ops.sh", "src/core/data-version.ts", "Dockerfile"]) {
+    for (const path of ["scripts/deploy/upgrade.sh", "scripts/lib", "scripts/runtime", "scripts/ops/ops.sh", "src/core/data-version.ts", "Dockerfile"]) {
       await cp(join(project, path), join(work, path), { recursive: true });
     }
     await writeFile(join(work, "scripts/deploy/deploy.sh"), deployStub);
@@ -769,10 +782,10 @@ scenario("target upgrader: an upgrade interrupted before the checkout continues 
   // unless this upgrade's migration already started.
   await interrupted();
   const pending = await readFile(join(state, "deploy-transaction"), "utf8");
-  await writeFile(join(state, "migration.json"), `{\n  "deployment": "${pending}"\n}\n`);
+  await writeFile(join(state, "release-data.json"), `{\n  "deployment": "${pending}"\n}\n`);
   result = await upgrade([target, "rollback"]);
   expect(result.code, result.text).toBe(1); expect(result.text).toContain("数据迁移已经开始");
-  await rm(join(state, "migration.json"));
+  await rm(join(state, "release-data.json"));
   // Recovery reads the recorded image first: on another Docker daemon it refuses both ways before touching any container.
   for (const action of ["continue", "rollback"]) {
     result = await upgrade([target, action], { FIXTURE_DAEMON: "feb63570-4e9c-4408-bcc5-f4ddbfad1aa3" });
@@ -854,83 +867,6 @@ scenario("target upgrader: interrupts reaching its process group while it restor
   await git("config", "--unset", "core.hooksPath");
 });
 
-// The first upgrade to a version with candidate images starts from 98f1b4a: its recovery entry (ops.sh resume/rollback,
-// and the TUI that shows the transaction and runs them) reads the record with the checked-out old code and exports the
-// target's upgrader by its own UPGRADER_EXPORT_PATHS. The history must include that commit (CI checks out fetch-depth 0).
-const LEGACY_ENTRY = "98f1b4a94575ebeb0f4653e221ad6c701a00598e";
-const LEGACY_PATHS = ["scripts/ops/ops.sh", "scripts/lib", "scripts/ops/tui/transaction.ts", "scripts/ops/tui/platform.ts", "src/core/data-version.ts"];
-
-/**
- * A commit after the fixture's old one whose recovery entry and libraries are those of 98f1b4a, and after it a target
- * with the fixture target's tree, so that main fast-forwards to it.
- */
-async function legacyCommits({ run, git, work, reset, old, target, processes }: Fixture) {
-  const available = await runCommand(processes, project, ["git", "cat-file", "-e", `${LEGACY_ENTRY}^{commit}`]);
-  expect(available.code, `需要包含 ${LEGACY_ENTRY} 的 git 历史（CI 的 checkout 使用 fetch-depth: 0）`).toBe(0);
-  await reset(old);
-  await rm(join(work, "scripts/lib"), { recursive: true });
-  const exported = await run([bash!, "-c", `git -C '${posix(project)}' archive ${LEGACY_ENTRY} ${LEGACY_PATHS.join(" ")} | tar -x -C .`]);
-  expect(exported.code, exported.text).toBe(0);
-  await git("add", "-A"); await git("commit", "-m", "legacy entry");
-  const legacy = await git("rev-parse", "HEAD");
-  return { legacy, next: await git("commit-tree", `${target}^{tree}`, "-p", legacy, "-m", "fixture-new") };
-}
-
-/** What the old TUI's maintenance view reads to offer continuing or rolling back. */
-async function legacyTui({ run, work }: Fixture) {
-  const module = JSON.stringify(pathToFileURL(join(work, "scripts/ops/tui/transaction.ts")).href);
-  const result = await run([process.execPath, "-e", `const { loadPendingTransaction: load } = await import(${module}); const p = load();
-    console.log(JSON.stringify(p && { operation: p.operation, target: p.targetSha, committed: p.committed, restore: p.codeRestorePending }));`]);
-  expect(result.code, result.text).toBe(0);
-  return JSON.parse(result.text.trim().split("\n").pop()!);
-}
-
-scenario("first transition: the 98f1b4a recovery entry continues or rolls back an upgrade the new upgrader left before the checkout", "target-upgrader-legacy-", async fx => {
-  const { state, git, upgrade, ops, log } = fx;
-  const { legacy, next } = await legacyCommits(fx);
-  // The new upgrader published the pointer and stopped the service; the code is still the old one.
-  const interrupted = async () => {
-    await fx.reset(legacy);
-    const failed = await upgrade([next], { FIXTURE_DEPLOY: "pending", FIXTURE_ROLLBACK: "fail" });
-    expect(failed.code, failed.text).toBe(1);
-    expect(existsSync(join(state, "deploy-transaction")), failed.text).toBe(true);
-    await git("reset", "--hard", legacy);
-    expect(await legacyTui(fx)).toEqual({ operation: "upgrade", target: next, committed: false, restore: false });
-  };
-  await interrupted();
-  // The TUI runs the old ops.sh; it exports the target's upgrader, which continues with the recorded image.
-  let result = await ops(["resume"], { MIXIN_OPS_TUI: "1" });
-  expect(result.text).toContain("升级完成");
-  expect(await log()).toEqual([`deploy action=continue handoff= token=none receipt=[] stdin= tty=no head=${next.slice(0, 7)}`]);
-  expect(await git("rev-parse", "HEAD")).toBe(next); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
-  await interrupted();
-  result = await ops(["rollback"], { MIXIN_OPS_TUI: "1" });
-  expect(result.code, result.text).toBe(0);
-  expect(await log()).toEqual(["rename mixin-chatbot-rollback mixin-chatbot", `start mixin-chatbot head=${legacy.slice(0, 7)}`]);
-  expect(await git("rev-parse", "HEAD")).toBe(legacy); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
-  expect(await fx.candidateTags()).toEqual([]); expect(await fx.officialTag()).toBe("sha256:old");
-  expect(await fx.container("mixin-chatbot")).toBe("sha256:old true");
-});
-
-scenario("first transition: the 98f1b4a recovery entry finishes a rollback whose code was restored before the pointer was cleared", "target-upgrader-legacy-restore-", async fx => {
-  const { work, state, git, upgrade, ops, log } = fx;
-  const { legacy, next } = await legacyCommits(fx);
-  // The data, configuration and container were rolled back and the code restore failed; then the old code came back
-  // without the pointer being cleared.
-  await fx.reset(legacy);
-  const failed = await upgrade([next], { FIXTURE_DEPLOY: "pending", FIXTURE_INDEX_LOCK: "1" });
-  expect(failed.code, failed.text).toBe(1); expect(failed.text).toContain("只恢复代码");
-  await rm(join(work, ".git/index.lock")); await git("reset", "--hard", legacy);
-  expect(await legacyTui(fx)).toEqual({ operation: "upgrade", target: next, committed: false, restore: true });
-  let result = await ops(["resume"], { MIXIN_OPS_TUI: "1" });
-  expect(result.code, result.text).toBe(1); expect(result.text).toContain("不能继续");
-  result = await ops(["rollback"], { MIXIN_OPS_TUI: "1" });
-  expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级已回滚");
-  expect(await log()).toEqual([]);
-  expect(await git("rev-parse", "HEAD")).toBe(legacy); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
-  expect(await fx.container("mixin-chatbot")).toBe("sha256:old true");
-});
-
 scenario("target upgrader: a new upgrade builds the target once, previews in that image as the original service identity, records every choice before the stop and hands over with stdin closed; low ports under rootless", "target-upgrader-new-", async fx => {
   const { work, state, mock, stage, git, upgrade, log, record, reset, candidateTags, officialTag, sidecar, old, target } = fx;
   const short = target.slice(0, 7);
@@ -964,8 +900,8 @@ scenario("target upgrader: a new upgrade builds the target once, previews in tha
   const args = (await readFile(join(mock, "preview-args"), "utf8")).trim().split("\n");
   const mounts = args.flatMap((arg, index) => args[index - 1] === "-v" ? [arg] : []);
   expect(mounts).toEqual([`${posix(work)}/data:/app/data:ro`, `${posix(work)}/logs:/app/logs`, `${posix(stage)}/preview:/preview`]);
-  expect(args.slice(args.indexOf(candidate.image_id))).toEqual([candidate.image_id, "bun", "run", "scripts/migrations/run.ts",
-    "preview", "--project", "/app", "--groups", "/app/data/groups", "--scratch", "/preview", "--plan", "/preview/migration-plan.json"]);
+  expect(args.slice(args.indexOf(candidate.image_id))).toEqual([candidate.image_id, "bun", "run", "scripts/runtime/data-current.ts",
+    "preview", "--project", "/app", "--groups", "/app/data/groups", "--plan", "/preview/data-plan.json"]);
   expect(args).toContain("GROUP_DATA_ROOT=/app/data/groups");
   expect(args[args.indexOf("--user") + 1]).toBe(identity); expect(args[args.indexOf("--network") + 1]).toBe("none");
   expect(await record()).toEqual({ format: "1", operation: "upgrade", snapshot, target_sha: target, original_sha: old, original_branch: "main",
@@ -1050,6 +986,26 @@ scenario("target upgrader: an external group root is mounted read-only; missing 
   await rm(join(state, "group-data-root"));
 });
 
+scenario("target upgrader: reset consent and configuration precede stop, source freeze precedes checkout, freeze failure restores old service", "target-upgrader-reset-", async fx => {
+  const { work, mock, reset, upgrade, old, target, log, git, container } = fx;
+  await reset(old);
+  const cancelled = await upgrade([target], { FIXTURE_RESET: "1" }, "n\n");
+  await unchangedCheck(fx)(old, cancelled);
+  const failed = await upgrade([target], { FIXTURE_RESET: "1", FIXTURE_FREEZE: "failed" }, "y\n");
+  expect(failed.code, failed.text).toBe(1);
+  expect(failed.text).toContain("旧版统计补账未完成");
+  expect(await git("rev-parse", "HEAD")).toBe(old);
+  expect((await container("mixin-chatbot")).split(" ").slice(0, 2)).toEqual(["sha256:old", "true"]);
+  await reset(old);
+  const result = await upgrade([target], { FIXTURE_RESET: "1" }, "y\n");
+  expect(result.code, result.text).toBe(0);
+  const events = await log(), configure = events.indexOf(`configure head=${old.slice(0, 7)}`), stop = events.indexOf(`stop mixin-chatbot head=${old.slice(0, 7)}`);
+  const freeze = events.indexOf(`freeze head=${old.slice(0, 7)}`), deploy = events.findIndex(line => line.startsWith("deploy action=continue"));
+  expect(configure).toBeGreaterThan(-1); expect(stop).toBeGreaterThan(configure); expect(freeze).toBeGreaterThan(stop); expect(deploy).toBeGreaterThan(freeze);
+  const snapshot = await readFile(join(mock, "snapshot"), "utf8");
+  expect(await readFile(join(work, "backup/snapshots", snapshot, "stats-frozen.json"), "utf8")).toBe("frozen");
+});
+
 scenario("target upgrader: a Cloudflare token is asked before the stop and handed over only in memory", "target-upgrader-token-", async fx => {
   const { state, mock, upgrade, log, reset, old, target } = fx;
   const unchanged = unchangedCheck(fx);
@@ -1082,6 +1038,9 @@ scenario("target upgrader: never runs from inside the work tree; the documented 
   expect(bootstrap.code, bootstrap.text).toBe(0);
   result = await run([bash!, "-c", `set -e\n${bootstrap.text.trim()}`], env());
   expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级完成");
-  expect(await git("rev-parse", "HEAD")).toBe(target); expect(existsSync(join(work, "tmp/upgrade-bootstrap"))).toBe(false);
-  expect(await readdir(join(work, "tmp"))).toEqual(["upgrade-fixture"]);
+  expect(await git("rev-parse", "HEAD")).toBe(target);
+  const exports = (await readdir(join(work, "tmp"))).filter(name => name !== "upgrade-fixture");
+  expect(exports).toHaveLength(1); expect(exports[0]).toMatch(/^upgrade-[A-Za-z0-9]{8}$/);
+  // The one-time command keeps its exact export available for recovery; the fixture owns its eventual cleanup.
+  expect(existsSync(join(work, "tmp", exports[0]!, "scripts/deploy/upgrade.sh"))).toBe(true);
 });

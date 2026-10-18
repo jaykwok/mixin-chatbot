@@ -76,9 +76,12 @@ function readOnlySettingsStorage(readGlobal: () => string | undefined): PiSettin
  * .pi/settings.json 进去改模型和运行策略。
  */
 export function openSettings(path = PI_SETTINGS_PATH): SettingsManager {
-  const settings = SettingsManager.fromStorage(readOnlySettingsStorage(
-    () => existsSync(path) ? readFileSync(path, "utf8") : undefined
-  ), { projectTrusted: false });
+  const raw = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+  if (raw !== undefined) {
+    try { validateEngineSettings(JSON.parse(raw)); }
+    catch (error) { throw new Error(`${path}: ${(error as Error).message}`, { cause: error }); }
+  }
+  const settings = SettingsManager.fromStorage(readOnlySettingsStorage(() => raw), { projectTrusted: false });
   const failures = settings.drainErrors();
   // 设置文件坏了就是选型信息坏了，不能退回默认模型继续跑。
   if (failures.length) {
@@ -113,6 +116,10 @@ export async function resolveModelSelection(
   if (!model) {
     throw new Error(`Pi 未提供 ${providerId}/${modelId}，请运行 bun run configure 重新选择`);
   }
+  if (model.api !== ("pi-virtual" as string) && (!Number.isSafeInteger(model.contextWindow) || model.contextWindow < 1 || !Number.isSafeInteger(model.maxTokens) || model.maxTokens < 1 || model.maxTokens > model.contextWindow))
+    throw new Error("所选模型的上下文或输出上限无效，请重新配置");
+  if (providerId === "kimi-coding" && (model.api !== "openai-completions" || !/\/v1\/?$/.test(new URL(model.baseUrl).pathname)))
+    throw new Error("kimi-coding 需要 openai-completions 协议和以 /v1 结尾的 baseUrl，请重新配置");
   const auth = await runtime.checkAuth(providerId, { signal: options.signal });
   if (!auth) {
     throw new Error(`provider ${providerId} 未配置可用凭证，请运行 bun run configure`);

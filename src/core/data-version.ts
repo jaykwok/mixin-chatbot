@@ -2,25 +2,23 @@
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-export const DATA_VERSION = 5;
+export const DATA_VERSION = 6;
 export const VERSION_FILE = "data-version.json";
-export const MIGRATION_FILE = "migration.json";
+export const RELEASE_FILE = "release-data.json";
 /** The group root lease's directory inside the group root (src/core/maintenance.ts); group and user segments never start with a dot. */
 export const GROUP_ROOT_LEASE = ".mixin-lease.lock";
 export interface DataVersion { dataVersion: number; transaction: string }
-export interface MigrationState { id: string; target: number; phase: string; groups: string; kind?: "migration" | "verification" | "registration" }
+export interface ReleaseState { format: 1; deployment: string; groups: string; phase: "prepared" | "committed" }
 
-/** The project marker is the commit point; the group marker is not a rollback permit. */
-export function migrationCommitted(project: string, journal: MigrationState): boolean {
-  if (journal.phase === "committed") return true;
-  if (journal.kind === "verification") return false;
-  const local = readDataVersion(join(project, "data/state", VERSION_FILE));
-  return local?.dataVersion === journal.target && local.transaction === journal.id;
+export function readRelease(project: string): ReleaseState | null {
+  const value = readMetadata(join(project, "data/state", RELEASE_FILE)) as ReleaseState | null;
+  if (value && (value.format !== 1 || !/^deploy-[A-Za-z0-9]+$/.test(value.deployment)
+    || typeof value.groups !== "string" || !["prepared", "committed"].includes(value.phase))) throw new Error("发布状态格式不匹配");
+  return value;
 }
-
 export function verificationPending(project: string, groups: string): boolean {
-  const journal = readMetadata(join(project, "data/state", MIGRATION_FILE)) as MigrationState | null;
-  return !!journal && journal.phase === "validated" && journal.target === DATA_VERSION && journal.groups === groups && !migrationCommitted(project, journal);
+  const release = readRelease(project);
+  return release?.phase === "prepared" && resolve(release.groups) === resolve(groups);
 }
 
 export function readMetadata(path: string): unknown {
@@ -49,16 +47,9 @@ export function inspectDataVersion(project: string, groups: string): { current: 
   try {
     const local = readDataVersion(join(project, "data/state", VERSION_FILE));
     const group = readDataVersion(join(groups, VERSION_FILE));
-    const pending = readMetadata(join(project, "data/state", MIGRATION_FILE)) as MigrationState | null;
-    if (local?.dataVersion && local.dataVersion > DATA_VERSION || group?.dataVersion && group.dataVersion > DATA_VERSION) {
-      return { current: false, detail: "数据版本比代码新，请使用匹配的代码；禁止降级启动" };
-    }
-    if (pending && !migrationCommitted(project, pending)) {
-      return { current: false, detail: "迁移尚未提交，请通过升级继续或恢复备份" };
-    }
-    if (!local && !group) return { current: false, detail: "数据尚未登记，请通过升级完成迁移和校验" };
+    if (!local && !group) return { current: false, detail: "数据尚未登记，请按 docs/data-migrations.md 准备当前格式，再部署" };
     if (!local || !group || local.dataVersion !== DATA_VERSION || group.dataVersion !== DATA_VERSION || local.transaction !== group.transaction) {
-      return { current: false, detail: "项目和群根标记不成对或版本不匹配，请通过升级重新校验并登记；已提交迁移不能回滚" };
+      return { current: false, detail: "项目和群根标记不成对或格式不匹配；旧版请通过 update 确认保留统计并重置，不成对时先恢复一致状态。参见 docs/data-migrations.md" };
     }
     return { current: true, detail: `数据版本 ${DATA_VERSION}` };
   } catch (error) { return { current: false, detail: (error as Error).message }; }

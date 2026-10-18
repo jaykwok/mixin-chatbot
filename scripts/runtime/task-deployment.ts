@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { RootlessTasks } from "../../src/core/rootless-tasks.ts";
 import { TaskPaths, type TaskLaunch } from "../../src/core/task-deployment.ts";
-import { publishJson } from "../migrations/lib/io.ts";
+import { publishJson } from "../lib/atomic-file.ts";
 
 const { values, positionals } = parseArgs({ args: process.argv.slice(2), allowPositionals: true,
   options: { image: { type: "string" }, data: { type: "string" }, groups: { type: "string" } } });

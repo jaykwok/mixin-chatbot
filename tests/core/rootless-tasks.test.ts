@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { RootlessTasks, type TaskDriver, type TaskStorage } from "../../src/core/rootless-tasks.ts";
 import { RemovalPermit } from "../../src/core/reclamation.ts";
 import { holdDirectory } from "../../src/core/held-directory.ts";
-import { publishJson } from "../../scripts/migrations/lib/io.ts";
+import { publishJson } from "../../scripts/lib/atomic-file.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { resultReferences } from "../../src/durable/results/references.ts";
 

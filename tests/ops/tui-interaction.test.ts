@@ -1,5 +1,6 @@
+import { writeTestData as writeFile } from "../helpers/stats-fixture.ts";
 import { expect, spyOn, test } from "bun:test";
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { App } from "../../scripts/ops/tui/app.ts";
@@ -18,7 +19,6 @@ import { MaintainView } from "../../scripts/ops/tui/views/maintain.ts";
 import { SettingsView } from "../../scripts/ops/tui/views/settings.ts";
 import * as tuiData from "../../scripts/ops/tui/data.ts";
 import * as tuiTransaction from "../../scripts/ops/tui/transaction.ts";
-import { sweepSessionStats } from "../../src/agent/stats-ledger.ts";
 import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import * as tuiReport from "../../scripts/ops/tui/report.ts";
 import { createRelayView, createRoutesView } from "../../scripts/ops/tui/views/passthrough.ts";
@@ -59,7 +59,7 @@ test("清空所有群需输入「全部清空」，范围不受筛选影响；�
   expect(spec.typeToConfirm).toBe("全部清空");
   expect(spec.subject).toContain("2 个群");
   expect(spec.steps.join(" ")).toContain("2 个群库");
-  expect(spec.steps.join(" ")).toContain("1 个升级前的 session.jsonl 先计入使用统计");
+  expect(spec.steps.join(" ")).toContain("使用统计不受影响");
   expect(spec.steps.join(" ")).toContain("使用统计不受影响");
   expect(calls.commands).toEqual([{ title: "清空所有群的会话历史", args: ["history-clear", "--all"] }]);
   expect(calls.toasts.at(-1)).toContain("所有群已清空");
@@ -705,6 +705,12 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
     }
     expect(calls.commands.map(call => call.args)).toEqual(expected);
     expect(interactive).toEqual([["update", "987654321"], ["deploy"], ...(platform === "linux" ? [["deploy"]] : []), ["uninstall"]]);
+    const upgrade = calls.confirms.find(spec => spec.title === "升级")!;
+    expect(upgrade.steps.join("\n")).toContain("与 ops update 相同的目标升级器");
+    expect(upgrade.steps.join("\n")).toContain("数据版本一致时直接升级");
+    expect(upgrade.steps.join("\n")).toContain("确认后才停机");
+    expect(upgrade.untouched).toEqual(["已入账统计（含提问次数、人数）", "webhook 密钥和 Cloudflare 隧道凭证"]);
+    expect(upgrade.recovery).toContain("继续上次操作");
     expect(calls.confirms.at(-1)?.typeToConfirm).toBe("卸载");
     const health = new HealthView();
     Object.assign(health, { platform, state: { kind: "ready", value: { pass: 0, warn: 0, fail: 1, checks: [{ name: "fixture", status: "fail", detail: "fixture" }] } } });
@@ -744,13 +750,12 @@ async function history(root: string, group: string, users: string | readonly str
   for (const user of typeof users === "string" ? [users] : users) {
     const dir = join(root, group, "users", user);
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "session.jsonl"), days.flatMap(day => [
+    await writeFile(join(dir, "stats.records"), days.flatMap(day => [
       { type: "message", timestamp: day + "T12:00:00Z", message: { role: "user", content: [{ type: "text", text: "统计" }] } },
       { type: "message", timestamp: day + "T12:01:00Z", message: { role: "assistant", content: [{ type: "toolCall", name: "fixture_tool" }] } },
     ]).map(line => JSON.stringify(line)).join("\n") + "\n");
   }
-  // 统计页读的是账本；整批会话写完后扫描一次，避免每新增成员都重新扫描已有会话。
-  await sweepSessionStats(root, { force: true });
+  await writeFile(join(root, group, "durable.sqlite"), "current database footprint");
 }
 
 test("统计、会话和临时文件刷新保留列表，切换数据根后清除旧范围", async () => {
@@ -831,7 +836,7 @@ test("未完成的事务只提供继续或回滚，确认页列出记录，数�
       expect(actions.slice(0, 2).map(action => action.label)).toEqual(["继续上次操作", "回滚上次操作"]);
       expect(actions.filter(action => action.disabled).map(action => action.value).sort()).toEqual(["deploy", "repair", "tunnel-update", "update"]);
       expect(actions.find(action => action.value === "deploy")?.label).toBe("部署 / 修改设置");
-      expect(actions.find(action => action.value === "update")?.label).toBe("升级（保留设置）");
+      expect(actions.find(action => action.value === "update")?.label).toBe("升级");
       for (const [width, rows] of [[72, 20], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
       // New deployments, upgrades and repairs are refused until the interrupted one is finished; no remote check starts.
       for (const blocked of ["deploy", "update", "repair", "tunnel-update"]) await view.onKey(key(blocked), app);
@@ -1502,7 +1507,7 @@ test("筛选临时文件后只清选中成员，全量清理仍明确覆盖所�
   } finally { await fixture.cleanup(); }
 });
 
-test("群筛选控制统计导出范围，常用日期可选，会话全部成员可达且清理目标正确", async () => {
+test("群筛选控制统计导出范围，常用日期可选，会话群库可达且清理目标正确", async () => {
   const fixture = await tempFixture("tui-groups-filter-");
   try {
     await history(fixture.root, "other-group", "13912345678");
@@ -1539,7 +1544,7 @@ test("群筛选控制统计导出范围，常用日期可选，会话全部成�
     await sessions.onKey(key("enter"), app);
     sessions.render(context());
     await sessions.onKey(key("end"), app);
-    expect(plain(sessions.render(context()))).toContain("138****5701");
+    expect(plain(sessions.render(context()))).toContain("support-group");
     for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(sessions.render(context(width, rows)), context(width, rows));
     await sessions.onKey(key("c"), app);
     expect(calls.commands.at(-1)?.args).toEqual(["history-clear", "support-group", "--storage-segment"]);

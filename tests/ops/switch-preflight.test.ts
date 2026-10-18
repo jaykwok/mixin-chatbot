@@ -326,7 +326,7 @@ async function expectRealSwitch(scenario: Scenario, dir: string, target: string)
 // before the stop after the preparation (snapshot, data decision). Only the service, the snapshot, Bun and the operation log
 // are stand-ins; the stand-in stop reports failure, so a run that reaches it changes nothing either.
 type UpgradeStage = "upgrade-preflight" | "switch-recheck";
-const stages = ["migration-preview", "upgrade-preflight", "deployment-snapshot", "switch-recheck", "stop-service"];
+const stages = ["data-preparation-preview", "upgrade-preflight", "deployment-snapshot", "switch-recheck", "stop-service"];
 const upgradeCases: (Scenario & {
   /** An interrupted upgrade's transaction pointer is present. */
   resume?: boolean;

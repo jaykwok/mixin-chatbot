@@ -13,7 +13,6 @@ import {
   rmdirSync, unlinkSync, writeFileSync, type BigIntStats,
 } from "node:fs";
 import { join } from "node:path";
-import { MIGRATION_FILE } from "../../src/core/data-version.ts";
 import { cliArgs } from "../lib/cli.ts";
 
 type Category = "confirmed-test" | "suspected-test" | "business" | "unknown";
@@ -127,34 +126,17 @@ function readText(path: string): string | null {
 /** 当前不能删除的条目：未完成事务的快照和归档，以及迁移日志引用的快照和事务。每次使用时重新读取。 */
 function protectedPaths(project: string): Map<string, string> {
   const paths = new Map<string, string>();
-  const ready = new Set<string>();
-  const receipts = join(project, "data/state/migration-cleanup");
-  if (realDirectory(receipts, "data/state/migration-cleanup")) for (const name of readdirSync(receipts)) {
-    if (!/^[\da-f-]{36}\.json$/.test(name)) continue;
-    const path = join(receipts, name), stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`迁移清理回执不是普通文件：${path}`);
-    const receipt = JSON.parse(readFileSync(path, "utf8"));
-    const journal = receipt?.journal;
-    if (receipt?.format !== 1 || typeof receipt.ready !== "boolean" || journal?.format !== 1 || journal?.id + ".json" !== name ||
-        !["pending", "complete"].includes(journal?.cleanup) || journal?.phase !== "committed" ||
-        journal?.backup !== `backup/snapshots/migration-${journal?.id}`) throw new Error(`迁移清理回执无效：${path}`);
-    if (receipt.ready) ready.add(journal.id);
-    else paths.set(journal.backup, `正式实例尚未确认就绪（data/state/migration-cleanup/${name}），先完成启动和 finalize`);
-  }
   for (const pointer of ["deploy-transaction", "upgrade-transaction"]) {
     const name = readText(join(project, "data/state", pointer))?.trim();
     if (!name || !TRANSACTION_NAME.test(name)) continue;
     for (const area of AREAS) paths.set(`backup/${area}/${name}`, `未完成的事务正在使用（data/state/${pointer}）`);
   }
-  const text = readText(join(project, "data/state", MIGRATION_FILE));
-  if (text !== null) {
-    let journal: { id?: string; backup?: unknown; deployment?: unknown };
-    try { journal = JSON.parse(stripBom(text)); }
-    catch { throw new Error(`迁移日志 data/state/${MIGRATION_FILE} 无法解析，无法判断哪些快照仍在使用；请先检查该文件`); }
-    if (typeof journal.backup === "string" && !ready.has(journal.id ?? "")) paths.set(journal.backup, `当前迁移日志 data/state/${MIGRATION_FILE} 引用的迁移快照`);
-    if (!ready.has(journal.id ?? "") && typeof journal.deployment === "string" && TRANSACTION_NAME.test(journal.deployment)) {
-      for (const area of AREAS) paths.set(`backup/${area}/${journal.deployment}`, `当前迁移日志 data/state/${MIGRATION_FILE} 引用的事务`);
-    }
+  const releaseText = readText(join(project, "data/state/release-data.json"));
+  if (releaseText) {
+    const release = JSON.parse(releaseText);
+    if (release.format !== 1 || !/^deploy-[A-Za-z0-9]+$/.test(release.deployment) || !["prepared", "committed"].includes(release.phase))
+      throw new Error("发布状态格式不匹配，无法确认备份是否可清理");
+    for (const area of AREAS) paths.set(`backup/${area}/${release.deployment}`, "当前格式发布回执正在引用");
   }
   return paths;
 }

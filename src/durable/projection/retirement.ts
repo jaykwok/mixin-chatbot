@@ -22,7 +22,7 @@
 import type { Database } from "bun:sqlite";
 import type { Context } from "@earendil-works/chord";
 import type { ConversationId, Harness } from "@earendil-works/pi-durable";
-import type { StatsRecord } from "../../agent/session-reader.ts";
+import type { StatsRecord } from "../../agent/stats-record.ts";
 import { finalizeConversationProjection, ingestConversationRecords, settleConversationUsage, type ConversationSource } from "../../agent/stats-ledger.ts";
 import { AttemptsDoc, type AttemptStart } from "../attempts.ts";
 import { AuxiliaryDoc, type AuxiliaryRequest } from "../auxiliary-records.ts";

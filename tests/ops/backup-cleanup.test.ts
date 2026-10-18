@@ -48,7 +48,7 @@ async function backupProject(root: string) {
     session: `1758000000000-${randomUUID()}-session.jsonl`, shell: "1758000000-12345-678-models.json",
     windows: `${randomUUID().replace(/-/g, "")}-relay.json`, transaction: "deploy-Ab12Cd34", unknown: "random-notes",
   };
-  const migration = `migration-${randomUUID()}`;
+  const migration = `deploy-${randomUUID().replaceAll("-", "")}`;
   await put(root, `${rm(names.self)}/state.txt`, `fixture root ${base(names.self)}/data`);
   await put(root, `${rm(names.testRoot)}/config.json`, JSON.stringify({ root: "D:\\Projects\\mixin-chatbot\\tmp\\tests-Ab12Cd\\fixtures\\other" }));
   await put(root, `${rm(names.filler)}/outside/secret.bin`, Buffer.alloc(1024 * 1024));
@@ -73,7 +73,7 @@ async function backupProject(root: string) {
   await put(root, "backup/snapshots/deploy-Zz99Yy88/transaction", "format=1\n");
   await put(root, `backup/snapshots/${migration}/manifest.json`, "{}");
   await put(root, "backup/reports/usage.html", "<html></html>");
-  await put(root, "data/state/migration.json", JSON.stringify({ backup: `backup/snapshots/${migration}`, deployment: "deploy-Qq11Ww22" }));
+  await put(root, "data/state/release-data.json", JSON.stringify({ format: 1, groups: root, phase: "committed", deployment: migration }));
   return { names, migration };
 }
 
@@ -107,7 +107,7 @@ test("backup scan classifies archives by name and content evidence without chang
     for (const name of [names.session, names.shell, names.windows, names.transaction]) expect(category(name), name).toBe("business");
     expect(entry("backup/snapshots/deploy-Zz99Yy88").category).toBe("business");
     expect(entry(`backup/snapshots/${migration}`).category).toBe("business");
-    expect(entry(`backup/snapshots/${migration}`).basis.join(" ")).toContain("迁移日志");
+    expect(entry(`backup/snapshots/${migration}`).basis.join(" ")).toContain("当前格式发布回执");
     // Only confirmed test data is suggested for deletion; reports and the manifest itself are never scanned.
     expect(scanned.entries.filter(item => item.action === "delete").every(item => item.category === "confirmed-test")).toBe(true);
     expect(scanned.entries.some(item => !/^backup\/(rm|snapshots)\//.test(item.path))).toBe(false);
@@ -158,7 +158,7 @@ test("backup cleanup deletes only entries the manifest selects, after rechecking
     }
     for (const name of [names.changed, names.replaced]) expect(outcome(done.results, rm(name)).outcome, name).toBe("changed");
     expect(outcome(done.results, rm(names.swapped)).outcome).toBe("refused");
-    expect(outcome(done.results, `backup/snapshots/${migration}`)).toMatchObject({ outcome: "refused", reason: expect.stringContaining("迁移日志") });
+    expect(outcome(done.results, `backup/snapshots/${migration}`)).toMatchObject({ outcome: "refused", reason: expect.stringContaining("当前格式发布回执") });
     for (const name of [names.suspected, names.unknown]) expect(outcome(done.results, rm(name)).reason, name).toContain("从不删除");
     // Everything not deleted is still there, links included, and nothing behind a link was entered.
     for (const name of Object.values(names)) if (!deleted.includes(rm(name))) expect((await lstat(join(root, rm(name)))).isSymbolicLink() || existsSync(join(root, rm(name))), name).toBe(true);

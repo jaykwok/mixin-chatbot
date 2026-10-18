@@ -1,11 +1,12 @@
+import { writeTestData as writeFile } from "../helpers/stats-fixture.ts";
 import { expect, spyOn, test } from "bun:test";
-import { lstat, mkdir, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, symlink } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { loadDiskUsage, loadGit, loadUpgrade, loadHealth, loadHistory, loadRecentStats, loadStatsOverview, loadTmp, probeService, type Health } from "../../scripts/ops/tui/data.ts";
 import type { Deployment } from "../../scripts/ops/tui/platform.ts";
 import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import { parseDate } from "../../scripts/ops/stats-admin.ts";
-import { statsLedgerPath, sweepSessionStats } from "../../src/agent/stats-ledger.ts";
+import { statsLedgerPath } from "../../src/agent/stats-ledger.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test("体检把取消信号和界面提示上下文传给子进程，并保留失败项", async () => {
@@ -135,7 +136,6 @@ test("并发磁盘扫描不重复计算重叠根目录，也不跟随目录链�
 test("并发扫描多个群和成员时统计、会话字节及深层临时文件总量一致", async () => {
   const fixture = await tempFixture("tui-parallel-scan-");
   const now = new Date(2026, 8, 12, 23).getTime();
-  let historyBytes = 0;
   try {
     for (let member = 0; member < 12; member++) {
       const dir = join(fixture.root, `g${Math.floor(member / 4)}`, "users", `u${member}`);
@@ -143,11 +143,9 @@ test("并发扫描多个群和成员时统计、会话字节及深层临时文�
       await mkdir(tmp, { recursive: true });
       const content = Array.from({ length: member + 1 }, () => JSON.stringify({ type: "message",
         timestamp: new Date(now - 3600000).toISOString(), message: { role: "user", content: [{ type: "text", text: "并发统计" }] } })).join("\n") + "\n";
-      historyBytes += Buffer.byteLength(content);
-      await writeFile(join(dir, "session.jsonl"), content);
+      await writeFile(join(dir, "stats.records"), content);
       await Promise.all(Array.from({ length: 20 }, (_, index) => writeFile(join(tmp, `${index}.txt`), "x".repeat(index + 1))));
     }
-    await sweepSessionStats(fixture.root, { force: true });
     const [stats, recent, history, tmp, disk] = await Promise.all([
       loadStatsOverview(fixture.root), loadRecentStats(fixture.root, 3, now), loadHistory(fixture.root),
       loadTmp(fixture.root), loadDiskUsage([fixture.root]),
@@ -156,15 +154,15 @@ test("并发扫描多个群和成员时统计、会话字节及深层临时文�
     expect(stats.reduce((sum, group) => sum + group.asks, 0)).toBe(78);
     expect(recent.today.asks).toBe(78);
     expect(recent.today.people).toBe(12);
-    expect(history.reduce((sum, group) => sum + group.bytes, 0)).toBe(historyBytes);
-    expect(history.flatMap(group => group.users)).toHaveLength(12);
+    expect(history.reduce((sum, group) => sum + group.bytes, 0)).toBe(0);
+    expect(history).toHaveLength(0);
     expect(tmp.reduce((sum, user) => sum + user.files, 0)).toBe(240);
     expect(tmp.reduce((sum, user) => sum + user.bytes, 0)).toBe(2520);
     // 统计账本也落在群数据根里，磁盘占用把它算进去。
     const ledger = statsLedgerPath(fixture.root);
     const ledgerBytes = await loadDiskUsage([ledger, `${ledger}-wal`, `${ledger}-shm`]);
     expect(ledgerBytes).toBeGreaterThan(0);
-    expect(disk).toBe(historyBytes + 2520 + ledgerBytes);
+    expect(disk).toBe(2520 + ledgerBytes);
   } finally { await fixture.cleanup(); }
 });
 
@@ -177,13 +175,12 @@ test("每日提问按消息当天计数，9 次和 1 次不会被平均成 5 次
       type: "message", timestamp: new Date(2026, 8, day, 12).toISOString(),
       message: { role: "user", content: [{ type: "text", text }] },
     });
-    await writeFile(join(dir, "session.jsonl"), [
+    await writeFile(join(dir, "stats.records"), [
       ...Array.from({ length: 9 }, () => message(11, "统计")),
       message(12, "资料"), message(12, "/help"),
       JSON.stringify({ type: "message", timestamp: new Date(2026, 8, 12, 12, 1).toISOString(),
         message: { role: "toolResult", toolName: "send_file", isError: false, details: { fileId: "fixture" } } }),
     ].join("\n") + "\n");
-    await sweepSessionStats(fixture.root, { force: true });
     const recent = await loadRecentStats(fixture.root, 3, new Date(2026, 8, 12, 23).getTime());
     // 成员和附件也按天留档：总览的指标块要用昨天的值算环比，只攒提问数的话算不出来。
     expect(recent.trend).toEqual([
@@ -193,12 +190,11 @@ test("每日提问按消息当天计数，9 次和 1 次不会被平均成 5 次
     ]);
     expect(recent.today).toEqual({ asks: 1, people: 1, files: 1, images: 0, groups: 1 });
     // 跨午夜才送达的附件仍计入送达当天，即使当天没有新提问。
-    await writeFile(join(dir, "session.jsonl"), [message(11, "昨日的任务"), JSON.stringify({
+    await writeFile(join(dir, "stats.records"), [message(11, "昨日的任务"), JSON.stringify({
       type: "message", timestamp: new Date(2026, 8, 12, 0, 1).toISOString(),
       message: { role: "toolResult", toolName: "send_file", isError: false, details: { fileId: "after-midnight" } },
     })].join("\n") + "\n");
     // 原地改写：账本整份重读并替换这一世代的行，旧的 9 次提问不会留在里面。
-    await sweepSessionStats(fixture.root, { force: true });
     const rewritten = await loadRecentStats(fixture.root, 3, new Date(2026, 8, 12, 23).getTime());
     expect(rewritten.today.files).toBe(1);
     expect(rewritten.trend.map(point => point.asks)).toEqual([0, 1, 0]);

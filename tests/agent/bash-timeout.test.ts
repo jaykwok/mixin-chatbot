@@ -23,7 +23,8 @@ describe("bash default timeout", () => {
       return;
     }
     const { BASH_DEFAULT_TIMEOUT } = await import("../../src/core/config.ts");
-    const { buildLocalTools } = await import("../../src/agent/local-tools.ts");
+    const { createMemberEnv } = await import("../../src/durable/member-env.ts");
+    const { BACKGROUND_CONTEXT } = await import("@earendil-works/chord/context");
     expect(BASH_DEFAULT_TIMEOUT).toBe(10);
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-bash-timeout-"));
     const workspace = join(root, "workspace");
@@ -31,46 +32,18 @@ describe("bash default timeout", () => {
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
 
     try {
-      const tools = await buildLocalTools({
-        workspaceDir: workspace,
-        tempDir: userTemp,
-        phone: "+8613800000000",
-        groupId: "group-a",
-        venvDir: join(root, "venv"),
-        materialsIndexPath: join(root, "index", "materials.md"),
-      });
-      const bash = tools.find((tool) => tool.name === "bash")!;
-      const context = {
-        sessionManager: {
-          getSessionId: () => "session-test",
-          getSessionFile: () => join(root, "session.jsonl"),
-        },
-        model: { provider: "provider-test", id: "model-test" },
-        thinkingLevel: "off",
-      } as never;
-
-      const start = Date.now();
-      const run = bash.execute(
-        "bash-no-timeout",
-        { command: "sleep 60", mutates: [] },
-        undefined,
-        undefined,
-        context
-      );
-      await expect(run).rejects.toThrow(
-        `Command timed out after ${BASH_DEFAULT_TIMEOUT} seconds`
-      );
-      expect(Date.now() - start).toBeLessThan(30_000);
-
-      // 模型显式声明的 timeout 仍然优先。
-      const explicit = bash.execute(
-        "bash-explicit-timeout",
-        { command: "sleep 60", timeout: 1, mutates: [] },
-        undefined,
-        undefined,
-        context
-      );
-      await expect(explicit).rejects.toThrow("Command timed out after 1 seconds");
+      const env = await createMemberEnv({ workspaceDir: workspace, tempDir: userTemp,
+        phone: "+8613800000000", groupId: "group-a", venvDir: join(root, "venv"), materialsIndexPath: join(root, "index/materials.md") });
+      for (const seconds of [undefined, 1]) {
+        const start = Date.now();
+        const result = await env.exec("sleep 60", { timeout: seconds }, BACKGROUND_CONTEXT);
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.error.code).toBe("timeout");
+          expect(result.error.message).toContain(`Command timed out after ${seconds ?? BASH_DEFAULT_TIMEOUT} seconds`);
+        }
+        expect(Date.now() - start).toBeLessThan((seconds ?? BASH_DEFAULT_TIMEOUT) * 1000 + 7000);
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }

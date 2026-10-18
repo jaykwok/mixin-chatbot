@@ -1,13 +1,11 @@
 import { describeAge } from "../lib/age.ts";
 import { redactSecrets } from "../lib/redact.ts";
 // 查看各群会话占用；停机后清空指定群：在群库里为每位成员登记 /clear（机器人下次启动时先执行），
-// 并把升级前的旧会话文件归档到 backup/rm。未交付记录独立保留；目录遍历使用实际存储段并拒绝链接。
-import { lstat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+// 未交付记录独立保留；目录遍历使用实际存储段并拒绝链接。
+import { join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
-import { archiveFile, withMaintenance } from "../../src/core/maintenance.ts";
-import { ingestBeforeArchive } from "../../src/agent/stats-ledger.ts";
+import { withMaintenance } from "../../src/core/maintenance.ts";
 import { GROUP_DATABASE } from "../../src/durable/groups.ts";
 import { queueGroupClear, queueMemberCompaction } from "../../src/durable/offline.ts";
 import { assertDataDirectory, byName, dataDirectoryNames, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
@@ -17,7 +15,7 @@ import { conversationTimings, historicalContext } from "../../src/durable/diagno
 function usage(): void {
   console.log("用法：bun run history <命令>");
   console.log("");
-  console.log("  list                 列出各群的会话历史（群库与旧会话文件的占用、最后活动）");
+  console.log("  list                 列出各群的会话历史（群库的占用、最后活动）");
   console.log("  clear <群号>         清空该群全部成员的会话历史");
   console.log("  clear --all          清空所有群全部成员的会话历史；某个群失败时其余群照常清空");
   console.log("  compact <群号> <成员号码>  登记手动压缩，启动后执行并产生模型用量");
@@ -26,7 +24,7 @@ function usage(): void {
   console.log("  --group-id / --storage-segment  明确使用原始群号或存储目录段，两者互斥");
   console.log("");
   console.log("  停机后执行：在群库里为每位成员登记清空，机器人下次启动时先执行（排队中的消息一并取消，");
-  console.log("  与成员自己发 /clear 相同；旧上下文留在群库里，不释放空间）；升级前的旧会话文件移入 backup/rm。");
+  console.log("  与成员自己发 /clear 相同；旧上下文留在群库里，不释放空间）。");
   console.log("  未交付消息另行保留。清空后每位成员的下一条消息都会开启全新会话。");
 }
 
@@ -45,7 +43,7 @@ async function resolveGroupDir(groupId: string, root: string, kind: GroupSelecti
 }
 
 /**
- * 清空本群历史：群库登记清空，旧会话文件归档。CLI 调用方须先持有维护租约（机器人已停止）。
+ * 清空本群历史：群库登记清空，登记新上下文。CLI 调用方须先持有维护租约（机器人已停止）。
  * notes 为 false 时不打印每群都相同的说明，由清空全部群时统一打印一次。
  */
 export async function clearGroup(
@@ -73,7 +71,7 @@ export async function clearGroup(
     return 0;
   }
 
-  // 群库先登记：登记失败（例如群库属于别的群）就整个不动，旧会话文件也不归档。
+  // 群库先登记：登记失败（例如群库属于别的群）就整个不动。
   if (target.database) {
     try {
       const queued = await queueGroupClear(join(dir, GROUP_DATABASE));
@@ -87,37 +85,7 @@ export async function clearGroup(
       return 1;
     }
   }
-  let failed = 0;
-  if (target.users.length) {
-    const legacy = target.users.reduce((total, user) => total + user.bytes, 0);
-    console.log(`群 ${target.group}：即将归档 ${target.users.length} 位成员升级前的旧会话文件（${formatSize(legacy)}）。`);
-  }
-  let removed = 0;
-  let freed = 0;
-  for (const user of target.users) {
-    try {
-      await assertDataDirectory(dirname(user.path), root);
-      const info = await lstat(user.path);
-      if (!info.isFile() || info.isSymbolicLink()) throw new Error("历史文件已改变或是链接");
-      // 先落账再归档：统计只认账本，这一步漏了这段历史就再也补不回来。
-      await ingestBeforeArchive(root, target.group, user.user);
-      await archiveFile(user.path);
-      removed++;
-      freed += user.bytes;
-      console.log(`已归档 ${user.user} 的旧会话文件（${formatSize(user.bytes)}，最后活动于 ${describeAge(user.modified)}）`);
-    } catch (error) {
-      failed++;
-      console.error(`清空失败 ${user.path}：${String(error)}`);
-    }
-  }
-
-  console.log("");
-  if (target.users.length) console.log(`已归档 ${removed} 位成员的旧会话文件，${formatSize(freed)} 移入 backup/rm。`);
   if (notes) console.log(RESULT_NOTE);
-  if (failed > 0) {
-    console.log(`${failed} 项清空失败，常见原因是机器人仍在占用这些文件——停下来再试一次。`);
-    return 1;
-  }
   return 0;
 }
 
@@ -177,13 +145,7 @@ async function list(root: string = GROUP_DATA_ROOT): Promise<number> {
   for (const group of groups) {
     console.log(`群 ${group.group}：${formatSize(group.bytes)}，最后活动于 ${describeAge(lastActivity(group))}`);
     if (group.database) console.log(`  群库 ${GROUP_DATABASE}  ${formatSize(group.database.bytes)}（${describeAge(group.database.modified)}）`);
-    if (group.users.length) console.log(`  升级前的旧会话文件：${group.users.length} 位成员`);
-    for (const user of group.users.slice(0, 5)) {
-      console.log(`  ${user.user}  ${formatSize(user.bytes)}（${describeAge(user.modified)}）`);
-    }
-    if (group.users.length > 5) {
-      console.log(`  …… 另有 ${group.users.length - 5} 位成员`);
-    }
+
   }
   console.log("");
   console.log("清空某个群：bun run history clear <群号>；清空所有群：bun run history clear --all");

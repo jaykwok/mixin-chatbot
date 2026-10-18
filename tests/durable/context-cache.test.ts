@@ -73,9 +73,8 @@ test("official cache scans only additions, preserves system-first requests and i
     g.faux.setResponses([fauxAssistantMessage("summary")]);
     const compact = await conversation.compact(undefined, context); await g.harness.waitForTask(compact, context);
     const compacted = await g.ask(conversation);
-    // Pi only moves a system message preceded exclusively by users. A retained assistant after compaction keeps
-    // the positional baseline later; verify cache coherence against the official independent view in this case.
-    expect(compacted.messages.some(message => message.role === "system")).toBe(true);
+    // Pi 1.3 restores the baseline before retained assistant history.
+    expect(compacted.messages[0]!.role).toBe("system");
     expect(compacted.messages).toEqual((await conversation.context(context)).messages.slice(0, -1));
     expect(compacted.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes("<summary>"))).toBe(true);
     await conversation.reset("handoff", context);

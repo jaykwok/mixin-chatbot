@@ -315,7 +315,7 @@ test("端点列不出清单时退回手填 id；Pi 不认识的模型要自己�
   }
 }, 30000);
 
-test("重新配置保留手工写的官方字段，只替换向导问过的部分", async () => {
+test("重新配置内置服务商清除过时 overrides，使用当前官方元数据", async () => {
   const files = await tempFixture("pi-configure-preserve-");
   try {
     await mkdir(join(files.root, "data", "config"), { recursive: true });
@@ -335,17 +335,7 @@ test("重新配置保留手工写的官方字段，只替换向导问过的部�
     });
     expect({ code: result.code, stderr: result.stderr }).toEqual({ code: 0, stderr: "" });
 
-    expect(JSON.parse(await readFile(join(files.root, MODELS_JSON), "utf8"))).toEqual({
-      providers: {
-        "zai-coding-cn": {
-          headers: { "X-Tenant": "acme" },
-          compat: { supportsMaxOutputTokens: false },
-          authHeader: true,
-          modelOverrides: { "glm-5.3-flash": { contextWindow: 4096 } },
-          apiKey: "test-only-key",
-        },
-      },
-    });
+    expect(JSON.parse(await readFile(join(files.root, MODELS_JSON), "utf8"))).toEqual({ providers: { "zai-coding-cn": { apiKey: "test-only-key" } } });
   } finally {
     await files.cleanup();
   }

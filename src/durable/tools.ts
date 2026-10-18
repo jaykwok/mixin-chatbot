@@ -1,43 +1,13 @@
-// The four official tools (read, bash, edit, write) adapted to the Durable engine.
-//
-// One registry serves a group and its tools serve every member. Each call reads the calling conversation's identity
-// (`mixin.identity`, src/durable/identity.ts), computes the member's places on the server, and runs the tools
-// built for that member (src/agent/local-tools.ts: the official factories behind the workspace/tmp path
-// guard, the caller environment for bash, full output moved into the member's tmp). Model arguments never choose the
-// member, the group or a root, and one member's call never sees another member's tmp as writable.
-//
-// Adapter rules: bash's full-output file is private (0600); read gives scripts text or an image block.
-// - The tools get only `{ cwd, model }`: the four official tools read nothing else once bash's session environment is
-//   off (it reads the upstream session manager). Pi's session variables (PI_SESSION_ID, PI_MODEL, ...) are therefore
-//   not exported to bash; nothing in the project reads them.
-// - Bash's raw output is also appended to `api.output`, keeping its tail, so an aborted or interrupted result carries
-//   the output committed so far.
-// - A throw other than an abort becomes an error result and the tool task completes, as in coding-agent. An abort is
-//   rethrown: Durable writes the aborted result from what was committed before the abort mark, after which the call
-//   can commit nothing. The full-output file still moves into the member's tmp, but that result does not name it.
-// - Running updates are not forwarded as `api.details`: they would carry the full-output path before it is moved into
-//   the member's tmp, and Durable would keep the last of them as the details of a result without its own.
-// - `structuredContent` (bash's exit code and full output, read's text or image block) is the result's
-//   `structuredOutput`, declared by the tool's `outputSchema`: scripts get it (src/durable/codemode/index.ts).
-// - Replay: read is safe (read-only), the rest unsafe. Output limits 64 KB / 2200 lines lie above the official
-//   truncation (50 KB / 2000 lines plus its notice), so the Harness does not truncate again.
-// - Registrations carry the pi-ai Tool fields (name, description, parameters, constrainedSampling) plus callers (from
-//   the exposure), executionMode and prepareArguments. The project's prompt replaces the default tool snippets and
-//   guidelines (src/durable/prompt.ts).
-//
-// A model's call and a script's nested call (Durable `executeTool()`) run the same registration: the Harness resolves,
-// repairs and validates the arguments and runs the tool hooks (the request door) for both, then `MemberTool.run`
-// checks the identity, computes the member's places and runs the official tool.
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { copyJson, type Context, type JsonValue } from "@earendil-works/chord";
 import {
-  type AgentToolResult, createBashToolDefinition, createEditToolDefinition, createReadToolDefinition,
-  createWriteToolDefinition, type ExtensionToolContext, type ToolDefinition,
+  type AgentToolResult, type ExtensionToolContext, type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { defineExtension, type Extension, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration } from "@earendil-works/pi-durable";
 import { buildDocumentEnvironmentTool, buildDocumentTool } from "../agent/document-extract.ts";
-import { bashInputParameters, bashToolNote, buildLocalTools } from "../agent/local-tools.ts";
+import { nativeBaseTools } from "./base-tools.ts";
+import { createMemberEnv } from "./member-env.ts";
 import { groupIndexDir, groupVenvDir, groupWorkspaceDir, materialsIndexPath, userTempDir } from "../agent/paths.ts";
 import { IdentityDoc } from "./identity.ts";
 
@@ -92,7 +62,7 @@ export interface MemberCall {
 }
 
 /** A tool as the catalogue shows it (official definition fields), runnable for the calling member. */
-export interface MemberTool extends Policy {
+export interface AdaptedMemberTool extends Policy {
   readonly definition: ToolDefinition;
   /**
    * Check the caller's identity and run the official tool for that member, returning its whole result (including
@@ -101,15 +71,12 @@ export interface MemberTool extends Policy {
   run(args: unknown, call: MemberCall): Promise<AgentToolResult<unknown>>;
 }
 
-/**
- * What the catalogue shows, from the official factories: names, descriptions and schemas depend on neither the member
- * nor the cwd. The member's tools are built per call; tests check that they show the same.
- */
-export function catalogueDefinitions(cwd: string): ToolDefinition[] {
-  const bash = createBashToolDefinition(cwd, { exposeSessionEnvironment: false });
-  return [createReadToolDefinition(cwd), { ...bash, parameters: bashInputParameters(bash), description: bash.description + bashToolNote() },
-    createEditToolDefinition(cwd), createWriteToolDefinition(cwd)] as ToolDefinition[];
-}
+export type MemberTool = AdaptedMemberTool | {
+  readonly definition: Pick<ToolDefinition, "name" | "description" | "parameters" | "namespace" | "exposure">;
+  readonly native: ToolRegistration;
+  readonly replay: "safe" | "unsafe";
+  readonly outputLimits: NonNullable<ToolRegistration["outputLimits"]>;
+};
 
 function json(value: unknown): JsonValue | undefined {
   return value === undefined ? undefined : copyJson(value as JsonValue, { omitUndefinedProperties: true }) as JsonValue;
@@ -140,7 +107,7 @@ export type MemberToolBuilder = (member: Member, call: MemberCall) => ToolDefini
  * member's tools).
  */
 export function memberTool(definition: ToolDefinition, options: Pick<BaseToolsOptions, "root" | "groupId" | "venvDir">,
-  build: MemberToolBuilder): MemberTool {
+  build: MemberToolBuilder): AdaptedMemberTool {
   const policy = POLICY[definition.name] ?? OTHER_POLICY;
   return {
     definition,
@@ -156,15 +123,6 @@ export function memberTool(definition: ToolDefinition, options: Pick<BaseToolsOp
       return tool.execute(call.callId, args as never, call.signal, undefined, ctx);
     },
   };
-}
-
-function localTool(definition: ToolDefinition, options: BaseToolsOptions): MemberTool {
-  if (POLICY[definition.name] === undefined) throw new Error(`no policy for tool ${definition.name}`);
-  return memberTool(definition, options, ({ phone, places }, call) => buildLocalTools({
-    workspaceDir: places.workspaceDir, tempDir: places.tempDir, phone, groupId: options.groupId,
-    venvDir: places.venvDir, materialsIndexPath: places.indexPath, resourceReadDirs: [...options.resourceReadDirs ?? []],
-    ...(call.onBashOutput === undefined ? {} : { onBashOutput: call.onBashOutput }),
-  }));
 }
 
 /** Places that only fill a definition's builder; nothing runs there. */
@@ -223,9 +181,10 @@ async function sequentialTurn(key: string, signal: AbortSignal | undefined): Pro
 /**
  * The Durable registration of a member tool: what the model and scripts call. A tool's `outputSchema` is its
  * `structuredOutputSchema` and its `structuredContent` the `structuredOutput` scripts get (bash's exit code and output,
- * read's text or image block, an MCP tool's declared value); a schema-less tool's scripts get its output.
+ * an MCP tool's declared value); a schema-less tool's scripts get its output.
  */
 export function memberRegistration(tool: MemberTool): ToolRegistration {
+  if ("native" in tool) return tool.native;
   const { definition } = tool;
   const schema = definition.outputSchema;
   const sequential = definition.executionMode === "sequential";
@@ -270,7 +229,16 @@ export function memberRegistration(tool: MemberTool): ToolRegistration {
 
 /** The four tools for the group's members, in catalogue order. */
 export function baseMemberTools(options: BaseToolsOptions): MemberTool[] {
-  return catalogueDefinitions(resolve(groupWorkspaceDir(options.root, options.groupId))).map((definition) => localTool(definition, options));
+  return nativeBaseTools().map(official => {
+    const policy = POLICY[official.name]!;
+    const native: ToolRegistration = { ...official, ...policy, async execute(args, api, context) {
+      const { phone, places } = await resolveMember(options, { api, context });
+      const env = await createMemberEnv({ ...places, materialsIndexPath: places.indexPath, phone, groupId: options.groupId,
+        resourceReadDirs: options.resourceReadDirs, inputPaths: (args as { input_paths?: string[] }).input_paths });
+      return official.execute(args, { ...api, env }, context);
+    } };
+    return { definition: official, native, ...policy };
+  });
 }
 
 /** The registrations, in catalogue order. */

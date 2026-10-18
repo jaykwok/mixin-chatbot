@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 // Identity documents of the Durable store: the group is decided by which database, the member by the
 // directory; tools and prompt sections read the identity document, never model arguments or a changeable cwd.
 import type { Context } from "@earendil-works/chord";
@@ -5,13 +6,15 @@ import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { AgentDoc, configure, defineDoc, defineDocFamily, type Conversation, type ConversationId, type DocumentReader, type Harness, type ModelRef } from "@earendil-works/pi-durable";
 
 /** Which group a database belongs to: written once on first open, checked on every later open. */
-export type GroupState = { groupId: string; version: 1 };
+export type GroupState = { groupId: string; generation: string; version: 1 };
 export const GroupDoc = defineDoc<GroupState>({
   kind: "mixin.group",
   version: 1,
   scope: "session",
-  initial: () => ({ groupId: "", version: 1 }),
+  initial: () => ({ groupId: "", generation: randomUUID(), version: 1 }),
 });
+const generationValid = (value: unknown): value is string => typeof value === "string"
+  && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 
 /** One member (the server-confirmed phone) maps to exactly one ownerless conversation. */
 export type MemberRecord = { conversationId: number; createdAt: number };
@@ -40,6 +43,7 @@ export async function claimGroup(harness: Harness, groupId: string, context: Con
   if (!groupId) throw new Error("群标识为空");
   const recorded = await harness.commit(async (tx) => {
     const group = await tx.doc(GroupDoc);
+    if (!generationValid(group.generation)) throw new Error("群数据库格式不匹配，请使用当前格式新群库");
     if (group.groupId === "") group.groupId = groupId;
     return group.groupId;
   }, context);
@@ -51,7 +55,9 @@ export async function claimGroup(harness: Harness, groupId: string, context: Con
  * before a Harness opens the database, since opening a Harness recovers interrupted tasks (src/durable/groups.ts).
  */
 export async function databaseGroup(reader: DocumentReader, context: Context): Promise<string | undefined> {
-  return (await reader.snapshot(GroupDoc, context))?.groupId || undefined;
+  const group = await reader.snapshot(GroupDoc, context);
+  if (group?.groupId && !generationValid(group.generation)) throw new Error("群数据库格式不匹配，拒绝恢复运行任务");
+  return group?.groupId || undefined;
 }
 
 export interface AgentSetup { model: ModelRef; thinkingLevel?: ModelThinkingLevel }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { buildLocalTools } from "../../src/agent/local-tools.ts";
+import { buildLocalTools } from "../helpers/native-tools.ts";
 import { ResultFiles, removeResultDirectories } from "../../src/durable/results/files.ts";
 import { configuredRootlessTasks } from "../../src/core/task-backend.ts";
 import { referencedResults, resultReferences } from "../../src/durable/results/references.ts";

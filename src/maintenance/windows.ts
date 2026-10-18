@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { join } from "node:path";
-import { publishJson } from "../../scripts/migrations/lib/io.ts";
+import { publishJson } from "../../scripts/lib/atomic-file.ts";
 import { decodeWindowsJournal, type TreeEvidence, type WindowsJournal } from "../contracts/maintenance.ts";
 import { removeWindowsTree, sameIdentity } from "../core/held-directory.ts";
 import { reclamationEvidence } from "../core/reclamation-files.ts";

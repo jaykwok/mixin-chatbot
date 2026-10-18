@@ -2,7 +2,7 @@
 // 只读；继续和回滚都交给 ops 脚本，脚本会再次校验记录。
 
 import { join, posix, resolve, win32 } from "node:path";
-import { MIGRATION_FILE, VERSION_FILE, type MigrationState } from "../../../src/core/data-version.ts";
+import { RELEASE_FILE, type ReleaseState } from "../../../src/core/data-version.ts";
 import { PROJECT_DIR, type Platform } from "./platform.ts";
 import { readTransaction, type TransactionReadSet } from "../../lib/confirmed-transaction.ts";
 
@@ -15,7 +15,7 @@ export interface PendingTransaction {
   operation: "deploy" | "upgrade";
   /** Linux 升级在调用部署脚本前中断时还没有快照。 */
   snapshot: string | null;
-  /** 旧版事务没有记录：Windows 按已保存设置合成；Linux 已有快照时继续前在终端逐项确认并补录一次。 */
+  /** Preparing a Linux upgrade before its deployment snapshot has no record yet. */
   record: TransactionRecord | null;
   targetSha: string | null;
   /** 数据已经提交时只能继续完成新实例启动。 */
@@ -73,12 +73,8 @@ export function parseTransactionRecord(text: string): TransactionRecord {
 
 function snapshotCommitted(read: TransactionReadSet, snapshot: string | null): boolean {
   if (!snapshot) return false;
-  const journal = JSON.parse(read.text("data/state/" + MIGRATION_FILE) ?? "null") as (MigrationState & { deployment?: string }) | null;
-  if (!journal || journal.deployment !== snapshot) return false;
-  if (journal.phase === "committed") return true;
-  if (journal.kind === "verification") return false;
-  const local = JSON.parse(read.text("data/state/" + VERSION_FILE) ?? "null") as { dataVersion: number; transaction: string } | null;
-  return local?.dataVersion === journal.target && local?.transaction === journal.id;
+  const release = JSON.parse(read.text("data/state/" + RELEASE_FILE) ?? "null") as ReleaseState | null;
+  return release?.format === 1 && release.deployment === snapshot && release.phase === "committed";
 }
 
 /** 读取未完成的事务；没有时返回 null，指针或记录无效时抛出。 */
@@ -98,33 +94,25 @@ export function loadPendingTransaction(project = PROJECT_DIR): PendingTransactio
   const deploySnapshot = readSnapshotName(join(state, "deploy-transaction"));
   // Windows 升级有独立指针；Linux 升级是停机记录加部署事务。
   const windowsUpgrade = readSnapshotName(join(state, "upgrade-transaction"));
-  const linuxUpgrade = readText(join(state, "update-transaction"));
   const snapshot = windowsUpgrade ?? deploySnapshot;
-  if (!snapshot && linuxUpgrade === null) return null;
+  if (!snapshot) return null;
   const directory = snapshot ? join(project, "backup/snapshots", snapshot) : null;
   const text = directory ? readText(join(directory, "transaction")) : null;
   const record = text === null ? null : parseTransactionRecord(text);
   if (record && record.snapshot !== snapshot) throw new Error("事务记录与快照不一致");
   let targetSha = record?.target_sha || null;
-  if (!record && linuxUpgrade !== null) targetSha = linuxUpgrade.split("\n")[3]?.trim() || null;
-  else if (!record && directory) {
-    targetSha = readText(join(directory, "target-sha"))?.trim()
-      // 旧版 Windows 升级只在 Clixml 快照里保存目标提交。
-      || /<S N="UpgradeTarget">([0-9a-f]{40})<\/S>/.exec(readText(join(directory, "deployment.xml")) ?? "")?.[1] || null;
-  }
+  if (directory && record === null) throw new Error("事务格式不匹配，请用对应版本完成原操作");
   if (targetSha && !SHA.test(targetSha)) throw new Error("事务目标提交无效");
-  const operation = windowsUpgrade || linuxUpgrade !== null || record?.operation === "upgrade" ? "upgrade" : "deploy";
-  // Linux 升级的部署事务结束后只剩提交回执：已提交就只能继续收尾。
-  const receipt = linuxUpgrade !== null && !deploySnapshot && readText(join(state, "update-commit"))?.trim() === "committed";
+  const operation = windowsUpgrade || record?.operation === "upgrade" ? "upgrade" : "deploy";
   const codeRestorePending = !!deploySnapshot && readText(join(project, "backup/snapshots", deploySnapshot, "code-restore")) !== null;
-  return { confirmation, operation, snapshot, record, targetSha, committed: receipt || snapshotCommitted(confirmation, snapshot), codeRestorePending };
+  return { confirmation, operation, snapshot, record, targetSha, committed: snapshotCommitted(confirmation, snapshot), codeRestorePending };
 }
 
 const shortSha = (sha: string | null) => sha ? sha.slice(0, 7) : "（非 git 部署）";
 
 /** 维护页确认框和恢复菜单共用的摘要：标题一行，记录内容逐行。 */
 export function describePendingTransaction(pending: PendingTransaction,
-  platform: Platform = process.platform === "win32" ? "windows" : "linux"): { subject: string; record: string[] } {
+  _platform: Platform = process.platform === "win32" ? "windows" : "linux"): { subject: string; record: string[] } {
   const kind = pending.operation === "upgrade" ? "升级" : "部署";
   const record = pending.record;
   return {
@@ -133,6 +121,6 @@ export function describePendingTransaction(pending: PendingTransaction,
       `群数据总根：${record.target_group_root}${record.original_group_root !== record.target_group_root ? `（原 ${record.original_group_root}）` : ""}`,
       `端口 ${record.bot_port} · 入口 ${record.deploy_mode === "cloudflare" ? "Cloudflare" : `直连（来源 ${record.platform_ip}）`}${record.bot_domain ? ` · ${record.bot_domain}` : ""}`,
       `原运行状态：${record.was_running === "1" ? "运行" : "停止"}`,
-    ] : [platform === "linux" && pending.snapshot && !pending.codeRestorePending ? "旧版事务没有记录：继续前需在终端逐项确认并补录一次，回滚不需要" : "旧版事务：继续时按已保存设置处理"],
+    ] : ["升级正在准备当前发布记录"],
   };
 }

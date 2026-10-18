@@ -41,7 +41,7 @@ test("tier pricing uses the whole request's input plus cache and never rewrites 
   expect(official.every(model => model.cost.tiers?.every(tier => tier.inputTokensAbove > 0) ?? true)).toBe(true);
 });
 
-test.each(["server_busy", "servers are currently busy", "the engine is currently overloaded", "503 service unavailable"])("native retry %s has a fresh start and SDK retries zero", async error => {
+test.each(["server_busy", "servers are currently busy", "the engine is currently overloaded", "503 service unavailable", "exceeded request buffer limit while retrying upstream", "unable to forward upstream"])("native retry %s has a fresh start and SDK retries zero", async error => {
   const { faux, models, model } = fauxModels();
   expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage: error }))).toBe(true);
   const options: number[] = [];

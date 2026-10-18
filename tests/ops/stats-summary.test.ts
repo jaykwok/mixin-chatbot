@@ -1,8 +1,8 @@
+import { writeTestData as writeFile } from "../helpers/stats-fixture.ts";
 import { expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tempFixture } from "../helpers/temp.ts";
-import { sweepSessionStats } from "../../src/agent/stats-ledger.ts";
 import { collectAll, collectComparisons, parseDate } from "../../scripts/ops/stats-admin.ts";
 import { change, comparisons, comparisonWindows, describeStatsWindow, engagement, periodWindow, summarize, trend } from "../../scripts/ops/stats-summary.ts";
 import { writeReport } from "../../scripts/ops/tui/report.ts";
@@ -54,7 +54,7 @@ test("每日补零、周月去重、跨群排行、空本期比较与报表脱�
   try {
     const put = async (group: string, user: string, entries: [string, number, string?][]) => {
       const dir = join(f.root, group, "users", user); await mkdir(dir, { recursive: true });
-      await writeFile(join(dir, "session.jsonl"), entries.flatMap(([date, count, role = "user"]) => Array.from({ length: count }, () => JSON.stringify({
+      await writeFile(join(dir, "stats.records"), entries.flatMap(([date, count, role = "user"]) => Array.from({ length: count }, () => JSON.stringify({
         type: "message", timestamp: new Date(at(date) + 12 * 3600000).toISOString(),
         message: { role, content: [{ type: "text", text: "fixture question" }] },
       }))).join("\n") + "\n");
@@ -64,7 +64,6 @@ test("每日补零、周月去重、跨群排行、空本期比较与报表脱�
     await put("b", "13912345678", [["2026-10-03", 2]]);
     await put("a", "13712345678", [["2026-10-02", 1, "assistant"]]);
     await put("prior-only", "13612345678", [["2026-09-29", 2]]);
-    await sweepSessionStats(f.root, { force: true });
     const window = range("2026-10-01", "2026-10-03"), groups = await collectAll(f.root, window);
     const summary = summarize(groups);
     expect(summary.asks).toBe(7); expect(summary.people).toBe(2); expect(summary.average).toBe(3.5);

@@ -7,7 +7,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { AttemptsDoc, type AttemptStart, type UsageRecord } from "../../src/durable/attempts.ts";
 import { AuxiliaryDoc, type AuxiliaryRequest } from "../../src/durable/auxiliary-records.ts";
-import { memberConversation } from "../../src/durable/identity.ts";
+import { GroupDoc, memberConversation } from "../../src/durable/identity.ts";
 import { conversationSource, projectConversation } from "../../src/durable/projection.ts";
 import { recoverProjectionRetirement, retireProjectedRequests, selectRetirement, type ProjectionSnapshot } from "../../src/durable/projection/retirement.ts";
 import { fingerprint, pendingUsage } from "../../src/durable/projection/usage.ts";
@@ -37,11 +37,12 @@ for (const crash of ["before-group-commit", "after-group-commit", "none"]) test(
           startedAt: original.startedAt, endedAt: original.startedAt + 1, outcome: "stop", usage: bill };
       }
     }, context);
+    const generation = (await opened.harness.snapshot(GroupDoc, context))!.generation;
     let injected = false;
     const interrupted = new Proxy(opened.harness, { get(target, name) {
       if (name !== "commit") { const value = Reflect.get(target, name); return typeof value === "function" ? value.bind(target) : value; }
       return async (change: Parameters<Harness["commit"]>[0], ctx: typeof context) => {
-        const pending = () => (ledger.query("SELECT digest FROM sources WHERE id = ?").get(conversationSource("group-a", "member", conversation.id).id) as { digest: string } | null)?.digest.includes('"retiring"');
+        const pending = () => (ledger.query("SELECT digest FROM sources WHERE id = ?").get(conversationSource("group-a", "member", conversation.id, generation).id) as { digest: string } | null)?.digest.includes('"retiring"');
         const value = await target.commit(async tx => {
           const result = await change(tx);
           if (!injected && crash === "before-group-commit" && pending()) { injected = true; throw new Error("synthetic group commit failure"); }
@@ -73,12 +74,11 @@ for (const crash of ["before-group-commit", "after-group-commit", "none"]) test(
     expect(await count()).toBe(0); expect(totals()).toEqual(accounted);
     // Settled usage is current accounting: the report must not count it as an unverifiable pre-upgrade source.
     expect([...readLedger(ledger).legacy]).toEqual([]);
-    const checkpoint = JSON.parse((ledger.query("SELECT digest FROM sources WHERE id = ?").get(conversationSource("group-a", "member", conversation.id).id) as { digest: string }).digest);
+    const checkpoint = JSON.parse((ledger.query("SELECT digest FROM sources WHERE id = ?").get(conversationSource("group-a", "member", conversation.id, (await opened.harness.snapshot(GroupDoc, context))!.generation).id) as { digest: string }).digest);
     expect(checkpoint).toEqual({ version: 1, links: {}, orphans: {} });
     await Promise.all([projectConversation(ledger, opened.harness, member, context), projectConversation(ledger, opened.harness, member, context)]);
     expect(totals()).toEqual(accounted);
-    // A future entry projection rebuild must preserve usage whose starts have already retired.
-    ledger.query("UPDATE sources SET projection = 3 WHERE id = ?").run(conversationSource("group-a", "member", conversation.id).id);
+    // New starts preserve already retired usage across another incremental projection.
     await opened.harness.commit(async tx => {
       (await tx.doc(AttemptsDoc, conversation.id)).starts["next"] = { ...original, kind: "compaction", k: 900, usage: bill };
     }, context);
@@ -151,7 +151,7 @@ test("a stale checkpoint retires nothing; a start changed after staging stops re
     faux.setResponses([fauxAssistantMessage("complete")]);
     await (await conversation.submit({ type: "input", content: "question", requestId: "stale" }, context)).wait(context);
     const original = Object.values((await opened.harness.snapshot(AttemptsDoc, conversation.id, context))!.starts)[0]!;
-    const member = { groupId: "group-a", phone: "member", conversationId: conversation.id }, source = conversationSource("group-a", "member", conversation.id);
+    const member = { groupId: "group-a", phone: "member", conversationId: conversation.id }, source = conversationSource("group-a", "member", conversation.id, (await opened.harness.snapshot(GroupDoc, context))!.generation);
     await projectConversation(ledger, opened.harness, member, context); // Retires the reply's own start.
     await opened.harness.commit(async tx => {
       const attempts = await tx.doc(AttemptsDoc, conversation.id);

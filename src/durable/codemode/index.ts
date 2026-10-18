@@ -30,7 +30,7 @@
 //   only once. The outcome's display snapshot can lag a later child; its independent receipt still charges it.
 import { copyJson, type Context, type JsonValue } from "@earendil-works/chord";
 import type { Usage } from "@earendil-works/pi-ai";
-import { CodemodeSandbox, type CodemodeResult, type CodemodeRun, type CodemodeRunOptions, type CodemodeSandboxBase, MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "@earendil-works/pi-codemode";
+import { CodemodeSandbox, type CodemodeResult, type CodemodeRun, type CodemodeRunOptions, type CodemodeSandboxBase } from "@earendil-works/pi-codemode";
 import {
   defineExtension, type Extension, hook, type JsonObject, LiveDoc, type LiveState, NestedCallDoc, type NestedCallState, type NestedToolExecutionResult, ToolTask,
   type TaskDocToken, type TaskId, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration, type Tx,
@@ -44,7 +44,10 @@ import { resultRegistration } from "../results/ownership.ts";
 import { ResultFiles, resultsDirName } from "../results/files.ts";
 import { type BaseToolsOptions, type MemberTool, resolveMember } from "../tools.ts";
 import { recordNestedUsage } from "./usage.ts";
+import { isScriptResult, RUN_DOC_KIND, type RunState, type ScriptResult } from "./protocol.ts";
+import { codemodeWorkers } from "./workers.ts";
 
+import { checkStoreLimits } from "./store.ts";
 export { CodemodeStoreDoc };
 
 /** Memory a script's VM may allocate (coding-agent's limit). */
@@ -86,7 +89,8 @@ function namespacesOf(tools: readonly MemberTool[]): CodemodeNamespace[] {
 
 /** `mixin.codemode`: the official codemode tool, run for the calling member, and the `codemode` prompt section. */
 export function codemodeExtension(options: CodemodeOptions): Extension {
-  const sandbox = options.sandbox ?? new CodemodeSandbox({ memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES });
+  const sandbox = options.sandbox ?? new CodemodeSandbox({ memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
+    acquireWorker: codemodeWorkers.acquireWorker, onWorkerStarted: codemodeWorkers.onWorkerStarted });
   const official = {
     namespaces: namespacesOf(options.tools),
     inlineBudget: options.inlineBudget ?? CODEMODE_INLINE_BUDGET,
@@ -128,21 +132,6 @@ async function runCodemode(options: CodemodeOptions, build: (sandbox: CodemodeSa
   } finally {
     attempt.end();
     await files.release();
-  }
-}
-
-/** The sandbox's store limits (pi-codemode `store()`), on the whole store. Throws why the store does not fit. */
-export function checkStoreLimits(values: Readonly<Record<string, JsonValue>>): void {
-  let total = 0;
-  for (const [key, value] of Object.entries(values)) {
-    const json = JSON.stringify(value);
-    if (json.length > MAX_STORE_VALUE_CHARS) {
-      throw new RangeError(`store(${JSON.stringify(key)}) value has ${json.length} characters of JSON, more than the limit of ${MAX_STORE_VALUE_CHARS}`);
-    }
-    total += key.length + json.length;
-  }
-  if (total > MAX_STORE_TOTAL_CHARS) {
-    throw new RangeError(`store is full: with the writes of other scripts, stored values would have ${total} characters of JSON, more than the limit of ${MAX_STORE_TOTAL_CHARS}. Delete keys with store(key, undefined).`);
   }
 }
 
@@ -208,20 +197,6 @@ async function keptUsage(taskId: TaskId, live: Readonly<LiveState> | undefined,
 // - Timing: the sandbox run settles before the official tool's commits for the outcome (files, then the outcome), so
 //   commits after it are the result's. Relied on by "store limits hold for the merged store" and "results directory
 //   changed at every write"; no test changes the timing on its own.
-
-/** The outcome the official tool commits for a script: its output, and details with the call rows. */
-type ScriptResult = { output: ToolResultContent[]; isError?: boolean; details: CodemodeDetails };
-type ToolResultContent = NonNullable<ToolExecutionResult["output"]>[number];
-
-function isScriptResult(value: unknown): value is ScriptResult {
-  if (typeof value !== "object" || value === null) return false;
-  const result = value as { output?: unknown; details?: { calls?: unknown } };
-  return Array.isArray(result.output) && typeof result.details === "object" && result.details !== null && Array.isArray(result.details.calls);
-}
-
-/** The official run document (not exported), as the attempt's first commit names it. */
-type RunState = { result?: JsonObject; outputDir?: string };
-const RUN_DOC_KIND = "pi.codemode.run";
 
 /** One attempt of a codemode call: the member's environment, the wrapped API and the sandbox seen by the official tool. */
 class Attempt {

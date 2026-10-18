@@ -13,7 +13,7 @@
 import { spyOn } from "bun:test";
 import { type FileHandle, open } from "node:fs/promises";
 import { join } from "node:path";
-import * as io from "../../scripts/migrations/lib/io.ts";
+import * as io from "../../scripts/lib/atomic-file.ts";
 import { applyArchiveRemoval, previewArchiveRemoval } from "../../src/maintenance/archive.ts";
 import { LegacyReclamationPending, reclaimLegacy } from "../../src/maintenance/legacy.ts";
 import type { MemberScope } from "../../src/maintenance/scope.ts";

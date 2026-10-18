@@ -731,89 +731,6 @@ resume_recorded_upgrade() {
     DEPLOY_TRANSACTION_ACTION=rollback bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" </dev/null
 }
 
-# 旧版升级留下的停机记录（data/state/update-transaction）；新升级不再写它。新版运维脚本只会在
-# 旧版升级切换代码之后出现，此时当前代码就是那次升级的目标。部署已经开始：由部署脚本按事务继续或回滚，
-# 回滚后恢复升级前的代码；部署尚未开始：数据和配置未改动，只能回滚（恢复代码和原容器）。
-legacy_update_recovery() {
-    local action="$1" stop_state="$STATE_DIR/update-transaction" commit_file="$STATE_DIR/update-commit" saved=() current status=0
-    [ -f "$stop_state" ] && [ ! -L "$stop_state" ] || { ER '升级停机记录不是普通文件'; return 1; }
-    [ ! -L "$commit_file" ] || { ER '升级提交回执不能是链接'; return 1; }
-    require_git_checkout || return 1
-    mapfile -t saved < "$stop_state"
-    [ "${#saved[@]}" = 6 ] && [ "${saved[0]}" = 1 ] &&
-      [[ "${saved[1]}" =~ ^[0-9a-f]{40}$ && "${saved[3]}" =~ ^[0-9a-f]{40}$ && "${saved[4]}" =~ ^(-|[0-9a-f]{64})$ && "${saved[5]}" =~ ^[01]$ ]] || { ER '升级停机记录无效'; return 1; }
-    [ "${saved[2]}" = HEAD ] || git_here check-ref-format --branch "${saved[2]}" >/dev/null || { ER '升级停机记录的分支无效'; return 1; }
-    local original_sha="${saved[1]}" original_branch="${saved[2]}" target_sha="${saved[3]}" original_container="${saved[4]}" was_running="${saved[5]}"
-    current="$(git_here rev-parse HEAD 2>/dev/null)"
-    [ "$current" = "$original_sha" ] || [ "$current" = "$target_sha" ] || { ER '当前代码与中断升级不匹配'; return 1; }
-    WA "未完成的旧版升级：${original_sha:0:7} -> ${target_sha:0:7}；原运行状态：$([ "$was_running" = 1 ] && echo 运行 || echo 停止)"
-    # 回滚最后要恢复代码：工作区有升级后的人工改动时，在恢复任何内容之前停止。
-    if [ "$action" = rollback ] && [ "$current" != "$original_sha" ] && ! code_restore_safe "$original_branch" "$original_sha" "$target_sha"; then
-        ER "没有回滚：恢复升级前的代码会覆盖升级后的工作区改动（见上方），数据、配置和容器保持现状。把改动提交到其他分支、备份或撤销后重试 $(ops_command_hint rollback)"
-        return 1
-    fi
-    if [ -e "$STATE_DIR/deploy-transaction" ]; then
-        if transaction_code_restore_pending; then
-            if [ "$action" = continue ]; then
-                ER "上次升级的数据、配置和容器已经回滚，只剩代码待恢复，不能继续；请使用 $(ops_command_hint rollback) 完成回滚"
-                return 1
-            fi
-        else
-            if [ "$action" = continue ] && [ "$current" != "$target_sha" ]; then
-                ER "当前代码不是中断升级的目标提交 ${target_sha:0:7}，无法继续；请使用 $(ops_command_hint rollback) 回滚"
-                return 1
-            fi
-            DEPLOY_TRANSACTION_ACTION="$action" BOT_UPDATE_COMMIT_FILE="$commit_file" bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" </dev/null || status=$?
-            if [ -e "$STATE_DIR/deploy-transaction" ] && ! transaction_code_restore_pending; then
-                WA "部署事务尚未完成，保留当前代码和停机记录；请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
-                return 1
-            fi
-            if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then
-                rm -f -- "$stop_state" "$commit_file" || WA '升级停机记录清理失败'
-                if [ "$status" = 0 ]; then OK "中断的升级已完成：${target_sha:0:7}"; else ER '数据已经提交，保留新版本；请检查服务状态'; fi
-                return "$status"
-            fi
-        fi
-        # 部署事务已回滚：原容器和原运行状态已由部署脚本恢复，再恢复升级前的代码。
-        # 代码恢复后才清除事务指针和停机记录；失败时重试回滚只恢复代码。
-        if [ "$(git_here rev-parse HEAD 2>/dev/null)" != "$original_sha" ]; then
-            code_restore_safe "$original_branch" "$original_sha" "$target_sha" || {
-                ER "代码没有恢复：升级后的工作区改动（见上方）会被覆盖；数据、配置和原运行状态已恢复。把改动提交到其他分支、备份或撤销后运行 $(ops_command_hint rollback)，只恢复代码"
-                return 1
-            }
-            restore_checkout "$original_branch" "$original_sha" || {
-                ER "代码未能恢复到升级前的 ${original_sha:0:7}（原因见上方）；数据、配置和原运行状态已恢复。处理 git 问题后运行 $(ops_command_hint rollback)，只恢复代码"
-                return 1
-            }
-        fi
-        rm -f -- "$STATE_DIR/deploy-transaction" "$stop_state" "$commit_file" || WA '升级停机记录清理失败'
-        if [ "$status" = 0 ]; then OK "升级已回滚：代码恢复到 ${original_sha:0:7}，数据、配置和原运行状态已恢复"
-        else ER "中断的升级未能完成，已回滚到 ${original_sha:0:7}"; fi
-        return "$status"
-    fi
-    if [ "$action" = continue ]; then
-        ER "旧版升级在部署开始前中断，无法按旧流程继续；请使用 $(ops_command_hint rollback) 恢复原版本后重新升级"
-        return 1
-    fi
-    if [ "$(cat "$commit_file" 2>/dev/null)" = committed ]; then
-        ER "升级已经提交，不能回滚；保留新版本，请检查服务状态后启动"
-        return 1
-    fi
-    if [ "$current" != "$original_sha" ]; then
-        restore_checkout "$original_branch" "$original_sha" || { ER "代码自动回滚失败，请检查当前 git 状态"; return 1; }
-    fi
-    if [ "$original_container" != - ]; then
-        if [ "$(docker container inspect --format '{{.Id}}' "$CONTAINER" 2>/dev/null)" != "$original_container" ]; then
-            ER '原容器身份不匹配，保留停机记录，拒绝启动其他容器'
-            return 1
-        fi
-        if [ "$was_running" = 1 ]; then docker start "$original_container" >/dev/null || { ER '恢复原容器失败'; return 1; }; fi
-    fi
-    rm -f -- "$stop_state" "$commit_file" || WA '升级停机记录清理失败'
-    if [ "$was_running" = 1 ]; then OK "升级已回滚：代码恢复到 ${original_sha:0:7}，原容器已重新启动"
-    else OK "升级已回滚：代码恢复到 ${original_sha:0:7}，机器人服务保持停止（升级前未运行）"; fi
-}
-
 # 在主 shell 中运行（不是子 shell）：发给 ops.sh 的 TERM 才能由升级器转发处理，否则只杀掉父进程，升级在后台继续。
 # 升级是 ops.sh 的最后一个命令，退出陷阱在脚本结束时运行。
 update() {
@@ -827,7 +744,7 @@ update() {
     trap 'status=$?; remove_upgrade_stage; operation_finish "$status"' EXIT
     acquire_deploy_lock || { ER "另一个部署或升级正在进行"; return 1; }
     local action="${UPDATE_TRANSACTION_ACTION:-}"
-    # The lock remains held across dispatch and the child deployer, including legacy record backfill.
+    # The lock remains held across dispatch and the child deployer.
     if [ -n "${UPDATE_TRANSACTION_CONFIRMATION:-}" ]; then
         bun "$PROJECT_DIR/scripts/lib/confirmed-transaction.ts" "$PROJECT_DIR" "$action" "$UPDATE_TRANSACTION_CONFIRMATION" || return 1
     fi
@@ -839,9 +756,8 @@ update() {
             WA "$(describe_pending_transaction)"
         fi
         if [ -z "$action" ]; then choose_pending_action || return 1; action="$PENDING_ACTION"; fi
-        # 旧版事务在这里补录：之后的部署脚本和升级器都在关闭的标准输入下运行，只读记录。
-        if [ "$action" = continue ] && [ -e "$STATE_DIR/deploy-transaction" ]; then backfill_legacy_transaction || return 1; fi
-        if [ -e "$STATE_DIR/update-transaction" ]; then legacy_update_recovery "$action"; return; fi
+        # 仅恢复当前事务格式；后续脚本关闭标准输入，沿用已保存的决定。
+        if [ -e "$STATE_DIR/update-transaction" ]; then ER "事务格式不匹配，请用对应旧版完成原操作"; return 1; fi
         if [ "${TRANSACTION[operation]}" = upgrade ]; then resume_recorded_upgrade "$action"; return; fi
         # 中断的是部署：交给部署脚本按事务记录继续或回滚。
         DEPLOY_TRANSACTION_ACTION="$action" bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" </dev/null

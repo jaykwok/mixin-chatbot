@@ -14,7 +14,7 @@ function Get-OpsCommandHint([string]$Command) {
     if ($env:MIXIN_OPS_TUI -eq '1') {
         $paths = @{
             'deploy' = '系统 → 服务部署 → 部署 / 修改设置'
-            'update' = '系统 → 服务部署 → 升级（保留设置）'
+            'update' = '系统 → 服务部署 → 升级'
             'resume' = '系统 → 服务部署 → 继续上次操作'
             'rollback' = '系统 → 服务部署 → 回滚上次操作'
             'start' = '系统 → 服务部署 → 启动'

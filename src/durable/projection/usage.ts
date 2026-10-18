@@ -1,7 +1,7 @@
 // Usage classification of request starts for the stats ledger: pure functions over the group's start records and the
 // projection checkpoint saved in the ledger source. Nothing here reads or writes a database.
 import { createHash } from "node:crypto";
-import type { StatsRecord } from "../../agent/session-reader.ts";
+import type { StatsRecord } from "../../agent/stats-record.ts";
 import type { AttemptStart } from "../attempts.ts";
 import type { AuxiliaryRequest } from "../auxiliary-records.ts";
 

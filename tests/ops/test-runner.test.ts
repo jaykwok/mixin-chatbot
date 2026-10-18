@@ -103,7 +103,7 @@ test.skipIf(process.platform !== "win32")("Windows normalizes an aliased TEMP or
     await writeFile(file, `import { expect, test } from "bun:test";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { buildLocalTools } from ${JSON.stringify(fileURLToPath(new URL("../../src/agent/local-tools.ts", import.meta.url)))};
+import { buildLocalTools } from ${JSON.stringify(fileURLToPath(new URL("../helpers/native-tools.ts", import.meta.url)))};
 test("aliased-root-tools", async () => {
   const root = process.env.TEST_TEMP_ROOT;
   expect(root).toBe(await realpath(root));

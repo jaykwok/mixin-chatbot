@@ -32,12 +32,14 @@ $groups = if ($pendingRecord) { $pendingRecord.target_group_root } else { Get-Sa
 if ($pendingPath -and -not (Test-Path -LiteralPath $groups -PathType Container)) {
     throw "上次升级的群数据总根不存在：$groups；原服务和新服务都依赖它，请恢复后重试。"
 }
-$plan = Join-Path $Project ('tmp\migration-plan-' + [Guid]::NewGuid().ToString('N') + '.json')
-$recordedPlan = if ($pendingPath) { Join-Path $pendingPath 'migration-plan.json' } else { '' }
+$plan = Join-Path $Project ('tmp\data-plan-' + [Guid]::NewGuid().ToString('N') + '.json')
+$recordedPlan = if ($pendingPath) { Join-Path $pendingPath 'data-plan.json' } else { '' }
 $applyPlan = $plan
-$previewRunner = Join-Path $PSScriptRoot '..\migrations\run.ts'
-$runner = Join-Path $Project 'scripts\migrations\run.ts'
-function Invoke-Migration([string]$Action) {
+$previewRunner = Join-Path $PSScriptRoot '..\runtime\data-current.ts'
+$resetConfig = ''
+$stageRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+$runner = Join-Path $Project 'scripts\runtime\data-current.ts'
+function Invoke-DataPreparation([string]$Action) {
     & $bun run $runner $Action --project $Project --groups $groups --plan $applyPlan
     if ($LASTEXITCODE -ne 0) { throw "数据迁移 $Action 失败 ($LASTEXITCODE)" }
 }
@@ -63,18 +65,39 @@ function Assert-SwitchReady {
 try {
 Write-OperationEvent 'info' ("original=$OriginalSha target=$TargetSha rollback=$([bool]$Rollback)")
 if (-not $Rollback) {
-Set-OperationStage 'migration-preview'
+Set-OperationStage 'data-preparation-preview'
 if ($recordedPlan -and (Test-Path -LiteralPath $recordedPlan -PathType Leaf)) {
-    # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
+    # 续做沿用停机前确认的数据准备计划；apply 会重新核对配置和版本标记，变化即中止。
     $applyPlan = $recordedPlan
-    Write-Host '继续上次升级：沿用停机前确认的迁移计划。'
+    Write-Host '继续上次升级：沿用停机前确认的数据准备计划。'
 } else {
     # 续做不能等待输入：旧版事务没有保存计划时只做非交互预览，需要确认就停止。
     # 外层 @() 保留数组；if 的单元素输出会变成字符串，传给原生程序时被 splat 拆成逐个字符。
-    $previewMode = @(if (-not $pendingPath) { '--interactive' })
-    & $bun run $previewRunner preview --decisions-only @previewMode --project $Project --groups $groups --plan $plan
+
+    & $bun run $previewRunner probe --project $Project --groups $groups
+    $probeCode = $LASTEXITCODE
+    $previewOptions = @()
+    if ($probeCode -eq 20) {
+        if ($pendingPath) { throw '未完成事务缺少已确认的重置计划；请回滚后重试' }
+        Write-Host '保留完整统计与 webhook/Cloudflare 入口；旧会话、资料和其他配置将清理。成功后自动删除旧会话回滚副本。'
+        if ((Read-Host '确认按此方式升级并重新配置？输入 RESET 继续') -cne 'RESET') { throw '已取消；旧服务和数据未改动' }
+        if ($stageRoot -eq [IO.Path]::GetFullPath($Project)) { throw '重置必须通过目标版本导出的升级入口执行' }
+        $resetConfig = Join-Path $stageRoot 'reset-config'
+        & $bun run $previewRunner prepare-reset --project $Project --groups $groups --reset-config $resetConfig
+        if ($LASTEXITCODE -ne 0) { throw '重置草稿准备失败，旧服务未停止' }
+        Push-Location -LiteralPath $stageRoot
+        try { & $bun install --frozen-lockfile; if ($LASTEXITCODE -ne 0) { throw '目标版本隔离依赖安装失败，旧服务未停止' } }
+        finally { Pop-Location }
+        Push-Location -LiteralPath $resetConfig
+        try {
+            & $bun run (Join-Path $stageRoot 'scripts\config\configure.ts')
+            if ($LASTEXITCODE -ne 0) { throw '新模型配置未完成，旧服务未停止' }
+        } finally { Pop-Location }
+        $previewOptions = @('--reset-config', $resetConfig)
+    } elseif ($probeCode -ne 0) { throw '数据版本检查失败；旧服务未停止' }
+    & $bun run $previewRunner preview --project $Project --groups $groups --plan $plan @previewOptions
     if ($LASTEXITCODE -ne 0) {
-        if ($pendingPath) { throw "续做无法沿用迁移确认（原因见上方）；请使用 $(Get-OpsCommandHint 'rollback') 回滚后重新升级。" }
+        if ($pendingPath) { throw "续做无法沿用数据准备计划（原因见上方）；请使用 $(Get-OpsCommandHint 'rollback') 回滚后重新升级。" }
         throw '迁移预览未完成；旧服务尚未停止'
     }
 }
@@ -104,14 +127,20 @@ if (-not $pendingPath) {
     }
 }
 $confirmedAction = if ($Rollback) { 'rollback' } else { 'continue' }
-$snapshot = Open-UpgradeSnapshot $Project $TaskName $OriginalSha $OriginalBranch $TargetSha $upgradeRecord $plan $ConfirmedTransaction $confirmedAction
+$snapshot = Open-UpgradeSnapshot $Project $TaskName $OriginalSha $OriginalBranch $TargetSha $upgradeRecord $plan $ConfirmedTransaction $confirmedAction $resetConfig
+$applyPlan = Join-Path $snapshot.Path 'data-plan.json'
 Write-OperationEvent 'info' ('snapshot=' + $snapshot.Path)
 $OriginalSha = $snapshot.UpgradeOriginal
 $OriginalBranch = $snapshot.UpgradeBranch
 $transactionPointer = Join-Path $Project 'data\state\upgrade-transaction'
 $committed = $false
 $mutated = $false
-$migrationAttempted = Test-Path -LiteralPath (Join-Path $Project 'data\state\migration.json')
+$dataPreparationAttempted = Test-Path -LiteralPath (Join-Path $snapshot.Path 'reset.json')
+$releasePath = Join-Path $Project 'data\state\release-data.json'
+if (Test-Path -LiteralPath $releasePath) {
+    $savedRelease = Get-Content -LiteralPath $releasePath -Raw | ConvertFrom-Json
+    $dataPreparationAttempted = $dataPreparationAttempted -or ($savedRelease.deployment -eq (Split-Path $snapshot.Path -Leaf))
+}
 try {
     if (-not $snapshot.TaskXml) { throw '升级快照没有计划任务，请先部署；旧服务尚未停止' }
     # Use the exported built-in-only command before dependency installation: if a
@@ -139,6 +168,14 @@ try {
     if ($snapshot.WasRunning) { Write-Host "已停止机器人服务（计划任务 $TaskName）；升级完成前不处理消息。" }
     else { Write-Host "机器人服务升级前未运行（计划任务 $TaskName），升级后保持停止。" }
     $mutated = $true
+    if ((Test-Path -LiteralPath (Join-Path $snapshot.Path 'reset-config')) -and
+        -not (Test-Path -LiteralPath (Join-Path $snapshot.Path 'stats-frozen.json'))) {
+        $sourceHead = [string](& $git -C $Project rev-parse HEAD)
+        if ($sourceHead.Trim() -ne $OriginalSha) { throw '缺少旧版统计冻结凭据，不能在新版代码中补算旧会话；请回滚后重试' }
+        Set-OperationStage 'freeze-source-statistics'
+        & $bun run (Join-Path $PSScriptRoot '..\runtime\stats-freeze.ts') --groups $groups --receipt (Join-Path $snapshot.Path 'stats-frozen.json')
+        if ($LASTEXITCODE -ne 0) { throw '旧版统计补账失败；旧会话尚未清理' }
+    }
     Set-OperationStage 'checkout'
     if ((Invoke-OperationNative $git @('-C', $Project, 'checkout', '--quiet', 'main') -Quiet) -ne 0) { throw '切换 main 失败' }
     if ((Invoke-OperationNative $git @('-C', $Project, 'merge', '--ff-only', '--quiet', $TargetSha) -Quiet) -ne 0) { throw '目标提交无法快进' }
@@ -154,9 +191,9 @@ try {
     }
     if ($committed) { Write-Host '数据已在上次中断前提交，直接启用新版本。' }
     else {
-    Set-OperationStage 'migration-apply'
-    $migrationAttempted = $true
-    Invoke-Migration 'apply'
+    Set-OperationStage 'data-preparation-apply'
+    $dataPreparationAttempted = $true
+    Invoke-DataPreparation 'apply'
     Set-OperationStage 'verification-service'
     Set-Content -LiteralPath (Join-Path $Project 'data\state\verify-only') -Value 'verify' -Encoding ASCII
     Write-Host '启动验证实例，等待部署预检通过（最长 90 秒）...'
@@ -173,8 +210,8 @@ try {
     Write-Host '部署预检通过。'
     if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止' }
     if ($RestartTunnel -and (Get-Service Cloudflared -ErrorAction SilentlyContinue)) { Restart-Service Cloudflared -ErrorAction Stop }
-    Set-OperationStage 'migration-commit'
-    Invoke-Migration 'commit'
+    Set-OperationStage 'data-preparation-commit'
+    Invoke-DataPreparation 'commit'
     $committed = $true
     Write-Host '升级已提交；此后失败不再回退数据。'
     }
@@ -195,11 +232,7 @@ try {
         if (-not $ready) { throw "数据已经提交，但业务实例未就绪；保留新版本，请检查日志后使用 $(Get-OpsCommandHint 'resume') 继续" }
         Write-Host '机器人已启动。'
     } else { Write-Host '机器人服务保持停止（升级前未运行）。' }
-    # 正式实例就绪后才清理迁移副本；清理失败不影响本次升级，独立回执供以后重试。
-    if ($snapshot.WasRunning) {
-        & $bun run $runner finalize --project $Project --groups $groups --deployment (Split-Path $snapshot.Path -Leaf)
-        if ($LASTEXITCODE -ne 0) { Write-Warning '升级已完成，迁移备份清理未完成；修复日志中的问题后运行 migrations cleanup 重试。' }
-    } else { Write-Warning '服务保持停止，迁移备份保留；首次正式启动并通过健康检查后，按数据迁移文档执行 finalize。' }
+    Invoke-DataPreparation 'finish-reset'
     Remove-Item -LiteralPath $transactionPointer -Force
     try { Remove-CompletedBackup $snapshot.Path $Project }
     catch { Write-Warning ('升级已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }
@@ -213,7 +246,7 @@ try {
     if (-not $committed -and $mutated) {
         Set-OperationStage 'rollback'
         if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '无法停止新实例，拒绝恢复数据；请人工处理' }
-        if ($migrationAttempted) {
+        if ($dataPreparationAttempted) {
             & $bun run $runner rollback --project $Project --groups $groups --deployment (Split-Path $snapshot.Path -Leaf)
             if ($LASTEXITCODE -eq 42) { throw '数据已提交，保留新代码；请检查后启动，禁止回退' }
             if ($LASTEXITCODE -ne 0) { throw '数据恢复失败；保持停机，保留新代码和备份' }
@@ -242,7 +275,7 @@ try {
     $snapshot.Lock.Dispose()
     $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId
     }
-    # Failed activation retains migration snapshots; successful activation finalizes only owned snapshots.
+    # Failed activation retains data preparation snapshots; successful activation finalizes only owned snapshots.
 }
 } finally {
     Remove-Item -LiteralPath $plan -Force -ErrorAction SilentlyContinue

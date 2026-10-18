@@ -32,7 +32,6 @@ COPY --chown=appuser:appgroup scripts/config ./scripts/config
 COPY --chown=appuser:appgroup scripts/ops/*.ts ./scripts/ops/
 COPY --chown=appuser:appgroup scripts/lib/*.ts ./scripts/lib/
 COPY --chown=appuser:appgroup scripts/runtime ./scripts/runtime
-COPY --chown=appuser:appgroup scripts/migrations ./scripts/migrations
 COPY --chown=appuser:appgroup scripts/test.ts ./scripts/test.ts
 
 RUN mkdir -p \

@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
-import { buildLocalTools } from "../../src/agent/local-tools.ts";
+import { buildLocalTools } from "../helpers/native-tools.ts";
 import { loadModuleDefinitions } from "../../src/agent/modules.ts";
 import { buildChatContext } from "../../src/agent/prompt.ts";
 import { tempFixture } from "../helpers/temp.ts";

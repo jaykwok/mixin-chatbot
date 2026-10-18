@@ -116,5 +116,5 @@ if (import.meta.main) {
     if (!project) throw new Error("restore 需要空暂存项目路径");
     await withMaintenance(() => restoreDataBackup(path, project, groups ?? join(project, "data/groups")), GROUP_DATA_ROOT);
   }
-  console.log("完成；恢复到暂存目录后，请配置模型并运行 scripts/migrations/validate.ts，再开放调度。");
+  console.log("完成；恢复到暂存目录后，请配置模型并运行 scripts/runtime/data-current.ts validate --groups <群根>，再开放调度。");
 }

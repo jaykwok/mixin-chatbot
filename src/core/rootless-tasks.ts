@@ -5,7 +5,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, realpath, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { executeProcess, type ProcessOptions } from "../../scripts/lib/process.ts";
-import { publishJson } from "../../scripts/migrations/lib/io.ts";
+import { publishJson } from "../../scripts/lib/atomic-file.ts";
 import { ID_PATTERN, RESULT_NAME, validTreeEvidence, type TreeEvidence } from "../contracts/maintenance.ts";
 import { IMAGE_PATTERN, type Receipt, type ReceiptPhase } from "../contracts/task-receipt.ts";
 import { archiveEntry } from "./archive-entry.ts";

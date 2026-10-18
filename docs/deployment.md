@@ -138,7 +138,7 @@ Cloudflare 入口应采用默认拒绝、显式放行的策略。实际规则在
 
 优先级：**显式环境变量 > `data/config/runtime.json` > 代码默认值**。
 
-Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原生预算、上下文缓存和可选辅助模型、MCP 的配置方式见[运行设置与可选工具](runtime-tools.md)。升级至数据版本 4 时由迁移工具转换旧引擎设置。
+Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原生预算、上下文缓存和可选辅助模型、MCP 的配置方式见[运行设置与可选工具](runtime-tools.md)。跨数据版本升级时重新配置，见[自动重置升级](data-migrations.md)。
 
 部署脚本保存支持的设置，未显式指定的值沿用已存配置。仅在前台启动时设置环境变量不会自动落盘；停机后可运行 `bun run configure-runtime` 保存当前支持项。配置文件中的未知键、无效类型及越界值会阻止启动。
 
@@ -180,7 +180,7 @@ Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原�
 
 ### 数据目录
 
-从 Pi 0.85.1 升级时，配置迁移和版本登记由[升级事务](data-migrations.md)完成；Windows 首次过渡需要按该文档先停机，Docker 首次升级到本版需按该文档运行一次引导命令。[数据版本 3](data-migrations.md#数据版本-3durable-引擎) 把每位成员的会话导入所在群的群库，缓存保温随之关闭。迁移程序随代码发布在 `scripts/migrations/`，升级不依赖 `tmp/` 中的工具。
+当前格式只保存新一代 Durable 群库。跨数据版本更新按[自动重置升级](data-migrations.md)保留统计 schema 2 与入口凭证，重新配置并清理旧会话及群资料；普通更新沿用原数据。
 
 ```text
 data/
@@ -196,7 +196,7 @@ data/
 │   ├── agent.sqlite           待交付内容、路由隔离与路径身份
 │   ├── relay.sqlite           远端对象的持久账本
 │   ├── data-version.json      项目数据版本与迁移事务号
-│   ├── migration.json         迁移进度；提交后保留为回执
+│   ├── release-data.json      当前发布的验证/提交状态
 │   ├── instance.json          实例 PID、启动时间与关闭令牌
 │   └── ...                    部署状态与维护租约
 ├── runtime/
@@ -213,10 +213,10 @@ data/
         ├── index/             materials.md、扫描 manifest；可选 ignore.txt、parsed/ 文档缓存
         ├── venv/              原生部署按需准备的解析环境
         └── users/<user>/
-            ├── session.jsonl  数据版本 3 之前的 Pi 会话：已导入群库，原地保留供统计补账
             └── tmp/           生成文件、缓存与完整工具输出
 backup/                        为了能撤销某个操作而留的；清理用 backup-scan / backup-clean，别手动删
-├── snapshots/                 部署、升级与连接器安装的回滚现场，以及数据迁移快照
+├── snapshots/                 部署、升级与连接器安装的回滚现场
+├── statistics/                跨代重置前的独立统计快照及核对摘要，成功后继续保留
 └── rm/                        被移除的旧文件、会话与用户 tmp；操作期间的归档在 rm/<快照名>/
 tmp/                           报告、测试隔离 cwd、诊断产物、一次性脚本；无任务使用时可清理
 ├── reports/                   TUI 导出的离线 HTML 报表
@@ -230,7 +230,7 @@ logs/                          应用日志与可选的隧道日志
 
 建议正常停机后备份整个 `data/`，并单独备份外置的 `GROUP_DATA_ROOT`。`data/runtime/pi/settings.json` 是必须保留的模型选型；`data/runtime/models-store.json` 也应随配置备份，动态目录服务商依赖它离线启动，移除后需重新运行向导联网刷新。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
 
-群库和群目录里的结果文件必须作为同一批数据备份；只有数据库不能恢复图片、附件或全文。停机后可运行 `bun scripts/ops/data-backup.ts backup <新目录>`：取得维护租约、检查并 checkpoint 所有数据库，再复制状态和群目录，写入逐文件 SHA-256 清单。配置、密钥、模型目录缓存和选型仍需另行备份。恢复命令 `bun scripts/ops/data-backup.ts restore <备份目录> <空暂存项目> [空群数据根]` 先验证全部摘要，再复制到空目录并检查 SQLite；配置补齐后运行 `bun scripts/migrations/validate.ts`，验收通过再切换数据根。恢复工具不会覆盖正在使用的数据。
+群库和群目录里的结果文件必须作为同一批数据备份；只有数据库不能恢复图片、附件或全文。停机后可运行 `bun scripts/ops/data-backup.ts backup <新目录>`：取得维护租约、检查并 checkpoint 所有数据库，再复制状态和群目录，写入逐文件 SHA-256 清单。配置、密钥、模型目录缓存和选型仍需另行备份。恢复命令 `bun scripts/ops/data-backup.ts restore <备份目录> <空暂存项目> [空群数据根]` 先验证全部摘要，再复制到空目录并检查 SQLite；配置补齐后运行 `bun scripts/runtime/data-current.ts validate --project <暂存项目> --groups <暂存群根>`，验收通过再切换数据根。恢复工具不会覆盖正在使用的数据。
 
 Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 999 次，正常退出不重试；停止机器人也会停止启动器。此退避让旧群租约有时间过期。修改代码后需按正常部署流程更新启动器；运行中的服务不会自动切换到这份代码。
 
@@ -287,7 +287,7 @@ Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 9
 
 ## 数据版本与升级
 
-参见[数据版本与升级事务](data-migrations.md)。业务入口 `src/server/index.ts` 和 TUI 入口在加载配置前检查项目与群根的版本；历史迁移集中在 `scripts/migrations/`。升级由目标版本的升级器执行（Docker 为 `scripts/deploy/upgrade.sh`，由 `ops update` 从目标提交导出后运行），在停机前完成迁移预览和全部确认；提交前仅启动验证实例，提交后恢复正常业务。旧版 `ops.sh` 升级到本版时会被拒绝并打印一次性引导命令，见[第一次升级](data-migrations.md#第一次升级)。
+当前应用数据版本为 6，Pi 精确锁为 1.3.0。update 以成对数据版本判断：相同则正常升级；较旧版本在停机前提示重置并重新配置，然后自动用旧版补账、保存统计快照、清理旧会话并切换。统计 schema 2 和 webhook / Cloudflare 入口凭证原样保留，旧格式不进入新运行时。标记损坏、不成对或数据比程序更新时拒绝清理。提交前只验证实例不处理业务，失败可回滚；完整步骤和首次升级入口见[自动重置升级](data-migrations.md)。
 
 ## 任务隔离部署
 

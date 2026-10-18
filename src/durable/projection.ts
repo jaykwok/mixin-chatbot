@@ -9,39 +9,27 @@
 // Start records cover requests killed before an entry exists. Complete terminal usage survives a crash before
 // classification; partial estimates do not become confirmed bills. Aborted entries do not count as replies.
 //
-// A conversation the data migration imported (scripts/migrations/v3.ts) starts counting after its import record: the
-// imported entries were counted from the session file, which the old ledger source keeps covering.
 import type { Database } from "bun:sqlite";
 import { copyJson, type Context } from "@earendil-works/chord";
-import { AssistantEntry, type ConversationId, defineDoc, type EntryRecord, type Harness, type TaskId, ToolResultEntry, UserEntry, type Tx } from "@earendil-works/pi-durable";
+import { AssistantEntry, type ConversationId, type EntryRecord, type Harness, type TaskId, ToolResultEntry, UserEntry, type Tx } from "@earendil-works/pi-durable";
 import { groupSegment, userSegment } from "../agent/paths.ts";
-import type { StatsRecord } from "../agent/session-reader.ts";
-import { type ConversationSource, DURABLE_PROJECTION, finalizeConversationProjection, hasRetiredConversation, ingestConversationRecords } from "../agent/stats-ledger.ts";
+import type { StatsRecord } from "../agent/stats-record.ts";
+import { type ConversationSource, DURABLE_PROJECTION, finalizeConversationProjection, ingestConversationRecords } from "../agent/stats-ledger.ts";
 import { type AttemptStart, AttemptsDoc, isNotSent } from "./attempts.ts";
 import { AuxiliaryDoc } from "./auxiliary-records.ts";
 import { recoverProjectionRetirement, retireProjectedRequests } from "./projection/retirement.ts";
 import { pendingUsage, type ProjectionCheckpoint } from "./projection/usage.ts";
 import { KeyedQueue } from "../core/lifecycle.ts";
+import { GroupDoc } from "./identity.ts";
 import { NestedUsageDoc } from "./codemode/usage.ts";
 
 const PAGE = 200;
 
-/** What the v3 import wrote into a conversation (scripts/migrations/lib/durable.ts keeps a frozen copy). */
-export type LegacyImport = {
-  version: 1; source: string; sha256: string; bytes: number; entries: number;
-  /** The newest imported entry (0 when none): usage at or before it was counted by the old ledger. */
-  through: number;
-  interrupted: boolean; importedAt: number;
-};
-export const LegacyImportDoc = defineDoc<LegacyImport>({
-  kind: "mixin.legacy-import", version: 1, scope: "conversation", history: "latest", fork: "initial",
-  initial: () => ({ version: 1, source: "", sha256: "", bytes: 0, entries: 0, through: 0, interrupted: false, importedAt: 0 }),
-});
-
-export function conversationSource(groupId: string, phone: string, conversationId: number): ConversationSource {
+export function conversationSource(groupId: string, phone: string, conversationId: number, generation: string): ConversationSource {
+  if (!generation) throw new Error("群数据库缺少统计代际");
   const group = groupSegment(groupId);
   const user = userSegment(phone);
-  return { id: `durable:${group}:${user}:${conversationId}`, group, user, identity: `durable:${conversationId}` };
+  return { id: `durable:${generation}:${group}:${user}:${conversationId}`, group, user, identity: `durable:${generation}:${conversationId}` };
 }
 
 const at = (timestamp: unknown) => new Date(typeof timestamp === "number" ? timestamp : Number.NaN).toISOString();
@@ -53,13 +41,9 @@ function records(entry: EntryRecord, start?: AttemptStart): StatsRecord[] {
   if (ToolResultEntry.is(entry)) {
     const details = message.details as { calls?: { name?: unknown }[]; complete?: unknown; partial?: unknown; usage?: unknown } | undefined;
     const codemode = message.toolName === "codemode" && Array.isArray(details?.calls) ? details : undefined;
-    // Results of the project's own codemode (before Pi 1.2.0) say `complete` and carry the combined usage on the result.
-    // The official codemode's say `partial` while the script ran (a result built from its slot) and carry the nested
-    // calls' usage in the details: Durable counts it under each nested tool, never on the codemode result.
-    const legacy = codemode !== undefined && "complete" in codemode;
     const nested = codemode === undefined ? undefined : {
       names: codemode.calls!.map(call => typeof call?.name === "string" ? call.name : "unknown"),
-      complete: legacy ? codemode.complete === true : codemode.partial !== true,
+      complete: codemode.partial !== true,
     };
     // Official codemode details are display snapshots. Its ordinary children have independent atomic receipts;
     // AuxiliaryDoc already owns auxiliary charges. Legacy result usage remains on the message.
@@ -94,17 +78,20 @@ const projections = new KeyedQueue();
 /** The entry cursor and start-to-entry links are committed together in the existing ledger source. */
 export async function projectConversation(db: Database, harness: Harness, member: { groupId: string; phone: string; conversationId: number },
   context: Context): Promise<number> {
-  const source = conversationSource(member.groupId, member.phone, member.conversationId);
+  const generation = (await harness.snapshot(GroupDoc, context))?.generation;
+  if (!generation) throw new Error("群数据库缺少统计代际，请使用当前格式新群库");
+  const source = conversationSource(member.groupId, member.phone, member.conversationId, generation);
   return projections.run(db.filename + ":" + source.id, () => project(db, harness, member.conversationId as ConversationId, source, context), context.abortSignal);
 }
 
 async function project(db: Database, harness: Harness, conversation: ConversationId, source: ConversationSource, context: Context): Promise<number> {
   await recoverProjectionRetirement(db, harness, source, conversation, context);
-  const floor = (await harness.snapshot(LegacyImportDoc, conversation, context))?.through ?? 0;
+  const floor = 0;
   for (let attempt = 1; ; attempt++) {
     const row = db.query("SELECT offset, digest, projection FROM sources WHERE id = ?").get(source.id) as
       { offset: number; digest: string; projection: number } | null;
-    const current = row !== null && (row.projection === DURABLE_PROJECTION || hasRetiredConversation(db, source.id));
+    if (row && row.projection !== DURABLE_PROJECTION) throw new Error("当前会话的统计投影格式不匹配；保留历史账本并检查数据库代际");
+    const current = row !== null;
     const prior = current ? row.offset : floor, digest = current ? row.digest : "", links = checkpoint(digest);
     const { attempts, auxiliary, terminal, generations, entries, nested } = await harness.commit(async tx => {
       // One group transaction prevents a new entry from racing its request's start snapshot.

@@ -144,10 +144,10 @@ describe("model selection and Durable settings", () => {
     expect(reasoning.harnessSettings.stream).toEqual({ timeoutMs: 120000, maxRetries: 0, maxRetryDelayMs: 5000 });
   });
 
-  test("legacy engine settings require the one-time migration", async () => {
+  test("unsupported settings are refused and require reconfiguration", async () => {
     for (const mode of ["idle", "streaming"] as const) {
       const settingsPath = await settingsFile({ defaultProvider: "local-key", defaultModel: "chat", cacheWarming: mode });
-      await expect(openModelSelection({ modelsPath, modelsStorePath, settingsPath })).rejects.toThrow("旧配置请通过升级迁移");
+      await expect(openModelSelection({ modelsPath, modelsStorePath, settingsPath })).rejects.toThrow("不支持的字段请重新配置");
     }
   });
 

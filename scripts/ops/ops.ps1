@@ -1068,8 +1068,8 @@ function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [str
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
     $archive = Join-Path $stage 'target.zip'
-    $export = Invoke-GitCapture @('archive', '--format=zip', ('--output=' + $archive), $target,
-        'scripts/deploy/upgrade.ps1', 'scripts/lib', 'scripts/migrations', 'src/core/data-version.ts')
+    # The target's isolated configuration wizard needs its complete source and lockfile only on a data reset.
+    $export = Invoke-GitCapture @('archive', '--format=zip', ('--output=' + $archive), $target)
     if ($export.ExitCode -ne 0) { Err $export.Text; return $false }
     Expand-Archive -LiteralPath $archive -DestinationPath $stage
     # The parent may be pwsh 7; the supported child host is Windows PowerShell 5.1.

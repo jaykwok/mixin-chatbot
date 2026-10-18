@@ -8,7 +8,7 @@
 
 ## 工作原理
 
-基于 **Bun + Hono + Pi Durable 引擎**，支持 Windows 原生部署和 Linux / Docker。每个群一个 Durable 数据库（`<群目录>/durable.sqlite`），群内每位成员一个对话。下面是任务处理与取消、交付之间的关系：
+基于 **Bun + Hono + Pi Durable 1.3.0 引擎**，支持 Windows 原生部署和 Linux / Docker。每个群一个 Durable 数据库（`<群目录>/durable.sqlite`），群内每位成员一个对话。下面是任务处理与取消、交付之间的关系：
 
 ```mermaid
 flowchart TD
@@ -54,7 +54,11 @@ flowchart TD
 | `send_file` / `send_image` | 发送文件或图片；本地路径复用文件工具的解析规则 |
 | `codemode` | 在沙箱里运行模型写的 JavaScript，并行或按依赖顺序调用其他工具，只把筛选后的结果交给模型 |
 
-每个对话都接入 codemode：沿用 Pi 官方 codemode 的脚本运行时和说明文字（[durable/codemode](../src/durable/codemode)，与上游的差异写在 `upstream.ts` 开头），不向脚本开放模型目录。六个 `document_*` 加工工具只能在脚本里调用：不直接声明给模型，列在 codemode 的说明里，用法说明由脚本里的 `describeNamespace("document_work")` 取得。`send_file` / `send_image` 只给模型直接调用，脚本拿不到；其余工具两种方式都能调用。脚本里的调用走同一套工具包装、路径边界和文档并发上限（解析与加工各同时 2 个）。脚本输出过长时，完整输出和超长的子调用结果直接写在本用户 tmp 的 `codemode/<任务>-<调用>/` 下，只有本人的 `read` 能打开，不经过共享的系统临时目录。
+基础四工具由 `@earendil-works/pi-durable/tools` 原生注册；每次调用从持久身份解析成员并创建独立的 `ExecutionEnv`（`src/durable/member-env.ts`），不共享可变 cwd。`read` 使用 bounded BinaryReader 和官方 Photon 图片处理；bash 的结构化结果使用 `exitCode` / `fullOutputPath`，诊断由 Durable 统一呈现。
+
+每个对话都接入 codemode：沿用 Pi 官方 codemode 的脚本运行时和说明文字（[durable/codemode](../src/durable/codemode)，宿主职责集中在 `index.ts`，非公开文档/结果形状依赖集中在 `protocol.ts`），不向脚本开放模型目录。六个 `document_*` 加工工具只能在脚本里调用：不直接声明给模型，列在 codemode 的说明里，用法说明由脚本里的 `describeNamespace("document_work")` 取得。`send_file` / `send_image` 只给模型直接调用，脚本拿不到；其余工具两种方式都能调用。原生 `read` 没有结构化输出 schema，官方 Codemode 只返回其文本，图片块在脚本值中省略；需要模型查看图片时直接调用 `read`。脚本里的调用走同一套工具包装、路径边界和文档并发上限（解析与加工各同时 2 个）。脚本输出过长时，完整输出和超长的子调用结果直接写在本用户 tmp 的 `codemode/<任务>-<调用>/` 下，只有本人的 `read` 能打开，不经过共享的系统临时目录。
+
+Codemode 的进程级预算为 2，所有群共享同步 `acquireWorker()`。满额明确拒绝；构造失败或真实 worker exit 才释放。result、取消或 `close()` 完成不能当成线程退出。关机先停止准入，等待实际退出仍受整个应用的统一关机期限约束。
 
 Windows 用 Job Object 管理工具进程及后代，Linux 用 subreaper 和父进程死亡通知回收后代；主命令退出、超时、取消或机器人父进程强制结束都会触发收尾。输出总量限制为 16 MiB，并保留错误尾部。
 
@@ -119,7 +123,7 @@ Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) �
 
 统计包含普通回复、历史压缩、辅助模型以及旧记录中的分支摘要、缓存保温等调用的 input/output/cacheRead/cacheWrite，按模型、日期及调用类型分组。新辅助模型用量按 provider/model 单独入账，不并入父工具重复累计。费用是 SDK 根据配置价格的估算，**不代表 Coding Plan 实际账单或套餐配额**；升级不按新价格重算历史费用。
 
-工具调用分两层计：模型发出的调用（一个 codemode 脚本算一次）和脚本运行时调用的工具（子调用）。SDK 把子调用的用量并进那条工具结果，账本按“工具”类型记一次，模型记为 unknown，不和外层回复重复累计；子调用记录被截断或未结束时单独标出“不完整”，计数可能偏少。数据版本 2 之前入账、原件已无法核对的会话没有这两项，统计页标为旧口径（见 [数据版本 2](data-migrations.md#数据版本-2统计账本)）。
+工具调用分两层计：模型发出的调用（一个 codemode 脚本算一次）和脚本运行时调用的工具（子调用）。SDK 把子调用的用量并进那条工具结果，账本按“工具”类型记一次，模型记为 unknown，不和外层回复重复累计；子调用记录被截断或未结束时单独标出“不完整”，计数可能偏少。账本中已知缺失的历史来源仍保留旧口径标记，不从已删除的会话重算，见[自动重置升级](data-migrations.md)。
 
 统计数据独立存放在 `<群数据根>/stats.sqlite`，CLI、TUI 和 HTML 报表都读这一份。账本由 [stats-ledger.ts](../src/agent/stats-ledger.ts) 维护：Durable 对话由 [projection.ts](../src/durable/projection.ts) 在每次回复前、`/clear` 和维护时按条目游标增量入账；数据版本 3 之前的会话文件原地保留，由每日兜底扫描补入尚未入账的部分。两者都不重复累加，也不会用较旧的读取覆盖新账；读取方只用只读连接。**不得删库重建**：原件可能已删除，账本是仅存的历史。
 
@@ -161,7 +165,7 @@ Windows 使用标准安装位置的 Git Bash 时，最外层运行器会先启�
 | [registry.ts](../src/durable/registry.ts)、[tools.ts](../src/durable/tools.ts)、[codemode](../src/durable/codemode) | 对话的扩展、工具与 codemode |
 | [projection.ts](../src/durable/projection.ts)、[projection](../src/durable/projection)、[compaction.ts](../src/durable/compaction.ts) | 用量入账、已结束请求的统计裁剪与上下文压缩 |
 | [results](../src/durable/results) | codemode 结果的归属登记、引用保护与过期回收 |
-| [prompt.ts](../src/agent/prompt.ts)、[local-tools.ts](../src/agent/local-tools.ts) | 资料助手提示词与本地工具边界 |
+| [prompt.ts](../src/agent/prompt.ts)、[base-tools.ts](../src/durable/base-tools.ts)、[member-env.ts](../src/durable/member-env.ts) | 资料助手提示词与本地工具边界 |
 | [process.ts](../src/core/process.ts)、[process-supervisor.ts](../src/core/process-supervisor.ts) | 工具进程执行与后代回收 |
 | [rootless-tasks.ts](../src/core/rootless-tasks.ts)、[task-runtime](../src/core/task-runtime)、[task-backend.ts](../src/core/task-backend.ts) | Linux 每任务隔离：阶段回执、容器、输入快照与回收；工具入口统一结束任务 |
 | [maintenance](../src/maintenance)、[maintenance-view.ts](../src/durable/maintenance-view.ts) | tmp 维护计划、离线回收与归档；群库视图由 durable 一侧提供 |
@@ -210,4 +214,8 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 
 ## 数据版本与升级
 
-参见[数据版本与升级事务](data-migrations.md)。业务入口 `src/server/index.ts` 和 TUI 入口在加载配置前检查项目与群根的版本；历史迁移集中在 `scripts/migrations/`。升级在提交前仅启动验证实例，提交后恢复正常业务。
+当前应用数据格式为 6，只支持当前配置和新会话。历史迁移器、JSONL 导入和旧字段别名已删除；切换步骤见[自动重置升级](data-migrations.md)。统计 schema 2 原样保留，新增来源包含持久群库代际，成员去重身份不变。`scripts/runtime/data-current.ts` 负责版本探测、当前格式验证与发布提交；跨代时调用 `data-reset.ts` 的可恢复清理事务。`stats-freeze.ts` 在切换代码/依赖之前运行旧发布的读者和投影器完成补账，目标运行时不含旧格式解析。schema 2 整库核对和独立备份是清理前提，统计格式变化另做一次性工具。只有不兼容的数据变化才递增 `DATA_VERSION`，一般升级不触发清理。
+
+六个直接 Pi 依赖精确锁为 1.3.0，内部包使用官方精确依赖和 Bun 锁文件，不重复设置 Pi overrides。仍保留两处 Durable 补丁：`beforeSummarize` 逐次请求准入，以及 `settleNestedTool` 在子调用终结事务内写原子费用回执。普通 afterTool 无法替代原子结算。升级时需要重新验证取消、恢复和回滚语义。
+
+Codemode 仍需宿主负责成员结果目录、合并 store 总量校验、可靠交付和独立费用回执；不复制 VM、journal、参数解析或 provider 转换。

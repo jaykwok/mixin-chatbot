@@ -26,12 +26,12 @@
   },
   "dependencies": {
     "@clack/prompts": "1.7.0",
-    "@earendil-works/chord": "1.2.0",
-    "@earendil-works/pi-ai": "1.2.0",
-    "@earendil-works/pi-codemode": "1.2.0",
-    "@earendil-works/pi-coding-agent": "1.2.0",
-    "@earendil-works/pi-durable": "1.2.0",
-    "@earendil-works/pi-mcp": "1.2.0",
+    "@earendil-works/chord": "1.3.0",
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-codemode": "1.3.0",
+    "@earendil-works/pi-coding-agent": "1.3.0",
+    "@earendil-works/pi-durable": "1.3.0",
+    "@earendil-works/pi-mcp": "1.3.0",
     "fs-extra": "11.4.0",
     "hono": "4.13.7",
     "marked": "18.0.5",
@@ -46,21 +46,12 @@
     "typescript": "5.9.3"
   },
   "overrides": {
-    "@earendil-works/chord": "1.2.0",
-    "@earendil-works/pi-agent-core": "1.2.0",
-    "@earendil-works/pi-ai": "1.2.0",
-    "@earendil-works/pi-codemode": "1.2.0",
-    "@earendil-works/pi-coding-agent": "1.2.0",
-    "@earendil-works/pi-durable": "1.2.0",
-    "@earendil-works/pi-mcp": "1.2.0",
-    "@earendil-works/pi-telemetry": "1.2.0",
-    "@earendil-works/pi-tui": "1.2.0",
     "brace-expansion": "5.0.12",
     "image-size": "2.0.4",
     "smol-toml": "1.9.0"
   },
   "patchedDependencies": {
-    "@earendil-works/pi-durable@1.2.0": "scripts/patches/@earendil-works%2Fpi-durable@1.2.0.patch",
-    "knip@6.40.0": "scripts/patches/knip@6.40.0.patch"
+    "knip@6.40.0": "scripts/patches/knip@6.40.0.patch",
+    "@earendil-works/pi-durable@1.3.0": "scripts/patches/@earendil-works%2Fpi-durable@1.3.0.patch"
   }
 }

@@ -1,3 +1,4 @@
+import { writeCurrentConfig } from "../helpers/current-config.ts";
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, utimes, writeFile } from "node:fs/promises";
@@ -16,15 +17,16 @@ async function run(args: string[], cwd: string, env: Record<string, string> = {}
   return { code, text: out + err };
 }
 
-for (const entry of ["migration", ...(process.platform === "win32" ? ["powershell"] : []), ...(bash && existsSync(bash) ? ["bash"] : [])]) {
+for (const entry of ["current-data", ...(process.platform === "win32" ? ["powershell"] : []), ...(bash && existsSync(bash) ? ["bash"] : [])]) {
   for (const status of [0, 1]) test(`${entry} announces one operation log, repeating it only on failure (exit ${status})`, async () => {
     const f = await tempFixture("operation-log-chain-");
     try {
-      const groups = join(f.root, "groups"), migration = join(project, "scripts/migrations/run.ts");
+      const groups = join(f.root, "groups"), migration = join(project, "scripts/runtime/data-current.ts");
       await mkdir(join(f.root, "data/runtime/pi"), { recursive: true });
       await writeFile(join(f.root, "data/runtime/pi/settings.json"), JSON.stringify({ defaultProvider: "fixture", defaultModel: "fixture" }));
-      if (status === 0) await mkdir(groups);
-      let args = [process.execPath, migration, "preview", "--decisions-only", "--project", f.root, "--groups", groups];
+      if (status === 0) { await mkdir(groups); await writeCurrentConfig(f.root); }
+      else { await mkdir(join(groups, "g", "users"), { recursive: true }); }
+      let args = [process.execPath, migration, "preview", "--project", f.root, "--groups", groups];
       if (entry === "powershell") {
         const header = `\ufeff$ErrorActionPreference='Stop'\n[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)\n. ${quotePS(join(project, "scripts/lib/operation-log.ps1"))}\n`;
         const child = join(f.root, "child.ps1"), parent = join(f.root, "parent.ps1");
@@ -44,17 +46,17 @@ for (const entry of ["migration", ...(process.platform === "win32" ? ["powershel
       expect(result.code, result.text).toBe(status);
       const directory = join(f.root, "logs/operations"), logs = await readdir(directory);
       expect(logs).toHaveLength(1);
-      expect(logs[0]).toStartWith(entry === "migration" ? "migration-" : "upgrade-");
+      expect(logs[0]).toStartWith(entry === "current-data" ? "deploy-" : "upgrade-");
       expect(result.text.split(logs[0]!).length - 1, result.text).toBe(status === 0 ? 1 : 2);
       expect(result.text.match(/本次操作日志：/g), result.text).toHaveLength(status === 0 ? 1 : 2);
       const text = await readFile(join(directory, logs[0]!), "utf8");
-      expect(text).toContain(`migration-finished: exit=${status}`);
-      if (entry !== "migration") expect(text).toContain(`operation finished; exit=${status}`);
-      if (status) expect(text).toContain("目录不存在");
+      expect(text).toContain(`data-finished: exit=${status}`);
+      if (entry !== "current-data") expect(text).toContain(`operation finished; exit=${status}`);
+      if (status) expect(text).toContain("未登记的群根含运行数据");
       else {
-        expect(result.text).toContain("迁移预检：需要迁移到数据版本");
+        expect(result.text).toContain("当前格式 6：新实例");
         expect(result.text).not.toContain('"decisions"');
-        expect(text).toContain("preview-result:");
+        expect(text).toContain("action=preview");
       }
     } finally { await f.cleanup(); }
   }, 30000);
@@ -148,13 +150,14 @@ test("migration preflight records failures without loading project configuration
   try {
     await mkdir(join(f.root, "data/config"), { recursive: true });
     await writeFile(join(f.root, "data/config/runtime.json"), "invalid-json");
-    const result = await run([process.execPath, join(project, "scripts/migrations/run.ts"), "preview", "--project", f.root, "--groups", join(f.root, "missing")], f.root);
+    await mkdir(join(f.root, "groups/g/users"), { recursive: true });
+    const result = await run([process.execPath, join(project, "scripts/runtime/data-current.ts"), "preview", "--project", f.root, "--groups", join(f.root, "groups")], f.root);
     expect(result.code, result.text).toBe(1);
     const logs = await readdir(join(f.root, "logs/operations")); expect(logs).toHaveLength(1);
     const text = await readFile(join(f.root, "logs/operations", logs[0]!), "utf8");
-    expect(text).toContain("目录不存在"); expect(text).toContain("migration-finished: exit=1");
+    expect(text).toContain("未登记的群根含运行数据"); expect(text).toContain("data-finished: exit=1");
     expect(result.text).toContain(logs[0]!);
-    expect(existsSync(join(f.root, "data/state/migration.json"))).toBe(false);
+    expect(existsSync(join(f.root, "data/state/release-data.json"))).toBe(false);
   } finally { await f.cleanup(); }
 }, 15000);
 

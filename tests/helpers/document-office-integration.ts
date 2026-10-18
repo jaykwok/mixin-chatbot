@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dlopen, FFIType, ptr } from "bun:ffi";
-import { buildLocalTools } from "../../src/agent/local-tools.ts";
+import { buildLocalTools } from "../helpers/native-tools.ts";
 import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
 import { groupWorkspaceDir, materialsIndexPath, userTempDir } from "../../src/agent/paths.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";

@@ -12,7 +12,7 @@ import {
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { Conversation, Extension } from "@earendil-works/pi-durable";
-import { buildLocalTools } from "../../src/agent/local-tools.ts";
+import { buildLocalTools } from "../helpers/native-tools.ts";
 import { type AgentModuleDefinition, loadModuleDefinitions } from "../../src/agent/modules.ts";
 import { groupWorkspaceDir } from "../../src/agent/paths.ts";
 import { buildChatContext } from "../../src/agent/prompt.ts";

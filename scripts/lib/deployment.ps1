@@ -114,10 +114,10 @@ function Write-DeploymentTransaction([string]$Directory, [hashtable]$Record) {
     Save-FileAtomically (Join-Path $Directory 'transaction') { param($temporary) [IO.File]::WriteAllText($temporary, $text, [Text.UTF8Encoding]::new($false)) }.GetNewClosure()
 }
 
-# 旧版快照没有记录时返回 $null；存在但无效时拒绝。
+# 当前发布必须有完整记录；格式不匹配时用对应旧版完成原操作。
 function Read-DeploymentTransaction([string]$Directory) {
     $path = Join-Path $Directory 'transaction'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw '事务格式不匹配：缺少当前发布记录' }
     $record = @{}
     foreach ($line in [IO.File]::ReadAllLines($path, [Text.UTF8Encoding]::new($false))) {
         $index = $line.IndexOf('=')
@@ -178,16 +178,16 @@ function Open-DeploymentTransaction([string]$ProjectRoot, [string]$Confirmation 
 }
 
 # The pointer is published only after the confirmed choices are recorded; resume and rollback read only that record.
-function Publish-DeploymentTransaction($Snapshot, [hashtable]$Record, [string]$Pointer, [string]$MigrationPlan = '') {
+function Publish-DeploymentTransaction($Snapshot, [hashtable]$Record, [string]$Pointer, [string]$DataPreparationPlan = '') {
     Write-DeploymentTransaction $Snapshot.Path $Record
-    if ($MigrationPlan) { Copy-Item -LiteralPath $MigrationPlan -Destination (Join-Path $Snapshot.Path 'migration-plan.json') -ErrorAction Stop }
+    if ($DataPreparationPlan) { Copy-Item -LiteralPath $DataPreparationPlan -Destination (Join-Path $Snapshot.Path 'data-plan.json') -ErrorAction Stop }
     $name = Split-Path $Snapshot.Path -Leaf
     # Publishing only ever creates the pointer: an existing one belongs to another unfinished transaction.
     Save-FileAtomically $Pointer { param($temporary) [IO.File]::WriteAllText($temporary, $name) }.GetNewClosure() -CreateOnly
 }
 
 # An interrupted upgrade reuses its original snapshot and original running state.
-function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha, [hashtable]$Record = $null, [string]$MigrationPlan = '', [string]$Confirmation = '', [string]$Action = '') {
+function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha, [hashtable]$Record = $null, [string]$DataPreparationPlan = '', [string]$Confirmation = '', [string]$Action = '', [string]$ResetConfig = '') {
     $pointer = Join-Path $ProjectRoot 'data\state\upgrade-transaction'
     if (Test-Path -LiteralPath $pointer) {
         $deploymentLock = [IO.File]::Open((Join-Path $ProjectRoot 'data\state\deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -216,10 +216,11 @@ function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$
             $Record.was_running = if ($state.WasRunning) { '1' } else { '0' }
             Write-DeploymentTransaction $state.Path $Record
         }
-        if ($MigrationPlan -and (Test-Path -LiteralPath $MigrationPlan -PathType Leaf)) {
-            Copy-Item -LiteralPath $MigrationPlan -Destination (Join-Path $state.Path 'migration-plan.json') -ErrorAction Stop
+        if ($DataPreparationPlan -and (Test-Path -LiteralPath $DataPreparationPlan -PathType Leaf)) {
+            Copy-Item -LiteralPath $DataPreparationPlan -Destination (Join-Path $state.Path 'data-plan.json') -ErrorAction Stop
         }
         $name = Split-Path $state.Path -Leaf
+        if ($ResetConfig) { Copy-Item -LiteralPath $ResetConfig -Destination (Join-Path $state.Path 'reset-config') -Recurse -ErrorAction Stop }
         # Create only: never replace the pointer of another unfinished transaction.
         Save-FileAtomically $pointer { param($temporary) [IO.File]::WriteAllText($temporary, $name) }.GetNewClosure() -CreateOnly
         return $state

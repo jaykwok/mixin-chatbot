@@ -1,18 +1,17 @@
+import { writeTestData as writeFile } from "../helpers/stats-fixture.ts";
 import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 // 这些数字会被抄进汇报材料，所以口径必须钉死：指令不算提问、干预算提问、区间按自然日
-// 闭区间、半行 JSON 不能让整份统计失败。测试用真实的 session.jsonl 记录形状入账。
+// 闭区间、半行 JSON 不能让整份统计失败。测试用真实的 stats.records 记录形状入账。
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir } from "node:fs/promises";
 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectAll, collectGroup } from "../../scripts/ops/stats-admin.ts";
 import { cacheReadRate, emptyUsage, formatCacheRate } from "../../scripts/lib/usage.ts";
-import { ingestSessionFile, openStatsLedger, sweepSessionStats } from "../../src/agent/stats-ledger.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 /** 统计只读账本，所以每个用例都要先把写好的会话文件入账。 */
-const ingest = (root: string) => sweepSessionStats(root, { force: true });
 
 test("账本按固定顺序折算：成员入账次序不影响工具、模型与每日统计", async () => {
   const fixture = await tempFixture("stats-fold-order-");
@@ -22,7 +21,7 @@ test("账本按固定顺序折算：成员入账次序不影响工具、模型�
       const root = join(fixture.root, label);
       for (const [index, user] of users.entries()) {
         await mkdir(join(root, "group", "users", user), { recursive: true });
-        await writeFile(join(root, "group", "users", user, "session.jsonl"), JSON.stringify({
+        await writeFile(join(root, "group", "users", user, "stats.records"), JSON.stringify({
           type: "message", timestamp: `2026-09-0${index + 1}T12:00:00Z`,
           message: { role: "assistant", provider: "fixture", model: user, content: [{ type: "toolCall", name: user }],
             usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } },
@@ -32,12 +31,6 @@ test("账本按固定顺序折算：成员入账次序不影响工具、模型�
     };
     const forwardRoot = await build("forward");
     const reverseRoot = await build("reverse");
-    const db = openStatsLedger(reverseRoot);
-    try {
-      // 逆序入账：折算顺序由账本的 ORDER BY 决定，不受写入次序影响。
-      for (const user of [...users].reverse()) await ingestSessionFile(db, reverseRoot, "group", user);
-    } finally { db.close(); }
-    await ingest(forwardRoot);
     const forward = await collectGroup("group", forwardRoot);
     const reverse = await collectGroup("group", reverseRoot);
     const serialize = (value: unknown) => JSON.stringify(value, (_key, part) =>
@@ -71,7 +64,7 @@ async function makeRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-stats-"));
   const write = async (group: string, user: string, lines: string[]) => {
     await mkdir(join(root, group, "users", user), { recursive: true });
-    await writeFile(join(root, group, "users", user, "session.jsonl"), lines.join("\n") + "\n");
+    await writeFile(join(root, group, "users", user, "stats.records"), lines.join("\n") + "\n");
   };
 
   await write("group-a", "13800000000", [
@@ -99,7 +92,6 @@ async function makeRoot(): Promise<string> {
   // 只说过一句话就再没来过的成员，仍然算「使用过」。
   await write("group-b", "13700000000", [userMsg("2026-08-12T05:00:00.000Z", "在吗")]);
 
-  await ingest(root);
   return root;
 }
 
@@ -107,9 +99,8 @@ describe("usage stats", () => {
   test("the real CLI displays a group whose only usage is history compaction", async () => {
     const fixture = await tempFixture("stats-compaction-cli-");
     const user = join(fixture.root, "g/users/u"); await mkdir(user, { recursive: true });
-    await writeFile(join(user, "session.jsonl"), JSON.stringify({ type: "compaction", timestamp: "2026-09-11T12:01:00Z",
+    await writeFile(join(user, "stats.records"), JSON.stringify({ type: "compaction", timestamp: "2026-09-11T12:01:00Z",
       usage: { input: 321, output: 20, cacheRead: 0, cacheWrite: 9, cost: { total: 0.5 } } }) + "\n");
-    await ingest(fixture.root);
     const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../../scripts/ops/stats-admin.ts", import.meta.url)), "g", "--group-id"],
       { cwd: fixture.root, env: { ...process.env, GROUP_DATA_ROOT: fixture.root }, stdout: "pipe", stderr: "pipe", windowsHide: true });
     const timer = setTimeout(() => child.kill(), 15000);
@@ -124,7 +115,7 @@ describe("usage stats", () => {
     const user = join(fixture.root, "g", "users", "u");
     await mkdir(user, { recursive: true });
     const usage = (input: number, output: number, cacheRead: number, cacheWrite: number, cost: number) => ({ input, output, cacheRead, cacheWrite, cost: { total: cost } });
-    await writeFile(join(user, "session.jsonl"), [
+    await writeFile(join(user, "stats.records"), [
       { type: "model_change", provider: "zai", modelId: "plan", timestamp: "2026-09-10T12:00:00Z" },
       { type: "message", timestamp: "2026-09-11T12:00:00Z", message: { role: "assistant", usage: usage(100, 10, 900, 500, 1) } },
       { type: "compaction", timestamp: "2026-09-11T12:01:00Z", usage: usage(200, 20, 0, 0, 2) },
@@ -132,7 +123,6 @@ describe("usage stats", () => {
       { type: "branch_summary", timestamp: "2026-09-12T12:01:00Z", usage: usage(50, 5, 100, 10, 3) },
       { type: "message", timestamp: "2026-09-12T12:02:00Z", message: { role: "assistant" } },
     ].map(value => JSON.stringify(value)).join("\n") + "\n");
-    await ingest(fixture.root);
     try {
       const result = await collectGroup("g", fixture.root);
       expect(result.tokens).toMatchObject({ input: 350, output: 35, cacheRead: 1000, cacheWrite: 510,
@@ -213,26 +203,10 @@ describe("usage stats", () => {
     }
   });
 
-  // 机器人边跑边追写，最后一行可能只写了一半。少一条记录可以接受，整份统计失败不行。
-  test("survives a half-written trailing line", async () => {
-    const root = await makeRoot();
-    try {
-      const path = join(root, "group-b", "users", "13700000000", "session.jsonl");
-      await writeFile(path, (await Bun.file(path).text()) + '{"type":"message","times');
-      await ingest(root);
-      const stats = await collectGroup("group-b", root);
-      expect(stats.asks).toBe(1);
-      expect(stats.skipped).toBe(1);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
   test("ranks groups by usage and skips groups nobody has used", async () => {
     const root = await makeRoot();
     try {
       await mkdir(join(root, "group-empty", "users"), { recursive: true });
-      await ingest(root);
       const groups = await collectAll(root);
       expect(groups.map((group) => group.group)).toEqual(["group-a", "group-b"]);
       expect(groups[0]!.asks).toBe(4);

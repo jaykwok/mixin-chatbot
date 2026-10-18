@@ -94,8 +94,8 @@ check_stop_disk_space() {
 }
 
 # 迁移日志是否属于这个事务：apply 以事务快照名记下 deployment。
-migration_mentions_deployment() {
-    [ -f "$PROJECT_DIR/data/state/migration.json" ] && grep -q "\"deployment\": \"$1\"" "$PROJECT_DIR/data/state/migration.json"
+data_preparation_mentions_deployment() {
+    [ -f "$PROJECT_DIR/data/state/release-data.json" ] && grep -q "\"deployment\": \"$1\"" "$PROJECT_DIR/data/state/release-data.json"
 }
 
 # 部署、升级器和回滚共用的项目 UFW 规则操作。
@@ -197,7 +197,7 @@ begin_deployment() {
         PREVIOUS_RUNNING="$(cat "$DEPLOY_SNAPSHOT/was-running")"
         [[ "$PREVIOUS_RUNNING" =~ ^[01]$ ]] || return 1
         # 已提交的事务由部署脚本在读取设置前直接完成激活；这里不能重新开始事务或迁移。
-        if declare -F migration_docker >/dev/null && migration_docker committed --deployment "$saved_name"; then
+        if declare -F data_preparation_docker >/dev/null && data_preparation_docker committed --deployment "$saved_name"; then
             print_error "上次操作的数据已经提交；请使用 $(ops_command_hint resume) 完成新实例启动"
             return 1
         fi
@@ -228,7 +228,7 @@ begin_deployment() {
             docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || return 1
         fi
         NEW_CONTAINER_ATTEMPTED=0; DEPLOY_FILES_MUTATED=1; TUNNEL_STARTED_BY_DEPLOY=0; DEPLOYMENT_COMMITTED=0
-        MIGRATION_APPLY_ATTEMPTED=1
+        DATA_PREPARATION_APPLY_ATTEMPTED=1
         operation_event info "resuming snapshot=$DEPLOY_SNAPSHOT; originally_running=$PREVIOUS_RUNNING"
         trap rollback_deployment EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
         print_warning "继续中断的部署，沿用原快照和原运行状态：$saved_name"
@@ -342,7 +342,7 @@ rollback_deployment() {
     trap : INT TERM HUP
     [ "$DEPLOYMENT_COMMITTED" = 0 ] || { operation_finish "$status"; return "$status"; }
     # A signal can arrive after the receipt write and before the local flag is assigned.
-    if [ "${MIGRATION_APPLY_ATTEMPTED:-0}" = 0 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ] && [ "$(cat "$BOT_UPDATE_COMMIT_FILE" 2>/dev/null)" = committed ]; then operation_finish "$status"; return "$status"; fi
+    if [ "${DATA_PREPARATION_APPLY_ATTEMPTED:-0}" = 0 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ] && [ "$(cat "$BOT_UPDATE_COMMIT_FILE" 2>/dev/null)" = committed ]; then operation_finish "$status"; return "$status"; fi
     operation_event error "deployment interrupted; exit=$status"
     operation_stage rollback
     set +e
@@ -377,10 +377,10 @@ restore_deployment() {
     fi
     # Data must be restored before the old container can start. A committed data marker
     # is authoritative even if the shell died before writing its deployment receipt.
-    if declare -F rollback_data_migration >/dev/null; then
-        local migration_status=0
-        rollback_data_migration || migration_status=$?
-        if [ "$migration_status" != 0 ]; then
+    if declare -F rollback_current_data >/dev/null; then
+        local data_preparation_status=0
+        rollback_current_data || data_preparation_status=$?
+        if [ "$data_preparation_status" != 0 ]; then
             # The upgrader keeps the target code (and its recovery tools) on this receipt,
             # even when data restoration itself failed.
             if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
@@ -418,7 +418,7 @@ restore_deployment() {
         else failed=1; fi
     fi
     if [ "$failed" = 0 ]; then
-        if [ "${MIGRATION_APPLY_ATTEMPTED:-0}" = 1 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then : > "$BOT_UPDATE_COMMIT_FILE"; fi
+        if [ "${DATA_PREPARATION_APPLY_ATTEMPTED:-0}" = 1 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then : > "$BOT_UPDATE_COMMIT_FILE"; fi
         # 升级的代码由升级器恢复：代码还不是升级前的提交时保留事务指针，记下“待恢复代码”阶段
         # （见 transaction_code_restore_pending），代码恢复后才清除，恢复失败时回滚仍可重试。
         if upgrade_code_pending; then : > "$DEPLOY_SNAPSHOT/code-restore" || failed=1

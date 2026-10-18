@@ -64,7 +64,7 @@ describe("usage projection", () => {
     const root = join(fixture.root, `root-${++counter}`);
     const ledger = openStatsLedger(root);
     try {
-      const source = conversationSource(GROUP, PHONE, 7);
+      const source = conversationSource(GROUP, PHONE, 7, "test-generation");
       const before = new Date(2026, 9, 6, 23, 59, 50).getTime();
       const after = new Date(2026, 9, 7, 0, 0, 5).getTime();
       const usage = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } };

@@ -14,7 +14,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { openStatsLedger } from "../../src/agent/stats-ledger.ts";
 import { AttemptsDoc, type UsageRecord } from "../../src/durable/attempts.ts";
 import { AuxiliaryDoc } from "../../src/durable/auxiliary-records.ts";
-import { memberConversation } from "../../src/durable/identity.ts";
+import { GroupDoc, memberConversation } from "../../src/durable/identity.ts";
 import { conversationSource, projectConversation } from "../../src/durable/projection.ts";
 import { handoffResults, ReclamationItems, ReclamationQueues } from "../../src/durable/results/queue.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
@@ -174,7 +174,7 @@ test("a retirement checkpoint left by a failed group commit keeps the baseline f
           startedAt: original.startedAt, endedAt: original.startedAt + 1, outcome: "stop", usage: bill };
       }
     }, context);
-    const source = conversationSource("group-a", "member", conversation.id).id;
+    const source = conversationSource("group-a", "member", conversation.id, (await opened.harness.snapshot(GroupDoc, context))!.generation).id;
     const digest = () => (ledger.query("SELECT digest FROM sources WHERE id = ?").get(source) as { digest: string } | null)?.digest;
     let captured: string | undefined;
     const failing = new Proxy(opened.harness, { get(target, name) {

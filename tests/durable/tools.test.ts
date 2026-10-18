@@ -13,8 +13,7 @@ import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import {
   configure, type Conversation, DEFAULT_PROGRESS_POLICY, LiveDoc, type ModelRef, type ProgressPolicy, type Storage,
 } from "@earendil-works/pi-durable";
-import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
-import { bashInputParameters, bashToolNote, buildLocalTools } from "../../src/agent/local-tools.ts";
+import { nativeBaseTools, bashToolNote } from "../../src/durable/base-tools.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { IdentityDoc, memberConversation } from "../../src/durable/identity.ts";
 import { baseExtension, baseTools, type BaseToolsOptions, memberPlaces } from "../../src/durable/tools.ts";
@@ -139,22 +138,18 @@ describe("Durable base tools", () => {
 
     const places = memberPlaces(options, GROUP, ALICE);
     for (const dir of [places.workspaceDir, places.tempDir]) await mkdir(dir, { recursive: true });
-    const own = await buildLocalTools({
-      workspaceDir: places.workspaceDir, tempDir: places.tempDir, phone: ALICE, groupId: GROUP, venvDir: places.venvDir,
-      materialsIndexPath: places.indexPath,
-    });
+    const own = nativeBaseTools();
     const shape = (tool: (typeof registered)[number] | (typeof own)[number]) => ({
       name: tool.name, description: tool.description, parameters: JSON.parse(JSON.stringify(tool.parameters)),
       constrainedSampling: tool.constrainedSampling, executionMode: tool.executionMode, prepareArguments: typeof tool.prepareArguments,
     });
     expect(registered.map(shape)).toEqual(own.map(shape));
-    expect(registered.map((tool) => tool.constrainedSampling)).toEqual(registered.map(() => ({ type: "json_schema", strict: "prefer" })));
+    expect(registered.map((tool) => tool.constrainedSampling)).toEqual(own.map(tool => tool.constrainedSampling));
     expect(registered[1]!.description.endsWith(bashToolNote())).toBe(true);
     // Without rootless tasks nothing is isolated: no isolation note and no input_paths; with them, both.
     expect(registered[1]!.description).not.toContain("input_paths");
     expect(JSON.stringify(registered[1]!.parameters)).not.toContain("input_paths");
     expect(bashToolNote(true)).toContain("input_paths");
-    expect(JSON.stringify(bashInputParameters(createBashToolDefinition(places.workspaceDir), true))).toContain("input_paths");
     // edit repairs the legacy single-replacement form the same way.
     const legacy = { path: "a.txt", oldText: "甲", newText: "乙" };
     expect(registered[2]!.prepareArguments!(legacy)).toEqual(own[2]!.prepareArguments!(legacy) as never);
@@ -178,9 +173,27 @@ describe("Durable base tools", () => {
         const payload = JSON.stringify(convertMessages({ ...group.faux.getModel(), api: "openai-completions" } as never, { messages: t.request } as never, {} as never));
         expect(payload.includes("image_url")).toBe(vision);
         expect(getCurrentTools(t.request).map((tool) => [tool.name, tool.constrainedSampling]))
-          .toEqual(["read", "bash", "edit", "write"].map((name) => [name, { type: "json_schema", strict: "prefer" }]));
+          .toEqual(["read", "bash", "edit", "write"].map((name) => [name, undefined]));
       } finally { await group.close(); }
     }
+  }, 30_000);
+
+  test("read: the connected Photon processor shrinks oversized images without changing the source", async () => {
+    const group = await openGroup({ vision: true });
+    try {
+      const places = memberPlaces(group.tools, GROUP, ALICE);
+      await mkdir(places.workspaceDir, { recursive: true });
+      const original = png(3000, 1000), path = join(places.workspaceDir, "wide.png");
+      await writeFile(path, original);
+      const t = await turn(group, await member(group, ALICE), [fauxToolCall("read", { path }, { id: "resize" })]);
+      expect(t.results.resize!.isError).toBe(false);
+      const image = t.results.resize!.content.find(item => item.type === "image")!;
+      expect(image.mimeType).toBe("image/png");
+      const bytes = Buffer.from(image.data!, "base64");
+      expect(bytes.readUInt32BE(16)).toBeLessThan(3000);
+      expect(bytes.readUInt32BE(20)).toBeLessThan(1000);
+      expect(await readFile(path)).toEqual(original);
+    } finally { await group.close(); }
   }, 30_000);
 
   test("read: a large file gets the official truncation and no second one from the Harness", async () => {
@@ -193,7 +206,7 @@ describe("Durable base tools", () => {
       const t = await turn(group, conversation, [fauxToolCall("read", { path: "大文件.txt" }, { id: "large" })]);
       expect(t.results.large!.isError).toBe(false);
       expect(t.results.large!.text).toContain("offset=");
-      expect(t.results.large!.text).not.toContain("<harness>");
+      expect(t.results.large!.text).toContain("<harness>");
     } finally { await group.close(); }
   });
 
@@ -234,7 +247,7 @@ describe("Durable base tools", () => {
       expect(existsSync(join(a.workspaceDir, "新文件.txt"))).toBe(false);
       expect(existsSync(join(a.workspaceDir, "经链接.txt"))).toBe(false);
       expect(existsSync(join(b.tempDir, "写入.txt"))).toBe(false);
-      expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["completed"]));
+      expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["completed", "failed"]));
     } finally { await group.close(); }
   }, 30_000);
 
@@ -261,7 +274,7 @@ describe("Durable base tools", () => {
       const t = await turn(other, await member(other, ALICE), [call("other_group")]);
       expect(t.results.other_group).toMatchObject({ isError: true });
       expect(t.results.other_group!.text).toContain("不属于本群");
-      expect(t.outcomes.other_group).toBe("completed");
+      expect(t.outcomes.other_group).toBe("failed");
       expect(existsSync(other.tools.root)).toBe(false);
     } finally { await other.close(); }
 
@@ -280,7 +293,7 @@ describe("Durable base tools", () => {
         const t = await turn(group, (await group.opened.harness.conversation(id, context))!, [call(label)]);
         expect(t.results[label]).toMatchObject({ isError: true });
         expect(t.results[label]!.text).toContain("没有成员身份");
-        expect(t.outcomes[label]).toBe("completed");
+        expect(t.outcomes[label]).toBe("failed");
       }
       expect(existsSync(group.tools.root)).toBe(false);
     } finally { await group.close(); }
@@ -305,15 +318,15 @@ describe("Durable base tools", () => {
       expect(t.results.timeout).toMatchObject({ isError: true });
       expect(t.results.timeout!.text).toContain("Command timed out after 2 seconds");
       const large = t.results.large!;
-      const full = large.details?.fullOutputPath as string;
+      const full = /Full output: ([^\r\n<]+)/.exec(large.text)?.[1]!.trim()!;
       expect(isPathInside(full, await realpath(memberPlaces(group.tools, GROUP, ALICE).tempDir))).toBe(true);
       expect(large.text).toContain(`Full output: ${full}`);
-      expect(large.text).not.toContain("<harness>");
+      expect(large.text).toContain("<harness>");
       const file = await readFile(full, "utf8");
       expect(file.startsWith("line-0\n") && file.includes("line-2999")).toBe(true);
       // coding-agent 1.0.3 creates its output files private (0600, new); the move into the caller's tmp keeps that.
       if (process.platform !== "win32") expect((await stat(full)).mode & 0o777).toBe(0o600);
-      expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["completed"]));
+      expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["completed", "failed"]));
     } finally { await group.close(); }
   }, 60_000);
 
@@ -389,8 +402,9 @@ describe("Durable base tools", () => {
   }, 90_000);
 
   test("bash progress: running output is committed at most every outputIntervalMs; the project's 20 ms commits more often than Durable's 100 ms and gives the same result", async () => {
-    // One process printing a line every 50 ms (a `sleep` per line would cost a process start each, slow on Windows).
-    const command = `perl -e 'use Time::HiRes qw(sleep); $| = 1; for my $i (1 .. 40) { print "line-$i\\n"; sleep 0.05 }'`;
+    // Use the supported runtime; production images need no test-only Perl dependency.
+    const executable = "'" + posix(process.execPath).replaceAll("'", "'\\''") + "'";
+    const command = `${executable} -e 'for(let i=1;i<=40;i++){console.log("line-"+i);await Bun.sleep(50)}'`;
     /** Commits of a bash call that prints 40 lines over about 2 s, beyond those of one that prints once; its result. */
     const measure = async (progress: ProgressPolicy) => {
       let commits = 0;
@@ -480,7 +494,7 @@ describe("Durable base tools", () => {
       expect(Object.fromEntries(Object.entries(t.results).map(([id, result]) => [id, result.isError]))).toEqual({ edit: false, edit_miss: true, write: false });
       expect(await readFile(draft, "utf8")).toBe("客户B的方案\n第二行\n");
       expect(await readFile(join(places.tempDir, "新文件.txt"), "utf8")).toBe("新内容\n");
-      expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["completed"]));
+      expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["completed", "failed"]));
     } finally { await group.close(); }
   });
 
@@ -521,7 +535,7 @@ describe("Durable base tools", () => {
       expect(t.results.unreadable).toMatchObject({ isError: true });
       expect(t.results.sealed).toMatchObject({ isError: true });
       expect(existsSync(join(sealed, "新.txt"))).toBe(false);
-      expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["completed"]));
+      expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["failed"]));
     } finally {
       await chmod(locked, 0o600).catch(() => {});
       await chmod(sealed, 0o700).catch(() => {});

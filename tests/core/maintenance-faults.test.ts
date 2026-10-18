@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import * as io from "../../scripts/migrations/lib/io.ts";
+import * as io from "../../scripts/lib/atomic-file.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { durableMemberScope } from "../../src/durable/maintenance-view.ts";

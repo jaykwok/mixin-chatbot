@@ -47,7 +47,7 @@ test("事务记录逐键校验：重复、未知、缺失或非法的值拒绝�
   expect(() => parseTransactionRecord(serialize(record) + "bot_port=2022\n")).toThrow("bot_port");
 });
 
-test("运维界面按指针读取事务，数据已提交只看本事务的迁移回执", async () => {
+test("运维界面按指针读取事务，数据已提交只看本事务的当前格式回执", async () => {
   const fixture = await tempFixture("transaction-pending-");
   const root = fixture.root, state = join(root, "data/state"), snapshot = join(root, "backup/snapshots/deploy-abc123");
   try {
@@ -63,49 +63,41 @@ test("运维界面按指针读取事务，数据已提交只看本事务的迁�
     // Direct entries show the recorded firewall source that continuing will use.
     await writeFile(join(snapshot, "transaction"), serialize({ ...record, deploy_mode: "direct", bot_domain: "" }));
     expect(describePendingTransaction(loadPendingTransaction(root)!).record).toContain("端口 2022 · 入口 直连（来源 203.0.113.17）");
-    // A legacy snapshot without a record: Linux continues only after the one-time backfill in a terminal.
     await Bun.file(join(snapshot, "transaction")).delete();
-    const legacy = loadPendingTransaction(root)!;
-    expect(describePendingTransaction(legacy, "linux").record).toEqual(["旧版事务没有记录：继续前需在终端逐项确认并补录一次，回滚不需要"]);
-    for (const [pending, platform] of [[legacy, "windows"], [{ ...legacy, snapshot: null }, "linux"], [{ ...legacy, codeRestorePending: true }, "linux"]] as const) {
-      expect(describePendingTransaction(pending, platform).record).toEqual(["旧版事务：继续时按已保存设置处理"]);
-    }
+    expect(() => loadPendingTransaction(root)).toThrow("事务格式不匹配");
     await writeFile(join(snapshot, "transaction"), serialize(record));
     // A committed journal from another deployment does not block rolling back this one.
-    const journal = { id: "migration-1", target: 1, phase: "committed", groups: "/srv/new", deployment: "deploy-older" };
-    await writeFile(join(state, "migration.json"), JSON.stringify(journal));
+    const journal = { format: 1, phase: "committed", groups: "/srv/new", deployment: "deploy-older" };
+    await writeFile(join(state, "release-data.json"), JSON.stringify(journal));
     expect(loadPendingTransaction(root)?.committed).toBe(false);
-    await writeFile(join(state, "migration.json"), JSON.stringify({ ...journal, deployment: "deploy-abc123" }));
+    await writeFile(join(state, "release-data.json"), JSON.stringify({ ...journal, deployment: "deploy-abc123" }));
     expect(loadPendingTransaction(root)?.committed).toBe(true);
-    await writeFile(join(state, "migration.json"), JSON.stringify({ ...journal, deployment: "deploy-abc123", phase: "validated", kind: "migration" }));
+    await writeFile(join(state, "release-data.json"), JSON.stringify({ ...journal, deployment: "deploy-abc123", phase: "prepared" }));
     expect(loadPendingTransaction(root)?.committed).toBe(false);
     // The record must belong to the pointed snapshot, and pointer names are never paths.
     await writeFile(join(snapshot, "transaction"), serialize({ ...record, snapshot: "deploy-other" }));
     expect(() => loadPendingTransaction(root)).toThrow("不一致");
     await writeFile(join(state, "deploy-transaction"), "../deploy-abc123");
     expect(() => loadPendingTransaction(root)).toThrow("名称无效");
-    // Legacy Docker deployment: no record, target from the snapshot.
     await writeFile(join(state, "deploy-transaction"), "deploy-abc123");
-    await Bun.write(join(snapshot, "transaction"), ""); await Bun.file(join(snapshot, "transaction")).delete();
-    await writeFile(join(snapshot, "target-sha"), "b".repeat(40) + "\n");
-    expect(loadPendingTransaction(root)).toMatchObject({ operation: "deploy", record: null, targetSha: "b".repeat(40) });
+    await Bun.file(join(snapshot, "transaction")).delete();
+    await writeFile(join(snapshot, "target-sha"), "b".repeat(40));
+    expect(() => loadPendingTransaction(root)).toThrow("事务格式不匹配");
     // Legacy Linux upgrade stopped before the deployment began: only the stop record and receipt exist.
-    await Bun.file(join(state, "deploy-transaction")).delete(); await Bun.file(join(state, "migration.json")).delete();
+    await Bun.file(join(state, "deploy-transaction")).delete(); await Bun.file(join(state, "release-data.json")).delete();
     await writeFile(join(state, "update-transaction"), ["1", "c".repeat(40), "main", "d".repeat(40), "-", "1", ""].join("\n"));
     await writeFile(join(state, "update-commit"), "");
-    expect(loadPendingTransaction(root)).toMatchObject({ operation: "upgrade", snapshot: null, record: null, targetSha: "d".repeat(40), committed: false, codeRestorePending: false });
-    await writeFile(join(state, "update-commit"), "committed");
-    expect(loadPendingTransaction(root)?.committed).toBe(true);
-    // Legacy Windows upgrade keeps its target only in the Clixml snapshot.
+    expect(() => loadPendingTransaction(root)).toThrow("事务格式不匹配");
     await Bun.file(join(state, "update-transaction")).delete(); await Bun.file(join(state, "update-commit")).delete();
+    // Historical Windows snapshots are refused too.
     await Bun.file(join(snapshot, "target-sha")).delete();
     await writeFile(join(state, "upgrade-transaction"), "deploy-abc123");
     await writeFile(join(snapshot, "deployment.xml"), `<Objs><Obj><MS><S N="UpgradeTarget">${"e".repeat(40)}</S></MS></Obj></Objs>`);
-    expect(loadPendingTransaction(root)).toMatchObject({ operation: "upgrade", snapshot: "deploy-abc123", record: null, targetSha: "e".repeat(40) });
+    expect(() => loadPendingTransaction(root)).toThrow("事务格式不匹配");
   } finally { await fixture.cleanup(); }
 });
 
-test.skipIf(!bash || !existsSync(bash))("Docker 事务记录可往返读写，拒绝篡改，并能从旧版快照合成", async () => {
+test.skipIf(!bash || !existsSync(bash))("Docker 事务记录可往返读写，拒绝篡改，拒绝没有记录的旧快照", async () => {
   const fixture = await tempFixture("transaction-bash-");
   const script = join(fixture.root, "record.sh"), snapshot = join(fixture.root, "backup/snapshots/deploy-abc123");
   await mkdir(snapshot, { recursive: true }); await mkdir(join(fixture.root, "data/state"), { recursive: true });
@@ -130,7 +122,7 @@ if write_transaction_record "$snap" 2>/dev/null; then echo 'invalid value writte
 printf deploy-abc123 > "$PROJECT_DIR/data/state/deploy-transaction"
 unset TRANSACTION
 load_pending_transaction
-echo "RECORD port=\${TRANSACTION[bot_port]} root=\${TRANSACTION[target_group_root]} platform=\${TRANSACTION[platform_ip]} legacy=$TRANSACTION_LEGACY"
+echo "RECORD port=\${TRANSACTION[bot_port]} root=\${TRANSACTION[target_group_root]} platform=\${TRANSACTION[platform_ip]}"
 cp "$snap/transaction" "$snap/transaction.good"
 printf 'bot_port=2023\\n' >> "$snap/transaction"
 if load_pending_transaction 2>/dev/null; then echo 'duplicate accepted'; exit 1; fi
@@ -138,69 +130,17 @@ sed 's/^deploy_mode=.*/deploy_mode=tunnel/' "$snap/transaction.good" > "$snap/tr
 if load_pending_transaction 2>/dev/null; then echo 'invalid mode accepted'; exit 1; fi
 sed 's/^snapshot=.*/snapshot=deploy-other/' "$snap/transaction.good" > "$snap/transaction"
 if load_pending_transaction 2>/dev/null; then echo 'foreign record accepted'; exit 1; fi
-# Legacy snapshot: target root, target commit and running state from the snapshot; port, mode and domain from saved settings.
+# Historical fragments cannot synthesize current release choices.
 rm "$snap/transaction" "$snap/transaction.good"
-printf '%s' "$(printf 'c%.0s' {1..40})" > "$snap/target-sha"; printf 0 > "$snap/was-running"; printf /srv/legacy > "$snap/group-root"
-printf 3033 > "$PROJECT_DIR/data/state/bot-port"; printf 'Bot.Example.com' > "$PROJECT_DIR/data/state/bot-domain"
-# Old snapshots never recorded the source address; they keep the old behaviour of the current setting.
-PLATFORM_IP=198.51.100.9
-load_pending_transaction
-echo "LEGACY port=\${TRANSACTION[bot_port]} root=\${TRANSACTION[target_group_root]} original=\${TRANSACTION[original_group_root]} domain=\${TRANSACTION[bot_domain]} action=\${TRANSACTION[domain_action]} platform=\${TRANSACTION[platform_ip]} legacy=$TRANSACTION_LEGACY"
-describe_pending_transaction; echo
-# The original group root comes from the snapshot's copy of the saved setting when there is one; every value names its source.
-mkdir -p "$snap/data/state"; printf /srv/original > "$snap/data/state/group-data-root"
-load_pending_transaction
-echo "SOURCES original=\${TRANSACTION[original_group_root]} from=\${TRANSACTION_SOURCE[original_group_root]} target=\${TRANSACTION_SOURCE[target_sha]} port=\${TRANSACTION_SOURCE[bot_port]} platform=\${TRANSACTION_SOURCE[platform_ip]}"
-# Continuing needs the values confirmed in a terminal; without one nothing is written.
-if backfill_legacy_transaction </dev/null; then echo 'backfilled without a terminal'; exit 1; fi
-[ ! -e "$snap/transaction" ] || { echo 'record written without confirmation'; exit 1; }
+printf '%s' "$(printf 'c%.0s' {1..40})" > "$snap/target-sha"
+if load_pending_transaction; then echo 'old snapshot accepted'; exit 1; fi
 `);
   try {
     const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toContain("RECORD port=2022 root=/srv/new groups platform=203.0.113.17 legacy=0");
-    expect(result.output).toContain(`LEGACY port=3033 root=/srv/legacy original=${posixPath(fixture.root)}/data/groups domain=bot.example.com action=persist platform=198.51.100.9 legacy=1`);
+    expect(result.output).toContain("RECORD port=2022 root=/srv/new groups platform=203.0.113.17");
     expect(result.output).toContain(`VERDICTS ${platformIpVerdicts()}\n`);
-    expect(result.output).toContain("旧版事务");
-    expect(result.output).toContain("SOURCES original=/srv/original from=快照 data/state/group-data-root target=快照 target-sha port=已保存设置 platform=当前终端的 PLATFORM_IP");
-    expect(result.output).toContain("逐项确认并补录");
-  } finally { await fixture.cleanup(); }
-}, 30000);
-
-// The confirmation reads a terminal: util-linux script provides one on Linux.
-test.skipIf(process.platform !== "linux" || !Bun.which("script"))("旧版事务继续前在终端核对每个值的来源，确认后只补录一次完整记录", async () => {
-  const fixture = await tempFixture("transaction-backfill-");
-  const snap = join(fixture.root, "backup/snapshots/deploy-abc123"), state = join(fixture.root, "data/state"), script = join(fixture.root, "backfill.sh");
-  await mkdir(join(snap, "data/state"), { recursive: true }); await mkdir(state, { recursive: true });
-  await writeFile(join(snap, "target-sha"), "c".repeat(40)); await writeFile(join(snap, "was-running"), "1");
-  await writeFile(join(snap, "group-root"), "/srv/groups"); await writeFile(join(snap, "data/state/group-data-root"), "/srv/groups");
-  await writeFile(join(state, "bot-port"), "3033"); await writeFile(join(state, "deploy-transaction"), "deploy-abc123");
-  await writeFile(script, `#!/usr/bin/env bash
-set -euo pipefail
-. '${join(project, "scripts/lib/common.sh")}'
-PROJECT_DIR="$1"
-load_pending_transaction
-if backfill_legacy_transaction; then echo "BACKFILLED legacy=$TRANSACTION_LEGACY"; else echo DECLINED; fi
-load_pending_transaction
-echo "RELOADED legacy=$TRANSACTION_LEGACY port=\${TRANSACTION[bot_port]} root=\${TRANSACTION[target_group_root]}"
-`);
-  const answer = async (input: string) => {
-    const child = Bun.spawn(["script", "-qec", `bash '${script}' '${fixture.root}'`, "/dev/null"], {
-      cwd: fixture.root, env: { ...process.env, PLATFORM_IP: "" }, stdin: new Blob([input]), stdout: "pipe", stderr: "pipe" });
-    const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-    expect(code, out + err).toBe(0);
-    return out + err;
-  };
-  try {
-    let output = await answer("n\n");
-    expect(output).toContain("DECLINED"); expect(output).toContain("RELOADED legacy=1");
-    expect(output).toMatch(/目标提交\s+c{40}（快照 target-sha）/); expect(output).toMatch(/端口\s+3033（已保存设置）/);
-    expect(output).toMatch(/原群数据总根\s+\/srv\/groups（快照 data\/state\/group-data-root）/); expect(output).toMatch(/平台IP\s+\S+（默认值）/);
-    expect(existsSync(join(snap, "transaction"))).toBe(false);
-    output = await answer("y\n");
-    expect(output).toContain("BACKFILLED legacy=0"); expect(output).toContain("RELOADED legacy=0 port=3033 root=/srv/groups");
-    const record = await readFile(join(snap, "transaction"), "utf8");
-    expect(record).toContain(`target_sha=${"c".repeat(40)}\n`); expect(record).toContain("operation=deploy\n"); expect(record).toContain("was_running=1\n");
+    expect(result.output).toContain("事务格式不匹配");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -213,7 +153,7 @@ test.skipIf(process.platform !== "win32")("Windows 事务记录与 Docker 同一
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
 $snapshot=${quotePS(snapshot)}; $pointer=Join-Path $PSScriptRoot 'data\\state\\deploy-transaction'
-if (Read-DeploymentTransaction $snapshot) { throw 'absent record not null' }
+try { Read-DeploymentTransaction $snapshot; throw 'old snapshot accepted' } catch { if ($_.Exception.Message -notmatch '事务格式不匹配') { throw } }
 $verdicts=foreach ($value in @(${platformIps.map(value => `'${value}'`).join(", ")})) { '"' + $value + '"=' + [int](Test-TransactionValue 'platform_ip' $value) }
 Write-Output ('VERDICTS ' + ($verdicts -join ' '))
 $record=@{ format='1'; operation='deploy'; snapshot=(Split-Path $snapshot -Leaf); target_sha=''; original_sha=''; original_branch=''
@@ -223,7 +163,7 @@ $bad=$record.Clone(); $bad.bot_port='70000'
 try { Publish-DeploymentTransaction ([pscustomobject]@{Path=$snapshot}) $bad $pointer; throw 'invalid record published' } catch { if ($_.Exception.Message -eq 'invalid record published') { throw } }
 if (Test-Path -LiteralPath $pointer) { throw 'pointer published without a valid record' }
 Publish-DeploymentTransaction ([pscustomobject]@{Path=$snapshot}) $record $pointer (Join-Path $PSScriptRoot 'plan.json')
-if (-not (Test-Path -LiteralPath (Join-Path $snapshot 'migration-plan.json'))) { throw 'plan not kept with the snapshot' }
+if (-not (Test-Path -LiteralPath (Join-Path $snapshot 'data-plan.json'))) { throw 'plan not kept with the snapshot' }
 $read=Read-DeploymentTransaction $snapshot
 if ($read.target_group_root -cne 'E:\\groups' -or $read.unmanaged_tunnel -cne 'direct' -or $read.platform_ip -cne '203.0.113.17') { throw 'record not read back' }
 Write-Output (Format-DeploymentTransaction $read)

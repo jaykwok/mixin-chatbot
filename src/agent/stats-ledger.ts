@@ -1,24 +1,10 @@
-// 使用统计账本：唯一的统计来源，与会话文件的存亡无关。
-//
-// 对话在 Durable 群库里，由 src/durable/projection.ts 按条目游标入账；升级前的旧会话文件 session.jsonl 原地保留，
-// 随时可能被 history clear 归档，由每日扫描补账。旧会话文件入账按「世代 + 自然日」聚合：一份会话文件的每一次新建算一个世代（source），同一世代
-// 整份重读时先清行再写，所以补跑、重跑、被改写后重读都不会把数字算两遍。
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
-import { lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { dataDirectoryNames } from "../../scripts/lib/group-data.ts";
 import { countUsageRecord, emptyUsage, type UsageTotals } from "../../scripts/lib/usage.ts";
-import { readSessionSlice, SessionFileChangedError, type SessionSlice, type StatsRecord } from "./session-reader.ts";
-import { SESSION_FILE } from "./paths.ts";
+import type { StatsRecord } from "./stats-record.ts";
 
-/**
- * 2：增加 `sources.projection`，账本含子调用（`nested`、`nested_incomplete`）和工具自身用量（`tool`）。
- * 由数据迁移 v2 从 1 转换；旧代码把未知的工具 kind 当作已送附件，所以必须拒绝读新账本。
- */
 const SCHEMA_VERSION = 2;
-/** 入账口径。1 只出现在迁移时原件无法核对、原样保留的旧世代上。 */
-const PROJECTION = 2;
 /** Durable projection: aborted entries are separate requests, and starts without an entry remain visible. */
 export const DURABLE_PROJECTION = 4;
 /** Frozen usage of retired requests (`settled:<source>`): never re-projected, so it has no entry projector version.
@@ -43,9 +29,9 @@ const hasSchema = (db: Database) => !!db.query("SELECT 1 FROM sqlite_master WHER
 
 function assertSchemaVersion(db: Database): void {
   const version = (db.query("SELECT version FROM stats_schema WHERE id = 1").get() as { version: number } | null)?.version;
-  // 原始会话可能已归档或删除；账本必须保留，由升级里的数据迁移转换旧版本。
+  // 原始会话可能已归档或删除；账本必须保留，结构变化时应单独转换备份并核对。
   if (version !== SCHEMA_VERSION) {
-    throw new Error(`统计账本版本 ${version ?? "未知"} 与当前 ${SCHEMA_VERSION} 不一致；请通过 TUI“升级”或 ops update 完成数据迁移，勿删除 stats.sqlite`);
+    throw new Error(`统计账本版本 ${version ?? "未知"} 与当前 ${SCHEMA_VERSION} 不一致；请保留 stats.sqlite，并按 docs/data-migrations.md 的统计转换说明准备当前格式账本`);
   }
 }
 
@@ -125,7 +111,7 @@ const byKey = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 /**
  * 把新增记录折成日粒度的桶。
  *
- * provider/model 是跨行状态：`model_change` 和带模型信息的回复会决定后续记录的归属，
+ * provider/model 随带模型信息的回复更新，
  * 所以增量入账必须把它随游标一起存回账本，否则续读的那一段会被算到 unknown 上。
  */
 function fold(records: StatsRecord[], state: { provider: string; model: string }) {
@@ -153,11 +139,6 @@ function fold(records: StatsRecord[], state: { provider: string; model: string }
   };
 
   for (const record of records) {
-    if (record.type === "model_change") {
-      state.provider = record.provider ?? "unknown";
-      state.model = record.modelId ?? "unknown";
-      continue;
-    }
     if (record.type === "message" && record.message?.role === "assistant") {
       state.provider = record.message.provider ?? state.provider;
       state.model = record.message.model ?? state.model;
@@ -171,10 +152,6 @@ function fold(records: StatsRecord[], state: { provider: string; model: string }
       const identifier = (value: unknown) => typeof value === "string" && value.trim() ? value : "unknown";
       countUsage(day, record.kind || "usage", at, record.usage,
         { provider: identifier(record.provider), model: identifier(record.model) });
-      continue;
-    }
-    if (record.type === "compaction" || record.type === "branch_summary") {
-      countUsage(day, record.type, at, record.usage);
       continue;
     }
     if (record.type !== "message" || !record.message) continue;
@@ -238,128 +215,8 @@ function apply(db: Database, source: string, folded: ReturnType<typeof fold>): v
   }
 }
 
-export interface IngestResult {
-  /** 这一世代在账本里的主键。 */
-  source: string;
-  records: number;
-  /** 整份重读过：本世代的旧行已被替换。 */
-  reset: boolean;
-}
-
-/**
- * 把一份会话文件的新增部分入账；文件不存在时返回 null，已归档世代的账目保持不动。
- * 游标、跨行状态和聚合行在同一个事务里落盘，中途失败下次重来即可。
- */
-export function ingestSessionFile(db: Database, root: string, group: string, user: string): Promise<IngestResult | null> {
-  return ingestSessionPath(db, join(resolve(root), group, "users", user, SESSION_FILE), group, user);
-}
-
-/**
- * 按显式路径入账，归属到指定的群/成员目录段。
- * 回收区里的归档会话只能这样补账：文件名不带群和成员信息。
- *
- * 每日扫描可能与任务结束或 `/clear` 同时入账同一份文件。读文件前记下这份文件在账本里的
- * 那一行，提交时它必须原样未动（首次入账则仍不存在）；别的连接在此期间入账、整份重建或
- * 标记归档，这一轮就作废重读。否则追加的那段会被累加两次，或者较旧的整份重读把新账、
- * 游标和归档标记覆盖回去——文件已归档时再也补不回来。
- */
-export async function ingestSessionPath(db: Database, path: string, group: string, user: string): Promise<IngestResult | null> {
-  for (let attempt = 1; ; attempt++) {
-    const result = await ingestOnce(db, path, group, user);
-    if (result !== "conflict") return result;
-    if (attempt >= 3) throw new Error("统计入账冲突：同一会话正被反复入账，稍后由下次入账补上");
-  }
-}
-
-async function ingestOnce(db: Database, path: string, group: string, user: string): Promise<IngestResult | null | "conflict"> {
-  let identity: string;
-  try {
-    const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink()) return null;
-    identity = `${info.dev}:${info.ino}:${info.birthtimeMs}`;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
-  // 整行取出：提交前按同一个键再取一次比对，任何列变了都说明别人动过。
-  const located = () => db.query(`SELECT * FROM sources WHERE group_segment = ? AND user_segment = ? AND identity = ?`)
-    .get(group, user, identity) as SourceRow | null;
-  const prior = located();
-  // 旧口径的世代只在原件仍在时才会续读到：整份重读，按当前口径重算后替换旧行。
-  const cursor = prior?.projection === PROJECTION ? { identity: prior.identity, offset: prior.offset, digest: prior.digest } : undefined;
-  let slice: SessionSlice;
-  try {
-    slice = await readSessionSlice(path, cursor);
-  } catch (error) {
-    if (error instanceof SessionFileChangedError) return "conflict";
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
-  // 以实际读取句柄的身份为准；文件在打开前被换代时重新定位账本，不能套用旧世代游标。
-  if (slice.cursor.identity !== identity) return "conflict";
-  const continued = !slice.reset && cursor !== undefined && prior !== null;
-  // /clear 标记归档之后、移走文件之前仍可能被扫描。没有新增字节或尾行变化就不写库，
-  // 保留原来的归档状态；返回 source 让归档调用方仍可标记已经入账过的会话。
-  if (continued && slice.cursor.offset === prior.offset && slice.cursor.digest === prior.digest
-    && Number(slice.pending) === prior.pending) return { source: prior.id, records: 0, reset: false };
-  const id = prior?.id ?? slice.sessionId ?? `file:${group}/${user}:${identity}`;
-  const state = { provider: continued ? prior!.provider : "unknown", model: continued ? prior!.model : "unknown" };
-  const folded = fold(slice.records, state);
-  const now = Date.now();
-  // immediate：先拿写锁再核对，跨进程时也不会基于过期快照提交。续读、首次入账和整份重建都要核对。
-  const committed = db.transaction(() => {
-    if (JSON.stringify(located()) !== JSON.stringify(prior)) return false;
-    if (continued) {
-      // 普通入账不撤销归档标记；离线重算同一世代时也一样。
-      db.query(`UPDATE sources SET offset = ?, digest = ?, bad_lines = bad_lines + ?, pending = ?,
-        provider = ?, model = ?, seen_at = ? WHERE id = ?`)
-        .run(slice.cursor.offset, slice.cursor.digest, slice.badLines, slice.pending ? 1 : 0,
-          state.provider, state.model, now, id);
-    } else {
-      // 整份重读：先清掉这一世代的旧行，再按新内容写一遍，重复入账不会翻倍。
-      for (const table of ["activity", "tool_counts", "usage_totals"]) {
-        db.query(`DELETE FROM ${table} WHERE source = ?`).run(id);
-      }
-      db.query(`INSERT INTO sources (id, group_segment, user_segment, identity, offset, digest,
-          bad_lines, pending, provider, model, seen_at, archived_at, projection)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-        ON CONFLICT(id) DO UPDATE SET group_segment = excluded.group_segment, user_segment = excluded.user_segment,
-          identity = excluded.identity, offset = excluded.offset, digest = excluded.digest,
-          bad_lines = excluded.bad_lines, pending = excluded.pending, provider = excluded.provider,
-          model = excluded.model, seen_at = excluded.seen_at, projection = excluded.projection`)
-        .run(id, group, user, slice.cursor.identity, slice.cursor.offset, slice.cursor.digest,
-          slice.badLines, slice.pending ? 1 : 0, state.provider, state.model, now, PROJECTION);
-    }
-    apply(db, id, folded);
-    return true;
-  }).immediate();
-  if (!committed) return "conflict";
-  return { source: id, records: slice.records.length, reset: slice.reset };
-}
-
-/**
- * 归档前的最后一次入账，并记下归档时间。
- *
- * 定时扫描只是兜底：`/clear` 是群成员随时能发的指令，两次扫描之间清掉的那段历史一旦
- * 进了回收区就再也补不回来，所以归档路径必须先落账再移文件。
- */
-export async function ingestBeforeArchive(root: string, group: string, user: string): Promise<void> {
-  const db = openStatsLedger(root);
-  try {
-    const result = await ingestSessionFile(db, root, group, user);
-    if (result) db.query("UPDATE sources SET archived_at = ? WHERE id = ?").run(Date.now(), result.source);
-  } finally { db.close(); }
-}
-
 /** 一段持久会话在账本里的世代：一个成员会话一个 source，游标是已入账的最新条目号。 */
 export interface ConversationSource { id: string; group: string; user: string; identity: string; digest?: string }
-
-/** Retired starts cannot reconstruct the original timestamps or confirmed usage of older entries.
- * Keep their aggregate and cursor across projector upgrades; any future conversion must migrate
- * this finalized source explicitly instead of silently rebuilding it from incomplete evidence. */
-export function hasRetiredConversation(db: Database, source: string): boolean {
-  return db.query("SELECT 1 FROM meta WHERE key = ?").get("durable_retired:" + source) !== null;
-}
 
 export function finalizeConversationProjection(db: Database, source: string): void {
   db.query("INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')").run("durable_retired:" + source);
@@ -389,21 +246,17 @@ export function settleConversationUsage(db: Database, source: ConversationSource
  * 持久会话的增量入账：`records` 是条目号 `from` 之后、到 `to` 为止的记录，按条目顺序。
  * 游标、跨行模型状态和聚合行在同一个事务里落盘；账本里的游标不等于 `from`（别处刚入过账）时
  * 不写，返回 false，调用方重读后再来。`replace` 的那一类用量整类重算（压缩用量来自请求门的开始记录，
- * 不随条目增长），先删后写，重复入账不会翻倍。`floor` 是还没有来源行时的起点：数据迁移导入的会话
- * 从导入记录之后计起，导入的条目已由原会话文件入账。
+ * 不随条目增长），先删后写，重复入账不会翻倍。当前会话从条目零开始。
  */
 export function ingestConversationRecords(db: Database, source: ConversationSource, from: number, to: number,
   records: StatsRecord[], replace?: { kind: string; records: StatsRecord[] } | { kind: string; records: StatsRecord[] }[],
   floor = 0, expectedDigest?: string): boolean {
   return db.transaction(() => {
     const prior = db.query("SELECT * FROM sources WHERE id = ?").get(source.id) as SourceRow | null;
-    const reset = prior !== null && prior.projection !== DURABLE_PROJECTION && !hasRetiredConversation(db, source.id);
-    if ((reset ? floor : prior?.offset ?? floor) !== from) return false;
-    if (expectedDigest !== undefined && (reset ? "" : prior?.digest ?? "") !== expectedDigest) return false;
-    if (reset) for (const table of ["activity", "tool_counts", "usage_totals"]) {
-      db.query(`DELETE FROM ${table} WHERE source = ?`).run(source.id);
-    }
-    const state = { provider: reset ? "unknown" : prior?.provider ?? "unknown", model: reset ? "unknown" : prior?.model ?? "unknown" };
+    if (prior && prior.projection !== DURABLE_PROJECTION) throw new Error("当前会话的统计投影格式不匹配；保留历史账本并检查数据库代际");
+    if ((prior?.offset ?? floor) !== from) return false;
+    if (expectedDigest !== undefined && (prior?.digest ?? "") !== expectedDigest) return false;
+    const state = { provider: prior?.provider ?? "unknown", model: prior?.model ?? "unknown" };
     const folded = fold(records, state);
     const now = Date.now();
     db.query(`INSERT INTO sources (id, group_segment, user_segment, identity, offset, digest,
@@ -419,87 +272,6 @@ export function ingestConversationRecords(db: Database, source: ConversationSour
     }
     return true;
   }).immediate();
-}
-
-export interface SweepResult { files: number; records: number; failed: number; skippedFiles: number; skippedDay: boolean }
-
-interface SweepOptions {
-  force?: boolean;
-  now?: number;
-  onError?: (path: string, error: unknown) => void;
-}
-
-/** 重试时只比较元数据；摘要仍由真正入账时的 reader 校验。纳秒时间避免把快速改写误判为未变。 */
-async function sweepFingerprint(path: string): Promise<string | null> {
-  try {
-    const info = await lstat(path, { bigint: true });
-    if (!info.isFile() || info.isSymbolicLink()) return null;
-    return [info.dev, info.ino, info.birthtimeNs, info.size, info.mtimeNs, info.ctimeNs].join(":");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
-}
-
-/**
- * 全量扫一遍并入账。默认一天只跑一次：当天的数字靠任务结束与归档前的入账，定时扫描是
- * 兜底（崩溃、手工改动、旧文件、任务之间的缓存保温用量），没必要每五分钟把所有会话文件都摸一遍。
- * 部分失败时保留当天已完成文件的指纹，重试只读失败或变化的文件；全部成功才标记当天完成。
- */
-export async function sweepSessionStats(root: string, options: SweepOptions = {}): Promise<SweepResult> {
-  const base = resolve(root);
-  const db = openStatsLedger(base);
-  try {
-    const today = dayKey(options.now ?? Date.now());
-    const last = (db.query("SELECT value FROM meta WHERE key = 'last_sweep_day'").get() as { value: string } | null)?.value;
-    if (!options.force && last === today) return { files: 0, records: 0, failed: 0, skippedFiles: 0, skippedDay: true };
-    // 使用现有 meta，不改账本 schema；逐文件保存，崩溃或重启不会丢掉这一轮的进度。
-    const prefix = "sweep_file:", dayPrefix = today + ":";
-    db.transaction(() => {
-      if (options.force) {
-        db.query("DELETE FROM meta WHERE key GLOB ?").run(prefix + "*");
-        db.query("DELETE FROM meta WHERE key = 'last_sweep_day' AND value = ?").run(today);
-      } else {
-        db.query("DELETE FROM meta WHERE key GLOB ? AND substr(value, 1, 11) <> ?").run(prefix + "*", dayPrefix);
-      }
-    }).immediate();
-    const completed = new Map((db.query("SELECT key, value FROM meta WHERE key GLOB ?").all(prefix + "*") as { key: string; value: string }[])
-      .map(row => [row.key, row.value]));
-    const checkpoint = db.query("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
-    let files = 0, records = 0, failed = 0, skippedFiles = 0;
-    const fail = (path: string, error: unknown) => {
-      failed++;
-      if (options.onError) options.onError(path, error);
-      else console.warn(`统计账本扫描失败 - 路径: ${path}, 错误: ${String(error)}`);
-    };
-    const directories = async (path: string): Promise<string[]> => {
-      try { return (await dataDirectoryNames(path, base)).sort(byKey); }
-      catch (error) { fail(path, error); return []; }
-    };
-    for (const group of await directories(base)) {
-      for (const user of await directories(join(base, group, "users"))) {
-        const path = join(base, group, "users", user, SESSION_FILE);
-        const key = prefix + JSON.stringify([group, user]);
-        try {
-          const before = await sweepFingerprint(path);
-          if (before === null) continue;
-          if (completed.get(key) === dayPrefix + before) { skippedFiles++; continue; }
-          const result = await ingestSessionFile(db, base, group, user);
-          if (result) { files++; records += result.records; }
-          const after = await sweepFingerprint(path);
-          // 归档移走的原件无需再读；被换代或追加则留下重试，不能把未确认内容记作完成。
-          if (after === null) continue;
-          if (after !== before || !result) throw new SessionFileChangedError();
-          checkpoint.run(key, dayPrefix + after);
-        } catch (error) { fail(path, error); }
-      }
-    }
-    if (failed === 0) db.transaction(() => {
-      checkpoint.run("last_sweep_day", today);
-      db.query("DELETE FROM meta WHERE key GLOB ? AND substr(value, 1, 11) = ?").run(prefix + "*", dayPrefix);
-    }).immediate();
-    return { files, records, failed, skippedFiles, skippedDay: false };
-  } finally { db.close(); }
 }
 
 export interface ActivityRow { group: string; user: string; day: string; asks: number; replies: number; firstAt: number; lastAt: number }
