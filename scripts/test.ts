@@ -75,6 +75,21 @@ export function testFiles(targets: string[], base = project): string[] {
   return [...found].sort();
 }
 
+/** Existing paths are targets; bare names remain Bun filters. Never turn a missing explicit path into a filter. */
+export function testTargets(args: string[], base = project): { targets: Set<number>; filtered: boolean } {
+  const targets = new Set<number>();
+  let filtered = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg.startsWith("-")) { if (VALUE_OPTIONS.has(arg)) i++; continue; }
+    if (existsSync(resolve(base, arg))) targets.add(i);
+    else if (/[\\/]/.test(arg) || /\.(?:[cm]?[jt]s|[jt]sx)$/i.test(arg))
+      throw new Error(`测试路径不存在：${arg}（相对项目 ${base} 解析）。请检查文件是否已删除或路径是否拼错；未启动测试。`);
+    else filtered = true;
+  }
+  return { targets, filtered };
+}
+
 /** Longest first onto the least loaded group; a file without a recorded time weighs the median. Deterministic. */
 export function partition(files: string[], weights: Weights, jobs: number, base = project): string[][] {
   const weight = (file: string) => { const ms = weights[timingKey(file, base)]; return typeof ms === "number" && Number.isFinite(ms) && ms >= 0 ? ms : undefined; };
@@ -329,10 +344,11 @@ async function main() {
   // DrvFs 上 chmod 是否生效取决于挂载元数据）；Windows 用系统临时目录，避免工作区扫描打开后代目录干扰重命名；其余平台用项目 tmp/。
   const wsl = process.platform === "linux" && release().toLowerCase().includes("microsoft");
   const requestedRoot = resolve(process.env.MIXIN_TEST_WORK_ROOT || (wsl ? "/tmp/mixin-tests" : process.platform === "win32" ? tmpdir() : join(project, "tmp")));
-  let options: Options, jobs: number;
+  let options: Options, jobs: number, selection: ReturnType<typeof testTargets>;
   try {
     options = parseOptions(process.argv.slice(2));
     jobs = options.jobs ?? (process.env.MIXIN_TEST_JOBS ? jobCount(process.env.MIXIN_TEST_JOBS, "MIXIN_TEST_JOBS") : defaultJobs());
+    selection = testTargets(options.args);
   } catch (error) { console.error((error as Error).message); process.exit(2); }
   await mkdir(requestedRoot, { recursive: true });
   // Windows TEMP may contain an 8.3 alias (RUNNER~1 on CI). Give cwd and every fixture environment variable
@@ -341,12 +357,7 @@ async function main() {
 
   // 测试文件可以相对项目，也可以是绝对路径；其余参数原样交给 bun test。
   // 既不是路径也不是选项取值的参数是 bun test 的文件名筛选，这时不分组。
-  const args = [...options.args], targets = new Set<number>();
-  let filtered = false;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i]!.startsWith("-")) { if (VALUE_OPTIONS.has(args[i]!)) i++; continue; }
-    if (existsSync(resolve(project, args[i]!))) targets.add(i); else filtered = true;
-  }
+  const args = [...options.args], { targets, filtered } = selection;
   const outfile = outfileAt(args);
   let junit: string | undefined;
   if (outfile) {

@@ -23,10 +23,15 @@ import { tempFixture } from "../helpers/temp.ts";
 const fixture = await tempFixture("durable-closeout-");
 afterAll(() => fixture.cleanup());
 const group = "group-a", phone = "13800000001", url = "https://example.invalid/callback?key=synthetic";
-let counter = 0;
+let counter = 0, latest: { replies: string[]; reports: unknown[]; faux: ReturnType<typeof fauxModels>["faux"] } | undefined;
 async function until(probe: () => boolean | Promise<boolean>) {
-  const end = Date.now() + 20_000;
-  while (!await probe()) { if (Date.now() > end) throw new Error("closeout wait timed out"); await Bun.sleep(10); }
+  // Give up before the 20 s test timeout so the failure reports the service state.
+  const end = Date.now() + 15_000;
+  while (!await probe()) {
+    if (Date.now() > end) throw new Error(`closeout wait timed out; replies=${JSON.stringify(latest?.replies)}; `
+      + `calls=${latest?.faux.state.callCount}; reports=${latest?.reports.map(String).join(" | ")}`);
+    await Bun.sleep(10);
+  }
 }
 function setup() {
   const root = join(fixture.root, `root-${++counter}`), { faux, models, model } = fauxModels(), stateDb = new Database(":memory:");
@@ -38,6 +43,7 @@ function setup() {
     selection: { runtime: models as never, settings: undefined as never, model: models.getModel(model.provider, model.modelId)! as never,
       ref: model, thinkingLevel: "off", notices: [], harnessSettings: { compaction: { enabled: false, keepRecentTokens: 1 },
         ...(TEST_PROGRESS === undefined ? {} : { progress: TEST_PROGRESS }) } }, onReport: error => reports.push(error) });
+  latest = { replies, reports, faux };
   return { root, faux, model, models, stateDb, deliveries, replies, reports, open };
 }
 async function database(root: string, change: (session: ReturnType<typeof createSession>) => Promise<void>) {

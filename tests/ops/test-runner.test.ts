@@ -4,7 +4,7 @@ import { mkdir, readdir, readFile, realpath, rename, rm, symlink, writeFile } fr
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tempFixture } from "../helpers/temp.ts";
-import { defaultJobs, measuredWeights, mergeJunit, parseOptions, partition, recordWeights, summarize, testFiles, timingKey } from "../../scripts/test.ts";
+import { defaultJobs, measuredWeights, mergeJunit, parseOptions, partition, recordWeights, summarize, testFiles, testTargets, timingKey } from "../../scripts/test.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const gitBash = process.platform === "win32" ? [process.env.ProgramFiles, process.env["ProgramFiles(x86)"]]
@@ -32,6 +32,49 @@ async function until(file: string) {
     await Bun.sleep(20);
   }
 }
+
+test("explicit missing test paths fail before creating a run or executing any tests", async () => {
+  const fixture = await tempFixture("test-runner-missing-");
+  try {
+    // Keep the regression bounded even if missing paths accidentally expand to the whole suite again.
+    const copy = join(fixture.root, "project"), work = join(fixture.root, "work"), marker = join(fixture.root, "ran");
+    await mkdir(join(copy, "scripts"), { recursive: true }); await mkdir(join(copy, "tests"));
+    await writeFile(join(copy, "scripts/test.ts"), await readFile(join(project, "scripts/test.ts")));
+    await writeFile(join(copy, "tests/sentinel.test.ts"), `import { test } from "bun:test";
+import { writeFileSync } from "node:fs";
+test("sentinel", () => { writeFileSync(${JSON.stringify(marker)}, "unexpected run"); });`);
+    const missing = ["tests/ops/migrations.test.ts", "tests\\ops\\missing.test.ts", "./missing-directory/",
+      join(copy, "absolute-missing.test.ts"), "deleted.test.ts"];
+    for (const [i, path] of missing.entries()) {
+      const args = i % 2 ? ["tests/sentinel.test.ts", path, "--jobs=2"] : [path, "--jobs=1"];
+      const child = Bun.spawn([process.execPath, join(copy, "scripts/test.ts"), ...args], {
+        cwd: fixture.root, env: { ...process.env, MIXIN_TEST_WORK_ROOT: work }, stdout: "pipe", stderr: "pipe", windowsHide: true,
+      });
+      const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(code, out + err).toBe(2);
+      expect(err).toContain(`测试路径不存在：${path}`);
+      expect(existsSync(marker)).toBe(false);
+      expect(existsSync(work)).toBe(false);
+      expect(existsSync(join(copy, "tmp"))).toBe(false);
+    }
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+test("test target validation preserves existing paths, bare filters and path-shaped option values", async () => {
+  const fixture = await tempFixture("test-targets-");
+  try {
+    await mkdir(join(fixture.root, "tests")); await writeFile(join(fixture.root, "tests/existing.test.ts"), "");
+    const file = join(fixture.root, "tests/existing.test.ts");
+    expect(testTargets(["tests", file], fixture.root)).toEqual({ targets: new Set([0, 1]), filtered: false });
+    expect(testTargets(["closeout", "--timeout", "5000", "tests"], fixture.root)).toEqual({ targets: new Set([3]), filtered: true });
+    expect(testTargets(["-t", "missing.test.ts", "--test-name-pattern", "tests/not-a-path", "--reporter-outfile", "reports/missing.xml",
+      "--preload", "setup/missing.ts", "--test-name-pattern=also/missing.test.ts", "tests"], fixture.root))
+      .toEqual({ targets: new Set([9]), filtered: false });
+    for (const extension of ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"])
+      expect(() => testTargets([`missing.test.${extension}`], fixture.root)).toThrow("测试路径不存在");
+    expect(() => testTargets(["closeout", "tests/deleted.test.ts"], fixture.root)).toThrow("测试路径不存在");
+  } finally { await fixture.cleanup(); }
+});
 
 test.skipIf(!gitBash)("Git Bash /tmp survives retirement of another live shell's temporary fixture", async () => {
   const fixture = await tempFixture("test-runner-msys-");
