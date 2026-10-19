@@ -50,9 +50,36 @@ function formatDateTime(ms: number): string {
   return `${formatDate(ms)} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+// 以 ANYWHERE 开头的规则匹配任意层级，其余规则从资料根目录起按前缀匹配。
+const ANYWHERE = "**/";
+
+const IGNORE_TEMPLATE = [
+  "# 本群资料索引的排除规则（手工维护；首次运行时自动生成，之后不会覆盖）",
+  "#",
+  "# 每行一条，# 开头为注释，不区分大小写，路径分隔符用 /。例如：",
+  "#   归档/2023        排除资料根目录下的 归档/2023/ 及其全部内容",
+  "#   **/#recycle      排除任意层级名为 #recycle 的目录或文件",
+  "# 除开头的 **/ 外不支持其他通配符。",
+  "#",
+  "# 只影响资料索引 materials.md，不限制机器人直接查找或读取这些文件。",
+  `# 已默认跳过、无需填写：点开头的目录和文件、${[...ALWAYS_SKIPPED].join("、")}、软链接。`,
+  "# 修改后下一轮对话自动重建索引；跨版本重置升级时本文件原位保留。",
+  "",
+].join("\n");
+
+/** 首次运行时写入只含注释的模板；已有文件（包括链接或目录）一律不动。 */
+async function ensureIgnoreTemplate(ignorePath: string): Promise<void> {
+  try {
+    await writeFile(ignorePath, IGNORE_TEMPLATE, { encoding: "utf8", flag: "wx" });
+  } catch {
+    // 已存在是常态；目录缺失或不可写时交给后面的索引校验报告。
+  }
+}
+
 /**
- * 读取人工维护的排除前缀。每行一个 workspace 相对路径（POSIX 分隔符），`#` 开头为注释。
- * 同步盘常见的回收站、历史归档目录写在这里，避免上千个已删除文件顶掉真正的资料。
+ * 读取人工维护的排除规则。每行一个 workspace 相对路径（POSIX 分隔符），`#` 开头为注释；
+ * 以 ANYWHERE 开头的规则匹配任意层级。同步盘常见的回收站、历史归档目录写在这里，避免上千个
+ * 已删除文件顶掉真正的资料。
  */
 export async function loadIgnorePrefixes(ignorePath: string): Promise<string[]> {
   let raw: string;
@@ -66,15 +93,19 @@ export async function loadIgnorePrefixes(ignorePath: string): Promise<string[]> 
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith("#"))
-    .map((line) => line.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase());
+    .map((line) => line.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase())
+    // 单独的 `**` 没有名称，不能当成排除全部。
+    .filter((line) => line !== "**" && line !== "");
 }
 
 function isIgnored(relPath: string, prefixes: string[]): boolean {
   if (prefixes.length === 0) return false;
   const target = relPath.toLowerCase();
-  return prefixes.some(
-    (prefix) => target === prefix || target.startsWith(`${prefix}/`)
-  );
+  return prefixes.some((prefix) => {
+    if (!prefix.startsWith(ANYWHERE)) return target === prefix || target.startsWith(`${prefix}/`);
+    const name = prefix.slice(ANYWHERE.length);
+    return target === name || target.startsWith(`${name}/`) || target.endsWith(`/${name}`) || target.includes(`/${name}/`);
+  });
 }
 
 /**
@@ -281,6 +312,7 @@ export async function ensureMaterialsIndex(
   now = Date.now()
 ): Promise<MaterialsIndexSummary | null> {
   const key = resolve(options.indexPath);
+  await ensureIgnoreTemplate(options.ignorePath);
   let cached = cache.get(key);
   let stamp: string;
   try {

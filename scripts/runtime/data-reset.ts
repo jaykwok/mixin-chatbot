@@ -22,22 +22,36 @@ const markers = (project: string, groups: string) => [hash(join(project, "data/s
 
 const segment = (name: string) => !!name && !name.startsWith(".") && !/[\\/\x00-\x1f:]/.test(name);
 const groupDatabase = (name: string) => /\.sqlite(?:-wal|-shm|-journal)?$/i.test(name) && !/^stats\.sqlite(?:-wal|-shm|-journal)?$/i.test(name);
+/** The hand-maintained index exclusion list survives resets; everything else under index/ is regenerated. */
+const indexKept = (name: string) => name.toLowerCase() === "ignore.txt";
 /** Explicit depths only: never traverse workspace, whole groups or arbitrary material folders. */
 function resetGroupEntry(name: string): boolean {
   if (name === VERSION_FILE) return true;
   const parts = name.split("/");
   if (!parts.every(segment)) return false;
   return parts.length === 2 && (parts[1] === "index" || groupDatabase(parts[1]!))
+    || parts.length === 3 && parts[1] === "index" && !indexKept(parts[2]!)
     || parts.length === 4 && parts[1] === "users" && ["session.jsonl", "tmp"].includes(parts[3]!);
 }
-function groupResetMoves(groups: string): Move[] {
-  const names = new Set([VERSION_FILE]);
+/** Planning refuses unrecognised index entries; verify and rollback leave them in place instead of failing midway. */
+function groupResetMoves(groups: string, planning = false): Move[] {
+  const names = new Set([VERSION_FILE]), unknown: string[] = [];
   for (const group of readdirSync(groups, { withFileTypes: true })) {
     if (group.name.startsWith(".")) continue;
     const root = join(groups, group.name); plain(root);
     if (!group.isDirectory()) continue;
     if (!segment(group.name)) throw new Error(`群目录名称无效：${root}`);
-    names.add(group.name + "/index");
+    // A real index directory is cleared entry by entry so ignore.txt stays in place; a missing index, a link
+    // (refused by plain()) or a file is listed whole as before.
+    const index = join(root, "index"); plain(index);
+    const info = existsSync(index) ? lstatSync(index) : null;
+    if (info?.isDirectory() && !info.isSymbolicLink()) {
+      for (const entry of readdirSync(index)) {
+        if (indexKept(entry)) continue;
+        if (!segment(entry)) { unknown.push(join(index, entry)); continue; }
+        names.add(`${group.name}/index/${entry}`);
+      }
+    } else names.add(group.name + "/index");
     for (const suffix of ["", "-wal", "-shm", "-journal"]) names.add(group.name + "/durable.sqlite" + suffix);
     for (const entry of readdirSync(root)) if (groupDatabase(entry)) names.add(group.name + "/" + entry);
     const users = join(root, "users"); plain(users);
@@ -49,6 +63,8 @@ function groupResetMoves(groups: string): Move[] {
       for (const name of ["session.jsonl", "tmp"]) names.add(`${group.name}/users/${user.name}/${name}`);
     }
   }
+  if (planning && unknown.length)
+    throw new Error(`索引目录含无法识别的条目（如 .DS_Store），重置未移动任何数据。请删除或移出以下条目后重试：\n${unknown.join("\n")}`);
   return [...names].map(name => {
     const path = join(groups, name); plain(path);
     return { area: "groups", name, existed: existsSync(path) };
@@ -248,7 +264,7 @@ export async function applyReset(project: string, groups: string, deployment: st
         incompleteJsonl: incomplete, at: new Date().toISOString() });
     } finally { baseline.close(); }
     if (readdirSync(groups).some(name => name.startsWith(".reset-"))) throw new Error("群根含未完成的重置，请先继续或回滚");
-    const moves: Move[] = groupResetMoves(groups);
+    const moves: Move[] = groupResetMoves(groups, true);
     for (const name of ["data/config", "data/runtime", ...readdirSync(join(project, "data/state")).filter(name => !stateKept.has(name)).map(name => "data/state/" + name)])
       moves.push({ area: "project", name, existed: existsSync(join(project, name)) });
     for (const move of moves) movePaths(project, groups, p.projectArchive, p.archive, move);
@@ -301,8 +317,10 @@ export async function rollbackReset(project: string, groups: string, deployment:
     } else if (!move.existed) await rm(live, { recursive: true, force: true });
   }
   // Discard only listed runtime paths created during verification, never their group or user parents.
+  // A journal written before ignore.txt was kept lists g/index whole; its restored children are original too.
   const original = new Set(journal.moves.filter(m => m.area === "groups").map(m => m.name));
-  for (const move of groupResetMoves(groups)) if (!original.has(move.name) && move.existed)
+  const listed = (name: string) => name.split("/").some((_, i, parts) => original.has(parts.slice(0, i + 1).join("/")));
+  for (const move of groupResetMoves(groups)) if (!listed(move.name) && move.existed)
     await rm(movePaths(project, groups, p.projectArchive, p.archive, move).live, { recursive: true, force: true });
   await removeEmptyArchive(p.archive);
   await rm(p.projectArchive, { recursive: true, force: true });

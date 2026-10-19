@@ -210,7 +210,7 @@ data/
     └── <group>/
         ├── durable.sqlite     群库（Pi Durable）：成员的会话、排队消息、控制命令与运行记录（另有 -wal 等，需一起备份）
         ├── workspace/         外部同步的资料源
-        ├── index/             materials.md、扫描 manifest；可选 ignore.txt、parsed/ 文档缓存
+        ├── index/             materials.md、扫描 manifest、parsed/ 文档缓存；ignore.txt 排除规则（自动生成模板，手工维护）
         ├── venv/              原生部署按需准备的解析环境
         └── users/<user>/
             └── tmp/           生成文件、缓存与完整工具输出

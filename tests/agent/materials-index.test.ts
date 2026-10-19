@@ -114,6 +114,50 @@ describe("materials index", () => {
     }
   });
 
+  test("anywhere rules match a name at any depth while plain rules stay anchored at the root", async () => {
+    const { root, workspace } = await makeWorkspace();
+    const ignorePath = join(root, "index", "ignore.txt");
+    await mkdir(join(workspace, "产品资料", "#Recycle"), { recursive: true });
+    await mkdir(join(workspace, "#recycle"), { recursive: true });
+    await mkdir(join(workspace, "项目", "归档"), { recursive: true });
+    await mkdir(join(workspace, "归档"), { recursive: true });
+    await Promise.all([
+      writeFile(join(workspace, "产品资料", "#Recycle", "旧.pptx"), "old"),
+      writeFile(join(workspace, "#recycle", "旧.docx"), "old"),
+      writeFile(join(workspace, "项目", "归档", "保留.docx"), "keep"),
+      writeFile(join(workspace, "归档", "排除.docx"), "drop"),
+      writeFile(join(workspace, "产品资料", "Thumbs.db"), "cache"),
+    ]);
+    await writeFile(ignorePath, "**/#recycle/\n**/thumbs.db\n归档\n**\n**/\n", "utf8");
+    try {
+      const prefixes = await loadIgnorePrefixes(ignorePath);
+      expect(prefixes).toEqual(["**/#recycle", "**/thumbs.db", "归档"]);
+      const paths = (await scanWorkspace(workspace, prefixes)).entries.map((entry) => entry.path);
+      expect(paths.some((path) => path.toLowerCase().includes("#recycle"))).toBe(false);
+      expect(paths).not.toContain("产品资料/Thumbs.db");
+      expect(paths).not.toContain("归档/排除.docx");
+      expect(paths).toContain("项目/归档/保留.docx");
+      expect(paths).toContain("产品资料/价格清单.xlsx");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("creates a comment-only ignore template once and never overwrites an existing list", async () => {
+    const { root, workspace } = await makeWorkspace();
+    const options = { workspaceDir: workspace, indexPath: join(root, "index", "materials.md"), ignorePath: join(root, "index", "ignore.txt") };
+    try {
+      expect((await ensureMaterialsIndex(options))?.totalFiles).toBe(4);
+      const template = await readFile(options.ignorePath, "utf8");
+      expect(template).toContain("**/");
+      expect(template).toContain("node_modules");
+      expect(await loadIgnorePrefixes(options.ignorePath)).toEqual([]);
+      await writeFile(options.ignorePath, "sync-tools/rm\n", "utf8");
+      expect((await ensureMaterialsIndex(options))?.totalFiles).toBe(3);
+      expect(await readFile(options.ignorePath, "utf8")).toBe("sync-tools/rm\n");
+    } finally { await application.drain(); await rm(root, { recursive: true, force: true }); }
+  });
+
   test("renders one greppable line per file with size and date", async () => {
     const { root, workspace } = await makeWorkspace();
     try {

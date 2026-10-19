@@ -32,8 +32,8 @@ async function fixture(incompleteJsonl = false) {
   await writeFile(join(groups, "g/durable.sqlite"), "old-session");
   const kept = ["g/workspace/资料/reference.sqlite", "g/other-materials/book.pdf", "g/stats.sqlite", "g/venv/keep.txt",
     "g/users/u/notes.txt", "g/users/u/materials/reference.sqlite", "2081562792700661761/workspace/资料.docx",
-    "2081562792700661761/notes.txt", ".reclamation/backup/rm/previous.txt", "root-materials.sqlite"];
-  const cleared = ["g/index/nested/materials.md", "g/users/u/session.jsonl", "g/users/u/tmp/output.docx",
+    "2081562792700661761/notes.txt", ".reclamation/backup/rm/previous.txt", "root-materials.sqlite", "g/index/ignore.txt"];
+  const cleared = ["g/index/nested/materials.md", "g/index/materials.md.manifest.json","g/users/u/session.jsonl", "g/users/u/tmp/output.docx",
     "g/durable.sqlite-wal", "g/durable.sqlite-shm", "g/durable.sqlite-journal", "g/other.sqlite", "g/other.sqlite-wal",
     "2081562792700661761/durable.sqlite", "2081562792700661761/users/u/tmp/old.pdf"];
   for (const name of [...kept, ...cleared]) {
@@ -127,7 +127,8 @@ test("reset refuses journals that could move whole groups, materials or statisti
   try {
     await applyReset(f.project, f.groups, id, f.plan);
     const path = join(f.snapshot, "reset.json"), journal = JSON.parse(await readFile(path, "utf8"));
-    for (const name of ["g", "g/workspace", "g/users/u", "g/users/u/materials", "stats.sqlite", "g/stats.sqlite", "g/workspace/reference.sqlite", "g/../outside.sqlite"]) {
+    for (const name of ["g", "g/workspace", "g/users/u", "g/users/u/materials", "stats.sqlite", "g/stats.sqlite", "g/workspace/reference.sqlite", "g/../outside.sqlite",
+      "g/index/ignore.txt", "g/index/IGNORE.TXT", "g/index/nested/materials.md"]) {
       await writeFile(path, JSON.stringify({ ...journal, moves: [...journal.moves, { area: "groups", name, existed: true }] }));
       await expect(applyReset(f.project, f.groups, id, f.plan)).rejects.toThrow();
       await expect(rollbackReset(f.project, f.groups, id)).rejects.toThrow();
@@ -165,7 +166,8 @@ test("reset refuses database-shaped directories and linked cleanup paths without
     await symlink(join(f.groups, "g/workspace"), index, process.platform === "win32" ? "junction" : "dir");
     await expect(applyReset(f.project, f.groups, id, f.plan)).rejects.toThrow("链接");
     expect(await readFile(join(f.groups, "g/durable.sqlite"), "utf8")).toBe("old-session");
-    for (const name of f.kept) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
+    expect(await readFile(join(f.groups, "g/old-index/ignore.txt"), "utf8")).toBe("g/index/ignore.txt");
+    for (const name of f.kept.filter(name => !name.startsWith("g/index/"))) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
   } finally { await f.cleanup(); }
 });
 
@@ -202,6 +204,80 @@ test("reset rollback restores configuration, session, outbox and markers and can
     expect(await readFile(join(f.project, "data/config/obsolete.json"), "utf8")).toBe("old-config");
     expect(resetVersion(f.project, f.groups)).toBe(DATA_VERSION - 1);
     expect(statsDigest(join(f.groups, "stats.sqlite"))).toBe(f.before);
+  } finally { await f.cleanup(); }
+});
+
+test("reset leaves index/ignore.txt in place while clearing the rest of the index", async () => {
+  const f = await fixture();
+  try {
+    const ignore = join(f.groups, "g/index/ignore.txt"), inode = lstatSync(ignore).ino;
+    await applyReset(f.project, f.groups, id, f.plan);
+    expect(lstatSync(ignore).ino).toBe(inode);
+    expect(existsSync(join(f.groups, ".reset-" + id, "g/index/ignore.txt"))).toBe(false);
+    for (const name of ["g/index/nested", "g/index/materials.md.manifest.json"]) expect(existsSync(join(f.groups, name))).toBe(false);
+    expect(verifyReset(f.project, f.groups, id)).toBe(true);
+    // The list is never part of the move set, so edits made while the reset is pending survive a rollback.
+    await writeFile(ignore, "edited during reset");
+    await rollbackReset(f.project, f.groups, id);
+    expect(await readFile(ignore, "utf8")).toBe("edited during reset");
+    for (const name of f.cleared) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
+  } finally { await f.cleanup(); }
+});
+
+test("rollback of a journal that moved index whole restores every index entry", async () => {
+  const f = await fixture();
+  try {
+    await applyReset(f.project, f.groups, id, f.plan);
+    // Rebuild what an earlier version's apply leaves: the whole index archived and one g/index move in the journal.
+    const live = join(f.groups, "g/index"), saved = join(f.groups, ".reset-" + id, "g/index");
+    await rename(join(live, "ignore.txt"), join(saved, "ignore.txt")); await rm(live, { recursive: true });
+    const path = join(f.snapshot, "reset.json"), journal = JSON.parse(await readFile(path, "utf8"));
+    const at = journal.moves.findIndex((m: { name: string }) => m.name.startsWith("g/index/"));
+    const moves = journal.moves.filter((m: { name: string }) => !m.name.startsWith("g/index/"));
+    moves.splice(at, 0, { area: "groups", name: "g/index", existed: true });
+    await writeFile(path, JSON.stringify({ ...journal, moves }));
+    expect(verifyReset(f.project, f.groups, id)).toBe(true);
+    // A verification instance may already have generated a fresh index; rollback replaces it with the original.
+    await mkdir(live); await writeFile(join(live, "materials.md"), "new generation");
+    await rollbackReset(f.project, f.groups, id);
+    for (const name of [...f.kept, ...f.cleared]) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
+    expect(existsSync(join(live, "materials.md"))).toBe(false);
+    expect(existsSync(join(f.groups, ".reset-" + id))).toBe(false);
+    expect(JSON.parse(await readFile(path, "utf8")).phase).toBe("restored");
+  } finally { await f.cleanup(); }
+});
+
+test("reset lists every unrecognised index entry before moving anything; later ones are left alone", async () => {
+  const f = await fixture();
+  try {
+    const index = join(f.groups, "g/index"), other = join(f.groups, "2081562792700661761/index");
+    await mkdir(other); await writeFile(join(index, ".DS_Store"), "finder"); await writeFile(join(other, ".hidden"), "unknown");
+    const failure = await applyReset(f.project, f.groups, id, f.plan).then(() => null, error => error as Error);
+    expect(failure?.message).toContain("未移动任何数据");
+    for (const path of [join(index, ".DS_Store"), join(other, ".hidden")]) expect(failure?.message).toContain(path);
+    expect(await readFile(join(f.groups, "g/durable.sqlite"), "utf8")).toBe("old-session");
+    expect(existsSync(join(f.snapshot, "reset.json"))).toBe(false);
+    await rm(join(index, ".DS_Store")); await rm(join(other, ".hidden"));
+    // Once the moves are planned, an entry that appears later blocks neither commit checks nor rollback and is kept.
+    await applyReset(f.project, f.groups, id, f.plan);
+    await writeFile(join(index, ".DS_Store"), "finder");
+    expect(verifyReset(f.project, f.groups, id)).toBe(true);
+    await rollbackReset(f.project, f.groups, id);
+    expect(await readFile(join(index, ".DS_Store"), "utf8")).toBe("finder");
+    for (const name of f.cleared) expect(await readFile(join(f.groups, name), "utf8")).toBe(name);
+  } finally { await f.cleanup(); }
+});
+
+test("reset moves a non-directory index whole and restores it on rollback", async () => {
+  const f = await fixture();
+  try {
+    const index = join(f.groups, "g/index");
+    await rm(index, { recursive: true }); await writeFile(index, "legacy index file");
+    await applyReset(f.project, f.groups, id, f.plan);
+    expect(existsSync(index)).toBe(false);
+    expect(await readFile(join(f.groups, ".reset-" + id, "g/index"), "utf8")).toBe("legacy index file");
+    await rollbackReset(f.project, f.groups, id);
+    expect(await readFile(index, "utf8")).toBe("legacy index file");
   } finally { await f.cleanup(); }
 });
 

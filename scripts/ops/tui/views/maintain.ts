@@ -68,7 +68,7 @@ const ACTIONS: Action[] = [
       const steps = [
         "交给与 ops update 相同的目标升级器；停机前核对数据版本",
         "数据版本一致时直接升级，保留设置、会话和资料",
-        "跨数据版本时先提示清理群直属数据库（保留 stats.sqlite）、index、成员会话和 tmp，重新配置；确认后才停机",
+        "跨数据版本时先提示清理群直属数据库（保留 stats.sqlite）、index（保留 ignore.txt）、成员会话和 tmp，重新配置；确认后才停机",
         "跨代更新原样保留并备份现有统计账本；旧会话、未入账消息及待处理任务直接清理，不再补算",
         git.behind > 0 ? `快进到 origin/main ${targetSha ? fmt.shortSha(targetSha) : ""}（${git.behind} 个提交）` : "核对本次确认的目标提交",
         app.deployment.runtime === "docker" ? "准备目标镜像，按已保存计划切换数据" : "安装目标依赖，按已保存计划切换数据",
