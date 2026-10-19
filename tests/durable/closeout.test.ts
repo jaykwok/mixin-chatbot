@@ -1,15 +1,16 @@
 // Migration closeout: durable receipts, offline/manual compaction, reference-aware expiry and backup/reopen.
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdir, readFile, readdir, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { createSession } from "@earendil-works/pi-durable";
+import { createSession, type Harness } from "@earendil-works/pi-durable";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { DurableService, memberKey, type Outbound } from "../../src/durable/service.ts";
 import { DeliveryStore } from "../../src/agent/delivery-store.ts";
 import { userTempDir } from "../../src/agent/paths.ts";
 import { ControlsDoc, WebhookReceiptsDoc } from "../../src/durable/inbox.ts";
+import { GroupDoc } from "../../src/durable/identity.ts";
 import { groupDatabasePath } from "../../src/durable/groups.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { queueMemberCompaction } from "../../src/durable/offline.ts";
@@ -17,7 +18,7 @@ import { readLedger, openStatsLedger } from "../../src/agent/stats-ledger.ts";
 import { ReclamationItems } from "../../src/durable/results/queue.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { createDataBackup, restoreDataBackup } from "../../scripts/ops/data-backup.ts";
-import { fauxModels, gatedResponse, TEST_PROGRESS } from "../helpers/durable.ts";
+import { fauxModels, gatedResponse, openGroupHarness, TEST_PROGRESS } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const fixture = await tempFixture("durable-closeout-");
@@ -36,7 +37,13 @@ async function until(probe: () => boolean | Promise<boolean>) {
 function setup() {
   const root = join(fixture.root, `root-${++counter}`), { faux, models, model } = fauxModels(), stateDb = new Database(":memory:");
   const deliveries = new DeliveryStore(stateDb), replies: string[] = [], reports: unknown[] = [];
-  const outbound: Outbound = { sendText: async () => true, sendReply: async text => { replies.push(text); return true; },
+  // Duplicate admissions can recover a finalized answer through sendText before the worker calls sendReply.
+  // Recovery still owns the finalized outbox row during the send; control receipts and progress are not answers.
+  const outbound: Outbound = { sendText: async (text, groupId, phone, _url, options) => {
+    if (options?.traffic !== "status" && deliveries.pending(memberKey(groupId, phone))
+      .some(item => item.id.startsWith("reply:") && item.text === text)) replies.push(text);
+    return true;
+  }, sendReply: async text => { replies.push(text); return true; },
     rate: () => ({ used: 0, limit: 20 }), refresh: async item => item.text };
   const open = () => new DurableService({ root, stateDb, deliveries, modules: [], relay: null, materials: false, outbound,
     limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 10, resultRetentionMs: 1 },
@@ -70,7 +77,36 @@ test("concurrent duplicate receipts survive cold restart and clear; expiry permi
     service = w.open(); await service.start();
     await service.admit(phone, group, "private synthetic content", url, true);
     await until(() => w.replies.length === 2); expect(w.faux.state.callCount).toBe(2);
+    expect(w.replies).toEqual(["once", "after TTL"]);
   } finally { await service.close(); w.stateDb.close(); }
+});
+
+test("a duplicate admission can deliver the finalized answer through outbox recovery before the worker sends", async () => {
+  const w = setup(), service = w.open();
+  w.faux.setResponses([fauxAssistantMessage("once")]);
+  const opened = await openGroupHarness(join(fixture.root, `prototype-${++counter}.sqlite`), w.models);
+  const prototype = Object.getPrototypeOf(opened.harness) as Pick<Harness, "snapshot">, original = prototype.snapshot;
+  await opened.close();
+  const release = Promise.withResolvers<void>();
+  let held = false;
+  const spy = spyOn(prototype, "snapshot").mockImplementation(async function(this: Harness, ...args: unknown[]) {
+    if (!held && args[0] === GroupDoc && w.deliveries.pending(memberKey(group, phone)).some(item => item.text === "once")) {
+      held = true; await release.promise;
+    }
+    return Reflect.apply(original, this, args);
+  } as Harness["snapshot"]);
+  try {
+    await service.admit(phone, group, "same request", url, true);
+    await until(() => held);
+    // The worker has finalized the outbox row but cannot reach sendReply yet.
+    await service.admit(phone, group, "same request", url, true);
+    await until(() => w.replies.length === 1);
+    release.resolve(); await service.close();
+    expect(w.replies).toEqual(["once"]);
+    expect(w.faux.state.callCount).toBe(1);
+    expect(w.deliveries.pending(memberKey(group, phone))).toEqual([]);
+    expect(w.reports).toEqual([]);
+  } finally { release.resolve(); await service.close(); spy.mockRestore(); w.stateDb.close(); }
 });
 
 test("offline compaction is deduplicated without calling a model; cold start resumes it and projects its own usage", async () => {

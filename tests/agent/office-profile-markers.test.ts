@@ -37,7 +37,8 @@ for (const mode of ["close", "recover"] as const) test.skipIf(!linux)(`${mode} r
     expect(result.errors).toHaveLength(3);
     for (const error of result.errors) expect(error).toContain("not a small regular file");
     expect(result.elapsedMs).toBeLessThan(2_000);
-    expect(result.afterFds).toBe(result.beforeFds);
+    expect(result.beforeOpen).toEqual([]);
+    expect(result.afterOpen).toEqual([]);
     expect(result.receiptPreserved).toBe(true);
     expect(result.stillFIFO).toBe(true);
     expect(result.profileGone).toBe(false);
