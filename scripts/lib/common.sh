@@ -17,7 +17,7 @@ ops_command_hint() {
     local command="$1" path=""
     if [ "${MIXIN_OPS_TUI:-}" = "1" ]; then
         case "$command" in
-            deploy) path='系统 → 服务部署 → 部署 / 修改设置' ;;
+            deploy) path='系统 → 服务部署 → 重新部署' ;;
             update) path='系统 → 服务部署 → 升级' ;;
             resume) path='系统 → 服务部署 → 继续上次操作' ;;
             rollback) path='系统 → 服务部署 → 回滚上次操作' ;;

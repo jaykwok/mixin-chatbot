@@ -16,7 +16,7 @@ for (const shell of ["powershell", "bash"] as const) {
     shell + " 运行参数预检后停机，保留停止状态，应用或健康检查失败恢复原配置和服务", async () => {
       for (const scenario of ["running", "stopped", "missing", "precheck-fail", "apply-fail", "stop-fail", "health-fail", "rollback-fail", "foreign",
         // "guarded": an unfinished deployment or upgrade, whose containers and tag may not match the data.
-        ...(shell === "powershell" ? ["foreground"] : ["paused", "guarded"])]) {
+        ...(shell === "powershell" ? ["foreground", "foreground-task"] : ["paused", "guarded"])]) {
         const fixture = await tempFixture("runtime-ops-" + scenario + "-");
         try {
           const events = join(fixture.root, "events.txt"), state = join(fixture.root, "state.txt");
@@ -51,7 +51,7 @@ for (const shell of ["powershell", "bash"] as const) {
               "    default {throw 'unexpected fixture command'}",
               "  }",
               "}",
-              "function Get-ScheduledTask {if($env:FIXTURE_SCENARIO -notin @('foreground','missing')){@{State=$(if((Fixture-State) -eq 'running'){'Running'}else{'Ready'}); Actions=@(@{WorkingDirectory=$(if($env:FIXTURE_SCENARIO -eq 'foreign'){Join-Path $Project 'other'}else{$Project})})}}}",
+              "function Get-ScheduledTask {if($env:FIXTURE_SCENARIO -notin @('foreground','missing')){@{State=$(if((Fixture-State) -eq 'running' -and $env:FIXTURE_SCENARIO -ne 'foreground-task'){'Running'}else{'Ready'}); Actions=@(@{WorkingDirectory=$(if($env:FIXTURE_SCENARIO -eq 'foreign'){Join-Path $Project 'other'}else{$Project})})}}}",
               "function Get-BotPids {if((Fixture-State) -eq 'running'){12345}}",
               "function Stop-Bot {Record 'stop'; if($env:FIXTURE_SCENARIO -eq 'stop-fail'){return $false}; [IO.File]::WriteAllText($env:FIXTURE_STATE,'exited'); return $true}",
               "function Start-Bot {Record 'start'; [IO.File]::WriteAllText($env:FIXTURE_STATE,'running'); return $true}",
@@ -63,6 +63,8 @@ for (const shell of ["powershell", "bash"] as const) {
               "$fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-RuntimeConfiguration'},$true)",
               "if(-not $fn){throw 'missing runtime configuration entry'}",
               ". ([scriptblock]::Create($fn.Extent.Text))",
+              "$helper=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-BotRunState'},$true)",
+              ". ([scriptblock]::Create($helper.Extent.Text))",
               "try { Invoke-RuntimeConfiguration " + quote(draftName) + " } catch { Write-Output $_.Exception.Message; exit 1 }",
             ].join("\r\n"));
           } else {
@@ -125,7 +127,7 @@ for (const shell of ["powershell", "bash"] as const) {
           expect(code, scenario + "\n" + stdout + stderr).toBe(success ? 0 : 1);
           const recorded = (await readFile(events, "utf8")).trim().split(/\r?\n/).filter(Boolean);
           const expected = ["paused", "guarded"].includes(scenario) || (scenario === "foreign" && shell === "bash") ? []
-            : ["precheck-fail", "foreground", "foreign"].includes(scenario) ? ["check:running"]
+            : ["precheck-fail", "foreground", "foreground-task", "foreign"].includes(scenario) ? ["check:running"]
             : ["stopped", "missing"].includes(scenario) ? ["check:" + initial, "apply:" + initial]
             : scenario === "stop-fail" ? ["check:running", "stop", "start"]
             : scenario === "apply-fail" ? ["check:running", "stop", "apply:exited", "stop", "rollback:exited", "start"]

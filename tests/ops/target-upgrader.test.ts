@@ -102,6 +102,8 @@ case "$cmd" in
             case " $* " in
                 *' probe '*) exit 20 ;;
                 *' prepare-reset '*) mkdir -p "$preview/reset-config/data/config"; printf 'draft' > "$preview/reset-config/data/config/models.json"; exit 0 ;;
+                *' offer-models '*) printf 'offer-models\n' >> "$FIXTURE_EVENTS"; exit "\${FIXTURE_MODELS:-21}" ;;
+                *' discard-models '*) printf 'discard-models\n' >> "$FIXTURE_EVENTS"; exit 0 ;;
                 *' bun run configure '*) printf 'configure head=%s\n' "$(current_head)" >> "$FIXTURE_EVENTS"; exit 0 ;;
                 *' bun run scripts/runtime/stats-freeze.ts '*)
                     printf '%s\n' "$@" > "$mock/freeze-args"
@@ -1010,6 +1012,17 @@ scenario("target upgrader: reset consent precedes stop, target image freezes the
   expect(freezeArgs.some(arg => arg.includes(":/upgrade"))).toBe(false);
   const snapshot = await readFile(join(mock, "snapshot"), "utf8");
   expect(await readFile(join(work, "backup/snapshots", snapshot, "stats-frozen.json"), "utf8")).toBe("frozen");
+  expect(events.indexOf("offer-models")).toBeGreaterThan(-1); expect(events.indexOf("offer-models")).toBeLessThan(configure);
+  // An accepted existing model configuration is kept by default (Enter) and reconfigured only on request, from an empty draft.
+  for (const [answer, configured] of [["", false], ["y", true]] as const) {
+    await reset(old);
+    const run = await upgrade([target], { FIXTURE_RESET: "1", FIXTURE_MODELS: "0" }, `y\n${answer}\n`);
+    expect(run.code, run.text).toBe(0); expect(run.text).toContain("是否重新配置模型");
+    const lines = await log(), configuredAt = lines.indexOf(`configure head=${old.slice(0, 7)}`);
+    expect(configuredAt > -1).toBe(configured);
+    expect(lines.includes("discard-models")).toBe(configured);
+    if (configured) expect(lines.indexOf("discard-models")).toBeLessThan(configuredAt);
+  }
 
   // Same-code reset can be interrupted before the freeze, with HEAD already at the target.
   await reset(target);

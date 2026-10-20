@@ -85,6 +85,8 @@ export interface View {
   id: string;
   /** 导航栏上的标签。 */
   label: string;
+  /** 只在部分部署形态下有意义的页面（例如隧道日志）；不可用时不出现在导航、Tab 和菜单里。分区首页必须始终可用。 */
+  available?(deployment: Deployment): boolean;
   render(ctx: ViewContext): string[];
   /** 本页特有的按键提示；通用键由 app 补。 */
   hints(): [string, string][];

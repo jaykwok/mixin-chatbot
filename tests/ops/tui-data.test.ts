@@ -13,7 +13,7 @@ test("体检把取消信号和界面提示上下文传给子进程，并保留�
   const deployment: Deployment = { platform: "windows", runtime: "scheduled-task", port: 1011,
     mode: "direct", domain: "", groupDataRoot: "unused", groupDataRootIsCustom: false };
   const health: Health = { pass: 0, warn: 0, fail: 1, checks: [
-    { name: "本地机器人健康", status: "fail", detail: "实例不存在", fix: "系统 → 服务部署 → 部署 / 修改设置" },
+    { name: "本地机器人健康", status: "fail", detail: "实例不存在", fix: "系统 → 服务部署 → 重新部署" },
   ] };
   const controller = new AbortController();
   const capture = spyOn(tuiExec, "capture").mockResolvedValue({ code: 1, stdout: JSON.stringify(health), stderr: "", timedOut: false });

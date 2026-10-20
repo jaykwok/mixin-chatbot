@@ -50,7 +50,6 @@ export class StorageView implements View {
         disabled: this.state.kind !== "ready" || !this.state.value.length },
       { value: "x", label: "物理回收已登记的产物", description: "按当前天数预览所有群，确认后永久删除，释放磁盘空间", danger: true },
       { value: "r", label: "永久删除归档", description: "预览群根/.reclamation/backup/rm 中内容未变的归档，确认后释放磁盘空间", danger: true },
-      { value: "h", label: "清空会话历史", description: "前往 数据 → 会话：c 清空当前群，a 清空全部群；不影响使用统计" },
     ];
   }
 
@@ -104,8 +103,6 @@ export class StorageView implements View {
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
-    // 会话与临时文件分开清理；从这里也能直接找到清空会话。
-    if (key.name === "h") { app.go("history"); return true; }
     if (key.name === "escape" && this.expanded) { this.expanded = false; return true; }
     if (key.name === "escape" && this.filter.clear()) { this.selected = 0; return true; }
     if (key.name === "/" && !this.expanded) {

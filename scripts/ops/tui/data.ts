@@ -12,6 +12,8 @@ import { LOG_FILE, PROJECT_DIR, opsCommand, type Deployment } from "./platform.t
 import { day } from "./render/format.ts";
 import { readRuntimeSettings } from "../../config/runtime-settings.ts";
 import { validateRelayConfig } from "../../../src/integrations/relay-s3.ts";
+import { readAuxiliaryConfig } from "../../../src/core/auxiliary-config.ts";
+import { readMcpConfig } from "../../../src/core/mcp-config.ts";
 
 // ===== 体检 =====
 
@@ -104,6 +106,18 @@ async function git(args: string[], signal?: AbortSignal, timeout = 15_000): Prom
 }
 
 let gitRead: Promise<GitState | null> | null = null;
+/** 第一次读到的 HEAD：界面代码在启动时加载，升级或回滚后运行中的界面仍是这个版本。 */
+let startCommit: string | null = null;
+
+/**
+ * 自启动以来界面会加载的代码是否被升级、继续或回滚改动；只有退出后重新运行才会加载新代码。
+ * 界面也引用 src 与其他脚本里的校验和读取逻辑，因此按代码与依赖清单判断，只改文档时不提示。
+ */
+export async function tuiCodeChanged(signal?: AbortSignal): Promise<boolean> {
+  if (!startCommit) return false;
+  const diff = await git(["diff", "--quiet", startCommit, "HEAD", "--", "scripts", "src", "package.json", "bun.lock"], signal);
+  return diff.code === 1;
+}
 
 /**
  * 页眉、总览和维护页共享在途查询；下次刷新仍读取最新状态。
@@ -150,6 +164,7 @@ async function readGit(signal?: AbortSignal, target = "origin/main"): Promise<Gi
   }
   const [sha = "", subject = ""] = head.stdout.trim().split(/\r?\n/);
 
+  if (/^[0-9a-f]{40,64}$/.test(sha)) startCommit ??= sha;
   let ahead = 0;
   let behind = -1;
   if (counts.code === 0) {
@@ -349,6 +364,56 @@ export async function loadRelaySummary(project = PROJECT_DIR, signal?: AbortSign
     pathStyle: config.forcePathStyle, maxBytes: config.maxBytes, expireHours: config.expireHours,
     cleanupGraceMinutes: config.cleanupGraceMinutes, sessionToken: config.sessionToken !== undefined,
   };
+}
+
+/**
+ * 设置页展示的当前模型：只读 Pi 设置里的选择，完整校验（目录、凭证）由体检和启动负责。
+ * 推理级别与服务相同：先取该模型的单独设置，再取全局默认；超出模型能力时由服务启动时下调。
+ */
+export interface ModelSummary { provider: string; model: string; thinking: { level: string; source: "model" | "default" } | null }
+
+export async function loadModelSummary(project = PROJECT_DIR, signal?: AbortSignal): Promise<ModelSummary | null> {
+  let raw: string;
+  try {
+    raw = await readFile(join(project, "data", "runtime", "pi", "settings.json"), { encoding: "utf8", signal });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  let doc: unknown;
+  try { doc = JSON.parse(raw.replace(/^\uFEFF/, "")); } catch { throw new Error("data/runtime/pi/settings.json 不是有效 JSON"); }
+  const value = doc && typeof doc === "object" && !Array.isArray(doc) ? doc as Record<string, unknown> : {};
+  const text = (name: string) => typeof value[name] === "string" && (value[name] as string).trim() ? value[name] as string : null;
+  const provider = text("defaultProvider"), model = text("defaultModel");
+  if (!provider || !model) return null;
+  const overrides = value.modelThinkingLevels && typeof value.modelThinkingLevels === "object" && !Array.isArray(value.modelThinkingLevels)
+    ? value.modelThinkingLevels as Record<string, unknown> : {};
+  const override = overrides[`${provider}/${model}`], fallback = text("defaultThinkingLevel");
+  const thinking = typeof override === "string" && override.trim() ? { level: override, source: "model" as const }
+    : fallback ? { level: fallback, source: "default" as const } : null;
+  return { provider, model, thinking };
+}
+
+/** 辅助模型只读状态：引用的分类 / 识图模型与并发预算；文件格式错误原样报出。 */
+export type AuxiliarySummary = { enabled: false } | {
+  enabled: true; classifier: string | null; image: string | null; maxConcurrent: number; classifierRetries: number;
+};
+
+export async function loadAuxiliarySummary(project = PROJECT_DIR, signal?: AbortSignal): Promise<AuxiliarySummary> {
+  signal?.throwIfAborted();
+  const config = readAuxiliaryConfig(join(project, "data", "config", "auxiliary.json"));
+  if (!config) return { enabled: false };
+  const ref = (model: { provider: string; modelId: string } | undefined) => model ? `${model.provider}/${model.modelId}` : null;
+  return { enabled: true, classifier: ref(config.classifier), image: ref(config.image), maxConcurrent: config.maxConcurrent, classifierRetries: config.classifierRetries };
+}
+
+/** MCP 只读状态：服务器名称、传输、工具白名单数量和是否需要 OAuth 登录；不显示命令参数、环境变量或 URL 凭据。 */
+export interface McpServerSummary { name: string; transport: "stdio" | "http"; tools: number; oauth: boolean }
+
+export async function loadMcpSummary(project = PROJECT_DIR, signal?: AbortSignal): Promise<McpServerSummary[] | null> {
+  signal?.throwIfAborted();
+  const config = readMcpConfig(join(project, "data", "config", "mcp.json"));
+  return config ? config.servers.map(server => ({ name: server.name, transport: server.transport, tools: server.tools.length, oauth: server.oauth !== undefined })) : null;
 }
 
 export function loadRuntimeSettings(project = PROJECT_DIR, signal?: AbortSignal) {

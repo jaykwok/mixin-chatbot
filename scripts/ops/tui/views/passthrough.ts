@@ -18,6 +18,8 @@ interface Command {
   ask?: string[];
   /** 不需确认、但会改动外部状态的操作，替代「只读查看」的说明。 */
   effect?: string;
+  /** 向导类命令需要真正的终端（隐藏输入、确认提问），交给 runInteractive。 */
+  interactive?: boolean;
   /** 需要确认时给出说明；返回 null 表示只读操作，直接执行。 */
   danger?: (values: string[]) => {
     subject: string;
@@ -91,7 +93,8 @@ class CommandMenu implements View {
       }
     }
 
-    const code = await app.run(command.label, command.args(values));
+    const code = command.interactive ? await app.runInteractive(command.label, command.args(values))
+      : await app.run(command.label, command.args(values));
     app.toast(code === 0 ? "ok" : "danger", code === 0
       ? `${command.label}完成`
       : `${command.label}退出码 ${code}`);
@@ -104,7 +107,7 @@ class CommandMenu implements View {
       title: this.title, items: this.commands, selected: this.selected,
       details: [
         ctx.theme.bold(command.summary),
-        ctx.theme.c(command.danger ? "warn" : "ok", command.danger ? "修改操作 · 执行前需确认" : command.effect ?? "只读查看"),
+        ctx.theme.c(command.danger || command.interactive ? "warn" : "ok", command.danger ? "修改操作 · 执行前需确认" : command.effect ?? "只读查看"),
         "",
         ...(command.ask?.length ? ["需要提供：" + command.ask.join("、"), ""] : []),
         this.intro,
@@ -119,10 +122,18 @@ export function createRelayView(): View {
     "relay",
     "外链",
     "大文件外链",
-    "外链配置请进入「系统 → 设置 → 外链配置」。这里查看、测试和清理已生成的外链。" +
+    "这里修改外链配置，并查看、测试和清理已生成的外链；配置也可在「系统 → 设置 → 外链配置」修改。" +
       "清理只删后端对象和索引记录，已经发进群里的旧链接不会因此复活或消失。" +
       "测试不需停机，修改配置或云端权限、生命周期后用它验收。",
     [
+      {
+        label: "修改外链配置",
+        summary: "启用、修改或停用 S3 外链，保存前预览确认",
+        status: "idle",
+        effect: "向导 · 确认后短暂重启运行中的机器人，取消不修改",
+        interactive: true,
+        args: () => ["relay-configure"],
+      },
       {
         label: "列出在册外链",
         summary: "旧的排在前面，附有效期规则说明",

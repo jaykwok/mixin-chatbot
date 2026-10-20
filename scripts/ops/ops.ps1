@@ -233,6 +233,14 @@ function Invoke-RelayAdmin([string[]]$RelayArgs) {
     }
 }
 
+# 停机维护前确认原运行方式。只有计划任务正在运行才是后台实例；有本项目机器人进程而任务不存在或
+# 未在运行（通常为 Ready），就是前台实例：Start-Bot 只能启动计划任务，会改变运行方式和账户环境。
+function Get-BotRunState($Task) {
+    $taskRunning = [bool]($Task -and $Task.State -eq 'Running')
+    $processes = @(Get-BotPids).Count -gt 0
+    return [pscustomobject]@{ Running = ($taskRunning -or $processes); Foreground = ($processes -and -not $taskRunning) }
+}
+
 # 先形成经确认的配置草稿，再停机提交并恢复服务；凭据只存在于隐藏输入和配置文件中。
 function Invoke-RelayConfiguration {
     $bunPath = Get-BunPath
@@ -250,8 +258,9 @@ function Invoke-RelayConfiguration {
         if (-not (Test-Path -LiteralPath $draft -PathType Leaf)) { return }
         $ErrorActionPreference = "Stop"
         $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
-        if ($wasRunning -and -not $task) {
+        $run = Get-BotRunState $task
+        $wasRunning = $run.Running
+        if ($run.Foreground) {
             throw "机器人以前台方式运行，无法自动恢复；请先停止前台实例，再重新配置外链"
         }
         if ($wasRunning) {
@@ -273,6 +282,53 @@ function Invoke-RelayConfiguration {
             }
         } finally {
             Remove-Item -LiteralPath $draft -Force -ErrorAction SilentlyContinue
+            Pop-Location
+        }
+    }
+}
+
+# 模型配置向导在维护租约下运行，要求机器人停止；结束后按原运行状态恢复。
+# 向导在草稿中填写，确认后才一起替换配置文件，取消或失败时原配置不变。
+function Invoke-ModelConfiguration {
+    $bunPath = Get-BunPath
+    if (-not $bunPath) { throw "找不到可用的 bun；请安装 Bun：https://bun.sh" }
+    if ($pendingTransaction) {
+        throw "有未完成的部署或升级；请先用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 回滚"
+    }
+    $statePath = Join-Path $Project 'data\state'
+    New-Item -ItemType Directory -Force -Path $statePath | Out-Null
+    $lock = [IO.File]::Open((Join-Path $statePath 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $wasRunning = $false
+    $stopAttempted = $false
+    Push-Location $Project
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $run = Get-BotRunState $task
+        $wasRunning = $run.Running
+        if ($run.Foreground) {
+            throw "机器人以前台方式运行，无法自动恢复；请先停止前台实例，再配置模型"
+        }
+        if ($wasRunning) {
+            Step "停止机器人以配置模型；向导结束后恢复运行"
+            $stopAttempted = $true
+            if (-not (Stop-Bot)) { throw "无法停止机器人，模型配置未开始" }
+        }
+        $ErrorActionPreference = "Continue"
+        # 直接继承终端，保留密码掩码和 Ctrl+C；不把凭据放进参数或输出管道。
+        Invoke-WithUtf8Output { & $bunPath run "scripts\config\configure.ts" }
+        if ($LASTEXITCODE -ne 0) { throw "模型配置未完成；原配置保持不变" }
+        if (-not $wasRunning) { Done "模型配置将在下次启动机器人时生效；已保持停止状态" }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        try {
+            if ($wasRunning -and $stopAttempted) {
+                if (-not (Start-Bot)) { throw "模型配置已结束，但机器人恢复启动失败" }
+                if ((Wait-Local) -ne 200) { throw "机器人恢复后未通过健康检查，请在 $(Get-OpsCommandHint 'logs') 查看日志" }
+                Done "机器人已恢复运行，已重新读取模型配置"
+            }
+        } finally {
+            $lock.Dispose()
             Pop-Location
         }
     }
@@ -309,8 +365,9 @@ function Invoke-RuntimeConfiguration([string]$DraftName) {
             [IO.Path]::GetFullPath($task.Actions[0].WorkingDirectory) -ne [IO.Path]::GetFullPath($Project))) {
             throw '计划任务不属于当前项目，未修改配置或服务'
         }
-        $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
-        if ($wasRunning -and -not $task) { throw '机器人以前台方式运行，无法自动恢复；请先停止前台实例，再保存运行参数' }
+        $run = Get-BotRunState $task
+        $wasRunning = $run.Running
+        if ($run.Foreground) { throw '机器人以前台方式运行，无法自动恢复；请先停止前台实例，再保存运行参数' }
         if ($wasRunning) {
             Step '运行参数已确认，短暂停止机器人以应用设置'
             $stopAttempted = $true
@@ -407,8 +464,9 @@ function Invoke-TmpAdmin([string[]]$TmpArgs) {
             [IO.Path]::GetFullPath($task.Actions[0].WorkingDirectory) -ne [IO.Path]::GetFullPath($Project))) {
             throw '计划任务不属于当前项目，未开始临时文件维护'
         }
-        $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
-        if ($wasRunning -and -not $task) { throw '机器人以前台方式运行，无法自动恢复；请先停止前台实例，再执行临时文件维护' }
+        $run = Get-BotRunState $task
+        $wasRunning = $run.Running
+        if ($run.Foreground) { throw '机器人以前台方式运行，无法自动恢复；请先停止前台实例，再执行临时文件维护' }
         if ($wasRunning) {
             $stopAttempted = $true
             if (-not (Stop-Bot)) { throw '无法停止机器人，未开始临时文件维护' }
@@ -1381,6 +1439,9 @@ switch ($Command) {
     "runtime-configure" {
         try { Invoke-RuntimeConfiguration $Target } catch { Err $_.Exception.Message; exit 1 }
     }
+    "model-configure" {
+        try { Invoke-ModelConfiguration } catch { Err $_.Exception.Message; exit 1 }
+    }
     "relay-ls" { if (-not (Invoke-RelayAdmin @("list"))) { exit 1 } }
     "relay-test" { if (-not (Invoke-RelayAdmin @("test"))) { exit 1 } }
     "relay-purge" {
@@ -1488,6 +1549,7 @@ switch ($Command) {
         Write-Host "  foreground      以前台方式运行 launcher（Ctrl+C 停止）"
         Write-Host "  logs            持续查看 logs\mixin-chatbot.log"
         Write-Host "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
+        Write-Host "  model-configure 停止机器人，运行模型配置向导，结束后恢复原运行状态"
         Write-Host "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
         Write-Host "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
         Write-Host "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"

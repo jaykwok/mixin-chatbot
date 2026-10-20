@@ -485,15 +485,33 @@ preview_data_preparation() {
         -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" "$IMAGE_ID" \
         bun run scripts/runtime/data-current.ts probe --project /app --groups "$groups" || status=$?
     if [ "$status" = 20 ]; then
-        ask_yes_no '数据版本不兼容。保留 stats.sqlite、workspace 和其他资料、webhook/Cloudflare 入口；仅清理各群直属的其他 SQLite 数据库、index、成员 session.jsonl 和 tmp，重新配置模型及可选功能。未入账消息和待处理任务不再补算；成功后删除本次回滚副本。继续？[y/N] ' || {
+        ask_yes_no '数据版本不兼容。保留 stats.sqlite、workspace 和其他资料、webhook/Cloudflare 入口；外链、文档、隧道、辅助模型、MCP 等管理员设置经新版本校验后保留，不接受的丢弃并需重新设置；模型配置能被新版 Pi 读取时可选择沿用，否则重新配置；仅清理各群直属的其他 SQLite 数据库、index、成员 session.jsonl 和 tmp。未入账消息和待处理任务不再补算；成功后删除本次回滚副本。继续？[y/N] ' || {
             print_warning '已取消；旧服务、配置和数据未改动'; exit 1;
         }
         docker run --rm -i --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp \
             -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" -v "$PREVIEW_DIR:/preview" "$IMAGE_ID" \
             bun run scripts/runtime/data-current.ts prepare-reset --project /app --groups "$groups" --reset-config /preview/reset-config || exit 1
-        print_status '在隔离目录重新配置模型；旧服务继续运行。其他可选功能恢复默认，可在升级后配置。'
-        docker run --rm -it --user "$SERVICE_USER" -e HOME=/app/data/runtime/home \
-            -v "$PREVIEW_DIR/reset-config/data:/app/data" -v "$PREVIEW_DIR/reset-config/backup:/app/backup" "$IMAGE_ID" bun run configure || exit 1
+        # 只有新版 Pi 能完整读取（选中的模型存在、实际解析出凭证）才提供沿用；文件存在本身不算数。
+        # 检查子进程使用草稿 cwd，并把待重建的服务 HOME 映射到草稿；需要网络的命令在这里会失败，转入配置向导。
+        local models=0
+        docker run --rm -i --network none --user "$SERVICE_USER" -w /app -e HOME=/app/data/runtime/home \
+            -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" -v "$PREVIEW_DIR:/preview" "$IMAGE_ID" \
+            bun run scripts/runtime/data-current.ts offer-models --project /app --groups "$groups" --reset-config /preview/reset-config || models=$?
+        if [ "$models" = 0 ]; then
+            print_warning '校验只能发现新版 Pi 拒绝的配置；Pi 发布说明若提到模型配置含义变化，请选择重新配置。'
+            if ! ask_yes_no '是否重新配置模型（provider/key/model）？[y/N] '; then models=kept
+            else
+                docker run --rm --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp -v "$PREVIEW_DIR:/preview" "$IMAGE_ID" \
+                    bun run scripts/runtime/data-current.ts discard-models --reset-config /preview/reset-config || exit 1
+            fi
+        elif [ "$models" != 21 ]; then
+            print_error '模型配置检查失败，未停止旧服务'; exit 1
+        fi
+        if [ "$models" != kept ]; then
+            print_status '在隔离目录配置模型；旧服务继续运行。新版本不接受的设置已在上方列出，可在升级后重新设置。'
+            docker run --rm -it --user "$SERVICE_USER" -e HOME=/app/data/runtime/home \
+                -v "$PREVIEW_DIR/reset-config/data:/app/data" -v "$PREVIEW_DIR/reset-config/backup:/app/backup" "$IMAGE_ID" bun run configure || exit 1
+        fi
         RESET_CONFIG="$PREVIEW_DIR/reset-config"
         mode=(--reset-config /preview/reset-config)
         status=0

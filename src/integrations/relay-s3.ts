@@ -1,4 +1,5 @@
 // S3 Signature V4 comes from Bun; HTTP stays here so cancellation covers every request.
+import { readFileSync } from "node:fs";
 import { S3Client } from "bun";
 import { MAX_ATTACHMENT_BYTES, RELAY_HTTP_TIMEOUT, RELAY_PROBE_TIMEOUT } from "../core/transfer-limits.ts";
 
@@ -28,6 +29,19 @@ function required(value: unknown, field: string, path: string): string {
     throw new Error(`${path} 的 ${field} 必须是非空字符串，且不能含控制字符或首尾空格`);
   }
   return value;
+}
+
+/** The one reader of relay.json: the service, configuration checks and reset accept exactly the same files. */
+export function readRelayConfigFile(path: string): RelayConfig | null {
+  let raw: string;
+  try { raw = readFileSync(path, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error(path + " 无法读取");
+  }
+  let doc: unknown;
+  try { doc = JSON.parse(raw); } catch { throw new Error(path + " 不是有效 JSON"); }
+  return validateRelayConfig(doc, path);
 }
 
 export function validateRelayConfig(doc: unknown, path = "data/config/relay.json"): RelayConfig {

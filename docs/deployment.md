@@ -33,7 +33,7 @@ Cloudflare 模式会自动将官方 `cloudflared` 下载到项目根目录（Win
 
 Python 小版本范围固定为 `>=3.14,<3.15`，补丁版本由 uv 选择；依赖及传递依赖由 `uv.lock` 锁定。Windows 和 Docker 默认都使用 `<群目录>/venv/`，每群独立、首次使用时按需 `uv sync`；不会自动使用项目根目录 `.venv`。各群依赖从下载缓存复制安装，避免硬链接导致原地修改相互影响；基础 Python 解释器和下载缓存可以共用。
 
-仅管理员显式配置 `BOT_DOCUMENT_ENV` 时，所有群才共用指定环境。TUI「设置 → 高级运行参数 → 文档与诊断」中的「共享文档环境覆盖」留空或恢复默认，即为每群独立。Docker 镜像里的 `/app/.venv` 用于构建验证和显式选择，不替代群 venv。群 venv 缺失或与当前配置不一致时由 uv 按需准备，因此该群首次使用文档功能可能需要联网下载 Python 和依赖。生成文件保留在用户 tmp，venv 只存工具依赖。
+仅管理员显式配置 `BOT_DOCUMENT_ENV` 时，所有群才共用指定环境。TUI「设置 → 高级运行参数 → 文档处理」中的「共享文档环境覆盖」留空或恢复默认，即为每群独立。Docker 镜像里的 `/app/.venv` 用于构建验证和显式选择，不替代群 venv。群 venv 缺失或与当前配置不一致时由 uv 按需准备，因此该群首次使用文档功能可能需要联网下载 Python 和依赖。生成文件保留在用户 tmp，venv 只存工具依赖。
 
 通常无需手工同步。需要预热某个群时，停止服务，在项目根目录执行（将路径换成实际群目录）：
 
@@ -48,7 +48,7 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 
 Linux 的同等操作为 `UV_PROJECT_ENVIRONMENT=/absolute/group/venv uv sync --locked --no-dev --no-install-project`，成功后运行 `bun scripts/runtime/document-manifest.ts . /absolute/group/venv`。marker 只记录预期配置，运行时仍验证实际解释器、依赖及导入。
 
-Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffice.org/download/download-libreoffice/)安装。在 TUI「设置 → 高级运行参数 → 文档与诊断」的「LibreOffice 程序路径」中填写程序的绝对路径，例如 `C:/Program Files/LibreOffice/program/soffice.exe`；便携版填写其 `program/soffice.exe` 的绝对路径。留空时先从服务账户的 PATH 查找 `soffice`、`libreoffice`，Windows 再查标准安装目录。Linux 同样可设置，如 `/usr/bin/soffice`；隔离任务须填写任务容器内已存在的程序路径，Docker 镜像预装 LibreOffice，通常保持自动查找即可。指定路径无效时会报错，请修正或恢复自动查找。变更后重启服务。PDF 预览直接使用 Python 库。预览字体取自运行主机，建议安装与客户模板一致的字体；Docker 提供 Noto CJK。缺少 LibreOffice 时仍可编辑和组装文件，工具会明确报告未完成视觉检查。
+Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffice.org/download/download-libreoffice/)安装。在 TUI「设置 → 高级运行参数 → 文档处理」的「LibreOffice 程序路径」中填写程序的绝对路径，例如 `C:/Program Files/LibreOffice/program/soffice.exe`；便携版填写其 `program/soffice.exe` 的绝对路径。留空时先从服务账户的 PATH 查找 `soffice`、`libreoffice`，Windows 再查标准安装目录。Linux 同样可设置，如 `/usr/bin/soffice`；隔离任务须填写任务容器内已存在的程序路径，Docker 镜像预装 LibreOffice，通常保持自动查找即可。指定路径无效时会报错，请修正或恢复自动查找。变更后重启服务。PDF 预览直接使用 Python 库。预览字体取自运行主机，建议安装与客户模板一致的字体；Docker 提供 Noto CJK。缺少 LibreOffice 时仍可编辑和组装文件，工具会明确报告未完成视觉检查。
 
 只读 Docker 容器需要可写的 `/tmp`，例如 `--tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777`；部署脚本已提供该挂载。LibreOffice 的 Unix 进程通信文件使用 `/tmp`，仅设置 `TMPDIR` 无法代替它。每次转换的 LibreOffice 用户配置（profile）放在系统临时目录下单独创建的目录（容器内即该 `/tmp`），任务结束、失败或取消后删除，文档工具同时最多两次转换；缓存和输出放在本次任务临时目录。Windows 上 profile 目录较深时曾出现 LibreOffice 退出码为 0 却不生成 PDF，因此不放在群目录下，服务账户的 TEMP 也应保持较短路径。转换错误会保留 LibreOffice 的诊断输出。
 
@@ -142,7 +142,7 @@ Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原�
 
 部署脚本保存支持的设置，未显式指定的值沿用已存配置。仅在前台启动时设置环境变量不会自动落盘；停机后可运行 `bun run configure-runtime` 保存当前支持项。配置文件中的未知键、无效类型及越界值会阻止启动。
 
-日常调整可进入 **系统 → 设置 → 高级运行参数**，按“并发与附件、超时与退出、缓存与索引、文档与诊断”选择，共 17 项。Enter 修改，`d` 恢复选中项的默认值，`s` 预览并保存；默认值与机器人运行时共用定义。Esc 返回保留当前草稿，退出 TUI 前会提醒尚未保存的修改。端口、监听地址和群数据目录仍通过服务部署设置。
+日常调整可进入 **系统 → 设置 → 高级运行参数**，按“并发与附件、超时与退出、缓存与索引、文档处理、日志与诊断”选择，共 17 项。Enter 修改，`d` 恢复选中项的默认值，`s` 预览并保存；默认值与机器人运行时共用定义。Esc 返回保留当前草稿，退出 TUI 前会提醒尚未保存的修改。端口、监听地址和群数据目录仍通过服务部署设置。
 
 确认后才短暂停止运行中的机器人，保存并通过健康检查后恢复；原本停止的实例保持停止。应用或健康检查失败时尝试恢复原配置；并发修改不会被覆盖。界面显示的是保存值与默认值，环境变量仍有更高优先级：保存前检查 Windows 当前环境或 Linux 容器的相关覆盖，发生冲突时拒绝写入；自定义计划任务还需检查其启动环境。
 
@@ -172,7 +172,7 @@ Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原�
 
 ### 默认文档模板
 
-`BOT_DOCUMENT_PPTX_TEMPLATE`、`BOT_DOCUMENT_DOCX_TEMPLATE` 在 TUI「设置 → 高级运行参数 → 文档与诊断」中分别为「默认 PPT 模板」「默认 Word 模板」，应用后重启生效。机器人用 `document_build` 生成文档且没有指定模板时套用它们；用户或机器人指定了其他文件时以指定的为准。
+`BOT_DOCUMENT_PPTX_TEMPLATE`、`BOT_DOCUMENT_DOCX_TEMPLATE` 在 TUI「设置 → 高级运行参数 → 文档处理」中分别为「默认 PPT 模板」「默认 Word 模板」，应用后重启生效。机器人用 `document_build` 生成文档且没有指定模板时套用它们；用户或机器人指定了其他文件时以指定的为准。
 
 - 相对路径（如 `模板/公司.potx`）在各群自己的 `workspace` 中查找，不能含 `..`，也不能经链接指向 workspace 之外。某群没有这个文件时，该群照常使用内置版式，并在工具结果中提示，不报错。适合各群使用不同模板。
 - 绝对路径所有群共用同一份文件。Windows 直接填文件路径；Linux Docker 填容器内路径，例如放在宿主机 `data/templates/公司.potx`，填写 `/app/data/templates/公司.potx`。

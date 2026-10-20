@@ -13,7 +13,7 @@ function Get-PlatformIp { if ($env:PLATFORM_IP) { return $env:PLATFORM_IP.Trim()
 function Get-OpsCommandHint([string]$Command) {
     if ($env:MIXIN_OPS_TUI -eq '1') {
         $paths = @{
-            'deploy' = '系统 → 服务部署 → 部署 / 修改设置'
+            'deploy' = '系统 → 服务部署 → 重新部署'
             'update' = '系统 → 服务部署 → 升级'
             'resume' = '系统 → 服务部署 → 继续上次操作'
             'rollback' = '系统 → 服务部署 → 回滚上次操作'
@@ -29,7 +29,7 @@ function Get-OpsCommandHint([string]$Command) {
         }
         if ($paths.ContainsKey($Command)) { return "「$($paths[$Command])」" }
         if ($Command -eq 'configure') {
-            return '先修正 data/config/models.json 和 data/runtime/pi/settings.json；配置有效后，可在「系统 → 服务部署 → 部署 / 修改设置」重新选择模型'
+            return '先修正 data/config/models.json 和 data/runtime/pi/settings.json；配置有效后，可在「系统 → 设置 → 模型配置」重新选择模型'
         }
     }
     if ($Command -eq 'configure') { return 'bun run configure' }

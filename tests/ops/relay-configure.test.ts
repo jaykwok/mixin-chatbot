@@ -14,7 +14,7 @@ for (const shell of ["powershell", "bash"] as const) {
   test.skipIf(shell === "powershell" ? process.platform !== "win32" : !bash || !existsSync(bash))(
     shell + " 外链配置仅确认后停机，成功或失败均恢复原运行状态，取消时无服务变更", async () => {
       // bash also guards the one-off containers: "guarded" is a deployment in progress or an unfinished transaction.
-      for (const scenario of ["running", "stopped", "cancel", "apply-fail", "stop-fail", "restart-fail", ...(shell === "powershell" ? ["foreground"] : ["guarded"])]) {
+      for (const scenario of ["running", "stopped", "cancel", "apply-fail", "stop-fail", "restart-fail", ...(shell === "powershell" ? ["foreground", "foreground-task"] : ["guarded"])]) {
         const fixture = await tempFixture("relay-ops-" + scenario + "-");
         try {
           const events = join(fixture.root, "events.txt"), state = join(fixture.root, "state.txt");
@@ -40,7 +40,7 @@ for (const shell of ["powershell", "bash"] as const) {
               "    if($env:FIXTURE_SCENARIO -eq 'apply-fail'){$global:LASTEXITCODE=1}",
               "  } else {throw 'unexpected fixture command'}",
               "}",
-              "function Get-ScheduledTask {if($env:FIXTURE_SCENARIO -ne 'foreground'){@{State=$(if((Fixture-State) -eq 'running'){'Running'}else{'Ready'})}}}",
+              "function Get-ScheduledTask {if($env:FIXTURE_SCENARIO -ne 'foreground'){@{State=$(if((Fixture-State) -eq 'running' -and $env:FIXTURE_SCENARIO -ne 'foreground-task'){'Running'}else{'Ready'})}}}",
               "function Get-BotPids {if((Fixture-State) -eq 'running'){12345}}",
               "function Stop-Bot { Record 'stop'; if($env:FIXTURE_SCENARIO -eq 'stop-fail'){return $false}; [IO.File]::WriteAllText($env:FIXTURE_STATE,'exited'); return $true }",
               "function Start-Bot { Record 'start'; if($env:FIXTURE_SCENARIO -eq 'restart-fail'){return $false}; [IO.File]::WriteAllText($env:FIXTURE_STATE,'running'); return $true }",
@@ -52,6 +52,8 @@ for (const shell of ["powershell", "bash"] as const) {
               "$fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-RelayConfiguration'},$true)",
               "if(-not $fn){throw 'missing relay configuration entry'}",
               ". ([scriptblock]::Create($fn.Extent.Text))",
+              "$helper=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-BotRunState'},$true)",
+              ". ([scriptblock]::Create($helper.Extent.Text))",
               "try { Invoke-RelayConfiguration } catch { Write-Output $_.Exception.Message; exit 1 }",
             ].join("\n"));
           } else {
@@ -101,7 +103,7 @@ for (const shell of ["powershell", "bash"] as const) {
           const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
           expect(code, scenario + "\n" + stdout + stderr).toBe(["running", "stopped", "cancel"].includes(scenario) ? 0 : 1);
           const recorded = (await readFile(events, "utf8")).trim().split(/\r?\n/);
-          const expected = scenario === "cancel" || scenario === "foreground" ? ["draft:running"]
+          const expected = ["cancel", "foreground", "foreground-task"].includes(scenario) ? ["draft:running"]
             : scenario === "stopped" ? ["draft:exited", "apply:exited"]
               : scenario === "stop-fail" ? ["draft:running", "stop", "start"]
                 : scenario === "guarded" ? []

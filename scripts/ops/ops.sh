@@ -409,6 +409,38 @@ relay_configure() (
     if [ "$was_running" = 0 ]; then OK "外链设置将在下次启动机器人时生效；已保持停止状态"; fi
 )
 
+# 模型配置向导在维护租约下运行，要求机器人停止；整个过程持有部署锁，结束后恢复原运行状态。
+# 向导在草稿中填写，确认后才一起替换配置文件，取消或失败时原配置不变。
+model_configure() (
+    local user="" state="" was_running=0 terminal=(-i)
+    if ! command -v docker >/dev/null 2>&1; then ER "找不到 docker"; return 1; fi
+    guard_one_off_container || return 1
+    cd "$PROJECT_DIR" || return 1
+    user="$(service_container_user)" || return 1
+    state="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.State}}')" || {
+        ER "无法查询容器状态，模型配置未开始"; return 1;
+    }
+    restore_model_service() {
+        local code=$?
+        trap - EXIT INT TERM
+        if [ "$was_running" = 1 ]; then start_bot || code=1; fi
+        exit "$code"
+    }
+    trap restore_model_service EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [ "$state" = "running" ]; then
+        was_running=1
+        P "停止机器人以配置模型；向导结束后恢复运行"
+        docker stop "$CONTAINER" >/dev/null || { ER "停止容器失败，模型配置未开始"; return 1; }
+    fi
+    if [ -t 0 ] && [ -t 1 ]; then terminal+=(-t); fi
+    docker run --rm "${terminal[@]}" --user "$user" -e HOME=/app/data/runtime/home \
+        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
+        mixin-chatbot bun run configure || { ER "模型配置未完成；原配置保持不变"; return 1; }
+    if [ "$was_running" = 0 ]; then OK "模型配置将在下次启动机器人时生效；已保持停止状态"; fi
+)
+
 # 应用 TUI 已确认的运行参数；整个停机、发布和恢复过程与部署互斥。
 runtime_configure() (
     local draft_name="${1:-}" draft_file="" owner="" image="mixin-chatbot"
@@ -894,6 +926,7 @@ case "${1:-}" in
     tunnel-protocol) configure_tunnel_protocol "${2:-}" ;;
     tunnel-update) . "$PROJECT_DIR/scripts/lib/cloudflared-update.sh"; update_cloudflared ;;
     relay-configure) relay_configure ;;
+    model-configure) model_configure ;;
     runtime-configure) runtime_configure "${2:-}" ;;
     relay-ls)    relay_admin list ;;
     relay-test)  relay_admin test ;;
@@ -937,6 +970,7 @@ case "${1:-}" in
         echo "  start      启动 Docker 容器"
         echo "  logs       持续查看最近 50 行 Docker 日志"
         echo "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
+        echo "  model-configure 停止机器人，运行模型配置向导，结束后恢复原运行状态"
         echo "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
         echo "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
         echo "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"

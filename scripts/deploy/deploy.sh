@@ -718,6 +718,18 @@ print_success "持久化目录权限正常"
 print_status "验证任务隔离、固定镜像与宿主目录映射..."
 task_runtime_prepare || { print_error "任务隔离预检失败，原服务未因本次预检停止"; exit 1; }
 
+# 跨数据版本只能由升级器重置并重新配置模型。部署不做重置，也不能因为检测到旧 models.json 就沿用它，停机前直接拒绝。
+if [ "$RECORDED" = 0 ]; then
+    DATA_VERSION_STATUS=0
+    data_preparation_docker probe >/dev/null || DATA_VERSION_STATUS=$?
+    if [ "$DATA_VERSION_STATUS" = 20 ]; then
+        print_error "数据版本较旧，重新部署不会沿用旧模型配置和会话；请运行 $(ops_command_hint update)，确认后重置旧会话并重新配置模型。服务尚未停止"
+        exit 1
+    elif [ "$DATA_VERSION_STATUS" != 0 ]; then
+        print_error "数据版本检查失败（原因见上方）；服务尚未停止"
+        exit 1
+    fi
+fi
 DATA_PREPARATION_PLANNED=0
 if [ "$RECORDED" = 1 ] && [ -f "$TRANSACTION_SNAPSHOT/data-plan.json" ]; then
     # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。

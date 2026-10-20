@@ -47,6 +47,7 @@ function terminal() {
 
 test("设置仅加载选中项，重复选择复用在途读取；离页丢弃旧结果，重入可读取新结果", async () => {
   const { app } = stub(), view = new SettingsView();
+  app.deployment = { ...deployment, mode: "cloudflare" };
   const tunnel = Promise.withResolvers<data.TunnelLogging>();
   const old = Promise.withResolvers<settings.RuntimeSnapshot>(), fresh = Promise.withResolvers<settings.RuntimeSnapshot>();
   let tunnelSignal: AbortSignal | undefined, runtimeSignal: AbortSignal | undefined;
@@ -56,19 +57,27 @@ test("设置仅加载选中项，重复选择复用在途读取；离页丢弃�
   const readRuntime = spyOn(data, "loadRuntimeSettings").mockImplementationOnce((_project, signal) => {
     runtimeSignal = signal; return old.promise;
   }).mockReturnValue(fresh.promise);
+  const readModel = spyOn(data, "loadModelSummary").mockResolvedValue({ provider: "deepseek", model: "deepseek-chat", thinking: null });
+  const readAuxiliary = spyOn(data, "loadAuxiliarySummary").mockResolvedValue({ enabled: false });
+  const readMcp = spyOn(data, "loadMcpSummary").mockResolvedValue(null);
   try {
     await view.refresh(app);
+    expect(readModel).toHaveBeenCalledTimes(1);
+    for (const read of [readAuxiliary, readMcp, readRelay, readTunnel, readProtocol, readRuntime]) expect(read).not.toHaveBeenCalled();
+    await view.onKey(key("down"), app);
+    expect(readAuxiliary).toHaveBeenCalledTimes(1);
+    await view.onKey(key("down"), app);
+    expect(readMcp).toHaveBeenCalledTimes(1);
+    await view.onKey(key("down"), app);
     expect(readRelay).toHaveBeenCalledTimes(1);
-    expect(readTunnel).not.toHaveBeenCalled(); expect(readRuntime).not.toHaveBeenCalled();
-    expect(readProtocol).not.toHaveBeenCalled();
+    expect(readTunnel).not.toHaveBeenCalled();
     await view.onKey(key("down"), app);
     expect(readRelay).toHaveBeenCalledTimes(1);
     expect(readTunnel).toHaveBeenCalledTimes(1);
-    await view.onKey(key("down"), app);
-    expect(tunnelSignal?.aborted).toBe(true);
     expect(readProtocol).toHaveBeenCalledTimes(1);
     expect(readRuntime).not.toHaveBeenCalled();
     await view.onKey(key("down"), app);
+    expect(tunnelSignal?.aborted).toBe(true);
     expect(readRuntime).toHaveBeenCalledTimes(1);
     await view.onKey(key("end"), app);
     expect(readRuntime).toHaveBeenCalledTimes(1);
@@ -82,10 +91,12 @@ test("设置仅加载选中项，重复选择复用在途读取；离页丢弃�
     expect(view.activity()).toBeNull();
     await view.onKey(key("home"), app); await view.onKey(key("end"), app);
     expect(readRuntime).toHaveBeenCalledTimes(2);
-    expect(plain(view.render(ctx()))).toContain("0 项自定义");
+    expect(readModel).toHaveBeenCalledTimes(1);
+    expect(plain(view.render({ ...ctx(), deployment: app.deployment }))).toContain("0 项自定义");
   } finally {
     tunnel.resolve("off"); old.resolve(snapshot); fresh.resolve(snapshot);
     view.onLeave(); readTunnel.mockRestore(); readProtocol.mockRestore(); readRelay.mockRestore(); readRuntime.mockRestore();
+    readModel.mockRestore(); readAuxiliary.mockRestore(); readMcp.mockRestore();
   }
 });
 
@@ -96,6 +107,7 @@ test("外链配置项显示当前状态、桶根目录和期限，不显示凭�
     pathStyle: false, maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30, sessionToken: true,
   };
   const read = spyOn(data, "loadRelaySummary").mockResolvedValue(enabled);
+  view["selected"] = view["items"].indexOf("relay");
   try {
     expect(plain(view.render(ctx()))).not.toContain("当前：");
     await view.refresh(app);
@@ -193,18 +205,22 @@ test("保存日志设置复用全局刷新，不再重复读取，也不加载�
   const stream = spyOn(execution, "stream").mockImplementation(() => {
     saved = "on"; return { done: Promise.resolve(0), cancel() {} };
   });
-  const app = new App([view], { screen: tty.screen, deployment });
+  const protocol = spyOn(data, "loadTunnelProtocol").mockResolvedValue("auto");
+  const tunnelDeployment: Deployment = { ...deployment, mode: "cloudflare" };
+  const app = new App([view], { screen: tty.screen, deployment: tunnelDeployment });
   app["refreshChrome"] = async () => {};
   app.choose = async () => "on"; app.confirm = async () => true;
   tty.screen.start(() => {}, () => {});
   try {
-    await app["handleKey"](key("down"));
-    await app["handleKey"](key("enter"));
+    view["selected"] = view["items"].indexOf("tunnel");
+    await view.refresh(app);
+    expect(read).toHaveBeenCalledTimes(1);
+    await app["handleKey"](key("l"));
     await tick();
     expect(read).toHaveBeenCalledTimes(2);
     expect(runtime).not.toHaveBeenCalled();
-    expect(plain(view.render(ctx()))).toContain("当前：开启");
-  } finally { view.onLeave(); read.mockRestore(); runtime.mockRestore(); stream.mockRestore(); tty.close(); }
+    expect(plain(view.render({ ...ctx(), deployment: tunnelDeployment }))).toContain("隧道日志：开启");
+  } finally { view.onLeave(); read.mockRestore(); protocol.mockRestore(); runtime.mockRestore(); stream.mockRestore(); tty.close(); }
 });
 
 test("运行参数在 TUI 校验和预览，确认前不写草稿；保存通过运维执行面板并显示后台活动", async () => {
@@ -257,7 +273,7 @@ test("文档模块开关默认开启，选择关闭后只保存对应运行参�
   const run = spyOn(app, "run").mockResolvedValue(0);
   try {
     await view.onKey(key("a"), app); await view.refresh(app);
-    await view.onKey(key("end"), app); await view.onKey(key("enter"), app);
+    await view.onKey(key("end"), app); await view.onKey(key("up"), app); await view.onKey(key("enter"), app);
     expect(plain(view.render(ctx()))).toContain("文档加工模块");
     expect(plain(view.render(ctx()))).toContain("开启（默认）");
     await view.onKey(key("down"), app);
@@ -281,7 +297,7 @@ test("默认 PPT/Word 模板按扩展名校验，留空恢复内置版式", asyn
   const run = spyOn(app, "run").mockResolvedValue(0);
   try {
     await view.onKey(key("a"), app); await view.refresh(app);
-    await view.onKey(key("end"), app); await view.onKey(key("enter"), app);
+    await view.onKey(key("end"), app); await view.onKey(key("up"), app); await view.onKey(key("enter"), app);
     await view.onKey(key("down"), app); await view.onKey(key("down"), app);
     expect(plain(view.render(ctx()))).toContain("默认 PPT 模板");
     expect(plain(view.render(ctx()))).toContain("内置版式（默认）");
@@ -313,7 +329,7 @@ test("LibreOffice 程序路径可编辑保存，留空恢复自动查找", async
   try {
     const enterOffice = async (target: SettingsView) => {
       await target.onKey(key("a"), app); await target.refresh(app);
-      await target.onKey(key("end"), app); await target.onKey(key("enter"), app);
+      await target.onKey(key("end"), app); await target.onKey(key("up"), app); await target.onKey(key("enter"), app);
       for (let i = 0; i < 4; i++) await target.onKey(key("down"), app);
     };
     await enterOffice(view);

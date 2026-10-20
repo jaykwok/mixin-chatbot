@@ -4,7 +4,7 @@
 
 import type { StatusName } from "../render/theme.ts";
 import * as fmt from "../render/format.ts";
-import { loadGit, loadUpgrade, type GitState, type UpgradeState } from "../data.ts";
+import { loadGit, loadUpgrade, tuiCodeChanged, type GitState, type UpgradeState } from "../data.ts";
 import { describePendingTransaction, loadPendingTransaction } from "../transaction.ts";
 import { confirmTransaction } from "../../../lib/confirmed-transaction.ts";
 import type { AppApi, ConfirmSpec, Loading, View, ViewAction, ViewContext } from "../view.ts";
@@ -17,6 +17,8 @@ interface Action {
   summary: string;
   /** 只在这些平台上出现；不给表示两个平台都有。 */
   only?: "windows" | "linux";
+  /** 只在 Cloudflare 隧道模式下出现；直连部署没有隧道连接器。 */
+  tunnel?: true;
   status: StatusName;
   /** 该命令会向用户提问，必须拿到真正的 TTY（update 在跨数据版本时确认清理并重新配置）。 */
   interactive?: boolean | ((app: AppApi) => boolean);
@@ -27,12 +29,12 @@ interface Action {
 const ACTIONS: Action[] = [
   {
     key: "deploy",
-    label: "部署 / 修改设置",
-    summary: "配置并部署当前代码，失败恢复原部署",
+    label: "重新部署",
+    summary: "重新确认端口、入口、群目录和模型并部署当前代码，失败恢复原部署",
     status: "busy",
     interactive: true,
     confirm: (app) => ({
-      title: "部署 / 修改设置",
+      title: "重新部署",
       subject: "运行当前版本的部署向导",
       steps: ["确认模型、端口、群数据目录和访问方式，默认沿用已有配置",
         app.deployment.runtime === "docker" ? "构建镜像并切换容器" : "安装依赖并注册计划任务",
@@ -54,7 +56,7 @@ const ACTIONS: Action[] = [
           title: "升级",
           subject: "这份部署不是 git 仓库，无法自动升级",
           blocked: true,
-          steps: ["先通过 Git 获取项目，再进入「系统 → 服务部署 → 部署 / 修改设置」；之后即可在此升级"],
+          steps: ["先通过 Git 获取项目，再进入「系统 → 服务部署 → 重新部署」；之后即可在此升级"],
         };
       }
       if (git.dirty) {
@@ -149,6 +151,7 @@ const ACTIONS: Action[] = [
     label: "修复隧道",
     summary: "按当前 token 来源强制重装 Cloudflared 服务",
     only: "windows",
+    tunnel: true,
     status: "warn",
     confirm: () => ({
       title: "修复隧道",
@@ -164,6 +167,7 @@ const ACTIONS: Action[] = [
     key: "tunnel-update",
     label: "更新 cloudflared",
     summary: "更新本项目隧道连接器到官方稳定版，校验后切换，失败恢复旧版本",
+    tunnel: true,
     status: "warn",
     confirm: () => ({
       title: "更新 cloudflared",
@@ -200,6 +204,7 @@ const ACTIONS: Action[] = [
 const ACTION_ORDER = ["resume", "rollback", "start", "restart", "stop", "update", "deploy", "repair", "tunnel-update", "repair-tunnel", "uninstall"];
 /** 有未完成的事务时，这些入口会开始新的部署或升级，必须先继续或回滚。 */
 const BLOCKED_BY_PENDING = new Set(["deploy", "update", "repair", "tunnel-update"]);
+const RESTART_NOTICE = "代码已更新：当前仍是启动时的旧版界面，按 q 退出后重新运行 bun run tui";
 const PENDING_NOTICE = "有未完成的部署或升级：请先「继续上次操作」或「回滚上次操作」";
 
 interface Pending { subject: string; record: string[]; committed: boolean; codeRestorePending: boolean; confirmation?: import("../../../lib/confirmed-transaction.ts").TransactionReadSet }
@@ -268,7 +273,10 @@ export class MaintainView implements View {
   private readonly upgrade = new LazySetting<UpgradeState | null>(signal => loadUpgrade(signal));
   private selected = 0;
   private platform: "windows" | "linux" = "linux";
+  private tunnel = true;
   private pending: Pending | null = null;
+  /** 升级、继续或回滚改动了界面代码：提示退出后重新运行，直到本次界面结束。 */
+  private restartNotice = false;
 
   private get waitingForVersion(): boolean { return this.refreshing || this.state.kind !== "ready"; }
   private get selectingUpgrade(): boolean { return !this.pending && this.availableActions[this.selected]?.key === "update"; }
@@ -300,7 +308,7 @@ export class MaintainView implements View {
 
   private get availableActions(): Action[] {
     return [...(this.pending ? transactionActions(this.pending) : []), ...ACTIONS]
-      .filter((action) => !action.only || action.only === this.platform)
+      .filter((action) => (!action.only || action.only === this.platform) && (!action.tunnel || this.tunnel))
       .sort((a, b) => ACTION_ORDER.indexOf(a.key) - ACTION_ORDER.indexOf(b.key))
       .map(action => action.key === "repair" ? { ...action, summary: this.platform === "windows"
         ? "检查并修复计划任务、防火墙与隧道" : "通过部署向导重建当前版本" } : action);
@@ -324,7 +332,12 @@ export class MaintainView implements View {
   }
 
   async refresh(app: AppApi): Promise<void> {
+    const selected = this.availableActions[this.selected]?.key;
     this.platform = app.deployment.platform;
+    this.tunnel = app.deployment.mode === "cloudflare";
+    // 部署形态变化会增减操作：按操作标识保留选择，被隐藏的操作退到范围内的相邻项。
+    const actions = this.availableActions, index = actions.findIndex(action => action.key === selected);
+    this.selected = index >= 0 ? index : Math.min(this.selected, actions.length - 1);
     this.loadPending();
     if (this.selectingUpgrade) {
       await this.checkUpgrade(app, true);
@@ -410,9 +423,18 @@ export class MaintainView implements View {
         : await app.run(action.label, action.args(app, preview?.targetSha));
       app.toast(code === 0 ? "ok" : "danger", code === 0 ? `${action.label}完成` : `${action.label}未成功（退出码 ${code}）`);
       this.loadPending();
+      if (["update", "resume", "rollback"].includes(action.key)) void this.checkTuiCode(app);
       return true;
     }
     return false;
+  }
+
+  private async checkTuiCode(app: AppApi): Promise<void> {
+    try {
+      if (this.restartNotice || !await tuiCodeChanged()) return;
+      this.restartNotice = true;
+      app.toast("warn", RESTART_NOTICE);
+    } catch { /* 只是提示；读取失败不影响已完成的操作 */ }
   }
 
   render(ctx: ViewContext): string[] {
@@ -425,7 +447,7 @@ export class MaintainView implements View {
     const spec = action.confirm(ctx, git, preview?.targetSha);
     const blocked = spec?.blocked === true;
     const versionNotice = this.state.kind === "error" ? this.state.message : "版本读取中…（升级暂不可用）";
-    const details = this.pending && BLOCKED_BY_PENDING.has(action.key) ? [
+    const details = [...(this.restartNotice ? [theme.c("warn", RESTART_NOTICE), ""] : []), ...(this.pending && BLOCKED_BY_PENDING.has(action.key) ? [
       theme.bold(action.summary),
       theme.c("warn", PENDING_NOTICE),
       "",
@@ -444,7 +466,7 @@ export class MaintainView implements View {
         "", theme.bold(`待应用的提交（${git.behind}，本次检查）`),
         ...git.incoming.map(commit => `${commit.sha}  ${commit.subject}`),
       ] : []),
-    ];
+    ])];
     const version = this.selectingUpgrade ? (preview
       ? `当前 ${fmt.shortSha(preview.git.sha)} → origin/main ${fmt.shortSha(preview.targetSha)}`
       : upgrade.kind === "ready" ? "非 git 部署，升级不可用" : upgrade.kind === "error" ? "远端检查失败，请按 r 重试" : "正在检查远端版本…")

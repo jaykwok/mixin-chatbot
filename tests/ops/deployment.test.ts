@@ -481,6 +481,8 @@ test.skipIf(process.platform !== "win32")("Windows redeployment selects the new 
     expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
     const script = join(f.root, "group-root.ps1");
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+. ${quotePS(join(project, "scripts/lib/common.ps1"))}
 $Project=Join-Path $PSScriptRoot 'project'; $StateDir=Join-Path $Project 'data/state'; $RuntimeDir=Join-Path $Project 'data/runtime'
 $GroupRootFile=Join-Path $StateDir 'group-data-root'; $DefaultGroupDataRoot=Join-Path $Project 'data/groups'
 $ModelsFile=Join-Path $Project 'data/config/models.json'; $newRoot=Join-Path $PSScriptRoot 'new groups'
@@ -488,23 +490,32 @@ New-Item -ItemType Directory -Force -Path $StateDir,(Split-Path $ModelsFile),(Jo
 # An empty saved root falls back to the default instead of being dereferenced as null.
 Set-Content -LiteralPath $GroupRootFile $(if ($env:FIXTURE_EMPTY -eq '1') { '' } else { Join-Path $PSScriptRoot 'old-offline-root' }) -NoNewline
 Set-Content -LiteralPath $ModelsFile '{}'; Set-Content -LiteralPath (Join-Path $RuntimeDir 'pi/settings.json') '{}'
-$env:GROUP_DATA_ROOT=''; $bunPath='fixture-bun'; $script:questions=0; $script:previews=0
+$env:GROUP_DATA_ROOT=''; $bunPath='fixture-bun'; $script:questions=0; $script:previews=0; $script:probes=0
 function Step {}; function Done {}; function Warn($message){throw $message}
 function Read-Host { $script:questions++; if($script:questions -gt 1){throw 'group selection looped'}; return $newRoot }
 function fixture-bun {
-    if($args -notcontains 'preview'){throw 'changed data before preview'}
     $offset=[Array]::IndexOf($args,'--groups')
-    if($offset -lt 0 -or $args[$offset+1] -ne $newRoot){throw 'preview still uses old root'}
+    if($offset -lt 0 -or $args[$offset+1] -ne $newRoot){throw 'data check still uses old root'}
+    # An older data version is refused before any preview, whatever model files exist.
+    if($args -contains 'probe'){ $script:probes++; $global:LASTEXITCODE=[int]$env:FIXTURE_PROBE; return }
+    if($args -notcontains 'preview'){throw 'changed data before preview'}
+    if($script:probes -ne 1){throw 'preview before the data version check'}
     $script:previews++; $global:LASTEXITCODE=0
 }
 ${source.slice(start, end)}
 if($script:previews -ne 1 -or $dataPreparationGroups -ne $newRoot){throw 'missing selected-root preview'}
 Write-Output 'ROOT_SELECTED'
 `);
-    let result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root);
+    const run = (env: Record<string, string> = {}) => execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root, { ...process.env, FIXTURE_PROBE: "0", ...env });
+    let result = await run();
     expect(result.code, result.output).toBe(0); expect(result.output).toContain("ROOT_SELECTED");
-    result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], f.root, { ...process.env, FIXTURE_EMPTY: "1" });
+    result = await run({ FIXTURE_EMPTY: "1" });
     expect(result.code, result.output).toBe(0); expect(result.output).toContain("ROOT_SELECTED");
+    result = await run({ FIXTURE_PROBE: "20" });
+    expect(result.code).toBe(1); expect(result.output).toContain("重新部署不会沿用旧模型配置"); expect(result.output).toContain("update");
+    expect(result.output).not.toContain("ROOT_SELECTED");
+    result = await run({ FIXTURE_PROBE: "1" });
+    expect(result.code).toBe(1); expect(result.output).toContain("数据版本检查失败");
   } finally { await f.cleanup(); }
 }, 15000);
 
@@ -1896,6 +1907,37 @@ echo "RESULT port=$BOT_PORT mode=$DEPLOY_MODE root=$HOST_GROUP_DATA_ROOT domain=
     expect(result.code, result.output).toBe(90); expect(result.output).toContain("normal settings read");
   } finally { await fixture.cleanup(); }
 }, 120000);
+
+test.skipIf(!bash || !existsSync(bash))("Docker redeployment refuses an older data version before the stop, whatever model files exist", async () => {
+  const fixture = await tempFixture("deployment-docker-version-");
+  const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+  const start = source.indexOf("# 跨数据版本只能由升级器重置"), end = source.indexOf("\nDATA_PREPARATION_PLANNED=0\n", start);
+  expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
+  // The check precedes the preview that is skipped when settings.json is missing, and every stop.
+  expect(end).toBeLessThan(source.indexOf("\nbegin_deployment\n"));
+  const script = join(fixture.root, "version.sh");
+  await writeFile(script, `#!/usr/bin/env bash
+set -euo pipefail
+RECORDED="$FIXTURE_RECORDED"
+print_error(){ echo "$*" >&2; }; ops_command_hint(){ echo "ops $1"; }
+data_preparation_docker(){ echo "PROBE $*"; return "$FIXTURE_STATUS"; }
+${source.slice(start, end)}
+echo CONTINUED
+`);
+  const run = (recorded: string, status: string) => execute([bash!, posixPath(script)], fixture.root, { ...process.env, FIXTURE_RECORDED: recorded, FIXTURE_STATUS: status });
+  try {
+    let result = await run("0", "20");
+    expect(result.code).toBe(1); expect(result.output).toContain("重新部署不会沿用旧模型配置"); expect(result.output).toContain("ops update");
+    expect(result.output).not.toContain("CONTINUED");
+    result = await run("0", "1");
+    expect(result.code).toBe(1); expect(result.output).toContain("数据版本检查失败"); expect(result.output).not.toContain("CONTINUED");
+    result = await run("0", "0");
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("CONTINUED");
+    // A recorded transaction (including the upgrader's reset handoff) follows its confirmed plan.
+    result = await run("1", "20");
+    expect(result.code, result.output).toBe(0); expect(result.output).toContain("CONTINUED");
+  } finally { await fixture.cleanup(); }
+}, 30000);
 
 test.skipIf(!bash || !existsSync(bash))("Docker continue applies the migration plan confirmed before the stop instead of previewing again", async () => {
   const fixture = await tempFixture("deployment-docker-plan-");

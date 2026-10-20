@@ -117,6 +117,11 @@ export class App implements AppApi {
     return this.views.find((view) => view.id === this.active) ?? this.views[0]!;
   }
 
+  /** 当前部署可用的子页；分区首页始终可用。 */
+  private pages(section: Section = this.section): View[] {
+    return section.views.filter(view => view.available?.(this.deployment) ?? true);
+  }
+
   private get section(): Section {
     return this.sections.find(section => section.views.some(view => view.id === this.active))!;
   }
@@ -156,6 +161,8 @@ export class App implements AppApi {
   private async refreshChrome(): Promise<void> {
     const revision = ++this.chromeRevision;
     this.deployment = this.readDeployment();
+    // 部署形态变化（例如切换到直连）后，当前子页可能已不可用。
+    if (!this.pages().includes(this.current)) this.go(this.pages()[0]!.id);
     await Promise.all([
       probeService(this.deployment.port).then(service => {
         if (revision !== this.chromeRevision || this.quit) return;
@@ -188,8 +195,11 @@ export class App implements AppApi {
 
   go(view: string): void {
     const section = this.sections.find(section => section.id === view);
-    if (section) view = this.lastView.get(section.id) ?? section.views[0]!.id;
-    if (view === this.active || !this.views.some((entry) => entry.id === view)) return;
+    if (section) {
+      const last = this.lastView.get(section.id);
+      view = this.pages(section).some(page => page.id === last) ? last! : section.views[0]!.id;
+    }
+    if (view === this.active || !this.sections.some(entry => this.pages(entry).some(page => page.id === view))) return;
     if (this.current.onLeave?.()) {
       const pending = this.refreshes.get(this.current);
       if (pending) pending.again = true;
@@ -371,7 +381,7 @@ export class App implements AppApi {
     const view = this.current;
     const choices: Choice[] = [
       ...(view.actions?.() ?? []),
-      ...this.section.views.filter(page => page.id !== view.id).map(page => ({
+      ...this.pages().filter(page => page.id !== view.id).map(page => ({
         value: "@view/" + page.id, label: "切换到" + page.label, description: this.section.label + "分区内的其他功能（也可按 Tab 切换）",
       })),
       { value: "@refresh", label: "刷新本页", description: "重新读取当前页面和服务状态" },
@@ -379,7 +389,7 @@ export class App implements AppApi {
       { value: "@help", label: "键位帮助", description: "查看导航、筛选、操作与返回方式" },
     ];
     const value = await this.choose({
-      title: (this.section.views.length > 1 ? this.section.label + " / " : "") + view.label + " · 操作",
+      title: (this.pages().length > 1 ? this.section.label + " / " : "") + view.label + " · 操作",
       description: "选择要做的事；清理、停止等操作会继续展示范围与确认步骤。", choices,
     });
     if (value === null) return;
@@ -428,7 +438,7 @@ export class App implements AppApi {
         return;
       }
       case "tab": {
-        const pages = this.section.views;
+        const pages = this.pages();
         const index = pages.indexOf(this.current);
         this.go(pages[(index + (key.shift ? -1 : 1) + pages.length) % pages.length]!.id);
         this.paint();
@@ -604,13 +614,13 @@ export class App implements AppApi {
         uptime: this.service?.state === "ready" && this.service.startedAt ? Date.now() - this.service.startedAt : undefined,
       }),
       navigation[0]!,
-      this.section.views.length > 1
-        ? subnav(this.theme, columns, this.section.views, this.active)
+      this.pages().length > 1
+        ? subnav(this.theme, columns, this.pages(), this.active)
         : navigation[1]!,
     ];
     const keys: [string, string][] = [
       ["←→", "分区"],
-      ...(this.section.views.length > 1 ? [["Tab", "子页"]] as [string, string][] : []),
+      ...(this.pages().length > 1 ? [["Tab", "子页"]] as [string, string][] : []),
       ["Space", "操作"],
       ["r", "刷新"],
       ["?", "帮助"],
@@ -711,7 +721,7 @@ export class App implements AppApi {
         "Enter                 进入或执行", "Esc                   返回上一层",
         "r                     刷新", "q / Ctrl+C            退出",
         "1–5                   直接进入主分区", "",
-        "总览 · 监控（体检 / 日志 / 隧道日志）· 统计",
+        "总览 · 监控（体检 / 日志 / 隧道日志，仅 Cloudflare 部署）· 统计",
         "数据（会话 / 临时文件 / 外链）· 系统（服务部署 / 回调路由 / 设置）", "",
         "菜单：↑↓ 选择，Enter 确认；直接输入文字可筛选菜单。",
         "统计：w 选择常用日期，d 自定义区间，e 导出，o 打开报表。",

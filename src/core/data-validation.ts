@@ -7,7 +7,7 @@ import { openExistingStatsLedger } from "../agent/stats-ledger.ts";
 import { assertDeliverySchema } from "../agent/delivery-store.ts";
 import { readAuxiliaryConfig } from "./auxiliary-config.ts";
 import { readMcpConfig } from "./mcp-config.ts";
-import { validateRelayConfig } from "../integrations/relay-s3.ts";
+import { readRelayConfigFile } from "../integrations/relay-s3.ts";
 import { readRelayIndex } from "../integrations/relay-index.ts";
 
 type ValidationObserver = (phase: "config" | "stats" | "delivery" | "relay", state: "start" | "end" | "failed") => void;
@@ -26,7 +26,7 @@ export async function validateConfiguration(project: string, observe?: Validatio
     const path = join(project, "data/config/runtime.json");
     validateRuntimeConfig(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {});
     const relayPath = join(project, "data/config/relay.json");
-    if (existsSync(relayPath)) validateRelayConfig(JSON.parse(readFileSync(relayPath, "utf8")), relayPath);
+    readRelayConfigFile(relayPath);
     const runtime = await openModelRuntime({ modelsPath: join(project, "data/config/models.json"), modelsStorePath: join(project, "data/runtime/models-store.json") });
     await resolveModelSelection(runtime, openSettings(join(project, "data/runtime/pi/settings.json")));
     const auxiliary = readAuxiliaryConfig(join(project, "data/config/auxiliary.json"));

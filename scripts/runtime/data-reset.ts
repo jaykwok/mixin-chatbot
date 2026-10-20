@@ -1,14 +1,46 @@
-// A release boundary: preserve the existing ledger and entrance credentials; discard old session formats.
+// A release boundary: preserve the existing ledger, entrance credentials and accepted administrator settings; discard old session formats.
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { cp, mkdir, rename, rm, rmdir } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Database } from "bun:sqlite";
 import { DATA_VERSION, VERSION_FILE, readDataVersion, readMetadata } from "../../src/core/data-version.ts";
+import { ADVANCED_RUNTIME_KEYS, validateRuntimeConfig } from "../../src/core/runtime-schema.ts";
+import { readAuxiliaryConfig } from "../../src/core/auxiliary-config.ts";
+import { readMcpConfig } from "../../src/core/mcp-config.ts";
+import { readRelayConfigFile } from "../../src/integrations/relay-s3.ts";
+import { readRelayIndex } from "../../src/integrations/relay-index.ts";
 import { digest, publishJson } from "../lib/atomic-file.ts";
 
 const credentials = ["webhook-secret", "cloudflared-token"];
+/**
+ * Administrator settings cross a reset only when the target version's own reader accepts them; there are no
+ * converters. Each check is the reader the target runs, so a kept file cannot fail later in the preview.
+ * A setting whose meaning changes must change its format too, so the old file fails and is dropped.
+ * The reset runs before dependencies are installed on Windows: these readers must stay built-in only.
+ */
+const settings: Record<string, (path: string) => unknown> = {
+  "relay.json": path => readRelayConfigFile(path),
+  "auxiliary.json": path => readAuxiliaryConfig(path),
+  "mcp.json": path => readMcpConfig(path),
+  "cloudflared-logging": path => choice(path, ["off", "on"]),
+  "cloudflared-protocol": path => choice(path, ["auto", "http2", "quic"]),
+};
+/**
+ * Mirrors scripts/lib/tunnel-logging.{sh,ps1}. Linux: sed trims ASCII blanks on each line and $(…) drops trailing
+ * newlines; a BOM stays. Windows: Get-Content drops a UTF-8 BOM, then Trim() strips whitespace at both ends.
+ * JavaScript trim() also strips U+FEFF, so it stands in for neither.
+ */
+function choice(path: string, values: string[]) {
+  const text = readFileSync(path, "utf8");
+  const value = process.platform === "win32" ? text.replace(/^\uFEFF/, "").replace(/^[^\S\uFEFF]+|[^\S\uFEFF]+$/g, "")
+    : text.split("\n").map(line => line.replace(/^[ \t\v\f\r]+|[ \t\v\f\r]+$/g, "")).join("\n").replace(/\n+$/, "");
+  if (!values.includes(value)) throw new Error(`只接受 ${values.join("、")}`);
+}
+/** Built from the release's task image; the deployment supplies them again. */
+const runtimeDropped = new Set(["BOT_TASK_IMAGE", "BOT_TASK_CONTROL_ROOT"]);
+const relayLedger = ["relay.sqlite", "relay.sqlite-wal", "relay.sqlite-shm", "relay.sqlite-journal"];
 const tables = { stats_schema: "id", sources: "id", activity: "source, day", tool_counts: "source, day, kind, tool",
   usage_totals: "source, day, kind, provider, model", meta: "key" };
 const stateKept = new Set(["service.lock", "deploy.lock", "deploy-transaction", "upgrade-transaction", "data-plan.json",
@@ -69,6 +101,17 @@ function groupResetMoves(groups: string, planning = false): Move[] {
     const path = join(groups, name); plain(path);
     return { area: "groups", name, existed: existsSync(path) };
   });
+}
+/** A ledger the target version cannot read is reset with the sessions instead of blocking the upgrade. */
+function keptRelayLedger(project: string, draft: string): boolean {
+  const config = join(draft, "data/config/relay.json"), path = join(project, "data/state/relay.sqlite");
+  plain(config); plain(path);
+  if (!existsSync(config)) return false;
+  for (const name of relayLedger) {
+    const file = join(project, "data/state", name); plain(file);
+    if (existsSync(file) && !lstatSync(file).isFile()) return false;
+  }
+  try { readRelayIndex(path); return true; } catch { return false; }
 }
 /** Only empty archive scaffolding can be discarded; unlisted files must never be recursively deleted. */
 async function removeEmptyArchive(path: string): Promise<void> {
@@ -157,9 +200,108 @@ export async function prepareResetDraft(project: string, groups: string, draft: 
   await mkdir(join(draft, "data/runtime/pi"), { recursive: true, mode: 0o700 });
   await mkdir(join(draft, "backup/rm"), { recursive: true, mode: 0o700 });
   const setting = (name: string, fallback: string) => existsSync(join(project, "data/state", name)) ? readFileSync(join(project, "data/state", name), "utf8").trim() : fallback;
-  await publishJson(join(draft, "data/config/runtime.json"), { GROUP_DATA_ROOT: groups,
+  const kept: string[] = [], dropped: string[] = [];
+  await publishJson(join(draft, "data/config/runtime.json"), { ...runtimeSettings(project, kept, dropped), GROUP_DATA_ROOT: groups,
     BOT_PORT: setting("bot-port", "1011"), BOT_HOST: setting("deploy-mode", "direct") === "cloudflare" ? "127.0.0.1" : "0.0.0.0" });
   for (const name of credentials) if (existsSync(join(project, "data/config", name))) await cp(join(project, "data/config", name), join(draft, "data/config", name));
+  for (const [name, validate] of Object.entries(settings)) {
+    const path = join(project, "data/config", name); plain(path);
+    if (!existsSync(path)) continue;
+    try {
+      if (!lstatSync(path).isFile()) throw new Error("不是普通文件");
+      validate(path); await cp(path, join(draft, "data/config", name)); kept.push(name);
+    } catch (error) { dropped.push(`${name}（${(error as Error).message}）`); }
+  }
+  if (kept.length) console.log(`保留管理员设置：${kept.join("、")}`);
+  if (dropped.length) console.log(`新版本不接受以下设置，已丢弃，升级后请重新设置：\n  ${dropped.join("\n  ")}`);
+}
+
+/** Read as src/core/runtime-config.ts does; each key is then judged alone, so one rejected key does not discard the others. */
+function runtimeSettings(project: string, kept: string[], dropped: string[]): Record<string, string> {
+  const path = join(project, "data/config/runtime.json"); plain(path);
+  if (!existsSync(path)) return {};
+  let old: Record<string, unknown>;
+  try {
+    const text = readFileSync(path, "utf8");
+    try { old = JSON.parse(text); } catch { throw new Error("不是有效 JSON"); }
+    if (!old || typeof old !== "object" || Array.isArray(old)) throw new Error("必须是对象");
+  } catch (error) { dropped.push(`runtime.json 运行设置（${(error as Error).message}）`); return {}; }
+  const result: Record<string, string> = {};
+  for (const key of ADVANCED_RUNTIME_KEYS) {
+    if (old[key] === undefined || runtimeDropped.has(key)) continue;
+    try { Object.assign(result, validateRuntimeConfig({ [key]: old[key] })); kept.push(key); }
+    catch (error) { dropped.push(`${key}（${(error as Error).message}）`); }
+  }
+  return result;
+}
+
+const modelFiles = ["data/config/models.json", "data/runtime/pi/settings.json", "data/runtime/models-store.json"];
+/** Homes under replaced config/runtime/state trees must resolve from the draft too. Other paths stay unchanged. */
+function resetModelEnvironment(project: string, draft: string): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  const replaced = ["data/config", "data/runtime", "data/state"].map(name => join(project, name));
+  for (const key of ["HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]) {
+    if (!env[key] || !isAbsolute(env[key])) continue;
+    if (replaced.some(root => {
+      const suffix = relative(root, env[key]!);
+      return !isAbsolute(suffix) && suffix !== ".." && !suffix.startsWith(".." + sep);
+    })) env[key] = resolve(draft, relative(project, env[key]));
+  }
+  if (env.USERPROFILE && env.USERPROFILE !== process.env.USERPROFILE && /^[A-Za-z]:[\\/]/.test(env.USERPROFILE)) {
+    env.HOMEDRIVE = env.USERPROFILE.slice(0, 2); env.HOMEPATH = env.USERPROFILE.slice(2);
+  }
+  return env;
+}
+/**
+ * The old model configuration is offered for reuse only when the target Pi loads it, the selected model still
+ * exists and Pi actually resolves its credentials — never because the files exist. checkAuth alone is not enough:
+ * it treats `!command` keys as configured and skips header references, so the real getAuth runs here, including
+ * those commands, in a child whose cwd and homes under replaced trees point at the draft. Absolute references to old
+ * files cannot be hidden on every platform; commit checks the actual reset tree again before losing rollback.
+ * Every failure exit removes all copies, so the wizard starts from an empty draft.
+ * Pi changes that keep the format but alter meaning are not detectable here; the
+ * administrator still chooses.
+ */
+export async function offerResetModels(project: string, draft: string): Promise<{ model: string } | { reason: string }> {
+  project = resolve(project); draft = resolve(draft);
+  for (const name of modelFiles) { plain(join(project, name)); plain(join(draft, name)); }
+  try {
+    for (const name of modelFiles.slice(0, 2)) if (!existsSync(join(project, name))) throw new Error(`缺少 ${name}`);
+    for (const name of modelFiles) {
+      const path = join(project, name);
+      if (existsSync(path) && !lstatSync(path).isFile()) throw new Error(`${name} 不是普通文件`);
+    }
+    for (const name of modelFiles) {
+      if (!existsSync(join(project, name))) continue;
+      await mkdir(dirname(join(draft, name)), { recursive: true, mode: 0o700 });
+      await cp(join(project, name), join(draft, name));
+    }
+    const { checkResetModels } = await import("./reset-model-check.ts");
+    return { model: await checkResetModels(draft, resetModelEnvironment(project, draft)) };
+  } catch (error) {
+    await discardResetModels(draft);
+    return { reason: (error as Error).message };
+  }
+}
+/** Reconfiguring after an accepted offer starts the wizard from an empty draft, not from the old fields. */
+export async function discardResetModels(draft: string): Promise<void> {
+  for (const name of modelFiles) { const path = join(draft, name); plain(path); await rm(path, { force: true }); }
+}
+
+/**
+ * auxiliary.json names models, which exist only once the reset's model configuration is done. A reference the
+ * new configuration cannot resolve drops the whole file, like any other setting the new version rejects.
+ */
+export async function settleResetDraft(draft: string): Promise<void> {
+  const path = join(draft, "data/config/auxiliary.json"); plain(path);
+  const auxiliary = readAuxiliaryConfig(path);
+  if (!auxiliary) return;
+  const { openModelRuntime } = await import("../../src/core/model-config.ts");
+  const runtime = await openModelRuntime({ modelsPath: join(draft, "data/config/models.json"), modelsStorePath: join(draft, "data/runtime/models-store.json") });
+  const missing = (["classifier", "image"] as const).filter(type => auxiliary[type] && !runtime.getModelOfType(type, auxiliary[type]!.provider, auxiliary[type]!.modelId));
+  if (!missing.length) return;
+  await rm(path);
+  console.log(`新模型配置中没有 auxiliary.json 引用的 ${missing.join("、")} 模型，已丢弃该文件，升级后请重新设置`);
 }
 
 export function makeResetPlan(project: string, groups: string, draft: string): ResetPlan {
@@ -167,6 +309,12 @@ export function makeResetPlan(project: string, groups: string, draft: string): R
   if (from === null) throw new Error("本次不需要数据重置");
   plain(draft); assertSecrets(project);
   if (JSON.stringify(secretHashes(project)) !== JSON.stringify(secretHashes(draft))) throw new Error("草稿改变了入口凭证，拒绝切换");
+  // Old Pi files never cross by being present: they leave with data/config and data/runtime. The draft holds
+  // either a copy the target Pi accepted (offerResetModels) or the wizard's output; the preview validates it.
+  for (const name of modelFiles.slice(0, 2)) {
+    const path = join(draft, name); plain(path);
+    if (!existsSync(path)) throw new Error("草稿中没有模型配置：现有配置未被新版本接受时必须完成配置向导后重试");
+  }
   return { from, markers: markers(project, groups), inputs: inputHash(project), draft: treeHash(join(draft, "data")) };
 }
 
@@ -265,7 +413,10 @@ export async function applyReset(project: string, groups: string, deployment: st
     } finally { baseline.close(); }
     if (readdirSync(groups).some(name => name.startsWith(".reset-"))) throw new Error("群根含未完成的重置，请先继续或回滚");
     const moves: Move[] = groupResetMoves(groups, true);
-    for (const name of ["data/config", "data/runtime", ...readdirSync(join(project, "data/state")).filter(name => !stateKept.has(name)).map(name => "data/state/" + name)])
+    // The remote-object ledger follows its kept configuration, so objects uploaded before the reset are still swept.
+    const ledger = keptRelayLedger(project, p.draft);
+    for (const name of ["data/config", "data/runtime", ...readdirSync(join(project, "data/state"))
+      .filter(name => !stateKept.has(name) && !(ledger && relayLedger.includes(name))).map(name => "data/state/" + name)])
       moves.push({ area: "project", name, existed: existsSync(join(project, name)) });
     for (const move of moves) movePaths(project, groups, p.projectArchive, p.archive, move);
     journal = { format: 2, deployment, groups: resolve(groups), phase: "moving", moves, stats, draft: plan.draft, credentials: secretHashes(project) };

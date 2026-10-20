@@ -7,7 +7,7 @@ import { DATA_VERSION, VERSION_FILE, RELEASE_FILE, GROUP_ROOT_LEASE, readDataVer
 import { digest, publishJson } from "../lib/atomic-file.ts";
 import { readFileSync } from "node:fs";
 import { openOperationLog, operationError } from "../lib/operation-log.ts";
-import { applyReset, finishReset, makeResetPlan, prepareResetDraft, resetArchiveName, resetVersion, rollbackReset, verifyReset, type ResetPlan } from "./data-reset.ts";
+import { applyReset, finishReset, makeResetPlan, prepareResetDraft, resetArchiveName, resetVersion, rollbackReset, settleResetDraft, offerResetModels, discardResetModels, verifyReset, type ResetPlan } from "./data-reset.ts";
 
 const args = process.argv.slice(2), action = args.shift();
 const option = (name: string) => { const i = args.indexOf(name); return i < 0 ? undefined : args[i + 1]; };
@@ -63,7 +63,7 @@ async function main(): Promise<void> {
   if (action === "probe") {
     const from = resetVersion(project, groups);
     if (from !== null) {
-      console.log(`数据格式 ${from} → ${DATA_VERSION}：需要重新配置并清理旧会话；原样保留现有统计账本和 webhook / Cloudflare 入口凭证。`);
+      console.log(`数据格式 ${from} → ${DATA_VERSION}：需要清理旧会话；原样保留现有统计账本和 webhook / Cloudflare 入口凭证，管理员设置和模型配置经新版本校验后保留，模型配置可选择重新配置。`);
       process.exitCode = 20;
     } else console.log(`数据格式兼容 ${DATA_VERSION}，正常升级，不清理会话。`);
     return;
@@ -72,6 +72,18 @@ async function main(): Promise<void> {
     if (!resetDraft) throw new Error("prepare-reset requires --reset-config");
     await prepareResetDraft(project, groups, resolve(resetDraft)); return;
   }
+  if (action === "offer-models") {
+    // Exit 0: the draft now holds the existing model configuration, accepted by this version's Pi; 21: the wizard must run.
+    if (!resetDraft || !existsSync(join(resolve(resetDraft), "data/config"))) throw new Error("offer-models requires a prepared --reset-config");
+    const offer = await offerResetModels(project, resolve(resetDraft));
+    if ("model" in offer) console.log(`现有模型配置可被新版本读取（${offer.model}），可以直接沿用。`);
+    else { console.log(`现有模型配置不能沿用：${offer.reason}`); process.exitCode = 21; }
+    return;
+  }
+  if (action === "discard-models") {
+    if (!resetDraft) throw new Error("discard-models requires --reset-config");
+    await discardResetModels(resolve(resetDraft)); return;
+  }
   if (action === "committed") {
     const release = readRelease(project);
     process.exitCode = release?.deployment === deployment && resolve(release.groups) === groups && release.phase === "committed" ? 0 : 1;
@@ -79,6 +91,7 @@ async function main(): Promise<void> {
   }
   if (action === "preview") {
     if (resetDraft) {
+      await settleResetDraft(resolve(resetDraft));
       const reset = makeResetPlan(project, groups, resolve(resetDraft));
       const { validateConfiguration } = await import("../../src/core/data-validation.ts");
       await validateConfiguration(resolve(resetDraft));
@@ -150,9 +163,19 @@ async function main(): Promise<void> {
       if (release?.deployment !== deployment || resolve(release.groups) !== groups) throw new Error("没有本次发布的当前格式准备记录");
       if (release.phase === "committed") return;
       const state = inspect();
-      verifyReset(project, groups, deployment);
+      const resetting = verifyReset(project, groups, deployment);
       const { validateCurrentData } = await import("../../src/core/data-validation.ts");
       await validateCurrentData(project, groups);
+      if (resetting) {
+        // Absolute credential paths may have reached old files during preview. They must resolve after the
+        // reset as well, while rollback still owns those originals and before publishing current markers.
+        const { checkResetModels } = await import("./reset-model-check.ts");
+        // The pre-stop offer passes again once rollback restores the old files, so name the way out.
+        try { await checkResetModels(project); }
+        catch (error) {
+          throw new Error(`重置后的模型凭证无法解析（${(error as Error).message}）；未提交，旧数据将回滚。重新升级时请在询问是否重新配置模型时选择 y`);
+        }
+      }
       if (state.fresh) {
         const marker = { dataVersion: DATA_VERSION, transaction: deployment };
         await publishJson(groupPath, marker);

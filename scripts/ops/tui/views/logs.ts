@@ -11,6 +11,7 @@ import { loadLogTail, type LogLine } from "../data.ts";
 import { LOG_FILE, PROJECT_DIR, TUNNEL_LOG_FILE } from "../platform.ts";
 import { capture } from "../exec.ts";
 import type { AppApi, Loading, View, ViewAction, ViewContext } from "../view.ts";
+import type { Deployment } from "../platform.ts";
 import { ListFilter, pending } from "./common.ts";
 import { join } from "node:path";
 
@@ -45,6 +46,8 @@ export class LogsView implements View {
     this.path = source === "bot" ? LOG_FILE : TUNNEL_LOG_FILE;
   }
 
+  available(deployment: Deployment): boolean { return this.source === "bot" || deployment.mode === "cloudflare"; }
+
   activity(): string | null {
     return this.lookupController ? "正在扫描任务日志…" : null;
   }
@@ -55,7 +58,7 @@ export class LogsView implements View {
       ["End", "跟随"],
       ["/", "搜索"],
       ["l", "级别"],
-      this.source === "bot" ? ["t", this.lookupController ? "查询中" : "查任务"] : ["o", "日志设置"],
+      ...(this.source === "bot" ? [["t", this.lookupController ? "查询中" : "查任务"]] as [string, string][] : []),
     ];
   }
 
@@ -66,7 +69,7 @@ export class LogsView implements View {
       { value: "l", label: "筛选日志级别", description: "全部、警告及错误、仅错误" },
       ...(this.source === "bot"
         ? [{ value: "t", label: "提取任务排查记录", description: "输入 8 位任务编号，从当前与轮转日志中提取上下文", disabled: this.lookupController !== null }]
-        : [{ value: "o", label: "设置隧道日志", description: "进入系统设置，开启或关闭隧道日志" }]),
+        : []),
       { value: "home", label: "跳到最早的可见记录" },
       { value: "end", label: "回到最新记录并跟随" },
     ];
@@ -128,7 +131,6 @@ export class LogsView implements View {
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
-    if (key.name === "o" && this.source === "cloudflared") { app.go("settings"); return true; }
     if (key.name === "escape" && this.filter.clear()) { this.offset = 0; return true; }
     if (key.name === "/") {
       if (await this.filter.edit(app, "搜索日志内容")) this.offset = 0;
@@ -226,7 +228,7 @@ export class LogsView implements View {
   render(ctx: ViewContext): string[] {
     const { theme, width: total, height } = ctx;
     const empty = this.source === "bot" ? "暂无机器人日志"
-      : "暂无隧道日志；在「系统 → 设置」开启后查看，按 o 进入";
+      : "暂无隧道日志；在「系统 → 设置 → Cloudflare 隧道」开启后查看";
     const waiting = pending(theme, total, this.state, empty);
     if (waiting) return waiting;
     const all = this.filtered((this.state as { value: LogLine[] }).value);

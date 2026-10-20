@@ -64,10 +64,6 @@ export class OverviewView implements View {
   actions(): ViewAction[] {
     return [
       { value: "enter", label: "处理选中事项", disabled: this.state.kind !== "ready" },
-      { value: "health", label: "检查服务健康", description: "检查服务、隧道与配置，查看修复建议" },
-      { value: "logs", label: "查看运行日志", description: "跟随最新输出，筛选异常与任务记录" },
-      { value: "stats", label: "查看用量与报表", description: "按日期、群与成员查看使用情况" },
-      { value: "maintain", label: "管理服务与部署", description: "启动、重启、升级和修复" },
     ];
   }
 
@@ -169,7 +165,6 @@ export class OverviewView implements View {
   }
 
   onKey(key: { name: string }, app: AppApi): boolean {
-    if (["health", "logs", "stats", "maintain"].includes(key.name)) { app.go(key.name); return true; }
     if (this.state.kind !== "ready") return false;
     const todos = this.todos(this.state.value);
     const moved = moveSelection(key.name, this.selected, todos.length);

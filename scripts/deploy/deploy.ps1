@@ -419,6 +419,12 @@ $recordedDataPreparationPlan = if ($resuming) { Join-Path $pendingSnapshot.Path 
 # 续做不能提问：迁移预览不带 --interactive，需要确认时停止。
 # 外层 @() 保留数组；if 的单元素输出会变成字符串，传给原生程序时被 splat 拆成逐个字符。
 
+# 跨数据版本只能由升级器重置并重新配置模型。部署不做重置，也不能因为检测到旧 models.json 就沿用它，停机前直接拒绝。
+if (-not $resuming) {
+    & $bunPath run $dataPreparationRunner probe --project $Project --groups $dataPreparationGroups | Out-Null
+    if ($LASTEXITCODE -eq 20) { throw "数据版本较旧，重新部署不会沿用旧模型配置和会话；请运行 $(Get-OpsCommandHint 'update')，确认后重置旧会话并重新配置模型。旧服务尚未停止" }
+    if ($LASTEXITCODE -ne 0) { throw '数据版本检查失败（原因见上方）；旧服务尚未停止' }
+}
 if ($recordedDataPreparationPlan -and (Test-Path -LiteralPath $recordedDataPreparationPlan -PathType Leaf)) {
     # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
     $dataPreparationPlan = $recordedDataPreparationPlan

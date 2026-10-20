@@ -79,8 +79,8 @@ if ($recordedPlan -and (Test-Path -LiteralPath $recordedPlan -PathType Leaf)) {
     $previewOptions = @()
     if ($probeCode -eq 20) {
         if ($pendingPath) { throw '未完成事务缺少已确认的重置计划；请回滚后重试' }
-        Write-Host '保留 stats.sqlite、workspace 和其他资料、webhook/Cloudflare 入口；仅清理各群直属的其他 SQLite 数据库、index、成员 session.jsonl 和 tmp，重新配置模型及可选功能。未入账消息和待处理任务不再补算；成功后删除本次回滚副本。'
-        if (([string](Read-Host '确认按此方式升级并重新配置？输入 RESET 继续（不区分大小写）')).Trim() -ine 'RESET') { throw '已取消；旧服务和数据未改动' }
+        Write-Host '保留 stats.sqlite、workspace 和其他资料、webhook/Cloudflare 入口；外链、文档、隧道、辅助模型、MCP 等管理员设置经新版本校验后保留，不接受的丢弃并需重新设置；模型配置能被新版 Pi 读取时可选择沿用，否则重新配置；仅清理各群直属的其他 SQLite 数据库、index、成员 session.jsonl 和 tmp。未入账消息和待处理任务不再补算；成功后删除本次回滚副本。'
+        if (([string](Read-Host '确认按此方式升级？输入 RESET 继续（不区分大小写）')).Trim() -ine 'RESET') { throw '已取消；旧服务和数据未改动' }
         if ($stageRoot -eq [IO.Path]::GetFullPath($Project)) { throw '重置必须通过目标版本导出的升级入口执行' }
         $resetConfig = Join-Path $stageRoot 'reset-config'
         & $bun run $previewRunner prepare-reset --project $Project --groups $groups --reset-config $resetConfig
@@ -88,11 +88,25 @@ if ($recordedPlan -and (Test-Path -LiteralPath $recordedPlan -PathType Leaf)) {
         Push-Location -LiteralPath $stageRoot
         try { & $bun install --frozen-lockfile; if ($LASTEXITCODE -ne 0) { throw '目标版本隔离依赖安装失败，旧服务未停止' } }
         finally { Pop-Location }
-        Push-Location -LiteralPath $resetConfig
-        try {
-            & $bun run (Join-Path $stageRoot 'scripts\config\configure.ts')
-            if ($LASTEXITCODE -ne 0) { throw '新模型配置未完成，旧服务未停止' }
-        } finally { Pop-Location }
+        # 只有新版 Pi 能完整读取（选中的模型存在、实际解析出凭证）才提供沿用；文件存在本身不算数。
+        & $bun run $previewRunner offer-models --project $Project --groups $groups --reset-config $resetConfig
+        $modelsCode = $LASTEXITCODE
+        $configureModels = $true
+        if ($modelsCode -eq 0) {
+            Write-Host '校验只能发现新版 Pi 拒绝的配置；Pi 发布说明若提到模型配置含义变化，请选择重新配置。' -ForegroundColor Yellow
+            $configureModels = Read-YesNo '是否重新配置模型（provider/key/model）？[y/N]' $false
+            if ($configureModels) {
+                & $bun run $previewRunner discard-models --reset-config $resetConfig
+                if ($LASTEXITCODE -ne 0) { throw '无法清除草稿中的旧模型配置，旧服务未停止' }
+            }
+        } elseif ($modelsCode -ne 21) { throw '模型配置检查失败，旧服务未停止' }
+        if ($configureModels) {
+            Push-Location -LiteralPath $resetConfig
+            try {
+                & $bun run (Join-Path $stageRoot 'scripts\config\configure.ts')
+                if ($LASTEXITCODE -ne 0) { throw '新模型配置未完成，旧服务未停止' }
+            } finally { Pop-Location }
+        }
         $previewOptions = @('--reset-config', $resetConfig)
     } elseif ($probeCode -ne 0) { throw '数据版本检查失败；旧服务未停止' }
     & $bun run $previewRunner preview --project $Project --groups $groups --plan $plan @previewOptions

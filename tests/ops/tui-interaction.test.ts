@@ -71,7 +71,7 @@ test("清空所有群需输入「全部清空」，范围不受筛选影响；�
   expect(history.actions().find(action => action.value === "a")?.disabled).toBe(true);
 });
 
-test("会话页底部固定显示清空入口并说明不影响统计；临时文件页可直接跳到会话页", async () => {
+test("会话页底部固定显示清空入口并说明不影响统计；临时文件页不重复提供清空会话", async () => {
   const history = new HistoryView(), { app, calls } = fakeApp();
   Object.assign(history, { state: { kind: "ready", value: [
     { group: "support", users: [], bytes: 100, database: { bytes: 100, modified: 0 } },
@@ -94,9 +94,9 @@ test("会话页底部固定显示清空入口并说明不影响统计；临时�
   expect(calls.commands).toEqual([{ title: "清空 support 的会话历史", args: ["history-clear", "support", "--storage-segment"] }]);
 
   const storage = new StorageView();
-  expect(storage.actions().find(action => action.value === "h")?.description).toContain("数据 → 会话");
-  expect(await storage.onKey(key("h"), app)).toBe(true);
-  expect(calls.destinations).toEqual(["history"]);
+  expect(storage.actions().some(action => action.value === "h")).toBe(false);
+  expect(await storage.onKey(key("h"), app)).toBe(false);
+  expect(calls.destinations).toEqual([]);
 });
 
 function fakeApp(root = "unused") {
@@ -636,7 +636,7 @@ test("完成的执行面板按方向键回看而不关闭，长输出首尾可�
   } finally { tty.close(); }
 });
 
-test("总览的待办与常用入口可直接进入具体功能", () => {
+test("总览的待办与常驻入口可直接进入具体功能，菜单不重复分区导航", () => {
   const view = new OverviewView();
   const { app, calls } = fakeApp();
   Object.assign(view, { state: { kind: "ready", value: {
@@ -653,11 +653,11 @@ test("总览的待办与常用入口可直接进入具体功能", () => {
   view.onKey(key("enter"), app);
   expect(calls.destinations).toEqual(["maintain", "storage", "maintain"]);
   const shown = plain(view.render(context()));
-  expect(shown).toContain("查看运行日志");
+  expect(view.actions!().map(action => action.value)).toEqual(["enter"]);
   // 分隔线只数需要关注的条数，不把常驻入口算进去。
   expect(shown).toContain("1 项待关注");
-  view.onKey(key("health"), app);
-  expect(calls.destinations.at(-1)).toBe("health");
+  expect(view.onKey(key("health"), app)).toBe(false);
+  expect(calls.destinations).toEqual(["maintain", "storage", "maintain"]);
   const maintain = new MaintainView();
   Object.assign(maintain, { platform: "windows", state: { kind: "ready", value: {
     sha: "123456789", behind: 24, incoming: Array.from({ length: 24 }, (_, i) => ({ sha: String(i), subject: "待应用更新" })),
@@ -812,6 +812,70 @@ test("统计、会话和临时文件刷新保留列表，切换数据根后清�
   } finally { finishes.forEach(finish => finish()); mocks.forEach(mock => mock.mockRestore()); await fixture.cleanup(); }
 });
 
+test("切换为直连隐藏隧道操作时，选择按操作保留，被隐藏时退到范围内，页面照常绘制", async () => {
+  const load = spyOn(tuiTransaction, "loadPendingTransaction").mockReturnValue(null);
+  const git = spyOn(tuiData, "loadGit").mockResolvedValue(null);
+  try {
+    const { app } = fakeApp();
+    app.deployment.mode = "cloudflare";
+    const view = new MaintainView();
+    await view.refresh(app);
+    const keys = () => view.actions().map(action => action.value);
+    expect(keys()).toContain("tunnel-update");
+    const ctx = () => ({ ...context(120, 35), deployment: app.deployment });
+    // Last entry (uninstall) and a tunnel entry: the first keeps its action, the second falls back inside the list.
+    await view.onKey(key("end"), app);
+    app.deployment.mode = "direct";
+    await view.refresh(app);
+    expect(keys()).not.toContain("tunnel-update");
+    expect(plain(view.render(ctx()))).toContain(`${keys().length} / ${keys().length}`);
+    expect(plain(view.render(ctx()))).toContain("删除容器/任务");
+    app.deployment.mode = "cloudflare";
+    await view.refresh(app);
+    await view.onKey(key("end"), app);
+    while (view.actions()[view["selected"]]!.value !== "tunnel-update") await view.onKey(key("up"), app);
+    app.deployment.mode = "direct";
+    await view.refresh(app);
+    expect(view["selected"]).toBeLessThan(keys().length);
+    for (const [width, rows] of [[72, 20], [120, 35]]) fits(view.render({ ...context(width, rows), deployment: app.deployment }), context(width, rows));
+  } finally { load.mockRestore(); git.mockRestore(); }
+});
+
+test("升级、继续或回滚改动了代码时提示重新运行界面，只提示一次；代码未变不提示", async () => {
+  const record: tuiTransaction.TransactionRecord = {
+    format: "1", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "2".repeat(40), original_sha: "1".repeat(40),
+    original_branch: "main", original_group_root: "/srv/groups", target_group_root: "/srv/groups", was_running: "1",
+    bot_port: "1011", deploy_mode: "direct", bot_domain: "", domain_action: "keep", unmanaged_tunnel: "",
+    platform_ip: "203.0.113.17", reconfigure_ai: "0",
+  };
+  const confirmation = { operation: "upgrade" as const, id: "deploy-fixture", digest: "a".repeat(64), text: () => null };
+  const pending: tuiTransaction.PendingTransaction = { confirmation, operation: "upgrade", snapshot: "deploy-fixture", record, targetSha: record.target_sha, committed: false, codeRestorePending: false };
+  const load = spyOn(tuiTransaction, "loadPendingTransaction").mockReturnValue(pending);
+  const git = spyOn(tuiData, "loadGit").mockResolvedValue({ branch: "main", sha: "1111111", subject: "fixture", dirty: false, ahead: 0, behind: 0, incoming: [] });
+  const changed = spyOn(tuiData, "tuiCodeChanged").mockResolvedValue(false);
+  try {
+    const { app, calls } = fakeApp();
+    app.runInteractive = async (title, args) => { calls.commands.push({ title, args }); return 0; };
+    const view = new MaintainView();
+    await view.refresh(app);
+    await view.onKey(key("resume"), app); await tick();
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(plain(view.render(context(120, 35)))).not.toContain("重新运行 bun run tui");
+    changed.mockResolvedValue(true);
+    await view.onKey(key("rollback"), app); await tick();
+    expect(calls.toasts.filter(text => text.includes("重新运行 bun run tui"))).toHaveLength(1);
+    load.mockReturnValue(null);
+    await view.refresh(app);
+    for (const [width, rows] of [[72, 20], [120, 35]]) {
+      fits(view.render(context(width, rows)), context(width, rows));
+      expect(plain(view.render(context(width, rows)))).toContain("按 q 退出后重新运行 bun run tui");
+    }
+    // 只是启动、停止等操作不检查代码。
+    await view.onKey(key("restart"), app); await tick();
+    expect(changed).toHaveBeenCalledTimes(2);
+  } finally { load.mockRestore(); git.mockRestore(); changed.mockRestore(); }
+});
+
 test("未完成的事务只提供继续或回滚，确认页列出记录，数据已提交时禁止回滚", async () => {
   const record: tuiTransaction.TransactionRecord = {
     format: "1", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "2".repeat(40), original_sha: "1".repeat(40),
@@ -834,8 +898,9 @@ test("未完成的事务只提供继续或回滚，确认页列出记录，数�
       await view.refresh(app);
       const actions = view.actions();
       expect(actions.slice(0, 2).map(action => action.label)).toEqual(["继续上次操作", "回滚上次操作"]);
-      expect(actions.filter(action => action.disabled).map(action => action.value).sort()).toEqual(["deploy", "repair", "tunnel-update", "update"]);
-      expect(actions.find(action => action.value === "deploy")?.label).toBe("部署 / 修改设置");
+      expect(actions.filter(action => action.disabled).map(action => action.value).sort()).toEqual(["deploy", "repair", "update"]);
+      expect(actions.some(action => action.value === "tunnel-update" || action.value === "repair-tunnel")).toBe(false);
+      expect(actions.find(action => action.value === "deploy")?.label).toBe("重新部署");
       expect(actions.find(action => action.value === "update")?.label).toBe("升级");
       for (const [width, rows] of [[72, 20], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
       // New deployments, upgrades and repairs are refused until the interrupted one is finished; no remote check starts.
@@ -1179,7 +1244,7 @@ test("进入系统页时慢版本查询不隐藏菜单、不吞方向键，也�
     expect(plain(view.render(context()))).toContain("服务与部署");
     expect(plain(view.render(context()))).toContain("版本读取中");
     await app["handleKey"](key("down"));
-    expect(plain(view.render(context()))).toContain("2 / 8");
+    expect(plain(view.render(context()))).toContain("2 / 7");
     await app["handleKey"](key("update"));
     expect(commands).toEqual([]);
     await app["handleKey"](key("home"));
@@ -1599,14 +1664,16 @@ test("快速离开日志页后，未完成的加载不会重新启动后台轮�
 
 test("日志设置只显示关闭和开启，取消或选择当前值不执行；失败后显示恢复的设置", async () => {
   const { app, calls } = fakeApp();
+  app.deployment.mode = "cloudflare";
   const view = new SettingsView();
   let saved: tuiData.TunnelLogging = "off";
   const read = spyOn(tuiData, "loadTunnelLogging").mockImplementation(async () => saved);
+  const protocol = spyOn(tuiData, "loadTunnelProtocol").mockResolvedValue("auto");
   const relay = spyOn(tuiData, "loadRelaySummary").mockResolvedValue({ enabled: false });
   const confirm = spyOn(app, "confirm").mockResolvedValue(false);
   const run = spyOn(app, "run").mockImplementation(async (_title, args) => { saved = args[1] as tuiData.TunnelLogging; return 0; });
   try {
-    await view.onKey(key("down"), app);
+    view["selected"] = view["items"].indexOf("tunnel");
     await view.refresh(app);
     calls.choices.push(null, "off", "on");
     for (let i = 0; i < 3; i++) await view.onKey(key("l"), app);
@@ -1618,32 +1685,77 @@ test("日志设置只显示关闭和开启，取消或选择当前值不执行�
     calls.choices.push("on");
     await view.onKey(key("l"), app);
     expect(run.mock.calls.at(-1)?.[1]).toEqual(["tunnel-logging", "on"]);
-    expect(view["state"]).toEqual({ kind: "ready", value: "on" });
+    expect(view["logging"].state).toEqual({ kind: "ready", value: "on" });
     run.mockResolvedValue(1);
     calls.choices.push("off");
     await view.onKey(key("l"), app);
-    expect(view["state"]).toEqual({ kind: "ready", value: "on" });
-    await view.onKey(key("home"), app);
-    await view.onKey(key("down"), app);
-    expect(plain(view.render(context(120, 35)))).not.toMatch(/debug/i);
-    await view.onKey(key("v"), app);
-    expect(calls.destinations).toEqual(["tunnel-logs"]);
-    expect(createRelayView().actions!().map(action => action.label)).not.toContain("配置外链");
-  } finally { view.onLeave(); read.mockRestore(); relay.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
+    expect(view["logging"].state).toEqual({ kind: "ready", value: "on" });
+    const shown = plain(view.render({ ...context(120, 35), deployment: app.deployment }));
+    expect(shown).toContain("隧道日志：开启");
+    expect(shown).not.toMatch(/debug/i);
+    // 隧道日志页在监控分区，设置页不再提供互跳。
+    expect(view.hints().map(([name]) => name)).not.toContain("v");
+    expect(await view.onKey(key("v"), app)).toBe(false);
+    expect(calls.destinations).toEqual([]);
+  } finally { view.onLeave(); read.mockRestore(); protocol.mockRestore(); relay.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
+});
+
+test("Cloudflare 隧道合并为一项，Enter 先选日志或连接模式；直连部署隐藏隧道设置", async () => {
+  const { app, calls } = fakeApp();
+  const view = new SettingsView();
+  const logging = spyOn(tuiData, "loadTunnelLogging").mockResolvedValue("off");
+  const protocol = spyOn(tuiData, "loadTunnelProtocol").mockResolvedValue("quic");
+  const runtime = spyOn(tuiData, "loadRuntimeSettings").mockResolvedValue({ hash: null, values: {} });
+  const model = spyOn(tuiData, "loadModelSummary").mockResolvedValue(null);
+  try {
+    const direct = plain(view.render(context(120, 35)));
+    expect(direct).not.toContain("Cloudflare 隧道");
+    expect(view.actions!().map(action => action.value)).toEqual(["m", "e", "a"]);
+    expect(await view.onKey(key("l"), app)).toBe(false);
+    expect(await view.onKey(key("p"), app)).toBe(false);
+    expect(logging).not.toHaveBeenCalled(); expect(protocol).not.toHaveBeenCalled();
+    await view.onKey(key("end"), app);
+    expect(plain(view.render(context(120, 35)))).toContain("文档处理：文档模块");
+
+    // 切到 Cloudflare 部署时仍停在高级运行参数，隧道项插在它前面。
+    app.deployment.mode = "cloudflare";
+    const tunnel = { ...context(120, 35), deployment: app.deployment };
+    expect(plain(view.render(tunnel))).toContain("6 / 6");
+    expect(view.actions!().map(action => action.value)).toEqual(["m", "e", "l", "p", "a"]);
+    await view.onKey(key("up"), app);
+    await view.refresh(app);
+    const shown = plain(view.render(tunnel));
+    expect(shown).toContain("Cloudflare 隧道");
+    expect(shown).toContain("隧道日志：关闭（默认关闭） · 连接模式：QUIC（UDP）");
+    expect(shown).toContain("监控 → 隧道日志");
+    calls.choices.push("p", null);
+    await view.onKey(key("enter"), app);
+    expect(calls.menus.map(menu => menu.title)).toEqual(["Cloudflare 隧道", "Cloudflared 连接模式"]);
+    calls.choices.push(null);
+    await view.onKey(key("enter"), app);
+    expect(calls.menus).toHaveLength(3);
+    expect(calls.commands).toHaveLength(0);
+    for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) {
+      const ctx = { ...context(width, rows), deployment: app.deployment };
+      fits(view.render(ctx), ctx);
+    }
+  } finally { view.onLeave(); logging.mockRestore(); protocol.mockRestore(); runtime.mockRestore(); model.mockRestore(); }
 });
 
 test("连接模式默认自动，三种选择可保存；取消、原值和恢复后的失败都正确显示", async () => {
   const { app, calls } = fakeApp();
+  app.deployment.mode = "cloudflare";
   const view = new SettingsView();
   let saved: tuiData.TunnelProtocol = "auto";
   const read = spyOn(tuiData, "loadTunnelProtocol").mockImplementation(async () => saved);
+  const logging = spyOn(tuiData, "loadTunnelLogging").mockResolvedValue("off");
   const confirm = spyOn(app, "confirm").mockResolvedValue(false);
   const run = spyOn(app, "run").mockImplementation(async (_title, args) => { saved = args[1] as tuiData.TunnelProtocol; return 0; });
   try {
     await view.onKey(key("p"), app);
     await view.refresh(app);
     calls.choices.push(null, "auto", "http2");
-    for (let i = 0; i < 3; i++) await view.onKey(key("enter"), app);
+    for (let i = 0; i < 3; i++) await view.onKey(key("p"), app);
     expect(calls.menus[0]!.choices.map(choice => choice.value)).toEqual(["auto", "http2", "quic"]);
     expect(calls.menus[0]!.initial).toBe("auto");
     expect(run).not.toHaveBeenCalled();
@@ -1651,42 +1763,46 @@ test("连接模式默认自动，三种选择可保存；取消、原值和恢�
     confirm.mockResolvedValue(true);
     for (const mode of ["http2", "quic", "auto"] as const) {
       calls.choices.push(mode);
-      await view.onKey(key("enter"), app);
+      await view.onKey(key("p"), app);
       expect(run.mock.calls.at(-1)?.[1]).toEqual(["tunnel-protocol", mode]);
       expect(view["protocol"].state).toEqual({ kind: "ready", value: mode });
     }
     run.mockResolvedValue(1);
     calls.choices.push("http2");
-    await view.onKey(key("enter"), app);
+    await view.onKey(key("p"), app);
     expect(view["protocol"].state).toEqual({ kind: "ready", value: "auto" });
     for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) {
-      const ctx = context(width, rows);
+      const ctx = { ...context(width, rows), deployment: app.deployment };
       fits(view.render(ctx), ctx);
-      expect(plain(view.render(ctx))).toContain("Cloudflared 连接模式");
+      expect(plain(view.render(ctx))).toContain("Cloudflare 隧道");
     }
-  } finally { view.onLeave(); read.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
+    expect(plain(view.render({ ...context(120, 35), deployment: app.deployment }))).toContain("连接模式：自动（默认）");
+  } finally { view.onLeave(); read.mockRestore(); logging.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
 });
 
 test("离开连接模式时取消加载，迟到的结果不能覆盖状态；读取错误可重试", async () => {
   const { app } = fakeApp();
+  app.deployment.mode = "cloudflare";
   const view = new SettingsView();
   let finish!: (value: tuiData.TunnelProtocol) => void;
   const read = spyOn(tuiData, "loadTunnelProtocol").mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const logging = spyOn(tuiData, "loadTunnelLogging").mockResolvedValue("off");
+  const model = spyOn(tuiData, "loadModelSummary").mockResolvedValue(null);
   try {
     await view.onKey(key("p"), app);
     const loading = view.refresh(app);
-    expect(view.activity()).toContain("连接模式");
+    expect(view.activity()).toContain("隧道设置");
     await view.onKey(key("home"), app);
     finish("quic"); await loading;
     expect(view["protocol"].state.kind).toBe("idle");
     read.mockRejectedValueOnce(new Error("invalid preference"));
     await view.onKey(key("p"), app);
     expect(view["protocol"].state.kind).toBe("error");
-    expect(plain(view.render(context(120, 35)))).toContain("invalid preference");
+    expect(plain(view.render({ ...context(120, 35), deployment: app.deployment }))).toContain("invalid preference");
     read.mockResolvedValue("auto");
     await view.refresh(app);
     expect(view["protocol"].state).toEqual({ kind: "ready", value: "auto" });
-  } finally { view.onLeave(); read.mockRestore(); }
+  } finally { view.onLeave(); read.mockRestore(); logging.mockRestore(); model.mockRestore(); }
 });
 
 test("隧道日志复用跟随搜索和级别筛选，读取独立文件，任务查询只用于机器人日志", async () => {
@@ -1714,10 +1830,39 @@ test("隧道日志复用跟随搜索和级别筛选，读取独立文件，任�
     calls.answers.push("fixture-ray");
     await view.onKey(key("/"), app);
     expect(plain(view.render(context()))).not.toContain("retrying");
-    await view.onKey(key("o"), app);
-    expect(calls.destinations).toEqual(["settings"]);
+    expect(view.hints().map(([name]) => name)).not.toContain("o");
+    expect(await view.onKey(key("o"), app)).toBe(false);
+    expect(calls.destinations).toEqual([]);
   } finally { view.onLeave(); read.mockRestore(); }
   expect(view["timer"]).toBeNull();
+  expect(view.available!(deployment)).toBe(false);
+  expect(view.available!({ ...deployment, mode: "cloudflare" })).toBe(true);
+  expect(new LogsView().available!(deployment)).toBe(true);
+});
+
+test("直连部署不显示隧道日志页：Tab、子导航和页面菜单都跳过它，切换部署形态后回到可用页", async () => {
+  const tty = terminal();
+  const bot = new LogsView(), tunnel = new LogsView("cloudflared");
+  const read = spyOn(tuiData, "loadLogTail").mockResolvedValue([]);
+  const app = new App([
+    { id: "home", label: "总览", render: () => [], hints: () => [] },
+    { id: "monitor", label: "监控", views: [bot, tunnel] },
+  ], { screen: tty.screen, deployment: { ...deployment } });
+  app["refreshChrome"] = async () => {};
+  tty.screen.start(() => {}, () => {});
+  try {
+    await app["handleKey"](key("right"));
+    expect(app["current"].id).toBe("logs");
+    expect(app["pages"]().map(view => view.id)).toEqual(["logs"]);
+    await app["handleKey"](key("tab"));
+    expect(app["current"].id).toBe("logs");
+    app.go("tunnel-logs");
+    expect(app["current"].id).toBe("logs");
+    app.deployment.mode = "cloudflare";
+    expect(app["pages"]().map(view => view.id)).toEqual(["logs", "tunnel-logs"]);
+    await app["handleKey"](key("tab"));
+    expect(app["current"].id).toBe("tunnel-logs");
+  } finally { bot.onLeave(); tunnel.onLeave(); read.mockRestore(); tty.close(); }
 });
 
 test("操作预览在宽窄窗口及无色终端都完整容纳菜单，最后一项始终可达", async () => {
@@ -1730,7 +1875,7 @@ test("操作预览在宽窄窗口及无色终端都完整容纳菜单，最后�
         const ctx = { ...context(width, rows), theme: createTheme(depth) };
         const frame = view.render(ctx);
         fits(frame, ctx);
-        expect(plain(frame)).toContain(view.id === "maintain" ? "卸载" : view.id === "settings" ? "Cloudflared 日志"
+        expect(plain(frame)).toContain(view.id === "maintain" ? "卸载" : view.id === "settings" ? "高级运行参数"
           : view.id === "relay" ? "清理全部外链" : "移除废弃绑定");
       }
     }
@@ -1746,6 +1891,7 @@ test("外链配置在两个平台接管真实终端，不通过普通弹窗或�
       const interactive: string[][] = [];
       app.runInteractive = async (_title, args) => { interactive.push(args); return 0; };
       const view = new SettingsView();
+      view["selected"] = view["items"].indexOf("relay");
       expect(plain(view.render(context(120, 35)))).toContain("保存前预览并确认");
       await view.onKey!(key("enter"), app);
       expect(interactive).toEqual([["relay-configure"]]);
@@ -1753,14 +1899,114 @@ test("外链配置在两个平台接管真实终端，不通过普通弹窗或�
       expect(calls.prompts).toHaveLength(0);
       expect(calls.confirms).toHaveLength(0);
       expect(calls.toasts).toEqual(["外链配置向导已结束"]);
+      // 数据 → 外链页提供同一个向导入口。
+      const relay = createRelayView();
+      expect(relay.actions!()[0]!.label).toBe("修改外链配置");
+      await relay.onKey!(key("enter"), app);
+      expect(interactive).toEqual([["relay-configure"], ["relay-configure"]]);
+      expect(calls.commands).toHaveLength(0);
+      expect(calls.confirms).toHaveLength(0);
     }
   } finally { settings.mockRestore(); }
+});
+
+test("模型配置先说明停机影响，确认后在真实终端运行向导；取消不执行", async () => {
+  const model = spyOn(tuiData, "loadModelSummary").mockResolvedValue({ provider: "deepseek", model: "deepseek-chat", thinking: { level: "low", source: "model" } });
+  try {
+    for (const platform of ["windows", "linux"] as const) {
+      const { app, calls } = fakeApp();
+      app.deployment.platform = platform;
+      const interactive: string[][] = [];
+      app.runInteractive = async (_title, args) => { interactive.push(args); return 0; };
+      const view = new SettingsView();
+      await view.refresh(app);
+      const shown = plain(view.render(context(120, 35)));
+      expect(shown).toContain("当前：deepseek/deepseek-chat");
+      expect(shown).toContain("推理级别：low（该模型单独设置）");
+      expect(shown).toContain("向导期间机器人停止");
+      app.confirm = async (spec) => { calls.confirms.push(spec); return false; };
+      await view.onKey!(key("enter"), app);
+      expect(interactive).toEqual([]);
+      expect(calls.confirms[0]!.steps.join(" ")).toContain("停止正在运行的机器人");
+      expect(calls.confirms[0]!.steps.join(" ")).toContain("取消或失败时原配置不变");
+      app.confirm = async (spec) => { calls.confirms.push(spec); return true; };
+      await view.onKey!(key("m"), app);
+      expect(interactive).toEqual([["model-configure"]]);
+      expect(calls.commands).toHaveLength(0);
+      expect(calls.toasts).toEqual(["模型配置向导已结束"]);
+    }
+  } finally { model.mockRestore(); }
+});
+
+test("辅助模型与 MCP 只读显示引用和服务器，不显示命令、环境变量或 URL；格式错误给出原因", async () => {
+  const { app, calls } = fakeApp();
+  const auxiliary = spyOn(tuiData, "loadAuxiliarySummary").mockResolvedValue({
+    enabled: true, classifier: "openai/gpt-5-mini", image: null, maxConcurrent: 2, classifierRetries: 1,
+  });
+  const mcp = spyOn(tuiData, "loadMcpSummary").mockResolvedValue([
+    { name: "documents", transport: "http", tools: 3, oauth: true }, { name: "localdocs", transport: "stdio", tools: 1, oauth: false },
+  ]);
+  const view = new SettingsView();
+  try {
+    await view.onKey(key("down"), app); await tick();
+    let shown = plain(view.render(context(120, 35)));
+    for (const text of ["文档分流：openai/gpt-5-mini", "图片生成：未启用", "并发上限 2 · 分类重试 1 次", "data/config/auxiliary.json"]) expect(shown).toContain(text);
+    expect(plain(view.render(context(80, 24)))).toContain("分类");
+    await view.onKey(key("enter"), app);
+    expect(auxiliary).toHaveBeenCalledTimes(2);
+    expect(calls.toasts.at(-1)).toContain("auxiliary.json");
+    expect(calls.confirms).toHaveLength(0);
+    await view.onKey(key("down"), app); await tick();
+    shown = plain(view.render(context(120, 35)));
+    expect(shown).toContain("documents · HTTP · 3 个工具 · OAuth");
+    expect(shown).toContain("localdocs · stdio · 1 个工具");
+    expect(shown).toContain("docs/runtime-tools.md");
+    expect(plain(view.render(context(80, 24)))).toContain("2 台服务器");
+    mcp.mockRejectedValue(new Error("mcp.json 格式无效"));
+    await view.refresh(app);
+    expect(plain(view.render(context(120, 35)))).toContain("当前：mcp.json 格式无效");
+    expect(plain(view.render(context(80, 24)))).toContain("配置无效");
+    expect(calls.commands).toHaveLength(0);
+  } finally { view.onLeave(); auxiliary.mockRestore(); mcp.mockRestore(); }
+});
+
+test("设置摘要读取模型选择、辅助模型和 MCP 文件；缺失表示未启用，MCP 摘要不含凭据字段", async () => {
+  const fixture = await tempFixture("tui-settings-summary-");
+  try {
+    const project = fixture.root;
+    expect(await tuiData.loadModelSummary(project)).toBeNull();
+    expect(await tuiData.loadAuxiliarySummary(project)).toEqual({ enabled: false });
+    expect(await tuiData.loadMcpSummary(project)).toBeNull();
+    await mkdir(join(project, "data", "runtime", "pi"), { recursive: true });
+    await mkdir(join(project, "data", "config"), { recursive: true });
+    const settings = join(project, "data", "runtime", "pi", "settings.json");
+    await Bun.write(settings, String.fromCharCode(0xfeff) + JSON.stringify({ defaultProvider: "deepseek", defaultModel: "deepseek-chat" }));
+    expect(await tuiData.loadModelSummary(project)).toEqual({ provider: "deepseek", model: "deepseek-chat", thinking: null });
+    // Same order as the service: the selected model's own level, then the global default; other models' levels do not count.
+    await Bun.write(settings, JSON.stringify({ defaultProvider: "deepseek", defaultModel: "deepseek-chat", defaultThinkingLevel: "high",
+      modelThinkingLevels: { "deepseek/other": "minimal" } }));
+    expect((await tuiData.loadModelSummary(project))?.thinking).toEqual({ level: "high", source: "default" });
+    await Bun.write(settings, JSON.stringify({ defaultProvider: "deepseek", defaultModel: "deepseek-chat", defaultThinkingLevel: "high",
+      modelThinkingLevels: { "deepseek/deepseek-chat": "low" } }));
+    expect((await tuiData.loadModelSummary(project))?.thinking).toEqual({ level: "low", source: "model" });
+    await Bun.write(join(project, "data", "config", "auxiliary.json"), JSON.stringify({ format: 1, image: { provider: "openai", modelId: "gpt-image-1" } }));
+    expect(await tuiData.loadAuxiliarySummary(project)).toEqual({ enabled: true, classifier: null, image: "openai/gpt-image-1", maxConcurrent: 2, classifierRetries: 1 });
+    await Bun.write(join(project, "data", "config", "mcp.json"), JSON.stringify({ format: 1, servers: [{
+      name: "documents", transport: "http", url: "https://mcp.example/mcp", tools: ["search"], headersEnv: { Authorization: "DOCS_SECRET_HEADER" },
+    }] }));
+    const servers = await tuiData.loadMcpSummary(project);
+    expect(servers).toEqual([{ name: "documents", transport: "http", tools: 1, oauth: false }]);
+    expect(JSON.stringify(servers)).not.toContain("DOCS_SECRET_HEADER");
+    await Bun.write(join(project, "data", "config", "auxiliary.json"), JSON.stringify({ format: 2 }));
+    await expect(tuiData.loadAuxiliarySummary(project)).rejects.toThrow("格式无效");
+  } finally { await fixture.cleanup(); }
 });
 
 test("测试外链不需确认，直接交给 relay-test 并说明会上传后删除测试对象", async () => {
   const { app, calls } = fakeApp();
   const relay = createRelayView();
-  expect(relay.actions!().map(action => action.label)).toEqual(["列出在册外链", "测试外链", "按关键字清理", "清理全部外链"]);
+  expect(relay.actions!().map(action => action.label)).toEqual(["修改外链配置", "列出在册外链", "测试外链", "按关键字清理", "清理全部外链"]);
+  await relay.onKey!(key("down"), app);
   await relay.onKey!(key("down"), app);
   expect(plain(relay.render(context(120, 35)))).toContain("在线检查 · 测试对象检查完即删除");
   await relay.onKey!(key("enter"), app);
@@ -1773,8 +2019,7 @@ test("测试外链不需确认，直接交给 relay-test 并说明会上传后�
 test("必填输入为空会停止，路由群名中的空格完整传递", async () => {
   const { app, calls } = fakeApp();
   const relay = createRelayView();
-  await relay.onKey!(key("down"), app);
-  await relay.onKey!(key("down"), app);
+  for (let i = 0; i < 3; i++) await relay.onKey!(key("down"), app);
   calls.answers.push(" ");
   await relay.onKey!(key("enter"), app);
   calls.answers.push("--all");

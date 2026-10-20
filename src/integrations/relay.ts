@@ -1,6 +1,6 @@
 // Temporary S3 distribution for local files above the IM attachment limit.
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync, createReadStream, createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -12,19 +12,11 @@ import { log } from "../core/log.ts";
 import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../core/storage.ts";
 import { openRelayIndex, relayCacheKey, type RelayIndex, type RelayIndexEntry } from "./relay-index.ts";
 import { deleteObject, downloadUrl, objectBaseUrl, objectNameFromUrl, putObject, remoteStillExists,
-  storedObjectUrl, validateRelayConfig, S3RequestError, type RelayConfig } from "./relay-s3.ts";
+  readRelayConfigFile, storedObjectUrl, S3RequestError, type RelayConfig } from "./relay-s3.ts";
 export { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, validateRelayConfig, type RelayConfig } from "./relay-s3.ts";
 
 export function loadRelayConfig(path = RELAY_CONFIG_PATH): RelayConfig | null {
-  let raw: string;
-  try { raw = readFileSync(path, "utf8"); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw new Error(path + " 无法读取");
-  }
-  let doc: unknown;
-  try { doc = JSON.parse(raw); } catch { throw new Error(path + " 不是有效 JSON"); }
-  return validateRelayConfig(doc, path);
+  return readRelayConfigFile(path);
 }
 
 let cachedConfig: RelayConfig | null | undefined;
