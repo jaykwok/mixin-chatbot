@@ -896,9 +896,14 @@ ${body}` }, { id })], { stopReason: "toolUse" })]);
   test("sequential tools run one at a time within a script; others overlap", async () => {
     const active = { sequential: 0, parallel: 0 };
     const peak = { sequential: 0, parallel: 0 };
+    // Parallel calls wait for each other instead of a fixed sleep: on a slow runner the journal writes before a
+    // sub-call can outlast any sleep and hide a real overlap. If they are wrongly serialised, each gives up after
+    // five seconds and the peak stays at 1. Sequential calls only hold long enough for a wrong overlap to show.
+    const met = Promise.withResolvers<void>();
     const tracked = (kind: "sequential" | "parallel") => probe(`probe_${kind}`, async () => {
       peak[kind] = Math.max(peak[kind], ++active[kind]);
-      await Bun.sleep(150);
+      if (kind === "parallel" && active.parallel === 2) met.resolve();
+      await (kind === "parallel" ? Promise.race([met.promise, Bun.sleep(5_000)]) : Bun.sleep(150));
       active[kind]--;
       return text(kind);
     }, kind === "sequential" ? { executionMode: "sequential" } : {});
@@ -910,7 +915,7 @@ return 1;`);
       expect(returned(run.result)).toBe(1);
       expect(peak).toEqual({ sequential: 1, parallel: 2 });
     } finally { await group.close(); }
-  });
+  }, 60_000);
 });
 
 describe("Durable codemode: store, failures and limits", () => {
