@@ -9,7 +9,7 @@ import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
 import { isPathInside } from "../contracts/paths.ts";
 import { venvPythonPath } from "../agent/python-toolchain.ts";
-import { runProcess } from "../core/process.ts";
+import { runProcess, timedCommand } from "../core/process.ts";
 import { ProcessFailure } from "../../scripts/lib/process.ts";
 import { holdDirectory } from "../core/held-directory.ts";
 import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../core/task-backend.ts";
@@ -226,7 +226,8 @@ async function executeMember(command: string | readonly string[], opts: ShellExe
           void writing.catch(() => {});
           const text = decoders[stream].decode(data); if (text) opts.onOutput?.(text, context, { stream });
         } };
-      const result = task ? await task.run(processOptions, [member.workspaceDir, dirname(member.materialsIndexPath)], { paths: member.inputPaths ?? [] }) : await runProcess(processOptions);
+      const result = task ? await timedCommand(() => task.run(processOptions, [member.workspaceDir, dirname(member.materialsIndexPath)], { paths: member.inputPaths ?? [] }))
+        : await runProcess(processOptions);
       code = result.exitCode;
     } catch (error) { failure = error; }
     finally { if (backend && task) await finishTask(backend, task, "keep"); }

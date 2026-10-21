@@ -26,6 +26,9 @@ const groups: { label: string; description: string; options: RuntimeOption[] }[]
   ] },
   { label: "超时与退出", description: "整轮、模型、工具、交付及关机时限", options: [
     { key: "BOT_RUN_TIMEOUT_SECONDS", label: "整轮处理时限", unit: "秒", description: "覆盖准备、模型、工具与最终交付；其他时限仍受整轮剩余时间约束。" },
+    { key: "BOT_CLOSEOUT_SECONDS", label: "提前收尾", unit: "秒", description: "剩余此时间进入收尾；须小于整轮时限一半。" },
+    { key: "BOT_DELIVERY_RESERVE_SECONDS", label: "交付保留", unit: "秒", description: "最后这段时间只允许读取、登记、发送；须小于收尾时间。" },
+    { key: "BOT_FALLBACK_SEND_SECONDS", label: "失败兜底发送预算", unit: "秒", description: "任务结束后独立的发送预算，失败内容保留供 /deliver。" },
     { key: "BOT_MODEL_IDLE_TIMEOUT_SECONDS", label: "模型无进展时限", unit: "秒", description: "模型等待或输出期间，连续没有有效进展的上限。" },
     { key: "BOT_MODEL_RESPONSE_TIMEOUT_SECONDS", label: "单次模型响应时限", unit: "秒", description: "包含首字等待；持续输出也不会延长此时限。" },
     { key: "BOT_BASH_TIMEOUT", label: "命令默认时限", unit: "秒", description: "模型未指定时使用；工具可声明其他时限，最高 3600 秒。" },

@@ -27,6 +27,10 @@ import { codemodeExtension } from "./codemode/index.ts";
 import { moduleExtensionName, promptExtension } from "./prompt.ts";
 import { type SendDelivery, sendMemberTools } from "./send.ts";
 import { baseExtension, baseMemberTools, documentMemberTools, memberRegistration, memberTool, type MemberTool } from "./tools.ts";
+import type { CloseoutStore } from "../agent/deliverables.ts";
+import { deliverableTool } from "./closeout.ts";
+import { buildMaterialsTools } from "../agent/materials-search.ts";
+import { materialsIgnorePath } from "../agent/paths.ts";
 
 export interface GroupRegistryOptions {
   /** Group data root (`GROUP_DATA_ROOT`). */
@@ -38,6 +42,7 @@ export interface GroupRegistryOptions {
   modules: readonly AgentModuleDefinition[];
   relay: RelayConfig | null;
   delivery: SendDelivery;
+  closeout?: CloseoutStore;
   auxiliary?: { config: AuxiliaryConfig; budget: AuxiliaryBudget; door: RequestDoor };
   mcp?: { manager: McpTools; door: RequestDoor };
 }
@@ -53,7 +58,10 @@ export function groupExtensions(options: GroupRegistryOptions): Extension[] {
   };
   const base = baseMemberTools(members);
   const documents = documentMemberTools(members);
-  const send = sendMemberTools({ ...members, relay: options.relay, delivery: options.delivery });
+  const searchTools = buildMaterialsTools({ workspaceDir: "catalogue", tempDir: "catalogue", venvDir: "catalogue", indexPath: "catalogue", ignorePath: "catalogue" })
+    .map(definition => memberTool(definition, members, ({ places }) => buildMaterialsTools({ ...places, ignorePath: materialsIgnorePath(options.root, options.groupId) })));
+  const send = sendMemberTools({ ...members, relay: options.relay, delivery: options.delivery, closeout: options.closeout });
+  if (options.closeout) send.push(deliverableTool(members, options.closeout, options.relay?.maxBytes));
   const auxiliary = options.auxiliary ? auxiliaryMemberTools(members, options.auxiliary.door, options.auxiliary.config, options.auxiliary.budget) : [];
   const mcp = options.mcp ? mcpMemberTools(members, options.mcp.manager, options.mcp.door) : [];
   const modules = options.modules.map((module) => ({
@@ -64,10 +72,11 @@ export function groupExtensions(options: GroupRegistryOptions): Extension[] {
   return [
     promptExtension({ root: options.root, groupId: options.groupId, modules: options.modules, relayEnabled: options.relay !== null }),
     baseExtension(members, documents),
+    defineExtension({ name: "mixin.materials-search", tools: searchTools.map(memberRegistration) }),
     defineExtension({ name: "mixin.send", tools: send.map(memberRegistration) }),
     ...(auxiliary.length ? [defineExtension({ name: "mixin.auxiliary", tools: auxiliary.map(memberRegistration) })] : []),
     ...(mcp.length ? [defineExtension({ name: "mixin.mcp", tools: mcp.map(memberRegistration) })] : []),
     ...modules.map(({ module, tools }) => defineExtension({ name: moduleExtensionName(module), tools: tools.map(memberRegistration) })),
-    codemodeExtension({ members, tools: [...base, ...documents, ...send, ...auxiliary, ...mcp, ...modules.flatMap(({ tools }) => tools)] }),
+    codemodeExtension({ members, tools: [...base, ...documents, ...searchTools, ...send, ...auxiliary, ...mcp, ...modules.flatMap(({ tools }) => tools)] }),
   ];
 }

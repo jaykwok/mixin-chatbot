@@ -37,13 +37,16 @@ import {
   type HarnessOptions, hook, LiveDoc, type LiveState, type SettledSubmissionRecord, type Submission,
 } from "@earendil-works/pi-durable";
 import { canonicalCommand, HELP_TEXT, unknownCommandText } from "../agent/commands.ts";
+import { clearRunning, markRunning } from "./running-requests.ts";
 import { refreshDeliveryText } from "../agent/delivery-links.ts";
 import { type DeliveryAttachment, DeliveryStore } from "../agent/delivery-store.ts";
+import { CloseoutStore, closeoutReferences, fileDigest, type Deliverable } from "../agent/deliverables.ts";
+import { closeoutExtension, closeoutTool, validateCloseout, type CloseoutTiming } from "./closeout.ts";
 import { describeRequestFailure, modelRequestError } from "../agent/failure.ts";
 import { ensureMaterialsIndex } from "../agent/materials-index.ts";
 import type { AgentModuleDefinition } from "../agent/modules.ts";
 import { groupIndexDir, groupWorkspaceDir, materialsIgnorePath, materialsIndexPath, userTempDir } from "../agent/paths.ts";
-import type { OutboundNotes } from "../agent/send-tools.ts";
+import { transferFile, type OutboundNotes, type FileTransfer } from "../agent/send-tools.ts";
 import { ensureStorageIdentity } from "../agent/storage-identity.ts";
 import { openStatsLedger } from "../agent/stats-ledger.ts";
 import { DEDUP_TTL, MAX_ACTIVE_REQUESTS, MAX_DEDUP_SIZE } from "../core/config.ts";
@@ -78,6 +81,7 @@ const CAPACITY_FULL = "⚠️ 机器人现在比较忙，这条消息未加入�
 
 /** Where replies and receipts go; the IM functions by default, fakes in tests. */
 export interface Outbound {
+  sendAttachment?(path: string, name: string, groupId: string, phone: string, callbackUrl: string, signal: AbortSignal): Promise<FileTransfer>;
   sendText(text: string, groupId: string, phone: string, callbackUrl: string,
     options?: { traffic?: "status" | "required"; signal?: AbortSignal }): Promise<boolean>;
   sendReply(body: string, groupId: string, phone: string, callbackUrl: string, signal?: AbortSignal, appendix?: string): Promise<boolean>;
@@ -121,6 +125,8 @@ export interface DurableServiceOptions {
   limits: Omit<ServiceLimits, "activeRequests" | "queue" | "tickMs" | "heartbeatMs" | "resultRetentionMs" | "memberIdleMs"> & Partial<ServiceLimits>;
   outbound?: Outbound;
   deliveries?: DeliveryStore;
+  /** Production supplies validated runtime settings; tiny lifecycle fixtures can omit closeout. */
+  closeout?: CloseoutTiming;
   /** The storage identity table (src/core/state.ts by default). */
   stateDb?: Database;
   /** Extensions installed after the project's (tests). */
@@ -201,6 +207,7 @@ export class DurableService {
   readonly #limits: ServiceLimits;
   readonly #outbound: Outbound;
   readonly #deliveries: DeliveryStore;
+  readonly #closeout: CloseoutStore;
   readonly #context: Context;
   readonly #cancel: (reason?: unknown) => void;
   readonly #closing = new AbortController();
@@ -229,6 +236,9 @@ export class DurableService {
     if (!Number.isSafeInteger(this.#limits.activeRequests) || this.#limits.activeRequests < 1) throw new Error("普通请求总容量必须是正整数");
     this.#outbound = options.outbound ?? IM;
     this.#deliveries = options.deliveries ?? new DeliveryStore(options.stateDb);
+    if (options.closeout) validateCloseout(options.closeout, this.#limits.runTimeoutMs);
+    this.#closeout = new CloseoutStore(this.#deliveries);
+    this.#closeout.sweepMetadata();
     const cancellable = withCancel(options.context ?? BACKGROUND_CONTEXT);
     this.#context = cancellable.context;
     this.#cancel = cancellable.cancel;
@@ -350,6 +360,7 @@ export class DurableService {
     let reply: string;
     if (command === "/stop" || command === "/clear") {
       const release = this.#hold(member);
+      this.#closeout.withdraw(member.key);
       const receipt: ControlReceipt = { groupId, phone, requestId: `ctl:${randomUUID()}` };
       this.#receipts.set(receipt.requestId, receipt);
       receipt.ticket = this.#runtimes.get(groupId)?.door.controlReceived(phone, receipt.requestId);
@@ -490,6 +501,7 @@ export class DurableService {
     await waitFor(member.starting ?? Promise.resolve(), this.#closing.signal);
     const pending = (await pendingControls(harness, this.#context)).find((control) => control.requestId === requestId);
     if (pending === undefined) { door.controlExecuted(requestId); return; }
+    this.#closeout.withdraw(member.key);
     const conversation = member.conversationId === undefined ? undefined
       : await harness.conversation(member.conversationId as ConversationId, this.#context);
     if (conversation !== undefined) {
@@ -617,6 +629,7 @@ export class DurableService {
             member.workerRetry = undefined;
           } finally {
             if (member.current?.requestId === head.requestId) member.current = undefined;
+            clearRunning(member.groupId, member.phone, taskNumber(head.requestId));
             if (member.starting === started) member.starting = undefined;
             startedDone();
             member.lastUsed = Date.now();
@@ -630,7 +643,7 @@ export class DurableService {
   /** Run one inbox item; `submitted` is called once its submission exists (or nothing will be submitted). */
   async #process(harness: Harness, conversation: Conversation, member: MemberState, item: InboxItem, submitted: () => void): Promise<void> {
     const reply = this.#deliveries.find(member.key, replyRow(item.requestId));
-    if (reply !== undefined) {
+    if (reply !== undefined || this.#closeout.plan(member.key, `fallback:${item.requestId}`)) {
       // Settled and stored before a crash: finish the removal; the reply waits in the outbox.
       await this.#remove(harness, conversation.id, item.requestId);
       await this.#project(harness, member);
@@ -681,6 +694,7 @@ export class DurableService {
       }
     }
     if (member.current?.requestId !== item.requestId) member.current = { requestId: item.requestId, startedAt };
+    markRunning(member.groupId, member.phone, taskNumber(item.requestId));
     this.#log(`任务开始 - ${taskText(member, item.requestId)}, 总时限: ${this.#limits.runTimeoutMs / 1000}秒, ` +
       `模型无进展时限: ${this.#limits.modelIdleMs / 1000}秒, 单次模型响应时限: ${this.#limits.modelResponseMs / 1000}秒`);
     let settled: SettledSubmissionRecord;
@@ -690,7 +704,7 @@ export class DurableService {
       submitted();
       settled = await this.#watch(harness, conversation, member, submission, item.cancelled === true ? undefined : startedAt);
       await this.#settle(harness, conversation, member, item, settled);
-    } finally { member.current = undefined; }
+    } finally { member.current = undefined; clearRunning(member.groupId, member.phone, taskNumber(item.requestId)); }
   }
 
   /** Wait for the submission to settle, aborting the run when a limit is reached. */
@@ -756,12 +770,17 @@ export class DurableService {
   }
 
   async #settle(harness: Harness, conversation: Conversation, member: MemberState, item: InboxItem, settled: SettledSubmissionRecord): Promise<void> {
+    // The worker's item predates controls. Re-read cancellation after the invocation has settled.
+    const current = (await inboxItems(harness, conversation.id, this.#context)).find(x => x.requestId === item.requestId);
+    const cancelled = current?.cancelled || member.gate !== undefined || (member.cancelBefore ?? -Infinity) >= item.receivedAt;
     const aborted = member.aborted.get(settled.id.toString());
     member.aborted.delete(settled.id.toString());
     const notes = this.#deliveries.find(member.key, notesRow(item.requestId));
     let failure: string | undefined;
     let reply: { body: string; notes?: { text: string; attachments: DeliveryAttachment[] } } | undefined;
-    if (aborted !== undefined) {
+    if (cancelled) {
+      // Explicit cancellation wins over a watchdog firing at the same time.
+    } else if (aborted !== undefined) {
       failure = describeRequestFailure(aborted.error);
     } else if (settled.status === "done" && item.cancelled !== true) {
       const answer = settled.type === "input" && settled.answer !== undefined
@@ -778,10 +797,40 @@ export class DurableService {
     } else if (settled.status === "unanswered" && settled.reason !== "aborted" && item.cancelled !== true) {
       failure = describeRequestFailure(await this.#failure(harness, conversation, settled));
     }
+    let fallback: string | undefined;
+    if (failure !== undefined && this.#options.closeout && !this.#closing.signal.aborted) {
+      const candidates = await this.#validCandidates(member.key, item.requestId);
+      const latest = (await inboxItems(harness, conversation.id, this.#context)).find(x => x.requestId === item.requestId);
+      if (!latest?.cancelled && !member.gate && (member.cancelBefore ?? -Infinity) < item.receivedAt) {
+        const files = this.#closeout.files(member.key, item.requestId);
+        const descriptions = candidates.map(x => {
+          const file = files.find(f => f.sha256 === x.sha256);
+          const status = file?.state === "sent" ? "；该版本已在任务中发出" : file?.state === "uncertain" ? "；该版本可能已发出，发送 /deliver 可重发（如已收到可忽略）" : "";
+          return `· 《${x.name}》— ${x.status === "checked" ? "已检查版本" : "草稿"}；文件结构完整；检查记录（模型登记）：${x.checked.join("、") || "未登记"}；未检查：${x.unchecked.join("、") || "未登记"}；已知问题：${x.issues.join("、") || "无登记"}${status}。`;
+        });
+        const rejected = this.#closeout.registrations(member.key, item.requestId).some(x => x.status === "rejected" || !x.complete);
+        const text = [failure, candidates.length ? "系统将交付本任务已登记的可用版本：" : "本任务没有可交付的已登记版本。",
+          ...descriptions, rejected ? "存在已知错误或不完整的版本，未作为交付候选。" : "",
+          candidates.some(x => x.status === "draft") ? "这是未完成全部检查的草稿，请核对后使用。" : ""].filter(Boolean).join("\n");
+        // Both the explanation and file plan commit before inbox removal: no crash window loses the result.
+        fallback = this.#closeout.createPlan(member.key, item.requestId, text, candidates, this.#options.closeout.fallbackMs).id;
+      }
+      failure = undefined;
+    }
     await this.#remove(harness, conversation.id, item.requestId);
     await this.#project(harness, member);
     this.#log(`任务结束 - ${taskText(member, item.requestId)}, 结果: ${settled.status}${"reason" in settled && settled.reason ? `/${settled.reason}` : ""}`);
     if (failure !== undefined) await this.#notify(member, failure);
+    if (fallback && member.callbackUrl) {
+      const release = await member.delivery.acquire(this.#closing.signal);
+      try {
+        member.attempted.add(fallback);
+        if (!await this.#sendPlan(member, fallback, false) && !this.#closeout.plan(member.key, fallback)?.withdrawn && !this.#closing.signal.aborted) {
+          await this.#notify(member, "已保存交付内容，发送 /deliver 可补发；发送结果不确定的文件不会自动重发。");
+        }
+      } finally { release(); }
+    }
+    await this.#releaseSnapshots(member, item.requestId, !!cancelled || (member.cancelBefore ?? -Infinity) >= item.receivedAt);
     if (reply !== undefined && member.callbackUrl !== undefined) {
       const release = await member.delivery.acquire(this.#closing.signal);
       try {
@@ -794,7 +843,10 @@ export class DurableService {
           const appendix = reply.notes === undefined ? "" : await this.#outbound.refresh(reply.notes, this.#closing.signal);
           sent = await this.#outbound.sendReply(reply.body, member.groupId, member.phone, member.callbackUrl, this.#closing.signal, appendix || undefined);
         } catch (error) { this.#report(error); }
-        if (sent) { this.#deliveries.acknowledge([id]); member.attempted.delete(id); }
+        if (sent) {
+          this.#closeout.acknowledgeRelay(member.key, item.requestId); this.#deliveries.acknowledge([id]); member.attempted.delete(id);
+          await this.#releaseSnapshots(member, item.requestId);
+        }
         else await this.#notify(member, "回复未能完整发到群里，已保存的内容可用 /deliver 补发");
       } finally { release(); }
     }
@@ -831,6 +883,21 @@ export class DurableService {
     const release = await member.delivery.acquire(this.#closing.signal);
     try {
       const pending = this.#deliveries.pending(member.key);
+      const expired = pending.filter(item => item.id.startsWith("fallback:")).flatMap(item => {
+        const plan = this.#closeout.plan(member.key, item.id);
+        return plan && !plan.withdrawn && !plan.expiredNoticeAt && plan.deadline <= Date.now() ? [plan] : [];
+      });
+      if (expired.length && !member.gate) {
+        const signal = AbortSignal.any([this.#closing.signal, AbortSignal.timeout(15_000)]);
+        try {
+          if (await waitFor(this.#outbound.sendText("上次任务的交付未完成，已保存内容；发送 /deliver 获取。", member.groupId, member.phone, callbackUrl, { signal }), signal)) {
+            for (const plan of expired) {
+              const current = this.#closeout.plan(member.key, plan.id);
+              if (current) this.#closeout.savePlan({ ...current, expiredNoticeAt: Date.now() });
+            }
+          }
+        } catch (error) { if (!this.#closing.signal.aborted) this.#report(error); }
+      }
       if (pending.some(item => item.id.startsWith("reply:")) && member.conversationId !== undefined) {
         const handle = await this.#groups.acquire(member.groupId);
         // Usage projection is serialized per conversation. A worker may already be projecting
@@ -838,6 +905,10 @@ export class DurableService {
         this.#track(this.#project(handle.harness, member).finally(() => handle.release()));
       }
       for (const item of pending) {
+        if (item.id.startsWith("fallback:")) {
+          if (!member.attempted.has(item.id)) { member.attempted.add(item.id); await this.#sendPlan(member, item.id, false); }
+          continue;
+        }
         if (!item.id.startsWith("reply:") || member.attempted.has(item.id) || this.#deliveries.find(member.key, item.id) === undefined) continue;
         member.attempted.add(item.id);
         let sent = false;
@@ -850,6 +921,8 @@ export class DurableService {
           return;
         }
         this.#deliveries.acknowledge([item.id]);
+        this.#closeout.acknowledgeRelay(member.key, item.id.slice("reply:".length));
+        await this.#releaseSnapshots(member, item.id.slice("reply:".length));
         member.attempted.delete(item.id);
       }
     } finally { release(); }
@@ -875,15 +948,99 @@ export class DurableService {
         return;
       }
       for (const item of pending) {
+        if (item.id.startsWith("fallback:")) {
+          if (!await this.#sendPlan(member, item.id, true)) throw new Error("补发未完成，文件和说明仍保留，可稍后再发送 /deliver");
+          continue;
+        }
         member.attempted.add(item.id);
         const text = await this.#outbound.refresh(item, this.#closing.signal);
         if (!await this.#outbound.sendText(text, member.groupId, member.phone, callbackUrl, { signal: this.#closing.signal })) {
           throw new Error("补发失败，尚未发完的回复仍已保存，可稍后再发送 /deliver");
         }
         this.#deliveries.acknowledge([item.id]);
+        this.#closeout.acknowledgeRelay(member.key, item.id.replace(/^(reply|notes):/, ""));
+        await this.#releaseSnapshots(member, item.id.replace(/^(reply|notes):/, ""));
         member.attempted.delete(item.id);
       }
     } finally { release(); }
+  }
+
+  async #releaseSnapshots(member: MemberState, requestId: string, cancelled = false): Promise<void> {
+    await this.#closeout.releaseSnapshots(member.key, requestId, userTempDir(this.#options.root, member.groupId, member.phone), cancelled).catch(error => this.#report(error));
+  }
+
+  async #validCandidates(session: string, requestId: string): Promise<Deliverable[]> {
+    const all = this.#closeout.registrations(session, requestId), rejected = new Set(all.filter(x => x.status === "rejected").map(x => x.sha256));
+    const selected: Deliverable[] = [];
+    for (const slot of new Set(all.map(x => x.slot))) {
+      const versions = all.filter(x => x.slot === slot && x.complete && !rejected.has(x.sha256)).sort((a, b) =>
+        Number(b.status === "checked") - Number(a.status === "checked") || b.seq - a.seq);
+      for (const record of versions) {
+        try { if (await fileDigest(record.path, this.#closing.signal) === record.sha256) { selected.push(record); break; } }
+        catch { this.#closing.signal.throwIfAborted(); }
+      }
+    }
+    return selected;
+  }
+
+  /** Called only under the member's delivery lock. A /stop can withdraw the next file without waiting for this lock. */
+  async #sendPlan(member: MemberState, id: string, manual: boolean): Promise<boolean> {
+    let plan = this.#closeout.plan(member.key, id);
+    const row = this.#deliveries.find(member.key, id), callbackUrl = member.callbackUrl;
+    if (!plan || !row || !callbackUrl) return !row;
+    if (member.gate || (!manual && (plan.withdrawn || plan.deadline <= Date.now()))) return false;
+    if (manual) {
+      plan = { ...plan, withdrawn: false, textSent: false, deadline: Date.now() + (this.#options.closeout?.fallbackMs ?? 120_000) };
+      this.#closeout.savePlan(plan);
+    }
+    const signal = AbortSignal.any([this.#closing.signal, AbortSignal.timeout(Math.max(1, plan.deadline - Date.now()))]);
+    const withdrawn = () => member.gate !== undefined || this.#closeout.plan(member.key, id)?.withdrawn !== false;
+    try {
+      if (!plan.textSent) {
+        const uncertain = this.#closeout.files(member.key, undefined, id).some(x => x.state === "uncertain");
+        const text = await waitFor(this.#outbound.refresh(row, signal), signal) + (manual && uncertain ? "\n上次发送结果不确定，本次按你的 /deliver 请求重发，如已收到可忽略。" : "");
+        if (withdrawn() || !await waitFor(this.#outbound.sendText(text, member.groupId, member.phone, callbackUrl, { signal }), signal)) return false;
+        plan = { ...plan, textSent: true, withdrawn: withdrawn() }; this.#closeout.acknowledgePlanText(plan);
+      }
+      for (let file of this.#closeout.files(member.key, undefined, id)) {
+        if (file.state === "sent" || (!manual && ["uncertain", "withdrawn"].includes(file.state))) continue;
+        if (withdrawn()) return false;
+        signal.throwIfAborted();
+        let dispatched = false;
+        try {
+          if (await fileDigest(file.path, signal) !== file.sha256) throw new Error("快照摘要不一致，拒绝发送");
+          if (withdrawn()) return false;
+          file = { ...file, state: "sending", attempts: file.attempts + 1, at: Date.now() }; this.#closeout.saveFile(file);
+          let transfer: FileTransfer;
+          if (this.#outbound.sendAttachment) {
+            dispatched = true;
+            transfer = await waitFor(this.#outbound.sendAttachment(file.path, file.name, member.groupId, member.phone, callbackUrl, signal), signal);
+          } else {
+            if (this.#options.outbound) throw new Error("测试 Outbound 未提供 sendAttachment");
+            transfer = await transferFile({ kind: "local", path: file.path, size: file.size }, file.name, {
+              groupId: member.groupId, getCallbackUrl: () => callbackUrl, relay: this.#options.relay,
+              tempDir: userTempDir(this.#options.root, member.groupId, member.phone),
+            }, signal, () => { dispatched = true; });
+          }
+          if (transfer.mode === "relay") {
+            if (withdrawn()) { this.#closeout.saveFile({ ...file, mode: "relay", state: "withdrawn" }); return false; }
+            signal.throwIfAborted(); dispatched = true;
+            if (!await waitFor(this.#outbound.sendText(transfer.note, member.groupId, member.phone, callbackUrl, { signal }), signal)) throw new Error("外链发送结果未确认");
+          }
+          this.#closeout.saveFile({ ...file, mode: transfer.mode, state: "sent" });
+        } catch (error) {
+          this.#closeout.saveFile({ ...file, state: dispatched ? "uncertain" : "failed", error: String(error) });
+          this.#report(error);
+          if (signal.aborted) break;
+        }
+      }
+      if (this.#closeout.files(member.key, undefined, id).every(x => x.state === "sent") && !withdrawn()) {
+        this.#deliveries.acknowledge([id]); member.attempted.delete(id);
+        await this.#releaseSnapshots(member, plan.requestId);
+        return true;
+      }
+    } catch (error) { if (!this.#closing.signal.aborted) this.#report(error); }
+    return false;
   }
 
   async #notify(member: MemberState, text: string): Promise<void> {
@@ -979,6 +1136,8 @@ export class DurableService {
           const values = await idleGroupReferences(handle.harness, this.#context);
           if (!values) continue;
           values.push(...this.#deliveries.groupReferences(groupId));
+          this.#closeout.sweepMetadata();
+          values.push(...closeoutReferences(this.#closeout.db, groupId));
           // The gate keeps this snapshot of the whole group's references valid; it is searched, never rescanned per member.
           const references = resultReferences(values);
           const members = await this.#memberList(handle.harness);
@@ -1045,6 +1204,7 @@ export class DurableService {
     const { selection } = this.#options;
     const holder: { harness?: Harness } = {};
     const door = groupDoor(holder, { onReport: (error) => this.#report(error),
+      ...(this.#options.closeout ? { prepareTool: (name, args, api, context) => closeoutTool(name, args, api, context, this.#options.closeout!, this.#limits.runTimeoutMs) } satisfies Partial<import("./door.ts").DoorOptions> : {}),
       beforeDispatch: (phone, signal) => this.#waitForRun(memberKey(groupId, phone), signal),
       dispatchError: (phone) => {
         const current = this.#members.get(memberKey(groupId, phone))?.current;
@@ -1060,11 +1220,13 @@ export class DurableService {
     const registry = createRegistry();
     const install = (extension: Extension) => registry.install(door.wrapTools(extension));
     install(door.extension());
+    if (this.#options.closeout) install(closeoutExtension(this.#closeout, this.#options.closeout, this.#limits.runTimeoutMs));
     if (this.#options.materials !== false) install(this.#materials(groupId, runtime));
     for (const extension of groupExtensions({
       root: this.#options.root, groupId,
       ...(this.#options.venvDir === undefined ? {} : { venvDir: this.#options.venvDir }),
       modules: this.#options.modules, relay: this.#options.relay, delivery: this.#delivery(groupId),
+      ...(this.#options.closeout ? { closeout: this.#closeout } : {}),
       ...(this.#options.auxiliary ? { auxiliary: { config: this.#options.auxiliary, budget: this.#auxiliaryBudget, door } } : {}),
       ...(this.#options.mcp ? { mcp: { manager: this.#options.mcp, door } } : {}),
     })) install(extension);
@@ -1092,7 +1254,10 @@ export class DurableService {
       const items = await inboxItems(harness, conversationId, context);
       for (const item of items) this.#addRequest(item.requestId, member.key);
       const head = items[0];
-      if (head?.startedAt !== undefined && head.cancelled !== true) member.current = { requestId: head.requestId, startedAt: head.startedAt };
+      if (head?.startedAt !== undefined && head.cancelled !== true) {
+        member.current = { requestId: head.requestId, startedAt: head.startedAt };
+        markRunning(member.groupId, member.phone, taskNumber(head.requestId));
+      }
       if (head !== undefined) kicks.push(member);
     }
     // Every restored head's original deadline is visible to the door before any task is scheduled.
@@ -1150,6 +1315,8 @@ export class DurableService {
       add: (note, attachment) => {
         const id = row();
         const existing = this.#deliveries.find(member.key, id);
+        if (attachment && existing?.attachments.some(saved => saved.original === note &&
+          saved.reference.url === attachment.reference.url && saved.reference.backend === attachment.reference.backend)) return;
         this.#deliveries.put(member.key, id, [existing?.text, note].filter(Boolean).join("\n\n"),
           [...(existing?.attachments ?? []), ...(attachment ? [attachment] : [])]);
       },

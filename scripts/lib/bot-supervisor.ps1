@@ -7,6 +7,10 @@ function Invoke-BotSupervision {
         [ValidateRange(0, 999)][int]$RestartLimit = 999
     )
     $previousPreference = $ErrorActionPreference
+    # Security software (Huorong) checks each process creation in proportion to the creator's RWX reservation,
+    # ~3 ms/MB; Bun's default 1 GB JIT region cost ~3 s per tool command. 128 MB leaves the bot ample JIT space.
+    # An explicit value in the task's environment wins.
+    if (-not $env:BUN_JSC_jitMemoryReservationSize) { $env:BUN_JSC_jitMemoryReservationSize = '134217728' }
     try {
         $ErrorActionPreference = 'Continue'
         for ($attempt = 0; ; $attempt++) {

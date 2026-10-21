@@ -43,11 +43,11 @@ async function uploadBuffered(source: ResolvedSource, callbackUrl: string, name:
  * 大小，让「多大」和「能不能碰」两个判断都发生在读取之前——外链那条路要靠这个大小来
  * 决定走哪边，也靠它避免把一个 2GB 文件先读进内存才发现放不下。
  */
-type ResolvedSource =
+export type ResolvedSource =
   | { kind: "remote"; url: string }
   | { kind: "local"; path: string; size: number };
 
-async function resolveSource(
+export async function resolveSource(
   source: string,
   workspaceDir: string,
   tempDir: string,
@@ -131,7 +131,7 @@ async function fetchRemoteBytes(
 }
 
 /** 读进内存供 IM 直传；只在确认不超过单条附件上限后调用。 */
-async function readBytes(
+export async function readBytes(
   resolved: ResolvedSource,
   signal?: AbortSignal
 ): Promise<Uint8Array> {
@@ -211,6 +211,27 @@ export interface SendToolsOptions {
   relayIndex?: RelayIndex;
   /** 外链地址交给运行时持久化并并入最终交付。 */
   notes: OutboundNotes;
+  fileDelivery?: (source: ResolvedSource, name: string, signal: AbortSignal | undefined, send: (source: ResolvedSource, beforeSend: () => void) => Promise<FileTransfer>) => Promise<FileTransfer>;
+}
+
+export type FileTransfer = { mode: "direct"; fileId?: string; alreadySent?: boolean } |
+  { mode: "relay"; url: string; note: string; attachment: DeliveryAttachment; size: number };
+
+/** One transport for model calls and server-side closeout. The callback marks the irreversible IM send boundary. */
+export async function transferFile(source: ResolvedSource, name: string, options: Pick<SendToolsOptions, "getCallbackUrl" | "groupId" | "relay" | "relayIndex" | "tempDir">,
+  signal?: AbortSignal, beforeSend: () => void = () => {}): Promise<FileTransfer> {
+  signal?.throwIfAborted();
+  if (options.relay && source.kind === "local" && source.size > MAX_ATTACHMENT_BYTES) {
+    const url = await relayFile({ config: options.relay, localPath: source.path, size: source.size, filename: name, signal, index: options.relayIndex, tempDir: options.tempDir });
+    const note = `📎 ${name}（${formatSize(source.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发，请点击链接并点击“继续前往”下载文件：\n${url}${describeRelayExpiry(options.relay, url)}`;
+    return { mode: "relay", url, note, size: source.size, attachment: { original: note, reference: relayReference(options.relay, url, name, source.size) } };
+  }
+  const callbackUrl = options.getCallbackUrl();
+  const fileId = await uploadBuffered(source, callbackUrl, name, "file", options.groupId, signal);
+  if (!fileId) throw new Error("文件上传失败");
+  signal?.throwIfAborted(); beforeSend();
+  if (!await sendFile(fileId, options.groupId, callbackUrl, undefined, signal)) throw new Error("文件发送结果未确认");
+  return { mode: "direct", fileId };
 }
 
 // 消息发出就无法撤回：只允许模型逐条直接调用，脚本（codemode 等经 ctx.executeTool 的调用）拿不到这两个工具。
@@ -219,7 +240,7 @@ const SEND_EXPOSURE = "model-only";
 const SENDS: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 
 export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
-  const { getCallbackUrl, groupId, workspaceDir, tempDir, relay, relayIndex, notes } = options;
+  const { getCallbackUrl, groupId, workspaceDir, tempDir, relay, notes } = options;
 
   const imageParams = Type.Object({
     source: Type.String({
@@ -303,22 +324,10 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
       const resolved = await resolveSource(params.source, workspaceDir, tempDir, signal);
       const name = sanitizeFilename(params.filename ?? filenameFromSource(params.source));
 
-      if (relay && resolved.kind === "local" && resolved.size > MAX_ATTACHMENT_BYTES) {
-        const url = await relayFile({
-          config: relay,
-          localPath: resolved.path,
-          size: resolved.size,
-          filename: name,
-          signal,
-          index: relayIndex,
-          tempDir,
-        });
-        // 群消息显示本次签名的实际到期时间；复用对象不会延长原期限。
-        const expiry = describeRelayExpiry(relay, url);
-        // 交给运行时并入本轮回复，而不是在这里单独发一条：URL 必须逐字正确，所以不能让
-        // 模型复述；但也不值得为它多花一条出站配额。
-        const note = `📎 ${name}（${formatSize(resolved.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发，请点击链接并点击“继续前往”下载文件：\n${url}${expiry}`;
-        notes.add(note, { original: note, reference: relayReference(relay, url, name, resolved.size) });
+      const send = (source: ResolvedSource, beforeSend: () => void) => transferFile(source, name, options, signal, beforeSend);
+      const result = options.fileDelivery ? await options.fileDelivery(resolved, name, signal, send) : await send(resolved, () => {});
+      if (result.mode === "relay") {
+        notes.add(result.note, result.attachment);
         return {
           content: [
             {
@@ -330,16 +339,11 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
                 `请说明文件链接已生成，不要声称已送达或重复粘贴链接地址。`,
             },
           ],
-          details: { name, url, size: resolved.size, mode: "relay" },
+          details: { name, url: result.url, size: result.size, mode: "relay" },
         };
       }
 
-      const callbackUrl = getCallbackUrl();
-      const fileId = await uploadBuffered(resolved, callbackUrl, name, "file", groupId, signal);
-      if (!fileId) throw new Error(`文件上传失败: ${params.source}`);
-      const ok = await sendFile(fileId, groupId, callbackUrl, undefined, signal);
-      if (!ok) throw new Error(`文件发送失败: ${params.source}`);
-      return { content: [{ type: "text", text: `已发送文件: ${name}` }], details: { fileId, name } };
+      return { content: [{ type: "text", text: `${result.alreadySent ? "该版本已发送，无需重复发送" : "已发送文件"}: ${name}` }], details: { fileId: result.fileId, name } };
     },
   };
 

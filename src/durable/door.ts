@@ -96,6 +96,8 @@ export interface DoorOptions {
   beforeDispatch?: (phone: string, signal: AbortSignal) => Promise<void>;
   /** Synchronous lifecycle check immediately before dispatch, including after auth and receipt commits. */
   dispatchError?: (phone: string) => Error | undefined;
+  /** Execution boundary, including recovered and nested calls. May clamp arguments or refuse new work. */
+  prepareTool?: (name: string, args: unknown, api: ToolExecutionApi, context: Context) => Promise<unknown>;
 }
 
 const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -301,7 +303,9 @@ export class RequestDoor {
         signal.throwIfAborted();
         const blocked = this.#options.dispatchError?.(phone);
         if (blocked) throw blocked;
-        return tool.execute(args, api, context);
+        const prepared = this.#options.prepareTool ? await this.#options.prepareTool(tool.name, args, api, context) : args;
+        signal.throwIfAborted();
+        return tool.execute(prepared, api, context);
       },
     });
     return {

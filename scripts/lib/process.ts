@@ -5,6 +5,13 @@ import { monitorJob } from "./process-job.ts";
 
 const supervisor = fileURLToPath(new URL("./process-supervisor.ts", import.meta.url));
 export const PROCESS_CLEANUP_MS = 5_000;
+/**
+ * JIT reservation of a supervisor (16 MB). Some Windows security software (Huorong) checks a process's creator in
+ * proportion to its RWX reservation, ~3 ms/MB; Bun's default 1 GB made every supervised command start ~3 s later. The
+ * helper only parses one request and spawns, so a small region is plenty. bun:ffi needs the JIT, so it cannot be off.
+ * Commands do not inherit it: they get the caller's environment.
+ */
+export const SUPERVISOR_ENV = { BUN_JSC_jitMemoryReservationSize: String(16 * 1024 * 1024) } as const;
 export interface ProcessEvent { phase: string; elapsedMs: number; pid?: number; code?: number | null; signal?: string | null; detail?: string }
 export interface ProcessOptions {
   command: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal;
@@ -39,7 +46,7 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
   };
   event("spawn-request");
   const jobName = `Local\\mixin-process-${randomUUID()}`;
-  const child = spawn(process.execPath, [supervisor], { cwd: options.cwd, env: { ...process.env, MIXIN_PROCESS_EVENTS: "1", MIXIN_PROCESS_JOB: jobName },
+  const child = spawn(process.execPath, [supervisor], { cwd: options.cwd, env: { ...process.env, ...SUPERVISOR_ENV, MIXIN_PROCESS_EVENTS: "1", MIXIN_PROCESS_JOB: jobName },
     stdio: ["pipe", "pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
   result.pid = child.pid;
   let failure: { kind: ProcessFailure["kind"]; message: string; cause?: unknown } | undefined;

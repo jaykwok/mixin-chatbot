@@ -27,7 +27,7 @@ export interface MaterialsIndexSummary {
   truncated: boolean;
 }
 
-interface FileEntry {
+export interface FileEntry {
   path: string;
   size: number;
   mtime: number;
@@ -98,7 +98,7 @@ export async function loadIgnorePrefixes(ignorePath: string): Promise<string[]> 
     .filter((line) => line !== "**" && line !== "");
 }
 
-function isIgnored(relPath: string, prefixes: string[]): boolean {
+export function isIgnored(relPath: string, prefixes: string[]): boolean {
   if (prefixes.length === 0) return false;
   const target = relPath.toLowerCase();
   return prefixes.some((prefix) => {
@@ -250,7 +250,7 @@ async function rebuild(options: EnsureOptions): Promise<MaterialsIndexSummary> {
     topLevel: summarizeTopLevel(scan.entries),
     truncated: scan.truncated,
   };
-  const manifest: Manifest = { version: 1, identity: await identity(options), digest, summary, checkedAt: Date.now(), indexStamp: await fileStamp(options.indexPath) };
+  const manifest: Manifest = { version: 1, identity: await identity(options), digest, summary, entries: scan.entries, checkedAt: Date.now(), indexStamp: await fileStamp(options.indexPath) };
   await writeIndexFile(options.indexPath + ".manifest.json", JSON.stringify(manifest));
   log.info(
     `资料索引已更新 - 文件: ${summary.totalFiles}, 大小: ${formatSize(summary.totalBytes)}, 耗时: ${((Date.now() - started) / 1000).toFixed(2)}秒, 路径: ${summary.path}`
@@ -271,7 +271,17 @@ interface CacheEntry {
   indexStamp: string;
 }
 
-interface Manifest extends CacheEntry { version: 1; digest: string; }
+interface Manifest extends CacheEntry { version: 1; digest: string; entries?: FileEntry[]; }
+
+/** Structured copy of the same index, with exact bytes/mtime. Older manifests are rebuilt once on demand. */
+export async function materialsRecords(options: EnsureOptions) {
+  const summary = await ensureMaterialsIndex(options);
+  if (!summary) throw new Error("资料索引不可用，请检查资料目录");
+  let manifest = await readManifest(options);
+  if (!manifest?.entries) { await rebuild(options); manifest = await readManifest(options); }
+  if (!manifest?.entries) throw new Error("资料索引刷新中，请稍后重试");
+  return { entries: manifest.entries, summary: manifest.summary, stale: Date.now() - manifest.checkedAt >= MATERIALS_INDEX_TTL };
+}
 async function fileStamp(path: string): Promise<string> {
   try {
     const info = await lstat(path);

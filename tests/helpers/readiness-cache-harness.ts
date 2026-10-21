@@ -8,7 +8,7 @@ import { documentMarker, DOCUMENT_TOOLCHAIN_MARKER } from "../../scripts/runtime
 let runs = 0, success = true, release: (() => void) | undefined, hold = false;
 const prepared: string[] = [];
 spyOn(Bun, "which").mockReturnValue("fixture-uv");
-mock.module("../../src/core/process.ts", () => ({ runProcess: async (options: any) => {
+mock.module("../../src/core/process.ts", () => ({ timedCommand: (work: () => Promise<unknown>) => work(), runProcess: async (options: any) => {
   if (options.args[0] === "-c") {
     assert.ok(options.args[1].includes("docxcompose"));
     return { exitCode: 0, output: "" };

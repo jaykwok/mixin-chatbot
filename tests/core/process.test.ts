@@ -1,8 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
-import { runProcess } from "../../src/core/process.ts";
+import { commandScope, runProcess, timedCommand } from "../../src/core/process.ts";
+import { log } from "../../src/core/log.ts";
+import { executeProcess, ProcessFailure, SUPERVISOR_ENV } from "../../scripts/lib/process.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { fileURLToPath } from "node:url";
 
@@ -174,4 +176,70 @@ describe("supervised real subprocesses", () => {
       await fixture.cleanup();
     }
   }, 40000);
+});
+
+describe("command start cost and timing log", () => {
+  test("slow diagnostic identity does not extend execution or cleanup time", async () => {
+    const lines: string[] = [];
+    const info = spyOn(log, "info").mockImplementation(line => { lines.push(line); });
+    const { promise, resolve } = Promise.withResolvers<string>();
+    try {
+      const started = performance.now();
+      await commandScope.run({ tool: "probe", toolTask: 1, describe: () => promise },
+        () => timedCommand(async () => ({ exitCode: 0 })));
+      const bound = (performance.now() - started) / 1000 + 0.02;
+      await Bun.sleep(150);
+      resolve("群: g, 用户: p, 任务: original");
+      await Bun.sleep(0);
+      expect(lines).toHaveLength(1);
+      expect(Number(/总: ([\d.]+)秒/.exec(lines[0]!)![1])).toBeLessThan(bound);
+    } finally { resolve("成员未知"); info.mockRestore(); }
+  });
+
+  const supervisorReady = (events: { phase: string; detail?: string }[]) => events.find(event => event.phase === "supervisor-ready")?.detail;
+
+  test("the supervisor runs with a 16 MB JIT reservation; the command keeps the caller's environment", async () => {
+    const events: { phase: string; detail?: string }[] = [];
+    const env = { ...process.env };
+    delete env.BUN_JSC_jitMemoryReservationSize;
+    const result = await executeProcess({ command: process.execPath, args: ["-e", "console.log(process.env.BUN_JSC_jitMemoryReservationSize ?? 'unset')"],
+      cwd: process.cwd(), env, timeoutMs: 30000, observe: event => events.push(event) });
+    expect(SUPERVISOR_ENV.BUN_JSC_jitMemoryReservationSize).toBe("16777216");
+    expect(supervisorReady(events)).toBe("jit=16777216");
+    expect(result.stdout.trim()).toBe("unset");
+  }, 40000);
+
+  test("inside a tool call each command logs one line: member, tool, outcome and phase times; outside nothing", async () => {
+    const lines: string[] = [];
+    const info = spyOn(log, "info").mockImplementation(line => { lines.push(line); });
+    const scope = { tool: "bash", toolTask: 42, describe: async () => "群: g, 用户: p, 任务: abcd1234" };
+    try {
+      await runProcess({ command: process.execPath, args: ["-e", "1"], cwd: process.cwd(), timeoutMs: 30000 });
+      const exit = await commandScope.run(scope, () =>
+        runProcess({ command: process.execPath, args: ["-e", "process.exit(3)"], cwd: process.cwd(), timeoutMs: 30000 }));
+      expect(exit.exitCode).toBe(3);
+      const failed = await commandScope.run(scope, () =>
+        runProcess({ command: process.execPath, args: ["-e", "setTimeout(() => {}, 30000)"], cwd: process.cwd(), timeoutMs: 1500 })).catch(error => error);
+      expect(failed).toBeInstanceOf(ProcessFailure);
+      const deadline = Date.now() + 5000;
+      while (lines.length < 2 && Date.now() < deadline) await Bun.sleep(10);
+      const seconds = String.raw`\d+\.\d\d秒`;
+      const phases = `总: ${seconds}, 监督进程启动: ${seconds}, 命令启动: ${seconds}`;
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toMatch(new RegExp(`^命令耗时 - 群: g, 用户: p, 任务: abcd1234, 工具: bash#42, 结果: 退出码 3, ${phases}, 执行: ${seconds}, 回收: ${seconds}$`));
+      expect(lines[1]).toMatch(new RegExp(`^命令耗时 - 群: g, 用户: p, 任务: abcd1234, 工具: bash#42, 结果: 超时, ${phases}, 执行: -, 回收: -$`));
+    } finally { info.mockRestore(); }
+  }, 60000);
+
+  test("a command without supervisor phases (an isolated container) logs its total only", async () => {
+    const lines: string[] = [];
+    const info = spyOn(log, "info").mockImplementation(line => { lines.push(line); });
+    try {
+      await commandScope.run({ tool: "document_extract", toolTask: 7, describe: () => Promise.reject(new Error("gone")) },
+        () => timedCommand(async () => ({ exitCode: 0, output: "" })));
+      const deadline = Date.now() + 2000;
+      while (!lines.length && Date.now() < deadline) await Bun.sleep(5);
+      expect(lines).toEqual([expect.stringMatching(/^命令耗时 - 成员未知, 工具: document_extract#7, 结果: 退出码 0, 总: \d+\.\d\d秒$/)]);
+    } finally { info.mockRestore(); }
+  });
 });

@@ -16,6 +16,7 @@ import {
   loadDiskUsage,
   loadGit,
   loadTmp,
+  loadCloseoutState,
   type DailyPoint,
   type GitState,
   type RecentStats,
@@ -38,6 +39,7 @@ interface Snapshot {
   tmp: UserTmp[] | null;
   disk: number | null;
   git: GitState | null;
+  closeout?: { pending: number; uncertain: number };
 }
 
 interface Todo {
@@ -76,7 +78,7 @@ export class OverviewView implements View {
     // "ready" means the page has a snapshot to render, including placeholders.
     // Per-source loading/errors below track data readiness; navigation stays usable.
     this.state = { kind: "ready", value: snapshot };
-    this.loading = new Set(["stats", "tmp", "disk", "git"]);
+    this.loading = new Set(["stats", "tmp", "disk", "git", "closeout"]);
     this.errors.clear();
     app.redraw();
 
@@ -107,6 +109,7 @@ export class OverviewView implements View {
       read("tmp", "临时目录", "storage", () => loadTmp(root), value => { snapshot.tmp = value; }),
       read("disk", "磁盘占用", "storage", () => loadDiskUsage([join(PROJECT_DIR, "data"), root]), value => { snapshot.disk = value; }),
       read("git", "版本", "maintain", loadGit, value => { snapshot.git = value; }),
+      read("closeout", "交付账本", "storage", loadCloseoutState, value => { snapshot.closeout = value; }),
     ]);
   }
 
@@ -114,6 +117,7 @@ export class OverviewView implements View {
   private todos(snapshot: Snapshot): Todo[] {
     const list: Todo[] = [...this.errors.values()];
     const { git } = snapshot;
+    if (snapshot.closeout?.pending) list.push({ status: "warn", text: `附件待交付 ${snapshot.closeout.pending} 个，其中结果不确定 ${snapshot.closeout.uncertain} 个；请对应用户用 /deliver 补发`, hint: "数据", target: "storage" });
 
     if (git?.dirty) {
       list.push({

@@ -1,4 +1,6 @@
 import { matchesInstance } from "../../../src/core/health.ts";
+import { Database } from "bun:sqlite";
+import { assertCloseoutSchema } from "../../../src/agent/deliverables.ts";
 // 统计、会话和临时目录直接读取宿主机文件，无需 npm 依赖。
 // 健康诊断复用 ops 的 JSON 接口，容器和服务维护转交对应平台脚本。
 
@@ -14,6 +16,17 @@ import { readRuntimeSettings } from "../../config/runtime-settings.ts";
 import { validateRelayConfig } from "../../../src/integrations/relay-s3.ts";
 import { readAuxiliaryConfig } from "../../../src/core/auxiliary-config.ts";
 import { readMcpConfig } from "../../../src/core/mcp-config.ts";
+
+/** Read-only: opening the operator overview must not initialize or recover the send ledger. */
+export async function loadCloseoutState(): Promise<{ pending: number; uncertain: number }> {
+  const path = join(PROJECT_DIR, "data/state/agent.sqlite");
+  try { await lstat(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { pending: 0, uncertain: 0 }; throw error; }
+  const db = new Database(path, { readonly: true, strict: true });
+  try {
+    if (!assertCloseoutSchema(db)) return { pending: 0, uncertain: 0 };
+    return db.query("SELECT count(*) AS pending, coalesce(sum(state IN ('uncertain','sending')),0) AS uncertain FROM file_sends WHERE state!='sent' AND delivery_id IS NOT NULL").get() as { pending: number; uncertain: number };
+  } finally { db.close(); }
+}
 
 // ===== 体检 =====
 

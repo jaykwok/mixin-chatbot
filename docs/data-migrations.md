@@ -4,6 +4,10 @@
 
 当前应用数据版本为 **6**，Pi 为 **1.3.0**。正式运行时只支持当前配置和群会话格式；不保留 v1–v5 转换链、JSONL 导入或旧字段别名。统计账本仍是 **schema 2**，本轮无需转换，历史账目不依赖旧会话存在。
 
+任务收尾新增独立的 **closeout schema 1**，存于 `data/state/agent.sqlite`：`deliverables`（不可变登记和检查范围）、`file_sends`（附件状态）、`fallback_plans`（说明送达及发送截止时间）、`document_events`（本任务重建/渲染记录），版本在 `closeout_schema`。没有这些表时一次性创建；已有表缺失或版本不符时拒绝启动，不做逐版本转换。既有 `deliveries` 仍使用 delivery schema 2，统计库不变。
+
+备份须同时保留 `agent.sqlite` 及其 WAL/SHM、群 Durable 数据库和成员 tmp 中 `.deliverables` 快照；不要只备份表或只备份文件。跨代重置时这些运行状态随 `data/state` 和成员 tmp 一起归档，统计账本按原流程原位保留。普通升级不清空交付账本，遗留 `sending` 恢复为 `uncertain`，等待用户手动 `/deliver`。正常结束或确认送达后释放无需重试的快照；失败、不确定及停止的交付计划保留字节供补发。
+
 ## 什么时候提示清理
 
 升级检查项目 `data/state/data-version.json` 和群根 `data-version.json`，以应用数据版本判断，不以应用发布号或 Pi 版本号判断。

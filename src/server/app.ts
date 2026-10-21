@@ -8,7 +8,7 @@ import { createApp } from "./http-app.ts";
 import { application } from "../core/lifecycle.ts";
 import { acquireGroupRootLease, acquireLease, archiveFile } from "../core/maintenance.ts";
 import { ALLOW_INSECURE_WEBHOOK, GROUP_DATA_ROOT, HOST, MODEL_IDLE_TIMEOUT_MS, MODEL_RESPONSE_TIMEOUT_MS, PORT, RATE_LIMIT_CLEANUP_INTERVAL,
-  RUN_TIMEOUT_MS, SHUTDOWN_TIMEOUT_MS } from "../core/config.ts";
+  RUN_TIMEOUT_MS, SHUTDOWN_TIMEOUT_MS, CLOSEOUT_MS, DELIVERY_RESERVE_MS, FALLBACK_SEND_MS } from "../core/config.ts";
 import { RUNTIME_DIR, STATE_DIR, WEBHOOK_SECRET_FILE } from "../core/storage.ts";
 import { log } from "../core/log.ts";
 import { cleanupCallbackRoutes } from "../integrations/callback-route.ts";
@@ -122,6 +122,7 @@ try {
     auxiliary: readAuxiliaryConfig(),
     mcp,
     limits: { runTimeoutMs: RUN_TIMEOUT_MS, modelIdleMs: MODEL_IDLE_TIMEOUT_MS, modelResponseMs: MODEL_RESPONSE_TIMEOUT_MS },
+    closeout: { closeoutMs: CLOSEOUT_MS, reserveMs: DELIVERY_RESERVE_MS, fallbackMs: FALLBACK_SEND_MS },
     onReport: (error) => log.error("消息服务后台错误: " + String(error)),
     onFatal: (error) => {
       log.error("群存储发生无法确认的提交失败，立即退出，等待监督器重启: " + String(error) + "; cause: " + String(error.cause));

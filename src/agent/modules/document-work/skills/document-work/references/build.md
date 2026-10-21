@@ -58,7 +58,9 @@
 
 ## 从资料中取图
 
-`document_images` 从本群 PDF、PPT、Word 中把内嵌位图提取到 tmp，返回每张图的页码、像素尺寸和在页面中的位置比例（`box`，左上角为原点），重复出现的背景和 logo 只保留一次并标出 `pages`，整页大图标为 `fullPage`。返回的 `path` 可直接写进 Markdown 的 `![说明](path)`。单次最多返回 60 张；超出时 `truncated` 为 true，`warnings` 说明还有几张未提取，用 `pages` 分批再取。
+`document_images` 从本群 PDF、PPT、Word 中把内嵌位图提取到 tmp，返回每张图的页码、像素尺寸和在页面中的位置比例（`box`，左上角为原点），重复出现的背景和 logo 只保留一次并标出 `pages`，整页大图标为 `fullPage`。返回的 `path` 可直接写进 Markdown 的 `![说明](path)`。单次最多返回 60 张；达到数量或上下文输出上限时 `truncated` 为 true。PDF/PPT 用 `pages` 分批；DOCX 将非空的 `next` 传给 `after` 继续。
+
+DOCX 默认返回 `order`（图片序号）、`paragraph`、`headingPath`、`caption`、`before`、`after`；前后文各默认 80 字，`contextChars` 最多 300。重复图片的 `occurrences` 最多列出三处。先用 `extract:false` 和 `match:["功能名称"]` 查位置，这一步不写图片；再用 `orders:[序号]` 提取所需图片。`match` 按标题、图注和前后文做字面匹配，任一关键词命中即可。PDF/PPT 暂不支持这些上下文筛选参数。
 
 架构图常由多个形状或矢量图组成，无法作为单张图提取；先 `document_render` 看页面，再用 `crops: [{ page, box: [x0, y0, x1, y1] }]` 按比例截取该区域（PDF 直接可用，PPT/Word 需要 LibreOffice）。截图是位图，放大有限，宜用 `width=` 控制在页面一半以内。产品资料中的示意图属于正式资料，引用时保持原意，不要拼接改动。
 

@@ -90,7 +90,7 @@ async function answer(operation: string, request: any): Promise<unknown> {
       const images = Array.from({ length: many ? 60 : 2 }, (_, index) => ({ page: 1 + (index % 3), pages: [1 + (index % 3)],
         path: join(directory, `s${index}.png`), width: 400, height: 300, box: index === 0 ? null : [0.1, 0.2, 0.5, 0.6], fullPage: false,
         ...(index === 1 ? { name: "Picture 3" } : {}) }));
-      return { pages: 3, selectedPages: [1, 2, 3], images,
+      return { pages: 3, selectedPages: [1, 2, 3], images, totalMatched: many ? 63 : 2, next: null,
         crops: (request.crops ?? []).map((crop: any, index: number) => ({ page: crop.page, box: crop.box, path: join(directory, `crop-${index}.png`), width: 800, height: 600 })),
         skipped: { small: 1, repeated: 2, unsupported: 1, limit: many ? 3 : 0 }, unsupported: [{ page: 2, name: "Picture 9", format: "emf" }],
         warnings: ["跳过了 1 张矢量或不支持格式的图片（EMF/WMF/SVG 等），可用 crops 从渲染页面截取",

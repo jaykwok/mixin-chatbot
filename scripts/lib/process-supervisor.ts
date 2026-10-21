@@ -72,7 +72,7 @@ if (process.platform === "win32") {
   throw new Error(`不支持受监督的命令执行平台: ${process.platform}`);
 }
 
-event("supervisor-ready", { pid: process.pid });
+event("supervisor-ready", { pid: process.pid, detail: `jit=${process.env.BUN_JSC_jitMemoryReservationSize ?? "default"}` });
 let finishing = false;
 const stdioMode = process.argv[2] === "--stdio";
 let stdioChild: ReturnType<typeof spawn> | undefined;

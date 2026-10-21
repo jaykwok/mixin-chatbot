@@ -5,7 +5,7 @@ import { mock } from "bun:test";
 import { application, waitFor } from "../../src/core/lifecycle.ts";
 let runs = 0, active = 0, peak = 0, release: (() => void) | undefined, hold = false;
 mock.module("../../src/agent/python-toolchain.ts", () => ({ ensureDocumentToolchain: async () => true, venvPythonPath: () => "fixture-python" }));
-mock.module("../../src/core/process.ts", () => ({ runProcess: async (options: any) => {
+mock.module("../../src/core/process.ts", () => ({ timedCommand: (work: () => Promise<unknown>) => work(), runProcess: async (options: any) => {
   runs++; active++; peak = Math.max(peak, active);
   try {
     assert.equal(options.command, "fixture-python");

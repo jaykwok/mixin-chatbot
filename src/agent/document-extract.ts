@@ -9,7 +9,7 @@ import { Type } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { application, waitFor } from "../core/lifecycle.ts";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
-import { runProcess } from "../core/process.ts";
+import { runProcess, timedCommand } from "../core/process.ts";
 import type { IsolatedTask } from "../core/rootless-tasks.ts";
 import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../core/task-backend.ts";
 import { log } from "../core/log.ts";
@@ -18,6 +18,7 @@ import { ensureDocumentToolchain, venvPythonPath } from "./python-toolchain.ts";
 import { isPathInside } from "../contracts/paths.ts";
 import { resolveToolPath } from "./tool-path.ts";
 import { structuredResult } from "./structured-result.ts";
+import { fileDigest } from "./deliverables.ts";
 
 const script = fileURLToPath(new URL("../../scripts/runtime/extract_document.py", import.meta.url));
 const lock = fileURLToPath(new URL("../../uv.lock", import.meta.url));
@@ -30,6 +31,7 @@ const flights = new Map<string, Flight>();
 // Private cache pointers are bounded and disposable. The signed task receipt owns the bytes;
 // normal reference-aware maintenance reclaims them even after this process has restarted.
 const isolatedCaches = new Map<string, string>();
+const sourceStamp = (s: Awaited<ReturnType<typeof stat>>) => JSON.stringify([s.size, s.mtimeMs, s.ctimeMs, s.ino, s.birthtimeMs]);
 export interface DocumentOptions { workspaceDir: string; tempDir: string; indexPath: string; venvDir: string; }
 
 async function validCache(dir: string, digest: string, signal?: AbortSignal): Promise<Extracted | null> {
@@ -101,7 +103,7 @@ export async function extractDocument(options: DocumentOptions, source: string, 
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
   const cached = dir ? await validCache(dir, digest, signal) : null;
-  if (cached) return { ...cached, ...located };
+  if (cached) { await rememberExtraction(options, path, info, cached, signal); return { ...cached, ...located }; }
   let flight = flights.get(flightKey);
   if (!flight || flight.controller.signal.aborted) {
     const controller = new AbortController();
@@ -131,7 +133,8 @@ export async function extractDocument(options: DocumentOptions, source: string, 
         const execution = { command: isolated ? ISOLATED_PYTHON : venvPythonPath(options.venvDir), args: [script, snapshot, extension, output, String(maxChars), report],
           cwd: scratch, timeoutMs: 120000, signal: budget,
           env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8", PYTHONDONTWRITEBYTECODE: "1", TMP: scratch, TEMP: scratch, TMPDIR: scratch } };
-        const result = isolated ? await isolated.run(execution, [dirname(script)]) : await runProcess(execution);
+        const container = isolated;
+        const result = container ? await timedCommand(() => container.run(execution, [dirname(script)])) : await runProcess(execution);
         if (result.exitCode !== 0) throw new Error("文档解析失败：" + result.output.slice(-1200));
         const reportInfo = await lstat(report);
         if (!reportInfo.isFile() || reportInfo.isSymbolicLink() || reportInfo.size > 4096) throw new Error("文档解析结果文件无效");
@@ -144,7 +147,7 @@ export async function extractDocument(options: DocumentOptions, source: string, 
         const textHash = await hashFile(output, budget);
         await rename(output, join(dir, "text.txt"));
         const manifest = join(dir, ".metadata-" + randomUUID());
-        await writeFile(manifest, JSON.stringify({ ...metadata, digest, textHash, parserIdentity }), { mode: 0o600 });
+        await writeFile(manifest, JSON.stringify({ ...metadata, digest, textHash, parserIdentity, sourcePath: path, sourceStamp: sourceStamp(info) }), { mode: 0o600 });
         await rename(manifest, join(dir, "metadata.json"));
         if (isolated) {
           await finishTask(backend!, isolated, "keep-outputs"); retained = true;
@@ -165,11 +168,93 @@ export async function extractDocument(options: DocumentOptions, source: string, 
     flights.set(flightKey, owner);
   }
   flight.consumers++;
-  try { return { ...await waitFor(flight.promise, signal), ...located }; }
+  try {
+    const extracted = await waitFor(flight.promise, signal);
+    await rememberExtraction(options, path, info, extracted, signal);
+    return { ...extracted, ...located };
+  }
   finally {
     flight.consumers--;
     if (!flight.consumers && !flight.done) flight.controller.abort(new Error("文档解析调用已全部取消"));
   }
+}
+
+async function rememberExtraction(options: DocumentOptions, source: string, before: Awaited<ReturnType<typeof stat>>, extracted: Extracted, signal: AbortSignal) {
+  // Disposable lookup hints. An unsuccessful hint write must not invalidate a successful extraction.
+  try {
+    if (sourceStamp(before) !== sourceStamp(await stat(source))) return;
+    const parent = isPathInside(source, await realpath(options.workspaceDir)) ? dirname(options.indexPath) : options.tempDir;
+    const dir = join(parent, "parsed-sources"); await mkdir(dir, { recursive: true });
+    const path = join(dir, createHash("sha256").update(source).digest("hex") + ".json"), temp = path + "." + randomUUID();
+    try {
+      await writeFile(temp, JSON.stringify({ source, stamp: sourceStamp(before), ...extracted, textHash: await fileDigest(extracted.path, signal, 8 * 1024 * 1024) }));
+      await rename(temp, path);
+    } finally { await rm(temp, { force: true }).catch(() => {}); }
+  } catch { signal.throwIfAborted(); }
+}
+
+type CachedText = { path: string; truncated: boolean };
+type TextMetadata = { path: string; textHash: string; truncated: boolean; sourcePath: string; sourceStamp: string };
+
+/** One cache catalogue per search, loaded only on a pointer miss. Never hashes binary sources or starts a parser. */
+export function createDocumentTextLookup(options: DocumentOptions, signal: AbortSignal): (source: string) => Promise<CachedText | { reason: string }> {
+  let roots: Promise<string[]> | undefined;
+  const locations = () => roots ??= Promise.all([options.workspaceDir, options.tempDir, dirname(options.indexPath)].map(path => realpath(path)));
+  let catalogue: Promise<{ sources: Map<string, TextMetadata[]>; legacy: boolean }> | undefined;
+  const json = async (path: string) => {
+    signal.throwIfAborted();
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 64 * 1024) throw new Error("解析缓存元数据无效");
+    return JSON.parse(await readFile(path, { encoding: "utf8", signal }));
+  };
+  async function loadCatalogue(index: string) {
+    const sources = new Map<string, TextMetadata[]>(); let legacy = false;
+    const root = join(index, "parsed");
+    try {
+      if ((await lstat(root)).isSymbolicLink() || !isPathInside(await realpath(root), index)) return { sources, legacy };
+      for (const dir of await readdir(root, { withFileTypes: true })) {
+        signal.throwIfAborted();
+        if (!dir.isDirectory() || dir.isSymbolicLink() || !/^[a-f0-9]{64}$/.test(dir.name)) continue;
+        try {
+          const metadata = await json(join(root, dir.name, "metadata.json"));
+          if (typeof metadata.sourcePath !== "string" || typeof metadata.sourceStamp !== "string") { legacy = true; continue; }
+          const entries = sources.get(metadata.sourcePath) ?? [];
+          entries.push({ ...metadata, path: join(root, dir.name, "text.txt") }); sources.set(metadata.sourcePath, entries);
+        } catch { signal.throwIfAborted(); }
+      }
+    } catch { signal.throwIfAborted(); }
+    return { sources, legacy };
+  }
+  return async source => {
+    signal.throwIfAborted();
+    const [workspace, temp, index] = await locations() as [string, string, string];
+    const info = await stat(source), stamp = sourceStamp(info);
+    const missing = { reason: "缺少有效解析缓存；请单独调用 document_extract" };
+    if (!info.isFile() || info.size > MAX_SOURCE_BYTES || ![workspace, temp].some(root => isPathInside(source, root))) return missing;
+    const verify = async (value: { path: string; textHash: string; truncated: boolean }): Promise<CachedText | undefined> => {
+      const path = await realpath(value.path);
+      await assertTaskPathAllowed(path);
+      if (![index, temp].some(root => isPathInside(path, root))) return;
+      const s = await stat(path);
+      if (!s.isFile() || s.size > 8 * 1024 * 1024 || typeof value.truncated !== "boolean" ||
+        await fileDigest(path, signal, 8 * 1024 * 1024) !== value.textHash || sourceStamp(await stat(source)) !== stamp) return;
+      return { path, truncated: value.truncated };
+    };
+    try {
+      const pointerRoot = isPathInside(source, workspace) ? index : temp;
+      const value = await json(join(pointerRoot, "parsed-sources", createHash("sha256").update(source).digest("hex") + ".json"));
+      if (value.source === source && value.stamp === stamp) {
+        const hit = await verify(value); if (hit) return hit;
+      }
+    } catch { signal.throwIfAborted(); }
+    const cache = await (catalogue ??= loadCatalogue(index));
+    for (const metadata of cache.sources.get(source) ?? []) {
+      if (metadata.sourceStamp !== stamp) continue;
+      try { const hit = await verify(metadata); if (hit) return hit; }
+      catch { signal.throwIfAborted(); }
+    }
+    return cache.legacy ? { reason: "旧缓存缺少来源记录；请对该文件调用一次 document_extract 核验并登记（命中缓存时不启动解析）" } : missing;
+  };
 }
 
 const extractOutput = Type.Object({

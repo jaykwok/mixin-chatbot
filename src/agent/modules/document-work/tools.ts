@@ -10,7 +10,7 @@ import { defineTool, type ToolAnnotations, type ToolDefinition, type ToolExposur
 import { AsyncSemaphore } from "../../../core/async-semaphore.ts";
 import { application } from "../../../core/lifecycle.ts";
 import { log } from "../../../core/log.ts";
-import { runProcess } from "../../../core/process.ts";
+import { runProcess, timedCommand } from "../../../core/process.ts";
 import { runtimeSetting } from "../../../core/runtime-config.ts";
 import type { IsolatedTask } from "../../../core/rootless-tasks.ts";
 import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../../../core/task-backend.ts";
@@ -47,6 +47,7 @@ interface BuildResult {
 }
 interface Rendered { pages: number; images: { page: number; path: string }[]; contacts: string[]; unrenderedPages: number[]; }
 interface ImageExtraction {
+  totalMatched: number; next: number | null;
   pages: number; selectedPages: number[]; images: unknown[]; crops: unknown[]; unsupported: unknown[]; warnings: string[]; directory: string;
   skipped: { small: number; repeated: number; unsupported: number; limit: number };
 }
@@ -86,8 +87,9 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
     let ready = false, totalBytes = 0;
     const run = async (command: string, args: string[]) => {
       const execution = { command, args, cwd: scratch, env, signal: budget, timeoutMs: 240000 };
-      const result = isolated
-        ? await isolated.run(execution, [dirname(pythonScript), flowchartScripts, ...(command === process.execPath ? [fileURLToPath(new URL("../../../../node_modules", import.meta.url)), process.execPath] : [])])
+      const container = isolated;
+      const result = container
+        ? await timedCommand(() => container.run(execution, [dirname(pythonScript), flowchartScripts, ...(command === process.execPath ? [fileURLToPath(new URL("../../../../node_modules", import.meta.url)), process.execPath] : [])]))
         : await runProcess(execution);
       if (result.exitCode !== 0) throw new Error("文档操作失败：" + result.output.slice(-2000));
     };
@@ -275,20 +277,24 @@ const renderOutput = Type.Object({
   warnings: Type.Array(Type.String()),
   report: Type.String(),
 }, { additionalProperties: false });
+const imageContext = { order: Type.Optional(Type.Integer()), paragraph: Type.Optional(Type.Integer()),
+  headingPath: Type.Optional(Type.Array(Type.String())), caption: Type.Optional(Type.String()), before: Type.Optional(Type.String()), after: Type.Optional(Type.String()) };
 const imagesOutput = Type.Object({
   source: Type.String(), digest: Type.String(),
   pages: Type.Integer({ minimum: 0, description: "PDF/PPT 总页数；Word 为 0" }),
   selectedPages: Type.Array(Type.Integer(), { description: "本次处理的页" }),
-  images: Type.Array(Type.Object({ page: Type.Integer({ description: "所在页；Word 为图片在正文中的序号" }), pages: pages, path: Type.String(),
+  images: Type.Array(Type.Object({ page: Type.Integer({ description: "所在页；Word 为图片在正文中的序号" }), pages: pages, path: Type.Optional(Type.String()),
+    ...imageContext, occurrences: Type.Optional(Type.Array(Type.Object(imageContext))),
     width: Type.Integer(), height: Type.Integer(), box: Type.Union([Type.Array(Type.Number()), Type.Null()]), fullPage: Type.Boolean() })),
   crops: Type.Array(Type.Object({ page: Type.Integer(), box: Type.Array(Type.Number()), path: Type.String(), width: Type.Integer(), height: Type.Integer() })),
   skipped: Type.Object({ small: Type.Integer(), repeated: Type.Integer(), unsupported: Type.Integer(), limit: Type.Integer() },
-    { description: "跳过的图片数：太小、重复、格式不支持（EMF/WMF/SVG 等）、超过单次 60 张上限" }),
+    { description: "跳过的图片数：太小、重复、格式不支持（EMF/WMF/SVG 等）、达到图片数量或上下文输出上限" }),
   unsupported: Type.Array(Type.Unknown()),
-  truncated: Type.Boolean({ description: "为 true 时有图片因数量上限没有提取" }),
+  truncated: Type.Boolean({ description: "为 true 时图片列表达到数量或输出上限；DOCX 用 after=next 继续" }),
   warnings: Type.Array(Type.String()),
   directory: Type.String(),
   report: Type.String(),
+  totalMatched: Type.Integer(), next: Type.Union([Type.Integer(), Type.Null()]),
 }, { additionalProperties: false });
 
 function summary(result: Inspection, inspection: string) {
@@ -536,9 +542,13 @@ export function buildDocumentWorkTools(options: DocumentOptions, templates: Docu
   });
   const images = defineTool({
     name: "document_images", label: "提取图片素材", namespace: NAMESPACE, exposure: SCRIPT_ONLY, annotations: WRITES_COPY, outputSchema: imagesOutput,
-    description: "从 PDF、PPTX、DOCX 中提取内嵌的位图图片到本用户 tmp，作为 Markdown 图片的素材；返回每张图的页码、像素尺寸和页面位置（box 为页面比例，左上角为原点），重复出现的图只保留一次。矢量图无法提取，可用 crops 按页面比例截取渲染区域（Office 需要 LibreOffice）。PDF 默认处理前 20 页、PPT 前 50 页，pages 每次最多 50 页；单次最多返回 60 张，超出时 truncated 为 true。",
+    description: "从 PDF、PPTX、DOCX 提取位图素材。DOCX 默认返回图片序号、段落、标题路径、图注和前后文；先 extract:false 配合 match 关键词查图，再按 orders 提取，next 非空时传 after 翻页。重复图片只保存一次并列出最多三处出现位置。PDF/PPTX 用 pages 分页，矢量图用 crops 截图。每次最多 60 张。",
     parameters: Type.Object({
       source: Type.String({ description: "本群 workspace 或本用户 tmp 中的 PDF/PPTX/DOCX" }),
+      context: Type.Optional(Type.Boolean({ default: true })), contextChars: Type.Optional(Type.Integer({ minimum: 0, maximum: 300, default: 80 })),
+      match: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 100 }), { maxItems: 10, description: "DOCX 上下文中的字面关键词，任一命中即可" })),
+      extract: Type.Optional(Type.Boolean({ default: true })),
+      orders: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { maxItems: 60 })), after: Type.Optional(Type.Integer({ minimum: 0 })),
       pages: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, maxItems: 50, description: "PDF 页码或 PPT 页码；Word 忽略" })),
       minSize: Type.Optional(Type.Integer({ minimum: 16, maximum: 2000, description: "跳过短边小于该像素的图（默认 96，用于滤掉图标）" })),
       crops: Type.Optional(Type.Array(Type.Object({
@@ -552,10 +562,11 @@ export function buildDocumentWorkTools(options: DocumentOptions, templates: Docu
         // Crops of an Office file are cut from its LibreOffice rendering.
         const office = params.crops && extname(source.source) !== ".pdf" ? { office: await job.officeProfile() } : {};
         const { result, report } = await job.python<ImageExtraction>("images",
-          { ...source, directory: job.directory, ...office, pages: params.pages, minSize: params.minSize, crops: params.crops });
+          { ...source, directory: job.directory, ...office, pages: params.pages, minSize: params.minSize, crops: params.crops,
+            context: params.context, contextChars: params.contextChars, match: params.match, extract: params.extract, orders: params.orders, after: params.after });
         return structuredResult({ source: source.original, digest: source.digest, pages: result.pages, selectedPages: result.selectedPages,
           images: result.images, crops: result.crops, skipped: result.skipped, unsupported: result.unsupported,
-          truncated: result.skipped.limit > 0, warnings: result.warnings, directory: result.directory, report });
+          truncated: result.skipped.limit > 0, warnings: result.warnings, directory: result.directory, report, totalMatched: result.totalMatched, next: result.next });
       });
     },
   });

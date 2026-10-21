@@ -7,6 +7,7 @@ import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { assertDataDirectory } from "../../scripts/lib/group-data.ts";
 import { assertDeliverySchema } from "../agent/delivery-store.ts";
+import { closeoutReferences } from "../agent/deliverables.ts";
 import { groupSegment, userSegment } from "../agent/paths.ts";
 import type { ResultOwnership } from "../contracts/maintenance.ts";
 import { exists } from "../maintenance/plans.ts";
@@ -65,7 +66,7 @@ async function withDeliveries<T>(path: string, exclusive: boolean, read: (values
     db.exec(exclusive ? "BEGIN IMMEDIATE" : "BEGIN"); assertDeliverySchema(db);
     const exists = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'").get();
     const rows = exists ? db.query("SELECT text, attachments FROM deliveries ORDER BY id").all() as { text: string; attachments: string }[] : [];
-    return await read(rows.map(row => ({ text: row.text, attachments: JSON.parse(row.attachments) })));
+    return await read([...rows.map(row => ({ text: row.text, attachments: JSON.parse(row.attachments) })), ...closeoutReferences(db)]);
   } finally { db.close(); }
 }
 

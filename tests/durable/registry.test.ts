@@ -185,7 +185,7 @@ describe("Durable group registry", () => {
     const group = await openGroup();
     try {
       const seenBy = await turn(group, await member(group));
-      expect(seenBy.tools).toEqual(["read", "bash", "edit", "write", "document_environment", "document_extract", "send_image", "send_file", "codemode"]);
+      expect(seenBy.tools).toEqual(["read", "bash", "edit", "write", "document_environment", "document_extract", "materials_find", "materials_grep", "send_image", "send_file", "codemode"]);
       // CODEMODE_INLINE_BUDGET keeps every declaration of the registry's own tools in the section.
       for (const name of ["read", "bash", "edit", "write", "document_environment", "document_extract",
         "document_inspect", "document_patch", "document_compose", "document_build", "document_render", "document_images"]) {
@@ -205,14 +205,14 @@ describe("Durable group registry", () => {
       const before = await call(group, alice, "codemode", { code });
       expect(before.isError, before.text).toBe(false);
       expect(JSON.parse(before.text.slice(before.text.indexOf("{")))).toEqual({ send: false, names: ["read", "bash", "edit", "write",
-        "document_environment", "document_extract", "document_inspect", "document_patch", "document_compose", "document_build", "document_render",
+        "document_environment", "document_extract", "materials_find", "materials_grep", "document_inspect", "document_patch", "document_compose", "document_build", "document_render",
         "document_images"] });
       const moduleExtension = group.extensions.find((extension) => extension.name === "mixin.document-work")!;
       await alice.configure({ extensions: { remove: [moduleExtension] } }, context);
       const after = await call(group, alice, "codemode", { code });
       expect(after.isError, after.text).toBe(false);
       expect(JSON.parse(after.text.slice(after.text.indexOf("{")))).toEqual({ send: false, names: ["read", "bash", "edit", "write",
-        "document_environment", "document_extract"] });
+        "document_environment", "document_extract", "materials_find", "materials_grep"] });
       const prompt = await turn(group, alice);
       expect(prompt.prompt).not.toContain(documentWork.prompt);
       expect(prompt.prompt).not.toContain("<skills>");

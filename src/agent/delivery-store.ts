@@ -24,6 +24,8 @@ export function assertDeliverySchema(db: Database): void {
 
 /** Durable pending text, independent of Pi history. No callback credentials are stored. */
 export class DeliveryStore {
+  /** Related attachment plans must commit in the same SQLite transaction as their explanatory outbox text. */
+  get database(): Database { return this.db; }
   constructor(private readonly db: Database = stateDatabase()) {
     db.transaction(() => {
       const exists = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'").get();

@@ -5,6 +5,7 @@ import { validateRuntimeConfig } from "./runtime-schema.ts";
 import { openModelRuntime, openSettings, resolveModelSelection } from "./model-config.ts";
 import { openExistingStatsLedger } from "../agent/stats-ledger.ts";
 import { assertDeliverySchema } from "../agent/delivery-store.ts";
+import { assertCloseoutSchema } from "../agent/deliverables.ts";
 import { readAuxiliaryConfig } from "./auxiliary-config.ts";
 import { readMcpConfig } from "./mcp-config.ts";
 import { readRelayConfigFile } from "../integrations/relay-s3.ts";
@@ -62,7 +63,7 @@ export async function validateCurrentData(project: string, groups: string, state
     const state = join(stateProject, "data/state/agent.sqlite");
     if (existsSync(state)) {
       const db = new Database(state, { readonly: true, strict: true });
-      try { assertDeliverySchema(db); } finally { db.close(); }
+      try { assertDeliverySchema(db); assertCloseoutSchema(db); } finally { db.close(); }
     }
   });
 }

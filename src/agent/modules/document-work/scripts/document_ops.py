@@ -527,6 +527,63 @@ RASTER_TYPES = {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"}
 MAX_IMAGE_EDGE = 2000
 
 
+def word_image_contexts(document, context_chars=80):
+    """One XML walk, one forward/backward text pass. Never rescan preceding python-docx Paragraphs."""
+    paragraphs, pictures = [], []
+    w, a, r = NS["w"], NS["a"], NS["r"]
+    def walk(node, paragraph=None):
+        if node.tag == "{%s}p" % w:
+            paragraph = {"paragraph": len(paragraphs) + 1, "parts": [], "length": 0, "style": "", "level": None}
+            props = node.find("{%s}pPr" % w)
+            if props is not None:
+                style, level = props.find("{%s}pStyle" % w), props.find("{%s}outlineLvl" % w)
+                if style is not None:
+                    paragraph["style"] = style.get("{%s}val" % w, "")
+                if level is not None:
+                    paragraph["level"] = int(level.get("{%s}val" % w, "9")) + 1
+            paragraphs.append(paragraph)
+        if node.tag == "{%s}t" % w and paragraph is not None:
+            paragraph["parts"].append(node.text or "")
+            paragraph["length"] += len(node.text or "")
+        elif node.tag == "{%s}blip" % a:
+            pictures.append({"order": len(pictures) + 1, "paragraph": paragraph["paragraph"] if paragraph else 0,
+                             "embed": node.get("{%s}embed" % r), "offset": paragraph["length"] if paragraph else 0})
+        for child in node:
+            walk(child, paragraph)
+    walk(document.element.body)
+    styles = {style.style_id: style.name or "" for style in document.styles}
+    headings, previous = [], ""
+    for p in paragraphs:
+        p["raw"] = "".join(p.pop("parts"))
+        p["text"] = p["raw"].strip()
+        style = styles.get(p["style"], p["style"]).lower()
+        match = re.search(r"(?:heading|标题)\s*(\d+)", style)
+        level = p["level"] or (int(match.group(1)) if match else None)
+        if level and 1 <= level <= 9:
+            headings = [entry for entry in headings if entry[0] < level]
+            headings.append((level, p["text"][:60]))
+        p["headingPath"] = [text for _, text in headings]
+        p["before"] = previous[-context_chars:] if context_chars else ""
+        p["caption"] = p["text"][:120] if "caption" in style or re.match(r"^(?:(?:图|Figure|截图)\s*[\d一二三四五六七八九十]|说明[：:])", p["text"], re.I) else ""
+        if p["text"]:
+            previous = p["text"]
+    following = ""
+    for p in reversed(paragraphs):
+        p["after"] = following[:context_chars]
+        if p["text"]:
+            following = p["text"]
+    for picture in pictures:
+        number = picture["paragraph"]
+        p = paragraphs[number - 1] if number else {}
+        neighbours = paragraphs[max(0, number - 2):number + 1] if number else []
+        offset = picture.pop("offset")
+        before = (p.get("before", "") + "\n" + p.get("raw", "")[max(0, offset - context_chars):offset]).strip()
+        after = (p.get("raw", "")[offset:offset + context_chars] + "\n" + p.get("after", "")).strip()
+        picture.update(headingPath=p.get("headingPath", []), before=before[-context_chars:] if context_chars else "", after=after[:context_chars],
+                       caption=next((near["caption"] for near in neighbours if near["caption"]), ""))
+    return pictures
+
+
 def images(request):
     """Extract embedded raster images (and optional cropped page regions) as reusable assets."""
     import hashlib
@@ -543,11 +600,16 @@ def images(request):
     results, warnings, unsupported = [], [], []
     skipped = {"small": 0, "repeated": 0, "unsupported": 0, "limit": 0}
     seen = {}
+    extract = request.get("extract", True)
+    context_enabled = request.get("context", True)
+    total_matched, next_order = 0, None
+    if kind != ".docx" and any(request.get(key) for key in ("match", "orders", "after")):
+        raise ValueError("match/orders/after 当前只支持 DOCX；PDF/PPTX 请用 pages")
 
     def clamp(value):
         return round(min(1.0, max(0.0, value)), 4)
 
-    def record(picture, page, box, name, extra=None):
+    def record(picture, page, box, name, extra=None, signature=None):
         # Pixel-size and page-share filters apply to every source; icons drawn at a few percent of the page
         # are noise for reuse even when their pixel size is large.
         if min(picture.size) < min_side or (box and (box[2] - box[0]) < 0.03 and (box[3] - box[1]) < 0.05):
@@ -555,25 +617,31 @@ def images(request):
             picture.close()
             return
         # Exact content match: a thumbnail signature would merge different shapes on transparent backgrounds.
-        signature = (picture.size, hashlib.sha1(picture.convert("RGBA").tobytes()).hexdigest())
+        signature = signature or (picture.size, hashlib.sha1(picture.convert("RGBA").tobytes()).hexdigest())
         if signature in seen:
             entry = seen[signature]
-            if page not in entry["pages"]:
+            if page not in entry["pages"] and (kind != ".docx" or len(entry["pages"]) < 3):
                 entry["pages"].append(page)
+            if extra and "order" in extra and len(entry.get("occurrences", [])) < 3:
+                entry.setdefault("occurrences", []).append(extra)
             skipped["repeated"] += 1
+            picture.close()
             return
         if len(results) >= 60:
             skipped["limit"] += 1
             picture.close()
             return
-        if max(picture.size) > MAX_IMAGE_EDGE:
+        if extract and max(picture.size) > MAX_IMAGE_EDGE:
             picture.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE))
         path = folder / name
-        if picture.mode not in ("RGB", "RGBA", "L"):
+        if extract and picture.mode not in ("RGB", "RGBA", "L"):
             picture = picture.convert("RGBA" if "A" in picture.mode or "transparency" in picture.info else "RGB")
-        picture.save(path)
-        entry = {"page": page, "pages": [page], "path": str(path), "width": picture.width, "height": picture.height, "box": box,
+        if extract:
+            picture.save(path)
+        entry = {"page": page, "pages": [page], **({"path": str(path)} if extract else {}), "width": picture.width, "height": picture.height, "box": box,
                  "fullPage": bool(box and (box[2] - box[0]) * (box[3] - box[1]) >= 0.85), **(extra or {})}
+        if extra and "order" in extra:
+            entry["occurrences"] = [extra]
         results.append(entry)
         seen[signature] = entry
         picture.close()
@@ -652,22 +720,35 @@ def images(request):
             document = Document(str(source))
             total = 0
             selected = []
-            # Walk blips in body order so anchored (floating) pictures are included, not only inline ones.
-            index = 0
-            for blip in document.element.body.iter("{%s}blip" % NS["a"]):
-                embed = blip.get("{%s}embed" % NS["r"])
+            contexts = word_image_contexts(document, max(0, min(300, int(request.get("contextChars", 80)))))
+            terms = [str(term).casefold() for term in request.get("match", [])]
+            orders = set(request.get("orders") or [])
+            if len(orders) > 60 or any(not isinstance(n, int) or n < 1 for n in orders):
+                raise ValueError("orders 必须为正整数序号，最多 60 个")
+            matches = [c for c in contexts if (not orders or c["order"] in orders) and
+                       (not terms or any(term in " ".join(c["headingPath"] + [c["caption"], c["before"], c["after"]]).casefold() for term in terms))]
+            total_matched = len(matches)
+            selected_contexts = [c for c in matches if c["order"] > int(request.get("after") or 0)]
+            for context in selected_contexts:
+                if len(results) >= 60:
+                    next_order = results[-1]["order"]
+                    skipped["limit"] += 1
+                    continue
+                index, embed = context["order"], context["embed"]
                 part = document.part.related_parts.get(embed) if embed else None
                 if part is None:
                     continue
-                index += 1
                 extension = Path(str(part.partname)).suffix.lstrip(".").lower()
                 if extension not in RASTER_TYPES:
                     skipped["unsupported"] += 1
                     unsupported.append({"index": index, "format": extension})
                     continue
                 picture = Image.open(io.BytesIO(part.blob))
-                picture.load()
-                record(picture, index, None, f"w{index:03}.{'jpg' if extension in ('jpg', 'jpeg') else 'png'}")
+                if extract:
+                    picture.load()
+                extra = {key: value for key, value in context.items() if key != "embed" and (context_enabled or key in ("order", "paragraph"))}
+                record(picture, index, None, f"w{index:03}.{'jpg' if extension in ('jpg', 'jpeg') else 'png'}", extra,
+                       hashlib.sha256(part.blob).hexdigest())
     crop_results = []
     if crops:
         import pypdfium2 as pdfium
@@ -691,11 +772,19 @@ def images(request):
                         picture.close()
     if unsupported:
         warnings.append("跳过了 %d 张矢量或不支持格式的图片（EMF/WMF/SVG 等），可用 crops 从渲染页面截取" % len(unsupported))
-    if skipped["limit"]:
-        warnings.append("超过单次 60 张上限，另有 %d 张未提取；用 pages 分批提取" % skipped["limit"])
     results.sort(key=lambda item: (item["page"], -(item["width"] * item["height"])))
-    return {"pages": total, "selectedPages": selected, "images": results, "crops": crop_results, "skipped": skipped,
-            "unsupported": unsupported[:40], "warnings": warnings, "directory": str(folder)}
+    output = {"pages": total, "selectedPages": selected, "images": results, "crops": crop_results, "skipped": skipped,
+              "totalMatched": total_matched if kind == ".docx" else len(results), "next": next_order,
+              "unsupported": unsupported[:40], "warnings": warnings, "directory": str(folder)}
+    # Leave room for the TS envelope under the 64 KiB tool-result limit. At most 60 entries are checked here.
+    if kind == ".docx":
+        while results and len(json.dumps(output, ensure_ascii=False).encode("utf-8")) > 48 * 1024:
+            removed = results.pop()
+            output["next"] = min(output["next"] or removed["order"], removed["order"] - 1)
+            skipped["limit"] += 1
+    if skipped["limit"]:
+        warnings.append("达到图片数量或上下文输出上限；请用 %s 分批继续" % ("after=next" if kind == ".docx" else "pages"))
+    return output
 
 
 def main():

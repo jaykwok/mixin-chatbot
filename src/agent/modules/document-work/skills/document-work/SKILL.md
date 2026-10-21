@@ -43,6 +43,9 @@ return { output: patched.output, contacts: preview.contacts, unrenderedPages: pr
 
 ## 工作原则
 
+- **先保住交付**。默认一次生成、一次渲染看图、一次必要修正，然后登记并发送。生成后先用 `deliverable_register` 登记草稿，检查后再登记 checked；图片、参数或事实错误标记 rejected。第二轮修改只用于修正事实错误。看到收尾计时就停止美化，生成文件不等于完成检查，不能反复重建直到超时。
+- **按上下文找图**。DOCX 的 `document_images` 返回图片序号、段落、标题、图注及前后文。先用 `extract:false, match:["关键词"]` 定位，再用 `orders` 提取；返回 `next` 时传给 `after` 继续。不要编写逐张图片重复扫描前面全部段落的脚本。
+
 - **先看大纲再选材**。`document_inspect` 加 `outline: true` 返回 PPT 每页标题、文字量、图片与表格数，以及 Word 标题层级和可用样式；用它决定复用哪几页、以哪份文件为模板，不要通读全部段落。
 - **复用优先于重写**。原页、原图、原表能直接用就用 `slides` / `start,end` 选进来；只有资料里没有的内容才用 Markdown 新写。新写内容放在 `content` 项里，工具会按第一份来源的母版和样式排版。打算把某页做成卡片、时间轴、指标、分层、流程、循环或金字塔时，在该页 `##` 标题后写对应注释（`<!-- timeline -->` 等），自动识别只是没写注释时的兜底；带判断和回退的流程图写 ```` ```mermaid ```` 代码块。资料里的架构图、流程图用 `document_images` 提取或按区域截取后在 Markdown 中引用。
 - **只报告实际生成的版式**。`build.layouts` 列出本次新生成的页（`generatedPages`）中真正排成图示的页和类型，`build.attention` 说明退回普通版式的原因。向用户描述某个新页是“时间轴”“数字指标”前先核对 `layouts`；新页没有列出就是普通版式，要么补注释重新生成，要么如实说明。`keepSlides` 保留的模板页不在 `layouts` 里，它们的版式以大纲和渲染图为准。含 `content` 项的 PPT `document_compose` 也返回这三项，页码是组装后文件的页码，`slides` 选入的来源页不在其中；Word 不返回。

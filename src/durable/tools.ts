@@ -10,6 +10,8 @@ import { nativeBaseTools } from "./base-tools.ts";
 import { createMemberEnv } from "./member-env.ts";
 import { groupIndexDir, groupVenvDir, groupWorkspaceDir, materialsIndexPath, userTempDir } from "../agent/paths.ts";
 import { IdentityDoc } from "./identity.ts";
+import { commandScope } from "../core/process.ts";
+import { memberTaskText } from "./running-requests.ts";
 
 export interface BaseToolsOptions {
   /** Group data root (`GROUP_DATA_ROOT`). */
@@ -208,7 +210,13 @@ export function memberRegistration(tool: MemberTool): ToolRegistration {
       const output = (data: string | Uint8Array) => { try { api.output(data); } catch {} };
       try {
         signal?.throwIfAborted();
-        const result = await tool.run(args, { api, context, callId: api.callId, signal, onBashOutput: output });
+        let label = "成员未知";
+        try {
+          const identity = await api.snapshot(IdentityDoc, api.conversationId, context);
+          if (identity?.phone) label = memberTaskText(identity.groupId, identity.phone);
+        } catch { /* Diagnostic identity must not change tool failure semantics. */ }
+        const scope = { tool: definition.name, toolTask: api.taskId as number, describe: async () => label };
+        const result = await commandScope.run(scope, () => tool.run(args, { api, context, callId: api.callId, signal, onBashOutput: output }));
         const details = json(result.details);
         const structured = schema === undefined ? undefined : json(result.structuredContent);
         return {
@@ -235,7 +243,9 @@ export function baseMemberTools(options: BaseToolsOptions): MemberTool[] {
       const { phone, places } = await resolveMember(options, { api, context });
       const env = await createMemberEnv({ ...places, materialsIndexPath: places.indexPath, phone, groupId: options.groupId,
         resourceReadDirs: options.resourceReadDirs, inputPaths: (args as { input_paths?: string[] }).input_paths });
-      return official.execute(args, { ...api, env }, context);
+      const label = memberTaskText(options.groupId, phone);
+      const scope = { tool: official.name, toolTask: api.taskId as number, describe: async () => label };
+      return commandScope.run(scope, () => official.execute(args, { ...api, env }, context));
     } };
     return { definition: official, native, ...policy };
   });

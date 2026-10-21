@@ -1,6 +1,6 @@
 // The four official tools on the Durable engine (D2-2, src/durable/tools.ts), driven by faux tool calls through a real
 // group Harness wired as the service will be (the door first). Real shells and files under tmp/; no network.
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -16,7 +16,10 @@ import {
 import { nativeBaseTools, bashToolNote } from "../../src/durable/base-tools.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { IdentityDoc, memberConversation } from "../../src/durable/identity.ts";
-import { baseExtension, baseTools, type BaseToolsOptions, memberPlaces } from "../../src/durable/tools.ts";
+import { baseExtension, baseTools, type BaseToolsOptions, memberPlaces, memberRegistration } from "../../src/durable/tools.ts";
+import { clearRunning, markRunning } from "../../src/durable/running-requests.ts";
+import { runProcess, timedCommand } from "../../src/core/process.ts";
+import { log } from "../../src/core/log.ts";
 import { type GroupHarness, openGroupHarness, PROJECT_PROGRESS as PROGRESS } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -300,8 +303,11 @@ describe("Durable base tools", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
-  test("bash: output, non-zero exit and timeout are results; a large output's full file moves into the caller's tmp", async () => {
+  test("bash: output, non-zero exit and timeout are results; a large output's full file moves into the caller's tmp; each command logs its timing with the running task", async () => {
     const group = await openGroup();
+    const lines: string[] = [];
+    const info = spyOn(log, "info").mockImplementation(line => { if (line.startsWith("命令耗时")) lines.push(line); });
+    markRunning(GROUP, ALICE, "abcd1234");
     try {
       const t = await turn(group, await member(group, ALICE), [
         fauxToolCall("bash", { command: "echo 你好; echo 第二行" }, { id: "ok" }),
@@ -327,8 +333,53 @@ describe("Durable base tools", () => {
       // coding-agent 1.0.3 creates its output files private (0600, new); the move into the caller's tmp keeps that.
       if (process.platform !== "win32") expect((await stat(full)).mode & 0o777).toBe(0o600);
       expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["completed", "failed"]));
-    } finally { await group.close(); }
+      const deadline = Date.now() + 5000;
+      while (lines.length < 4 && Date.now() < deadline) await Bun.sleep(10);
+      const prefix = `命令耗时 - 群: ${GROUP}, 用户: ${ALICE}, 任务: abcd1234, 工具: bash#`;
+      expect(lines).toHaveLength(4);
+      for (const line of lines) expect(line.startsWith(prefix)).toBe(true);
+      expect(lines.map(line => /结果: ([^,]+)/.exec(line)?.[1]).sort()).toEqual(["超时", "退出码 0", "退出码 0", "退出码 3"]);
+    } finally { info.mockRestore(); clearRunning(GROUP, ALICE, "abcd1234"); await group.close(); }
   }, 60_000);
+
+  test("timing: a tool keeps its original request even when the member advances before a later command", async () => {
+    const lines: string[] = [];
+    const info = spyOn(log, "info").mockImplementation(line => { lines.push(line); });
+    markRunning(GROUP, BOB, "original");
+    try {
+      const registration = memberRegistration({ definition: { name: "probe", description: "probe", parameters: {} } as never,
+        replay: "safe", outputLimits: {} as never, async run() {
+          markRunning(GROUP, BOB, "next");
+          await timedCommand(async () => ({ exitCode: 0 }));
+          return { content: [{ type: "text", text: "ok" }], details: undefined };
+        } });
+      const api = { taskId: 9, callId: "call", conversationId: 1, output() {}, snapshot: async () => ({ phone: BOB, groupId: GROUP }) };
+      await registration.execute({}, api as never, context as never);
+      await Bun.sleep(0);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("任务: original");
+    } finally { clearRunning(GROUP, BOB, "original"); clearRunning(GROUP, BOB, "next"); info.mockRestore(); }
+  });
+
+  test("timing: an adapted tool's commands are logged with the caller from the conversation identity; no run known gives 任务: -", async () => {
+    const lines: string[] = [];
+    const info = spyOn(log, "info").mockImplementation(line => { if (line.startsWith("命令耗时")) lines.push(line); });
+    try {
+      const registration = memberRegistration({ definition: { name: "probe", description: "probe", parameters: {} } as never,
+        replay: "safe", outputLimits: {} as never, async run() {
+          await runProcess({ command: process.execPath, args: ["-e", "1"], cwd: process.cwd(), timeoutMs: 30000 });
+          return { content: [{ type: "text", text: "ok" }], details: undefined };
+        } });
+      const api = { taskId: 9, callId: "call", conversationId: 1, output() {},
+        snapshot: async () => ({ phone: BOB, groupId: GROUP }) };
+      const result = await registration.execute({}, api as never, context as never);
+      expect(result.isError).toBeUndefined();
+      const deadline = Date.now() + 5000;
+      while (!lines.length && Date.now() < deadline) await Bun.sleep(10);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]!.startsWith(`命令耗时 - 群: ${GROUP}, 用户: ${BOB}, 任务: -, 工具: probe#9, 结果: 退出码 0, 总: `)).toBe(true);
+    } finally { info.mockRestore(); }
+  }, 30_000);
 
   test("bash cancel: the aborted result keeps the output's tail, the shell and its child stop, the full output moves into the caller's tmp", async () => {
     const group = await openGroup();

@@ -39,6 +39,9 @@ export const ALLOW_INSECURE_WEBHOOK = process.env.ALLOW_INSECURE_WEBHOOK === "1"
 /** 详细日志会记录用户消息正文，默认关闭。 */
 export const DEBUG = (runtimeSetting("BOT_DEBUG") ?? RUNTIME_DEFAULTS.BOT_DEBUG) === "1";
 export const RUN_TIMEOUT_MS = integerEnv("BOT_RUN_TIMEOUT_SECONDS") * 1000;
+export const CLOSEOUT_MS = integerEnv("BOT_CLOSEOUT_SECONDS") * 1000;
+export const DELIVERY_RESERVE_MS = integerEnv("BOT_DELIVERY_RESERVE_SECONDS") * 1000;
+export const FALLBACK_SEND_MS = integerEnv("BOT_FALLBACK_SEND_SECONDS") * 1000;
 /** Only model waiting/streaming; raw tool deltas do not renew this budget without parsed changes. */
 export const MODEL_IDLE_TIMEOUT_MS = integerEnv("BOT_MODEL_IDLE_TIMEOUT_SECONDS") * 1000;
 /** Per response, including time to first content; even continuous progress cannot renew it. */
