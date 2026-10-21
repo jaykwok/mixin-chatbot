@@ -14,7 +14,8 @@ const posixPath = (value: string) => value.replaceAll("\\", "/").replace(/^([A-Z
 
 async function execute(args: string[], cwd: string, env = process.env) {
   const child = Bun.spawn(args, { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true });
-  const timeout = setTimeout(() => child.kill(), 15000);
+  // A cold Add-Type compile on a Windows CI runner once took over 15 s, so the kill only stops a real hang.
+  const timeout = setTimeout(() => child.kill(), 45000);
   try {
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     return { code, output: out + "\n" + err };
@@ -169,6 +170,6 @@ ensure_cloudflared "$FIXTURE_ROOT" > "$FIXTURE_RESULT"
           }
         }
       } finally { await fixture.cleanup(); }
-    }, 60000,
+    }, 120000,
   );
 }
