@@ -94,7 +94,7 @@ async function answer(operation: string, request: any): Promise<unknown> {
         crops: (request.crops ?? []).map((crop: any, index: number) => ({ page: crop.page, box: crop.box, path: join(directory, `crop-${index}.png`), width: 800, height: 600 })),
         skipped: { small: 1, repeated: 2, unsupported: 1, limit: many ? 3 : 0 }, unsupported: [{ page: 2, name: "Picture 9", format: "emf" }],
         warnings: ["跳过了 1 张矢量或不支持格式的图片（EMF/WMF/SVG 等），可用 crops 从渲染页面截取",
-          ...(many ? ["超过单次 60 张上限，另有 3 张未提取；用 pages 分批提取"] : [])], directory };
+          ...(many ? ["达到图片数量或上下文输出上限；请用 pages 分批继续"] : [])], directory };
     }
   }
   throw new Error("unexpected document operation " + operation);

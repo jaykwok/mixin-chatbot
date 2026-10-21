@@ -239,7 +239,7 @@ def check_edge_cases(root, results):
     assert big["truncated"] is False and big["skipped"]["limit"] == 0
     many = results["manyImages"]
     assert len(many["images"]) == 60 and many["skipped"]["limit"] == 3 and many["truncated"] is True, many["skipped"]
-    assert any("60 张上限" in w and "3 张" in w for w in many["warnings"]), many["warnings"]
+    assert any("达到图片数量或上下文输出上限" in w and "pages" in w for w in many["warnings"]), many["warnings"]
 
 
 def check_office_errors(root):

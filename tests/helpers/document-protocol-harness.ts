@@ -165,7 +165,7 @@ const pictures = await call("document_images", { source: "页面.pdf", crops: [{
 assert.deepEqual([pictures.truncated, pictures.images.length, pictures.crops.length, pictures.skipped.limit], [false, 2, 1, 0]);
 const many = await call("document_images", { source: "many.pdf" }, "images-many");
 assert.deepEqual([many.truncated, many.images.length, many.skipped.limit], [true, 60, 3]);
-assert.match(many.warnings.join(""), /60 张上限/);
+assert.match(many.warnings.join(""), /达到图片数量或上下文输出上限；请用 pages 分批继续/);
 
 // Failures throw with the reason; nothing comes back as a successful result.
 await assert.rejects(tools[0]!.execute("call", { source: join(other, "私有.docx") } as never, undefined, undefined, {} as never), /只能解析/);
