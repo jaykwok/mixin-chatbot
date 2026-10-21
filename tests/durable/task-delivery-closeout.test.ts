@@ -205,8 +205,11 @@ test("store deduplication, rejection of all copies, schema recovery, and protect
 
 test.each(["task_timeout", "model_idle", "model_response_timeout"])("watchdog %s delivers a draft with its independent budget", async reason => {
   const f = await setup(); await f.service.close();
-  const service = new DurableService({ ...f.options, limits: { runTimeoutMs: 600, tickMs: 10,
-    modelIdleMs: reason === "model_idle" ? 120 : 900, modelResponseMs: reason === "model_response_timeout" ? 120 : 900 },
+  // Every limit also covers the first model call, which registers the draft; a CI stall there longer than the
+  // limit would abort before any draft exists. Give the limit under test that headroom and keep the others out of reach.
+  const limit = (kind: string) => reason === kind ? 1500 : 30_000, logs: string[] = [];
+  const service = new DurableService({ ...f.options, onLog: line => logs.push(line), limits: { runTimeoutMs: limit("task_timeout"), tickMs: 10,
+    modelIdleMs: limit("model_idle"), modelResponseMs: limit("model_response_timeout") },
     closeout: { closeoutMs: 250, reserveMs: 100, fallbackMs: 2000 } });
   f.faux.setResponses([f.register(), (_t, options) => new Promise(resolve => {
     options?.signal?.addEventListener("abort", () => resolve(fauxAssistantMessage("", { stopReason: "aborted" })), { once: true });
@@ -216,8 +219,9 @@ test.each(["task_timeout", "model_idle", "model_response_timeout"])("watchdog %s
     await until(() => f.sent.some(x => x.kind === "file"), reason);
     expect(f.sent.filter(x => x.kind === "file")).toHaveLength(1);
     expect(f.sent.some(x => x.text.includes("草稿"))).toBe(true);
+    expect(logs.filter(line => line.includes("取消原因: "))).toEqual([expect.stringContaining("取消原因: " + reason)]);
   } finally { await service.close(); f.stateDb.close(); }
-});
+}, 30_000);
 
 test("a stop during the first fallback attachment withdraws the rest; manual delivery sends only the remainder", async () => {
   const f = await setup(), path2 = join(f.temp, "other.txt"); await writeFile(path2, "other version");
