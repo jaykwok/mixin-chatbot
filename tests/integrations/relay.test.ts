@@ -5,7 +5,8 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkRelayBackend, loadRelayConfig, validateRelayConfig, listRelayObjects, purgeRelayObjects, refreshRelayReference,
-  relayFile, relayReference, sweepExpiredRelayObjects } from "../../src/integrations/relay.ts";
+  relayFile, relayNote, relayReference, sweepExpiredRelayObjects } from "../../src/integrations/relay.ts";
+import { refreshDeliveryText } from "../../src/agent/delivery-links.ts";
 import { downloadUrl, objectBaseUrl, objectNameFromUrl, storedObjectUrl } from "../../src/integrations/relay-s3.ts";
 import { openRelayIndex } from "../../src/integrations/relay-index.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -170,6 +171,16 @@ test("real HTTP PUT and HEAD precede a GET-only link; SQLite has unsigned identi
   } finally { await f.cleanup(); }
 });
 
+test("the relay note puts the deadline and download hint before the long URL", () => {
+  const url = "https://bucket.example.test/x.pptx?X-Amz-Date=20261021T025304Z&X-Amz-Expires=7198&X-Amz-Signature=" + "f".repeat(64);
+  const lines = relayNote("产品介绍.pptx", 90_000_000, url).split("\n");
+  expect(lines[0]).toBe("📎 产品介绍.pptx（85.8MB）");
+  // 02:53:04Z + 7198 s = 04:53:02Z, shown rounded down in Beijing time.
+  expect(lines[1]).toBe("⏳ 请在 2026/10/21 12:53（北京时间）前下载，过期后链接失效。");
+  expect(lines[2]).toContain("继续前往");
+  expect(lines.at(-1)).toBe(url);
+});
+
 test("concurrent deduplication and new shares preserve old deadlines while near-expiry objects retire", async () => {
   const f = await fixture();
   try {
@@ -186,7 +197,15 @@ test("concurrent deduplication and new shares preserve old deadlines while near-
     for (const url of [listing.find(entry => entry.name === row.name && new URL(entry.url).pathname === new URL(first).pathname)!.url, refreshed.url]) expect(Number(new URL(url).searchParams.get("X-Amz-Expires"))).toBeLessThanOrEqual(120);
     expect(new URL(again).pathname).not.toBe(new URL(first).pathname);
     expect(Number(new URL(again).searchParams.get("X-Amz-Expires"))).toBeGreaterThan(28780);
-    expect(refreshed.expiry).toContain("北京时间 UTC+8");
+    expect(refreshed.note).toBe(relayNote(row.name, row.size, refreshed.url));
+    // A pending record saved with the old layout (URL before the deadline) is resent whole in the current layout.
+    const legacy = "📎 " + row.name + "（1KB）超过群聊 25.0MB 附件上限，已改为链接分发，请点击链接并点击“继续前往”下载文件：\n" + first +
+      "\n⏳ 链接有效至 2026/10/21 12:53:02（北京时间 UTC+8），到期后文件将被清理，请及时下载。";
+    const resent = await refreshDeliveryText({ text: "已完成\n\n" + legacy,
+      attachments: [{ original: legacy, reference: relayReference(changed, first, row.name, row.size) }] }, undefined, changed, f.index);
+    expect(resent).toStartWith("已完成\n\n📎 " + row.name + "（");
+    expect(resent).not.toContain("链接有效至");
+    expect(resent.split("\n").at(-1)).toStartWith(objectBaseUrl(changed));
     expect(f.index.entries().find(entry => entry.url === row.url)).toMatchObject({ expiresAt: shortened.expiresAt, deleteAfter: shortened.deleteAfter });
     expect(f.index.entries()).toHaveLength(2);
   } finally { await f.cleanup(); }

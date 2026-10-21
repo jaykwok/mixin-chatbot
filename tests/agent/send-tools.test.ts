@@ -135,7 +135,7 @@ describe("attachment send tools", () => {
       expect(requests.some((r) => r.method === "POST" || r.url.includes("webhook"))).toBe(false);
       // 附件上传端点不该被碰过——大文件根本没进 IM 的通道。
       expect(requests.some((r) => r.url.includes("upload"))).toBe(false);
-      expect(drained[0]).toContain("链接有效至");
+      expect(drained[0]).toContain("（北京时间）前下载");
       // 工具结果里不再重复给出 URL，免得模型照抄一遍、同一条消息出现两个地址。
       const text = (result.content[0] as { text: string }).text;
       expect(text).not.toContain(details.url);
@@ -185,10 +185,14 @@ describe("attachment send tools", () => {
         {} as never
       );
 
-      // 到期时文件会被删掉，事后没有补救途径；群里必须当场看到期限。
+      // 到期时文件会被删掉，事后没有补救途径；群里必须当场看到期限。签名链接很长，
+      // 客户端会折叠它后面的内容，所以期限写在链接前面、链接放最后一行。
       const announcement = notes.peek()[0]!;
-      expect(announcement).toContain("链接有效至");
-      expect(announcement).toContain("到期后文件将被清理");
+      expect(announcement).toContain("（北京时间）前下载");
+      expect(announcement).toContain("过期后链接失效");
+      const lines = announcement.split("\n");
+      expect(lines.at(-1)).toStartWith("https://");
+      expect(lines.findIndex((line) => line.includes("前下载"))).toBeLessThan(lines.length - 1);
     } finally {
       for (const index of opened) index.close();
       globalThis.fetch = originalFetch;
@@ -228,8 +232,8 @@ describe("attachment send tools", () => {
 
       const announcement = notes.peek()[0]!;
       expect(announcement).toContain("X-Amz-Signature=");
-      expect(announcement).toContain("链接有效至");
-      expect(announcement).toContain("到期后文件将被清理");
+      expect(announcement).toContain("（北京时间）前下载");
+      expect(announcement).toContain("过期后链接失效");
       expect(notes.references()).toHaveLength(1);
       expect(notes.references()[0]!.reference.url).not.toContain("X-Amz-");
     } finally {

@@ -15,7 +15,7 @@ import {
   MAX_ATTACHMENT_BYTES,
 } from "../core/config.ts";
 import { sendFile, sendImage, uploadAttachment } from "../integrations/im.ts";
-import { describeRelayExpiry, relayFile, relayReference, type RelayConfig } from "../integrations/relay.ts";
+import { relayFile, relayNote, relayReference, type RelayConfig } from "../integrations/relay.ts";
 import type { DeliveryAttachment } from "./delivery-store.ts";
 import type { RelayIndex } from "../integrations/relay-index.ts";
 import { isPathInside } from "../contracts/paths.ts";
@@ -223,7 +223,7 @@ export async function transferFile(source: ResolvedSource, name: string, options
   signal?.throwIfAborted();
   if (options.relay && source.kind === "local" && source.size > MAX_ATTACHMENT_BYTES) {
     const url = await relayFile({ config: options.relay, localPath: source.path, size: source.size, filename: name, signal, index: options.relayIndex, tempDir: options.tempDir });
-    const note = `📎 ${name}（${formatSize(source.size)}）超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接分发，请点击链接并点击“继续前往”下载文件：\n${url}${describeRelayExpiry(options.relay, url)}`;
+    const note = relayNote(name, source.size, url);
     return { mode: "relay", url, note, size: source.size, attachment: { original: note, reference: relayReference(options.relay, url, name, source.size) } };
   }
   const callbackUrl = options.getCallbackUrl();

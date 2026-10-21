@@ -603,7 +603,8 @@ describe("must-deliver appendix", () => {
   // 否则链接被改写一次就再也打不开。
   const LINK =
     "https://files.example.com/d/relay/20260831-3fe1b8f7-e45d-40d5-87c7-5e846b5b3868-%E6%8A%A5%E5%91%8A_2025_%E6%9C%80%E7%BB%88.pdf";
-  const APPENDIX = `📎 报告_2025_最终.pdf（36.1MB）超过群聊 25.0MB 附件上限，已改为链接分发：\n${LINK}\n⏳ 链接 8 小时后失效，届时文件会被删除，请及时下载。`;
+  const APPENDIX = `📎 报告_2025_最终.pdf（36.1MB）\n⏳ 请在 2026/08/31 18:00（北京时间）前下载，过期后链接失效。\n` +
+    `文件超过群聊 25.0MB 附件上限，已改为链接下载：点击下方链接，在提示页点“继续前往”即可下载。\n${LINK}`;
 
   function capture(handler?: (payload: Record<string, unknown>) => Response) {
     const payloads: Record<string, unknown>[] = [];

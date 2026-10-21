@@ -7,7 +7,7 @@ import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { application, KeyedQueue } from "../core/lifecycle.ts";
-import { RELAY_HTTP_TIMEOUT } from "../core/config.ts";
+import { MAX_ATTACHMENT_BYTES, RELAY_HTTP_TIMEOUT } from "../core/config.ts";
 import { log } from "../core/log.ts";
 import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../core/storage.ts";
 import { openRelayIndex, relayCacheKey, type RelayIndex, type RelayIndexEntry } from "./relay-index.ts";
@@ -52,7 +52,7 @@ function isExpired(entry: RelayIndexEntry): boolean {
 }
 
 export async function refreshRelayReference(reference: RelayReference, signal?: AbortSignal,
-  config = getRelayConfig(), suppliedIndex?: RelayIndex): Promise<{ url: string; expiry: string }> {
+  config = getRelayConfig(), suppliedIndex?: RelayIndex): Promise<{ url: string; note: string }> {
   if (!config || reference.backend !== backend(config) || !objectNameFromUrl(config, reference.url)) {
     throw new Error("附件后端已变更，待补发记录已保留，请联系管理员");
   }
@@ -66,22 +66,31 @@ export async function refreshRelayReference(reference: RelayReference, signal?: 
     }
     if (!await remoteStillExists(config, current.url, current.size, signal)) throw new Error("附件已从后端删除，待补发记录已保留，请重新生成文件");
     const url = downloadUrl(config, current.url, current.expiresAt!);
-    return { url, expiry: describeRelayExpiry(config, url) };
+    return { url, note: relayNote(reference.name, reference.size, url) };
   }, signal);
 }
 
-/** A reused object keeps its original deadline, including the initial send tool's note. */
-export function describeRelayExpiry(config: RelayConfig, url?: string): string {
-  if (!url) return "\n⏳ 链接最长 " + config.expireHours + " 小时内有效，到期后文件将被清理，请及时下载。";
+/**
+ * The group notice for a relayed file. The signed URL is long enough that the IM client folds what follows it,
+ * so the deadline and download hint come first and the URL is always the last line.
+ */
+export function relayNote(name: string, size: number, url: string): string {
+  return `📎 ${name}（${formatSize(size)}）\n` +
+    `⏳ 请在 ${relayDeadline(url)}（北京时间）前下载，过期后链接失效。\n` +
+    `文件超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接下载：点击下方链接，在提示页点“继续前往”即可下载。\n` +
+    url;
+}
+
+/** A reused object keeps its original deadline. Rounded down to the minute so the stated time is never late. */
+function relayDeadline(url: string): string {
   const parsed = new URL(url);
   const stamp = parsed.searchParams.get("X-Amz-Date") ?? "";
   const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(stamp);
   const seconds = Number(parsed.searchParams.get("X-Amz-Expires"));
   if (!match || !Number.isFinite(seconds)) throw new Error("S3 下载签名缺少有效期");
   const deadline = new Date(Date.UTC(+match[1]!, +match[2]! - 1, +match[3]!, +match[4]!, +match[5]!, +match[6]!) + seconds * 1000);
-  const local = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(deadline);
-  return "\n⏳ 链接有效至 " + local + "（北京时间 UTC+8），到期后文件将被清理，请及时下载。";
+  return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(deadline);
 }
 
 type PurgeOutcome = "deleted" | "orphaned" | "failed";

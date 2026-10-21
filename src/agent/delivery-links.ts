@@ -19,9 +19,9 @@ export async function refreshDeliveryText(item: Pick<PendingDelivery, "text" | "
   for (const attachment of unique.values()) {
     signal?.throwIfAborted();
     if (!text.includes(attachment.original)) throw new Error("附件与待补发正文不一致，记录已保留");
+    // The whole note is rebuilt, so records saved with an older layout also go out in the current one.
     const fresh = await refreshRelayReference(attachment.reference, signal, config, index);
-    const prefix = attachment.original.slice(0, attachment.original.indexOf("\n") + 1);
-    text = text.replaceAll(attachment.original, prefix + fresh.url + fresh.expiry);
+    text = text.replaceAll(attachment.original, fresh.note);
   }
   return text;
 }
