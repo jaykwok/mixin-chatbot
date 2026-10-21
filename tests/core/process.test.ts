@@ -227,7 +227,9 @@ describe("command start cost and timing log", () => {
       const phases = `总: ${seconds}, 监督进程启动: ${seconds}, 命令启动: ${seconds}`;
       expect(lines).toHaveLength(2);
       expect(lines[0]).toMatch(new RegExp(`^命令耗时 - 群: g, 用户: p, 任务: abcd1234, 工具: bash#42, 结果: 退出码 3, ${phases}, 执行: ${seconds}, 回收: ${seconds}$`));
-      expect(lines[1]).toMatch(new RegExp(`^命令耗时 - 群: g, 用户: p, 任务: abcd1234, 工具: bash#42, 结果: 超时, ${phases}, 执行: -, 回收: -$`));
+      // Whether the killed command's exit is reported after a timeout depends on the platform's supervisor
+      // (Linux reports it, Windows does not), so both phases may be times or "-".
+      expect(lines[1]).toMatch(new RegExp(`^命令耗时 - 群: g, 用户: p, 任务: abcd1234, 工具: bash#42, 结果: 超时, ${phases}, 执行: (?:-|${seconds}), 回收: (?:-|${seconds})$`));
     } finally { info.mockRestore(); }
   }, 60000);
 

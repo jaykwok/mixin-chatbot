@@ -164,7 +164,9 @@ test("并发扫描多个群和成员时统计、会话字节及深层临时文�
     expect(ledgerBytes).toBeGreaterThan(0);
     expect(disk).toBe(2520 + ledgerBytes);
   } finally { await fixture.cleanup(); }
-});
+  // About 0.2–0.8 s normally, but it writes 252 files and opens the stats ledger; a stalled Windows CI runner
+  // once took over 20 s here (the next small test took 8 s), so it gets more room than the default.
+}, 60000);
 
 test("每日提问按消息当天计数，9 次和 1 次不会被平均成 5 次", async () => {
   const fixture = await tempFixture("tui-daily-");
