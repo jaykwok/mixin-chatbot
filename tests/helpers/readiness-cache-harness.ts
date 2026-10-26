@@ -8,11 +8,12 @@ import { DOCUMENT_TOOLCHAIN_PACKAGES } from "../../src/core/config.ts";
 import { documentMarker, DOCUMENT_TOOLCHAIN_MARKER } from "../../scripts/runtime/document-manifest.ts";
 let runs = 0, success = true, release: (() => void) | undefined, hold = false;
 const prepared: string[] = [];
-// While `heldMarker` is set, the second marker read waits for it, as on a slow runner (CI 40277116967).
-let heldMarker: PromiseWithResolvers<void> | undefined, markerReads = 0;
+// The late-reader race of CI 40277116967, made explicit. While `late` is set, the second marker read announces itself and
+// waits for `release`, and the check cannot finish before that read began: both callers have missed the cache.
+let late: { entered: PromiseWithResolvers<void>; release: PromiseWithResolvers<void> } | undefined, markerReads = 0;
 const realReadFile = fs.readFile;
 const slowReadFile = (async (path: Parameters<typeof fs.readFile>[0], ...rest: unknown[]) => {
-  if (heldMarker && String(path).endsWith(DOCUMENT_TOOLCHAIN_MARKER) && ++markerReads === 2) await heldMarker.promise;
+  if (late && String(path).endsWith(DOCUMENT_TOOLCHAIN_MARKER) && ++markerReads === 2) { late.entered.resolve(); await late.release.promise; }
   return (realReadFile as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
 }) as typeof fs.readFile;
 mock.module("node:fs/promises", () => ({ ...fs, readFile: slowReadFile }));
@@ -41,6 +42,7 @@ mock.module("../../src/core/process.ts", () => ({ timedCommand: (work: () => Pro
   assert.ok(options.args.includes("--offline"));
   assert.equal(options.args.at(-1), "3.14");
   if (hold) await waitFor(new Promise<void>(resolve => { release = resolve; }), options.signal);
+  if (late) await waitFor(late.entered.promise, options.signal);
   options.signal.throwIfAborted();
   return { exitCode: success ? 0 : 1, output: "" };
 } }));
@@ -71,12 +73,23 @@ const p2 = documentToolchainReady(venv);
 while (runs < 6) await Bun.sleep(5);
 await Bun.sleep(30); abort.abort(); assert.equal(await p1, true);
 hold = false; release!(); assert.equal(await p2, true); assert.equal(runs, 6);
-// Both callers miss the cache; the one whose marker read finishes after the other's check settled uses that proof.
+// Both callers miss the cache and one finishes reading the marker only after the other returned: it reuses that check while
+// the files are as checked, and is not ready if they changed meanwhile; no second check either way. Results in return order.
+async function lateReader(meanwhile?: () => Promise<void>): Promise<boolean[]> {
+  late = { entered: Promise.withResolvers(), release: Promise.withResolvers() }; markerReads = 0;
+  const order: boolean[] = [];
+  const settle = async (ready: boolean) => {
+    order.push(ready);
+    if (order.length === 1) { await meanwhile?.(); late!.release.resolve(); }
+  };
+  await Promise.all([documentToolchainReady(venv).then(settle), documentToolchainReady(venv).then(settle)]);
+  assert.equal(markerReads, 2); late = undefined;
+  return order;
+}
 await writeFile(python, "late-reader-check");
-heldMarker = Promise.withResolvers<void>(); markerReads = 0;
-const settle = (ready: boolean) => { heldMarker!.resolve(); return ready; };
-assert.deepEqual(await Promise.all([documentToolchainReady(venv).then(settle), documentToolchainReady(venv).then(settle)]), [true, true]);
-assert.equal(markerReads, 2); assert.equal(runs, 7); heldMarker = undefined;
+assert.deepEqual(await lateReader(), [true, true]); assert.equal(runs, 7);
+await writeFile(python, "late-reader-recheck");
+assert.deepEqual(await lateReader(() => writeFile(python, "late-reader-changed-meanwhile")), [true, false]); assert.equal(runs, 8);
 const groupA = join(process.cwd(), "groups/group a/venv"), groupB = join(process.cwd(), "groups/group b/venv");
 assert.deepEqual(await Promise.all([
   ensureDocumentToolchain(groupA), ensureDocumentToolchain(groupA), ensureDocumentToolchain(groupB),

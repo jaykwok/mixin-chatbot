@@ -82,8 +82,13 @@ export async function documentToolchainReady(venvDir: string, signal?: AbortSign
     verified.delete(target);
     const content = await readFile(join(target, DOCUMENT_TOOLCHAIN_MARKER), "utf8");
     if (content.replace(/\r\n?/g, "\n").trim() !== await expected()) return false;
-    // A check of these same file states may have finished while the marker was read; its proof is this call's too.
-    if (proven(target, stamp)) { signal?.throwIfAborted(); return true; }
+    // A check of these same file states may have finished while the marker was read. Its proof covers this call only
+    // while the files are still in that state; if they changed meanwhile, they are not ready, as a check would find.
+    if (proven(target, stamp)) {
+      const current = await fingerprint(target);
+      signal?.throwIfAborted();
+      return current === stamp;
+    }
     const key = target + stamp;
     let job = checking.get(key);
     if (!job || job.controller.signal.aborted) {
