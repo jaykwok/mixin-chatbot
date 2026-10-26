@@ -75,7 +75,7 @@ function checkLedger(enabling: boolean) {
 
 async function prepare(draftPath: string): Promise<void> {
   intro("可选的大文件外链配置");
-  note("超过 25 MiB 的本地文件可上传到私有 S3 存储桶，再向群里发送限时下载链接。\n" +
+  note("超过 " + NATIVE_FILE_MAX_BYTES / MIB + " MiB 的本地文件可上传到私有 S3 存储桶，再发送限时下载链接。\n" +
     "填写期间机器人继续运行；确认保存后，原本运行中的机器人会短暂重启以应用配置。", "配置方式");
   const raw = await currentFile();
   let fields: Record<string, unknown> = {};

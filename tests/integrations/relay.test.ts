@@ -1,5 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import { log } from "../../src/core/log.ts";
+import { NATIVE_FILE_MAX_BYTES } from "../../src/core/transfer-limits.ts";
 import { createHash, createHmac } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -114,7 +115,7 @@ test("configuration is S3 only with two-hour downloads and separate 30-minute cl
       { ...base, prefix: "a//b" }, { ...base, prefix: "a\\b" }, { ...base, prefix: "a?b" },
       { ...base, expireHours: 0 }, { ...base, expireHours: null }, { ...base, expireHours: 169 },
       { ...base, cleanupGraceMinutes: 0 }, { ...base, cleanupGraceMinutes: 1441 },
-      { ...base, maxBytes: 25 * 1024 ** 2 }, { ...base, maxBytes: 6 * 1024 ** 3 },
+      { ...base, maxBytes: NATIVE_FILE_MAX_BYTES }, { ...base, maxBytes: 6 * 1024 ** 3 },
     ]) expect(() => validateRelayConfig(invalid)).toThrow();
     // A console's bucket domain would get the bucket prepended twice under virtual-hosted style.
     expect(() => validateRelayConfig({ ...base, endpoint: "https://test-bucket.s3.example.test" })).toThrow("请填写 https://s3.example.test");

@@ -182,6 +182,7 @@ test("S3 向导先形成草稿，保存后使用默认两小时下载和独立�
   try {
     const prepared = await run(fixture.root, "--draft", answers);
     expect(prepared.code, prepared.output).toBe(0);
+    expect(prepared.output).toContain("超过 30 MiB 的本地文件可上传到私有 S3 存储桶，再发送限时下载链接。");
     expect(prepared.output).toContain("保存预览");
     expect(prepared.output).toContain("下载有效期：2 小时");
     expect(prepared.output).toContain("再保留 30 分钟");

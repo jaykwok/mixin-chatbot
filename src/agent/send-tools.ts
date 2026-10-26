@@ -286,7 +286,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
         throw new Error("图片 width/height 必须是正整数");
       }
       // 图片不走外链：群聊里图片的价值在于内联显示，换成一条链接就没有意义了，
-      // 而且超过 25MB 的图基本都是本该当文件发的东西。
+      // 而且超过原生文件上限（NATIVE_FILE_MAX_BYTES）的图基本都是本该当文件发的东西。
       const resolved = await resolveSource(params.source, workspaceDir, tempDir, signal);
       if (resolved.kind === "local" && resolved.size > NATIVE_FILE_MAX_BYTES) throw oversizeError("本地图片", resolved.size);
       const name = filenameFromSource(params.source);
