@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs/promises";
 import { mkdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { mock, spyOn } from "bun:test";
@@ -7,6 +8,14 @@ import { DOCUMENT_TOOLCHAIN_PACKAGES } from "../../src/core/config.ts";
 import { documentMarker, DOCUMENT_TOOLCHAIN_MARKER } from "../../scripts/runtime/document-manifest.ts";
 let runs = 0, success = true, release: (() => void) | undefined, hold = false;
 const prepared: string[] = [];
+// While `heldMarker` is set, the second marker read waits for it, as on a slow runner (CI 40277116967).
+let heldMarker: PromiseWithResolvers<void> | undefined, markerReads = 0;
+const realReadFile = fs.readFile;
+const slowReadFile = (async (path: Parameters<typeof fs.readFile>[0], ...rest: unknown[]) => {
+  if (heldMarker && String(path).endsWith(DOCUMENT_TOOLCHAIN_MARKER) && ++markerReads === 2) await heldMarker.promise;
+  return (realReadFile as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+}) as typeof fs.readFile;
+mock.module("node:fs/promises", () => ({ ...fs, readFile: slowReadFile }));
 spyOn(Bun, "which").mockReturnValue("fixture-uv");
 mock.module("../../src/core/process.ts", () => ({ timedCommand: (work: () => Promise<unknown>) => work(), runProcess: async (options: any) => {
   if (options.args[0] === "-c") {
@@ -62,6 +71,12 @@ const p2 = documentToolchainReady(venv);
 while (runs < 6) await Bun.sleep(5);
 await Bun.sleep(30); abort.abort(); assert.equal(await p1, true);
 hold = false; release!(); assert.equal(await p2, true); assert.equal(runs, 6);
+// Both callers miss the cache; the one whose marker read finishes after the other's check settled uses that proof.
+await writeFile(python, "late-reader-check");
+heldMarker = Promise.withResolvers<void>(); markerReads = 0;
+const settle = (ready: boolean) => { heldMarker!.resolve(); return ready; };
+assert.deepEqual(await Promise.all([documentToolchainReady(venv).then(settle), documentToolchainReady(venv).then(settle)]), [true, true]);
+assert.equal(markerReads, 2); assert.equal(runs, 7); heldMarker = undefined;
 const groupA = join(process.cwd(), "groups/group a/venv"), groupB = join(process.cwd(), "groups/group b/venv");
 assert.deepEqual(await Promise.all([
   ensureDocumentToolchain(groupA), ensureDocumentToolchain(groupA), ensureDocumentToolchain(groupB),

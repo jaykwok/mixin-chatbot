@@ -63,22 +63,27 @@ async function verify(venvDir: string, signal?: AbortSignal): Promise<boolean> {
   return result.exitCode === 0;
 }
 
+/** A still-fresh proof for exactly these file states, moved to the recent end of the cache. */
+function proven(target: string, stamp: string): boolean {
+  const cached = verified.get(target);
+  if (cached?.fingerprint !== stamp || Date.now() - cached.at >= READY_TTL) return false;
+  verified.delete(target); verified.set(target, cached);
+  return true;
+}
+
 export async function documentToolchainReady(venvDir: string, signal?: AbortSignal): Promise<boolean> {
   try {
     if (!(await stat(venvPythonPath(venvDir))).isFile()) return false;
     const target = resolve(venvDir);
     const stamp = await fingerprint(target);
-    const cached = verified.get(target);
-    if (cached?.fingerprint === stamp && Date.now() - cached.at < READY_TTL) {
-      verified.delete(target); verified.set(target, cached);
-      signal?.throwIfAborted();
-      return true;
-    }
+    if (proven(target, stamp)) { signal?.throwIfAborted(); return true; }
     // An observed mismatch invalidates the old proof even if files later regain
     // the same metadata (for example a marker is removed and immediately restored).
     verified.delete(target);
     const content = await readFile(join(target, DOCUMENT_TOOLCHAIN_MARKER), "utf8");
     if (content.replace(/\r\n?/g, "\n").trim() !== await expected()) return false;
+    // A check of these same file states may have finished while the marker was read; its proof is this call's too.
+    if (proven(target, stamp)) { signal?.throwIfAborted(); return true; }
     const key = target + stamp;
     let job = checking.get(key);
     if (!job || job.controller.signal.aborted) {
