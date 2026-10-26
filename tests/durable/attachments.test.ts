@@ -221,9 +221,10 @@ test("a failed download is told to the member and explained to the request that 
 
 test("/clear voids earlier unbound attachments and their files; a download finishing after it does not revive one; later ones stay", async () => {
   const where = root(), m = model(), out = recordingOutbound();
-  const gate = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>(), slowDone = Promise.withResolvers<void>();
   let slowId = "";
-  const { service } = open(where, m, out.outbound, { source: (fileId, ...rest) => (fileId === slowId ? gated(gate.promise, true) : download)(fileId, ...rest) });
+  const slowSource: AttachmentSource = async (...args) => { try { return await gated(gate.promise, true)(...args); } finally { slowDone.resolve(); } };
+  const { service } = open(where, m, out.outbound, { source: (fileId, ...rest) => fileId === slowId ? slowSource(fileId, ...rest) : download(fileId, ...rest) });
   try {
     const ready = attachment(out, ALICE, { fileId: upload("ready", "r.txt") });
     await service.attach(ready);
@@ -237,13 +238,17 @@ test("/clear voids earlier unbound attachments and their files; a download finis
     await service.attach(after);
     gate.resolve();
     await until(async () => (await stateOf(service, after.reply.msgUid))?.state === "ready", "the later download");
-    await until(() => downloads(slowId) === 1, "the late download");
-    await Bun.sleep(100);
+    // The late download ignores the cancellation: wait for it to return, then for its files to go (the .part is renamed, and the
+    // result removed as not kept). A fixed sleep after its request was too short on a slow runner (CI 40275415799).
+    await slowDone.promise;
+    const own = (await stateOf(service, after.reply.msgUid))!;
+    const ownName = own.path!.split(/[\\/]/).at(-1)!;
+    await until(async () => (await received(where)).join() === ownName, "the late download's files gone");
+    expect(downloads(slowId)).toBe(1);
     expect((await stateOf(service, ready.reply.msgUid))!.state).toBe("void");
     expect((await stateOf(service, slow.reply.msgUid))!.state).toBe("void");
     expect((await stateOf(service, slow.reply.msgUid))!.path).toBeUndefined();
-    const own = (await stateOf(service, after.reply.msgUid))!;
-    expect(await received(where)).toEqual([own.path!.split(/[\\/]/).at(-1)!]);
+    expect(await received(where)).toEqual([ownName]);
     await service.admit(ask(out, ALICE, "go"));
     await until(() => m.prompts.length === 1, "the run");
     expect(m.prompts[0]).toContain("-after.txt");
