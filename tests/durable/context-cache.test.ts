@@ -5,11 +5,12 @@ import { type Message } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
 import { configure, createRegistry, Harness, type Conversation, type Storage } from "@earendil-works/pi-durable";
 import { SqliteStorage, type SqliteExecutor } from "@earendil-works/pi-durable/storage/sqlite";
-import { claimGroup, memberConversation } from "../../src/durable/identity.ts";
-import { groupDoor } from "../../src/durable/models.ts";
+import { claimSpace, memberConversation } from "../../src/durable/identity.ts";
+import { spaceDoor } from "../../src/durable/models.ts";
 import { openGroupDatabase } from "../../src/durable/sqlite.ts";
 import { fauxModels } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 const fixture = await tempFixture("durable-cache-"); afterAll(() => fixture.cleanup());
 let n = 0;
@@ -28,12 +29,12 @@ async function open(retention: number, path = join(fixture.root, `cache-${++n}.s
     return typeof value === "function" ? value.bind(target) : value;
   } });
   const { faux, models, model } = fauxModels();
-  const holder: { harness?: Harness } = {}, door = groupDoor(holder), registry = createRegistry(); registry.install(door.extension());
+  const holder: { harness?: Harness } = {}, door = spaceDoor(holder), registry = createRegistry();
   const harness = await Harness.open(storage, { models: door.wrap(models), registry,
     settings: { contextRetentionMs: retention, compaction: { enabled: false, keepRecentTokens: 100 }, retry: { maxRetries: 0 } } }, context);
-  holder.harness = harness; await claimGroup(harness, "g", context);
+  holder.harness = harness; await claimSpace(harness, scopeOf("g"), context);
   const reset = () => { counts.sql = counts.pages = counts.rows = 0; };
-  const member = async (phone = "alice") => (await memberConversation(harness, "g", phone, { model }, context)).conversation;
+  const member = async (phone = "alice") => (await memberConversation(harness, scopeOf("g"), phone, { model }, context)).conversation;
   const ask = async (conversation: Conversation) => {
     let messages: Message[] = [];
     faux.setResponses([(transcript) => { messages = structuredClone(transcript.messages); return fauxAssistantMessage("reply"); }]);

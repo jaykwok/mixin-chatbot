@@ -9,7 +9,7 @@ const cases = [
 test.each(cases)("$kind cache invalidates changed inputs and coalesces cancellable work", async ({ kind, script }) => {
   const fixture = await tempFixture(kind + "-cache-");
   const child = Bun.spawn([process.execPath, fileURLToPath(script)], {
-    cwd: fixture.root, env: { ...process.env, GROUP_DATA_ROOT: "data/groups" }, stdout: "pipe", stderr: "pipe", windowsHide: true,
+    cwd: fixture.root, env: process.env, stdout: "pipe", stderr: "pipe", windowsHide: true,
   });
   const timer = setTimeout(() => child.kill(), 15000);
   try {

@@ -1,17 +1,17 @@
 {
   "version": 1,
   "id": "33333333-3333-4333-8333-333333333333",
-  "root": "<ROOT0>/groups",
-  "recordedRoot": "<ROOT0>/groups",
+  "root": "<ROOT0>/data",
+  "recordedRoot": "<ROOT0>/data",
   "rootIdentity": "<string>",
   "legacy": false,
   "createdAt": "<number>",
   "before": "<number>",
   "items": [
     {
-      "group": "group-a",
+      "space": "groups/group-a",
       "user": "alice",
-      "path": "<ROOT0>/groups/group-a/users/alice/tmp/codemode/1-result",
+      "path": "<ROOT0>/data/tmp/groups/group-a/alice/codemode/1-result",
       "result": "1-result",
       "owner": {
         "phone": "alice",

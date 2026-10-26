@@ -11,6 +11,7 @@
 //
 // models.json 里向导没问过的官方字段（headers、compat、authHeader）在重新
 // 配置时原样保留。部署脚本在停止旧实例后调用；本地停机时也可运行 bun run configure。
+// 还没有应用机器人配置时（首次部署、升级重置），先填应用机器人凭据，再配模型。
 import {
   cancel,
   confirm,
@@ -23,6 +24,7 @@ import {
   select,
   text,
 } from "@clack/prompts";
+import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -36,9 +38,11 @@ import { getApiProviders } from "@earendil-works/pi-ai/compat";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { SettingsManager, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { openModelRuntime, openSettings, resolveModelSelection } from "../../src/core/model-config.ts";
-import { MODELS_JSON_PATH, PI_SETTINGS_PATH } from "../../src/core/storage.ts";
+import { APP_BOT_CONFIG_PATH, MODELS_JSON_PATH, PI_SETTINGS_PATH } from "../../src/core/storage.ts";
 import { withMaintenance } from "../../src/core/maintenance.ts";
 import { withModelConfigurationDraft, type ModelConfigurationDraft } from "./model-config-draft.ts";
+import { configureAppBot } from "./configure-app-bot.ts";
+
 
 type JsonObject = Record<string, unknown>;
 /** 向导之外手工调过的官方 provider 字段，重新配置时按原样带回。 */
@@ -264,6 +268,10 @@ function preserved(previous: JsonObject | undefined): JsonObject {
 
 async function main(draft: ModelConfigurationDraft): Promise<void> {
   // No emoji in console output: Windows Server consoles render them as "??".
+  if (!existsSync(APP_BOT_CONFIG_PATH)) {
+    intro(`应用机器人配置（写入 ${APP_BOT_CONFIG_PATH}）`);
+    await configureAppBot();
+  }
   intro(`AI 配置（写入 ${MODELS_JSON_PATH} 与 ${PI_SETTINGS_PATH}）`);
 
   // 先离线建运行时：随包目录足够列出内置服务商，选定之后只刷新那一个。

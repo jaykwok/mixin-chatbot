@@ -29,7 +29,7 @@ export async function legacyInventory(root: string, member: UserTmp, recordedRoo
     try { items.push({ path, ...await read() }); }
     catch (error) { items.push({ path, createdAt: Infinity, reason: String(error) }); }
   };
-  const shared = join(root, member.group, "index", "parsed"), privateCache = join(member.dir, ".document-cache");
+  const shared = join(root, "index", "parsed"), privateCache = join(member.dir, ".document-cache");
   for (const cache of [shared, privateCache]) for (const name of await names(cache, root)) {
     const path = join(cache, name);
     await inspect(path, async () => {

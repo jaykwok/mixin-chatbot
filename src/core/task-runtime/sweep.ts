@@ -22,7 +22,11 @@ export class ReceiptSweep {
     private readonly reclaim: (id: string, temp: string) => Promise<DirectoryRemoval>) {}
 
   async tick(tempDir: string, before: number, references: ReferenceText, excluded: ReadonlySet<string>, settled?: ResultSettled): Promise<DirectoryRemoval[]> {
-    await this.control.initialize(); const temp = await realpath(tempDir), results: DirectoryRemoval[] = [];
+    await this.control.initialize();
+    // A member who never ran a tool has no tmp yet, so nothing of theirs can be swept.
+    const temp = await realpath(tempDir).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+    if (temp === undefined) return [];
+    const results: DirectoryRemoval[] = [];
     for (const name of await this.#batch(temp)) {
       const id = name.slice(0, -5); if (!name.endsWith(".json") || !ID_PATTERN.test(id)) continue;
       if (excluded.has(id)) continue;

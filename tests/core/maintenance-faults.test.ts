@@ -15,22 +15,23 @@ import { applyReclamation, previewReclamation } from "../../src/maintenance/recl
 import { RootlessTasks, type TaskDriver } from "../../src/core/rootless-tasks.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 const exists = (path: string) => lstat(path).then(() => true, () => false);
 const json = async (path: string) => JSON.parse(await readFile(path, "utf8"));
 
 async function group(root: string, results: Record<string, string | undefined>) {
   new Database(join(root, "../state.sqlite")).close(); // An empty delivery ledger: nothing is waiting to be sent.
-  const { models, model } = fauxModels(), opened = await openGroupHarness(join(root, "group-a/durable.sqlite"), models);
+  const { models, model } = fauxModels(), opened = await openGroupHarness(join(root, "conversations/groups/group-a/durable.sqlite"), models);
   try {
-    await memberConversation(opened.harness, "group-a", "alice", { model }, context);
+    await memberConversation(opened.harness, scopeOf("group-a"), "alice", { model }, context);
     await opened.harness.commit(async tx => {
       for (const [name, task] of Object.entries(results)) (await tx.doc(ResultsDoc)).calls[name] = { phone: "alice", createdAt: 1, ...task ? { isolatedTask: task } : {} };
     }, context);
   } finally { await opened.close(); }
 }
 async function calls(root: string) {
-  const { models } = fauxModels(), opened = await openGroupHarness(join(root, "group-a/durable.sqlite"), models);
+  const { models } = fauxModels(), opened = await openGroupHarness(join(root, "conversations/groups/group-a/durable.sqlite"), models);
   try { return Object.keys((await opened.harness.snapshot(ResultsDoc, context))?.calls ?? {}); } finally { await opened.close(); }
 }
 
@@ -46,12 +47,12 @@ function failAfterPublish(match: (path: string, value: any) => boolean) {
 }
 
 async function archiveFixture(prefix: string) {
-  const f = await tempFixture(prefix), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture(prefix), root = join(f.root, "data"), temp = join(root, "tmp/groups/group-a/alice");
   await mkdir(join(temp, "codemode/1-result"), { recursive: true });
   await writeFile(join(temp, "codemode/1-result/output"), "result");
   await writeFile(join(temp, "note.txt"), "note");
   await group(root, { "1-result": undefined });
-  return { f, root, temp, options: { root, state: join(f.root, "state.sqlite"), archive: join(root, ".reclamation/backup/rm"), scope: durableMemberScope } };
+  return { f, root, temp, options: { root, state: join(f.root, "state.sqlite"), archive: join(root, "state/reclamation/backup/rm"), scope: durableMemberScope } };
 }
 
 test("archive: a progress write that landed before an error is replayed to the same archived result and settles ownership once", async () => {
@@ -111,7 +112,7 @@ test.skipIf(process.platform === "win32")("archive removal (Linux): entries of t
 });
 
 test.skipIf(process.platform !== "win32")("physical reclamation (Windows): a removal persisted before an error resumes from its journal and settles once", async () => {
-  const f = await tempFixture("faults-reclaim-"), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture("faults-reclaim-"), root = join(f.root, "data"), temp = join(root, "tmp/groups/group-a/alice");
   try {
     await mkdir(join(temp, "codemode/1-result"), { recursive: true });
     await writeFile(join(temp, "codemode/1-result/output"), "result");
@@ -139,7 +140,7 @@ const driver: TaskDriver = { async run(args) {
 } };
 
 test.skipIf(process.platform !== "linux")("physical reclamation (task): a removal persisted before an error resumes from the receipt and settles once", async () => {
-  const f = await tempFixture("faults-task-"), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture("faults-task-"), root = join(f.root, "data"), temp = join(root, "tmp/groups/group-a/alice");
   try {
     await mkdir(temp, { recursive: true });
     const backend = new RootlessTasks(join(f.root, "control"), image, driver);

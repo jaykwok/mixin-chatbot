@@ -5,7 +5,7 @@ import { tempFixture } from "../helpers/temp.ts";
 test("isolated tool entries keep bash output and reclaim probes and failed document jobs", async () => {
   const fixture = await tempFixture("isolated-frontdoors-");
   const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../helpers/isolated-frontdoors.ts", import.meta.url))], {
-    cwd: fixture.root, env: { ...process.env, GROUP_DATA_ROOT: "data/groups" }, stdout: "pipe", stderr: "pipe", windowsHide: true,
+    cwd: fixture.root, env: process.env, stdout: "pipe", stderr: "pipe", windowsHide: true,
   });
   const timer = setTimeout(() => child.kill(), 15000);
   try {

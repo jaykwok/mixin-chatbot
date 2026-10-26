@@ -25,10 +25,10 @@ export async function directoryEntity(path: string, message: string): Promise<st
 export const exists = (path: string) => lstat(path).then(() => true, error => { if (error.code === "ENOENT") return false; throw error; });
 
 /** Item indexes per member, in plan order: each member is applied under one protected view. */
-export function memberIndexes(items: readonly { group: string; user: string }[]): number[][] {
+export function memberIndexes(items: readonly { space: string; user: string }[]): number[][] {
   const members = new Map<string, number[]>();
   items.forEach((item, index) => {
-    const key = JSON.stringify([item.group, item.user]), indexes = members.get(key) ?? [];
+    const key = JSON.stringify([item.space, item.user]), indexes = members.get(key) ?? [];
     indexes.push(index); members.set(key, indexes);
   });
   return [...members.values()];

@@ -2,7 +2,7 @@
 
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { userSegment } from "../../src/agent/paths.ts";
+import { userSegment } from "../../src/core/layout.ts";
 import { assertDataDirectory, byName, dataDirectoryNames, resolveGroupName, type GroupSelection } from "./group-data.ts";
 import { mapConcurrent } from "./concurrent.ts";
 
@@ -19,7 +19,8 @@ interface TmpEntry extends Usage {
 }
 
 export interface UserTmp extends Usage {
-  group: string;
+  /** `direct` or `groups/<segment>` (src/core/layout.ts `spacePath`). */
+  space: string;
   user: string;
   dir: string;
   entries: TmpEntry[];
@@ -50,33 +51,52 @@ async function measure(path: string): Promise<Usage> {
   return total;
 }
 
-/** 扫描所有群下所有用户的 tmp。找不到目录就是还没人在这个群里用过工具，不是错误。 */
-export async function scanTmp(root: string, userFilter?: string, groupFilter?: string, selection: GroupSelection = "auto"): Promise<UserTmp[]> {
+/** 一个成员 tmp 的顶层条目；tasks/ 下每个请求目录单独成为一个条目，按各自的时间归档。 */
+async function topEntries(dir: string, root: string): Promise<string[]> {
+  const names: string[] = [];
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (entry.name !== "tasks" || !entry.isDirectory() || entry.isSymbolicLink()) { names.push(entry.name); continue; }
+    const tasks = join(dir, "tasks");
+    await assertDataDirectory(tasks, root);
+    names.push(...(await readdir(tasks)).map(name => "tasks/" + name));
+  }
+  return names;
+}
+
+/**
+ * 扫描数据目录（root）下 tmp/ 里所有空间的成员 tmp：单聊空间 tmp/direct/<用户>，群 tmp/groups/<群>/<用户>。
+ * 找不到目录就是还没人用过工具，不是错误。spaceFilter 为 direct（单聊空间；明确选择群参数含义时按群处理），或群号/群目录名。
+ */
+export async function scanTmp(root: string, userFilter?: string, spaceFilter?: string, selection: GroupSelection = "auto"): Promise<UserTmp[]> {
   const found: UserTmp[] = [];
-  const groups = await dataDirectoryNames(root, root);
-  // TUI 传的是已扫描到的目录名：精确匹配优先，不能同时命中其再次编码后的另一个目录。
-  const selectedGroup = groupFilter ? await resolveGroupName(groupFilter, root, selection) : undefined;
-  for (const group of groups) {
-    if (selectedGroup !== undefined && group !== selectedGroup) continue;
-    const usersDir = join(root, group, "users");
+  const tmp = join(root, "tmp"), groupsDir = join(tmp, "groups");
+  let spaces: string[];
+  if (spaceFilter === "direct" && selection === "auto") spaces = ["direct"];
+  else if (spaceFilter) {
+    // TUI 传的是已扫描到的目录名：精确匹配优先，不能同时命中其再次编码后的另一个目录。
+    const group = await resolveGroupName(spaceFilter, groupsDir, selection, root);
+    spaces = group === null ? [] : ["groups/" + group];
+  } else spaces = ["direct", ...(await dataDirectoryNames(groupsDir, root)).map(group => "groups/" + group)];
+  for (const space of spaces) {
+    const usersDir = join(tmp, ...space.split("/"));
     const users = await dataDirectoryNames(usersDir, root);
     const selectedUser = userFilter ? (users.includes(userFilter) ? userFilter : userSegment(userFilter)) : undefined;
     const results = await mapConcurrent(users.filter(user => selectedUser === undefined || user === selectedUser), async user => {
-      const dir = join(usersDir, user, "tmp");
+      const dir = join(usersDir, user);
       // 这里不能只看目录：tmp 里的散落文件（迁过来的 pi-bash-*.log 就是）也要算进来。
       let names: string[];
       try {
         await assertDataDirectory(dir, root);
         const info = await lstat(dir);
         if (!info.isDirectory() || info.isSymbolicLink()) return null;
-        names = (await readdir(dir, { withFileTypes: true })).map((entry) => entry.name);
+        names = await topEntries(dir, root);
       } catch {
         return null; // 这个用户还没触发过任何工具，tmp 尚未建立。
       }
       if (names.length === 0) return null;
 
       const entries: TmpEntry[] = [];
-      const total: UserTmp = { group, user, dir, entries, bytes: 0, files: 0, newest: 0 };
+      const total: UserTmp = { space, user, dir, entries, bytes: 0, files: 0, newest: 0 };
       for (const name of names) {
         const path = join(dir, name);
         const measured = await measure(path);
@@ -90,5 +110,5 @@ export async function scanTmp(root: string, userFilter?: string, groupFilter?: s
     });
     found.push(...results.filter((entry): entry is UserTmp => entry !== null));
   }
-  return found.sort((a, b) => b.bytes - a.bytes || byName(a.group, b.group) || byName(a.user, b.user));
+  return found.sort((a, b) => b.bytes - a.bytes || byName(a.space, b.space) || byName(a.user, b.user));
 }

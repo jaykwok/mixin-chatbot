@@ -1,4 +1,4 @@
-import { dayKey } from "../../src/agent/stats-ledger.ts";
+import { addTokens, dayKey, emptyTokens, type TokenTotals } from "../../src/agent/stats-ledger.ts";
 import { byName } from "../lib/group-data.ts";
 import type { GroupStats, Window } from "./stats-admin.ts";
 
@@ -61,7 +61,7 @@ export function comparisonWindows(window: Window): { previous: Window; yearAgo: 
 }
 
 export interface ComparisonData { previous: { window: Window; groups: GroupStats[] }; yearAgo: { window: Window; groups: GroupStats[] } }
-export interface TrendPoint { date: string; asks: number; replies: number; askers: Set<string>; files: number; images: number; cost: number; unknownCost: number; missingUsage: number }
+export interface TrendPoint { date: string; asks: number; askers: Set<string>; tokens: TokenTotals }
 
 /** Counts identities in the ledger, including a person appearing in several groups only once. */
 export function summarize(groups: GroupStats[]) {
@@ -82,7 +82,7 @@ export function summarize(groups: GroupStats[]) {
 
 /** Zero-fill natural days. Open bounds use the first/last recorded day, never inventing earlier history. */
 export function trend(groups: GroupStats[], window: Window, grain: Grain = "day"): TrendPoint[] {
-  const observed = groups.flatMap(group => [...group.daily.keys(), ...group.usage.days.keys()]).sort();
+  const observed = groups.flatMap(group => [...group.daily.keys(), ...group.tokenDays.keys()]).sort();
   const first = window.since === undefined ? observed[0] : dayKey(window.since);
   const last = window.until === undefined ? observed.at(-1) : dayKey(window.until);
   if (!first || !last) return [];
@@ -92,17 +92,15 @@ export function trend(groups: GroupStats[], window: Window, grain: Grain = "day"
     const day = dayKey(date.getTime());
     const key = grain === "month" ? day.slice(0, 7) : grain === "week" ? dayKey(shift(date, -((date.getDay() + 6) % 7)).getTime()) : day;
     let point = points.get(key);
-    if (!point) points.set(key, point = { date: key, asks: 0, replies: 0, askers: new Set(), files: 0, images: 0, cost: 0, unknownCost: 0, missingUsage: 0 });
+    if (!point) points.set(key, point = { date: key, asks: 0, askers: new Set(), tokens: emptyTokens() });
     for (const group of groups) {
       const daily = group.daily.get(day);
       if (daily) {
-        point.asks += daily.asks; point.replies += daily.replies;
-        point.files += daily.files; point.images += daily.images;
+        point.asks += daily.asks;
         for (const user of daily.askers) point.askers.add(user);
       }
-      point.cost += group.usage.days.get(day)?.cost ?? 0;
-      point.unknownCost += group.usage.days.get(day)?.unknownCost ?? 0;
-      point.missingUsage += group.usage.days.get(day)?.missingUsage ?? 0;
+      const tokens = group.tokenDays.get(day);
+      if (tokens) addTokens(point.tokens, tokens);
     }
   }
   return [...points.values()];
@@ -129,4 +127,5 @@ export function comparisons(data: ComparisonData | null | undefined, groups?: Se
   }));
 }
 
+export const TOKEN_NOTE = "token 为模型已返回的用量（对话、压缩，以及工具自身调用的辅助模型），按服务同步当天入账：跨日停机或后台压缩在下次同步才计入，不等于发生时刻；不含费用，也不代表服务商的完整账单。";
 export const STATS_NOTE = "按账本成员标识跨群去重；覆盖人数指实际提问人数，不代表群总人数。周从周一开始，按服务本地自然日统计；无记录日期补 0，不代表历史采集完整。包含今天的区间尚未结束，对比不按小时对齐；本周、本月与上周、上月已到达的自然日比较，其他自定义区间与前一等长区间比较；同比按去年同日期（闰日截到月末）。全部或单边区间不计算同比环比。";

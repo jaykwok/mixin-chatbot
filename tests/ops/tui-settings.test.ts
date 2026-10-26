@@ -15,8 +15,8 @@ import { waitFor } from "../helpers/tui-process.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const deployment: Deployment = {
-  platform: "linux", runtime: "docker", mode: "direct", port: 1011, domain: "",
-  groupDataRoot: "unused", groupDataRootIsCustom: false,
+  platform: "linux", runtime: "docker", port: 1011,
+  dataRoot: "unused", workspaceRoot: "",
 };
 const key = (name: string): Key => ({ name, raw: name, ctrl: false, shift: false });
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -47,13 +47,11 @@ function terminal() {
 
 test("设置仅加载选中项，重复选择复用在途读取；离页丢弃旧结果，重入可读取新结果", async () => {
   const { app } = stub(), view = new SettingsView();
-  app.deployment = { ...deployment, mode: "cloudflare" };
-  const tunnel = Promise.withResolvers<data.TunnelLogging>();
+  const relay = Promise.withResolvers<data.RelaySummary>();
   const old = Promise.withResolvers<settings.RuntimeSnapshot>(), fresh = Promise.withResolvers<settings.RuntimeSnapshot>();
-  let tunnelSignal: AbortSignal | undefined, runtimeSignal: AbortSignal | undefined;
-  const readTunnel = spyOn(data, "loadTunnelLogging").mockImplementation((_project, signal) => { tunnelSignal = signal; return tunnel.promise; });
-  const readProtocol = spyOn(data, "loadTunnelProtocol").mockResolvedValue("auto");
-  const readRelay = spyOn(data, "loadRelaySummary").mockResolvedValue({ enabled: false });
+  let relaySignal: AbortSignal | undefined, runtimeSignal: AbortSignal | undefined;
+  const readAppBot = spyOn(data, "loadAppBotSummary").mockResolvedValue({ configured: true, environment: "production" });
+  const readRelay = spyOn(data, "loadRelaySummary").mockImplementation((_project, signal) => { relaySignal = signal; return relay.promise; });
   const readRuntime = spyOn(data, "loadRuntimeSettings").mockImplementationOnce((_project, signal) => {
     runtimeSignal = signal; return old.promise;
   }).mockReturnValue(fresh.promise);
@@ -62,22 +60,20 @@ test("设置仅加载选中项，重复选择复用在途读取；离页丢弃�
   const readMcp = spyOn(data, "loadMcpSummary").mockResolvedValue(null);
   try {
     await view.refresh(app);
+    expect(readAppBot).toHaveBeenCalledTimes(1);
+    for (const read of [readModel, readAuxiliary, readMcp, readRelay, readRuntime]) expect(read).not.toHaveBeenCalled();
+    await view.onKey(key("down"), app);
     expect(readModel).toHaveBeenCalledTimes(1);
-    for (const read of [readAuxiliary, readMcp, readRelay, readTunnel, readProtocol, readRuntime]) expect(read).not.toHaveBeenCalled();
     await view.onKey(key("down"), app);
     expect(readAuxiliary).toHaveBeenCalledTimes(1);
     await view.onKey(key("down"), app);
     expect(readMcp).toHaveBeenCalledTimes(1);
+    expect(readRelay).not.toHaveBeenCalled();
     await view.onKey(key("down"), app);
     expect(readRelay).toHaveBeenCalledTimes(1);
-    expect(readTunnel).not.toHaveBeenCalled();
-    await view.onKey(key("down"), app);
-    expect(readRelay).toHaveBeenCalledTimes(1);
-    expect(readTunnel).toHaveBeenCalledTimes(1);
-    expect(readProtocol).toHaveBeenCalledTimes(1);
     expect(readRuntime).not.toHaveBeenCalled();
     await view.onKey(key("down"), app);
-    expect(tunnelSignal?.aborted).toBe(true);
+    expect(relaySignal?.aborted).toBe(true);
     expect(readRuntime).toHaveBeenCalledTimes(1);
     await view.onKey(key("end"), app);
     expect(readRuntime).toHaveBeenCalledTimes(1);
@@ -85,19 +81,50 @@ test("设置仅加载选中项，重复选择复用在途读取；离页丢弃�
     expect(runtimeSignal?.aborted).toBe(true);
     const next = view.refresh(app);
     expect(readRuntime).toHaveBeenCalledTimes(2);
-    old.resolve({ hash: null, values: { BOT_DEBUG: "1" } }); await tick();
+    old.resolve({ hash: null, values: { BOT_DOCUMENT_WORK_ENABLED: "1" } }); await tick();
     expect(view.activity()).toBe("正在读取运行参数…");
     fresh.resolve(snapshot); await next;
     expect(view.activity()).toBeNull();
     await view.onKey(key("home"), app); await view.onKey(key("end"), app);
     expect(readRuntime).toHaveBeenCalledTimes(2);
+    expect(readAppBot).toHaveBeenCalledTimes(1);
     expect(readModel).toHaveBeenCalledTimes(1);
     expect(plain(view.render({ ...ctx(), deployment: app.deployment }))).toContain("0 项自定义");
   } finally {
-    tunnel.resolve("off"); old.resolve(snapshot); fresh.resolve(snapshot);
-    view.onLeave(); readTunnel.mockRestore(); readProtocol.mockRestore(); readRelay.mockRestore(); readRuntime.mockRestore();
+    relay.resolve({ enabled: false }); old.resolve(snapshot); fresh.resolve(snapshot);
+    view.onLeave(); readAppBot.mockRestore(); readRelay.mockRestore(); readRuntime.mockRestore();
     readModel.mockRestore(); readAuxiliary.mockRestore(); readMcp.mockRestore();
   }
+});
+
+test("应用机器人项只显示是否配置和平台环境，不显示凭据；向导先确认停机影响，取消不执行", async () => {
+  const { app } = stub(), view = new SettingsView();
+  const read = spyOn(data, "loadAppBotSummary").mockResolvedValue({ configured: true, environment: "production" });
+  const confirm = spyOn(app, "confirm").mockResolvedValue(false);
+  const interactive: string[][] = [];
+  app.runInteractive = async (_title, args) => { interactive.push(args); return 0; };
+  try {
+    await view.refresh(app);
+    expect(plain(view.render(ctx(120, 30)))).toContain("当前：已配置（线上环境）；凭据不在界面显示");
+    expect(plain(view.render(ctx(80, 24)))).toContain("已配置 · 线上");
+    read.mockResolvedValue({ configured: false });
+    await view.refresh(app);
+    expect(plain(view.render(ctx(80, 24)))).toContain("未配置");
+    read.mockRejectedValue(new Error("app-bot.json 内容无效，请重新运行应用机器人配置"));
+    await view.refresh(app);
+    expect(plain(view.render(ctx(120, 30)))).toContain("当前：app-bot.json 内容无效");
+    await view.onKey(key("enter"), app);
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm.mock.calls[0]![0].steps.join("\n")).toContain("不连接事件 Stream");
+    expect(interactive).toEqual([]);
+    confirm.mockResolvedValue(true);
+    await view.onKey(key("b"), app);
+    expect(interactive).toEqual([["configure-app-bot"]]);
+    for (const [width, height] of [[72, 15], [80, 19], [120, 30]]) {
+      const lines = view.render(ctx(width, height));
+      expect(lines.length).toBeLessThanOrEqual(height);
+    }
+  } finally { view.onLeave(); read.mockRestore(); confirm.mockRestore(); }
 });
 
 test("外链配置项显示当前状态、桶根目录和期限，不显示凭据；读取失败只给说明", async () => {
@@ -197,30 +224,27 @@ test("设置读取使用现有 App 动画，提示过期后仍持续转动，分
   }
 });
 
-test("保存日志设置复用全局刷新，不再重复读取，也不加载未选中的运行参数", async () => {
+test("维护命令结束后复用全局刷新，只重读选中项，也不加载未选中的运行参数", async () => {
   const tty = terminal(), view = new SettingsView();
-  let saved: data.TunnelLogging = "off";
-  const read = spyOn(data, "loadTunnelLogging").mockImplementation(async () => saved);
+  let configured = false;
+  const read = spyOn(data, "loadAppBotSummary").mockImplementation(async () => configured
+    ? { configured: true, environment: "staging" } : { configured: false });
   const runtime = spyOn(data, "loadRuntimeSettings").mockResolvedValue(snapshot);
   const stream = spyOn(execution, "stream").mockImplementation(() => {
-    saved = "on"; return { done: Promise.resolve(0), cancel() {} };
+    configured = true; return { done: Promise.resolve(0), cancel() {} };
   });
-  const protocol = spyOn(data, "loadTunnelProtocol").mockResolvedValue("auto");
-  const tunnelDeployment: Deployment = { ...deployment, mode: "cloudflare" };
-  const app = new App([view], { screen: tty.screen, deployment: tunnelDeployment });
+  const app = new App([view], { screen: tty.screen, deployment });
   app["refreshChrome"] = async () => {};
-  app.choose = async () => "on"; app.confirm = async () => true;
   tty.screen.start(() => {}, () => {});
   try {
-    view["selected"] = view["items"].indexOf("tunnel");
     await view.refresh(app);
     expect(read).toHaveBeenCalledTimes(1);
-    await app["handleKey"](key("l"));
+    expect(await app.run("通讯录", ["directory"])).toBe(0);
     await tick();
     expect(read).toHaveBeenCalledTimes(2);
     expect(runtime).not.toHaveBeenCalled();
-    expect(plain(view.render({ ...ctx(), deployment: tunnelDeployment }))).toContain("隧道日志：开启");
-  } finally { view.onLeave(); read.mockRestore(); protocol.mockRestore(); runtime.mockRestore(); stream.mockRestore(); tty.close(); }
+    expect(plain(view.render(ctx()))).toContain("已配置（预发环境）");
+  } finally { view.onLeave(); read.mockRestore(); runtime.mockRestore(); stream.mockRestore(); tty.close(); }
 });
 
 test("运行参数在 TUI 校验和预览，确认前不写草稿；保存通过运维执行面板并显示后台活动", async () => {
@@ -273,12 +297,12 @@ test("文档模块开关默认开启，选择关闭后只保存对应运行参�
   const run = spyOn(app, "run").mockResolvedValue(0);
   try {
     await view.onKey(key("a"), app); await view.refresh(app);
-    await view.onKey(key("end"), app); await view.onKey(key("up"), app); await view.onKey(key("enter"), app);
+    await view.onKey(key("end"), app); await view.onKey(key("enter"), app);
     expect(plain(view.render(ctx()))).toContain("文档加工模块");
     expect(plain(view.render(ctx()))).toContain("开启（默认）");
     await view.onKey(key("down"), app);
     expect(plain(view.render(ctx()))).toContain("共享文档环境覆盖");
-    expect(plain(view.render(ctx()))).toContain("每群独立 venv（默认）");
+    expect(plain(view.render(ctx()))).toContain("data/runtime/document-env（默认）");
     await view.onKey(key("up"), app);
     choices.push("edit", "0");
     await view.onKey(key("enter"), app);
@@ -297,7 +321,7 @@ test("默认 PPT/Word 模板按扩展名校验，留空恢复内置版式", asyn
   const run = spyOn(app, "run").mockResolvedValue(0);
   try {
     await view.onKey(key("a"), app); await view.refresh(app);
-    await view.onKey(key("end"), app); await view.onKey(key("up"), app); await view.onKey(key("enter"), app);
+    await view.onKey(key("end"), app); await view.onKey(key("enter"), app);
     await view.onKey(key("down"), app); await view.onKey(key("down"), app);
     expect(plain(view.render(ctx()))).toContain("默认 PPT 模板");
     expect(plain(view.render(ctx()))).toContain("内置版式（默认）");
@@ -329,7 +353,7 @@ test("LibreOffice 程序路径可编辑保存，留空恢复自动查找", async
   try {
     const enterOffice = async (target: SettingsView) => {
       await target.onKey(key("a"), app); await target.refresh(app);
-      await target.onKey(key("end"), app); await target.onKey(key("up"), app); await target.onKey(key("enter"), app);
+      await target.onKey(key("end"), app); await target.onKey(key("enter"), app);
       for (let i = 0; i < 4; i++) await target.onKey(key("down"), app);
     };
     await enterOffice(view);
@@ -360,7 +384,7 @@ test("LibreOffice 程序路径可编辑保存，留空恢复自动查找", async
 
 test("分类、默认值和开关在宽窄窗口完整可达；退出 TUI 前提醒未保存草稿", async () => {
   const { app, choices } = stub(), view = new SettingsView(), tty = terminal();
-  const read = spyOn(data, "loadRuntimeSettings").mockResolvedValue({ hash: null, values: { BOT_DEBUG: "1" } });
+  const read = spyOn(data, "loadRuntimeSettings").mockResolvedValue({ hash: null, values: { BOT_DOCUMENT_WORK_ENABLED: "1" } });
   try {
     await view.onKey(key("a"), app); await view.refresh(app);
     await view.onKey(key("end"), app); await view.onKey(key("enter"), app);
@@ -369,11 +393,12 @@ test("分类、默认值和开关在宽窄窗口完整可达；退出 TUI 前提
       const context = ctx(width, height), lines = view.render(context);
       expect(lines.length).toBeLessThanOrEqual(height);
       expect(lines.every(line => Bun.stringWidth(line) === width)).toBe(true);
-      expect(plain(lines)).toContain("机器人详细日志");
+      expect(plain(lines)).toContain("LibreOffice 程序");
     }
+    await view.onKey(key("home"), app);
     choices.push("default");
     await view.onKey(key("enter"), app);
-    expect(plain(view.render(ctx()))).toContain("关闭（待保存）");
+    expect(plain(view.render(ctx()))).toContain("开启（待保存）");
     expect(view.hasUnsavedChanges()).toBe(true);
     await view.onKey(key("escape"), app); await view.onKey(key("escape"), app);
     expect(plain(view.render(ctx()))).toContain("1 项待保存");

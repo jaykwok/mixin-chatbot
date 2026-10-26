@@ -22,10 +22,11 @@ import { runProcess, timedCommand } from "../../src/core/process.ts";
 import { log } from "../../src/core/log.ts";
 import { type GroupHarness, openGroupHarness, PROJECT_PROGRESS as PROGRESS } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { appLayout, groupScope } from "../../src/core/layout.ts";
 
 const fixture = await tempFixture("durable-tools-");
 afterAll(() => fixture.cleanup());
-const GROUP = "group-a";
+const GROUP = "group-a", SPACE = groupScope(GROUP);
 const ALICE = "+8613800000001";
 const BOB = "+8613800000002";
 let counter = 0;
@@ -40,7 +41,7 @@ type Group = {
 };
 
 /**
- * A group-a Harness with `mixin.base`; `toolsGroup` builds the tools for another group. Data roots have Chinese names.
+ * A group-a Harness with `mixin.base`; `toolsGroup` builds the tools for another group. Data directories have Chinese names.
  * `door: false` leaves out the request door, which refuses a conversation without a member identity before any tool runs.
  */
 async function openGroup(options: {
@@ -51,7 +52,7 @@ async function openGroup(options: {
   const models = createModels();
   models.setProvider(faux.provider);
   const model = faux.getModel();
-  const tools: BaseToolsOptions = { root: join(fixture.root, `群数据-${n}`), groupId: options.toolsGroup ?? GROUP };
+  const tools: BaseToolsOptions = { layout: appLayout(join(fixture.root, `群数据-${n}`)), scope: groupScope(options.toolsGroup ?? GROUP) };
   const opened = await openGroupHarness(join(fixture.root, `db-${n}.sqlite`), models, {
     group: GROUP, door: options.door, extensions: [baseExtension(tools)], storage: options.storage,
     settings: { retry: { baseDelayMs: 5, maxAgentDelayMs: 20 }, ...(options.progress === undefined ? {} : { progress: options.progress }) },
@@ -60,7 +61,7 @@ async function openGroup(options: {
 }
 
 async function member(group: Group, phone: string): Promise<Conversation> {
-  return (await memberConversation(group.opened.harness, GROUP, phone, { model: group.model }, context)).conversation;
+  return (await memberConversation(group.opened.harness, SPACE, phone, { model: group.model }, context)).conversation;
 }
 
 type Content = { type: string; text?: string; data?: string; mimeType?: string };
@@ -128,7 +129,7 @@ function png(width: number, height: number): Buffer {
 
 describe("Durable base tools", () => {
   test("registrations: the catalogue equals the member's tools; replay, output limits, constrained sampling", async () => {
-    const options: BaseToolsOptions = { root: join(fixture.root, "目录"), groupId: GROUP };
+    const options: BaseToolsOptions = { layout: appLayout(join(fixture.root, "目录")), scope: SPACE };
     const registered = baseTools(options);
     expect(registered.map((tool) => tool.name)).toEqual(["read", "bash", "edit", "write"]);
     const limits = { maxBytes: 64 * 1024, maxLines: 2200 };
@@ -139,7 +140,7 @@ describe("Durable base tools", () => {
       write: { replay: "unsafe", outputLimits: limits },
     });
 
-    const places = memberPlaces(options, GROUP, ALICE);
+    const places = memberPlaces(options, SPACE, ALICE);
     for (const dir of [places.workspaceDir, places.tempDir]) await mkdir(dir, { recursive: true });
     const own = nativeBaseTools();
     const shape = (tool: (typeof registered)[number] | (typeof own)[number]) => ({
@@ -163,7 +164,7 @@ describe("Durable base tools", () => {
       const group = await openGroup({ vision });
       try {
         const conversation = await member(group, ALICE);
-        const places = memberPlaces(group.tools, GROUP, ALICE);
+        const places = memberPlaces(group.tools, SPACE, ALICE);
         await mkdir(join(places.workspaceDir, "资料"), { recursive: true });
         await writeFile(join(places.workspaceDir, "资料", "联系表.png"), png(8, 6));
         const id = `png_${vision}`;
@@ -184,7 +185,7 @@ describe("Durable base tools", () => {
   test("read: the connected Photon processor shrinks oversized images without changing the source", async () => {
     const group = await openGroup({ vision: true });
     try {
-      const places = memberPlaces(group.tools, GROUP, ALICE);
+      const places = memberPlaces(group.tools, SPACE, ALICE);
       await mkdir(places.workspaceDir, { recursive: true });
       const original = png(3000, 1000), path = join(places.workspaceDir, "wide.png");
       await writeFile(path, original);
@@ -203,7 +204,7 @@ describe("Durable base tools", () => {
     const group = await openGroup();
     try {
       const conversation = await member(group, ALICE);
-      const places = memberPlaces(group.tools, GROUP, ALICE);
+      const places = memberPlaces(group.tools, SPACE, ALICE);
       await mkdir(places.workspaceDir, { recursive: true });
       await writeFile(join(places.workspaceDir, "大文件.txt"), Array.from({ length: 4000 }, (_, i) => `第${i + 1}行 ${"内容".repeat(10)}`).join("\n"));
       const t = await turn(group, conversation, [fauxToolCall("read", { path: "大文件.txt" }, { id: "large" })]);
@@ -217,8 +218,8 @@ describe("Durable base tools", () => {
     const group = await openGroup();
     try {
       const alice = await member(group, ALICE);
-      const a = memberPlaces(group.tools, GROUP, ALICE);
-      const b = memberPlaces(group.tools, GROUP, BOB);
+      const a = memberPlaces(group.tools, SPACE, ALICE);
+      const b = memberPlaces(group.tools, SPACE, BOB);
       const outside = join(fixture.root, `外部-${counter}`);
       for (const dir of [a.workspaceDir, a.tempDir, b.tempDir, dirname(a.indexPath), outside]) await mkdir(dir, { recursive: true });
       await writeFile(join(a.workspaceDir, "资料.txt"), "共享资料");
@@ -254,16 +255,16 @@ describe("Durable base tools", () => {
     } finally { await group.close(); }
   }, 30_000);
 
-  test("identity: each member's bash gets its own phone, group and tmp, and no Pi session variables", async () => {
+  test("identity: each member's bash gets its own phone, space and tmp, and no Pi session variables", async () => {
     const group = await openGroup();
     try {
-      const command = 'printf "%s" "$PI_CALLER_PHONE|$PI_GROUP_ID|$PI_USER_TMP|$TMPDIR|${PI_SESSION_ID-unset}|${PI_SESSION_FILE-unset}|${PI_PROVIDER-unset}|${PI_MODEL-unset}|${PI_REASONING_LEVEL-unset}" > "$PI_USER_TMP/env.txt"';
+      const command = 'printf "%s" "$PI_CALLER_PHONE|$PI_SPACE|$PI_USER_TMP|$TMPDIR|${PI_SESSION_ID-unset}|${PI_SESSION_FILE-unset}|${PI_PROVIDER-unset}|${PI_MODEL-unset}|${PI_REASONING_LEVEL-unset}" > "$PI_USER_TMP/env.txt"';
       for (const phone of [ALICE, BOB]) {
         const t = await turn(group, await member(group, phone), [fauxToolCall("bash", { command }, { id: `env_${phone}` })]);
         expect(t.results[`env_${phone}`]!.isError).toBe(false);
-        const places = memberPlaces(group.tools, GROUP, phone);
+        const places = memberPlaces(group.tools, SPACE, phone);
         expect(await readFile(join(places.tempDir, "env.txt"), "utf8"))
-          .toBe(`${phone}|${GROUP}|${places.tempDir}|${places.tempDir}|unset|unset|unset|unset|unset`);
+          .toBe(`${phone}|group:${GROUP}|${places.tempDir}|${places.tempDir}|unset|unset|unset|unset|unset`);
       }
     } finally { await group.close(); }
     // Two shells; a Bun process's first spawn takes about 3 s under this host's security software.
@@ -276,29 +277,29 @@ describe("Durable base tools", () => {
     try {
       const t = await turn(other, await member(other, ALICE), [call("other_group")]);
       expect(t.results.other_group).toMatchObject({ isError: true });
-      expect(t.results.other_group!.text).toContain("不属于本群");
+      expect(t.results.other_group!.text).toContain("不属于本空间");
       expect(t.outcomes.other_group).toBe("failed");
-      expect(existsSync(other.tools.root)).toBe(false);
+      expect(existsSync(other.tools.layout.tmp)).toBe(false);
     } finally { await other.close(); }
 
     const group = await openGroup({ door: false });
     try {
       // Never written: the snapshot is undefined. Written with this group and no phone: every such conversation would
       // share one tmp, so it is refused as well.
-      for (const [label, groupId] of [["no_identity", undefined], ["no_phone", GROUP]] as const) {
+      for (const [label, space] of [["no_identity", undefined], ["no_phone", `group:${GROUP}`]] as const) {
         const id = await group.opened.harness.commit(async (tx) => {
           const record = await tx.createConversation({ ownership: { kind: "ownerless" } });
           await configure(tx, record.id, { model: group.model, thinkingLevel: "off" });
-          if (groupId !== undefined) (await tx.doc(IdentityDoc, record.id)).groupId = groupId;
+          if (space !== undefined) (await tx.doc(IdentityDoc, record.id)).space = space;
           return record.id;
         }, context);
-        if (groupId !== undefined) expect(await group.opened.harness.snapshot(IdentityDoc, id, context)).toMatchObject({ groupId, phone: "" });
+        if (space !== undefined) expect(await group.opened.harness.snapshot(IdentityDoc, id, context)).toMatchObject({ space, phone: "" });
         const t = await turn(group, (await group.opened.harness.conversation(id, context))!, [call(label)]);
         expect(t.results[label]).toMatchObject({ isError: true });
         expect(t.results[label]!.text).toContain("没有成员身份");
         expect(t.outcomes[label]).toBe("failed");
       }
-      expect(existsSync(group.tools.root)).toBe(false);
+      expect(existsSync(group.tools.layout.tmp)).toBe(false);
     } finally { await group.close(); }
     expect(existsSync(marker)).toBe(false);
   });
@@ -307,7 +308,7 @@ describe("Durable base tools", () => {
     const group = await openGroup();
     const lines: string[] = [];
     const info = spyOn(log, "info").mockImplementation(line => { if (line.startsWith("命令耗时")) lines.push(line); });
-    markRunning(GROUP, ALICE, "abcd1234");
+    markRunning(SPACE, ALICE, "abcd1234");
     try {
       const t = await turn(group, await member(group, ALICE), [
         fauxToolCall("bash", { command: "echo 你好; echo 第二行" }, { id: "ok" }),
@@ -325,7 +326,7 @@ describe("Durable base tools", () => {
       expect(t.results.timeout!.text).toContain("Command timed out after 2 seconds");
       const large = t.results.large!;
       const full = /Full output: ([^\r\n<]+)/.exec(large.text)?.[1]!.trim()!;
-      expect(isPathInside(full, await realpath(memberPlaces(group.tools, GROUP, ALICE).tempDir))).toBe(true);
+      expect(isPathInside(full, await realpath(memberPlaces(group.tools, SPACE, ALICE).tempDir))).toBe(true);
       expect(large.text).toContain(`Full output: ${full}`);
       expect(large.text).toContain("<harness>");
       const file = await readFile(full, "utf8");
@@ -335,30 +336,30 @@ describe("Durable base tools", () => {
       expect(new Set(Object.values(t.outcomes))).toEqual(new Set(["completed", "failed"]));
       const deadline = Date.now() + 5000;
       while (lines.length < 4 && Date.now() < deadline) await Bun.sleep(10);
-      const prefix = `命令耗时 - 群: ${GROUP}, 用户: ${ALICE}, 任务: abcd1234, 工具: bash#`;
+      const prefix = `命令耗时 - 群 ${GROUP}, 用户: ${ALICE}, 任务: abcd1234, 工具: bash#`;
       expect(lines).toHaveLength(4);
       for (const line of lines) expect(line.startsWith(prefix)).toBe(true);
       expect(lines.map(line => /结果: ([^,]+)/.exec(line)?.[1]).sort()).toEqual(["超时", "退出码 0", "退出码 0", "退出码 3"]);
-    } finally { info.mockRestore(); clearRunning(GROUP, ALICE, "abcd1234"); await group.close(); }
+    } finally { info.mockRestore(); clearRunning(SPACE, ALICE, "abcd1234"); await group.close(); }
   }, 60_000);
 
   test("timing: a tool keeps its original request even when the member advances before a later command", async () => {
     const lines: string[] = [];
     const info = spyOn(log, "info").mockImplementation(line => { lines.push(line); });
-    markRunning(GROUP, BOB, "original");
+    markRunning(SPACE, BOB, "original");
     try {
       const registration = memberRegistration({ definition: { name: "probe", description: "probe", parameters: {} } as never,
         replay: "safe", outputLimits: {} as never, async run() {
-          markRunning(GROUP, BOB, "next");
+          markRunning(SPACE, BOB, "next");
           await timedCommand(async () => ({ exitCode: 0 }));
           return { content: [{ type: "text", text: "ok" }], details: undefined };
         } });
-      const api = { taskId: 9, callId: "call", conversationId: 1, output() {}, snapshot: async () => ({ phone: BOB, groupId: GROUP }) };
+      const api = { taskId: 9, callId: "call", conversationId: 1, output() {}, snapshot: async () => ({ phone: BOB, space: `group:${GROUP}` }) };
       await registration.execute({}, api as never, context as never);
       await Bun.sleep(0);
       expect(lines).toHaveLength(1);
       expect(lines[0]).toContain("任务: original");
-    } finally { clearRunning(GROUP, BOB, "original"); clearRunning(GROUP, BOB, "next"); info.mockRestore(); }
+    } finally { clearRunning(SPACE, BOB, "original"); clearRunning(SPACE, BOB, "next"); info.mockRestore(); }
   });
 
   test("timing: an adapted tool's commands are logged with the caller from the conversation identity; no run known gives 任务: -", async () => {
@@ -371,13 +372,13 @@ describe("Durable base tools", () => {
           return { content: [{ type: "text", text: "ok" }], details: undefined };
         } });
       const api = { taskId: 9, callId: "call", conversationId: 1, output() {},
-        snapshot: async () => ({ phone: BOB, groupId: GROUP }) };
+        snapshot: async () => ({ phone: BOB, space: `group:${GROUP}` }) };
       const result = await registration.execute({}, api as never, context as never);
       expect(result.isError).toBeUndefined();
       const deadline = Date.now() + 5000;
       while (!lines.length && Date.now() < deadline) await Bun.sleep(10);
       expect(lines).toHaveLength(1);
-      expect(lines[0]!.startsWith(`命令耗时 - 群: ${GROUP}, 用户: ${BOB}, 任务: -, 工具: probe#9, 结果: 退出码 0, 总: `)).toBe(true);
+      expect(lines[0]!.startsWith(`命令耗时 - 群 ${GROUP}, 用户: ${BOB}, 任务: -, 工具: probe#9, 结果: 退出码 0, 总: `)).toBe(true);
     } finally { info.mockRestore(); }
   }, 30_000);
 
@@ -385,7 +386,7 @@ describe("Durable base tools", () => {
     const group = await openGroup();
     try {
       const conversation = await member(group, ALICE);
-      const places = memberPlaces(group.tools, GROUP, ALICE);
+      const places = memberPlaces(group.tools, SPACE, ALICE);
       const command = [
         `awk 'BEGIN { for (i = 0; i < 8000; i++) print "line-" i }'`,
         // Git Bash's $$ and $! are MSYS pids; /proc/<pid>/winpid gives the Windows one.
@@ -495,7 +496,7 @@ describe("Durable base tools", () => {
     let reopened: GroupHarness | undefined;
     try {
       const conversation = await member(group, ALICE);
-      const places = memberPlaces(group.tools, GROUP, ALICE);
+      const places = memberPlaces(group.tools, SPACE, ALICE);
       const command = [
         'pid() { if [ -r "/proc/$1/winpid" ]; then cat "/proc/$1/winpid"; else echo "$1"; fi; }',
         'echo run >> "$PI_USER_TMP/runs.txt"',
@@ -515,7 +516,7 @@ describe("Durable base tools", () => {
       }
 
       group.faux.setResponses([fauxAssistantMessage("好的")]);
-      reopened = await openGroupHarness(group.opened.path, group.models, { group: GROUP, extensions: [baseExtension(group.tools)] });
+      reopened = await openGroupHarness(group.opened.path, group.models, { scope: SPACE, extensions: [baseExtension(group.tools)] });
       const again = (await reopened.harness.conversation(conversation.id, context))!;
       await again.waitForIdle(context);
       const result = (await again.entries({}, 1000, undefined, context)).items
@@ -533,7 +534,7 @@ describe("Durable base tools", () => {
   test("edit and write: a mismatch is an error result and every tool task completes", async () => {
     const group = await openGroup();
     try {
-      const places = memberPlaces(group.tools, GROUP, ALICE);
+      const places = memberPlaces(group.tools, SPACE, ALICE);
       await mkdir(places.tempDir, { recursive: true });
       const draft = join(places.tempDir, "草稿.txt");
       await writeFile(draft, "客户A的方案\n第二行\n");
@@ -552,7 +553,7 @@ describe("Durable base tools", () => {
   test("arguments: edit's legacy single replacement is repaired before validation; a call missing a required argument runs nothing", async () => {
     const group = await openGroup();
     try {
-      const places = memberPlaces(group.tools, GROUP, ALICE);
+      const places = memberPlaces(group.tools, SPACE, ALICE);
       await mkdir(places.tempDir, { recursive: true });
       const draft = join(places.tempDir, "旧格式.txt");
       await writeFile(draft, "甲乙丙\n");
@@ -571,7 +572,7 @@ describe("Durable base tools", () => {
   // Unix permission bits; Windows has none of these and root bypasses them.
   test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("permissions: an unreadable file and a read-only directory in the caller's tmp give error results", async () => {
     const group = await openGroup();
-    const places = memberPlaces(group.tools, GROUP, ALICE);
+    const places = memberPlaces(group.tools, SPACE, ALICE);
     const locked = join(places.tempDir, "锁定.txt");
     const sealed = join(places.tempDir, "只读目录");
     try {

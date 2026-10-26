@@ -7,10 +7,10 @@ import type { ResultOwnership } from "../../contracts/maintenance.ts";
 
 /** Session scope: /clear and context compaction must not erase ownership or pending-delivery references. */
 export const ResultsDoc = defineDoc<{ calls: Record<string, ResultOwnership> }>({
-  kind: "mixin.results", version: 1, scope: "session", initial: () => ({ calls: {} }),
+  kind: "mixin.results", version: 1, checkpointWhen: () => false, scope: "session", initial: () => ({ calls: {} }),
 });
 
-/** Active records per group database. A full table refuses new results until maintenance hands old ones over. */
+/** Active records per space database. A full table refuses new results until maintenance hands old ones over. */
 export const RESULT_CAPACITY = 4096;
 /** From this many active records maintenance expires unreferenced results before their retention deadline. */
 export const RESULT_PRESSURE = 3072;

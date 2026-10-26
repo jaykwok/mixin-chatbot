@@ -1,6 +1,6 @@
 // 视图共用的小零件。放在这里而不是 app.ts，页面就不必为了拿两个排版函数去依赖整个壳层。
 
-import { pad } from "../render/width.ts";
+import { pad, width } from "../render/width.ts";
 import { columns as sideBySide, mark, rule, spinner, status, table, wrap } from "../render/widgets.ts";
 import type { StatusName, Theme } from "../render/theme.ts";
 import type { AppApi, Loading, ViewContext } from "../view.ts";
@@ -99,6 +99,8 @@ export function actionWorkbench(
     selected: number;
     details: string[];
     note: string;
+    /** 菜单栏底部的图例，按条目换行；列表用不完的行才显示。 */
+    legend?: string[];
   }
 ): string[] {
   const { theme, width: total, height } = ctx;
@@ -106,7 +108,16 @@ export function actionWorkbench(
   const wide = total >= 96;
   const menuWidth = wide ? Math.max(26, Math.floor(total * 0.3)) : total;
   const body = Math.max(1, height - 1);
-  const room = Math.max(1, wide ? body - 1 : Math.min(items.length, body - 6));
+  // The legend only takes rows the list does not need; it never pushes an item out of view.
+  const legendLines: string[] = [];
+  for (const entry of options.legend ?? []) {
+    const last = legendLines.at(-1);
+    if (last !== undefined && width(last + "  " + entry) <= menuWidth - 1) legendLines[legendLines.length - 1] = last + "  " + entry;
+    else legendLines.push(entry);
+  }
+  const spare = (wide ? body - 1 : body - 6) - items.length;
+  const legend = spare >= legendLines.length + 1 ? legendLines : [];
+  const room = Math.max(1, wide ? body - 1 - legend.length : Math.min(items.length, body - 6));
   const start = windowStart(selected, items.length, room);
   const current = items[selected];
 
@@ -120,6 +131,7 @@ export function actionWorkbench(
         ...(!wide ? [{ header: "", flex: 1, render: (item: typeof items[number]) => theme.c("muted", item.summary) }] : []),
       ],
     }),
+    ...legend.map(line => pad(" " + theme.c("muted", line), menuWidth)),
   ];
 
   const detailWidth = wide ? total - menuWidth - 2 : total;

@@ -9,6 +9,7 @@ import { buildLocalTools } from "../helpers/native-tools.ts";
 import { loadModuleDefinitions } from "../../src/agent/modules.ts";
 import { buildChatContext } from "../../src/agent/prompt.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { groupScope } from "../../src/core/layout.ts";
 
 describe("project document resources", () => {
   test.each([true, false])("loads tools, skill, prompt and read access together; enabled=%s", async enabled => {
@@ -34,7 +35,7 @@ describe("project document resources", () => {
       const prompt = buildChatContext({ relayEnabled: false, modulePrompt: resources.prompt });
       expect(prompt.includes("document-work")).toBe(enabled);
       expect(prompt).toContain("document_extract");
-      const local = await buildLocalTools({ ...options, phone: "test", groupId: "test",
+      const local = await buildLocalTools({ ...options, phone: "test", scope: groupScope("test"),
         materialsIndexPath: options.indexPath, resourceReadDirs: resources.readOnlyDirs });
       expect(local.map(t => t.name)).toEqual(["read", "bash", "edit", "write"]);
       const skill = new URL("../../src/agent/modules/document-work/skills/document-work/SKILL.md", import.meta.url);
@@ -76,13 +77,13 @@ describe("project document resources", () => {
       const call = (name: string, params: object) => tools.find(t => t.name === name)!.execute("test", params, undefined, undefined, {} as never);
       const foreign = join(other, "private.docx");
       await writeFile(foreign, "private");
-      await expect(call("document_inspect", { source: foreign })).rejects.toThrow("本群");
-      await expect(call("document_render", { source: foreign })).rejects.toThrow("本群");
-      await expect(call("document_compose", { items: [{ source: foreign }] })).rejects.toThrow("本群");
-      await expect(call("document_build", { format: "docx", template: foreign, content: "# x" })).rejects.toThrow("本群");
+      await expect(call("document_inspect", { source: foreign })).rejects.toThrow("共享资料 workspace 或当前用户 tmp");
+      await expect(call("document_render", { source: foreign })).rejects.toThrow("共享资料 workspace 或当前用户 tmp");
+      await expect(call("document_compose", { items: [{ source: foreign }] })).rejects.toThrow("共享资料 workspace 或当前用户 tmp");
+      await expect(call("document_build", { format: "docx", template: foreign, content: "# x" })).rejects.toThrow("共享资料 workspace 或当前用户 tmp");
       const foreignImage = join(other, "p.png");
       await writeFile(foreignImage, "png");
-      await expect(call("document_build", { format: "pptx", content: "# x\n\n![图](" + foreignImage.replaceAll("\\", "/") + ")" })).rejects.toThrow("本群");
+      await expect(call("document_build", { format: "pptx", content: "# x\n\n![图](" + foreignImage.replaceAll("\\", "/") + ")" })).rejects.toThrow("共享资料 workspace 或当前用户 tmp");
       await expect(call("document_build", { format: "pptx", content: "# x", keepSlides: [1] })).rejects.toThrow("模板");
       await expect(call("document_compose", { items: [{ content: "# 无文件来源" }] })).rejects.toThrow("第一项");
       const source = join(workspace, "source.docx");

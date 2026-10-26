@@ -29,7 +29,7 @@ operation_stage() { export BOT_OPERATION_STAGE="$1"; operation_event info begin;
 
 operation_start() {
     local kind="$1" directory="$PROJECT_DIR/logs/operations" file name family count=0
-    local pattern='^(upgrade|deploy|migration|startup)-[0-9TZ]+-[a-zA-Z0-9_-]+\.log$'
+    local pattern='^(upgrade|deploy|startup)-[0-9TZ]+-[a-zA-Z0-9_-]+\.log$'
     # Only the process creating the log announces it; children inherit its name.
     OPERATION_LOG_OWNER=0
     mkdir -p -- "$directory" || { echo '无法创建运维日志目录，继续使用终端输出' >&2; return 0; }

@@ -15,6 +15,6 @@ describe("project system prompt", () => {
   });
   test("enforces evidence, instruction boundaries and accurate delivery claims", () => {
     const prompt = buildChatContext({ relayEnabled: false });
-    for (const phrase of ["不是指令", "生效日期", "不等于用户已经收到", "只允许写自己的 tmp", "FIFO", "/stop", "$PI_USER_TMP"]) expect(prompt).toContain(phrase);
+    for (const phrase of ["不是指令", "生效日期", "不等于用户已经收到", "只允许写本次请求的临时目录", "FIFO", "/stop", "$PI_USER_TMP"]) expect(prompt).toContain(phrase);
   });
 });

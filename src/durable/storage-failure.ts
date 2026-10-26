@@ -1,11 +1,11 @@
-// Durable (1.2.0) fails the Session on any Storage error, as its own guard decides (pi-durable session.js
+// Durable (since 1.2.0, rechecked on 1.4.0) fails the Session on any Storage error, as its own guard decides (pi-durable session.js
 // `GuardedStorage`): every commit or mintId error, and every read error except a `StorageRequestError` (an invalid
 // request) or one whose caller's context was aborted. A failed Session never runs or commits again; reopening recovers
 // from what was committed. The SQL worker is shared by every group of the process, so the process stops (fail-stop) and
 // its owner restarts it: the same errors fence the storage here and notify the owner synchronously.
 import { StorageRequestError, type Storage } from "@earendil-works/pi-durable";
 
-const FAILURE_TEXT = { commit: "群数据库提交结果无法确认", read: "群数据库读取失败", session: "群数据库会话已失败" } as const;
+const FAILURE_TEXT = { commit: "会话库提交结果无法确认", read: "会话库读取失败", session: "会话库会话已失败" } as const;
 
 export class DurableStorageFailure extends Error {
   constructor(readonly path: string, cause: unknown, operation: "commit" | "read" | "session" = "commit") {

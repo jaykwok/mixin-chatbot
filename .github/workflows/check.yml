@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       # scripts/test.ts runs timing-balanced groups in parallel, one isolated run each (one per spare core, at most four on Windows and six elsewhere).
@@ -82,12 +82,12 @@ jobs:
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/backup:/app/backup" -v "$PWD/tests:/app/tests:ro" \
             -e MIXIN_TEST_WORK_ROOT=/app/tmp \
             mixin-chatbot-check bun run test tests/core/process.test.ts
-      - name: Test data version registration and reset in the restricted image
+      - name: Test deployment record registration in the restricted image
         run: |
           docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/backup:/app/backup" -v "$PWD/tests:/app/tests:ro" \
             -e MIXIN_TEST_WORK_ROOT=/app/tmp \
-            mixin-chatbot-check bun run test tests/ops/data-current.test.ts tests/ops/data-reset.test.ts
+            mixin-chatbot-check bun run test tests/ops/data-current.test.ts
       - name: Test editable documents and Office previews in the restricted image
         run: |
           # Match production: LibreOffice's Unix socket uses /tmp, not TMPDIR.

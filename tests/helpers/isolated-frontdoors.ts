@@ -32,7 +32,7 @@ await writeFile(join(workspace, "source.docx"), "synthetic docx");
 const ctx = {} as never;
 
 // bash: kept, whatever the command's exit code.
-const tools = await buildLocalTools({ workspaceDir: workspace, tempDir: temp, phone: "synthetic", groupId: "synthetic", venvDir: join(root, "absent-venv"), materialsIndexPath: join(index, "materials.md") });
+const tools = await buildLocalTools({ workspaceDir: workspace, tempDir: temp, phone: "synthetic", scope: { kind: "group", groupId: "synthetic" }, venvDir: join(root, "absent-venv"), materialsIndexPath: join(index, "materials.md") });
 const bash = tools.find(tool => tool.name === "bash")!;
 await bash.execute("bash", { command: "true" }, undefined, undefined, ctx);
 exitCode = 3; await bash.execute("bash", { command: "false" }, undefined, undefined, ctx).catch(() => {}); exitCode = 0;

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { authorizeMcp } from "@earendil-works/pi-mcp/oauth";
 import { readMcpConfig, type McpServerConfig } from "../../src/core/mcp-config.ts";
-import { McpTools } from "../../src/integrations/mcp.ts";
+import { McpTools, type McpMember } from "../../src/integrations/mcp.ts";
 import { mcpOAuth } from "../../src/integrations/mcp-oauth.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -13,23 +13,25 @@ const f = await tempFixture("mcp-"); afterAll(() => f.cleanup());
 const fixtureServer = fileURLToPath(new URL("../helpers/mcp-fixture.ts", import.meta.url));
 const supervisor = fileURLToPath(new URL("../../src/core/process-supervisor.ts", import.meta.url));
 let n = 0;
-const member = { groupId: "群-A", phone: "+86 alice", workspaceDir: join(f.root, "workspace"), tempDir: join(f.root, "alice") };
+const GROUP_ID = "群-A";
+const member: McpMember = { scope: { kind: "group", groupId: GROUP_ID }, phone: "+86 alice", workspaceDir: join(f.root, "workspace"), tempDir: join(f.root, "alice") };
+const direct: McpMember = { ...member, scope: { kind: "direct" } };
 await mkdir(member.workspaceDir); await mkdir(member.tempDir);
 
 function http() {
-  const state = { changed: false, calls: 0, hanging: false, requests: [] as { method: string; group: string | null; member: string | null; token: string | null }[],
+  const state = { changed: false, calls: 0, hanging: false, requests: [] as { method: string; chat: string | null; group: string | null; member: string | null; token: string | null }[],
     started: Promise.withResolvers<void>(), release: Promise.withResolvers<void>(), discovery: false, onCall: async () => {} };
   let sessions = 0;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request): Promise<Response> {
     const token = request.headers.get("authorization");
     if (request.method === "DELETE") {
-      state.requests.push({ method: "DELETE", group: request.headers.get("x-mixin-group"), member: request.headers.get("x-mixin-member"), token });
+      state.requests.push({ method: "DELETE", chat: request.headers.get("x-mixin-chat"), group: request.headers.get("x-mixin-group"), member: request.headers.get("x-mixin-member"), token });
       return new Response(null, { status: 204 });
     }
     if (state.discovery && request.method === "GET") { state.started.resolve(); await state.release.promise; return Response.json({}); }
     if (state.discovery) return new Response(null, { status: 401, headers: { "www-authenticate": `Bearer resource_metadata="http://127.0.0.1:${server.port}/.well-known/oauth-protected-resource"` } });
     const rpc = await request.json() as { id?: number; method: string; params?: { protocolVersion: string } };
-    state.requests.push({ method: rpc.method, group: request.headers.get("x-mixin-group"), member: request.headers.get("x-mixin-member"), token });
+    state.requests.push({ method: rpc.method, chat: request.headers.get("x-mixin-chat"), group: request.headers.get("x-mixin-group"), member: request.headers.get("x-mixin-member"), token });
     if (rpc.id === undefined) return new Response(null, { status: 202 });
     let result: unknown;
     const headers: Record<string, string> = {};
@@ -49,13 +51,17 @@ test("MCP uses official member sessions, an allowlist, identity headers and a fi
     await manager.initialize(new AbortController().signal); expect(manager.catalogue.map(entry => entry.tool.name)).toEqual(["echo"]);
     const output = await manager.call(manager.catalogue[0]!, member, { text: "hello" }, new AbortController().signal, work => work());
     expect(output.content).toEqual([{ type: "text", text: "ok" }]);
-    expect(h.state.requests.find(request => request.method === "tools/call")).toMatchObject({ group: encodeURIComponent(member.groupId), member: encodeURIComponent(member.phone) });
+    expect(h.state.requests.find(request => request.method === "tools/call")).toMatchObject({ chat: "group", group: encodeURIComponent(GROUP_ID), member: encodeURIComponent(member.phone) });
     expect(h.state.requests.filter(request => request.method === "DELETE")).toHaveLength(2);
+    // A direct-chat member: the chat kind, no group header.
+    await manager.call(manager.catalogue[0]!, direct, { text: "direct" }, new AbortController().signal, work => work());
+    expect(h.state.requests.filter(request => request.method === "tools/call").at(-1)).toMatchObject({ chat: "direct", group: null, member: encodeURIComponent(member.phone) });
+    expect(h.state.calls).toBe(2);
     await expect(manager.call(manager.catalogue[0]!, member, { text: "held" }, new AbortController().signal, async () => { throw new Error("synthetic pending control"); })).rejects.toThrow("synthetic pending control");
-    expect(h.state.calls).toBe(1);
+    expect(h.state.calls).toBe(2);
     h.state.changed = true;
     await expect(manager.call(manager.catalogue[0]!, member, { text: "schema" }, new AbortController().signal, work => work())).rejects.toThrow("目录变化");
-    expect(h.state.calls).toBe(1);
+    expect(h.state.calls).toBe(2);
   } finally { await manager.close(); await h.close(); }
 });
 
@@ -218,7 +224,7 @@ test("stdio MCP inherits only selected environment and uses the member's cwd", a
   try {
     await manager.initialize(new AbortController().signal);
     const output = await manager.call(manager.catalogue[0]!, member, { text: "hello" }, new AbortController().signal, work => work());
-    expect(JSON.parse((output.content![0] as { text: string }).text)).toMatchObject({ group: member.groupId, phone: member.phone, cwd: member.tempDir, secret: null });
+    expect(JSON.parse((output.content![0] as { text: string }).text)).toMatchObject({ chat: "group", group: GROUP_ID, phone: member.phone, cwd: member.tempDir, secret: null });
   } finally { await manager.close(); if (previous === undefined) delete process.env.MIXIN_TEST_AMBIENT_SECRET; else process.env.MIXIN_TEST_AMBIENT_SECRET = previous; }
   // Supervisor and server are two Bun processes: alone about 13 s on this Windows host, past 30 s beside parallel test groups.
 }, 60000);

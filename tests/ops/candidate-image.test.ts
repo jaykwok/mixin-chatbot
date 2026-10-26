@@ -105,23 +105,22 @@ test.skipIf(!available)("候选镜像记录：写入前逐项校验再原子改�
   } finally { await fixture.cleanup(); }
 }, 30000);
 
-// The recovery entry reads the transaction record with the checked-out code. During the first upgrade to a version with
-// candidate images the checkout is still the old one (98f1b4a): its Bash and TUI parsers accept exactly these keys and
-// format 1. Image identity lives in candidate-image beside the record instead.
-test.skipIf(!available)("事务记录保持 format 1、键集合不变：首次过渡时旧版恢复入口仍能读取", async () => {
-  const frozen = ["format", "operation", "snapshot", "target_sha", "original_sha", "original_branch", "original_group_root",
-    "target_group_root", "was_running", "bot_port", "deploy_mode", "bot_domain", "domain_action", "unmanaged_tunnel", "platform_ip", "reconfigure_ai"];
+// Bash and the TUI agree on the record's key set and format 2. A record of another format is refused; image identity lives
+// in candidate-image beside the record.
+test.skipIf(!available)("事务记录为 format 2，Bash 与 TUI 的键集合一致；其他格式的记录和镜像键被拒绝", async () => {
+  const keys = ["format", "operation", "snapshot", "target_sha", "original_sha", "original_branch", "original_workspace_root",
+    "target_workspace_root", "was_running", "bot_port", "reconfigure_ai"];
   const fixture = await tempFixture("candidate-format-");
   try {
     const { results } = await scenarios("format", fixture.root);
     expect({ keys: results.keys, format1: results["format-1"], format2: results["format-2"], imageKey: results["candidate-key"] })
-      .toEqual({ keys: frozen.join(" "), format1: "0", format2: "1", imageKey: "1" });
-    const record = Object.fromEntries(frozen.map(key => [key, ""])) as Record<string, string>;
-    Object.assign(record, { format: "1", operation: "upgrade", snapshot: "deploy-abc123", target_sha: "a".repeat(40), original_sha: "b".repeat(40),
-      original_branch: "main", original_group_root: "/srv/groups", target_group_root: "/srv/groups", was_running: "1", bot_port: "2022",
-      deploy_mode: "direct", domain_action: "keep", platform_ip: "203.0.113.17", reconfigure_ai: "0" });
-    expect(Object.keys(parseTransactionRecord(serialize(record)))).toEqual(frozen);
-    expect(() => parseTransactionRecord(serialize({ ...record, format: "2" }))).toThrow();
+      .toEqual({ keys: keys.join(" "), format1: "1", format2: "0", imageKey: "1" });
+    const record = Object.fromEntries(keys.map(key => [key, ""])) as Record<string, string>;
+    Object.assign(record, { format: "2", operation: "upgrade", snapshot: "deploy-abc123", target_sha: "a".repeat(40), original_sha: "b".repeat(40),
+      original_branch: "main", original_workspace_root: "", target_workspace_root: "", was_running: "1", bot_port: "2022",
+      reconfigure_ai: "0" });
+    expect(Object.keys(parseTransactionRecord(serialize(record)))).toEqual(keys);
+    expect(() => parseTransactionRecord(serialize({ ...record, format: "1" }))).toThrow("事务记录无效：format");
     expect(() => parseTransactionRecord(serialize({ ...record, image_id: candidate.image_id }))).toThrow();
   } finally { await fixture.cleanup(); }
 }, 30000);
@@ -148,11 +147,13 @@ test.skipIf(!available)("候选镜像按 ID 构建和核对：daemon、归属、
     // One build with the reserved tag and the ownership labels; the ID comes from --iidfile, the official tag is untouched.
     expect({ code: results.build, id: results["build-id"], tagged: results.tagged }).toEqual({ code: "0", id: b, tagged: b });
     expect(results["build-call"]).toContain(`build --iidfile `);
-    expect(results["build-call"]).toContain(`--tag ${candidate.image_tag} --label org.opencontainers.image.revision=${"a".repeat(40)} ` +
+    expect(results["build-call"]).toContain(`--tag ${candidate.image_tag} --build-arg APP_BUILD=${"a".repeat(12)} --label org.opencontainers.image.revision=${"a".repeat(40)} ` +
       "--label org.mixin-chatbot.project=0123456789ab --label org.mixin-chatbot.operation=0123456789abcdef --label org.mixin-chatbot.source=commit");
     expect(results["build-call"]).not.toMatch(/--tag mixin-chatbot( |$)/);
     expect([results["build-failed"], results["build-failed-id"], results["build-bad-iid"], results["build-bad-iid-id"]]).toEqual(["1", "", "1", ""]);
     expect(await message("build-bad-iid")).toContain("没有给出有效的镜像 ID：not-an-id");
+    // A failed build leaves no iidfile; only the build's own output and the failure are reported.
+    expect((await message("build-failed")).trim().split("\n")).toEqual(["build failed", "候选镜像构建失败（退出码 1）"]);
 
     expect({
       ok: results.verify, daemon: results["verify-daemon"], arch: results["verify-arch"], owner: results["verify-owner"],
@@ -338,19 +339,19 @@ test.skipIf(!available)("准备候选镜像：本次操作独占保留标签，�
   } finally { await fixture.cleanup(); }
 }, 30000);
 
-test.skipIf(!available)("停机前复核：备份目录要放得下停机后的快照，数据、群根和升级器目录各留余量；估算不了就不停机", async () => {
+test.skipIf(!available)("停机前复核：备份目录要放得下停机后的快照，数据和升级器目录各留余量；估算不了就不停机", async () => {
   const fixture = await tempFixture("candidate-snapshot-");
   try {
     const { results, message } = await scenarios("snapshot", fixture.root);
-    // Configuration, markers, state databases, group statistics and Durable databases (1,500,000 bytes plus directory entries); group
-    // workspaces and other state files (5 MB each) are not copied.
+    // Configuration, the deployment record and the state databases (1,500,000 bytes plus directory entries); conversation
+    // databases, the shared workspace and other state files (5 MB each) are not copied.
     expect([results["estimate-at-least"], results["estimate-at-most"], results["estimate-empty"]]).toEqual(["yes", "yes", "0"]);
     const reserve = 1073741824;
     expect({ code: results.stop, args: results["stop-args"] })
-      .toEqual({ code: "0", args: `<f>/project/backup ${reserve + 5000} <f>/project/data ${reserve} <f>/groups ${reserve}` });
+      .toEqual({ code: "0", args: `<f>/project/backup ${reserve + 5000} <f>/project/data ${reserve}` });
     // Before the first backup the project directory stands in for backup/, which it will be made in.
     expect({ code: results["stop-no-backup"], args: results["stop-no-backup-args"] })
-      .toEqual({ code: "0", args: `<f>/project ${reserve + 5000} <f>/project/data ${reserve} <f>/groups ${reserve} <f>/upgrader ${reserve}` });
+      .toEqual({ code: "0", args: `<f>/project ${reserve + 5000} <f>/project/data ${reserve} <f>/upgrader ${reserve}` });
     expect([results["stop-unknown"], results["stop-unknown-checked"]]).toEqual(["1", "no"]);
     expect(await message("stop-unknown")).toContain("无法估算快照的大小");
   } finally { await fixture.cleanup(); }

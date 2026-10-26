@@ -7,7 +7,7 @@ function Move-ToProjectArchive([string]$Path, [string]$ProjectRoot, [string]$All
         throw "归档路径不在指定目录内：$source"
     }
     $archive = [IO.Path]::GetFullPath((Join-Path $ProjectRoot 'backup\rm'))
-    if ($env:BOT_DEPLOY_BACKUP_ID -match '^(deploy|tunnel)-[a-zA-Z0-9-]+$') { $archive = Join-Path $archive $env:BOT_DEPLOY_BACKUP_ID }
+    if ($env:BOT_DEPLOY_BACKUP_ID -match '^deploy-[a-zA-Z0-9-]+$') { $archive = Join-Path $archive $env:BOT_DEPLOY_BACKUP_ID }
     if ($source -eq $archive -or $archive.StartsWith($source.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw "不能将项目根目录或回收区移入其自身"
     }
@@ -23,7 +23,7 @@ function Remove-CompletedBackup([string]$SnapshotPath, [string]$ProjectRoot) {
     $backup = Join-Path $root 'backup'
     $snapshot = [IO.Path]::GetFullPath($SnapshotPath)
     $name = Split-Path $snapshot -Leaf
-    if ((Split-Path $snapshot -Parent) -ne (Join-Path $backup 'snapshots') -or $name -notmatch '^(deploy|tunnel)-[a-zA-Z0-9-]+$') {
+    if ((Split-Path $snapshot -Parent) -ne (Join-Path $backup 'snapshots') -or $name -notmatch '^deploy-[a-zA-Z0-9-]+$') {
         throw '备份清理路径无效'
     }
     $targets = @($snapshot, (Join-Path $backup "rm\$name"))
@@ -125,8 +125,7 @@ function Save-DeploymentFiles([string]$ProjectRoot, [string]$Snapshot) {
     Protect-ProjectSecretPath $Snapshot
     # 服务商、选型和动态目录缓存一起恢复，保证回滚后仍能离线解析出原模型。
     $paths = @('data\config', 'data\runtime\pi\settings.json', 'data\runtime\models-store.json', 'data\runtime\bot-launcher.ps1',
-        'data\state\bot-port', 'data\state\deploy-mode',
-        'data\state\bot-domain', 'data\state\group-data-root', 'data\state\cloudflared-managed')
+        'data\state\bot-port', 'data\state\workspace-root')
     foreach ($relative in $paths) {
         $source = Join-Path $ProjectRoot $relative
         if (Test-Path -LiteralPath $source) {

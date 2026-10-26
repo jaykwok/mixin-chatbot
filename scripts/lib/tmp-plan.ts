@@ -5,7 +5,8 @@ import { join, resolve } from "node:path";
 import { decodePlanSummary, decodeProgressSummary, ID_PATTERN } from "../../src/contracts/maintenance.ts";
 
 /** Archive plans and their removal lists live with the archive; physical reclamation plans in their own directory. */
-const ARCHIVE_PLANS = [".reclamation", "backup", "rm", ".tmp-plans"], RECLAIM_PLANS = [".reclamation", "plans"];
+/** Below the data directory (src/core/layout.ts `reclamation`). */
+const ARCHIVE_PLANS = ["state", "reclamation", "backup", "rm", ".tmp-plans"], RECLAIM_PLANS = ["state", "reclamation", "plans"];
 
 async function read(root: string, id: string, suffix: string, location = ARCHIVE_PLANS): Promise<unknown> {
   if (!ID_PATTERN.test(id)) throw new Error("归档清单 ID 无效");

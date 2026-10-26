@@ -1,21 +1,20 @@
-// D1-R1-1: once the service learns that a lease is lost, another process may already own the data, so the service must
+// D1-R1-1: once the service learns that its lease is lost, another process may already own the data, so the service must
 // not write again: no statistics, no Durable commit, no archive, no maintenance, no waiting for tasks. A normal shutdown
 // still does all of that. Both run the real service entry point in its own process (tests/helpers/service-harness.ts) with synthetic
 // data; the loss is a real takeover of the lease by this process, reported by the service's own heartbeat.
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
-import { GROUP_ROOT_LEASE } from "../../src/core/data-version.ts";
-import { acquireGroupRootLease, acquireLease } from "../../src/core/maintenance.ts";
+import { acquireLease } from "../../src/core/maintenance.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const harness = fileURLToPath(new URL("../helpers/service-harness.ts", import.meta.url));
-const HEARTBEAT = "data/groups/group/workspace/tool-heartbeat.txt";
+const HEARTBEAT = "data/workspace/tool-heartbeat.txt";
 // Lease directories and logs are not data; the tool's heartbeat is checked on its own.
-const NOT_DATA = ["logs", "gate.open", HEARTBEAT, "data/state/service.lock", `data/groups/${GROUP_ROOT_LEASE}`];
+const NOT_DATA = ["logs", "gate.open", HEARTBEAT, "data/state/service.lock"];
 const sha256 = (data: string | Buffer) => createHash("sha256").update(data).digest("hex");
 
 /**
@@ -65,7 +64,7 @@ function startService(root: string) {
   const port = probe.port;
   void probe.stop(true);
   const child = Bun.spawn([process.execPath, harness], {
-    cwd: root, env: { ...process.env, GROUP_DATA_ROOT: "data/groups", BOT_HOST: "127.0.0.1", BOT_PORT: String(port) },
+    cwd: root, env: { ...process.env, BOT_HOST: "127.0.0.1", BOT_PORT: String(port) },
     stdout: "pipe", stderr: "pipe", windowsHide: true,
   });
   let output = "";
@@ -93,8 +92,8 @@ function startService(root: string) {
 }
 
 describe("service lease loss", () => {
-  for (const lease of ["group root", "service"] as const) {
-    test(`a known loss of the ${lease} lease ends the service at once: nothing more is written and the tool is reaped`, async () => {
+  {
+    test("a known loss of the service lease ends the service at once: nothing more is written and the tool is reaped", async () => {
       const fixture = await tempFixture("lease-loss-");
       const service = startService(fixture.root);
       let takeover: (() => Promise<void>) | undefined;
@@ -104,17 +103,19 @@ describe("service lease loss", () => {
         // Idle at the gates: nothing changes on its own.
         await Bun.sleep(300);
         expect(snapshot(fixture.root)).toEqual(before);
-        expect(before["data/groups/stats.sqlite"]).toBeDefined();
-        expect(before["data/groups/group/durable.sqlite"]).toBeDefined();
+        expect(before["data/state/stats.sqlite"]).toBeDefined();
+        expect(before["data/conversations/groups/100/durable.sqlite"]).toBeDefined();
         expect(alive(ready.tool)).toBe(true);
-        // Another holder takes the lease over; the service's next heartbeat (every 5 s) reports the loss.
-        if (lease === "group root") {
-          rmSync(join(fixture.root, "data/groups", GROUP_ROOT_LEASE), { recursive: true, force: true });
-          takeover = await acquireGroupRootLease("test", join(fixture.root, "data/groups"), { retries: 0 });
-        } else {
-          rmSync(join(fixture.root, "data/state/service.lock"), { recursive: true, force: true });
-          takeover = await acquireLease("test", join(fixture.root, "data/state/service"), { retries: 0 });
+        // Another holder takes the lease over; the service's next heartbeat (every 5 s) reports the loss. A heartbeat
+        // stats the lock and then touches it: a takeover between the two would have the service touch the new lock and
+        // compromise this one instead. Taking over just after a heartbeat leaves the next one 5 s away.
+        const lockDir = join(fixture.root, "data/state/service.lock"), beat = statSync(lockDir).mtimeMs;
+        for (const end = Date.now() + 10_000; statSync(lockDir).mtimeMs === beat;) {
+          if (Date.now() > end) throw new Error("no service heartbeat within 10 s");
+          await Bun.sleep(20);
         }
+        rmSync(lockDir, { recursive: true, force: true });
+        takeover = await acquireLease("test", join(fixture.root, "data/state/service"), { retries: 0 });
         await service.line("服务租约丢失", 15_000);
         // The callback has run: release the task, the maintenance and the archive, as if the service had carried on.
         writeFileSync(join(fixture.root, "gate.open"), "");
@@ -138,7 +139,7 @@ describe("service lease loss", () => {
     }, 60_000);
   }
 
-  test("a normal shutdown still records statistics, archives the instance file, reaps the tool and releases both leases", async () => {
+  test("a normal shutdown still records statistics, archives the instance file, reaps the tool and releases the lease", async () => {
     const fixture = await tempFixture("lease-shutdown-");
     const service = startService(fixture.root);
     try {
@@ -150,20 +151,20 @@ describe("service lease loss", () => {
       await service.line("BLOCKED_ABORTED", 10_000);
       // Shutdown waits for the maintenance at its gate. The /clear waiting at the gate before its projection is not waited
       // for: the group's Harness closes under it, the control stays in the stream and runs again at the next start, and
-      // the next projection counts what this one would have (src/durable/groups.ts closeAll).
+      // the next projection counts what this one would have (src/durable/spaces.ts closeAll).
       writeFileSync(join(fixture.root, "gate.open"), "");
       const { code, at } = await within(service.exited, 30_000, "normal shutdown");
       const transcript = await service.transcript();
       expect(code, transcript).toBe(0);
       expect(transcript).not.toContain("ERROR");
-      const db = new Database(join(fixture.root, "data/groups/stats.sqlite"));
+      const db = new Database(join(fixture.root, "data/state/stats.sqlite"));
       try {
-        const users = db.query("SELECT user_segment FROM sources").all().map((row) => (row as { user_segment: string }).user_segment);
-        expect(users).toEqual(expect.arrayContaining(["archive"]));
+        const users = (table: string) => db.query(`SELECT DISTINCT user FROM ${table}`).all().map((row) => (row as { user: string }).user);
+        expect(users("asks_daily")).toEqual(expect.arrayContaining(["archive"]));
+        expect(users("usage_daily")).toEqual(expect.arrayContaining(["archive"]));
       } finally { db.close(); }
       const archived = readdirSync(join(fixture.root, "backup/rm"));
       expect(archived.some((name) => name.endsWith("-instance.json"))).toBe(true);
-      expect(existsSync(join(fixture.root, "data/groups", GROUP_ROOT_LEASE))).toBe(false);
       expect(existsSync(join(fixture.root, "data/state/service.lock"))).toBe(false);
       expect(alive(ready.tool)).toBe(false);
       const last = beats(fixture.root);

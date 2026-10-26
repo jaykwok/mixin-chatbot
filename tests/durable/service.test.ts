@@ -1,98 +1,76 @@
-// The Durable message lifecycle (D3, src/durable/service.ts): durable admission, the member worker and its replies,
-// queue limit, /stop, /clear, /deliver, /status, the watchdog, restart recovery, control replay (also of a /clear queued
-// while stopped, src/durable/offline.ts), storage identity and usage projection. Faux providers and a recording outbound; no network, no real IM.
+// The Durable message lifecycle (src/durable/service.ts): durable admission with receipts, the member worker and its
+// replies and their retries, queue limit, /stop, /clear, /status, the watchdog, restart recovery, control replay (also of a
+// /clear queued while stopped, src/durable/offline.ts), storage identity and usage projection. Faux providers and a
+// recording outbound; no network, no platform.
 import { afterAll, describe, spyOn, test } from "bun:test";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
-import { Database } from "bun:sqlite";
 import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { type AssistantMessage, type Message, type Models, Type } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, type FauxResponseFactory, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { type ConversationId, createSession, defineExtension, type Harness, LiveDoc, type ModelRef } from "@earendil-works/pi-durable";
+import { type ConversationId, createSession, defineExtension, type Harness, LiveDoc, type ModelRef, type Tx } from "@earendil-works/pi-durable";
 import { ReclamationItems } from "../../src/durable/results/queue.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
-import { DeliveryStore } from "../../src/agent/delivery-store.ts";
-import { userTempDir } from "../../src/agent/paths.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { resultsRoot } from "../../src/durable/results/files.ts";
 import { holdDirectory, type HeldDirectory } from "../../src/core/held-directory.ts";
-import { GroupHarnesses, groupDatabasePath } from "../../src/durable/groups.ts";
+import { SpaceHarnesses } from "../../src/durable/spaces.ts";
 import { RequestDoor } from "../../src/durable/door.ts";
 import { memberConversation, MemberDirectory } from "../../src/durable/identity.ts";
 import { ControlsDoc, InboxDoc, type InboxItem, type StoredControl } from "../../src/durable/inbox.ts";
-import { queueGroupClear } from "../../src/durable/offline.ts";
-import { GroupDoc } from "../../src/durable/identity.ts";
+import { queueSpaceClear } from "../../src/durable/offline.ts";
+import { pendingDeliveries, recordsOf, ReceiptsDoc } from "../../src/durable/records.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import type { ModelSelection } from "../../src/durable/models.ts";
-import { DurableService, type DurableServiceOptions, type Outbound, STATUS_TEXT } from "../../src/durable/service.ts";
+import { DurableService, type DurableServiceOptions } from "../../src/durable/service.ts";
+import type { Outbound } from "../../src/durable/outbound.ts";
 import { SqliteClient } from "../../src/durable/sqlite-client.ts";
 import { DurableStorageFailure } from "../../src/durable/storage-failure.ts";
 import { fauxModels, openGroupHarness, TEST_PROGRESS } from "../helpers/durable.ts";
+import { type Recording, recordingOutbound, replyTexts, type Sent } from "../helpers/recording-outbound.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import "../helpers/restore-spies.ts";
+import { databaseOf, scopeOf, statsOf, tmpOf } from "../helpers/layout.ts";
+import { awaitingRemoval } from "../helpers/results.ts";
+import { appLayout } from "../../src/core/layout.ts";
 
 const fixture = await tempFixture("durable-service-");
 afterAll(() => fixture.cleanup());
-const GROUP = "group-a";
+const GROUP = "100";
+const GROUP_B = "200";
 const ALICE = "13800000001";
 const BOB = "13800000002";
-const URL = "https://example.invalid/callback?key=synthetic";
 let counter = 0;
-
-type Sent = { kind: "status" | "text" | "reply"; text: string; phone: string; appendix?: string };
-
-function recordingOutbound() {
-  const sent: Sent[] = [];
-  /** Every send as "group phone url: text". */
-  const targets: string[] = [];
-  const state = { fail: false };
-  const outbound: Outbound = {
-    async sendText(text, groupId, phone, url, options) {
-      sent.push({ kind: options?.traffic === "status" ? "status" : "text", text, phone });
-      targets.push(`${groupId} ${phone} ${url}: ${text}`);
-      return !state.fail;
-    },
-    async sendReply(text, groupId, phone, url, _signal, appendix) {
-      sent.push({ kind: "reply", text, phone, ...(appendix === undefined ? {} : { appendix }) });
-      targets.push(`${groupId} ${phone} ${url}: ${text}`);
-      return !state.fail;
-    },
-    rate: () => ({ used: 1, limit: 20 }),
-    refresh: async (item) => item.text,
-  };
-  return { sent, targets, outbound, state };
-}
 
 function selection(models: Models, ref: ModelRef, contextWindow = 128000): ModelSelection {
   const model = models.getModel(ref.provider, ref.modelId)!;
   return {
     runtime: models as never, settings: undefined as never, model: { ...model, contextWindow } as never, ref, thinkingLevel: "off",
     harnessSettings: { retry: { maxRetries: 1, baseDelayMs: 5, maxAgentDelayMs: 20 }, ...(TEST_PROGRESS === undefined ? {} : { progress: TEST_PROGRESS }) },
-    notices: [],
   };
 }
 
-type Fixture = { root: string; stateDb: Database; deliveries: DeliveryStore };
+type Fixture = { root: string };
 
 function place(): Fixture {
-  const stateDb = new Database(":memory:");
-  return { root: join(fixture.root, `root-${++counter}`), stateDb, deliveries: new DeliveryStore(stateDb) };
+  return { root: join(fixture.root, `root-${++counter}`) };
 }
 
 /** Harness is a public factory. Obtain the implementation prototype from a real, closed instance. */
-async function harnessPrototype(models: Models): Promise<Pick<Harness, "conversation" | "snapshot">> {
+async function harnessPrototype(models: Models): Promise<Pick<Harness, "conversation" | "snapshot" | "commit">> {
   const opened = await openGroupHarness(join(fixture.root, `prototype-${++counter}.sqlite`), models);
-  try { return Object.getPrototypeOf(opened.harness) as Pick<Harness, "conversation" | "snapshot">; }
+  try { return Object.getPrototypeOf(opened.harness) as Pick<Harness, "conversation" | "snapshot" | "commit">; }
   finally { await opened.close(); }
 }
 
 function open(where: Fixture, models: Models, ref: ModelRef, outbound: Outbound, options: Partial<DurableServiceOptions> = {}) {
   const reports: unknown[] = [];
   const service = new DurableService({
-    root: where.root, selection: selection(models, ref), modules: [], relay: null, materials: false,
+    layout: appLayout(where.root), selection: selection(models, ref), modules: [], relay: null, materials: false,
     limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20 },
-    outbound, deliveries: where.deliveries, stateDb: where.stateDb, onReport: (error) => reports.push(error), ...options,
+    outbound, onReport: (error) => reports.push(error), ...options,
   });
   return { service, reports };
 }
@@ -119,25 +97,52 @@ function gate(answer: string) {
   return { step, open: resolve, state };
 }
 
-const replies = (sent: Sent[]) => sent.filter((item) => item.kind === "reply").map((item) => item.text);
+/** Answers (joined segments per message); terminal errors, also delivered as replies, are `failures`. */
+const replies = (sent: Sent[]) => replyTexts(sent).filter((text) => !text.startsWith("⚠️"));
+const failures = (sent: Sent[]) => replyTexts(sent).filter((text) => text.startsWith("⚠️"));
+const notices = (sent: Sent[]) => sent.filter((item) => item.kind === "notice").map((item) => item.text);
+
+/** The reply texts of a member's records that still wait for delivery. */
+/** Default limits with retries of failed deliveries 100 ms apart. */
+const RETRY_LIMITS = { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20, deliveryRetryMs: [100] };
+
+async function pending(service: DurableService, phone = ALICE, group = GROUP): Promise<string[]> {
+  return pendingDeliveries(await service.records(scopeOf(group), phone))
+    .map((record) => record.delivery!.parts.filter((part) => part.kind === "markdown").map((part) => part.body).join(""));
+}
 
 async function registeredResult(where: Fixture, models: Models, model: ModelRef, name: string) {
-  const opened = await openGroupHarness(groupDatabasePath(where.root, GROUP), models, { group: GROUP });
+  const opened = await openGroupHarness(databaseOf(where.root, GROUP), models, { group: GROUP });
   try {
-    await memberConversation(opened.harness, GROUP, ALICE, { model }, context);
+    await memberConversation(opened.harness, scopeOf(GROUP), ALICE, { model }, context);
     await opened.harness.commit(async tx => { (await tx.doc(ResultsDoc)).calls[name] = { phone: ALICE, createdAt: Date.now() }; }, context);
   } finally { await opened.close(); }
 }
 
+/** An inbox item stored with its run record and receipt, as admission commits them (seeding a crash window). */
+async function seedItem(tx: Tx, conversationId: ConversationId, out: Recording, phone: string, item: InboxItem): Promise<void> {
+  (await tx.doc(InboxDoc, conversationId)).items.push(item);
+  const { reply } = out.message(GROUP, phone, item.content);
+  (await recordsOf(tx, phone)).requests[item.requestId] = { requestId: item.requestId, reply, createdAt: Date.now(), notes: [], deliverables: [], files: [], events: {} };
+  (await tx.doc(ReceiptsDoc)).items[reply.msgUid] = { at: Date.now(), phone, request: item.requestId };
+}
+
 /** Change Alice's inbox and the control stream directly in the closed group database (a crash window). */
-async function inject(where: Fixture, change: (inbox: { items: InboxItem[] }, controls: { seq: number; pending: StoredControl[] }) => void) {
-  const session = createSession(await openGroupStorage(groupDatabasePath(where.root, GROUP)));
+async function inject(where: Fixture, change: (tx: Tx, conversationId: ConversationId, controls: { seq: number; pending: StoredControl[] }) => Promise<void>) {
+  const session = createSession(await openGroupStorage(databaseOf(where.root, GROUP)));
   try {
     const member = await session.snapshot(MemberDirectory, ALICE, context);
-    await session.commit(async (tx) => {
-      change(await tx.doc(InboxDoc, member!.conversationId as ConversationId), await tx.doc(ControlsDoc));
-    }, context);
+    await session.commit(async (tx) => change(tx, member!.conversationId as ConversationId, await tx.doc(ControlsDoc)), context);
   } finally { await session.close(context); }
+}
+
+/** Seed Alice's conversation and inbox in a fresh group database before the service opens it. */
+async function seed(where: Fixture, models: Models, model: ModelRef, change: (tx: Tx, conversationId: ConversationId) => Promise<void>) {
+  const seeded = await openGroupHarness(databaseOf(where.root, GROUP), models, { group: GROUP });
+  try {
+    const { conversation } = await memberConversation(seeded.harness, scopeOf(GROUP), ALICE, { model }, context);
+    await seeded.harness.commit((tx) => change(tx, conversation.id), context);
+  } finally { await seeded.close(); }
 }
 
 describe("durable service: admission order across asynchronous boundaries", () => {
@@ -150,18 +155,18 @@ describe("durable service: admission order across asynchronous boundaries", () =
     }));
     const { service, reports } = open(where, models, model, out.outbound);
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-    const acquire = GroupHarnesses.prototype.acquire;
+    const acquire = SpaceHarnesses.prototype.acquire;
     let first = true, secondSettled = false;
-    const spy = spyOn(GroupHarnesses.prototype, "acquire").mockImplementation(async function(this: GroupHarnesses, groupId) {
+    const spy = spyOn(SpaceHarnesses.prototype, "acquire").mockImplementation(async function(this: SpaceHarnesses, scope) {
       if (first) { first = false; entered.resolve(); await release.promise; if (failFirst) throw new Error("synthetic admission failure"); }
-      return acquire.call(this, groupId);
+      return acquire.call(this, scope);
     });
     let earlier: Promise<unknown> | undefined, later: Promise<unknown> | undefined;
     try {
-      earlier = service.admit(ALICE, GROUP, "FIRST: template A", URL).catch(error => error);
+      earlier = service.admit(out.message(GROUP, ALICE, "FIRST: template A")).catch(error => error);
       await entered.promise;
-      later = service.admit(ALICE, GROUP, "SECOND: template B", URL).finally(() => { secondSettled = true; });
-      await service.admit(BOB, GROUP, "OTHER", URL);
+      later = service.admit(out.message(GROUP, ALICE, "SECOND: template B")).finally(() => { secondSettled = true; });
+      await service.admit(out.message(GROUP, BOB, "OTHER"));
       await until(() => replies(out.sent).length === 1, "other member's reply");
       expect(secondSettled).toBe(false); expect(inputs).toHaveLength(1); expect(inputs[0]).toContain("OTHER");
       release.resolve();
@@ -182,17 +187,17 @@ describe("durable service: admission order across asynchronous boundaries", () =
     }));
     const { service, reports } = open(where, models, model, out.outbound);
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-    const acquire = GroupHarnesses.prototype.acquire;
+    const acquire = SpaceHarnesses.prototype.acquire;
     let first = true;
-    const spy = spyOn(GroupHarnesses.prototype, "acquire").mockImplementation(async function(this: GroupHarnesses, groupId) {
+    const spy = spyOn(SpaceHarnesses.prototype, "acquire").mockImplementation(async function(this: SpaceHarnesses, scope) {
       if (first) { first = false; entered.resolve(); await release.promise; }
-      return acquire.call(this, groupId);
+      return acquire.call(this, scope);
     });
     let earlier: Promise<unknown> | undefined, later: Promise<unknown> | undefined;
     try {
-      earlier = service.admit(ALICE, GROUP, "OLD", URL); await entered.promise;
-      await service.control(ALICE, GROUP, command, URL);
-      later = service.admit(ALICE, GROUP, "FRESH", URL);
+      earlier = service.admit(out.message(GROUP, ALICE, "OLD")); await entered.promise;
+      await service.control(out.message(GROUP, ALICE, command));
+      later = service.admit(out.message(GROUP, ALICE, "FRESH"));
       release.resolve(); await earlier; await later;
       await until(() => replies(out.sent).length === 1, "fresh reply");
       expect(inputs).toHaveLength(1); expect(inputs[0]).toContain("FRESH"); expect(inputs[0]).not.toContain("OLD");
@@ -211,14 +216,14 @@ describe("durable service: manual compaction receipt", () => {
     const { service } = open(where, models, model, out.outbound, { selection: configured });
     const pending: Promise<string>[] = [];
     try {
-      await service.admit(ALICE, GROUP, "history", URL); await until(() => replies(out.sent).length === 1, "history");
-      await service.admit(ALICE, GROUP, "live", URL); await until(() => held.state.started === 1, "live generation");
-      pending.push(service.control(ALICE, GROUP, "/compact", URL));
-      pending.push(service.control(ALICE, GROUP, "/compact", URL));
-      const storage = await openGroupStorage(groupDatabasePath(where.root, GROUP));
+      await service.admit(out.message(GROUP, ALICE, "history")); await until(() => replies(out.sent).length === 1, "history");
+      await service.admit(out.message(GROUP, ALICE, "live")); await until(() => held.state.started === 1, "live generation");
+      pending.push(service.control(out.message(GROUP, ALICE, "/compact")));
+      pending.push(service.control(out.message(GROUP, ALICE, "/compact")));
+      const storage = await openGroupStorage(databaseOf(where.root, GROUP));
       try {
         await until(async () => (await storage.scanSubmissions({}, 100, undefined, context)).items.some(s => s.type === "write" && s.status === "queued"), "queued summary");
-        await service.control(ALICE, GROUP, command, URL);
+        await service.control(out.message(GROUP, ALICE, command));
         const receipts = await Promise.all(pending);
         const summaries = (await storage.scanSubmissions({}, 100, undefined, context)).items.filter(s => s.requestId?.startsWith("compaction:"));
         expect(summaries).toHaveLength(1);
@@ -236,11 +241,11 @@ describe("durable service: manual compaction receipt", () => {
     const { service, reports } = open(where, models, model, out.outbound, { selection: configured });
     let compact: Promise<string> | undefined;
     try {
-      await service.admit(ALICE, GROUP, "historical request", URL); await until(() => replies(out.sent).length === 1, "history");
-      await service.admit(ALICE, GROUP, "live request", URL); await until(() => held.state.started === 1, "live generation");
+      await service.admit(out.message(GROUP, ALICE, "historical request")); await until(() => replies(out.sent).length === 1, "history");
+      await service.admit(out.message(GROUP, ALICE, "live request")); await until(() => held.state.started === 1, "live generation");
       let resolved = false;
-      compact = service.control(ALICE, GROUP, "/compact", URL).then(reply => { resolved = true; return reply; });
-      const storage = await openGroupStorage(groupDatabasePath(where.root, GROUP));
+      compact = service.control(out.message(GROUP, ALICE, "/compact")).then(reply => { resolved = true; return reply; });
+      const storage = await openGroupStorage(databaseOf(where.root, GROUP));
       try {
         await until(async () => (await storage.scanSubmissions({}, 100, undefined, context)).items.some(s => s.type === "write" && s.status === "queued"), "queued summary");
         expect(resolved).toBe(false);
@@ -256,7 +261,7 @@ describe("durable service: manual compaction receipt", () => {
   test("an empty conversation reports no history to compact", async () => {
     const { models, model } = fauxModels(), where = place(), out = recordingOutbound();
     const { service } = open(where, models, model, out.outbound);
-    try { expect(await service.control(ALICE, GROUP, "/compact", URL)).toContain("无需压缩"); }
+    try { expect(await service.control(out.message(GROUP, ALICE, "/compact"))).toContain("无需压缩"); }
     finally { await service.close(); }
   });
 });
@@ -270,19 +275,24 @@ describe("durable service: admission, worker and reply", () => {
     faux.setResponses([held.step]);
     const { service, reports } = open(where, models, model, out.outbound);
     try {
-      expect(await service.admit(ALICE, GROUP, "你好", URL)).toEqual({ status: "accepted" });
+      const asked = out.message(GROUP, ALICE, "你好");
+      expect(await service.admit(asked)).toEqual({ status: "accepted" });
       await until(() => held.state.started === 1, "the request");
-      expect(out.sent).toEqual([{ kind: "status", text: STATUS_TEXT, phone: ALICE }]);
+      // No "working on it" notice: nothing is sent before the answer.
+      expect(out.sent).toEqual([]);
       held.open();
       await until(() => replies(out.sent).length === 1, "the reply");
       expect(replies(out.sent)).toEqual(["你好，这是回答"]);
-      expect(where.deliveries.pending(JSON.stringify([GROUP, ALICE]))).toEqual([]);
-      const ledger = openStatsLedger(where.root);
+      // The lead segment answers the message it came from and @-mentions its sender.
+      const reply = out.sent.find((item) => item.kind === "reply")!;
+      expect([reply.msgUid, reply.mention]).toEqual([asked.reply.msgUid, `im-${ALICE}`]);
+      await until(async () => (await pending(service)).length === 0, "no pending delivery");
+      const ledger = openStatsLedger(statsOf(where.root));
       try {
         const rows = readLedger(ledger);
-        expect(rows.activity.map(({ group, user, asks, replies: answered }) => ({ group, user, asks, replies: answered })))
-          .toEqual([{ group: GROUP, user: ALICE, asks: 1, replies: 1 }]);
-        expect(rows.usage.map(({ kind, requests }) => ({ kind, requests }))).toEqual([{ kind: "assistant", requests: 1 }]);
+        expect(rows.asks.map(({ group, user, asks }) => ({ group, user, asks }))).toEqual([{ group: GROUP, user: ALICE, asks: 1 }]);
+        expect(rows.usage.map(({ group, user, bucket }) => ({ group, user, bucket }))).toEqual([{ group: GROUP, user: ALICE, bucket: "models" }]);
+        expect(rows.usage[0]!.totalTokens).toBeGreaterThan(0);
       } finally { ledger.close(); }
       expect(reports).toEqual([]);
     } finally { await service.close(); }
@@ -296,31 +306,32 @@ describe("durable service: admission, worker and reply", () => {
     faux.setResponses([first.step, fauxAssistantMessage("别人"), ...Array.from({ length: 8 }, (_, index) => fauxAssistantMessage(`回答${index + 2}`))]);
     const { service } = open(where, models, model, out.outbound);
     try {
-      expect((await service.admit(ALICE, GROUP, "第1条", URL)).status).toBe("accepted");
+      expect((await service.admit(out.message(GROUP, ALICE, "第1条"))).status).toBe("accepted");
       await until(() => first.state.started === 1, "the first request");
-      expect((await service.admit(BOB, GROUP, "别人的消息", URL)).status).toBe("accepted");
+      expect((await service.admit(out.message(GROUP, BOB, "别人的消息"))).status).toBe("accepted");
       await until(() => replies(out.sent).includes("别人"), "the other member's reply");
-      for (let index = 2; index <= 9; index++) expect((await service.admit(ALICE, GROUP, `第${index}条`, URL)).status).toBe("accepted");
-      expect(await service.admit(ALICE, GROUP, "第10条", URL)).toEqual({ status: "full", message: "本会话已有 8 条消息排队，请稍后重发" });
+      for (let index = 2; index <= 9; index++) expect((await service.admit(out.message(GROUP, ALICE, `第${index}条`))).status).toBe("accepted");
+      expect(await service.admit(out.message(GROUP, ALICE, "第10条"))).toEqual({ status: "full", message: "本会话已有 8 条消息排队，请稍后重发" });
       first.open();
       await until(() => replies(out.sent).length === 10, "all replies");
       expect(replies(out.sent).filter((text) => text !== "别人")).toEqual(["一", ...Array.from({ length: 8 }, (_, index) => `回答${index + 2}`)]);
     } finally { await service.close(); }
   });
 
-  test("a model error is reported to the member as the AgentSession engine reports it; nothing is stored for /deliver", async () => {
+  test("a model error is delivered to the member as the AgentSession engine reports it, with the mention; nothing is left to send", async () => {
     const { faux, models, model } = fauxModels();
     const where = place();
     const out = recordingOutbound();
     faux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 invalid api key" })]);
     const { service } = open(where, models, model, out.outbound);
     try {
-      await service.admit(ALICE, GROUP, "会失败", URL);
-      await until(() => out.sent.some((item) => item.kind === "text"), "the failure text");
-      const failure = out.sent.find((item) => item.kind === "text")!.text;
+      await service.admit(out.message(GROUP, ALICE, "会失败"));
+      await until(() => failures(out.sent).length === 1, "the failure text");
+      const failure = failures(out.sent)[0]!;
       expect(failure).toContain("⚠️ 抱歉，处理您的请求时出错了。");
       expect(failure).toContain("401 invalid api key");
-      expect(where.deliveries.pending(JSON.stringify([GROUP, ALICE]))).toEqual([]);
+      expect(out.sent.find((item) => item.kind === "reply")!.mention).toBe(`im-${ALICE}`);
+      await until(async () => (await pending(service)).length === 0, "no pending delivery");
     } finally { await service.close(); }
   });
 
@@ -336,17 +347,17 @@ describe("durable service: admission, worker and reply", () => {
     ]);
     const { service } = open(where, models, model, out.outbound);
     try {
-      await service.admit(ALICE, GROUP, "第一条", URL);
+      await service.admit(out.message(GROUP, ALICE, "第一条"));
       await until(() => started === 1, "the first request");
-      await service.admit(ALICE, GROUP, "第二条", URL);
+      await service.admit(out.message(GROUP, ALICE, "第二条"));
       failNow();
       await until(() => replies(out.sent).length === 1, "the second reply");
-      expect(out.sent.filter((item) => item.kind === "text").map((item) => item.text).join("\n")).toContain("401 invalid api key");
+      expect(failures(out.sent).join("\n")).toContain("401 invalid api key");
       expect(replies(out.sent)).toEqual(["第二条的回答"]);
     } finally { await service.close(); }
   });
 
-  test("one member in two groups: two independent runs at once; replies, callbacks and usage stay in their group", async () => {
+  test("one member in two groups: two independent runs at once; replies and usage stay in their group", async () => {
     const { faux, models, model } = fauxModels();
     const where = place();
     const out = recordingOutbound();
@@ -354,11 +365,10 @@ describe("durable service: admission, worker and reply", () => {
     const second = gate("乙群的回答");
     faux.setResponses([first.step, second.step]);
     const { service } = open(where, models, model, out.outbound);
-    const urlB = "https://example.invalid/callback?key=synthetic-b";
     try {
-      await service.admit(ALICE, GROUP, "甲群的问题", URL);
+      await service.admit(out.message(GROUP, ALICE, "甲群的问题"));
       await until(() => first.state.started === 1, "the first group's request");
-      await service.admit(ALICE, "group-b", "乙群的问题", urlB);
+      await service.admit(out.message(GROUP_B, ALICE, "乙群的问题"));
       // Both run at once: neither waits for the other.
       await until(() => second.state.started === 1, "the second group's request");
       expect(JSON.stringify(second.state.transcripts[0])).not.toContain("甲群");
@@ -366,34 +376,97 @@ describe("durable service: admission, worker and reply", () => {
       await until(() => replies(out.sent).length === 1, "the second group's reply");
       first.open();
       await until(() => replies(out.sent).length === 2, "the first group's reply");
-      expect(out.targets.filter((line) => line.endsWith("的回答")))
-        .toEqual([`group-b ${ALICE} ${urlB}: 乙群的回答`, `${GROUP} ${ALICE} ${URL}: 甲群的回答`]);
-      const ledger = openStatsLedger(where.root);
+      expect(out.sent.filter((item) => item.kind === "reply").map((item) => `${item.space} ${item.phone}: ${item.text}`))
+        .toEqual([`${GROUP_B} ${ALICE}: 乙群的回答`, `${GROUP} ${ALICE}: 甲群的回答`]);
+      const ledger = openStatsLedger(statsOf(where.root));
       try {
-        expect(readLedger(ledger).activity.map(({ group, user, asks, replies: answered }) => ({ group, user, asks, replies: answered }))
-          .sort((a, b) => a.group.localeCompare(b.group)))
-          .toEqual([{ group: GROUP, user: ALICE, asks: 1, replies: 1 }, { group: "group-b", user: ALICE, asks: 1, replies: 1 }]);
+        const rows = readLedger(ledger);
+        expect(rows.asks.map(({ group, user, asks }) => ({ group, user, asks })).sort((a, b) => a.group.localeCompare(b.group)))
+          .toEqual([{ group: GROUP, user: ALICE, asks: 1 }, { group: GROUP_B, user: ALICE, asks: 1 }]);
+        expect([...new Set(rows.usage.map(row => row.group))].sort()).toEqual([GROUP, GROUP_B].sort());
       } finally { ledger.close(); }
     } finally { await service.close(); }
   });
 
-  test("a failed reply send stays in the outbox; /deliver sends it", async () => {
+  test("a reply the platform refused stays in the run record and is sent again on its own to the original message", async () => {
     const { faux, models, model } = fauxModels();
     const where = place();
     const out = recordingOutbound();
-    faux.setResponses([fauxAssistantMessage("要补发的回答")]);
-    const { service } = open(where, models, model, out.outbound);
+    faux.setResponses([fauxAssistantMessage("要重发的回答")]);
+    const { service } = open(where, models, model, out.outbound, { limits: { ...RETRY_LIMITS } });
     try {
-      out.state.fail = true;
-      await service.admit(ALICE, GROUP, "问题", URL);
-      await until(() => out.sent.some((item) => item.text === "回复未能完整发到群里，已保存的内容可用 /deliver 补发"), "the failure notice");
-      expect(where.deliveries.pending(JSON.stringify([GROUP, ALICE])).map((item) => item.text)).toEqual(["要补发的回答"]);
-      out.state.fail = false;
-      expect(await service.control(ALICE, GROUP, "/deliver", URL)).toBe("");
-      expect(out.sent.at(-1)).toEqual({ kind: "text", text: "要补发的回答", phone: ALICE });
-      expect(where.deliveries.pending(JSON.stringify([GROUP, ALICE]))).toEqual([]);
-      await service.control(ALICE, GROUP, "/deliver", URL);
-      expect(out.sent.at(-1)!.text).toBe("你在本群没有待补发的回复。");
+      let refused = 0;
+      out.state.failWhen = (item) => item.kind === "reply" && ++refused > 0 ? "failed" : false;
+      const question = out.message(GROUP, ALICE, "问题");
+      await service.admit(question);
+      await until(() => refused >= 2, "a second refused attempt");
+      expect(await pending(service)).toEqual(["要重发的回答"]);
+      out.state.failWhen = undefined;
+      await until(async () => (await pending(service)).length === 0, "the retry");
+      const sent = out.sent.at(-1)!;
+      expect([sent.kind, sent.text, sent.msgUid, sent.mention]).toEqual(["reply", "要重发的回答", question.reply.msgUid, `im-${ALICE}`]);
+      expect(replies(out.sent)).toEqual(["要重发的回答"]);
+      expect(notices(out.sent)).toEqual([]);
+    } finally { await service.close(); }
+  });
+
+  test("interleaved members and a restart before a retry: every reply keeps its own question's summary, name and @ target", async () => {
+    const { faux, models, model } = fauxModels();
+    const where = place();
+    const out = recordingOutbound(), raw: { msgUid: string; body: string; mention?: string }[] = [];
+    const send = out.outbound.send;
+    out.outbound.send = async (target, message, options) => {
+      const outcome = await send(target, message, options);
+      if (outcome.status === "sent" && message.msgType === "markdown") raw.push({ msgUid: options?.replyMsgId ?? "", body: message.content.content,
+        ...(message.content.a?.[0]?.i ? { mention: message.content.a[0].i } : {}) });
+      return outcome;
+    };
+    faux.setResponses([fauxAssistantMessage("答甲一"), fauxAssistantMessage("答乙"), fauxAssistantMessage("答甲二")]);
+    let { service } = open(where, models, model, out.outbound, { limits: { ...RETRY_LIMITS, deliveryRetryMs: [300] } });
+    try {
+      // Alice's first answer is refused, so its retry comes after the restart.
+      out.state.failWhen = (item) => item.kind === "reply" && item.text === "答甲一" ? "failed" : false;
+      const a1 = out.message(GROUP, ALICE, "甲的第一个问题", { name: "张三" });
+      const b = out.message(GROUP, BOB, "乙的问题", { name: "李四" });
+      const a2 = out.message(GROUP, ALICE, "甲的第二个问题", { name: "张三" });
+      await service.admit(a1); await service.admit(b); await service.admit(a2);
+      await until(() => replies(out.sent).length === 2, "two answers");
+      await service.close();
+      out.state.failWhen = undefined;
+      ({ service } = open(where, models, model, out.outbound, { limits: { ...RETRY_LIMITS } }));
+      await service.start();
+      const lead = (question: typeof a1) => raw.filter((item) => item.msgUid === question.reply.msgUid && item.mention !== undefined);
+      await until(() => lead(a1).length > 0, "the retried first answer");
+      for (const [question, phone, name, summary, answer] of [[a1, ALICE, "张三", "甲的第一个问题", "答甲一"], [b, BOB, "李四", "乙的问题", "答乙"],
+        [a2, ALICE, "张三", "甲的第二个问题", "答甲二"]] as const) {
+        const sent = lead(question).filter((item) => item.body.endsWith(answer));
+        // Delivered once to its own message, with the asker's @ and the asker's summary line.
+        expect(sent).toHaveLength(1);
+        expect(sent[0]!.mention).toBe(`im-${phone}`);
+        expect(sent[0]!.body.startsWith(`> 回复 ${name}：${summary}`)).toBe(true);
+      }
+    } finally { await service.close(); }
+  });
+
+  test("an uncertain reply counts as sent: never sent again, nothing left to send, no notice", async () => {
+    const { faux, models, model } = fauxModels();
+    const where = place();
+    const out = recordingOutbound();
+    faux.setResponses([fauxAssistantMessage("不确定是否送达的回答")]);
+    const { service } = open(where, models, model, out.outbound, { limits: { ...RETRY_LIMITS } });
+    try {
+      out.state.failWhen = (item) => item.kind === "reply" ? "uncertain" : false;
+      await service.admit(out.message(GROUP, ALICE, "问题"));
+      const part = async () => Object.values((await service.records(scopeOf(GROUP), ALICE)).requests)[0]?.delivery?.parts[0];
+      await until(async () => (await part())?.state === "uncertain", "the uncertain send");
+      out.state.failWhen = undefined;
+      // Neither maintenance nor a retry wait resends it.
+      await service.maintain();
+      await Bun.sleep(300);
+      expect(replies(out.sent)).toEqual([]);
+      expect([(await part())!.attempts, (await part())!.retryAt]).toEqual([1, undefined]);
+      expect(await pending(service)).toEqual([]);
+      expect(notices(out.sent)).toEqual([]);
     } finally { await service.close(); }
   });
 });
@@ -407,17 +480,17 @@ describe("durable service: controls", () => {
     faux.setResponses([held.step, fauxAssistantMessage("新的回答")]);
     const { service } = open(where, models, model, out.outbound);
     try {
-      await service.admit(ALICE, GROUP, "长任务", URL);
-      await service.admit(ALICE, GROUP, "排队的", URL);
+      await service.admit(out.message(GROUP, ALICE, "长任务"));
+      await service.admit(out.message(GROUP, ALICE, "排队的"));
       await until(() => held.state.started === 1, "the request");
-      const receipt = await service.control(ALICE, GROUP, "/stop", URL);
+      const receipt = await service.control(out.message(GROUP, ALICE, "/stop"));
       expect(receipt).toContain("⏹ 已停止你在本群的当前任务");
-      await service.admit(ALICE, GROUP, "停止之后", URL);
+      await service.admit(out.message(GROUP, ALICE, "停止之后"));
       await until(() => replies(out.sent).length === 1, "the next reply");
       expect(replies(out.sent)).toEqual(["新的回答"]);
       expect(faux.state.callCount).toBe(2);
     } finally { await service.close(); }
-    const database = createSession(await openGroupStorage(groupDatabasePath(where.root, GROUP)));
+    const database = createSession(await openGroupStorage(databaseOf(where.root, GROUP)));
     try {
       expect((await database.snapshot(ControlsDoc, context))?.pending).toEqual([]);
     } finally { await database.close(context); }
@@ -433,15 +506,15 @@ describe("durable service: controls", () => {
     await registeredResult(where, models, model, "1-call_a");
     const { service } = open(where, models, model, out.outbound);
     try {
-      await service.admit(ALICE, GROUP, "第一轮", URL);
+      await service.admit(out.message(GROUP, ALICE, "第一轮"));
       await until(() => replies(out.sent).length === 1, "the first reply");
-      const results = join(resultsRoot(userTempDir(where.root, GROUP, ALICE)), "1-call_a");
+      const results = join(resultsRoot(tmpOf(where.root, GROUP, ALICE)), "1-call_a");
       await mkdir(results, { recursive: true });
       await writeFile(join(results, "index.txt"), "x");
-      await service.admit(ALICE, GROUP, "第二轮", URL);
+      await service.admit(out.message(GROUP, ALICE, "第二轮"));
       await until(() => held.state.started === 1, "the second request");
-      const clearing = service.control(ALICE, GROUP, "/clear", URL);
-      await service.admit(ALICE, GROUP, "清空之后", URL);
+      const clearing = service.control(out.message(GROUP, ALICE, "/clear"));
+      await service.admit(out.message(GROUP, ALICE, "清空之后"));
       expect(await clearing).toContain("🧹 已为你在本群开启新会话");
       await until(() => replies(out.sent).length === 2, "the reply after clear");
       expect(replies(out.sent)).toEqual(["第一轮回答", "新会话回答"]);
@@ -449,18 +522,17 @@ describe("durable service: controls", () => {
       expect(text).toContain("清空之后");
       expect(text).not.toContain("第一轮");
       expect(text).not.toContain("第二轮");
-      // /status lists the expiry as soon as /clear requests it; wait for the maintenance outcome itself (the first pass
-      // may still find the group busy finishing the reply).
+      // /clear requests the expiry; wait for the maintenance outcome itself (the first pass may still find the group
+      // busy finishing the reply). The receipt is checked in the database below.
       await until(async () => {
         await service.maintain();
-        return process.platform === "linux" ? (await service.control(ALICE, GROUP, "/status", URL)).includes("待物理回收")
-          : (await readdir(resultsRoot(userTempDir(where.root, GROUP, ALICE)))).length === 0;
+        return process.platform === "linux" ? await awaitingRemoval(databaseOf(where.root, GROUP), ALICE) > 0
+          : (await readdir(resultsRoot(tmpOf(where.root, GROUP, ALICE)))).length === 0;
       }, "idle result reclamation");
-      expect(await service.control(ALICE, GROUP, "/status", URL)).toContain("已过期结果：1");
-      expect(await readdir(resultsRoot(userTempDir(where.root, GROUP, ALICE)))).toEqual(process.platform === "linux" ? ["1-call_a"] : []);
+      expect(await readdir(resultsRoot(tmpOf(where.root, GROUP, ALICE)))).toEqual(process.platform === "linux" ? ["1-call_a"] : []);
       if (process.platform === "linux") expect(await readFile(join(results, "index.txt"), "utf8")).toBe("x");
     } finally { await service.close(); }
-    const database = createSession(await openGroupStorage(groupDatabasePath(where.root, GROUP)));
+    const database = createSession(await openGroupStorage(databaseOf(where.root, GROUP)));
     try {
       const receipt = process.platform === "linux"
         ? (await database.snapshot(ReclamationItems, "1-call_a", context))!.call
@@ -488,16 +560,16 @@ describe("durable service: controls", () => {
     const { service } = open(where, models, model, out.outbound, { extensions: () => [slow] });
     const realNow = Date.now;
     try {
-      await service.admit(ALICE, GROUP, "第一轮", URL);
+      await service.admit(out.message(GROUP, ALICE, "第一轮"));
       await until(() => started, "the slow tool");
-      const stopping = service.control(ALICE, GROUP, "/stop", URL);
+      const stopping = service.control(out.message(GROUP, ALICE, "/stop"));
       // The clock stands still: the /clear and the message after it arrive in the same millisecond.
       const frozen = realNow() + 1000;
       Date.now = () => frozen;
       let clearing: Promise<string>;
       try {
-        clearing = service.control(ALICE, GROUP, "/clear", URL);
-        expect(await service.admit(ALICE, GROUP, "清空之后", URL)).toEqual({ status: "accepted" });
+        clearing = service.control(out.message(GROUP, ALICE, "/clear"));
+        expect(await service.admit(out.message(GROUP, ALICE, "清空之后"))).toEqual({ status: "accepted" });
       } finally { Date.now = realNow; }
       release();
       await stopping;
@@ -507,7 +579,7 @@ describe("durable service: controls", () => {
     } finally { Date.now = realNow; release(); await service.close(); }
   });
 
-  test("/status reports the running message, the queue and the outbox", async () => {
+  test("/status reports the running message and the queue", async () => {
     const { faux, models, model } = fauxModels();
     const where = place();
     const out = recordingOutbound();
@@ -515,18 +587,21 @@ describe("durable service: controls", () => {
     faux.setResponses([held.step, fauxAssistantMessage("第二条")]);
     const { service } = open(where, models, model, out.outbound);
     try {
-      await service.admit(ALICE, GROUP, "一", URL);
-      await service.admit(ALICE, GROUP, "二", URL);
+      await service.admit(out.message(GROUP, ALICE, "一"));
+      await service.admit(out.message(GROUP, ALICE, "二"));
       await until(() => held.state.started === 1, "the request");
-      const status = await service.control(ALICE, GROUP, "/status", URL);
+      const status = await service.control(out.message(GROUP, ALICE, "/status"));
       expect(status).toContain("状态：执行中");
       expect(status).toContain("等待处理的消息：1");
-      expect(status).toContain("待补发回复：0");
+      expect(status).not.toContain("待补发");
       expect(status).toContain("最长处理时间：60 秒");
       expect(status).toMatch(/任务编号：[0-9a-f]{8}\n/);
       held.open();
       await until(() => replies(out.sent).length === 2, "both replies");
-      expect(await service.control(ALICE, GROUP, "/help", URL)).toContain("可用指令");
+      // The platform accepted the second reply before its record is marked sent.
+      await until(async () => (await pending(service)).length === 0, "the delivery records");
+      expect(await service.control(out.message(GROUP, ALICE, "/help"))).toContain("可用指令");
+      expect(await service.control(out.message(GROUP, ALICE, "/status"))).toContain("状态：空闲");
     } finally { await service.close(); }
   });
 });
@@ -540,9 +615,9 @@ describe("durable service: watchdog", () => {
     faux.setResponses([held.step]);
     const { service } = open(where, models, model, out.outbound, { limits: { runTimeoutMs: 300, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20 } });
     try {
-      await service.admit(ALICE, GROUP, "慢任务", URL);
-      await until(() => out.sent.some((item) => item.kind === "text"), "the timeout text");
-      expect(out.sent.find((item) => item.kind === "text")!.text).toMatch(/任务总时限 0\.3 秒已到（任务：[0-9a-f]{8}）/);
+      await service.admit(out.message(GROUP, ALICE, "慢任务"));
+      await until(() => failures(out.sent).length === 1, "the timeout text");
+      expect(failures(out.sent)[0]).toMatch(/任务总时限 0\.3 秒已到（任务：[0-9a-f]{8}）/);
       expect(replies(out.sent)).toEqual([]);
     } finally { await service.close(); }
   });
@@ -559,7 +634,7 @@ describe("durable service: watchdog", () => {
       onLog: (line) => logs.push(line),
     });
     try {
-      await service.admit(ALICE, GROUP, "慢任务", URL);
+      await service.admit(out.message(GROUP, ALICE, "慢任务"));
       await until(() => logs.filter((line) => line.startsWith("任务仍在运行")).length >= 2, "two heartbeats");
       // On a busy machine the first heartbeat can still be in the preparation phase; the model is held, so one in its phase follows.
       const waiting = (line: string) => line.startsWith("任务仍在运行") && line.endsWith("阶段: 等待或接收模型输出");
@@ -567,7 +642,7 @@ describe("durable service: watchdog", () => {
       held.open();
       await until(() => logs.some((line) => line.startsWith("任务结束")), "the end line");
       const task = /任务: ([0-9a-f]{8})/.exec(logs.find((line) => line.startsWith("任务开始"))!)![1];
-      expect(logs.find((line) => line.startsWith("任务开始"))).toContain(`群: ${GROUP}, 用户: ${ALICE}, 任务: ${task}, 总时限: 60秒`);
+      expect(logs.find((line) => line.startsWith("任务开始"))).toContain(`群 ${GROUP}, 用户: ${ALICE}, 任务: ${task}, 总时限: 60秒`);
       expect(logs.find(waiting)).toMatch(new RegExp(`任务: ${task}, 已用: \\d+秒, 阶段: 等待或接收模型输出`));
       expect(logs.find((line) => line.startsWith("任务结束"))).toContain(`任务: ${task}, 结果: done`);
     } finally { await service.close(); }
@@ -581,9 +656,33 @@ describe("durable service: watchdog", () => {
     faux.setResponses([held.step]);
     const { service } = open(where, models, model, out.outbound, { limits: { runTimeoutMs: 60_000, modelIdleMs: 300, modelResponseMs: 60_000, tickMs: 20 } });
     try {
-      await service.admit(ALICE, GROUP, "卡住", URL);
-      await until(() => out.sent.some((item) => item.kind === "text"), "the idle text");
-      expect(out.sent.find((item) => item.kind === "text")!.text).toContain("模型连续 0.3 秒无有效进展");
+      await service.admit(out.message(GROUP, ALICE, "卡住"));
+      await until(() => failures(out.sent).length === 1, "the idle text");
+      expect(failures(out.sent)[0]).toContain("模型连续 0.3 秒无有效进展");
+    } finally { await service.close(); }
+  });
+});
+
+describe("durable service: segmented replies", () => {
+  test("two members' long answers in one group arrive each in one piece: only the lead segment has the @, nothing lands between", async () => {
+    const { faux, models, model } = fauxModels();
+    const where = place();
+    const out = recordingOutbound();
+    // About 9,000 characters: three segments each.
+    const first = gate("甲".repeat(9_000)), second = gate("乙".repeat(9_000));
+    faux.setResponses([first.step, second.step]);
+    const { service } = open(where, models, model, out.outbound);
+    try {
+      await service.admit(out.message(GROUP, ALICE, "长问题一"));
+      await service.admit(out.message(GROUP, BOB, "长问题二"));
+      await until(() => first.state.started + second.state.started === 2, "both requests");
+      first.open(); second.open();
+      await until(() => out.sent.filter((item) => item.kind === "reply").length === 6, "both answers");
+      const segments = out.sent.filter((item) => item.kind === "reply");
+      // Each member's segments are consecutive, and only each first one mentions the sender.
+      const owners = segments.map((item) => item.phone);
+      expect(owners.filter((phone, index) => index > 0 && phone !== owners[index - 1])).toHaveLength(1);
+      expect(segments.map((item) => item.mention !== undefined)).toEqual([true, false, false, true, false, false]);
     } finally { await service.close(); }
   });
 });
@@ -607,25 +706,26 @@ describe("durable service: threshold compaction", () => {
       onLog: (line) => logs.push(line),
     });
     try {
-      await service.admit(ALICE, GROUP, "第一轮", URL);
+      await service.admit(out.message(GROUP, ALICE, "第一轮"));
       await until(() => replies(out.sent).length === 1, "the first reply");
-      await service.admit(ALICE, GROUP, "第二轮", URL);
+      await service.admit(out.message(GROUP, ALICE, "第二轮"));
       await until(() => summary.state.started === 1, "the summarize request");
       // The second request is the summary of the first turn.
       expect(JSON.stringify(summary.state.transcripts[0])).toContain("第一轮");
       // Held for more than twice the model idle limit: compaction is not a model round, nothing is aborted.
       await until(() => logs.some((line) => line.startsWith("任务仍在运行") && line.endsWith("阶段: 压缩会话历史")), "a heartbeat in the compaction phase");
       await Bun.sleep(700);
-      expect(out.sent.filter((item) => item.kind === "text")).toEqual([]);
+      expect(failures(out.sent)).toEqual([]);
       summary.open();
       await until(() => replies(out.sent).length === 2, "the second reply");
       expect(replies(out.sent)[1]).toBe("第二轮回答");
       expect(logs.filter((line) => line.startsWith("任务结束")).map((line) => line.includes("结果: done"))).toEqual([true, true]);
-      const ledger = openStatsLedger(where.root);
+      const ledger = openStatsLedger(statsOf(where.root));
       try {
-        const kinds = readLedger(ledger).usage.map(({ kind, requests }) => ({ kind, requests }))
-          .sort((a, b) => a.kind.localeCompare(b.kind));
-        expect(kinds).toEqual([{ kind: "assistant", requests: 2 }, { kind: "compaction", requests: 1 }]);
+        // The compaction's usage joins the model's totals in pi.usage; both rounds and the summary are one model row.
+        const rows = readLedger(ledger);
+        expect(rows.usage.map(({ bucket }) => bucket)).toEqual(["models"]);
+        expect(rows.asks.reduce((sum, row) => sum + row.asks, 0)).toBe(2);
       } finally { ledger.close(); }
       expect(reports).toEqual([]);
     } finally { await service.close(); }
@@ -645,29 +745,30 @@ describe("durable service: threshold compaction", () => {
         compaction: { enabled: true, reserveTokens: 128_000 - 8_000, keepRecentTokens: 100, backgroundTokens: 0 } } },
     });
     try {
-      await service.admit(ALICE, GROUP, "第一轮", URL);
+      await service.admit(out.message(GROUP, ALICE, "第一轮"));
       await until(() => replies(out.sent).length === 1, "the first reply");
-      await service.admit(ALICE, GROUP, "第二轮", URL);
-      await until(() => out.sent.some((item) => item.kind === "text" && item.text.includes("会话历史压缩未完成")), "the failure text");
-      const text = out.sent.find((item) => item.kind === "text" && item.text.includes("会话历史压缩未完成"))!.text;
+      await service.admit(out.message(GROUP, ALICE, "第二轮"));
+      await until(() => failures(out.sent).some((text) => text.includes("会话历史压缩未完成")), "the failure text");
+      const text = failures(out.sent).find((text) => text.includes("会话历史压缩未完成"))!;
       expect(text).toStartWith("⚠️ 抱歉，处理您的请求时出错了。");
       expect(text).toMatch(/会话历史压缩未完成（任务 \d+，达到阈值时压缩；Compaction failed: /);
       expect(text).toContain("400 synthetic summarize refusal");
       expect(replies(out.sent)).toHaveLength(1);
-      expect(await service.control(ALICE, GROUP, "/status", URL)).toMatch(/\n最近一次会话历史压缩失败：任务 \d+，达到阈值时压缩：.*400 synthetic summarize refusal/);
+      expect(await service.control(out.message(GROUP, ALICE, "/status"))).toMatch(/\n最近一次会话历史压缩失败：任务 \d+，达到阈值时压缩：.*400 synthetic summarize refusal/);
     } finally { await service.close(); }
   });
 });
 
 describe("durable service: restart", () => {
-  test("a run cut off by shutdown resumes at start; its reply waits for the member's next message (no callback URL is stored)", async () => {
+  test("a run cut off by shutdown resumes at start; its reply goes to the message it answers without waiting for another", async () => {
     const where = place();
     const first = fauxModels();
     const held = gate("不会到");
     first.faux.setResponses([held.step]);
     const out = recordingOutbound();
     let opened = open(where, first.models, first.model, out.outbound);
-    await opened.service.admit(ALICE, GROUP, "跨重启的问题", URL);
+    const question = out.message(GROUP, ALICE, "跨重启的问题");
+    await opened.service.admit(question);
     await until(() => held.state.started === 1, "the request");
     await opened.service.close();
 
@@ -676,13 +777,14 @@ describe("durable service: restart", () => {
     const after = recordingOutbound();
     opened = open(where, second.models, second.model, after.outbound);
     try {
-      expect(await opened.service.start()).toEqual([GROUP]);
-      await until(() => where.deliveries.pending(JSON.stringify([GROUP, ALICE])).length === 1, "the stored reply");
-      expect(after.sent).toEqual([]);
-      await opened.service.admit(ALICE, GROUP, "第二条", URL);
-      await until(() => after.sent.filter((item) => item.kind !== "status").length === 2, "both replies");
-      expect(after.sent.filter((item) => item.kind !== "status").map((item) => item.text).sort()).toEqual(["第二条的回答", "重启后的回答"]);
-      expect(where.deliveries.pending(JSON.stringify([GROUP, ALICE]))).toEqual([]);
+      expect(await opened.service.start()).toEqual([scopeOf(GROUP)]);
+      await until(() => replies(after.sent).length === 1, "the recovered reply");
+      // No second status notice: the message had started before the restart.
+      expect(after.sent.map((item) => [item.kind, item.text, item.msgUid])).toEqual([["reply", "重启后的回答", question.reply.msgUid]]);
+      await opened.service.admit(after.message(GROUP, ALICE, "第二条"));
+      await until(() => replies(after.sent).length === 2, "both replies");
+      expect(replies(after.sent)).toEqual(["重启后的回答", "第二条的回答"]);
+      await until(async () => (await pending(opened.service)).length === 0, "no pending delivery");
     } finally { await opened.service.close(); }
   });
 
@@ -692,18 +794,18 @@ describe("durable service: restart", () => {
     faux.setResponses([fauxAssistantMessage("第一条回答")]);
     const out = recordingOutbound();
     let opened = open(where, models, model, out.outbound);
-    await opened.service.admit(ALICE, GROUP, "先建会话", URL);
+    await opened.service.admit(out.message(GROUP, ALICE, "先建会话"));
     await until(() => replies(out.sent).length === 1, "the first reply");
     await opened.service.close();
-    await inject(where, (inbox) => inbox.items.push({ requestId: "msg:unsubmitted", content: "未提交的问题", receivedAt: Date.now() }));
+    await inject(where, (tx, id) => seedItem(tx, id, out, ALICE, { requestId: "msg:unsubmitted", content: "未提交的问题", receivedAt: Date.now() }));
     faux.setResponses([fauxAssistantMessage("补交后的回答"), fauxAssistantMessage("不该有第二次")]);
     opened = open(where, models, model, out.outbound);
     try {
-      expect(await opened.service.start()).toEqual([GROUP]);
-      await until(() => where.deliveries.pending(JSON.stringify([GROUP, ALICE])).length === 1, "the stored answer");
+      expect(await opened.service.start()).toEqual([scopeOf(GROUP)]);
+      await until(() => replies(out.sent).length === 2, "the recovered answer");
       await Bun.sleep(100);
       expect(faux.state.callCount).toBe(2);
-      expect(where.deliveries.pending(JSON.stringify([GROUP, ALICE])).map((item) => item.text)).toEqual(["补交后的回答"]);
+      expect(replies(out.sent)).toEqual(["第一条回答", "补交后的回答"]);
     } finally { await opened.service.close(); }
   });
 
@@ -713,16 +815,16 @@ describe("durable service: restart", () => {
     faux.setResponses([fauxAssistantMessage("第一条回答")]);
     const out = recordingOutbound();
     let opened = open(where, models, model, out.outbound);
-    await opened.service.admit(ALICE, GROUP, "先建会话", URL);
+    await opened.service.admit(out.message(GROUP, ALICE, "先建会话"));
     await until(() => replies(out.sent).length === 1, "the first reply");
     await opened.service.close();
     // A crash between the control's admission and its execution: one message admitted before it, one after it.
     const at = Date.now();
-    await inject(where, (inbox, controls) => {
+    await inject(where, async (tx, id, controls) => {
       controls.seq = 1;
-      controls.pending.push({ phone: ALICE, requestId: "ctl:replayed", seq: 1, command: "/stop", receivedAt: at });
-      inbox.items.push({ requestId: "msg:before", content: "不该运行", receivedAt: at - 1 });
-      inbox.items.push({ requestId: "msg:after", content: "停止之后", receivedAt: at + 1 });
+      controls.pending.push({ phone: ALICE, requestId: "ctl:replayed", seq: 1, command: "/stop", receivedAt: at, reply: out.message(GROUP, ALICE, "/stop").reply });
+      await seedItem(tx, id, out, ALICE, { requestId: "msg:before", content: "不该运行", receivedAt: at - 1 });
+      await seedItem(tx, id, out, ALICE, { requestId: "msg:after", content: "停止之后", receivedAt: at + 1 });
     });
     const seen: string[] = [];
     faux.setResponses(["停止之后的回答", "重启后新消息的回答", "不该有第四次"].map((answer) => (transcript: { messages: unknown[] }) => {
@@ -731,24 +833,21 @@ describe("durable service: restart", () => {
     }));
     opened = open(where, models, model, out.outbound);
     try {
-      expect(await opened.service.start()).toEqual([GROUP]);
-      // The message after the /stop runs once the /stop ran (its reply waits for a callback URL); the one before it never
-      // reaches the model.
+      expect(await opened.service.start()).toEqual([scopeOf(GROUP)]);
+      // The message after the /stop runs once the /stop ran; the one before it never reaches the model.
       await until(() => faux.state.callCount === 2, "the message after the /stop");
-      await until(() => where.deliveries.pending(JSON.stringify([GROUP, ALICE])).some((item) => item.text === "停止之后的回答"),
-        "the reply committed before the new callback arrives");
-      await opened.service.admit(ALICE, GROUP, "重启后的新消息", URL);
+      await until(() => replies(out.sent).includes("停止之后的回答"), "the reply of the message after the /stop");
+      await opened.service.admit(out.message(GROUP, ALICE, "重启后的新消息"));
       await until(() => replies(out.sent).includes("重启后新消息的回答"), "the new reply");
       await Bun.sleep(100);
       expect(faux.state.callCount).toBe(3);
-      // A callback can arrive after finalization but before the worker finishes. Either that worker or outbox
-      // recovery sends the stored answer; both routes must send it exactly once before the new answer.
-      expect(out.sent.filter((item) => item.kind !== "status").map((item) => item.text))
-        .toEqual(["第一条回答", "停止之后的回答", "重启后新消息的回答"]);
-      expect(where.deliveries.pending(JSON.stringify([GROUP, ALICE]))).toEqual([]);
+      expect(replies(out.sent)).toEqual(["第一条回答", "停止之后的回答", "重启后新消息的回答"]);
+      // The replayed /stop answers its own command message.
+      expect(notices(out.sent).some((text) => text.startsWith("⏹ 已停止你在本群的当前任务"))).toBe(true);
+      await until(async () => (await pending(opened.service)).length === 0, "no pending delivery");
       expect(seen.join("")).not.toContain("不该运行");
     } finally { await opened.service.close(); }
-    const database = createSession(await openGroupStorage(groupDatabasePath(where.root, GROUP)));
+    const database = createSession(await openGroupStorage(databaseOf(where.root, GROUP)));
     try {
       expect((await database.snapshot(ControlsDoc, context))?.pending).toEqual([]);
     } finally { await database.close(context); }
@@ -760,18 +859,18 @@ describe("durable service: restart", () => {
     faux.setResponses([fauxAssistantMessage("Alice 第一轮回答"), fauxAssistantMessage("Bob 第一轮回答")]);
     const out = recordingOutbound();
     let opened = open(where, models, model, out.outbound);
-    await opened.service.admit(ALICE, GROUP, "Alice 第一轮", URL);
+    await opened.service.admit(out.message(GROUP, ALICE, "Alice 第一轮"));
     await until(() => replies(out.sent).length === 1, "Alice's first reply");
-    await opened.service.admit(BOB, GROUP, "Bob 第一轮", URL);
+    await opened.service.admit(out.message(GROUP, BOB, "Bob 第一轮"));
     await until(() => replies(out.sent).length === 2, "Bob's first reply");
     await opened.service.close();
     // The stopped process's clock can be ahead of maintenance's clock: every existing input still precedes this clear.
-    await inject(where, (inbox) => { inbox.items.push({ requestId: "msg:queued", content: "清空前排队", receivedAt: Date.now() + 60_000 }); });
-    const path = groupDatabasePath(where.root, GROUP);
-    expect(await queueGroupClear(path)).toEqual({ groupId: GROUP, queued: [ALICE, BOB], waiting: [] });
+    await inject(where, (tx, id) => seedItem(tx, id, out, ALICE, { requestId: "msg:queued", content: "清空前排队", receivedAt: Date.now() + 60_000 }));
+    const path = databaseOf(where.root, GROUP);
+    expect(await queueSpaceClear(path)).toEqual({ scope: scopeOf(GROUP), queued: [ALICE, BOB], waiting: [] });
     // Run twice: no second /clear per member.
-    expect(await queueGroupClear(path)).toEqual({ groupId: GROUP, queued: [], waiting: [ALICE, BOB] });
-    expect(await queueGroupClear(join(where.root, "no-group", "durable.sqlite"))).toBeUndefined();
+    expect(await queueSpaceClear(path)).toEqual({ scope: scopeOf(GROUP), queued: [], waiting: [ALICE, BOB] });
+    expect(await queueSpaceClear(databaseOf(where.root, "no-group"))).toBeUndefined();
     const seen: Message[][] = [];
     faux.setResponses([1, 2].map(() => (transcript: { messages: unknown[] }) => {
       seen.push(transcript.messages as Message[]);
@@ -779,9 +878,9 @@ describe("durable service: restart", () => {
     }));
     opened = open(where, models, model, out.outbound);
     try {
-      expect(await opened.service.start()).toEqual([GROUP]);
-      await opened.service.admit(ALICE, GROUP, "Alice 清空之后", URL);
-      await opened.service.admit(BOB, GROUP, "Bob 清空之后", URL);
+      expect(await opened.service.start()).toEqual([scopeOf(GROUP)]);
+      await opened.service.admit(out.message(GROUP, ALICE, "Alice 清空之后"));
+      await opened.service.admit(out.message(GROUP, BOB, "Bob 清空之后"));
       await until(() => replies(out.sent).length === 4, "the replies after the clear");
       await Bun.sleep(100);
       // The message queued before the clear never reached the model; neither member sees its old context.
@@ -803,11 +902,13 @@ describe("durable service: storage identity", () => {
     const where = place();
     const { models, model } = fauxModels();
     const out = recordingOutbound();
-    await mkdir(join(where.root, GROUP, "users", "Abc"), { recursive: true });
+    await mkdir(join(where.root, "tmp", "groups", GROUP, "Abc"), { recursive: true });
     const { service } = open(where, models, model, out.outbound);
     try {
-      await expect(service.admit("abc", GROUP, "大小写别名", URL)).rejects.toThrow("标识大小写与已有目录 Abc 冲突");
-      expect(await readdir(join(where.root, GROUP))).toEqual(["users"]);
+      await expect(service.admit(out.message(GROUP, "abc", "大小写别名"))).rejects.toThrow("标识大小写与已有目录 Abc 冲突");
+      expect(service.seen(out.sent[0]?.msgUid ?? "none")).toBe(false);
+      expect(await readdir(join(where.root, "tmp", "groups", GROUP))).toEqual(["Abc"]);
+      expect(existsSync(databaseOf(where.root, GROUP))).toBe(false);
     } finally { await service.close(); }
   });
 });
@@ -823,10 +924,10 @@ test("a control holds the request door at receipt, before its asynchronous group
     authEntered = true; await auth.promise; authReturned = true;
     return typeof args[0] === "string" ? originalAuth(args[0], args[1]) : originalAuth(args[0], args[1]);
   });
-  const originalAcquire = GroupHarnesses.prototype.acquire;
-  const acquireSpy = spyOn(GroupHarnesses.prototype, "acquire").mockImplementation(async function (this: GroupHarnesses, groupId) {
+  const originalAcquire = SpaceHarnesses.prototype.acquire;
+  const acquireSpy = spyOn(SpaceHarnesses.prototype, "acquire").mockImplementation(async function (this: SpaceHarnesses, scope) {
     if (blockAcquire) { acquireEntered = true; await acquire.promise; }
-    return originalAcquire.call(this, groupId);
+    return originalAcquire.call(this, scope);
   });
   const originalPending = RequestDoor.prototype.pendingControls;
   const pendingSpy = spyOn(RequestDoor.prototype, "pendingControls").mockImplementation(function (this: RequestDoor, phone) {
@@ -837,10 +938,10 @@ test("a control holds the request door at receipt, before its asynchronous group
   const { service } = open(where, models, model, out.outbound);
   let command: Promise<string> | undefined;
   try {
-    await service.admit(ALICE, GROUP, "held before dispatch", URL);
+    await service.admit(out.message(GROUP, ALICE, "held before dispatch"));
     await until(() => authEntered, "credential resolution");
     blockAcquire = true;
-    command = service.control(ALICE, GROUP, "/stop", URL);
+    command = service.control(out.message(GROUP, ALICE, "/stop"));
     await until(() => acquireEntered, "control's group acquire");
     auth.resolve();
     await until(() => checked !== undefined, "serial boundary after credential resolution");
@@ -884,15 +985,15 @@ test("a control waits for a start that passed its gate, before looking up/aborti
   const { service } = open(where, models, model, out.outbound);
   let command: Promise<string> | undefined;
   try {
-    await service.admit(ALICE, GROUP, "must be cancelled before it starts", URL);
+    await service.admit(out.message(GROUP, ALICE, "must be cancelled before it starts"));
     await entered.promise;
-    command = service.control(ALICE, GROUP, "/clear", URL);
+    command = service.control(out.message(GROUP, ALICE, "/clear"));
     await admitted.promise;
     // The mutation removing the wait synchronously calls harness.conversation before this continuation.
     expect(earlyLookup).toBe(false);
     block = false; release.resolve(); await command;
     expect(faux.state.callCount).toBe(0);
-    await service.admit(ALICE, GROUP, "new question after clear", URL);
+    await service.admit(out.message(GROUP, ALICE, "new question after clear"));
     await until(() => replies(out.sent).length === 1, "the new question's answer");
     expect(replies(out.sent)).toEqual(["after the control"]);
   } finally {
@@ -900,6 +1001,75 @@ test("a control waits for a start that passed its gate, before looking up/aborti
     await service.close(); conversationSpy.mockRestore(); admittedSpy.mockRestore(); snapshotSpy.mockRestore();
   }
 });
+
+/**
+ * A run settles while a /stop or /clear waits before its receipt check (its group acquire is held). `redelivered`: the
+ * control is the platform's redelivery of one executed before a restart, so the run's answer goes out; otherwise it is a
+ * new control and the run is cancelled.
+ */
+async function settleDuringReceiptCheck(command: "/stop" | "/clear", redelivered: boolean) {
+  const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
+  const control = out.message(GROUP, ALICE, command);
+  let { service, reports } = open(where, models, model, out.outbound);
+  if (redelivered) {
+    await service.control(control);
+    await service.close();
+    ({ service, reports } = open(where, models, model, out.outbound));
+    await service.start();
+    expect(service.seen(control.reply.msgUid)).toBe(false);
+  }
+  const held = gate("重启后的回答"); faux.setResponses([held.step]);
+  const release = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+  let block = false;
+  const originalAcquire = SpaceHarnesses.prototype.acquire;
+  const acquireSpy = spyOn(SpaceHarnesses.prototype, "acquire").mockImplementation(async function (this: SpaceHarnesses, scope) {
+    if (block) { block = false; entered.resolve(); await release.promise; }
+    return originalAcquire.call(this, scope);
+  });
+  let receipt: Promise<string> | undefined;
+  try {
+    const question = out.message(GROUP, ALICE, "重启后的问题");
+    await service.admit(question);
+    await until(() => held.state.started === 1, "the request");
+    block = true;
+    receipt = service.control(control);
+    await entered.promise;
+    held.open();
+    // The settled run waits for the receipt check: nothing is decided or sent yet.
+    await Bun.sleep(100);
+    expect(out.sent.filter(item => item.msgUid === question.reply.msgUid)).toEqual([]);
+    release.resolve();
+    const text = await receipt;
+    const record = async () => Object.values((await service.records(scopeOf(GROUP), ALICE)).requests).find(each => each.reply.msgUid === question.reply.msgUid)!;
+    await until(async () => (await record()).closedAt !== undefined, "the run's record closed");
+    if (redelivered) await until(() => replies(out.sent).includes("重启后的回答"), "the answer");
+    else await Bun.sleep(100);
+    return { text, record: await record(), answers: out.sent.filter(item => item.msgUid === question.reply.msgUid), reports };
+  } finally {
+    block = false; release.resolve(); held.open();
+    await receipt?.catch(() => {});
+    await service.close(); acquireSpy.mockRestore();
+  }
+}
+
+for (const command of ["/stop", "/clear"] as const) {
+  test(`a ${command} redelivered after a restart neither cancels nor withholds a reply that settles during its receipt check`, async () => {
+    const { text, record, answers, reports } = await settleDuringReceiptCheck(command, true);
+    expect(text).toBe("");
+    expect(record.cancelled).not.toBe(true);
+    expect(answers.map(item => item.text)).toEqual(["重启后的回答"]);
+    expect(reports).toEqual([]);
+  });
+
+  test(`a new ${command} still cancels a run that settles during its receipt check`, async () => {
+    const { text, record, answers, reports } = await settleDuringReceiptCheck(command, false);
+    expect(text).not.toBe("");
+    expect(record.cancelled).toBe(true);
+    expect(record.delivery).toBeUndefined();
+    expect(answers).toEqual([]);
+    expect(reports).toEqual([]);
+  });
+}
 
 test.skipIf(process.getuid?.() === 0)("a held result defers idle reclamation without blocking clear or later messages", async () => {
   const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
@@ -917,22 +1087,22 @@ test.skipIf(process.getuid?.() === 0)("a held result defers idle reclamation wit
   });
   await registeredResult(where, models, model, "1-locked");
   const { service } = open(where, models, model, out.outbound);
-  const temp = userTempDir(where.root, GROUP, ALICE), locked = join(resultsRoot(temp), "1-locked");
+  const temp = tmpOf(where.root, GROUP, ALICE), locked = join(resultsRoot(temp), "1-locked");
   let held: HeldDirectory | undefined, command: Promise<string> | undefined;
   try {
-    await service.admit(ALICE, GROUP, "seed", URL);
+    await service.admit(out.message(GROUP, ALICE, "seed"));
     await until(() => replies(out.sent).length === 1, "seed reply");
     await mkdir(locked, { recursive: true }); await writeFile(join(locked, "index.txt"), "synthetic");
     if (process.platform === "win32") held = await holdDirectory(temp, ["codemode", "1-locked"]);
     else await chmod(locked, 0o555);
-    command = service.control(ALICE, GROUP, "/clear", URL);
+    command = service.control(out.message(GROUP, ALICE, "/clear"));
     expect(await command).toContain("开启新会话");
-    await service.admit(ALICE, GROUP, "later question", URL);
+    await service.admit(out.message(GROUP, ALICE, "later question"));
     await until(() => replies(out.sent).length === 2, "new context proceeds with deferred physical reclamation");
     expect(replies(out.sent)).toEqual(["seed", "after the failed cleanup"]);
     await until(async () => {
       await service.maintain();
-      return (await service.control(ALICE, GROUP, "/status", URL)).includes("待物理回收");
+      return await awaitingRemoval(databaseOf(where.root, GROUP), ALICE) > 0;
     }, "held result remains recorded for maintenance");
     expect(resets).toBe(1);
     expect(await readFile(join(locked, "index.txt"), "utf8")).toBe("synthetic");
@@ -948,74 +1118,29 @@ test.skipIf(process.getuid?.() === 0)("a held result defers idle reclamation wit
   }
 }, 20_000);
 
-test("a callback arriving during finalization sends the recovered answer once across worker and outbox recovery", async () => {
+test("a transient storage error while settling: the worker settles the same submission again, without another provider call or duplicate send", async () => {
   const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
-  faux.setResponses([fauxAssistantMessage("recovered answer"), fauxAssistantMessage("next answer")]);
-  const seeded = await openGroupHarness(groupDatabasePath(where.root, GROUP), models);
-  try {
-    const { conversation } = await memberConversation(seeded.harness, GROUP, ALICE, { model }, context);
-    await seeded.harness.commit(async (tx) => {
-      (await tx.doc(InboxDoc, conversation.id)).items.push({ requestId: "msg:recover-send", content: "recovered question", receivedAt: Date.now() });
-    }, context);
-  } finally { await seeded.close(); }
-  const prototype = await harnessPrototype(models), original = prototype.snapshot;
-  const release = Promise.withResolvers<void>();
-  let atProjection = false, held = false;
-  const spy = spyOn(prototype, "snapshot").mockImplementation(async function (this: Harness, ...args: unknown[]) {
-    if (!held && args[0] === GroupDoc && where.deliveries.pending(JSON.stringify([GROUP, ALICE])).some((item) => item.text === "recovered answer")) {
-      held = true; atProjection = true;
-      await release.promise;
-    }
+  let armed = false;
+  faux.setResponses([() => { armed = true; return fauxAssistantMessage("first"); }, fauxAssistantMessage("second")]);
+  await seed(where, models, model, async (tx, id) => {
+    await seedItem(tx, id, out, ALICE, { requestId: "msg:first-retry", content: "first question", receivedAt: Date.now() });
+    await seedItem(tx, id, out, ALICE, { requestId: "msg:second-retry", content: "second question", receivedAt: Date.now() + 1 });
+  });
+  const prototype = await harnessPrototype(models), original = prototype.commit;
+  const spy = spyOn(prototype, "commit").mockImplementation(function (this: Harness, ...args: unknown[]) {
+    if (armed) { armed = false; return Promise.reject(new Error("transient settle I/O failure")); }
     return Reflect.apply(original, this, args);
-  } as Harness["snapshot"]);
+  } as Harness["commit"]);
   const { service, reports } = open(where, models, model, out.outbound);
   try {
     await service.start();
-    await until(() => atProjection, "the finalized answer before worker send");
-    await service.admit(ALICE, GROUP, "next question", URL);
-    await until(() => out.sent.some((item) => item.text === "recovered answer"), "outbox recovery send");
-    release.resolve();
-    await until(() => replies(out.sent).includes("next answer"), "next answer");
-    await Bun.sleep(30);
-    expect(out.sent.filter((item) => item.text === "recovered answer")).toHaveLength(1);
-    expect(faux.state.callCount).toBe(2);
-    expect(where.deliveries.pending(JSON.stringify([GROUP, ALICE]))).toEqual([]);
-    expect(reports).toEqual([]);
-  } finally { release.resolve(); await service.close(); spy.mockRestore(); }
-});
-
-test.each(["before", "after"] as const)("worker retries an outbox failure %s commit, without another message or duplicate provider/send", async (mode) => {
-  const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
-  faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
-  class FailOnce extends DeliveryStore {
-    failed = false;
-    override finalize(...args: Parameters<DeliveryStore["finalize"]>): void {
-      if (mode === "after") super.finalize(...args);
-      if (!this.failed) { this.failed = true; throw new Error("transient outbox I/O failure"); }
-      if (mode === "before") super.finalize(...args);
-    }
-  }
-  const store = new FailOnce(where.stateDb), { service, reports } = open(where, models, model, out.outbound, { deliveries: store });
-  // Seed both inputs offline: start() kicks this worker once, so no second admit/member.again can rescue a broken retry.
-  const seeded = await openGroupHarness(groupDatabasePath(where.root, GROUP), models);
-  try {
-    const { conversation } = await memberConversation(seeded.harness, GROUP, ALICE, { model }, context);
-    await seeded.harness.commit(async (tx) => {
-      (await tx.doc(InboxDoc, conversation.id)).items.push(
-        { requestId: "msg:first-retry", content: "first question", receivedAt: Date.now() },
-        { requestId: "msg:second-retry", content: "second question", receivedAt: Date.now() + 1 });
-    }, context);
-  } finally { await seeded.close(); }
-  try {
-    await service.start(); await service.control(ALICE, GROUP, "/status", URL);
     // A failed mutant reports counts at an assertion, not as the test framework's timeout.
-    await until(() => out.sent.filter((item) => ["first", "second"].includes(item.text)).length === 2,
-      "automatic outbox retry and queued message", 1500).catch(() => {});
+    await until(() => replies(out.sent).length === 2, "automatic retry and queued message", 3000).catch(() => {});
     expect(faux.state.callCount).toBe(2);
-    expect(out.sent.filter((item) => ["first", "second"].includes(item.text)).map((item) => item.text)).toEqual(["first", "second"]);
-    expect(reports.some((error) => String(error).includes("transient outbox"))).toBe(true);
-    expect(store.pending(JSON.stringify([GROUP, ALICE]))).toEqual([]);
-  } finally { await service.close(); }
+    expect(replies(out.sent)).toEqual(["first", "second"]);
+    expect(reports.some((error) => String(error).includes("transient settle"))).toBe(true);
+    await until(async () => (await pending(service)).length === 0, "no pending delivery");
+  } finally { await service.close(); spy.mockRestore(); }
 }, 20_000);
 
 test("an uncertain COMMIT fences the whole service immediately and reports fatal once", async () => {
@@ -1032,24 +1157,79 @@ test("an uncertain COMMIT fences the whole service immediately and reports fatal
     return result as never;
   });
   try {
-    await service.admit(ALICE, GROUP, "first", URL); await until(() => held.state.started === 1, "provider");
+    await service.admit(out.message(GROUP, ALICE, "first")); await until(() => held.state.started === 1, "provider");
     armed = true;
-    await expect(service.admit(ALICE, GROUP, "second", URL)).rejects.toBeInstanceOf(DurableStorageFailure);
+    await expect(service.admit(out.message(GROUP, ALICE, "second"))).rejects.toBeInstanceOf(DurableStorageFailure);
     expect(fatal).toHaveLength(1);
-    await expect(service.admit(BOB, GROUP, "third", URL)).rejects.toBe(fatal[0]);
+    await expect(service.admit(out.message(GROUP, BOB, "third"))).rejects.toBe(fatal[0]);
     expect(faux.state.callCount).toBe(1);
   } finally { spy.mockRestore(); held.open(); await service.close().catch(() => {}); }
 });
 
+test("an admission whose commit rolled back leaves no receipt: the platform's redelivery is admitted and answered once", async () => {
+  const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
+  faux.setResponses([fauxAssistantMessage("warm-up"), fauxAssistantMessage("answer")]);
+  const prototype = await harnessPrototype(models), original = prototype.commit;
+  let armed = false;
+  const spy = spyOn(prototype, "commit").mockImplementation(function (this: Harness, ...args: unknown[]) {
+    if (armed) { armed = false; return Promise.reject(new Error("admission rolled back")); }
+    return Reflect.apply(original, this, args);
+  } as Harness["commit"]);
+  const { service } = open(where, models, model, out.outbound);
+  try {
+    // The member's conversation exists: the next commit of an admission is the admission itself.
+    await service.admit(out.message(GROUP, ALICE, "warm-up")); await until(() => replies(out.sent).length === 1, "warm-up");
+    const message = out.message(GROUP, ALICE, "question");
+    armed = true;
+    await expect(service.admit(message)).rejects.toThrow("admission rolled back");
+    expect(service.seen(message.reply.msgUid)).toBe(false);
+    expect(await service.admit(message)).toEqual({ status: "accepted" });
+    await until(() => replies(out.sent).length === 2, "the answer");
+    expect(await service.admit(message)).toEqual({ status: "duplicate" });
+    await Bun.sleep(50);
+    expect(replies(out.sent)).toEqual(["warm-up", "answer"]); expect(faux.state.callCount).toBe(2);
+  } finally { spy.mockRestore(); await service.close(); }
+});
+
+test("an admission whose COMMIT outcome was lost but landed: after the restart the message runs once and its redelivery is a duplicate", async () => {
+  const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
+  faux.setResponses([fauxAssistantMessage("warm-up"), fauxAssistantMessage("answer")]);
+  const fatal: unknown[] = [], first = open(where, models, model, out.outbound, { onFatal: (error) => fatal.push(error) });
+  const original = SqliteClient.prototype.request;
+  let armed = false;
+  const spy = spyOn(SqliteClient.prototype, "request").mockImplementation(function (this: SqliteClient, command) {
+    const result = original.call(this, command);
+    if (armed && command.kind === "sql" && command.sql === "COMMIT") {
+      armed = false; return result.then(() => { throw new Error("lost native COMMIT acknowledgement"); }) as never;
+    }
+    return result as never;
+  });
+  const message = out.message(GROUP, ALICE, "question");
+  let second: DurableService | undefined;
+  try {
+    await first.service.admit(out.message(GROUP, ALICE, "warm-up")); await until(() => replies(out.sent).length === 1, "warm-up");
+    // Arm only after the warm-up turn's own closing commits, or the lost acknowledgement could hit one of them.
+    await until(async () => {
+      const records = await first.service.records(scopeOf(GROUP), ALICE);
+      return pendingDeliveries(records).length === 0 && Object.values(records.requests).every(record => record.closedAt !== undefined);
+    }, "the warm-up request closed");
+    armed = true;
+    await expect(first.service.admit(message)).rejects.toBeInstanceOf(DurableStorageFailure);
+    expect(fatal).toHaveLength(1);
+    spy.mockRestore();
+    await first.service.close().catch(() => {});
+    second = open(where, models, model, out.outbound).service;
+    await second.start();
+    await until(() => replies(out.sent).length === 2, "the answer after the restart");
+    expect(await second.admit(message)).toEqual({ status: "duplicate" });
+    await Bun.sleep(50);
+    expect(replies(out.sent)).toEqual(["warm-up", "answer"]); expect(faux.state.callCount).toBe(2);
+  } finally { spy.mockRestore(); await first.service.close().catch(() => {}); await second?.close(); }
+});
+
 test("a new clear cancels older persisted input even when its old-process timestamp is ahead of the current clock", async () => {
   const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
-  const seeded = await openGroupHarness(groupDatabasePath(where.root, GROUP), models);
-  try {
-    const { conversation } = await memberConversation(seeded.harness, GROUP, ALICE, { model }, context);
-    await seeded.harness.commit(async (tx) => {
-      (await tx.doc(InboxDoc, conversation.id)).items.push({ requestId: "msg:old-clock", content: "old persisted input", receivedAt: Date.now() + 60_000 });
-    }, context);
-  } finally { await seeded.close(); }
+  await seed(where, models, model, (tx, id) => seedItem(tx, id, out, ALICE, { requestId: "msg:old-clock", content: "old persisted input", receivedAt: Date.now() + 60_000 }));
   const seen: string[] = [];
   const step: FauxResponseFactory = (transcript) => {
     const input = transcript.messages.filter((message) => message.role === "user").at(-1)!;
@@ -1059,8 +1239,8 @@ test("a new clear cancels older persisted input even when its old-process timest
   faux.setResponses([step, step]);
   const { service } = open(where, models, model, out.outbound);
   try {
-    await service.control(ALICE, GROUP, "/clear", URL);
-    await service.admit(ALICE, GROUP, "after clear", URL);
+    await service.control(out.message(GROUP, ALICE, "/clear"));
+    await service.admit(out.message(GROUP, ALICE, "after clear"));
     await until(() => replies(out.sent).includes("new answer"), "the input after clear");
     expect(faux.state.callCount).toBe(1);
     expect(seen.join("")).not.toContain("old persisted input");
@@ -1077,22 +1257,22 @@ test("a clear also cancels an older admit that commits only after the clear fini
   };
   faux.setResponses([step, step, step]);
   const { service } = open(where, models, model, out.outbound);
-  await service.admit(ALICE, GROUP, "seed", URL);
+  await service.admit(out.message(GROUP, ALICE, "seed"));
   await until(() => replies(out.sent).length === 1, "seed reply");
-  expect(await service.control(ALICE, GROUP, "/status", URL)).toContain("状态：空闲");
+  expect(await service.control(out.message(GROUP, ALICE, "/status"))).toContain("状态：空闲");
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-  const original = GroupHarnesses.prototype.acquire;
+  const original = SpaceHarnesses.prototype.acquire;
   let blocked = false;
-  const spy = spyOn(GroupHarnesses.prototype, "acquire").mockImplementation(async function (this: GroupHarnesses, ...args) {
+  const spy = spyOn(SpaceHarnesses.prototype, "acquire").mockImplementation(async function (this: SpaceHarnesses, ...args) {
     if (!blocked) { blocked = true; entered.resolve(); await release.promise; }
     return original.call(this, ...args);
   });
-  const admitting = service.admit(ALICE, GROUP, "old delayed admit", URL);
+  const admitting = service.admit(out.message(GROUP, ALICE, "old delayed admit"));
   try {
     await entered.promise;
-    await service.control(ALICE, GROUP, "/clear", URL);
+    await service.control(out.message(GROUP, ALICE, "/clear"));
     release.resolve(); await admitting;
-    await service.admit(ALICE, GROUP, "after clear", URL);
+    await service.admit(out.message(GROUP, ALICE, "after clear"));
     await until(() => replies(out.sent).includes("new answer"), "the new input");
     expect(faux.state.callCount).toBe(2);
     expect(seen.join("")).not.toContain("old delayed admit");
@@ -1101,24 +1281,19 @@ test("a clear also cancels an older admit that commits only after the clear fini
 
 test("replaying an earlier-epoch stop preserves a later-epoch input after the clock moves backwards", async () => {
   const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
-  const seeded = await openGroupHarness(groupDatabasePath(where.root, GROUP), models);
-  try {
-    const { conversation } = await memberConversation(seeded.harness, GROUP, ALICE, { model }, context);
-    await seeded.harness.commit(async (tx) => {
-      const controls = await tx.doc(ControlsDoc);
-      controls.epoch = 2; controls.seq = 1;
-      controls.pending.push({ phone: ALICE, requestId: "ctl:old-epoch", seq: 1, command: "/stop", receivedAt: 90_000, epoch: 1 });
-      (await tx.doc(InboxDoc, conversation.id)).items.push(
-        { requestId: "msg:older-epoch", content: "must never reach model", receivedAt: 100_000, epoch: 0 },
-        { requestId: "msg:newer-epoch", content: "later epoch input", receivedAt: 10_000, epoch: 2 });
-    }, context);
-  } finally { await seeded.close(); }
+  await seed(where, models, model, async (tx, id) => {
+    const controls = await tx.doc(ControlsDoc);
+    controls.epoch = 2; controls.seq = 1;
+    controls.pending.push({ phone: ALICE, requestId: "ctl:old-epoch", seq: 1, command: "/stop", receivedAt: 90_000, epoch: 1 });
+    await seedItem(tx, id, out, ALICE, { requestId: "msg:older-epoch", content: "must never reach model", receivedAt: 100_000, epoch: 0 });
+    await seedItem(tx, id, out, ALICE, { requestId: "msg:newer-epoch", content: "later epoch input", receivedAt: 10_000, epoch: 2 });
+  });
   const seen: string[] = [];
   faux.setResponses([(transcript) => { seen.push(JSON.stringify(transcript.messages)); return fauxAssistantMessage("later epoch answer"); }]);
   const { service } = open(where, models, model, out.outbound);
   try {
     await service.start();
-    await until(() => where.deliveries.pending(JSON.stringify([GROUP, ALICE])).some((item) => item.text === "later epoch answer"), "later-epoch recovery");
+    await until(() => replies(out.sent).includes("later epoch answer"), "later-epoch recovery");
     expect(faux.state.callCount).toBe(1);
     expect(seen.join("")).toContain("later epoch input");
     expect(seen.join("")).not.toContain("must never reach model");
@@ -1128,10 +1303,10 @@ test("replaying an earlier-epoch stop preserves a later-epoch input after the cl
 test("a message arriving during maintenance waits for one member, not the whole group; the next pass resumes with the next member", async () => {
   const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
   faux.setResponses([fauxAssistantMessage("answer during maintenance")]);
-  const opened = await openGroupHarness(groupDatabasePath(where.root, GROUP), models, { group: GROUP });
+  const opened = await openGroupHarness(databaseOf(where.root, GROUP), models, { group: GROUP });
   const ids = new Map<number, string>();
   try {
-    for (const phone of [ALICE, BOB]) ids.set((await memberConversation(opened.harness, GROUP, phone, { model }, context)).conversation.id, phone);
+    for (const phone of [ALICE, BOB]) ids.set((await memberConversation(opened.harness, scopeOf(GROUP), phone, { model }, context)).conversation.id, phone);
   } finally { await opened.close(); }
   const visits: string[] = [], entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   let block = true;
@@ -1151,7 +1326,7 @@ test("a message arriving during maintenance waits for one member, not the whole 
     await entered.promise;
     const first = visits[0]!;
     let admitted = false;
-    const message = service.admit(first === ALICE ? BOB : ALICE, GROUP, "question", URL).then(result => { admitted = true; return result; });
+    const message = service.admit(out.message(GROUP, first === ALICE ? BOB : ALICE, "question")).then(result => { admitted = true; return result; });
     await Bun.sleep(50);
     expect(admitted).toBe(false);
     release.resolve();
@@ -1162,4 +1337,26 @@ test("a message arriving during maintenance waits for one member, not the whole 
     await until(async () => { await service.maintain(); return visits.length > 1; }, "the next maintenance pass");
     expect(visits[1]).not.toBe(first);
   } finally { release.resolve(); await service.close(); spy.mockRestore(); }
+});
+
+test("a /clear after the member's in-memory state was dropped as idle still resets the persisted conversation", async () => {
+  const where = place(), { faux, models, model } = fauxModels(), out = recordingOutbound();
+  const users: number[] = [];
+  faux.setResponses(Array.from({ length: 2 }, () => (transcript: Parameters<FauxResponseFactory>[0]) => {
+    users.push(transcript.messages.filter(message => message.role === "user").length);
+    return fauxAssistantMessage("answer");
+  }));
+  const { service } = open(where, models, model, out.outbound,
+    { limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20, memberIdleMs: 1 } });
+  try {
+    await service.admit(out.message(GROUP, ALICE, "before"));
+    await until(() => replies(out.sent).length === 1, "the first answer");
+    await Bun.sleep(20);
+    // The pass drops idle member state; the persisted conversation stays.
+    await service.maintain();
+    await service.control(out.message(GROUP, ALICE, "/clear"));
+    await service.admit(out.message(GROUP, ALICE, "after"));
+    await until(() => replies(out.sent).length === 2, "the second answer");
+    expect(users).toEqual([1, 1]);
+  } finally { await service.close(); }
 });

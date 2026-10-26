@@ -1,9 +1,10 @@
-// 发送工具定义：send_image / send_file（ToolDefinition，Pi agent 经 customTools 调用）。
-// 从 im 层封装：agent 给 source（URL、群 workspace 或当前用户 tmp 内路径），工具负责读取 + 上传 + 发送。
+// 发送工具定义：send_image / send_file（ToolDefinition）。
+// agent 给 source（URL、共享资料 workspace 或当前用户 tmp 内路径），工具负责读取 + 上传 + 发送到当前请求的回复目标。
 //
-// 小附件限量读入内存并直传；超限本地文件由配置的外链后端分发，未配置则报大小限制。
-import { open, realpath, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+// 远程来源先限量下载到当前用户 tmp；超限本地文件由配置的外链后端分发，未配置则报大小限制。
+import { randomUUID } from "node:crypto";
+import { open, realpath, stat, unlink, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import {
   formatSize,
@@ -12,11 +13,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   ATTACHMENT_HTTP_TIMEOUT,
-  MAX_ATTACHMENT_BYTES,
+  NATIVE_FILE_MAX_BYTES,
 } from "../core/config.ts";
-import { sendFile, sendImage, uploadAttachment } from "../integrations/im.ts";
 import { relayFile, relayNote, relayReference, type RelayConfig } from "../integrations/relay.ts";
-import type { DeliveryAttachment } from "./delivery-store.ts";
+import { imageInfo, type ImageInfo } from "../integrations/open-platform/image.ts";
+import type { LinkNote } from "../durable/records.ts";
 import type { RelayIndex } from "../integrations/relay-index.ts";
 import { isPathInside } from "../contracts/paths.ts";
 import { resolveToolPath } from "./tool-path.ts";
@@ -29,13 +30,20 @@ import { downloadPublicBytes } from "../core/public-download.ts";
 
 const attachmentSlots = new AsyncSemaphore(Number(runtimeSetting("BOT_ATTACHMENT_CONCURRENCY") ?? RUNTIME_DEFAULTS.BOT_ATTACHMENT_CONCURRENCY));
 
-async function uploadBuffered(source: ResolvedSource, callbackUrl: string, name: string, type: "image" | "file", group: string, signal?: AbortSignal) {
+/** Upload and send under the process-wide attachment concurrency limit. */
+async function withSlot<T>(signal: AbortSignal | undefined, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
   const budget = AbortSignal.any([application.signal, ...(signal ? [signal] : [])]);
   const release = await attachmentSlots.acquire(budget);
-  try {
-    const data = await readBytes(source, budget);
-    return await uploadAttachment(callbackUrl, data, name, type, group, budget);
-  } finally { release(); }
+  try { return await run(budget); } finally { release(); }
+}
+
+/** A remote source becomes an exclusive file in the member tmp; the caller removes it. */
+async function localCopy(source: ResolvedSource, tempDir: string, name: string, signal?: AbortSignal): Promise<{ path: string; size: number; temporary: boolean }> {
+  if (source.kind === "local") return { path: source.path, size: source.size, temporary: false };
+  const data = await readBytes(source, signal);
+  const path = join(tempDir, `${randomUUID()}-${name}`);
+  await writeFile(path, data, { flag: "wx" });
+  return { path, size: data.length, temporary: true };
 }
 
 /**
@@ -64,7 +72,7 @@ export async function resolveSource(
   const path = await realpath(requestedPath);
   await assertTaskPathAllowed(path);
   if (!roots.some((root) => isPathInside(path, root))) {
-    throw new Error("只能发送本群 workspace 或当前调用用户 tmp 目录内的文件");
+    throw new Error("只能发送共享资料 workspace 或当前调用用户 tmp 目录内的文件");
   }
   const info = await stat(path);
   if (!info.isFile()) throw new Error(`不是普通文件: ${source}`);
@@ -77,7 +85,7 @@ export async function resolveSource(
  */
 function oversizeError(kind: string, size: number): Error {
   return new Error(
-    `${kind}（${formatSize(size)}）超过群聊单条附件上限 ${formatSize(MAX_ATTACHMENT_BYTES)}`
+    `${kind}（${formatSize(size)}）超过单条附件上限 ${formatSize(NATIVE_FILE_MAX_BYTES)}`
   );
 }
 
@@ -88,7 +96,7 @@ async function fetchRemoteBytes(
 ): Promise<Uint8Array> {
   if (configuredRootlessTasks()) {
     const budget = AbortSignal.any([AbortSignal.timeout(ATTACHMENT_HTTP_TIMEOUT), ...(signal ? [signal] : [])]);
-    return downloadPublicBytes(url, MAX_ATTACHMENT_BYTES, budget);
+    return downloadPublicBytes(url, NATIVE_FILE_MAX_BYTES, budget);
   }
   const r = await fetch(url, {
     signal: signal
@@ -100,7 +108,7 @@ async function fetchRemoteBytes(
     throw new Error(`下载失败 HTTP ${r.status}: ${url}`);
   }
   const declared = Number(r.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > MAX_ATTACHMENT_BYTES) {
+  if (Number.isFinite(declared) && declared > NATIVE_FILE_MAX_BYTES) {
     await r.body?.cancel().catch(() => {});
     throw oversizeError("远程文件", declared);
   }
@@ -115,7 +123,7 @@ async function fetchRemoteBytes(
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_ATTACHMENT_BYTES) {
+      if (total > NATIVE_FILE_MAX_BYTES) {
         throw oversizeError("远程文件", total);
       }
       chunks.push(value);
@@ -139,23 +147,23 @@ export async function readBytes(
   if (resolved.kind === "remote") {
     return fetchRemoteBytes(resolved.url, signal);
   }
-  if (resolved.size > MAX_ATTACHMENT_BYTES) {
+  if (resolved.size > NATIVE_FILE_MAX_BYTES) {
     throw oversizeError("本地文件", resolved.size);
   }
   const handle = await open(resolved.path, "r");
   try {
     const info = await handle.stat();
     if (!info.isFile()) throw new Error("来源不再是普通文件");
-    if (info.size > MAX_ATTACHMENT_BYTES) throw oversizeError("本地文件", info.size);
+    if (info.size > NATIVE_FILE_MAX_BYTES) throw oversizeError("本地文件", info.size);
     const chunks: Buffer[] = [];
     let total = 0;
     for (;;) {
       signal?.throwIfAborted();
-      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_ATTACHMENT_BYTES + 1 - total));
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, NATIVE_FILE_MAX_BYTES + 1 - total));
       const { bytesRead } = await handle.read(buffer);
       if (!bytesRead) break;
       total += bytesRead;
-      if (total > MAX_ATTACHMENT_BYTES) throw oversizeError("本地文件", total);
+      if (total > NATIVE_FILE_MAX_BYTES) throw oversizeError("本地文件", total);
       chunks.push(buffer.subarray(0, bytesRead));
     }
     signal?.throwIfAborted();
@@ -184,25 +192,29 @@ function sanitizeFilename(filename: string): string {
 }
 
 /**
- * 工具产出的、必须原样进群的文本。
- *
- * 外链由运行时原样保存并并入最终交付，避免模型复述 URL 引入错误。
- * 交付可能拆成多条平台消息；失败或取消后可通过 /deliver 补发。
+ * 外链附注：由运行时原样保存在请求记录里，最终回复之后作为单独一条文本发送，避免模型复述 URL 引入错误。
+ * 发送失败时自动重试，直到交付时限。
  */
 export interface OutboundNotes {
-  add(note: string, attachment?: DeliveryAttachment): void;
-  /** 只读快照。拼回复时用它，但在确认送达前不清空。 */
-  peek(): string[];
-  references(): DeliveryAttachment[];
-  /** 重置本轮内存附注；未交付内容独立保存在 DeliveryStore。 */
-  clear(): void;
+  add(note: LinkNote): Promise<void>;
+}
+
+/** 发送没有得到确认。uncertain：平台可能已经收到，不能自动重发。 */
+export class SendNotConfirmed extends Error {
+  constructor(message: string, readonly uncertain: boolean) {
+    super(message);
+    this.name = "SendNotConfirmed";
+  }
+}
+
+/** 当前请求的回复目标。dispatched 在不可撤回的发送调用之前调用。失败抛 SendNotConfirmed 或上传错误。 */
+export interface SendChannel {
+  file(file: { path: string; name: string; size: number }, signal: AbortSignal | undefined, dispatched: () => void): Promise<void>;
+  image(image: { path: string; name: string; size: number } & ImageInfo, signal: AbortSignal | undefined, dispatched: () => void): Promise<void>;
 }
 
 export interface SendToolsOptions {
-  /** callback URL 用 getter 读取，以支持平台轮换机器人 key。 */
-  getCallbackUrl: () => string;
-  /** 固定为创建当前用户会话时所属的群，不能从模型参数中获取。 */
-  groupId: string;
+  channel: SendChannel;
   workspaceDir: string;
   tempDir: string;
   /** 缺省或 null 表示未配置外链后端，超限文件按原样报错。 */
@@ -214,24 +226,24 @@ export interface SendToolsOptions {
   fileDelivery?: (source: ResolvedSource, name: string, signal: AbortSignal | undefined, send: (source: ResolvedSource, beforeSend: () => void) => Promise<FileTransfer>) => Promise<FileTransfer>;
 }
 
-export type FileTransfer = { mode: "direct"; fileId?: string; alreadySent?: boolean } |
-  { mode: "relay"; url: string; note: string; attachment: DeliveryAttachment; size: number };
+export type FileTransfer = { mode: "direct"; alreadySent?: boolean } |
+  { mode: "relay"; url: string; note: string; attachment: LinkNote; size: number };
 
-/** One transport for model calls and server-side closeout. The callback marks the irreversible IM send boundary. */
-export async function transferFile(source: ResolvedSource, name: string, options: Pick<SendToolsOptions, "getCallbackUrl" | "groupId" | "relay" | "relayIndex" | "tempDir">,
+/** One transport for model calls and server-side closeout. The callback marks the irreversible send boundary. */
+export async function transferFile(source: ResolvedSource, name: string, options: Pick<SendToolsOptions, "channel" | "relay" | "relayIndex" | "tempDir">,
   signal?: AbortSignal, beforeSend: () => void = () => {}): Promise<FileTransfer> {
   signal?.throwIfAborted();
-  if (options.relay && source.kind === "local" && source.size > MAX_ATTACHMENT_BYTES) {
+  if (options.relay && source.kind === "local" && source.size > NATIVE_FILE_MAX_BYTES) {
     const url = await relayFile({ config: options.relay, localPath: source.path, size: source.size, filename: name, signal, index: options.relayIndex, tempDir: options.tempDir });
     const note = relayNote(name, source.size, url);
     return { mode: "relay", url, note, size: source.size, attachment: { original: note, reference: relayReference(options.relay, url, name, source.size) } };
   }
-  const callbackUrl = options.getCallbackUrl();
-  const fileId = await uploadBuffered(source, callbackUrl, name, "file", options.groupId, signal);
-  if (!fileId) throw new Error("文件上传失败");
-  signal?.throwIfAborted(); beforeSend();
-  if (!await sendFile(fileId, options.groupId, callbackUrl, undefined, signal)) throw new Error("文件发送结果未确认");
-  return { mode: "direct", fileId };
+  if (source.kind === "local" && source.size > NATIVE_FILE_MAX_BYTES) throw oversizeError("本地文件", source.size);
+  const local = await localCopy(source, options.tempDir, name, signal);
+  try {
+    await withSlot(signal, budget => options.channel.file({ path: local.path, name, size: local.size }, budget, beforeSend));
+    return { mode: "direct" };
+  } finally { if (local.temporary) await unlink(local.path).catch(() => {}); }
 }
 
 // 消息发出就无法撤回：只允许模型逐条直接调用，脚本（codemode 等经 ctx.executeTool 的调用）拿不到这两个工具。
@@ -240,18 +252,18 @@ const SEND_EXPOSURE = "model-only";
 const SENDS: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 
 export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
-  const { getCallbackUrl, groupId, workspaceDir, tempDir, relay, notes } = options;
+  const { workspaceDir, tempDir, relay, notes } = options;
 
   const imageParams = Type.Object({
     source: Type.String({
-      description: "图片来源：http(s) URL、本群 workspace 或当前用户 tmp 内的路径",
+      description: "图片来源：http(s) URL、共享资料 workspace 或当前用户 tmp 内的路径",
     }),
-    width: Type.Optional(Type.Number({ description: "宽度（像素，可选）" })),
-    height: Type.Optional(Type.Number({ description: "高度（像素，可选）" })),
+    width: Type.Optional(Type.Number({ description: "宽度（像素，可选；默认从图片读取）" })),
+    height: Type.Optional(Type.Number({ description: "高度（像素，可选；默认从图片读取）" })),
   });
   const fileParams = Type.Object({
     source: Type.String({
-      description: "文件来源：http(s) URL、本群 workspace 或当前用户 tmp 内的路径",
+      description: "文件来源：http(s) URL、共享资料 workspace 或当前用户 tmp 内的路径",
     }),
     filename: Type.Optional(Type.String({ description: "文件名（可选，默认从 source 推断）" })),
   });
@@ -260,8 +272,8 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
     name: "send_image",
     label: "发送图片",
     description:
-      "向当前群聊发送一张图片。source 为 http(s) URL、本群 workspace 或当前调用用户 tmp 内的路径。",
-    promptSnippet: "向群聊发送图片",
+      "向当前会话（提问所在的群或单聊）发送一张图片（PNG、JPEG、GIF、WebP、BMP），在聊天里直接显示；发送图片默认用本工具，包括资料库里的图片原件。source 为 http(s) URL、共享资料 workspace 或当前调用用户 tmp 内的路径。",
+    promptSnippet: "向当前会话发送图片",
     exposure: SEND_EXPOSURE,
     annotations: SENDS,
     constrainedSampling: { type: "json_schema", strict: "prefer" },
@@ -276,46 +288,34 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
       // 图片不走外链：群聊里图片的价值在于内联显示，换成一条链接就没有意义了，
       // 而且超过 25MB 的图基本都是本该当文件发的东西。
       const resolved = await resolveSource(params.source, workspaceDir, tempDir, signal);
-      const callbackUrl = getCallbackUrl();
-      const fileId = await uploadBuffered(
-        resolved,
-        callbackUrl,
-        filenameFromSource(params.source),
-        "image",
-        groupId,
-        signal
-      );
-      if (!fileId) throw new Error(`图片上传失败: ${params.source}`);
-      const ok = await sendImage(
-        fileId,
-        groupId,
-        callbackUrl,
-        undefined,
-        params.width,
-        params.height,
-        signal
-      );
-      if (!ok) throw new Error(`图片发送失败: ${params.source}`);
-      return {
-        content: [
-          { type: "text", text: `已发送图片 (${params.width ?? "?"}×${params.height ?? "?"})` },
-        ],
-        details: { fileId, source: params.source },
-      };
+      if (resolved.kind === "local" && resolved.size > NATIVE_FILE_MAX_BYTES) throw oversizeError("本地图片", resolved.size);
+      const name = filenameFromSource(params.source);
+      const local = await localCopy(resolved, tempDir, name, signal);
+      try {
+        const info = await imageInfo(local.path);
+        if (!info) throw new Error(`无法识别图片格式或尺寸（支持 PNG、JPEG、GIF、WebP、BMP）: ${params.source}`);
+        const width = params.width ?? info.width, height = params.height ?? info.height;
+        await withSlot(signal, budget => options.channel.image({ path: local.path, name, size: local.size, ...info, width, height }, budget, () => {}));
+        return {
+          content: [{ type: "text", text: `已发送图片 (${width}×${height})` }],
+          details: { source: params.source, width, height },
+        };
+      } finally { if (local.temporary) await unlink(local.path).catch(() => {}); }
     },
   };
 
   const relayNote = relay
-    ? ` 超过 ${formatSize(MAX_ATTACHMENT_BYTES)} 的本地文件会上传外部存储，下载链接由系统保存并附在本轮回复末尾；工具生成链接不代表平台已确认送达。`
+    ? ` 超过 ${formatSize(NATIVE_FILE_MAX_BYTES)} 的本地文件会上传外部存储，下载链接由系统保存并附在本轮回复末尾；工具生成链接不代表平台已确认送达。`
     : "";
 
   const sendFileTool: ToolDefinition<typeof fileParams> = {
     name: "send_file",
     label: "发送文件",
     description:
-      "向当前群聊发送一个文件。source 为 http(s) URL、本群 workspace 或当前调用用户 tmp 内的路径。" +
+      "向当前会话（提问所在的群或单聊）发送一个文件。source 为 http(s) URL、共享资料 workspace 或当前调用用户 tmp 内的路径。" +
+      "图片默认用 send_image 在聊天里显示，用户明确要文件形式时才用本工具发图片。" +
       relayNote,
-    promptSnippet: "向群聊发送文件",
+    promptSnippet: "向当前会话发送文件",
     exposure: SEND_EXPOSURE,
     annotations: SENDS,
     constrainedSampling: { type: "json_schema", strict: "prefer" },
@@ -327,7 +327,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
       const send = (source: ResolvedSource, beforeSend: () => void) => transferFile(source, name, options, signal, beforeSend);
       const result = options.fileDelivery ? await options.fileDelivery(resolved, name, signal, send) : await send(resolved, () => {});
       if (result.mode === "relay") {
-        notes.add(result.note, result.attachment);
+        await notes.add(result.attachment);
         return {
           content: [
             {
@@ -335,7 +335,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
               // 明确告诉模型别再贴一遍：链接会由代码原样附在回复末尾，模型复述一遍只会
               // 让同一条消息里出现两个 URL。
               text:
-                `文件超过 ${formatSize(MAX_ATTACHMENT_BYTES)}，已改为链接分发，下载链接会由系统自动附在你本轮回复的末尾。` +
+                `文件超过 ${formatSize(NATIVE_FILE_MAX_BYTES)}，已改为链接分发，下载链接会由系统自动附在你本轮回复的末尾。` +
                 `请说明文件链接已生成，不要声称已送达或重复粘贴链接地址。`,
             },
           ],
@@ -343,7 +343,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
         };
       }
 
-      return { content: [{ type: "text", text: `${result.alreadySent ? "该版本已发送，无需重复发送" : "已发送文件"}: ${name}` }], details: { fileId: result.fileId, name } };
+      return { content: [{ type: "text", text: `${result.alreadySent ? "该版本已发送，无需重复发送" : "已发送文件"}: ${name}` }], details: { name } };
     },
   };
 

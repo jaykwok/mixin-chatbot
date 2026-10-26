@@ -7,10 +7,10 @@ import {
 } from "../../src/contracts/maintenance.ts";
 
 type Doc = Record<string, any>;
-const root = resolve("/srv/groups"), archive = join(root, ".reclamation", "backup", "rm");
+const root = resolve("/srv/mixin/data"), archive = join(root, "state", "reclamation", "backup", "rm");
 const id = "11111111-2222-4333-8444-555555555555", other = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 const evidence: TreeEvidence = { dev: "2049", ino: "131074", uid: 1000, fingerprint: "a".repeat(64), bytes: 5, files: 1, newest: 1 };
-const member = join(root, "g", "users", "u", "tmp");
+const member = join(root, "tmp", "groups", "g", "u");
 
 /** A saved document: every field but the digest, then the digest over them in this order. */
 const sealed = (value: Doc): Doc => ({ ...value, digest: planDigest(value) });
@@ -28,9 +28,9 @@ function rejects(make: (edit?: (value: Doc) => void) => Doc, decode: (value: Doc
 describe("archive plans", () => {
   const plan = (edit?: (value: Doc) => void) => {
     const value: Doc = { version: 1, id, root, rootIdentity: "2049:1", archive, recordedRoot: root, createdAt: 1, before: 2, items: [
-      { group: "g", user: "u", source: join(member, "a"), destination: join(archive, `tmp-${id}-0`), owners: { "1-r.txt": { phone: "u", createdAt: 1 } },
+      { space: "groups/g", user: "u", source: join(member, "a"), destination: join(archive, `tmp-${id}-0`), owners: { "1-r.txt": { phone: "u", createdAt: 1 } },
         task: other, status: "ready", evidence },
-      { group: "g", user: "u", source: member, destination: join(archive, `tmp-${id}-1`), owners: {}, status: "deferred", reason: "x" },
+      { space: "groups/g", user: "u", source: member, destination: join(archive, `tmp-${id}-1`), owners: {}, status: "deferred", reason: "x" },
     ] };
     edit?.(value);
     return sealed(value);
@@ -59,9 +59,9 @@ describe("archive plans", () => {
     ["items", value => { value.items = {}; }],
     ["before", value => { value.before = null; }],
     ["items[0]", value => { value.items[0] = []; }],
-    ["items[0].group/user", value => { value.items[0].group = "../g"; }],
-    ["items[0].group/user", value => { value.items[0].user = ["u"]; }],
-    ["items[0].source", value => { value.items[0].source = join(root, "g", "users", "v", "tmp", "a"); }],
+    ["items[0].space/user", value => { value.items[0].space = "groups/../g"; }],
+    ["items[0].space/user", value => { value.items[0].user = ["u"]; }],
+    ["items[0].source", value => { value.items[0].source = join(root, "tmp", "groups", "g", "v", "a"); }],
     ["items[0].source", value => { value.items[0].source = member + "/./a"; }],
     ["items[1].source（成员 tmp 本身不能归档）", value => { value.items[1].status = "ready"; }],
     ["items[0].destination", value => { value.items[0].destination = join(archive, `tmp-${id}-1`); }],
@@ -140,8 +140,8 @@ describe("removal lists", () => {
 describe("physical reclamation plans", () => {
   const plan = (edit?: (value: Doc) => void) => {
     const value: Doc = { version: 1, id, root, recordedRoot: "/srv/recorded", rootIdentity: "2049:1", legacy: true, createdAt: 1, before: 2, items: [
-      { group: "g", user: "u", path: join(member, "codemode", "1-r.txt"), result: "1-r.txt", owner: { phone: "u", createdAt: 1 }, token: "t", evidence, status: "ready" },
-      { group: "g", user: "u", path: member, task: other, status: "deferred", reason: "x" },
+      { space: "groups/g", user: "u", path: join(member, "codemode", "1-r.txt"), result: "1-r.txt", owner: { phone: "u", createdAt: 1 }, token: "t", evidence, status: "ready" },
+      { space: "groups/g", user: "u", path: member, task: other, status: "deferred", reason: "x" },
     ] };
     edit?.(value);
     return sealed(value);
@@ -151,8 +151,8 @@ describe("physical reclamation plans", () => {
 
   test("rules", () => {
     expect(decode(plan()).items).toHaveLength(2);
-    expect(failure(() => decodeReclaimPlan(plan(), { ...view, digest: plan().digest, legacy: false })).message).toBe("回收清单、摘要或群根实体已变化，拒绝执行：legacy");
-    rejects(plan, decode, "回收清单、摘要或群根实体已变化，拒绝执行", [
+    expect(failure(() => decodeReclaimPlan(plan(), { ...view, digest: plan().digest, legacy: false })).message).toBe("回收清单、摘要或数据目录实体已变化，拒绝执行：legacy");
+    rejects(plan, decode, "回收清单、摘要或数据目录实体已变化，拒绝执行", [
       ["recordedRoot", value => { value.recordedRoot = root; }],
       ["items[0].path", value => { value.items[0].path = "relative"; }],
       ["items[1].task", value => { value.items[1].task = "x"; }],

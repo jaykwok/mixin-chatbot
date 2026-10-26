@@ -8,31 +8,37 @@ import { defineExtension, type Extension, type ToolExecutionApi, type ToolExecut
 import { buildDocumentEnvironmentTool, buildDocumentTool } from "../agent/document-extract.ts";
 import { nativeBaseTools } from "./base-tools.ts";
 import { createMemberEnv } from "./member-env.ts";
-import { groupIndexDir, groupVenvDir, groupWorkspaceDir, materialsIndexPath, userTempDir } from "../agent/paths.ts";
+import { parseScopeKey, requestTmp, scopeKey, userTmp, type Layout, type Scope } from "../core/layout.ts";
 import { IdentityDoc } from "./identity.ts";
+import { InboxDoc } from "./inbox.ts";
 import { commandScope } from "../core/process.ts";
 import { memberTaskText } from "./running-requests.ts";
 
 export interface BaseToolsOptions {
-  /** Group data root (`GROUP_DATA_ROOT`). */
-  root: string;
-  /** The group this Harness serves; a conversation whose identity names another group is refused. */
-  groupId: string;
-  /** Document environment (`BOT_DOCUMENT_ENV`); default the group's venv. */
+  layout: Layout;
+  /** The space this Harness serves; a conversation whose identity names another space is refused. */
+  scope: Scope;
+  /** Document environment (`BOT_DOCUMENT_ENV`); default the layout's shared one. */
   venvDir?: string;
   /** Read-only resource directories of the enabled modules. */
   resourceReadDirs?: readonly string[];
 }
 
-/** Where a member's tools work. */
-export interface MemberPlaces { workspaceDir: string; tempDir: string; indexPath: string; venvDir: string }
+/**
+ * Where a member's tools work: the application's read-only workspace and index, the member's tmp (attachments and the
+ * managed task/result directories) and, inside a run, the request's own directory (`tasks/<request>`), the model's
+ * working and output directory.
+ */
+export interface MemberPlaces { workspaceDir: string; tempDir: string; requestDir?: string; indexPath: string; venvDir: string }
 
-export function memberPlaces(options: Pick<BaseToolsOptions, "root" | "venvDir">, groupId: string, phone: string): MemberPlaces {
+export function memberPlaces(options: Pick<BaseToolsOptions, "layout" | "venvDir">, scope: Scope, phone: string, requestId?: string): MemberPlaces {
+  const tempDir = resolve(userTmp(options.layout, scope, phone));
   return {
-    workspaceDir: resolve(groupWorkspaceDir(options.root, groupId)),
-    tempDir: resolve(userTempDir(options.root, groupId, phone)),
-    indexPath: resolve(materialsIndexPath(options.root, groupId)),
-    venvDir: resolve(options.venvDir ?? groupVenvDir(options.root, groupId)),
+    workspaceDir: resolve(options.layout.workspace),
+    tempDir,
+    ...(requestId === undefined ? {} : { requestDir: requestTmp(tempDir, requestId) }),
+    indexPath: resolve(options.layout.materialsIndex),
+    venvDir: resolve(options.venvDir ?? options.layout.documentEnv),
   };
 }
 
@@ -86,14 +92,17 @@ function json(value: unknown): JsonValue | undefined {
 
 /**
  * The calling conversation's member and places, from its identity document; refuses a conversation without a member or
- * of another group. Creates the member's directories.
+ * of another space. The request is the inbox head: the item the run belongs to stays there until the run settled.
+ * Creates the member's and the request's directories (and the default workspace; an external one must exist).
  */
-export async function resolveMember(options: Pick<BaseToolsOptions, "root" | "groupId" | "venvDir">, call: Pick<MemberCall, "api" | "context">) {
+export async function resolveMember(options: Pick<BaseToolsOptions, "layout" | "scope" | "venvDir">, call: Pick<MemberCall, "api" | "context">) {
   const identity = await call.api.snapshot(IdentityDoc, call.api.conversationId, call.context);
   if (!identity?.phone) throw new Error("会话没有成员身份，工具未执行");
-  if (identity.groupId !== options.groupId) throw new Error("会话的成员身份不属于本群，工具未执行");
-  const places = memberPlaces(options, options.groupId, identity.phone);
-  for (const dir of [places.workspaceDir, places.tempDir, groupIndexDir(options.root, options.groupId)]) await mkdir(dir, { recursive: true });
+  if (identity.space !== scopeKey(options.scope)) throw new Error("会话的成员身份不属于本空间，工具未执行");
+  const head = (await call.api.snapshot(InboxDoc, call.api.conversationId, call.context))?.items[0];
+  const places = memberPlaces(options, options.scope, identity.phone, head?.requestId);
+  const dirs = [places.requestDir ?? places.tempDir, resolve(options.layout.index), ...options.layout.externalWorkspace ? [] : [places.workspaceDir]];
+  for (const dir of dirs) await mkdir(dir, { recursive: true });
   return { phone: identity.phone, places };
 }
 
@@ -108,7 +117,7 @@ export type MemberToolBuilder = (member: Member, call: MemberCall) => ToolDefini
  * tool `build` makes for that member. Definitions must not depend on the member (tests check the catalogue against a
  * member's tools).
  */
-export function memberTool(definition: ToolDefinition, options: Pick<BaseToolsOptions, "root" | "groupId" | "venvDir">,
+export function memberTool(definition: ToolDefinition, options: Pick<BaseToolsOptions, "layout" | "scope" | "venvDir">,
   build: MemberToolBuilder): AdaptedMemberTool {
   const policy = POLICY[definition.name] ?? OTHER_POLICY;
   return {
@@ -213,7 +222,8 @@ export function memberRegistration(tool: MemberTool): ToolRegistration {
         let label = "成员未知";
         try {
           const identity = await api.snapshot(IdentityDoc, api.conversationId, context);
-          if (identity?.phone) label = memberTaskText(identity.groupId, identity.phone);
+          const space = identity?.phone ? parseScopeKey(identity.space) : undefined;
+          if (space) label = memberTaskText(space, identity!.phone);
         } catch { /* Diagnostic identity must not change tool failure semantics. */ }
         const scope = { tool: definition.name, toolTask: api.taskId as number, describe: async () => label };
         const result = await commandScope.run(scope, () => tool.run(args, { api, context, callId: api.callId, signal, onBashOutput: output }));
@@ -235,15 +245,15 @@ export function memberRegistration(tool: MemberTool): ToolRegistration {
   } as ToolRegistration;
 }
 
-/** The four tools for the group's members, in catalogue order. */
+/** The four tools for the space's members, in catalogue order. */
 export function baseMemberTools(options: BaseToolsOptions): MemberTool[] {
   return nativeBaseTools().map(official => {
     const policy = POLICY[official.name]!;
     const native: ToolRegistration = { ...official, ...policy, async execute(args, api, context) {
       const { phone, places } = await resolveMember(options, { api, context });
-      const env = await createMemberEnv({ ...places, materialsIndexPath: places.indexPath, phone, groupId: options.groupId,
+      const env = await createMemberEnv({ ...places, materialsIndexPath: places.indexPath, phone, scope: options.scope,
         resourceReadDirs: options.resourceReadDirs, inputPaths: (args as { input_paths?: string[] }).input_paths });
-      const label = memberTaskText(options.groupId, phone);
+      const label = memberTaskText(options.scope, phone);
       const scope = { tool: official.name, toolTask: api.taskId as number, describe: async () => label };
       return commandScope.run(scope, () => official.execute(args, { ...api, env }, context));
     } };
@@ -257,7 +267,7 @@ export function baseTools(options: BaseToolsOptions): ToolRegistration[] {
 }
 
 /**
- * `mixin.base`: the four official tools, then `extra` (the group registry adds document_environment and
+ * `mixin.base`: the four official tools, then `extra` (the space registry adds document_environment and
  * document_extract, src/durable/registry.ts).
  */
 export function baseExtension(options: BaseToolsOptions, extra: readonly MemberTool[] = []): Extension {

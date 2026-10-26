@@ -15,12 +15,11 @@ import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels, type Message, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { loadModuleDefinitions } from "../../src/agent/modules.ts";
-import { groupWorkspaceDir } from "../../src/agent/paths.ts";
+import { appLayout, groupScope } from "../../src/core/layout.ts";
 import { documentToolchainReady, venvPythonPath } from "../../src/agent/python-toolchain.ts";
-import { createOutboundNotes } from "./outbound-notes.ts";
 import { runProcess } from "../../src/core/process.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
-import { groupExtensions } from "../../src/durable/registry.ts";
+import { spaceExtensions } from "../../src/durable/registry.ts";
 import { openGroupHarness } from "./durable.ts";
 
 const environment = process.argv[2];
@@ -32,8 +31,8 @@ await mkdir(root, { recursive: true });
 globalThis.fetch = (() => { throw new Error("Unexpected network request"); }) as unknown as typeof fetch;
 
 assert.equal(await documentToolchainReady(venvDir), true, "test venv must match uv.lock and Python 3.14");
-const groupRoot = join(root, "groups"), group = "group";
-const workspace = groupWorkspaceDir(groupRoot, group);
+const layout = appLayout(join(root, "data")), scope = groupScope("group");
+const workspace = layout.workspace;
 await mkdir(workspace, { recursive: true });
 const fixtures = await runProcess({ command: venvPythonPath(venvDir), args: [fileURLToPath(new URL("./document-fixtures.py", import.meta.url)), "prepare", resolve(workspace)],
   cwd: root, env: { ...process.env, PYTHONUTF8: "1", PYTHONDONTWRITEBYTECODE: "1" }, timeoutMs: 60000 });
@@ -43,11 +42,11 @@ const faux = fauxProvider({ tokensPerSecond: 0 });
 const models = createModels();
 models.setProvider(faux.provider);
 const model = faux.getModel();
-const extensions = groupExtensions({
-  root: groupRoot, groupId: group, venvDir, modules: await loadModuleDefinitions({ documentWorkEnabled: true }), relay: null,
-  delivery: { callbackUrl: () => { throw new Error("unexpected send"); }, notes: () => createOutboundNotes() },
+const extensions = spaceExtensions({
+  layout, scope, venvDir, modules: await loadModuleDefinitions({ documentWorkEnabled: true }), relay: null,
+  outbound: { send: async () => { throw new Error("unexpected send"); }, sequence: async () => { throw new Error("unexpected send"); }, upload: async () => { throw new Error("unexpected upload"); }, links: async () => "" },
 });
-const opened = await openGroupHarness(join(root, "durable.sqlite"), models, { group, extensions });
+const opened = await openGroupHarness(join(root, "durable.sqlite"), models, { scope, extensions });
 
 type Transcript = { messages: readonly Message[] };
 const results: Record<string, ToolResultMessage> = {};
@@ -98,7 +97,7 @@ try {
     }), (transcript: Transcript) => { results.contact = lastResult(transcript); return fauxAssistantMessage("DONE"); }]
       : [(transcript: Transcript) => { results.patch = lastResult(transcript); return fauxAssistantMessage("DONE"); }],
   ]);
-  const { conversation } = await memberConversation(opened.harness, group, "alice", { model: { provider: model.provider, modelId: model.id } }, context);
+  const { conversation } = await memberConversation(opened.harness, scope, "alice", { model: { provider: model.provider, modelId: model.id } }, context);
   const settled = await (await conversation.submit({ type: "input", content: "比较资料、选编并改稿" }, context)).wait(context);
   assert.equal(faux.getPendingResponseCount(), 0, JSON.stringify(settled));
 

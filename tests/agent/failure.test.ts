@@ -137,24 +137,6 @@ describe("请求失败回执", () => {
     expect(reply).toContain("发到群里失败");
   });
 
-  test("已保存的回复发送失败时引导补发，不误报模型故障", () => {
-    for (const raw of [
-      "回复未能完整发到群里，已保存的内容可用 /deliver 补发",
-      "补发失败，尚未发完的回复仍已保存，可稍后再发送 /deliver",
-    ]) {
-      const reply = describeRequestFailure(new Error(raw));
-      expect(reply).toContain("请稍后发送 /deliver");
-      expect(reply).toContain("可能包含你已经收到的部分");
-      expect(reply).not.toContain("暂时无法确定原因");
-    }
-  });
-
-  test("待补发内容过多时提示先补发再提问", () => {
-    const reply = describeRequestFailure(new Error("待补发回复已达 64 条，请先发送 /deliver 补发，再发送新的问题"));
-    expect(reply).toContain("暂时无法处理新问题");
-    expect(reply).toContain("请先发送 /deliver");
-  });
-
   test("没有任何线索的空回复单独描述，可直接重发", () => {
     const reply = describeRequestFailure(new Error("Pi 未返回回复"));
     expect(reply).toContain("模型没有返回回复");

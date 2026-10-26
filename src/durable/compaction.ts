@@ -8,10 +8,9 @@
 // blocking compaction comes soon anyway. Examples with Pi's defaults (reserve 16384, keep 20000): a 128k window starts
 // background compaction at 95616 tokens and blocks at 111616; a 64k window has blocking compaction only.
 //
-// Cost. Durable adds a summarize response's usage to `pi.usage` under the model's key, together with the conversation's
-// generations, and keeps no per-compaction record. The request door (door.ts) therefore marks a summarize request's
-// start record `kind: "compaction"` and, before handing the response back, records its usage there (best effort): a
-// compaction start without usage was not answered, withdrawn, or lost its usage write, and counts as unknown, not zero.
+// Usage. Durable adds a summarize response's usage to `pi.usage` under the model's key, together with the conversation's
+// generations; statistics count it there and do not separate compactions. Summarize requests reach the provider through
+// the request door (door.ts), found by the conversation's provider session like a generation.
 import type { CompactionPolicy } from "@earendil-works/pi-durable";
 
 /** Upper bound of the background margin (Durable's default `backgroundTokens`). */

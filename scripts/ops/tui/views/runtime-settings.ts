@@ -28,18 +28,17 @@ const groups: { label: string; description: string; options: RuntimeOption[] }[]
     { key: "BOT_RUN_TIMEOUT_SECONDS", label: "整轮处理时限", unit: "秒", description: "覆盖准备、模型、工具与最终交付；其他时限仍受整轮剩余时间约束。" },
     { key: "BOT_CLOSEOUT_SECONDS", label: "提前收尾", unit: "秒", description: "剩余此时间进入收尾；须小于整轮时限一半。" },
     { key: "BOT_DELIVERY_RESERVE_SECONDS", label: "交付保留", unit: "秒", description: "最后这段时间只允许读取、登记、发送；须小于收尾时间。" },
-    { key: "BOT_FALLBACK_SEND_SECONDS", label: "失败兜底发送预算", unit: "秒", description: "任务结束后独立的发送预算，失败内容保留供 /deliver。" },
+    { key: "BOT_FALLBACK_SEND_SECONDS", label: "失败兜底发送预算", unit: "秒", description: "任务失败时兜底发送的时限；到期后没发出的内容不再重试。" },
     { key: "BOT_MODEL_IDLE_TIMEOUT_SECONDS", label: "模型无进展时限", unit: "秒", description: "模型等待或输出期间，连续没有有效进展的上限。" },
     { key: "BOT_MODEL_RESPONSE_TIMEOUT_SECONDS", label: "单次模型响应时限", unit: "秒", description: "包含首字等待；持续输出也不会延长此时限。" },
     { key: "BOT_BASH_TIMEOUT", label: "命令默认时限", unit: "秒", description: "模型未指定时使用；工具可声明其他时限，最高 3600 秒。" },
-    { key: "BOT_DELIVERY_TIMEOUT_SECONDS", label: "消息交付时限", unit: "秒", description: "包含出站发送的排队和重试。" },
     { key: "BOT_SHUTDOWN_TIMEOUT_SECONDS", label: "关机收尾时限", unit: "秒", description: "覆盖 HTTP、任务、子进程与租约收尾。" },
   ] },
   { label: "缓存与索引", description: "资料索引容量、刷新与模型缓存策略", options: [
     { key: "BOT_INDEX_TTL_MINUTES", label: "索引刷新间隔", unit: "分钟", description: "活跃会话每轮检查；首次等待构建，过期后后台刷新。" },
     { key: "BOT_INDEX_MAX_FILES", label: "索引文件上限", description: "单次扫描收录的文件数，防止过大的目录树占满资源。" },
     { key: "BOT_INDEX_MAX_DEPTH", label: "索引目录深度", description: "超过此深度的目录会跳过，索引标记为不完整。" },
-    { key: "PI_CACHE_RETENTION", label: "模型缓存保留", description: "使用 Pi 原生设置，供模型请求和缓存保温共同读取；期限和收益取决于服务商支持。保温另在 Pi 设置中开启，默认关闭。", choices: [
+    { key: "PI_CACHE_RETENTION", label: "模型缓存保留", description: "Pi 原生的服务端缓存保留期限，由支持缓存的服务商决定实际期限和收益；Pi 设置里的 durable.stream.cacheRetention 优先。", choices: [
       { value: "short", label: "短期（默认）" }, { value: "long", label: "长期" },
     ] },
   ] },
@@ -47,15 +46,10 @@ const groups: { label: string; description: string; options: RuntimeOption[] }[]
     { key: "BOT_DOCUMENT_WORK_ENABLED", label: "文档加工模块", description: "统一启停文档 skill、编辑/组装/渲染工具及其提示词；基础检索、解析和原文件发送仍可用。应用后重启生效。", choices: [
       { value: "1", label: "开启" }, { value: "0", label: "关闭" },
     ] },
-    { key: "BOT_DOCUMENT_ENV", label: "共享文档环境覆盖", empty: "每群独立 venv", description: "留空时每群独立使用 <群目录>/venv，首次按需 uv sync。填写路径会让所有群改用同一个环境；通常保持默认。Linux 填容器内路径。" },
-    { key: "BOT_DOCUMENT_PPTX_TEMPLATE", label: "默认 PPT 模板", empty: "内置版式", description: "生成 PPT 未指定模板时套用，支持 .pptx/.potx。相对路径在各群 workspace 中查找，某群没有该文件时用内置版式；绝对路径所有群共用，Linux 填容器内路径。应用后重启生效。" },
-    { key: "BOT_DOCUMENT_DOCX_TEMPLATE", label: "默认 Word 模板", empty: "内置版式", description: "生成 Word 未指定模板时套用，支持 .docx/.dotx。相对路径在各群 workspace 中查找，某群没有该文件时用内置版式；绝对路径所有群共用，Linux 填容器内路径。应用后重启生效。" },
+    { key: "BOT_DOCUMENT_ENV", label: "共享文档环境覆盖", empty: "data/runtime/document-env", description: "留空时全部单聊和群共用 data/runtime/document-env，首次使用时由 uv 按需准备。填写路径则改用指定的现成环境；通常保持默认。Linux 填容器内路径；隔离任务使用镜像内的环境。" },
+    { key: "BOT_DOCUMENT_PPTX_TEMPLATE", label: "默认 PPT 模板", empty: "内置版式", description: "生成 PPT 未指定模板时套用，支持 .pptx/.potx。相对路径在共享资料中查找，找不到时用内置版式；绝对路径按服务看到的路径，Linux 填容器内路径。应用后重启生效。" },
+    { key: "BOT_DOCUMENT_DOCX_TEMPLATE", label: "默认 Word 模板", empty: "内置版式", description: "生成 Word 未指定模板时套用，支持 .docx/.dotx。相对路径在共享资料中查找，找不到时用内置版式；绝对路径按服务看到的路径，Linux 填容器内路径。应用后重启生效。" },
     { key: "BOT_DOCUMENT_OFFICE_PATH", label: "LibreOffice 程序路径", empty: "自动查找", description: "Word/PPT 预览和页面截图使用。填程序的绝对路径，例如 C:/Program Files/LibreOffice/program/soffice.exe 或 /usr/bin/soffice，不填目录、引号或参数。Linux 隔离任务填任务容器内路径。留空先查 PATH，Windows 再查标准安装目录；指定路径无效时会报错。应用后重启生效。" },
-  ] },
-  { label: "日志与诊断", description: "机器人详细日志", options: [
-    { key: "BOT_DEBUG", label: "机器人详细日志", description: "开启后机器人日志会记录用户消息正文，分享前请脱敏。与 Cloudflared 日志分别控制。", choices: [
-      { value: "0", label: "关闭" }, { value: "1", label: "开启" },
-    ] },
   ] },
 ];
 

@@ -1,10 +1,11 @@
 // 全局参数与默认值。持久化目录统一由 src/core/storage.ts 定义：
-// data/config 放配置与密钥，data/state 放持久账本与部署状态，data/runtime 放 SDK 运行资源，
-// data/groups 放群共享工作区、用户临时文件与会话。
-// 无必需 .env/config.json；可选环境变量覆盖部署参数。访问控制由 webhook secret + 防火墙/WAF 共同承担。
+// data/config 放配置与密钥，data/state 放持久账本与部署状态，data/runtime 放 SDK 运行资源；
+// 资料、索引、会话库与临时文件的布局见 src/core/layout.ts。
+// 无必需 .env/config.json；可选环境变量覆盖部署参数。消息只经平台 Stream 入站，HTTP 只监听回环地址。
 // 计时和期限常量使用毫秒；bash 工具的 timeout 参数使用秒。
 
-import { DEFAULT_GROUP_DATA_ROOT } from "./storage.ts";
+import { DATA_DIR } from "./storage.ts";
+import { appLayout } from "./layout.ts";
 import { readFileSync } from "node:fs";
 import { runtimeSetting } from "./runtime-config.ts";
 import { RUNTIME_DEFAULTS, RUNTIME_RANGES } from "./runtime-schema.ts";
@@ -22,22 +23,18 @@ function integerEnv(name: keyof typeof RUNTIME_RANGES): number {
 }
 
 /**
- * 群数据总根：agent 的 cwd 是 <GROUP_DATA_ROOT>/<group>/workspace，群内成员的对话在群库
- * <GROUP_DATA_ROOT>/<group>/durable.sqlite，当前调用用户的临时目录位于
- * <GROUP_DATA_ROOT>/<group>/users/<phone>/tmp（升级前的旧会话文件 session.jsonl 也在这一层，原地保留）。
- * 默认 data/groups。部署时可经 GROUP_DATA_ROOT 指向其他磁盘；配置、部署状态和 runtime
- * 仍固定在项目 data/ 的分类子目录中，避免运维脚本失去统一入口。
+ * 应用数据布局：全部单聊和群聊共用的资料 workspace（默认 data/workspace，WORKSPACE_ROOT 可指向外置目录，相对路径
+ * 以项目根解析），以及固定在 data 下的索引、会话库、临时文件和统计。启动后固定，改资料路径需重启。
  */
-export const GROUP_DATA_ROOT =
-  runtimeSetting("GROUP_DATA_ROOT") || DEFAULT_GROUP_DATA_ROOT;
+export const LAYOUT = appLayout(DATA_DIR, runtimeSetting("WORKSPACE_ROOT"));
 
 // ===== 服务 =====
 export const PORT = integerEnv("BOT_PORT");
-export const HOST = runtimeSetting("BOT_HOST") || RUNTIME_DEFAULTS.BOT_HOST;
-/** 仅本地开发可显式开启无 secret 的 /webhook；生产默认失败关闭。 */
-export const ALLOW_INSECURE_WEBHOOK = process.env.ALLOW_INSECURE_WEBHOOK === "1";
-/** 详细日志会记录用户消息正文，默认关闭。 */
-export const DEBUG = (runtimeSetting("BOT_DEBUG") ?? RUNTIME_DEFAULTS.BOT_DEBUG) === "1";
+/**
+ * HTTP 只供本机的 TUI、/health 与 /_admin/shutdown：配置只接受回环地址。rootless 容器的端口发布要求容器内监听全部
+ * 地址，这由部署脚本设置 BOT_CONTAINER_BIND_ALL=1 决定（宿主只发布到 127.0.0.1），不来自用户配置。
+ */
+export const HOST = process.env.BOT_CONTAINER_BIND_ALL === "1" ? "0.0.0.0" : runtimeSetting("BOT_HOST") || RUNTIME_DEFAULTS.BOT_HOST;
 export const RUN_TIMEOUT_MS = integerEnv("BOT_RUN_TIMEOUT_SECONDS") * 1000;
 export const CLOSEOUT_MS = integerEnv("BOT_CLOSEOUT_SECONDS") * 1000;
 export const DELIVERY_RESERVE_MS = integerEnv("BOT_DELIVERY_RESERVE_SECONDS") * 1000;
@@ -47,62 +44,23 @@ export const MODEL_IDLE_TIMEOUT_MS = integerEnv("BOT_MODEL_IDLE_TIMEOUT_SECONDS"
 /** Per response, including time to first content; even continuous progress cannot renew it. */
 export const MODEL_RESPONSE_TIMEOUT_MS = integerEnv("BOT_MODEL_RESPONSE_TIMEOUT_SECONDS") * 1000;
 export const SHUTDOWN_TIMEOUT_MS = integerEnv("BOT_SHUTDOWN_TIMEOUT_SECONDS") * 1000;
-export const DELIVERY_TIMEOUT_MS = integerEnv("BOT_DELIVERY_TIMEOUT_SECONDS") * 1000;
-export const MAX_WEBHOOK_BODY_BYTES = 64 * 1024;
 
-// ===== IM 服务 =====
-export const IM_RETRY_COUNT = 2; // 总尝试次数（首次 + 1 次重试）
-export const IM_RETRY_DELAY = 2000; // ms
-export const IM_HTTP_TIMEOUT = 15_000; // 单次 webhook 发送超时
-/** 官方 textMsg.content 单条上限。 */
-export const IM_TEXT_MAX_LENGTH = 5000;
+// ===== 出站文件 =====
 export const ATTACHMENT_HTTP_TIMEOUT = 60_000;
-export { MAX_ATTACHMENT_BYTES } from "./transfer-limits.ts";
+export { NATIVE_FILE_MAX_BYTES } from "./transfer-limits.ts";
 /** 外链分发总预算，包含快照、等锁、探测和 PUT；同时受整轮任务和 /stop 取消约束。 */
 export { RELAY_HTTP_TIMEOUT } from "./transfer-limits.ts";
-/** 机器人出站发送滑动窗口（按 callback key 全局统计，多用户共享）。 */
-export const IM_RATE_LIMIT_WINDOW = 60_000; // ms
-export const IM_RATE_LIMIT_MAX_MESSAGES = 20;
-/** 达到此用量后暂停可丢弃的状态消息，为最终回复、指令和附件预留额度。 */
-export const IM_STATUS_PAUSE_AT = 12;
-/** 达到此用量后尝试向当前群发送一次压力预警（每窗口最多一次）。 */
-export const IM_RATE_WARNING_AT = 16;
 
-// ===== Webhook =====
-export const VALID_HOSTNAMES = new Set(["imtwo.zdxlz.com", "im.zdxlz.com"]);
-// 回调 URL 允许的端口（空集合表示仅允许默认 https 端口 443）
-export const VALID_CALLBACK_PORTS = new Set<number>();
-/** callBackUrl 必须命中此路径（量子密信出站发送端点）。 */
-export const CALLBACK_PATH_PREFIX = "/im-external/v1/webhook/send";
-export const REQUIRED_WEBHOOK_FIELDS = [
-  "type",
-  "textMsg",
-  "phone",
-  "groupId",
-  "callBackUrl",
-];
+// ===== 入站 =====
 /** phone 合法字符集（用作群内用户目录名，同时防路径穿越）。 */
 export const PHONE_PATTERN = /^[A-Za-z0-9_+\-]{1,32}$/;
-/** groupId 可含 Unicode，但拒绝控制字符和 Unicode 行分隔符。 */
-export const GROUP_ID_PATTERN = /^[^\u0000-\u001f\u007f-\u009f\u2028\u2029]+$/u;
-export const MAX_GROUP_ID_LENGTH = 256;
-export const MAX_CALLBACK_URL_LENGTH = 2048;
 /** 单条消息内容上限（防超大 payload）。 */
 export const MAX_CONTENT_LENGTH = 16 * 1024;
-export const DEDUP_TTL = 30_000; // 请求去重窗口（ms）
-export const MAX_DEDUP_SIZE = 1000; // 去重字典最大容量
-/** callback key 到群路由观察的闲置保留时间与容量；超限时对未知 key 失败关闭。 */
-export const CALLBACK_ROUTE_TTL = 24 * 60 * 60_000;
-export const MAX_CALLBACK_ROUTES = 1000;
-
-// ===== 速率限制 =====
-export const RATE_LIMIT_WINDOW = 60_000; // ms
-/** 本应用自设的入站防滥用阈值；与自定义 Webhook 机器人官方 20 RPM 出站额度无关。 */
-export const RATE_LIMIT_MAX_REQUESTS = 10;
-/** 入站限流键容量；容量耗尽时把新 (群, phone) 按限流处理并回调通知，避免内存无界增长。 */
-export const MAX_RATE_LIMIT_KEYS = 10_000;
-export const RATE_LIMIT_CLEANUP_INTERVAL = 300_000; // ms
-/** 已确认但尚未完成清理的 Pi 后台任务总数；超限时通过 callback 通知用户重发。 */
+/** 已打开空间里空闲成员的内存状态保留时间（ms）。 */
+export const MEMBER_IDLE_MS = 30_000;
+/** 后台维护（空间回收、记录过期、附件过期）的间隔。 */
+export const MAINTENANCE_INTERVAL_MS = 300_000;
+/** 已确认但尚未完成清理的 Pi 后台任务总数；超限时提示用户稍后重发。 */
 export const MAX_ACTIVE_REQUESTS = integerEnv("BOT_MAX_ACTIVE_REQUESTS");
 
 // ===== Agent 工具 =====
@@ -126,7 +84,7 @@ export const MATERIALS_INDEX_MAX_DEPTH = integerEnv("BOT_INDEX_MAX_DEPTH");
 /**
  * 解析和生成文档的直接依赖，完整依赖锁为 uv.lock。
  * 就绪校验包含解释器、锁定版本和导入结果；文件状态未变时可短期复用成功结果。
- * 默认按需准备每群独立 venv；仅显式指定时共享环境，模型不能修改环境。
+ * 默认按需准备应用共享的 data/runtime/document-env；BOT_DOCUMENT_ENV 可指定现成环境，模型不能修改环境。
  */
 export const DOCUMENT_TOOLCHAIN_PACKAGES: readonly string[] = documentPackages(readFileSync(
   new URL("../../pyproject.toml", import.meta.url), "utf8"
@@ -139,6 +97,3 @@ export const LOG_DIR = "logs";
 export const LOG_FILE = "mixin-chatbot.log";
 export const LOG_MAX_BYTES = 5 * 1024 ** 2; // 5MB
 export const LOG_BACKUP_COUNT = 3;
-/** 拒绝日志按类别分别限量，防止扫描流量耗尽所有日志保留空间。 */
-export const REJECTION_LOG_WINDOW_MS = 60_000;
-export const REJECTION_LOG_DETAIL_LIMIT = 10;

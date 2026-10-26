@@ -161,7 +161,7 @@ export class App implements AppApi {
   private async refreshChrome(): Promise<void> {
     const revision = ++this.chromeRevision;
     this.deployment = this.readDeployment();
-    // 部署形态变化（例如切换到直连）后，当前子页可能已不可用。
+    // 部署形态变化后，当前子页可能已不可用。
     if (!this.pages().includes(this.current)) this.go(this.pages()[0]!.id);
     await Promise.all([
       probeService(this.deployment.port).then(service => {
@@ -193,13 +193,16 @@ export class App implements AppApi {
     }
   }
 
-  go(view: string): void {
+  go(view: string, focus?: string): void {
     const section = this.sections.find(section => section.id === view);
     if (section) {
       const last = this.lastView.get(section.id);
       view = this.pages(section).some(page => page.id === last) ? last! : section.views[0]!.id;
     }
-    if (view === this.active || !this.sections.some(entry => this.pages(entry).some(page => page.id === view))) return;
+    const target = this.sections.flatMap(entry => this.pages(entry)).find(page => page.id === view);
+    if (!target) return;
+    if (focus) target.focus?.(focus);
+    if (view === this.active) { if (focus) this.redraw(); return; }
     if (this.current.onLeave?.()) {
       const pending = this.refreshes.get(this.current);
       if (pending) pending.again = true;
@@ -314,13 +317,11 @@ export class App implements AppApi {
 
     let code = 1;
     try {
-      const readOnly = ["logs", "relay-ls", "history-ls", "tmp-ls", "stat", "doctor", "status"].includes(args[0] ?? "") ||
-        (args[0] === "routes" && (args[1] ?? "list") === "list");
+      const readOnly = ["logs", "relay-ls", "history-ls", "tmp-ls", "stat", "doctor", "status", "directory", "directory-departments"].includes(args[0] ?? "");
       const handle = stream(command, full, (line) => {
         pane.lines.push(line);
         this.redraw();
-      }, { env, cancelMode: readOnly &&
-        !args.includes("-Repair") && !args.includes("-RestartTunnel") ? "terminate" : "finish" });
+      }, { env, cancelMode: readOnly && !args.includes("-Repair") ? "terminate" : "finish" });
       pane.cancel = handle.cancel;
       code = await handle.done;
     } catch (error) {
@@ -636,6 +637,7 @@ export class App implements AppApi {
       width: columns,
       height: bodyHeight,
       deployment: this.deployment,
+      service: this.service,
     };
     let body = this.current.render(ctx).slice(0, bodyHeight);
     while (body.length < bodyHeight) body.push(pad("", columns));
@@ -721,13 +723,15 @@ export class App implements AppApi {
         "Enter                 进入或执行", "Esc                   返回上一层",
         "r                     刷新", "q / Ctrl+C            退出",
         "1–5                   直接进入主分区", "",
-        "总览 · 监控（体检 / 日志 / 隧道日志，仅 Cloudflare 部署）· 统计",
-        "数据（会话 / 临时文件 / 外链）· 系统（服务部署 / 回调路由 / 设置）", "",
+        "总览 · 监控（体检 / 日志）· 统计",
+        "数据（会话 / 临时文件 / 外链）· 系统（服务部署 / 通讯录 / 设置）", "",
         "菜单：↑↓ 选择，Enter 确认；直接输入文字可筛选菜单。",
         "统计：w 选择常用日期，d 自定义区间，e 导出，o 打开报表。",
+        "会话：c 清空当前空间，a 清空全部，Enter 看成员，p 压缩选中成员的上下文。",
         "临时文件：d 选择天数，Enter 看文件，p 清当前成员，a 清全部。",
         "详情先按 Esc 返回列表，再按 Esc 清除筛选。",
-        "历史和临时目录清理会移入 backup/rm；外链对象删除不可恢复。"
+        "清空会话不删除文件（旧上下文留在会话库）；临时文件归档到 data/state/reclamation/backup/rm；",
+        "外链对象删除不可恢复。"
       );
       controls.push(this.theme.c("muted", "Enter / Esc 关闭"));
     } else {

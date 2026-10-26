@@ -3,9 +3,11 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { CodemodeSandbox, toCodemodeIdentifier } from "@earendil-works/pi-codemode";
 import { mcpMemberTools } from "../../src/durable/mcp.ts";
-import { groupDoor } from "../../src/durable/models.ts";
+import { spaceDoor } from "../../src/durable/models.ts";
 import { McpTools } from "../../src/integrations/mcp.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
+import { appLayout } from "../../src/core/layout.ts";
 
 test("two MCP servers whose names normalize alike remain independently callable through the official sandbox", async () => {
   const f = await tempFixture("mcp-names-"), dispatched: string[] = [];
@@ -21,12 +23,12 @@ test("two MCP servers whose names normalize alike remain independently callable 
     return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
   } }) }));
   const manager = new McpTools({ format: 1, servers: servers.map(({ name, server }) => ({ name, transport: "http", tools: ["search"], url: `http://127.0.0.1:${server.port}/mcp` })) }, join(f.root, "discovery"));
-  const door = groupDoor({}), signal = new AbortController().signal;
-  const member = { groupId: "group", phone: "alice", workspaceDir: join(f.root, "workspace"), tempDir: join(f.root, "tmp") };
+  const door = spaceDoor({}), signal = new AbortController().signal;
+  const member = { scope: scopeOf("group"), phone: "alice", workspaceDir: join(f.root, "workspace"), tempDir: join(f.root, "tmp") };
   let sandbox: CodemodeSandbox | undefined;
   try {
     await mkdir(member.workspaceDir); await mkdir(member.tempDir); await manager.initialize(signal);
-    const adapters = mcpMemberTools({ root: f.root, groupId: member.groupId }, manager, door);
+    const adapters = mcpMemberTools({ layout: appLayout(f.root), scope: member.scope }, manager, door);
     const tools = adapters.map((adapter, i) => ({ name: adapter.definition.name,
       execute: (args: unknown) => manager.call(manager.catalogue[i]!, member, args as Record<string, unknown>, signal, dispatch => dispatch()),
     }));

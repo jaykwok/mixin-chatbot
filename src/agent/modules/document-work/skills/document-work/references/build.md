@@ -2,7 +2,7 @@
 
 `document_build` 与 `document_compose` 的 `content` 项都接受同一种 Markdown。内容由你写，排版由工具按模板完成：Word 继承页面设置、页眉页脚、主题字体和样式；PPT 继承母版和版式，并从模板样例页推断标题位置、字体、字号与颜色。
 
-**默认模板**：管理员可为 PPT、Word 各配置一份默认模板。`document_build` 不传 `template` 时自动套用，结果的 `build.defaultTemplate` 为 `used`；本群没有该文件时为 `missing`，`warnings` 会说明并改用内置版式，此时不要声称用了公司模板。用户要求沿用某份文件的样式时才传 `template`，它优先于默认模板。`document_compose` 的 `content` 项沿用组装来源的版式，不套默认模板。
+**默认模板**：管理员可为 PPT、Word 各配置一份默认模板。`document_build` 不传 `template` 时自动套用，结果的 `build.defaultTemplate` 为 `used`；共享资料中没有该文件时为 `missing`，`warnings` 会说明并改用内置版式，此时不要声称用了公司模板。用户要求沿用某份文件的样式时才传 `template`，它优先于默认模板。`document_compose` 的 `content` 项沿用组装来源的版式，不套默认模板。
 
 ## Markdown 约定
 
@@ -21,13 +21,13 @@
 | `<!-- notes: 讲稿 -->` | 忽略 | 写入当页备注 |
 | `<!-- cards -->` `<!-- flow -->` `<!-- layers -->` `<!-- timeline -->` `<!-- cycle -->` `<!-- pyramid -->` `<!-- stats -->` `<!-- plain -->` | 忽略 | 指定当页图示，见下文 |
 
-图片路径可以是本群 workspace 中的产品图（相对路径或绝对路径）、`document_images` 提取出的素材，也可以是你先在 tmp 中截取或生成的图片；支持 png / jpg / gif / bmp / tiff，单张不超过 32 MiB。不存在或格式不支持的图片会被跳过并在 `warnings` 中说明。
+图片路径可以是共享 workspace 中的产品图（相对路径或绝对路径）、`document_images` 提取出的素材，也可以是你先在 tmp 中截取或生成的图片；支持 png / jpg / gif / bmp / tiff，单张不超过 32 MiB。不存在或格式不支持的图片会被跳过并在 `warnings` 中说明。
 
 不要使用 HTML、脚注、数学公式或嵌套表格；不要为了排版在文字里补空格或全角空格。
 
 ## PPT 参数
 
-- `template`：任意本群 PPT 或 PowerPoint 模板（.potx），通常选产品介绍或客户方案原件，它的母版和标题风格会被沿用。没有合适模板时省略：管理员配置了默认 PPT 模板就套用它，否则用默认 16:9 版式。
+- `template`：workspace 中任意 PPT 或 PowerPoint 模板（.potx），通常选产品介绍或客户方案原件，它的母版和标题风格会被沿用。没有合适模板时省略：管理员配置了默认 PPT 模板就套用它，否则用默认 16:9 版式。
 - `keepSlides` + `sequence`：保留模板的封面、目录、封底等页，并指定新页插入位置。例如 `keepSlides: [1, 45]`，`sequence: [1, "content", 45]`。
 - `styleFrom`：模板页较杂时，指定几页内容页作为标题样式与内容区域的推断依据。
 - `title` / `subtitle` / `cover`：有 `title` 时默认生成封面页。产品方案类 PPT 的封面元素通常画在第 1 页上而非版式里，此时生成的封面会是白页；应改用 `keepSlides: [1]`、`cover: false`，再用 `document_patch` 改封面上的客户名或标题。大纲中首页 `chars` 很少且版式名含“标题幻灯片”，一般表示版式自带封面设计，可直接 `cover: true`。
@@ -58,7 +58,7 @@
 
 ## 从资料中取图
 
-`document_images` 从本群 PDF、PPT、Word 中把内嵌位图提取到 tmp，返回每张图的页码、像素尺寸和在页面中的位置比例（`box`，左上角为原点），重复出现的背景和 logo 只保留一次并标出 `pages`，整页大图标为 `fullPage`。返回的 `path` 可直接写进 Markdown 的 `![说明](path)`。单次最多返回 60 张；达到数量或上下文输出上限时 `truncated` 为 true。PDF/PPT 用 `pages` 分批；DOCX 将非空的 `next` 传给 `after` 继续。
+`document_images` 从 workspace 中的 PDF、PPT、Word 把内嵌位图提取到 tmp，返回每张图的页码、像素尺寸和在页面中的位置比例（`box`，左上角为原点），重复出现的背景和 logo 只保留一次并标出 `pages`，整页大图标为 `fullPage`。返回的 `path` 可直接写进 Markdown 的 `![说明](path)`。单次最多返回 60 张；达到数量或上下文输出上限时 `truncated` 为 true。PDF/PPT 用 `pages` 分批；DOCX 将非空的 `next` 传给 `after` 继续。
 
 DOCX 默认返回 `order`（图片序号）、`paragraph`、`headingPath`、`caption`、`before`、`after`；前后文各默认 80 字，`contextChars` 最多 300。重复图片的 `occurrences` 最多列出三处。先用 `extract:false` 和 `match:["功能名称"]` 查位置，这一步不写图片；再用 `orders:[序号]` 提取所需图片。`match` 按标题、图注和前后文做字面匹配，任一关键词命中即可。PDF/PPT 暂不支持这些上下文筛选参数。
 
@@ -66,7 +66,7 @@ DOCX 默认返回 `order`（图片序号）、`paragraph`、`headingPath`、`cap
 
 ## Word 参数
 
-- `template`：任意本群 Word 或 Word 模板（.dotx），通常是同类正式文档或历史方案；省略时同样先用管理员配置的默认 Word 模板。工具清空其正文，保留节设置、页眉页脚、样式与主题；如需保留原正文的一部分，用 `document_compose` 的 `start,end` 复用正文块，再跟一个 `content` 项。
+- `template`：workspace 中任意 Word 或 Word 模板（.dotx），通常是同类正式文档或历史方案；省略时同样先用管理员配置的默认 Word 模板。工具清空其正文，保留节设置、页眉页脚、样式与主题；如需保留原正文的一部分，用 `document_compose` 的 `start,end` 复用正文块，再跟一个 `content` 项。
 - `title` / `subtitle`：写入 Title / Subtitle 样式；模板没有这些样式时退回加粗大字。
 - 页眉页脚随模板保留，包括其中的文档名和页码域；需要改页眉文字时对成品用 `document_patch`（含页码域的段落会被拒绝，改相邻段落或用脚本）。
 

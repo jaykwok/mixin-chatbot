@@ -7,7 +7,7 @@ import { applyArchiveRemoval, applyTmpArchive, previewArchiveRemoval, previewTmp
 import type { MemberScope } from "../../src/maintenance/scope.ts";
 import { RootlessTasks, type TaskDriver } from "../../src/core/rootless-tasks.ts";
 
-const fixture = process.argv[2]!, root = join(fixture, "groups"), temp = join(root, "group-a/users/alice/tmp");
+const fixture = process.argv[2]!, root = join(fixture, "data"), temp = join(root, "tmp/groups/group-a/alice");
 const scope: MemberScope = { async withMember(_paths, _member, _mode, run) {
   return run({ calls: {}, liveWork: false, protectedPath: () => false, settle: async () => {} });
 } };
@@ -19,7 +19,7 @@ const driver: TaskDriver = { async run(args) {
 } };
 
 const backend = new RootlessTasks(join(fixture, "control"), image, driver);
-const options = { root, state: join(fixture, "state.sqlite"), archive: join(root, ".reclamation/backup/rm"), scope, backend };
+const options = { root, state: join(fixture, "state.sqlite"), archive: join(root, "state/reclamation/backup/rm"), scope, backend };
 const task = await backend.create(temp);
 for (const name of ["data-1.txt", "data-2.txt", "data-3.txt"]) await fs.writeFile(join(task.path, name), name);
 await task.seal();

@@ -6,12 +6,12 @@ import { loadDiskUsage, loadGit, loadUpgrade, loadHealth, loadHistory, loadRecen
 import type { Deployment } from "../../scripts/ops/tui/platform.ts";
 import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import { parseDate } from "../../scripts/ops/stats-admin.ts";
-import { statsLedgerPath } from "../../src/agent/stats-ledger.ts";
+import { statsOf } from "../helpers/layout.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test("体检把取消信号和界面提示上下文传给子进程，并保留失败项", async () => {
   const deployment: Deployment = { platform: "windows", runtime: "scheduled-task", port: 1011,
-    mode: "direct", domain: "", groupDataRoot: "unused", groupDataRootIsCustom: false };
+    dataRoot: "unused", workspaceRoot: "" };
   const health: Health = { pass: 0, warn: 0, fail: 1, checks: [
     { name: "本地机器人健康", status: "fail", detail: "实例不存在", fix: "系统 → 服务部署 → 重新部署" },
   ] };
@@ -139,7 +139,7 @@ test("并发扫描多个群和成员时统计、会话字节及深层临时文�
   try {
     for (let member = 0; member < 12; member++) {
       const dir = join(fixture.root, `g${Math.floor(member / 4)}`, "users", `u${member}`);
-      const tmp = join(dir, "tmp", "nested");
+      const tmp = join(fixture.root, "tmp", "groups", `g${Math.floor(member / 4)}`, `u${member}`, "nested");
       await mkdir(tmp, { recursive: true });
       const content = Array.from({ length: member + 1 }, () => JSON.stringify({ type: "message",
         timestamp: new Date(now - 3600000).toISOString(), message: { role: "user", content: [{ type: "text", text: "并发统计" }] } })).join("\n") + "\n";
@@ -158,8 +158,8 @@ test("并发扫描多个群和成员时统计、会话字节及深层临时文�
     expect(history).toHaveLength(0);
     expect(tmp.reduce((sum, user) => sum + user.files, 0)).toBe(240);
     expect(tmp.reduce((sum, user) => sum + user.bytes, 0)).toBe(2520);
-    // 统计账本也落在群数据根里，磁盘占用把它算进去。
-    const ledger = statsLedgerPath(fixture.root);
+    // 统计账本也落在数据目录里，磁盘占用把它算进去。
+    const ledger = statsOf(fixture.root);
     const ledgerBytes = await loadDiskUsage([ledger, `${ledger}-wal`, `${ledger}-shm`]);
     expect(ledgerBytes).toBeGreaterThan(0);
     expect(disk).toBe(2520 + ledgerBytes);
@@ -177,28 +177,27 @@ test("每日提问按消息当天计数，9 次和 1 次不会被平均成 5 次
       type: "message", timestamp: new Date(2026, 8, day, 12).toISOString(),
       message: { role: "user", content: [{ type: "text", text }] },
     });
+    const answer = (day: number, hour: number, input: number) => JSON.stringify({
+      type: "message", timestamp: new Date(2026, 8, day, hour, 1).toISOString(),
+      message: { role: "assistant", provider: "p", model: "m", usage: { input, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    });
     await writeFile(join(dir, "stats.records"), [
       ...Array.from({ length: 9 }, () => message(11, "统计")),
-      message(12, "资料"), message(12, "/help"),
-      JSON.stringify({ type: "message", timestamp: new Date(2026, 8, 12, 12, 1).toISOString(),
-        message: { role: "toolResult", toolName: "send_file", isError: false, details: { fileId: "fixture" } } }),
+      message(12, "资料"), message(12, "/help"), answer(12, 12, 300),
     ].join("\n") + "\n");
     const recent = await loadRecentStats(fixture.root, 3, new Date(2026, 8, 12, 23).getTime());
-    // 成员和附件也按天留档：总览的指标块要用昨天的值算环比，只攒提问数的话算不出来。
+    // 成员和 token 也按天留档：总览的指标块要用昨天的值算环比，只攒提问数的话算不出来。
     expect(recent.trend).toEqual([
-      { day: "2026-09-10", asks: 0, people: 0, files: 0 },
-      { day: "2026-09-11", asks: 9, people: 1, files: 0 },
-      { day: "2026-09-12", asks: 1, people: 1, files: 1 },
+      { day: "2026-09-10", asks: 0, people: 0, tokens: 0 },
+      { day: "2026-09-11", asks: 9, people: 1, tokens: 0 },
+      { day: "2026-09-12", asks: 1, people: 1, tokens: 300 },
     ]);
-    expect(recent.today).toEqual({ asks: 1, people: 1, files: 1, images: 0, groups: 1 });
-    // 跨午夜才送达的附件仍计入送达当天，即使当天没有新提问。
-    await writeFile(join(dir, "stats.records"), [message(11, "昨日的任务"), JSON.stringify({
-      type: "message", timestamp: new Date(2026, 8, 12, 0, 1).toISOString(),
-      message: { role: "toolResult", toolName: "send_file", isError: false, details: { fileId: "after-midnight" } },
-    })].join("\n") + "\n");
-    // 原地改写：账本整份重读并替换这一世代的行，旧的 9 次提问不会留在里面。
+    expect(recent.today).toEqual({ asks: 1, people: 1, tokens: 300, groups: 1 });
+    // token 计入入账当天，即使当天没有新提问。
+    await writeFile(join(dir, "stats.records"), [message(11, "昨日的任务"), answer(12, 0, 50)].join("\n") + "\n");
+    // 原地改写：夹具整份替换这位成员的行，旧的 9 次提问不会留在里面。
     const rewritten = await loadRecentStats(fixture.root, 3, new Date(2026, 8, 12, 23).getTime());
-    expect(rewritten.today.files).toBe(1);
+    expect(rewritten.today.tokens).toBe(50);
     expect(rewritten.trend.map(point => point.asks)).toEqual([0, 1, 0]);
   } finally { await fixture.cleanup(); }
 });

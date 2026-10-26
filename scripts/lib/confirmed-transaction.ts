@@ -3,9 +3,8 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-const stateFiles = ["deploy-transaction", "upgrade-transaction", "update-transaction", "update-commit", "release-data.json", "data-version.json"];
-const snapshotFiles = ["transaction", "deployment.xml", "target-sha", "group-root", "was-running", "previous-image",
-  "tunnel-running", "tunnel-command", "code-restore", "data-plan.json"];
+const stateFiles = ["deploy-transaction", "upgrade-transaction", "release-data.json", "data-version.json"];
+const snapshotFiles = ["transaction", "deployment.xml", "target-sha", "was-running", "previous-image", "code-restore", "data-plan.json"];
 const hash = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
 export type TransactionReadSet = { operation: "deploy" | "upgrade"; id: string; digest: string; text(path: string): string | null };
 export type ConfirmedTransaction = { version: 1; operation: "deploy" | "upgrade"; id: string; digest: string; action: "continue" | "rollback" };
@@ -23,7 +22,6 @@ export function readTransaction(project: string): TransactionReadSet | null {
   const text = (file: string) => files.get(file)?.toString("utf8").replace(/^\uFEFF/, "") ?? null;
   const deploy = text("data/state/deploy-transaction")?.trim(), upgrade = text("data/state/upgrade-transaction")?.trim();
   for (const name of [deploy, upgrade]) if (name !== undefined && !/^deploy-[A-Za-z0-9]+$/.test(name)) throw new Error("事务快照名称无效");
-  if (text("data/state/update-transaction") !== null) throw new Error("事务格式不匹配，请用对应旧版完成原操作");
   if (!deploy && !upgrade) return null;
   const id = (upgrade ?? deploy)!;
   for (const name of new Set([deploy, upgrade])) if (name) {

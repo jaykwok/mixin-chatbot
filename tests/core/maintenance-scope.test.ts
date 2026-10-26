@@ -5,29 +5,31 @@ import { Database } from "bun:sqlite";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { DeliveryStore } from "../../src/agent/delivery-store.ts";
-import { withGroupSnapshot } from "../../src/durable/diagnostics.ts";
+import { withSpaceSnapshot } from "../../src/durable/diagnostics.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { durableMemberScope } from "../../src/durable/maintenance-view.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { applyTmpArchive, previewTmpArchive } from "../../src/maintenance/archive.ts";
 import type { MemberScope } from "../../src/maintenance/scope.ts";
 import { fauxModels, gatedResponse, openGroupHarness } from "../helpers/durable.ts";
+import { referTo } from "../helpers/pending-reply.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
+import { databaseOf, scopeOf, tmpOf } from "../helpers/layout.ts";
 
 async function fixture(durable: boolean) {
-  const f = await tempFixture("maintenance-scope-"), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture("maintenance-scope-"), root = join(f.root, "data"), temp = tmpOf(root, "group-a", "alice");
   await mkdir(temp, { recursive: true });
-  const state = join(f.root, "state.sqlite"), db = new Database(state), deliveries = new DeliveryStore(db);
-  const path = join(root, "group-a/durable.sqlite"), { models, model, faux } = fauxModels();
+  const state = join(f.root, "state.sqlite"), db = new Database(state);
+  const path = databaseOf(root, "group-a"), { models, model, faux } = fauxModels();
+  await mkdir(join(path, ".."), { recursive: true });
   const group = durable ? await openGroupHarness(path, models) : undefined;
   if (group) {
-    await memberConversation(group.harness, "group-a", "alice", { model }, context);
+    await memberConversation(group.harness, scopeOf("group-a"), "alice", { model }, context);
     await group.harness.commit(async tx => { (await tx.doc(ResultsDoc)).calls["1-result"] = { phone: "alice", createdAt: 1 }; }, context);
   }
-  const member = { group: "group-a", user: "alice", dir: temp, entries: [], bytes: 0, files: 0, newest: 0 };
-  return { f, root, temp, path, deliveries, group, model, faux, member, options: { root, state, archive: join(root, ".reclamation/backup/rm"), scope: durableMemberScope },
+  const member = { space: "groups/group-a", user: "alice", dir: temp, entries: [], bytes: 0, files: 0, newest: 0 };
+  return { f, root, temp, path, group, model, faux, member, options: { root, state, archive: join(root, "state", "reclamation", "backup", "rm"), scope: durableMemberScope },
     async close() { await group?.close(); db.close(); await f.cleanup(); } };
 }
 
@@ -37,15 +39,16 @@ test("a read-only member view refuses settlement", async () => {
     await f.group!.close();
     await expect(durableMemberScope.withMember({ root: f.root, state: f.options.state }, f.member, { exclusive: false, requireGroup: true },
       view => view.settle(new Map([["1-result", { phone: "alice", createdAt: 1 }]])))).rejects.toThrow("只读预览不能结算回收账本");
-    await withGroupSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls["1-result"]).toBeDefined());
+    await withSpaceSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls["1-result"]).toBeDefined());
   } finally { await f.close(); }
 });
 
-test("without a group database the outbox ledger still protects a member's paths", async () => {
-  const f = await fixture(false);
+test("a pending reply in the member's run records protects the path it names", async () => {
+  const f = await fixture(true);
   try {
     await writeFile(join(f.temp, "pending.txt"), "awaiting delivery"); await writeFile(join(f.temp, "loose.txt"), "nothing refers to this");
-    f.deliveries.put(JSON.stringify(["group-a", "alice"]), "pending", join(f.temp, "pending.txt"));
+    await referTo(f.group!.harness, "alice", "msg:pending", join(f.temp, "pending.txt"));
+    await f.group!.close();
     const plan = await previewTmpArchive(f.options, 0), status = (name: string) => plan.items.find(item => item.source === join(f.temp, name))?.status;
     expect([status("pending.txt"), status("loose.txt")]).toEqual(["kept", "ready"]);
   } finally { await f.close(); }
@@ -55,7 +58,7 @@ test("recoverable group work protects every path of the member", async () => {
   const f = await fixture(true), gated = gatedResponse("done");
   try {
     await writeFile(join(f.temp, "loose.txt"), "nothing refers to this");
-    const { conversation } = await memberConversation(f.group!.harness, "group-a", "alice", { model: f.model }, context);
+    const { conversation } = await memberConversation(f.group!.harness, scopeOf("group-a"), "alice", { model: f.model }, context);
     f.faux.setResponses([gated.step]);
     const submission = await conversation.submit({ type: "input", content: "work" }, context);
     await gated.started;
@@ -74,7 +77,7 @@ test("a failed archive settlement stops the batch and keeps moved entries archiv
     await mkdir(join(f.temp, "codemode/1-result"), { recursive: true }); await writeFile(join(f.temp, "codemode/1-result/output"), "owned");
     await writeFile(join(f.temp, "changed.txt"), "before");
     // A later member (no group database) that the stopped batch must not reach.
-    const later = join(f.root, "group-b/users/bob/tmp"); await mkdir(later, { recursive: true }); await writeFile(join(later, "later.txt"), "later");
+    const later = tmpOf(f.root, "group-b", "bob"); await mkdir(later, { recursive: true }); await writeFile(join(later, "later.txt"), "later");
     const plan = await previewTmpArchive(f.options, 0), index = (name: string) => plan.items.findIndex(item => item.source === join(f.temp, name));
     const laterIndex = plan.items.findIndex(item => item.source === join(later, "later.txt"));
     expect(laterIndex).toBeGreaterThan(index("changed.txt"));
@@ -88,9 +91,9 @@ test("a failed archive settlement stops the batch and keeps moved entries archiv
     expect(saved.outcomes[index("changed.txt")].reason).toContain("synthetic settlement failure");
     expect(saved.outcomes[laterIndex]).toBeUndefined();
     expect(await readFile(join(later, "later.txt"), "utf8")).toBe("later");
-    await withGroupSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls["1-result"]).toBeDefined());
+    await withSpaceSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls["1-result"]).toBeDefined());
     const replay = await applyTmpArchive(f.options, plan.id, plan.digest);
     expect([replay.outcomes[index("codemode")]!.status, replay.outcomes[laterIndex]!.status]).toEqual(["archived", "archived"]);
-    await withGroupSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls).toEqual({}));
+    await withSpaceSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls).toEqual({}));
   } finally { await f.close(); }
 });

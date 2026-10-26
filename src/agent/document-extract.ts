@@ -60,7 +60,8 @@ async function sourceDigest(path: string, signal: AbortSignal): Promise<string> 
 }
 
 async function pruneCache(root: string, keep: string): Promise<void> {
-  // Legacy cache ownership does not prove a protected parent or absence of shared-identity writers.
+  // Linux without the isolated task backend (development only): the cache is shared with the service identity, so its
+  // ownership proves neither a protected parent nor the absence of other writers.
   if (process.platform === "linux") return;
   const entries = await readdir(root, { withFileTypes: true });
   const candidates = await Promise.all(entries.filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && /^[a-f0-9]{64}$/.test(entry.name))
@@ -79,7 +80,7 @@ export async function extractDocument(options: DocumentOptions, source: string, 
   const workspace = await realpath(options.workspaceDir), temp = await realpath(options.tempDir);
   const path = await realpath(resolveToolPath(source, workspace));
   await assertTaskPathAllowed(path);
-  if (![workspace, temp].some(root => isPathInside(path, root))) throw new Error("只能解析本群 workspace 或当前用户 tmp 中的文档");
+  if (![workspace, temp].some(root => isPathInside(path, root))) throw new Error("只能解析共享资料 workspace 或当前用户 tmp 中的文档");
   const extension = extname(path).toLowerCase();
   if (![".pdf", ".docx", ".pptx", ".xlsx"].includes(extension)) throw new Error("仅支持 PDF、DOCX、PPTX、XLSX；扫描件需要 OCR");
   const located = { source: path, format: extension.slice(1) as Format };
@@ -89,7 +90,7 @@ export async function extractDocument(options: DocumentOptions, source: string, 
   const parserIdentity = createHash("sha256").update(await readFile(script)).update(await readFile(lock)).digest("hex");
   const key = createHash("sha256").update(JSON.stringify([digest, extension, parserIdentity, maxChars])).digest("hex");
   const backend = configuredRootlessTasks();
-  // Only shared source material has a group cache. Private generated documents stay in the user's tmp.
+  // Only shared source material has the public cache. Private generated documents stay in the user's tmp.
   const parent = isPathInside(path, workspace) ? await realpath(dirname(options.indexPath)) : temp;
   const root = join(parent, isPathInside(path, workspace) ? "parsed" : ".document-cache");
   if (!backend) {
@@ -200,7 +201,7 @@ type TextMetadata = { path: string; textHash: string; truncated: boolean; source
 export function createDocumentTextLookup(options: DocumentOptions, signal: AbortSignal): (source: string) => Promise<CachedText | { reason: string }> {
   let roots: Promise<string[]> | undefined;
   const locations = () => roots ??= Promise.all([options.workspaceDir, options.tempDir, dirname(options.indexPath)].map(path => realpath(path)));
-  let catalogue: Promise<{ sources: Map<string, TextMetadata[]>; legacy: boolean }> | undefined;
+  let catalogue: Promise<Map<string, TextMetadata[]>> | undefined;
   const json = async (path: string) => {
     signal.throwIfAborted();
     const info = await lstat(path);
@@ -208,22 +209,23 @@ export function createDocumentTextLookup(options: DocumentOptions, signal: Abort
     return JSON.parse(await readFile(path, { encoding: "utf8", signal }));
   };
   async function loadCatalogue(index: string) {
-    const sources = new Map<string, TextMetadata[]>(); let legacy = false;
+    const sources = new Map<string, TextMetadata[]>();
     const root = join(index, "parsed");
     try {
-      if ((await lstat(root)).isSymbolicLink() || !isPathInside(await realpath(root), index)) return { sources, legacy };
+      if ((await lstat(root)).isSymbolicLink() || !isPathInside(await realpath(root), index)) return sources;
       for (const dir of await readdir(root, { withFileTypes: true })) {
         signal.throwIfAborted();
         if (!dir.isDirectory() || dir.isSymbolicLink() || !/^[a-f0-9]{64}$/.test(dir.name)) continue;
         try {
           const metadata = await json(join(root, dir.name, "metadata.json"));
-          if (typeof metadata.sourcePath !== "string" || typeof metadata.sourceStamp !== "string") { legacy = true; continue; }
+          // Without its source the entry cannot be matched here; document_extract checks and registers it by content.
+          if (typeof metadata.sourcePath !== "string" || typeof metadata.sourceStamp !== "string") continue;
           const entries = sources.get(metadata.sourcePath) ?? [];
           entries.push({ ...metadata, path: join(root, dir.name, "text.txt") }); sources.set(metadata.sourcePath, entries);
         } catch { signal.throwIfAborted(); }
       }
     } catch { signal.throwIfAborted(); }
-    return { sources, legacy };
+    return sources;
   }
   return async source => {
     signal.throwIfAborted();
@@ -248,12 +250,12 @@ export function createDocumentTextLookup(options: DocumentOptions, signal: Abort
       }
     } catch { signal.throwIfAborted(); }
     const cache = await (catalogue ??= loadCatalogue(index));
-    for (const metadata of cache.sources.get(source) ?? []) {
+    for (const metadata of cache.get(source) ?? []) {
       if (metadata.sourceStamp !== stamp) continue;
       try { const hit = await verify(metadata); if (hit) return hit; }
       catch { signal.throwIfAborted(); }
     }
-    return cache.legacy ? { reason: "旧缓存缺少来源记录；请对该文件调用一次 document_extract 核验并登记（命中缓存时不启动解析）" } : missing;
+    return missing;
   };
 }
 
@@ -271,9 +273,9 @@ const extractOutput = Type.Object({
 
 export function buildDocumentEnvironmentTool(venvDir: string): ToolDefinition {
   return {
-    name: "document_environment", label: "文档解析环境", description: "查询并按需准备本群固定版本的文档解析环境；成功后返回解释器位置。失败时说明能力不可用，不自行安装或修改共享环境。",
+    name: "document_environment", label: "文档解析环境", description: "查询并按需准备固定版本的共享文档解析环境；成功后返回解释器位置。失败时说明能力不可用，不自行安装或修改共享环境。",
     parameters: Type.Object({}),
-    // 按需建立本群固定版本的环境（会下载依赖），环境已就绪时重复调用不再改动。
+    // 按需建立固定版本的共享环境（会下载依赖），环境已就绪时重复调用不再改动。
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async execute(_id, _params, toolSignal) {
       const backend = configuredRootlessTasks();
@@ -296,7 +298,7 @@ export function buildDocumentEnvironmentTool(venvDir: string): ToolDefinition {
 
 export function buildDocumentTool(options: DocumentOptions): ToolDefinition {
   const parameters = Type.Object({ source: Type.String(), maxChars: Type.Optional(Type.Integer({ minimum: 1000, maximum: 2000000 })) });
-  const tool: ToolDefinition<typeof parameters> = { name: "document_extract", label: "提取文档", description: "提取本群 PDF/DOCX/PPTX/XLSX 文本，按当前文件内容校验并复用缓存；保留页码、幻灯片或 sheet/行号。返回文本文件路径，再用 read/bash 按需检索。",
+  const tool: ToolDefinition<typeof parameters> = { name: "document_extract", label: "提取文档", description: "提取资料库或当前用户 tmp 中的 PDF/DOCX/PPTX/XLSX 文本，按当前文件内容校验并复用缓存；保留页码、幻灯片或 sheet/行号。返回文本文件路径，再用 read/bash 按需检索。",
     parameters, outputSchema: extractOutput,
     // 解析缓存是内部实现，对资料和用户文件只读。
     annotations: { readOnlyHint: true, openWorldHint: false },

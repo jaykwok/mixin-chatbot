@@ -7,6 +7,7 @@
 import type { Key } from "./render/screen.ts";
 import type { StatusName, Theme } from "./render/theme.ts";
 import type { Deployment } from "./platform.ts";
+import type { Service } from "./data.ts";
 
 export interface ViewContext {
   theme: Theme;
@@ -15,6 +16,8 @@ export interface ViewContext {
   /** 正文区可用行数，已扣掉页眉、导航和页脚。 */
   height: number;
   deployment: Deployment;
+  /** 页眉用的同一次服务探测；尚未探测时为空。只用于显示，执行前由运维脚本自己核对。 */
+  service?: Service | null;
 }
 
 /** 危险操作的确认框。字段是刻意分成这几项的，见 app.ts 里的说明。 */
@@ -77,15 +80,15 @@ export interface AppApi {
   openFile(path: string): Promise<void>;
   /** 请求重绘（数据异步到达后调用）。 */
   redraw(): void;
-  /** 切到另一个页面。 */
-  go(view: string): void;
+  /** 切到另一个页面；focus 交给目标页的 focus()，用来预选一项（如总览跳到「启动」）。 */
+  go(view: string, focus?: string): void;
 }
 
 export interface View {
   id: string;
   /** 导航栏上的标签。 */
   label: string;
-  /** 只在部分部署形态下有意义的页面（例如隧道日志）；不可用时不出现在导航、Tab 和菜单里。分区首页必须始终可用。 */
+  /** 只在部分部署形态下有意义的页面；不可用时不出现在导航、Tab 和菜单里。分区首页必须始终可用。 */
   available?(deployment: Deployment): boolean;
   render(ctx: ViewContext): string[];
   /** 本页特有的按键提示；通用键由 app 补。 */
@@ -100,6 +103,8 @@ export interface View {
   activity?(): string | null;
   /** 内存中尚未提交的编辑；退出 TUI 前由 App 统一提醒。 */
   hasUnsavedChanges?(): boolean;
+  /** 从别的页面跳来时预选一项；不认识的值忽略。 */
+  focus?(item: string): void;
   /** 离开时停止轮询；返回 true 表示当前读取已失效，重入时需要补一次刷新。 */
   onLeave?(): boolean | void;
   /** 返回 true 表示按键已被消费，app 不再继续处理。 */

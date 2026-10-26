@@ -9,13 +9,7 @@ import { createHash, createHmac } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
-import type { Harness } from "@earendil-works/pi-durable";
-import { openStatsLedger } from "../../src/agent/stats-ledger.ts";
-import { AttemptsDoc, type UsageRecord } from "../../src/durable/attempts.ts";
-import { AuxiliaryDoc } from "../../src/durable/auxiliary-records.ts";
-import { GroupDoc, memberConversation } from "../../src/durable/identity.ts";
-import { conversationSource, projectConversation } from "../../src/durable/projection.ts";
+import { memberConversation } from "../../src/durable/identity.ts";
 import { handoffResults, ReclamationItems, ReclamationQueues } from "../../src/durable/results/queue.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { durableMemberScope } from "../../src/durable/maintenance-view.ts";
@@ -25,6 +19,7 @@ import { ReferenceText } from "../../src/core/reference-text.ts";
 import { RootlessTasks, type TaskDriver } from "../../src/core/rootless-tasks.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 const golden = join(import.meta.dir, "../fixtures/maintenance-formats");
 const platform = process.platform === "win32" ? "win32" : "linux";
@@ -70,9 +65,9 @@ function expectDigest(plan: { digest: string }) {
 }
 
 async function group(root: string, results: string[]) {
-  const { models, model } = fauxModels(), path = join(root, "group-a/durable.sqlite"), opened = await openGroupHarness(path, models);
+  const { models, model } = fauxModels(), path = join(root, "conversations/groups/group-a/durable.sqlite"), opened = await openGroupHarness(path, models);
   try {
-    await memberConversation(opened.harness, "group-a", "alice", { model }, context);
+    await memberConversation(opened.harness, scopeOf("group-a"), "alice", { model }, context);
     await opened.harness.commit(async tx => {
       for (const name of results) (await tx.doc(ResultsDoc)).calls[name] = { phone: "alice", createdAt: 1 };
     }, context);
@@ -81,7 +76,7 @@ async function group(root: string, results: string[]) {
 }
 
 test("archive plan, progress, removal list and removal progress keep the baseline format", async () => {
-  const f = await tempFixture("formats-archive-"), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture("formats-archive-"), root = join(f.root, "data"), temp = join(root, "tmp/groups/group-a/alice");
   const db = new Database(join(f.root, "state.sqlite"));
   try {
     await mkdir(join(temp, "codemode/1-result"), { recursive: true });
@@ -89,7 +84,7 @@ test("archive plan, progress, removal list and removal progress keep the baselin
     await writeFile(join(temp, "note.txt"), "note");
     await mkdir(join(temp, "folder/inner"), { recursive: true }); await writeFile(join(temp, "folder/inner/x"), "x");
     await group(root, ["1-result"]);
-    const options = { root, state: join(f.root, "state.sqlite"), archive: join(root, ".reclamation/backup/rm"), scope: durableMemberScope };
+    const options = { root, state: join(f.root, "state.sqlite"), archive: join(root, "state/reclamation/backup/rm"), scope: durableMemberScope };
     const plan = await previewTmpArchive(options, 0, undefined, undefined, "auto", PLAN);
     expectDigest(plan);
     const progress = await applyTmpArchive(options, plan.id, plan.digest);
@@ -113,7 +108,7 @@ test("archive plan, progress, removal list and removal progress keep the baselin
 });
 
 test("physical reclamation plan, progress and journals keep the baseline format", async () => {
-  const f = await tempFixture("formats-reclaim-"), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture("formats-reclaim-"), root = join(f.root, "data"), temp = join(root, "tmp/groups/group-a/alice");
   const db = new Database(join(f.root, "state.sqlite"));
   try {
     await mkdir(join(temp, "codemode/1-result"), { recursive: true });
@@ -136,7 +131,7 @@ test("result ownership, the reclamation queue and its items keep the baseline do
   try {
     const { models, model } = fauxModels(), opened = await openGroupHarness(join(f.root, "group.sqlite"), models);
     try {
-      await memberConversation(opened.harness, "group-a", "alice", { model }, context);
+      await memberConversation(opened.harness, scopeOf("group-a"), "alice", { model }, context);
       await opened.harness.commit(async tx => {
         const calls = (await tx.doc(ResultsDoc)).calls;
         calls["1-a"] = { phone: "alice", createdAt: 1 }; calls["2-b"] = { phone: "alice", createdAt: 2, isolatedTask: PLAN };
@@ -152,45 +147,6 @@ test("result ownership, the reclamation queue and its items keep the baseline do
   } finally { await f.cleanup(); }
 });
 
-test("a retirement checkpoint left by a failed group commit keeps the baseline format", async () => {
-  const f = await tempFixture("formats-retirement-");
-  const bill: UsageRecord = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15,
-    cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 } };
-  const { faux, models, model } = fauxModels(), ledger = openStatsLedger(join(f.root, "stats"));
-  const opened = await openGroupHarness(join(f.root, "group.sqlite"), models);
-  try {
-    const { conversation } = await memberConversation(opened.harness, "group-a", "member", { model }, context);
-    faux.setResponses([fauxAssistantMessage("complete")]);
-    await (await conversation.submit({ type: "input", content: "question", requestId: "retirement" }, context)).wait(context);
-    const original = Object.values((await opened.harness.snapshot(AttemptsDoc, conversation.id, context))!.starts)[0]!;
-    const member = { groupId: "group-a", phone: "member", conversationId: conversation.id };
-    await projectConversation(ledger, opened.harness, member, context);
-    await opened.harness.commit(async tx => {
-      // More than one retirement batch (256), so the checkpoint is left in its retiring state.
-      const attempts = await tx.doc(AttemptsDoc, conversation.id), auxiliary = await tx.doc(AuxiliaryDoc, conversation.id);
-      for (let i = 0; i < 600; i++) {
-        attempts.starts["c:" + i] = { ...original, kind: "compaction", k: 100 + i, usage: bill };
-        auxiliary.starts["a:" + i] = { taskId: original.taskId, callId: String(i), kind: "classifier", provider: "p", model: "m",
-          startedAt: original.startedAt, endedAt: original.startedAt + 1, outcome: "stop", usage: bill };
-      }
-    }, context);
-    const source = conversationSource("group-a", "member", conversation.id, (await opened.harness.snapshot(GroupDoc, context))!.generation).id;
-    const digest = () => (ledger.query("SELECT digest FROM sources WHERE id = ?").get(source) as { digest: string } | null)?.digest;
-    let captured: string | undefined;
-    const failing = new Proxy(opened.harness, { get(target, name) {
-      if (name !== "commit") { const value = Reflect.get(target, name); return typeof value === "function" ? value.bind(target) : value; }
-      return (change: Parameters<Harness["commit"]>[0], ctx: typeof context) => target.commit(async tx => {
-        const result = await change(tx);
-        if (!captured && digest()?.includes('"retiring"')) { captured = digest(); throw new Error("synthetic group commit failure"); }
-        return result;
-      }, ctx);
-    } });
-    await expect(projectConversation(ledger, failing, member, context)).rejects.toThrow("synthetic");
-    await check("retirement-checkpoint", JSON.parse(captured!), [f.root]);
-    await check("retirement-meta", ledger.query("SELECT key FROM meta WHERE key LIKE 'durable_retired:%' ORDER BY key").all(), [f.root]);
-  } finally { ledger.close(); await opened.close(); await f.cleanup(); }
-});
-
 const image = "sha256:" + "a".repeat(64);
 const driver: TaskDriver = { async run(args) {
   if (args[0] === "info") return { exitCode: 0, output: JSON.stringify({ ID: "formats-fixture", SecurityOptions: ["name=rootless"] }) };
@@ -199,7 +155,7 @@ const driver: TaskDriver = { async run(args) {
 } };
 
 test.skipIf(process.platform !== "linux")("a signed task receipt keeps the baseline envelope and payload through archive", async () => {
-  const f = await tempFixture("formats-receipt-"), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture("formats-receipt-"), root = join(f.root, "data"), temp = join(root, "tmp/groups/group-a/alice");
   const db = new Database(join(f.root, "state.sqlite"));
   try {
     await mkdir(temp, { recursive: true });
@@ -216,7 +172,7 @@ test.skipIf(process.platform !== "linux")("a signed task receipt keeps the basel
       return { keys: Object.keys(saved), signature: saved.signature, payload: JSON.parse(saved.payload) };
     };
     await check("receipt-sealed", await envelope(), [f.root]);
-    const options = { root, state: join(f.root, "state.sqlite"), archive: join(root, ".reclamation/backup/rm"), scope: durableMemberScope, backend };
+    const options = { root, state: join(f.root, "state.sqlite"), archive: join(root, "state/reclamation/backup/rm"), scope: durableMemberScope, backend };
     const plan = await previewTmpArchive(options, 0, undefined, undefined, "auto", PLAN);
     await applyTmpArchive(options, plan.id, plan.digest);
     await check("receipt-archived", await envelope(), [f.root]);
@@ -225,7 +181,7 @@ test.skipIf(process.platform !== "linux")("a signed task receipt keeps the basel
 });
 
 test.skipIf(process.platform !== "linux")("a receipt written before the optional fields existed is still accepted, listed and kept by sweeps", async () => {
-  const f = await tempFixture("formats-old-receipt-"), temp = join(f.root, "groups/group-a/users/alice/tmp");
+  const f = await tempFixture("formats-old-receipt-"), temp = join(f.root, "data/tmp/groups/group-a/alice");
   try {
     await mkdir(temp, { recursive: true });
     const control = join(f.root, "control"), backend = new RootlessTasks(control, image, driver);

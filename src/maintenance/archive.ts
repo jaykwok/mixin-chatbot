@@ -13,7 +13,7 @@ import { publishJson } from "../../scripts/lib/atomic-file.ts";
 import { scanTmp, type UserTmp } from "../../scripts/lib/tmp-scan.ts";
 import type { GroupSelection } from "../../scripts/lib/group-data.ts";
 import { isPathInside } from "../contracts/paths.ts";
-import { decodeArchivePlan, decodeArchiveProgress, decodeRemovalPlan, decodeRemovalProgress, DIGEST_PATTERN, finishedEarlier, ID_PATTERN, planDigest, sameOwnership,
+import { memberTmpDir, decodeArchivePlan, decodeArchiveProgress, decodeRemovalPlan, decodeRemovalProgress, DIGEST_PATTERN, finishedEarlier, ID_PATTERN, planDigest, sameOwnership,
   type ArchiveItem, type ArchiveRemovalPlan, type ArchiveRemovalProgress, type RemovalItem, type ResultOwnership, type TmpArchivePlan,
   type TmpArchiveProgress, type TreeEvidence } from "../contracts/maintenance.ts";
 import { archiveEntry } from "../core/archive-entry.ts";
@@ -83,7 +83,7 @@ export async function previewTmpArchive(options: TmpArchiveOptions, days: number
         const owned = Object.entries(view.calls).map(([name, owner]) =>
           [name, owner, owner.isolatedTask ? join(member.dir, ".isolated-work", owner.isolatedTask) : join(member.dir, "codemode", name)] as const);
         for (const candidate of await archiveCandidates(options, member)) {
-          const item: ArchiveItem = { group: member.group, user: member.user, source: candidate.path,
+          const item: ArchiveItem = { space: member.space, user: member.user, source: candidate.path,
             destination: join(archive, `tmp-${id}-${items.length}`), owners: {}, ...(candidate.task ? { task: candidate.task } : {}),
             status: candidate.reason ? "deferred" : "ready", ...(candidate.reason ? { reason: candidate.reason } : {}) };
           for (const [name, owner, path] of owned) if (isPathInside(path, item.source)) item.owners[name] = owner;
@@ -96,7 +96,7 @@ export async function previewTmpArchive(options: TmpArchiveOptions, days: number
           items.push(item);
         }
       });
-    } catch (error) { items.push({ group: member.group, user: member.user, source: member.dir, destination: join(archive, `tmp-${id}-${items.length}`), owners: {}, status: "deferred", reason: String(error) }); }
+    } catch (error) { items.push({ space: member.space, user: member.user, source: member.dir, destination: join(archive, `tmp-${id}-${items.length}`), owners: {}, status: "deferred", reason: String(error) }); }
   }
   const value = { version: 1 as const, id, root, rootIdentity: await entity(root), archive, recordedRoot: options.recordedRoot ?? root,
     createdAt, before: Number.isFinite(before) ? before : Number.MAX_VALUE, items };
@@ -141,8 +141,8 @@ export async function applyTmpArchive(options: TmpArchiveOptions, id: string, ex
       }
       await save(); continue;
     }
-    const first = plan.items[indexes[0]!]!, member: UserTmp = { group: first.group, user: first.user,
-      dir: join(plan.root, first.group, "users", first.user, "tmp"), entries: [], bytes: 0, files: 0, newest: 0 };
+    const first = plan.items[indexes[0]!]!, member: UserTmp = { space: first.space, user: first.user,
+      dir: memberTmpDir(plan.root, first.space, first.user), entries: [], bytes: 0, files: 0, newest: 0 };
     try {
       await options.scope.withMember(options, member, { exclusive: true, requireGroup: false }, async view => {
         const owners = new Map<string, ResultOwnership>();
@@ -205,7 +205,7 @@ async function removalSource(options: ArchiveRemovalOptions, archive: string, pl
   const saved = await readJson(join(plans, id + ".json")), root = await realpath(options.root), inside = relative(root, archive);
   let view: PlanView = { root, archive };
   if (saved?.root !== root) {
-    if (!options.recordedRoot || saved?.root !== options.recordedRoot || !inside || inside.startsWith("..") || isAbsolute(inside)) throw new Error("归档清单属于另一群根；宿主维护请用 --recorded-root 指定服务看到的群根");
+    if (!options.recordedRoot || saved?.root !== options.recordedRoot || !inside || inside.startsWith("..") || isAbsolute(inside)) throw new Error("归档清单属于另一数据目录；宿主维护请用 --recorded-root 指定服务看到的数据目录");
     view = { root: options.recordedRoot, archive: join(options.recordedRoot, inside) };
   }
   return readArchivePlan(options, view, plans, id, expectedDigest ?? (typeof saved?.digest === "string" ? saved.digest : ""));

@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
 import { LiveDoc, ProviderDoc, type ConversationId } from "@earendil-works/pi-durable";
-import { AttemptsDoc } from "../../src/durable/attempts.ts";
 import { MemberDirectory } from "../../src/durable/identity.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -21,7 +20,7 @@ import { fauxModels, openGroupHarness } from ${spec("../helpers/durable.ts")};
 const [path, mode] = process.argv.slice(2), {faux, models, model} = fauxModels();
 faux.setResponses([fauxAssistantMessage('first'), fauxAssistantMessage('second'), async () => { console.log('READY'); return await new Promise(() => {}); }]);
 const opened = await openGroupHarness(path, models, {settings:{compaction:{enabled:false, keepRecentTokens:1}}});
-const {conversation} = await memberConversation(opened.harness, 'group-a', 'member', {model}, context);
+const {conversation} = await memberConversation(opened.harness, {kind:'group', groupId:'group-a'}, 'member', {model}, context);
 for (const content of ['one', 'two']) await (await conversation.submit({type:'input',content}, context)).wait(context);
 const provider = await opened.harness.snapshot(ProviderDoc, conversation.id, context);
 const taskId = await opened.harness.commit(async tx => {
@@ -54,10 +53,8 @@ test.each(["manual", "background"] as const)("force-kill during %s summary resum
     if (result.state.status !== "terminal") throw new Error("compaction did not terminate");
     expect(result.state.outcome.status).toBe("completed"); expect(faux.state.callCount).toBe(1);
     const live = await opened.harness.snapshot(LiveDoc, id, context); expect(live?.compactions ?? []).toEqual([]);
-    const starts = Object.values((await opened.harness.snapshot(AttemptsDoc, id, context))!.starts).filter(start => start.kind === "compaction");
-    expect(starts).toHaveLength(2); expect(starts[0]!.taskId).toBe(taskId); expect(starts[1]!.taskId).toBe(taskId);
-    expect(starts.filter(start => start.usage === undefined)).toHaveLength(1);
-    expect(starts.find(start => start.usage !== undefined)!.usage!.cost.total).toBe(0);
+    // The recovered summarize request found its member by the conversation's provider session.
+    expect(opened.door!.dispatched).toBe(1);
     const conversation = await opened.harness.conversation(id, context);
     const deadline = Date.now() + 5000;
     while (!JSON.stringify(await conversation!.context(context)).includes("recovered summary") && Date.now() < deadline) await Bun.sleep(10);

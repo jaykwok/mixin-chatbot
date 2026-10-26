@@ -17,10 +17,8 @@ interface Action {
   summary: string;
   /** 只在这些平台上出现；不给表示两个平台都有。 */
   only?: "windows" | "linux";
-  /** 只在 Cloudflare 隧道模式下出现；直连部署没有隧道连接器。 */
-  tunnel?: true;
   status: StatusName;
-  /** 该命令会向用户提问，必须拿到真正的 TTY（update 在跨数据版本时确认清理并重新配置）。 */
+  /** 该命令会向用户提问，必须拿到真正的 TTY（例如 update 确认切换到 main）。 */
   interactive?: boolean | ((app: AppApi) => boolean);
   confirm(app: Pick<AppApi, "deployment">, git: GitState | null, targetSha?: string): ConfirmSpec | null;
   args(app: AppApi, targetSha?: string): string[];
@@ -30,16 +28,16 @@ const ACTIONS: Action[] = [
   {
     key: "deploy",
     label: "重新部署",
-    summary: "重新确认端口、入口、群目录和模型并部署当前代码，失败恢复原部署",
+    summary: "重新确认端口、共享资料目录、应用凭据和模型并部署当前代码，失败恢复原部署",
     status: "busy",
     interactive: true,
     confirm: (app) => ({
       title: "重新部署",
       subject: "运行当前版本的部署向导",
-      steps: ["确认模型、端口、群数据目录和访问方式，默认沿用已有配置",
+      steps: ["确认本机端口、共享资料目录和模型，默认沿用已有配置；缺少应用机器人凭据时先填写",
         app.deployment.runtime === "docker" ? "构建镜像并切换容器" : "安装依赖并注册计划任务",
         "检查新实例就绪状态，失败时恢复部署前的配置和服务"],
-      untouched: ["会话历史", "群共享资料"],
+      untouched: ["会话历史", "使用统计", "共享资料"],
       recovery: "替换期间服务会短暂中断；尚未安装 Bun 和项目依赖的机器需先完成环境安装",
     }),
     args: () => ["deploy"],
@@ -68,13 +66,12 @@ const ACTIONS: Action[] = [
         };
       }
       const steps = [
-        "交给与 ops update 相同的目标升级器；停机前核对数据版本",
-        "数据版本一致时直接升级，保留设置、会话和资料",
-        "跨数据版本时先提示清理群直属数据库（保留 stats.sqlite）、index（保留 ignore.txt）、成员会话和 tmp，重新配置；确认后才停机",
-        "跨代更新原样保留并备份现有统计账本；旧会话、未入账消息及待处理任务直接清理，不再补算",
+        "交给与 ops update 相同的目标升级器；停机前核对部署记录和数据格式",
+        "数据格式一致时升级，保留设置、会话、资料和使用统计",
+        "目标的数据格式不同或目录没有有效部署记录时拒绝升级并保留现场，需在新目录全新部署",
         git.behind > 0 ? `快进到 origin/main ${targetSha ? fmt.shortSha(targetSha) : ""}（${git.behind} 个提交）` : "核对本次确认的目标提交",
         app.deployment.runtime === "docker" ? "准备目标镜像，按已保存计划切换数据" : "安装目标依赖，按已保存计划切换数据",
-        "验证新实例，提交后恢复原运行状态；跨代更新成功后清理本次旧会话副本",
+        "验证新实例，提交后恢复原运行状态",
       ];
       return {
         title: "升级",
@@ -83,8 +80,8 @@ const ACTIONS: Action[] = [
             ? `${fmt.shortSha(git.sha)} → ${targetSha ? fmt.shortSha(targetSha) : "origin/main"}，共 ${git.behind} 个提交`
             : `当前 ${fmt.shortSha(git.sha)}；origin/main ${targetSha ? fmt.shortSha(targetSha) : "待检查"}`,
         steps,
-        untouched: ["已入账统计（含提问次数、人数）", "workspace 和其他资料目录", "webhook 密钥和 Cloudflare 隧道凭证"],
-        recovery: "提交前失败恢复数据、代码和原服务；提交后启动或清理失败，使用「继续上次操作」收尾。旧版入口无法导出升级器时，按 docs/data-migrations.md 首次引导",
+        untouched: ["已入账统计（含提问次数、人数）", "会话、资料和全部设置"],
+        recovery: "提交前失败恢复数据、代码和原服务；提交后启动失败，使用「继续上次操作」收尾",
       };
     },
     args: (_app, targetSha) => {
@@ -101,7 +98,7 @@ const ACTIONS: Action[] = [
       title: "重启",
       subject: "停止并重新启动机器人",
       steps: ["停止当前实例（正在处理的任务会被中断）", "重新启动并核对新实例的身份和就绪状态"],
-      untouched: ["配置", "会话历史", "群数据"],
+      untouched: ["配置", "会话历史", "使用统计", "共享资料"],
       recovery: "无需恢复；重启不改任何数据",
     }),
     args: () => ["restart"],
@@ -109,16 +106,16 @@ const ACTIONS: Action[] = [
   {
     key: "repair",
     label: "修复部署",
-    summary: "Windows 修复任务与规则；Linux 通过部署向导重建",
+    summary: "Windows 修复计划任务；Linux 通过部署向导重建",
     status: "warn",
     interactive: app => app.deployment.platform === "linux",
     confirm: app => ({
       title: "修复部署",
       subject: app.deployment.platform === "windows" ? "修复可确定的部署问题" : "按当前代码重建部署",
       steps: app.deployment.platform === "windows"
-        ? ["检查并修复计划任务、防火墙和隧道", "完成后重新体检"]
+        ? ["检查并修复计划任务", "完成后重新体检"]
         : ["进入部署向导，回车沿用当前配置", "重新构建镜像并切换容器，核对实例健康", "失败时恢复原部署"],
-      untouched: ["会话历史", "群共享资料"],
+      untouched: ["会话历史", "使用统计", "共享资料"],
       recovery: "可能短暂中断服务；无法自动判断的配置问题会显示具体原因",
     }),
     args: app => app.deployment.platform === "windows" ? ["doctor", "-Repair"] : ["deploy"],
@@ -132,7 +129,7 @@ const ACTIONS: Action[] = [
       title: "停止",
       subject: "停止机器人",
       steps: ["停止当前实例", "停止期间群成员发来的消息不会被处理"],
-      untouched: ["配置", "会话历史", "群数据"],
+      untouched: ["配置", "会话历史", "使用统计", "共享资料"],
       recovery: "用「启动」重新拉起",
       danger: true,
     }),
@@ -147,52 +144,20 @@ const ACTIONS: Action[] = [
     args: () => ["start"],
   },
   {
-    key: "repair-tunnel",
-    label: "修复隧道",
-    summary: "按当前 token 来源强制重装 Cloudflared 服务",
-    only: "windows",
-    tunnel: true,
-    status: "warn",
-    confirm: () => ({
-      title: "修复隧道",
-      subject: "强制重装 Cloudflared 服务",
-      steps: ["停止并卸载现有 Cloudflared 服务", "按当前 token 来源重新安装", "完成后跑一次体检确认公网连通"],
-      untouched: ["机器人本身", "配置与数据"],
-      recovery: "重装期间公网访问会中断",
-      danger: true,
-    }),
-    args: () => ["repair-tunnel"],
-  },
-  {
-    key: "tunnel-update",
-    label: "更新 cloudflared",
-    summary: "更新本项目隧道连接器到官方稳定版，校验后切换，失败恢复旧版本",
-    tunnel: true,
-    status: "warn",
-    confirm: () => ({
-      title: "更新 cloudflared",
-      subject: "检查并更新本项目隧道连接器",
-      steps: ["查询官方稳定版，下载并校验 SHA-256；无更新时直接结束", "核对连接器归属和启动参数，替换项目中的程序",
-        "原来运行的隧道按原参数重启；原来停止的隧道保持停止"],
-      recovery: "正在运行的隧道会短暂中断公网访问；替换或启动失败时恢复旧程序及运行状态。Windows 服务更新需管理员权限",
-    }),
-    args: () => ["tunnel-update"],
-  },
-  {
     key: "uninstall",
     label: "卸载",
-    summary: "删除容器/任务，可选删除镜像、隧道与数据",
+    summary: "删除容器/任务，可选删除镜像与数据",
     status: "danger",
     interactive: true,
     confirm: (app) => ({
       title: "卸载",
       subject: "卸载 mixin-chatbot",
       steps: [
-        app.deployment.runtime === "docker" ? "停止并删除容器" : "停止并注销计划任务、清理防火墙规则",
-        "随后逐项询问：是否删除镜像、是否停止 cloudflared、是否删除 data/ 与 logs/",
+        app.deployment.runtime === "docker" ? "停止并删除容器" : "停止并注销计划任务",
+        app.deployment.runtime === "docker" ? "随后逐项询问：是否删除镜像、是否删除 data/ 与 logs/" : "随后询问：是否删除 data/ 与 logs/",
         "每一项都要单独确认，不会一次全删",
       ],
-      untouched: ["自定义群数据根（若指向项目外，不会被删除）"],
+      untouched: ["外部共享资料目录（若配置在项目外，不会被删除）"],
       recovery: "选择删除 data/ 时文件会移入 backup/rm，不是直接删除",
       typeToConfirm: "卸载",
       danger: true,
@@ -201,9 +166,22 @@ const ACTIONS: Action[] = [
   },
 ];
 
-const ACTION_ORDER = ["resume", "rollback", "start", "restart", "stop", "update", "deploy", "repair", "tunnel-update", "repair-tunnel", "uninstall"];
+const ACTION_ORDER = ["resume", "rollback", "start", "restart", "stop", "update", "deploy", "repair", "uninstall"];
 /** 有未完成的事务时，这些入口会开始新的部署或升级，必须先继续或回滚。 */
-const BLOCKED_BY_PENDING = new Set(["deploy", "update", "repair", "tunnel-update"]);
+const BLOCKED_BY_PENDING = new Set(["deploy", "update", "repair"]);
+/** 标记的含义：服务部署页的菜单栏底部显示。 */
+const LEGEND = ["✓ 不中断", "● 短暂中断", "! 停止服务", "✗ 不可逆", "○ 当前不需要"];
+
+/** 按页眉的服务探测调整启动、停止、重启的显示；探测只用于提示，执行仍交给运维脚本核对。 */
+function withServiceState(action: Action, service: ViewContext["service"]): Action {
+  if (!service) return action;
+  const running = service.state === "ready";
+  if (action.key === "start" && running) return { ...action, status: "idle", summary: "机器人已在运行，无需启动；需要时用「重启」" };
+  if ((action.key === "stop" || action.key === "restart") && service.state === "unreachable") {
+    return { ...action, status: "idle", summary: action.key === "stop" ? "机器人当前未运行，无需停止" : "机器人当前未运行；用「启动」拉起" };
+  }
+  return action;
+}
 const RESTART_NOTICE = "代码已更新：当前仍是启动时的旧版界面，按 q 退出后重新运行 bun run tui";
 const PENDING_NOTICE = "有未完成的部署或升级：请先「继续上次操作」或「回滚上次操作」";
 
@@ -228,9 +206,9 @@ function transactionActions(pending: Pending): Action[] {
         title: "继续上次操作",
         subject,
         steps: ["沿用事务记录继续：不拉取新的 origin/main，不重新提问", ...record,
-          pending.committed ? "数据已经提交：完成新实例启动及本次旧会话副本清理" : "按已确认计划准备数据、验证并提交，再恢复原运行状态；跨代更新成功后清理旧会话副本"],
-        untouched: ["已入账统计", "webhook 密钥和 Cloudflare 隧道凭证"],
-        recovery: pending.committed ? "数据已提交，不能再回滚；启动或清理失败时保留事务，可再次继续" : "失败时恢复到操作前；也可改用「回滚上次操作」",
+          pending.committed ? "数据已经提交：完成新实例启动" : "按已确认计划准备数据、验证并提交，再恢复原运行状态"],
+        untouched: ["已入账统计"],
+        recovery: pending.committed ? "数据已提交，不能再回滚；启动失败时保留事务，可再次继续" : "失败时恢复到操作前；也可改用「回滚上次操作」",
       }),
       args: () => ["resume", "--confirmed-transaction", confirmTransaction(pending.confirmation!, "continue")],
     },
@@ -255,7 +233,7 @@ function transactionActions(pending: Pending): Action[] {
       } : {
         title: "回滚上次操作",
         subject,
-        steps: ["停止当前实例，恢复操作前的数据", "恢复操作前的代码、配置、依赖和网络入口", ...record, "按原运行状态恢复服务"],
+        steps: ["停止当前实例，恢复操作前的数据", "恢复操作前的代码、配置和依赖", ...record, "按原运行状态恢复服务"],
         recovery: "回滚失败时保持停机并保留快照，处理后可重试回滚或改为继续",
         danger: true,
       },
@@ -273,7 +251,6 @@ export class MaintainView implements View {
   private readonly upgrade = new LazySetting<UpgradeState | null>(signal => loadUpgrade(signal));
   private selected = 0;
   private platform: "windows" | "linux" = "linux";
-  private tunnel = true;
   private pending: Pending | null = null;
   /** 升级、继续或回滚改动了界面代码：提示退出后重新运行，直到本次界面结束。 */
   private restartNotice = false;
@@ -308,10 +285,10 @@ export class MaintainView implements View {
 
   private get availableActions(): Action[] {
     return [...(this.pending ? transactionActions(this.pending) : []), ...ACTIONS]
-      .filter((action) => (!action.only || action.only === this.platform) && (!action.tunnel || this.tunnel))
+      .filter((action) => !action.only || action.only === this.platform)
       .sort((a, b) => ACTION_ORDER.indexOf(a.key) - ACTION_ORDER.indexOf(b.key))
       .map(action => action.key === "repair" ? { ...action, summary: this.platform === "windows"
-        ? "检查并修复计划任务、防火墙与隧道" : "通过部署向导重建当前版本" } : action);
+        ? "检查并修复计划任务" : "通过部署向导重建当前版本" } : action);
   }
 
   hints(): [string, string][] {
@@ -324,17 +301,22 @@ export class MaintainView implements View {
   actions(): ViewAction[] {
     return this.availableActions.map(action => ({
       value: action.key, label: action.label, description: action.summary,
-      danger: action.status === "danger" || action.key === "stop" || action.key === "repair-tunnel" || action.key === "rollback",
+      danger: action.status === "danger" || action.key === "stop" || action.key === "rollback",
       disabled: this.pending ? BLOCKED_BY_PENDING.has(action.key) || (action.key === "rollback" && this.pending.committed)
         || (action.key === "resume" && this.pending.codeRestorePending)
         : action.key === "update" && (this.selectingUpgrade ? this.upgrade.state.kind !== "ready" : this.waitingForVersion),
     }));
   }
 
+  /** 从总览跳来时选中指定操作（服务未运行时为「启动」）。 */
+  focus(key: string): void {
+    const index = this.availableActions.findIndex(action => action.key === key);
+    if (index >= 0) this.selected = index;
+  }
+
   async refresh(app: AppApi): Promise<void> {
     const selected = this.availableActions[this.selected]?.key;
     this.platform = app.deployment.platform;
-    this.tunnel = app.deployment.mode === "cloudflare";
     // 部署形态变化会增减操作：按操作标识保留选择，被隐藏的操作退到范围内的相邻项。
     const actions = this.availableActions, index = actions.findIndex(action => action.key === selected);
     this.selected = index >= 0 ? index : Math.min(this.selected, actions.length - 1);
@@ -442,7 +424,7 @@ export class MaintainView implements View {
     const upgrade = this.upgrade.state;
     const preview = this.selectingUpgrade && upgrade.kind === "ready" ? upgrade.value : null;
     const git = this.selectingUpgrade ? preview?.git ?? null : this.state.kind === "ready" ? this.state.value : null;
-    const actions = this.availableActions;
+    const actions = this.availableActions.map(item => withServiceState(item, ctx.service));
     const action = actions[this.selected]!;
     const spec = action.confirm(ctx, git, preview?.targetSha);
     const blocked = spec?.blocked === true;
@@ -474,6 +456,6 @@ export class MaintainView implements View {
       : git ? `${fmt.shortSha(git.sha)} · ${git.behind > 0 ? `待更新 ${git.behind} 个提交（上次同步）` : git.ahead > 0 ? "本地有领先提交" : git.behind < 0 ? "尚无远端对照" : "与上次同步一致"}`
         : "非 git 部署，升级不可用";
     const note = !this.selectingUpgrade && this.refreshing && this.state.kind === "ready" ? `${version} · ${versionNotice}` : version;
-    return actionWorkbench(ctx, { title: "服务与部署", items: actions, selected: this.selected, details, note });
+    return actionWorkbench(ctx, { title: "服务与部署", items: actions, selected: this.selected, details, note, legend: LEGEND });
   }
 }

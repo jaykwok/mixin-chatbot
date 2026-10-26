@@ -11,11 +11,11 @@
 param(
     [Parameter(Position = 0)]
     [string]$Command = "",
-    # relay-purge 的关键字、routes 的子命令、stat/history-clear 的群号、backup-clean 的报告名，或 tunnel-logging 的开关。
+    # relay-purge 的关键字、stat/history-clear 的群号、backup-clean 的报告名、directory-confirm 的轮次，
+    # 或 directory-departments / directory-scope 的部门 ID（多个用逗号分隔并加引号）。
     [Parameter(Position = 1)]
     [string]$Target = "",
     [switch]$Repair,
-    [switch]$RestartTunnel,
     # doctor 以单行 JSON 输出逐项结果，供运维界面消费；人类可读的输出保持原样。
     [switch]$Json,
     # tmp-purge 的范围。PowerShell 会把 --days 这种 token 当参数名去绑定，所以这里用原生
@@ -29,11 +29,12 @@ param(
     [string]$Since = "",
     [string]$Until = "",
     [string]$Period = "",
-    # routes 的目标；Group 也可用于限定 tmp-ls/tmp-purge 的群。
-    [string]$Fingerprint = "",
+    # stat/history 的群；也可用于限定 tmp-ls/tmp-purge 的群（-Group direct 为单聊空间）。
     [string]$Group = "",
     [switch]$StorageSegment,
     [switch]$GroupId,
+    # history-clear / history-compact 选择单聊空间而不是某个群。
+    [switch]$Direct,
     # backup-clean 的确认码（预演时给出）；不用 -Confirm，那是 PowerShell 的通用参数名。
     [string]$ConfirmCode = "",
     [string]$ConfirmedTransaction = "",
@@ -53,7 +54,7 @@ if ($RequestBase64) {
 if ($RequestBase64) {
     $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
     foreach ($property in $request.PSObject.Properties) {
-        if ($property.Name -notin @('Command', 'Target', 'Fingerprint', 'Group', 'User', 'Since', 'Until', 'Period', 'Days', 'All', 'Json', 'Repair', 'RestartTunnel', 'StorageSegment', 'GroupId', 'ConfirmedTransaction', 'Plan', 'Digest')) {
+        if ($property.Name -notin @('Command', 'Target', 'Group', 'User', 'Since', 'Until', 'Period', 'Days', 'All', 'Json', 'Repair', 'StorageSegment', 'GroupId', 'Direct', 'ConfirmedTransaction', 'Plan', 'Digest')) {
             throw "无效的运维请求字段"
         }
         Set-Variable -Name $property.Name -Value $property.Value
@@ -62,7 +63,7 @@ if ($RequestBase64) {
 if ($StorageSegment -and $GroupId) { throw "群目录选择参数互斥" }
 
 $Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-# 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、主机名校验、交互提示）。
+# 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、交互提示）。
 $CommonLib = Join-Path $PSScriptRoot "..\lib\common.ps1"
 if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
     Write-Host "缺少 $CommonLib；请从仓库完整获取脚本目录后重试。" -ForegroundColor Red
@@ -74,14 +75,10 @@ $DataDir = Join-Path $Project "data"
 $ConfigDir = Join-Path $DataDir "config"
 $StateDir = Join-Path $DataDir "state"
 $RuntimeDir = Join-Path $DataDir "runtime"
-$DefaultGroupDataRoot = Join-Path $DataDir "groups"
 $LogPath  = Join-Path $Project "logs\mixin-chatbot.log"
-$TunnelScript = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
 $ModelsFile = Join-Path $ConfigDir "models.json"
-$WebhookSecretFile = Join-Path $ConfigDir "webhook-secret"
+$AppBotFile = Join-Path $ConfigDir "app-bot.json"
 $RelayConfigFile = Join-Path $ConfigDir "relay.json"
-$LocalCloudflared = Join-Path $Project "cloudflared.exe"
-$TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsPowerShell = "powershell.exe" }
 
@@ -128,47 +125,6 @@ function Get-TaskStateLabel($State) {
         "Queued" { return "排队中" }
         default { return [string]$State }
     }
-}
-function Get-DeployModeLabel([string]$Mode) {
-    if ($Mode -eq "cloudflare") { return "Cloudflare" }
-    return "直连"
-}
-function Wait-ServiceGone([string]$Name, [int]$Attempts = 10) {
-    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        if (-not (Get-Service -Name $Name -ErrorAction SilentlyContinue)) { return $true }
-        if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds 500 }
-    }
-    return $false
-}
-function Remove-ManagedFirewallRules {
-    if (-not (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) { return $true }
-    $rules = @(Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue)
-    if ($rules.Count -eq 0) { return $true }
-    if (-not (IsAdmin)) {
-        Warn "发现 $($rules.Count) 条 mixin-chatbot 防火墙规则，但清理需要管理员权限"
-        return $false
-    }
-    try {
-        $rules | Remove-NetFirewallRule -ErrorAction Stop
-        Done "已清理 mixin-chatbot Windows 防火墙规则"
-        return $true
-    } catch {
-        Warn "清理 Windows 防火墙规则失败：$($_.Exception.Message)"
-        return $false
-    }
-}
-$script:CurlPath = $null
-$script:CurlPathResolved = $false
-function Get-CurlPath {
-    if (-not $script:CurlPathResolved) {
-        $script:CurlPath = Find-VersionedApplication "curl.exe" '(?i)(^|\s)curl\s+'
-        $script:CurlPathResolved = $true
-    }
-    return $script:CurlPath
-}
-function Get-CloudflaredPath {
-    if (Test-CloudflaredApplication $LocalCloudflared) { return $LocalCloudflared }
-    return $null
 }
 $script:GitPath = $null
 $script:GitPathResolved = $false
@@ -287,9 +243,9 @@ function Invoke-RelayConfiguration {
     }
 }
 
-# 模型配置向导在维护租约下运行，要求机器人停止；结束后按原运行状态恢复。
+# 配置向导（模型、应用机器人凭据）在维护租约下运行，要求机器人停止；结束后按原运行状态恢复。
 # 向导在草稿中填写，确认后才一起替换配置文件，取消或失败时原配置不变。
-function Invoke-ModelConfiguration {
+function Invoke-ConfigureWizard([string]$Script, [string]$Label) {
     $bunPath = Get-BunPath
     if (-not $bunPath) { throw "找不到可用的 bun；请安装 Bun：https://bun.sh" }
     if ($pendingTransaction) {
@@ -307,25 +263,25 @@ function Invoke-ModelConfiguration {
         $run = Get-BotRunState $task
         $wasRunning = $run.Running
         if ($run.Foreground) {
-            throw "机器人以前台方式运行，无法自动恢复；请先停止前台实例，再配置模型"
+            throw "机器人以前台方式运行，无法自动恢复；请先停止前台实例，再进行$($Label)"
         }
         if ($wasRunning) {
-            Step "停止机器人以配置模型；向导结束后恢复运行"
+            Step "停止机器人以进行$($Label)；向导结束后恢复运行"
             $stopAttempted = $true
-            if (-not (Stop-Bot)) { throw "无法停止机器人，模型配置未开始" }
+            if (-not (Stop-Bot)) { throw "无法停止机器人，$($Label)未开始" }
         }
         $ErrorActionPreference = "Continue"
         # 直接继承终端，保留密码掩码和 Ctrl+C；不把凭据放进参数或输出管道。
-        Invoke-WithUtf8Output { & $bunPath run "scripts\config\configure.ts" }
-        if ($LASTEXITCODE -ne 0) { throw "模型配置未完成；原配置保持不变" }
-        if (-not $wasRunning) { Done "模型配置将在下次启动机器人时生效；已保持停止状态" }
+        Invoke-WithUtf8Output { & $bunPath run $Script }
+        if ($LASTEXITCODE -ne 0) { throw "$($Label)未完成；原配置保持不变" }
+        if (-not $wasRunning) { Done "$($Label)将在下次启动机器人时生效；已保持停止状态" }
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
         try {
             if ($wasRunning -and $stopAttempted) {
-                if (-not (Start-Bot)) { throw "模型配置已结束，但机器人恢复启动失败" }
+                if (-not (Start-Bot)) { throw "$($Label)已结束，但机器人恢复启动失败" }
                 if ((Wait-Local) -ne 200) { throw "机器人恢复后未通过健康检查，请在 $(Get-OpsCommandHint 'logs') 查看日志" }
-                Done "机器人已恢复运行，已重新读取模型配置"
+                Done "机器人已恢复运行，已重新读取$($Label)"
             }
         } finally {
             $lock.Dispose()
@@ -405,24 +361,15 @@ function Invoke-RuntimeConfiguration([string]$DraftName) {
     }
 }
 
-# 群数据操作由 Bun 统一管理存储边界；计划任务的环境变量不会传到当前 PowerShell，
-# 所以自定义 GROUP_DATA_ROOT 必须显式传入，防止维护操作误用默认 data\groups。
-function Invoke-GroupDataAdmin([string]$Script, [string[]]$TmpArgs) {
+# 数据操作由 Bun 统一管理存储边界；外置共享资料目录保存在 data\config\runtime.json，工具与服务读同一份。
+function Invoke-DataAdmin([string]$Script, [string[]]$TmpArgs) {
     $bunPath = Get-BunPath
     if (-not $bunPath) {
         Err "找不到可用的 bun；请安装 Bun：https://bun.sh"
         return $false
     }
-    $groupRoot = try { Resolve-ProjectPath $DeployedGroupDataRoot } catch { $null }
-    if (-not $groupRoot) {
-        Err "群数据总根路径无效：$DeployedGroupDataRoot"
-        return $false
-    }
     Push-Location $Project
-    $hadGroupRoot = Test-Path Env:GROUP_DATA_ROOT
-    $previousGroupRoot = if ($hadGroupRoot) { $env:GROUP_DATA_ROOT } else { $null }
     try {
-        $env:GROUP_DATA_ROOT = $groupRoot
         $previous = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
@@ -436,8 +383,6 @@ function Invoke-GroupDataAdmin([string]$Script, [string[]]$TmpArgs) {
             $ErrorActionPreference = $previous
         }
     } finally {
-        if ($hadGroupRoot) { $env:GROUP_DATA_ROOT = $previousGroupRoot }
-        else { Remove-Item Env:GROUP_DATA_ROOT -ErrorAction SilentlyContinue }
         Pop-Location
     }
 }
@@ -445,7 +390,7 @@ function Invoke-GroupDataAdmin([string]$Script, [string[]]$TmpArgs) {
 function Invoke-TmpAdmin([string[]]$TmpArgs) {
     # 预览只读取数据并保存清单，服务照常运行；执行清单（--digest）和一步完成的 purge 才停机。
     if ($TmpArgs[0] -eq 'list' -or ($TmpArgs[0] -ne 'purge' -and $TmpArgs -notcontains '--digest')) {
-        return (Invoke-GroupDataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs)
+        return (Invoke-DataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs)
     }
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     $lock = [IO.File]::Open((Join-Path $StateDir 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -454,7 +399,7 @@ function Invoke-TmpAdmin([string[]]$TmpArgs) {
     $completed = $false
     $started = $true
     try {
-        foreach ($record in @('deploy-transaction', 'upgrade-transaction', 'update-transaction')) {
+        foreach ($record in @('deploy-transaction', 'upgrade-transaction')) {
             if (Test-Path -LiteralPath (Join-Path $StateDir $record)) {
                 throw '存在未完成的部署或升级事务，请先继续或回滚，再维护临时文件'
             }
@@ -471,7 +416,7 @@ function Invoke-TmpAdmin([string[]]$TmpArgs) {
             $stopAttempted = $true
             if (-not (Stop-Bot)) { throw '无法停止机器人，未开始临时文件维护' }
         }
-        $completed = Invoke-GroupDataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs
+        $completed = Invoke-DataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs
     } finally {
         try { if ($wasRunning -and $stopAttempted) { $started = Start-Bot } }
         finally { $lock.Dispose() }
@@ -479,25 +424,52 @@ function Invoke-TmpAdmin([string[]]$TmpArgs) {
     return ($completed -and $started)
 }
 
+# stat-import 不带路径时弹出系统“打开文件”对话框选择旧统计账本；没有桌面会话或取消时返回空。
+# 对话框要求 STA 线程（pwsh 默认 MTA），所以放进单独的 STA runspace；起始目录是项目的上一级（旧部署通常在旁边）。
+function Select-LegacyStatsFile {
+    if (-not [Environment]::UserInteractive) { return $null }
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.ApartmentState = 'STA'
+    $runspace.Open()
+    try {
+        $shell = [powershell]::Create()
+        $shell.Runspace = $runspace
+        [void]$shell.AddScript({
+            param($Start)
+            Add-Type -AssemblyName System.Windows.Forms
+            $dialog = New-Object System.Windows.Forms.OpenFileDialog
+            $dialog.Title = '选择旧版统计账本（旧部署的 data\groups\stats.sqlite）'
+            $dialog.Filter = 'SQLite 数据库 (*.sqlite;*.sqlite3;*.db)|*.sqlite;*.sqlite3;*.db|所有文件 (*.*)|*.*'
+            $dialog.CheckFileExists = $true
+            if ($Start -and (Test-Path -LiteralPath $Start -PathType Container)) { $dialog.InitialDirectory = $Start }
+            # 置顶的隐形父窗口让对话框出现在终端前面，而不是藏在后面。
+            $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }
+            try { if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $dialog.FileName } }
+            finally { $owner.Dispose(); $dialog.Dispose() }
+        }).AddArgument((Split-Path -Parent $Project))
+        return @($shell.Invoke()) | Select-Object -First 1
+    } finally { $runspace.Dispose() }
+}
+
 # 清历史必须先把机器人停下来，不能只删文件：内存里已经建立的会话仍握着完整的消息列表，
 # 所以先停止实例，再归档会话，最后恢复调用前的运行或停止状态。
-function Clear-GroupHistory([string]$GroupValue, [string]$Operation = "clear") {
-    if (-not $GroupValue) {
-        Err "history-$Operation 需要群号：ops.ps1 history-$Operation <群号>"
+function Clear-SpaceHistory([string]$SpaceValue, [string]$Operation = "clear") {
+    if (-not $SpaceValue) {
+        Err "history-$Operation 需要群号或 -Direct：ops.ps1 history-$Operation <群号>|-Direct"
         return $false
     }
     if ($Operation -eq "compact" -and -not $User) { Err "history-compact 需要 -User <成员号码>"; return $false }
-    Step "先停止机器人：运行中的机器人独占群库"
+    Step "先停止机器人：运行中的机器人独占会话库"
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
     if (-not (Stop-Bot)) { return $false }
-    $historyArgs = @($Operation, $GroupValue)
+    $historyArgs = @($Operation, $SpaceValue)
     if ($Operation -eq "compact") {
         $historyArgs += $User
     }
     if ($StorageSegment) { $historyArgs += "--storage-segment" }
     elseif ($GroupId) { $historyArgs += "--group-id" }
-    try { $cleared = Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" $historyArgs }
+    try { $cleared = Invoke-DataAdmin "scripts\ops\history-admin.ts" $historyArgs }
     finally {
         if ($wasRunning) { $started = Start-Bot } else { $started = $true }
     }
@@ -538,27 +510,6 @@ function Resolve-ProjectPath([string]$Value) {
         return [System.IO.Path]::GetFullPath($Value)
     }
     return [System.IO.Path]::GetFullPath((Join-Path $Project $Value))
-}
-
-function Get-TunnelTokenSource {
-    try {
-        $source = Resolve-TunnelToken $Project
-        return [pscustomobject]@{
-            Available = $true
-            Kind      = $source.Kind
-            Path      = $source.Path
-            Display   = $source.Display
-            Detail    = $(if ($source.Kind -eq 'file') { "$($source.Display)（值已隐藏）" } else { $source.Display })
-        }
-    } catch {
-        return [pscustomobject]@{
-            Available = $false
-            Kind      = "missing"
-            Path      = $null
-            Display   = "隧道 token"
-            Detail    = $_.Exception.Message
-        }
-    }
 }
 
 # 通用 HTTP 探测，禁用系统代理；凭据通过 .NET 请求设置，不进入命令行或临时文件。
@@ -632,39 +583,25 @@ function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]
 $pendingTransaction = (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) -or
     (Test-Path -LiteralPath (Join-Path $StateDir 'upgrade-transaction'))
 $recovering = $Command -in @('resume', 'rollback') -or ($pendingTransaction -and $Command -in @('update', 'upgrade'))
-$Port = '1011'; $DeployMode = 'direct'; $Domain = ''; $DeployedGroupDataRoot = $DefaultGroupDataRoot
+$Port = '1011'; $DeployedWorkspaceRoot = ''
 function Read-StateText([string]$Name) {
     $path = Join-Path $StateDir $Name
     if (Test-Path -LiteralPath $path -PathType Leaf) { return "$(Get-Content -LiteralPath $path -Raw)".Trim() }
     return $null
 }
 if (-not $recovering) {
-    # 普通操作使用已保存设置（环境变量优先）；空文件与损坏的值一样报错，空的群根按默认值。
+    # 普通操作使用已保存设置（环境变量优先）；空文件与损坏的值一样报错；共享资料目录为空表示默认 data\workspace。
     $savedPort = Read-StateText 'bot-port'
     $Port = if ($env:BOT_PORT) { $env:BOT_PORT } elseif ($null -ne $savedPort) { $savedPort } else { '1011' }
-    $savedMode = Read-StateText 'deploy-mode'
-    $DeployMode = if ($null -ne $savedMode) { $savedMode } else { 'direct' }
-    $Domain = if ($env:BOT_DOMAIN) { $env:BOT_DOMAIN.Trim() } else { [string](Read-StateText 'bot-domain') }
-    $savedGroupRoot = Read-StateText 'group-data-root'
-    if ($savedGroupRoot) { $DeployedGroupDataRoot = $savedGroupRoot }
+    $DeployedWorkspaceRoot = Get-SavedWorkspaceRoot $Project
 }
 # 部署脚本自行校验并提供修正。
-if (-not $recovering -and $Command -notin @('deploy', 'tunnel-update')) {
+if (-not $recovering -and $Command -ne 'deploy') {
     $portNumber = 0
     if (-not [int]::TryParse($Port, [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
         throw "BOT_PORT/data/state/bot-port 中的端口无效：$Port"
     }
     $Port = "$portNumber"
-    if ($DeployMode -notin @("direct", "cloudflare")) {
-        throw "data/state/deploy-mode 中的部署模式无效：$DeployMode"
-    }
-    if ($Domain) {
-        $normalizedDomain = ConvertTo-Hostname $Domain
-        if (-not $normalizedDomain) {
-            throw "BOT_DOMAIN/data/state/bot-domain 中的域名无效：$Domain"
-        }
-        $Domain = $normalizedDomain
-    }
 }
 
 # 使用启动时间和本地实例记录识别相对路径启动的机器人。
@@ -701,129 +638,17 @@ function Wait-Local {
     return $lastStatus
 }
 
-function Test-Public {
-    # 优先使用 curl.exe 保持 TLS 行为一致；旧系统回退到 Invoke-WebRequest。
-    $curlPath = Get-CurlPath
-    if ($curlPath) {
-        $code = & $curlPath --ssl-no-revoke -m 10 -s -o NUL -w "%{http_code}" "https://$Domain/favicon.svg" 2>$null
-        if ($LASTEXITCODE -eq 0) { return "$code".Trim() }
-    }
-    try {
-        return "" + (Invoke-WebRequest -Uri "https://$Domain/favicon.svg" -UseBasicParsing -TimeoutSec 10).StatusCode
-    } catch {
-        $response = $_.Exception.Response
-        if ($response -and $response.StatusCode) { return "" + [int]$response.StatusCode }
-        return $null
-    }
-}
-
-function Wait-Public {
-    if (-not $Domain) { return $null }
-    $lastStatus = $null
-    for ($attempt = 1; $attempt -le 8; $attempt++) {
-        $lastStatus = Test-Public
-        if ($lastStatus -eq "200") { return $lastStatus }
-        if ($attempt -lt 8) { Start-Sleep -Seconds 2 }
-    }
-    return $lastStatus
-}
-
-function Invoke-TunnelRepair {
-    if ($DeployMode -ne "cloudflare") {
-        Err "repair-tunnel 只适用于 data\state\deploy-mode 为 cloudflare 的部署"
-        return $false
-    }
-    if (-not (IsAdmin)) {
-        Err "repair-tunnel 需要管理员 PowerShell"
-        Warn "请在提升权限的 PowerShell 窗口中重新运行此命令"
-        return $false
-    }
-    if (-not (Test-Path -LiteralPath $TunnelScript -PathType Leaf)) {
-        Err "找不到隧道安装脚本：$TunnelScript"
-        return $false
-    }
-
-    $tokenSource = Get-TunnelTokenSource
-    if (-not $tokenSource.Available) {
-        Err "没有可用的 Cloudflare 隧道 token 来源：$($tokenSource.Detail)"
-        Warn "请将 token 放入 data\config\cloudflared-token 后重试"
-        return $false
-    }
-
-    Step "使用 $($tokenSource.Display) 重新安装 Cloudflared 服务（token 已隐藏）..."
-    $hadReinstallEnv = Test-Path Env:CLOUDFLARED_REINSTALL
-    $previousReinstallEnv = $env:CLOUDFLARED_REINSTALL
-    $previousErrorActionPreference = $ErrorActionPreference
-    $tunnelExitCode = 1
-    $invokeError = $null
-    try {
-        $env:CLOUDFLARED_REINSTALL = "1"
-        # 子脚本直接继承当前控制台输出；临时放宽原生 stderr 处理，确保仍能读取真实退出码。
-        $ErrorActionPreference = "Continue"
-        try {
-            if ($tokenSource.Kind -eq "file") {
-                & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $TunnelScript $tokenSource.Path
-            } else {
-                & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $TunnelScript
-            }
-            $tunnelExitCode = $LASTEXITCODE
-        } catch {
-            $invokeError = $_.Exception.Message
-        }
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-        if ($hadReinstallEnv) {
-            $env:CLOUDFLARED_REINSTALL = $previousReinstallEnv
-        } else {
-            Remove-Item Env:CLOUDFLARED_REINSTALL -ErrorAction SilentlyContinue
-        }
-    }
-
-    if ($invokeError) {
-        Err "执行 start-tunnel.ps1 失败：$invokeError"
-        return $false
-    }
-    if ($tunnelExitCode -ne 0) {
-        Err "start-tunnel.ps1 返回退出码 $tunnelExitCode"
-        return $false
-    }
-
-    $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-    if (-not $svc -or $svc.Status -ne "Running") {
-        Err "重装后 Cloudflared 服务仍未运行"
-        return $false
-    }
-    Done "Cloudflared 服务已重装并运行"
-
-    if ($Domain) {
-        Step "等待 https://$Domain/favicon.svg 恢复..."
-        $publicStatus = Wait-Public
-        if ($publicStatus -eq "200") {
-            Done "公网隧道健康检查返回 HTTP 200"
-            return $true
-        }
-        Warn "连接器正在运行，但公网健康检查为 $(if ($publicStatus) { "HTTP $publicStatus" } else { "无法连接" })"
-        Warn "请检查 Cloudflare DNS/WAF，以及 Published application → http://localhost:$Port"
-        return $false
-    }
-
-    Warn "缺少 data\state\bot-domain；连接器已修复，但无法验证公网健康状态"
-    return $true
-}
-
 function Show-Doctor {
-    if (-not $Json) { Step "mixin-chatbot 健康检查（模式=$(Get-DeployModeLabel $DeployMode)，端口=$Port）" }
+    if (-not $Json) { Step "mixin-chatbot 健康检查（本机端口=$Port）" }
     $rows = @()
 
-    try {
-        $resolvedGroupDataRoot = Resolve-ProjectPath $DeployedGroupDataRoot
-        if (Test-Path -LiteralPath $resolvedGroupDataRoot -PathType Container) {
-            $rows += New-DoctorRow "群数据总根" "pass" $resolvedGroupDataRoot
-        } else {
-            $rows += New-DoctorRow "群数据总根" "fail" "目录不存在：$resolvedGroupDataRoot" "通过 $(Get-OpsCommandHint 'deploy') 确认群数据总根。"
-        }
-    } catch {
-        $rows += New-DoctorRow "群数据总根" "fail" "路径无效：$DeployedGroupDataRoot" "通过 $(Get-OpsCommandHint 'deploy') 选择有效目录。"
+    # 外置资料目录缺失时服务拒绝启动（不会当成空资料目录）；默认目录由服务创建。
+    if (-not $DeployedWorkspaceRoot) {
+        $rows += New-DoctorRow "共享资料目录" "pass" "$(Join-Path $DataDir 'workspace')（默认）"
+    } elseif (Test-Path -LiteralPath $DeployedWorkspaceRoot -PathType Container) {
+        $rows += New-DoctorRow "共享资料目录" "pass" "$DeployedWorkspaceRoot（外置，只读）"
+    } else {
+        $rows += New-DoctorRow "共享资料目录" "fail" "外置目录不存在：$DeployedWorkspaceRoot" "恢复该目录或挂载；改用其他目录请设置 WORKSPACE_ROOT 后使用 $(Get-OpsCommandHint 'deploy')。"
     }
 
     $localStatus = Test-Local
@@ -870,65 +695,94 @@ function Show-Doctor {
 
     $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } elseif ($localStatus -eq 503) { "只验证实例，不处理消息" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } elseif ($localStatus -eq 503) { "使用 $(Get-OpsCommandHint 'resume') 继续上次操作并完成提交。" } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')，再到 $(Get-OpsCommandHint 'logs') 查看日志。" })
 
-    if ($DeployMode -eq "cloudflare") {
-        $tokenSource = Get-TunnelTokenSource
-        $tokenDetail = if ($tokenSource.Available) { "$($tokenSource.Detail)；仅表示可用于修复，无法证明服务已安装同一 token" } else { $tokenSource.Detail }
-        $rows += New-DoctorRow "隧道 token 来源" $(if ($tokenSource.Available) { "pass" } else { "warn" }) $tokenDetail $(if ($tokenSource.Available) { "" } else { "将 token 放入 data\config\cloudflared-token，再使用 $(Get-OpsCommandHint 'repair-tunnel')。" })
-
-        $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-        $managedTunnel = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
-        if (-not $svc) {
-            $rows += New-DoctorRow "Cloudflared 服务" "fail" "未安装" "请以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')。"
-        } elseif ($svc.Status -eq "Running") {
-            if ($managedTunnel) {
-                $rows += New-DoctorRow "Cloudflared 服务" "pass" "运行中（本项目管理）"
-            } else {
-                $rows += New-DoctorRow "Cloudflared 服务" "warn" "运行中，但没有本项目归属标记" "确认该服务连接的是当前隧道；需纳入本项目管理时使用 $(Get-OpsCommandHint 'repair-tunnel')。"
+    # Stream 与通讯录状态只读运行中服务的 /health，不另开 Stream 连接（同一应用只能有一条）。
+    if ($localStatus -eq 200) {
+        $streamRows = $null
+        $previousErrorActionPreference = $ErrorActionPreference
+        $bunPath = Get-BunPath
+        if ($bunPath) {
+            Push-Location $Project
+            try {
+                $ErrorActionPreference = "Continue"
+                $streamRows = @(Invoke-WithUtf8Output { & $bunPath run "scripts\ops\directory-admin.ts" doctor 2>$null })
+                if ($LASTEXITCODE -ne 0) { $streamRows = $null }
+            } catch {
+                $streamRows = $null
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+                Pop-Location
             }
-        } else {
-            $ownership = if ($managedTunnel) { "本项目管理" } else { "未记录归属" }
-            $rows += New-DoctorRow "Cloudflared 服务" "fail" "$(Get-ServiceStateLabel $svc.Status)（$ownership）" "使用 $(Get-OpsCommandHint 'doctor -Repair')；如果 token 已变化或服务未记录归属，再使用 $(Get-OpsCommandHint 'repair-tunnel')。"
         }
-
-        if ($Domain) {
-            $rows += New-DoctorRow "data/state/bot-domain" "pass" $Domain
-            $publicStatus = Test-Public
-            if ($publicStatus -eq "200") {
-                $rows += New-DoctorRow "公网 CF→隧道→机器人" "pass" "HTTP 200"
-            } elseif ($publicStatus -eq "502") {
-                $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" "HTTP 502（隧道已到达，但源站不可用）" "检查本地健康状态，以及 Cloudflare Published application → http://localhost:$Port。"
-            } elseif ($publicStatus -eq "403") {
-                $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" "HTTP 403（可能是 WAF 策略）" "允许 /favicon.svg 健康检查；按文档只限制 /webhook/ 路径。"
-            } elseif ($publicStatus -eq "530" -or $publicStatus -eq "1033") {
-                $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" "HTTP $publicStatus（连接器不可用）" "使用 $(Get-OpsCommandHint 'repair-tunnel')，然后检查 Cloudflare 控制台的隧道路由与 DNS。"
-            } else {
-                $rows += New-DoctorRow "公网 CF→隧道→机器人" "fail" $(if ($publicStatus) { "HTTP $publicStatus" } else { "DNS/TLS/连接失败" }) "使用 $(Get-OpsCommandHint 'repair-tunnel')，然后检查 Cloudflare DNS、WAF 和 Published application。"
+        if ($null -eq $streamRows) {
+            $rows += New-DoctorRow "事件 Stream" "warn" "无法读取服务状态" "查看 $(Get-OpsCommandHint 'logs')。"
+        } else {
+            foreach ($line in $streamRows) {
+                $parts = "$line" -split "`t", 3
+                if ($parts.Count -lt 3 -or -not $parts[1]) { continue }
+                $fix = switch ($parts[1]) {
+                    "事件 Stream" { "检查出站访问 imtwo.zdxlz.com 的 443 端口和应用凭据（$(Get-OpsCommandHint 'configure-app-bot')），再查看 $(Get-OpsCommandHint 'logs')。" }
+                    "通讯录同步" { "有待确认撤销时，核对后使用 $(Get-OpsCommandHint 'directory-confirm') <轮次>；同步不完整时查看日志。" }
+                    "运行状况" { "在 $(Get-OpsCommandHint 'logs') 中查看对应记录（Durable 报告、交付超时放弃、统计累计值回退等）；停住的任务由成员用 /status 查看、/stop 或 /clear 结束。" }
+                    default { "" }
+                }
+                $status = if ($parts[0] -in @("pass", "warn")) { $parts[0] } else { "fail" }
+                $rows += New-DoctorRow $parts[1] $status $parts[2] $(if ($status -eq "pass") { "" } else { $fix })
             }
-        } else {
-            $rows += New-DoctorRow "data/state/bot-domain" "warn" "缺少；跳过公网健康检查" "通过 $(Get-OpsCommandHint 'deploy') 填写 Cloudflare 公网域名，并在 Cloudflare 控制台配置对应路由。"
-            $rows += New-DoctorRow "公网 CF→隧道→机器人" "warn" "没有 data/state/bot-domain，未测试" "通过 $(Get-OpsCommandHint 'deploy') 设置域名，再使用 $(Get-OpsCommandHint 'doctor')。"
         }
+    }
+
+    # 版本取自运行中服务的 /health；服务未运行时取部署记录。本地代码不同于运行版本时另起一行说明。
+    $versionRows = $null
+    $bunPath = Get-BunPath
+    if ($bunPath) {
+        $previousErrorActionPreference = $ErrorActionPreference
+        Push-Location $Project
+        try {
+            $ErrorActionPreference = "Continue"
+            $versionArgs = if ($localStatus -eq 200) { @("--port", "$Port") } else { @() }
+            $versionRows = @(Invoke-WithUtf8Output { & $bunPath run "scripts\ops\version-info.ts" @versionArgs 2>$null })
+            if ($LASTEXITCODE -ne 0) { $versionRows = $null }
+        } catch {
+            $versionRows = $null
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+            Pop-Location
+        }
+    }
+    if ($null -eq $versionRows) {
+        $rows += New-DoctorRow "应用机器人" "warn" "无法读取版本信息"
+    } else {
+        foreach ($line in $versionRows) {
+            $parts = "$line" -split "`t", 2
+            if ($parts.Count -lt 2 -or -not $parts[0]) { continue }
+            if ($parts[1].StartsWith("未知：")) {
+                $rows += New-DoctorRow $parts[0] "fail" $parts[1] "部署记录无法读取；不要在此目录覆盖部署，参见 docs\data-migrations.md。"
+            } else {
+                $rows += New-DoctorRow $parts[0] "pass" $parts[1]
+            }
+        }
+    }
+
+    if (Test-Path -LiteralPath $AppBotFile -PathType Leaf) {
+        $rows += New-DoctorRow "data/config/app-bot.json" "pass" "已配置（不显示凭据）"
+    } else {
+        $rows += New-DoctorRow "data/config/app-bot.json" "fail" "缺少（服务拒绝启动）" "使用 $(Get-OpsCommandHint 'configure-app-bot') 填写 AppID 和 AppSecret。"
     }
 
     # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
     $modelsOk = Test-ModelConfiguration $Project
     $rows += New-DoctorRow "模型配置（models.json + Pi 设置）" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } elseif (-not (Test-Path -LiteralPath $ModelsFile)) { "通过 $(Get-OpsCommandHint 'deploy') 完成首次模型配置。" } else { "模型配置建议：$(Get-OpsCommandHint 'configure')。" })
 
-    $secretOk = (Test-Path -LiteralPath $WebhookSecretFile) -and ("$(Get-Content -LiteralPath $WebhookSecretFile -Raw)".Trim() -match "^[0-9a-fA-F]{64}$")
-    $rows += New-DoctorRow "data/config/webhook-secret" $(if ($secretOk) { "pass" } else { "fail" }) $(if ($secretOk) { "有效" } else { "缺少或无效（生产服务拒绝启动）" }) $(if ($secretOk) { "" } else { "使用 $(Get-OpsCommandHint 'deploy')；密钥变化后还必须更新 IM webhook URL。" })
-
     $rows += Get-RelayDoctorRows
 
-    # doctor -Json 让运维界面复用这同一套体检，而不是自己再实现一遍计划任务/隧道/配置的判断。
+    # doctor -Json 让运维界面复用这同一套体检，而不是自己再实现一遍计划任务/Stream/配置的判断。
     # stdout 必须只有 JSON，所以这里直接返回，不走下面的彩色输出。
     if ($Json) {
         $payload = [pscustomobject]@{
             pass   = @($rows | Where-Object { $_.Status -eq "pass" }).Count
             warn   = @($rows | Where-Object { $_.Status -eq "warn" }).Count
             fail   = @($rows | Where-Object { $_.Status -eq "fail" }).Count
-            mode   = $DeployMode
-            port    = [int]$Port
-            domain = $Domain
+            port   = [int]$Port
             # 单行输出：ConvertTo-Json 默认会把数组换行展开，Compress 后一行读完即可。
             checks = @($rows | ForEach-Object {
                 [pscustomobject]@{ name = $_.Name; status = $_.Status; detail = $_.Detail; fix = $_.Fix }
@@ -979,41 +833,6 @@ function Invoke-DoctorRepair {
     if ((Test-Local) -ne 200) {
         $changed = $true
         if (-not (Restart-Bot)) { $ok = $false }
-    }
-
-    if ($DeployMode -eq "cloudflare") {
-        $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-        $publicStatus = if ($Domain) { Test-Public } else { $null }
-        $connectorFailure = $Domain -and ($publicStatus -eq $null -or $publicStatus -eq "530" -or $publicStatus -eq "1033")
-
-        if (-not $svc -or $svc.Status -ne "Running" -or $connectorFailure) {
-            $changed = $true
-            $tokenSource = Get-TunnelTokenSource
-            if ($tokenSource.Available) {
-                if (-not (Invoke-TunnelRepair)) { $ok = $false }
-            } elseif ($svc -and (IsAdmin) -and (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
-                try {
-                    Set-Service -Name "Cloudflared" -StartupType Automatic -ErrorAction Stop
-                    if ($svc.Status -eq "Running") {
-                        Restart-Service Cloudflared -ErrorAction Stop
-                    } else {
-                        Start-Service Cloudflared -ErrorAction Stop
-                    }
-                    Done "Cloudflared 服务已用当前已安装的 token 重启"
-                } catch {
-                    Err "重启 Cloudflared 失败：$($_.Exception.Message)"
-                    $ok = $false
-                }
-            } elseif ($svc -and -not (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
-                Err "Cloudflared 服务没有本项目归属标记，doctor 不会自动重启它"
-                Warn "确认 token 后以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')，将服务重新安装并纳入本项目管理"
-                $ok = $false
-            } else {
-                Err "Cloudflared 需要修复，但没有可用的 token 来源"
-                Warn "请将 token 放入 data\config\cloudflared-token，然后以管理员身份使用 $(Get-OpsCommandHint 'repair-tunnel')"
-                $ok = $false
-            }
-        }
     }
 
     if (-not $changed) { Done "没有发现可自动修复的失败项" }
@@ -1126,7 +945,8 @@ function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [str
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
     $archive = Join-Path $stage 'target.zip'
-    # The target's isolated configuration wizard needs its complete source and lockfile only on a data reset.
+    # The whole tree, not just the upgrader: it loads its own lib, and its data preview (data-current.ts) imports the
+    # target's src to check the data before the live checkout changes.
     $export = Invoke-GitCapture @('archive', '--format=zip', ('--output=' + $archive), $target)
     if ($export.ExitCode -ne 0) { Err $export.Text; return $false }
     Expand-Archive -LiteralPath $archive -DestinationPath $stage
@@ -1135,7 +955,6 @@ function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [str
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $stage 'scripts\deploy\upgrade.ps1'),
         '-Project', $Project, '-OriginalSha', $original, '-TargetSha', $target, '-OriginalBranch', $branch,
         '-BunPath', (Get-BunPath), '-GitPath', (Get-GitPath))
-    if ($RestartTunnel) { $arguments += '-RestartTunnel' }
     if ($Action -eq 'rollback') { $arguments += '-Rollback' }
     if ($Confirmation) { $arguments += @('-ConfirmedTransaction', $Confirmation) }
     Set-OperationStage 'target-upgrader'
@@ -1189,96 +1008,8 @@ function Run-Foreground {
     return $foregroundExitCode -eq 0
 }
 
-function Uninstall-TunnelService([switch]$Confirmed) {
-    Step "停止并卸载 Cloudflared 服务..."
-    Warn "此操作会删除系统中名为 Cloudflared 的服务；请确认它属于本项目。"
-    if (-not (IsAdmin)) {
-        Err "卸载 Cloudflared 服务需要管理员 PowerShell"
-        return $false
-    }
-
-    $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-    if ($svc -and -not $Confirmed) {
-        if (-not (Read-YesNo "确认停止并删除 Cloudflared 系统服务？[y/N]" $false)) {
-            Warn "已取消 Cloudflared 服务卸载"
-            return $true
-        }
-    }
-    if ($svc) {
-        try {
-            if ($svc.Status -ne "Stopped") { Stop-Service -Name "Cloudflared" -Force -ErrorAction Stop }
-        } catch {
-            Warn "停止 Cloudflared 服务失败：$($_.Exception.Message)"
-        }
-
-        $cfPath = Get-CloudflaredPath
-        if ($cfPath) {
-            $previousErrorActionPreference = $ErrorActionPreference
-            try {
-                $ErrorActionPreference = "Continue"
-                & $cfPath service uninstall
-                $uninstallExitCode = $LASTEXITCODE
-            } finally {
-                $ErrorActionPreference = $previousErrorActionPreference
-            }
-            if ($uninstallExitCode -ne 0) {
-                Warn "cloudflared service uninstall 返回退出码 $uninstallExitCode，将尝试系统级删除服务。"
-            }
-        } else {
-            Warn "找不到可用的 cloudflared 程序，将尝试系统级删除服务。"
-        }
-
-        $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-        if ($svc) {
-            $scPath = Join-Path $env:SystemRoot "System32\sc.exe"
-            if (-not (Test-Path -LiteralPath $scPath -PathType Leaf)) {
-                Err "找不到系统 sc.exe，无法删除残留的 Cloudflared 服务"
-                return $false
-            }
-            $previousErrorActionPreference = $ErrorActionPreference
-            try {
-                $ErrorActionPreference = "Continue"
-                & $scPath delete Cloudflared | Out-Null
-                $scExitCode = $LASTEXITCODE
-            } finally {
-                $ErrorActionPreference = $previousErrorActionPreference
-            }
-            $serviceGone = Wait-ServiceGone "Cloudflared"
-            if ($scExitCode -ne 0 -and -not $serviceGone) {
-                Err "系统删除 Cloudflared 服务失败（退出码 $scExitCode）"
-                return $false
-            }
-        }
-    }
-
-    if (Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue) {
-        Err "Cloudflared 服务仍然存在；可能正在等待系统完成删除，请稍后重试"
-        return $false
-    }
-    Move-ToProjectArchive $TunnelManagedFile $Project
-    Done "Cloudflared 服务已清理"
-
-    if (Test-Path -LiteralPath $LocalCloudflared -PathType Leaf) {
-        if (Read-YesNo "是否删除项目内下载的 cloudflared.exe？[y/N]" $false) {
-            try {
-                Move-ToProjectArchive $LocalCloudflared $Project
-                Done "项目内 cloudflared.exe 已删除"
-            } catch {
-                Warn "删除 cloudflared.exe 失败：$($_.Exception.Message)"
-                return $false
-            }
-        } else {
-            Done "已保留项目内 cloudflared.exe"
-        }
-    }
-    Get-ChildItem -LiteralPath $Project -Filter "cloudflared.exe.download-*" -File -ErrorAction SilentlyContinue |
-        ForEach-Object { Move-ToProjectArchive $_.FullName $Project }
-    return $true
-}
-
 function Uninstall-Bot {
     Step "卸载 mixin-chatbot"
-    $resolvedGroupDataRoot = try { Resolve-ProjectPath $DeployedGroupDataRoot } catch { $null }
     if (-not (IsAdmin)) { Warn "当前不是管理员，任务/服务删除可能失败；如失败请以管理员身份重跑。" }
     if (-not (Stop-Bot)) { Err '停止机器人失败，卸载已停止。'; return $false }
     $remainingBotPids = @(Get-BotPids)
@@ -1312,35 +1043,7 @@ function Uninstall-Bot {
         Move-ToProjectArchive $RuntimeDir $Project
         Done "空的 data\runtime 目录已删除"
     }
-    [void](Remove-ManagedFirewallRules)
-
-    $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-    if ($svc) {
-        if (Read-YesNo "是否同时停止并卸载 Cloudflared 隧道服务？[y/N]" $false) {
-            if (-not (Uninstall-TunnelService -Confirmed)) {
-                Err "Cloudflared 服务未能完整卸载；已停止后续数据清理。"
-                return $false
-            }
-        }
-    } elseif (Test-Path -LiteralPath $LocalCloudflared -PathType Leaf) {
-        if (Read-YesNo "Cloudflared 服务不存在；是否清理项目内 cloudflared.exe？[y/N]" $false) {
-            try {
-                Move-ToProjectArchive $LocalCloudflared $Project
-                Done "项目内 cloudflared.exe 已删除"
-            } catch {
-                Warn "删除 cloudflared.exe 失败：$($_.Exception.Message)"
-            }
-        }
-    }
-    Get-ChildItem -LiteralPath $Project -Filter "cloudflared.exe.download-*" -File -ErrorAction SilentlyContinue |
-        ForEach-Object { Move-ToProjectArchive $_.FullName $Project }
-
-    if (Read-YesNo "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N]" $false) {
-        $remainingTunnel = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-        if ($remainingTunnel -and (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf)) {
-            Err "本项目管理的 Cloudflared 服务仍然存在；为避免删除其归属/token 状态，已保留 data/ 和 logs/。"
-            return $false
-        }
+    if (Read-YesNo "是否删除 data/（配置、部署状态、runtime、默认共享资料、会话、临时文件和统计）和 logs/？[y/N]" $false) {
         $logsDir = Join-Path $Project "logs"
         try {
             if (Test-Path -LiteralPath $DataDir) {
@@ -1358,11 +1061,10 @@ function Uninstall-Bot {
             return $false
         }
     } else {
-        Done "已保留 data/ 和 logs/（配置、状态与默认群数据保留）"
+        Done "已保留 data/ 和 logs/（配置、状态、资料、会话与统计保留）"
     }
-    if ($resolvedGroupDataRoot -and
-        $resolvedGroupDataRoot.TrimEnd('\') -ne $DefaultGroupDataRoot.TrimEnd('\')) {
-        Warn "自定义群数据根未删除：$resolvedGroupDataRoot"
+    if ($DeployedWorkspaceRoot) {
+        Warn "外置共享资料目录不属于本项目，未删除：$DeployedWorkspaceRoot"
     }
     Done "卸载流程完成；如上方有警告，请按提示补充清理。"
     return $true
@@ -1399,22 +1101,6 @@ switch ($Command) {
     "upgrade"   { if (-not (Invoke-Update -ConfirmedTarget $Target)) { exit 1 } }
     "resume"    { if (-not (Invoke-TransactionCommand 'continue' $ConfirmedTransaction)) { exit 1 } }
     "rollback"  { if (-not (Invoke-TransactionCommand 'rollback' $ConfirmedTransaction)) { exit 1 } }
-    "repair-tunnel" {
-        if (-not (Invoke-TunnelRepair)) { exit 1 }
-        Write-Host ""
-        if (-not (Show-Doctor)) { exit 1 }
-    }
-    "uninstall-tunnel" { if (-not (Uninstall-TunnelService)) { exit 1 } }
-    "tunnel-logging" {
-        try { Set-CloudflaredLogging $Project $Target } catch { Err $_.Exception.Message; exit 1 }
-    }
-    "tunnel-protocol" {
-        try { Set-CloudflaredProtocol $Project $Target } catch { Err $_.Exception.Message; exit 1 }
-    }
-    "tunnel-update" {
-        . (Join-Path $Project 'scripts\lib\cloudflared-update.ps1')
-        try { Update-ProjectCloudflared $Project (Get-BunPath) } catch { Err $_.Exception.Message; exit 1 }
-    }
     "restart"   { if (-not (Restart-Bot)) { exit 1 } }
     "stop"      {
         Step "停止机器人..."
@@ -1440,8 +1126,19 @@ switch ($Command) {
         try { Invoke-RuntimeConfiguration $Target } catch { Err $_.Exception.Message; exit 1 }
     }
     "model-configure" {
-        try { Invoke-ModelConfiguration } catch { Err $_.Exception.Message; exit 1 }
+        try { Invoke-ConfigureWizard "scripts\config\configure.ts" "模型配置" } catch { Err $_.Exception.Message; exit 1 }
     }
+    "configure-app-bot" {
+        try { Invoke-ConfigureWizard "scripts\config\configure-app-bot.ts" "应用机器人配置" } catch { Err $_.Exception.Message; exit 1 }
+    }
+    # 只经本机控制接口读写运行中的服务，不另开 Stream 连接。
+    "directory" { if (-not (Invoke-DataAdmin "scripts\ops\directory-admin.ts" @("status"))) { exit 1 } }
+    "directory-confirm" {
+        if ($Target -notmatch '^[1-9][0-9]*$') { Err "directory-confirm 需要轮次编号"; exit 2 }
+        if (-not (Invoke-DataAdmin "scripts\ops\directory-admin.ts" @("confirm", $Target))) { exit 1 }
+    }
+    "directory-departments" { if (-not (Invoke-DataAdmin "scripts\ops\directory-admin.ts" @("departments", $Target))) { exit 1 } }
+    "directory-scope" { if (-not (Invoke-DataAdmin "scripts\ops\directory-admin.ts" @("scope", $Target))) { exit 1 } }
     "relay-ls" { if (-not (Invoke-RelayAdmin @("list"))) { exit 1 } }
     "relay-test" { if (-not (Invoke-RelayAdmin @("test"))) { exit 1 } }
     "relay-purge" {
@@ -1451,22 +1148,6 @@ switch ($Command) {
         }
         $relayArgs = if ($All) { @("purge", "--all") } else { @("purge", "--keyword", $Target) }
         if (-not (Invoke-RelayAdmin $relayArgs)) { exit 1 }
-    }
-    "routes" {
-        $routeArgs = @($Target)
-        switch ($Target) {
-            "list" { }
-            "reset" {
-                if (-not $Fingerprint -or -not $Group) { Err "routes reset 需要 -Fingerprint 和 -Group"; exit 2 }
-                $routeArgs += @($Fingerprint, "--group", $Group)
-            }
-            "forget" {
-                if (-not $Fingerprint) { Err "routes forget 需要 -Fingerprint"; exit 2 }
-                $routeArgs += $Fingerprint
-            }
-            default { Err "routes 需要 list、reset 或 forget"; exit 2 }
-        }
-        if (-not (Invoke-GroupDataAdmin "scripts\ops\route-admin.ts" $routeArgs)) { exit 1 }
     }
     "tmp-ls" {
         $tmpArgs = @("list")
@@ -1499,32 +1180,55 @@ switch ($Command) {
         if ($StorageSegment) { $statArgs += "--storage-segment" }
         elseif ($GroupId) { $statArgs += "--group-id" }
         if ($Target) { $statArgs += @("--", $Target) }
-        if (-not (Invoke-GroupDataAdmin "scripts\ops\stats-admin.ts" $statArgs)) { exit 1 }
+        if (-not (Invoke-DataAdmin "scripts\ops\stats-admin.ts" $statArgs)) { exit 1 }
+    }
+    "stat-import" {
+        # 一次性导入旧版统计：不带路径时弹出文件选择框；停机导入（维护租约），再恢复调用前的运行或停止状态。
+        $legacy = $Target
+        if (-not $legacy) {
+            Step "请在弹出的窗口中选择旧统计账本（旧部署的 data\groups\stats.sqlite）"
+            $legacy = Select-LegacyStatsFile
+            if (-not $legacy) { Err "未选择文件，未导入；也可直接给出路径：ops.ps1 stat-import <stats.sqlite>"; exit 2 }
+        }
+        if (-not (Test-Path -LiteralPath $legacy -PathType Leaf)) { Err "找不到旧统计账本：$legacy"; exit 1 }
+        $legacy = (Resolve-Path -LiteralPath $legacy).Path
+        Step "导入旧统计账本：$legacy"
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
+        if (-not (Stop-Bot)) { exit 1 }
+        try { $imported = Invoke-DataAdmin "scripts\ops\stats-import.ts" @($legacy) }
+        finally { if ($wasRunning) { $started = Start-Bot } else { $started = $true } }
+        if (-not ($imported -and $started)) { exit 1 }
     }
     "history-ls" {
-        if (-not (Invoke-GroupDataAdmin "scripts\ops\history-admin.ts" @("list"))) { exit 1 }
+        if (-not (Invoke-DataAdmin "scripts\ops\history-admin.ts" @("list"))) { exit 1 }
     }
     "history-clear" {
-        # -All 清空所有群（history-admin 的 clear --all）；与群号或群选择参数同用时拒绝，漏写群号只报错。
+        # -All 清空所有会话空间（history-admin 的 clear --all）；-Direct 为单聊空间；与群号或群选择参数同用时拒绝，漏写群号只报错。
         if ($All) {
-            if ($Target -or $StorageSegment -or $GroupId) { Err "history-clear -All 不能再指定群或群选择参数"; exit 2 }
-            if (-not (Clear-GroupHistory "--all")) { exit 1 }
+            if ($Target -or $Direct -or $StorageSegment -or $GroupId) { Err "history-clear -All 不能再指定群、-Direct 或群选择参数"; exit 2 }
+            if (-not (Clear-SpaceHistory "--all")) { exit 1 }
         }
-        elseif (-not (Clear-GroupHistory $Target)) { exit 1 }
+        elseif ($Direct) {
+            if ($Target -or $StorageSegment -or $GroupId) { Err "history-clear -Direct 不能再指定群或群选择参数"; exit 2 }
+            if (-not (Clear-SpaceHistory "--direct")) { exit 1 }
+        }
+        elseif (-not (Clear-SpaceHistory $Target)) { exit 1 }
     }
     "history-compact" {
         if (-not $User) { Err "history-compact 需要 -User <成员号码>"; exit 2 }
-        if (-not (Clear-GroupHistory $Target "compact")) { exit 1 }
+        if ($Direct -and ($Target -or $StorageSegment -or $GroupId)) { Err "history-compact -Direct 不能再指定群或群选择参数"; exit 2 }
+        if (-not (Clear-SpaceHistory $(if ($Direct) { "--direct" } else { $Target }) "compact")) { exit 1 }
     }
     # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具逐条重新检查。
     "backup-scan" {
-        if (-not (Invoke-GroupDataAdmin "scripts\ops\backup-cleanup.ts" @("scan"))) { exit 1 }
+        if (-not (Invoke-DataAdmin "scripts\ops\backup-cleanup.ts" @("scan"))) { exit 1 }
     }
     "backup-clean" {
         if (-not $Target) { Err "backup-clean 需要报告名（tmp\backup-cleanup 下的目录名）"; exit 2 }
         $cleanArgs = @("apply", $Target)
         if ($ConfirmCode) { $cleanArgs += @("--confirm", $ConfirmCode) }
-        if (-not (Invoke-GroupDataAdmin "scripts\ops\backup-cleanup.ts" $cleanArgs)) { exit 1 }
+        if (-not (Invoke-DataAdmin "scripts\ops\backup-cleanup.ts" $cleanArgs)) { exit 1 }
     }
     "uninstall" { if (-not (Uninstall-Bot)) { exit 1 } }
     default {
@@ -1532,17 +1236,15 @@ switch ($Command) {
         $unknown = $Command -and $Command -ne "help"
         if ($unknown) { Err "无法识别的命令：$Command" }
         Write-Host "mixin-chatbot 运维工具（Windows Server）" -ForegroundColor Cyan
-        Write-Host "用法：powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <命令> [-Repair] [-RestartTunnel]"
+        Write-Host "用法：powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <命令> [-Repair]"
         Write-Host "运维界面：在项目根目录运行 bun run tui。"
         Write-Host ""
-        Write-Host "  doctor          只读诊断；-Json 输出 JSON；-Repair 自动修复"
+        Write-Host "  doctor          只读诊断（含共享资料目录与运行版本）；-Json 输出 JSON；-Repair 自动修复"
         Write-Host "  deploy          配置并部署当前代码；已有部署可重建，失败自动回滚"
-        Write-Host "  update          预检、停机后同步 origin/main，按需迁移并验证；提交前失败回滚"
-        Write-Host "                  默认沿用隧道，只有加 -RestartTunnel 才重启"
+        Write-Host "  update          同步 origin/main，停机前检查部署记录与配置，停机后切换并验证；提交前失败回滚"
+        Write-Host "                  沿用现有端口、共享资料目录、应用凭据和 AI 配置；改配置请用 deploy"
         Write-Host "  resume          按事务记录继续中断的部署或升级（不重新提问）"
         Write-Host "  rollback        回滚中断的部署或升级；数据已提交时只能继续"
-        Write-Host "  repair-tunnel   按当前 token 来源强制重装 Cloudflared 服务"
-        Write-Host "  uninstall-tunnel 停止并卸载 Cloudflared 服务，可选删除本地程序"
         Write-Host "  restart         停止并重新启动机器人"
         Write-Host "  stop            停止计划任务和 Bun 进程"
         Write-Host "  start           启动机器人计划任务"
@@ -1551,16 +1253,19 @@ switch ($Command) {
         Write-Host "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
         Write-Host "  model-configure 停止机器人，运行模型配置向导，结束后恢复原运行状态"
         Write-Host "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
-        Write-Host "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
-        Write-Host "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"
-        Write-Host "  tunnel-update 更新本项目 cloudflared 到官方稳定版；校验后切换，失败恢复旧版本（需宿主机 Bun）"
+        Write-Host "  configure-app-bot 停止机器人，填写应用机器人 AppID/AppSecret 并验证，结束后恢复原运行状态"
+        Write-Host "  directory       查看事件 Stream 与通讯录同步状态（同步范围、映射数、最近同步、待确认撤销）"
+        Write-Host "  directory-confirm <轮次> 确认该轮暂停的大批撤销；服务重新完整扫描后才撤销"
+        Write-Host "  directory-departments [部门ID]"
+        Write-Host "                  列出该部门（默认根部门）的直属子部门：ID、人数、名称，用来选择同步范围"
+        Write-Host "  directory-scope [""部门ID,…""]"
+        Write-Host "                  只同步这些部门及其子部门，留空为整个通讯录；范围有变化时立即重新同步"
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
         Write-Host "  relay-test      上传并删除一个随机测试文件，验收外链签名、私有访问和删除权限"
         Write-Host "  relay-purge <关键字>|-All"
         Write-Host "                  删除匹配的外链对象并清掉索引记录"
-        Write-Host "  routes list | reset -Fingerprint <指纹> -Group <群号> | forget -Fingerprint <指纹>"
-        Write-Host "  tmp-ls [-User <手机号>] [-Group <群号>]"
-        Write-Host "                  列出各用户临时目录的占用（缓存、中间产物、截断日志）"
+        Write-Host "  tmp-ls [-User <手机号>] [-Group <群号>|direct]"
+        Write-Host "                  列出各用户临时目录的占用（缓存、中间产物、截断日志）；direct 为单聊空间"
         Write-Host "  tmp-preview -Days <天数> | -All  核对引用并保存清单（服务照常运行）"
         Write-Host "  tmp-purge -Plan <ID> -Digest <摘要>  停机执行或继续归档清单，再恢复原状态"
         Write-Host "  tmp-reclaim -Days <天数> | -All  预览物理回收，再用 -Plan/-Digest 确认"
@@ -1569,16 +1274,17 @@ switch ($Command) {
         Write-Host "                  清理用户临时目录；-Days 只删这些天没改动过的条目"
         Write-Host "  stat [群号] [-Period today|yesterday|week|last-week|month|last-month|7d|30d|all]"
         Write-Host "              或 [-Since <日期>] [-Until <日期>]"
-        Write-Host "                  使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
-        Write-Host "  history-ls      列出各群的会话历史（群库与旧会话文件的占用、最后活动）"
-        Write-Host "  history-clear <群号>  清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
-        Write-Host "  history-compact <群号> -User <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
+        Write-Host "                  使用统计：多少人用过、提问多少次、模型用了多少 token；日期格式 YYYY-MM-DD"
+        Write-Host "  stat-import [旧账本]  一次性导入旧版统计（提问数与 token）；不给路径时弹出文件选择框；停机导入后恢复原运行状态"
+        Write-Host "  history-ls      列出单聊空间和各群的会话历史（会话库的占用、最后活动）"
+        Write-Host "  history-clear <群号>|-Direct  清空该群（或单聊空间）全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
+        Write-Host "  history-compact <群号>|-Direct -User <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
         Write-Host "                  群选择可加 -GroupId（原始群号）或 -StorageSegment（目录段）"
-        Write-Host "  history-clear -All  清空所有群全部成员的上下文；一次停机完成，某个群失败时其余群照常清空"
+        Write-Host "  history-clear -All  清空所有会话空间全部成员的上下文；一次停机完成，某个空间失败时其余照常清空"
         Write-Host "  backup-scan     只读扫描 backup\rm 和 backup\snapshots，分类后在 tmp\backup-cleanup 生成清单，不删除"
         Write-Host "  backup-clean <报告名> [-ConfirmCode <确认码>]"
         Write-Host "                  不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"
-        Write-Host "  uninstall       清理任务/进程/防火墙/launcher，可选清理隧道、data 和 logs"
+        Write-Host "  uninstall       清理任务/进程/launcher，可选清理 data 和 logs"
         if ($unknown) { exit 1 }
     }
 }

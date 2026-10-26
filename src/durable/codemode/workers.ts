@@ -1,4 +1,6 @@
-/** Process-wide admission. A result/close is not a worker exit in Pi 1.3.0. */
+/** Process-wide admission. A result, a cancellation or close() is not a worker exit (seen first with Pi 1.3.0, checked
+ * against the pinned codemode by tests/durable/codemode-workers.test.ts): a reservation ends only when the worker exits
+ * or fails to start. */
 export class CodemodeWorkers {
   #reserved = 0;
   #stopped = false;

@@ -5,7 +5,6 @@ export const DATA_DIR = "data";
 export const CONFIG_DIR = join(DATA_DIR, "config");
 export const STATE_DIR = join(DATA_DIR, "state");
 export const RUNTIME_DIR = join(DATA_DIR, "runtime");
-export const DEFAULT_GROUP_DATA_ROOT = join(DATA_DIR, "groups");
 
 /**
  * User-managed configuration and secrets.
@@ -15,10 +14,13 @@ export const DEFAULT_GROUP_DATA_ROOT = join(DATA_DIR, "groups");
  * 这几件事只有一个入口。选中哪个模型另存在 PI_SETTINGS_PATH。
  */
 export const MODELS_JSON_PATH = join(CONFIG_DIR, "models.json");
-export const WEBHOOK_SECRET_FILE = join(CONFIG_DIR, "webhook-secret");
+/** 应用机器人凭据（AppID、AppSecret、环境），文件权限 0600。 */
+export const APP_BOT_CONFIG_PATH = join(CONFIG_DIR, "app-bot.json");
 /** 可选：大文件临时分发的 S3 对象存储；缺失即关闭该特性。 */
 export const RELAY_CONFIG_PATH = join(CONFIG_DIR, "relay.json");
 export const RUNTIME_CONFIG_PATH = join(CONFIG_DIR, "runtime.json");
+/** 可选：通讯录同步范围（选定的部门）；缺失即同步整个通讯录。 */
+export const DIRECTORY_CONFIG_PATH = join(CONFIG_DIR, "directory.json");
 /** Trusted administrator configuration; missing files leave these capabilities disabled. */
 export const AUXILIARY_CONFIG_PATH = join(CONFIG_DIR, "auxiliary.json");
 export const MCP_CONFIG_PATH = join(CONFIG_DIR, "mcp.json");
@@ -26,7 +28,7 @@ export const STATE_DATABASE_PATH = join(STATE_DIR, "agent.sqlite");
 
 /**
  * 项目私有的 Pi agent 目录，就是 Pi 各处 agentDir 参数指的那个目录；会话历史另存在
- * GROUP_DATA_ROOT 下。目录里除可重建资源外还有 settings.json，删掉会丢选型，要备份。
+ * data/conversations 下。目录里除可重建资源外还有 settings.json，删掉会丢选型，要备份。
  */
 export const PI_AGENT_DIR = join(RUNTIME_DIR, "pi");
 /**

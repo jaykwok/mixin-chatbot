@@ -2,6 +2,7 @@
 # agent 的 bash 工具需要 bash.exe；请安装 Git for Windows（同时提供 git）。
 # 运行时：Bun（https://bun.sh）。
 # 持久化：Windows 计划任务（优先开机启动、无需用户登录；失败自动重试）。
+# 消息经平台事件 Stream 主动连出接收（imtwo.zdxlz.com、imfl.zdxlz.com 的 443 端口）；HTTP 只监听 127.0.0.1，无需入站端口。
 #
 # 请在管理员 PowerShell 中运行：
 #   powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1
@@ -26,14 +27,10 @@ $DataDir = Join-Path $Project "data"
 $ConfigDir = Join-Path $DataDir "config"
 $StateDir = Join-Path $DataDir "state"
 $RuntimeDir = Join-Path $DataDir "runtime"
-$DefaultGroupDataRoot = Join-Path $DataDir "groups"
 $ModelsFile = Join-Path $ConfigDir "models.json"
-$WebhookSecretFile = Join-Path $ConfigDir "webhook-secret"
+$AppBotFile = Join-Path $ConfigDir "app-bot.json"
 $PortFile = Join-Path $StateDir "bot-port"
-$ModeFile = Join-Path $StateDir "deploy-mode"
-$DomainFile = Join-Path $StateDir "bot-domain"
-$GroupRootFile = Join-Path $StateDir "group-data-root"
-$TunnelManagedFile = Join-Path $StateDir "cloudflared-managed"
+$WorkspaceRootFile = Join-Path $StateDir "workspace-root"
 $LauncherFile = Join-Path $RuntimeDir "bot-launcher.ps1"
 $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { $WindowsPowerShell = "powershell.exe" }
@@ -191,10 +188,10 @@ foreach ($bunPathCandidate in $bunPaths) {
 if (-not $bunPath) { Fail "bun --version 执行失败；找到的 bun 命令都不可用。"; exit 1 }
 Done "bun 版本：$bunVersion"
 
-# 从此处开始才允许修改持久配置、依赖、服务和网络入口。
+# 从此处开始才允许修改持久配置、依赖和服务。
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { throw "部署需要管理员权限；请在管理员终端中使用 $(Get-OpsCommandHint 'deploy')。" }
-if ([Version]($bunVersion -replace '-.*$', '') -lt [Version]'1.4.3') { throw '需要 Bun 1.4.3 或更高版本。' }
+if ([Version]($bunVersion -replace '-.*$', '') -lt [Version]'1.4.4') { throw '需要 Bun 1.4.4 或更高版本。' }
 $UvPath = @(Get-ApplicationPaths 'uv.exe' | Where-Object { Test-VersionedApplication $_ '^uv ' } | Select-Object -First 1)
 if ($UvPath.Count -ne 1) { throw '缺少原生 uv.exe，请先安装 uv 并加入 PATH。' }
 $UvDir = Split-Path $UvPath[0] -Parent
@@ -206,23 +203,19 @@ function Invoke-PendingDeploymentRollback($Snapshot) {
     $name = Split-Path $Snapshot.Path -Leaf
     $journal = Join-Path $StateDir 'release-data.json'
     try {
-        $original = $record.original_group_root
-        if (-not $original.StartsWith($Project.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -and
-            -not (Test-Path -LiteralPath $original -PathType Container)) {
-            throw "原群数据总根不存在：$original；原服务依赖它，请恢复原位置后再回滚。"
+        $original = $record.original_workspace_root
+        if ($original -and -not (Test-Path -LiteralPath $original -PathType Container)) {
+            throw "原共享资料目录不存在：$original；原服务依赖它，请恢复原位置后再回滚。"
         }
         if (Test-Path -LiteralPath $journal) {
-            if (-not (Test-Path -LiteralPath $record.target_group_root -PathType Container)) {
-                throw "本次部署的群数据总根不存在：$($record.target_group_root)；恢复迁移前的数据需要它，请恢复后再回滚。"
-            }
-            & $bunPath run $dataPreparationRunner committed --project $Project --groups $record.target_group_root --deployment $name
+            & $bunPath run $dataPreparationRunner committed --project $Project --deployment $name
             if ($LASTEXITCODE -eq 0) { throw "上次操作的数据已经提交，不能回滚；请选择继续（$(Get-OpsCommandHint 'resume')）完成新实例启动。" }
         }
         Set-OperationStage 'rollback'
-        Step "回滚上次部署：恢复数据、配置、依赖、计划任务、网络入口和原运行状态..."
+        Step "回滚上次部署：恢复数据、配置、依赖、计划任务和原运行状态..."
         if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '机器人进程未停止，拒绝恢复数据。' }
         if (Test-Path -LiteralPath $journal) {
-            & $bunPath run $dataPreparationRunner rollback --project $Project --groups $record.target_group_root --deployment $name
+            & $bunPath run $dataPreparationRunner rollback --project $Project --deployment $name
             if ($LASTEXITCODE -eq 42) { throw "上次操作的数据已经提交，不能回滚；请选择继续（$(Get-OpsCommandHint 'resume')）完成新实例启动。" }
             if ($LASTEXITCODE -ne 0) { throw '数据恢复失败；保持停机，保留快照和迁移备份。' }
         }
@@ -231,7 +224,7 @@ function Invoke-PendingDeploymentRollback($Snapshot) {
         Remove-Item -LiteralPath (Join-Path $StateDir 'deploy-transaction') -Force
         Write-OperationEvent 'info' ('pending deployment rolled back; snapshot=' + $Snapshot.Path)
         $serviceState = if ($Snapshot.WasRunning) { '机器人服务已重新启动' } else { '机器人服务保持停止' }
-        Done "上次部署已回滚：配置、依赖、计划任务和网络入口已恢复到部署前；$serviceState。"
+        Done "上次部署已回滚：配置、依赖和计划任务已恢复到部署前；$serviceState。"
     } finally {
         $Snapshot.Lock.Dispose()
         $env:BOT_DEPLOY_BACKUP_ID = $Snapshot.PreviousBackupId
@@ -271,18 +264,14 @@ if (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) {
         if ($record.target_sha -and $head.Trim() -ne $record.target_sha) {
             throw "当前代码不是上次部署的目标提交 $($record.target_sha.Substring(0, 7))；请切回该提交后继续，或回滚。"
         }
-        # 挂载缺失时明确停止，绝不在续做中重新创建空的群数据总根。
-        if (-not (Test-Path -LiteralPath $record.target_group_root -PathType Container)) {
-            throw "事务记录的群数据总根不存在：$($record.target_group_root)；请恢复后重试继续，或回滚。"
-        }
         $pendingName = Split-Path $pendingSnapshot.Path -Leaf
         $pendingCommitted = $false
         if (Test-Path -LiteralPath (Join-Path $StateDir 'release-data.json')) {
-            & $bunPath run $dataPreparationRunner committed --project $Project --groups $record.target_group_root --deployment $pendingName
+            & $bunPath run $dataPreparationRunner committed --project $Project --deployment $pendingName
             $pendingCommitted = $LASTEXITCODE -eq 0
         }
         if ($pendingCommitted) {
-            # 数据在上次中断前已经提交：配置、计划任务和入口都已就位，只需启动新实例。
+            # 数据在上次中断前已经提交：配置和计划任务都已就位，只需启动新实例。
             # 不重新迁移；实例未就绪时保留事务指针，可再次继续。
             Set-OperationStage 'activate-service'
             Step "上次部署的数据已经提交，启动新实例（不再迁移）..."
@@ -294,7 +283,7 @@ if (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) {
             Remove-Item -LiteralPath (Join-Path $StateDir 'deploy-transaction') -Force
             try { Remove-CompletedBackup $pendingSnapshot.Path $Project }
             catch { Warn ('部署已完成，但备份清理未完成，请检查 backup/snapshots 和 backup/rm：' + $_.Exception.Message) }
-            Done "上次部署已完成，机器人已启动（群数据总根=$($record.target_group_root)）。"
+            Done "上次部署已完成，机器人已启动。"
             $operationExit = 0
         }
     } catch { $pendingSnapshot.Lock.Dispose(); $env:BOT_DEPLOY_BACKUP_ID = $pendingSnapshot.PreviousBackupId; throw }
@@ -303,7 +292,7 @@ if (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) {
         $env:BOT_DEPLOY_BACKUP_ID = $pendingSnapshot.PreviousBackupId
         return
     }
-    Step "继续上次部署：端口、入口模式、群数据总根、域名和隧道确认均取自事务记录"
+    Step "继续上次部署：端口和共享资料目录取自事务记录"
 } elseif ($Resume -or $Rollback) {
     if ($ConfirmedTransaction) { throw '确认后的部署事务已消失，请刷新预览' }
     Done '没有未完成的部署。'
@@ -313,10 +302,10 @@ if (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) {
 $resuming = [bool]$pendingSnapshot
 if ($resuming) {
     # 续做的运行参数沿用 runtime.json；当前终端的环境变量既不校验也不写入。
-    foreach ($key in @('BOT_DEBUG', 'BOT_MAX_ACTIVE_REQUESTS', 'BOT_BASH_TIMEOUT', 'BOT_INDEX_TTL_MINUTES', 'BOT_INDEX_MAX_FILES', 'BOT_INDEX_MAX_DEPTH',
+    foreach ($key in @('BOT_MAX_ACTIVE_REQUESTS', 'BOT_BASH_TIMEOUT', 'BOT_INDEX_TTL_MINUTES', 'BOT_INDEX_MAX_FILES', 'BOT_INDEX_MAX_DEPTH',
         'BOT_RUN_TIMEOUT_SECONDS', 'BOT_MODEL_IDLE_TIMEOUT_SECONDS', 'BOT_MODEL_RESPONSE_TIMEOUT_SECONDS', 'BOT_SHUTDOWN_TIMEOUT_SECONDS',
-        'BOT_DELIVERY_TIMEOUT_SECONDS', 'BOT_DOCUMENT_ENV', 'BOT_DOCUMENT_WORK_ENABLED', 'BOT_DOCUMENT_PPTX_TEMPLATE', 'BOT_DOCUMENT_DOCX_TEMPLATE',
-        'PI_CACHE_RETENTION', 'BOT_ATTACHMENT_CONCURRENCY', 'BOT_MODEL_CACHE_RETENTION')) {
+        'BOT_DOCUMENT_ENV', 'BOT_DOCUMENT_WORK_ENABLED', 'BOT_DOCUMENT_PPTX_TEMPLATE', 'BOT_DOCUMENT_DOCX_TEMPLATE',
+        'PI_CACHE_RETENTION', 'BOT_ATTACHMENT_CONCURRENCY')) {
         Remove-Item -LiteralPath "Env:$key" -ErrorAction SilentlyContinue
     }
 }
@@ -331,11 +320,6 @@ if (Test-Path -LiteralPath $runtimeFile) {
         throw "data\config\runtime.json 无法解析（$($_.Exception.Message)）；$next。"
     }
 }
-$BotDebug = if ($env:BOT_DEBUG) { $env:BOT_DEBUG.Trim() } elseif ($savedRuntime.BOT_DEBUG) { [string]$savedRuntime.BOT_DEBUG } else { '0' }
-if ($BotDebug -notin @("0", "1")) {
-    Fail "BOT_DEBUG 只能是 0 或 1。"
-    exit 1
-}
 $BotMaxActiveRequests = if ($env:BOT_MAX_ACTIVE_REQUESTS) { $env:BOT_MAX_ACTIVE_REQUESTS.Trim() }
     elseif ($savedRuntime.BOT_MAX_ACTIVE_REQUESTS) { [string]$savedRuntime.BOT_MAX_ACTIVE_REQUESTS } else { '32' }
 $parsedMaxActiveRequests = 0
@@ -345,95 +329,51 @@ if (-not [int]::TryParse($BotMaxActiveRequests, [ref]$parsedMaxActiveRequests) -
     exit 1
 }
 
-# ---- 4b. Pi 群数据总根（<group>/workspace + <group>/durable.sqlite + <group>/users/<phone>/tmp）----
-Step "配置 Pi 群数据总根"
-$savedGroupRoot = if (Test-Path -LiteralPath $GroupRootFile -PathType Leaf) {
-    "$(Get-Content -LiteralPath $GroupRootFile -Raw)".Trim()
-} else {
-    ""
-}
-$groupRootDefault = if ($resuming) {
-    $record.target_group_root
-} elseif (-not [string]::IsNullOrWhiteSpace($env:GROUP_DATA_ROOT)) {
-    $env:GROUP_DATA_ROOT.Trim()
-} elseif (-not [string]::IsNullOrWhiteSpace($savedGroupRoot)) {
-    $savedGroupRoot
-} else {
-    "data\groups"
-}
-Write-Host "  默认 data\groups；GROUP_DATA_ROOT 可覆盖到其他磁盘。"
-Write-Host "  部署成功后会记入 data\state\group-data-root，下次自动沿用。"
-Write-Host "  如需调整，可输入相对仓库路径或绝对路径。"
-Write-Host "  每个群使用 <root>\<group>\workspace 和群库 durable.sqlite；每个调用用户使用 <group>\users\<phone>\tmp。"
-$groupRootChecked = $false
-while ($true) {
-    # 续做只检查一次记录的群根，不可用时停止，不在停机期间提问。
-    if ($resuming -and $groupRootChecked) { throw "事务记录的群数据总根不可用（原因见上方）：$groupRootDefault；请处理后重试继续，或回滚。" }
-    $groupRootChecked = $true
-    $wdIn = if ($resuming) { '' } else { Read-Host "群数据总根 [默认：$groupRootDefault]" }
-    $groupRootCandidate = if ($wdIn) { $wdIn.Trim() } else { $groupRootDefault }
+# ---- 4b. 共享资料目录（默认 data\workspace；WORKSPACE_ROOT 可指向已存在的外置目录，服务只读）----
+# 续做沿用事务记录；否则取 WORKSPACE_ROOT，未设置时沿用已保存设置。设为 data\workspace 即恢复默认。外置目录不创建。
+$DefaultWorkspace = Join-Path $DataDir 'workspace'
+$workspaceRequest = if ($resuming) { $record.target_workspace_root }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:WORKSPACE_ROOT)) { $env:WORKSPACE_ROOT.Trim() }
+    else { Get-SavedWorkspaceRoot $Project }
+$WorkspaceRoot = ''
+if ($workspaceRequest) {
     try {
-        $GroupDataRoot = if ([System.IO.Path]::IsPathRooted($groupRootCandidate)) {
-            [System.IO.Path]::GetFullPath($groupRootCandidate)
-        } else {
-            [System.IO.Path]::GetFullPath((Join-Path $Project $groupRootCandidate))
+        $workspaceCandidate = if ([System.IO.Path]::IsPathRooted($workspaceRequest)) { [System.IO.Path]::GetFullPath($workspaceRequest) }
+            else { [System.IO.Path]::GetFullPath((Join-Path $Project $workspaceRequest)) }
+    } catch { throw "WORKSPACE_ROOT 路径无效：$workspaceRequest；服务尚未停止。" }
+    if ($workspaceCandidate.TrimEnd('\') -ne $DefaultWorkspace.TrimEnd('\')) {
+        if (-not (Test-Path -LiteralPath $workspaceCandidate -PathType Container)) {
+            $next = if ($resuming) { '请恢复该目录后重试继续，或回滚' } else { '外置资料目录必须已存在；服务尚未停止' }
+            throw "共享资料目录不存在或不是目录：$workspaceCandidate；$next。"
         }
-    } catch {
-        Warn "群数据总根路径无效：$groupRootCandidate"
-        continue
+        $WorkspaceRoot = (Resolve-Path -LiteralPath $workspaceCandidate).Path
     }
-    $volumeRoot = [System.IO.Path]::GetPathRoot($GroupDataRoot).TrimEnd('\')
-    if ($GroupDataRoot.TrimEnd('\') -eq $volumeRoot -or $GroupDataRoot.TrimEnd('\') -eq $Project.TrimEnd('\')) {
-        Warn "群数据总根不能是文件系统根目录或项目根目录：$GroupDataRoot"
-        continue
-    }
-    $projectChildPrefix = $Project.TrimEnd('\') + '\'
-    if ($GroupDataRoot.StartsWith($projectChildPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
-        $GroupDataRoot.TrimEnd('\') -ne $DefaultGroupDataRoot.TrimEnd('\')) {
-        Warn "项目内群数据目录固定为 data\groups；如需自定义，请选择项目外的路径：$GroupDataRoot"
-        continue
-    }
-    if (Test-Path -LiteralPath $GroupDataRoot) {
-        if (-not (Test-Path -LiteralPath $GroupDataRoot -PathType Container)) {
-            Warn "群数据总根不是目录：$GroupDataRoot"
-            continue
-        }
-    } else {
-        try {
-            New-Item -ItemType Directory -Force -Path $GroupDataRoot | Out-Null
-        } catch {
-            Warn "无法创建群数据总根：$GroupDataRoot（$($_.Exception.Message)）"
-            continue
-        }
-    }
-    $GroupDataRoot = (Resolve-Path -LiteralPath $GroupDataRoot).Path
-    break
 }
-Done "群数据总根：$GroupDataRoot"
+Done "共享资料目录：$(if ($WorkspaceRoot) { "$WorkspaceRoot（外置，服务只读）" } else { "$DefaultWorkspace（默认）" })"
+# 数据预检与提交都按最终资料目录核对布局（runtime.json 要到预检之后才写入新值）；空字符串参数会被 Windows PowerShell 丢弃，默认目录写全路径。
+$finalWorkspace = if ($WorkspaceRoot) { $WorkspaceRoot } else { $DefaultWorkspace }
 
 $dataPreparationPlan = Join-Path $Project ('tmp\data-plan-' + [Guid]::NewGuid().ToString('N') + '.json')
 $dataPreparationPlanned = $false
 $dataPreparationAttempted = $resuming -and (Test-Path -LiteralPath (Join-Path $StateDir 'release-data.json'))
-$dataPreparationGroups = $GroupDataRoot
 $recordedDataPreparationPlan = if ($resuming) { Join-Path $pendingSnapshot.Path 'data-plan.json' } else { '' }
 # 续做不能提问：迁移预览不带 --interactive，需要确认时停止。
 # 外层 @() 保留数组；if 的单元素输出会变成字符串，传给原生程序时被 splat 拆成逐个字符。
 
-# 跨数据版本只能由升级器重置并重新配置模型。部署不做重置，也不能因为检测到旧 models.json 就沿用它，停机前直接拒绝。
+# 数据版本在停机前核对：有数据但没有有效版本标记（含旧版 webhook 数据）时拒绝，旧服务不受影响。
 if (-not $resuming) {
-    & $bunPath run $dataPreparationRunner probe --project $Project --groups $dataPreparationGroups | Out-Null
-    if ($LASTEXITCODE -eq 20) { throw "数据版本较旧，重新部署不会沿用旧模型配置和会话；请运行 $(Get-OpsCommandHint 'update')，确认后重置旧会话并重新配置模型。旧服务尚未停止" }
-    if ($LASTEXITCODE -ne 0) { throw '数据版本检查失败（原因见上方）；旧服务尚未停止' }
+    & $bunPath run $dataPreparationRunner check --project $Project --workspace $finalWorkspace
+    if ($LASTEXITCODE -ne 0) { throw '数据版本核对未通过（原因见上方）；旧服务尚未停止' }
 }
 if ($recordedDataPreparationPlan -and (Test-Path -LiteralPath $recordedDataPreparationPlan -PathType Leaf)) {
-    # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
+    # 续做沿用停机前的数据预检计划；apply 会重新核对版本标记，变化即中止。
     $dataPreparationPlan = $recordedDataPreparationPlan
     $dataPreparationPlanned = $true
 } elseif ((Test-Path -LiteralPath $ModelsFile) -and (Test-Path -LiteralPath (Join-Path $RuntimeDir 'pi\settings.json'))) {
-    & $bunPath run $dataPreparationRunner preview --project $Project --groups $dataPreparationGroups --plan $dataPreparationPlan
+    & $bunPath run $dataPreparationRunner preview --project $Project --plan $dataPreparationPlan --workspace $finalWorkspace
     if ($LASTEXITCODE -ne 0) {
-        if ($resuming) { throw '续做无法沿用迁移确认（原因见上方）；服务保持停止，请回滚后重新部署。' }
-        throw '迁移预览未完成；旧服务尚未停止'
+        if ($resuming) { throw '续做无法沿用数据预检（原因见上方）；服务保持停止，请回滚后重新部署。' }
+        throw '数据预检未通过；旧服务尚未停止'
     }
     $dataPreparationPlanned = $true
 }
@@ -441,8 +381,10 @@ if ($recordedDataPreparationPlan -and (Test-Path -LiteralPath $recordedDataPrepa
 $reconfigureAi = $false
 if ($resuming) {
     # 续做不运行需要交互的配置向导；缺少模型配置时停止，由回滚后的部署完成配置。
-    if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
-        throw "缺少 data\config\models.json；续做不运行配置向导，服务保持停止。请回滚（$(Get-OpsCommandHint 'rollback')）后重新部署。"
+    foreach ($required in @($ModelsFile, $AppBotFile)) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+            throw "缺少 data\config\$(Split-Path $required -Leaf)；续做不运行配置向导，服务保持停止。请回滚（$(Get-OpsCommandHint 'rollback')）后重新部署。"
+        }
     }
     if ($record.reconfigure_ai -eq '1') { Warn '上次选择的 AI 重新配置不会在续做中运行；需要时请在部署完成后重新部署修改。' }
 } elseif (Test-Path -LiteralPath $ModelsFile -PathType Leaf) {
@@ -451,200 +393,47 @@ if ($resuming) {
     if ($reconfigureAi) { Write-Host "  配置向导需要新安装的依赖，将在停止机器人服务并安装依赖后打开。" }
 }
 
-$persistDomain = $false
-$clearPersistedDomain = $false
-$invalidConfiguredDomain = ""
-if (-not [string]::IsNullOrWhiteSpace($env:BOT_DOMAIN)) {
-    $rawPublicDomain = $env:BOT_DOMAIN.Trim()
-    $domainSource = "BOT_DOMAIN"
-} elseif (Test-Path -LiteralPath $DomainFile) {
-    $rawPublicDomain = "$(Get-Content -LiteralPath $DomainFile -Raw)".Trim()
-    $domainSource = "data\state\bot-domain"
-} else {
-    $rawPublicDomain = ""
-    $domainSource = ""
-}
-$publicDomain = ConvertTo-Hostname $rawPublicDomain
-if ($rawPublicDomain -and -not $publicDomain) {
-    $invalidConfiguredDomain = $rawPublicDomain
-    $clearPersistedDomain = $domainSource -eq "data\state\bot-domain"
-} elseif ($publicDomain -and ($domainSource -eq "BOT_DOMAIN" -or $publicDomain -cne $rawPublicDomain)) {
-    $persistDomain = $true
-}
-if ($resuming) {
-    # 续做使用停机前确认的域名及其写回方式。
-    $publicDomain = $record.bot_domain
-    $persistDomain = $record.domain_action -eq 'persist'
-    $clearPersistedDomain = $record.domain_action -eq 'clear'
-    $invalidConfiguredDomain = ""
-}
+# 量子密信的 HTTP 回调已停用：消息经平台事件 Stream 主动连出接收，HTTP 只监听本机，供健康检查和管理使用。
+$BotHost = '127.0.0.1'
 
-# ---- 4c. 监听端口（显式环境变量 > 已保存值 > 1011）----
-$portDefaultSource = ""
-$rawPortDefault = if ($resuming) {
-    $portDefaultSource = "事务记录"
+# ---- 4c. 本机管理端口（不询问：事务记录 > 显式 BOT_PORT 高级覆盖 > 已保存值 > 1011）----
+# 无效或被其他程序占用的端口在停机前停止并说明改法，不自动换成别的端口。
+$savedPort = if (Test-Path -LiteralPath $PortFile) { "$(Get-Content -LiteralPath $PortFile -Raw)".Trim() } else { $null }
+$portSource = ""
+$rawPort = if ($resuming) {
+    $portSource = "事务记录"
     $record.bot_port
 } elseif (-not [string]::IsNullOrWhiteSpace($env:BOT_PORT)) {
-    $portDefaultSource = "BOT_PORT"
+    $portSource = "BOT_PORT"
     $env:BOT_PORT.Trim()
-} elseif (Test-Path -LiteralPath $PortFile) {
-    $portDefaultSource = "data\state\bot-port"
-    "$(Get-Content -LiteralPath $PortFile -Raw)".Trim()
+} elseif ($null -ne $savedPort) {
+    $portSource = "data\state\bot-port"
+    $savedPort
 } else {
     "1011"
 }
-$defaultPortNumber = 0
-if ([int]::TryParse($rawPortDefault, [ref]$defaultPortNumber) -and
-    $defaultPortNumber -ge 1 -and $defaultPortNumber -le 65535) {
-    $portDefault = "$defaultPortNumber"
+$portFix = if ($resuming) {
+    "续做沿用事务记录的端口；请回滚后再设置 BOT_PORT 重新部署改端口"
 } else {
-    Warn "$portDefaultSource 中的端口无效，已改用安全默认值 1011：$rawPortDefault"
-    $portDefault = "1011"
+    "改端口：设置环境变量 BOT_PORT=<端口> 后重新部署（$(Get-OpsCommandHint deploy)）；服务尚未停止"
 }
-while ($true) {
-    $portIn = if ($resuming) { '' } else { Read-Host "机器人监听端口 [默认：$portDefault]" }
-    $Port = if ($portIn) { $portIn.Trim() } else { $portDefault }
-    $portNumber = 0
-    if ([int]::TryParse($Port, [ref]$portNumber) -and $portNumber -ge 1 -and $portNumber -le 65535) {
-        $Port = "$portNumber"
-        break
-    }
-    Warn "端口必须是 1–65535 的整数"
+$portNumber = 0
+if (-not ([int]::TryParse($rawPort, [ref]$portNumber) -and $portNumber -ge 1 -and $portNumber -le 65535)) {
+    throw "$portSource 中的端口无效（应为 1–65535 的整数）：$rawPort；$portFix"
 }
-Done "监听端口：$Port"
-
-# ---- 5. 部署模式 ----
-$modeDefaultSource = ""
-$rawModeDefault = if ($resuming) {
-    $modeDefaultSource = "事务记录"
-    $record.deploy_mode
-} elseif (-not [string]::IsNullOrWhiteSpace($env:DEPLOY_MODE)) {
-    $modeDefaultSource = "DEPLOY_MODE"
-    $env:DEPLOY_MODE.Trim().ToLowerInvariant()
-} elseif (Test-Path -LiteralPath $ModeFile -PathType Leaf) {
-    $modeDefaultSource = "data\state\deploy-mode"
-    "$(Get-Content -LiteralPath $ModeFile -Raw)".Trim().ToLowerInvariant()
-} else {
-    "direct"
+$Port = "$portNumber"
+# 沿用的端口可能正由原服务监听，不探测；新端口（含首次部署）要先确认没有其他程序占用。
+if (-not $resuming -and $Port -ne $savedPort) {
+    $probe = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $inUse = $false
+        try { $inUse = $probe.ConnectAsync('127.0.0.1', $portNumber).Wait(2000) } catch { $inUse = $false }
+    } finally { $probe.Dispose() }
+    if ($inUse) { throw "本机端口 $Port 已被其他程序占用；$portFix" }
 }
-if ($rawModeDefault -in @("direct", "cloudflare")) {
-    $modeDefault = $rawModeDefault
-} else {
-    Warn "$modeDefaultSource 中的部署模式无效，已改用安全默认值 direct：$rawModeDefault"
-    $modeDefault = "direct"
-}
-$modeDefaultChoice = if ($modeDefault -eq "cloudflare") { "2" } else { "1" }
-$modeDefaultLabel = if ($modeDefault -eq "cloudflare") { "Cloudflare" } else { "直连" }
-if (-not $resuming) {
-    Step "选择部署模式："
-    Write-Host "  1) 直连模式       - 服务器有公网 IP；在 Windows 防火墙放行端口 $Port"
-    Write-Host "  2) Cloudflare 模式 - 云电脑；部署后自动启动 cloudflared 隧道"
-}
-while ($true) {
-    $modeIn = if ($resuming) { '' } else { Read-Host "输入 1 或 2 [默认：$modeDefaultChoice / $modeDefaultLabel]" }
-    $modeChoice = if ([string]::IsNullOrWhiteSpace($modeIn)) { $modeDefaultChoice } else { $modeIn.Trim() }
-    if ($modeChoice -eq "1") {
-        $mode = "direct"
-        break
-    }
-    if ($modeChoice -eq "2") {
-        $mode = "cloudflare"
-        break
-    }
-    Warn "请输入 1 或 2"
-}
-$modeLabel = if ($mode -eq "cloudflare") { "Cloudflare" } else { "直连" }
-$BotHost = if ($mode -eq "cloudflare") { "127.0.0.1" } else { "0.0.0.0" }
-Done "部署模式：$modeLabel"
-if ($invalidConfiguredDomain) {
-    Warn "$domainSource 中的域名无效，已忽略：$invalidConfiguredDomain"
-}
-if ($mode -eq "cloudflare" -and -not $resuming) {
-    Write-Host "Cloudflare 公网域名准备："
-    Write-Host "  1) 将根域名（如 example.com）添加到 Cloudflare，按指引在域名注册商修改 NS，等待状态变为 Active（已激活）。域名无需转移注册商，但 DNS 需托管到 Cloudflare。"
-    Write-Host "  2) 下面填写机器人使用的子域名，例如 bot.example.com。"
-    Write-Host "  3) 在同一 Cloudflare 账户的 Networking → Tunnels 中创建或选择 Cloudflared 隧道；Published application 路由填相同子域名，服务地址设为 http://127.0.0.1:$Port。"
-    Write-Host "DNS 接入和公开路由需在控制台完成；此处填写域名不会自动创建它们。可留空稍后配置，公网回调需配置完成后才能使用。"
-    $domainDefault = $publicDomain
-    while ($true) {
-        $domainPrompt = if ($domainDefault) {
-            "Cloudflare 公网域名 [默认：$domainDefault；支持完整根 URL]"
-        } else {
-            "Cloudflare 公网域名（可留空；支持 im-bot.example.com 或 https://im-bot.example.com）"
-        }
-        $domainIn = Read-Host $domainPrompt
-        if ([string]::IsNullOrWhiteSpace($domainIn)) {
-            $publicDomain = $domainDefault
-            break
-        }
-        $normalizedDomain = ConvertTo-Hostname $domainIn
-        if ($normalizedDomain) {
-            $publicDomain = $normalizedDomain
-            $persistDomain = $true
-            if ($publicDomain -cne $domainIn.Trim()) {
-                Done "已规范化公网域名：$publicDomain"
-            }
-            break
-        }
-        Warn "域名格式无效；请输入纯 hostname，或只含 hostname 的 http(s) URL（不能带端口、路径、查询参数）"
-    }
-}
+Done "本机管理端口：127.0.0.1:$Port$(if ($portSource) { "（来自 $portSource）" })"
 
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-# 续做沿用停机前确认的来源 IP，不随当前终端的环境变量变化。
-$platformIp = if ($resuming) { $record.platform_ip } else { Get-PlatformIp }
-$allowUnmanagedFirewall = $env:ALLOW_UNMANAGED_FIREWALL -eq "1"
-$cleanupFirewallAfterHealth = $false
-$currentFirewallRuleName = $null
-if ($mode -eq "direct") {
-    $parsedIp = $null
-    if (-not [System.Net.IPAddress]::TryParse($platformIp, [ref]$parsedIp)) {
-        Fail "PLATFORM_IP 无效：$platformIp"
-        exit 1
-    }
-}
-
-# 外部连接器不能仅凭服务名认领；此时尚未停止服务，取消不会改动部署。
-$unmanagedTunnelConfirmed = $false
-$preflightTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-$preflightTunnelManaged = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
-if ($preflightTunnelService -and -not $preflightTunnelManaged) {
-    Warn "系统存在没有本项目归属标记的 Cloudflared 服务，部署脚本不会自动修改它。"
-    $tunnelQuestion = if ($mode -eq "cloudflare") {
-        "确认该服务正在服务本项目，继续沿用？[y/N]"
-    } else {
-        "确认该服务与本项目无关或其入口仍受保护，继续直连部署？[y/N]"
-    }
-    if ($resuming) {
-        # 续做不能提问：只接受停机前按同一模式做过的确认。
-        if ($record.unmanaged_tunnel -ne $mode) {
-            throw "续做期间出现未确认的 Cloudflared 服务；服务保持停止，请确认其归属后回滚（$(Get-OpsCommandHint 'rollback')）并重新部署。"
-        }
-    } elseif (-not (Read-YesNo $tunnelQuestion $false)) {
-        Fail "未确认未托管 Cloudflared 的归属，部署已取消；机器人服务和配置均未改动。"
-        exit 1
-    }
-    $unmanagedTunnelConfirmed = $true
-}
-# 缺少隧道服务时先收集 token（输入隐藏），部署实例就绪后再安装，避免停机期间等待输入。
-$tunnelInputPrepared = $false
-$preparedTunnelInput = $null
-if ($mode -eq "cloudflare" -and -not $preflightTunnelService) {
-    if ($resuming) {
-        # 停机前输入的 token 不写入事务记录；续做只能使用已保存的来源。
-        try { $null = Resolve-TunnelToken $Project '' }
-        catch { throw "续做需要隧道 token，但没有可用的已保存 token（$($_.Exception.Message)）；请保存到 data\config\cloudflared-token 后重试继续，或回滚。" }
-    } else {
-        Step "未安装 Cloudflared 服务；请先提供隧道 token，部署实例就绪后自动安装"
-        Show-TunnelTokenHelp
-        while ($true) {
-            $preparedTunnelInput = Read-TunnelTokenInput
-            try { $null = Resolve-TunnelToken $Project $preparedTunnelInput; break }
-            catch { Warn $_.Exception.Message }
-        }
-        $tunnelInputPrepared = $true
-    }
-}
 
 Set-OperationStage 'deployment-snapshot'
 $transactionPointer = Join-Path $StateDir 'deploy-transaction'
@@ -659,13 +448,11 @@ if ($resuming) {
             $head = [string](& $gitPath -C $Project rev-parse HEAD 2>$null)
             if ($LASTEXITCODE -eq 0) { $targetSha = $head.Trim() }
         } catch { $targetSha = '' }
-        $domainAction = if ($persistDomain) { 'persist' } elseif ($clearPersistedDomain) { 'clear' } else { 'keep' }
         Publish-DeploymentTransaction $snapshot @{
-            format = '1'; operation = 'deploy'; snapshot = (Split-Path $snapshot.Path -Leaf); target_sha = $targetSha
-            original_sha = ''; original_branch = ''; original_group_root = (Get-SavedGroupDataRoot $Project); target_group_root = $GroupDataRoot
-            was_running = $(if ($snapshot.WasRunning) { '1' } else { '0' }); bot_port = $Port; deploy_mode = $mode; bot_domain = [string]$publicDomain
-            domain_action = $domainAction; unmanaged_tunnel = $(if ($unmanagedTunnelConfirmed) { $mode } else { '' })
-            platform_ip = $platformIp; reconfigure_ai = $(if ($reconfigureAi) { '1' } else { '0' })
+            format = '2'; operation = 'deploy'; snapshot = (Split-Path $snapshot.Path -Leaf); target_sha = $targetSha
+            original_sha = ''; original_branch = ''; original_workspace_root = (Get-SavedWorkspaceRoot $Project); target_workspace_root = $WorkspaceRoot
+            was_running = $(if ($snapshot.WasRunning) { '1' } else { '0' }); bot_port = $Port
+            reconfigure_ai = $(if ($reconfigureAi) { '1' } else { '0' })
         } $transactionPointer $(if ($dataPreparationPlanned) { $dataPreparationPlan } else { '' })
     } catch { $snapshot.Lock.Dispose(); $env:BOT_DEPLOY_BACKUP_ID = $snapshot.PreviousBackupId; throw }
 }
@@ -688,120 +475,65 @@ $bunInstallExitCode = Invoke-OperationNative $bunPath @('install', '--frozen-loc
 if ($bunInstallExitCode -ne 0) { Fail "bun install 执行失败（退出码 $bunInstallExitCode）。"; exit 1 }
 if ($dataPreparationPlanned) {
     $dataPreparationAttempted = $true
-    & $bunPath run $dataPreparationRunner apply --project $Project --groups $dataPreparationGroups --plan $dataPreparationPlan
-    if ($LASTEXITCODE -ne 0) { throw '数据迁移失败' }
+    & $bunPath run $dataPreparationRunner apply --project $Project --plan $dataPreparationPlan
+    if ($LASTEXITCODE -ne 0) { throw '数据准备失败' }
 }
 
-# ---- 3. 持久化目录 + AI 配置 ----
+# ---- 3. 持久化目录 + 应用机器人凭据 + AI 配置 ----
 New-Item -ItemType Directory -Force -Path $ConfigDir, $StateDir, $RuntimeDir, (Join-Path $Project "logs") | Out-Null
 Protect-ProjectSecretPath $ConfigDir
 Protect-ProjectSecretPath $StateDir
-if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
-    Step "首次配置 AI（provider/key/model）..."
+# 向导全程是中文提示，不切 UTF-8 就没法读，见 Invoke-WithUtf8Output。
+function Invoke-ConfigureWizard([string]$Script, [string]$Label) {
     $previousErrorActionPreference = $ErrorActionPreference
     $configureExitCode = 1
     try {
         $ErrorActionPreference = "Continue"
-        # 向导全程是中文提示，不切 UTF-8 就没法读，见 Invoke-WithUtf8Output。
-        Invoke-WithUtf8Output { & $bunPath run configure }
+        Invoke-WithUtf8Output { & $bunPath run $Script }
         $configureExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
-    if ($configureExitCode -ne 0) { Fail "AI 配置失败（退出码 $configureExitCode）。"; exit 1 }
-    if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) { Fail "未生成 data\config\models.json，部署中止。"; exit 1 }
-} elseif ($reconfigureAi) {
+    if ($configureExitCode -ne 0) { throw "$($Label)失败（退出码 $configureExitCode）。" }
+}
+if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) {
+    # 首次配置先问应用机器人凭据（缺少时），再问模型。
+    Step "首次配置应用机器人凭据和 AI（provider/key/model）..."
+    Invoke-ConfigureWizard configure '配置'
+    if (-not (Test-Path -LiteralPath $ModelsFile -PathType Leaf)) { throw "未生成 data\config\models.json，部署中止。" }
+} elseif (-not (Test-Path -LiteralPath $AppBotFile -PathType Leaf)) {
+    Step "配置应用机器人凭据..."
+    Invoke-ConfigureWizard configure-app-bot '应用机器人配置'
+}
+if ($reconfigureAi) {
     # 是否重配已在停机前确认；向导依赖刚安装的依赖，只能在这里运行。
     Step "重新配置 AI（provider/key/model）..."
-    $previousErrorActionPreference = $ErrorActionPreference
-    $configureExitCode = 1
-    try {
-        $ErrorActionPreference = "Continue"
-        Invoke-WithUtf8Output { & $bunPath run configure }
-        $configureExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($configureExitCode -ne 0) { Fail "AI 配置失败（退出码 $configureExitCode）。"; exit 1 }
+    Invoke-ConfigureWizard configure 'AI 配置'
 }
 
 if (-not (Test-ModelConfiguration $Project)) { throw '模型配置无效，正在恢复原部署。' }
-
-# ---- 4. webhook 密钥 ----
-$showSecret = $false
-if (-not (Test-Path -LiteralPath $WebhookSecretFile -PathType Leaf)) {
-    Step "生成 webhook 随机密钥..."
-    $bytes = New-Object byte[] 32
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $rng.GetBytes($bytes)
-    $secret = -join ($bytes | ForEach-Object { $_.ToString("x2") })
-    Set-Content -LiteralPath $WebhookSecretFile -Value $secret -NoNewline -Encoding ASCII
-    $showSecret = $true
-    Done "webhook 密钥已生成"
-} else {
-    $secret = "$(Get-Content -LiteralPath $WebhookSecretFile -Raw)".Trim()
-    if ($secret -notmatch "^[0-9a-fA-F]{64}$") {
-        Fail "data\config\webhook-secret 格式无效（应为 64 位十六进制字符）。"
-        Write-Host "停机并将该文件移入 backup\rm 后，重新部署可生成新密钥。" -ForegroundColor Red
-        exit 1
-    }
-    Done "沿用已有 webhook-secret"
-}
-
-# 让直连模式防火墙规则始终跟随所选端口。Cloudflare 模式只监听 loopback，
-# 并删除本脚本遗留的直连规则。
-if ($mode -eq "direct") {
-    try {
-        $firewallProfiles = @(Get-NetFirewallProfile -ErrorAction Stop)
-        if ($firewallProfiles.Count -eq 0) { throw "未找到 Windows 防火墙配置文件" }
-        $disabledProfiles = @($firewallProfiles | Where-Object { -not $_.Enabled })
-        if ($disabledProfiles.Count -gt 0) {
-            throw "Windows 防火墙配置文件未全部启用：$($disabledProfiles.Name -join ', ')"
-        }
-        # 先写入新规则，再删除旧规则；这样更新失败时不会让当前 webhook 入口中断。
-        $currentFirewallRule = New-NetFirewallRule -DisplayName "mixin-chatbot TCP $Port" -Group "mixin-chatbot" `
-            -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
-            -RemoteAddress $platformIp -ErrorAction Stop
-        $currentFirewallRuleName = $currentFirewallRule.Name
-        $cleanupFirewallAfterHealth = $true
-        Done "Windows 防火墙已写入限定回调来源的 TCP $Port 规则"
-    } catch {
-        if (-not $allowUnmanagedFirewall) {
-            Fail "Windows 防火墙安全基线无法生效，直连模式拒绝在 0.0.0.0 上启动：$($_.Exception.Message)"
-            Write-Host "修复 Windows 防火墙，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。" -ForegroundColor Red
-            exit 1
-        }
-        Warn "ALLOW_UNMANAGED_FIREWALL=1：未使用 Windows 防火墙基线，依赖你已配置的外部防火墙。原因：$($_.Exception.Message)"
-    }
-} else {
-    # 旧直连入口保留到新机器人和隧道健康，部署中途失败时仍可恢复旧服务。
-    $cleanupFirewallAfterHealth = $true
-}
-
+if (-not (Test-Path -LiteralPath $AppBotFile -PathType Leaf)) { throw '缺少 data\config\app-bot.json（应用机器人凭据），正在恢复原部署。' }
+Protect-ProjectSecretPath $AppBotFile
 
 # 旧服务已在依赖和配置变更之前停止，所有后续失败统一进入 finally 回滚。
 function Sq($s) { return "'" + ($s -replace "'", "''") + "'" }
 function Save-DeploymentState {
     Set-Content -LiteralPath $PortFile -Value $Port -NoNewline -Encoding ASCII
-    Set-Content -LiteralPath $ModeFile -Value $mode -NoNewline -Encoding ASCII
-    Set-Content -LiteralPath $GroupRootFile -Value $GroupDataRoot -NoNewline -Encoding UTF8
-    if ($persistDomain) {
-        Set-Content -LiteralPath $DomainFile -Value $publicDomain -NoNewline -Encoding ASCII
-    } elseif ($clearPersistedDomain) {
-        Move-ToProjectArchive $DomainFile $Project
-    }
+    Set-Content -LiteralPath $WorkspaceRootFile -Value $WorkspaceRoot -NoNewline -Encoding UTF8
 }
-$env:GROUP_DATA_ROOT = $GroupDataRoot
+# 原生服务从 runtime.json 读取 WORKSPACE_ROOT；默认目录不写入（runtime-settings.ts 删除该项）。
+$env:WORKSPACE_ROOT = if ($WorkspaceRoot) { $WorkspaceRoot } else { $DefaultWorkspace }
+# 构建标识（src/core/version.ts 的 APP_BUILD）随提交记入部署记录；启动器每次启动时按检出重新取得。
+$env:APP_BUILD = Get-CheckoutBuild $gitPath $Project
 $env:BOT_PORT = $Port
 $env:BOT_HOST = $BotHost
-$env:BOT_DEBUG = $BotDebug
 $env:BOT_MAX_ACTIVE_REQUESTS = $BotMaxActiveRequests
 if (-not $dataPreparationPlanned) {
-    & $bunPath run $dataPreparationRunner preview --project $Project --groups $GroupDataRoot --plan $dataPreparationPlan
-    if ($LASTEXITCODE -ne 0) { throw '迁移预览失败' }
+    & $bunPath run $dataPreparationRunner preview --project $Project --plan $dataPreparationPlan --workspace $finalWorkspace
+    if ($LASTEXITCODE -ne 0) { throw '数据预检失败' }
     $dataPreparationAttempted = $true
-    & $bunPath run $dataPreparationRunner apply --project $Project --groups $GroupDataRoot --plan $dataPreparationPlan
-    if ($LASTEXITCODE -ne 0) { throw '数据迁移失败' }
+    & $bunPath run $dataPreparationRunner apply --project $Project --plan $dataPreparationPlan
+    if ($LASTEXITCODE -ne 0) { throw '数据准备失败' }
 }
 Set-Content -LiteralPath (Join-Path $StateDir 'verify-only') -Value 'verify' -Encoding ASCII
 Invoke-WithUtf8Output { & $bunPath run scripts/config/runtime-settings.ts }
@@ -811,27 +543,11 @@ $launcherBody = @"
 `$env:PATH = $(Sq ($UvDir + ";" + $BashDir + ";")) + `$env:PATH
 Set-Location $(Sq $Project)
 . $(Sq (Join-Path $Project 'scripts\lib\bot-supervisor.ps1'))
-`$botExitCode = Invoke-BotSupervision -BunPath $(Sq $bunPath) -Entry $(Sq $Entry)
+`$botExitCode = Invoke-BotSupervision -BunPath $(Sq $bunPath) -Entry $(Sq $Entry) -GitPath $(Sq $gitPath)
 exit `$botExitCode
 "@
 $utf8WithBom = New-Object System.Text.UTF8Encoding($true)
 [System.IO.File]::WriteAllText($LauncherFile, $launcherBody, $utf8WithBom)
-
-$publicDomainDisplay = if ($publicDomain) { $publicDomain } else { "<你的域名>" }
-$url = if ($mode -eq "cloudflare") {
-    "https://$publicDomainDisplay/webhook/<SECRET>"
-} else {
-    "http://<服务器IP>:$Port/webhook/<SECRET>"
-}
-Write-Host ""
-Write-Host "==== 回调 URL（填入 IM 平台）====" -ForegroundColor Cyan
-if ($showSecret) {
-    Write-Host ("  " + ($url -replace "<SECRET>", $secret)) -ForegroundColor White
-    Warn "密钥仅显示一次；轮换时停机并将 data\config\webhook-secret 移入 backup\rm，再重新部署。"
-} else {
-    Write-Host "  $url" -ForegroundColor White
-    Write-Host "  密钥未变化；查看：Get-Content data\config\webhook-secret"
-}
 
 Step "安装 Windows 计划任务 '$TaskName'（优先开机启动，失败自动重试）..."
 $fileArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $LauncherFile + '"'
@@ -883,109 +599,16 @@ if (-not $healthy) {
     throw "新部署未通过预检"
 }
 Done "部署预检通过"
-if ($mode -eq "direct") {
-    $existingTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-    if ($existingTunnelService) {
-        if (Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf) {
-            Step "直连模式：停止并禁用本项目管理的 Cloudflared 服务..."
-            try {
-                if ($existingTunnelService.Status -ne "Stopped") {
-                    Stop-Service -Name "Cloudflared" -Force -ErrorAction Stop
-                }
-                Set-Service -Name "Cloudflared" -StartupType Disabled -ErrorAction Stop
-                Done "本项目 Cloudflared 已停止并禁用，重启后也不会恢复旧隧道入口"
-            } catch {
-                Fail "无法停止或禁用本项目 Cloudflared 服务：$($_.Exception.Message)"
-                exit 1
-            }
-        } elseif (-not $unmanagedTunnelConfirmed) {
-            # 停机期间不再询问；停机前没有这项服务，说明它是部署期间出现的，回滚后重新部署时再确认。
-            Fail "部署期间出现未标记为本项目所有的 Cloudflared 服务，无法确认遗留隧道的安全边界；部署将回滚。确认其归属后重新部署。"
-            throw '部署期间出现未确认的 Cloudflared 服务'
-        }
-    }
-}
 # 登录时启动意味着无人值守重启后不会自动运行，需要提醒；正常的开机任务只做说明。
 if ($taskUsesS4U) { Done "任务启动方式：$taskStartDescription。" } else { Warn "任务启动方式：$taskStartDescription。" }
 
-# ---- 7b. Cloudflare 模式：确保隧道在线（已有服务则启动，否则调用安装脚本）----
-if ($mode -eq "cloudflare") {
-    Step "Cloudflare 模式：确保 cloudflared 隧道在线..."
-    $svc = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-    if ($svc) {
-        $managedTunnelService = Test-Path -LiteralPath $TunnelManagedFile -PathType Leaf
-        if (-not $managedTunnelService) {
-            if (-not $unmanagedTunnelConfirmed) {
-                Fail "部署期间出现没有本项目归属标记的 Cloudflared 服务，无法确认它连接的是当前隧道；部署将回滚。确认其归属后重新部署。"
-                throw '部署期间出现未确认的 Cloudflared 服务'
-            }
-        } else {
-            Set-Service -Name "Cloudflared" -StartupType Automatic -ErrorAction Stop
-        }
-        if ($svc.Status -ne "Running") {
-            try { Start-Service "Cloudflared"; Done "Cloudflared 服务已启动（原状态：$(Get-ServiceStateLabel $svc.Status)）。" }
-            catch { Warn "启动 Cloudflared 服务失败：$($_.Exception.Message)。请使用 $(Get-OpsCommandHint 'doctor -Repair')，并查看 Windows 事件查看器。" }
-        } else {
-            Done "Cloudflared 服务已经在运行。"
-        }
-        Done "继续沿用现有隧道连接；更新 data\config\cloudflared-token 后，请使用 $(Get-OpsCommandHint 'repair-tunnel') 使新 token 生效。"
-    } else {
-        Step "安装 Cloudflared 隧道服务（使用停机前提供的 token）..."
-        $stPath = Join-Path $Project "scripts\tunnel\start-tunnel.ps1"
-        $env:BOT_PORT = $Port
-        # 停机前已校验 token 来源；服务在停机前后才消失时没有预先输入，由安装器读取默认来源。
-        $tokIn = if ($tunnelInputPrepared) { $preparedTunnelInput } else { '' }
-        $preparedTunnelInput = $null
-        $previousTokenInput = $env:MIXIN_TUNNEL_TOKEN_INPUT
-        $previousAllowVerification = $env:MIXIN_TUNNEL_ALLOW_VERIFICATION
-        $previousErrorActionPreference = $ErrorActionPreference
-        $tunnelExitCode = 1
-        try {
-            # Windows PowerShell 5.1 会把原生命令的 stderr 包装为 ErrorRecord；
-            # 此处让子脚本直接输出，再按真实退出码判断，避免错误提示中断退出码采集。
-            $ErrorActionPreference = "Continue"
-            $env:MIXIN_TUNNEL_TOKEN_INPUT = $tokIn
-            # 提交前运行的是验证实例；安装器需要明确放行它，否则会判定为本机没有机器人。
-            $env:MIXIN_TUNNEL_ALLOW_VERIFICATION = '1'
-            & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stPath
-            $tunnelExitCode = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previousErrorActionPreference
-            $env:MIXIN_TUNNEL_TOKEN_INPUT = $previousTokenInput
-            $env:MIXIN_TUNNEL_ALLOW_VERIFICATION = $previousAllowVerification
-            $tokIn = $null
-        }
-        $installedTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-        if ($tunnelExitCode -ne 0 -or -not $installedTunnelService -or $installedTunnelService.Status -ne "Running") {
-            # 停机期间不再重新询问 token；回滚恢复原服务后，重新部署会在停机前再次收集。
-            Fail "Cloudflared 隧道未能安装或启动（见上方提示）；部署将回滚。确认 token 后重新部署。"
-            throw 'Cloudflared 隧道安装失败'
-        }
-    }
-    $finalTunnelService = Get-Service -Name "Cloudflared" -ErrorAction SilentlyContinue
-    if (-not $finalTunnelService -or $finalTunnelService.Status -ne "Running") {
-        Fail "Cloudflare 模式部署未完成：Cloudflared 服务没有运行。请使用 $(Get-OpsCommandHint 'doctor -Repair')。"
-        exit 1
-    }
-}
-
-if ($cleanupFirewallAfterHealth) {
-    # 只在确实删除了旧规则时提示；没有遗留规则的常规重部署不输出。
-    $staleFirewallRules = @(Get-NetFirewallRule -Group "mixin-chatbot" -ErrorAction SilentlyContinue |
-        Where-Object { $mode -ne "direct" -or $_.Name -ne $currentFirewallRuleName })
-    if ($staleFirewallRules.Count -gt 0) {
-        $staleFirewallRules | Remove-NetFirewallRule -ErrorAction Stop
-        if ($mode -eq "direct") { Done "已删除 $($staleFirewallRules.Count) 条本项目旧防火墙规则，Windows 防火墙只保留当前机器人入口" }
-        else { Done "Cloudflare 模式已删除 $($staleFirewallRules.Count) 条本项目旧直连防火墙规则" }
-    }
-}
-# 部署预检通过且隧道/直连切换成功后再提交，避免 doctor 读取半完成配置。
+# 部署预检通过后再提交，避免 doctor 读取半完成配置。
 Step "提交部署..."
 Save-DeploymentState
 Done "部署状态已写入 data\state。"
 if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止' }
-& $bunPath run $dataPreparationRunner commit --project $Project --groups $GroupDataRoot
-if ($LASTEXITCODE -ne 0) { throw '迁移提交失败' }
+& $bunPath run $dataPreparationRunner commit --project $Project --deployment (Split-Path $snapshot.Path -Leaf) --workspace $finalWorkspace
+if ($LASTEXITCODE -ne 0) { throw '数据提交失败' }
 $deploymentCommitted = $true
 Remove-Item -LiteralPath (Join-Path $StateDir 'verify-only') -Force
 Step "启动机器人并等待健康检查..."
@@ -993,8 +616,9 @@ Enable-ScheduledTask -TaskName $TaskName | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 if (-not (Wait-BotHealth $Port)) { throw "数据已提交，但业务实例未就绪；保留新版本，请使用 $(Get-OpsCommandHint 'logs') 检查后使用 $(Get-OpsCommandHint 'resume') 继续。" }
 $deploymentActivated = $true
-Done "机器人已启动（群数据总根=$GroupDataRoot）。停止请用 $(Get-OpsCommandHint 'stop')；日志：$(Get-OpsCommandHint 'logs')"
-Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 → 外链配置」按需启用。"
+Done "机器人已启动（共享资料目录=$(if ($WorkspaceRoot) { $WorkspaceRoot } else { $DefaultWorkspace })）。停止请用 $(Get-OpsCommandHint 'stop')；日志：$(Get-OpsCommandHint 'logs')"
+Done "消息接收：平台事件 Stream（主动连出 imtwo.zdxlz.com、imfl.zdxlz.com 的 443 端口，无需入站端口或公网域名）。"
+Done "可选大文件外链：不超过 30 MiB 的文件直接发送；更大的文件需要外链，运行 bun run tui，进入「系统 → 设置 → 外链配置」按需启用。"
 
 } catch { Write-OperationFailure $_; throw } finally {
     if (-not $deploymentCommitted -and $deploymentMutated) {
@@ -1002,8 +626,7 @@ Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 �
         try {
             if ($dataPreparationAttempted) {
                 if (-not (Stop-ProjectBot $Project $TaskName -KeepDisabled)) { throw '验证实例未停止，拒绝恢复数据' }
-                $rollbackGroups = if ($dataPreparationPlanned) { $dataPreparationGroups } else { $GroupDataRoot }
-                & $bunPath run $dataPreparationRunner rollback --project $Project --groups $rollbackGroups --deployment (Split-Path $snapshot.Path -Leaf)
+                & $bunPath run $dataPreparationRunner rollback --project $Project --deployment (Split-Path $snapshot.Path -Leaf)
                 if ($LASTEXITCODE -ne 0) { throw '数据已提交或恢复失败；保持停机，保留备份' }
             }
             Remove-Item -LiteralPath (Join-Path $StateDir 'verify-only') -Force -ErrorAction SilentlyContinue
@@ -1011,7 +634,7 @@ Done "可选大文件外链：运行 bun run tui，进入「系统 → 设置 �
             Remove-Item -LiteralPath $transactionPointer -Force -ErrorAction Stop
             Write-OperationEvent 'info' ('data and deployment restored; snapshot=' + $snapshot.Path)
             $serviceState = if ($snapshot.WasRunning) { '机器人服务已重新启动' } else { '机器人服务保持停止' }
-            Write-Host ('部署已回滚：配置、依赖、计划任务和网络入口已恢复到部署前；' + $serviceState + '。') -ForegroundColor Yellow
+            Write-Host ('部署已回滚：配置、依赖和计划任务已恢复到部署前；' + $serviceState + '。') -ForegroundColor Yellow
         }
         catch {
             Write-OperationFailure $_

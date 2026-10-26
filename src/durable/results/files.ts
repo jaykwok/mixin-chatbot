@@ -31,7 +31,7 @@ import { configuredRootlessTasks } from "../../core/task-backend.ts";
 
 const IMAGE_EXTENSIONS: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
 
-/** Directory name of one call: unique per task in the group's database; the call ID made path-safe. */
+/** Directory name of one call: unique per task in the space's database; the call ID made path-safe. */
 export function resultsDirName(taskId: number, callId: string): string {
   return `${taskId}-${callId.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80)}`;
 }

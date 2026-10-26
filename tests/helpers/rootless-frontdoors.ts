@@ -12,7 +12,7 @@ const root = process.argv[2]!, temp = join(root, "caller"), workspace = join(roo
 await Promise.all([temp, workspace, index].map(path => mkdir(path)));
 await mkdir(join(root, "control"), { mode: 0o700 });
 await writeFile(join(index, "materials.md"), "synthetic reference");
-const tools = await buildLocalTools({ workspaceDir: workspace, tempDir: temp, phone: "synthetic", groupId: "synthetic", venvDir: join(root, "absent-venv"), materialsIndexPath: join(index, "materials.md"), resourceReadDirs: [join(root, "control")] });
+const tools = await buildLocalTools({ workspaceDir: workspace, tempDir: temp, phone: "synthetic", scope: { kind: "group", groupId: "synthetic" }, venvDir: join(root, "absent-venv"), materialsIndexPath: join(index, "materials.md"), resourceReadDirs: [join(root, "control")] });
 const call = (name: string, args: object) => tools.find(tool => tool.name === name)!.execute(name, args, undefined, undefined, {} as never);
 const first = await call("bash", { command: 'printf owned > "$PI_USER_TMP/output"; printf "TASK_PATH:%s\\n" "$PI_USER_TMP"' });
 const text = first.content.filter(item => item.type === "text").map(item => item.text).join("\n");

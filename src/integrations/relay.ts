@@ -7,13 +7,13 @@ import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { application, KeyedQueue } from "../core/lifecycle.ts";
-import { MAX_ATTACHMENT_BYTES, RELAY_HTTP_TIMEOUT } from "../core/config.ts";
+import { NATIVE_FILE_MAX_BYTES, RELAY_HTTP_TIMEOUT } from "../core/config.ts";
 import { log } from "../core/log.ts";
 import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../core/storage.ts";
 import { openRelayIndex, relayCacheKey, type RelayIndex, type RelayIndexEntry } from "./relay-index.ts";
 import { deleteObject, downloadUrl, objectBaseUrl, objectNameFromUrl, putObject, remoteStillExists,
-  readRelayConfigFile, storedObjectUrl, S3RequestError, type RelayConfig } from "./relay-s3.ts";
-export { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, validateRelayConfig, type RelayConfig } from "./relay-s3.ts";
+  readRelayConfigFile, storedObjectUrl, S3RequestError, LinkUnavailable, type RelayConfig } from "./relay-s3.ts";
+export { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, LinkUnavailable, validateRelayConfig, type RelayConfig } from "./relay-s3.ts";
 
 export function loadRelayConfig(path = RELAY_CONFIG_PATH): RelayConfig | null {
   return readRelayConfigFile(path);
@@ -39,7 +39,7 @@ export function relayBackendId(config: RelayConfig): string {
 const backend = relayBackendId;
 
 /** Durable references contain neither signing credentials nor transient query parameters. */
-export interface RelayReference { backend: string; url: string; name: string; size: number; }
+export type RelayReference = { backend: string; url: string; name: string; size: number };
 export function relayReference(config: RelayConfig, url: string, name: string, size: number): RelayReference {
   const stored = new URL(url);
   stored.search = "";
@@ -54,17 +54,17 @@ function isExpired(entry: RelayIndexEntry): boolean {
 export async function refreshRelayReference(reference: RelayReference, signal?: AbortSignal,
   config = getRelayConfig(), suppliedIndex?: RelayIndex): Promise<{ url: string; note: string }> {
   if (!config || reference.backend !== backend(config) || !objectNameFromUrl(config, reference.url)) {
-    throw new Error("附件后端已变更，待补发记录已保留，请联系管理员");
+    throw new LinkUnavailable("附件后端已变更，请联系管理员");
   }
   const index = suppliedIndex ?? await getRelayIndex();
   const entry = index.findUploaded(reference.url);
-  if (!entry || (reference.size >= 0 && entry.size !== reference.size)) throw new Error("附件已不在外链账本中，待补发记录已保留，请重新生成文件");
+  if (!entry || (reference.size >= 0 && entry.size !== reference.size)) throw new LinkUnavailable("附件已不在外链账本中，请重新生成文件");
   return withUploadLock(entry.key, async () => {
     const current = index.get(entry.key);
     if (!current || current.url !== reference.url || current.state !== "uploaded" || isExpired(current)) {
-      throw new Error("附件下载链接已过期，待补发记录已保留，请重新发送文件");
+      throw new LinkUnavailable("附件下载链接已过期，请重新发送文件");
     }
-    if (!await remoteStillExists(config, current.url, current.size, signal)) throw new Error("附件已从后端删除，待补发记录已保留，请重新生成文件");
+    if (!await remoteStillExists(config, current.url, current.size, signal)) throw new LinkUnavailable("附件已从后端删除，请重新生成文件");
     const url = downloadUrl(config, current.url, current.expiresAt!);
     return { url, note: relayNote(reference.name, reference.size, url) };
   }, signal);
@@ -77,7 +77,7 @@ export async function refreshRelayReference(reference: RelayReference, signal?: 
 export function relayNote(name: string, size: number, url: string): string {
   return `📎 ${name}（${formatSize(size)}）\n` +
     `⏳ 请在 ${relayDeadline(url)}（北京时间）前下载，过期后链接失效。\n` +
-    `文件超过群聊 ${formatSize(MAX_ATTACHMENT_BYTES)} 附件上限，已改为链接下载：点击下方链接，在提示页点“继续前往”即可下载。\n` +
+    `文件超过 ${formatSize(NATIVE_FILE_MAX_BYTES)} 附件上限，已改为链接下载：点击下方链接，在提示页点“继续前往”即可下载。\n` +
     url;
 }
 

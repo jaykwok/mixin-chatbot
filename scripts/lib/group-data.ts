@@ -1,6 +1,6 @@
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { groupSegment } from "../../src/agent/paths.ts";
+import { groupSegment } from "../../src/core/layout.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";
 
 export type GroupSelection = "auto" | "id" | "segment";
@@ -17,9 +17,9 @@ export function byName(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** A scanned storage name and an external ID are different namespaces. */
-export async function resolveGroupName(value: string, root: string, kind: GroupSelection = "auto"): Promise<string | null> {
-  const names = await dataDirectoryNames(root, root);
+/** A scanned storage name and an external ID are different namespaces. `dir` lists the group segments, `root` bounds the walk. */
+export async function resolveGroupName(value: string, dir: string, kind: GroupSelection = "auto", root = dir): Promise<string | null> {
+  const names = await dataDirectoryNames(dir, root);
   const encoded = groupSegment(value);
   const byId = names.includes(encoded) ? encoded : null;
   const bySegment = names.includes(value) ? value : null;
@@ -35,12 +35,12 @@ export async function resolveGroupName(value: string, root: string, kind: GroupS
 export async function assertDataDirectory(path: string, root: string): Promise<void> {
   const base = resolve(root);
   let current = resolve(path);
-  if (!isPathInside(current, base)) throw new Error("群数据目录越界");
+  if (!isPathInside(current, base)) throw new Error("数据目录越界");
   const canonical = await realpath(base);
   for (;;) {
     const info = await lstat(current);
     if (!info.isDirectory() || info.isSymbolicLink() || !isPathInside(await realpath(current), canonical)) {
-      throw new UnsafeDataDirectoryError("群数据路径已改变或包含符号链接，拒绝操作");
+      throw new UnsafeDataDirectoryError("数据路径已改变或包含符号链接，拒绝操作");
     }
     if (current === base) break;
     current = dirname(current);
@@ -50,7 +50,7 @@ export async function assertDataDirectory(path: string, root: string): Promise<v
 export async function dataDirectoryNames(path: string, root: string): Promise<string[]> {
   try {
     await assertDataDirectory(path, root);
-    // Group and user segments never start with a dot (src/agent/paths.ts); the group root lease directory does.
+    // Group and user segments never start with a dot (src/core/layout.ts).
     return (await readdir(path, { withFileTypes: true }))
       .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith(".")).map(entry => entry.name);
   } catch (error) {

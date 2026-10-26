@@ -43,7 +43,7 @@ function Start-OperationLog([string]$ProjectRoot, [string]$Kind) {
         $directory = Join-Path $ProjectRoot 'logs\operations'
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
         if ((Get-Item -LiteralPath $directory).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '日志目录不能是链接' }
-        $pattern = '^(upgrade|deploy|migration|startup)-[0-9TZ]+-[a-zA-Z0-9_-]+\.log$'
+        $pattern = '^(upgrade|deploy|startup)-[0-9TZ]+-[a-zA-Z0-9_-]+\.log$'
         $context.OwnsLog = -not ($env:BOT_OPERATION_LOG -match $pattern)
         $name = if (-not $context.OwnsLog) { $env:BOT_OPERATION_LOG } else { $Kind + '-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-' + [Guid]::NewGuid().ToString('N') + '.log' }
         $path = Join-Path $directory $name

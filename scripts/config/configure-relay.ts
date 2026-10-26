@@ -4,7 +4,7 @@ import { cancel, confirm, intro, isCancel, log, note, outro, password, select, t
 import { createHash, randomUUID } from "node:crypto";
 import { chown, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
+import { NATIVE_FILE_MAX_BYTES } from "../../src/core/config.ts";
 import { archiveFile, replaceFile, withMaintenance } from "../../src/core/maintenance.ts";
 import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../../src/core/storage.ts";
 import { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, relayBackendId, validateRelayConfig, type RelayConfig } from "../../src/integrations/relay.ts";
@@ -111,7 +111,7 @@ async function prepare(draftPath: string): Promise<void> {
       "腾讯 COS 桶名包含 APPID，端点形如 cos.ap-chengdu.myqcloud.com（不含桶名）；天翼云端点和区域按所选产品、资源池的 S3 文档填写。",
       "对象默认放在桶根目录，路径为 日期-UUID/原文件名，建议使用专用桶；高级设置可改放子目录。",
       "云端另设生命周期兜底；关闭版本控制、对象锁及复制，避免删除后仍保留历史副本。",
-      "默认下载有效 2 小时，额外保留 30 分钟后清理。查看和补发不延长期限。",
+      "默认下载有效 2 小时，额外保留 30 分钟后清理。查看和重发不延长期限。",
       "此向导只校验配置，不上传文件，也不修改云端权限或生命周期。",
     ].join("\n"), "对象存储准备");
     const next: RelayConfig = { ...(previous ?? {
@@ -163,7 +163,7 @@ async function prepare(draftPath: string): Promise<void> {
       // No defaultValue: clack would turn a cleared field back into the old directory, leaving no way to choose the root.
       next.prefix = bail<string>(await text({ message: "对象目录 Prefix（清空表示桶根目录）", initialValue: next.prefix,
         validate: value => validationError({ ...next, prefix: value ?? "" }) })).trim();
-      next.maxBytes = Number(await askText("单文件外链上限（MiB，须大于 " + MAX_ATTACHMENT_BYTES / MIB + "，最大 5120）",
+      next.maxBytes = Number(await askText("单文件外链上限（MiB，须大于 " + NATIVE_FILE_MAX_BYTES / MIB + "，最大 5120）",
         String(next.maxBytes / MIB), value => validationError({ ...next, maxBytes: Number(value) * MIB }))) * MIB;
       next.expireHours = Number(await askText("链接有效期（小时，最多 168）", String(next.expireHours),
         value => validationError({ ...next, expireHours: Number(value) })));

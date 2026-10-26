@@ -9,23 +9,24 @@ interface DatabaseFiles {
   modified: number;
 }
 
-export interface GroupHistory {
-  group: string;
+export interface SpaceHistory {
+  /** `direct` or `groups/<segment>` (src/core/layout.ts `spacePath`). */
+  space: string;
   dir: string;
-  /** 群库；尚无对话时没有这一项。 */
+  /** 会话库；尚无对话时没有这一项。 */
   database?: DatabaseFiles;
-  /** 群库及日志合计。 */
+  /** 会话库及日志合计。 */
   bytes: number;
 }
 
-const DATABASE = "durable.sqlite";
+export const DATABASE = "durable.sqlite";
 
-/** 群的最后活动：群库最新的修改时间。 */
-export function lastActivity(group: GroupHistory): number {
-  return group.database?.modified ?? 0;
+/** 空间的最后活动：会话库最新的修改时间。 */
+export function lastActivity(space: SpaceHistory): number {
+  return space.database?.modified ?? 0;
 }
 
-/** 群库文件（不跟随链接）；没有主库文件时为 undefined。 */
+/** 会话库文件（不跟随链接）；没有主库文件时为 undefined。 */
 async function databaseFiles(dir: string): Promise<DatabaseFiles | undefined> {
   let bytes = 0;
   let modified = 0;
@@ -42,22 +43,33 @@ async function databaseFiles(dir: string): Promise<DatabaseFiles | undefined> {
   return { bytes, modified };
 }
 
-/**
- * 一个群（实际目录段）的会话历史；没有群库时为 null。
- */
-export async function scanGroupHistory(root: string, group: string): Promise<GroupHistory | null> {
-  const dir = join(root, group);
+/** 数据目录（root）下一个空间的会话历史；没有会话库时为 null。 */
+export async function scanSpaceHistory(root: string, space: string): Promise<SpaceHistory | null> {
+  const dir = join(root, "conversations", ...space.split("/"));
   const database = await databaseFiles(dir);
   if (database === undefined) return null;
-  return { group, dir, database, bytes: database.bytes };
+  return { space, dir, database, bytes: database.bytes };
 }
 
-/** 按占用从大到小列出各群的会话历史；没有群库的群不出现。 */
-export async function scanHistory(root: string): Promise<GroupHistory[]> {
-  const groups: GroupHistory[] = [];
-  for (const group of await dataDirectoryNames(root, root)) {
-    const history = await scanGroupHistory(root, group);
-    if (history) groups.push(history);
+/** 有会话库的空间：单聊空间 conversations/direct，群 conversations/groups/<群>；不跟随链接。 */
+export async function historySpaces(root: string): Promise<string[]> {
+  const conversations = join(root, "conversations");
+  const top = await dataDirectoryNames(conversations, root);
+  return [...(top.includes("direct") ? ["direct"] : []),
+    ...(await dataDirectoryNames(join(conversations, "groups"), root)).map(group => "groups/" + group)];
+}
+
+/** 按占用从大到小列出各空间的会话历史；没有会话库的空间不出现。 */
+export async function scanHistory(root: string): Promise<SpaceHistory[]> {
+  const spaces: SpaceHistory[] = [];
+  for (const space of await historySpaces(root)) {
+    const history = await scanSpaceHistory(root, space);
+    if (history) spaces.push(history);
   }
-  return groups.sort((a, b) => b.bytes - a.bytes || byName(a.group, b.group));
+  return spaces.sort((a, b) => b.bytes - a.bytes || byName(a.space, b.space));
+}
+
+/** 显示用：单聊空间与群（目录段）。 */
+export function spaceName(space: string): string {
+  return space === "direct" ? "单聊" : `群 ${space.slice("groups/".length)}`;
 }

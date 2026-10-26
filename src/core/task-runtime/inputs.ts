@@ -24,7 +24,7 @@ export function assertReadOnlyExport(source: string, canonical: string, controlR
 }
 
 const allowedEnvironment = new Set(["TMP", "TEMP", "TMPDIR", "LANG", "LC_ALL", "PYTHONUTF8", "PYTHONIOENCODING", "PYTHONDONTWRITEBYTECODE", "PYTHON_BASIC_REPL",
-  "XDG_CACHE_HOME", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT", "PI_USER_TMP", "PI_PYTHON", "PI_MATERIALS_INDEX", "PI_CALLER_PHONE", "PI_GROUP_ID", "AI_AGENT", "PI_CODING_AGENT",
+  "XDG_CACHE_HOME", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT", "PI_USER_TMP", "PI_PYTHON", "PI_MATERIALS_INDEX", "PI_CALLER_PHONE", "PI_SPACE", "AI_AGENT", "PI_CODING_AGENT",
   "npm_config_cache", "BUN_INSTALL_CACHE_DIR", "PIP_CACHE_DIR", "UV_CACHE_DIR"]);
 
 export function workerEnvironment(env: NodeJS.ProcessEnv | undefined): [string, string | undefined][] {

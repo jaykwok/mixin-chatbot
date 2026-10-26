@@ -2,26 +2,27 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import { acquireGroupRootLease, acquireLease } from "../core/maintenance.ts";
+import { acquireLease } from "../core/maintenance.ts";
 import { validateCurrentData } from "../core/data-validation.ts";
-import { serviceGroupRoot, verificationPending } from "../core/data-version.ts";
+import { verificationPending } from "../core/data-version.ts";
+import { APP_BUILD, APP_VERSION } from "../core/version.ts";
+import { constantTimeEqual } from "./http.ts";
 
-const releaseService = await acquireLease("verification");
-let releaseGroups: (() => Promise<void>) | undefined;
-const release = async () => { await releaseGroups?.(); await releaseService(); };
+const release = await acquireLease("verification");
 let server: ReturnType<typeof Bun.serve> | undefined;
 try {
-  releaseGroups = await acquireGroupRootLease("verification", serviceGroupRoot());
-  if (!verificationPending(process.cwd(), serviceGroupRoot())) throw new Error("升级事务已提交或不再允许只验证启动");
-  await validateCurrentData(process.cwd(), serviceGroupRoot());
+  if (!verificationPending(process.cwd())) throw new Error("升级事务已提交或不再允许只验证启动");
+  await validateCurrentData(process.cwd());
   const { HOST, PORT } = await import("../core/config.ts");
   const token = randomBytes(32).toString("hex"), instanceId = randomUUID(), startedAt = Date.now();
   const path = join("data/state", "instance.json");
-  let stopping = false;
+  let stopping = false, written: Promise<void> | undefined;
   const stop = async () => {
     if (stopping) return;
     stopping = true;
     await server?.stop(true);
+    // A stop during the write removes the file only after it exists.
+    await written?.catch(() => {});
     await unlink(path).catch(() => {});
     await release();
     process.exit(0);
@@ -29,14 +30,16 @@ try {
   server = Bun.serve({ hostname: HOST, port: PORT, fetch(request) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return Response.json({
-      service: "mixin-chatbot", version: 1, status: "ready", instanceId, startedAt, pid: process.pid, verificationOnly: true,
+      service: "mixin-chatbot", version: 1, appVersion: APP_VERSION, build: APP_BUILD, status: "ready", instanceId, startedAt, pid: process.pid, verificationOnly: true,
     });
-    if (request.method === "POST" && url.pathname === "/_admin/shutdown" && request.headers.get("Authorization") === `Bearer ${token}`) {
+    if (request.method === "POST" && url.pathname === "/_admin/shutdown" && constantTimeEqual(request.headers.get("Authorization") ?? "", `Bearer ${token}`)) {
       setTimeout(() => void stop(), 0);
       return Response.json({ status: "stopping" });
     }
     return Response.json({ status: "maintenance" }, { status: 503 });
   } });
-  await writeFile(path, JSON.stringify({ pid: process.pid, port: server.port, token, host: HOST, cwd: process.cwd(), instanceId, startedAt }), { mode: 0o600 });
+  // Before instance.json names this process: a signal from here on still removes it and releases the lease.
   process.once("SIGINT", () => void stop()); process.once("SIGTERM", () => void stop());
+  written = writeFile(path, JSON.stringify({ pid: process.pid, port: server.port, token, host: HOST, cwd: process.cwd(), instanceId, startedAt }), { mode: 0o600 });
+  await written;
 } catch (error) { await server?.stop(true); await release(); throw error; }

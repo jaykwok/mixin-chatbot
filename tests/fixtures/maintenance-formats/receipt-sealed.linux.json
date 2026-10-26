@@ -11,7 +11,7 @@
     "manager": "<ID1>",
     "daemon": "formats-fixture",
     "image": "sha256:<HEX64>",
-    "temp": "<ROOT0>/groups/group-a/users/alice/tmp",
+    "temp": "<ROOT0>/data/tmp/groups/group-a/alice",
     "createdAt": "<number>",
     "pid": "<number>",
     "ownerEpoch": "<ID2>",

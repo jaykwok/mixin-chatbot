@@ -6,8 +6,8 @@ import { RELEASE_FILE, type ReleaseState } from "../../../src/core/data-version.
 import { PROJECT_DIR, type Platform } from "./platform.ts";
 import { readTransaction, type TransactionReadSet } from "../../lib/confirmed-transaction.ts";
 
-const KEYS = ["format", "operation", "snapshot", "target_sha", "original_sha", "original_branch", "original_group_root",
-  "target_group_root", "was_running", "bot_port", "deploy_mode", "bot_domain", "domain_action", "unmanaged_tunnel", "platform_ip", "reconfigure_ai"] as const;
+const KEYS = ["format", "operation", "snapshot", "target_sha", "original_sha", "original_branch", "original_workspace_root",
+  "target_workspace_root", "was_running", "bot_port", "reconfigure_ai"] as const;
 export type TransactionRecord = Record<(typeof KEYS)[number], string>;
 
 export interface PendingTransaction {
@@ -26,13 +26,6 @@ export interface PendingTransaction {
 
 const SHA = /^([0-9a-f]{40}|[0-9a-f]{64})?$/;
 const SNAPSHOT = /^deploy-[A-Za-z0-9]+$/;
-/** 直连防火墙放行的来源：IPv4 或 IPv6，可带前缀长度。 */
-const PLATFORM_IP = /^(([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-Fa-f]*:[0-9A-Fa-f:.]*)(\/[0-9]{1,3})?$/;
-
-function validHostname(value: string): boolean {
-  return value.length <= 253 && value === value.toLowerCase() &&
-    value.split(".").every(label => label.length <= 63 && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(label));
-}
 
 const absolute = (value: string) => posix.isAbsolute(value) || win32.isAbsolute(value);
 
@@ -40,19 +33,14 @@ const absolute = (value: string) => posix.isAbsolute(value) || win32.isAbsolute(
 export function transactionValueValid(key: string, value: string): boolean {
   if (/[\x00-\x1f\x7f]/.test(value)) return false;
   switch (key) {
-    case "format": return value === "1";
+    case "format": return value === "2";
     case "operation": return value === "deploy" || value === "upgrade";
     case "snapshot": return SNAPSHOT.test(value);
     case "target_sha": case "original_sha": return SHA.test(value);
     case "original_branch": return /^[^\s~^:?*[\\]*$/.test(value);
-    case "original_group_root": case "target_group_root": return absolute(value);
+    case "original_workspace_root": case "target_workspace_root": return !value || absolute(value);
     case "was_running": case "reconfigure_ai": return value === "0" || value === "1";
     case "bot_port": return /^[1-9][0-9]{0,4}$/.test(value) && Number(value) <= 65535;
-    case "deploy_mode": return value === "direct" || value === "cloudflare";
-    case "bot_domain": return value === "" || validHostname(value);
-    case "domain_action": return ["keep", "persist", "clear"].includes(value);
-    case "unmanaged_tunnel": return ["", "direct", "cloudflare"].includes(value);
-    case "platform_ip": return value.length <= 64 && PLATFORM_IP.test(value);
     default: return false;
   }
 }
@@ -109,6 +97,7 @@ export function loadPendingTransaction(project = PROJECT_DIR): PendingTransactio
 }
 
 const shortSha = (sha: string | null) => sha ? sha.slice(0, 7) : "（非 git 部署）";
+const workspace = (root: string) => root || "data/workspace";
 
 /** 维护页确认框和恢复菜单共用的摘要：标题一行，记录内容逐行。 */
 export function describePendingTransaction(pending: PendingTransaction,
@@ -118,8 +107,8 @@ export function describePendingTransaction(pending: PendingTransaction,
   return {
     subject: `未完成的${kind}：目标提交 ${shortSha(pending.targetSha)}`,
     record: record ? [
-      `群数据总根：${record.target_group_root}${record.original_group_root !== record.target_group_root ? `（原 ${record.original_group_root}）` : ""}`,
-      `端口 ${record.bot_port} · 入口 ${record.deploy_mode === "cloudflare" ? "Cloudflare" : `直连（来源 ${record.platform_ip}）`}${record.bot_domain ? ` · ${record.bot_domain}` : ""}`,
+      `共享资料目录：${workspace(record.target_workspace_root)}${record.original_workspace_root !== record.target_workspace_root ? `（原 ${workspace(record.original_workspace_root)}）` : ""}`,
+      `本机端口 ${record.bot_port}`,
       `原运行状态：${record.was_running === "1" ? "运行" : "停止"}`,
     ] : ["升级正在准备当前发布记录"],
   };

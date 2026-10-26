@@ -26,7 +26,7 @@ export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, doo
         const { phone, places } = await resolveMember(options, call);
         if (!call.signal) throw new Error("MCP 工具需要可取消的任务");
         await mkdir(places.tempDir, { recursive: true });
-        const result = await manager.call(entry, { groupId: options.groupId, phone, workspaceDir: places.workspaceDir, tempDir: places.tempDir },
+        const result = await manager.call(entry, { scope: options.scope, phone, workspaceDir: places.workspaceDir, tempDir: places.requestDir ?? places.tempDir },
           args as Record<string, unknown>, call.signal, (dispatch, signal) => door.external(call.api, call.context, dispatch, signal));
         call.signal.throwIfAborted();
         const content = toLlmContent(result);

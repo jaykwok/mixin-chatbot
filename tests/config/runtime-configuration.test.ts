@@ -31,7 +31,7 @@ test("运行参数按需读取、形成独立草稿，预检不写配置，应�
   try {
     expect(await readRuntimeSettings(configFile(fixture.root))).toEqual({ hash: null, values: {} });
     expect(existsSync(configFile(fixture.root))).toBe(false);
-    const old = { BOT_PORT: 8888, BOT_HOST: "127.0.0.1", GROUP_DATA_ROOT: "/app/group-data", BOT_DEBUG: "1", BOT_INDEX_MAX_DEPTH: 14 };
+    const old = { BOT_PORT: 8888, BOT_HOST: "127.0.0.1", WORKSPACE_ROOT: "/srv/materials", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_INDEX_MAX_DEPTH: 14 };
     const snapshot = await seed(fixture.root, old);
     const draft = await writeRuntimeDraft(snapshot, { BOT_MAX_ACTIVE_REQUESTS: "64", PI_CACHE_RETENTION: "long" }, configFile(fixture.root));
     const checked = await run(fixture.root, "--check", draft);
@@ -40,7 +40,7 @@ test("运行参数按需读取、形成独立草稿，预检不写配置，应�
     const applied = await run(fixture.root, "--apply", draft, { BOT_PORT: "1234", BOT_ATTACHMENT_CONCURRENCY: "8" });
     expect(applied.code, applied.output).toBe(0);
     expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({
-      BOT_PORT: "8888", BOT_HOST: "127.0.0.1", GROUP_DATA_ROOT: "/app/group-data", BOT_DEBUG: "1", BOT_INDEX_MAX_DEPTH: "14",
+      BOT_PORT: "8888", BOT_HOST: "127.0.0.1", WORKSPACE_ROOT: "/srv/materials", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_INDEX_MAX_DEPTH: "14",
       BOT_MAX_ACTIVE_REQUESTS: "64", PI_CACHE_RETENTION: "long",
     });
     await rm(draft + ".rollback");
@@ -52,7 +52,7 @@ test("运行参数按需读取、形成独立草稿，预检不写配置，应�
 test("恢复默认会删除该覆盖值；环境冲突在停机前校验，取消草稿不影响原配置", async () => {
   const fixture = await tempFixture("runtime-reset-");
   try {
-    const snapshot = await seed(fixture.root, { BOT_MAX_ACTIVE_REQUESTS: "64", BOT_DEBUG: "1", BOT_DOCUMENT_ENV: "/app/custom-env" });
+    const snapshot = await seed(fixture.root, { BOT_MAX_ACTIVE_REQUESTS: "64", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_DOCUMENT_ENV: "/app/custom-env" });
     const draft = await writeRuntimeDraft(snapshot, { BOT_MAX_ACTIVE_REQUESTS: null, BOT_DOCUMENT_ENV: null }, configFile(fixture.root));
     const conflict = await run(fixture.root, "--check", draft, { BOT_MAX_ACTIVE_REQUESTS: "64" });
     expect(conflict.code).toBe(1);
@@ -60,7 +60,7 @@ test("恢复默认会删除该覆盖值；环境冲突在停机前校验，取�
     expect((await readRuntimeSettings(configFile(fixture.root))).hash).toBe(snapshot.hash);
     const applied = await run(fixture.root, "--apply", draft, { BOT_MAX_ACTIVE_REQUESTS: "032" });
     expect(applied.code, applied.output).toBe(0);
-    expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({ BOT_DEBUG: "1" });
+    expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({ BOT_DOCUMENT_WORK_ENABLED: "1" });
     const rollback = await run(fixture.root, "--rollback", draft);
     expect(rollback.code, rollback.output).toBe(0);
     expect(await readRuntimeSettings(configFile(fixture.root))).toEqual(snapshot);
@@ -73,7 +73,7 @@ test("拒绝非法值、部署字段和过期草稿，避免覆盖并发修改",
   const fixture = await tempFixture("runtime-conflict-");
   try {
     const snapshot = await seed(fixture.root, { BOT_INDEX_TTL_MINUTES: "5" });
-    for (const changes of [{ BOT_ATTACHMENT_CONCURRENCY: "9" }, { BOT_DEBUG: "true" }, { BOT_INDEX_MAX_FILES: "99" }, { BOT_PORT: "8080" }, {}]) {
+    for (const changes of [{ BOT_ATTACHMENT_CONCURRENCY: "9" }, { BOT_DOCUMENT_WORK_ENABLED: "true" }, { BOT_INDEX_MAX_FILES: "99" }, { BOT_PORT: "8080" }, {}]) {
       await expect(writeRuntimeDraft(snapshot, changes, configFile(fixture.root))).rejects.toThrow();
     }
     const draft = await writeRuntimeDraft(snapshot, { BOT_INDEX_TTL_MINUTES: "10" }, configFile(fixture.root));
@@ -123,17 +123,17 @@ test("发布失败保留原文件并可恢复，首次创建的配置可以回�
 test("回滚遇到后续修改时保留现场；未恢复的草稿不会被 TUI 清理", async () => {
   const fixture = await tempFixture("runtime-rollback-conflict-");
   try {
-    const snapshot = await seed(fixture.root, { BOT_DEBUG: "0" });
-    const draft = await writeRuntimeDraft(snapshot, { BOT_DEBUG: "1" }, configFile(fixture.root));
+    const snapshot = await seed(fixture.root, { BOT_DOCUMENT_WORK_ENABLED: "0" });
+    const draft = await writeRuntimeDraft(snapshot, { BOT_DOCUMENT_WORK_ENABLED: "1" }, configFile(fixture.root));
     expect((await run(fixture.root, "--apply", draft)).code).toBe(0);
-    await seed(fixture.root, { BOT_DEBUG: "1", BOT_BASH_TIMEOUT: "123" });
+    await seed(fixture.root, { BOT_DOCUMENT_WORK_ENABLED: "1", BOT_BASH_TIMEOUT: "123" });
     const rollback = await run(fixture.root, "--rollback", draft);
     expect(rollback.code).toBe(1);
     expect(rollback.output).toContain("又被修改");
     await discardRuntimeDraft(draft);
     expect(existsSync(draft)).toBe(true);
     expect(existsSync(draft + ".rollback")).toBe(true);
-    expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({ BOT_DEBUG: "1", BOT_BASH_TIMEOUT: "123" });
+    expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({ BOT_DOCUMENT_WORK_ENABLED: "1", BOT_BASH_TIMEOUT: "123" });
   } finally { await fixture.cleanup(); }
 }, 30000);
 

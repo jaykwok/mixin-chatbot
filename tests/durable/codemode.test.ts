@@ -25,12 +25,14 @@ import { type CodemodeDetails, codemodeExtension, CodemodeStoreDoc } from "../..
 import { removeResultDirectories, resultsDirName, resultsRoot } from "../../src/durable/results/files.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
-import { projectConversation } from "../../src/durable/projection.ts";
+import { syncMemberStats } from "../../src/durable/projection.ts";
 import {
   baseMemberTools, type BaseToolsOptions, type MemberCall, memberPlaces, memberRegistration, type MemberTool,
 } from "../../src/durable/tools.ts";
 import { type GroupHarness, openGroupHarness, PROJECT_PROGRESS as PROGRESS } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
+import { appLayout, groupScope } from "../../src/core/layout.ts";
 
 const fixture = await tempFixture("durable-codemode-");
 afterAll(() => fixture.cleanup());
@@ -80,7 +82,7 @@ async function openGroup(setup: Setup = {}): Promise<Group> {
     models = setup.models;
   }
   const model = faux.getModel();
-  const base: BaseToolsOptions = { root: join(fixture.root, `群数据-${n}`), groupId: setup.toolsGroup ?? GROUP };
+  const base: BaseToolsOptions = { layout: appLayout(join(fixture.root, `群数据-${n}`)), scope: groupScope(setup.toolsGroup ?? GROUP) };
   const members = baseMemberTools(base);
   const modules = setup.modules ?? [];
   const extensions = [
@@ -107,10 +109,10 @@ async function openGroup(setup: Setup = {}): Promise<Group> {
 }
 
 async function member(group: Group, phone = ALICE): Promise<Conversation> {
-  return (await memberConversation(group.opened.harness, GROUP, phone, { model: group.model }, context)).conversation;
+  return (await memberConversation(group.opened.harness, scopeOf(GROUP), phone, { model: group.model }, context)).conversation;
 }
 
-const places = (group: Group, phone = ALICE) => memberPlaces(group.base, GROUP, phone);
+const places = (group: Group, phone = ALICE) => memberPlaces(group.base, groupScope(GROUP), phone);
 
 type Content = { type: string; text?: string; data?: string; mimeType?: string };
 type Result = { isError: boolean; text: string; content: Content[]; details?: CodemodeDetails & { fullOutputPath?: string }; usage?: Usage };
@@ -299,25 +301,6 @@ const echo = probe("probe_echo", ({ text: value }) => {
 const send = probe("send_probe", () => text("sent"), { exposure: "model-only", description: "Send something (model only)." });
 const sendModule: Module = { name: "fixture.send", tools: [send] };
 
-test("parallel codemode children project nested counts once across cursor replay and rejects incompatible projection without rewriting history", async () => {
-  const group = await openGroup({ modules: [module(echo)] }), alice = await member(group);
-  const ledger = openStatsLedger(group.base.root);
-  try {
-    const run = await script(group, alice, 'await Promise.all([tools.probe_echo({text:"one"}),tools.probe_echo({text:"two"})]);');
-    expect(run.result.details!.partial).toBeUndefined();
-    const identity = { groupId: GROUP, phone: ALICE, conversationId: alice.id };
-    await projectConversation(ledger, group.opened.harness, identity, context);
-    const rows = () => readLedger(ledger).tools.filter(row => row.kind === "nested").map(({ tool, count }) => ({ tool, count }));
-    expect(rows()).toEqual([{ tool: "probe_echo", count: 2 }]);
-    await projectConversation(ledger, group.opened.harness, identity, context); expect(rows()).toEqual([{ tool: "probe_echo", count: 2 }]);
-    const before = readLedger(ledger).usage;
-    ledger.query("UPDATE sources SET projection = 3 WHERE projection = 4").run();
-    await expect(projectConversation(ledger, group.opened.harness, identity, context)).rejects.toThrow("统计投影格式不匹配");
-    expect(rows()).toEqual([{ tool: "probe_echo", count: 2 }]);
-    expect(readLedger(ledger).usage).toEqual(before);
-  } finally { ledger.close(); await group.close(); }
-});
-
 describe("Durable codemode: declarations and scope", () => {
   test("declarations: the official grammar tool, replay safe; plain direct tools; the codemode section lists what scripts can call", async () => {
     const group = await openGroup({ modules: [module(echo), sendModule] });
@@ -492,9 +475,9 @@ return { errors, legacy };`);
     try {
       const run = await script(other, await member(other), code);
       expect(run.result).toMatchObject({ isError: true });
-      expect(run.result.text).toContain("会话的成员身份不属于本群，工具未执行");
+      expect(run.result.text).toContain("会话的成员身份不属于本空间，工具未执行");
       expect(run.outcome).toBe("completed");
-      expect(existsSync(other.base.root)).toBe(false);
+      expect(existsSync(other.base.layout.tmp)).toBe(false);
     } finally { await other.close(); }
 
     const group = await openGroup({ door: false });
@@ -506,7 +489,7 @@ return { errors, legacy };`);
       }, context);
       const run = await script(group, (await group.opened.harness.conversation(id, context))!, code);
       expect(run.result.text).toContain("会话没有成员身份，工具未执行");
-      expect(existsSync(group.base.root)).toBe(false);
+      expect(existsSync(group.base.layout.tmp)).toBe(false);
     } finally { await group.close(); }
     expect(existsSync(marker)).toBe(false);
   });
@@ -636,26 +619,26 @@ return { a, b, hung };`, async () => nestedRunning(group, alice, "probe_hang"));
       expect(tools?.probe_metered).toEqual(usage(42));
       expect(tools?.codemode).toBeUndefined();
 
-      // Statistics charge the nested usage once, as the codemode result's, also when projected again.
-      const ledger = openStatsLedger(group.base.root);
+      // Statistics count the nested usage once, under the child tool, also when synced again.
+      const ledger = openStatsLedger(group.base.layout.stats);
       try {
-        const identity = { groupId: GROUP, phone: ALICE, conversationId: alice.id };
-        const charged = () => readLedger(ledger).usage.filter((row) => row.kind === "tool")
-          .map(({ requests, input, output, cost }) => ({ requests, input, output, cost: Math.round(cost * 1e6) / 1e6 }));
-        await projectConversation(ledger, group.opened.harness, identity, context);
-        expect(charged()).toEqual([{ requests: 2, input: 42, output: 84, cost: 0.126 }]);
-        await projectConversation(ledger, group.opened.harness, identity, context);
-        expect(charged()).toEqual([{ requests: 2, input: 42, output: 84, cost: 0.126 }]);
+        const identity = { scope: scopeOf(GROUP), phone: ALICE, conversationId: alice.id };
+        const charged = () => readLedger(ledger).usage.map(({ bucket, key, input, output, totalTokens }) => ({ bucket, key, input, output, totalTokens }))
+          .filter(row => row.bucket === "tools");
+        await syncMemberStats(ledger, group.opened.harness, identity, context);
+        expect(charged()).toEqual([{ bucket: "tools", key: "probe_metered", input: 42, output: 84, totalTokens: 126 }]);
+        await syncMemberStats(ledger, group.opened.harness, identity, context);
+        expect(charged()).toEqual([{ bucket: "tools", key: "probe_metered", input: 42, output: 84, totalTokens: 126 }]);
       } finally { ledger.close(); }
     } finally { await group.close(); }
   });
 
-  describe("usage across a restart: receipts charge each confirmed sub-call once, also when no VM reaches it again", () => {
+  describe("usage across a restart: each finished sub-call is charged once, at its own commit, also when no VM reaches it again", () => {
     const usage = (n: number): Usage => ({
       input: n, output: 2 * n, cacheRead: 0, cacheWrite: 0, totalTokens: 3 * n, reasoning: n,
       cost: { input: n / 1000, output: n / 500, cacheRead: 0, cacheWrite: 0, total: 3 * n / 1000 },
     });
-    const once = [{ requests: 1, input: 42, output: 84, cost: 0.126 }];
+    const once = [{ input: 42, output: 84 }];
     type Start = { version: number; fingerprint?: string };
     /**
      * Around the codemode call's API: `found` edits what a rerun's first commit found, `afterOutcome` runs once the outcome
@@ -712,16 +695,18 @@ return { a, b, hung };`, async () => nestedRunning(group, alice, "probe_hang"));
       return openGroup({ modules: [module(metered, probe("probe_hang", hang), ...tools)], extensions: [rerunFound] });
     }
 
-    /** The tool rows the ledger charged, after projecting the conversation twice (the same both times). */
+    /** The tool tokens in the ledger, summed over the tools, after syncing the conversation twice (the same both times). */
     async function charged(group: Group, conversation: Conversation) {
-      const ledger = openStatsLedger(group.base.root);
+      const ledger = openStatsLedger(group.base.layout.stats);
       try {
-        const identity = { groupId: GROUP, phone: ALICE, conversationId: conversation.id };
-        const rows = () => readLedger(ledger).usage.filter((row) => row.kind === "tool")
-          .map(({ requests, input, output, cost }) => ({ requests, input, output, cost: Math.round(cost * 1e6) / 1e6 }));
-        await projectConversation(ledger, group.opened.harness, identity, context);
+        const identity = { scope: scopeOf(GROUP), phone: ALICE, conversationId: conversation.id };
+        const rows = () => {
+          const tools = readLedger(ledger).usage.filter((row) => row.bucket === "tools");
+          return tools.length ? [{ input: tools.reduce((n, row) => n + row.input, 0), output: tools.reduce((n, row) => n + row.output, 0) }] : [];
+        };
+        await syncMemberStats(ledger, group.opened.harness, identity, context);
         const first = rows();
-        await projectConversation(ledger, group.opened.harness, identity, context);
+        await syncMemberStats(ledger, group.opened.harness, identity, context);
         expect(rows()).toEqual(first);
         return first;
       } finally { ledger.close(); }
@@ -791,7 +776,7 @@ return 1;`;
         expect(recovered.result.text).toContain("The script cannot resume: the sandbox changed since it started");
         expect(recovered.result.details!.usage).toEqual(usage(50));
         expect([runs, waits]).toEqual([1, 2]);
-        expect(await charged(group, alice)).toEqual([{ requests: 2, input: 50, output: 100, cost: 0.15 }]);
+        expect(await charged(group, alice)).toEqual([{ input: 50, output: 100 }]);
       } finally { await group.close(); }
     }, 60_000);
 
@@ -1428,7 +1413,7 @@ describe("Durable codemode: grammar and replay", () => {
         await writeFile(join(workspace, "note.txt"), "replay fixture note");
 
         // The Responses model writes the history: its custom tool call runs the raw source as a script.
-        const alice = (await memberConversation(group.opened.harness, GROUP, ALICE, { model: responses }, context)).conversation;
+        const alice = (await memberConversation(group.opened.harness, scopeOf(GROUP), ALICE, { model: responses }, context)).conversation;
         answers.push(toolCalls);
         await (await alice.submit({ type: "input", content: "先做两件事" }, context)).wait(context);
         expect(bodies).toHaveLength(2);

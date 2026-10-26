@@ -7,7 +7,7 @@ import { availableParallelism, release, tmpdir } from "node:os";
 const project = fileURLToPath(new URL("../", import.meta.url));
 
 // 分组并行：测试文件按耗时分成几组，每组都是一次完整的隔离运行（各自的工作目录、夹具、TEMP 和诊断日志），各组同时进行。
-// 不用 bun test --parallel：它的 worker 共用一个 cwd，而 data/groups、logs/ 等路径相对 cwd，会互相干扰。
+// 不用 bun test --parallel：它的 worker 共用一个 cwd，而 data/、logs/ 等路径相对 cwd，会互相干扰。
 // 耗时表只影响各组是否均衡，不影响运行哪些测试：仓库里的 tests/timings/<平台>.json 是基础，
 // 本机多组运行实测的耗时记在 tmp/test-timings-<平台>.json，优先使用。
 
@@ -222,7 +222,7 @@ async function execute(run: Run, args: string[], live: boolean, children: Set<Re
   const fixtures = join(run.cwd, "fixtures"), trash = join(run.cwd, "trash");
   writeSync(run.logFile, `工作目录 ${run.cwd}\n参数 ${JSON.stringify(args)}\n开始 ${new Date().toISOString()}\n\n`);
   const child = Bun.spawn([process.execPath, "test", ...args], { cwd: run.cwd, env: { ...process.env, TEMP: fixtures, TMP: fixtures,
-    TMPDIR: fixtures, TEST_TEMP_ROOT: fixtures, TEST_TRASH_DIR: trash, GROUP_DATA_ROOT: "data/groups" },
+    TMPDIR: fixtures, TEST_TEMP_ROOT: fixtures, TEST_TRASH_DIR: trash },
     stdin: "inherit", stdout: "pipe", stderr: "pipe", windowsHide: true });
   children.add(child);
   // 输出照常显示（或留待该组结束后整体显示），同时写入诊断日志。

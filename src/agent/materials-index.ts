@@ -1,4 +1,4 @@
-// 群共享资料清单写在 workspace 之外，避免被外部同步覆盖。
+// 应用共享资料清单写在 workspace 之外，避免被外部同步覆盖。
 // 提示词只提供清单路径；概览和正文按需检索，不随扫描结果改变缓存前缀。
 import { readFile, readdir, rename, lstat, writeFile, rm } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
@@ -54,7 +54,7 @@ function formatDateTime(ms: number): string {
 const ANYWHERE = "**/";
 
 const IGNORE_TEMPLATE = [
-  "# 本群资料索引的排除规则（手工维护；首次运行时自动生成，之后不会覆盖）",
+  "# 共享资料索引的排除规则（手工维护；首次运行时自动生成，之后不会覆盖）",
   "#",
   "# 每行一条，# 开头为注释，不区分大小写，路径分隔符用 /。例如：",
   "#   归档/2023        排除资料根目录下的 归档/2023/ 及其全部内容",
@@ -110,7 +110,7 @@ export function isIgnored(relPath: string, prefixes: string[]): boolean {
 
 /**
  * 遍历 workspace 收集文件。软链接整体跳过：同步盘里的链接可能指向树外甚至成环，而索引
- * 的用途只是定位本群资料。
+ * 的用途只是定位共享资料。
  */
 export async function scanWorkspace(
   workspaceDir: string,
@@ -198,7 +198,7 @@ export function renderMaterialsIndex(
   const totalBytes = scan.entries.reduce((sum, entry) => sum + entry.size, 0);
   const topLevel = summarizeTopLevel(scan.entries);
   const lines = [
-    "# 本群资料索引（自动生成，勿手工编辑）",
+    "# 共享资料索引（自动生成，勿手工编辑）",
     "",
     `- 资料根目录：${resolve(workspaceDir).replace(/\\/g, "/")}`,
     `- 生成时间：${formatDateTime(generatedAt)}`,

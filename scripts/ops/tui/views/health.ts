@@ -83,18 +83,17 @@ export class HealthView implements View {
   }
 
   async onKey(key: { name: string }, app: AppApi): Promise<boolean> {
-    // 修复入口只依赖部署平台，不必等待公网等诊断项返回；确认与维护流程仍由 App 管理。
+    // 修复入口只依赖部署平台，不必等待 Stream 等诊断项返回；确认与维护流程仍由 App 管理。
     if (key.name === "f") {
       const windows = app.deployment.platform === "windows";
       const ok = await app.confirm({
         title: windows ? "自动修复" : "重建修复",
         subject: windows ? "修复可确定的部署问题" : "通过部署向导重新构建当前版本",
         steps: windows ? [
-          "重新注册计划任务、修正防火墙规则一类可确定的修复",
-          "按当前 token 来源处理隧道（必要时重装 Cloudflared 服务）",
+          "重新注册计划任务一类可确定的修复",
           "修复后再跑一次体检",
         ] : ["确认部署选项，回车默认沿用已有配置", "重建镜像并核对新实例的健康状态", "失败时恢复原部署"],
-        untouched: ["data/ 配置与群数据", "已有的会话历史"],
+        untouched: ["data/ 中的配置、会话历史和使用统计", "共享资料"],
         recovery: "修复只改部署侧设施，不动数据；失败时体检结果会指出剩下的问题",
       });
       if (ok) {

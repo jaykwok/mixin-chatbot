@@ -4,12 +4,12 @@ import { TaskPaths, type TaskLaunch } from "../../src/core/task-deployment.ts";
 import { publishJson } from "../lib/atomic-file.ts";
 
 const { values, positionals } = parseArgs({ args: process.argv.slice(2), allowPositionals: true,
-  options: { image: { type: "string" }, data: { type: "string" }, groups: { type: "string" } } });
+  options: { image: { type: "string" }, data: { type: "string" }, workspace: { type: "string" } } });
 if (positionals.length !== 1 || !["check", "write"].includes(positionals[0]!) || !values.image || !values.data) {
-  throw new Error("用法：task-deployment.ts check|write --image <sha256> --data <宿主 data> [--groups <宿主外部群根>]");
+  throw new Error("用法：task-deployment.ts check|write --image <sha256> --data <宿主 data> [--workspace <宿主外置资料目录>]");
 }
 const launch: TaskLaunch = { version: 1, image: values.image, controlRoot: "/app/data/runtime/task-control",
-  mounts: [{ manager: "/app/data", daemon: values.data }, ...(values.groups ? [{ manager: "/app/group-data", daemon: values.groups }] : [])],
+  mounts: [{ manager: "/app/data", daemon: values.data }, ...(values.workspace ? [{ manager: "/app/workspace", daemon: values.workspace }] : [])],
   imagePaths: ["/app/scripts/runtime", "/app/src/agent/modules/document-work", "/app/node_modules", "/usr/local/bin/bun"] };
 new TaskPaths(launch, launch.image);
 // This check never takes the running service's controller lock or modifies its manager receipts.

@@ -22,6 +22,13 @@ test("清空所有群在两个运维平台都只以 --all / -All 传递，不带
   expect(opsCommand("linux", args).args.slice(1)).toEqual(args);
 });
 
+test("导入旧统计把所选文件作为路径交给两个平台的运维入口", () => {
+  const file = "D:\\old deployment\\data\\groups\\stats.sqlite";
+  const request = JSON.parse(Buffer.from(opsCommand("windows", ["stat-import", file]).args.at(-1)!, "base64").toString("utf8"));
+  expect(request).toEqual({ Command: "stat-import", Target: file });
+  expect(opsCommand("linux", ["stat-import", "/srv/old/data/groups/stats.sqlite"]).args.slice(1)).toEqual(["stat-import", "/srv/old/data/groups/stats.sqlite"]);
+});
+
 test("统计周期通过两个平台运维入口完整传递", () => {
   const args = ["stat", "support", "--period", "last-month"];
   const command = opsCommand("windows", args);
@@ -30,7 +37,7 @@ test("统计周期通过两个平台运维入口完整传递", () => {
 });
 
 // 从真实脚本提取函数和入口，只替换宿主机探测/写操作。
-// 测试不运行真实的 repair、purge、route-admin 或计划任务命令。
+// 测试不运行真实的 repair、purge、directory-admin 或计划任务命令。
 const BUILD = String.raw`
 $ErrorActionPreference = 'Stop'
 $tokens = $null
@@ -43,25 +50,30 @@ foreach ($name in @('Invoke-WithUtf8Output', 'Get-OpsCommandHint')) {
     $definition = $common.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     $parts += $definition.Extent.Text
 }
-foreach ($name in @('Show-Doctor', 'Step', 'Done', 'Warn', 'New-DoctorRow', 'Get-DeployModeLabel', 'Clear-GroupHistory')) {
+foreach ($name in @('Show-Doctor', 'Step', 'Done', 'Warn', 'New-DoctorRow', 'Clear-SpaceHistory')) {
     $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $true)
     if (-not $definition) { throw "missing function $name" }
     $parts += $definition.Extent.Text
 }
 $parts += @'
-$DeployMode = if ($env:TUI_TEST_CLOUDFLARE -eq '1') { 'cloudflare' } else { 'direct' }
 $Project = $PSScriptRoot
 $Port = 1011
-$Domain = 'bot.example.com'
-$TunnelManagedFile = Join-Path $PSScriptRoot 'cloudflared-managed'
 $TaskName = 'fixture'
-$DeployedGroupDataRoot = $PSScriptRoot
+$DeployedWorkspaceRoot = ''
+$DataDir = Join-Path $PSScriptRoot 'data'
 $ModelsFile = Join-Path $PSScriptRoot 'data\config\models.json'
 function Test-ModelConfiguration($project) {
     & $env:TUI_TEST_BUN $env:TUI_TEST_VALIDATOR $PSScriptRoot
     return $LASTEXITCODE -eq 0
 }
-$WebhookSecretFile = Join-Path $PSScriptRoot 'webhook-secret'
+$AppBotFile = Join-Path $PSScriptRoot 'data\config\app-bot.json'
+# Stands in for "bun run scripts\ops\directory-admin.ts doctor" (the service's Stream and directory rows: status, name, detail)
+# and "bun run scripts\ops\version-info.ts" (name, value).
+# The rows come from the environment: Bun's transpiler escapes non-ASCII text, which String.raw would keep as "\uXXXX".
+function Get-BunPath { return {
+    $global:LASTEXITCODE = 0
+    if ($args -contains 'scripts\ops\version-info.ts') { $env:TUI_TEST_VERSION -split [char]10 } else { $env:TUI_TEST_STREAM -split [char]10 }
+} }
 function Resolve-ProjectPath($value) { return $value }
 function Test-Local { if ($env:TUI_TEST_HEALTH -eq 'fail') { return 0 }; if ($env:TUI_TEST_HEALTH -eq 'verification') { return 503 }; return 200 }
 function Get-BotPids { if ($env:TUI_TEST_HEALTH -ne 'fail') { return 42 } }
@@ -70,9 +82,6 @@ function Get-NetTCPConnection { param($LocalPort, $State, $ErrorAction)
 }
 function Get-ScheduledTask { param($TaskName, $ErrorAction) }
 function Get-RelayDoctorRows { }
-function Get-TunnelTokenSource { return @{ Available = $false; Detail = '测试 token 缺少' } }
-function Get-Service { param($Name, $ErrorAction) }
-function Test-Public { return '530' }
 function Err($message) { [Console]::Error.WriteLine($message) }
 function Start-Bot { Step $env:TUI_TEST_PROGRESS; [Console]::Error.WriteLine($env:TUI_TEST_DIAGNOSTIC); return $true }
 function Stop-Bot { return $true }
@@ -83,7 +92,9 @@ function Write-Captured([string]$Script, [string[]]$CliArgs) {
 }
 function Invoke-RelayAdmin([string[]]$CliArgs) { Write-Captured 'relay' $CliArgs; return $true }
 function Invoke-TmpAdmin([string[]]$CliArgs) { Write-Captured 'tmp' $CliArgs; return $true }
-function Invoke-GroupDataAdmin([string]$Script, [string[]]$CliArgs) { Write-Captured $Script $CliArgs; return $true }
+function Invoke-DataAdmin([string]$Script, [string[]]$CliArgs) { Write-Captured $Script $CliArgs; return $true }
+# The system "open file" dialog: the path the test names, or nothing (cancelled).
+function Select-LegacyStatsFile { if ($env:TUI_TEST_PICK) { return $env:TUI_TEST_PICK } }
 '@
 $jsonEntry = @($ast.EndBlock.Statements | Where-Object { $_.Extent.Text.StartsWith('if ($Json -and $Command -in') })
 $parts += ($ast.EndBlock.Statements | Where-Object { $_.Extent.Text.StartsWith('if ($RequestBase64)') }).Extent.Text
@@ -107,7 +118,7 @@ async function fixtureWrapper() {
     '{"providers":{"zai-coding-cn":{"apiKey":"test-only"}}}');
   await writeFile(join(fixture.root, "data", "runtime", "pi", "settings.json"),
     '{"defaultProvider":"zai-coding-cn","defaultModel":"glm-5.3-flash"}');
-  await writeFile(join(fixture.root, "webhook-secret"), "a".repeat(64));
+  await writeFile(join(fixture.root, "data", "config", "app-bot.json"), '{"appId":"test-app","appSecret":"test-only-secret"}');
   const child = Bun.spawn(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", builder], {
     stdout: "pipe", stderr: "pipe", windowsHide: true,
     env: { ...process.env, TUI_TEST_OPS: join(PROJECT_DIR, "scripts", "ops", "ops.ps1"),
@@ -121,7 +132,9 @@ async function fixtureWrapper() {
     const child = Bun.spawn([command.command, ...command.args], {
       stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
       env: { ...process.env, ...command.env, TUI_TEST_HEALTH: health, TUI_TEST_BUN: process.execPath, TUI_TEST_VALIDATOR: join(PROJECT_DIR, "scripts/config/validate-models.ts"),
-        TUI_TEST_PROGRESS: "正在启动机器人", TUI_TEST_DIAGNOSTIC: "测试诊断：隧道信息", ...env },
+        TUI_TEST_PROGRESS: "正在启动机器人", TUI_TEST_DIAGNOSTIC: "测试诊断：Stream 信息",
+        TUI_TEST_STREAM: "pass\t事件 Stream\t已连接 3 分钟\nwarn\t通讯录同步\t待确认撤销：12 个成员（第 7 轮）",
+        TUI_TEST_VERSION: "应用机器人\tv1.0.0\n构建\tabc1234\n数据格式\t1", ...env },
     });
     const [stdout, stderr, code] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -130,13 +143,17 @@ async function fixtureWrapper() {
   } };
 }
 
-test("Windows 规范化参数保留路径和群名中的空格，Linux 保持原参数", () => {
-  const route = ["routes", "reset", "abcdef123456", "--group", "技术 支持群"];
-  expect(opsCommand("windows", route).args[5]).toBe("-RequestBase64");
-  expect(JSON.parse(Buffer.from(opsCommand("windows", route).args[6]!, "base64").toString())).toEqual({
-    Command: "routes", Target: "reset", Fingerprint: "abcdef123456", Group: "技术 支持群",
-  });
-  expect(opsCommand("linux", route).args.slice(1)).toEqual(route);
+test("Windows 规范化参数保留群名中的空格和撤销轮次，Linux 保持原参数", () => {
+  const decode = (args: string[]) => {
+    const command = opsCommand("windows", args);
+    expect(command.args[5]).toBe("-RequestBase64");
+    return JSON.parse(Buffer.from(command.args[6]!, "base64").toString());
+  };
+  const tmp = ["tmp-ls", "--group", "技术 支持群"];
+  expect(decode(tmp)).toEqual({ Command: "tmp-ls", Group: "技术 支持群" });
+  expect(decode(["directory-confirm", "7"])).toEqual({ Command: "directory-confirm", Target: "7" });
+  expect(opsCommand("linux", tmp).args.slice(1)).toEqual(["tmp-ls", "--group=技术 支持群"]);
+  expect(opsCommand("linux", ["directory-confirm", "7"]).args.slice(1)).toEqual(["directory-confirm", "7"]);
 });
 
 windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非零，修复不会混入只读接口", async () => {
@@ -157,8 +174,23 @@ windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非�
           expect(health.fix).toContain("系统 → 服务部署 → 继续上次操作");
         }
         for (const check of payload.checks) expect(typeof check.fix).toBe("string");
+        const names = payload.checks.map((check: { name: string }) => check.name);
+        expect(names).toContain("data/config/app-bot.json");
+        expect(names.includes("事件 Stream")).toBe(state === "pass");
+        expect(Object.keys(payload).sort()).toEqual(["checks", "fail", "pass", "port", "warn"]);
+        if (state === "pass") {
+          expect(payload.checks.find((check: { name: string }) => check.name === "事件 Stream")).toMatchObject({ status: "pass", detail: "已连接 3 分钟", fix: "" });
+          expect(payload.checks.find((check: { name: string }) => check.name === "通讯录同步")).toMatchObject({ status: "warn", detail: "待确认撤销：12 个成员（第 7 轮）" });
+          expect(payload.warn).toBeGreaterThan(0);
+          expect(payload.checks.find((check: { name: string }) => check.name === "应用机器人")).toMatchObject({ status: "pass", detail: "v1.0.0" });
+          expect(payload.checks.find((check: { name: string }) => check.name === "数据格式")).toMatchObject({ status: "pass", detail: "1" });
+        }
       }
     }
+    // An unreadable deployment record fails the check and warns against deploying over it.
+    const unknown = JSON.parse((await fixture.run(["doctor", "--json"], "pass", { TUI_TEST_VERSION: "应用机器人\t未知：部署记录没有程序版本（旧版数据）" })).stdout);
+    expect(unknown.checks.find((check: { name: string }) => check.name === "应用机器人")).toMatchObject({ status: "fail", detail: "未知：部署记录没有程序版本（旧版数据）" });
+    expect(unknown.checks.find((check: { name: string }) => check.name === "应用机器人").fix).toContain("不要在此目录覆盖部署");
     const repair = await fixture.run(["doctor", "--json", "-Repair"]);
     expect(repair.code).toBe(2);
     expect(repair.stdout).toBe("");
@@ -181,13 +213,18 @@ windowsTest("Windows TUI 部署入口调用部署脚本并保留失败退出码"
 windowsTest("TUI 体检与修复输出使用菜单路径，直接调用仍给命令行建议", async () => {
   const fixture = await fixtureWrapper();
   try {
+    // Missing credentials point at the app-bot wizard; a paused revocation points at the directory page.
+    await Bun.file(join(fixture.root, "data", "config", "app-bot.json")).delete();
     for (const tui of ["1", ""]) {
-      const env = { MIXIN_OPS_TUI: tui, TUI_TEST_CLOUDFLARE: "1" };
+      const env = { MIXIN_OPS_TUI: tui };
+      const passing = JSON.parse((await fixture.run(["doctor", "--json"], "pass", env)).stdout);
+      expect(passing.checks.find((check: { name: string }) => check.name === "通讯录同步").fix)
+        .toContain(tui ? "系统 → 通讯录 → 确认暂停的撤销" : "scripts\\ops\\ops.ps1 directory-confirm");
       const result = await fixture.run(["doctor", "--json"], "fail", env);
       expect(result.code, result.stderr).toBe(1);
       const health = JSON.parse(result.stdout);
       const fixes = health.checks.map((check: { fix: string }) => check.fix).join("\n");
-      expect(fixes).toContain(tui ? "系统 → 服务部署 → 修复隧道" : "scripts\\ops\\ops.ps1 repair-tunnel");
+      expect(fixes).toContain(tui ? "系统 → 设置 → 应用机器人" : "scripts\\ops\\ops.ps1 configure-app-bot");
       expect(fixes).toContain(tui ? "系统 → 服务部署 → 重新部署" : "scripts\\ops\\ops.ps1 deploy");
       expect(fixes).toContain(tui ? "监控 → 日志" : "scripts\\ops\\ops.ps1 logs");
       if (tui) expect(fixes).not.toMatch(/ops\.ps1|scripts[\\/]|bun run/);
@@ -205,15 +242,15 @@ windowsTest("Windows TUI 在中文代码页下通过 UTF-8 输出普通进度、
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("正在启动机器人");
     expect(result.stdout).toContain("机器人已启动");
-    expect(result.stderr.trim()).toBe("测试诊断：隧道信息");
+    expect(result.stderr.trim()).toBe("测试诊断：Stream 信息");
     const command = opsCommand("windows", ["start"]);
     command.args[4] = join(fixture.root, "ops-fixture.ps1");
     const lines: string[] = [];
     expect(await stream(command.command, command.args, line => lines.push(line), {
-      env: { TUI_TEST_PROGRESS: "正在启动机器人", TUI_TEST_DIAGNOSTIC: "测试诊断：隧道信息" },
+      env: { TUI_TEST_PROGRESS: "正在启动机器人", TUI_TEST_DIAGNOSTIC: "测试诊断：Stream 信息" },
     }).done).toBe(0);
     expect(lines.join("\n")).toContain("正在启动机器人");
-    expect(lines).toContain("测试诊断：隧道信息");
+    expect(lines).toContain("测试诊断：Stream 信息");
     expect(lines.join("\n")).not.toContain("�");
     const error = await fixture.run(["未知操作"]);
     expect(error.code).toBe(1);
@@ -221,13 +258,14 @@ windowsTest("Windows TUI 在中文代码页下通过 UTF-8 输出普通进度、
   } finally { await fixture.cleanup(); }
 }, 15000);
 
-windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 CLI", async () => {
+windowsTest("Windows 通讯录、外链全清和临时目录范围都到达正确 CLI", async () => {
   const fixture = await fixtureWrapper();
   try {
     const cases = [
-      { input: ["routes", "list"], argv: ["list"], script: "scripts\\ops\\route-admin.ts" },
-      { input: ["routes", "reset", "abcdef123456", "--group", "技术 支持群"], argv: ["reset", "abcdef123456", "--group", "技术 支持群"], script: "scripts\\ops\\route-admin.ts" },
-      { input: ["routes", "forget", "abcdef123456"], argv: ["forget", "abcdef123456"], script: "scripts\\ops\\route-admin.ts" },
+      { input: ["directory"], argv: ["status"], script: "scripts\\ops\\directory-admin.ts" },
+      { input: ["directory-confirm", "7"], argv: ["confirm", "7"], script: "scripts\\ops\\directory-admin.ts" },
+      { input: ["directory-departments", "1001"], argv: ["departments", "1001"], script: "scripts\\ops\\directory-admin.ts" },
+      { input: ["directory-scope", "1001,1002"], argv: ["scope", "1001,1002"], script: "scripts\\ops\\directory-admin.ts" },
       { input: ["relay-test"], argv: ["test"], script: "relay" },
       { input: ["relay-purge", "--all"], argv: ["purge", "--all"], script: "relay" },
       ...["-All", "-all", "-A", "--all", "--group", "含 空格与'引号"].map(keyword => ({
@@ -249,7 +287,7 @@ windowsTest("Windows 路由、外链全清和临时目录范围都到达正确 C
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout)).toEqual({ script, argv });
     }
-    expect((await fixture.run(["routes", "reset", "abcdef123456"])).code).toBe(2);
+    for (const round of [[], ["0"], ["7;x"]]) expect((await fixture.run(["directory-confirm", ...round])).code).toBe(2);
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -265,6 +303,28 @@ windowsTest("Windows 清空所有群经 -All 交给 history-admin clear --all，
       expect(refused.code).toBe(2);
       expect(refused.stdout).not.toContain("history-admin");
     }
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+windowsTest("Windows stat-import 给了路径直接导入，不给路径时用文件选择框所选文件，取消或文件不存在时不导入", async () => {
+  const fixture = await fixtureWrapper();
+  try {
+    const ledger = join(fixture.root, "old deployment", "stats.sqlite");
+    await mkdir(join(fixture.root, "old deployment"), { recursive: true });
+    await writeFile(ledger, "synthetic");
+    const captured = (stdout: string) => JSON.parse(stdout.trim().split(/\r?\n/).at(-1)!);
+    const given = await fixture.run(["stat-import", ledger], "fail");
+    expect(given.code, given.stderr).toBe(0);
+    expect(captured(given.stdout)).toEqual({ script: "scripts\\ops\\stats-import.ts", argv: [ledger] });
+    const picked = await fixture.run(["stat-import"], "fail", { TUI_TEST_PICK: ledger });
+    expect(picked.code, picked.stderr).toBe(0);
+    expect(captured(picked.stdout)).toEqual({ script: "scripts\\ops\\stats-import.ts", argv: [ledger] });
+    const cancelled = await fixture.run(["stat-import"], "fail");
+    expect(cancelled.code).toBe(2);
+    expect(cancelled.stdout).not.toContain("stats-import.ts");
+    const missing = await fixture.run(["stat-import", join(fixture.root, "absent.sqlite")], "fail");
+    expect(missing.code).toBe(1);
+    expect(missing.stdout).not.toContain("stats-import.ts");
   } finally { await fixture.cleanup(); }
 }, 30000);
 

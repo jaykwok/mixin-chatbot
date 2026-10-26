@@ -1,131 +1,101 @@
-# 数据版本与自动重置升级
+# 版本、数据格式与从旧版切换
 
 [返回运维手册](operations.md) · [部署与配置](deployment.md)
 
-当前应用数据版本为 **6**，Pi 为 **1.3.0**。正式运行时只支持当前配置和群会话格式；不保留 v1–v5 转换链、JSONL 导入或旧字段别名。统计账本仍是 **schema 2**，本轮无需转换，历史账目不依赖旧会话存在。
+应用机器人从 **v1.0.0** 起使用新的发布体系。此前的 webhook 发布（代码见标签 `legacy-webhook`）没有程序版本，**不能原地升级**：在新目录全新部署，旧会话、资料目录和配置都不迁移，只有旧版统计可一次性导入新账本（见[导入旧版统计](#导入旧版统计)），切换步骤见[从旧版 webhook 发布切换](#从旧版-webhook-发布切换)。
 
-任务收尾新增独立的 **closeout schema 1**，存于 `data/state/agent.sqlite`：`deliverables`（不可变登记和检查范围）、`file_sends`（附件状态）、`fallback_plans`（说明送达及发送截止时间）、`document_events`（本任务重建/渲染记录），版本在 `closeout_schema`。没有这些表时一次性创建；已有表缺失或版本不符时拒绝启动，不做逐版本转换。既有 `deliveries` 仍使用 delivery schema 2，统计库不变。
+## 版本与存储格式
 
-备份须同时保留 `agent.sqlite` 及其 WAL/SHM、群 Durable 数据库和成员 tmp 中 `.deliverables` 快照；不要只备份表或只备份文件。跨代重置时这些运行状态随 `data/state` 和成员 tmp 一起归档，统计账本按原流程原位保留。普通升级不清空交付账本，遗留 `sending` 恢复为 `uncertain`，等待用户手动 `/deliver`。正常结束或确认送达后释放无需重试的快照；失败、不确定及停止的交付计划保留字节供补发。
+| 名称 | 来源 | 用途 |
+| --- | --- | --- |
+| 程序版本 | `package.json` 的 `version`（当前 1.0.0） | 发布与升级判断、TUI 显示 |
+| 数据格式 | `src/core/version.ts` 的 `DATA_VERSION`（当前 1） | 程序能否打开现有数据 |
+| 构建 | Git 提交（12 位，有已跟踪改动时带 `-dirty`） | 区分同一版本号的不同构建 |
+| 会话存储 schema | Pi Durable 的 SQLite schema（当前 2） | 依赖库内部格式，由数据格式一并约束 |
+| 统计 schema | 统计账本自己的版本（当前 3） | 统计账本格式，独立维护 |
 
-## 什么时候提示清理
+这几个数字互不对应：数据格式 1 与统计 schema 3 没有关系，Pi 的包版本也不是数据格式。
 
-升级检查项目 `data/state/data-version.json` 和群根 `data-version.json`，以应用数据版本判断，不以应用发布号或 Pi 版本号判断。
+Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版程序无法再打开。本程序不使用这项自动升级：服务、离线维护和诊断在官方打开会话库之前先核对 schema，已有的会话库不是当前 schema 2（例如 Pi 1.3 时期未发布的测试库，或不是会话库的文件）就拒绝并原样保留文件，新库照常创建。部署和升级的数据校验、验证实例和最终提交也以只读连接逐个核对 `data/conversations/` 下已有的会话库（无法读取的同样拒绝），所以不兼容的库在提交之前就被拒绝，发布仍可回滚，而不是提交后业务启动才失败。未发布的测试数据请在新目录全新部署。
 
-| 状态 | 行为 |
-| --- | --- |
-| 两侧版本、登记 ID 一致，且是当前版本 | 正常升级，沿用配置和会话，不提示清理 |
-| 两侧一致，版本低于当前版本 | 停机前提示保留统计并重置，确认后沿用或重新配置模型 |
-| 标记缺失一侧、损坏或两侧不一致 | 拒绝自动清理，先恢复一致状态 |
-| 数据版本高于程序版本 | 拒绝降级，不能借重置绕过 |
-| 全新实例、两侧均未登记 | 按首次部署规则校验并登记；已有未登记运行数据仍拒绝 |
+部署提交时把**实际部署**的版本和数据所属的应用写入部署记录 `data/state/data-version.json`：
 
-只有配置或会话存储发生不兼容变化才提高 `DATA_VERSION`。同一数据版本的普通更新直接升级。重新部署不做重置：检测到较旧的数据版本时在停机前拒绝并提示改用 `update`，即使已有 `models.json` 也不会沿用。
-
-## 保留与清理范围
-
-保留整个 `stats.sqlite`，包括提问/回复/工具次数、人数去重信息、日/月趋势、token、费用、缺失或未知标记、来源键和游标。保留 `data/config/webhook-secret`、已有 `cloudflared-token`、入口模式、端口、域名和群根位置，webhook URL 与隧道凭证不重新生成。计划任务启动器、容器任务隔离元数据等部署资源继续由发布事务管理。
-
-管理员设置用**目标版本**的校验规则逐项判断：通过就原样带入新配置，不通过就丢弃并在停机前列出原因，升级后重新设置。判断使用新版服务实际读取该文件的同一套规则（包括编码细节，例如服务不接受带 BOM 的 `relay.json`、`runtime.json`；`cloudflared-*` 按所在平台的脚本读法），保留下来的设置不会在之后的预检或启动时被拒绝。不做格式转换，也不维护设置的升级链；设置格式或含义发生不兼容变化时，同时改变格式，使旧文件无法通过校验。
-
-| 设置 | 判断方式 |
-| --- | --- |
-| `relay.json`（外链） | 外链配置校验；保留时外链账本 `data/state/relay.sqlite` 一并原位保留，升级前上传的对象到期后照常清理；账本无法读取时随旧状态重置 |
-| `runtime.json` 中的运行设置（TUI 可调的并发、时限、索引、文档加工、模板、LibreOffice 路径、日志等） | 逐键校验，个别键不通过只丢弃该键；`BOT_TASK_IMAGE`、`BOT_TASK_CONTROL_ROOT` 属于部署资源，不带入；端口、监听地址和群根位置由部署参数生成 |
-| `auxiliary.json`（辅助模型） | 格式校验；新模型配置完成后，引用的分类/识图模型不存在时整份丢弃 |
-| `mcp.json` | MCP 配置校验 |
-| `cloudflared-logging`、`cloudflared-protocol` | 只接受当前可选值 |
-
-模型配置（`models.json`、Pi `settings.json` 和模型目录缓存 `models-store.json`）不会因为文件存在就沿用。新版 Pi 能读取 `models.json` 和设置、选中的模型仍然存在，并且 Pi 实际解析出凭证时，提示是否重新配置，直接回车即整组沿用。凭证检查在独立子进程中执行，工作目录是重置草稿；位于待替换的 `data/config`、`data/runtime`、`data/state` 下的 HOME、用户目录及 XDG 配置/数据/缓存目录映射到草稿，其他目录沿用原环境设置。因此，命令引用的 Key 或请求头若依赖将被清理的相对路径或这些 HOME 文件，会在停机前被拒绝。Docker 的检查容器不联网，需要网络的凭证命令会转入向导。每次检查的进程树总限时 30 秒，Pi 对每条命令另限时 10 秒；引用的环境变量必须存在。
-
-草稿检查无法在所有平台隐藏旧目录的绝对路径，因此提交重置前还会在实际重置后的目录中重新解析凭证。这也适用于向导生成的配置；失败则拒绝提交，保留回滚副本，由升级器恢复旧数据和服务。校验只能发现新版 Pi 拒绝的配置，Pi 发布说明若提到模型配置含义变化，应选择重新配置。停机前校验不通过时列出原因并必须运行配置向导；选择重新配置时向导从空草稿开始，不带入旧字段。旧文件随 `data/config`、`data/runtime` 一起移走，草稿中没有模型配置时停机前拒绝。`data/config` 中不在上表的文件不带入新配置。
-
-以停止服务后的**现有统计账本**为准，已有账目原样保留；不再从旧会话补算。尚未入账的完整消息、不完整 JSONL 尾行和未完成任务都随旧会话清理。账本中的历史跳过标记继续保留。
-
-群资料原位保留，不移动或删除整个群目录。群根默认是 `data/groups`，配置外置群根时使用已保存的位置；只按下面的明确层级清理，不递归搜索资料中的数据库：
-
-| 路径（相对群根） | 跨代重置行为 |
-| --- | --- |
-| `stats.sqlite` 及其 WAL/SHM/journal | 原样保留并独立备份 |
-| `<群号>/stats.sqlite` 及其配套文件 | 保留 |
-| `<群号>/` 直属的其他 `*.sqlite` 及 `-wal` / `-shm` / `-journal` | 暂存，成功后清理；含 Durable 会话、消息队列及控制状态 |
-| `<群号>/index/` 下除 `ignore.txt` 外的条目 | 暂存，成功后清理，由新版本重建；含 `.DS_Store` 等以 `.` 开头或无法识别的条目时，移动前列出全部这类条目并停止，删除或移出后重试 |
-| `<群号>/index/ignore.txt` | 原位保留，不参与移动和回滚 |
-| `<群号>/users/<用户>/session.jsonl`、`tmp/` | 暂存，成功后清理；包含旧会话和生成文件 |
-| `<群号>/workspace/`、其他资料目录和文件、`venv/` | 原位保留，其中的 `.sqlite` 文件也不清理 |
-| 群根其他文件及历史归档 | 保留 |
-
-项目侧重建运行状态及旧 outbox；管理员设置和模型配置按上文规则保留或重新配置。旧任务与待交付事项不会由新实例承接。项目日志和不属于本次事务的历史备份不会被批量清空。资料同步无需重新拷贝已有文件；若此前版本已清理资料，可从独立资料源按原群号拷回 `workspace/`，无需恢复旧会话数据库。
-
-新群库会生成持久 UUID，新的统计来源带这个代际，避免重建后的 conversationId 与旧来源碰撞；群号和成员标识不变，代际不参与人数去重。
-
-## 自动运行顺序
-
-Windows 使用 `scripts\ops\ops.ps1 update`；Linux 使用 `bash scripts/ops/ops.sh update`。rootful Docker 用 root，rootless Docker 用其所属用户。TUI 的「系统 → 服务部署 → 升级」调用同一 `update` 入口，并交出终端供升级器确认及配置；继续和回滚也共用 CLI 事务。首次从旧入口切换时见下节。
-
-1. 旧服务继续运行时，导出目标发布、检查数据版本。跨代更新提示清理范围；Windows 输入 `RESET`（忽略大小写和首尾空格），Linux 确认继续。未确认或非交互输入不作自动同意。
-2. 用新版 Pi 检查现有模型配置，可沿用时询问是否重新配置；需要时在隔离目录运行新版配置向导，生成并离线校验新模型配置。入口凭证、部署参数和通过校验的管理员设置带入新配置，丢弃的设置在此前列出，其余使用当前默认设置。取消、配置失败或停机前复核失败时，原服务与数据不变。
-3. 记录发布事务和新配置草稿，停止旧服务。由**目标版本**的工具取得项目和群根维护租约，只读取现有统计账本并保存摘要、时区和冻结回执。Windows 使用导出目录的依赖，Docker 使用已固定的目标镜像；不依赖旧代码、旧依赖或旧会话读者。
-4. 核查统计结构、完整性及冻结前后一致性，使用 SQLite 一致快照写入 `backup/statistics/<发布事务>/stats.sqlite`，并逐表有序计算摘要，核对原账本与备份的全部行。
-5. 按上表逐项将群数据库、索引、成员会话和 tmp 暂存于群根 `.reset-<发布事务>/`，资料及群目录本身不移动；旧配置及运行状态暂存于 `data/.reset-<发布事务>/`，发布新配置。移动始终留在原挂载/卷内，逐项改名之前先持久化日志到发布快照，中断后可以继续或回滚。
-6. 只启动验证实例，不接收业务消息。提交前再次核对统计和入口凭证，并在重置后的目录中重新解析模型凭证；通过后成对登记当前数据版本，再恢复原服务运行状态。
-7. 新实例健康检查通过后，按清单删除本次群运行数据的回滚副本及旧配置副本；群归档中如有清单之外的文件，保留并报告，不整包删除。独立的 `backup/statistics/<发布事务>/` 继续保留，其中 `baseline.json` 记录全表摘要、时区、时间和历史 JSONL 不完整尾行的来源数及行数。原服务本就停止时保持停止，在验证通过并提交后清理。
-
-确认和模型配置完成后，停机阶段不再提问。中断后使用 `resume` 沿用已保存计划，无须重复输入模型密钥。提交前失败会恢复旧会话、配置、代码、依赖及原运行状态；已经提交后不允许回退旧数据，启动或清理失败保留事务，修复原因后 `resume` 收尾。
-
-Windows 移动清单中的文件、目录及回滚恢复时，遇到 `EPERM` / `EACCES` / `EBUSY` 会等待并重试，最多 10 秒。待清理目录本身或其子目录被其他程序持有时，可能阻止移动；资料目录不参与移动。持续失败会报告源路径、目标路径、错误码、尝试次数和耗时，保留回滚材料；不会通过强删或修改权限绕过。此时关闭相关占用或修正目录权限后重试；确认原数据恢复完整、自动回滚完成后，重新运行 `update`。
-
-确认 reset 后不再打开或验证旧群库、JSONL 和任务队列；外链账本只在外链配置保留时只读检查结构，不通过就随旧状态重置，不阻挡升级。旧会话损坏、缺少群库代际或包含未完成任务都不阻挡清理。历史来源的投影版本和 pending 标记按账本原值保留，不要求旧版收尾。`baseline.json` 的 `incompleteJsonl`（`sources` / `lines`）记录账本已有的 pending 来源数和总量，不扫描原会话。
-
-仍会核对需要保留的统计账本、入口凭证和清理路径：统计库缺失、schema 不是 2、完整性失败、冻结后变化或备份不一致时停止，保留原数据；不能通过创建空账本绕过。未来统计格式变化使用一次性转换工具处理，不把旧会话兼容逻辑加回正式运行时。
-
-## 第一次从旧版升级
-
-旧版 `ops update` 可能仍导出已删除的 `scripts/migrations`，会在执行目标升级器之前失败，只显示“无法导出升级器”；旧 TUI 的升级也走这个旧入口，因此同样需要下面的一次性引导。已安装的旧脚本无法显示新版本的提示。第一次可在原项目目录直接导出目标升级器；代码必须已经提交至目标 ref，生产工作树保持干净。即使工作树已经切到新版、磁盘仍为成对旧数据，也可使用此入口或新版 `update` 重置，无须恢复旧版读者或手改版本标记。
-
-Linux / Docker：
-
-```bash
-git fetch origin main
-mkdir -p tmp
-stage=$(mktemp -d "$PWD/tmp/upgrade-XXXXXXXX")
-git archive origin/main scripts/deploy/upgrade.sh scripts/lib scripts/runtime src/core/data-version.ts Dockerfile | tar -x -C "$stage"
-bash "$stage/scripts/deploy/upgrade.sh" "$PWD" origin/main
+```json
+{ "dataVersion": 1, "appVersion": "1.0.0", "build": "0123456789ab", "transaction": "deploy-…", "application": "<64 位十六进制>" }
 ```
 
-Windows（管理员 PowerShell，在原项目目录执行）：
+`application` 是平台环境与 AppID 的 SHA-256 摘要（不含 AppSecret，不保存 AppID 原文）。整个数据目录属于这一个应用：会话、成员身份、通讯录和待交付消息都不能跨应用或跨环境沿用。部署预检、验证实例、提交和服务启动都核对它，在打开通讯录、会话库或恢复任务之前拒绝不一致的配置；配置向导也不接受另一个 AppID 或环境。更换同一应用的 AppSecret 不受影响。要改用另一个应用，在新目录全新部署。
 
-```powershell
-git fetch origin main
-$projectPath = (Get-Location).Path
-$originalSha = (git rev-parse HEAD).Trim()
-$originalBranch = (git rev-parse --abbrev-ref HEAD).Trim()
-$targetSha = (git rev-parse origin/main).Trim()
-$stagePath = Join-Path $projectPath ('tmp\upgrade-' + [Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $stagePath | Out-Null
-$archivePath = Join-Path $stagePath 'target.zip'
-git archive --format=zip --output=$archivePath $targetSha
-Expand-Archive -LiteralPath $archivePath -DestinationPath $stagePath
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $stagePath 'scripts\deploy\upgrade.ps1') -Project $projectPath -OriginalSha $originalSha -TargetSha $targetSha -OriginalBranch $originalBranch
-```
+运行中的服务在 `/health` 中报告自己的 `appVersion` 和 `build`（`version` 字段是健康协议版本，与程序版本无关）。TUI 总览、页眉和 `ops doctor` 显示的是**正在运行的服务**报告的版本；服务没有运行时取自部署记录并注明“未运行”。检出的代码比运行中的服务新时另起一行，例如“本地工具 v1.1.0 · 运行服务 v1.0.0”。检出代码的 `package.json` 不代表已经部署的版本。
 
-这两个入口与正常 update 使用同一个目标升级器，仍有版本检查、确认、配置、统计冻结与备份核对及失败回滚。保留临时导出目录直到事务结束，再删除对应的 `$stage` / `$stagePath`（先核对完整路径位于项目 `tmp` 内）；其中可能有配置凭证，不能分享或提交。成功切换后使用普通 `update`。
+## 新装与升级
 
-首次引导中断、旧入口仍不可用时，保留原导出目录和目标提交：Linux 在最后一条调用后加 `continue` 或 `rollback`；Windows 重复最后一条调用以继续，或加 `-Rollback` 回滚。沿用第一次记录的参数，不重新计算目标提交。不要删除事务指针或先手工切代码。
+部署和升级在停机前按部署记录判断：
 
-## 统计检查和备份
+| 目录状态 | 行为 |
+| --- | --- |
+| 没有部署记录，也没有运行数据 | 全新安装 |
+| 部署记录有效，数据格式与程序一致，应用与配置一致 | 正常升级或重新部署，沿用配置、会话和统计 |
+| 有运行数据（`data/conversations`、`data/tmp`、`data/index`、`data/state/*.sqlite`，或旧版的 `data/groups` 等），但没有部署记录 | 拒绝原地安装或升级，提示在新目录全新部署 |
+| 部署记录损坏、缺字段（旧版没有程序版本，未发布的测试数据没有应用绑定）或数据格式不受支持（包括比程序新的格式） | 报错，现场原样保留，不自动初始化、不清理 |
+| 部署记录登记的应用或平台环境与 `data/config/app-bot.json` 不一致 | 拒绝，现场保留 |
 
-自动核对覆盖以下六张表的全部行，同时执行 `PRAGMA integrity_check` 和外键检查：
+缺少版本标记不会被当作“可以覆盖旧数据”的理由。TUI 打开有运行数据却没有部署记录、记录损坏或缺字段（缺少程序版本、事务或应用绑定，程序版本格式无效）的目录时只提供诊断，并提示新目录部署；只有基础版本字段（数据格式、事务、程序版本与构建）有效、数据格式不受支持时才提供“升级（检查数据格式）”，由目标版本的升级器判断能否接手；这时应用绑定也由目标版本校验。
 
-```sql
-SELECT * FROM stats_schema ORDER BY id;
-SELECT * FROM sources ORDER BY id;
-SELECT * FROM activity ORDER BY source, day;
-SELECT * FROM tool_counts ORDER BY source, day, kind, tool;
-SELECT * FROM usage_totals ORDER BY source, day, kind, provider, model;
-SELECT * FROM meta ORDER BY key;
-```
+部署记录只在部署提交时写入。发布进行中（`data/state/release-data.json` 为 `prepared`）回滚时恢复发布前的记录；全新安装回滚后不留记录。部署事务、升级失败恢复、健康检查和统计保护的规则见[中断恢复](operations.md#中断恢复)。
 
-可用 `bun run stat`、TUI **数据 → 统计** 和 HTML 报表复核。验证新问题只增加一次、同一成员再次提问不增加去重人数。自动验证为离线配置与服务验证，实际服务商仍需最小真实请求验收。
+## 以后的版本升级
 
-统计库是长期数据，不能随会话删除。新业务启动后账目继续增长，冻结备份只覆盖切换时点；仍需日常备份当前账本。若未来统计 schema 改变，应提供独立的一次性转换脚本，对备份转换并逐表核对，不建立长期版本转换链，也不能删库重建空统计绕过检查。
+正式程序不包含历史格式的读取器、转换链或启动时转换。版本之间的规则：
+
+| 情况 | 规则 |
+| --- | --- |
+| 同一数据格式、同一应用的新版本 | 停机前核对配置、资料目录与存储格式，按部署事务升级 |
+| 依赖库或本项目改变磁盘格式 | 发布时提高 `DATA_VERSION`，并另行提供专门的升级方案；在那之前新版本拒绝原地升级 |
+| 数据格式比目标程序新，或不受支持 | 停机前拒绝，旧服务与数据保持原样 |
+| 回滚目标不能打开现有数据 | 拒绝回滚，不以恢复代码或镜像成功代替服务可恢复 |
+
+程序版本按完整的 `主.次.修订` 解析；构建只用于定位代码，不参与兼容判断。预检、验证实例和健康检查不会在真实数据上打开会自动迁移存储格式的库。将来确需改写数据的版本，必须在改写之前确定备份与恢复边界。
+
+## 从旧版 webhook 发布切换
+
+旧版的会话历史、群目录、成员 tmp、索引和配置都不迁移。旧版统计可用一次性导入工具并入新账本（见[导入旧版统计](#导入旧版统计)），其余数据没有导入工具。旧目录保留不动（其中的统计账本 `data/groups/stats.sqlite` 导入后仍可作为历史原件留存），确认新部署运行正常后再自行处理。
+
+1. **处理旧外链对象**（配置过大文件外链时）：在旧目录用 `bun run relay list`（Linux 为 `bash scripts/ops/ops.sh relay-ls`）查看仍在册的对象。旧服务停止后不会再按期删除它们：要么先用旧版 `relay purge --all`（`relay-purge --all`）删除，要么确认存储桶的生命周期规则会清理，或稍后在对象存储控制台手动删除。新部署的外链账本不认识旧对象。
+2. **停止旧服务**：旧目录中 `bash scripts/ops/ops.sh stop` 或 `scripts\ops\ops.ps1 stop`。
+3. **退役旧入口**：
+   - Cloudflare 模式：Windows 在旧目录以管理员运行 `scripts\ops\ops.ps1 uninstall-tunnel`（删除 `Cloudflared` 服务）；Linux 结束旧连接器进程（PID 记在旧目录 `data/state/cloudflared.pid`，先用 `ps -p <PID> -o args=` 核对是旧项目根目录下的 `cloudflared`）。随后在 Cloudflare 控制台删除机器人子域名的公开路由、对应 DNS 记录和不再使用的隧道。
+   - 直连模式：Linux 删除注释为 `Mixin-Chatbot (平台IP)` 的 UFW 规则（`sudo ufw status numbered` 后按编号 `sudo ufw delete <编号>`）；Windows 以管理员运行 `Remove-NetFirewallRule -Group mixin-chatbot`。
+   - 在 Mixin 后台停用旧的 webhook 回调。
+4. **让出全局名称**：容器名 `mixin-chatbot` 和 Windows 计划任务 `mixin-chatbot` 是全机唯一的。Linux 执行 `docker rm mixin-chatbot`（还有 `mixin-chatbot-rollback` 时一并删除；数据在旧目录的挂载里，不受影响）；Windows 以管理员执行 `Unregister-ScheduledTask -TaskName mixin-chatbot -Confirm:$false`。新部署发现属于其他目录的容器时会拒绝继续。
+5. **全新部署 1.0.0**：在新目录克隆仓库并按[部署与配置](deployment.md)部署，配置应用机器人凭据和模型。外链、MCP、辅助模型和运行参数在 TUI 中重新设置。
+6. **验收**：在客户端做最小验收（单聊、群里提问、文件回复）；新部署的统计从零开始，需要旧数字时按下一节导入。
+
+### 导入旧版统计
+
+一次性工具只取新统计用到的字段：按天、按成员的提问数，以及按天、按成员、按模型（`provider/model`）的 input、output、cacheRead、cacheWrite token。费用、请求次数、回复数、工具次数、附件和中断记录一律不导入；旧账本没有 totalTokens，按四项相加补出。旧版的压缩、分支摘要等用量也按其模型计入。
+
+1. 先停止旧服务（让旧账本的 WAL 落盘）。旧账本是旧部署目录里的 `data/groups/stats.sqlite`，不用复制或改名。
+2. 选择文件并导入，任选一种：
+   - TUI **统计** 页按 `i`（或空格菜单“导入旧版统计”）：逐级浏览目录，只列子目录和 `.sqlite`／`.sqlite3`／`.db` 文件，也可以“输入路径…”；第一次从新部署的上一级目录开始。选中后先只读预览将导入的提问数、成员日、token 和日期范围，确认后执行。
+   - Windows 运行 `scripts\ops\ops.ps1 stat-import`，不带路径时弹出系统“打开文件”对话框；也可以直接 `ops.ps1 stat-import <路径>`。
+   - Linux 运行 `bash scripts/ops/ops.sh stat-import <路径>`。包装器把所选文件（有 `-wal` 时一并）复制到 `backup/` 下的私有临时目录供一次性容器读取，导入后删除副本。
+   - 不用包装器时先停机，再 `bun run stat-import <路径>`。
+
+   包装器停机导入，再恢复调用前的运行状态。
+3. 用 `bun run stat` 或 TUI **统计** 页核对。
+
+工具在内存快照上读旧账本，只接受旧版统计 schema 2。旧版以 WAL 模式保存账本；工具把账本和尚未 checkpoint 的 `-wal`（如有）复制到私有临时目录再读，原文件不变，旧目录里也不会多出 `-shm`／`-wal`。导入行在新账本中标为导入来源，与服务实时写入的行分开存放、合并显示。同一份旧账本重复导入不会重复计数（输出“已经导入过”）；新账本导入过另一份旧统计后拒绝再导入，以免两份旧账本重叠计数。
+
+## 统计账本
+
+统计账本 `data/state/stats.sqlite` 是长期数据，统计 schema 为 **3**。会话清空、tmp 清理、重新部署和升级都不改动已有账目。服务启动、部署提交和验证实例都以只读方式打开账本，核对 schema 版本并读取每张表；版本不符时拒绝，不新建、不改写。备份在停写边界内对每个 SQLite 文件执行 `PRAGMA quick_check`、checkpoint 并比对文件摘要，见[数据目录](deployment.md#数据目录)。
+
+账本只记两类数字：
+
+- **提问**：成员发给机器人的一条普通消息（含干活途中的插话）在进入成员队列时按请求 ID 计一次，记在受理当天；`/stop`、`/clear` 等指令不计。之后每次同步再按成员的请求记录补一次，已计过的不重复。已计入的请求 ID 保留 30 天，维护时删除更早的，30 天前的提问此后也不再补计，所以长期停放的任务不会被重复计数。
+- **token**：Durable 在每个会话里按模型（`provider/model`）和工具名累计已返回的用量（`pi.usage`）。服务在每轮结束、`/compact`、`/clear`、维护和打开空间时同步，把增长量记到同步当天。停机期间或后台压缩产生的用量在下次同步时计入，所以 token 的日期是入账日，不是发生时刻；新建的会话库是新来源，从零开始计；同一会话库的累计值回退（被替换为较早的副本，例如单独从备份恢复）时，那部分用量之前已经入账，按当前值重设基准、本次不入账，并写告警日志，不会重复计数。
+
+不记录费用、请求次数、回复数、工具调用次数和附件。只有已返回并提交的用量才计入：请求在提交前被中断或崩溃丢失时不计，统计不代表服务商的完整账单。
+
+可用 `bun run stat`、TUI **统计** 页和 HTML 报表复核。统计 schema 将来改变时，按上面“依赖库或本项目改变磁盘格式”的规则处理，不建立长期版本转换链，也不能删库重建空统计绕过检查。

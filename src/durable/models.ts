@@ -1,18 +1,19 @@
 // Model access for the Durable engine. One ModelRuntime and model selection per process,
 // (src/core/model-config.ts: models.json, read-only model catalogue, in-memory credentials, no catalogue network); one
-// request door per group Harness, since controls hold the requests of members of one group.
+// request door per space Harness, since controls hold the requests of members of one space.
 //
-// The door wraps the runtime as `HarnessOptions.models`, and its extension must come first in the group's registry (it
-// registers each generation request before Durable asks for the stream). Credentials stay the runtime's: the door asks
+// The door wraps the runtime as `HarnessOptions.models` and finds each request's member from its provider session id
+// (`memberSessions` below). Credentials stay the runtime's: the door asks
 // `getAuth` for each request, so models.json keys, environment and command references and headers behave as without it.
 // A routed (virtual) model is refused here at startup, and again by the door for any request that names one.
 import type { Context } from "@earendil-works/chord";
 import type { Api, CacheRetention, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
-import type { Harness, HarnessSettings, ModelRef } from "@earendil-works/pi-durable";
+import { type ConversationId, type Harness, type HarnessSettings, type ModelRef, ProviderDoc } from "@earendil-works/pi-durable";
 import { openModelRuntime, openSettings, resolveModelSelection } from "../core/model-config.ts";
-import { RequestDoor, VIRTUAL_MODEL_API, type DoorOptions } from "./door.ts";
-import { IdentityDoc } from "./identity.ts";
+import { conversationIds } from "./conversations.ts";
+import { RequestDoor, VIRTUAL_MODEL_API, type DoorOptions, type SessionBinding } from "./door.ts";
+import { IdentityDoc, MemberDirectory, SpaceDoc } from "./identity.ts";
 import { durableSettings } from "./settings.ts";
 
 export interface ModelSelection {
@@ -23,8 +24,6 @@ export interface ModelSelection {
   ref: ModelRef;
   thinkingLevel: ModelThinkingLevel;
   harnessSettings: HarnessSettings;
-  /** Configured values the Durable engine does not honour, for the startup log. */
-  notices: string[];
 }
 
 export interface ModelSelectionOptions {
@@ -55,19 +54,40 @@ export async function selectModel(runtime: ModelRuntime, settings: SettingsManag
   if (model.api === VIRTUAL_MODEL_API) {
     throw new Error(`${model.provider}/${model.id} 是路由（虚拟）模型，Durable 运行时不支持，请运行 bun run configure 选择具体模型`);
   }
-  const { settings: harnessSettings, notices } = durableSettings(settings, model, options.cacheRetention);
-  return { runtime, settings, model, ref: { provider: model.provider, modelId: model.id }, thinkingLevel, harnessSettings, notices };
-}
-
-/** The member a conversation belongs to, from its identity document (src/durable/identity.ts). */
-async function memberOf(harness: Harness, conversationId: number, context: Context): Promise<string | undefined> {
-  return (await harness.snapshot(IdentityDoc, conversationId as never, context))?.phone;
+  // Override keys are `provider/modelId`; a provider ID has no slash, a model ID may.
+  const windowOf = (key: string) => {
+    const slash = key.indexOf("/");
+    return slash > 0 ? runtime.getModel(key.slice(0, slash), key.slice(slash + 1))?.contextWindow : undefined;
+  };
+  const harnessSettings = durableSettings(settings, model, options.cacheRetention, windowOf);
+  return { runtime, settings, model, ref: { provider: model.provider, modelId: model.id }, thinkingLevel, harnessSettings };
 }
 
 /**
- * A group's request door. Set `holder.harness` once `Harness.open` returned; install `door.extension()` first in the
- * group's registry and pass `door.wrap(selection.runtime)` as `HarnessOptions.models`.
+ * Member sessions of a space from committed data (src/durable/identity.ts): an ownerless conversation whose identity
+ * names this space and a member whose directory record points back to it, with its provider session id. A fork (owned,
+ * identity not inherited) or a conversation the directory does not confirm has none.
  */
-export function groupDoor(holder: { harness?: Harness }, options: Omit<DoorOptions, "memberOf"> = {}): RequestDoor {
-  return new RequestDoor(holder, { ...options, memberOf });
+async function memberSessions(harness: Harness, context: Context, conversationId?: number): Promise<SessionBinding[]> {
+  const space = (await harness.snapshot(SpaceDoc, context))?.space;
+  if (!space) return [];
+  const ids = conversationId === undefined ? await conversationIds(harness, context, true) : [conversationId as ConversationId];
+  const found: SessionBinding[] = [];
+  for (const id of ids) {
+    const identity = await harness.snapshot(IdentityDoc, id, context);
+    if (!identity?.phone || identity.space !== space) continue;
+    if ((await harness.snapshot(MemberDirectory, identity.phone, context))?.conversationId !== id) continue;
+    const sessionId = (await harness.snapshot(ProviderDoc, id, context))?.sessionId;
+    if (sessionId) found.push({ sessionId, conversationId: id, phone: identity.phone });
+  }
+  return found;
+}
+
+/**
+ * A space's request door. Set `holder.harness` once `Harness.open` returned, call `door.loadSessions` before scheduling
+ * resumes and `door.bind` after each member conversation commit; pass `door.wrap(selection.runtime)` as
+ * `HarnessOptions.models` and install every extension through `door.wrapTools`.
+ */
+export function spaceDoor(holder: { harness?: Harness }, options: Omit<DoorOptions, "sessions"> = {}): RequestDoor {
+  return new RequestDoor(holder, { ...options, sessions: memberSessions });
 }

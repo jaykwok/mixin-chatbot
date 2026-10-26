@@ -7,8 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { DeliveryStore } from "../../src/agent/delivery-store.ts";
-import { withGroupSnapshot } from "../../src/durable/diagnostics.ts";
+import { withSpaceSnapshot } from "../../src/durable/diagnostics.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
@@ -17,6 +16,7 @@ import { describeUnfinished, legacyBlocker, LegacyReclamationPending, reclaimLeg
 import { reclamationEvidence } from "../../src/core/reclamation-files.ts";
 import { applyArchiveRemoval, applyTmpArchive, previewArchiveRemoval, previewTmpArchive } from "../../src/maintenance/archive.ts";
 import type { MemberScope } from "../../src/maintenance/scope.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 // Opt-in only: the ordinary suite must never obtain privileges. Every byte is synthetic,
 // and the root-owned journal needs trusted ancestors (so /tmp is deliberately unsuitable).
@@ -220,17 +220,17 @@ privileged("IA-1 end to end: tmp discard --legacy removes an archived file of th
   const root = await mkdtemp("/var/lib/mixin-reclamation-test-");
   console.log("Synthetic privileged fixture retained at " + root);
   await chmod(root, 0o755);
-  const groups = join(root, "groups"), temp = join(groups, "group-a/users/alice/tmp"), journal = join(root, "journal");
+  const groups = join(root, "data"), temp = join(groups, "tmp/groups/group-a/alice"), journal = join(root, "journal");
   await mkdir(temp, { recursive: true }); await mkdir(journal, { mode: 0o700 });
   await writeFile(join(temp, "reviewed.txt"), "reviewed original"); await chown(join(temp, "reviewed.txt"), 1000, 1000);
   const scope: MemberScope = { async withMember(_paths, _member, _mode, run) {
     return run({ calls: {}, liveWork: false, protectedPath: () => false, settle: async () => {} });
   } };
-  const options = { root: groups, state: join(root, "state.sqlite"), archive: join(groups, ".reclamation/backup/rm"), scope };
+  const options = { root: groups, state: join(root, "state.sqlite"), archive: join(groups, "state/reclamation/backup/rm"), scope };
   const plan = await previewTmpArchive(options, 0);
   expect((await applyTmpArchive(options, plan.id, plan.digest)).outcomes[0]?.status).toBe("archived");
   // The archive belongs to the old service identity, as on a deployment.
-  for (const path of [join(groups, ".reclamation"), join(groups, ".reclamation/backup"), options.archive]) await chown(path, 1000, 1000);
+  for (const path of [join(groups, "state/reclamation"), join(groups, "state/reclamation/backup"), options.archive]) await chown(path, 1000, 1000);
   const plain = await previewArchiveRemoval(options);
   expect(plain.items[0]?.status).toBe("deferred");
   const removal = await previewArchiveRemoval({ ...options, legacy: true });
@@ -331,16 +331,16 @@ async function archiveFixture(names: string[]) {
   const root = await mkdtemp("/var/lib/mixin-reclamation-test-");
   console.log("Synthetic privileged fixture retained at " + root);
   await chmod(root, 0o755);
-  const groups = join(root, "groups"), temp = join(groups, "group-a/users/alice/tmp"), journal = join(root, "journal");
+  const groups = join(root, "data"), temp = join(groups, "tmp/groups/group-a/alice"), journal = join(root, "journal");
   await mkdir(temp, { recursive: true }); await mkdir(journal, { mode: 0o700 });
   for (const name of names) { await writeFile(join(temp, name), "reviewed " + name); await chown(join(temp, name), 1000, 1000); }
   const scope: MemberScope = { async withMember(_paths, _member, _mode, run) {
     return run({ calls: {}, liveWork: false, protectedPath: () => false, settle: async () => {} });
   } };
-  const options = { root: groups, state: join(root, "state.sqlite"), archive: join(groups, ".reclamation/backup/rm"), scope };
+  const options = { root: groups, state: join(root, "state.sqlite"), archive: join(groups, "state/reclamation/backup/rm"), scope };
   const plan = await previewTmpArchive(options, 0);
   await applyTmpArchive(options, plan.id, plan.digest);
-  for (const path of [join(groups, ".reclamation"), join(groups, ".reclamation/backup"), options.archive]) await chown(path, 1000, 1000);
+  for (const path of [join(groups, "state/reclamation"), join(groups, "state/reclamation/backup"), options.archive]) await chown(path, 1000, 1000);
   await chmod(options.archive, 0o750);
   return { root, groups, journal, archive: options.archive, destinations: plan.items.map(item => item.destination) };
 }
@@ -500,18 +500,18 @@ async function sharedResultsFixture(names: string[]) {
   const root = await mkdtemp("/var/lib/mixin-reclamation-test-");
   console.log("Synthetic privileged fixture retained at " + root);
   await chmod(root, 0o755);
-  const groups = join(root, "groups"), codemode = join(groups, "group-a/users/alice/tmp/codemode"), plans = join(root, "plans");
-  const durable = join(groups, "group-a/durable.sqlite"), paths = names.map(name => join(codemode, name));
+  const groups = join(root, "data"), codemode = join(groups, "tmp/groups/group-a/alice/codemode"), plans = join(root, "plans");
+  const durable = join(groups, "conversations/groups/group-a/durable.sqlite"), paths = names.map(name => join(codemode, name));
   await mkdir(codemode, { recursive: true }); await mkdir(plans, { mode: 0o700 });
   const { models, model } = fauxModels(), group = await openGroupHarness(durable, models);
   try {
-    await memberConversation(group.harness, "group-a", "alice", { model }, context);
+    await memberConversation(group.harness, scopeOf("group-a"), "alice", { model }, context);
     for (const name of names) {
       await mkdir(join(codemode, name)); await writeFile(join(codemode, name, "result"), "shared " + name);
       await group.harness.commit(async tx => { (await tx.doc(ResultsDoc)).calls[name] = { phone: "alice", createdAt: 1 }; }, context);
     }
   } finally { await group.close(); }
-  const db = new Database(join(root, "state.sqlite")); new DeliveryStore(db); db.close();
+  new Database(join(root, "state.sqlite")).close();
   for (const path of paths) { await chown(path, 1000, 1000); await chown(join(path, "result"), 1000, 1000); await chmod(path, 0o700); }
   await chown(codemode, 1000, 1000); await chmod(codemode, 0o750);
   return { root, groups, codemode, plans, durable, paths };
@@ -549,7 +549,7 @@ privileged("R7-1/R7-2 in physical reclamation: an interrupted plan holds the sha
   const write = spawnSync(process.execPath, ["-e", "require('node:fs').writeFileSync(process.argv[1], 'ok')", probe], { uid: 1000, gid: 1000, encoding: "utf8" });
   expect(write.status, write.stderr).toBe(0);
   await unlink(probe);
-  await withGroupSnapshot(f.durable, async harness => expect(Object.keys((await harness.snapshot(ResultsDoc, context))?.calls ?? {})).toEqual([]));
+  await withSpaceSnapshot(f.durable, async harness => expect(Object.keys((await harness.snapshot(ResultsDoc, context))?.calls ?? {})).toEqual([]));
   expect(statuses(done(apply(original)))).toEqual(["removed", "removed"]);
   expect(await ownership(f.codemode)).toEqual([1000, 1000, 0o750]);
 }, 120_000);

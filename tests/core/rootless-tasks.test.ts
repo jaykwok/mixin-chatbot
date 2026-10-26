@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { createHmac } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,16 +15,19 @@ const image = "sha256:" + "a".repeat(64);
 test("a different-device subtree cannot receive a removal permit", () => {
   expect(() => new RemovalPermit({ dev: 1n, ino: 2n }, { dev: 3n, ino: 4n })).toThrow("不同设备");
 });
+const mountSource = (args: string[]) => args[args.indexOf("--mount") + 1]!.split(",").find(value => value.startsWith("src="))!.slice(4);
+/** What the mapping helper prints for a directory: its identity, as the task daemon's view reports it. */
+async function identityOf(path: string): Promise<string> {
+  const info = await lstat(path, { bigint: true });
+  return JSON.stringify({ directory: info.isDirectory(), dev: String(info.dev), ino: String(info.ino) });
+}
 function syntheticDriver(managerPath: (source: string) => string = source => source) {
   const containers = new Map<string, any>(), calls: string[][] = []; let index = 0;
   const driver: TaskDriver = { async run(args) {
     calls.push(args);
     if (args[0] === "info") return { exitCode: 0, output: JSON.stringify({ ID: "synthetic-daemon", SecurityOptions: ["name=rootless"] }) };
     if (args[0] === "image") return { exitCode: 0, output: JSON.stringify([{ Id: image, Os: "linux" }]) };
-    if (args[0] === "run") {
-      const source = args[args.indexOf("--mount") + 1]!.split(",").find(value => value.startsWith("src="))!.slice(4);
-      return { exitCode: 0, output: await readFile(managerPath(source), "utf8") };
-    }
+    if (args[0] === "run") return { exitCode: 0, output: await identityOf(managerPath(mountSource(args))) };
     if (args[0] === "create") {
       const values = (key: string) => args.flatMap((value, i) => value === key ? [args[i + 1]!] : []);
       const cid = String(++index).padStart(64, "0");
@@ -191,10 +195,12 @@ test.skipIf(process.platform !== "linux")("container manager refuses unmapped in
 test.skipIf(process.platform !== "linux")("a wrong physical mount fails before allocating work and a repaired mapping can retry", async () => {
   const f = await tempFixture("task-mapping-proof-"), temp = join(f.root, "caller"), control = join(f.root, "control");
   await mkdir(temp);
+  // Another directory with the same (empty) content: equal content is no proof of the same entity.
+  const twin = await mkdtemp(join(tmpdir(), "task-mapping-twin-"));
   const deployment = { version: 1 as const, image, mounts: [{ manager: f.root, daemon: "/daemon" }], imagePaths: [] };
   const backend = syntheticDriver(source => source.replace("/daemon", f.root)); let wrong = true;
-  const driver: TaskDriver = { run: (args, options) => wrong && args[0] === "run"
-    ? Promise.resolve({ exitCode: 0, output: "a different physical directory" }) : backend.driver.run(args, options) };
+  const driver: TaskDriver = { run: async (args, options) => wrong && args[0] === "run"
+    ? { exitCode: 0, output: await identityOf(twin) } : backend.driver.run(args, options) };
   const tasks = new RootlessTasks(control, image, driver, undefined, deployment);
   try {
     await expect(tasks.create(temp)).rejects.toThrow("不指向同一实体");
@@ -203,6 +209,61 @@ test.skipIf(process.platform !== "linux")("a wrong physical mount fails before a
     wrong = false;
     const task = await tasks.create(temp);
     await task.seal(); expect((await tasks.reclaim(task.id)).status).toBe("removed");
+  } finally { await rm(twin, { recursive: true, force: true }); await f.cleanup(); }
+});
+
+// F4: the proof only reads. A materials root keeps its entries and modification time, gets no probe file, and is
+// mounted read-only into the helper; the real read-only bind mount is covered by tests/ops/real-docker-mapping.test.ts.
+test.skipIf(process.platform !== "linux")("the mapping proof writes nothing into a root and mounts it read-only", async () => {
+  const f = await tempFixture("task-mapping-readonly-");
+  try {
+    const control = join(f.root, "control");
+    await mkdir(join(f.root, "sub")); await writeFile(join(f.root, "sub", "a.txt"), "material");
+    const state = async () => ({ names: (await readdir(f.root, { recursive: true })).sort(), mtime: (await lstat(f.root, { bigint: true })).mtimeNs });
+    const before = await state();
+    const deployment = { version: 1 as const, image, mounts: [{ manager: f.root, daemon: "/daemon" }], imagePaths: [] };
+    const backend = syntheticDriver(source => source.replace("/daemon", f.root));
+    await new RootlessTasks(control, image, backend.driver, undefined, deployment).verifyDeployment();
+    const probe = backend.calls.find(call => call[0] === "run")!;
+    expect(probe[probe.indexOf("--mount") + 1]).toBe("type=bind,src=/daemon,dst=/mapping-proof,readonly");
+    for (const flag of ["--read-only", "--rm"]) expect(probe).toContain(flag);
+    expect(probe.slice(probe.indexOf("--network"), probe.indexOf("--network") + 2)).toEqual(["--network", "none"]);
+    expect(await state()).toEqual(before);
+  } finally { await f.cleanup(); }
+});
+
+for (const [name, answer, message] of [
+  ["a daemon failure", { exitCode: 125, output: "Error response from daemon: invalid mount config" }, "任务容器操作失败"],
+  ["a malformed helper answer", { exitCode: 0, output: "{\"directory\":true,\"dev\":\"1\"}" }, "核验结果无效"],
+  ["a helper that sees a file", { exitCode: 0, output: "{\"directory\":false,\"dev\":\"1\",\"ino\":\"2\"}" }, "核验结果无效"],
+] as const)
+  test.skipIf(process.platform !== "linux")(`${name} refuses the mapping; the helper is removed by name`, async () => {
+    const f = await tempFixture("task-mapping-failure-");
+    try {
+      const deployment = { version: 1 as const, image, mounts: [{ manager: f.root, daemon: "/daemon" }], imagePaths: [] };
+      const backend = syntheticDriver(source => source.replace("/daemon", f.root));
+      const driver: TaskDriver = { run: (args, options) => args[0] === "run" ? Promise.resolve(answer) : backend.driver.run(args, options) };
+      await expect(new RootlessTasks(join(f.root, "control"), image, driver, undefined, deployment).verifyDeployment()).rejects.toThrow(message);
+      const helper = backend.calls.find(call => call[0] === "container" && call[1] === "rm");
+      if (answer.exitCode !== 0) expect(helper?.[3]).toStartWith("mixin-mapping-");
+    } finally { await f.cleanup(); }
+  });
+
+test.skipIf(process.platform !== "linux")("a root replaced while the helper runs is refused", async () => {
+  const f = await tempFixture("task-mapping-replaced-");
+  try {
+    const root = join(f.root, "root");
+    await mkdir(root);
+    const deployment = { version: 1 as const, image, mounts: [{ manager: root, daemon: "/daemon/root" }], imagePaths: [] };
+    const backend = syntheticDriver(source => source.replace("/daemon/root", root));
+    const driver: TaskDriver = { run: async (args, options) => {
+      if (args[0] !== "run") return backend.driver.run(args, options);
+      // The daemon saw the directory that was held; then the path is pointed at another one.
+      const answer = await identityOf(root);
+      await rename(root, join(f.root, "moved")); await mkdir(root);
+      return { exitCode: 0, output: answer };
+    } };
+    await expect(new RootlessTasks(join(root, "control"), image, driver, undefined, deployment).verifyDeployment()).rejects.toThrow("已被替换");
   } finally { await f.cleanup(); }
 });
 function allocationStorage(overrides: Partial<TaskStorage> = {}): TaskStorage {
@@ -236,6 +297,8 @@ test.skipIf(process.platform !== "linux")("reclamation saves its deletion intent
     const calls = backend.calls.length;
     expect(await tasks.sweep(temp, Infinity, resultReferences([]))).toEqual([]);
     expect(backend.calls.length).toBe(calls);
+    // A member whose tmp was never created (no tool ran yet) has nothing to sweep: no ENOENT.
+    expect(await tasks.sweep(join(f.root, "never-created"), Infinity, resultReferences([]))).toEqual([]);
   } finally { await live.seal(); await tasks.reclaim(live.id); await f.cleanup(); }
 });
 

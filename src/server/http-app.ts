@@ -1,241 +1,83 @@
-import { Hono, type Context } from "hono";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { isSlashCommandMessage } from "../agent/commands.ts";
-import { waitFor } from "../core/lifecycle.ts";
-import { MAX_WEBHOOK_BODY_BYTES } from "../core/config.ts";
-import { WEBHOOK_SECRET_FILE } from "../core/storage.ts";
-import { log } from "../core/log.ts";
-import { observeCallbackRoute } from "../integrations/callback-route.ts";
-import { constantTimeEqual, getClientIp, HttpError, isJsonContentType } from "./http.ts";
-import { RejectionLogger } from "./rejection-log.ts";
+import { Hono } from "hono";
 import { randomUUID } from "node:crypto";
-import { admitUserRequest, enqueueUserControl, enqueueUserNotice, hasUserRequestCapacity, isDuplicate,
-  isRateLimited, validateWebhookData } from "./webhook.ts";
+import { log } from "../core/log.ts";
+import { APP_BUILD, APP_VERSION } from "../core/version.ts";
+import type { DepartmentInfo } from "../integrations/open-platform/directory.ts";
+import { parseDepartmentIds } from "../integrations/open-platform/directory-scope.ts";
+import { constantTimeEqual } from "./http.ts";
 
 export interface AppOptions {
-  signal: AbortSignal;
-  webhookSecret: string | null;
-  allowInsecure: boolean;
   isStopping: () => boolean;
   adminToken: string;
   shutdown: () => void;
   instanceId?: string;
   startedAt?: number;
+  /** Extra health fields (event stream, directory sync); must not throw or contain credentials. */
+  health?: () => Record<string, unknown>;
+  /** Confirms the paused bulk revocation of directory scan `scanId` (see IdentityDirectory.confirmRevocations). */
+  confirmRevocations?: (scanId: number) => "started" | "stale" | "busy";
+  /** Direct child departments of `parent` from the platform (for choosing the directory scope). */
+  listDepartments?: (parent: string) => Promise<DepartmentInfo[]>;
+  /** Checks the departments with the platform, saves the scope (`undefined`: the whole directory) and rescans; the current scope again is a no-op. */
+  changeScope?: (departments: string[] | undefined) => Promise<DepartmentInfo[] | "unchanged">;
 }
 
-/** HTTP construction is separate from SDK startup and OS signal ownership. */
+/**
+ * The host-local control surface: `/health`, `/_admin/shutdown` and `/_admin/directory/*`. Messages arrive over the platform's event stream,
+ * so nothing here is reachable from the platform; the server listens on loopback only (src/core/config.ts).
+ */
 export function createApp(options: AppOptions): Hono {
-const app = new Hono();
-const identity = { service: "mixin-chatbot" as const, version: 1 as const, instanceId: options.instanceId ?? randomUUID(),
-  startedAt: options.startedAt ?? Date.now(), pid: process.pid };
+  const app = new Hono();
+  // version is the health protocol; appVersion and build name the running program.
+  const identity = { service: "mixin-chatbot" as const, version: 1 as const, appVersion: APP_VERSION, build: APP_BUILD, instanceId: options.instanceId ?? randomUUID(),
+    startedAt: options.startedAt ?? Date.now(), pid: process.pid };
 
-const rejectionLog = new RejectionLogger();
-options.signal.addEventListener("abort", () => rejectionLog.flush(), { once: true });
-
-
-/** Hono 4.13 body-limit trusts Content-Length and reads chunked bodies without
- * cancellation. Keep the actual byte cap, read deadline and fatal UTF-8 decoding
- * together here; swapping just the size check would weaken this boundary. */
-async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
-  const contentLength = c.req.header("content-length");
-  if (contentLength) {
-    const declared = Number(contentLength);
-    if (!Number.isInteger(declared) || declared < 0) {
-      throw new HttpError(400, "无效的 Content-Length");
-    }
-    if (declared > MAX_WEBHOOK_BODY_BYTES) {
-      throw new HttpError(413, `请求体过大（上限 ${MAX_WEBHOOK_BODY_BYTES} 字节）`);
-    }
-  }
-
-  const reader = c.req.raw.body?.getReader();
-  if (!reader) throw new HttpError(400, "请求体不能为空");
-  const signal = AbortSignal.any([options.signal, AbortSignal.timeout(10000)]);
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-  while (true) {
-    const { done, value } = await waitFor(reader.read(), signal);
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_WEBHOOK_BODY_BYTES) {
-      void reader.cancel().catch(() => {});
-      throw new HttpError(413, `请求体过大（上限 ${MAX_WEBHOOK_BODY_BYTES} 字节）`);
-    }
-    chunks.push(value);
-  }
-  } catch (error) {
-    void reader.cancel().catch(() => {});
-    if (signal.aborted) throw new HttpError(408, "请求体读取超时或服务关闭",
-      options.signal.aborted ? "service_stopping" : undefined);
-    throw error;
-  } finally { reader.releaseLock(); }
-
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  } catch {
-    throw new HttpError(400, "请求必须是有效的 UTF-8 JSON");
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new HttpError(400, "请求 JSON 必须是对象");
-  }
-  return parsed as Record<string, unknown>;
-}
-
-/** webhook 业务处理：解析 + 校验 + 去重 + 限流 + 写进成员的 inbox 后回执（控制命令后台执行）。 */
-const webhookHandler = async (c: Context) => {
-  if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试", "service_stopping");
-
-  // 声明了 Content-Type 时只接受标准 JSON 或 +json 媒体类型。
-  const ct = c.req.header("content-type") ?? "";
-  if (ct && !isJsonContentType(ct)) {
-    throw new HttpError(415, "Content-Type 必须是 application/json");
-  }
-
-  const clientIp = getClientIp(c);
-  const data = await readJsonBody(c);
-  const { phone, groupId, content, callbackUrl } = validateWebhookData(data);
-  const callbackRoute = observeCallbackRoute(callbackUrl, groupId);
-
-  log.info(
-    `收到请求 - IP: ${clientIp}, 用户: ${phone}, 群组: ${groupId}, 回复key指纹: ${callbackRoute.fingerprint}, 内容长度: ${content.length}`
-  );
-
-  if (!callbackRoute.safe) {
-    if (callbackRoute.reason === "capacity") {
-      log.error(`callback 路由保护容量已满，拒绝未知 key ${callbackRoute.fingerprint}`);
-      throw new HttpError(503, "回调路由保护暂时无法接收新的机器人 key", "callback_route_capacity");
-    }
-    log.error(
-      `阻止跨群广播：回复 key ${callbackRoute.fingerprint} 同时对应多个群 (${callbackRoute.groups.join(", ")})；请为每个群重新创建独立的会话机器人`
-    );
-    throw new HttpError(
-      409,
-      "同一个机器人回复 key 被多个群共用；为防止消息串群，本次请求已停止",
-      "callback_route_conflict"
-    );
-  }
-
-  if (isSlashCommandMessage(content)) {
-    if (options.isStopping()) throw new HttpError(503, "服务正在关闭", "service_stopping");
-    const accepted = await enqueueUserControl(content, phone, groupId, callbackUrl, clientIp);
-    if (!accepted) rejectionLog.record(c, 503, "request_capacity");
-    return c.json({ status: accepted ? "success" : "busy" }, accepted ? 200 : 503);
-  }
-  if (isDuplicate(phone, groupId, content)) {
-    log.info(`跳过重复请求 - 用户: ${phone}`);
-    return c.json({ status: "success" });
-  }
-  if (!hasUserRequestCapacity()) {
-    log.warn(`后台请求容量已满 - 用户: ${phone}, 群: ${groupId}`);
-    enqueueUserNotice(
-      "capacity",
-      "⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。",
-      phone,
-      groupId,
-      callbackUrl
-    );
-    return c.json({ status: "success" });
-  }
-  if (isRateLimited(phone, groupId)) {
-    log.warn(`速率限制触发 - 用户: ${phone}, 群: ${groupId}`);
-    enqueueUserNotice(
-      "rate-limit",
-      "⚠️ 短时间内收到的消息较多，这条消息未加入队列，不会自动处理，请稍后重新发送。",
-      phone,
-      groupId,
-      callbackUrl
-    );
-    return c.json({ status: "success" });
-  }
-  // readJsonBody 等 await 期间可能收到关闭信号；不再接收无法被关机流程追踪的新任务。
-  if (options.isStopping()) throw new HttpError(503, "服务正在关闭，请稍后重试", "service_stopping");
-  // 写进成员的 inbox 之后才回执 200：此后重启也会处理它。同一成员的消息由消息服务按到达顺序逐条处理。
-  const admission = admitUserRequest(content, phone, groupId, callbackUrl, clientIp);
-  if (!admission) {
-    // 单线程内无 await，正常不会在容量预检后命中；仍按不可重投平台处理。
-    enqueueUserNotice(
-      "capacity",
-      "⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。",
-      phone,
-      groupId,
-      callbackUrl
-    );
-    return c.json({ status: "success" });
-  }
-  // 排队已满或写入失败时 admitUserRequest 已给成员发回执；平台不重投，仍回 200。
-  await admission;
-  return c.json({ status: "success" });
-};
-
-// ---- webhook 路由：有密钥走随机路径鉴权；无密钥仅显式开发模式可开放 ----
-const webhookSecret = options.webhookSecret;
-if (webhookSecret) {
-  log.info("Webhook 已启用随机密钥路径鉴权（/webhook/<secret>）");
-  app.post("/webhook/:secret", async (c) => {
-    const got = c.req.param("secret");
-    if (!got || !constantTimeEqual(got, webhookSecret)) {
-      rejectionLog.record(c, 404, "webhook_secret_mismatch");
-      return c.json({ status: "error", message: "Not Found" }, 404);
-    }
-    return webhookHandler(c);
+  app.get("/health", (c) => {
+    const stopping = options.isStopping();
+    let extra: Record<string, unknown> = {};
+    try { extra = options.health?.() ?? {}; } catch (error) { log.error("健康状态读取失败: " + String(error)); }
+    return c.json({ ...identity, status: stopping ? "stopping" : "ready", ...extra }, stopping ? 503 : 200);
   });
-  // 无密钥路径直接 404，强制走密钥路径
-  app.post("/webhook", (c) => {
-    rejectionLog.record(c, 404, "webhook_secret_missing");
-    return c.json({ status: "error", message: "Not Found" }, 404);
+  const authorized = (header: string | undefined) => constantTimeEqual(header ?? "", "Bearer " + options.adminToken);
+  app.post("/_admin/shutdown", (c) => {
+    if (!authorized(c.req.header("Authorization"))) return c.notFound();
+    setTimeout(options.shutdown, 0);
+    return c.json({ status: "stopping" });
   });
-} else {
-  if (!options.allowInsecure) {
-    throw new Error(
-      `${WEBHOOK_SECRET_FILE} 缺失或格式无效；生产默认拒绝无鉴权启动。本地调试可显式设置 ALLOW_INSECURE_WEBHOOK=1。`
-    );
-  }
-  log.warn("ALLOW_INSECURE_WEBHOOK=1：开放 /webhook，仅限隔离的本地开发环境！");
-  app.post("/webhook", webhookHandler);
-}
-
-app.get("/favicon.svg", async () =>
-  new Response(await readFile(join("public", "favicon.svg")), {
-    headers: { "Content-Type": "image/svg+xml" },
-  }));
-app.get("/favicon.ico", async () =>
-  new Response(await readFile(join("public", "favicon.svg")), {
-    headers: { "Content-Type": "image/svg+xml" },
-  }));
-
-app.onError((err, c) => {
-  if (err instanceof HttpError) {
-    // err.message 可能包含来自请求体的字段值，日志只记录稳定的原因标签。
-    rejectionLog.httpError(c, err);
-    return new Response(JSON.stringify({ status: "error", message: err.message }), {
-      status: err.status,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-  log.error(`未处理异常 - IP: ${getClientIp(c)}, 错误: ${String(err)}`);
-  return c.json({ status: "error", message: "内部服务器错误" }, 500);
-});
-app.notFound((c) => {
-  rejectionLog.record(c, 404, "route_not_found");
-  return c.json({ status: "error", message: "Not Found" }, 404);
-});
-
-
-app.get("/health", (c) => c.json({ ...identity, status: options.isStopping() ? "stopping" : "ready" }, options.isStopping() ? 503 : 200));
-app.post("/_admin/shutdown", (c) => {
-  if (!constantTimeEqual(c.req.header("Authorization") ?? "", "Bearer " + options.adminToken)) return c.notFound();
-  setTimeout(options.shutdown, 0);
-  return c.json({ status: "stopping" });
-});
-return app;
+  app.post("/_admin/directory/confirm", async (c) => {
+    if (!authorized(c.req.header("Authorization")) || !options.confirmRevocations) return c.notFound();
+    const body = await c.req.json().catch(() => undefined) as { scanId?: unknown } | undefined;
+    const scanId = body?.scanId;
+    if (typeof scanId !== "number" || !Number.isSafeInteger(scanId) || scanId < 1) return c.json({ status: "error", message: "scanId 无效" }, 400);
+    const result = options.confirmRevocations(scanId);
+    if (result === "started") return c.json({ status: "started" }, 202);
+    return c.json({ status: result, message: result === "busy" ? "通讯录同步正在进行，请稍后重试" : "这一轮已不是待确认的撤销，请刷新后重新查看" }, 409);
+  });
+  app.post("/_admin/directory/departments", async (c) => {
+    if (!authorized(c.req.header("Authorization")) || !options.listDepartments) return c.notFound();
+    const body = await c.req.json().catch(() => undefined) as { parent?: unknown } | undefined;
+    let parent: string;
+    try { [parent] = parseDepartmentIds([body?.parent ?? "1"], "parent"); }
+    catch (error) { return c.json({ status: "error", message: (error as Error).message }, 400); }
+    try { return c.json({ status: "ok", departments: await options.listDepartments(parent) }); }
+    catch (error) { return c.json({ status: "error", message: `读取部门失败：${(error as Error).message}` }, 502); }
+  });
+  app.post("/_admin/directory/scope", async (c) => {
+    if (!authorized(c.req.header("Authorization")) || !options.changeScope) return c.notFound();
+    const body = await c.req.json().catch(() => undefined) as { departments?: unknown } | undefined;
+    let departments: string[] | undefined;
+    try { departments = body?.departments === null ? undefined : parseDepartmentIds(body?.departments); }
+    catch (error) { return c.json({ status: "error", message: (error as Error).message }, 400); }
+    try {
+      const checked = await options.changeScope(departments);
+      return checked === "unchanged" ? c.json({ status: "unchanged" }) : c.json({ status: "started", departments: checked }, 202);
+    }
+    catch (error) { return c.json({ status: "error", message: (error as Error).message }, 409); }
+  });
+  app.onError((err, c) => {
+    log.error(`本机控制接口异常: ${String(err)}`);
+    return c.json({ status: "error", message: "内部服务器错误" }, 500);
+  });
+  app.notFound((c) => c.json({ status: "error", message: "Not Found" }, 404));
+  return app;
 }

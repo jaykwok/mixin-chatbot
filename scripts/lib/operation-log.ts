@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { redactSecrets as redact } from "./redact.ts";
 
-const namePattern = /^(upgrade|deploy|migration|startup)-[\dTZ]+-[\w-]+\.log$/;
+const namePattern = /^(upgrade|deploy|startup)-[\dTZ]+-[\w-]+\.log$/;
 const maxBytes = 2 * 1024 * 1024;
 
 export function operationError(error: unknown): string {
@@ -18,7 +18,7 @@ export function operationError(error: unknown): string {
   return describe(error);
 }
 
-export function openOperationLog(project: string, kind: "upgrade" | "deploy" | "migration" | "startup", inherited = process.env.BOT_OPERATION_LOG) {
+export function openOperationLog(project: string, kind: "upgrade" | "deploy" | "startup", inherited = process.env.BOT_OPERATION_LOG) {
   const directory = join(project, "logs/operations");
   // Inheriting a log also delegates its terminal announcement to the caller.
   const parentName = inherited && namePattern.test(inherited) ? inherited : undefined;
@@ -31,7 +31,7 @@ export function openOperationLog(project: string, kind: "upgrade" | "deploy" | "
     if (existsSync(path) && (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink())) throw new Error("diagnostic file is not a regular file");
     if (!existsSync(path)) closeSync(openSync(path, "wx", 0o600));
     // Rotate only this file's family, including inherited upgrade logs. Startup
-    // restart loops must never evict the upgrade or migration that caused them.
+    // restart loops must never evict the upgrade or deployment that caused them.
     const family = name.split("-")[0] + "-";
     const old = readdirSync(directory).filter(file => file !== name && file.startsWith(family) && namePattern.test(file))
       .map(file => ({ file, stat: lstatSync(join(directory, file)) }))

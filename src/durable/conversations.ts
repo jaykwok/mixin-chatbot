@@ -1,6 +1,7 @@
 import type { Context } from "@earendil-works/chord";
 import { type ConversationId, type Harness, InboxDoc as PiInboxDoc } from "@earendil-works/pi-durable";
 import { InboxDoc } from "./inbox.ts";
+import { LIVE_TASK_STATES } from "./task-states.ts";
 
 /** Scan once through the public transaction API; callers choose whether forks count. */
 export async function conversationIds(session: Pick<Harness, "commit">, context: Context, ownerless = false): Promise<ConversationId[]> {
@@ -16,10 +17,10 @@ export async function conversationIds(session: Pick<Harness, "commit">, context:
   }, context);
 }
 
-/** Call only while the group admission gate is held. Any recoverable work postpones physical reclamation. */
-export async function idleGroupReferences(harness: Harness, context: Context): Promise<unknown[] | undefined> {
+/** Call only while the space admission gate is held. Any recoverable work postpones physical reclamation. */
+export async function idleSpaceReferences(harness: Harness, context: Context): Promise<unknown[] | undefined> {
   const busy = await harness.commit(async tx => {
-    for (const status of ["pending", "running", "waiting", "completing"] as const) {
+    for (const status of LIVE_TASK_STATES) {
       if ((await tx.scanTasks({ status }, 1)).items.length) return true;
     }
     return false;

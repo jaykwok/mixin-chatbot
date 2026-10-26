@@ -49,7 +49,7 @@ export function buildMaterialsTools(options: DocumentOptions & { ignorePath: str
   }
   const find: ToolDefinition<typeof findParams> = {
     name: "materials_find", label: "查找资料文件", parameters: findParams,
-    description: "在本群资料索引内按文件名/路径的字面关键词查找（不启动进程）。返回相对路径、字节数、修改时间及索引完整性；any 任一关键词、all 全部关键词。索引可能滞后，未命中不代表不存在。",
+    description: "在共享资料索引内按文件名/路径的字面关键词查找（不启动进程）。返回相对路径、字节数、修改时间及索引完整性；any 任一关键词、all 全部关键词。索引可能滞后，未命中不代表不存在。",
     annotations: { readOnlyHint: true, openWorldHint: false },
     async execute(_id, params, signal) {
       const started = performance.now();
@@ -63,14 +63,14 @@ export function buildMaterialsTools(options: DocumentOptions & { ignorePath: str
   };
   const grep: ToolDefinition<typeof grepParams> = {
     name: "materials_grep", label: "检索资料正文", parameters: grepParams,
-    description: "在本群纯文本及有效的 document_extract 缓存中检索字面关键词，any 任一命中、all 同一行全部命中；返回文件、行号、前后文。不会启动解析或其他进程。缓存缺失/失效返回 notIndexed，请先单独 document_extract，再检索。最多 15 秒、16 KiB 结果，每文件最多 5 个命中。",
+    description: "在共享资料的纯文本及有效的 document_extract 缓存中检索字面关键词，any 任一命中、all 同一行全部命中；返回文件、行号、前后文。不会启动解析或其他进程。缓存缺失/失效返回 notIndexed，请先单独 document_extract，再检索。最多 15 秒、16 KiB 结果，每文件最多 5 个命中。",
     annotations: { readOnlyHint: true, openWorldHint: false },
     async execute(_id, params, callerSignal) {
       const started = performance.now();
       const budget = AbortSignal.timeout(15_000), signal = AbortSignal.any([budget, ...(callerSignal ? [callerSignal] : [])]);
       const data = await index(), root = await realpath(options.workspaceDir);
       const wanted = params.paths?.map(x => resolve(root, x));
-      if (wanted?.some(x => !isPathInside(x, root))) throw new Error("只能检索本群资料索引中的路径");
+      if (wanted?.some(x => !isPathInside(x, root))) throw new Error("只能检索共享资料索引中的路径");
       const entries = data.entries.filter(x => !wanted || wanted.includes(resolve(root, x.path)));
       const cachedText = createDocumentTextLookup(options, signal);
       const hits: { path: string; line: number; snippet: string; extracted: boolean; truncated: boolean }[] = [];

@@ -72,8 +72,8 @@ function readOnlySettingsStorage(readGlobal: () => string | undefined): PiSettin
 /**
  * Pi 原生设置管理器，全局作用域读项目私有 agent 目录下的 settings.json。
  *
- * 项目作用域必须关掉：agent 的 cwd 是群共享工作区，群成员能往里传文件，也就能放一个
- * .pi/settings.json 进去改模型和运行策略。
+ * 项目作用域必须关掉：agent 的 cwd 是应用共享资料区，内容来自外部同步源，同步源里只要放一个
+ * .pi/settings.json 就能改模型和运行策略。
  */
 export function openSettings(path = PI_SETTINGS_PATH): SettingsManager {
   const raw = existsSync(path) ? readFileSync(path, "utf8") : undefined;

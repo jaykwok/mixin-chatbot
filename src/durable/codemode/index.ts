@@ -20,19 +20,19 @@
 //   The commit that stores a script's outcome and writes is checked against the merged store: over the sandbox's limits
 //   the writes are undone in that transaction and the script fails, with why.
 // - Usage: a nested call's usage is counted by Durable under its tool (`pi.usage.tools`), not on the codemode result.
-//   Independent receipts (./usage.ts) share each nested result's terminal transaction. The stats ledger consumes them
-//   by a durable sequence, independently of cancellation, VM replay, or the parent's outcome. `details.usage` is only
-//   a display snapshot; while the script runs the details are `{ calls, usage, partial: true }`. The sum is taken from what
-//   Durable kept, not from what this attempt's VM went through: every nested call of the call has its slot in
-//   `pi.live.nestedTools` while the call runs, and its result, with the usage Durable recorded, in the call's
-//   `NestedCallDoc`, once per key. A rerun that decides without running the script (deadline passed, another code mode
-//   version or sandbox, a divergence) or is cancelled before its replay reaches a finished call still charges it, and
-//   only once. The outcome's display snapshot can lag a later child; its independent receipt still charges it.
+//   The stats ledger takes the conversation's `pi.usage` totals (../projection.ts), so cancellation, VM replay or the
+//   parent's outcome do not change what is charged. `details.usage` is only a display snapshot; while the script runs
+//   the details are `{ calls, usage, partial: true }`. The sum is taken from what Durable kept, not from what this
+//   attempt's VM went through: every nested call of the call has its slot in `pi.live.nestedTools` while the call runs,
+//   and its result, with the usage Durable recorded, in the call's `NestedCallDoc`, once per key. A rerun that decides
+//   without running the script (deadline passed, another code mode version or sandbox, a divergence) or is cancelled
+//   before its replay reaches a finished call still shows it, and only once. The outcome's display snapshot can lag a
+//   later child; `pi.usage` still counts it.
 import { copyJson, type Context, type JsonValue } from "@earendil-works/chord";
 import type { Usage } from "@earendil-works/pi-ai";
 import { CodemodeSandbox, type CodemodeResult, type CodemodeRun, type CodemodeRunOptions, type CodemodeSandboxBase } from "@earendil-works/pi-codemode";
 import {
-  defineExtension, type Extension, hook, type JsonObject, LiveDoc, type LiveState, NestedCallDoc, type NestedCallState, type NestedToolExecutionResult, ToolTask,
+  defineExtension, type Extension, type JsonObject, LiveDoc, type LiveState, NestedCallDoc, type NestedCallState, type NestedToolExecutionResult,
   type TaskDocToken, type TaskId, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration, type Tx,
 } from "@earendil-works/pi-durable";
 import {
@@ -43,7 +43,6 @@ import { err, type ExecutionEnv, FileError, ok } from "@earendil-works/pi-durabl
 import { resultRegistration } from "../results/ownership.ts";
 import { ResultFiles, resultsDirName } from "../results/files.ts";
 import { type BaseToolsOptions, type MemberTool, resolveMember } from "../tools.ts";
-import { recordNestedUsage } from "./usage.ts";
 import { isScriptResult, RUN_DOC_KIND, type RunState, type ScriptResult } from "./protocol.ts";
 import { codemodeWorkers } from "./workers.ts";
 
@@ -68,7 +67,7 @@ export type CodemodeDetails = Omit<CodemodeToolDetails, "calls"> & {
 
 export interface CodemodeOptions {
   /** Identity and places, as for the base tools. */
-  readonly members: Pick<BaseToolsOptions, "root" | "groupId" | "venvDir">;
+  readonly members: Pick<BaseToolsOptions, "layout" | "scope" | "venvDir">;
   /** The registry's tools: their namespaces group them in the `codemode` section and for `searchTools()`. */
   readonly tools: readonly MemberTool[];
   /** Estimated tokens of the tool declarations in the `codemode` section; default CODEMODE_INLINE_BUDGET. */
@@ -104,7 +103,6 @@ export function codemodeExtension(options: CodemodeOptions): Extension {
       sandbox, args as { code: string }, api, context),
   };
   return defineExtension({ name: "mixin.codemode", tools: [tool],
-    hooks: [hook(ToolTask, { settleNestedTool: (call, key, result, tx) => recordNestedUsage(call, key, result, tx) })],
     ...(extension.sections ? { sections: extension.sections } : {}) });
 }
 

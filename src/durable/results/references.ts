@@ -1,4 +1,4 @@
-// Whether a result directory is still referenced by any context, fork or pending delivery of the group.
+// Whether a result directory is still referenced by any context, fork or pending delivery of the space.
 import { resolve, sep } from "node:path";
 import { ReferenceText } from "../../core/reference-text.ts";
 import { resultsRoot } from "./files.ts";
@@ -6,7 +6,7 @@ import { resultsRoot } from "./files.ts";
 const fold = (value: string) => process.platform === "win32" ? value.toLowerCase() : value;
 
 /** Conservative matching: references may occur in message text, tool details or attachment originals.
- * Build once per maintenance pass of a group; every member, queued item and receipt reuses it. */
+ * Build once per maintenance pass of a space; every member, queued item and receipt reuses it. */
 export function resultReferences(values: readonly unknown[]): ReferenceText {
   return new ReferenceText(() => fold(values.map(value => JSON.stringify(value)).join("\n").replaceAll("\\\\", "\\").replaceAll("/", sep)), sep);
 }

@@ -109,7 +109,7 @@ test.skipIf(!available)("身份取值和 Docker 模式：rootless 只用 0:0，r
     expect(await message("operator-rootless-root")).toContain("不要用 sudo");
     expect(await message("operator-rootless-root")).toContain("ops.sh rollback");
 
-    expect([results["recorded-none"], results["recorded-mode"]]).toEqual(["1", "0"]);
+    expect([results["recorded-none"], results["recorded-port"]]).toEqual(["1", "0"]);
     expect({
       rootful: results["data-rootful"], rootfulRoot: results["data-rootful-root"], missing: results["data-missing"],
       rootless: results["data-rootless"], rootlessOther: results["data-rootless-other"],
@@ -123,7 +123,7 @@ test.skipIf(!available)("原容器的身份：只认本项目的数据挂载和�
   try {
     const { results, message } = await scenarios("container", fixture.root);
     expect([results.read, results["read-fields"], results["read-missing"], results["read-down"]])
-      .toEqual(["0", "c0ffee|1000:1000|sha256:old|/srv/groups", "2", "1"]);
+      .toEqual(["0", `c0ffee|1000:1000|sha256:old|${posixPath(fixture.root)}/project/data`, "2", "1"]);
     // A missing container is a status for the caller, not an error; an unreachable daemon is reported.
     expect(await message("read-missing")).toBe("");
     expect(await message("read-down")).toContain("无法读取原容器 mixin-chatbot");
@@ -178,6 +178,16 @@ test.skipIf(!available)("部署确定服务身份：沿用原容器；从未部�
     expect(results["deploy-declined-question"]).toContain("已有数据的属主不变");
     expect(await message("deploy-declined")).toContain("未确认服务的运行身份");
     expect(await message("deploy-root-owned")).toContain("不应以 root");
+    // Root's first deployment also hands over data/ itself (not its contents): task isolation and resets write at its top.
+    expect({
+      first: results["directories-first"], firstChowns: results["directories-first-chowns"],
+      kept: results["directories-kept"] + results["directories-kept-chowns"],
+      user: results["directories-user"] + results["directories-user-chowns"], fails: results["directories-chown-fails"],
+    }).toEqual({
+      first: "0",
+      firstChowns: "-R 1001:1001 <p>/data/config <p>/data/state <p>/data/runtime <p>/logs <p>/backup;1001:1001 <p>/data;",
+      kept: "0", user: "0", fails: "1",
+    });
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -204,11 +214,10 @@ test.skipIf(!available)("运维的一次性容器先取得部署锁并拒绝未�
   const fixture = await tempFixture("service-user-guard-");
   try {
     const { results, message } = await scenarios("guard", fixture.root);
-    expect({ clear: results["guard-clear"], busy: results["guard-busy"], deploy: results["guard-deploy"], update: results["guard-update"] })
-      .toEqual({ clear: "0", busy: "1", deploy: "1", update: "1" });
+    expect({ clear: results["guard-clear"], busy: results["guard-busy"], deploy: results["guard-deploy"] })
+      .toEqual({ clear: "0", busy: "1", deploy: "1" });
     expect(await message("guard-busy")).toContain("部署或升级正在进行");
     expect(await message("guard-deploy")).toContain("ops.sh resume");
-    expect(await message("guard-update")).toContain("ops.sh rollback");
     expect({
       none: results["busy-none"], free: results["busy-free"], held: results["busy-held"], own: results["busy-own"], pointer: results["busy-pointer"],
     }).toEqual({ none: "1", free: "1", held: "0", own: "1", pointer: "0" });

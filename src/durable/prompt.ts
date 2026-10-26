@@ -2,7 +2,7 @@
 //
 // - coding-agent `buildSystemPromptSections` with the project's own prompt (`systemPromptOverride`) keeps only
 //   `preamble` (untagged: the project prompt with the enabled module's text), `skills` (the module's skills, as
-//   `formatSkillsForPrompt` lists them for the read tool) and `cwd` (the group workspace, forward slashes). It leaves
+//   `formatSkillsForPrompt` lists them for the read tool) and `cwd` (the application workspace, forward slashes). It leaves
 //   out the tool snippets and guidelines, the rules and the Pi documentation that its default prompt would carry, and
 //   adds nothing else here (no appended prompt, context files or extension sections).
 // - Durable renders sections in this order and tags all but `preamble` as `<key>\n...\n</key>`, the shape
@@ -14,12 +14,11 @@ import { resolve } from "node:path";
 import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import { defineExtension, type Extension, type PromptInput, section } from "@earendil-works/pi-durable";
 import type { AgentModuleDefinition } from "../agent/modules.ts";
-import { groupWorkspaceDir } from "../agent/paths.ts";
+import type { Layout } from "../core/layout.ts";
 import { buildChatContext } from "../agent/prompt.ts";
 
 export interface PromptOptions {
-  root: string;
-  groupId: string;
+  layout: Pick<Layout, "workspace">;
   /** The enabled modules; a module counts while the conversation selects `mixin.<name>`. */
   modules: readonly AgentModuleDefinition[];
   /** Whether a large-file relay is configured (the delivery paragraph differs). */
@@ -34,7 +33,7 @@ function selectedModules(options: PromptOptions, input: PromptInput) {
 
 /** `mixin.prompt`: sections only; install it before the tool extensions so its sections come first. */
 export function promptExtension(options: PromptOptions): Extension {
-  const cwd = resolve(groupWorkspaceDir(options.root, options.groupId)).replace(/\\/g, "/");
+  const cwd = resolve(options.layout.workspace).replace(/\\/g, "/");
   return defineExtension({
     name: "mixin.prompt",
     sections: [

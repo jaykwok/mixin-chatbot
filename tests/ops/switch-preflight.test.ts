@@ -382,6 +382,8 @@ test.skipIf(process.platform !== "win32")("Windows upgrader refuses switch confl
         await mkdir(join(dir, "data/state"), { recursive: true }); await mkdir(join(dir, "data/groups"));
         await writeFile(join(dir, "data/state/upgrade-transaction"), `deploy-${"a".repeat(32)}`);
       }
+      // A new upgrade keeps the deployed app-bot credentials and refuses before any change without them.
+      await mkdir(join(dir, "data/config"), { recursive: true }); await writeFile(join(dir, "data/config/app-bot.json"), "{}");
       cases.push({ scenario, dir, ...refs });
     }
     const before = cases.map(({ dir }) => ({ index: readFileSync(join(dir, ".git/index")), mtime: statSync(join(dir, ".git/index")).mtimeMs, files: snapshot(dir) }));
@@ -402,9 +404,9 @@ $run=[scriptblock]::Create($body)
 function Start-OperationLog { $null }; function Stop-OperationLog { }; function Write-OperationEvent { }; function Write-OperationFailure { }
 function Set-OperationStage([string]$Stage) { $script:stages += $Stage }
 function Get-ScheduledTask { [pscustomobject]@{State='Ready'} }
-function Get-SavedGroupDataRoot { Join-Path $Project 'data\\groups' }; function Get-PlatformIp { '203.0.113.17' }
-function Read-DeploymentTransaction { @{ target_group_root = (Join-Path $Project 'data\\groups') } }
-function fixture-bun { $global:LASTEXITCODE=0; if($script:stopped){throw 'Bun ran after the stop'}; if($args -contains '--version'){ '1.4.3' }; if($args -contains 'committed'){ $global:LASTEXITCODE=1 } }
+function Get-SavedWorkspaceRoot { '' }
+function Read-DeploymentTransaction { @{ target_workspace_root = '' } }
+function fixture-bun { $global:LASTEXITCODE=0; if($script:stopped){throw 'Bun ran after the stop'}; if($args -contains '--version'){ '1.4.4' }; if($args -contains 'committed'){ $global:LASTEXITCODE=1 } }
 function Open-UpgradeSnapshot($root,$task,$original,$branch,$target) {
     $script:opened=$true
     if($script:during){ [IO.File]::WriteAllText((Join-Path $root $script:during[0]), $script:during[1]) }
@@ -416,7 +418,7 @@ ${cases.map(({ scenario, dir, head, main, target }, index) => `[void]$cases.Add(
   ...(upgradeCases[index]!.during ?? ["", ""])].map(quotePS).join(",")}))`).join("\n")}
 foreach($case in $cases){
     $Project=$case[1]; $OriginalSha=$case[2]; $OriginalBranch=$case[3]; $TargetSha=$case[4]
-    $Rollback=$false; $RestartTunnel=$false; $BunPath='fixture-bun'; $GitPath='git'
+    $Rollback=$false; $BunPath='fixture-bun'; $GitPath='git'
     $script:during=if($case[5]){ @($case[5],$case[6]) } else { $null }
     $script:stages=@(); $script:opened=$false; $script:stopped=$false
     $message=''

@@ -30,9 +30,9 @@ const exists = (path: string) => fs.lstat(path).then(() => true, error => { if (
 const onLinux = test.skipIf(process.platform !== "linux"), onWindows = test.skipIf(process.platform !== "win32");
 
 async function fixture(prefix: string) {
-  const f = await tempFixture(prefix), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture(prefix), root = join(f.root, "data"), temp = join(root, "tmp/groups/group-a/alice");
   await fs.mkdir(temp, { recursive: true });
-  return { f, root, temp, options: { root, state: join(f.root, "state.sqlite"), archive: join(root, ".reclamation/backup/rm"), scope } };
+  return { f, root, temp, options: { root, state: join(f.root, "state.sqlite"), archive: join(root, "state/reclamation/backup/rm"), scope } };
 }
 
 /** Archive one plain entry made by `make`, then preview its removal. */

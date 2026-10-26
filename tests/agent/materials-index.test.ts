@@ -164,7 +164,7 @@ describe("materials index", () => {
       const scan = await scanWorkspace(workspace);
       const rendered = renderMaterialsIndex(workspace, scan, Date.parse("2026-09-04T10:00:00"));
 
-      expect(rendered).toContain("# 本群资料索引");
+      expect(rendered).toContain("# 共享资料索引");
       expect(rendered).toMatch(
         /产品资料\/安全大脑\/产品介绍\.pptx \| [\d.]+ ?[KMG]?B \| \d{4}-\d{2}-\d{2}/
       );

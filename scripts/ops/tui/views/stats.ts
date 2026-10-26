@@ -1,8 +1,8 @@
 import { cacheReadRate, formatCacheRate } from "../../../lib/usage.ts";
 import { byName } from "../../../lib/group-data.ts";
 // 统计概览与可滚动明细；导出路径保留到下一次导出，显号只在当前明细内有效。
-import { relative } from "node:path";
-import { bar, columns as sideBySide, rule, status, table, tile, wrap } from "../render/widgets.ts";
+import { dirname, relative } from "node:path";
+import { bar, columns as sideBySide, rule, table, tile, wrap } from "../render/widgets.ts";
 import { pad, truncate, width } from "../render/width.ts";
 import { Viewport } from "../render/viewport.ts";
 import * as fmt from "../render/format.ts";
@@ -10,7 +10,10 @@ import { loadStatsOverview, type GroupStats, type Window } from "../data.ts";
 import { collectComparisons, parseDate } from "../../stats-admin.ts";
 import { change, comparisons, describeStatsWindow, PERIODS, periodWindow, summarize, trend, type ComparisonData, type Grain } from "../../stats-summary.ts";
 import { PROJECT_DIR } from "../platform.ts";
+import type { TokenTotals } from "../../../../src/agent/stats-ledger.ts";
 import { writeReport } from "../report.ts";
+import { previewLegacyStats, type ImportPreview } from "../../stats-import.ts";
+import { pickFile } from "./file-picker.ts";
 import type { AppApi, Loading, View, ViewAction, ViewContext } from "../view.ts";
 import { gap, ListFilter, moveSelection, pending, windowStart } from "./common.ts";
 
@@ -32,6 +35,8 @@ export class StatsView implements View {
   private opening = false;
   private revision = 0;
   private filter = new ListFilter();
+  /** 上次选旧统计账本时所在的目录；第一次从项目的上一级开始（旧部署通常在旁边）。 */
+  private importDir: string | undefined;
 
   constructor(private readonly reportDir?: string) {}
 
@@ -48,6 +53,7 @@ export class StatsView implements View {
     keys.push(["e", this.exporting ? "导出中" : "导出"]);
     keys.push(["t", "汇总趋势"], ["g", "日/周/月"]);
     if (this.lastReport) keys.push(["o", this.opening ? "打开中" : "打开"]);
+    if (!this.detail) keys.push(["i", "导入旧统计"]);
     return keys;
   }
 
@@ -63,6 +69,7 @@ export class StatsView implements View {
       { value: "d", label: "自定义起止日期", description: this.describeWindow() },
       { value: "e", label: "导出当前范围的 HTML 报表", description: "导出所列群；在群明细中还会附上当前群的明细", disabled: this.exporting || this.overview.kind !== "ready" },
       { value: "o", label: "打开最近的报表", disabled: this.opening || !this.lastReport },
+      { value: "i", label: "导入旧版统计", description: "一次性：浏览选择旧部署的 data/groups/stats.sqlite，预览后停机导入" },
     ];
   }
 
@@ -77,7 +84,7 @@ export class StatsView implements View {
 
   async refresh(app: AppApi, reset = false): Promise<void> {
     const revision = ++this.revision;
-    if (this.root !== undefined && this.root !== app.deployment.groupDataRoot) {
+    if (this.root !== undefined && this.root !== app.deployment.dataRoot) {
       reset = true;
       this.detail = null;
       this.unmasked = false;
@@ -85,11 +92,11 @@ export class StatsView implements View {
       this.scroll.reset();
       this.filter.clear();
     }
-    this.root = app.deployment.groupDataRoot;
+    this.root = app.deployment.dataRoot;
     if (reset || this.overview.kind !== "ready") this.overview = { kind: "loading" };
     app.redraw();
     try {
-      const [groups, comparisonData] = await Promise.all([loadStatsOverview(app.deployment.groupDataRoot, this.window), collectComparisons(app.deployment.groupDataRoot, this.window)]);
+      const [groups, comparisonData] = await Promise.all([loadStatsOverview(app.deployment.dataRoot, this.window), collectComparisons(app.deployment.dataRoot, this.window)]);
       if (revision !== this.revision) return;
       this.comparisonData = comparisonData;
       this.overview = { kind: "ready", value: groups };
@@ -124,6 +131,7 @@ export class StatsView implements View {
     if (key.name === "d") { await this.pickWindow(app); return true; }
     if (key.name === "e") { void this.export(app); return true; }
     if (key.name === "o" && this.lastReport) { void this.openReport(app); return true; }
+    if (key.name === "i") { await this.importLegacy(app); return true; }
     if (this.overview.kind !== "ready") return false;
     if (this.showTrend && !this.detail) return this.scroll.onKey(key.name);
     if (this.detail) return this.scroll.onKey(key.name);
@@ -198,6 +206,42 @@ export class StatsView implements View {
     finally { this.exporting = false; app.redraw(); }
   }
 
+  /** 一次性导入旧版统计：选文件 → 只读预览 → 确认 → 交给 stat-import（停机导入、恢复原运行状态）。 */
+  private async importLegacy(app: AppApi): Promise<void> {
+    const file = await pickFile(app, {
+      title: "导入旧版统计 · 选择旧统计账本",
+      description: "旧部署的 data/groups/stats.sqlite",
+      start: this.importDir ?? dirname(PROJECT_DIR),
+      accept: name => /\.(sqlite3?|db)$/i.test(name),
+    });
+    if (file === null) { app.toast("idle", "已取消"); return; }
+    this.importDir = dirname(file);
+    let preview: ImportPreview;
+    try { preview = previewLegacyStats(file, app.deployment.dataRoot); }
+    catch (error) { app.toast("danger", "不能导入：" + (error instanceof Error ? error.message : String(error))); return; }
+    if (preview.status === "already") { app.toast("idle", "这份旧统计已经导入过，不会重复计入"); return; }
+    const contents = `${preview.asks} 次提问（${preview.memberDays} 个成员日）、${fmt.count(preview.totalTokens)} token（${preview.usageRows} 行，按天、成员、模型）`
+      + (preview.firstDay ? `，${preview.firstDay} ~ ${preview.lastDay}` : "，没有记录");
+    if (preview.status === "other") {
+      await app.confirm({ title: "导入旧版统计", subject: file, blocked: true,
+        steps: ["新账本已导入过另一份旧统计；为免两份重叠计数，不能再导入", "所选文件：" + contents] });
+      return;
+    }
+    if (!await app.confirm({
+      title: "导入旧版统计", subject: file,
+      steps: [
+        "读取：" + contents + "；费用、请求次数、回复数等不导入",
+        "停止机器人，在新账本里记为导入来源（与实时统计分开存放、合并显示）",
+        "恢复到操作前的运行状态",
+      ],
+      untouched: ["所选文件（只读取快照）", "已有的实时统计", "会话与资料"],
+      recovery: "同一份旧账本再导入不会重复计入；导入后不能再导入另一份",
+    })) { app.toast("idle", "已取消"); return; }
+    const code = await app.run("导入旧版统计", ["stat-import", file]);
+    app.toast(code === 0 ? "ok" : "danger", code === 0 ? "旧统计已导入，已恢复运行状态" : "导入未完成，请看输出");
+    if (code === 0) void this.refresh(app, true);
+  }
+
   private async openReport(app: AppApi): Promise<void> {
     if (this.opening || !this.lastReport) return;
     this.opening = true;
@@ -249,7 +293,7 @@ export class StatsView implements View {
     const room = Math.max(1, height - 3 - notes.length);
     const start = windowStart(this.selected, groups.length, room);
     const nameSize = Math.min(30, Math.max(12, Math.floor(total * 0.28)));
-    const barSize = Math.max(1, total - 2 - nameSize - 26 - 10);
+    const barSize = Math.max(1, total - 2 - nameSize - 29 - 10);
     const loaded = this.overview.kind === "ready" ? this.overview.value.length : 0;
     const body = [
       rule(theme, total, "统计 · " + this.describeWindow(),
@@ -262,7 +306,7 @@ export class StatsView implements View {
           { header: "人数", size: 5, align: "right", render: group => String(summarize([group]).people) },
           { header: "提问", size: 6, align: "right", render: group => String(group.asks) },
           { header: "", size: barSize, render: group => bar(theme, group.asks, max, barSize) },
-          { header: "附件", size: 5, align: "right", render: group => String(group.delivered.get("send_file") ?? 0) },
+          { header: "token", size: 8, align: "right", render: group => fmt.count(group.tokens.totalTokens) },
           { header: "最后活动", size: 10, align: "right", render: group => fmt.since(group.lastAt) },
         ],
       })),
@@ -283,14 +327,15 @@ export class StatsView implements View {
     const rate = cacheReadRate(stats.tokens);
     const specs = [
       { label: "提问", value: fmt.count(stats.asks) + " 次", trend: months.map(([, month]) => month.asks),
-        foot: stats.replies + " 轮处理" },
-      { label: "提问人数", value: summarize([stats]).people + " 人", foot: stats.days.size + " 天活跃" },
-      { label: "已送附件", value: (stats.delivered.get("send_file") ?? 0) + " 份",
-        foot: "图片 " + (stats.delivered.get("send_image") ?? 0) + " 张" },
-      // 缓存读率是个比例，用仪表而不是又一个百分数——它解释了左边那笔开销为什么是这个数。
-      { label: "模型开销", value: "$" + stats.tokens.cost.toFixed(4),
+        foot: stats.days.size + " 天活跃" },
+      { label: "提问人数", value: summarize([stats]).people + " 人",
+        foot: stats.users.length ? "人均 " + (stats.asks / stats.users.length).toFixed(1) + " 次" : "无提问" },
+      { label: "模型用量", value: fmt.count(stats.tokens.totalTokens) + " token",
+        foot: "输入 " + fmt.count(stats.tokens.input) + " · 输出 " + fmt.count(stats.tokens.output) },
+      // 缓存读率是个比例，用仪表而不是又一个百分数——它解释了左边那笔用量里有多少是缓存命中。
+      { label: "缓存读率", value: formatCacheRate(stats.tokens),
         ...(rate === null ? {} : { meter: { total: 1, segments: [{ value: rate, color: "accent" as const }] } }),
-        foot: "缓存读率 " + formatCacheRate(stats.tokens) },
+        foot: "缓存命中 " + fmt.count(stats.tokens.cacheRead) },
     ];
     const inner = total - 2;
     const cell = Math.floor((inner - 6) / 4);
@@ -314,18 +359,18 @@ export class StatsView implements View {
         { header: "日期", flex: 1, render: row => row.date },
         { header: "提问", size: 6, align: "right", render: row => String(row.asks) },
         { header: "人数", size: 5, align: "right", render: row => String(row.askers.size) },
-        { header: "文件", size: 5, align: "right", render: row => String(row.files) },
+        { header: "token", size: 8, align: "right", render: row => fmt.count(row.tokens.totalTokens) },
       ],
     })];
   }
 
-  /** 模型直接发起的调用在前；脚本里的子调用另起一组，不和它们相加。 */
-  private toolRows(theme: ViewContext["theme"], stats: GroupStats, size: number): string[] {
-    const rows = (tools: Map<string, number>, prefix = "") => [...tools].sort((a, b) => b[1] - a[1] || byName(a[0], b[0])).map(([tool, count]) => {
-      const name = truncate(prefix + tool, Math.max(1, size - 9));
-      return pad(" " + name + pad(theme.c("muted", count + " 次"), Math.max(0, size - 1 - width(name)), "right"), size);
+  /** 对话与压缩按模型在前；工具自身调用的辅助模型按工具名另起一组。 */
+  private tokenRows(theme: ViewContext["theme"], stats: GroupStats, size: number): string[] {
+    const rows = (map: Map<string, TokenTotals>) => [...map].sort((a, b) => b[1].totalTokens - a[1].totalTokens || byName(a[0], b[0])).map(([key, tokens]) => {
+      const name = truncate(key, Math.max(1, size - 11));
+      return pad(" " + name + pad(theme.c("muted", fmt.count(tokens.totalTokens)), Math.max(0, size - 1 - width(name)), "right"), size);
     });
-    return stats.nested.size ? [...rows(stats.tools), pad(" " + theme.c("muted", "脚本子调用"), size), ...rows(stats.nested, "↳ ")] : rows(stats.tools);
+    return stats.tools.size ? [...rows(stats.models), pad(" " + theme.c("muted", "工具"), size), ...rows(stats.tools)] : rows(stats.models);
   }
 
   /**
@@ -343,25 +388,15 @@ export class StatsView implements View {
       ...this.comparisonLines([stats], total, new Set([stats.group])),
       gap(total),
     ];
-    // 数据本身有缺口时必须说出来，否则上面那笔开销看起来比实际更确定。
-    const caveats = [
-      stats.tokens.unknownCost ? "费用未知 " + stats.tokens.unknownCost + " 条" : "",
-      stats.tokens.missingUsage ? "用量不完整 " + stats.tokens.missingUsage + " 条" : "",
-      stats.skipped ? "跳过 " + stats.skipped + " 行无法解析的记录" : "",
-      stats.nestedIncomplete ? "子调用记录不完整 " + stats.nestedIncomplete + " 次，计数可能偏少" : "",
-      stats.legacySources ? "旧口径账目 " + stats.legacySources + " 个会话" : "",
-    ].filter(Boolean);
-
     const listWidth = wide ? Math.floor(total * 0.6) : total;
     const sideWidth = total - listWidth - 2;
-    const room = Math.max(1, height - out.length - caveats.length - 1);
+    const room = Math.max(1, height - out.length - 1);
     const rows = table(theme, {
       // marker 只在有选中行时才画箭头；这里给 1 是为了让表格和同屏其他内容共用同一条装订线。
       width: listWidth, rows: stats.users, marker: 1,
       columns: [
         { header: "成员", flex: 1, render: user => this.unmasked ? user.user : fmt.maskUser(user.user) },
         { header: "提问", size: 5, align: "right", render: user => String(user.asks) },
-        { header: "附件", size: 5, align: "right", render: user => String(user.files) },
         { header: "活跃天", size: 6, align: "right", render: user => String(user.days.size) },
         { header: "最后活动", size: 10, align: "right", render: user => fmt.day(user.lastAt) },
       ],
@@ -372,7 +407,7 @@ export class StatsView implements View {
     // 放不下不等于可以不给。宽窗口才把它们挪到右栏，两边同时落在第一屏。
     const side = [
       ...this.trendRows(theme, [stats], wide ? sideWidth : total), gap(wide ? sideWidth : total),
-      rule(theme, wide ? sideWidth : total, "工具调用"), ...this.toolRows(theme, stats, wide ? sideWidth : total),
+      rule(theme, wide ? sideWidth : total, "token · 按模型与工具"), ...this.tokenRows(theme, stats, wide ? sideWidth : total),
     ];
     // Scroll both columns together so long daily histories never disappear below the member list.
     const scrolling = wide ? sideBySide([rows.slice(1), side], [listWidth, sideWidth], 2) : [...rows.slice(1), gap(total), ...side];
@@ -384,7 +419,6 @@ export class StatsView implements View {
     ];
 
     out.push(...members);
-    if (caveats.length) out.push(pad(" " + status(theme, "warn", caveats.join(" · ")), total));
     return out;
   }
 }

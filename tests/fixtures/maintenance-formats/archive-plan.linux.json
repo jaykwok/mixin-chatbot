@@ -1,18 +1,18 @@
 {
   "version": 1,
   "id": "11111111-1111-4111-8111-111111111111",
-  "root": "<ROOT0>/groups",
+  "root": "<ROOT0>/data",
   "rootIdentity": "<string>",
-  "archive": "<ROOT0>/groups/.reclamation/backup/rm",
-  "recordedRoot": "<ROOT0>/groups",
+  "archive": "<ROOT0>/data/state/reclamation/backup/rm",
+  "recordedRoot": "<ROOT0>/data",
   "createdAt": "<number>",
   "before": "<number>",
   "items": [
     {
-      "group": "group-a",
+      "space": "groups/group-a",
       "user": "alice",
-      "source": "<ROOT0>/groups/group-a/users/alice/tmp/codemode",
-      "destination": "<ROOT0>/groups/.reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-0",
+      "source": "<ROOT0>/data/tmp/groups/group-a/alice/codemode",
+      "destination": "<ROOT0>/data/state/reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-0",
       "owners": {
         "1-result": {
           "phone": "alice",
@@ -31,10 +31,10 @@
       }
     },
     {
-      "group": "group-a",
+      "space": "groups/group-a",
       "user": "alice",
-      "source": "<ROOT0>/groups/group-a/users/alice/tmp/note.txt",
-      "destination": "<ROOT0>/groups/.reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-1",
+      "source": "<ROOT0>/data/tmp/groups/group-a/alice/note.txt",
+      "destination": "<ROOT0>/data/state/reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-1",
       "owners": {},
       "status": "ready",
       "evidence": {
@@ -48,10 +48,10 @@
       }
     },
     {
-      "group": "group-a",
+      "space": "groups/group-a",
       "user": "alice",
-      "source": "<ROOT0>/groups/group-a/users/alice/tmp/folder",
-      "destination": "<ROOT0>/groups/.reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-2",
+      "source": "<ROOT0>/data/tmp/groups/group-a/alice/folder",
+      "destination": "<ROOT0>/data/state/reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-2",
       "owners": {},
       "status": "ready",
       "evidence": {

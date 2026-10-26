@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "path": "<ROOT0>/groups/group-a/users/alice/tmp/codemode/1-result",
+  "path": "<ROOT0>/data/tmp/groups/group-a/alice/codemode/1-result",
   "proof": {
     "dev": "<string>",
     "ino": "<string>",

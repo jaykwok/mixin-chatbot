@@ -1,16 +1,15 @@
 // Stable process entry. Gate persistent data before loading configuration or business modules.
 import { existsSync } from "node:fs";
-import { assertDataVersion, serviceGroupRoot, verificationPending } from "../core/data-version.ts";
+import { assertDataVersion, verificationPending } from "../core/data-version.ts";
 import { openOperationLog, operationError } from "../../scripts/lib/operation-log.ts";
 try {
-  const groups = serviceGroupRoot();
-  const pending = verificationPending(process.cwd(), groups);
+  const pending = verificationPending(process.cwd());
   if (process.argv.includes("--verify-only") && !pending) throw new Error("只验证启动需要尚未提交且已校验的升级事务");
   const verification = pending && (process.argv.includes("--verify-only") || existsSync("data/state/verify-only"));
   if (verification) {
     await import("./verify.ts");
   } else {
-    assertDataVersion(process.cwd(), groups);
+    assertDataVersion(process.cwd());
     await import("./app.ts");
   }
 } catch (error) {

@@ -1,6 +1,6 @@
 ---
 name: document-work
-description: 基于本群资料修改 Word、选编和修改 PPT，或在产品资料和模板的版式上生成新的客户方案、交付文档和问题处理报告。查询资料或发送原件时无需使用。
+description: 基于共享资料修改 Word、选编和修改 PPT，或在产品资料和模板的版式上生成新的客户方案、交付文档和问题处理报告。查询资料或发送原件时无需使用。
 ---
 
 # 文档加工
@@ -14,7 +14,7 @@ description: 基于本群资料修改 Word、选编和修改 PPT，或在产品�
 | 在资料和模板基础上写新内容 | 用 Markdown 写内容 → `document_build` 或 `document_compose` 的 `content` 项；需要原图时先 `document_images` 取素材 | [build.md](references/build.md) |
 | 规划方案、交付文档、问题报告的内容 | 按读者要回答的问题组织，再走上面三条路径 | [content.md](references/content.md) |
 
-底稿提供结构，当前正式资料提供事实，模板提供样式；三者可来自不同文件，都从本群 `workspace` 检索。旧客户方案中的参数、客户名和承诺必须重新核对。
+底稿提供结构，当前正式资料提供事实，模板提供样式；三者可来自不同文件，都从共享 `workspace` 检索。旧客户方案中的参数、客户名和承诺必须重新核对。
 
 ## 调用方式
 

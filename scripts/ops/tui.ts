@@ -5,7 +5,8 @@ try {
   process.chdir(PROJECT_DIR);
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) {
-    console.log("bun run tui — 运维界面；数据未迁移时仅提供升级 / 诊断");
+    console.log("bun run tui — 运维界面；有未完成的部署事务时先提供继续或回滚；没有部署记录的空目录提供部署，" +
+      "基础版本字段有效、只是数据格式不受当前代码支持时提供升级检查（应用绑定由目标版本校验），有数据却没有记录、记录损坏或缺字段（含没有程序版本的旧版）时只提供诊断（需在新目录全新部署）");
   } else {
     // 有未完成的事务时先按记录判断，普通设置损坏也能进入继续或回滚。
     const reason = recoveryReason();

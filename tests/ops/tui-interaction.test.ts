@@ -21,13 +21,13 @@ import * as tuiData from "../../scripts/ops/tui/data.ts";
 import * as tuiTransaction from "../../scripts/ops/tui/transaction.ts";
 import * as tuiExec from "../../scripts/ops/tui/exec.ts";
 import * as tuiReport from "../../scripts/ops/tui/report.ts";
-import { createRelayView, createRoutesView } from "../../scripts/ops/tui/views/passthrough.ts";
+import { createDirectoryView, createRelayView } from "../../scripts/ops/tui/views/passthrough.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { waitFor } from "../helpers/tui-process.ts";
 
 const deployment: Deployment = {
-  platform: "linux", runtime: "docker", mode: "direct", port: 1011, domain: "",
-  groupDataRoot: "unused", groupDataRootIsCustom: false,
+  platform: "linux", runtime: "docker", port: 1011,
+  dataRoot: "unused", workspaceRoot: "",
 };
 const key = (name: string, text?: string): Key => ({ name, raw: name, text, ctrl: false, shift: false });
 const plain = (lines: string[]) => lines.map(line => Bun.stripANSI(line)).join("\n");
@@ -35,7 +35,7 @@ const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 
 test("管理台登记成员压缩，说明费用并保留历史；取消时不运行命令", async () => {
   const history = new HistoryView(), { app, calls } = fakeApp();
-  Object.assign(history, { state: { kind: "ready", value: [{ group: "synthetic", users: [], bytes: 123, database: { bytes: 123 } }] } });
+  Object.assign(history, { state: { kind: "ready", value: [{ space: "groups/synthetic", dir: "unused", bytes: 123, database: { bytes: 123, modified: 0 } }] } });
   calls.answers.push("alice");
   await history.onKey(key("p"), app);
   expect(calls.commands[0]?.args).toEqual(["history-compact", "synthetic", "alice", "--storage-segment"]);
@@ -45,11 +45,60 @@ test("管理台登记成员压缩，说明费用并保留历史；取消时不�
   expect(calls.commands).toHaveLength(1);
 });
 
-test("清空所有群需输入「全部清空」，范围不受筛选影响；取消时不运行命令", async () => {
+test("会话详情列出提问过的成员（打码、最近在前），p 直接压缩选中成员；没有名单时仍可输入号码", async () => {
+  const history = new HistoryView(), { app, calls } = fakeApp();
+  Object.assign(history, { state: { kind: "ready", value: [{ space: "groups/synthetic", dir: "unused", bytes: 123, database: { bytes: 123, modified: 0 } }] } });
+  const user = (phone: string, asks: number, lastAt: number) => ({ user: phone, asks, firstAt: lastAt, lastAt, days: new Set<string>() });
+  const stats = spyOn(tuiData, "loadStatsOverview").mockResolvedValue([
+    { group: "other", users: [user("13900000009", 9, Date.now())] },
+    { group: "synthetic", users: [user("13800000001", 2, Date.now() - 86_400_000), user("13800000002", 5, Date.now() - 60_000)] },
+  ] as unknown as Awaited<ReturnType<typeof tuiData.loadStatsOverview>>);
+  try {
+    await history.onKey(key("enter"), app);
+    await tick();
+    for (const [width, rows] of [[72, 20], [100, 24]] as const) fits(history.render(context(width, rows)), context(width, rows));
+    const shown = plain(history.render(context()));
+    expect(shown).toContain("2 位提问过的成员");
+    expect(shown).not.toContain("13800000002");
+    expect(shown.indexOf("138****0002")).toBeLessThan(shown.indexOf("138****0001"));
+    expect(shown).not.toContain("139****0009");
+    await history.onKey(key("down"), app);
+    await history.onKey(key("p"), app);
+    expect(calls.prompts).toEqual([]);
+    expect(calls.confirms[0]!.subject).toContain("138****0001");
+    expect(calls.commands[0]?.args).toEqual(["history-compact", "synthetic", "13800000001", "--storage-segment"]);
+    // Back on the list p asks for the number (members who never asked are not in the ledger).
+    await history.onKey(key("escape"), app);
+    calls.answers.push("13800000003");
+    await history.onKey(key("p"), app);
+    expect(calls.prompts).toHaveLength(1);
+    expect(calls.commands[1]?.args).toEqual(["history-compact", "synthetic", "13800000003", "--storage-segment"]);
+    // A hashed member segment names no number: still asked for.
+    stats.mockResolvedValue([{ group: "synthetic", users: [user("sha256-user-" + "a".repeat(64), 1, Date.now())] }] as unknown as Awaited<ReturnType<typeof tuiData.loadStatsOverview>>);
+    await history.onKey(key("enter"), app);
+    await tick();
+    calls.answers.push("13800000004");
+    await history.onKey(key("p"), app);
+    expect(calls.prompts).toHaveLength(2);
+    expect(calls.commands[2]?.args).toEqual(["history-compact", "synthetic", "13800000004", "--storage-segment"]);
+  } finally { stats.mockRestore(); }
+});
+
+test("通讯录的部门列表和同步范围可以留空：分别为根部门和整个通讯录；必填的轮次仍不能留空", async () => {
+  const view = createDirectoryView(), { app, calls } = fakeApp();
+  const press = (label: string) => view.onKey!(key(view.actions!().find(action => action.label === label)!.value), app);
+  calls.answers.push("", " ", "100, 200", "");
+  await press("列出部门"); await press("设置同步范围"); await press("设置同步范围"); await press("确认暂停的撤销");
+  expect(calls.commands.map(command => command.args)).toEqual([["directory-departments"], ["directory-scope"], ["directory-scope", "100, 200"]]);
+  expect(calls.confirms.map(confirm => confirm.subject)).toEqual(["同步整个通讯录", "只同步部门 100, 200 及其子部门"]);
+  expect(calls.toasts.at(-1)).toBe("此项不能为空，操作未执行");
+});
+
+test("清空所有会话空间需输入「全部清空」，范围不受筛选影响；取消时不运行命令", async () => {
   const history = new HistoryView(), { app, calls } = fakeApp();
   Object.assign(history, { state: { kind: "ready", value: [
-    { group: "support", users: [{ user: "13800000000", bytes: 10, modified: 0, path: "unused" }], bytes: 110, database: { bytes: 100, modified: 0 } },
-    { group: "sales", users: [], bytes: 200, database: { bytes: 200, modified: 0 } },
+    { space: "groups/support", dir: "unused", bytes: 110, database: { bytes: 110, modified: 0 } },
+    { space: "groups/sales", dir: "unused", bytes: 200, database: { bytes: 200, modified: 0 } },
   ] } });
   expect(history.actions().find(action => action.value === "a")).toMatchObject({ danger: true, disabled: false });
   calls.answers.push("support");
@@ -57,12 +106,12 @@ test("清空所有群需输入「全部清空」，范围不受筛选影响；�
   await history.onKey(key("a"), app);
   const spec = calls.confirms[0]!;
   expect(spec.typeToConfirm).toBe("全部清空");
-  expect(spec.subject).toContain("2 个群");
-  expect(spec.steps.join(" ")).toContain("2 个群库");
+  expect(spec.subject).toContain("2 个会话空间");
+  expect(spec.subject).toContain("不受列表筛选影响");
+  expect(spec.steps.join(" ")).toContain("在 2 个会话库里");
   expect(spec.steps.join(" ")).toContain("使用统计不受影响");
-  expect(spec.steps.join(" ")).toContain("使用统计不受影响");
-  expect(calls.commands).toEqual([{ title: "清空所有群的会话历史", args: ["history-clear", "--all"] }]);
-  expect(calls.toasts.at(-1)).toContain("所有群已清空");
+  expect(calls.commands).toEqual([{ title: "清空所有会话空间的历史", args: ["history-clear", "--all"] }]);
+  expect(calls.toasts.at(-1)).toContain("所有会话空间已清空");
   app.confirm = async (spec) => { calls.confirms.push(spec); return false; };
   await history.onKey(key("a"), app);
   expect(calls.commands).toHaveLength(1);
@@ -74,8 +123,9 @@ test("清空所有群需输入「全部清空」，范围不受筛选影响；�
 test("会话页底部固定显示清空入口并说明不影响统计；临时文件页不重复提供清空会话", async () => {
   const history = new HistoryView(), { app, calls } = fakeApp();
   Object.assign(history, { state: { kind: "ready", value: [
-    { group: "support", users: [], bytes: 100, database: { bytes: 100, modified: 0 } },
-    { group: "sales", users: [{ user: "13800000000", bytes: 10, modified: 0, path: "unused" }], bytes: 210, database: { bytes: 200, modified: 0 } },
+    { space: "groups/support", dir: "unused", bytes: 100, database: { bytes: 100, modified: 0 } },
+    { space: "groups/sales", dir: "unused", bytes: 210, database: { bytes: 210, modified: 0 } },
+    { space: "direct", dir: "unused", bytes: 50, database: { bytes: 50, modified: 0 } },
   ] } });
   for (const [width, rows] of [[72, 20], [100, 24], [120, 35]] as const) {
     const lines = history.render(context(width, rows));
@@ -83,15 +133,19 @@ test("会话页底部固定显示清空入口并说明不影响统计；临时�
     expect(lines).toHaveLength(context(width, rows).height);
     const tail = plain(lines.slice(-3));
     expect(tail).toContain("不影响使用统计");
-    expect(tail).toContain("c 当前群  support");
-    expect(tail).toContain("a 全部群  2 个群");
+    expect(tail).toContain("c 当前  群 support");
+    expect(tail).toContain("a 全部  3 个会话空间");
   }
   expect(history.hints().slice(0, 2).map(([name]) => name)).toEqual(["c", "a"]);
   expect(history.actions().slice(0, 2).map(action => action.value)).toEqual(["c", "a"]);
   await history.onKey(key("c"), app);
   expect(calls.confirms[0]!.typeToConfirm).toBe("support");
   expect(calls.confirms[0]!.steps.join(" ")).toContain("使用统计不受影响");
-  expect(calls.commands).toEqual([{ title: "清空 support 的会话历史", args: ["history-clear", "support", "--storage-segment"] }]);
+  expect(calls.commands).toEqual([{ title: "清空群 support的会话历史", args: ["history-clear", "support", "--storage-segment"] }]);
+  // The direct space is cleared with --direct and confirmed by typing 单聊.
+  await history.onKey(key("down"), app); await history.onKey(key("down"), app); await history.onKey(key("c"), app);
+  expect(calls.confirms[1]!.typeToConfirm).toBe("单聊");
+  expect(calls.commands[1]).toEqual({ title: "清空单聊的会话历史", args: ["history-clear", "--direct"] });
 
   const storage = new StorageView();
   expect(storage.actions().some(action => action.value === "h")).toBe(false);
@@ -103,12 +157,12 @@ function fakeApp(root = "unused") {
   const calls = {
     answers: [] as (string | null)[], prompts: [] as string[], confirms: [] as ConfirmSpec[],
     commands: [] as { title: string; args: string[] }[], toasts: [] as string[],
-    opened: [] as string[], destinations: [] as string[],
+    opened: [] as string[], destinations: [] as string[], focuses: [] as string[],
     choices: [] as (string | null)[], menus: [] as SelectSpec[],
   };
   const app: AppApi = {
-    deployment: { ...deployment, groupDataRoot: root }, theme: createTheme("truecolor"),
-    redraw() {}, go(id) { calls.destinations.push(id); }, toast(_status, text) { calls.toasts.push(text); },
+    deployment: { ...deployment, dataRoot: root }, theme: createTheme("truecolor"),
+    redraw() {}, go(id, focus) { calls.destinations.push(id); if (focus) calls.focuses.push(focus); }, toast(_status, text) { calls.toasts.push(text); },
     async ask(label) { calls.prompts.push(label); return calls.answers.shift() ?? null; },
     async choose(spec) { calls.menus.push(spec); return calls.choices.shift() ?? null; },
     async confirm(spec) { calls.confirms.push(spec); return true; },
@@ -117,7 +171,7 @@ function fakeApp(root = "unused") {
       if (args[0] === "tmp-preview") {
         const value = (flag: string) => args[args.indexOf(flag) + 1];
         const { previewTmpArchive } = await import("../../src/maintenance/archive.ts"), { durableMemberScope } = await import("../../src/durable/maintenance-view.ts");
-        await previewTmpArchive({ root, state: join(root, "absent-state.sqlite"), archive: join(root, ".reclamation/backup/rm"), scope: durableMemberScope },
+        await previewTmpArchive({ root, state: join(root, "absent-state.sqlite"), archive: join(root, "state/reclamation/backup/rm"), scope: durableMemberScope },
           args.includes("--all") ? 0 : Number(value("--days")), args.includes("--user") ? value("--user") : undefined,
           args.includes("--group") ? value("--group") : undefined, "segment", value("--plan"));
       }
@@ -158,13 +212,14 @@ test("左右切换主分区、Tab 切换子页并记住位置，待办可以跨�
     id, label, render: () => [], hints: () => [],
     onLeave() { left.push(id); },
     onKey(key) { received.push(id + ":" + key.name); return true; },
+    focus(item) { received.push(id + ":focus:" + item); },
   });
   const app = new App([
     { id: "overview", label: "总览", views: [page("overview", "总览")] },
     { id: "monitor", label: "监控", views: [page("health", "体检"), page("logs", "日志")] },
     { id: "stats", label: "统计", views: [page("stats", "统计")] },
     { id: "data", label: "数据", views: [page("history", "会话"), page("storage", "临时文件"), page("relay", "外链")] },
-    { id: "system", label: "系统", views: [page("maintain", "服务部署"), page("routes", "回调路由")] },
+    { id: "system", label: "系统", views: [page("maintain", "服务部署"), page("directory", "通讯录")] },
   ], { screen: tty.screen, deployment });
   tty.screen.start(event => { void app["handleKey"](event); }, () => {});
   try {
@@ -199,6 +254,12 @@ test("左右切换主分区、Tab 切换子页并记住位置，待办可以跨�
     expect(app["current"].id).toBe("history");
     expect(left).toContain("logs");
     expect(plain([tty.text()])).toContain("Tab");
+    // A preselection reaches the target page, also when it is already shown; an unknown page changes nothing.
+    app.go("maintain", "start");
+    app.go("maintain", "stop");
+    app.go("missing", "start");
+    expect(app["current"].id).toBe("maintain");
+    expect(received.slice(-2)).toEqual(["maintain:focus:start", "maintain:focus:stop"]);
   } finally { tty.close(); }
 });
 
@@ -446,11 +507,12 @@ test("总览逐项显示指标，慢磁盘和 Git 不挡住统计、导航或选
   let diskDone!: (bytes: number) => void;
   let gitDone!: (value: tuiData.GitState | null) => void;
   const recent = spyOn(tuiData, "loadRecentStats").mockResolvedValue({
-    today: { asks: 12, people: 3, files: 2, images: 1, groups: 1 }, trend: [],
+    today: { asks: 12, people: 3, tokens: 2048, groups: 1 }, trend: [],
   });
   const tmp = spyOn(tuiData, "loadTmp").mockResolvedValue([]);
   const disk = spyOn(tuiData, "loadDiskUsage").mockImplementation(() => new Promise(resolve => { diskDone = resolve; }));
   const git = spyOn(tuiData, "loadGit").mockImplementation(() => new Promise(resolve => { gitDone = resolve; }));
+  const service = spyOn(tuiData, "probeService").mockResolvedValue({ state: "ready", pid: 42, latency: 1 });
   try {
     const refresh = view.refresh(app);
     expect(plain(view.render(context()))).toContain("读取中");
@@ -459,13 +521,14 @@ test("总览逐项显示指标，慢磁盘和 Git 不挡住统计、导航或选
     for (const [columns, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(columns, rows)), context(columns, rows));
     expect(plain(view.render(context()))).toContain("12 次");
     expect(plain(view.render(context()))).toContain("版本读取中");
-    view.onKey(key("down"), app); // 常用入口中的日志。
+    view.onKey(key("down"), app); // 没有告警：常用入口中的日志。
     diskDone(4096);
-    gitDone({ branch: "main", sha: "abcdef12345", subject: "fixture", dirty: true, behind: 0, ahead: 0, incoming: [] });
+    gitDone({ branch: "main", sha: "abcdef12345", subject: "fixture", dirty: false, behind: 0, ahead: 0, incoming: [] });
     await refresh;
     view.onKey(key("enter"), app);
     expect(calls.destinations).toEqual(["logs"]);
-    expect(plain(view.render(context()))).toContain("abcdef1");
+    expect(plain(view.render(context(120, 35)))).toContain("main@abcdef1");
+    expect(plain(view.render(context()))).not.toContain("版本读取中");
 
     recent.mockRejectedValueOnce(new Error("fixture stats failed"));
     const retry = view.refresh(app);
@@ -475,7 +538,7 @@ test("总览逐项显示指标，慢磁盘和 Git 不挡住统计、导航或选
     diskDone(8192);
     gitDone(null);
     await retry;
-  } finally { recent.mockRestore(); tmp.mockRestore(); disk.mockRestore(); git.mockRestore(); }
+  } finally { recent.mockRestore(); tmp.mockRestore(); disk.mockRestore(); git.mockRestore(); service.mockRestore(); }
 });
 
 test("初次读取尚未完成也可以退出，终端立即恢复", async () => {
@@ -636,33 +699,59 @@ test("完成的执行面板按方向键回看而不关闭，长输出首尾可�
   } finally { tty.close(); }
 });
 
-test("总览的待办与常驻入口可直接进入具体功能，菜单不重复分区导航", () => {
+test("总览有告警时只列告警并提示入口，没有告警时列常用入口；回车进入对应页面，菜单不重复分区导航", () => {
   const view = new OverviewView();
   const { app, calls } = fakeApp();
-  Object.assign(view, { state: { kind: "ready", value: {
-    today: { asks: 0, people: 0, files: 0, images: 0, groups: 0 }, trend: [], disk: 0,
-    git: { branch: "main", sha: "123456789", dirty: true, ahead: 0, behind: 0 },
-    tmp: [{ bytes: 10, entries: [{ newest: 0, bytes: 10 }] }],
+  const snapshot = (value: Record<string, unknown>) => Object.assign(view, { selected: 0, state: { kind: "ready", value: {
+    today: { asks: 0, people: 0, tokens: 0, groups: 0 }, trend: [], disk: 0,
+    git: { branch: "main", sha: "123456789", dirty: false, ahead: 0, behind: 0 },
+    tmp: [{ bytes: 10, entries: [{ newest: 0, bytes: 10 }] }], ...value,
   } } });
+  // 服务没应答排在最前，回车直达系统页并预选「启动」；未提交改动随后。
+  snapshot({ service: { state: "unreachable" }, git: { branch: "main", sha: "123456789", dirty: true, ahead: 0, behind: 0 } });
   for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
-  // 未提交改动在前，临时文件是常驻入口，回车均进入对应页面。
+  let shown = plain(view.render(context()));
+  expect(shown).toContain("2 项待关注");
+  expect(shown).toContain("机器人未运行");
+  expect(shown).toContain("见顶部分区");
+  expect(shown).not.toContain("查看临时文件占用");
   view.onKey(key("enter"), app);
   view.onKey(key("down"), app);
   view.onKey(key("enter"), app);
+  expect(calls.destinations).toEqual(["maintain", "maintain"]);
+  expect(calls.focuses).toEqual(["start"]);
+  // 服务自本次启动的事件：最近一天内的才列为待办，进日志。
+  snapshot({ service: { state: "ready", attention: {
+    parked: { count: 1, lastAt: Date.now() - 60_000, space: "群 g1" },
+    notSent: { count: 4, lastAt: Date.now() - 2 * 24 * 3600_000, space: "单聊" },
+  } } });
+  shown = plain(view.render(context()));
+  expect(shown).toContain("1 项待关注");
+  expect(shown).toContain("停住的任务 1 次（最近 群 g1");
+  expect(shown).not.toContain("未发出的模型请求");
+  view.onKey(key("enter"), app);
+  expect(calls.destinations.at(-1)).toBe("logs");
+  // 没有告警：临时文件在常用入口最前，末项是系统。
+  snapshot({ service: { state: "ready" } });
+  shown = plain(view.render(context()));
+  expect(shown).toContain("日常管理");
+  expect(shown).not.toContain("见顶部分区");
+  view.onKey(key("enter"), app);
   view.onKey(key("end"), app);
   view.onKey(key("enter"), app);
-  expect(calls.destinations).toEqual(["maintain", "storage", "maintain"]);
-  const shown = plain(view.render(context()));
+  expect(calls.destinations.slice(-2)).toEqual(["storage", "maintain"]);
   expect(view.actions!().map(action => action.value)).toEqual(["enter"]);
-  // 分隔线只数需要关注的条数，不把常驻入口算进去。
-  expect(shown).toContain("1 项待关注");
   expect(view.onKey(key("health"), app)).toBe(false);
-  expect(calls.destinations).toEqual(["maintain", "storage", "maintain"]);
+  expect(calls.destinations).toHaveLength(5);
   const maintain = new MaintainView();
   Object.assign(maintain, { platform: "windows", state: { kind: "ready", value: {
     sha: "123456789", behind: 24, incoming: Array.from({ length: 24 }, (_, i) => ({ sha: String(i), subject: "待应用更新" })),
   } } });
   fits(maintain.render(context(72, 20)), context(72, 20));
+  maintain.focus("start");
+  expect(maintain["availableActions"][maintain["selected"]]!.key).toBe("start");
+  maintain.focus("unknown");
+  expect(maintain["availableActions"][maintain["selected"]]!.key).toBe("start");
 });
 
 test("健康页可展开完整结果和建议，窄窗口不会遮住分页或底部内容", async () => {
@@ -697,7 +786,7 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
     const view = new MaintainView();
     Object.assign(view, { platform, state: { kind: "ready", value: { sha: "123456789", behind: 1, dirty: false, incoming: [{ sha: "987654321", subject: "fixture" }] } } });
     const expected = [["start"], ["restart"], ["stop"], ["update", "987654321"], ["deploy"],
-      platform === "windows" ? ["doctor", "-Repair"] : ["deploy"], ["tunnel-update"], ...(platform === "windows" ? [["repair-tunnel"]] : []), ["uninstall"]];
+      platform === "windows" ? ["doctor", "-Repair"] : ["deploy"], ["uninstall"]];
     for (let i = 0; i < expected.length; i++) {
       fits(view.render(context(72, 20)), context(72, 20));
       await view.onKey(key("enter"), app);
@@ -707,9 +796,9 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
     expect(interactive).toEqual([["update", "987654321"], ["deploy"], ...(platform === "linux" ? [["deploy"]] : []), ["uninstall"]]);
     const upgrade = calls.confirms.find(spec => spec.title === "升级")!;
     expect(upgrade.steps.join("\n")).toContain("与 ops update 相同的目标升级器");
-    expect(upgrade.steps.join("\n")).toContain("数据版本一致时直接升级");
-    expect(upgrade.steps.join("\n")).toContain("确认后才停机");
-    expect(upgrade.untouched).toEqual(["已入账统计（含提问次数、人数）", "workspace 和其他资料目录", "webhook 密钥和 Cloudflare 隧道凭证"]);
+    expect(upgrade.steps.join("\n")).toContain("数据格式一致时升级");
+    expect(upgrade.steps.join("\n")).toContain("拒绝升级并保留现场，需在新目录全新部署");
+    expect(upgrade.untouched).toEqual(["已入账统计（含提问次数、人数）", "会话、资料和全部设置"]);
     expect(upgrade.recovery).toContain("继续上次操作");
     expect(calls.confirms.at(-1)?.typeToConfirm).toBe("卸载");
     const health = new HealthView();
@@ -722,9 +811,10 @@ test("维护页在两个平台均可完成部署、升级、重启和修复，�
 
 test.each([
   { args: ["doctor", "-Repair"], readOnly: false },
-  { args: ["tunnel-update"], readOnly: false },
-  { args: ["routes", "list"], readOnly: true },
-  { args: ["routes", "reset", "fixture", "--group", "group"], readOnly: false },
+  { args: ["directory"], readOnly: true },
+  { args: ["directory-confirm", "3"], readOnly: false },
+  { args: ["directory-departments", "1"], readOnly: true },
+  { args: ["directory-scope", "1001"], readOnly: false },
 ])("执行面板收到 Esc：只读列表可中止，维护写入等待完成（%j）", async ({ args, readOnly }) => {
   const tty = terminal();
   const app = new App([{ id: "fixture", label: "测试", render: () => [], hints: () => [] }], { screen: tty.screen, deployment });
@@ -748,14 +838,15 @@ test.each([
 
 async function history(root: string, group: string, users: string | readonly string[], days = ["2026-09-12"]) {
   for (const user of typeof users === "string" ? [users] : users) {
-    const dir = join(root, group, "users", user);
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "stats.records"), days.flatMap(day => [
+    // Entered into the statistics ledger (tests/helpers/stats-fixture.ts); no session files.
+    await writeFile(join(root, group, "users", user, "stats.records"), days.flatMap(day => [
       { type: "message", timestamp: day + "T12:00:00Z", message: { role: "user", content: [{ type: "text", text: "统计" }] } },
-      { type: "message", timestamp: day + "T12:01:00Z", message: { role: "assistant", content: [{ type: "toolCall", name: "fixture_tool" }] } },
+      { type: "message", timestamp: day + "T12:01:00Z", message: { role: "assistant", provider: "fixture", model: "m", usage: { input: 10, output: 1 } } },
+      { type: "message", timestamp: day + "T12:01:30Z", message: { role: "toolResult", toolName: "fixture_tool", usage: { input: 5, output: 1 } } },
     ]).map(line => JSON.stringify(line)).join("\n") + "\n");
   }
-  await writeFile(join(root, group, "durable.sqlite"), "current database footprint");
+  await mkdir(join(root, "conversations/groups", group), { recursive: true });
+  await writeFile(join(root, "conversations/groups", group, "durable.sqlite"), "current database footprint");
 }
 
 test("统计、会话和临时文件刷新保留列表，切换数据根后清除旧范围", async () => {
@@ -764,8 +855,8 @@ test("统计、会话和临时文件刷新保留列表，切换数据根后清�
   const mocks: { mockRestore(): void }[] = [];
   try {
     await history(fixture.root, "old-group", "13812345678");
-    const tmp = join(fixture.root, "old-group", "users", "13812345678", "tmp");
-    await mkdir(tmp);
+    const tmp = join(fixture.root, "tmp/groups/old-group/13812345678");
+    await mkdir(tmp, { recursive: true });
     await writeFile(join(tmp, "sample.txt"), "fixture");
     const { app, calls } = fakeApp(fixture.root);
     const stats = new StatsView();
@@ -795,7 +886,7 @@ test("统计、会话和临时文件刷新保留列表，切换数据根后清�
     finishes.shift()!();
     await window;
 
-    app.deployment.groupDataRoot = join(fixture.root, "new-root");
+    app.deployment.dataRoot = join(fixture.root, "new-root");
     empty = true;
     for (const view of views) {
       calls.answers.push("old-group");
@@ -812,41 +903,11 @@ test("统计、会话和临时文件刷新保留列表，切换数据根后清�
   } finally { finishes.forEach(finish => finish()); mocks.forEach(mock => mock.mockRestore()); await fixture.cleanup(); }
 });
 
-test("切换为直连隐藏隧道操作时，选择按操作保留，被隐藏时退到范围内，页面照常绘制", async () => {
-  const load = spyOn(tuiTransaction, "loadPendingTransaction").mockReturnValue(null);
-  const git = spyOn(tuiData, "loadGit").mockResolvedValue(null);
-  try {
-    const { app } = fakeApp();
-    app.deployment.mode = "cloudflare";
-    const view = new MaintainView();
-    await view.refresh(app);
-    const keys = () => view.actions().map(action => action.value);
-    expect(keys()).toContain("tunnel-update");
-    const ctx = () => ({ ...context(120, 35), deployment: app.deployment });
-    // Last entry (uninstall) and a tunnel entry: the first keeps its action, the second falls back inside the list.
-    await view.onKey(key("end"), app);
-    app.deployment.mode = "direct";
-    await view.refresh(app);
-    expect(keys()).not.toContain("tunnel-update");
-    expect(plain(view.render(ctx()))).toContain(`${keys().length} / ${keys().length}`);
-    expect(plain(view.render(ctx()))).toContain("删除容器/任务");
-    app.deployment.mode = "cloudflare";
-    await view.refresh(app);
-    await view.onKey(key("end"), app);
-    while (view.actions()[view["selected"]]!.value !== "tunnel-update") await view.onKey(key("up"), app);
-    app.deployment.mode = "direct";
-    await view.refresh(app);
-    expect(view["selected"]).toBeLessThan(keys().length);
-    for (const [width, rows] of [[72, 20], [120, 35]]) fits(view.render({ ...context(width, rows), deployment: app.deployment }), context(width, rows));
-  } finally { load.mockRestore(); git.mockRestore(); }
-});
-
 test("升级、继续或回滚改动了代码时提示重新运行界面，只提示一次；代码未变不提示", async () => {
   const record: tuiTransaction.TransactionRecord = {
-    format: "1", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "2".repeat(40), original_sha: "1".repeat(40),
-    original_branch: "main", original_group_root: "/srv/groups", target_group_root: "/srv/groups", was_running: "1",
-    bot_port: "1011", deploy_mode: "direct", bot_domain: "", domain_action: "keep", unmanaged_tunnel: "",
-    platform_ip: "203.0.113.17", reconfigure_ai: "0",
+    format: "2", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "2".repeat(40), original_sha: "1".repeat(40),
+    original_branch: "main", original_workspace_root: "", target_workspace_root: "", was_running: "1",
+    bot_port: "1011", reconfigure_ai: "0",
   };
   const confirmation = { operation: "upgrade" as const, id: "deploy-fixture", digest: "a".repeat(64), text: () => null };
   const pending: tuiTransaction.PendingTransaction = { confirmation, operation: "upgrade", snapshot: "deploy-fixture", record, targetSha: record.target_sha, committed: false, codeRestorePending: false };
@@ -878,10 +939,9 @@ test("升级、继续或回滚改动了代码时提示重新运行界面，只�
 
 test("未完成的事务只提供继续或回滚，确认页列出记录，数据已提交时禁止回滚", async () => {
   const record: tuiTransaction.TransactionRecord = {
-    format: "1", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "2".repeat(40), original_sha: "1".repeat(40),
-    original_branch: "main", original_group_root: "/srv/old-groups", target_group_root: "/srv/new-groups", was_running: "1",
-    bot_port: "2022", deploy_mode: "cloudflare", bot_domain: "bot.example.com", domain_action: "keep", unmanaged_tunnel: "",
-    platform_ip: "203.0.113.17", reconfigure_ai: "0",
+    format: "2", operation: "upgrade", snapshot: "deploy-fixture", target_sha: "2".repeat(40), original_sha: "1".repeat(40),
+    original_branch: "main", original_workspace_root: "/srv/old-shared", target_workspace_root: "/srv/new-shared", was_running: "1",
+    bot_port: "2022", reconfigure_ai: "0",
   };
   const confirmation = { operation: "upgrade" as const, id: "deploy-fixture", digest: "a".repeat(64), text: () => null };
   const pending: tuiTransaction.PendingTransaction = { confirmation, operation: "upgrade", snapshot: "deploy-fixture", record, targetSha: record.target_sha, committed: false, codeRestorePending: false };
@@ -899,20 +959,19 @@ test("未完成的事务只提供继续或回滚，确认页列出记录，数�
       const actions = view.actions();
       expect(actions.slice(0, 2).map(action => action.label)).toEqual(["继续上次操作", "回滚上次操作"]);
       expect(actions.filter(action => action.disabled).map(action => action.value).sort()).toEqual(["deploy", "repair", "update"]);
-      expect(actions.some(action => action.value === "tunnel-update" || action.value === "repair-tunnel")).toBe(false);
       expect(actions.find(action => action.value === "deploy")?.label).toBe("重新部署");
       expect(actions.find(action => action.value === "update")?.label).toBe("升级");
       for (const [width, rows] of [[72, 20], [120, 35]]) fits(view.render(context(width, rows)), context(width, rows));
       // New deployments, upgrades and repairs are refused until the interrupted one is finished; no remote check starts.
-      for (const blocked of ["deploy", "update", "repair", "tunnel-update"]) await view.onKey(key(blocked), app);
+      for (const blocked of ["deploy", "update", "repair"]) await view.onKey(key(blocked), app);
       expect(calls.commands).toHaveLength(0); expect(calls.confirms).toHaveLength(0);
       expect(calls.toasts.at(-1)).toContain("继续上次操作");
       expect(remote).not.toHaveBeenCalled();
       await view.onKey(key("enter"), app);
       const resume = calls.confirms.at(-1)!;
       expect(resume.subject).toBe("未完成的升级：目标提交 2222222");
-      expect(resume.steps.join("\n")).toContain("/srv/new-groups（原 /srv/old-groups）");
-      expect(resume.steps.join("\n")).toContain("端口 2022 · 入口 Cloudflare · bot.example.com");
+      expect(resume.steps.join("\n")).toContain("共享资料目录：/srv/new-shared（原 /srv/old-shared）");
+      expect(resume.steps.join("\n")).toContain("本机端口 2022");
       expect(resume.steps.join("\n")).toContain("原运行状态：运行");
       expect(calls.commands.at(-1)?.args.slice(0, 2)).toEqual(["resume", "--confirmed-transaction"]);
       await view.onKey(key("rollback"), app);
@@ -1419,7 +1478,7 @@ test("统计汇总逐日补零，可切换周月粒度，基期比较在窄窗�
 test("临时文件预览失败、零候选及取消都不执行归档；结果按实际进度报告", async () => {
   const fixture = await tempFixture("tui-storage-outcomes-");
   try {
-    const dir = join(fixture.root, "g1/users/u1/tmp"); await mkdir(dir, { recursive: true });
+    const dir = join(fixture.root, "tmp/groups/g1/u1"); await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "sample.txt"), "fixture");
     const { app, calls } = fakeApp(fixture.root), view = new StorageView(), run = app.run;
     await view.refresh(app);
@@ -1438,7 +1497,7 @@ test("临时文件预览失败、零候选及取消都不执行归档；结果�
     app.run = async (title, args) => {
       if (args[0] !== "tmp-purge") return run(title, args);
       calls.commands.push({ title, args });
-      await writeFile(join(fixture.root, ".reclamation/backup/rm/.tmp-plans", args[2] + ".progress.json"), JSON.stringify({
+      await writeFile(join(fixture.root, "state/reclamation/backup/rm/.tmp-plans", args[2] + ".progress.json"), JSON.stringify({
         version: 1, digest: args[4], outcomes: { "0": { status: "failed", bytes: 0, reason: "synthetic failure" } },
       }));
       return 1;
@@ -1452,17 +1511,17 @@ test("临时文件预览失败、零候选及取消都不执行归档；结果�
 test("归档后 r 预览并永久删除归档，x 预览物理回收；都要输入确认词，结果按实际进度报告", async () => {
   const fixture = await tempFixture("tui-storage-discard-");
   try {
-    const dir = join(fixture.root, "g1/users/u1/tmp"); await mkdir(dir, { recursive: true });
+    const dir = join(fixture.root, "tmp/groups/g1/u1"); await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "sample.txt"), "fixture");
     const core = await import("../../src/maintenance/archive.ts"), reclamation = await import("../../src/maintenance/reclaim.ts"), { durableMemberScope } = await import("../../src/durable/maintenance-view.ts");
-    const options = { root: fixture.root, state: join(fixture.root, "absent-state.sqlite"), archive: join(fixture.root, ".reclamation/backup/rm"), scope: durableMemberScope };
+    const options = { root: fixture.root, state: join(fixture.root, "absent-state.sqlite"), archive: join(fixture.root, "state/reclamation/backup/rm"), scope: durableMemberScope };
     const { app, calls } = fakeApp(fixture.root), view = new StorageView(), run = app.run;
     app.run = async (title, args) => {
       const value = (flag: string) => args[args.indexOf(flag) + 1]!;
       if (args[0] === "tmp-purge") await core.applyTmpArchive(options, value("--plan"), value("--digest"));
       else if (args[0] === "tmp-discard" && args.includes("--digest")) await core.applyArchiveRemoval(options, value("--plan"), value("--digest"));
       else if (args[0] === "tmp-discard") await core.previewArchiveRemoval(options, value("--plan"));
-      else if (args[0] === "tmp-reclaim") await reclamation.previewReclamation({ ...options, directory: join(fixture.root, ".reclamation/plans") }, 0, undefined, undefined, "auto", value("--plan"));
+      else if (args[0] === "tmp-reclaim") await reclamation.previewReclamation({ ...options, directory: join(fixture.root, "state/reclamation/plans") }, 0, undefined, undefined, "auto", value("--plan"));
       else return run(title, args);
       calls.commands.push({ title, args }); return 0;
     };
@@ -1504,7 +1563,7 @@ test("存储清当前会同时传群与成员，清所有则明确显示范围",
   const fixture = await tempFixture("tui-storage-view-");
   try {
     for (const group of ["g1", "g2"]) {
-      const dir = join(fixture.root, group, "users", "13812345678", "tmp");
+      const dir = join(fixture.root, "tmp/groups", group, "13812345678");
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, "sample.txt"), "fixture");
     }
@@ -1517,15 +1576,15 @@ test("存储清当前会同时传群与成员，清所有则明确显示范围",
     // 两行清理预览各自说清范围：一行是选中成员，一行是全部，且明说忽略筛选。
     expect(plain(view.render(context()))).toContain("p 当前");
     expect(plain(view.render(context()))).toContain("a 全部");
-    expect(plain(view.render(context()))).toContain("所有群与成员，忽略筛选");
+    expect(plain(view.render(context()))).toContain("所有空间与成员，忽略筛选");
     await view.onKey(key("p"), app);
-    expect(calls.commands[0]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String), "--group", "g1", "--user", "13812345678", "--storage-segment"]);
+    expect(calls.commands[0]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String), "--user", "13812345678", "--group", "g1", "--storage-segment"]);
     expect(calls.commands[1]!.args).toEqual(["tmp-purge", "--plan", calls.commands[0]!.args[3]!, "--digest", expect.any(String)]);
     expect(calls.confirms[0]!.subject).toContain("群 g1");
     await view.onKey(key("a"), app);
     expect(calls.commands[2]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String)]);
     expect(calls.commands[3]!.args[0]).toBe("tmp-purge");
-    expect(calls.confirms[1]!.subject).toContain("所有群的所有成员");
+    expect(calls.confirms[1]!.subject).toContain("所有空间的所有成员");
   } finally { await fixture.cleanup(); }
 });
 
@@ -1533,7 +1592,7 @@ test("筛选临时文件后只清选中成员，全量清理仍明确覆盖所�
   const fixture = await tempFixture("tui-storage-filter-");
   try {
     for (const [group, count] of [["支持 一群", 3], ["支持 二群", 32]] as const) {
-      const dir = join(fixture.root, group, "users", "13812345678", "tmp");
+      const dir = join(fixture.root, "tmp/groups", group, "13812345678");
       await mkdir(dir, { recursive: true });
       for (let i = 0; i < count; i++) await writeFile(join(dir, `file-${String(i).padStart(2, "0")}.txt`), "fixture");
     }
@@ -1550,7 +1609,7 @@ test("筛选临时文件后只清选中成员，全量清理仍明确覆盖所�
     expect(plain(view.render(context()))).toContain("1 / 2");
     expect(plain(view.render(context()))).not.toContain("支持 一群");
     await view.onKey(key("p"), app);
-    expect(calls.commands[0]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String), "--group", "支持 二群", "--user", "13812345678", "--storage-segment"]);
+    expect(calls.commands[0]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String), "--user", "13812345678", "--group", "支持 二群", "--storage-segment"]);
     await view.onKey(key("a"), app);
     expect(calls.commands[2]!.args).toEqual(["tmp-preview", "--all", "--plan", expect.any(String)]);
     expect(calls.confirms[1]!.subject).toContain("不受列表筛选影响");
@@ -1662,212 +1721,9 @@ test("快速离开日志页后，未完成的加载不会重新启动后台轮�
   } finally { view.onLeave(); load.mockRestore(); }
 });
 
-test("日志设置只显示关闭和开启，取消或选择当前值不执行；失败后显示恢复的设置", async () => {
-  const { app, calls } = fakeApp();
-  app.deployment.mode = "cloudflare";
-  const view = new SettingsView();
-  let saved: tuiData.TunnelLogging = "off";
-  const read = spyOn(tuiData, "loadTunnelLogging").mockImplementation(async () => saved);
-  const protocol = spyOn(tuiData, "loadTunnelProtocol").mockResolvedValue("auto");
-  const relay = spyOn(tuiData, "loadRelaySummary").mockResolvedValue({ enabled: false });
-  const confirm = spyOn(app, "confirm").mockResolvedValue(false);
-  const run = spyOn(app, "run").mockImplementation(async (_title, args) => { saved = args[1] as tuiData.TunnelLogging; return 0; });
-  try {
-    view["selected"] = view["items"].indexOf("tunnel");
-    await view.refresh(app);
-    calls.choices.push(null, "off", "on");
-    for (let i = 0; i < 3; i++) await view.onKey(key("l"), app);
-    expect(calls.menus[0]!.choices.map(choice => choice.label)).toEqual(["关闭", "开启"]);
-    expect(calls.menus[0]!.initial).toBe("off");
-    expect(run).not.toHaveBeenCalled();
-    expect(confirm).toHaveBeenCalledTimes(1);
-    confirm.mockResolvedValue(true);
-    calls.choices.push("on");
-    await view.onKey(key("l"), app);
-    expect(run.mock.calls.at(-1)?.[1]).toEqual(["tunnel-logging", "on"]);
-    expect(view["logging"].state).toEqual({ kind: "ready", value: "on" });
-    run.mockResolvedValue(1);
-    calls.choices.push("off");
-    await view.onKey(key("l"), app);
-    expect(view["logging"].state).toEqual({ kind: "ready", value: "on" });
-    const shown = plain(view.render({ ...context(120, 35), deployment: app.deployment }));
-    expect(shown).toContain("隧道日志：开启");
-    expect(shown).not.toMatch(/debug/i);
-    // 隧道日志页在监控分区，设置页不再提供互跳。
-    expect(view.hints().map(([name]) => name)).not.toContain("v");
-    expect(await view.onKey(key("v"), app)).toBe(false);
-    expect(calls.destinations).toEqual([]);
-  } finally { view.onLeave(); read.mockRestore(); protocol.mockRestore(); relay.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
-});
-
-test("Cloudflare 隧道合并为一项，Enter 先选日志或连接模式；直连部署隐藏隧道设置", async () => {
-  const { app, calls } = fakeApp();
-  const view = new SettingsView();
-  const logging = spyOn(tuiData, "loadTunnelLogging").mockResolvedValue("off");
-  const protocol = spyOn(tuiData, "loadTunnelProtocol").mockResolvedValue("quic");
-  const runtime = spyOn(tuiData, "loadRuntimeSettings").mockResolvedValue({ hash: null, values: {} });
-  const model = spyOn(tuiData, "loadModelSummary").mockResolvedValue(null);
-  try {
-    const direct = plain(view.render(context(120, 35)));
-    expect(direct).not.toContain("Cloudflare 隧道");
-    expect(view.actions!().map(action => action.value)).toEqual(["m", "e", "a"]);
-    expect(await view.onKey(key("l"), app)).toBe(false);
-    expect(await view.onKey(key("p"), app)).toBe(false);
-    expect(logging).not.toHaveBeenCalled(); expect(protocol).not.toHaveBeenCalled();
-    await view.onKey(key("end"), app);
-    expect(plain(view.render(context(120, 35)))).toContain("文档处理：文档模块");
-
-    // 切到 Cloudflare 部署时仍停在高级运行参数，隧道项插在它前面。
-    app.deployment.mode = "cloudflare";
-    const tunnel = { ...context(120, 35), deployment: app.deployment };
-    expect(plain(view.render(tunnel))).toContain("6 / 6");
-    expect(view.actions!().map(action => action.value)).toEqual(["m", "e", "l", "p", "a"]);
-    await view.onKey(key("up"), app);
-    await view.refresh(app);
-    const shown = plain(view.render(tunnel));
-    expect(shown).toContain("Cloudflare 隧道");
-    expect(shown).toContain("隧道日志：关闭（默认关闭） · 连接模式：QUIC（UDP）");
-    expect(shown).toContain("监控 → 隧道日志");
-    calls.choices.push("p", null);
-    await view.onKey(key("enter"), app);
-    expect(calls.menus.map(menu => menu.title)).toEqual(["Cloudflare 隧道", "Cloudflared 连接模式"]);
-    calls.choices.push(null);
-    await view.onKey(key("enter"), app);
-    expect(calls.menus).toHaveLength(3);
-    expect(calls.commands).toHaveLength(0);
-    for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) {
-      const ctx = { ...context(width, rows), deployment: app.deployment };
-      fits(view.render(ctx), ctx);
-    }
-  } finally { view.onLeave(); logging.mockRestore(); protocol.mockRestore(); runtime.mockRestore(); model.mockRestore(); }
-});
-
-test("连接模式默认自动，三种选择可保存；取消、原值和恢复后的失败都正确显示", async () => {
-  const { app, calls } = fakeApp();
-  app.deployment.mode = "cloudflare";
-  const view = new SettingsView();
-  let saved: tuiData.TunnelProtocol = "auto";
-  const read = spyOn(tuiData, "loadTunnelProtocol").mockImplementation(async () => saved);
-  const logging = spyOn(tuiData, "loadTunnelLogging").mockResolvedValue("off");
-  const confirm = spyOn(app, "confirm").mockResolvedValue(false);
-  const run = spyOn(app, "run").mockImplementation(async (_title, args) => { saved = args[1] as tuiData.TunnelProtocol; return 0; });
-  try {
-    await view.onKey(key("p"), app);
-    await view.refresh(app);
-    calls.choices.push(null, "auto", "http2");
-    for (let i = 0; i < 3; i++) await view.onKey(key("p"), app);
-    expect(calls.menus[0]!.choices.map(choice => choice.value)).toEqual(["auto", "http2", "quic"]);
-    expect(calls.menus[0]!.initial).toBe("auto");
-    expect(run).not.toHaveBeenCalled();
-    expect(confirm).toHaveBeenCalledTimes(1);
-    confirm.mockResolvedValue(true);
-    for (const mode of ["http2", "quic", "auto"] as const) {
-      calls.choices.push(mode);
-      await view.onKey(key("p"), app);
-      expect(run.mock.calls.at(-1)?.[1]).toEqual(["tunnel-protocol", mode]);
-      expect(view["protocol"].state).toEqual({ kind: "ready", value: mode });
-    }
-    run.mockResolvedValue(1);
-    calls.choices.push("http2");
-    await view.onKey(key("p"), app);
-    expect(view["protocol"].state).toEqual({ kind: "ready", value: "auto" });
-    for (const [width, rows] of [[72, 20], [80, 24], [120, 35]]) {
-      const ctx = { ...context(width, rows), deployment: app.deployment };
-      fits(view.render(ctx), ctx);
-      expect(plain(view.render(ctx))).toContain("Cloudflare 隧道");
-    }
-    expect(plain(view.render({ ...context(120, 35), deployment: app.deployment }))).toContain("连接模式：自动（默认）");
-  } finally { view.onLeave(); read.mockRestore(); logging.mockRestore(); confirm.mockRestore(); run.mockRestore(); }
-});
-
-test("离开连接模式时取消加载，迟到的结果不能覆盖状态；读取错误可重试", async () => {
-  const { app } = fakeApp();
-  app.deployment.mode = "cloudflare";
-  const view = new SettingsView();
-  let finish!: (value: tuiData.TunnelProtocol) => void;
-  const read = spyOn(tuiData, "loadTunnelProtocol").mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-  const logging = spyOn(tuiData, "loadTunnelLogging").mockResolvedValue("off");
-  const model = spyOn(tuiData, "loadModelSummary").mockResolvedValue(null);
-  try {
-    await view.onKey(key("p"), app);
-    const loading = view.refresh(app);
-    expect(view.activity()).toContain("隧道设置");
-    await view.onKey(key("home"), app);
-    finish("quic"); await loading;
-    expect(view["protocol"].state.kind).toBe("idle");
-    read.mockRejectedValueOnce(new Error("invalid preference"));
-    await view.onKey(key("p"), app);
-    expect(view["protocol"].state.kind).toBe("error");
-    expect(plain(view.render({ ...context(120, 35), deployment: app.deployment }))).toContain("invalid preference");
-    read.mockResolvedValue("auto");
-    await view.refresh(app);
-    expect(view["protocol"].state).toEqual({ kind: "ready", value: "auto" });
-  } finally { view.onLeave(); read.mockRestore(); logging.mockRestore(); model.mockRestore(); }
-});
-
-test("隧道日志复用跟随搜索和级别筛选，读取独立文件，任务查询只用于机器人日志", async () => {
-  const { app, calls } = fakeApp();
-  const view = new LogsView("cloudflared");
-  const read = spyOn(tuiData, "loadLogTail").mockResolvedValue([
-    { level: "debug", text: "request fixture-ray" }, { level: "info", text: "connected" },
-    { level: "warn", text: "retrying" }, { level: "error", text: "refused" },
-  ]);
-  try {
-    await view.refresh(app);
-    expect(read.mock.calls[0]![2]).toEndWith(join("logs", "cloudflared.log"));
-    expect(plain(view.render(context()))).toContain("request fixture-ray");
-    expect(view.actions().some(action => action.value === "t")).toBe(false);
-    await view.onKey(key("t"), app);
-    expect(calls.prompts).toEqual([]);
-    calls.choices.push("1");
-    await view.onKey(key("l"), app);
-    const filtered = plain(view.render(context()));
-    expect(filtered).toContain("retrying");
-    expect(filtered).toContain("refused");
-    expect(filtered).not.toContain("fixture-ray");
-    calls.choices.push("0");
-    await view.onKey(key("l"), app);
-    calls.answers.push("fixture-ray");
-    await view.onKey(key("/"), app);
-    expect(plain(view.render(context()))).not.toContain("retrying");
-    expect(view.hints().map(([name]) => name)).not.toContain("o");
-    expect(await view.onKey(key("o"), app)).toBe(false);
-    expect(calls.destinations).toEqual([]);
-  } finally { view.onLeave(); read.mockRestore(); }
-  expect(view["timer"]).toBeNull();
-  expect(view.available!(deployment)).toBe(false);
-  expect(view.available!({ ...deployment, mode: "cloudflare" })).toBe(true);
-  expect(new LogsView().available!(deployment)).toBe(true);
-});
-
-test("直连部署不显示隧道日志页：Tab、子导航和页面菜单都跳过它，切换部署形态后回到可用页", async () => {
-  const tty = terminal();
-  const bot = new LogsView(), tunnel = new LogsView("cloudflared");
-  const read = spyOn(tuiData, "loadLogTail").mockResolvedValue([]);
-  const app = new App([
-    { id: "home", label: "总览", render: () => [], hints: () => [] },
-    { id: "monitor", label: "监控", views: [bot, tunnel] },
-  ], { screen: tty.screen, deployment: { ...deployment } });
-  app["refreshChrome"] = async () => {};
-  tty.screen.start(() => {}, () => {});
-  try {
-    await app["handleKey"](key("right"));
-    expect(app["current"].id).toBe("logs");
-    expect(app["pages"]().map(view => view.id)).toEqual(["logs"]);
-    await app["handleKey"](key("tab"));
-    expect(app["current"].id).toBe("logs");
-    app.go("tunnel-logs");
-    expect(app["current"].id).toBe("logs");
-    app.deployment.mode = "cloudflare";
-    expect(app["pages"]().map(view => view.id)).toEqual(["logs", "tunnel-logs"]);
-    await app["handleKey"](key("tab"));
-    expect(app["current"].id).toBe("tunnel-logs");
-  } finally { bot.onLeave(); tunnel.onLeave(); read.mockRestore(); tty.close(); }
-});
-
 test("操作预览在宽窄窗口及无色终端都完整容纳菜单，最后一项始终可达", async () => {
   const { app } = fakeApp();
-  for (const view of [new MaintainView(), new SettingsView(), createRelayView(), createRoutesView()]) {
+  for (const view of [new MaintainView(), new SettingsView(), createRelayView()]) {
     if (view instanceof MaintainView) view["state"] = { kind: "ready", value: null };
     await view.onKey!(key("end"), app);
     for (const [width, rows] of [[72, 20], [80, 24], [96, 20], [100, 24], [120, 35]]) {
@@ -1875,15 +1731,14 @@ test("操作预览在宽窄窗口及无色终端都完整容纳菜单，最后�
         const ctx = { ...context(width, rows), theme: createTheme(depth) };
         const frame = view.render(ctx);
         fits(frame, ctx);
-        expect(plain(frame)).toContain(view.id === "maintain" ? "卸载" : view.id === "settings" ? "高级运行参数"
-          : view.id === "relay" ? "清理全部外链" : "移除废弃绑定");
+        expect(plain(frame)).toContain(view.id === "maintain" ? "卸载" : view.id === "settings" ? "高级运行参数" : "清理全部外链");
       }
     }
   }
 });
 
 test("外链配置在两个平台接管真实终端，不通过普通弹窗或命令参数传递凭据", async () => {
-  const settings = spyOn(tuiData, "loadTunnelLogging").mockResolvedValue("off");
+  const settings = spyOn(tuiData, "loadRelaySummary").mockResolvedValue({ enabled: false });
   try {
     for (const platform of ["windows", "linux"] as const) {
       const { app, calls } = fakeApp();
@@ -1919,7 +1774,9 @@ test("模型配置先说明停机影响，确认后在真实终端运行向导�
       const interactive: string[][] = [];
       app.runInteractive = async (_title, args) => { interactive.push(args); return 0; };
       const view = new SettingsView();
-      await view.refresh(app);
+      const appBot = spyOn(tuiData, "loadAppBotSummary").mockResolvedValue({ configured: true, environment: "production" });
+      await view.onKey(key("down"), app); await tick();
+      appBot.mockRestore();
       const shown = plain(view.render(context(120, 35)));
       expect(shown).toContain("当前：deepseek/deepseek-chat");
       expect(shown).toContain("推理级别：low（该模型单独设置）");
@@ -1948,7 +1805,7 @@ test("辅助模型与 MCP 只读显示引用和服务器，不显示命令、环
   ]);
   const view = new SettingsView();
   try {
-    await view.onKey(key("down"), app); await tick();
+    await view.onKey(key("down"), app); await view.onKey(key("down"), app); await tick();
     let shown = plain(view.render(context(120, 35)));
     for (const text of ["文档分流：openai/gpt-5-mini", "图片生成：未启用", "并发上限 2 · 分类重试 1 次", "data/config/auxiliary.json"]) expect(shown).toContain(text);
     expect(plain(view.render(context(80, 24)))).toContain("分类");
@@ -2016,7 +1873,7 @@ test("测试外链不需确认，直接交给 relay-test 并说明会上传后�
   expect(calls.toasts).toEqual(["测试外链完成"]);
 });
 
-test("必填输入为空会停止，路由群名中的空格完整传递", async () => {
+test("外链清理的关键字为空会停止，不执行也不确认", async () => {
   const { app, calls } = fakeApp();
   const relay = createRelayView();
   for (let i = 0; i < 3; i++) await relay.onKey!(key("down"), app);
@@ -2026,9 +1883,4 @@ test("必填输入为空会停止，路由群名中的空格完整传递", async
   await relay.onKey!(key("enter"), app);
   expect(calls.commands).toHaveLength(0);
   expect(calls.confirms).toHaveLength(0);
-  const routes = createRoutesView();
-  await routes.onKey!(key("down"), app);
-  calls.answers.push("abcdef123456", "技术 支持群");
-  await routes.onKey!(key("enter"), app);
-  expect(calls.commands[0]!.args).toEqual(["routes", "reset", "abcdef123456", "--group", "技术 支持群"]);
 });

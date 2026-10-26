@@ -155,7 +155,7 @@ test("aliased-root-tools", async () => {
   expect(process.env.TEST_TRASH_DIR).toBe(join(process.cwd(), "trash"));
   const workspace = join(root, "workspace"), own = join(root, "own"), other = join(root, "other");
   await Promise.all([mkdir(workspace), mkdir(own), mkdir(other)]);
-  const tools = await buildLocalTools({ workspaceDir: workspace, tempDir: own, phone: "alice", groupId: "g",
+  const tools = await buildLocalTools({ workspaceDir: workspace, tempDir: own, phone: "alice", scope: { kind: "group", groupId: "g" },
     venvDir: join(root, "venv"), materialsIndexPath: join(root, "index", "materials.md") });
   const write = tools.find(tool => tool.name === "write");
   await write.execute("owned", { path: join(own, "result.txt"), content: "owned" }, undefined, undefined, {});

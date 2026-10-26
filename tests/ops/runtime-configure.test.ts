@@ -98,7 +98,7 @@ for (const shell of ["powershell", "bash"] as const) {
               '  if [ "$1" = container ]; then shift; elif [ "$1" = inspect ]; then return 97; fi',
               '  case "$1" in',
               '    ps) cat "$FIXTURE_STATE" ;;',
-              '    inspect) if [[ "$3" == *Config.Env* ]]; then printf "BOT_DEBUG=0\\nAPI_KEY=private-credential\\n";',
+              '    inspect) if [[ "$3" == *Config.Env* ]]; then printf "BOT_DOCUMENT_WORK_ENABLED=0\\nAPI_KEY=private-credential\\n";',
               '      elif [[ "$3" == *Mounts* ]]; then if [ "$FIXTURE_SCENARIO" = foreign ]; then printf "%s/other" "$DATA_DIR"; else printf "%s" "$DATA_DIR"; fi;',
               '      else printf fixture-image; fi ;;',
               '    run) fixture_config "$@" ;;',

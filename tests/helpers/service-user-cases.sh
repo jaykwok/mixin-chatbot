@@ -37,7 +37,7 @@ rootless() { echo '[name=seccomp,profile=builtin name=rootless name=cgroupns]' >
 rootful() { echo '[name=seccomp,profile=builtin name=cgroupns]' > "$fixture/options"; }
 uid() { echo "$1" > "$fixture/uid"; }
 owner() { if [ -n "$1" ]; then echo "$1" > "$fixture/owner"; else rm -f -- "$fixture/owner"; fi; }
-# container <name> <id|user|image|data|groups>, or remove it with no fields.
+# container <name> <id|user|image|data>, or remove it with no fields.
 container() {
     local name="$1"
     shift
@@ -130,9 +130,9 @@ identity_cases() {
     DOCKER_ROOTLESS=''; check operator-rootless-root require_deploy_operator rollback
     # Whether a deployment was ever committed: any of its settings.
     check recorded-none deployment_recorded
-    : > "$STATE_DIR/deploy-mode"
-    check recorded-mode deployment_recorded
-    rm -f -- "$STATE_DIR/deploy-mode"
+    : > "$STATE_DIR/bot-port"
+    check recorded-port deployment_recorded
+    rm -f -- "$STATE_DIR/bot-port"
     # The owner of data/state, offered for confirmation when the container is gone.
     rootful; uid 0
     owner 1000:1000; capture data-rootful data_owner_user 0
@@ -146,9 +146,9 @@ data_owner_user() { service_user_from_data "$1"; }
 container_cases() {
     local data="$PROJECT_DIR/data" name
     rootful
-    container mixin-chatbot "c0ffee|1000:1000|sha256:old|$data|/srv/groups"
+    container mixin-chatbot "c0ffee|1000:1000|sha256:old|$data"
     check read original_service_container
-    result read-fields "$ORIGINAL_CONTAINER_ID|$ORIGINAL_CONTAINER_USER|$ORIGINAL_CONTAINER_IMAGE|$ORIGINAL_CONTAINER_GROUPS"
+    result read-fields "$ORIGINAL_CONTAINER_ID|$ORIGINAL_CONTAINER_USER|$ORIGINAL_CONTAINER_IMAGE|$ORIGINAL_CONTAINER_DATA"
     container mixin-chatbot
     check read-missing original_service_container
     : > "$fixture/down"
@@ -164,18 +164,18 @@ container_cases() {
         check "from-$name" service_user_from_container "$rootless"
         result "from-$name-value" "$SERVICE_USER|$SERVICE_USER_SOURCE"
     }
-    identity rootful 0 "c0ffee|1000:1000|sha256:old|$data|"
-    identity rootful-dotted 0 "c0ffee|1000:1000|sha256:old|$PROJECT_DIR/./data/|"
-    identity rootless 1 "c0ffee|0:0|sha256:old|$data|"
-    identity foreign-data 0 "c0ffee|1000:1000|sha256:old|$fixture/other/data|"
-    identity no-data 0 "c0ffee|1000:1000|sha256:old||"
-    identity image-user 0 "c0ffee||sha256:old|$data|"
-    identity named-user 0 "c0ffee|appuser|sha256:old|$data|"
-    identity rootful-root 0 "c0ffee|0:0|sha256:old|$data|"
-    identity rootless-user 1 "c0ffee|1000:1000|sha256:old|$data|"
+    identity rootful 0 "c0ffee|1000:1000|sha256:old|$data"
+    identity rootful-dotted 0 "c0ffee|1000:1000|sha256:old|$PROJECT_DIR/./data/"
+    identity rootless 1 "c0ffee|0:0|sha256:old|$data"
+    identity foreign-data 0 "c0ffee|1000:1000|sha256:old|$fixture/other/data"
+    identity no-data 0 "c0ffee|1000:1000|sha256:old|"
+    identity image-user 0 "c0ffee||sha256:old|$data"
+    identity named-user 0 "c0ffee|appuser|sha256:old|$data"
+    identity rootful-root 0 "c0ffee|0:0|sha256:old|$data"
+    identity rootless-user 1 "c0ffee|1000:1000|sha256:old|$data"
     # One-off containers of the operations entry use the service container's identity, then the owner of data/config.
     capture one-off-container service_container_user
-    container mixin-chatbot "c0ffee|appuser|sha256:old|$data|"
+    container mixin-chatbot "c0ffee|appuser|sha256:old|$data"
     owner 1234:1234; capture one-off-named service_container_user
     container mixin-chatbot
     capture one-off-owner service_container_user
@@ -203,16 +203,16 @@ deploy_cases() {
         result "deploy-$name-questions" "$(wc -l < "$fixture/questions" | tr -d ' ')"
     }
     rootful; uid 0; echo n > "$fixture/answer"
-    container mixin-chatbot "c0ffee|1000:1000|sha256:old|$data|"
+    container mixin-chatbot "c0ffee|1000:1000|sha256:old|$data"
     deploy_identity container 0
-    container mixin-chatbot "c0ffee|appuser|sha256:old|$data|"
+    container mixin-chatbot "c0ffee|appuser|sha256:old|$data"
     deploy_identity unclear 0
     : > "$fixture/down"
     deploy_identity down 0
     rm -f -- "$fixture/down"
     # No service container: a leftover rollback container is looked at first.
     container mixin-chatbot
-    container mixin-chatbot-rollback "d00d|1000:1000|sha256:old|$data|"
+    container mixin-chatbot-rollback "d00d|1000:1000|sha256:old|$data"
     deploy_identity rollback-left 0
     container mixin-chatbot-rollback
     # Never deployed: the image default.
@@ -230,6 +230,21 @@ deploy_cases() {
     uid 1000; owner 1000:1000; rootless
     deploy_identity confirmed-rootless 1
     rm -f -- "$STATE_DIR/bot-port"
+    # The directory step: data/ itself (made by root before the first deployment) goes to the default identity as well.
+    load_function "$here/../../scripts/deploy/deploy.sh" prepare_service_directories
+    DATA_DIR="$data" CONFIG_DIR="$data/config" RUNTIME_DIR="$data/runtime" RUNTIME_HOME_DIR="$data/runtime/home"
+    LOG_DIR="$PROJECT_DIR/logs"
+    mkdir -p "$RUNTIME_HOME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup"
+    : > "$fixture/chowns"
+    SERVICE_USER=1001:1001 SERVICE_USER_SOURCE=default
+    uid 0; check directories-first prepare_service_directories; result directories-first-chowns "$(chowns)"
+    SERVICE_USER=1000:1000 SERVICE_USER_SOURCE=container
+    check directories-kept prepare_service_directories; result directories-kept-chowns "$(chowns)"
+    SERVICE_USER=1001:1001 SERVICE_USER_SOURCE=default
+    uid 1000; check directories-user prepare_service_directories; result directories-user-chowns "$(chowns)"
+    uid 0; : > "$fixture/chown-fails"
+    check directories-chown-fails prepare_service_directories
+    rm -f -- "$fixture/chown-fails"
 }
 
 files_cases() {
@@ -279,9 +294,6 @@ guard_cases() {
     : > "$STATE_DIR/deploy-transaction"
     check guard-deploy isolated guard_one_off_container
     rm -f -- "$STATE_DIR/deploy-transaction"
-    : > "$STATE_DIR/update-transaction"
-    check guard-update isolated guard_one_off_container
-    rm -f -- "$STATE_DIR/update-transaction"
     # The read-only check does not take the lock: it only asks whether someone else holds it.
     rm -f -- "$STATE_DIR/deploy.lock"
     check busy-none deployment_in_progress

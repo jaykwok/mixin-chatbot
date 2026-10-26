@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { publishJson } from "../../scripts/lib/atomic-file.ts";
 import { scanTmp, type UserTmp } from "../../scripts/lib/tmp-scan.ts";
 import type { GroupSelection } from "../../scripts/lib/group-data.ts";
-import { decodeReclaimPlan, decodeReclaimProgress, DIGEST_PATTERN, finishedEarlier, ID_PATTERN, journalRecordsDeletion, planDigest, RESULT_NAME,
+import { memberTmpDir, decodeReclaimPlan, decodeReclaimProgress, DIGEST_PATTERN, finishedEarlier, ID_PATTERN, journalRecordsDeletion, planDigest, RESULT_NAME,
   type ReclaimItem as Item, type ReclaimOutcome as Outcome, type ReclaimProgress as Progress, type ReclamationPlan,
   type ResultOwnership } from "../contracts/maintenance.ts";
 import type { RootlessTasks } from "../core/rootless-tasks.ts";
@@ -42,7 +42,7 @@ async function plansRoot(options: ReclamationOptions): Promise<string> {
 
 /** The member's candidate items under one protected view: isolated tasks, result directories, then old shared entries. */
 async function memberItems(options: ReclamationOptions, user: UserTmp, view: MemberView, before: number, preview: boolean): Promise<Item[]> {
-  const common = { group: user.group, user: user.user }, items: Item[] = [];
+  const common = { space: user.space, user: user.user }, items: Item[] = [];
   // Old shared directories are only removable by a platform backend that can fence them.
   const sharedReady = !!options.legacy || process.platform === "win32", sharedReason = "旧共享目录需要宿主特权离线回收";
   const add = async (item: Item, createdAt: number) => {
@@ -92,7 +92,7 @@ export async function previewReclamation(options: ReclamationOptions, days: numb
       await options.scope.withMember({ ...options, root }, member, { exclusive: false, requireGroup: true }, async view => {
         for (const item of await memberItems({ ...options, root }, member, view, before, true)) if (!seen.has(item.path)) { seen.add(item.path); items.push(item); }
       });
-    } catch (error) { items.push({ group: member.group, user: member.user, path: member.dir, status: "deferred", reason: String(error) }); }
+    } catch (error) { items.push({ space: member.space, user: member.user, path: member.dir, status: "deferred", reason: String(error) }); }
   }
   // Privileged reclamation: an entry whose parent (or itself) an unfinished operation still holds waits for that
   // operation's original plan. Apply checks again before any new journal.
@@ -119,7 +119,7 @@ export async function applyReclamation(options: ReclamationOptions, id: string, 
   const directory = await plansRoot(options), root = await realpath(options.root);
   const plan = decodeReclaimPlan(await readPrivate(join(directory, id + ".json")),
     { id, digest: expectedDigest, root, recordedRoot: options.recordedRoot ?? root, legacy: !!options.legacy });
-  if (plan.rootIdentity !== await identity(options.root)) throw new Error("回收清单、摘要或群根实体已变化，拒绝执行：rootIdentity");
+  if (plan.rootIdentity !== await identity(options.root)) throw new Error("回收清单、摘要或数据目录实体已变化，拒绝执行：rootIdentity");
   const progressPath = join(directory, id + ".progress.json");
   let progress: Progress;
   try { progress = decodeReclaimProgress(await readPrivate(progressPath), plan); }
@@ -131,9 +131,9 @@ export async function applyReclamation(options: ReclamationOptions, id: string, 
       for (const index of indexes) progress.outcomes[String(index)] = unchanged(plan.items[index]!);
       await save(); continue;
     }
-    const first = plan.items[indexes[0]!]!, dir = join(options.root, first.group, "users", first.user, "tmp");
+    const first = plan.items[indexes[0]!]!, dir = memberTmpDir(options.root, first.space, first.user);
     // Reconstruction includes a member whose previous successful deletion emptied tmp.
-    const member: UserTmp = { group: first.group, user: first.user, dir, entries: [], bytes: 0, files: 0, newest: 0 };
+    const member: UserTmp = { space: first.space, user: first.user, dir, entries: [], bytes: 0, files: 0, newest: 0 };
     await options.scope.withMember(options, member, { exclusive: true, requireGroup: true }, async view => {
       // Fresh evidence and receipts, indexed once for this view (first entry wins, as in plan order).
       const fresh = new Map<string, Item>();

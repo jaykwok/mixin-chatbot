@@ -1,63 +1,62 @@
 // D5 recovery: the message service's process is force-killed while a model response streams. A child process runs the
 // real DurableService (faux model streaming slowly, synthetic data, no network) and is killed after partial output was
-// committed; this process then starts a new service on the same group database and state database.
+// committed; this process then starts a new service on the same group database.
 import { afterAll, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
 import { type ConversationId, createSession } from "@earendil-works/pi-durable";
-import { DeliveryStore } from "../../src/agent/delivery-store.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
-import { AttemptsDoc } from "../../src/durable/attempts.ts";
-import { groupDatabasePath } from "../../src/durable/groups.ts";
 import { MemberDirectory } from "../../src/durable/identity.ts";
 import { InboxDoc } from "../../src/durable/inbox.ts";
-import { DurableService, type Outbound } from "../../src/durable/service.ts";
+import { pendingDeliveries } from "../../src/durable/records.ts";
+import { DurableService } from "../../src/durable/service.ts";
 import { openGroupDatabase, openGroupStorage } from "../../src/durable/sqlite.ts";
 import { fauxModels, TEST_PROGRESS } from "../helpers/durable.ts";
+import { recordingOutbound, replyTexts } from "../helpers/recording-outbound.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { databaseOf, scopeOf, statsOf } from "../helpers/layout.ts";
+import { appLayout } from "../../src/core/layout.ts";
 
 const fixture = await tempFixture("durable-service-kill-");
 afterAll(() => fixture.cleanup());
 const resolve = (specifier: string) => JSON.stringify(import.meta.resolve(specifier));
-const GROUP = "group-a";
+const GROUP = "100";
 const ALICE = "13800000001";
-const URL = "https://example.invalid/callback?key=synthetic";
 const LIMITS = { runTimeoutMs: 600_000, modelIdleMs: 600_000, modelResponseMs: 600_000, tickMs: 20 };
 
 // The child admits one message; its answer streams at 20 one-character tokens a second, so it never finishes. Once the
 // request has streamed for a while it prints READY with the time and waits to be killed.
 const child = `
-import { Database } from "bun:sqlite";
 import { createModels } from ${resolve("@earendil-works/pi-ai")};
 import { fauxAssistantMessage, fauxProvider } from ${resolve("@earendil-works/pi-ai/providers/faux")};
-import { DeliveryStore } from ${resolve("../../src/agent/delivery-store.ts")};
 import { DurableService } from ${resolve("../../src/durable/service.ts")};
+import { appLayout } from ${resolve("../../src/core/layout.ts")};
 import { TEST_PROGRESS } from ${resolve("../helpers/durable.ts")};
-const [root, statePath] = process.argv.slice(2);
+import { recordingOutbound } from ${resolve("../helpers/recording-outbound.ts")};
+const [root] = process.argv.slice(2);
 const faux = fauxProvider({ tokenSize: { min: 1, max: 1 }, tokensPerSecond: 20 });
 const models = createModels();
 models.setProvider(faux.provider);
 const ref = { provider: faux.getModel().provider, modelId: faux.getModel().id };
 faux.setResponses([fauxAssistantMessage("部分输出".repeat(10000))]);
-const stateDb = new Database(statePath);
-const outbound = {
-  sendText: async (text) => { console.log("SENT " + JSON.stringify(text)); return true; },
-  sendReply: async (text) => { console.log("REPLY " + JSON.stringify(text)); return true; },
-  rate: () => ({ used: 0, limit: 20 }),
-  refresh: async (item) => item.text,
+const out = recordingOutbound();
+const send = out.outbound.send;
+out.outbound.send = async (target, message, options) => {
+  const outcome = await send(target, message, options);
+  const item = out.sent.at(-1);
+  console.log(item.kind.toUpperCase() + " " + JSON.stringify(item.text));
+  return outcome;
 };
 const service = new DurableService({
-  root, modules: [], relay: null, materials: false, outbound, stateDb, deliveries: new DeliveryStore(stateDb),
+  layout: appLayout(root), modules: [], relay: null, materials: false, outbound: out.outbound,
   selection: { runtime: models, settings: undefined, model: models.getModel(ref.provider, ref.modelId), ref, thinkingLevel: "off",
-    harnessSettings: { retry: { maxRetries: 1, baseDelayMs: 5, maxAgentDelayMs: 20 }, ...(TEST_PROGRESS === undefined ? {} : { progress: TEST_PROGRESS }) },
-    notices: [] },
+    harnessSettings: { retry: { maxRetries: 1, baseDelayMs: 5, maxAgentDelayMs: 20 }, ...(TEST_PROGRESS === undefined ? {} : { progress: TEST_PROGRESS }) } },
   limits: ${JSON.stringify(LIMITS)},
 });
-await service.admit(${JSON.stringify(ALICE)}, ${JSON.stringify(GROUP)}, "问题", ${JSON.stringify(URL)});
+await service.admit(out.message(${JSON.stringify(GROUP)}, ${JSON.stringify(ALICE)}, "问题"));
 while (faux.state.callCount < 1) await Bun.sleep(10);
 await Bun.sleep(1500);
 console.log("READY " + Date.now());
@@ -76,8 +75,7 @@ test("a service killed while the answer streams: after restart the run resumes w
   const script = join(fixture.root, "service-child.ts");
   await writeFile(script, child);
   const root = join(fixture.root, "groups");
-  const statePath = join(fixture.root, "state.sqlite");
-  const killed = Bun.spawn([process.execPath, script, root, statePath], { stdout: "pipe", stderr: "pipe", windowsHide: true });
+  const killed = Bun.spawn([process.execPath, script, root], { stdout: "pipe", stderr: "pipe", windowsHide: true });
   let output = "";
   const decoder = new TextDecoder();
   const reader = killed.stdout.getReader();
@@ -93,7 +91,7 @@ test("a service killed while the answer streams: after restart the run resumes w
   // Only the status notice went out before the kill.
   expect(output.split("\n").filter((line) => line.startsWith("REPLY "))).toEqual([]);
 
-  const db = await openGroupDatabase(groupDatabasePath(root, GROUP));
+  const db = await openGroupDatabase(databaseOf(root, GROUP));
   try { expect(await db.get("PRAGMA integrity_check")).toEqual({ integrity_check: "ok" }); }
   finally { await db.close(); }
 
@@ -106,26 +104,18 @@ test("a service killed while the answer streams: after restart the run resumes w
     return fauxAssistantMessage("恢复后的回答") as AssistantMessage;
   };
   faux.setResponses([resumed]);
-  const stateDb = new Database(statePath);
-  const deliveries = new DeliveryStore(stateDb);
-  const sent: string[] = [];
-  const outbound: Outbound = {
-    sendText: async (text) => { sent.push(text); return true; },
-    sendReply: async (text) => { sent.push(text); return true; },
-    rate: () => ({ used: 0, limit: 20 }),
-    refresh: async (item) => item.text,
-  };
+  const out = recordingOutbound();
   const service = new DurableService({
-    root, modules: [], relay: null, materials: false, outbound, stateDb, deliveries, limits: LIMITS,
+    layout: appLayout(root), modules: [], relay: null, materials: false, outbound: out.outbound, limits: LIMITS,
     selection: { runtime: models as never, settings: undefined as never, model: models.getModel(model.provider, model.modelId)! as never, ref: model,
-      thinkingLevel: "off", notices: [],
+      thinkingLevel: "off",
       harnessSettings: { retry: { maxRetries: 1, baseDelayMs: 5, maxAgentDelayMs: 20 }, ...(TEST_PROGRESS === undefined ? {} : { progress: TEST_PROGRESS }) } },
   });
   try {
-    expect(await service.start()).toEqual([GROUP]);
+    expect(await service.start()).toEqual([scopeOf(GROUP)]);
     await until(() => transcripts.length === 1, "the resumed request");
     // The task keeps its first start: the elapsed time counts the killed process's part.
-    const status = await service.control(ALICE, GROUP, "/status", URL);
+    const status = await service.control(out.message(GROUP, ALICE, "/status"));
     expect(status).toContain("状态：执行中");
     expect(Number(/已用时间：(\d+) 秒/.exec(status)![1])).toBeGreaterThanOrEqual(1);
     // The request asks again from the member's question; the interrupted partial answer is not sent back.
@@ -133,29 +123,25 @@ test("a service killed while the answer streams: after restart the run resumes w
     expect(resent.filter((message) => message.role === "user" && JSON.stringify(message.content).includes("问题"))).toHaveLength(1);
     expect(resent.filter((message) => message.role === "assistant")).toEqual([]);
     release();
-    // The /status above gave this process the member's callback URL, so the reply goes out (without it, it would wait
-    // in the outbox: the restart test in service.test.ts).
-    await until(() => sent.includes("恢复后的回答"), "the reply");
-    expect(deliveries.pending(JSON.stringify([GROUP, ALICE]))).toEqual([]);
-    const ledger = openStatsLedger(root);
+    // The reply goes to the message it answers: its reply context was stored at admission.
+    await until(() => replyTexts(out.sent).includes("恢复后的回答"), "the reply");
+    await until(async () => pendingDeliveries(await service.records(scopeOf(GROUP), ALICE)).length === 0, "the delivery settled");
+    // A message that had started before the kill gets its answer and nothing else (besides the /status receipt above).
+    expect(out.sent.filter((item) => item.kind === "notice" && !item.text.startsWith("状态："))).toEqual([]);
+    const ledger = openStatsLedger(statsOf(root));
     try {
       const rows = readLedger(ledger);
-      expect(rows.activity.map(({ asks, replies }) => ({ asks, replies }))).toEqual([{ asks: 1, replies: 1 }]);
-      expect(rows.usage.map(({ kind, requests, missingUsage, unknownCost }) => ({ kind, requests, missingUsage, unknownCost })))
-        .toEqual([{ kind: "assistant", requests: 1, missingUsage: 0, unknownCost: 0 },
-          { kind: "interrupted", requests: 1, missingUsage: 1, unknownCost: 1 }]);
+      expect(rows.asks.map(({ asks }) => asks)).toEqual([1]);
+      // The killed request committed nothing; the recovered answer is the conversation's only usage.
+      expect(rows.usage.map(({ bucket }) => bucket)).toEqual(["models"]);
     } finally { ledger.close(); }
   } finally {
     await service.close();
-    stateDb.close();
   }
-  const storage = await openGroupStorage(groupDatabasePath(root, GROUP));
+  const storage = await openGroupStorage(databaseOf(root, GROUP));
   const session = createSession(storage);
   try {
     const conversationId = (await session.snapshot(MemberDirectory, ALICE, context))!.conversationId as ConversationId;
-    // Both starts are now accounted above (one interrupted, one successful) and can be retired.
-    const starts = Object.values((await session.snapshot(AttemptsDoc, conversationId, context))?.starts ?? {});
-    expect(starts).toEqual([]);
     expect((await session.snapshot(InboxDoc, conversationId, context))?.items).toEqual([]);
     // The partial answer stays in the conversation, marked aborted, before the recovered answer.
     const entries = (await storage.scanEntries({ conversationId }, 100, undefined, context)).items

@@ -1,32 +1,40 @@
-// The message lifecycle on the Durable engine admission, the member workers, controls, replies, the watchdog,
-// usage projection and maintenance. The webhook (src/server/webhook.ts) hands every message and command to it; it replaced
-// the previous session engine at data version 3.
+// The message lifecycle on the Durable engine: admission, the member workers, controls, replies and their delivery, the
+// watchdog, usage projection and maintenance. The inbound router (src/server/inbound.ts) hands every message and command
+// of the app bot's event stream to it.
 //
-// Admission. A webhook message is committed to the member's inbox (src/durable/inbox.ts) before `admit` returns, so the
-// webhook is acknowledged only after it is durable. The storage identity of the member's directories is checked first
-// (src/agent/storage-identity.ts), for a new member as for a known one.
+// Spaces and members. A space (`Scope`, src/core/layout.ts) is a group, or the one space all direct chats share; it has
+// its own Durable database and member tmp directories, while the materials workspace is shared by the whole application.
+// A member is (space, phone): its conversation, inbox and run
+// records. Where an answer goes is not member state: every inbound message carries an immutable reply context
+// (./records.ts), stored with its request or control, and everything sent for it uses that context.
+//
+// Admission. A message is committed to the member's inbox together with its receipt (`msgUid`) and its run record
+// before `admit` resolves. The arrival order and the member's admission turn are taken synchronously when `admit` or
+// `control` is called, so the stream's order holds across the asynchronous identity, open and commit steps. A
+// redelivered message finds its receipt in that commit and is dropped without a reply.
 //
 // Workers. One per member, in memory: submit the inbox head to Durable (idempotent by its requestId), wait for it to
-// settle, store the reply in the outbox (DeliveryStore, deterministic row ids), remove the item, project usage, send.
-// The member's IM callback URL is kept in memory only (it carries the bot key): after a restart, a recovered answer
-// waits in the outbox for the member's next message or /deliver. Link notes of send_file are written to the run's
-// outbox row as they are made, so they survive a crash and join the final reply.
+// settle, then in one commit remove the item and store the reply's delivery plan in the run record; then send the plan
+// part by part (./records.ts: pending → sending → sent | failed | uncertain). A failed part is tried again with a
+// growing wait until the delivery's window ends; an uncertain one counts as sent and is never resent.
 //
-// Controls. /stop and /clear are committed to the control stream before they run; the request door holds the member's
-// model requests from receipt until the removal is committed. /stop cancels the inbox and aborts the run. /clear also
-// holds the worker (new messages are admitted but not submitted), waits until the conversation is idle (Durable's abort
-// returns only then: no tool, codemode sub-call or store commit of the member is left), starts a new context, removes
-// the member's codemode result directories, then releases the worker. A restart executes waiting controls again.
+// Controls. /stop and /clear are committed to the control stream (with their receipt) before they run; the request door
+// holds the member's model requests from receipt until the removal is committed. /stop cancels the inbox and aborts the
+// run. /clear also holds the worker (new messages are admitted but not submitted), waits until the conversation is idle
+// (Durable's abort returns only then: no tool, codemode sub-call or store commit of the member is left), starts a new
+// context, removes the member's codemode result directories, then releases the worker. A restart executes waiting
+// controls again. Both end the sending of the member's earlier replies in the space.
 //
 // Watchdog. The total deadline counts from the item's first submission (stored, so it survives restarts); model
 // progress is the committed partial of the current attempt (`pi.live`): no change for the idle limit, or one attempt
 // running longer than the response limit, aborts the run like the previous engine's limits. Tool rounds, retry
 // backoff, deferred polls and compactions are not model idleness.
 //
-// Startup. Groups with work are opened by discovery; before scheduling resumes, the door gets the waiting controls and
-// every member's storage identity is checked; then the controls run again and the workers start.
-import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir } from "node:fs/promises";
+// Startup. Spaces with work are opened by discovery; before scheduling resumes, the door gets the waiting controls,
+// every member's storage identity is checked and delivery parts left `sending` become uncertain; then the controls run
+// again, the workers start and open delivery parts are sent (failed ones when their retry is due).
+import { randomUUID } from "node:crypto";
+import { access, lstat, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { Context } from "@earendil-works/chord";
@@ -34,67 +42,56 @@ import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { AssistantMessage, Models } from "@earendil-works/pi-ai";
 import {
   AssistantEntry, CompactionEntry, InboxDoc as PiInboxDoc, type Conversation, type ConversationId, createRegistry, defineExtension, type Extension, GenerationTask, type Harness,
-  type HarnessOptions, hook, LiveDoc, type LiveState, type SettledSubmissionRecord, type Submission,
+  type HarnessOptions, hook, LiveDoc, type LiveState, type ReportInfo, type SettledSubmissionRecord, type Submission,
 } from "@earendil-works/pi-durable";
 import { canonicalCommand, HELP_TEXT, unknownCommandText } from "../agent/commands.ts";
 import { clearRunning, markRunning } from "./running-requests.ts";
-import { refreshDeliveryText } from "../agent/delivery-links.ts";
-import { type DeliveryAttachment, DeliveryStore } from "../agent/delivery-store.ts";
-import { CloseoutStore, closeoutReferences, fileDigest, type Deliverable } from "../agent/deliverables.ts";
-import { closeoutExtension, closeoutTool, validateCloseout, type CloseoutTiming } from "./closeout.ts";
+import { deleteSnapshots, fileDigest, releasableSnapshots } from "../agent/deliverables.ts";
+import { SendNotConfirmed, transferFile } from "../agent/send-tools.ts";
+import { closeoutExtension, closeoutTool, validateCloseout, type CloseoutTiming, type RecordWriter } from "./closeout.ts";
 import { describeRequestFailure, modelRequestError } from "../agent/failure.ts";
 import { ensureMaterialsIndex } from "../agent/materials-index.ts";
 import type { AgentModuleDefinition } from "../agent/modules.ts";
-import { groupIndexDir, groupWorkspaceDir, materialsIgnorePath, materialsIndexPath, userTempDir } from "../agent/paths.ts";
-import { transferFile, type OutboundNotes, type FileTransfer } from "../agent/send-tools.ts";
 import { ensureStorageIdentity } from "../agent/storage-identity.ts";
-import { openStatsLedger } from "../agent/stats-ledger.ts";
-import { DEDUP_TTL, MAX_ACTIVE_REQUESTS, MAX_DEDUP_SIZE } from "../core/config.ts";
+import { openStatsLedger, pruneAskIds, settledAsks } from "../agent/stats-ledger.ts";
+import { Attention, type AttentionStatus } from "./attention.ts";
+import { MAX_ACTIVE_REQUESTS, MEMBER_IDLE_MS } from "../core/config.ts";
+import { scopeKey, scopeLabel, spaceDatabase, userTmp, type Layout, type Scope } from "../core/layout.ts";
 import { waitFor } from "../core/lifecycle.ts";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
-import { getOutboundRateStatus, sendReplyWithMention, sendText } from "../integrations/im.ts";
-import type { RelayConfig } from "../integrations/relay.ts";
+import { type Send, type SendOutcome, splitText, textMessage } from "../integrations/open-platform/messages.ts";
+import { LinkUnavailable, type RelayConfig } from "../integrations/relay.ts";
 import { RequestDoor, type ControlTicket } from "./door.ts";
-import { groupDatabasePath, GroupHarnesses } from "./groups.ts";
+import { SpaceHarnesses } from "./spaces.ts";
 import { IdentityDoc, memberConversation, MemberDirectory } from "./identity.ts";
-import { type ControlCommand, ControlsDoc, InboxDoc, type InboxItem, inboxItems, pendingControls, receivedBefore, WebhookReceiptsDoc } from "./inbox.ts";
-import { groupDoor, type ModelSelection } from "./models.ts";
+import { type ControlCommand, ControlsDoc, InboxDoc, type InboxItem, inboxItems, pendingControls, receivedBefore } from "./inbox.ts";
+import { spaceDoor, type ModelSelection } from "./models.ts";
 import type { AuxiliaryConfig } from "../core/auxiliary-config.ts";
 import { AuxiliaryBudget } from "./auxiliary.ts";
 import type { McpTools } from "../integrations/mcp.ts";
 import { queueManualCompaction } from "./manual-compaction.ts";
 import { recoverOfficeProfiles } from "../agent/office-profiles.ts";
 import { log } from "../core/log.ts";
-import { memberResultStatus, ResultMaintenance } from "./results/maintenance.ts";
+import { ResultMaintenance } from "./results/maintenance.ts";
 import { requestMemberExpiry } from "./results/ownership.ts";
 import { resultReferences } from "./results/references.ts";
-import { projectConversation } from "./projection.ts";
-import { groupExtensions } from "./registry.ts";
-import type { SendDelivery } from "./send.ts";
+import { countAsk, syncMemberStats } from "./projection.ts";
+import { spaceExtensions } from "./registry.ts";
 import type { DurableStorageFailure } from "./storage-failure.ts";
 import { memberPlaces } from "./tools.ts";
-import { conversationIds, idleGroupReferences } from "./conversations.ts";
+import { conversationIds, idleSpaceReferences } from "./conversations.ts";
+import { lateMinutes, type Outbound, replyMessage, replySegments, sendNotice, targetOf } from "./outbound.ts";
+import { sendChannel } from "./send.ts";
+import { ATTACHMENT_LIMITS, AttachmentDownloads, type AttachmentEvent, type AttachmentLimits, type AttachmentSource, arrivedBefore, attachmentLabel,
+  attachmentPrompt, bindAttachments, expireAttachments, newAttachmentId, removeAttachmentFiles, unconsumed, voidWhere } from "./attachments.ts";
+import {
+  type Attachment, type Delivery, DELIVERY_RETRY_DELAYS_MS, DELIVERY_WINDOW_MS, deliveryEnd, type DeliveryPart, type MemberRecords, memberRecords, openPart, pendingDeliveries, pruneReceipts,
+  pruneRecords, ReceiptsDoc, recordsOf, deliveryRetryDelay, type ReplyContext, type RequestRecord, settleInterrupted, undelivered,
+} from "./records.ts";
 
-export const STATUS_TEXT = "收到，正在处理🤔💭";
+export const lateNotice = (minutes: number) => `这条消息约 ${minutes} 分钟前发出，服务维护后才收到，正在处理。`;
 const QUEUE_FULL = "本会话已有 8 条消息排队，请稍后重发";
 const CAPACITY_FULL = "⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。";
-
-/** Where replies and receipts go; the IM functions by default, fakes in tests. */
-export interface Outbound {
-  sendAttachment?(path: string, name: string, groupId: string, phone: string, callbackUrl: string, signal: AbortSignal): Promise<FileTransfer>;
-  sendText(text: string, groupId: string, phone: string, callbackUrl: string,
-    options?: { traffic?: "status" | "required"; signal?: AbortSignal }): Promise<boolean>;
-  sendReply(body: string, groupId: string, phone: string, callbackUrl: string, signal?: AbortSignal, appendix?: string): Promise<boolean>;
-  rate(callbackUrl: string): { used: number; limit: number };
-  refresh(item: { text: string; attachments: DeliveryAttachment[]; blockedReason?: string }, signal?: AbortSignal): Promise<string>;
-}
-
-const IM: Outbound = {
-  sendText: (text, groupId, phone, callbackUrl, options) => sendText(text, groupId, phone, callbackUrl, options),
-  sendReply: (body, groupId, phone, callbackUrl, signal, appendix) => sendReplyWithMention(body, groupId, phone, callbackUrl, signal, appendix),
-  rate: (callbackUrl) => getOutboundRateStatus(callbackUrl),
-  refresh: (item, signal) => refreshDeliveryText(item, signal),
-};
 
 export interface ServiceLimits {
   /** Ordinary requests from admission through cleanup, including queued messages. */
@@ -110,30 +107,37 @@ export interface ServiceLimits {
   heartbeatMs: number;
   /** Codemode result directories older than this are removed by maintenance (idle members only). */
   resultRetentionMs: number;
-  /** An idle member of an open group keeps its state (callback address) this long after its last activity. */
+  /** An idle member of an open group keeps its in-memory state this long after its last activity. */
   memberIdleMs: number;
+  /** Waits before a failed delivery part is tried again, by attempts so far; the last one repeats. */
+  deliveryRetryMs: readonly number[];
+  /** Automatic sending of a delivery ends this long after its creation. */
+  deliveryWindowMs: number;
 }
 
 export interface DurableServiceOptions {
-  root: string;
+  layout: Layout;
   selection: ModelSelection;
   modules: readonly AgentModuleDefinition[];
   relay: RelayConfig | null;
+  /** The platform: sends, uploads and link refreshes. */
+  outbound: Outbound;
+  /** Direct-chat attachments (plan 5.5): the platform download. Without it attachments are registered as refused. */
+  attachments?: { source: AttachmentSource; limits?: Partial<AttachmentLimits> };
   auxiliary?: AuxiliaryConfig;
   mcp?: McpTools;
+  /** The document environment (BOT_DOCUMENT_ENV); default the layout's shared one. */
   venvDir?: string;
-  limits: Omit<ServiceLimits, "activeRequests" | "queue" | "tickMs" | "heartbeatMs" | "resultRetentionMs" | "memberIdleMs"> & Partial<ServiceLimits>;
-  outbound?: Outbound;
-  deliveries?: DeliveryStore;
+  limits: Omit<ServiceLimits, "activeRequests" | "queue" | "tickMs" | "heartbeatMs" | "resultRetentionMs" | "memberIdleMs" | "deliveryRetryMs" | "deliveryWindowMs"> & Partial<ServiceLimits>;
   /** Production supplies validated runtime settings; tiny lifecycle fixtures can omit closeout. */
   closeout?: CloseoutTiming;
   /** The storage identity table (src/core/state.ts by default). */
   stateDb?: Database;
   /** Extensions installed after the project's (tests). */
-  extensions?: (groupId: string) => readonly Extension[];
-  /** Refresh the group's materials index before each run (default true). */
+  extensions?: (scope: Scope) => readonly Extension[];
+  /** Refresh the application's materials index before each run (default true). */
   materials?: boolean;
-  maxIdleGroups?: number;
+  maxIdleSpaces?: number;
   context?: Context;
   /** Failures that do not fail the calling operation. Must not throw. */
   onReport?: (error: unknown) => void;
@@ -142,6 +146,17 @@ export interface DurableServiceOptions {
   /** Progress lines for the service log. Must not throw. */
   onLog?: (line: string) => void;
 }
+
+/** One inbound message or command of a member, as the router hands it over. */
+export interface Inbound {
+  scope: Scope;
+  phone: string;
+  content: string;
+  reply: ReplyContext;
+}
+
+/** A direct-chat image, file or video. */
+export type InboundAttachment = Omit<Inbound, "content"> & { attachment: AttachmentEvent };
 
 type AbortReason = { kind: "task_timeout" | "model_idle" | "model_response_timeout"; error: Error };
 
@@ -154,10 +169,9 @@ const ABORT_LABELS: Record<AbortReason["kind"], string> = {
 
 type MemberState = {
   readonly key: string;
-  readonly groupId: string;
+  readonly scope: Scope;
   readonly phone: string;
   conversationId?: number;
-  callbackUrl?: string;
   worker?: Promise<void>;
   again: boolean;
   /** Admitted control boundary for this process, including messages whose admission is still in flight. */
@@ -167,6 +181,11 @@ type MemberState = {
    * control is never started before it and aborted by it.
    */
   gate?: Promise<void>;
+  /**
+   * /stop and /clear commands not yet past their receipt check. A redelivered one changes nothing, so a run that settles
+   * meanwhile waits for the decision instead of reading the gate as a cancellation.
+   */
+  deciding: Set<Promise<void>>;
   /** A start in progress (from the gate check until the submission exists); a control waits for it before it cancels. */
   starting?: Promise<void>;
   /** Controls of this member run one at a time. */
@@ -178,27 +197,30 @@ type MemberState = {
   workProgress: number;
   workerRetry?: { attempt: number; nextAt: number; message: string };
   controlRetry?: { attempt: number; nextAt: number; message: string };
-  /** The inbox item being run (its outbox row collects link notes). */
+  /** The inbox item being run. */
   current?: { requestId: string; startedAt: number; deadlineError?: AbortReason };
   aborted: Map<string, AbortReason>;
-  /** Outbox rows this process already tried to send (the rest are replies recovered from an earlier process). */
-  attempted: Set<string>;
-  /** Automatic, recovered and manual delivery share one send/acknowledge boundary. */
+  /** Raised by a committed /stop or /clear: automatic sending in progress stops before its next part. */
+  withdrawals: number;
+  /** Automatic and recovered delivery share one send boundary. */
   delivery: AsyncSemaphore;
-  /** Public operations and automatic reply recovery still using this state. */
+  /** Public operations and automatic delivery still using this state. */
   uses: number;
   lastUsed: number;
 };
 
-type GroupRuntime = { door: RequestDoor; holder: { harness?: Harness }; refreshed: Map<number, Promise<void>>; epoch: number };
-type ControlReceipt = { groupId: string; phone: string; requestId: string; ticket?: ControlTicket };
+type SpaceRuntime = { door: RequestDoor; holder: { harness?: Harness }; refreshed: Map<number, Promise<void>>; epoch: number };
+type ControlReceipt = { scope: Scope; phone: string; requestId: string; ticket?: ControlTicket };
 /** Held while maintenance reclaims a group's results. A waiting message or command sets `yield`. */
 type ReclamationGate = { promise: Promise<void>; resolve: () => void; yield: boolean };
 
-export type AdmitResult = { status: "accepted" } | { status: "full"; message: string; reason?: "capacity" };
+export type AdmitResult = { status: "accepted" } | { status: "duplicate" } | { status: "full"; message: string; reason?: "capacity" };
 
 const textOf = (message: AssistantMessage | undefined) =>
   (message?.content ?? []).filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("").trim();
+
+/** Committed receipts this process has seen; an optimisation only, the durable receipt decides. */
+const SEEN_LIMIT = 20_000;
 
 /** The message service of the process (src/server/app.ts creates one). */
 export class DurableService {
@@ -206,15 +228,13 @@ export class DurableService {
   readonly #auxiliaryBudget: AuxiliaryBudget;
   readonly #limits: ServiceLimits;
   readonly #outbound: Outbound;
-  readonly #deliveries: DeliveryStore;
-  readonly #closeout: CloseoutStore;
   readonly #context: Context;
   readonly #cancel: (reason?: unknown) => void;
   readonly #closing = new AbortController();
   readonly #members = new Map<string, MemberState>();
-  readonly #runtimes = new Map<string, GroupRuntime>();
+  readonly #runtimes = new Map<string, SpaceRuntime>();
   readonly #receipts = new Map<string, ControlReceipt>();
-  readonly #groups: GroupHarnesses;
+  readonly #spaces: SpaceHarnesses;
   readonly #background = new Set<Promise<unknown>>();
   readonly #requests = new Map<string, { key: string; retired: boolean }>();
   readonly #memberRequests = new Map<string, number>();
@@ -222,7 +242,14 @@ export class DurableService {
   readonly #capacityWaiters = new Set<() => void>();
   readonly #reclaiming = new Map<string, ReclamationGate>();
   readonly #memberCursors = new Map<string, number>();
+  readonly #seen = new Set<string>();
   readonly #results: ResultMaintenance;
+  readonly #downloads?: AttachmentDownloads;
+  /** When a request stops waiting for the downloads it bound (this process). */
+  readonly #attachmentWaits = new Map<string, number>();
+  /** The next look at a delivery with a failed part (a retry) or its window's end, by member and request. */
+  readonly #deliveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #attention = new Attention();
   #lastArrival = 0;
   #maintenanceCursor = 0;
   #fatalError?: DurableStorageFailure;
@@ -232,38 +259,50 @@ export class DurableService {
     this.#options = options;
     this.#auxiliaryBudget = new AuxiliaryBudget(options.auxiliary?.maxConcurrent ?? 2);
     this.#limits = { activeRequests: MAX_ACTIVE_REQUESTS, queue: 8, tickMs: 1000, heartbeatMs: 60_000, resultRetentionMs: 7 * 24 * 3600_000,
-      memberIdleMs: DEDUP_TTL, ...options.limits };
+      memberIdleMs: MEMBER_IDLE_MS, deliveryRetryMs: DELIVERY_RETRY_DELAYS_MS, deliveryWindowMs: DELIVERY_WINDOW_MS, ...options.limits };
     if (!Number.isSafeInteger(this.#limits.activeRequests) || this.#limits.activeRequests < 1) throw new Error("普通请求总容量必须是正整数");
-    this.#outbound = options.outbound ?? IM;
-    this.#deliveries = options.deliveries ?? new DeliveryStore(options.stateDb);
+    this.#outbound = options.outbound;
     if (options.closeout) validateCloseout(options.closeout, this.#limits.runTimeoutMs);
-    this.#closeout = new CloseoutStore(this.#deliveries);
-    this.#closeout.sweepMetadata();
     const cancellable = withCancel(options.context ?? BACKGROUND_CONTEXT);
     this.#context = cancellable.context;
     this.#cancel = cancellable.cancel;
     this.#results = new ResultMaintenance({ context: this.#context, signal: this.#closing.signal, warn: line => log.warn(line) });
-    this.#groups = new GroupHarnesses({
-      root: options.root,
-      harnessOptions: (groupId) => this.#harnessOptions(groupId),
-      prepare: (harness, groupId, context) => this.#prepare(harness, groupId, context),
-      pendingWork: (harness, _groupId, context) => this.#pendingWork(harness, context),
-      ...(options.maxIdleGroups === undefined ? {} : { maxIdle: options.maxIdleGroups }),
+    this.#spaces = new SpaceHarnesses({
+      layout: options.layout,
+      harnessOptions: (scope) => this.#harnessOptions(scope),
+      prepare: (harness, scope, context) => this.#prepare(harness, scope, context),
+      pendingWork: (harness, _scope, context) => this.#pendingWork(harness, context),
+      ...(options.maxIdleSpaces === undefined ? {} : { maxIdle: options.maxIdleSpaces }),
       context: this.#context,
       onReport: (error) => this.#report(error),
       onFatal: (error) => this.#fatal(error),
-      onClosed: (groupId, harness) => this.#closedGroup(groupId, harness),
+      onClosed: (scope, harness) => this.#closedSpace(scope, harness),
     });
+    if (options.attachments) {
+      this.#downloads = new AttachmentDownloads(options.attachments.source, {
+        read: async (space, phone) => {
+          const handle = await this.#spaces.acquire(space);
+          try { return await memberRecords(handle.harness, phone, this.#context); } finally { handle.release(); }
+        },
+        update: async (space, phone, change) => {
+          const handle = await this.#spaces.acquire(space);
+          try { return await handle.harness.commit(async tx => change(await recordsOf(tx, phone)), this.#context); } finally { handle.release(); }
+        },
+        tempDir: (space, phone) => userTmp(options.layout, space, phone),
+        notify: (reply, text) => this.#track(this.#notify(reply, text)),
+        report: error => this.#report(error),
+      }, this.#closing.signal, { ...ATTACHMENT_LIMITS, ...options.attachments.limits });
+    }
   }
 
-  /** Startup: open every group with work (controls run again, workers start). Returns those groups. */
-  start(): Promise<string[]> {
-    return this.#groups.discover();
+  /** Startup: open every space with work (controls run again, workers start, untried deliveries go out). */
+  start(): Promise<Scope[]> {
+    return this.#spaces.discover();
   }
 
-  /** The member's last known callback URL, else `fallback`. */
-  callbackUrl(phone: string, groupId: string, fallback: string): string {
-    return this.#members.get(memberKey(groupId, phone))?.callbackUrl ?? fallback;
+  /** What needs an operator's look since this process started (`/health`). */
+  attention(): AttentionStatus {
+    return this.#attention.status();
   }
 
   // ---- admission ------------------------------------------------------------------------------------------------------
@@ -272,63 +311,76 @@ export class DurableService {
     return !this.#closing.signal.aborted && this.#requests.size < this.#limits.activeRequests;
   }
 
-  /** Commit a message to the member's inbox; resolves once it is durable. */
-  async admit(phone: string, groupId: string, content: string, callbackUrl: string, deduplicate = false): Promise<AdmitResult> {
-    // Re-checked synchronously after every wait: no await may separate the check from reserving member.uses.
-    for (let gate; (gate = this.#reclaiming.get(groupId));) { gate.yield = true; await waitFor(gate.promise, this.#closing.signal); }
+  /** A message whose receipt this process has already committed (a redelivery); the router drops it. */
+  seen(msgUid: string): boolean {
+    return this.#seen.has(msgUid);
+  }
+
+  /** A read-only view of a member's request records (diagnostics). */
+  async records(scope: Scope, phone: string): Promise<Readonly<MemberRecords>> {
+    const handle = await this.#spaces.acquire(scope);
+    try { return structuredClone(await memberRecords(handle.harness, phone, this.#context)); }
+    finally { handle.release(); }
+  }
+
+  /**
+   * Commit a message to the member's inbox with its receipt and run record; resolves once it is durable. Everything up to
+   * the admission turn is synchronous: call it in arrival order.
+   */
+  async admit(message: Inbound): Promise<AdmitResult> {
     this.#assertRunning();
+    const { scope, phone, content, reply } = message;
+    if (this.#seen.has(reply.msgUid)) return { status: "duplicate" };
     const requestId = `msg:${randomUUID()}`;
-    const key = memberKey(groupId, phone);
-    // Reserve synchronously, before identity/open/commit awaits. A duplicate may still be acknowledged when full.
-    if (this.hasUserRequestCapacity()) this.#addRequest(requestId, key);
-    else if (!deduplicate) return { status: "full", reason: "capacity", message: CAPACITY_FULL };
+    const key = memberKey(scope, phone);
+    // Reserve synchronously, before identity/open/commit awaits.
+    if (!this.hasUserRequestCapacity()) return { status: "full", reason: "capacity", message: CAPACITY_FULL };
+    this.#addRequest(requestId, key);
     const receivedAt = this.#arrival();
-    const member = this.#member(groupId, phone);
+    const member = this.#member(scope, phone);
     member.uses++;
-    member.callbackUrl = callbackUrl;
     member.lastUsed = Date.now();
     const turn = member.admission.acquire(this.#closing.signal);
     let release: (() => void) | undefined;
     let retained = false;
     try {
       release = await turn;
+      await this.#yieldToReclamation(scope);
       this.#assertRunning();
-      await ensureStorageIdentity(this.#options.root, groupId, phone, this.#options.stateDb);
-      const handle = await this.#groups.acquire(groupId);
+      await ensureStorageIdentity(this.#options.layout, scope, phone, this.#options.stateDb);
+      const handle = await this.#spaces.acquire(scope);
       let added: "added" | "duplicate" | "queue-full" | "capacity-full";
+      let voided: Attachment[] = [];
+      let createdAt = 0;
       try {
-        const { conversation } = await memberConversation(handle.harness, groupId, phone,
-          { model: this.#options.selection.ref, thinkingLevel: this.#options.selection.thinkingLevel }, this.#context);
-        member.conversationId = conversation.id;
+        const conversation = await this.#conversation(handle.harness, member);
         added = await handle.harness.commit(async (tx) => {
-          const now = Date.now();
-          const digest = deduplicate ? createHash("sha256").update(content, "utf8").digest("hex") : undefined;
-          const receipts = digest === undefined ? undefined : await tx.doc(WebhookReceiptsDoc);
-          if (receipts) {
-            receipts.items = receipts.items.filter(item => now - item.at <= DEDUP_TTL);
-            if (receipts.items.some(item => item.phone === phone && item.digest === digest)) return "duplicate" as const;
-          }
-          // Opening a previously unknown group may have recovered older work after the reservation.
-          if (!this.#requests.has(requestId)) {
-            if (!this.hasUserRequestCapacity()) return "capacity-full" as const;
-            this.#addRequest(requestId, key);
-          } else if (this.#requests.size > this.#limits.activeRequests) return "capacity-full" as const;
+          const receipts = await tx.doc(ReceiptsDoc);
+          if (receipts.items[reply.msgUid]) return "duplicate" as const;
+          // Opening a previously unknown space may have recovered older work after the reservation.
+          if (this.#requests.size > this.#limits.activeRequests) return "capacity-full" as const;
           const inbox = await tx.doc(InboxDoc, conversation.id);
           if (inbox.items.filter((item) => item.cancelled !== true).length > this.#limits.queue) return "queue-full" as const;
-          inbox.items.push({ requestId, content, receivedAt, epoch: this.#runtimes.get(groupId)!.epoch,
-            ...(receivedAt <= (member.cancelBefore ?? -Infinity) ? { cancelled: true } : {}) });
-          if (receipts && digest) {
-            receipts.items.push({ phone, digest, at: now });
-            if (receipts.items.length > MAX_DEDUP_SIZE) receipts.items.splice(0, receipts.items.length - MAX_DEDUP_SIZE);
-          }
+          const now = Date.now(), epoch = this.#runtimes.get(scopeKey(scope))!.epoch;
+          const cancelled = receivedAt <= (member.cancelBefore ?? -Infinity);
+          inbox.items.push({ requestId, content, receivedAt, epoch, ...(cancelled ? { cancelled: true } : {}) });
+          const records = await recordsOf(tx, phone);
+          records.requests[requestId] = { requestId, reply: structuredClone(reply), createdAt: now, notes: [], deliverables: [], files: [], events: {} };
+          createdAt = now;
+          receipts.items[reply.msgUid] = { at: now, phone, request: requestId };
+          // The request takes the member's earlier attachments in its admission commit (a cancelled one voids them).
+          voided = bindAttachments(records, requestId, { epoch, receivedAt }, cancelled, now);
           return "added" as const;
         }, this.#context);
         retained = added === "added";
       } finally { handle.release(); }
+      if (added === "duplicate") { this.#remember(reply.msgUid); return { status: "duplicate" }; }
       if (added === "queue-full") return { status: "full", message: QUEUE_FULL };
       if (added === "capacity-full") return { status: "full", reason: "capacity", message: CAPACITY_FULL };
+      this.#remember(reply.msgUid);
+      this.#countAsk(scope, phone, requestId, createdAt);
+      this.#discard(scope, phone, voided);
       this.#kick(member);
-      this.#track(this.#recovered(member).catch((error) => this.#report(error)));
       return { status: "accepted" };
     } finally {
       if (!retained) this.#dropRequest(requestId);
@@ -339,76 +391,158 @@ export class DurableService {
     }
   }
 
+  /**
+   * Register a direct-chat attachment with its receipt in arrival order, acknowledge it and start its download; the
+   * member's next admitted request binds it. Everything up to the admission turn is synchronous, as for admit().
+   */
+  async attach(message: InboundAttachment): Promise<AdmitResult> {
+    this.#assertRunning();
+    const { scope: space, phone, reply, attachment: event } = message;
+    if (this.#seen.has(reply.msgUid)) return { status: "duplicate" };
+    const downloads = this.#downloads, limits = downloads?.limits ?? ATTACHMENT_LIMITS;
+    const receivedAt = this.#arrival();
+    const member = this.#member(space, phone);
+    member.uses++;
+    member.lastUsed = Date.now();
+    const turn = member.admission.acquire(this.#closing.signal);
+    let release: (() => void) | undefined;
+    try {
+      release = await turn;
+      await this.#yieldToReclamation(space);
+      this.#assertRunning();
+      await ensureStorageIdentity(this.#options.layout, space, phone, this.#options.stateDb);
+      const handle = await this.#spaces.acquire(space);
+      let outcome: { status: "duplicate" } | { status: "full" } | { status: "added"; attachment: Attachment };
+      try {
+        await this.#conversation(handle.harness, member);
+        outcome = await handle.harness.commit(async (tx) => {
+          const receipts = await tx.doc(ReceiptsDoc);
+          if (receipts.items[reply.msgUid]) return { status: "duplicate" as const };
+          const now = Date.now();
+          receipts.items[reply.msgUid] = { at: now, phone };
+          const records = await recordsOf(tx, phone);
+          if (unconsumed(records).length >= limits.memberCount) return { status: "full" as const };
+          const attachment: Attachment = {
+            id: newAttachmentId(), msgUid: reply.msgUid, receivedAt, epoch: this.#runtimes.get(scopeKey(space))!.epoch, fileId: event.fileId, kind: event.kind,
+            name: event.name, ...(event.size === undefined ? {} : { size: event.size }), ...(event.mimeType ? { mimeType: event.mimeType } : {}),
+            reply: structuredClone(reply), state: "pending", at: now,
+          };
+          // Like an inbox item, an attachment behind an admitted /stop or /clear boundary is cancelled by it.
+          if (receivedAt <= (member.cancelBefore ?? -Infinity)) attachment.state = "void";
+          else if (downloads === undefined) Object.assign(attachment, { state: "rejected", error: "当前服务未开启附件接收" });
+          records.attachments[attachment.id] = attachment;
+          return { status: "added" as const, attachment: { ...attachment, reply: { ...attachment.reply } } };
+        }, this.#context);
+      } finally { handle.release(); }
+      this.#remember(reply.msgUid);
+      if (outcome.status === "duplicate") return { status: "duplicate" };
+      if (outcome.status === "full") {
+        return { status: "full", message: `未接收${attachmentLabel(event)}：你还有 ${limits.memberCount} 个附件尚未处理，请先发消息说明要怎么处理。` };
+      }
+      const { attachment } = outcome;
+      if (attachment.state === "pending") {
+        downloads!.schedule(space, phone, attachment.id);
+        this.#track(this.#notify(reply, `已收到${attachmentLabel(attachment)}，请说明要怎么处理。`));
+      } else if (attachment.state === "rejected") this.#track(this.#notify(reply, `未接收${attachmentLabel(attachment)}：${attachment.error}。`));
+      return { status: "accepted" };
+    } finally {
+      member.uses--;
+      release?.();
+      this.#pruneMember(member);
+    }
+  }
+
+  /** Voided attachments: stop their downloads and remove their files (best effort; the tmp archive takes what is left). */
+  #discard(space: Scope, phone: string, voided: readonly Attachment[]): void {
+    if (!voided.length) return;
+    const ids = voided.map(attachment => attachment.id);
+    this.#downloads?.cancel(ids);
+    this.#track(removeAttachmentFiles(userTmp(this.#options.layout, space, phone), ids).catch(error => this.#report(error)));
+  }
+
   // ---- controls -------------------------------------------------------------------------------------------------------
 
-  /** A slash command; its receipt is sent to the member (best effort) once it has run. */
-  async control(phone: string, groupId: string, content: string, callbackUrl: string, onAdmitted?: () => void): Promise<string> {
-    for (let gate; (gate = this.#reclaiming.get(groupId));) { gate.yield = true; await waitFor(gate.promise, this.#closing.signal); }
-    const member = this.#member(groupId, phone);
+  /**
+   * A slash command; its receipt is sent to the command's reply context (best effort) once it has run. Resolves to the
+   * receipt text, "" when nothing was sent (a redelivered command). The member's
+   * command order is taken synchronously: call it in arrival order.
+   */
+  async control(message: Inbound, onAdmitted?: () => void): Promise<string> {
+    this.#assertRunning();
+    const member = this.#member(message.scope, message.phone);
     member.uses++;
-    try { return await this.#controlMessage(phone, groupId, content, callbackUrl, onAdmitted); }
+    try { return await this.#controlMessage(member, message, onAdmitted); }
     finally { member.uses--; this.#pruneMember(member); }
   }
 
-  async #controlMessage(phone: string, groupId: string, content: string, callbackUrl: string, onAdmitted?: () => void): Promise<string> {
-    this.#assertRunning();
+  async #controlMessage(member: MemberState, message: Inbound, onAdmitted?: () => void): Promise<string> {
+    const { phone, scope, content, reply: context } = message;
     const command = canonicalCommand(content);
     const receivedAt = this.#arrival();
-    const member = this.#member(groupId, phone);
-    member.callbackUrl = callbackUrl;
     member.lastUsed = Date.now();
+    if (this.#seen.has(context.msgUid) && ["/stop", "/clear", "/compact"].includes(command)) return "";
     let reply: string;
     if (command === "/stop" || command === "/clear") {
+      // A duplicate is known only after the receipt check. Until then the hold only keeps new work from starting; a run
+      // that settles meanwhile waits for the decision (#settle), so a redelivered command cannot cancel its reply.
       const release = this.#hold(member);
-      this.#closeout.withdraw(member.key);
-      const receipt: ControlReceipt = { groupId, phone, requestId: `ctl:${randomUUID()}` };
+      const decision = Promise.withResolvers<void>();
+      member.deciding.add(decision.promise);
+      const decided = () => { member.deciding.delete(decision.promise); decision.resolve(); };
+      const receipt: ControlReceipt = { scope, phone, requestId: `ctl:${randomUUID()}` };
       this.#receipts.set(receipt.requestId, receipt);
-      receipt.ticket = this.#runtimes.get(groupId)?.door.controlReceived(phone, receipt.requestId);
+      receipt.ticket = this.#runtimes.get(scopeKey(scope))?.door.controlReceived(phone, receipt.requestId);
       // Reserve this member's order before any await; slower identity/open steps cannot reorder controls.
       const run = member.controls.then(async () => {
-        await ensureStorageIdentity(this.#options.root, groupId, phone, this.#options.stateDb);
-        await this.#control(member, command, receivedAt, receipt, onAdmitted);
+        await this.#yieldToReclamation(scope);
+        await ensureStorageIdentity(this.#options.layout, scope, phone, this.#options.stateDb);
+        return this.#control(member, command, receivedAt, receipt, context, decided, onAdmitted);
       });
       member.controls = run.catch(() => {});
+      let admitted: boolean;
       try {
-        await run;
+        admitted = await run;
       } finally {
+        decided();
         this.#receipts.delete(receipt.requestId);
-        if (receipt.ticket) this.#runtimes.get(groupId)?.door.controlDropped(receipt.ticket);
+        if (receipt.ticket) this.#runtimes.get(scopeKey(scope))?.door.controlDropped(receipt.ticket);
         release();
       }
-      reply = command === "/stop"
-        ? "⏹ 已停止你在本群的当前任务，并取消排队中的消息。已发出的内容不会撤回。"
-        : "🧹 已为你在本群开启新会话，下条消息从新会话开始，之前的聊天记录留在群库里。其他人的聊天记录不受影响。";
-      if (this.#deliveries.hasPending(member.key)) {
-        reply += command === "/stop" ? "\n已生成但尚未发完的回复已保留，发送 /deliver 可补发。" : "\n之前已生成但尚未发完的回复仍保留，发送 /deliver 可补发。";
-      }
+      if (!admitted) return "";
+      reply = await this.#controlReceipt(member, command);
     } else if (command === "/compact") {
       // Reserve command order before any await. Only admission is serialized; waiting for a summary must not block stop.
       const admission = member.controls.then(async () => {
-        await ensureStorageIdentity(this.#options.root, groupId, phone, this.#options.stateDb);
-        const handle = await this.#groups.acquire(groupId);
+        await this.#yieldToReclamation(scope);
+        await ensureStorageIdentity(this.#options.layout, scope, phone, this.#options.stateDb);
+        const handle = await this.#spaces.acquire(scope);
         try {
           await member.replaying;
-          const { conversation } = await memberConversation(handle.harness, groupId, phone,
-            { model: this.#options.selection.ref, thinkingLevel: this.#options.selection.thinkingLevel }, this.#context);
-          member.conversationId = conversation.id;
-          const queued = await handle.harness.commit(tx => queueManualCompaction(tx, conversation.id), this.#context);
+          const conversation = await this.#conversation(handle.harness, member);
+          const queued = await handle.harness.commit(async tx => {
+            const receipts = await tx.doc(ReceiptsDoc);
+            if (receipts.items[context.msgUid]) return undefined;
+            receipts.items[context.msgUid] = { at: Date.now(), phone };
+            return queueManualCompaction(tx, conversation.id);
+          }, this.#context);
+          this.#remember(context.msgUid);
           return { handle, queued };
         } catch (error) { handle.release(); throw error; }
       });
       member.controls = admission.then(() => {}, () => {});
       const { handle, queued } = await admission;
       try {
+        if (queued === undefined) return "";
         onAdmitted?.();
         const outcome = queued.submissionId !== undefined
           ? { status: "completed" as const, result: { submissionId: queued.submissionId, entryId: undefined } }
           : (await handle.harness.waitForTask(queued.taskId, this.#context)).state.outcome;
+        const library = scope.kind === "direct" ? "单聊库" : "群库";
         if (outcome.status !== "completed") {
           reply = "⚠️ 本次会话压缩未完成，原会话仍保留；可用 /status 查看状态。";
         } else if (outcome.result.entryId !== undefined) {
           // A compaction owned by a generation places its entry in the task's terminal commit.
-          reply = "📦 会话压缩已完成，摘要已写入会话，聊天记录仍保留在群库里。";
+          reply = `📦 会话压缩已完成，摘要已写入会话，聊天记录仍保留在${library}里。`;
         } else if (outcome.result.submissionId === undefined) {
           reply = "📦 本次无需压缩，当前会话没有可压缩的历史。";
         } else {
@@ -417,57 +551,69 @@ export class DurableService {
           if (!summary) throw new Error("压缩摘要提交不存在，无法确认已写入会话");
           const placed = await summary.wait(this.#context);
           reply = placed.status === "done"
-            ? "📦 会话压缩已完成，摘要已写入会话，聊天记录仍保留在群库里。"
+            ? `📦 会话压缩已完成，摘要已写入会话，聊天记录仍保留在${library}里。`
             : "⚠️ 压缩摘要未写入会话（已过期或取消），原会话仍保留；可用 /status 查看状态。";
         }
-        await this.#project(handle.harness, member);
+        await this.#syncStats(handle.harness, member);
       } finally { handle.release(); }
-    } else if (command === "/deliver") {
-      onAdmitted?.();
-      try {
-        await this.#deliver(member, callbackUrl);
-        return "";
-      } catch (error) {
-        reply = describeRequestFailure(error);
-      }
     } else if (command === "/status") {
       onAdmitted?.();
-      reply = await this.#status(member, callbackUrl);
+      reply = await this.#status(member);
     } else {
       onAdmitted?.();
       reply = command === "/help" ? HELP_TEXT : unknownCommandText(content);
     }
-    await this.#outbound.sendText(reply, groupId, phone, callbackUrl, { signal: this.#closing.signal })
-      .catch((error) => this.#report(error));
+    await this.#notify(context, reply);
     return reply;
   }
 
-  /** Commit the control to the stream, execute it, commit its removal; the door holds the member's requests meanwhile. */
-  async #control(member: MemberState, command: ControlCommand, receivedAt: number, receipt: ControlReceipt, onAdmitted?: () => void): Promise<void> {
-    const handle = await this.#groups.acquire(member.groupId);
+  /**
+   * Commit the control (with its receipt) to the stream, execute it, commit its removal; the door holds the member's
+   * requests meanwhile. False for a redelivered command: nothing was done. `decided` is called once the receipt check
+   * is known: after the cancellation boundary is set, or for a redelivery.
+   */
+  async #control(member: MemberState, command: ControlCommand, receivedAt: number, receipt: ControlReceipt, reply: ReplyContext,
+    decided: () => void, onAdmitted?: () => void): Promise<boolean> {
+    const handle = await this.#spaces.acquire(member.scope);
     try {
       await member.replaying;
       this.#assertRunning();
       const { harness } = handle;
-      const door = this.#runtimes.get(member.groupId)!.door;
+      const door = this.#runtimes.get(scopeKey(member.scope))!.door;
       const { requestId } = receipt;
       const ticket = receipt.ticket!;
       try {
-        const seq = await harness.commit(async (tx) => {
+        const admitted = await harness.commit(async (tx) => {
+          const receipts = await tx.doc(ReceiptsDoc);
+          if (receipts.items[reply.msgUid]) return undefined;
+          receipts.items[reply.msgUid] = { at: Date.now(), phone: member.phone };
           const controls = await tx.doc(ControlsDoc);
           controls.seq++;
-          controls.pending.push({ phone: member.phone, requestId, seq: controls.seq, command, receivedAt, epoch: controls.epoch ?? 0 });
-          return controls.seq;
+          controls.pending.push({ phone: member.phone, requestId, seq: controls.seq, command, receivedAt, epoch: controls.epoch ?? 0, reply: structuredClone(reply) });
+          // A stop or clear ends the sending of earlier replies too; what is left of them is dropped.
+          const now = Date.now(), withdrawn: string[] = [];
+          for (const record of Object.values((await recordsOf(tx, member.phone)).requests)) {
+            if (record.delivery && undelivered(record)) { record.delivery.abandoned = { at: now, reason: "withdrawn" }; withdrawn.push(record.requestId); }
+          }
+          return { seq: controls.seq, withdrawn };
         }, this.#context);
+        this.#remember(reply.msgUid);
+        if (admitted === undefined) { decided(); return false; }
+        const { seq, withdrawn } = admitted;
+        member.withdrawals++;
         door.controlAdmitted(ticket, seq);
         member.cancelBefore = Math.max(member.cancelBefore ?? -Infinity, receivedAt);
+        decided();
+        // Each withdrawn delivery is looked at once more under the delivery lock (after a send in flight): that frees its snapshots.
+        for (const id of withdrawn) this.#track(this.#autoDeliver(member, id));
       } catch (error) {
         await door.controlUncertain(ticket, async () =>
           (await pendingControls(harness, this.#context)).find((control) => control.requestId === requestId)?.seq);
         throw error;
       }
       onAdmitted?.();
-      await this.#execute(harness, member, command, requestId);
+      await this.#execute(harness, member, command, requestId, reply);
+      return true;
     } finally { handle.release(); }
   }
 
@@ -475,7 +621,7 @@ export class DurableService {
    * Run a control that is in the stream, then remove it (idempotent: startup runs waiting ones again). It cancels the
    * messages received before it; later ones (admitted while it waited or ran) stay.
    */
-  async #execute(harness: Harness, member: MemberState, command: ControlCommand, requestId: string): Promise<void> {
+  async #execute(harness: Harness, member: MemberState, command: ControlCommand, requestId: string, reply: ReplyContext | undefined): Promise<void> {
     try {
       for (let attempt = 0; ; attempt++) {
         try {
@@ -487,7 +633,7 @@ export class DurableService {
           const delay = retryDelay(attempt);
           member.controlRetry = { attempt: attempt + 1, nextAt: Date.now() + delay, message: String(error) };
           this.#report(error);
-          if (attempt === 0) await this.#notify(member, "控制操作暂未完成，将自动重试；完成前暂停本会话的新任务。可用 /status 查看。");
+          if (attempt === 0 && reply) await this.#notify(reply, "控制操作暂未完成，将自动重试；完成前暂停本会话的新任务。可用 /status 查看。");
           await retryWait(delay, this.#closing.signal);
         }
       }
@@ -495,22 +641,28 @@ export class DurableService {
   }
 
   async #executeOnce(harness: Harness, member: MemberState, command: ControlCommand, requestId: string): Promise<void> {
-    const door = this.#runtimes.get(member.groupId)!.door;
+    const door = this.#runtimes.get(scopeKey(member.scope))!.door;
     // The caller holds the worker (#hold). A start that passed the gate before is finished first: its item arrived
     // before this control, so the cancel below covers it and the abort reaches its run.
     await waitFor(member.starting ?? Promise.resolve(), this.#closing.signal);
     const pending = (await pendingControls(harness, this.#context)).find((control) => control.requestId === requestId);
     if (pending === undefined) { door.controlExecuted(requestId); return; }
-    this.#closeout.withdraw(member.key);
+    // The in-memory state of an idle member may have been dropped; the persisted conversation is still the member's.
+    member.conversationId ??= (await harness.snapshot(MemberDirectory, member.phone, this.#context))?.conversationId;
     const conversation = member.conversationId === undefined ? undefined
       : await harness.conversation(member.conversationId as ConversationId, this.#context);
     if (conversation !== undefined) {
-      await harness.commit(async (tx) => {
+      const voided = await harness.commit(async (tx) => {
         const inbox = await tx.doc(InboxDoc, conversation.id);
-        for (const item of inbox.items) if (receivedBefore(item, pending)) item.cancelled = true;
+        const cancelled = new Set<string>();
+        for (const item of inbox.items) if (receivedBefore(item, pending)) { item.cancelled = true; cancelled.add(item.requestId); }
+        // Attachments go with the requests that bound them; a /clear also voids the unbound ones received before it.
+        return voidWhere(await recordsOf(tx, member.phone), attachment => attachment.boundTo !== undefined ? cancelled.has(attachment.boundTo)
+          : command === "/clear" && arrivedBefore(attachment, pending), Date.now());
       }, this.#context);
       // Resolves once the conversation is idle: the run, its tools and codemode sub-calls have ended.
       await conversation.abort(this.#context, { background: true });
+      this.#discard(member.scope, member.phone, voided);
       // abort() withdraws queued inputs, but passive summary writes survive it. Cancel those through the public
       // submission lifecycle as part of the replayable control, so waiting compact commands can settle truthfully.
       const queued = (await harness.snapshot(PiInboxDoc, conversation.id, this.#context))?.items ?? [];
@@ -528,9 +680,9 @@ export class DurableService {
           }, this.#context);
         }
         // A clear can overlap another member's run. Record expiry here; an idle group sweep checks
-        // every member/fork and the outbox before touching bytes.
+        // every member/fork and the run records before touching bytes.
         await harness.commit(tx => requestMemberExpiry(tx, member.phone), this.#context);
-        await this.#project(harness, member);
+        await this.#syncStats(harness, member);
       }
     }
     await harness.commit(async (tx) => {
@@ -558,12 +710,22 @@ export class DurableService {
       });
     };
   }
+  #yieldToReclamation(scope: Scope): Promise<void> {
+    return (async () => {
+      for (let gate; (gate = this.#reclaiming.get(scopeKey(scope)));) { gate.yield = true; await waitFor(gate.promise, this.#closing.signal); }
+    })();
+  }
+
+  #remember(msgUid: string): void {
+    if (this.#seen.size >= SEEN_LIMIT) this.#seen.delete(this.#seen.values().next().value!);
+    this.#seen.add(msgUid);
+  }
 
   // ---- workers --------------------------------------------------------------------------------------------------------
 
   #kick(member: MemberState): void {
     if (this.#closing.signal.aborted || member.conversationId === undefined) return;
-    if (this.#reclaiming.has(member.groupId)) return;
+    if (this.#reclaiming.has(scopeKey(member.scope))) return;
     if (member.worker !== undefined) { member.again = true; return; }
     member.again = false;
     const worker = this.#work(member).catch((error) => { if (!this.#closing.signal.aborted) this.#report(error); })
@@ -598,7 +760,7 @@ export class DurableService {
   async #drain(member: MemberState): Promise<void> {
     for (;;) {
       if (this.#closing.signal.aborted) return;
-      const handle = await this.#groups.acquire(member.groupId);
+      const handle = await this.#spaces.acquire(member.scope);
       try {
         const { harness } = handle;
         const conversation = await harness.conversation(member.conversationId as ConversationId, this.#context);
@@ -612,6 +774,7 @@ export class DurableService {
           await waitFor(member.gate, this.#closing.signal);
           continue;
         }
+        if (head.cancelled !== true && head.startedAt === undefined && await this.#awaitAttachments(harness, member, head.requestId)) continue;
         // A restored inbox may exceed a newly lowered limit. Preserve it, but run only the allowed number of heads.
         await this.#enterRun(member);
         try {
@@ -629,7 +792,8 @@ export class DurableService {
             member.workerRetry = undefined;
           } finally {
             if (member.current?.requestId === head.requestId) member.current = undefined;
-            clearRunning(member.groupId, member.phone, taskNumber(head.requestId));
+            this.#attachmentWaits.delete(head.requestId);
+            clearRunning(member.scope, member.phone, taskNumber(head.requestId));
             if (member.starting === started) member.starting = undefined;
             startedDone();
             member.lastUsed = Date.now();
@@ -640,16 +804,46 @@ export class DurableService {
     }
   }
 
+  /**
+   * Before a request starts, wait for the downloads it bound, up to the limit counted from its first wait in this
+   * process. True when it waited (the caller reads its inbox again); a control arriving meanwhile ends the wait.
+   */
+  async #awaitAttachments(harness: Harness, member: MemberState, requestId: string): Promise<boolean> {
+    for (let waited = false; ; waited = true) {
+      const records = await memberRecords(harness, member.phone, this.#context);
+      if (!Object.values(records.attachments).some(attachment => attachment.boundTo === requestId && attachment.state === "pending")) return waited;
+      const now = Date.now();
+      let deadline = this.#attachmentWaits.get(requestId);
+      if (deadline === undefined) this.#attachmentWaits.set(requestId, deadline = now + (this.#downloads?.limits ?? ATTACHMENT_LIMITS).waitMs);
+      if (now >= deadline || member.gate !== undefined || this.#closing.signal.aborted) return waited;
+      await Bun.sleep(Math.min(200, deadline - now));
+    }
+  }
+
+  /** The member's text and what the request bound; a ready file that is gone is reported as such. */
+  async #requestContent(records: Readonly<MemberRecords>, item: InboxItem): Promise<string> {
+    const bound = Object.values(records.attachments).filter(attachment => attachment.boundTo === item.requestId && attachment.state !== "void")
+      .sort((a, b) => a.epoch - b.epoch || a.receivedAt - b.receivedAt);
+    const shown = await Promise.all(bound.map(async attachment => {
+      if (attachment.state !== "ready") return attachment;
+      try { await access(attachment.path!); return attachment; }
+      catch { return { ...attachment, state: "failed" as const, error: "文件已被清理" }; }
+    }));
+    return item.content + attachmentPrompt(shown);
+  }
+
   /** Run one inbox item; `submitted` is called once its submission exists (or nothing will be submitted). */
   async #process(harness: Harness, conversation: Conversation, member: MemberState, item: InboxItem, submitted: () => void): Promise<void> {
-    const reply = this.#deliveries.find(member.key, replyRow(item.requestId));
-    if (reply !== undefined || this.#closeout.plan(member.key, `fallback:${item.requestId}`)) {
-      // Settled and stored before a crash: finish the removal; the reply waits in the outbox.
-      await this.#remove(harness, conversation.id, item.requestId);
-      await this.#project(harness, member);
-      await this.#recovered(member);
+    const records = await memberRecords(harness, member.phone, this.#context);
+    const record = records.requests[item.requestId];
+    if (record === undefined) {
+      // Admission commits the item with its record; without one there is nowhere to answer.
+      submitted();
+      await this.#close(harness, member, conversation.id, item.requestId, { cancelled: true });
+      this.#report(new Error(`任务记录缺失，已移除 - ${taskText(member, item.requestId)}`));
       return;
     }
+    const reply = record.reply;
     const previous = item.startedAt !== undefined || item.cancelled === true
       ? await harness.commit((tx) => tx.submissionByRequest(conversation.id, item.requestId), this.#context) : undefined;
     if (previous?.status === "done" || previous?.status === "unanswered") {
@@ -664,8 +858,9 @@ export class DurableService {
     if ((item.cancelled === true || expired !== undefined) && previous === undefined) {
       // The first-start timestamp can be committed just before a crash that left no Durable submission.
       submitted();
-      await this.#remove(harness, conversation.id, item.requestId);
-      if (expired) await this.#notify(member, describeRequestFailure(expired.error));
+      const delivery = expired === undefined ? undefined : failureDelivery(reply, describeRequestFailure(expired.error), [], Date.now());
+      const stopped = await this.#close(harness, member, conversation.id, item.requestId, { cancelled: item.cancelled === true, ...(delivery ? { delivery } : {}) });
+      if (delivery && !stopped) await this.#autoDeliver(member, item.requestId);
       return;
     }
     if (expired && previous) {
@@ -673,38 +868,29 @@ export class DurableService {
       this.#markAborted(member, previous.id.toString(), expired, item.startedAt!);
       await conversation.abort(this.#context);
     }
-    if (item.startedAt === undefined && item.cancelled !== true) {
-      try {
-        this.#deliveries.assertCapacity(member.key);
-      } catch (error) {
-        await this.#remove(harness, conversation.id, item.requestId);
-        await this.#notify(member, describeRequestFailure(error));
-        return;
-      }
-    }
     const startedAt = item.startedAt ?? Date.now();
     if (item.startedAt === undefined) {
       await harness.commit(async (tx) => {
         const stored = (await tx.doc(InboxDoc, conversation.id)).items.find((each) => each.requestId === item.requestId);
         if (stored !== undefined) stored.startedAt = startedAt;
       }, this.#context);
-      if (member.callbackUrl !== undefined) {
-        this.#track(this.#outbound.sendText(STATUS_TEXT, member.groupId, member.phone, member.callbackUrl,
-          { traffic: "status", signal: this.#closing.signal }).catch(() => false));
-      }
+      // No "working on it" notice; only a message redelivered after an outage says why its answer comes late.
+      const late = lateMinutes(reply);
+      if (late !== undefined) this.#track(sendNotice(this.#outbound, reply, lateNotice(late), { signal: this.#closing.signal }).catch(() => false));
     }
     if (member.current?.requestId !== item.requestId) member.current = { requestId: item.requestId, startedAt };
-    markRunning(member.groupId, member.phone, taskNumber(item.requestId));
+    markRunning(member.scope, member.phone, taskNumber(item.requestId));
     this.#log(`任务开始 - ${taskText(member, item.requestId)}, 总时限: ${this.#limits.runTimeoutMs / 1000}秒, ` +
       `模型无进展时限: ${this.#limits.modelIdleMs / 1000}秒, 单次模型响应时限: ${this.#limits.modelResponseMs / 1000}秒`);
     let settled: SettledSubmissionRecord;
     try {
       // Durable admits a known requestId once: after a crash this finds the same submission.
-      const submission = await conversation.submit({ type: "input", content: item.content, requestId: item.requestId }, this.#context);
+      const content = await this.#requestContent(records, item);
+      const submission = await conversation.submit({ type: "input", content, requestId: item.requestId }, this.#context);
       submitted();
       settled = await this.#watch(harness, conversation, member, submission, item.cancelled === true ? undefined : startedAt);
       await this.#settle(harness, conversation, member, item, settled);
-    } finally { member.current = undefined; clearRunning(member.groupId, member.phone, taskNumber(item.requestId)); }
+    } finally { member.current = undefined; clearRunning(member.scope, member.phone, taskNumber(item.requestId)); }
   }
 
   /** Wait for the submission to settle, aborting the run when a limit is reached. */
@@ -769,15 +955,23 @@ export class DurableService {
     this.#log(`${ABORT_LABELS[reason.kind]} - ${taskText(member, member.current?.requestId ?? "")}, 已用: ${Math.floor((Date.now() - startedAt) / 1000)}秒, 取消原因: ${reason.kind}`);
   }
 
+  /**
+   * The run is over: in one commit the inbox item goes and the record gets its delivery plan (reply, failure, or the
+   * closeout fallback); then the plan is sent. No crash window loses the result or sends it twice.
+   */
   async #settle(harness: Harness, conversation: Conversation, member: MemberState, item: InboxItem, settled: SettledSubmissionRecord): Promise<void> {
-    // The worker's item predates controls. Re-read cancellation after the invocation has settled.
+    // The worker's item predates controls. Re-read cancellation after the invocation has settled, once every /stop or
+    // /clear received so far is known to be new (it sets cancelBefore) or a redelivery (it changes nothing).
+    await this.#controlsDecided(member, item);
     const current = (await inboxItems(harness, conversation.id, this.#context)).find(x => x.requestId === item.requestId);
-    const cancelled = current?.cancelled || member.gate !== undefined || (member.cancelBefore ?? -Infinity) >= item.receivedAt;
+    const cancelled = current?.cancelled === true || (member.cancelBefore ?? -Infinity) >= item.receivedAt;
     const aborted = member.aborted.get(settled.id.toString());
     member.aborted.delete(settled.id.toString());
-    const notes = this.#deliveries.find(member.key, notesRow(item.requestId));
+    const record = (await memberRecords(harness, member.phone, this.#context)).requests[item.requestId];
+    if (record === undefined) throw new Error(`任务记录缺失 - ${taskText(member, item.requestId)}`);
+    const now = Date.now();
     let failure: string | undefined;
-    let reply: { body: string; notes?: { text: string; attachments: DeliveryAttachment[] } } | undefined;
+    let delivery: Delivery | undefined;
     if (cancelled) {
       // Explicit cancellation wins over a watchdog firing at the same time.
     } else if (aborted !== undefined) {
@@ -787,69 +981,74 @@ export class DurableService {
         ? await harness.commit(async (tx) => (await tx.entry(AssistantEntry, settled.answer!))?.model?.[0] as AssistantMessage | undefined, this.#context)
         : undefined;
       const text = textOf(answer);
-      if (!text && !notes) failure = describeRequestFailure(new Error("Pi 未返回回复"));
-      else {
-        reply = { body: text || "文件链接已生成。", ...(notes === undefined ? {} : { notes }) };
-        // Stored before anything is sent: a failed or interrupted send leaves it for /deliver.
-        this.#deliveries.finalize(member.key, notesRow(item.requestId), replyRow(item.requestId),
-          [reply.body, notes?.text].filter(Boolean).join("\n\n"), notes?.attachments ?? []);
-      }
+      if (!text && !record.notes.length) failure = describeRequestFailure(new Error("Pi 未返回回复"));
+      else delivery = replyDelivery(record.reply, text || "文件链接已生成。", record.notes, now);
     } else if (settled.status === "unanswered" && settled.reason !== "aborted" && item.cancelled !== true) {
       failure = describeRequestFailure(await this.#failure(harness, conversation, settled));
     }
-    let fallback: string | undefined;
-    if (failure !== undefined && this.#options.closeout && !this.#closing.signal.aborted) {
-      const candidates = await this.#validCandidates(member.key, item.requestId);
-      const latest = (await inboxItems(harness, conversation.id, this.#context)).find(x => x.requestId === item.requestId);
-      if (!latest?.cancelled && !member.gate && (member.cancelBefore ?? -Infinity) < item.receivedAt) {
-        const files = this.#closeout.files(member.key, item.requestId);
-        const descriptions = candidates.map(x => {
-          const file = files.find(f => f.sha256 === x.sha256);
-          const status = file?.state === "sent" ? "；该版本已在任务中发出" : file?.state === "uncertain" ? "；该版本可能已发出，发送 /deliver 可重发（如已收到可忽略）" : "";
-          return `· 《${x.name}》— ${x.status === "checked" ? "已检查版本" : "草稿"}；文件结构完整；检查记录（模型登记）：${x.checked.join("、") || "未登记"}；未检查：${x.unchecked.join("、") || "未登记"}；已知问题：${x.issues.join("、") || "无登记"}${status}。`;
-        });
-        const rejected = this.#closeout.registrations(member.key, item.requestId).some(x => x.status === "rejected" || !x.complete);
-        const text = [failure, candidates.length ? "系统将交付本任务已登记的可用版本：" : "本任务没有可交付的已登记版本。",
-          ...descriptions, rejected ? "存在已知错误或不完整的版本，未作为交付候选。" : "",
-          candidates.some(x => x.status === "draft") ? "这是未完成全部检查的草稿，请核对后使用。" : ""].filter(Boolean).join("\n");
-        // Both the explanation and file plan commit before inbox removal: no crash window loses the result.
-        fallback = this.#closeout.createPlan(member.key, item.requestId, text, candidates, this.#options.closeout.fallbackMs).id;
-      }
-      failure = undefined;
+    if (failure !== undefined) {
+      if (this.#options.closeout && !this.#closing.signal.aborted) {
+        await this.#controlsDecided(member, item);
+        const latest = (await inboxItems(harness, conversation.id, this.#context)).find(x => x.requestId === item.requestId);
+        // A control that arrived while the candidates were checked cancels the fallback too.
+        if (!latest?.cancelled && (member.cancelBefore ?? -Infinity) < item.receivedAt) {
+          delivery = await this.#fallback(record, failure, this.#options.closeout.fallbackMs, now);
+        }
+      } else delivery = failureDelivery(record.reply, failure, record.notes, now);
     }
-    await this.#remove(harness, conversation.id, item.requestId);
-    await this.#project(harness, member);
+    // A control that arrived while the plan was prepared decides first; one committed meanwhile is found by #close.
+    await this.#controlsDecided(member, item);
+    const stopped = await this.#close(harness, member, conversation.id, item.requestId,
+      { cancelled: cancelled || (member.cancelBefore ?? -Infinity) >= item.receivedAt, ...(delivery ? { delivery } : {}) });
+    await this.#syncStats(harness, member);
     this.#log(`任务结束 - ${taskText(member, item.requestId)}, 结果: ${settled.status}${"reason" in settled && settled.reason ? `/${settled.reason}` : ""}`);
-    if (failure !== undefined) await this.#notify(member, failure);
-    if (fallback && member.callbackUrl) {
-      const release = await member.delivery.acquire(this.#closing.signal);
-      try {
-        member.attempted.add(fallback);
-        if (!await this.#sendPlan(member, fallback, false) && !this.#closeout.plan(member.key, fallback)?.withdrawn && !this.#closing.signal.aborted) {
-          await this.#notify(member, "已保存交付内容，发送 /deliver 可补发；发送结果不确定的文件不会自动重发。");
-        }
-      } finally { release(); }
+    if (delivery && !stopped) await this.#autoDeliver(member, item.requestId);
+  }
+
+  /**
+   * Wait until no /stop or /clear of the member is before its receipt check, unless one already admitted covers the item.
+   * The checks never wait for the worker, so a settling run cannot deadlock with them.
+   */
+  async #controlsDecided(member: MemberState, item: InboxItem): Promise<void> {
+    while (member.deciding.size && (member.cancelBefore ?? -Infinity) < item.receivedAt) {
+      await waitFor(Promise.race(member.deciding), this.#closing.signal);
     }
-    await this.#releaseSnapshots(member, item.requestId, !!cancelled || (member.cancelBefore ?? -Infinity) >= item.receivedAt);
-    if (reply !== undefined && member.callbackUrl !== undefined) {
-      const release = await member.delivery.acquire(this.#closing.signal);
-      try {
-        const id = replyRow(item.requestId);
-        // Another path may have delivered it while this worker was projecting usage or waiting for the lock.
-        if (member.attempted.has(id) || this.#deliveries.find(member.key, id) === undefined) return;
-        member.attempted.add(id);
-        let sent = false;
-        try {
-          const appendix = reply.notes === undefined ? "" : await this.#outbound.refresh(reply.notes, this.#closing.signal);
-          sent = await this.#outbound.sendReply(reply.body, member.groupId, member.phone, member.callbackUrl, this.#closing.signal, appendix || undefined);
-        } catch (error) { this.#report(error); }
-        if (sent) {
-          this.#closeout.acknowledgeRelay(member.key, item.requestId); this.#deliveries.acknowledge([id]); member.attempted.delete(id);
-          await this.#releaseSnapshots(member, item.requestId);
-        }
-        else await this.#notify(member, "回复未能完整发到群里，已保存的内容可用 /deliver 补发");
-      } finally { release(); }
+  }
+
+  /** The closeout fallback: the failure, what the run registered, and the files themselves. */
+  async #fallback(record: Readonly<RequestRecord>, failure: string, fallbackMs: number, now: number): Promise<Delivery> {
+    const candidates = await this.#validCandidates(record);
+    const descriptions = candidates.map(x => {
+      const file = record.files.find(f => f.sha256 === x.sha256);
+      const status = file?.state === "sent" ? "；该版本已在任务中发出" : file?.state === "uncertain" || file?.state === "sending" ? "；该版本可能已发出" : "";
+      return `· 《${x.name}》— ${x.status === "checked" ? "已检查版本" : "草稿"}；文件结构完整；检查记录（模型登记）：${x.checked.join("、") || "未登记"}；未检查：${x.unchecked.join("、") || "未登记"}；已知问题：${x.issues.join("、") || "无登记"}${status}。`;
+    });
+    const rejected = record.deliverables.some(x => x.status === "rejected" || !x.complete);
+    const text = [failure, candidates.length ? "系统将交付本任务已登记的可用版本：" : "本任务没有可交付的已登记版本。",
+      ...descriptions, rejected ? "存在已知错误或不完整的版本，未作为交付候选。" : "",
+      candidates.some(x => x.status === "draft") ? "这是未完成全部检查的草稿，请核对后使用。" : ""].filter(Boolean).join("\n");
+    const delivery = failureDelivery(record.reply, text, record.notes, now);
+    candidates.forEach((x, index) => {
+      const sent = record.files.find(f => f.sha256 === x.sha256)?.state;
+      delivery.parts.push({ id: `f${index}`, kind: "file", file: { name: x.name, path: x.path, size: x.size, sha256: x.sha256 },
+        state: sent === "sent" ? "sent" : sent === "uncertain" || sent === "sending" ? "uncertain" : "pending", attempts: 0 });
+    });
+    return { ...delivery, kind: "fallback", deadline: now + fallbackMs };
+  }
+
+  /** Per slot the best complete, not rejected version whose snapshot still matches: checked before draft, newest first. */
+  async #validCandidates(record: Readonly<RequestRecord>): Promise<RequestRecord["deliverables"]> {
+    const all = record.deliverables, rejected = new Set(all.filter(x => x.status === "rejected").map(x => x.sha256));
+    const selected: RequestRecord["deliverables"] = [];
+    for (const slot of new Set(all.map(x => x.slot))) {
+      const versions = all.filter(x => x.slot === slot && x.complete && !rejected.has(x.sha256)).sort((a, b) =>
+        Number(b.status === "checked") - Number(a.status === "checked") || b.seq - a.seq);
+      for (const version of versions) {
+        try { if (await fileDigest(version.path, this.#closing.signal) === version.sha256) { selected.push(version); break; } }
+        catch { this.#closing.signal.throwIfAborted(); }
+      }
     }
+    return selected;
   }
 
   /** The model error of an unanswered input, for a member reply. */
@@ -870,209 +1069,251 @@ export class DurableService {
     return new Error(`模型未能回答（${reason}）`);
   }
 
-  /** Replies stored by an earlier process and never tried: sent once a callback URL is known; a failure leaves them for /deliver. */
-  async #recovered(member: MemberState): Promise<void> {
-    member.uses++;
-    try { await this.#recoverReplies(member); }
-    finally { member.uses--; this.#pruneMember(member); }
-  }
-
-  async #recoverReplies(member: MemberState): Promise<void> {
-    const callbackUrl = member.callbackUrl;
-    if (callbackUrl === undefined) return;
-    const release = await member.delivery.acquire(this.#closing.signal);
-    try {
-      const pending = this.#deliveries.pending(member.key);
-      const expired = pending.filter(item => item.id.startsWith("fallback:")).flatMap(item => {
-        const plan = this.#closeout.plan(member.key, item.id);
-        return plan && !plan.withdrawn && !plan.expiredNoticeAt && plan.deadline <= Date.now() ? [plan] : [];
-      });
-      if (expired.length && !member.gate) {
-        const signal = AbortSignal.any([this.#closing.signal, AbortSignal.timeout(15_000)]);
-        try {
-          if (await waitFor(this.#outbound.sendText("上次任务的交付未完成，已保存内容；发送 /deliver 获取。", member.groupId, member.phone, callbackUrl, { signal }), signal)) {
-            for (const plan of expired) {
-              const current = this.#closeout.plan(member.key, plan.id);
-              if (current) this.#closeout.savePlan({ ...current, expiredNoticeAt: Date.now() });
-            }
-          }
-        } catch (error) { if (!this.#closing.signal.aborted) this.#report(error); }
-      }
-      if (pending.some(item => item.id.startsWith("reply:")) && member.conversationId !== undefined) {
-        const handle = await this.#groups.acquire(member.groupId);
-        // Usage projection is serialized per conversation. A worker may already be projecting
-        // this finalized answer; delivery must not wait for that independent bookkeeping.
-        this.#track(this.#project(handle.harness, member).finally(() => handle.release()));
-      }
-      for (const item of pending) {
-        if (item.id.startsWith("fallback:")) {
-          if (!member.attempted.has(item.id)) { member.attempted.add(item.id); await this.#sendPlan(member, item.id, false); }
-          continue;
-        }
-        if (!item.id.startsWith("reply:") || member.attempted.has(item.id) || this.#deliveries.find(member.key, item.id) === undefined) continue;
-        member.attempted.add(item.id);
-        let sent = false;
-        try {
-          const text = await this.#outbound.refresh(item, this.#closing.signal);
-          sent = await this.#outbound.sendText(text, member.groupId, member.phone, callbackUrl, { signal: this.#closing.signal });
-        } catch (error) { this.#report(error); }
-        if (!sent) {
-          await this.#notify(member, "回复未能完整发到群里，已保存的内容可用 /deliver 补发");
-          return;
-        }
-        this.#deliveries.acknowledge([item.id]);
-        this.#closeout.acknowledgeRelay(member.key, item.id.slice("reply:".length));
-        await this.#releaseSnapshots(member, item.id.slice("reply:".length));
-        member.attempted.delete(item.id);
-      }
-    } finally { release(); }
-  }
-
-  async #remove(harness: Harness, conversationId: number, requestId: string): Promise<void> {
+  /**
+   * Remove the inbox item and close its record (with the delivery plan, when there is one) in one commit. A /stop or
+   * /clear committed before this commit cancels the item even if it has not run yet: the plan is dropped. A later one
+   * withdraws the plan itself. True when the item closed as cancelled.
+   */
+  async #close(harness: Harness, member: MemberState, conversationId: number, requestId: string,
+    outcome: { cancelled?: boolean; delivery?: Delivery }): Promise<boolean> {
+    let cancelled = outcome.cancelled === true;
     await harness.commit(async (tx) => {
       const inbox = await tx.doc(InboxDoc, conversationId as ConversationId);
+      const stored = inbox.items.find((item) => item.requestId === requestId);
+      const controls = (await tx.doc(ControlsDoc)).pending;
+      cancelled = outcome.cancelled === true || stored?.cancelled === true
+        || (stored !== undefined && controls.some((control) => control.phone === member.phone && receivedBefore(stored, control)));
       inbox.items = inbox.items.filter((item) => item.requestId !== requestId);
+      const records = await recordsOf(tx, member.phone);
+      const now = Date.now();
+      const record = records.requests[requestId];
+      if (record !== undefined && record.closedAt === undefined) {
+        record.closedAt = now;
+        if (cancelled) record.cancelled = true;
+        else if (outcome.delivery) record.delivery = structuredClone(outcome.delivery);
+      }
+      pruneRecords(records, now, this.#settled);
     }, this.#context);
     const request = this.#requests.get(requestId);
     if (request) request.retired = true;
+    await this.#releaseSnapshots(harness, member, requestId);
+    return cancelled;
   }
 
-  /** /deliver: send the member's stored replies, oldest first (not the link notes of a run still going). */
-  async #deliver(member: MemberState, callbackUrl: string): Promise<void> {
-    const release = await member.delivery.acquire(this.#closing.signal);
+  async #releaseSnapshots(harness: Harness, member: MemberState, requestId: string): Promise<void> {
     try {
-      const running = member.current === undefined ? undefined : notesRow(member.current.requestId);
-      const pending = this.#deliveries.pending(member.key).filter((item) => item.id !== running);
-      if (!pending.length) {
-        await this.#outbound.sendText("你在本群没有待补发的回复。", member.groupId, member.phone, callbackUrl, { signal: this.#closing.signal });
-        return;
-      }
-      for (const item of pending) {
-        if (item.id.startsWith("fallback:")) {
-          if (!await this.#sendPlan(member, item.id, true)) throw new Error("补发未完成，文件和说明仍保留，可稍后再发送 /deliver");
-          continue;
-        }
-        member.attempted.add(item.id);
-        const text = await this.#outbound.refresh(item, this.#closing.signal);
-        if (!await this.#outbound.sendText(text, member.groupId, member.phone, callbackUrl, { signal: this.#closing.signal })) {
-          throw new Error("补发失败，尚未发完的回复仍已保存，可稍后再发送 /deliver");
-        }
-        this.#deliveries.acknowledge([item.id]);
-        this.#closeout.acknowledgeRelay(member.key, item.id.replace(/^(reply|notes):/, ""));
-        await this.#releaseSnapshots(member, item.id.replace(/^(reply|notes):/, ""));
-        member.attempted.delete(item.id);
-      }
-    } finally { release(); }
-  }
-
-  async #releaseSnapshots(member: MemberState, requestId: string, cancelled = false): Promise<void> {
-    await this.#closeout.releaseSnapshots(member.key, requestId, userTempDir(this.#options.root, member.groupId, member.phone), cancelled).catch(error => this.#report(error));
-  }
-
-  async #validCandidates(session: string, requestId: string): Promise<Deliverable[]> {
-    const all = this.#closeout.registrations(session, requestId), rejected = new Set(all.filter(x => x.status === "rejected").map(x => x.sha256));
-    const selected: Deliverable[] = [];
-    for (const slot of new Set(all.map(x => x.slot))) {
-      const versions = all.filter(x => x.slot === slot && x.complete && !rejected.has(x.sha256)).sort((a, b) =>
-        Number(b.status === "checked") - Number(a.status === "checked") || b.seq - a.seq);
-      for (const record of versions) {
-        try { if (await fileDigest(record.path, this.#closing.signal) === record.sha256) { selected.push(record); break; } }
-        catch { this.#closing.signal.throwIfAborted(); }
-      }
-    }
-    return selected;
-  }
-
-  /** Called only under the member's delivery lock. A /stop can withdraw the next file without waiting for this lock. */
-  async #sendPlan(member: MemberState, id: string, manual: boolean): Promise<boolean> {
-    let plan = this.#closeout.plan(member.key, id);
-    const row = this.#deliveries.find(member.key, id), callbackUrl = member.callbackUrl;
-    if (!plan || !row || !callbackUrl) return !row;
-    if (member.gate || (!manual && (plan.withdrawn || plan.deadline <= Date.now()))) return false;
-    if (manual) {
-      plan = { ...plan, withdrawn: false, textSent: false, deadline: Date.now() + (this.#options.closeout?.fallbackMs ?? 120_000) };
-      this.#closeout.savePlan(plan);
-    }
-    const signal = AbortSignal.any([this.#closing.signal, AbortSignal.timeout(Math.max(1, plan.deadline - Date.now()))]);
-    const withdrawn = () => member.gate !== undefined || this.#closeout.plan(member.key, id)?.withdrawn !== false;
-    try {
-      if (!plan.textSent) {
-        const uncertain = this.#closeout.files(member.key, undefined, id).some(x => x.state === "uncertain");
-        const text = await waitFor(this.#outbound.refresh(row, signal), signal) + (manual && uncertain ? "\n上次发送结果不确定，本次按你的 /deliver 请求重发，如已收到可忽略。" : "");
-        if (withdrawn() || !await waitFor(this.#outbound.sendText(text, member.groupId, member.phone, callbackUrl, { signal }), signal)) return false;
-        plan = { ...plan, textSent: true, withdrawn: withdrawn() }; this.#closeout.acknowledgePlanText(plan);
-      }
-      for (let file of this.#closeout.files(member.key, undefined, id)) {
-        if (file.state === "sent" || (!manual && ["uncertain", "withdrawn"].includes(file.state))) continue;
-        if (withdrawn()) return false;
-        signal.throwIfAborted();
-        let dispatched = false;
-        try {
-          if (await fileDigest(file.path, signal) !== file.sha256) throw new Error("快照摘要不一致，拒绝发送");
-          if (withdrawn()) return false;
-          file = { ...file, state: "sending", attempts: file.attempts + 1, at: Date.now() }; this.#closeout.saveFile(file);
-          let transfer: FileTransfer;
-          if (this.#outbound.sendAttachment) {
-            dispatched = true;
-            transfer = await waitFor(this.#outbound.sendAttachment(file.path, file.name, member.groupId, member.phone, callbackUrl, signal), signal);
-          } else {
-            if (this.#options.outbound) throw new Error("测试 Outbound 未提供 sendAttachment");
-            transfer = await transferFile({ kind: "local", path: file.path, size: file.size }, file.name, {
-              groupId: member.groupId, getCallbackUrl: () => callbackUrl, relay: this.#options.relay,
-              tempDir: userTempDir(this.#options.root, member.groupId, member.phone),
-            }, signal, () => { dispatched = true; });
-          }
-          if (transfer.mode === "relay") {
-            if (withdrawn()) { this.#closeout.saveFile({ ...file, mode: "relay", state: "withdrawn" }); return false; }
-            signal.throwIfAborted(); dispatched = true;
-            if (!await waitFor(this.#outbound.sendText(transfer.note, member.groupId, member.phone, callbackUrl, { signal }), signal)) throw new Error("外链发送结果未确认");
-          }
-          this.#closeout.saveFile({ ...file, mode: transfer.mode, state: "sent" });
-        } catch (error) {
-          this.#closeout.saveFile({ ...file, state: dispatched ? "uncertain" : "failed", error: String(error) });
-          this.#report(error);
-          if (signal.aborted) break;
-        }
-      }
-      if (this.#closeout.files(member.key, undefined, id).every(x => x.state === "sent") && !withdrawn()) {
-        this.#deliveries.acknowledge([id]); member.attempted.delete(id);
-        await this.#releaseSnapshots(member, plan.requestId);
-        return true;
-      }
+      const record = (await memberRecords(harness, member.phone, this.#context)).requests[requestId];
+      if (record?.closedAt === undefined) return;
+      await deleteSnapshots(releasableSnapshots(record), userTmp(this.#options.layout, member.scope, member.phone));
     } catch (error) { if (!this.#closing.signal.aborted) this.#report(error); }
-    return false;
   }
 
-  async #notify(member: MemberState, text: string): Promise<void> {
-    if (member.callbackUrl === undefined) return;
-    const sent = await this.#outbound.sendText(text, member.groupId, member.phone, member.callbackUrl, { signal: this.#closing.signal })
+  // ---- delivery -------------------------------------------------------------------------------------------------------
+
+  /**
+   * Send what is due of a request's delivery under the member's delivery lock, then plan the next look: a failed part
+   * is tried again when its wait is over, and the delivery is given up when its window ends.
+   */
+  async #autoDeliver(member: MemberState, requestId: string): Promise<void> {
+    const key = `${member.key}\u0000${requestId}`;
+    clearTimeout(this.#deliveryTimers.get(key));
+    this.#deliveryTimers.delete(key);
+    member.uses++;
+    try {
+      const release = await member.delivery.acquire(this.#closing.signal);
+      try {
+        const handle = await this.#spaces.acquire(member.scope);
+        try {
+          const next = await this.#sendDelivery(handle.harness, member, requestId);
+          if (next !== undefined) this.#deliverAt(member, requestId, next);
+        } finally { handle.release(); }
+      } finally { release(); }
+    } catch (error) {
+      if (this.#closing.signal.aborted) return;
+      this.#report(error);
+      this.#deliverAt(member, requestId, Date.now() + deliveryRetryDelay(1, this.#limits.deliveryRetryMs));
+    } finally { member.uses--; this.#pruneMember(member); }
+  }
+
+  /** One timer per delivery. It takes the member again when it fires: the in-memory state may be pruned meanwhile. */
+  #deliverAt(member: MemberState, requestId: string, at: number): void {
+    if (this.#closing.signal.aborted) return;
+    const key = `${member.key}\u0000${requestId}`;
+    clearTimeout(this.#deliveryTimers.get(key));
+    const { scope, phone } = member;
+    const timer = setTimeout(() => {
+      this.#deliveryTimers.delete(key);
+      if (!this.#closing.signal.aborted) this.#track(this.#autoDeliver(this.#member(scope, phone), requestId));
+    }, Math.max(0, at - Date.now()));
+    timer.unref?.();
+    this.#deliveryTimers.set(key, timer);
+  }
+
+  /**
+   * Send the due parts of one delivery, part by part. Resolves to when it needs another look (a retry, or the end of its
+   * window), or undefined when nothing is left to do. A text part that is not sent holds the later ones: segments never
+   * arrive out of order. Each attempt commits `sending` before the platform call.
+   */
+  async #sendDelivery(harness: Harness, member: MemberState, requestId: string): Promise<number | undefined> {
+    const epoch = member.withdrawals;
+    const read = async () => (await memberRecords(harness, member.phone, this.#context)).requests[requestId];
+    const record = await read();
+    if (record === undefined) return undefined;
+    if (!undelivered(record)) { await this.#releaseSnapshots(harness, member, requestId); return undefined; }
+    const end = deliveryEnd(record.delivery!, this.#limits.deliveryWindowMs);
+    if (end <= Date.now()) { await this.#expire(harness, member, requestId); return undefined; }
+    const signal = AbortSignal.any([this.#closing.signal, AbortSignal.timeout(end - Date.now())]);
+    const due = (part: Readonly<DeliveryPart>) =>
+      part.state === "pending" || (part.state === "failed" && part.retryAt !== undefined && part.retryAt <= Date.now());
+    /** One part. "stop": later parts wait (a text segment never overtakes an earlier one); "abort": give up for now. */
+    const step = async (planned: Readonly<DeliveryPart>, send?: Send): Promise<"next" | "stop" | "abort"> => {
+      if (!openPart(planned)) return "next";
+      if (!due(planned)) return planned.kind === "file" ? "next" : "stop";
+      if (member.withdrawals !== epoch || signal.aborted) return "abort";
+      const started = await harness.commit(async tx => {
+        const stored = (await recordsOf(tx, member.phone)).requests[requestId]?.delivery;
+        const part = stored?.parts.find(x => x.id === planned.id);
+        if (stored?.abandoned !== undefined || part === undefined || !due(part)) return false;
+        part.state = "sending"; part.attempts++; part.at = Date.now(); delete part.error; delete part.retryAt;
+        return true;
+      }, this.#context);
+      if (!started) return "abort";
+      const outcome = await this.#sendPart(member, record, planned, signal, send);
+      const retryAt = await harness.commit(async tx => {
+        const part = (await recordsOf(tx, member.phone)).requests[requestId]?.delivery?.parts.find(x => x.id === planned.id);
+        if (part === undefined) return undefined;
+        const now = Date.now();
+        part.state = outcome.state; part.at = now;
+        if (outcome.error === undefined) delete part.error; else part.error = outcome.error;
+        if (outcome.state === "failed" && outcome.final !== true) part.retryAt = now + deliveryRetryDelay(part.attempts, this.#limits.deliveryRetryMs);
+        return part.retryAt;
+      }, this.#context);
+      if (outcome.state === "sent") return "next";
+      const result = outcome.state === "uncertain" ? "结果不确定，按已发出处理" : retryAt === undefined ? "失败，不再重试" : `失败，${Math.ceil((retryAt - Date.now()) / 1000)} 秒后重试`;
+      this.#report(new Error(`交付${result} - ${taskText(member, requestId)}, 分段: ${planned.id}, ${outcome.error ?? ""}`));
+      return retryAt !== undefined && planned.kind !== "file" ? "stop" : "next";
+    };
+    const parts = record.delivery!.parts;
+    for (let index = 0; index < parts.length;) {
+      let verdict: "next" | "stop" | "abort";
+      if (parts[index]!.kind === "markdown") {
+        // Consecutive text segments hold the conversation's send order: only the first carries the summary and @, so
+        // another reply in the same group must not land between them. Files and link notes do not hold it (uploads).
+        let last = index;
+        while (last < parts.length && parts[last]!.kind === "markdown") last++;
+        const run = parts.slice(index, last);
+        index = last;
+        verdict = await this.#outbound.sequence(targetOf(record.reply), async send => {
+          for (const planned of run) {
+            const each = await step(planned, send);
+            if (each !== "next") return each;
+          }
+          return "next" as const;
+        }, signal).catch(error => { if (signal.aborted) return "abort" as const; throw error; });
+      } else verdict = await step(parts[index++]!);
+      if (verdict !== "next") break;
+    }
+    if (this.#closing.signal.aborted) return undefined;
+    const after = await read();
+    if (after === undefined || !undelivered(after)) { await this.#releaseSnapshots(harness, member, requestId); return undefined; }
+    const retries = after.delivery!.parts.flatMap(part => part.state === "failed" && part.retryAt !== undefined ? [part.retryAt] : []);
+    // Without a retry due, what is left was cut off (the window's end, a concurrent change): look again shortly.
+    return Math.min(retries.length ? Math.min(...retries) : Date.now() + 1000, end);
+  }
+
+  /** The window of a delivery passed with parts unsent: give it up and free the snapshots it kept. */
+  async #expire(harness: Harness, member: MemberState, requestId: string): Promise<void> {
+    const left = await harness.commit(async tx => {
+      const record = (await recordsOf(tx, member.phone)).requests[requestId];
+      if (record?.delivery === undefined || !undelivered(record)) return undefined;
+      record.delivery.abandoned = { at: Date.now(), reason: "expired" };
+      return record.delivery.parts.filter(openPart).length;
+    }, this.#context);
+    if (left === undefined) return;
+    this.#attention.note("deliveryAbandoned", member.scope);
+    this.#report(new Error(`交付超时放弃 - ${taskText(member, requestId)}, 未发出的分段: ${left}`));
+    await this.#releaseSnapshots(harness, member, requestId);
+  }
+
+  /**
+   * One platform send of a part. Never throws: a send that may have reached the platform is uncertain. A final failure
+   * is one that sending again cannot fix (a missing note, an expired link, a changed or missing snapshot).
+   */
+  async #sendPart(member: MemberState, record: Readonly<RequestRecord>, part: Readonly<DeliveryPart>, signal: AbortSignal, held?: Send):
+    Promise<{ state: "sent" | "failed" | "uncertain"; error?: string; final?: true }> {
+    const reply = record.reply, target = targetOf(reply), options = { replyMsgId: reply.msgUid, signal };
+    let dispatched = false;
+    const settle = (outcome: SendOutcome) => outcome.status === "sent" ? { state: "sent" as const } : { state: outcome.status, error: outcome.reason };
+    try {
+      if (part.kind === "markdown") {
+        dispatched = true;
+        const message = replyMessage(reply, part.body ?? "", part.lead === true);
+        return settle(await (held ? held(message, options) : this.#outbound.send(target, message, options)));
+      }
+      if (part.kind === "links") {
+        // Each note is its own part and one platform message, so a confirmed note is never resent with a later one.
+        const note = part.note === undefined ? undefined : record.notes[part.note];
+        if (!note) return { state: "failed", error: "外链说明缺失", final: true };
+        const segments = splitText(await this.#outbound.links([note], signal));
+        if (segments.length !== 1) return { state: "failed", error: "外链说明超过单条消息上限", final: true };
+        dispatched = true;
+        return settle(await this.#outbound.send(target, textMessage(segments[0]!), options));
+      }
+      const file = part.file!;
+      let digest: string;
+      try { digest = await fileDigest(file.path, signal); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "failed", error: "快照文件已不存在", final: true }; throw error; }
+      if (digest !== file.sha256) return { state: "failed", error: "快照摘要不一致，拒绝发送", final: true };
+      const transfer = await transferFile({ kind: "local", path: file.path, size: file.size }, file.name, {
+        channel: sendChannel(this.#outbound, reply), relay: this.#options.relay, tempDir: userTmp(this.#options.layout, member.scope, member.phone),
+      }, signal, () => { dispatched = true; });
+      if (transfer.mode === "direct") return { state: "sent" };
+      dispatched = true;
+      return settle(await this.#outbound.send(target, textMessage(transfer.note), options));
+    } catch (error) {
+      if (error instanceof LinkUnavailable) return { state: "failed", error: error.message, final: true };
+      const uncertain = error instanceof SendNotConfirmed ? error.uncertain : dispatched;
+      return { state: uncertain ? "uncertain" : "failed", error: String(error) };
+    }
+  }
+
+  /** The receipt of an executed /stop or /clear (also after a restart replayed it). */
+  async #controlReceipt(member: MemberState, command: ControlCommand): Promise<string> {
+    const here = member.scope.kind === "direct" ? "单聊" : "本群";
+    return command === "/stop"
+      ? `⏹ 已停止你在${here}的当前任务，并取消排队中的消息。已发出的内容不会撤回。`
+      : `🧹 已为你在${here}开启新会话，下条消息从新会话开始，之前的聊天记录留在${member.scope.kind === "direct" ? "单聊库" : "群库"}里。其他人的聊天记录不受影响。`;
+  }
+
+  async #notify(reply: ReplyContext, text: string, mention = false): Promise<void> {
+    const sent = await sendNotice(this.#outbound, reply, text, { mention, signal: this.#closing.signal })
       .catch((error) => { this.#report(error); return false; });
-    if (!sent) this.#report(new Error(`回执未送达 - 群: ${member.groupId}, 用户: ${member.phone}`));
+    if (!sent && !this.#closing.signal.aborted) this.#report(new Error(`回执未送达 - 会话: ${reply.receiveId}, 消息: ${reply.msgUid}`));
   }
 
-  async #status(member: MemberState, callbackUrl: string): Promise<string> {
-    // Idle groups are not discovered at startup. A status query must still see their durable member/expiry records.
+  async #status(member: MemberState): Promise<string> {
+    // Idle spaces are not discovered at startup. A status query must still see their durable member/expiry records.
     if (member.conversationId === undefined) {
       let exists = false;
       try {
-        const info = await lstat(groupDatabasePath(this.#options.root, member.groupId));
-        if (!info.isFile()) throw new Error("群库不是普通文件");
+        const info = await lstat(spaceDatabase(this.#options.layout, member.scope));
+        if (!info.isFile()) throw new Error("会话库不是普通文件");
         exists = true;
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       if (exists) {
-        const handle = await this.#groups.acquire(member.groupId);
+        const handle = await this.#spaces.acquire(member.scope);
         try { member.conversationId = (await handle.harness.snapshot(MemberDirectory, member.phone, this.#context))?.conversationId; }
         finally { handle.release(); }
       }
     }
-    const rate = this.#outbound.rate(callbackUrl);
     let phase = "空闲";
     let waiting = 0;
     let tools = "暂无";
-    let taskSpan: string | undefined;
+    let attachments = "";
     let compaction: string | undefined;
+    let parked: string | undefined;
     if (member.conversationId !== undefined) {
-      const handle = await this.#groups.acquire(member.groupId);
+      const handle = await this.#spaces.acquire(member.scope);
       try {
         const items = (await inboxItems(handle.harness, member.conversationId, this.#context)).filter((item) => item.cancelled !== true);
         const live = await handle.harness.snapshot(LiveDoc, member.conversationId as ConversationId, this.#context);
@@ -1084,27 +1325,23 @@ export class DurableService {
         const running = runningTools(live);
         if (running.length) tools = running.join("、");
         if (live?.compactions?.length) phase = "压缩会话历史";
+        // Durable's crash-loop guard: a task cut off restartLimit times in a row without progress is not run again.
+        const blocked = (await handle.harness.inspect(this.#context)).tasks.filter((task) => task.record.conversationId === member.conversationId
+          && task.state.kind === "blocked" && task.state.reason === "restart_limit");
+        if (blocked.length) {
+          phase = "已停放";
+          parked = `${blocked.map((task) => `${task.record.kind}#${task.record.id}`).join("、")}，运行中连续 ${Math.max(...blocked.map((task) => task.record.restarts ?? 0))} 次` +
+            "被异常中断且没有进展，已停止自动重跑；发送 /stop 结束本次任务（或 /clear 重新开始）后可继续对话";
+        }
         const failed = live?.compactionFailure;
         if (failed !== undefined) compaction = `任务 ${failed.taskId}，${compactionReasonText(failed.reason)}：${failed.error.slice(0, 300)}`;
-        if (live?.run) {
-          const task = await handle.harness.getTask(live.run.taskId, this.#context);
-          taskSpan = task?.startedAt === undefined ? "未知" : `${Math.max(0, Math.floor((Date.now() - task.startedAt) / 1000))} 秒（含等待/重试）`;
-        }
+        const waitingFiles = unconsumed(await memberRecords(handle.harness, member.phone, this.#context));
+        if (waitingFiles.length) attachments = `\n待处理附件：${waitingFiles.length} 个（下一条消息会一并处理）`;
       } finally { handle.release(); }
     }
-    let text = "状态：" + phase + "\n等待处理的消息：" + waiting + "\n正在运行的工具：" + tools +
-      "\n待补发回复：" + this.#deliveries.pending(member.key).length + "\n机器人近1分钟发送额度用量：" + rate.used + "/" + rate.limit;
-    if (taskSpan !== undefined) text += "\nDurable 任务跨度：" + taskSpan;
+    let text = "状态：" + phase + "\n等待处理的消息：" + waiting + "\n正在运行的工具：" + tools + attachments;
+    if (parked !== undefined) text += "\n停放的任务：" + parked;
     if (compaction !== undefined) text += "\n最近一次会话历史压缩失败：" + compaction;
-    if (member.conversationId !== undefined) {
-      const handle = await this.#groups.acquire(member.groupId);
-      try {
-        const { expired, backlog, pending } = await memberResultStatus(handle.harness, member.phone, this.#context);
-        if (expired.length) text += `\n已过期结果：${expired.length} 个（最近记录最多 256 个）：${expired.slice(-8).join("、")}`;
-        if (backlog) text += `\n已过期结果：${backlog} 个已转入持久回收账本，等待物理处置`;
-        if (pending) text += `\n待物理回收：${pending} 个`;
-      } finally { handle.release(); }
-    }
     const retry = member.controlRetry ?? member.workerRetry;
     if (retry) text += `\n自动重试：第 ${retry.attempt} 次，约 ${Math.max(0, Math.ceil((retry.nextAt - Date.now()) / 1000))} 秒后\n最近错误：${retry.message}`;
     if (member.current !== undefined) {
@@ -1116,43 +1353,44 @@ export class DurableService {
 
   // ---- maintenance ----------------------------------------------------------------------------------------------------
 
-  /** Visit a bounded rotation of known groups, including idle groups evicted from the connection cache. */
+  /** Visit a bounded rotation of known spaces, including idle spaces evicted from the connection cache. */
   async maintain(now = Date.now()): Promise<void> {
-    await this.#groups.sweep();
-    const groups = this.#groups.knownGroups;
-    const selected = Array.from({ length: Math.min(8, groups.length) }, (_, i) => groups[(this.#maintenanceCursor + i) % groups.length]!);
-    this.#maintenanceCursor = groups.length ? (this.#maintenanceCursor + selected.length) % groups.length : 0;
-    for (const groupId of selected) {
+    await this.#spaces.sweep();
+    try { pruneAskIds(this.#ledger(), now); } catch (error) { this.#report(error); }
+    const spaces = this.#spaces.knownSpaces;
+    const selected = Array.from({ length: Math.min(8, spaces.length) }, (_, i) => spaces[(this.#maintenanceCursor + i) % spaces.length]!);
+    this.#maintenanceCursor = spaces.length ? (this.#maintenanceCursor + selected.length) % spaces.length : 0;
+    for (const scope of selected) {
       if (this.#closing.signal.aborted) return;
-      const handle = await this.#groups.acquire(groupId);
+      const handle = await this.#spaces.acquire(scope);
       try {
+        await this.#pruneSpace(scope, handle.harness, now).catch(error => this.#report(error));
         // No await between the idle check and publishing the gate. Admissions reserve member.uses
         // synchronously, and worker/control replay state covers work already admitted.
-        if (this.#reclaiming.has(groupId) || [...this.#members.values()].some(state => state.groupId === groupId
+        if (this.#reclaiming.has(scopeKey(scope)) || [...this.#members.values()].some(state => scopeKey(state.scope) === scopeKey(scope)
           && (state.uses || state.worker || state.gate || state.starting || state.replaying || state.current))) continue;
         const gate: ReclamationGate = { ...Promise.withResolvers<void>(), yield: false };
-        this.#reclaiming.set(groupId, gate);
+        this.#reclaiming.set(scopeKey(scope), gate);
         try {
-          const values = await idleGroupReferences(handle.harness, this.#context);
+          const values = await idleSpaceReferences(handle.harness, this.#context);
           if (!values) continue;
-          values.push(...this.#deliveries.groupReferences(groupId));
-          this.#closeout.sweepMetadata();
-          values.push(...closeoutReferences(this.#closeout.db, groupId));
-          // The gate keeps this snapshot of the whole group's references valid; it is searched, never rescanned per member.
-          const references = resultReferences(values);
           const members = await this.#memberList(handle.harness);
-          const start = (this.#memberCursors.get(groupId) ?? 0) % Math.max(1, members.length);
+          // Run records (reply texts, link notes, file paths) may name result files.
+          for (const member of members) values.push(await memberRecords(handle.harness, member.phone, this.#context));
+          // The gate keeps this snapshot of the whole space's references valid; it is searched, never rescanned per member.
+          const references = resultReferences(values);
+          const start = (this.#memberCursors.get(scopeKey(scope)) ?? 0) % Math.max(1, members.length);
           let visited = 0;
           for (const member of [...members.slice(start), ...members.slice(0, start)]) {
             // A waiting admission ends the pass between members; the next pass resumes with the next member.
             if (gate.yield || this.#closing.signal.aborted) break;
             visited++;
             // A persisted member visited only for maintenance has no new user activity.
-            const state = this.#member(groupId, member.phone, 0);
+            const state = this.#member(scope, member.phone, 0);
             state.uses++;
             try {
               state.conversationId = member.conversationId;
-              await this.#project(handle.harness, state);
+              await this.#syncStats(handle.harness, state);
               const live = await handle.harness.snapshot(LiveDoc, member.conversationId as ConversationId, this.#context);
               const busy = state.worker !== undefined || state.gate !== undefined || state.current !== undefined
                 || (await inboxItems(handle.harness, member.conversationId, this.#context)).length > 0
@@ -1162,30 +1400,52 @@ export class DurableService {
               try {
                 // The hold precedes the context read: a newly admitted message cannot start a call during deletion.
                 if (state.starting || state.current || state.worker) continue;
-                const places = memberPlaces({ root: this.#options.root, ...(this.#options.venvDir === undefined ? {} : { venvDir: this.#options.venvDir }) },
-                  groupId, member.phone);
+                const places = memberPlaces(this.#placesOptions(), scope, member.phone);
                 await recoverOfficeProfiles(places.tempDir, deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error));
                 await this.#results.member(handle.harness, state.phone, places.tempDir, now - this.#limits.resultRetentionMs, references).catch((error) => this.#report(error));
               } finally { release(); }
             } finally { state.uses--; this.#pruneMember(state, now); }
           }
-          if (members.length) this.#memberCursors.set(groupId, (start + visited) % members.length);
-          else this.#memberCursors.delete(groupId);
+          if (members.length) this.#memberCursors.set(scopeKey(scope), (start + visited) % members.length);
+          else this.#memberCursors.delete(scopeKey(scope));
         } finally {
-          this.#reclaiming.delete(groupId); gate.resolve();
+          this.#reclaiming.delete(scopeKey(scope)); gate.resolve();
         }
       } finally { handle.release(); }
     }
     for (const member of this.#members.values()) this.#pruneMember(member, now);
   }
 
-  /** Stop: cancel waits, close every group (runs stay live in storage and resume on the next start). */
+  /** Drop finished run records and old receipts. A receipt stays while its request is open or undelivered. */
+  async #pruneSpace(space: Scope, harness: Harness, now: number): Promise<void> {
+    const phones = (await this.#memberList(harness)).map(member => member.phone);
+    const voided = await harness.commit(async tx => {
+      const receipts = await tx.doc(ReceiptsDoc);
+      const records = new Map<string, Awaited<ReturnType<typeof recordsOf>>>();
+      const expired: [string, Attachment[]][] = [];
+      for (const phone of new Set([...phones, ...Object.values(receipts.items).map(receipt => receipt.phone)])) {
+        const own = await recordsOf(tx, phone);
+        pruneRecords(own, now, this.#settled);
+        expired.push([phone, expireAttachments(own, now, this.#downloads?.limits.retentionMs)]);
+        records.set(phone, own);
+      }
+      pruneReceipts(receipts, receipt => receipt.request !== undefined && records.get(receipt.phone)?.requests[receipt.request] !== undefined, now);
+      return expired;
+    }, this.#context);
+    for (const [phone, attachments] of voided) this.#discard(space, phone, attachments);
+  }
+
+  /** Stop: cancel waits, close every space (runs stay live in storage and resume on the next start). */
   async close(): Promise<void> {
     this.#closing.abort(new Error("服务正在关闭"));
+    for (const timer of this.#deliveryTimers.values()) clearTimeout(timer);
+    this.#deliveryTimers.clear();
     this.#cancel(new Error("服务正在关闭"));
     await Promise.allSettled([...this.#runtimes.values()].map((runtime) => runtime.door.close()));
+    // Downloads stop at the closing signal; an unfinished one stays pending and starts again at the next open.
+    await this.#downloads?.idle();
     try {
-      await this.#groups.closeAll();
+      await this.#spaces.closeAll();
     } finally {
       await Promise.allSettled([...this.#background]);
       this.#statsLedger?.close();
@@ -1200,93 +1460,132 @@ export class DurableService {
 
   // ---- wiring ---------------------------------------------------------------------------------------------------------
 
-  #harnessOptions(groupId: string): HarnessOptions {
+  #harnessOptions(scope: Scope): HarnessOptions {
     const { selection } = this.#options;
     const holder: { harness?: Harness } = {};
-    const door = groupDoor(holder, { onReport: (error) => this.#report(error),
+    const door = spaceDoor(holder, { onReport: (error) => this.#report(error), onNotSent: () => this.#attention.note("notSent", scope),
       ...(this.#options.closeout ? { prepareTool: (name, args, api, context) => closeoutTool(name, args, api, context, this.#options.closeout!, this.#limits.runTimeoutMs) } satisfies Partial<import("./door.ts").DoorOptions> : {}),
-      beforeDispatch: (phone, signal) => this.#waitForRun(memberKey(groupId, phone), signal),
+      beforeDispatch: (phone, signal) => this.#waitForRun(memberKey(scope, phone), signal),
       dispatchError: (phone) => {
-        const current = this.#members.get(memberKey(groupId, phone))?.current;
+        const current = this.#members.get(memberKey(scope, phone))?.current;
         if (!current) return;
         current.deadlineError ??= this.#totalTimeout(current.requestId, current.startedAt);
         return current.deadlineError?.error;
       } });
     for (const receipt of this.#receipts.values()) {
-      if (receipt.groupId === groupId) receipt.ticket = door.controlReceived(receipt.phone, receipt.requestId);
+      if (scopeKey(receipt.scope) === scopeKey(scope)) receipt.ticket = door.controlReceived(receipt.phone, receipt.requestId);
     }
-    const runtime: GroupRuntime = { door, holder, refreshed: new Map(), epoch: 0 };
-    this.#runtimes.set(groupId, runtime);
+    const runtime: SpaceRuntime = { door, holder, refreshed: new Map(), epoch: 0 };
+    this.#runtimes.set(scopeKey(scope), runtime);
+    // Hooks observe through snapshots; their writes to the run record are commits of their own.
+    const write: RecordWriter = async (phone, requestId, change) => {
+      const harness = holder.harness;
+      if (harness === undefined) throw new Error("会话库未打开，不能写任务记录");
+      await harness.commit(async tx => {
+        const record = (await recordsOf(tx, phone)).requests[requestId];
+        if (record !== undefined && record.closedAt === undefined) change(record);
+      }, this.#context);
+    };
     const registry = createRegistry();
     const install = (extension: Extension) => registry.install(door.wrapTools(extension));
-    install(door.extension());
-    if (this.#options.closeout) install(closeoutExtension(this.#closeout, this.#options.closeout, this.#limits.runTimeoutMs));
-    if (this.#options.materials !== false) install(this.#materials(groupId, runtime));
-    for (const extension of groupExtensions({
-      root: this.#options.root, groupId,
-      ...(this.#options.venvDir === undefined ? {} : { venvDir: this.#options.venvDir }),
-      modules: this.#options.modules, relay: this.#options.relay, delivery: this.#delivery(groupId),
-      ...(this.#options.closeout ? { closeout: this.#closeout } : {}),
+    if (this.#options.closeout) install(closeoutExtension(write, this.#options.closeout, this.#limits.runTimeoutMs));
+    if (this.#options.materials !== false) install(this.#materials(runtime));
+    for (const extension of spaceExtensions({
+      ...this.#placesOptions(), scope,
+      modules: this.#options.modules, relay: this.#options.relay, outbound: this.#outbound,
+      closeout: this.#options.closeout !== undefined,
       ...(this.#options.auxiliary ? { auxiliary: { config: this.#options.auxiliary, budget: this.#auxiliaryBudget, door } } : {}),
       ...(this.#options.mcp ? { mcp: { manager: this.#options.mcp, door } } : {}),
     })) install(extension);
-    for (const extension of this.#options.extensions?.(groupId) ?? []) install(extension);
-    return { models: door.wrap(selection.runtime as unknown as Models), registry, settings: selection.harnessSettings };
+    for (const extension of this.#options.extensions?.(scope) ?? []) install(extension);
+    return { models: door.wrap(selection.runtime as unknown as Models), registry, settings: selection.harnessSettings,
+      onReport: (error, info) => this.#durableReport(scope, error, info) };
   }
 
-  /** Startup gate of a group: before scheduling resumes. */
-  async #prepare(harness: Harness, groupId: string, context: Context): Promise<void> {
-    const runtime = this.#runtimes.get(groupId)!;
+  /** Durable's own reports (faulted or parked tasks, failing hooks and listeners, a failed Session), with what they are about. */
+  #durableReport(scope: Scope, error: unknown, info: ReportInfo): void {
+    const task = "task" in info && info.task !== undefined ? `，任务 ${info.task.kind}#${info.task.id}，会话 ${info.task.conversationId}` : "";
+    const extension = "extension" in info && info.extension !== undefined ? `，扩展 ${info.extension}` : "";
+    const parked = info.type === "task_parked" ? "；已停止自动重跑，成员可用 /status 查看，/stop 或 /clear 结束" : "";
+    if (info.type === "task_parked") this.#attention.note("parked", scope);
+    else if (info.type === "task_faulted" || info.type === "session_failed" || info.type === "migration_failed") this.#attention.note("faulted", scope);
+    this.#report(new Error(`Durable 报告 ${info.type}（${scopeLabel(scope)}${task}${extension}）：${error instanceof Error ? error.message : String(error)}${parked}`, { cause: error }));
+  }
+
+  /** Startup gate of a space: before scheduling resumes. */
+  async #prepare(harness: Harness, scope: Scope, context: Context): Promise<void> {
+    const runtime = this.#runtimes.get(scopeKey(scope))!;
     runtime.holder.harness = harness;
     runtime.epoch = await harness.commit(async (tx) => {
       const controls = await tx.doc(ControlsDoc), epoch = controls.epoch ?? 0;
-      if (!Number.isSafeInteger(epoch) || epoch < 0 || epoch >= Number.MAX_SAFE_INTEGER) throw new Error("群库的控制世代无效");
+      if (!Number.isSafeInteger(epoch) || epoch < 0 || epoch >= Number.MAX_SAFE_INTEGER) throw new Error("会话库的控制世代无效");
       return controls.epoch = epoch + 1;
     }, context);
     const controls = await pendingControls(harness, context);
     runtime.door.loadControls(controls.map(({ phone, requestId, seq }) => ({ phone, requestId, seq })));
+    // A recovered generation or summarize request names its conversation only by its provider session.
+    await runtime.door.loadSessions(context);
     const kicks: MemberState[] = [];
+    const deliveries: { member: MemberState; requestId: string }[] = [];
+    const downloads: { phone: string; id: string }[] = [];
     for (const { phone, conversationId } of await this.#memberList(harness)) {
-      await ensureStorageIdentity(this.#options.root, groupId, phone, this.#options.stateDb);
-      await recoverOfficeProfiles(userTempDir(this.#options.root, groupId, phone), deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error));
-      const member = this.#member(groupId, phone);
+      await ensureStorageIdentity(this.#options.layout, scope, phone, this.#options.stateDb);
+      await recoverOfficeProfiles(userTmp(this.#options.layout, scope, phone), deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error));
+      const member = this.#member(scope, phone);
       member.conversationId = conversationId;
+      // Usage committed since the last sync (a background compaction, a run before a crash) counts from here.
+      await this.#syncStats(harness, member);
       const items = await inboxItems(harness, conversationId, context);
       for (const item of items) this.#addRequest(item.requestId, member.key);
       const head = items[0];
       if (head?.startedAt !== undefined && head.cancelled !== true) {
         member.current = { requestId: head.requestId, startedAt: head.startedAt };
-        markRunning(member.groupId, member.phone, taskNumber(head.requestId));
+        markRunning(member.scope, member.phone, taskNumber(head.requestId));
       }
       if (head !== undefined) kicks.push(member);
+      // Parts an ended process left `sending` may have reached the platform: uncertain, counted as sent.
+      const records = await memberRecords(harness, phone, context);
+      if (Object.values(records.requests).some(record => record.delivery?.parts.some(part => part.state === "sending") || record.files.some(file => file.state === "sending"))) {
+        await harness.commit(async tx => { settleInterrupted(await recordsOf(tx, phone)); }, context);
+      }
+      for (const record of pendingDeliveries(await memberRecords(harness, phone, context))) deliveries.push({ member, requestId: record.requestId });
+      for (const attachment of Object.values(records.attachments)) if (attachment.state === "pending") downloads.push({ phone, id: attachment.id });
     }
     // Every restored head's original deadline is visible to the door before any task is scheduled.
     harness.resume();
     this.#track((async () => {
       for (const control of controls) {
-        const member = this.#member(groupId, control.phone);
+        const member = this.#member(scope, control.phone);
         const release = this.#hold(member);
         const run: Promise<void> = (member.replaying ?? Promise.resolve()).then(async () => {
-          const handle = await this.#groups.acquire(groupId);
-          try { await this.#execute(handle.harness, member, control.command, control.requestId); } finally { handle.release(); }
+          const handle = await this.#spaces.acquire(scope);
+          try { await this.#execute(handle.harness, member, control.command, control.requestId, control.reply); } finally { handle.release(); }
+          // The receipt goes out only after execution, which also removes the control: one still waiting was never answered.
+          if (control.reply) await this.#notify(control.reply, await this.#controlReceipt(member, control.command));
         }).finally(release);
         const replaying = run.catch((error) => this.#report(error));
         member.replaying = replaying;
         void replaying.finally(() => { if (member.replaying === replaying) member.replaying = undefined; this.#pruneMember(member); });
       }
+      for (const { phone, id } of downloads) this.#downloads?.schedule(scope, phone, id);
       for (const member of kicks) this.#kick(member);
+      for (const { member, requestId } of deliveries) this.#track(this.#autoDeliver(member, requestId));
     })());
   }
 
   async #pendingWork(harness: Harness, context: Context): Promise<boolean> {
     if ((await pendingControls(harness, context)).length) return true;
-    for (const { conversationId } of await this.#memberList(harness)) {
+    for (const { phone, conversationId } of await this.#memberList(harness)) {
       if ((await inboxItems(harness, conversationId, context)).length) return true;
+      const records = await memberRecords(harness, phone, context);
+      if (Object.values(records.attachments).some(attachment => attachment.state === "pending")) return true;
+      // Open parts are sent at startup (failed ones when their retry is due), or the delivery is given up when its window passed.
+      if (pendingDeliveries(records).length) return true;
     }
     return false;
   }
 
-  /** Member conversations of a group: ownerless conversations with an identity. */
+  /** Member conversations of a space: ownerless conversations with an identity. */
   async #memberList(harness: Harness): Promise<{ phone: string; conversationId: number }[]> {
     const ids = await conversationIds(harness, this.#context, true);
     const members: { phone: string; conversationId: number }[] = [];
@@ -1297,38 +1596,9 @@ export class DurableService {
     return members;
   }
 
-  #delivery(groupId: string): SendDelivery {
-    return {
-      callbackUrl: (member) => {
-        const url = this.#members.get(memberKey(groupId, member.phone))?.callbackUrl;
-        if (url === undefined) throw new Error("服务重启后还没有收到你的新消息，暂时无法向群里发送文件；请再发一条消息后重试");
-        return url;
-      },
-      notes: (member) => this.#notes(this.#member(groupId, member.phone)),
-    };
-  }
-
-  /** Link notes go to the running item's outbox row at once (a crash keeps them; the final reply takes them over). */
-  #notes(member: MemberState): OutboundNotes {
-    const row = () => notesRow(member.current?.requestId ?? `unattached:${randomUUID()}`);
-    return {
-      add: (note, attachment) => {
-        const id = row();
-        const existing = this.#deliveries.find(member.key, id);
-        if (attachment && existing?.attachments.some(saved => saved.original === note &&
-          saved.reference.url === attachment.reference.url && saved.reference.backend === attachment.reference.backend)) return;
-        this.#deliveries.put(member.key, id, [existing?.text, note].filter(Boolean).join("\n\n"),
-          [...(existing?.attachments ?? []), ...(attachment ? [attachment] : [])]);
-      },
-      peek: () => [],
-      references: () => [],
-      clear: () => {},
-    };
-  }
-
-  /** Refresh the group's materials index once per run, before its first request. */
-  #materials(groupId: string, runtime: GroupRuntime): Extension {
-    const root = this.#options.root;
+  /** Refresh the application's materials index once per run, before its first request; every space shares it. */
+  #materials(runtime: SpaceRuntime): Extension {
+    const { layout } = this.#options;
     return defineExtension({
       name: "mixin.materials",
       hooks: [hook(GenerationTask, {
@@ -1336,12 +1606,12 @@ export class DurableService {
           const taskId = api.taskId as number;
           let refresh = runtime.refreshed.get(taskId);
           if (refresh === undefined) {
-            // A new group has neither directory yet (the tools create them on their first call); the index reports its own errors.
-            const workspaceDir = resolve(groupWorkspaceDir(root, groupId));
-            refresh = Promise.all([workspaceDir, groupIndexDir(root, groupId)].map((dir) => mkdir(dir, { recursive: true })))
+            // The default workspace is created on demand; an external one must exist (the index reports its own errors).
+            const workspaceDir = resolve(layout.workspace);
+            refresh = Promise.all([...layout.externalWorkspace ? [] : [workspaceDir], layout.index].map((dir) => mkdir(dir, { recursive: true })))
               .catch(() => {})
               .then(() => ensureMaterialsIndex({
-                workspaceDir, indexPath: resolve(materialsIndexPath(root, groupId)), ignorePath: resolve(materialsIgnorePath(root, groupId)),
+                workspaceDir, indexPath: resolve(layout.materialsIndex), ignorePath: resolve(layout.materialsIgnore),
               }))
               .then(() => {});
             runtime.refreshed.set(taskId, refresh);
@@ -1354,48 +1624,80 @@ export class DurableService {
     });
   }
 
+  /** Paths the tools of every space use: the shared layout and document environment. */
+  #placesOptions(): { layout: Layout; venvDir: string } {
+    return { layout: this.#options.layout, venvDir: this.#options.venvDir ?? resolve(this.#options.layout.documentEnv) };
+  }
+
+  #ledger(): Database {
+    return this.#statsLedger ??= openStatsLedger(this.#options.layout.stats);
+  }
+
+  /** Which pruning candidates are settled in the ledger; none while it cannot be read (the records wait for a sync). */
+  readonly #settled = (candidates: readonly RequestRecord[]): ReadonlySet<string> => {
+    try { return settledAsks(this.#ledger(), candidates.map(record => ({ requestId: record.requestId, at: record.createdAt }))); }
+    catch { return new Set(); }
+  };
+
+  /** Count an admitted message. Best effort: the next sync counts it from the run record. */
+  #countAsk(scope: Scope, phone: string, requestId: string, at: number): void {
+    try { countAsk(this.#ledger(), scope, phone, requestId, at); } catch (error) { this.#report(error); }
+  }
+
+  /** The member's conversation, created if needed; once committed, its provider session may reach the provider. */
+  async #conversation(harness: Harness, member: MemberState): Promise<Conversation> {
+    const { conversation } = await memberConversation(harness, member.scope, member.phone,
+      { model: this.#options.selection.ref, thinkingLevel: this.#options.selection.thinkingLevel }, this.#context);
+    member.conversationId = conversation.id;
+    await this.#runtimes.get(scopeKey(member.scope))?.door.bind(conversation.id, this.#context);
+    return conversation;
+  }
+
   /**
-   * Count the member's new usage into the ledger. Best effort: the cursor stays where it was on failure and the next
-   * projection catches up; a failure because the service is closing is not reported.
+   * Count the member's asks and usage growth into the ledger. Best effort: a failed sync changes nothing and the next one
+   * catches up; a failure because the service is closing is not reported.
    */
-  async #project(harness: Harness, member: MemberState): Promise<void> {
-    if (member.conversationId === undefined || this.#closing.signal.aborted) return;
+  async #syncStats(harness: Harness, member: MemberState): Promise<void> {
+    if (this.#closing.signal.aborted) return;
     try {
-      const db = this.#statsLedger ??= openStatsLedger(this.#options.root);
-      await projectConversation(db, harness, { groupId: member.groupId, phone: member.phone, conversationId: member.conversationId }, this.#context);
+      const regressed = await syncMemberStats(this.#ledger(), harness,
+        { scope: member.scope, phone: member.phone, conversationId: member.conversationId }, this.#context);
+      if (regressed.length) {
+        this.#attention.note("statsRegressed", member.scope);
+        log.warn(`统计累计值回退（会话库被替换为较早的副本），已按当前值重设基准，本次不入账 - ${scopeLabel(member.scope)}, 用户: ${member.phone}, 项目: ${regressed.join("、")}`);
+      }
     } catch (error) {
       if (!this.#closing.signal.aborted) this.#report(error);
     }
   }
 
-  #member(groupId: string, phone: string, lastUsed = Date.now()): MemberState {
-    const key = memberKey(groupId, phone);
+  #member(scope: Scope, phone: string, lastUsed = Date.now()): MemberState {
+    const key = memberKey(scope, phone);
     let member = this.#members.get(key);
     if (member === undefined) {
-      member = { key, groupId, phone, again: false, controls: Promise.resolve(), workProgress: 0, aborted: new Map(), attempted: new Set(),
+      member = { key, scope, phone, again: false, deciding: new Set(), controls: Promise.resolve(), workProgress: 0, aborted: new Map(), withdrawals: 0,
         admission: new AsyncSemaphore(1), delivery: new AsyncSemaphore(1), uses: 0, lastUsed };
       this.#members.set(key, member);
     }
     return member;
   }
 
-  async #closedGroup(groupId: string, harness?: Harness): Promise<void> {
-    const runtime = this.#runtimes.get(groupId);
+  async #closedSpace(scope: Scope, harness?: Harness): Promise<void> {
+    const runtime = this.#runtimes.get(scopeKey(scope));
     if (!runtime || (runtime.holder.harness !== undefined && runtime.holder.harness !== harness)) return;
     // Remove the same instance before awaiting its door: a late close must not discard a newly opened runtime.
-    this.#runtimes.delete(groupId);
+    this.#runtimes.delete(scopeKey(scope));
     runtime.holder.harness = undefined;
     runtime.refreshed.clear();
     await runtime.door.close();
-    for (const member of this.#members.values()) if (member.groupId === groupId) this.#pruneMember(member);
+    for (const member of this.#members.values()) if (scopeKey(member.scope) === scopeKey(scope)) this.#pruneMember(member);
   }
 
   #pruneMember(member: MemberState, now = Date.now()): void {
     // A control receipt always holds this member's gate and uses count until its ticket is released.
     if (member.uses || member.worker || member.gate || member.starting || member.replaying || member.current
-      || member.workerRetry || member.controlRetry || member.attempted.size || this.#deliveries.hasPending(member.key)
-      || this.#memberRequests.has(member.key)) return;
-    if (this.#runtimes.has(member.groupId) && now - member.lastUsed < this.#limits.memberIdleMs) return;
+      || member.workerRetry || member.controlRetry || this.#memberRequests.has(member.key)) return;
+    if (this.#runtimes.has(scopeKey(member.scope)) && now - member.lastUsed < this.#limits.memberIdleMs) return;
     if (this.#members.get(member.key) === member) this.#members.delete(member.key);
   }
 
@@ -1479,13 +1781,22 @@ export class DurableService {
   }
 }
 
-/** The DeliveryStore session of a member, shared with persisted pending replies. */
-export function memberKey(groupId: string, phone: string): string {
-  return JSON.stringify([groupId, phone]);
+/** The in-memory key of a member (space, phone). */
+export function memberKey(scope: Scope, phone: string): string {
+  return JSON.stringify([scopeKey(scope), phone]);
 }
 
-const notesRow = (requestId: string) => `notes:${requestId}`;
-const replyRow = (requestId: string) => `reply:${requestId}`;
+/** A final reply: its segments (the first one leads), then one text part per link note. */
+function replyDelivery(reply: ReplyContext, body: string, notes: readonly unknown[], now: number): Delivery {
+  const parts: DeliveryPart[] = replySegments(reply, body).map((segment, index) => ({
+    id: `m${index}`, kind: "markdown", body: segment, ...(index === 0 ? { lead: true as const } : {}), state: "pending", attempts: 0,
+  }));
+  notes.forEach((_, note) => parts.push({ id: `l${note}`, kind: "links", note, state: "pending", attempts: 0 }));
+  return { kind: "reply", createdAt: now, parts };
+}
+
+/** A terminal error is delivered like a reply: it leads (with the @ in a group) and keeps the run's link notes. */
+const failureDelivery = replyDelivery;
 
 const retryDelay = (attempt: number) => Math.min(100 * 2 ** Math.min(attempt, 9), 30_000);
 function retryWait(ms: number, signal: AbortSignal): Promise<void> {
@@ -1505,8 +1816,8 @@ function taskNumber(requestId: string): string {
   return requestId.replace(/^(?:msg|ctl):/, "").slice(0, 8);
 }
 
-function taskText(member: Pick<MemberState, "groupId" | "phone">, requestId: string): string {
-  return `群: ${member.groupId}, 用户: ${member.phone}, 任务: ${taskNumber(requestId)}`;
+function taskText(member: Pick<MemberState, "scope" | "phone">, requestId: string): string {
+  return `${scopeLabel(member.scope)}, 用户: ${member.phone}, 任务: ${taskNumber(requestId)}`;
 }
 
 function compactionReasonText(reason: string): string {

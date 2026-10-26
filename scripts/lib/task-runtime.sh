@@ -68,6 +68,50 @@ task_runtime_prepare() {
     task_runtime_manifest check
 }
 
+# Reclaim only this deployment's unreferenced copies on a separate task daemon. The caller holds
+# the deployment lock and has completed activation: before that, the previous image is needed for
+# rollback even when no task container currently uses it. No runtime GC, global prune or force rm.
+task_runtime_cleanup_images() {
+    local project daemon current images image facts used failed=0
+    [ "${DEPLOYMENT_COMMITTED:-0}" = 1 ] && [ ! -e "$PROJECT_DIR/data/state/deploy-transaction" ] &&
+        [ ! -L "$PROJECT_DIR/data/state/deploy-transaction" ] || {
+        echo '部署事务尚未完成，保留任务 daemon 的所有镜像' >&2; return 1;
+    }
+    task_runtime_read "$PROJECT_DIR/data/state/task-runtime" || return 1
+    task_runtime_check_endpoint "$SERVICE_USER" "$DOCKER_ROOTLESS" || return 1
+    daemon="$(candidate_daemon_id)" || return 1
+    # The shared daemon already follows the service's tag lifecycle. Do not change that policy.
+    [ "$daemon" != "$TASK_DOCKER_ID" ] || return 0
+    candidate_value_valid image_id "$IMAGE_ID" || return 1
+    project="$(candidate_project_id "$PROJECT_DIR")" || return 1
+    candidate_value_valid project_id "$project" || return 1
+    current="$(docker --host "$TASK_DOCKER_ENDPOINT" image inspect --format \
+        "{{.Id}}|{{index .Config.Labels \"$CANDIDATE_LABEL_PROJECT\"}}" "$IMAGE_ID")" || return 1
+    [ "$current" = "$IMAGE_ID|$project" ] || {
+        echo '无法确认当前任务镜像及其项目归属，保留其他镜像' >&2; return 1;
+    }
+    images="$(docker --host "$TASK_DOCKER_ENDPOINT" image ls --all --quiet --no-trunc \
+        --filter "label=$CANDIDATE_LABEL_PROJECT=$project")" || return 1
+    while IFS= read -r image; do
+        [ -n "$image" ] || continue
+        candidate_value_valid image_id "$image" || return 1
+        [ "$image" != "$IMAGE_ID" ] || continue
+        facts="$(docker --host "$TASK_DOCKER_ENDPOINT" image inspect --format \
+            "{{.Id}}|{{index .Config.Labels \"$CANDIDATE_LABEL_PROJECT\"}}|{{len .RepoTags}}|{{len .RepoDigests}}" "$image")" || return 1
+        # Recheck immutable ownership and leave any explicitly named/pinned image alone.
+        [ "$facts" = "$image|$project|0|0" ] || continue
+        # Include stopped containers; ancestor also conservatively keeps images used by descendants.
+        used="$(docker --host "$TASK_DOCKER_ENDPOINT" ps --all --quiet --no-trunc --filter "ancestor=$image")" || return 1
+        [ -z "$used" ] || continue
+        # Docker rejects a concurrent container reference. --no-prune keeps unrelated parent layers/images.
+        if ! docker --host "$TASK_DOCKER_ENDPOINT" image rm --no-prune "$image"; then
+            echo "任务镜像清理未完成，保留后重试：$image" >&2
+            failed=1
+        fi
+    done <<< "$images"
+    return "$failed"
+}
+
 task_runtime_record_previous() {
     local snapshot="$1" cid="${ORIGINAL_CONTAINER_ID:-}"
     [ -z "$cid" ] || [[ "$cid" =~ ^[a-f0-9]{64}$ ]] || { echo '原容器身份无效' >&2; return 1; }
@@ -102,11 +146,11 @@ task_runtime_retire_previous() {
 
 task_runtime_manifest() {
     local command="$1" extra=()
-    if [ "$HOST_GROUP_DATA_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then extra=(--groups "$HOST_GROUP_DATA_ROOT"); fi
+    if [ -n "${HOST_WORKSPACE_ROOT:-}" ]; then extra=(--workspace "$HOST_WORKSPACE_ROOT"); fi
     # check does not change the active manifest or take the old controller's lock.
     docker run --rm --user "$SERVICE_USER" --read-only --network none --cap-drop ALL --security-opt no-new-privileges \
         --tmpfs /tmp:rw,nosuid,nodev,size=16m -e HOME=/tmp \
-        "${TASK_RUNTIME_ARGS[@]}" "${GROUP_ROOT_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" \
+        "${TASK_RUNTIME_ARGS[@]}" "${WORKSPACE_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" \
         "$IMAGE_ID" bun run scripts/runtime/task-deployment.ts "$command" --image "$IMAGE_ID" \
         --data "$(realpath -- "$PROJECT_DIR/data")" "${extra[@]}"
 }

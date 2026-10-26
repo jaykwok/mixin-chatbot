@@ -45,7 +45,7 @@ const crashing = !!(request.crash || request.window);
 const scope: MemberScope = { async withMember(_paths, _member, _mode, run) {
   return run({ calls: {}, liveWork: false, protectedPath: () => false, settle: async () => {} });
 } };
-const archive = () => ({ root: request.groups, state: join(request.groups, "..", "state.sqlite"), archive: join(request.groups, ".reclamation/backup/rm"),
+const archive = () => ({ root: request.groups, state: join(request.groups, "..", "state.sqlite"), archive: join(request.groups, "state/reclamation/backup/rm"),
   scope, legacy: true, journal: request.journal });
 // Loaded only for reclamation requests: the durable modules make every other child slower to start.
 const reclamation = async () => ({ module: await import("../../src/maintenance/reclaim.ts"), options: { root: request.groups,

@@ -11,11 +11,11 @@ import type { AssistantMessage, Models } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { AssistantEntry, type Conversation, type HarnessSettings, ProviderDoc } from "@earendil-works/pi-durable";
 import { openModelRuntime, openSettings } from "../../src/core/model-config.ts";
-import { AttemptsDoc } from "../../src/durable/attempts.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { openModelSelection, selectModel } from "../../src/durable/models.ts";
 import { type GroupHarness, openGroupHarness } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 type Seen = { path: string; authorization: string | null; headers: Record<string, string>; body: Record<string, unknown> };
 const seen: Seen[] = [];
@@ -81,7 +81,7 @@ await writeFile(modelsPath, JSON.stringify({
     },
     "local-env": { api: "openai-completions", baseUrl: base, apiKey: `$${ENV_KEY}`, models: [model("chat")] },
     "local-command": { api: "openai-completions", baseUrl: base, apiKey: "!echo synthetic-command-key", models: [model("chat")] },
-    "local-responses": { api: "openai-responses", baseUrl: base, apiKey: "synthetic-literal-key", models: [tuned(), model("plain", { reasoning: true })] },
+    "local-responses": { api: "openai-responses", baseUrl: base, apiKey: "synthetic-literal-key", models: [tuned(), model("plain", { reasoning: true }), model("wide", { contextWindow: 256000 })] },
     "local-azure": { api: "azure-openai-responses", baseUrl: base, apiKey: "synthetic-literal-key", models: [tuned(), model("plain", { reasoning: true })] },
   },
 }));
@@ -104,7 +104,7 @@ function open(models: Models | ModelRuntime, options: Parameters<typeof openGrou
 /** One turn of member m1 on `ref`; returns what the server received, with the conversation's pi.provider id normalised. */
 async function turn(opened: GroupHarness, ref: { provider: string; modelId: string }, thinkingLevel: "off" | "high" = "off") {
   const before = seen.length;
-  const { conversation } = await memberConversation(opened.harness, "group-a", "m1", { model: ref, thinkingLevel }, context);
+  const { conversation } = await memberConversation(opened.harness, scopeOf("group-a"), "m1", { model: ref, thinkingLevel }, context);
   const settled = await (await conversation.submit({ type: "input", content: "同一个问题", requestId: "t1" }, context)).wait(context);
   const own = (await opened.harness.snapshot(ProviderDoc, conversation.id, context))?.sessionId;
   const requests = seen.slice(before);
@@ -134,14 +134,49 @@ describe("model selection and Durable settings", () => {
       compaction: { enabled: true, reserveTokens: 1024, keepRecentTokens: 2048, backgroundTokens: 4000 },
       followUpMode: "one-at-a-time",
       steeringMode: "one-at-a-time",
+      // Stated, not defaulted: a failed run keeps what Durable queued behind it; a crash loop parks after 5 cut-offs.
+      afterFailedRun: "keep",
+      restartLimit: 5,
       // Pi 1.0.3: tool progress every 20 ms (codemode sub-calls wait for it), answer progress at Durable's 100 ms.
       progress: { partialIntervalMs: 100, outputIntervalMs: 20 },
       contextRetentionMs: 600000,
     });
-    expect(selection.notices).toEqual([]);
     const reasoning = await openModelSelection({ modelsPath, modelsStorePath, settingsPath: await settingsFile({ defaultProvider: "local-key", defaultModel: "tuned", defaultThinkingLevel: "high" }) });
     expect(reasoning.thinkingLevel).toBe("high");
     expect(reasoning.harnessSettings.stream).toEqual({ timeoutMs: 120000, maxRetries: 0, maxRetryDelayMs: 5000 });
+    // The runtime setting is only the fallback: an explicit settings.json value wins.
+    const explicit = await openModelSelection({ modelsPath, modelsStorePath, cacheRetention: "long", settingsPath: await settingsFile({
+      defaultProvider: "local-key", defaultModel: "chat", durable: { stream: { cacheRetention: "none" } } }) });
+    expect(explicit.harnessSettings.stream?.cacheRetention).toBe("none");
+  });
+
+  test("per-model budgets go to Durable as native modelOverrides, each with the background threshold of its own window", async () => {
+    const overrides = {
+      // The selected model (window 32000): a reserve this large leaves no room for background compaction.
+      "local-key/chat": { reserveTokens: 28000 },
+      // Another catalogue model (window 256000): an eighth of its window, 32000.
+      "local-responses/wide": { keepRecentTokens: 30000 },
+      // Not in the catalogue: passed on as configured, no threshold guessed.
+      "gone/model": { reserveTokens: 1 },
+    };
+    const compaction = async (extra: object = {}) => (await openModelSelection({ modelsPath, modelsStorePath, settingsPath: await settingsFile({
+      defaultProvider: "local-key", defaultModel: "chat",
+      durable: { compaction: { reserveTokens: 1024, keepRecentTokens: 2048, modelOverrides: overrides, ...extra } },
+    }) })).harnessSettings.compaction;
+    expect(await compaction()).toEqual({ enabled: true, reserveTokens: 1024, keepRecentTokens: 2048, backgroundTokens: 4000, modelOverrides: {
+      "local-key/chat": { reserveTokens: 28000, backgroundTokens: 0 },
+      "local-responses/wide": { keepRecentTokens: 30000, backgroundTokens: 32000 },
+      "gone/model": { reserveTokens: 1 },
+    } });
+    // A configured threshold wins for the harness-wide policy and every model the catalogue knows.
+    expect(await compaction({ backgroundTokens: 5000 })).toEqual({ enabled: true, reserveTokens: 1024, keepRecentTokens: 2048, backgroundTokens: 5000, modelOverrides: {
+      "local-key/chat": { reserveTokens: 28000, backgroundTokens: 5000 },
+      "local-responses/wide": { keepRecentTokens: 30000, backgroundTokens: 5000 },
+      "gone/model": { reserveTokens: 1 },
+    } });
+    // Without overrides Durable gets none, and the defaults (reserve 16384, keep 20000) leave a 32000 window blocking only.
+    expect((await openModelSelection({ modelsPath, modelsStorePath, settingsPath: await settingsFile({ defaultProvider: "local-key", defaultModel: "chat" }) }))
+      .harnessSettings.compaction).toEqual({ enabled: true, reserveTokens: 16384, keepRecentTokens: 20000, backgroundTokens: 0 });
   });
 
   test("unsupported settings are refused and require reconfiguration", async () => {
@@ -234,7 +269,7 @@ describe("credentials and headers through the door", () => {
       try {
         const keys: (string | null)[] = [];
         const transformed: (string | undefined)[] = [];
-        const { conversation } = await memberConversation(opened.harness, "group-a", "m1", { model: { provider: "local-key", modelId: "chat" } }, context);
+        const { conversation } = await memberConversation(opened.harness, scopeOf("group-a"), "m1", { model: { provider: "local-key", modelId: "chat" } }, context);
         for (const requestId of ["r1", "r2"]) {
           const before = seen.length;
           expect((await (await conversation.submit({ type: "input", content: "轮换凭据", requestId }, context)).wait(context)).status).toBe("done");
@@ -266,18 +301,17 @@ describe("D0 P05 on the project's ModelRuntime", () => {
         plan.fail = 1;
         const result = await turn(opened, selection.ref);
         const entries = await assistants(result.conversation);
-        const starts = Object.values((await opened.harness.snapshot(AttemptsDoc, result.conversation.id, context))?.starts ?? {});
         return { status: result.settled.status, requests: result.requests.length, keys: result.requests.map((request) => request.authorization),
-          entries: entries.map((message) => ({ stopReason: message.stopReason, cost: message.usage.cost.total > 0 })), starts: starts.length };
+          entries: entries.map((message) => ({ stopReason: message.stopReason, cost: message.usage.cost.total > 0 })), dispatched: opened.door!.dispatched };
       } finally { plan.fail = 0; await opened.close(); }
     };
     expect(await run(mapped)).toEqual({
       status: "done", requests: 2, keys: ["Bearer synthetic-literal-key", "Bearer synthetic-literal-key"],
-      entries: [{ stopReason: "error", cost: false }, { stopReason: "stop", cost: true }], starts: 2,
+      entries: [{ stopReason: "error", cost: false }, { stopReason: "stop", cost: true }], dispatched: 2,
     });
-    // Control: one SDK retry hides the 503 from Durable, two HTTP requests stand behind one entry and one start.
+    // Control: one SDK retry hides the 503 from Durable, two HTTP requests stand behind one entry and one door dispatch.
     const hidden = await run({ ...mapped, stream: { ...mapped.stream, maxRetries: 1 } });
-    expect(hidden).toMatchObject({ status: "done", requests: 2, entries: [{ stopReason: "stop", cost: true }], starts: 1 });
+    expect(hidden).toMatchObject({ status: "done", requests: 2, entries: [{ stopReason: "stop", cost: true }], dispatched: 1 });
   });
 
   test("an abort right after the handover cancels the request in flight; its start is recorded once and nothing follows", async () => {
@@ -287,7 +321,7 @@ describe("D0 P05 on the project's ModelRuntime", () => {
     // The control's abort, started synchronously at the handover (the earliest a control can act on a sent request).
     const opened = await open(models, { door: { onDispatch: () => { aborted = true; void target?.abort(context); } } });
     try {
-      const { conversation } = await memberConversation(opened.harness, "group-a", "m1", { model: { provider: "local-key", modelId: "chat" } }, context);
+      const { conversation } = await memberConversation(opened.harness, scopeOf("group-a"), "m1", { model: { provider: "local-key", modelId: "chat" } }, context);
       target = conversation;
       const before = arrivals;
       plan.hold = 2000;
@@ -296,14 +330,12 @@ describe("D0 P05 on the project's ModelRuntime", () => {
       const atSettle = arrivals - before;
       await Bun.sleep(300);
       plan.hold = 0;
-      const starts = Object.values((await opened.harness.snapshot(AttemptsDoc, conversation.id, context))?.starts ?? {});
       expect({ status: settled.status, reason: "reason" in settled ? settled.reason : undefined }).toEqual({ status: "unanswered", reason: "aborted" });
       expect(aborted).toBe(true);
       expect(opened.door!.dispatched).toBe(1);
       // The request may or may not have reached the server before the abort; either way it counts once.
       expect(atSettle).toBeLessThanOrEqual(1);
       expect(arrivals - before).toBe(atSettle);
-      expect(starts.map((start) => ({ k: start.k, withdrawn: start.withdrawn === true }))).toEqual([{ k: 1, withdrawn: false }]);
     } finally { plan.hold = 0; await opened.close(); }
   });
 });

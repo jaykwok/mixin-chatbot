@@ -1,35 +1,30 @@
-// TUI 读取宿主机部署状态，与 ops 使用相同的端口、模式、域名和群数据根。
-// BOT_PORT、BOT_DOMAIN 的显式环境变量覆盖对应状态文件。
+// TUI 读取宿主机部署状态，与 ops 使用相同的本机端口和共享资料目录。
+// BOT_PORT 的显式环境变量覆盖对应状态文件。
 
 import { readFileSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cliArgs } from "../../lib/cli.ts";
 
 /** 仓库根目录。从本文件位置回溯，不依赖调用时的 cwd。 */
 export const PROJECT_DIR = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 
-const STATE_DIR = join(PROJECT_DIR, "data", "state");
-const DEFAULT_GROUP_DATA_ROOT = join(PROJECT_DIR, "data", "groups");
+const DATA_DIR = join(PROJECT_DIR, "data");
+const STATE_DIR = join(DATA_DIR, "state");
 
 export const LOG_FILE = join(PROJECT_DIR, "logs", "mixin-chatbot.log");
-export const TUNNEL_LOG_FILE = join(PROJECT_DIR, "logs", "cloudflared.log");
 
 export type Platform = "windows" | "linux";
-type DeployMode = "direct" | "cloudflare";
 
 export interface Deployment {
   platform: Platform;
   /** Windows 是 Bun + 计划任务，Linux 是 Docker 容器。运行时形态决定了哪些命令可用。 */
   runtime: "scheduled-task" | "docker";
   port: number;
-  mode: DeployMode;
-  /** 隧道模式下的公网域名；未设置时为空。 */
-  domain: string;
-  /** 群数据总根的绝对路径。 */
-  groupDataRoot: string;
-  /** 群数据根是否被指到了项目外的其他磁盘。 */
-  groupDataRootIsCustom: boolean;
+  /** 数据目录（data/）的绝对路径：会话、tmp、统计账本和索引都在它下面。 */
+  dataRoot: string;
+  /** 外置共享资料目录（WORKSPACE_ROOT）；空为默认的 data/workspace。 */
+  workspaceRoot: string;
 }
 
 /** 宿主平台只取决于运行环境；恢复入口用它转交命令，不读取已保存的设置。 */
@@ -60,26 +55,13 @@ export function loadDeployment(): Deployment {
     throw new Error(`端口无效：${rawPort}（来自 BOT_PORT 或 data/state/bot-port）`);
   }
 
-  const rawMode = readState("deploy-mode") || "direct";
-  if (rawMode !== "direct" && rawMode !== "cloudflare") {
-    throw new Error(`部署模式无效：${rawMode}（data/state/deploy-mode）`);
-  }
-
-  const rawRoot = readState("group-data-root");
-  const groupDataRoot = rawRoot
-    ? isAbsolute(rawRoot)
-      ? resolve(rawRoot)
-      : resolve(PROJECT_DIR, rawRoot)
-    : DEFAULT_GROUP_DATA_ROOT;
-
+  const workspace = readState("workspace-root");
   return {
     platform,
     runtime: platform === "windows" ? "scheduled-task" : "docker",
     port,
-    mode: rawMode,
-    domain: (process.env.BOT_DOMAIN?.trim() || readState("bot-domain")).toLowerCase(),
-    groupDataRoot,
-    groupDataRootIsCustom: groupDataRoot !== DEFAULT_GROUP_DATA_ROOT,
+    dataRoot: DATA_DIR,
+    workspaceRoot: workspace ? resolve(workspace) : "",
   };
 }
 
@@ -94,16 +76,13 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
   if (platform === "windows") {
     const request: Record<string, string | number | boolean> = { Command: args[0] ?? "" };
     let i = 1;
-    if (args[0] === "routes") {
-      request.Target = args[i++] ?? "list";
-      if (args[i] && args[i] !== "--group") request.Fingerprint = args[i++]!;
-    } else if (args[0] === "relay-purge") {
+    if (args[0] === "relay-purge") {
       if (args[i] === "--all") { request.All = true; i++; }
       else {
         if (args[i] === "--keyword") i++;
         request.Target = args[i++] ?? "";
       }
-    } else if (["update", "upgrade", "history-clear", "history-compact", "stat", "tunnel-logging", "tunnel-protocol", "runtime-configure"].includes(args[0] ?? "") && args[i] && !args[i]!.startsWith("--")) {
+    } else if (["update", "upgrade", "history-clear", "history-compact", "stat", "stat-import", "runtime-configure", "directory-confirm", "directory-departments", "directory-scope"].includes(args[0] ?? "") && args[i] && !args[i]!.startsWith("--")) {
       request.Target = args[i++]!;
       if (args[0] === "history-compact") {
         if (!args[i]) throw new Error("压缩需要成员号码");
@@ -111,8 +90,8 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
       }
     }
     const switches: Record<string, string> = {
-      all: "All", json: "Json", repair: "Repair", "restart-tunnel": "RestartTunnel",
-      "storage-segment": "StorageSegment", "group-id": "GroupId",
+      all: "All", json: "Json", repair: "Repair",
+      "storage-segment": "StorageSegment", "group-id": "GroupId", direct: "Direct",
     };
     const values: Record<string, string> = { days: "Days", user: "User", group: "Group", since: "Since", until: "Until", period: "Period", "confirmed-transaction": "ConfirmedTransaction", plan: "Plan", digest: "Digest" };
     // TUI passes argument values as opaque strings (including leading dashes).
@@ -121,11 +100,11 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
     for (; i < args.length; i++) {
       const flag = args[i]!;
       if (values[flag.slice(2)] && args[i + 1] !== undefined) encodedArgs.push(flag + "=" + args[++i]);
-      else encodedArgs.push(flag === "-Repair" ? "--repair" : flag === "-RestartTunnel" ? "--restart-tunnel" : flag);
+      else encodedArgs.push(flag === "-Repair" ? "--repair" : flag);
     }
     const parsed = cliArgs(encodedArgs, {
-      all: { type: "boolean" }, json: { type: "boolean" }, repair: { type: "boolean" }, "restart-tunnel": { type: "boolean" },
-      "storage-segment": { type: "boolean" }, "group-id": { type: "boolean" },
+      all: { type: "boolean" }, json: { type: "boolean" }, repair: { type: "boolean" },
+      "storage-segment": { type: "boolean" }, "group-id": { type: "boolean" }, direct: { type: "boolean" },
       days: { type: "string" }, user: { type: "string" }, group: { type: "string" }, since: { type: "string" }, until: { type: "string" },
       "confirmed-transaction": { type: "string" }, period: { type: "string" },
       plan: { type: "string" }, digest: { type: "string" },
@@ -157,8 +136,7 @@ export function opsCommand(platform: Platform, args: string[]): { command: strin
   return { command: "bash", args: [join(PROJECT_DIR, "scripts", "ops", "ops.sh"), ...commandArgs], env };
 }
 
-/** 人话的模式标签，界面和报表共用。 */
+/** 人话的运行形态标签，界面和报表共用。 */
 export function describeMode(deployment: Deployment): string {
-  const runtime = deployment.runtime === "docker" ? "Docker" : "计划任务";
-  return `${runtime} · ${deployment.mode === "cloudflare" ? "Cloudflare 隧道" : "直连"}`;
+  return deployment.runtime === "docker" ? "Docker" : "计划任务";
 }

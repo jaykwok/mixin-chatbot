@@ -72,7 +72,7 @@ update "$@"
         await writeFile(script, String.fromCharCode(0xfeff) + `param([string]$RequestBase64)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$Project = ${quotePS(repo)}; $RestartTunnel = $false
+$Project = ${quotePS(repo)}
 function Start-OperationLog {}; function Stop-OperationLog {}; function Set-OperationStage {}; function Write-OperationEvent {}
 function Write-OperationFailure {}; function IsAdmin { $true }; function Get-GitPath { 'git' }; function Get-BunPath { 'synthetic-bun' }
 function Err($text) { Write-Host $text }; function Done {}; function Warn {}; function Remove-UpgradeStage {}
@@ -112,8 +112,8 @@ Invoke-Update -ConfirmedTarget $request.Target | Out-Null
       spies.push(spyOn(data, "loadUpgrade").mockResolvedValue({ git: gitState, targetSha: confirmed }));
       let confirmation: ConfirmSpec | undefined;
       const app: AppApi = {
-        deployment: { platform, runtime: platform === "windows" ? "scheduled-task" : "docker", mode: "direct", port: 1011,
-          domain: "", groupDataRoot: fixture.root, groupDataRootIsCustom: true },
+        deployment: { platform, runtime: platform === "windows" ? "scheduled-task" : "docker", port: 1011,
+          dataRoot: fixture.root, workspaceRoot: "" },
         theme: createTheme("none"), redraw() {}, go() {}, toast() {}, async ask() { return null; }, async choose() { return null; },
         async confirm(spec) { confirmation = spec; await git("update-ref", "refs/remotes/origin/main", later); return true; }, async openFile() {},
         async run() { throw new Error("Unexpected non-interactive dispatch"); },
@@ -134,7 +134,7 @@ Invoke-Update -ConfirmedTarget $request.Target | Out-Null
         await dispatch(["update", invalid]); expect(await readFile(marker, "utf8")).toBe("");
         expect(await readFile(fetches, "utf8")).toBe("");
       }
-      await writeFile(join(stateDir, platform === "windows" ? "upgrade-transaction" : "update-transaction"), "new pending transaction");
+      await writeFile(join(stateDir, platform === "windows" ? "upgrade-transaction" : "deploy-transaction"), "new pending transaction");
       const pending = await dispatch(["update", confirmed]);
       expect(pending.output).toContain("预览后出现未完成的事务"); expect(await readFile(marker, "utf8")).toBe("");
       expect(await git("rev-parse", "HEAD")).toBe(original); expect(await readFile(join(repo, "version.txt"), "utf8")).toBe("original");

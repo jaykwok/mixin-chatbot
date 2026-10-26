@@ -6,17 +6,18 @@ import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { RootlessTasks, type TaskDriver } from "../../src/core/rootless-tasks.ts";
 import { applyReclamation, previewReclamation } from "../../src/maintenance/reclaim.ts";
 import { legacyJournalRoot } from "../../src/maintenance/legacy.ts";
-import { DeliveryStore } from "../../src/agent/delivery-store.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { handoffResults, ReclamationQueues } from "../../src/durable/results/queue.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { resultReferences } from "../../src/durable/results/references.ts";
 import { durableMemberScope } from "../../src/durable/maintenance-view.ts";
 import { applyArchiveRemoval, applyTmpArchive, previewArchiveRemoval, previewTmpArchive } from "../../src/maintenance/archive.ts";
-import { withGroupSnapshot } from "../../src/durable/diagnostics.ts";
+import { withSpaceSnapshot } from "../../src/durable/diagnostics.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
+import { referTo } from "../helpers/pending-reply.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { finishedEarlier } from "../../src/contracts/maintenance.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 const image = "sha256:" + "a".repeat(64);
 const driver: TaskDriver = { async run(args) {
@@ -25,11 +26,14 @@ const driver: TaskDriver = { async run(args) {
   throw new Error("This offline fixture cannot start Docker: " + args.join(" "));
 } };
 async function fixture() {
-  const f = await tempFixture("offline-reclamation-"), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture("offline-reclamation-"), root = join(f.root, "data"), temp = join(root, "tmp/groups/group-a/alice");
   await mkdir(temp, { recursive: true });
-  const { models, model } = fauxModels(), path = join(root, "group-a/durable.sqlite"), group = await openGroupHarness(path, models);
-  await memberConversation(group.harness, "group-a", "alice", { model }, context);
-  const state = join(f.root, "state.sqlite"), db = new Database(state), deliveries = new DeliveryStore(db);
+  const { models, model } = fauxModels(), path = join(root, "conversations/groups/group-a/durable.sqlite"), group = await openGroupHarness(path, models);
+  await memberConversation(group.harness, scopeOf("group-a"), "alice", { model }, context);
+  await memberConversation(group.harness, scopeOf("group-a"), "bob", { model }, context);
+  const state = join(f.root, "state.sqlite"), db = new Database(state);
+  /** A pending reply of another member naming a path. */
+  const refer = (key: string, target: string | undefined) => referTo(group.harness, "bob", key, target);
   const backend = new RootlessTasks(join(f.root, "control"), image, driver);
   const create = async (name: string, queued = false) => {
     // Like codemode, the receipt names its result, so a sweep can check the settled ownership.
@@ -41,30 +45,30 @@ async function fixture() {
     }, context);
     return task;
   };
-  return { f, root, temp, path, group, db, deliveries, backend, create,
+  return { f, root, temp, path, group, db, refer, backend, create,
     options: { root, state, directory: join(f.root, "plans"), scope: durableMemberScope, backend },
     async close() { await group.close(); db.close(); await f.cleanup(); } };
 }
 
-test.skipIf(process.platform !== "linux")("offline rechecks outbox references and settles exact active/queued ownership atomically", async () => {
+test.skipIf(process.platform !== "linux")("offline rechecks pending-reply references and settles exact active/queued ownership atomically", async () => {
   const f = await fixture();
   try {
     const a = await f.create("1-active"), b = await f.create("2-queued", true);
     const plan = await previewReclamation(f.options, 0);
     expect(plan.items.filter(item => item.status === "ready")).toHaveLength(2);
-    f.deliveries.put("another-member", "new-reference", join(a.path, "result"));
+    await f.refer("msg:new", join(a.path, "result"));
     const first = await applyReclamation(f.options, plan.id, plan.digest);
     expect(Object.values(first.outcomes).filter(item => item.status === "removed")).toHaveLength(1);
     expect(await readFile(join(a.path, "result"), "utf8")).toBe("1-active");
     expect((await f.backend.describe(b.id, f.temp)).phase).toBe("removed");
-    await withGroupSnapshot(f.path, async harness => {
+    await withSpaceSnapshot(f.path, async harness => {
       expect((await harness.snapshot(ReclamationQueues, "alice", context))!.count).toBe(0);
       expect((await harness.snapshot(ResultsDoc, context))!.calls["1-active"]).toBeDefined();
     });
-    f.deliveries.acknowledge(["new-reference"]);
+    await f.refer("msg:new", undefined);
     const final = await applyReclamation(f.options, plan.id, plan.digest);
     expect(Object.values(final.outcomes).every(item => item.status === "removed")).toBe(true);
-    await withGroupSnapshot(f.path, async harness => expect(Object.keys((await harness.snapshot(ResultsDoc, context))!.calls)).toHaveLength(0));
+    await withSpaceSnapshot(f.path, async harness => expect(Object.keys((await harness.snapshot(ResultsDoc, context))!.calls)).toHaveLength(0));
     expect(await applyReclamation(f.options, plan.id, plan.digest)).toEqual(final);
   } finally { await f.close(); }
 });
@@ -104,12 +108,12 @@ test.skipIf(process.platform !== "linux")("offline content changes and unregiste
   } finally { await f.close(); }
 });
 
-test.skipIf(process.platform !== "linux")("host maintenance protects references recorded at the container group root", async () => {
+test.skipIf(process.platform !== "linux")("host maintenance protects references recorded at the container data directory", async () => {
   const f = await fixture();
   try {
     const task = await f.create("1-mapped");
-    const options = { ...f.options, recordedRoot: "/app/data/groups" };
-    f.deliveries.put("another-member", "container-reference", join(task.path, "result").replace(f.root, options.recordedRoot));
+    const options = { ...f.options, recordedRoot: "/app/data" };
+    await f.refer("msg:container", join(task.path, "result").replace(f.root, options.recordedRoot));
     const plan = await previewReclamation(options, 0);
     expect(plan.items.find(item => item.task === task.id)?.status).toBe("kept");
     expect(Object.values((await applyReclamation(options, plan.id, plan.digest)).outcomes).some(item => item.status === "removed")).toBe(false);
@@ -126,7 +130,7 @@ test.skipIf(process.platform !== "linux")("an archived task keeps its receipt th
     expect(await lstat(absent).then(() => true, () => false)).toBe(false);
     const task = await f.create("1-archived");
     expect((await f.backend.inventory(f.temp, true)).items.map(item => item.id)).toEqual([task.id]);
-    const options = { root: f.root, state: f.options.state, archive: join(f.root, ".reclamation/backup/rm"), scope: durableMemberScope, backend: f.backend };
+    const options = { root: f.root, state: f.options.state, archive: join(f.root, "state/reclamation/backup/rm"), scope: durableMemberScope, backend: f.backend };
     const plan = await previewTmpArchive(options, 0), done = await applyTmpArchive(options, plan.id, plan.digest);
     const index = plan.items.findIndex(item => item.task === task.id);
     expect(done.outcomes[index]!.status).toBe("archived");
@@ -158,13 +162,13 @@ test.skipIf(process.platform !== "linux")("a resumed deletion still rechecks ref
     } } };
     expect(Object.values((await applyReclamation(failing, plan.id, plan.digest)).outcomes)[0]!.status).toBe("failed");
     expect((await f.backend.describe(task.id, f.temp)).phase).toBe("removed");
-    f.deliveries.put("another-member", "late-reference", join(task.path, "result"));
+    await f.refer("msg:late", join(task.path, "result"));
     const kept = Object.values((await applyReclamation(f.options, plan.id, plan.digest)).outcomes)[0]!;
     expect([kept.status, kept.reason]).toEqual(["failed", expect.stringContaining("保留待核对")]);
-    await withGroupSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls["1-referenced"]).toBeDefined());
-    f.deliveries.acknowledge(["late-reference"]);
+    await withSpaceSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls["1-referenced"]).toBeDefined());
+    await f.refer("msg:late", undefined);
     expect(Object.values((await applyReclamation(f.options, plan.id, plan.digest)).outcomes)[0]!.status).toBe("removed");
-    await withGroupSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls).toEqual({}));
+    await withSpaceSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls).toEqual({}));
   } finally { await f.close(); }
 });
 
@@ -173,7 +177,7 @@ test.skipIf(process.platform !== "linux")("a task claimed twice, or a member wit
   try {
     const task = await f.create("1-first");
     await f.group.harness.commit(async tx => { (await tx.doc(ResultsDoc)).calls["2-second"] = { phone: "alice", createdAt: 1, isolatedTask: task.id }; }, context);
-    const orphan = join(f.root, "group-b/users/carol/tmp"); await mkdir(orphan, { recursive: true }); await writeFile(join(orphan, "file"), "no group database");
+    const orphan = join(f.root, "tmp/groups/group-b/carol"); await mkdir(orphan, { recursive: true }); await writeFile(join(orphan, "file"), "no group database");
     const plan = await previewReclamation(f.options, 0), member = (dir: string) => plan.items.filter(item => item.path === dir);
     expect(member(f.temp).map(item => [item.status, item.reason])).toEqual([["deferred", expect.stringContaining("重复的结果归属")]]);
     expect(plan.items.some(item => item.task === task.id)).toBe(false);
@@ -199,7 +203,7 @@ test.skipIf(process.platform !== "linux")("C6: Q started first and stopped befor
     expect(qReplay.outcomes["0"]).toEqual(finishedEarlier());
     expect(await applyReclamation(f.options, q.id, q.digest)).toEqual(qReplay);
     expect(await applyReclamation(f.options, p.id, p.digest)).toEqual(pDone);
-    await withGroupSnapshot(f.path, async harness => {
+    await withSpaceSnapshot(f.path, async harness => {
       expect(Object.keys((await harness.snapshot(ResultsDoc, context))!.calls)).toHaveLength(0);
       expect((await harness.snapshot(ReclamationQueues, "alice", context))!.count).toBe(0);
     });

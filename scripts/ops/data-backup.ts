@@ -1,25 +1,30 @@
-// Offline snapshot under both maintenance leases. DB checkpoint/close precedes every external-file copy.
+// Offline snapshot under the maintenance lease. DB checkpoint/close precedes every external-file copy.
 import { Database } from "bun:sqlite";
 import { lstat, mkdir, readdir, realpath, readFile, copyFile, open, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { GROUP_DATA_ROOT } from "../../src/core/config.ts";
+import { LAYOUT } from "../../src/core/config.ts";
+import { DATA_DIR } from "../../src/core/storage.ts";
 import { withMaintenance } from "../../src/core/maintenance.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { hashFile } from "../../src/core/file-hash.ts";
 
-type FileRecord = { area: "state" | "groups"; path: string; bytes: number; sha256: string };
-type Manifest = { format: 1; at: string; files: FileRecord[] };
+/** The data directories a backup holds (below data/); configuration, secrets and runtime/ are backed up separately.
+ * The default workspace is included; an external WORKSPACE_ROOT belongs to its operator and is not. */
+const AREAS = ["state", "conversations", "tmp", "index", "workspace"] as const;
+type Area = typeof AREAS[number];
+type FileRecord = { area: Area; path: string; bytes: number; sha256: string };
+type Manifest = { format: 2; at: string; files: FileRecord[] };
 /** Moved-out tmp entries are already a copy outside the live data; their plans (`.tmp-plans`) stay in the backup.
- * Diagnostic snapshots (`.reclamation/snapshots`) are disposable copies of a group database. */
-const ARCHIVE = ".reclamation/backup/rm";
+ * Diagnostic snapshots (`reclamation/snapshots`) are disposable copies of a space database. */
+const ARCHIVE = "reclamation/backup/rm";
 async function files(root: string, prefix = "", skipArchive = false): Promise<string[]> {
   let names;
   try { names = await readdir(root); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
   const found: string[] = [];
   for (const name of names.sort()) {
     const relative = prefix ? `${prefix}/${name}` : name, path = join(root, name);
-    if (skipArchive && (prefix === ARCHIVE && name !== ".tmp-plans" || prefix === ".reclamation" && name === "snapshots")) continue;
+    if (skipArchive && (prefix === ARCHIVE && name !== ".tmp-plans" || prefix === "reclamation" && name === "snapshots")) continue;
     const info = await lstat(path);
     if (info.isSymbolicLink()) throw new Error(`备份拒绝链接：${path}`);
     if (info.isDirectory()) found.push(...await files(path, relative, skipArchive));
@@ -39,17 +44,27 @@ async function ordinaryAncestors(path: string): Promise<void> {
   }
 }
 async function syncFile(path: string) { const file = await open(path, "r+"); try { await file.sync(); } finally { await file.close(); } }
-/** Caller holds maintenance leases. Includes every member tmp, index, attachment and their ownership journals,
- * but not the tmp archive under the group root (`tmp discard` frees it; backing it up would double its space). */
-export async function createDataBackup(project: string, groups: string, destination: string): Promise<Manifest> {
-  const roots = { state: resolve(project, "data/state"), groups: resolve(groups) };
+/** The areas below a data directory that exist; the workspace only when it is the default one. */
+async function areaRoots(data: string, externalWorkspace: boolean): Promise<{ area: Area; root: string }[]> {
+  const found: { area: Area; root: string }[] = [];
+  for (const area of AREAS) {
+    if (area === "workspace" && externalWorkspace) continue;
+    const root = resolve(data, area);
+    try { await lstat(root); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    found.push({ area, root });
+  }
+  return found;
+}
+/** Caller holds the maintenance lease. Includes every conversation database, member tmp, index, attachment and their
+ * ownership journals, but not the tmp archive under state/reclamation (`tmp discard` frees it; backing it up would
+ * double its space). */
+export async function createDataBackup(data: string, destination: string, externalWorkspace = false): Promise<Manifest> {
   destination = resolve(destination);
   await ordinaryAncestors(destination);
-  for (const root of Object.values(roots)) {
-    if (isPathInside(destination, root) || isPathInside(root, destination)) throw new Error("备份目录与数据目录不能包含彼此");
-    await checkedRoot(root);
-  }
-  const entries = await Promise.all(Object.entries(roots).map(async ([area, root]) => ({ area: area as FileRecord["area"], root, names: await files(root, "", area === "groups") })));
+  if (isPathInside(destination, resolve(data)) || isPathInside(resolve(data), destination)) throw new Error("备份目录与数据目录不能包含彼此");
+  const roots = await areaRoots(data, externalWorkspace);
+  for (const { root } of roots) await checkedRoot(root);
+  const entries = await Promise.all(roots.map(async ({ area, root }) => ({ area, root, names: await files(root, "", area === "state") })));
   for (const { root, names } of entries) for (const name of names.filter(name => name.endsWith(".sqlite"))) {
     const db = new Database(join(root, name), { strict: true });
     try {
@@ -60,8 +75,8 @@ export async function createDataBackup(project: string, groups: string, destinat
   }
   await mkdir(dirname(destination), { recursive: true });
   await mkdir(destination, { mode: 0o700 }); // Never overwrite another backup.
-  const manifest: Manifest = { format: 1, at: new Date().toISOString(), files: [] };
-  for (const { area, root } of entries) for (const name of await files(root, "", area === "groups")) {
+  const manifest: Manifest = { format: 2, at: new Date().toISOString(), files: [] };
+  for (const { area, root } of entries) for (const name of await files(root, "", area === "state")) {
     if (/\.sqlite-(wal|shm|journal)$/.test(name)) continue;
     const source = join(root, name), target = join(destination, area, name), prior = await hashFile(source);
     await mkdir(dirname(target), { recursive: true, mode: 0o700 });
@@ -75,22 +90,21 @@ export async function createDataBackup(project: string, groups: string, destinat
   await syncFile(join(destination, "manifest.json"));
   return manifest;
 }
-/** Restore into empty staging roots. Validate the complete list before creating any data file. */
-export async function restoreDataBackup(source: string, project: string, groups: string): Promise<void> {
+/** Restore into the empty areas of a staging data directory. Validate the complete list before creating any data file. */
+export async function restoreDataBackup(source: string, data: string): Promise<void> {
   source = resolve(source); await checkedRoot(source);
   const manifest: Manifest = JSON.parse(await readFile(join(source, "manifest.json"), "utf8"));
-  if (manifest.format !== 1 || !Array.isArray(manifest.files)) throw new Error("备份清单格式无效");
-  const roots = { state: resolve(project, "data/state"), groups: resolve(groups) }, seen = new Set<string>();
-  if (roots.state === roots.groups || isPathInside(roots.state, roots.groups) || isPathInside(roots.groups, roots.state)) throw new Error("恢复的状态目录与群数据根不能重叠");
+  if (manifest.format !== 2 || !Array.isArray(manifest.files)) throw new Error("备份清单格式无效");
+  const roots = Object.fromEntries(AREAS.map(area => [area, resolve(data, area)])) as Record<Area, string>, seen = new Set<string>();
   for (const file of manifest.files) {
-    if (!["state", "groups"].includes(file.area) || typeof file.path !== "string" || file.path.split("/").some(part => !part || part === "." || part === "..")
+    if (!(AREAS as readonly string[]).includes(file.area) || typeof file.path !== "string" || file.path.split("/").some(part => !part || part === "." || part === "..")
       || /[\\:\x00]/.test(file.path) || !/^[a-f0-9]{64}$/.test(file.sha256)) throw new Error("备份清单路径或摘要无效");
     const key = file.area + "/" + file.path;
     if (seen.has(key.toLowerCase())) throw new Error("备份清单路径重复"); seen.add(key.toLowerCase());
     const path = join(source, key);
     if (await realpath(path) !== path || !(await lstat(path)).isFile() || (await lstat(path)).size !== file.bytes || await hashFile(path) !== file.sha256) throw new Error("备份文件缺失、损坏或被重定向");
   }
-  for (const root of Object.values(roots)) {
+  for (const root of new Set(manifest.files.map(file => roots[file.area]))) {
     await ordinaryAncestors(root);
     try { if ((await readdir(root)).length) throw new Error("恢复目标必须为空；不覆盖现有数据"); await checkedRoot(root); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -109,12 +123,14 @@ export async function restoreDataBackup(source: string, project: string, groups:
   }
 }
 if (import.meta.main) {
-  const [command, path, project, groups] = process.argv.slice(2);
-  if (!path || !["backup", "restore"].includes(command!)) throw new Error("用法：bun scripts/ops/data-backup.ts backup <新备份目录> | restore <备份目录> <空暂存项目> [空群数据根]");
-  if (command === "backup") await withMaintenance(() => createDataBackup(process.cwd(), GROUP_DATA_ROOT, path), GROUP_DATA_ROOT);
-  else {
+  const [command, path, project] = process.argv.slice(2);
+  if (!path || !["backup", "restore"].includes(command!)) throw new Error("用法：bun scripts/ops/data-backup.ts backup <新备份目录> | restore <备份目录> <空暂存项目>");
+  if (command === "backup") {
+    await withMaintenance(() => createDataBackup(DATA_DIR, path, LAYOUT.externalWorkspace));
+    if (LAYOUT.externalWorkspace) console.log(`外置共享资料目录 ${LAYOUT.workspace} 不在备份内，请另行备份。`);
+  } else {
     if (!project) throw new Error("restore 需要空暂存项目路径");
-    await withMaintenance(() => restoreDataBackup(path, project, groups ?? join(project, "data/groups")), GROUP_DATA_ROOT);
+    await withMaintenance(() => restoreDataBackup(path, join(project, "data")));
   }
-  console.log("完成；恢复到暂存目录后，请配置模型并运行 scripts/runtime/data-current.ts validate --groups <群根>，再开放调度。");
+  console.log("完成；恢复到暂存目录后，请补齐配置并运行 scripts/runtime/data-current.ts validate --project <暂存项目>，再开放调度。");
 }

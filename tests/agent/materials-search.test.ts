@@ -32,10 +32,10 @@ test("filename/body searches respect ignore, hidden paths and group boundaries; 
   expect(grep.hits).toHaveLength(1); expect(grep.hits[0].line).toBe(2); expect(grep.hits[0].snippet).toContain("before");
   expect(grep.notIndexed[0].path).toBe("manual.docx"); expect(grep.incomplete).toBe(true);
   expect(await stat(f.options.venvDir).then(() => true, () => false)).toBe(false);
-  await expect(f.call("materials_grep", { keywords: ["策略"], paths: ["../other/secret.txt"] })).rejects.toThrow("本群");
+  await expect(f.call("materials_grep", { keywords: ["策略"], paths: ["../other/secret.txt"] })).rejects.toThrow("只能检索共享资料索引中的路径");
 });
 
-test("old caches require explicit extraction once; a cache hit registers a pointer without parsing and source edits invalidate it", async () => {
+test("a cache entry without source fields needs one explicit extraction; a cache hit registers a pointer without parsing and source edits invalidate it", async () => {
   const f = await setup(), source = join(f.options.workspaceDir, "manual.docx");
   const digest = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
   const parser = createHash("sha256").update(await readFile(fileURLToPath(new URL("../../scripts/runtime/extract_document.py", import.meta.url))))
@@ -45,7 +45,7 @@ test("old caches require explicit extraction once; a cache hit registers a point
   await writeFile(join(cache, "text.txt"), "[段落 17]\n安全网关功能\n");
   await writeFile(join(cache, "metadata.json"), JSON.stringify({ digest: digest("original"), textHash: digest(await readFile(join(cache, "text.txt"))), units: 1, characters: 20, truncated: false }));
   const old = await f.call("materials_grep", { keywords: ["安全网关"] });
-  expect(old.hits).toEqual([]); expect(old.notIndexed[0].reason).toContain("旧缓存缺少来源记录");
+  expect(old.hits).toEqual([]); expect(old.notIndexed[0].reason).toContain("缺少有效解析缓存");
   expect(old.notIndexed[0].reason).toContain("document_extract");
   const extracted = await extractDocument(f.options, source);
   expect(extracted.cacheHit).toBe(true); expect(await stat(f.options.venvDir).then(() => true, () => false)).toBe(false);
@@ -55,7 +55,7 @@ test("old caches require explicit extraction once; a cache hit registers a point
   expect(result.hits).toEqual([]); expect(result.notIndexed).toHaveLength(1);
 });
 
-test.each([false, true])("300 large unpointed documents read the cache catalogue once without hashing originals (legacy=%s)", async legacy => {
+test.each([false, true])("300 large unpointed documents read the cache catalogue once without hashing originals (no source fields=%s)", async legacy => {
   const f = await setup(), cache = join(f.root, "index/parsed"), block = Buffer.alloc(64);
   await mkdir(cache);
   // Sparse 4 MiB originals make accidental source reads visible without 1.2 GiB of fixture writes.

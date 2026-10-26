@@ -6,10 +6,13 @@ import {
   createRegistry, Harness, type Extension, type HarnessOptions, type HarnessSettings, type ModelRef, type ProgressPolicy, type Storage,
 } from "@earendil-works/pi-durable";
 import type { DoorOptions, RequestDoor } from "../../src/durable/door.ts";
-import { claimGroup } from "../../src/durable/identity.ts";
-import { groupDoor } from "../../src/durable/models.ts";
+import { claimSpace } from "../../src/durable/identity.ts";
+import { groupScope, type Scope } from "../../src/core/layout.ts";
+import { spaceDoor } from "../../src/durable/models.ts";
 import { enginePolicy } from "../../src/core/engine-policy.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
+import { mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 
 /**
  * The progress policy group Harnesses run with unless a test sets its own: the native engine policy, or
@@ -44,29 +47,29 @@ export type GroupHarness = {
 
 /**
  * A group Harness wired as the service will be (src/durable/models.ts): the door's extension first in the registry, the
- * door's view of `models` as `HarnessOptions.models`, the database claimed for `group`. `door: false` opens without the
+ * door's view of `models` as `HarnessOptions.models`, the database claimed for `scope` (default the group `group`, "group-a"). `door: false` opens without the
  * door (parity controls). `outside` wraps what the Harness calls, outside the door. `extensions` follow the door's.
  * `settings` apply over TEST_PROGRESS.
  */
 export async function openGroupHarness(path: string, models: Models, options: {
-  settings?: HarnessSettings; door?: false | Omit<DoorOptions, "memberOf">; group?: string; outside?: (models: Models) => Models;
+  settings?: HarnessSettings; door?: false | Omit<DoorOptions, "sessions">; group?: string; scope?: Scope; outside?: (models: Models) => Models;
   extensions?: readonly Extension[];
   /** Wraps the group's storage, for example to count commits. */
   storage?: (storage: Storage) => Storage;
 } = {}): Promise<GroupHarness> {
   const holder: { harness?: Harness } = {};
   const reports: unknown[] = [];
-  const door = options.door === false ? undefined : groupDoor(holder, { onReport: (error) => reports.push(error), ...options.door });
+  const door = options.door === false ? undefined : spaceDoor(holder, { onReport: (error) => reports.push(error), ...options.door });
   const registry = createRegistry();
-  if (door !== undefined) registry.install(door.extension());
   for (const extension of options.extensions ?? []) registry.install(extension);
   const inner = door === undefined ? models : door.wrap(models);
   const view = options.outside === undefined ? inner : options.outside(inner);
+  await mkdir(dirname(path), { recursive: true });
   const storage = await openGroupStorage(path);
   const settings: HarnessSettings = { ...(TEST_PROGRESS === undefined ? {} : { progress: TEST_PROGRESS }), ...options.settings };
   const harness = await Harness.open(options.storage?.(storage) ?? storage, { models: view, registry, settings }, context);
   holder.harness = harness;
-  await claimGroup(harness, options.group ?? "group-a", context);
+  await claimSpace(harness, options.scope ?? groupScope(options.group ?? "group-a"), context);
   return { path, harness, door, models: view, reports, async close() { await door?.close(); await harness.close(context); } };
 }
 

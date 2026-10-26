@@ -36,10 +36,11 @@ const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const HELPER_NAME = /^(.+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 // 运维归档都以时间或 GUID 开头：lifecycle.sh（秒-随机数-随机数-原名）、lifecycle.ps1（GUID-原名）、maintenance.ts（毫秒-UUID-原名）。
 const PRODUCTION_NAMES = [/^\d{9,11}-\d{1,5}-\d{1,5}-./, /^[0-9a-f]{32}-./, new RegExp(`^\\d{13}-${UUID}-.`)];
-// 事务快照：Linux 用 mktemp 生成 deploy-XXXXXXXX，Windows 用 deploy-/tunnel-<GUID>。
+// 事务快照：Linux 用 mktemp 生成 deploy-XXXXXXXX，Windows 用 deploy-<GUID>。tunnel-<GUID>（隧道操作）和
+// migration-<UUID>（数据迁移）只会出现在旧版目录里：v1 不再产生，仍按业务归档保留，不当作未知条目。
 const TRANSACTION_NAME = /^(?:deploy-[A-Za-z0-9]{8}|(?:deploy|tunnel)-[0-9a-f]{32})$/;
 const MIGRATION_NAME = new RegExp(`^migration-${UUID}$`);
-const POINTERS = ["deploy-transaction", "upgrade-transaction", "update-transaction"];
+const POINTERS = ["deploy-transaction", "upgrade-transaction"];
 const REPORT_NAME = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/;
 const ENTRY_PATH = /^backup\/(rm|snapshots)\/([^/\\\u0000-\u001f\u007f]+)$/;
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -123,7 +124,7 @@ function readText(path: string): string | null {
   catch (error) { if (code(error) === "ENOENT") return null; throw error; }
 }
 
-/** 当前不能删除的条目：未完成事务的快照和归档，以及迁移日志引用的快照和事务。每次使用时重新读取。 */
+/** 当前不能删除的条目：未完成事务的快照和归档，以及发布回执引用的快照和归档。每次使用时重新读取。 */
 function protectedPaths(project: string): Map<string, string> {
   const paths = new Map<string, string>();
   for (const pointer of ["deploy-transaction", "upgrade-transaction"]) {
@@ -183,11 +184,11 @@ function inspect(project: string, area: typeof AREAS[number], name: string, prot
   if (!top) [category, basis] = ["unknown", [`无法读取：${tree.unreadable[0]}`]];
   else if (type === "link") [category, basis] = ["unknown", ["条目本身是链接或目录联接；工具不跟随链接"]];
   else if (area === "snapshots") {
-    if (type === "directory" && TRANSACTION_NAME.test(name)) [category, basis] = ["business", ["部署、升级或隧道快照：操作失败、回滚或清理未完成时保留，用于恢复"]];
-    else if (type === "directory" && MIGRATION_NAME.test(name)) [category, basis] = ["business", ["数据迁移快照：迁移前的数据库和配置副本"]];
+    if (type === "directory" && TRANSACTION_NAME.test(name)) [category, basis] = ["business", ["部署、升级（或旧版隧道操作）快照：操作失败、回滚或清理未完成时保留，用于恢复"]];
+    else if (type === "directory" && MIGRATION_NAME.test(name)) [category, basis] = ["business", ["旧版数据迁移快照：迁移前的数据库和配置副本"]];
     else [category, basis] = ["unknown", ["不是已知格式的快照"]];
   } else if (type === "directory" && TRANSACTION_NAME.test(name)) {
-    [category, basis] = ["business", ["部署、升级或隧道事务期间移入的原文件（该事务没有成功完成时保留）"]];
+    [category, basis] = ["business", ["部署、升级（或旧版隧道操作）事务期间移入的原文件（该事务没有成功完成时保留）"]];
   } else if (production) {
     [category, basis] = ["business", ["运维或人工归档：名称以时间或 GUID 开头，是 lifecycle.sh、lifecycle.ps1 或 maintenance.ts 的归档格式"]];
   } else if (helper !== undefined) {
@@ -353,7 +354,7 @@ export function apply(project: string, report: string, confirm?: string, progres
   const confirmation = sha256(bytes).slice(0, 16);
   const pointer = pendingPointer(project);
   if (pointer) throw new Error(`有未完成的部署或升级（data/state/${pointer}），先继续或回滚那次操作，再清理备份`);
-  protectedPaths(project); // 迁移日志无法解析时在处理任何条目之前停止；每个条目删除前还会重新读取。
+  protectedPaths(project); // 发布回执无法解析时在处理任何条目之前停止；每个条目删除前还会重新读取。
   if (confirm !== undefined && confirm !== confirmation) throw new Error("确认码与当前清单不符：清单在预演后被改动过，或确认码输入有误；请重新预演");
   const execute = confirm !== undefined;
   let resultFile: string | null = null;

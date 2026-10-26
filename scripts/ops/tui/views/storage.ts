@@ -6,7 +6,7 @@ import { box, meter, rule, table, wrap } from "../render/widgets.ts";
 import { pad } from "../render/width.ts";
 import { Viewport } from "../render/viewport.ts";
 import * as fmt from "../render/format.ts";
-import { loadTmp, type UserTmp } from "../data.ts";
+import { loadTmp, spaceName, type UserTmp } from "../data.ts";
 import type { AppApi, Loading, View, ViewAction, ViewContext } from "../view.ts";
 import { gap, ListFilter, moveSelection, pending, windowStart } from "./common.ts";
 import { randomUUID } from "node:crypto";
@@ -43,35 +43,35 @@ export class StorageView implements View {
     return [
       ...(this.expanded ? [{ value: "escape", label: "返回成员列表" }]
         : [{ value: "enter", label: "查看选中成员的文件", disabled: !this.users.length },
-          { value: "/", label: "筛选群或成员", description: "按群名、成员号码或打码后的号码查找" }]),
+          { value: "/", label: "筛选空间或成员", description: "按群名、「单聊」、成员号码或打码后的号码查找" }]),
       { value: "d", label: "选择清理天数", description: `当前：${this.days === 0 ? "不限时间" : `${this.days} 天未改动`}；选择后重新预览` },
-      { value: "p", label: "清理当前群的选中成员", description: "先预览命中条目与大小，再确认归档", danger: true, disabled: !this.users.length },
-      { value: "a", label: "清理所有群的所有成员", description: "按当前天数处理全部成员，不受列表筛选影响", danger: true,
+      { value: "p", label: "清理选中成员（当前空间）", description: "先预览命中条目与大小，再确认归档", danger: true, disabled: !this.users.length },
+      { value: "a", label: "清理所有空间的所有成员", description: "按当前天数处理全部成员，不受列表筛选影响", danger: true,
         disabled: this.state.kind !== "ready" || !this.state.value.length },
-      { value: "x", label: "物理回收已登记的产物", description: "按当前天数预览所有群，确认后永久删除，释放磁盘空间", danger: true },
-      { value: "r", label: "永久删除归档", description: "预览群根/.reclamation/backup/rm 中内容未变的归档，确认后释放磁盘空间", danger: true },
+      { value: "x", label: "物理回收已登记的产物", description: "按当前天数预览所有空间，确认后永久删除，释放磁盘空间", danger: true },
+      { value: "r", label: "永久删除归档", description: "预览 data/state/reclamation/backup/rm 中内容未变的归档，确认后释放磁盘空间", danger: true },
     ];
   }
 
   private get users(): UserTmp[] {
     return this.state.kind === "ready" ? this.state.value.filter(user =>
-      this.filter.matches(user.group, user.user, fmt.maskUser(user.user))
+      this.filter.matches(user.space, spaceName(user.space), user.user, fmt.maskUser(user.user))
     ) : [];
   }
 
   async refresh(app: AppApi): Promise<void> {
-    const rootChanged = this.root !== undefined && this.root !== app.deployment.groupDataRoot;
+    const rootChanged = this.root !== undefined && this.root !== app.deployment.dataRoot;
     if (rootChanged) {
       this.filter.clear();
       this.expanded = false;
       this.selected = 0;
       this.scroll.reset();
     }
-    this.root = app.deployment.groupDataRoot;
+    this.root = app.deployment.dataRoot;
     if (rootChanged || this.state.kind !== "ready") this.state = { kind: "loading" };
     app.redraw();
     try {
-      const users = await loadTmp(app.deployment.groupDataRoot);
+      const users = await loadTmp(app.deployment.dataRoot);
       this.state = { kind: "ready", value: users };
       this.selected = Math.min(this.selected, Math.max(0, this.users.length - 1));
       if (!this.users.length) this.expanded = false;
@@ -151,11 +151,12 @@ export class StorageView implements View {
       const all = key.name === "a";
       if (!all && !current) return true;
       const days = this.days;
-      const scope = all ? "所有群的所有成员（不受列表筛选影响）" : `群 ${current!.group} · 成员 ${fmt.maskUser(current!.user)}`;
-      const id = randomUUID(), root = app.deployment.groupDataRoot;
+      const scope = all ? "所有空间的所有成员（不受列表筛选影响）" : `${spaceName(current!.space)} · 成员 ${fmt.maskUser(current!.user)}`;
+      const id = randomUUID(), root = app.deployment.dataRoot;
       const args = days === 0 ? ["tmp-preview", "--all"] : ["tmp-preview", "--days", String(days)];
       args.push("--plan", id);
-      if (!all) args.push("--group", current!.group, "--user", current!.user, "--storage-segment");
+      if (!all) args.push("--user", current!.user, ...(current!.space === "direct" ? ["--group", "direct"]
+        : ["--group", current!.space.slice("groups/".length), "--storage-segment"]));
       if (await app.run(`核对归档范围 · ${scope}`, args) !== 0) { app.toast("danger", "预览失败，未执行归档，请看输出"); return true; }
       let plan;
       try { plan = await readTmpPlan(root, id); }
@@ -169,10 +170,10 @@ export class StorageView implements View {
         subject: `${scope}：${this.days === 0 ? "不限时间" : `${this.days} 天未改动`}，可归档 ${plan.ready} 个条目、${fmt.bytes(plan.bytes)}`,
         steps: [
           "短暂停机，取得维护租约后重验清单；完成后恢复原运行状态",
-          `将清单中仍符合条件的条目移入群根/.reclamation/backup/rm（最多 ${fmt.bytes(plan.bytes)}）`,
+          `将清单中仍符合条件的条目移入 data/state/reclamation/backup/rm（最多 ${fmt.bytes(plan.bytes)}）`,
           `已确认保留 ${plan.kept} 项，待处置 ${plan.deferred} 项；新增引用或内容变化的条目仍会保留`,
         ],
-        untouched: ["tmp 目录本身", "workspace", "会话历史"],
+        untouched: ["tmp 目录本身", "共享资料", "会话历史"],
         recovery: "按清单中的源路径和目标路径恢复；归档尚未释放磁盘空间，r 永久删除归档",
         typeToConfirm: this.days === 0 ? (all ? "全部清理" : "清理当前") : undefined,
         danger: this.days === 0,
@@ -195,10 +196,10 @@ export class StorageView implements View {
   /** Permanent deletion: physical reclamation of registered outputs, or of entries archived earlier. Same shape as
    * archival — a read-only preview beside the running service, then one maintenance window for the confirmed list. */
   private async permanent(kind: "reclaim" | "discard", app: AppApi): Promise<boolean> {
-    const reclaim = kind === "reclaim", days = this.days, id = randomUUID(), root = app.deployment.groupDataRoot;
+    const reclaim = kind === "reclaim", days = this.days, id = randomUUID(), root = app.deployment.dataRoot;
     const range = days === 0 ? "不限时间" : `${days} 天前登记`;
     const args = reclaim ? ["tmp-reclaim", ...(days === 0 ? ["--all"] : ["--days", String(days)]), "--plan", id] : ["tmp-discard", "--plan", id];
-    if (await app.run(reclaim ? `核对物理回收范围 · 所有群 · ${range}` : "核对可删除的归档", args) !== 0) {
+    if (await app.run(reclaim ? `核对物理回收范围 · 所有空间 · ${range}` : "核对可删除的归档", args) !== 0) {
       app.toast("danger", "预览失败，未删除任何内容，请看输出"); return true;
     }
     let plan;
@@ -210,13 +211,13 @@ export class StorageView implements View {
     }
     const ok = await app.confirm({
       title: reclaim ? "物理回收已登记的临时产物" : "永久删除临时文件归档",
-      subject: reclaim ? `所有群：${range}，可回收 ${plan.ready} 项、${fmt.bytes(plan.bytes)}` : `可删除 ${plan.ready} 项归档、${fmt.bytes(plan.bytes)}`,
+      subject: reclaim ? `所有空间：${range}，可回收 ${plan.ready} 项、${fmt.bytes(plan.bytes)}` : `可删除 ${plan.ready} 项归档、${fmt.bytes(plan.bytes)}`,
       steps: [
         "短暂停机，取得维护租约后逐项重验清单；完成后恢复原运行状态",
         reclaim ? "删除清单中仍无引用、内容未变的产物，并结算回收账本" : "删除清单中内容与归档时一致的条目，释放磁盘空间",
         `保留 ${plan.kept} 项，待处置 ${plan.deferred} 项；预览后有变化的条目不会删除`,
       ],
-      untouched: reclaim ? ["归档", "workspace", "会话历史"] : ["成员临时目录", "归档清单", "会话历史"],
+      untouched: reclaim ? ["归档", "共享资料", "会话历史"] : ["成员临时目录", "归档清单", "会话历史"],
       recovery: "不可恢复：删除后不能从归档或 Git 找回",
       typeToConfirm: "永久删除",
       danger: true,
@@ -248,7 +249,7 @@ export class StorageView implements View {
     const condition = this.days === 0 ? "不限时间" : `${this.days} 天未改动`;
     if (this.expanded && current) {
       const summary = box(theme, {
-        width: total, title: `${current.group} › ${fmt.maskUser(current.user)}`, note: condition, accent: "accent",
+        width: total, title: `${spaceName(current.space)} › ${fmt.maskUser(current.user)}`, note: condition, accent: "accent",
         body: [`年龄候选 ${currentHit.entries} 个 · ${fmt.bytes(currentHit.bytes)}；近期 ${currentHit.keptEntries} 个；执行前核对引用`],
       });
       const cutoff = Date.now() - this.days * DAY;
@@ -266,8 +267,8 @@ export class StorageView implements View {
     const preview = [
       rule(theme, total, `年龄候选 · ${condition}`, "按 p/a 核对可归档范围", "faint"),
       this.previewRow(theme, total, "p 当前", currentHit,
-        current ? `${current.group} / ${fmt.maskUser(current.user)}` : "未选择成员"),
-      this.previewRow(theme, total, "a 全部", hit, "所有群与成员，忽略筛选"),
+        current ? `${spaceName(current.space)} / ${fmt.maskUser(current.user)}` : "未选择成员"),
+      this.previewRow(theme, total, "a 全部", hit, "所有空间与成员，忽略筛选"),
     ];
     const room = Math.max(1, height - preview.length - 2);
     const start = windowStart(this.selected, users.length, room);
@@ -285,12 +286,12 @@ export class StorageView implements View {
         selected: this.selected - start,
         columns: [
           { header: "成员", flex: 1, render: (user) => fmt.maskUser(user.user) },
-          { header: "群", size: Math.max(10, Math.floor(total * 0.16)), render: (user) => user.group },
+          { header: "空间", size: Math.max(10, Math.floor(total * 0.16)), render: (user) => spaceName(user.space) },
           { header: "占用", size: 10, align: "right", render: (user) => fmt.bytes(user.bytes) },
           { header: "文件", size: 7, align: "right", render: (user) => String(user.files) },
           { header: "最后改动", size: 10, align: "right", render: (user) => fmt.since(user.newest) },
         ],
-      }) : [pad(`  ${theme.c("muted", "没有匹配的群或成员；/ 修改筛选，Esc 清除")}`, total)]),
+      }) : [pad(`  ${theme.c("muted", "没有匹配的空间或成员；/ 修改筛选，Esc 清除")}`, total)]),
     ];
     while (out.length < height - preview.length) out.push(gap(total));
     out.push(...preview);

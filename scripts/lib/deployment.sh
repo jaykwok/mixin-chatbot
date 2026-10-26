@@ -5,9 +5,9 @@
 . "$(dirname "${BASH_SOURCE[0]}")/service-user.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/task-runtime.sh"
 # 服务商、选型和动态目录缓存一起恢复，保证回滚后的实例仍能离线解析出原模型。
-DEPLOY_FILES=(data/config data/runtime/pi/settings.json data/runtime/models-store.json data/state/bot-port data/state/deploy-mode data/state/bot-domain data/state/group-data-root data/state/task-runtime)
+DEPLOY_FILES=(data/config data/runtime/pi/settings.json data/runtime/models-store.json data/state/bot-port data/state/workspace-root data/state/task-runtime)
 
-# archive_project_path is shared with ops and tunnel scripts.
+# archive_project_path is shared with the ops scripts.
 
 # 原容器使用的镜像在事务期间另存这个标签：数据提交后正式标签 mixin-chatbot 改指向候选镜像，失去标签的镜像
 # 可能被清除（containerd 镜像存储的行为并无保证），回滚就无法按镜像 ID 找回原镜像。标签也可能被管理员清除，回滚时如实报告。
@@ -38,8 +38,8 @@ release_transaction_candidate() {
 # 收尾（回滚、中断后的清理）一旦开始就要做完：在独立的进程组中运行命令，标准输入改为 /dev/null，忽略 INT/TERM/HUP
 # 等它结束，返回它的状态；此后这些信号保持忽略，只用于收尾。终端的 Ctrl+C 和断线只发给前台进程组，到不了收尾中的
 # docker 客户端、复制、git 和管道。只让本 shell 忽略信号不够：子进程会重设处理（docker 客户端自己处理 INT/TERM），
-# 管道和命令替换的子 shell 也会恢复默认处理。后台进程组读终端会被停住，所以 sudo 在其中只用已缓存的凭据（见 run_ufw）。
-# run_shielded is shared with connector updates through lifecycle.sh.
+# 管道和命令替换的子 shell 也会恢复默认处理。
+# run_shielded is defined in lifecycle.sh.
 
 # 未完成事务的镜像和服务身份（快照中的 candidate-image 与 service-user）。恢复入口在 committed 检查、回滚或任何运行
 # 容器的操作之前调用；此后只按记录的 image ID 和 UID:GID 运行容器，不重新构建、拉取，也不按标签选择。设置 IMAGE_ID、
@@ -67,93 +67,60 @@ load_transaction_runtime() {
     IMAGE_ID="${CANDIDATE[image_id]}"
 }
 
-# 停机后写入 backup/ 的快照的预计大小（字节）：部署快照（配置和状态文件）与迁移备份（配置、版本标记、data/state
-# 和群根中的数据库：统计账本和各群的 Durable 数据库）。只用来决定门槛，剩余空间以 df 实测为准。
+# 停机后写入 backup/ 的快照的预计大小（字节）：部署快照（配置和状态文件）与 data/state 中的数据库（含统计账本）。
+# 只用来决定门槛，剩余空间以 df 实测为准。
 snapshot_size_estimate() {
-    local group_root="$1" path files=()
+    local path files=()
     for path in "$PROJECT_DIR/data/config" "$PROJECT_DIR/data/runtime/pi/settings.json" "$PROJECT_DIR/data/runtime/models-store.json" \
-        "$PROJECT_DIR/data/state/data-version.json" "$group_root/data-version.json" "$PROJECT_DIR"/data/state/*.sqlite* "$group_root"/stats.sqlite* \
-        "$group_root"/*/durable.sqlite*; do
+        "$PROJECT_DIR/data/state/data-version.json" "$PROJECT_DIR"/data/state/*.sqlite*; do
         [ ! -e "$path" ] || files+=("$path")
     done
     if [ "${#files[@]}" -eq 0 ]; then echo 0; return 0; fi
     du -scb -- "${files[@]}" | tail -n 1 | cut -f1
 }
 
-# 停机前复核剩余空间：data/、群根和其余参数（例如升级器的导出目录）所在文件系统各保留 CANDIDATE_DATA_RESERVE_BYTES，
+# 停机前复核剩余空间：data/ 和参数中的路径（例如升级器的导出目录）所在文件系统各保留 CANDIDATE_DATA_RESERVE_BYTES，
 # backup/ 再加上快照的预计大小；共享剩余空间的路径需求相加（见 check_free_space）。
 check_stop_disk_space() {
-    local group_root="$1" backup="$PROJECT_DIR/backup" estimate path args=()
-    shift
-    estimate="$(snapshot_size_estimate "$group_root")" || estimate=''
+    local backup="$PROJECT_DIR/backup" estimate path args=()
+    estimate="$(snapshot_size_estimate)" || estimate=''
     [[ "$estimate" =~ ^[0-9]+$ ]] || { echo "无法估算快照的大小" >&2; return 1; }
     [ -e "$backup" ] || backup="$PROJECT_DIR"
     args=("$backup" $(( CANDIDATE_DATA_RESERVE_BYTES + estimate )))
-    for path in "$PROJECT_DIR/data" "$group_root" "$@"; do args+=("$path" "$CANDIDATE_DATA_RESERVE_BYTES"); done
+    for path in "$PROJECT_DIR/data" "$@"; do args+=("$path" "$CANDIDATE_DATA_RESERVE_BYTES"); done
     check_free_space "${args[@]}"
+}
+
+# 共享资料目录的边界在宿主路径空间核对：服务容器把外置资料目录改名挂到 /app/workspace，容器内看不出它在宿主上是否
+# 包含 data/ 或位于 state、tmp、会话、配置、备份、日志之内。宿主上解析后的 data、backup、logs 和资料目录按原路径
+# 只读挂进候选镜像（无网络、无权限提升），用与服务启动相同的规则（scripts/runtime/layout-check.ts）判断；只读，
+# 不创建任何目录。依赖 IMAGE_ID、SERVICE_USER、PROJECT_DIR 和 HOST_WORKSPACE_ROOT（空 = data/workspace）。
+check_workspace_layout() {
+    local project data backup logs workspace path mounts=()
+    project="$(realpath -e -- "$PROJECT_DIR")" && data="$(realpath -e -- "$PROJECT_DIR/data")" || {
+        echo "无法解析项目或 data/ 目录" >&2; return 1; }
+    backup="$(realpath -m -- "$PROJECT_DIR/backup")" && logs="$(realpath -m -- "$PROJECT_DIR/logs")" || return 1
+    if [ -n "$HOST_WORKSPACE_ROOT" ]; then
+        workspace="$(realpath -e -- "$HOST_WORKSPACE_ROOT" 2>/dev/null)" && [ -d "$workspace" ] || {
+            echo "WORKSPACE_ROOT 不存在或不是目录：$HOST_WORKSPACE_ROOT" >&2; return 1; }
+    else
+        workspace="$data/workspace"
+    fi
+    # 同一路径只挂一次（默认资料目录随 data/ 挂入；资料目录与 data/ 相同时也只挂一次）。
+    local seen=$'\n'
+    for path in "$data" "$backup" "$logs" "$workspace"; do
+        [ -e "$path" ] && [[ "$seen" != *$'\n'"$path"$'\n'* ]] || continue
+        seen+="$path"$'\n'
+        mounts+=(--mount "type=bind,source=$path,target=$path,readonly")
+    done
+    docker run --rm --network none --user "$SERVICE_USER" --read-only --tmpfs /tmp:size=8m -e HOME=/tmp -w /app \
+      --cap-drop ALL --security-opt no-new-privileges:true "${mounts[@]}" \
+      "$IMAGE_ID" bun scripts/runtime/layout-check.ts --project "$project" --data "$data" --backup "$backup" --logs "$logs" --workspace "$workspace"
 }
 
 # 迁移日志是否属于这个事务：apply 以事务快照名记下 deployment。
 data_preparation_mentions_deployment() {
     [ -f "$PROJECT_DIR/data/state/release-data.json" ] && grep -q "\"deployment\": \"$1\"" "$PROJECT_DIR/data/state/release-data.json"
-}
-
-# 部署、升级器和回滚共用的项目 UFW 规则操作。
-can_manage_ufw() {
-    [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1
-}
-
-run_ufw() {
-    if [ "$(id -u)" -eq 0 ]; then
-        ufw "$@"
-    elif [ "${SHIELDED_RUN:-0}" = 1 ]; then
-        # 回滚在后台进程组中运行（run_shielded），在那里询问密码会被终端停住；凭据已在回滚开始前刷新。
-        sudo -n ufw "$@"
-    else
-        sudo ufw "$@"
-    fi
-}
-
-# 回滚要以普通用户恢复防火墙规则时，先在前台刷新 sudo 凭据（必要时询问密码）。
-refresh_ufw_credentials() {
-    [ "$(id -u)" -ne 0 ] || return 0
-    sudo -v || print_warning "sudo 凭据未能刷新；回滚恢复防火墙规则时可能失败"
-}
-
-remove_managed_ufw_rules() {
-    local preserve_port="${1:-}" preserve_ip="${2:-}" kept=0
-    local rule_numbers=()
-    local line number
-    while IFS= read -r line; do
-        [[ "$line" == *"Mixin-Chatbot (平台IP)"* ]] || continue
-        if [ -n "$preserve_port" ] && [ "$kept" -eq 0 ] &&
-            [[ "$line" == *"${preserve_port}/tcp"* && "$line" == *"$preserve_ip"* ]]; then
-            kept=1
-            continue
-        fi
-        number="$(sed -n 's/^[[:space:]]*\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<< "$line")"
-        [ -n "$number" ] && rule_numbers+=("$number")
-    done < <(run_ufw status numbered)
-    local sorted_numbers=() failed=0
-    mapfile -t sorted_numbers < <(printf '%s\n' "${rule_numbers[@]}" | sed '/^$/d' | sort -rn)
-    # Callers report only rules that were actually removed.
-    REMOVED_UFW_RULES=0
-    for number in "${sorted_numbers[@]}"; do
-        if run_ufw --force delete "$number" >/dev/null; then REMOVED_UFW_RULES=$((REMOVED_UFW_RULES+1)); else failed=1; fi
-    done
-    return "$failed"
-}
-
-# Check before mkdir or Docker bind mounts can recreate an empty, missing data root.
-verify_deployed_group_root() {
-    local recorded="$PROJECT_DIR/data/state/group-data-root" root
-    [ -s "$recorded" ] || return 0
-    root="$(tr -d '\r\n' < "$recorded")"
-    case "$root" in /*) ;; *) root="$PROJECT_DIR/$root" ;; esac
-    if [ ! -d "$root" ]; then
-        print_error "已部署的群数据根不存在：$root；请恢复原挂载后重试"
-        return 1
-    fi
 }
 
 # 停机窗口写进运维日志：停止正在运行的服务时记下时刻（经环境交给同一次操作中的部署脚本），服务重新就绪时
@@ -187,9 +154,6 @@ begin_deployment() {
         [[ "$saved_name" =~ ^deploy-[a-zA-Z0-9]+$ ]] || { print_error "部署事务快照名称无效"; return 1; }
         DEPLOY_SNAPSHOT="$PROJECT_DIR/backup/snapshots/$saved_name"
         [ -d "$DEPLOY_SNAPSHOT" ] && [ ! -L "$DEPLOY_SNAPSHOT" ] || { print_error "部署快照缺失"; return 1; }
-        if [ -s "$DEPLOY_SNAPSHOT/group-root" ] && [ "$(cat "$DEPLOY_SNAPSHOT/group-root")" != "${HOST_GROUP_DATA_ROOT:-}" ]; then
-            print_error "中断部署必须使用原群目录继续"; return 1
-        fi
         # Rollback restores the snapshot whatever code is checked out; only continuing needs the original target.
         if [ "${ROLLBACK_REQUESTED:-0}" != 1 ] && [ -s "$DEPLOY_SNAPSHOT/target-sha" ] && [ "$(git -C "$PROJECT_DIR" rev-parse HEAD)" != "$(cat "$DEPLOY_SNAPSHOT/target-sha")" ]; then
             print_error "中断部署必须使用原目标提交继续"; return 1
@@ -203,11 +167,6 @@ begin_deployment() {
         fi
         export BOT_DEPLOY_BACKUP_ID="$saved_name"
         PREVIOUS_IMAGE="$(cat "$DEPLOY_SNAPSHOT/previous-image")"
-        PREVIOUS_TUNNEL_RUNNING="$(cat "$DEPLOY_SNAPSHOT/tunnel-running")"
-        TUNNEL_COMMAND=()
-        if [ -s "$DEPLOY_SNAPSHOT/tunnel-command" ]; then mapfile -d '' -t TUNNEL_COMMAND < "$DEPLOY_SNAPSHOT/tunnel-command"; fi
-        UFW_SNAPSHOTTED=0
-        if [ -f "$DEPLOY_SNAPSHOT/ufw-rules.txt" ]; then UFW_SNAPSHOTTED=1; fi
         PREVIOUS_CONTAINER_SAVED=0; PREVIOUS_STOP_ATTEMPTED=0
         if docker container inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
             PREVIOUS_CONTAINER_SAVED=1; PREVIOUS_STOP_ATTEMPTED=1
@@ -227,7 +186,7 @@ begin_deployment() {
             docker stop --time 30 mixin-chatbot >/dev/null || return 1
             docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || return 1
         fi
-        NEW_CONTAINER_ATTEMPTED=0; DEPLOY_FILES_MUTATED=1; TUNNEL_STARTED_BY_DEPLOY=0; DEPLOYMENT_COMMITTED=0
+        NEW_CONTAINER_ATTEMPTED=0; DEPLOY_FILES_MUTATED=1; DEPLOYMENT_COMMITTED=0
         DATA_PREPARATION_APPLY_ATTEMPTED=1
         operation_event info "resuming snapshot=$DEPLOY_SNAPSHOT; originally_running=$PREVIOUS_RUNNING"
         trap rollback_deployment EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
@@ -250,6 +209,8 @@ begin_deployment() {
     [ -n "$DEPLOY_SNAPSHOT" ] || { print_error "无法分配新的部署快照名称；backup/rm 中已有同名归档"; return 1; }
     export BOT_DEPLOY_BACKUP_ID="$(basename -- "$DEPLOY_SNAPSHOT")"
     chmod 700 "$DEPLOY_SNAPSHOT"
+    # 提交、回滚等以服务身份运行的容器要读取快照；只交出快照目录本身，仍是 700。
+    grant_service_access "$DEPLOY_SNAPSHOT" || return 1
     local relative
     for relative in "${DEPLOY_FILES[@]}"; do
         if [ -e "$PROJECT_DIR/$relative" ]; then
@@ -262,42 +223,16 @@ begin_deployment() {
     PREVIOUS_STOP_ATTEMPTED=0
     PREVIOUS_IMAGE="$(docker container inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null || true)"
     if [ "$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then PREVIOUS_RUNNING=1; fi
-    PREVIOUS_TUNNEL_RUNNING=0
-    TUNNEL_COMMAND=()
-    local tunnel_pid
-    if tunnel_pid="$(managed_cloudflared_pid)"; then
-        PREVIOUS_TUNNEL_RUNNING=1
-        mapfile -d '' -t TUNNEL_COMMAND < "/proc/$tunnel_pid/cmdline"
-    fi
-    UFW_SNAPSHOTTED=0
-    if command -v ufw >/dev/null 2>&1 && can_manage_ufw; then
-        run_ufw show added > "$DEPLOY_SNAPSHOT/ufw-before.txt"
-        : > "$DEPLOY_SNAPSHOT/ufw-rules.txt"
-        local line
-        while IFS= read -r line; do
-            [[ "$line" == *'Mixin-Chatbot (平台IP)'* ]] || continue
-            if [[ "$line" =~ ^ufw\ allow\ (proto\ tcp\ )?from\ ([0-9a-fA-F:./]+)\ to\ any\ port\ ([0-9]+)\ (proto\ tcp\ )?comment\  ]]; then
-                printf '%s %s\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" >> "$DEPLOY_SNAPSHOT/ufw-rules.txt"
-            else
-                print_error "无法安全记录项目 UFW 规则，尚未修改部署"; return 1
-            fi
-        done < "$DEPLOY_SNAPSHOT/ufw-before.txt"
-        UFW_SNAPSHOTTED=1
-    fi
     printf '%s' "$PREVIOUS_RUNNING" > "$DEPLOY_SNAPSHOT/was-running"
     printf '%s' "$PREVIOUS_IMAGE" > "$DEPLOY_SNAPSHOT/previous-image"
-    printf '%s' "$PREVIOUS_TUNNEL_RUNNING" > "$DEPLOY_SNAPSHOT/tunnel-running"
-    printf '%s' "${HOST_GROUP_DATA_ROOT:-}" > "$DEPLOY_SNAPSHOT/group-root"
     if [ -n "$target_sha" ]; then printf '%s\n' "$target_sha" > "$DEPLOY_SNAPSHOT/target-sha"
     else git -C "$PROJECT_DIR" rev-parse HEAD > "$DEPLOY_SNAPSHOT/target-sha" 2>/dev/null || : > "$DEPLOY_SNAPSHOT/target-sha"; fi
-    if [ "${#TUNNEL_COMMAND[@]}" -gt 0 ]; then printf '%s\0' "${TUNNEL_COMMAND[@]}" > "$DEPLOY_SNAPSHOT/tunnel-command"; fi
     # The pointer is published only after the confirmed choices are recorded; resume and rollback read only that record.
     if declare -F record_deployment_transaction >/dev/null; then record_deployment_transaction "$DEPLOY_SNAPSHOT" || return 1; fi
     printf '%s' "$(basename -- "$DEPLOY_SNAPSHOT")" > "$PROJECT_DIR/data/state/deploy-transaction.tmp"
     mv -- "$PROJECT_DIR/data/state/deploy-transaction.tmp" "$PROJECT_DIR/data/state/deploy-transaction"
     NEW_CONTAINER_ATTEMPTED=0
     DEPLOY_FILES_MUTATED=0
-    TUNNEL_STARTED_BY_DEPLOY=0
     DEPLOYMENT_COMMITTED=0
     operation_event info "snapshot=$DEPLOY_SNAPSHOT; originally_running=$PREVIOUS_RUNNING"
     trap rollback_deployment EXIT
@@ -346,7 +281,6 @@ rollback_deployment() {
     operation_event error "deployment interrupted; exit=$status"
     operation_stage rollback
     set +e
-    if [ "$DEPLOY_FILES_MUTATED" = 1 ] && [ "$UFW_SNAPSHOTTED" = 1 ]; then refresh_ufw_credentials; fi
     run_shielded restore_deployment "$status"
     status=$?
     operation_finish "$status"
@@ -361,11 +295,6 @@ restore_deployment() {
             downtime_ends 'previous version restarted'
         fi
         return 1
-    fi
-    stop_tunnel_launcher || failed=1
-    if [ -n "${tunnel_startup_log:-}" ]; then rm -f -- "$tunnel_startup_log" || failed=1; fi
-    if [ "$TUNNEL_STARTED_BY_DEPLOY" = 1 ] || [ "$PREVIOUS_TUNNEL_RUNNING" = 0 ]; then
-        if managed_cloudflared_pid >/dev/null 2>&1; then stop_managed_cloudflared || failed=1; fi
     fi
     if [ "$NEW_CONTAINER_ATTEMPTED" = 1 ] && docker container inspect mixin-chatbot >/dev/null 2>&1; then
         if docker stop --time 30 mixin-chatbot >/dev/null; then
@@ -397,13 +326,6 @@ restore_deployment() {
             cp -a -- "$DEPLOY_SNAPSHOT/$relative" "$PROJECT_DIR/$relative" || failed=1
         fi
     done
-    if [ "$UFW_SNAPSHOTTED" = 1 ]; then
-        remove_managed_ufw_rules || failed=1
-        local address port
-        while read -r address port; do
-            run_ufw allow from "$address" to any port "$port" proto tcp comment 'Mixin-Chatbot (平台IP)' || failed=1
-        done < "$DEPLOY_SNAPSHOT/ufw-rules.txt"
-    fi
     if [ -n "$PREVIOUS_IMAGE" ] && ! docker tag "$PREVIOUS_IMAGE" mixin-chatbot; then
         failed=1
         print_error "原镜像 ${PREVIOUS_IMAGE#sha256:} 已不存在（回滚标签 $PREVIOUS_IMAGE_TAG 缺失），无法恢复 mixin-chatbot 标签"
@@ -411,11 +333,6 @@ restore_deployment() {
     if [ "$PREVIOUS_CONTAINER_SAVED" = 1 ]; then docker rename "$ROLLBACK_CONTAINER" mixin-chatbot || failed=1; fi
     if [ "$failed" = 0 ] && [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ]; then
         if docker start mixin-chatbot >/dev/null; then downtime_ends 'previous version restarted'; else failed=1; fi
-    fi
-    if [ "$PREVIOUS_TUNNEL_RUNNING" = 1 ] && ! managed_cloudflared_pid >/dev/null 2>&1; then
-        if [ "${#TUNNEL_COMMAND[@]}" -gt 0 ]; then
-            start_managed_cloudflared_command "${TUNNEL_COMMAND[@]}" || failed=1
-        else failed=1; fi
     fi
     if [ "$failed" = 0 ]; then
         if [ "${DATA_PREPARATION_APPLY_ATTEMPTED:-0}" = 1 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then : > "$BOT_UPDATE_COMMIT_FILE"; fi

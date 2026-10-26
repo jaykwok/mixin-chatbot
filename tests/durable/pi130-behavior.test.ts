@@ -12,6 +12,7 @@ import { defineExtension } from "@earendil-works/pi-durable";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 test("finished malformed JSON cannot execute write/send/MCP; repaired Unicode escapes preserve every following field", async () => {
   const f = await tempFixture("strict-tool-json-");
@@ -31,7 +32,7 @@ test("finished malformed JSON cannot execute write/send/MCP; repaired Unicode es
     expect(valid.argumentsError).toBeUndefined(); expect(valid.arguments).toEqual({ path: "report.tex", content: "\\usepackage{booktabs}", after: "kept" });
     faux.setResponses([fauxAssistantMessage(names.map((name, i) => ({ ...fauxToolCall(name, {}, { id: `bad-${i}` }), ...bad })), { stopReason: "toolUse" }),
       fauxAssistantMessage([fauxToolCall("write", valid.arguments, { id: "valid" })], { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
-    const { conversation } = await memberConversation(opened.harness, "group-a", "alice", { model }, context);
+    const { conversation } = await memberConversation(opened.harness, scopeOf("group-a"), "alice", { model }, context);
     expect((await (await conversation.submit({ type: "input", content: "work" }, context)).wait(context)).status).toBe("done");
     expect(called).toEqual([valid.arguments]);
     const transcript = JSON.stringify((await conversation.entries({}, 100, undefined, context)).items);

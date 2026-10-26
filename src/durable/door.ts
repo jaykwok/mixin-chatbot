@@ -6,10 +6,10 @@
 // synchronous check of that registry, with no await in between. Both run on the one JS thread of the process that holds
 // the lease, so they are totally ordered: a request that passed the check was handed over before the control was
 // received and is in flight, and the control's abort cancels it; a request checked after the mark holds and is never
-// handed over (the control's abort ends the hold). Every await of the request path (identity read, credential
-// resolution, task read, start-record commit, the hold itself) lies before the final check. The registry is loaded from
-// the pending admissions at startup, before scheduling, and a control leaves it only after its removal from the stream
-// is committed by the service.
+// handed over (the control's abort ends the hold). Every await of the request path (member lookup, the run budget,
+// credential resolution, the hold itself) lies before the final check. The registry is loaded from the pending
+// admissions at startup, before scheduling, and a control leaves it only after its removal from the stream is committed
+// by the service.
 //
 // Registration ownership. Each admission attempt of a control holds its own ticket from receipt until that attempt is
 // resolved, and a control waiting in the admission stream holds one stream registration under its requestId. Every
@@ -20,52 +20,54 @@
 // calls the provider, so the door does not delegate generation requests to it. It implements `streamSimple` itself on the
 // public `Models` interface: `getProvider(id)` and `getAuth(model, ...)` (which also adds the models.json headers), merged
 // into the provider options as pi-ai `Models.applyAuth` / `ModelRuntime.prepareRequest` do,
-// then, after the final check, `provider.streamSimple` synchronously. A `beforeRequest` hook registers the generation's
-// abort signal with its conversation and task, synchronously, without I/O; the door looks the registration up by signal
-// identity (the hook context's `abortSignal` is the invocation controller's signal). The door fails closed: a request
-// without a registration is not sent.
+// then, after the final check, `provider.streamSimple` synchronously.
 //
-// Compaction. The summarize request (`models.completeSimple`) takes the same path: the
-// project's pi-durable patch (scripts/patches/) adds a `beforeSummarize` hook before every summarize attempt, which
-// registers the compaction's signal as `beforeRequest` does for a generation; the door then holds it for a pending
-// control, commits its start record (kind "compaction") and hands it over after the same final check. pi-ai's
-// `Models.completeSimple` is `streamSimple(...).result()`, so the door answers it with its own stream's result. Durable
-// keeps no per-compaction usage (it adds it to `pi.usage` with the generations), so the door writes the response's
-// usage into the start record before ending the stream (best effort; src/durable/compaction.ts).
+// Which member. Durable passes every generation and summarize request the conversation's provider session id
+// (`pi.provider`, created in the conversation's creating commit, fresh for a fork) as `options.sessionId`. The door maps
+// it to the conversation and member from committed data only: the member directory, the conversation's identity and its
+// provider document must agree (`sessions`, src/durable/models.ts). The map is loaded before scheduling (`loadSessions`),
+// extended after a member conversation was committed (`bind`), and read again once when a request names an unknown
+// session; a session still unknown, or claimed by two conversations, is not sent. Tools find their member the same way,
+// by conversation id. Nothing is inferred from the request's content or from which member is active.
+//
+// Compaction. The summarize request (`models.completeSimple`) carries the same session id and takes the same path, so
+// background, overflow and manual compaction hold for a member's pending control like a generation. pi-ai's
+// `Models.completeSimple` is `streamSimple(...).result()`, so the door answers it with its own stream's result.
 //
 // Error semantics. A failure while preparing the provider call (not a chat model, unknown provider, provider not
 // configured, credential resolution or header transform failing) ends the stream as Models' lazy setup does
 // (`api/lazy.js`): stop reason "error", the error's own message, no retry by the door, so Durable classifies it as it
-// would without the door. Routed (virtual) models are refused as a setup failure.
+// would without the door. Routed (virtual) models are refused as a setup failure. A request the door refuses (no or an
+// unknown session, the member lookup failing) ends in a NOT_SENT error, which Durable's retry policy retries.
 //
-// Start record. The door commits the attempt's start (src/durable/attempts.ts) before the final check and hands the
-// request over only after that commit succeeded. Its own steps (member read, start record) are retried with an abortable
-// backoff; if they keep failing the request is not sent and the stream ends in a NOT_SENT error, which Durable's retry
-// policy retries. A start whose request was then held is marked withdrawn (a failed withdraw leaves an over-count).
+// Usage. The door keeps no records: Durable adds each committed response's usage to `pi.usage`, which the statistics
+// read (src/agent/stats-ledger.ts).
 //
 // Not gated: deferred polls, which continue a request that already went through the door; a control aborts them like any
 // background work.
-import { type Context, copyJson } from "@earendil-works/chord";
-import { withoutAbortSignal } from "@earendil-works/chord/context";
+import type { Context } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   type AssistantMessage, type AssistantMessageEvent, type AssistantMessageEventStream, createAssistantMessageEventStream,
   createModels, type AnyModel, type AssistantImages, type ClassifierContext, type ClassifierModel, type ClassifierResult,
-  type ImageModel, type ImagesContext, type Model, type Models, normalizeContext, type Provider, type Usage,
+  type ImageModel, type ImagesContext, type Model, type Models, normalizeContext, type Provider,
 } from "@earendil-works/pi-ai";
 import { assertChatModel } from "@earendil-works/pi-ai/utils/model-operations";
-import type { ToolExecutionApi, ToolRegistration } from "@earendil-works/pi-durable";
-import { AuxiliaryDoc } from "./auxiliary-records.ts";
+import type { Extension, Harness, ToolExecutionApi, ToolRegistration } from "@earendil-works/pi-durable";
 import { ModelsError } from "@earendil-works/pi-ai/utils/models-error";
-import {
-  type CompactionCheckpoint, CompactionTask, defineExtension, type Extension, GenerationTask, type GenerationCheckpoint, type Harness, hook,
-} from "@earendil-works/pi-durable";
-import { AttemptsDoc, NOT_SENT, type UsageRecord } from "./attempts.ts";
 
 /** coding-agent `VIRTUAL_MODEL_API` (core/virtual-models.js; not exported from the package). */
 export const VIRTUAL_MODEL_API = "pi-virtual";
 
-type Registration = { kind: "generation" | "compaction"; conversationId: number; taskId: number; context: Context };
+/**
+ * Error-message prefix of a request the door ended without calling the provider. "internal error" is what pi-ai's
+ * `isRetryableAssistantError` matches, so Durable's retry policy retries it.
+ */
+export const NOT_SENT = "mixin request door: internal error, request not sent";
+
+/** A member conversation's provider session, as committed. */
+export type SessionBinding = { readonly sessionId: string; readonly conversationId: number; readonly phone: string };
 /** One admission attempt of a control: its registration from receipt until the attempt is resolved. */
 export type ControlTicket = { readonly phone: string; readonly requestId: string };
 /** A control waiting in the admission stream. */
@@ -76,18 +78,18 @@ type Prepared = {
   options: Record<string, unknown>;
 };
 type StreamOptions = {
-  signal?: AbortSignal; apiKey?: string; env?: Record<string, string>; headers?: Record<string, string>;
+  signal?: AbortSignal; sessionId?: string; apiKey?: string; env?: Record<string, string>; headers?: Record<string, string>;
   transformHeaders?: (headers: Record<string, string>) => Promise<Record<string, string>> | Record<string, string>;
 };
 
 export interface DoorOptions {
-  /** Member (group-scoped phone) of a conversation; read once per conversation and cached. */
-  memberOf(harness: Harness, conversationId: number, context: Context): Promise<string | undefined>;
-  /** Tries for each of the door's own steps (member read, start record) before giving up unsent; default 3. */
-  startTries?: number;
+  /** Verified member sessions of the space; only the given conversation's when `conversationId` is set. */
+  sessions(harness: Harness, context: Context, conversationId?: number): Promise<SessionBinding[]>;
   clock?: () => number;
-  /** Errors the door absorbed (failed tries, failed withdraws, failed stream reads). Must not throw. */
+  /** Errors the door absorbed (failed lookups, conflicting sessions, failed stream reads). Must not throw. */
   onReport?: (error: unknown) => void;
+  /** A request ended NOT_SENT (as `notSent` counts). Must not throw. */
+  onNotSent?: () => void;
   /** Tests: a request of this conversation holds for a pending control. */
   onHold?: (conversationId: number) => void;
   /** Tests: called synchronously right after the provider call returned its stream (the handover). */
@@ -103,11 +105,13 @@ export interface DoorOptions {
 const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
 
+/** Wait `ms` unless `signal` aborts; the abort listener goes with the timer, so the long-lived signal keeps none. */
 function pause(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     if (signal.aborted) return reject(signal.reason);
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
+    signal.addEventListener("abort", abort, { once: true });
   });
 }
 
@@ -122,14 +126,17 @@ function mergeHeaders(base: Record<string, string> | undefined, override: Record
   return merged;
 }
 
-/** One per group Harness; created by `groupDoor` (src/durable/models.ts). */
+/** One per space Harness; created by `spaceDoor` (src/durable/models.ts). */
 export class RequestDoor {
   readonly #toolScope = new AsyncLocalStorage<{ api: Pick<ToolExecutionApi, "taskId" | "conversationId">; context: Context; callId: string; signal: AbortSignal }>();
   readonly #requestedAt = new WeakMap<AssistantMessageEventStream, number>();
   readonly #holder: { harness?: Harness };
   readonly #options: DoorOptions;
-  readonly #registrations = new WeakMap<AbortSignal, Registration>();
-  readonly #members = new Map<number, string>();
+  readonly #bySession = new Map<string, SessionBinding>();
+  readonly #byConversation = new Map<number, SessionBinding>();
+  /** Sessions claimed by more than one conversation: never sent. */
+  readonly #conflicts = new Set<string>();
+  #reloading: Promise<void> | undefined;
   /** Admission attempts of controls, not yet resolved. */
   readonly #tickets = new Set<ControlTicket>();
   /** Controls waiting in the admission stream, by requestId. */
@@ -137,21 +144,76 @@ export class RequestDoor {
   readonly #waiters = new Set<() => void>();
   /** Background resolutions of uncertain admissions; `close()` stops them. */
   readonly #recoveries = new Set<Promise<void>>();
-  /** Start/terminal records already admitted; close drains them before the Harness closes. */
-  readonly #writes = new Set<Promise<unknown>>();
   readonly #closing = new AbortController();
   /** Generation and summarize requests the door handed to a provider. */
   dispatched = 0;
-  /** Requests ended NOT_SENT (the door's own steps failed, or no registration). */
+  /** Requests ended NOT_SENT (no or an unknown session, the member lookup failed). */
   notSent = 0;
   /** Requests ended by a setup failure (Models' semantics; nothing sent). */
   setupFailed = 0;
-  withdrawn = 0;
 
   /** `holder.harness` is set once `Harness.open` returned; the door runs only after scheduling started. */
   constructor(holder: { harness?: Harness }, options: DoorOptions) {
     this.#holder = holder;
     this.#options = options;
+  }
+
+  // ---- member sessions ------------------------------------------------------------------------------------------------
+
+  /** Startup before scheduling: every member session of the space, so a recovered summarize request finds its member. */
+  async loadSessions(context: Context): Promise<void> {
+    const found = await this.#options.sessions(this.#harness(), context);
+    this.#bySession.clear();
+    this.#byConversation.clear();
+    this.#conflicts.clear();
+    for (const binding of found) this.#add(binding);
+  }
+
+  /** After a member conversation's creating (or verifying) commit returned: its session may be sent from now on. */
+  async bind(conversationId: number, context: Context): Promise<void> {
+    if (this.#byConversation.has(conversationId)) return;
+    const [binding] = await this.#options.sessions(this.#harness(), context, conversationId);
+    if (binding === undefined) throw new Error(`request door: conversation ${conversationId} has no verified member session`);
+    this.#add(binding);
+    if (this.#conflicts.has(binding.sessionId)) throw new Error(`request door: session of conversation ${conversationId} is claimed twice`);
+  }
+
+  #add(binding: SessionBinding): void {
+    const other = this.#bySession.get(binding.sessionId);
+    if (this.#conflicts.has(binding.sessionId) || (other !== undefined && other.conversationId !== binding.conversationId)) {
+      this.#conflicts.add(binding.sessionId);
+      this.#bySession.delete(binding.sessionId);
+      if (other !== undefined) this.#byConversation.delete(other.conversationId);
+      this.#report(new Error(`request door: provider session of conversations ${other?.conversationId ?? "?"} and ${binding.conversationId} is the same; not sent`));
+      return;
+    }
+    this.#bySession.set(binding.sessionId, binding);
+    this.#byConversation.set(binding.conversationId, binding);
+  }
+
+  /** The member of a request's session: known, or after one reload of the space's sessions; otherwise refused. */
+  async #session(sessionId: string, signal: AbortSignal): Promise<SessionBinding> {
+    let binding = this.#bySession.get(sessionId);
+    if (binding === undefined && !this.#conflicts.has(sessionId)) {
+      this.#reloading ??= this.loadSessions(BACKGROUND_CONTEXT).finally(() => { this.#reloading = undefined; });
+      await this.#reloading;
+      signal.throwIfAborted();
+      binding = this.#bySession.get(sessionId);
+    }
+    if (binding === undefined) throw new Error("no verified member for this provider session");
+    return binding;
+  }
+
+  /** The member of a tool's conversation: known, or bound now from committed data; otherwise refused. */
+  async #member(conversationId: number, context: Context, signal: AbortSignal): Promise<string> {
+    let binding = this.#byConversation.get(conversationId);
+    if (binding === undefined) {
+      await this.bind(conversationId, context);
+      signal.throwIfAborted();
+      binding = this.#byConversation.get(conversationId);
+    }
+    if (binding === undefined) throw new Error(`conversation ${conversationId} has no member identity`);
+    return binding.phone;
   }
 
   // ---- controls (registered by the service on admission) -------------------------------------------------------------
@@ -210,7 +272,7 @@ export class RequestDoor {
     return "retrying";
   }
 
-  /** Startup before scheduling. Preserve receipts registered while the group was asynchronously opening. */
+  /** Startup before scheduling. Preserve receipts registered while the space was asynchronously opening. */
   loadControls(pending: Iterable<PendingControl>): void {
     this.#waiting.clear();
     for (const control of pending) this.#waiting.set(control.requestId, { ...control });
@@ -236,7 +298,6 @@ export class RequestDoor {
   async close(): Promise<void> {
     this.#closing.abort();
     await Promise.allSettled([...this.#recoveries]);
-    await Promise.allSettled([...this.#writes]);
   }
 
   async #resolve(ticket: ControlTicket, read: () => Promise<number | undefined>): Promise<boolean> {
@@ -263,32 +324,6 @@ export class RequestDoor {
 
   // ---- wiring ---------------------------------------------------------------------------------------------------------
 
-  /** Install first: registers each generation and summarize request's abort signal (synchronous, no I/O). */
-  extension(): Extension {
-    const registrations = this.#registrations;
-    const register = (kind: Registration["kind"], api: { conversationId: unknown; taskId: unknown }, context: Context) => {
-      if (context.abortSignal !== undefined) {
-        registrations.set(context.abortSignal, { kind, conversationId: api.conversationId as number, taskId: api.taskId as number, context });
-      }
-    };
-    return defineExtension({
-      name: "mixin-request-door",
-      hooks: [
-        hook(GenerationTask, {
-          async beforeRequest(_request, api, context: Context) {
-            register("generation", api, context);
-            return undefined;
-          },
-        }),
-        hook(CompactionTask, {
-          async beforeSummarize(_request, api, context: Context) {
-            register("compaction", api, context);
-          },
-        }),
-      ],
-    });
-  }
-
   /** ToolTask calls execute for both first execution and safe replay; beforeTool is skipped on replay. */
   wrapTools(extension: Extension): Extension {
     const wrap = (tool: ToolRegistration): ToolRegistration => ({
@@ -296,9 +331,7 @@ export class RequestDoor {
       execute: async (args, api, context) => {
         if (!context.abortSignal) throw new Error("tool execution requires a Durable invocation signal");
         const signal = AbortSignal.any([context.abortSignal, this.#closing.signal]);
-        const registration: Registration = { kind: "generation", conversationId: api.conversationId as number,
-          taskId: api.taskId as number, context };
-        const phone = await this.#member(registration, signal);
+        const phone = await this.#member(api.conversationId as number, context, signal);
         await this.#options.beforeDispatch?.(phone, signal);
         signal.throwIfAborted();
         const blocked = this.#options.dispatchError?.(phone);
@@ -351,11 +384,11 @@ export class RequestDoor {
   async external<T>(api: Pick<ToolExecutionApi, "taskId" | "conversationId">, context: Context, dispatch: () => Promise<T>, callerSignal: AbortSignal): Promise<T> {
     if (!context.abortSignal) throw new Error("external tool requires a Durable invocation signal");
     const signal = AbortSignal.any([context.abortSignal, callerSignal, this.#closing.signal]);
-    const registration: Registration = { kind: "generation", taskId: api.taskId as number, conversationId: api.conversationId as number, context };
-    const phone = await this.#member(registration, signal);
+    const conversationId = api.conversationId as number;
+    const phone = await this.#member(conversationId, context, signal);
     await this.#options.beforeDispatch?.(phone, signal);
     for (;;) {
-      await this.#hold(phone, registration, signal);
+      await this.#hold(phone, conversationId, signal);
       signal.throwIfAborted();
       if (this.pendingControls(phone) === 0) {
         const blocked = this.#options.dispatchError?.(phone);
@@ -375,9 +408,9 @@ export class RequestDoor {
       getAllModels: () => provider.getAllModels?.() ?? provider.getModels(),
       // Pi owns auth preparation and image capability validation. Only dispatch is wrapped, after every auth await.
       auth: { apiKey: { name: "Configured runtime", resolve: ({ signal }) => models.getAuth(model, { signal }) } },
-      ...(provider.classify ? { classify: ((selected, transcript, options) => this.#auxiliary("classifier", selected, options?.signal,
+      ...(provider.classify ? { classify: ((selected, transcript, options) => this.#auxiliary(options?.signal,
         () => provider.classify!(selected, transcript, { ...options, maxRetries: 0 }))) as Provider["classify"] } : {}),
-      ...(provider.generateImages ? { generateImages: ((selected, transcript, options) => this.#auxiliary("image", selected, options?.signal,
+      ...(provider.generateImages ? { generateImages: ((selected, transcript, options) => this.#auxiliary(options?.signal,
         () => provider.generateImages!(selected, transcript, { ...options, maxRetries: 0 }))) as Provider["generateImages"] } : {}),
     });
     return view;
@@ -397,54 +430,24 @@ export class RequestDoor {
     return this.#operationModels(models, model).generateImages(model, context, { signal, maxRetries: 0, timeoutMs: 120000 });
   }
 
-  async #auxiliary<T extends { stopReason: "stop" | "error" | "aborted"; usage?: Usage }>(kind: "classifier" | "image", model: AnyModel,
-    requestSignal: AbortSignal | undefined, dispatch: () => Promise<T>): Promise<T> {
+  /** Classifier and image requests: their usage is returned on the tool's result, which Durable adds to `pi.usage`. */
+  async #auxiliary<T>(requestSignal: AbortSignal | undefined, dispatch: () => Promise<T>): Promise<T> {
     const scope = this.#toolScope.getStore();
     if (!scope || !requestSignal) throw new Error("auxiliary request has no invocation");
-    const registration: Registration = { kind: "generation", conversationId: scope.api.conversationId as number,
-      taskId: scope.api.taskId as number, context: scope.context };
-    const phone = await this.#member(registration, requestSignal);
+    const conversationId = scope.api.conversationId as number;
+    const phone = await this.#member(conversationId, scope.context, requestSignal);
     await this.#options.beforeDispatch?.(phone, requestSignal);
     for (;;) {
-      await this.#hold(phone, registration, requestSignal);
+      await this.#hold(phone, conversationId, requestSignal);
+      // Serial boundary: the provider receives the request immediately after this final synchronous check.
       requestSignal.throwIfAborted();
       const blocked = this.#options.dispatchError?.(phone);
       if (blocked) throw blocked;
-      const key = await this.#tries(requestSignal, () => this.#write(() => this.#harness().commit(async tx => {
-        const doc = await tx.doc(AuxiliaryDoc, scope.api.conversationId);
-        let index = 1;
-        while (doc.starts[`${scope.api.taskId}:${scope.callId}:${index}`]) index++;
-        const key = `${scope.api.taskId}:${scope.callId}:${index}`;
-        doc.starts[key] = { taskId: scope.api.taskId as number, callId: scope.callId, kind, provider: model.provider, model: model.id,
-          startedAt: (this.#options.clock ?? Date.now)() };
-        return key;
-      }, scope.context)));
-      // Serial boundary: the provider receives the request immediately after this final synchronous check.
-      const blockedAtDispatch = this.#options.dispatchError?.(phone);
-      if (!blockedAtDispatch && !requestSignal.aborted && this.pendingControls(phone) === 0) {
-        this.dispatched++;
-        const work = dispatch();
-        this.#options.onDispatch?.(registration.conversationId);
-        const result = await work;
-        // After shutdown retain the durable start as unknown, like generation; never attempt a new receipt write.
-        if (this.#closing.signal.aborted) return result;
-        try {
-          await this.#write(() => this.#harness().commit(async tx => {
-            const start = (await tx.doc(AuxiliaryDoc, scope.api.conversationId)).starts[key];
-            if (!start) throw new Error("auxiliary request receipt missing");
-            start.endedAt = (this.#options.clock ?? Date.now)();
-            start.outcome = result.stopReason;
-            if (result.stopReason === "stop" && result.usage) start.usage = copyJson(result.usage, { omitUndefinedProperties: true }) as UsageRecord;
-          }, withoutAbortSignal(scope.context)));
-        } catch (error) { this.#report(error); }
-        return result;
-      }
-      await this.#write(() => this.#harness().commit(async tx => {
-        const start = (await tx.doc(AuxiliaryDoc, scope.api.conversationId)).starts[key];
-        if (start) start.withdrawn = true;
-      }, withoutAbortSignal(scope.context)));
-      if (blockedAtDispatch) throw blockedAtDispatch;
-      requestSignal.throwIfAborted();
+      if (this.pendingControls(phone) > 0) continue;
+      this.dispatched++;
+      const work = dispatch();
+      this.#options.onDispatch?.(conversationId);
+      return await work;
     }
   }
 
@@ -459,16 +462,18 @@ export class RequestDoor {
 
   async #run(models: Models, model: Model<never>, transcript: ReturnType<typeof normalizeContext>, options: StreamOptions | undefined,
     outer: AssistantMessageEventStream): Promise<void> {
-    const registeredSignal = options?.signal;
-    const registration = registeredSignal === undefined ? undefined : this.#registrations.get(registeredSignal);
-    if (registeredSignal === undefined || registration === undefined) return this.#end(outer, model, "error", "no registration for this request");
-    const signal = AbortSignal.any([registeredSignal, this.#closing.signal]);
+    const requestSignal = options?.signal;
+    const sessionId = options?.sessionId;
+    if (requestSignal === undefined || typeof sessionId !== "string" || sessionId === "") {
+      return this.#end(outer, model, "error", "the request carries no provider session");
+    }
+    const signal = AbortSignal.any([requestSignal, this.#closing.signal]);
     try {
       signal.throwIfAborted();
-      const phone = await this.#member(registration, signal);
+      const { phone, conversationId } = await this.#session(sessionId, signal);
       await this.#options.beforeDispatch?.(phone, signal);
       for (;;) {
-        await this.#hold(phone, registration, signal);
+        await this.#hold(phone, conversationId, signal);
         if (this.#options.dispatchError?.(phone)) return this.#end(outer, model, "aborted");
         let request: Prepared;
         try {
@@ -478,33 +483,23 @@ export class RequestDoor {
           this.setupFailed++;
           return this.#fail(outer, model, error);
         }
-        const key = await this.#tries(signal, () => this.#start(registration));
         // ---- serial boundary: no await from the checks below to the provider call ----
-        if (this.#options.dispatchError?.(phone)) {
-          await this.#withdraw(registration, key);
-          return this.#end(outer, model, "aborted");
-        }
-        if (signal.aborted) {
-          this.#end(outer, model, "aborted");
-          void this.#withdraw(registration, key);
-          return;
-        }
+        if (this.#options.dispatchError?.(phone) || signal.aborted) return this.#end(outer, model, "aborted");
         if (this.pendingControls(phone) === 0) {
           this.dispatched++;
           let inner: AssistantMessageEventStream;
           try {
             // Harness owns cancellation once dispatched: closing the door must not settle a recoverable task first.
-            inner = request.provider.streamSimple(request.model as never, transcript as never, { ...request.options, signal: registeredSignal } as never);
+            inner = request.provider.streamSimple(request.model as never, transcript as never, { ...request.options, signal: requestSignal } as never);
           } catch (error) {
-            // A provider that throws instead of returning a stream: as `api/lazy.js` (the start stays, counted once).
+            // A provider that throws instead of returning a stream: as `api/lazy.js`.
             return this.#fail(outer, model, error);
           }
-          this.#pipe(inner, outer, model, { registration, key });
-          this.#options.onDispatch?.(registration.conversationId);
+          this.#pipe(inner, outer, model);
+          this.#options.onDispatch?.(conversationId);
           return;
         }
-        this.#options.onHold?.(registration.conversationId);
-        await this.#withdraw(registration, key);
+        this.#options.onHold?.(conversationId);
       }
     } catch (error) {
       if (signal.aborted) return this.#end(outer, model, "aborted");
@@ -540,22 +535,10 @@ export class RequestDoor {
     };
   }
 
-  async #member(registration: Registration, signal: AbortSignal): Promise<string> {
-    const cached = this.#members.get(registration.conversationId);
-    if (cached !== undefined) return cached;
-    const phone = await this.#tries(signal, async () => {
-      const value = await this.#options.memberOf(this.#harness(), registration.conversationId, registration.context);
-      if (value === undefined || value === "") throw new Error(`conversation ${registration.conversationId} has no member identity`);
-      return value;
-    });
-    this.#members.set(registration.conversationId, phone);
-    return phone;
-  }
-
   /** Wait while the member has a received, unfinished control; the control's abort ends the wait. */
-  async #hold(phone: string, registration: Registration, signal: AbortSignal): Promise<void> {
+  async #hold(phone: string, conversationId: number, signal: AbortSignal): Promise<void> {
     while (this.pendingControls(phone) > 0) {
-      this.#options.onHold?.(registration.conversationId);
+      this.#options.onHold?.(conversationId);
       await new Promise<void>((resolve, reject) => {
         if (signal.aborted) return reject(signal.reason);
         const cleanup = () => { this.#waiters.delete(wake); signal.removeEventListener("abort", abort); };
@@ -567,97 +550,11 @@ export class RequestDoor {
     }
   }
 
-  /** Commit the start record of this invocation; returns its key. */
-  async #start(registration: Registration): Promise<string> {
-    const harness = this.#harness();
-    const { conversationId, taskId, context } = registration;
-    const task = await harness.getTask(taskId as never, context);
-    const checkpoint = (task?.state.status === "running" || task?.state.status === "pending" ? task.state.checkpoint : undefined) as
-      GenerationCheckpoint | CompactionCheckpoint | undefined;
-    const phase = registration.kind === "generation" ? "request" : "summarize";
-    if (checkpoint?.phase !== phase || !("model" in checkpoint)) throw new Error(`request door: task ${taskId} is not in phase ${phase}`);
-    const clock = this.#options.clock ?? Date.now;
-    return this.#write(() => harness.commit(async (tx) => {
-      const latest = (await tx.scanEntries({ conversationId: conversationId as never }, 1)).items[0]?.id ?? 0;
-      const doc = await tx.doc(AttemptsDoc, conversationId as never);
-      let k = 1;
-      while (doc.starts[`${taskId}:${checkpoint.attempt}:${k}`] !== undefined) k++;
-      const key = `${taskId}:${checkpoint.attempt}:${k}`;
-      doc.starts[key] = { taskId, attempt: checkpoint.attempt, k, afterEntry: latest as number, startedAt: clock(),
-        provider: checkpoint.model.provider, model: checkpoint.model.modelId, ...(registration.kind === "compaction" ? { kind: "compaction" as const } : {}) };
-      return key;
-    }, context));
-  }
-
-  /** The request was not sent after its start was committed: mark the start withdrawn (best effort, not cancelled by the abort). */
-  async #withdraw(registration: Registration, key: string): Promise<void> {
-    if (this.#closing.signal.aborted) return;
-    try {
-      await this.#write(() => this.#harness().commit(async (tx) => {
-        const start = (await tx.doc(AttemptsDoc, registration.conversationId as never)).starts[key];
-        if (start !== undefined) start.withdrawn = true;
-      }, withoutAbortSignal(registration.context)));
-      this.withdrawn++;
-    } catch (error) {
-      this.#report(error);
-    }
-  }
-
-  /** Record the terminal response before resolving it; errors/aborts carry no confirmed bill. */
-  async #usage(registration: Registration, key: string, message: AssistantMessage): Promise<void> {
-    // Late responses after shutdown retain their durable start as unconfirmed; never write to a closed Session.
-    if (this.#closing.signal.aborted) return;
-    try {
-      await this.#write(() => this.#harness().commit(async (tx) => {
-        const start = (await tx.doc(AttemptsDoc, registration.conversationId as never)).starts[key];
-        if (start !== undefined) {
-          start.outcome = message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "done";
-          if (start.outcome === "done") start.usage = copyJson(message.usage, { omitUndefinedProperties: true }) as UsageRecord;
-        }
-      }, withoutAbortSignal(registration.context)));
-    } catch (error) {
-      this.#report(error);
-    }
-  }
-
-  async #tries<T>(signal: AbortSignal, step: () => Promise<T>): Promise<T> {
-    const tries = this.#options.startTries ?? 3;
-    for (let attempt = 1; ; attempt++) {
-      signal.throwIfAborted();
-      try {
-        return await step();
-      } catch (error) {
-        if (signal.aborted || attempt >= tries) throw error;
-        this.#report(error);
-        await pause(10 * 4 ** (attempt - 1), signal);
-      }
-    }
-  }
-
-  #write<T>(operation: () => Promise<T>): Promise<T> {
-    this.#closing.signal.throwIfAborted();
-    const work = operation();
-    this.#writes.add(work);
-    void work.finally(() => this.#writes.delete(work)).catch(() => {});
-    return work;
-  }
-
-  #pipe(inner: AssistantMessageEventStream, outer: AssistantMessageEventStream, model: Model<never>,
-    usageOf?: { registration: Registration; key: string }): void {
+  #pipe(inner: AssistantMessageEventStream, outer: AssistantMessageEventStream, model: Model<never>): void {
     void (async () => {
       try {
-        let recorded = false;
-        for await (const event of inner) {
-          // The terminal event resolves the result. Persist its confirmed usage before forwarding it.
-          if (usageOf !== undefined && (event.type === "done" || event.type === "error")) {
-            await this.#usage(usageOf.registration, usageOf.key, event.type === "done" ? event.message : event.error);
-            recorded = true;
-          }
-          outer.push(event);
-        }
-        const message = await inner.result();
-        if (usageOf !== undefined && !recorded) await this.#usage(usageOf.registration, usageOf.key, message);
-        outer.end(message);
+        for await (const event of inner) outer.push(event);
+        outer.end(await inner.result());
       } catch (error) {
         // The request was handed over: a broken stream is an ordinary provider error, not NOT_SENT (as `api/lazy.js`).
         this.#fail(outer, model, error);
@@ -673,7 +570,7 @@ export class RequestDoor {
   }
 
   #end(outer: AssistantMessageEventStream, model: Model<never>, reason: "error" | "aborted", detail?: string): void {
-    if (reason === "error") this.notSent++;
+    if (reason === "error") { this.notSent++; this.#options.onNotSent?.(); }
     const message = this.#message(model, reason, reason === "aborted" ? "Request was aborted" : `${NOT_SENT} (${detail})`, this.#requestedAt.get(outer));
     outer.push({ type: "error", reason, error: message } as AssistantMessageEvent);
     outer.end(message);

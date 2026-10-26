@@ -26,7 +26,7 @@ test("tmp and stat return one for duplicate or targetless selectors without unha
     for (const [file, args] of [["tmp-admin.ts", ["list"]], ["stats-admin.ts", []]] as const) {
       for (const flags of [["--group-id"], ["--group-id", "--group-id"], ["--storage-segment", "--group-id"]]) {
         const child = Bun.spawn([process.execPath, join(fileURLToPath(new URL("../../scripts/ops/", import.meta.url)), file), ...args, ...flags],
-          { cwd: f.root, env: { ...process.env, GROUP_DATA_ROOT: join(f.root, "groups") }, stdout: "pipe", stderr: "pipe", windowsHide: true });
+          { cwd: f.root, env: process.env, stdout: "pipe", stderr: "pipe", windowsHide: true });
         const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
         expect(code).toBe(1); expect(stderr).not.toContain("at main");
         expect(stderr).toMatch(/重复|指定群|同时/);

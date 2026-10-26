@@ -7,6 +7,7 @@ import { mkdtemp, mkdir } from "node:fs/promises";
 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { groupScope } from "../../src/core/layout.ts";
 
 describe("bash default timeout", () => {
   test("a command with no declared timeout is stopped instead of hanging the turn", async () => {
@@ -33,7 +34,7 @@ describe("bash default timeout", () => {
 
     try {
       const env = await createMemberEnv({ workspaceDir: workspace, tempDir: userTemp,
-        phone: "+8613800000000", groupId: "group-a", venvDir: join(root, "venv"), materialsIndexPath: join(root, "index/materials.md") });
+        phone: "+8613800000000", scope: groupScope("group-a"), venvDir: join(root, "venv"), materialsIndexPath: join(root, "index/materials.md") });
       for (const seconds of [undefined, 1]) {
         const start = Date.now();
         const result = await env.exec("sleep 60", { timeout: seconds }, BACKGROUND_CONTEXT);

@@ -61,13 +61,11 @@ update
     await writeFile(join(work, ".gitignore"), "data/\nlogs/\ntmp/\nbackup/\n");
     // Every path of UPGRADER_EXPORT_PATHS exists in each commit; the Dockerfile content names the version.
     await mkdir(join(work, "scripts/deploy"), { recursive: true }); await mkdir(join(work, "scripts/lib")); await mkdir(join(work, "scripts/runtime"));
-    await mkdir(join(work, "src/core"), { recursive: true });
     await writeFile(join(work, "scripts/lib/fixture.sh"), ""); await writeFile(join(work, "scripts/runtime/fixture.ts"), "");
-    await writeFile(join(work, "src/core/data-version.ts"), "");
     await writeFile(join(work, "scripts/deploy/upgrade.sh"), `#!/usr/bin/env bash
 set -euo pipefail
 here="$(cd "$(dirname "\${BASH_SOURCE[0]}")/../.." && pwd)"
-[ -f "$here/src/core/data-version.ts" ] && [ -f "$here/scripts/lib/fixture.sh" ] && [ -f "$here/scripts/runtime/fixture.ts" ] || exit 44
+[ -f "$here/scripts/lib/fixture.sh" ] && [ -f "$here/scripts/runtime/fixture.ts" ] || exit 44
 input=''; IFS= read -r input || true
 printf 'upgrader version=%s dir=%s args=%s stdin=%s\\n' "$(cat "$here/Dockerfile")" "\${here#"$1"/}" "\${*:2}" "$input" >> "$FIXTURE_EVENTS"
 if [ "\${FIXTURE_UPGRADER_HOLD:-0}" = 1 ]; then
@@ -138,12 +136,11 @@ esac
 
     // Pending transactions: origin is unreachable and has moved on; nothing is fetched and the recorded target is used.
     await git("remote", "set-url", "origin", join(f.root, "missing.git"));
-    const snapshot = join(work, "backup/snapshots/deploy-fixture"), groups = posix(join(work, "data/groups"));
+    const snapshot = join(work, "backup/snapshots/deploy-fixture");
     await mkdir(snapshot, { recursive: true });
     const record = (overrides: Record<string, string> = {}) => writeFile(join(snapshot, "transaction"), Object.entries({
-      format: "1", operation: "upgrade", snapshot: "deploy-fixture", target_sha: target, original_sha: old, original_branch: "main",
-      original_group_root: groups, target_group_root: groups, was_running: "1", bot_port: "1011", deploy_mode: "direct", bot_domain: "",
-      domain_action: "keep", unmanaged_tunnel: "", platform_ip: "198.51.100.9", reconfigure_ai: "0", ...overrides,
+      format: "2", operation: "upgrade", snapshot: "deploy-fixture", target_sha: target, original_sha: old, original_branch: "main",
+      original_workspace_root: "", target_workspace_root: "", was_running: "1", bot_port: "1011", reconfigure_ai: "0", ...overrides,
     }).map(([key, value]) => `${key}=${value}\n`).join(""));
     await writeFile(join(state, "deploy-transaction"), "deploy-fixture"); await record();
     await writeFile(join(state, "running"), "true");
@@ -189,15 +186,6 @@ esac
     await rm(join(state, "deploy-transaction"));
     result = await update({ UPDATE_TRANSACTION_ACTION: "continue" });
     expect(result.code, result.text).toBe(0); expect(result.text).toContain("没有未完成的部署或升级"); expect(await events_()).toEqual([]);
-
-    // A former stop record is opaque: no old recovery engine or snapshot reconstruction remains.
-    await writeFile(join(state, "update-transaction"), "old-format-record");
-    for (const action of ["continue", "rollback"]) {
-      result = await update({ UPDATE_TRANSACTION_ACTION: action });
-      expect(result.code, result.text).toBe(1); expect(result.text).toContain("事务格式不匹配");
-      expect(await events_()).toEqual([]);
-      expect(await readFile(join(state, "update-transaction"), "utf8")).toBe("old-format-record");
-    }
     expect(await exports()).toEqual([]);
   } finally { await f.cleanup(); }
 }, 150000);

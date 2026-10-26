@@ -3,7 +3,7 @@ import { byName } from "../../lib/group-data.ts";
 // 统计报表导出：一份自包含的静态 HTML。
 //
 // 为什么是静态文件而不是一个网页面板：这份东西的用途是「发给别人看」和「贴进汇报材料」。
-// 静态文件双击就开、能直接当附件发走、不开端口、不需要鉴权、不用改 Cloudflare 规则。
+// 静态文件双击就开、能直接当附件发走、不开端口、不需要鉴权。
 // 在机器人进程里挂一个活的面板会带来一整套新的攻击面，而换来的只是同样这几张图。
 //
 // 文件里没有任何外链：CSS 内联、图形用 HTML 盒子而不是图表库、悬浮提示用纯 CSS。断网、
@@ -20,7 +20,8 @@ import { join } from "node:path";
 import * as fmt from "./render/format.ts";
 import { PROJECT_DIR, describeMode, type Deployment } from "./platform.ts";
 import type { GroupStats, Window } from "./data.ts";
-import { change, comparisons, describeStatsWindow, engagement, STATS_NOTE, summarize, trend, type ComparisonData } from "../stats-summary.ts";
+import { change, comparisons, describeStatsWindow, engagement, STATS_NOTE, summarize, TOKEN_NOTE, trend, type ComparisonData } from "../stats-summary.ts";
+import type { TokenTotals } from "../../../src/agent/stats-ledger.ts";
 
 export interface ReportInput {
   groups: GroupStats[];
@@ -253,8 +254,7 @@ function overviewSection(input: ReportInput): string {
   const { groups } = input;
   const asks = groups.reduce((sum, group) => sum + group.asks, 0);
   const summary = summarize(groups);
-  const files = groups.reduce((sum, group) => sum + (group.delivered.get("send_file") ?? 0), 0);
-  const images = groups.reduce((sum, group) => sum + (group.delivered.get("send_image") ?? 0), 0);
+  const tokens = groups.reduce((sum, group) => sum + group.tokens.totalTokens, 0);
   const days = new Set(groups.flatMap((group) => [...group.days])).size;
   const max = Math.max(0, ...groups.map((group) => group.asks));
 
@@ -269,7 +269,7 @@ function overviewSection(input: ReportInput): string {
           ${tile("使用群数", String(groups.length))}
           ${tile("覆盖提问人数", String(summary.people), "跨群去重，不代表群总人数")}
           ${tile("人均提问", summary.average.toFixed(1), "次 / 提问成员")}
-          ${tile("已送附件", String(files), images > 0 ? `另有 ${images} 张图片` : "")}
+          ${tile("模型用量", fmt.count(tokens), "token 合计")}
           ${tile("活跃天数", String(days))}
         </div>
       </section>
@@ -289,13 +289,12 @@ function overviewSection(input: ReportInput): string {
           )
           .join("")}
         ${tableView(
-          ["群", "提问人数", "提问", "处理轮次", "附件", "活跃天数", "首次", "最后"],
+          ["群", "提问人数", "提问", "token 合计", "活跃天数", "首次", "最后"],
           groups.map((group) => [
             group.group,
             String(summarize([group]).people),
             String(group.asks),
-            String(group.replies),
-            String(group.delivered.get("send_file") ?? 0),
+            String(group.tokens.totalTokens),
             String(group.days.size),
             fmt.day(group.firstAt),
             fmt.day(group.lastAt),
@@ -322,12 +321,12 @@ function analysisSections(input: ReportInput, groups: GroupStats[], title: strin
     return `<section><h2>${esc(title)} · ${label}明细</h2>
       <div class="section-note">无记录日期补 0；周、月首尾只统计所选区间内的日期。${points.length > 90 ? "图中展示最后 90 个周期，表格保留完整数据。" : ""}</div>
       <div class="cols trend-cols">${shown.map(point => column(point.date, point.asks, max, String(point.asks), `${point.date}：${point.asks} 次提问 · ${point.askers.size} 人`)).join("")}</div>
-      ${tableView(["日期", "提问", "提问人数", "人均提问", "处理轮次", "文件", "图片", "已知估算费用", "费用未知记录", "用量缺失记录"], points.map(point => [point.date, String(point.asks), String(point.askers.size), point.askers.size ? (point.asks / point.askers.size).toFixed(1) : "0.0", String(point.replies), String(point.files), String(point.images), "$" + point.cost.toFixed(6), String(point.unknownCost), String(point.missingUsage)]), label, grain === "day")}
+      ${tableView(["日期", "提问", "提问人数", "人均提问", "入账 token 合计"], points.map(point => [point.date, String(point.asks), String(point.askers.size), point.askers.size ? (point.asks / point.askers.size).toFixed(1) : "0.0", String(point.tokens.totalTokens)]), label, grain === "day")}
     </section>`;
   }).join("");
   return `<section><h2>${esc(title)} · 同比与环比</h2>
     <div class="section-note">${esc(STATS_NOTE)}</div>${comparison}</section>
-    <section><h2>${esc(title)} · 使用频率</h2><div class="section-note">日均包含无提问的日期；不限日期时，以首末有记录的日期为范围。费用仅为已有价格记录的估算。</div>
+    <section><h2>${esc(title)} · 使用频率</h2><div class="section-note">日均包含无提问的日期；不限日期时，以首末有记录的日期为范围。</div>
     <div class="tiles">${tile("日均提问", activity.dailyAverage.toFixed(1), `${activity.days} 个自然日`)}${tile("活跃天数占比", (activity.activeRate * 100).toFixed(1) + "%", `${summary.activeDays} 天有提问`)}${tile("提问高峰日", activity.peak?.date ?? "—", activity.peak ? `${activity.peak.asks} 次；并列峰值取最早一天` : "无提问记录")}${tile("前五名提问占比", (activity.topFiveShare * 100).toFixed(1) + "%", "观察提问是否集中于少数成员")}</div></section>
     <section><h2>${esc(title)} · 提问排行</h2>
     <div class="tiles">${tile("提问最多", summary.ranking[0] ? name(summary.ranking[0].user) : "—", summary.ranking[0] ? `${summary.ranking[0].asks} 次；并列者见下表` : "区间内无提问")}${tile("总提问数", String(summary.asks))}${tile("覆盖提问人数", String(summary.people))}${tile("人均提问", summary.average.toFixed(1))}</div>
@@ -343,13 +342,9 @@ function detailSection(input: ReportInput, stats: GroupStats): string {
   const memberMax = Math.max(0, ...members.map((user) => user.asks));
   const name = (user: string): string => (input.unmasked ? user : fmt.maskUser(user));
 
-  const tools = [...stats.tools].sort((a, b) => b[1] - a[1] || byName(a[0], b[0]));
-  const toolMax = Math.max(0, ...tools.map(([, count]) => count));
-  const nested = [...stats.nested].sort((a, b) => b[1] - a[1] || byName(a[0], b[0]));
-  const caveats = [
-    stats.nestedIncomplete ? `${stats.nestedIncomplete} 次调用的子调用记录不完整（超过 256 条的子调用不再记录），子调用计数可能偏少。` : "",
-    stats.legacySources ? `${stats.legacySources} 个会话按旧口径入账（升级前入账、原件无法核对），没有单列脚本子调用和工具自身用量。` : "",
-  ].filter(Boolean).join("");
+  const byTotal = (map: Map<string, TokenTotals>) => [...map].sort((a, b) => b[1].totalTokens - a[1].totalTokens || byName(a[0], b[0]));
+  const tokenRow = (key: string, u: TokenTotals) => [key, String(u.input), String(u.output), String(u.cacheRead), String(u.cacheWrite), String(u.totalTokens), formatCacheRate(u)];
+  const tokenHeader = ["输入", "输出", "缓存读", "缓存写", "合计", "加权缓存读率"];
 
   return `
       <section>
@@ -359,26 +354,26 @@ function detailSection(input: ReportInput, stats: GroupStats): string {
           ${tile("使用人数", `${members.length} 人`)}
           ${tile("提问次数", fmt.grouped(stats.asks), members.length > 0 ? `人均 ${(stats.asks / members.length).toFixed(1)} 次` : "")}
           ${tile("活跃天数", `${stats.days.size} 天`)}
-          ${tile("处理轮次", fmt.grouped(stats.replies))}
         </div>
       </section>
 
       <section>
         <h2>模型用量</h2>
-        <div class="section-note">当前区间内记录的 token 用量，包含历史压缩、分支摘要和工具自身用量（类型 tool，来源模型未知，记在 unknown 名下）。费用是 SDK 按配置价格估算，不代表 Coding Plan 实际账单或套餐配额；未知项不视为免费。</div>
+        <div class="section-note">${esc(TOKEN_NOTE)}</div>
         <div class="tiles">
           ${tile("输入", fmt.count(stats.tokens.input), "token")}
           ${tile("输出", fmt.count(stats.tokens.output), "token")}
           ${tile("缓存命中", fmt.count(stats.tokens.cacheRead), "token")}
           ${tile("缓存写入", fmt.count(stats.tokens.cacheWrite), "token")}
+          ${tile("合计", fmt.count(stats.tokens.totalTokens), "totalTokens，按模型原样累计")}
           ${tile("加权缓存读率", formatCacheRate(stats.tokens), "cacheRead / (input + cacheRead + cacheWrite)")}
-          ${tile("已知估算费用", "$" + stats.tokens.cost.toFixed(6), "费用未知 " + stats.tokens.unknownCost + " 条；用量不完整 " + stats.tokens.missingUsage + " 条")}
         </div>
       </section>
-      <section><h2>模型与压缩用量</h2>
-        ${tableView(["类型", "调用", "输入", "输出", "缓存读", "缓存写", "估算费用"], [...stats.usage.kinds].map(([kind, u]) => [kind, String(u.requests), String(u.input), String(u.output), String(u.cacheRead), String(u.cacheWrite), "$" + u.cost.toFixed(6)]), "类型用量")}
-        ${tableView(["provider / model", "调用", "加权缓存读率", "估算费用", "未知费用"], [...stats.usage.models].map(([key, u]) => [JSON.parse(key).join(" / "), String(u.requests), formatCacheRate(u), "$" + u.cost.toFixed(6), String(u.unknownCost)]), "模型用量")}
-        ${tableView(["日期", "调用", "加权缓存读率", "缓存写", "估算费用"], [...stats.usage.days].sort(([a], [b]) => a.localeCompare(b)).map(([day, u]) => [day, String(u.requests), formatCacheRate(u), String(u.cacheWrite), "$" + u.cost.toFixed(6)]), "每日用量")}
+      <section><h2>模型与工具用量</h2>
+        <div class="section-note">对话与压缩按 provider/model 计；辅助分类、生图等工具自身调用的模型按工具名计。</div>
+        ${tableView(["provider/model", ...tokenHeader], byTotal(stats.models).map(([key, u]) => tokenRow(key, u)), "模型用量")}
+        ${stats.tools.size ? tableView(["工具", ...tokenHeader], byTotal(stats.tools).map(([key, u]) => tokenRow(key, u)), "工具用量") : ""}
+        ${tableView(["入账日期", ...tokenHeader], [...stats.tokenDays].sort(([a], [b]) => a.localeCompare(b)).map(([day, u]) => tokenRow(day, u)), "每日用量")}
       </section>
 ${
   months.length > 0
@@ -418,41 +413,17 @@ ${
           .join("")}
         ${members.length > 20 ? `<div class="section-note">图中仅列前 20 位，完整名单见下方表格。</div>` : ""}
         ${tableView(
-          ["成员", "提问", "已确认附件", "活跃天数", "首次", "最后"],
+          ["成员", "提问", "活跃天数", "首次", "最后"],
           members.map((user) => [
             name(user.user),
             String(user.asks),
-            String(user.files),
             String(user.days.size),
             fmt.day(user.firstAt),
             fmt.day(user.lastAt),
           ]),
           "按成员"
         )}
-      </section>
-${
-  tools.length > 0
-    ? `
-      <section>
-        <h2>工具调用</h2>
-        <div class="section-note">模型发出的调用合计 ${tools.reduce((sum, [, count]) => sum + count, 0)} 次；一个 codemode 脚本算一次。</div>
-        ${tools
-          .slice(0, 10)
-          .map(([tool, count]) => hbar(tool, count, toolMax, fmt.grouped(count), `${tool}：${count} 次`))
-          .join("")}
-        ${tableView(["工具", "调用次数"], tools.map(([tool, count]) => [tool, String(count)]), "工具调用")}
-      </section>`
-    : ""
-}${
-  nested.length > 0 || caveats
-    ? `
-      <section>
-        <h2>脚本子调用</h2>
-        <div class="section-note">工具运行中（如 codemode 脚本里）发起的调用，合计 ${nested.reduce((sum, [, count]) => sum + count, 0)} 次，不含在上面的工具调用里。${esc(caveats)}</div>
-        ${tableView(["工具", "子调用次数"], nested.map(([tool, count]) => [tool, String(count)]), "脚本子调用")}
-      </section>`
-    : ""
-}`;
+      </section>`;
 }
 
 /**

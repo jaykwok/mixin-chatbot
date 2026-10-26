@@ -17,8 +17,8 @@ test.skipIf(process.platform !== "win32")("real Windows ops dispatch preserves t
   const quote = (text: string) => "'" + text.replaceAll("'", "''") + "'";
   const common = fileURLToPath(new URL("scripts/lib/deployment.ps1", project));
   await copyFile(new URL("scripts/lib/confirmed-transaction.ts", project), join(lib, "confirmed-transaction.ts"));
-  const record = { format: "1", operation: "deploy", snapshot: name, target_sha: "1".repeat(40), original_sha: "", original_branch: "",
-    original_group_root: root, target_group_root: root, was_running: "0", bot_port: "1011", deploy_mode: "direct", bot_domain: "", domain_action: "keep", unmanaged_tunnel: "", platform_ip: "203.0.113.17", reconfigure_ai: "0" };
+  const record = { format: "2", operation: "deploy", snapshot: name, target_sha: "1".repeat(40), original_sha: "", original_branch: "",
+    original_workspace_root: "", target_workspace_root: "", was_running: "0", bot_port: "1011", reconfigure_ai: "0" };
   await writeFile(join(snapshot, "transaction"), Object.entries(record).map(([key, value]) => `${key}=${value}`).join("\n") + "\n");
   const marker = join(fixture.root, "dispatched.txt"), driver = join(fixture.root, "dispatch.ps1");
   await writeFile(join(deploy, "deploy.ps1"), String.fromCharCode(0xfeff) + `param([switch]$Resume,[switch]$Rollback,[string]$ConfirmedTransaction)

@@ -3,9 +3,17 @@
 // It builds the mixin-chatbot image and uses the fixed container names, so run it only on a disposable
 // Docker host (a WSL distro or VM): MIXIN_REAL_DOCKER=1 bun run test tests/ops/real-docker.test.ts
 // Run only current-format deployments; historical instances must be prepared manually.
-// With the default group root both operators also check the preparation before the stop: a slowed build while the original
+// The deployed trees talk to a local fake platform (tests/helpers/fake-platform-server.ts, in its own process) instead of
+// the real one: the exported working tree's platform endpoints are replaced by the fixture, the production code keeps its
+// fixed hosts. Rootful containers use the host network (127.0.0.1); rootless ones reach the host at the source address of
+// its default route (or MIXIN_REAL_DOCKER_PLATFORM_HOST). MIXIN_REAL_DOCKER_LAYOUTS=external (comma list) limits the
+// shared workspace layouts that run (default data/workspace, or an external WORKSPACE_ROOT mounted read-only).
+// With the default workspace both operators also check the preparation before the stop: a slowed build while the original
 // service keeps answering (host load recorded), a single build with every container on the candidate's ID, work-tree files
 // kept out of the image, and tags moved while the preview waits.
+// Every layout first checks that an unusable WORKSPACE_ROOT (a link into the project's logs/) is refused before the stop; the
+// external one also checks after each deployment that its read-only workspace is unchanged and cannot be written. When a
+// layout's first deployment fails, its later steps fail at once as "前置失败，未执行" instead of running against no service.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -17,6 +25,8 @@ import { fileURLToPath } from "node:url";
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const enabled = process.env.MIXIN_REAL_DOCKER === "1" && process.platform === "linux";
 const ROOT_PREFIX = "/var/tmp/mixin-real-docker-";
+const layouts = (["default", "external"] as const).filter(layout =>
+  (process.env.MIXIN_REAL_DOCKER_LAYOUTS ?? "default,external").split(",").includes(layout));
 const baseImage = /^FROM\s+(oven\/bun:\S+)/m.exec(readFileSync(join(project, "Dockerfile"), "utf8"))?.[1] ?? "";
 // Scripts must take the Docker path of a host without Bun (validate-models falls back to the image).
 const hostPath = (process.env.PATH ?? "").split(":").filter(dir => dir && !existsSync(join(dir, "bun"))).join(":");
@@ -38,16 +48,54 @@ const rootless = enabled && docker("info", "--format", "{{.SecurityOptions}}").o
 const unprivilegedStart = rootless ? Number(readFileSync("/proc/sys/net/ipv4/ip_unprivileged_port_start", "utf8").trim()) : 0;
 const operator = rootless ? "rootless" : process.getuid?.() === 0 ? "root" : "group";
 
+// The fixture's synthetic application credentials and its one directory member.
+const FIXTURE_APP_ID = "fixture-app", FIXTURE_PHONE = "13800000000", FIXTURE_IM_USER = "im-fixture";
+let fixtureSecret = "";
+const platformHost = rootless
+  ? process.env.MIXIN_REAL_DOCKER_PLATFORM_HOST || (/\bsrc (\S+)/.exec(must("ip", ["-4", "route", "get", "1.1.1.1"]))?.[1] ?? "")
+  : "127.0.0.1";
+let platform: { child: ChildProcess; origin: string } | undefined;
+// Run from its own directory: the modules it shares with the service read data/config relative to the working directory.
+async function startPlatform(cwd: string): Promise<{ child: ChildProcess; origin: string }> {
+  const script = fileURLToPath(new URL("../helpers/fake-platform-server.ts", import.meta.url));
+  const child = spawn(process.execPath, [script], { cwd, stdio: ["pipe", "pipe", "pipe"], env: { ...passthrough, PATH: hostPath,
+    FAKE_PLATFORM_HOST: platformHost, FAKE_PLATFORM_ADVERTISE: platformHost, FAKE_PLATFORM_APP_ID: FIXTURE_APP_ID,
+    FAKE_PLATFORM_APP_SECRET: fixtureSecret, FAKE_PLATFORM_MEMBER: `${FIXTURE_PHONE}:${FIXTURE_IM_USER}` } });
+  let output = "";
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`fake platform did not start: ${output}`)), 20_000);
+    const collect = (chunk: Buffer) => {
+      output += chunk.toString();
+      const ready = /FAKE_PLATFORM_READY=(\{.*\})/.exec(output);
+      if (ready) { clearTimeout(timer); resolve({ child, origin: (JSON.parse(ready[1]!) as { origin: string }).origin }); }
+    };
+    child.stdout!.on("data", collect);
+    child.stderr!.on("data", collect);
+    child.on("exit", code => { clearTimeout(timer); reject(new Error(`fake platform exited (${code}): ${output}`)); });
+  });
+}
+interface PlatformState { sockets: number; tokens: number; sent: { body: Record<string, unknown>; content: unknown }[] }
+async function platformState(): Promise<PlatformState> {
+  return await (await fetch(`${platform!.origin}/__fixture/state`)).json() as PlatformState;
+}
+
 interface Container { id: string; name: string; image: string; user: string; sources: string[]; mounts: { Source: string; Destination: string; RW: boolean }[] }
 function containers(): Container[] {
   const ids = must("docker", ["ps", "-aq", "--no-trunc"]).split("\n").filter(Boolean);
   if (!ids.length) return [];
-  const inspected = JSON.parse(must("docker", ["inspect", ...ids])) as { Id: string; Name: string; Config: { Image: string; User: string };
+  // A short-lived container (the service's task daemon probes) may be gone by the time it is inspected: Docker then
+  // prints the others on stdout and only "no such object" errors.
+  const result = spawnSync("docker", ["inspect", ...ids], { env: { ...passthrough, PATH: hostPath, LANG: "C.UTF-8" }, encoding: "utf8" });
+  const errors = (result.stderr ?? "").split("\n").filter(line => line.trim() && !/no such object/i.test(line));
+  if (result.status !== 0 && (errors.length || !result.stdout?.trim())) throw new Error(`docker inspect failed (${result.status}): ${result.stderr}`);
+  const inspected = JSON.parse(result.stdout) as { Id: string; Name: string; Config: { Image: string; User: string };
     Mounts: { Source: string; Destination: string; RW: boolean }[] }[];
   return inspected.map(item => ({ id: item.Id, name: item.Name.replace(/^\//, ""), image: item.Config.Image, user: item.Config.User,
     sources: item.Mounts.map(mount => mount.Source), mounts: item.Mounts }));
 }
-const ours = (container: Container) => container.sources.length > 0 && container.sources.every(source => source.startsWith(ROOT_PREFIX));
+// The task daemon's socket (scripts/lib/task-runtime.sh, rootless) is the only mount allowed outside the fixture.
+const ours = (container: Container) => container.mounts.some(mount => mount.Source.startsWith(ROOT_PREFIX))
+  && container.mounts.every(mount => mount.Source.startsWith(ROOT_PREFIX) || mount.Destination === "/run/mixin-task/docker.sock");
 const previews = (root: string) => containers().filter(item => item.name.startsWith("mixin-chatbot-preview-") && item.sources.some(source => source.startsWith(root)));
 
 // Everything the tests create: every container whose mounts all lie in a fixture (the service, the rollback container,
@@ -59,10 +107,16 @@ function removeOurContainers(): void {
 // image has none and is removed by its recorded ID.
 const projects: string[] = [], unlabelled: string[] = [];
 const projectId = (work: string) => createHash("sha256").update(realpathSync(work)).digest("hex").slice(0, 12);
+// Under root the deployment also loads its image into the service UID's task daemon (scripts/lib/task-runtime.sh);
+// rootless shares the deploying user's daemon.
+const TASK_DAEMON = "unix:///run/user/1001/docker.sock";
 function removeOurImages(): void {
-  for (const id of projects) {
-    for (const image of new Set(docker("image", "ls", "-aq", "--no-trunc", "--filter", `label=org.mixin-chatbot.project=${id}`).out.split("\n").filter(Boolean))) {
-      docker("image", "rm", "--force", image);
+  const hosts = [[], ...(operator === "root" && existsSync(TASK_DAEMON.slice(7)) ? [["--host", TASK_DAEMON]] : [])];
+  for (const host of hosts) {
+    for (const id of projects) {
+      for (const image of new Set(docker(...host, "image", "ls", "-aq", "--no-trunc", "--filter", `label=org.mixin-chatbot.project=${id}`).out.split("\n").filter(Boolean))) {
+        docker(...host, "image", "rm", "--force", image);
+      }
     }
   }
   for (const image of unlabelled) docker("image", "rm", "--force", image);
@@ -240,6 +294,16 @@ function exportWorkingTree(target: string): void {
   }
 }
 
+// The exported tree with the fake platform's endpoints: every target published from it keeps them.
+function exportWithFakePlatform(target: string): void {
+  exportWorkingTree(target);
+  const path = join(target, "src/integrations/open-platform/config.ts"), anchor = "  const api = API_HOSTS[environment];\n";
+  const text = readFileSync(path, "utf8"), origin = platform!.origin;
+  if (text.split(anchor).length !== 2) throw new Error("platformEndpoints() changed: update the fake platform hook");
+  writeFileSync(path, text.replace(anchor, () => `  if (environment) return { api: "${origin}", stream: "${origin.replace(/^http:/, "ws:")}/open-apis/v1/events/stream", ` +
+    `storage: url => url.origin === "${origin}" && url.pathname.startsWith("/storage/") }; // fixture: local fake platform\n` + anchor));
+}
+
 // The tests read and publish in checkouts that another user may own; the scripts get no such exception.
 const git = (cwd: string, ...args: string[]) =>
   must("git", ["-c", "safe.directory=*", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], cwd);
@@ -271,8 +335,8 @@ function repository(base: string, fill: (work: string) => void) {
   return { work, upstream };
 }
 
-// Synthetic configuration and group data; returns the files no operation may change.
-function syntheticData(root: string, work: string, groups: string): string[] {
+// Synthetic configuration and shared materials; returns the files no operation may change.
+function syntheticData(work: string, shared: string): string[] {
   mkdirSync(join(work, "data/config"), { recursive: true });
   mkdirSync(join(work, "data/runtime/pi"), { recursive: true });
   writeFileSync(join(work, "data/config/models.json"), JSON.stringify({ providers: { fixture: {
@@ -280,14 +344,15 @@ function syntheticData(root: string, work: string, groups: string): string[] {
     models: [{ id: "fixture-model", contextWindow: 8192, maxTokens: 512, reasoning: false }],
   } } }));
   writeFileSync(join(work, "data/runtime/pi/settings.json"), JSON.stringify({ defaultProvider: "fixture", defaultModel: "fixture-model" }));
-  writeFileSync(join(work, "data/config/webhook-secret"), createHash("sha256").update(root + work).digest("hex"));
-  mkdirSync(join(groups, "fixture-group/workspace"), { recursive: true });
-  writeFileSync(join(groups, "fixture-group/workspace/notes.md"), "synthetic group data\n");
-  return [join(work, "data/config/models.json"), join(work, "data/config/webhook-secret"),
-    join(work, "data/runtime/pi/settings.json"), join(groups, "fixture-group")];
+  // Synthetic credentials of the local fake platform; the deployed tree never contacts the real one.
+  writeFileSync(join(work, "data/config/app-bot.json"), JSON.stringify({ environment: "production", appId: FIXTURE_APP_ID, appSecret: fixtureSecret }));
+  mkdirSync(shared, { recursive: true });
+  writeFileSync(join(shared, "notes.md"), "synthetic shared materials\n");
+  return [join(work, "data/config/models.json"), join(work, "data/config/app-bot.json"),
+    join(work, "data/runtime/pi/settings.json"), join(shared, "notes.md")];
 }
 
-const deployAnswers: [RegExp, string][] = [[/机器人监听端口/, ""], [/输入 1 或 2/, "1"], [/Pi 群数据总根/, ""], [/是否重新配置 AI/, "n"]];
+const deployAnswers: [RegExp, string][] = [[/是否重新配置 AI/, "n"]];
 
 describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.()}, ${operator})`, () => {
   let root = "";
@@ -296,7 +361,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
     try { await body(); } catch (error) { failed = true; throw error; }
   }, timeout);
 
-  beforeAll(() => {
+  beforeAll(async () => {
     if (!baseImage) throw new Error("Dockerfile has no oven/bun base image");
     const info = docker("info", "--format", "{{.ServerVersion}}");
     if (info.code !== 0) throw new Error(`Docker is not reachable: ${info.out}`);
@@ -307,11 +372,17 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
     // Another user deploys below it in the root run.
     chmodSync(root, 0o755);
     mkdirSync(join(root, "logs"));
-    console.log(`real Docker fixture: ${root} (Docker ${info.out})`);
+    fixtureSecret = createHash("sha256").update(root).digest("hex");
+    if (!platformHost) throw new Error("no host address for the rootless containers to reach the fake platform");
+    mkdirSync(join(root, "platform"));
+    platform = await startPlatform(join(root, "platform"));
+    console.log(`real Docker fixture: ${root} (Docker ${info.out}, fake platform ${platform.origin})`);
   });
 
   // Removing every container and image of the run takes longer than the default five seconds of a hook.
   afterAll(() => {
+    platform?.child.stdin?.end();
+    platform?.child.kill();
     if (!root) return;
     removeOurContainers();
     removeOurImages();
@@ -340,15 +411,15 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
     }, 300_000);
   });
 
-  if (operator !== "group") for (const layout of ["default", "external"] as const) {
-    describe(`${layout} group root`, () => {
-      let work = "", upstream = "", groups = "", port = 0;
+  if (operator !== "group") for (const layout of layouts) {
+    describe(`${layout} workspace`, () => {
+      let work = "", upstream = "", shared = "", port = 0;
       let fixture: string[] = [];
       let baseline: Record<string, string> = {};
       let accepted = "";
       // The service identity: the mapped 0:0 under rootless, the image's appuser for root's first deployment.
       const identity = operator === "rootless" ? "0:0" : "1001:1001";
-      const env = () => ({ BOT_PORT: String(port), ALLOW_UNMANAGED_FIREWALL: "1" });
+      const env = () => ({ BOT_PORT: String(port) });
       const head = () => git(work, "rev-parse", "HEAD");
       const bot = () => {
         const result = docker("inspect", "--format", "{{.Id}} {{.State.StartedAt}} {{.State.Running}} {{.Image}} {{.Config.User}}", "mixin-chatbot");
@@ -356,32 +427,118 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         return { id, started, running: running === "true", image, user };
       };
       const marker = () => docker("exec", "mixin-chatbot", "cat", "/app/src/upgrade-marker.txt").out;
-      // Ready inside the container and reachable on the host port, where the platform and the tunnel connect.
+      // Ready inside the container and reachable on the host port, where the health check and the TUI connect.
       const healthy = () => docker("exec", "mixin-chatbot", "bun", "run", "scripts/ops/health-check.ts").code === 0 &&
         spawnSync("curl", ["--noproxy", "*", "--max-time", "3", "-fsS", `http://127.0.0.1:${port}/health`]).status === 0;
+      // The service holds the fake platform's Stream, has mapped the directory member and answers a direct /help over OpenAPI.
+      const converses = async (what: string) => {
+        type Health = { stream?: { connected?: boolean }; directory?: { mappings?: number; running?: unknown } };
+        const health = async () => await fetch(`http://127.0.0.1:${port}/health`).then(response => response.json() as Promise<Health>, () => ({} as Health));
+        const ready = async () => {
+          const value = await health();
+          return value.stream?.connected === true && value.directory?.mappings === 1 && value.directory.running === undefined;
+        };
+        for (const end = Date.now() + 60_000; !await ready();) {
+          if (Date.now() > end) throw new Error(`${what}: no Stream or directory: ${JSON.stringify(await health())}`);
+          await Bun.sleep(250);
+        }
+        const replies = async () => (await platformState()).sent.filter(item => item.body.receive_id === FIXTURE_IM_USER).length;
+        const before = await replies();
+        await fetch(`${platform!.origin}/__fixture/push`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+          eventType: "callback:direct", groupId: "", userId: FIXTURE_IM_USER, msgUid: `uid-${crypto.randomUUID()}`, type: "text",
+          content: { content: "/help" }, extraContent: "" }) });
+        for (const end = Date.now() + 30_000; await replies() === before;) {
+          if (Date.now() > end) throw new Error(`${what}: no reply to /help: ${JSON.stringify(await platformState())}`);
+          await Bun.sleep(250);
+        }
+      };
       const pending = () => existsSync(join(work, "data/state/deploy-transaction"));
       const stages = () => existsSync(join(work, "tmp")) ? readdirSync(join(work, "tmp")).filter(entry => entry.startsWith("upgrade-")) : [];
       const snapshots = () => existsSync(join(work, "backup/snapshots")) ? readdirSync(join(work, "backup/snapshots")).length : 0;
+      // Every later step builds on the service of the first deployment.
+      let blocked = "";
+      const first = (name: string, body: () => Promise<void>, timeout: number) => step(name, async () => {
+        try { await body(); } catch (error) { blocked = name; throw error; }
+      }, timeout);
+      const dependent = (name: string, body: () => Promise<void>, timeout: number) => step(name, async () => {
+        if (blocked) throw new Error(`前置失败，未执行（${layout}：${blocked}）`);
+        await body();
+      }, timeout);
+      // The external workspace: every entry with its content and modification time, and the service cannot write it.
+      const sharedEntries = () => {
+        const entries: Record<string, string> = {};
+        const walk = (path: string) => {
+          for (const entry of readdirSync(path).sort()) {
+            const full = join(path, entry), info = lstatSync(full);
+            entries[full.slice(shared.length + 1)] = `${info.isDirectory() ? "dir" : info.isSymbolicLink() ? "link" : "file"} ${info.mtimeMs}`;
+            if (info.isDirectory()) walk(full);
+          }
+        };
+        walk(shared);
+        return entries;
+      };
+      let sharedBaseline: Record<string, string> = {};
+      const externalUnchanged = () => {
+        if (layout !== "external") return;
+        expect(sharedEntries()).toEqual(sharedBaseline);
+        const write = docker("exec", "mixin-chatbot", "sh", "-c", "echo probe > /app/workspace/.write-probe");
+        expect({ refused: write.code !== 0, readOnly: /read-only file system/i.test(write.out) }, write.out).toEqual({ refused: true, readOnly: true });
+        expect(existsSync(join(shared, ".write-probe"))).toBe(false);
+      };
 
-      step("first deployment starts the service from synthetic data", async () => {
+      first("first deployment starts the service from synthetic data", async () => {
         const base = join(root, layout);
-        ({ work, upstream } = repository(base, exportWorkingTree));
+        ({ work, upstream } = repository(base, exportWithFakePlatform));
         projects.push(projectId(work));
-        groups = layout === "default" ? join(work, "data/groups") : join(base, "group-data");
+        shared = layout === "default" ? join(work, "data/workspace") : join(base, "shared-files");
         port = await freePort();
-        fixture = syntheticData(root, work, groups);
+        fixture = syntheticData(work, shared);
+        if (layout === "external") sharedBaseline = sharedEntries();
         const deploy = start(root, `${layout}-deploy`, ["scripts/deploy/deploy.sh"], work,
-          { ...env(), ...(layout === "external" ? { GROUP_DATA_ROOT: groups } : {}) }, deployAnswers);
+          { ...env(), ...(layout === "external" ? { WORKSPACE_ROOT: shared } : {}) }, deployAnswers);
         const result = await deploy.done;
         expect({ code: result.code, tail: result.output.slice(-3000) }).toMatchObject({ code: 0 });
         expect(bot()).toMatchObject({ running: true, user: identity });
         expect(await until("the deployed service", () => healthy(), 60_000)).toBe(true);
+        await converses("the deployed service");
         expect(pending()).toBe(false);
+        // An external workspace is mounted read-only at /app/workspace; the default one is part of data/.
+        const mounts = JSON.parse(docker("inspect", "--format", "{{json .Mounts}}", "mixin-chatbot").out) as { Destination: string; RW: boolean }[];
+        expect(mounts.find(mount => mount.Destination === "/app/workspace")?.RW).toBe(layout === "external" ? false : undefined);
+        externalUnchanged();
         baseline = digest(fixture);
         accepted = head();
       }, 1_800_000);
 
-      step("upgrade previews in the candidate image, then restarts on the target commit as the same identity", async () => {
+      // F2: the final workspace is checked in host path space before the stop. A link that resolves into the project's
+      // logs/ is refused there: the service keeps running unchanged, no transaction is recorded and the saved setting
+      // stays. (A path inside data/ never gets that far: the task mapping refuses mount roots that overlap data/.)
+      dependent("an unusable WORKSPACE_ROOT (a link into the project's logs/) is refused before the stop", async () => {
+        const link = join(root, `${layout}-workspace-link`);
+        symlinkSync(join(work, "logs"), link);
+        const savedPath = join(work, "data/state/workspace-root");
+        const saved = () => existsSync(savedPath) ? readFileSync(savedPath, "utf8") : null;
+        const before = bot(), count = snapshots(), setting = saved();
+        try {
+          const result = await start(root, `${layout}-illegal-workspace`, ["scripts/deploy/deploy.sh"], work,
+            { ...env(), WORKSPACE_ROOT: link }, deployAnswers).done;
+          expect(result.code === 0, result.output.slice(-3000)).toBe(false);
+          expect(result.output).toContain("位于受管目录");
+          expect(result.output).toContain("共享资料目录不能使用");
+          expect(result.output).toContain("服务尚未停止");
+          expect(result.output).not.toContain("停机前复核剩余空间");
+        } finally { rmSync(link); }
+        expect(saved()).toBe(setting);
+        expect(bot()).toEqual(before);
+        expect({ head: head(), pending: pending(), stages: stages(), snapshots: snapshots(), previews: previews(root).length })
+          .toEqual({ head: accepted, pending: false, stages: [], snapshots: count, previews: 0 });
+        expect(labelled("{{.Tag}}").split("\n").filter(tag => tag.startsWith("candidate-"))).toEqual([]);
+        expect(digest(fixture)).toEqual(baseline);
+        externalUnchanged();
+        expect(healthy()).toBe(true);
+      }, 1_800_000);
+
+      dependent("upgrade previews in the candidate image, then restarts on the target commit as the same identity", async () => {
         const target = publish(upstream, "target A", () => writeFileSync(join(upstream, "src/upgrade-marker.txt"), "A"));
         const before = bot();
         const result = await start(root, `${layout}-upgrade-a`, ["scripts/ops/ops.sh", "update"], work, env()).done;
@@ -394,6 +551,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         expect(marker()).toBe("A");
         expect(healthy()).toBe(true);
         expect(digest(fixture)).toEqual(baseline);
+        externalUnchanged();
         expect({ pending: pending(), stages: stages(), previews: previews(root).length }).toEqual({ pending: false, stages: [], previews: 0 });
         accepted = target;
       }, 900_000);
@@ -427,7 +585,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       // runs the candidate by ID until the official tag names it. Files that are only in the work tree stay out of the image.
       // The operation log records the build and the downtime separately. The databases of the running service are in WAL
       // mode while the candidate previews the migration.
-      if (layout === "default") step("a slowed build keeps the original service answering; one build, every container on the candidate ID, untracked files kept out", async () => {
+      if (layout === "default") dependent("a slowed build keeps the original service answering; one build, every container on the candidate ID, untracked files kept out", async () => {
         const dockerfile = join(upstream, "Dockerfile"), fast = readFileSync(dockerfile, "utf8");
         // BuildKit keeps the layer cache after the images are removed: a value of this run makes the slow step run again.
         const slow = `RUN sleep 20 && echo "fixture slow build ${process.pid}-${Date.now()}"`;
@@ -498,7 +656,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
 
       // Tags are not identities. This upgrade's reserved tag moved to another image while the preview waits: the check
       // before the stop refuses, the service keeps running, and the moved tag is kept and reported, not removed.
-      if (layout === "default") step("moving the reserved tag while the upgrade previews stops it before the stop; the moved tag is kept", async () => {
+      if (layout === "default") dependent("moving the reserved tag while the upgrade previews stops it before the stop; the moved tag is kept", async () => {
         const runPath = join(upstream, "scripts/runtime/data-current.ts"), gate = join(work, "data/preview-gate");
         publish(upstream, "preview gate", () => prepend(runPath, previewGate));
         const before = bot(), count = snapshots(), other = decoy();
@@ -526,7 +684,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
 
       // The official tag moved to another image while the preview waits: the migration, the verification instance and the
       // service still run the candidate by ID, and publishing moves the tag back to it.
-      if (layout === "default") step("moving the official tag while the upgrade previews does not change the image it runs", async () => {
+      if (layout === "default") dependent("moving the official tag while the upgrade previews does not change the image it runs", async () => {
         const gate = join(work, "data/preview-gate");
         const target = publish(upstream, "official tag moved", () => writeFileSync(join(upstream, "src/upgrade-marker.txt"), "T"));
         const base = decoy(), previous = bot().image;
@@ -558,7 +716,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       // Killed after the data commit, while the new instance's first health check waits: the transaction stays with the
       // new code and the committed data. Rollback is refused before anything changes; resume only activates the recorded
       // image (no build, pull or migration), publishes the official tag and releases the reserved and rollback tags.
-      if (layout === "default") step("an upgrade killed after the data commit refuses rollback and is finished by resume on the recorded image", async () => {
+      if (layout === "default") dependent("an upgrade killed after the data commit refuses rollback and is finished by resume on the recorded image", async () => {
         const healthPath = join(upstream, "scripts/ops/health-check.ts");
         const hold = join(work, "data/hold-health"), heldMark = join(work, "data/state/health-held");
         const target = publish(upstream, "hold after commit", () => {
@@ -597,7 +755,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       // A saved port below the unprivileged start. Whether rootlesskit may bind it (CAP_NET_BIND_SERVICE) is asked of the
       // daemon itself, not of the check under test. Refused: the upgrade stops before the preview and the stop.
       // Allowed: it upgrades onto that port and the service answers there.
-      if (rootless && unprivilegedStart > 1) step("rootless: a saved privileged port is refused before the stop, or used when rootlesskit may bind it", async () => {
+      if (rootless && unprivilegedStart > 1) dependent("rootless: a saved privileged port is refused before the stop, or used when rootlesskit may bind it", async () => {
         const low = Math.min(1011, unprivilegedStart - 1), portFile = join(work, "data/state/bot-port");
         const probe = docker("run", "--rm", "-p", `127.0.0.1:${low}:${low}`, baseImage, "true");
         const allowed = probe.code === 0;
@@ -633,7 +791,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
 
       // The target's preview is held open so the interruption lands while the preview container runs.
       for (const signal of ["SIGINT to the process group", "SIGTERM to ops.sh"] as const) {
-        step(`cancelling the preview (${signal}) leaves the running service, code and data untouched`, async () => {
+        dependent(`cancelling the preview (${signal}) leaves the running service, code and data untouched`, async () => {
           const runPath = join(upstream, "scripts/runtime/data-current.ts");
           if (!readFileSync(runPath, "utf8").includes("fixture: hold preview")) {
             publish(upstream, "hold preview", () => prepend(runPath, 'if (process.argv.includes("preview")) await Bun.sleep(600_000); // fixture: hold preview'));
@@ -641,10 +799,14 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
           const before = bot(), count = snapshots();
           const upgrade = start(root, `${layout}-cancel-${signal.startsWith("SIGINT") ? "int" : "term"}`, ["scripts/ops/ops.sh", "update"], work, env(), [], true);
           const preview = await until("the preview container", () => previews(root)[0], 300_000);
-          // Offline, in the candidate image, as the service identity; data and group roots read-only.
+          // Offline, in the candidate image, as the service identity; data read-only.
           expect({ image: preview.image.startsWith("sha256:"), user: preview.user }).toEqual({ image: true, user: identity });
           const mounts = Object.fromEntries(preview.mounts.map(mount => [mount.Destination, mount.RW]));
-          expect(mounts).toMatchObject({ "/app/data": false, "/preview": true, ...(layout === "external" ? { "/app/group-data": false } : {}) });
+          // The data gate reads data/ only; the shared workspace is not mounted into the preview. Its layout was checked
+          // just before, in a container of its own that sees the final workspace read-only at its host path
+          // (check_workspace_layout in scripts/lib/deployment.sh).
+          expect(mounts).toMatchObject({ "/app/data": false, "/preview": true });
+          expect(mounts).not.toHaveProperty("/app/workspace");
           if (signal.startsWith("SIGINT")) process.kill(-upgrade.child.pid!, "SIGINT");
           else upgrade.child.kill("SIGTERM");
           const result = await upgrade.done;
@@ -663,7 +825,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
 
       // A terminal Ctrl+C reaches the whole foreground process group: sent over and over from the failed verification
       // until the rollback reports back, it must not cut short any of the Docker, migration or git steps.
-      step("a target that fails verification rolls back to the previous image, code and data, with Ctrl+C reaching its process group meanwhile", async () => {
+      dependent("a target that fails verification rolls back to the previous image, code and data, with Ctrl+C reaching its process group meanwhile", async () => {
         const verify = join(upstream, "src/server/verify.ts");
         publish(upstream, "broken verification", () => {
           const runPath = join(upstream, "scripts/runtime/data-current.ts");
@@ -692,10 +854,11 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         expect(await until("the restored service", () => healthy(), 60_000)).toBe(true);
         expect(existsSync(join(work, "data/state/verify-only"))).toBe(false);
         expect(digest(fixture)).toEqual(baseline);
+        externalUnchanged();
         expect(previews(root).length).toBe(0);
       }, 900_000);
 
-      step("after the rollback the next good target upgrades normally", async () => {
+      dependent("after the rollback the next good target upgrades normally", async () => {
         const target = publish(upstream, "target C", () => {
           const verify = join(upstream, "src/server/verify.ts");
           writeFileSync(verify, readFileSync(verify, "utf8").replace(/^throw new Error\("fixture: verification failure"\);\n/m, ""));
@@ -707,7 +870,17 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         expect(marker()).toBe("C");
         expect(bot().user).toBe(identity);
         expect(healthy()).toBe(true);
+        await converses("the upgraded service");
         expect(digest(fixture)).toEqual(baseline);
+        externalUnchanged();
+        if (operator === "root") {
+          // Cancelled previews and rolled-back candidates were also loaded by ID into the task daemon.
+          // A later successful commit must collect those copies, retaining the current worker image.
+          const copies = docker("--host", TASK_DAEMON, "image", "ls", "-aq", "--no-trunc", "--filter",
+            `label=org.mixin-chatbot.project=${projectId(work)}`);
+          expect(copies.code, copies.out).toBe(0);
+          expect([...new Set(copies.out.split("\n").filter(Boolean))]).toEqual([bot().image]);
+        }
         removeOurContainers();
       }, 900_000);
     });

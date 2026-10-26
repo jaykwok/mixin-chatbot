@@ -12,7 +12,7 @@ export async function buildLocalTools(options: MemberEnvOptions): Promise<ToolDe
     const env = await createMemberEnv({ ...options, inputPaths: (args as { input_paths?: string[] }).input_paths });
     const api = { env, output: (value: string | Uint8Array) => { text = (text + (typeof value === "string" ? value : new TextDecoder().decode(value))).slice(-50 * 1024); },
       retainedOutput: () => ({ text, truncated: false }), diagnostic: (value: { message: string }) => diagnostics.push(value),
-      agent: async () => ({ model: { provider: "fixture", modelId: "fixture" } }),
+      agent: async () => ({ model: { provider: "fixture", modelId: "fixture" } }), now: () => Date.now(),
       models: { getModel: () => ctx.model ?? { input: ["text", "image"] } } } as unknown as ToolExecutionApi;
     const result = await tool.execute(args, api, { ...BACKGROUND_CONTEXT, ...(signal ? { abortSignal: signal } : {}) });
     const content = [...result.output ?? (text ? [{ type: "text" as const, text }] : []),

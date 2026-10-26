@@ -1,42 +1,44 @@
 // 运行时与运维界面共用的纯配置定义；导入时不读取磁盘或加载机器人。
-import { isIP } from "node:net";
 import { isAbsolute } from "node:path";
 
 export const RUNTIME_KEYS = [
-  "BOT_PORT", "BOT_HOST", "BOT_DEBUG", "GROUP_DATA_ROOT", "BOT_MAX_ACTIVE_REQUESTS",
+  "BOT_PORT", "BOT_HOST", "WORKSPACE_ROOT", "BOT_MAX_ACTIVE_REQUESTS",
   "BOT_BASH_TIMEOUT", "BOT_INDEX_TTL_MINUTES", "BOT_INDEX_MAX_FILES", "BOT_INDEX_MAX_DEPTH",
   "BOT_RUN_TIMEOUT_SECONDS", "BOT_MODEL_IDLE_TIMEOUT_SECONDS", "BOT_MODEL_RESPONSE_TIMEOUT_SECONDS",
   "BOT_CLOSEOUT_SECONDS", "BOT_DELIVERY_RESERVE_SECONDS", "BOT_FALLBACK_SEND_SECONDS",
-  "BOT_SHUTDOWN_TIMEOUT_SECONDS", "BOT_DELIVERY_TIMEOUT_SECONDS",
+  "BOT_SHUTDOWN_TIMEOUT_SECONDS",
   "BOT_DOCUMENT_ENV", "BOT_DOCUMENT_WORK_ENABLED", "BOT_DOCUMENT_PPTX_TEMPLATE", "BOT_DOCUMENT_DOCX_TEMPLATE", "BOT_DOCUMENT_OFFICE_PATH",
   "PI_CACHE_RETENTION", "BOT_ATTACHMENT_CONCURRENCY", "BOT_TASK_IMAGE", "BOT_TASK_CONTROL_ROOT",
 ] as const;
 export type RuntimeKey = typeof RUNTIME_KEYS[number];
 export type RuntimeConfig = Partial<Record<RuntimeKey, string>>;
-export type AdvancedRuntimeKey = Exclude<RuntimeKey, "BOT_PORT" | "BOT_HOST" | "GROUP_DATA_ROOT">;
+export type AdvancedRuntimeKey = Exclude<RuntimeKey, "BOT_PORT" | "BOT_HOST" | "WORKSPACE_ROOT">;
 export const ADVANCED_RUNTIME_KEYS = RUNTIME_KEYS.filter((key): key is AdvancedRuntimeKey =>
-  key !== "BOT_PORT" && key !== "BOT_HOST" && key !== "GROUP_DATA_ROOT");
+  key !== "BOT_PORT" && key !== "BOT_HOST" && key !== "WORKSPACE_ROOT");
 
 export const RUNTIME_RANGES = {
   BOT_PORT: [1, 65535], BOT_MAX_ACTIVE_REQUESTS: [1, 1000], BOT_BASH_TIMEOUT: [10, 3600],
   BOT_INDEX_TTL_MINUTES: [1, 1440], BOT_INDEX_MAX_FILES: [100, 1000000], BOT_INDEX_MAX_DEPTH: [1, 64],
-  BOT_RUN_TIMEOUT_SECONDS: [10, 7200], BOT_SHUTDOWN_TIMEOUT_SECONDS: [5, 25], BOT_DELIVERY_TIMEOUT_SECONDS: [1, 600],
+  BOT_RUN_TIMEOUT_SECONDS: [10, 7200], BOT_SHUTDOWN_TIMEOUT_SECONDS: [5, 25],
   BOT_MODEL_IDLE_TIMEOUT_SECONDS: [10, 7200], BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: [10, 7200],
   BOT_ATTACHMENT_CONCURRENCY: [1, 8],
   BOT_CLOSEOUT_SECONDS: [1, 3600], BOT_DELIVERY_RESERVE_SECONDS: [1, 1800], BOT_FALLBACK_SEND_SECONDS: [1, 600],
 } as const;
 
 export const RUNTIME_DEFAULTS = {
-  BOT_PORT: "1011", BOT_HOST: "0.0.0.0", BOT_DEBUG: "0", BOT_MAX_ACTIVE_REQUESTS: "32",
+  BOT_PORT: "1011", BOT_HOST: "127.0.0.1", BOT_MAX_ACTIVE_REQUESTS: "32",
   BOT_BASH_TIMEOUT: "600", BOT_INDEX_TTL_MINUTES: "5", BOT_INDEX_MAX_FILES: "50000", BOT_INDEX_MAX_DEPTH: "12",
   BOT_RUN_TIMEOUT_SECONDS: "1200", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "180", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "600",
   BOT_CLOSEOUT_SECONDS: "300", BOT_DELIVERY_RESERVE_SECONDS: "120", BOT_FALLBACK_SEND_SECONDS: "120",
-  BOT_SHUTDOWN_TIMEOUT_SECONDS: "20", BOT_DELIVERY_TIMEOUT_SECONDS: "180",
+  BOT_SHUTDOWN_TIMEOUT_SECONDS: "20",
   BOT_DOCUMENT_ENV: "", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_DOCUMENT_PPTX_TEMPLATE: "", BOT_DOCUMENT_DOCX_TEMPLATE: "",
   BOT_DOCUMENT_OFFICE_PATH: "",
   PI_CACHE_RETENTION: "short", BOT_ATTACHMENT_CONCURRENCY: "2",
   BOT_TASK_IMAGE: "", BOT_TASK_CONTROL_ROOT: "",
 } satisfies Partial<Record<RuntimeKey, string>>;
+
+/** The HTTP server serves only local management (TUI, /health, /_admin/shutdown). */
+const LOOPBACK_HOSTS = ["127.0.0.1", "::1", "localhost"];
 
 export function validateRuntimeConfig(value: unknown): RuntimeConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("runtime.json 必须是对象");
@@ -51,9 +53,9 @@ export function validateRuntimeConfig(value: unknown): RuntimeConfig {
     if (range && (!Number.isInteger(Number(text)) || Number(text) < range[0] || Number(text) > range[1])) {
       throw new Error(`${key} 必须是 ${range[0]}-${range[1]} 的整数`);
     }
-    if ((key === "BOT_DEBUG" || key === "BOT_DOCUMENT_WORK_ENABLED") && !["0", "1"].includes(text)) throw new Error(`${key} 只能是 0 或 1`);
+    if (key === "BOT_DOCUMENT_WORK_ENABLED" && !["0", "1"].includes(text)) throw new Error(`${key} 只能是 0 或 1`);
     if (key === "PI_CACHE_RETENTION" && !["short", "long"].includes(text)) throw new Error("PI_CACHE_RETENTION 必须是 short 或 long");
-    if (key === "BOT_HOST" && text !== "localhost" && !isIP(text)) throw new Error("BOT_HOST 必须是 IP 地址或 localhost");
+    if (key === "BOT_HOST" && !LOOPBACK_HOSTS.includes(text)) throw new Error("BOT_HOST 只能是回环地址 127.0.0.1、::1 或 localhost（HTTP 只供本机管理）");
     if (key === "BOT_TASK_IMAGE" && !/^sha256:[a-f\d]{64}$/.test(text)) throw new Error("BOT_TASK_IMAGE 必须是完整 sha256 镜像 ID");
     if (key === "BOT_DOCUMENT_PPTX_TEMPLATE" || key === "BOT_DOCUMENT_DOCX_TEMPLATE") validateTemplatePath(key, text);
     if (key === "BOT_DOCUMENT_OFFICE_PATH" && !isAbsolute(text)) throw new Error("BOT_DOCUMENT_OFFICE_PATH 必须是 LibreOffice 程序的绝对路径，不要加引号或参数");
@@ -61,7 +63,7 @@ export function validateRuntimeConfig(value: unknown): RuntimeConfig {
   return result;
 }
 
-/** Default document templates: a path relative to each group's workspace, or an absolute path shared by all groups. */
+/** Default document templates: a path relative to the application workspace, or an absolute path. */
 const TEMPLATE_EXTENSIONS = { BOT_DOCUMENT_PPTX_TEMPLATE: [".pptx", ".potx"], BOT_DOCUMENT_DOCX_TEMPLATE: [".docx", ".dotx"] } as const;
 
 function validateTemplatePath(key: keyof typeof TEMPLATE_EXTENSIONS, text: string) {

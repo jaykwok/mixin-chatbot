@@ -25,8 +25,8 @@ const output = Object.assign(new PassThrough(), { isTTY: true, columns: 80, rows
 output.resume();
 const screen = new Screen(output, input);
 const app = new App([{ id: "test", label: "test", render: () => [], hints: () => [] }], { screen, deployment: {
-  platform: process.platform === "win32" ? "windows" : "linux", runtime: "native", mode: "direct",
-  port: 1, domain: "", groupDataRoot: root, groupDataRootIsCustom: true,
+  platform: process.platform === "win32" ? "windows" : "linux", runtime: process.platform === "win32" ? "scheduled-task" : "docker",
+  port: 1, dataRoot: root, workspaceRoot: "",
 } });
 app["refreshChrome"] = async () => { await capture(process.execPath, ["--no-env-file", script, root, "wait"], { timeout: 40000 }); };
 const running = app.start();

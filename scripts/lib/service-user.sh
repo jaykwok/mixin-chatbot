@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 服务容器的运行身份（数值 UID:GID）。部署和升级沿用原容器的身份：停机前从原容器读取并核对，写入事务快照中的
-# service-user 文件（transaction 保持 format 1，按名读取，旧版代码忽略它）；预览、迁移、验证实例、正式实例和续做都用它。
+# service-user 文件（它自己的 format 1，与事务记录的 format 2 无关）；预览、数据准备、验证实例、正式实例和续做都用它。
 # 已有数据的属主不批量改动，只给本次新建的目录和文件设置属主。
 #
 # rootful Docker 由 root 运行部署，容器身份就是宿主机上的属主；rootless Docker 由它所属的普通用户运行，容器里的 0:0
@@ -55,17 +55,17 @@ default_service_user() {
     if [ "$1" = 1 ]; then echo 0:0; else echo "$DEFAULT_ROOTFUL_SERVICE_USER"; fi
 }
 
-# 原服务容器 mixin-chatbot（运行或停止）：ORIGINAL_CONTAINER_ID、_USER（--user 的值）、_IMAGE、_DATA 和 _GROUPS
-# （/app/data、/app/group-data 挂载的来源，没有时为空）。返回 0 找到；2 不存在；1 其他错误（原因写到标准错误）。
+# 原服务容器 mixin-chatbot（运行或停止）：ORIGINAL_CONTAINER_ID、_USER（--user 的值）、_IMAGE 和 _DATA
+# （/app/data 挂载的来源，没有时为空）。返回 0 找到；2 不存在；1 其他错误（原因写到标准错误）。
 original_service_container() {
     local output
-    ORIGINAL_CONTAINER_ID='' ORIGINAL_CONTAINER_USER='' ORIGINAL_CONTAINER_IMAGE='' ORIGINAL_CONTAINER_DATA='' ORIGINAL_CONTAINER_GROUPS=''
-    if ! output="$(docker container inspect --format '{{.Id}}|{{.Config.User}}|{{.Image}}|{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}|{{range .Mounts}}{{if eq .Destination "/app/group-data"}}{{.Source}}{{end}}{{end}}' mixin-chatbot 2>&1)"; then
+    ORIGINAL_CONTAINER_ID='' ORIGINAL_CONTAINER_USER='' ORIGINAL_CONTAINER_IMAGE='' ORIGINAL_CONTAINER_DATA=''
+    if ! output="$(docker container inspect --format '{{.Id}}|{{.Config.User}}|{{.Image}}|{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' mixin-chatbot 2>&1)"; then
         [[ "$output" != *"No such container"* ]] || return 2
         printf '无法读取原容器 mixin-chatbot：%s\n' "$output" >&2
         return 1
     fi
-    IFS='|' read -r ORIGINAL_CONTAINER_ID ORIGINAL_CONTAINER_USER ORIGINAL_CONTAINER_IMAGE ORIGINAL_CONTAINER_DATA ORIGINAL_CONTAINER_GROUPS <<< "$output"
+    IFS='|' read -r ORIGINAL_CONTAINER_ID ORIGINAL_CONTAINER_USER ORIGINAL_CONTAINER_IMAGE ORIGINAL_CONTAINER_DATA <<< "$output"
 }
 
 # 从原容器取服务身份并核对：数据挂载属于本项目、--user 是数值 UID:GID 且与 Docker 的模式相符。设置 SERVICE_USER。
@@ -87,7 +87,7 @@ service_user_from_container() {
 # 是否已提交过部署：这些设置只在部署提交时写入。
 deployment_recorded() {
     local name
-    for name in bot-port deploy-mode group-data-root; do
+    for name in bot-port workspace-root; do
         [ ! -e "$PROJECT_DIR/data/state/$name" ] || return 0
     done
     return 1

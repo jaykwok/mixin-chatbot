@@ -8,15 +8,17 @@ import { createRegistry, defineExtension, Harness } from "@earendil-works/pi-dur
 import { McpTools } from "../../src/integrations/mcp.ts";
 import { codemodeExtension } from "../../src/durable/codemode/index.ts";
 import { removeResultDirectories } from "../../src/durable/results/files.ts";
-import { claimGroup, memberConversation } from "../../src/durable/identity.ts";
+import { claimSpace, memberConversation } from "../../src/durable/identity.ts";
 import { mcpMemberTools } from "../../src/durable/mcp.ts";
-import { groupDoor } from "../../src/durable/models.ts";
+import { spaceDoor } from "../../src/durable/models.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { memberPlaces, memberRegistration } from "../../src/durable/tools.ts";
 import { fauxModels } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { handoffFullResults, stubResultsBackend } from "../helpers/results-backend.ts";
+import { scopeOf } from "../helpers/layout.ts";
+import { appLayout, groupScope } from "../../src/core/layout.ts";
 
 const f = await tempFixture("durable-mcp-"); afterAll(() => f.cleanup());
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=";
@@ -40,19 +42,19 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
   } });
   const manager = new McpTools({ format: 1, servers: [{ name: "reports", tools: ["report"], transport: "http", url: `http://127.0.0.1:${server.port}/mcp` }] }, join(root, "discovery"));
   const { models, faux, model } = fauxModels(), holder: { harness?: Harness } = {};
-  const door = groupDoor(holder, { startTries: 1 }), members = { root: join(root, "root"), groupId: "group-a" };
+  const door = spaceDoor(holder), members = { layout: appLayout(join(root, "data")), scope: groupScope("group-a") };
   let harness: Harness | undefined;
   try {
-    await mkdir(members.root); await manager.initialize(new AbortController().signal);
-    const tools = mcpMemberTools(members, manager, door), registry = createRegistry(); registry.install(door.extension());
+    await mkdir(members.layout.data); await manager.initialize(new AbortController().signal);
+    const tools = mcpMemberTools(members, manager, door), registry = createRegistry();
     expect(tools[0]!.definition.exposure).toBe("deferred"); expect(tools[0]!.replay).toBe("unsafe");
     registry.install(defineExtension({ name: "mixin.mcp", tools: tools.map(memberRegistration) }));
     registry.install(codemodeExtension({ members, tools }));
     harness = await Harness.open(await openGroupStorage(join(root, "group.sqlite")), { registry, models: door.wrap(models), settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);
-    holder.harness = harness; await claimGroup(harness, "group-a", context);
+    holder.harness = harness; await claimSpace(harness, scopeOf("group-a"), context);
     if (isolated) await handoffFullResults(harness);
     for (const phone of ["alice", "bob"]) {
-      const { conversation } = await memberConversation(harness, "group-a", phone, { model }, context);
+      const { conversation } = await memberConversation(harness, scopeOf("group-a"), phone, { model }, context);
       const callId = `report-${phone}`;
       faux.setResponses([fauxAssistantMessage([fauxToolCall("codemode", { code: `return await tools.${tools[0]!.definition.name}({});` }, { id: callId })], { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
       await (await conversation.submit({ type: "input", content: "report" }, context)).wait(context);
@@ -62,7 +64,7 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
       const calls = (await harness.snapshot(ResultsDoc, context))!.calls;
       const owned = Object.entries(calls).filter(([, owner]) => owner.phone === phone).map(([name]) => name);
       expect(owned.some(name => /^\d+-mcp-/.test(name))).toBe(true);
-      const tempDir = memberPlaces(members, members.groupId, phone).tempDir;
+      const tempDir = memberPlaces(members, members.scope, phone).tempDir;
       const mcpName = owned.find(name => /^\d+-mcp-/.test(name))!;
       const mapping = new Map(owned.flatMap(name => calls[name]!.isolatedTask ? [[name, calls[name]!.isolatedTask!] as const] : []));
       if (isolated) expect(mapping.size).toBe(owned.length);

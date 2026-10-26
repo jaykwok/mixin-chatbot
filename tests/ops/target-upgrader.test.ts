@@ -10,7 +10,6 @@ const project = fileURLToPath(new URL("../../", import.meta.url));
 // This is the Linux Docker upgrader; Windows exercises upgrade.ps1 in deployment/upgrade-safety tests.
 const bash = process.platform === "linux" ? Bun.which("bash") : null;
 const posix = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
-const token = "eyJhIjoiZml4dHVyZS1hY2NvdW50IiwidCI6ImZpeHR1cmUifQ";
 
 // Docker stub: containers are files "<image> <running> [<user> [<id>]]" under mock/containers (the user defaults to the
 // daemon's mode: 0:0 rootless, 1000:1000 rootful), images are files of their platform and labels under mock/images and
@@ -98,29 +97,13 @@ case "$cmd" in
             if [ "$previous" = -v ] && [[ "$arg" == *:/preview ]]; then preview="\${arg%:/preview}"; fi
             previous="$arg"
         done
-        if [ "\${FIXTURE_RESET:-0}" = 1 ]; then
-            case " $* " in
-                *' probe '*) exit 20 ;;
-                *' prepare-reset '*) mkdir -p "$preview/reset-config/data/config"; printf 'draft' > "$preview/reset-config/data/config/models.json"; exit 0 ;;
-                *' offer-models '*) printf 'offer-models\n' >> "$FIXTURE_EVENTS"; exit "\${FIXTURE_MODELS:-21}" ;;
-                *' discard-models '*) printf 'discard-models\n' >> "$FIXTURE_EVENTS"; exit 0 ;;
-                *' bun run configure '*) printf 'configure head=%s\n' "$(current_head)" >> "$FIXTURE_EVENTS"; exit 0 ;;
-                *' bun run scripts/runtime/stats-freeze.ts '*)
-                    printf '%s\n' "$@" > "$mock/freeze-args"
-                    printf 'freeze head=%s\n' "$(current_head)" >> "$FIXTURE_EVENTS"
-                    [ "\${FIXTURE_FREEZE:-ok}" = ok ] || exit 1
-                    snapshot="$(cat "$FIXTURE_WORK/data/state/deploy-transaction")"
-                    test -s "$FIXTURE_WORK/backup/snapshots/$snapshot/reset-config/data/config/models.json" || exit 1
-                    printf 'frozen' > "$FIXTURE_WORK/backup/snapshots/$snapshot/stats-frozen.json"; exit 0 ;;
-            esac
-        fi
         # Only the preview is a one-off container of the upgrader; others (the model check after ops update) succeed.
         [ -n "$preview" ] || exit 0
         printf '%s\n' "$@" > "$mock/preview-args"
         printf 'preview head=%s\n' "$(current_head)" >> "$FIXTURE_EVENTS"
-        # A preview that waits (for example for migration decisions) until it is removed.
+        # A preview that waits until it is removed.
         [ "\${FIXTURE_PREVIEW:-ok}" != hold ] || exec sleep 30
-        [ "\${FIXTURE_PREVIEW:-ok}" = ok ] || { echo '迁移预检需要确认后才能继续' >&2; exit 2; }
+        [ "\${FIXTURE_PREVIEW:-ok}" = ok ] || { echo '目录没有部署记录，不能升级' >&2; exit 1; }
         # Changes made while the preview runs, which the check before the stop must notice.
         case "\${FIXTURE_DURING_PREVIEW:-}" in
             config) printf '{"changed":true}' > "$FIXTURE_WORK/data/config/models.json" ;;
@@ -164,10 +147,8 @@ const deployStub = `#!/usr/bin/env bash
 set -u
 input=''; IFS= read -r input || true
 snapshot="$(cat data/state/deploy-transaction 2>/dev/null || true)"
-token=none
-if [ -n "\${DEPLOY_TUNNEL_TOKEN_INPUT:-}" ]; then token=other; [ "$DEPLOY_TUNNEL_TOKEN_INPUT" != "$FIXTURE_TOKEN" ] || token=match; fi
-printf 'deploy action=%s handoff=%s token=%s receipt=[%s] stdin=%s tty=%s head=%s\\n' "\${DEPLOY_TRANSACTION_ACTION:-}" "\${DEPLOY_TRANSACTION_HANDOFF-unset}" \\
-    "$token" "$(cat "$BOT_UPDATE_COMMIT_FILE")" "$input" "$([ -t 0 ] && echo yes || echo no)" "$(git rev-parse --short HEAD)" >> "$FIXTURE_EVENTS"
+printf 'deploy action=%s receipt=[%s] stdin=%s tty=%s head=%s\\n' "\${DEPLOY_TRANSACTION_ACTION:-}" \\
+    "$(cat "$BOT_UPDATE_COMMIT_FILE")" "$input" "$([ -t 0 ] && echo yes || echo no)" "$(git rev-parse --short HEAD)" >> "$FIXTURE_EVENTS"
 if [ -n "$snapshot" ]; then
     printf '%s' "$snapshot" > "$FIXTURE_MOCK/snapshot"
     cp "backup/snapshots/$snapshot/transaction" "$FIXTURE_MOCK/record"
@@ -235,8 +216,7 @@ async function buildTemplate() {
     await mkdir(bin, { recursive: true }); await mkdir(state, { recursive: true }); await mkdir(join(work, "data/config"), { recursive: true });
     await writeFile(join(bin, "docker"), dockerStub);
     await writeFile(join(bin, "flock"), "#!/usr/bin/env bash\nexit 0\n");
-    await writeFile(join(bin, "pgrep"), '#!/usr/bin/env bash\n[ "${FIXTURE_UNMANAGED:-0}" = 1 ] && echo 4242\n');
-    for (const name of ["docker", "flock", "pgrep"]) await chmod(join(bin, name), 0o755);
+    for (const name of ["docker", "flock"]) await chmod(join(bin, name), 0o755);
     // The fixture repository carries the real upgrader files at both commits and a stub target deploy script.
     for (const path of ["scripts/deploy/upgrade.sh", "scripts/lib", "scripts/runtime", "scripts/ops/ops.sh", "src/core/data-version.ts", "Dockerfile"]) {
       await cp(join(project, path), join(work, path), { recursive: true });
@@ -260,8 +240,8 @@ async function buildTemplate() {
     const exported = await runCommand(processes, work, [bash!, "-c", `. '${posix(join(project, "scripts/lib/common.sh"))}'; git archive ${target} "\${UPGRADER_EXPORT_PATHS[@]}" | tar -x -C '${posix(stage)}'`], env);
     expect(exported.code, exported.text).toBe(0);
     expect(existsSync(join(stage, "scripts/deploy/deploy.sh"))).toBe(false);
-    await writeFile(join(work, "data/config/models.json"), "{}");
-    await writeFile(join(state, "bot-port"), "2022"); await writeFile(join(state, "deploy-mode"), "direct"); await writeFile(join(state, "bot-domain"), "Bot.Example.com");
+    await writeFile(join(work, "data/config/models.json"), "{}"); await writeFile(join(work, "data/config/app-bot.json"), "{}");
+    await writeFile(join(state, "bot-port"), "2022");
     // Nothing started while building may still run while the scenarios copy the template.
     await processes.stop();
     return { f, work, bin, old, target };
@@ -296,7 +276,7 @@ async function upgraderFixture(prefix: string, processes: ScenarioProcesses) {
   // so the work tree can have two POSIX names; without a PWD naming it, bash takes getcwd's /tmp/... form and the scripts
   // would see another project than the stub's container mounts. PWD pins the form the stubs use, for every entry.
   const env = (extra: Record<string, string> = {}) => ({ PATH: `${posix(bin)}:${process.env.PATH}`, PWD: posix(work),
-    FIXTURE_EVENTS: posix(events), FIXTURE_MOCK: posix(mock), FIXTURE_WORK: posix(work), FIXTURE_TOKEN: token,
+    FIXTURE_EVENTS: posix(events), FIXTURE_MOCK: posix(mock), FIXTURE_WORK: posix(work),
     DOCKER_HOST: "unix:///var/run/docker.sock", BOT_TASK_DOCKER_HOST: `unix://${socket}`, "BASH_FUNC_df%%": dfFunction,
     // Socket ownership is part of the synthetic daemon's fixture, including root-operated UID 1000 scenarios.
     "BASH_FUNC_stat%%": `() { if [ "$*" = '-c %u -- ${socket}' ]; then if [ "\${FIXTURE_ROOTLESS:-$([ "$(id -u)" = 0 ] && echo 0 || echo 1)}" = 1 ]; then id -u; else printf '%s' "\${FIXTURE_TASK_UID:-1000}"; fi; else command stat "$@"; fi\n}`, ...extra });
@@ -362,11 +342,11 @@ scenario("ops update ignores terminal settings through the post-upgrade check", 
   await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/heads/main`);
   // Upgrading uses only the saved settings, so the health check afterwards runs against the saved port as well
   // (its heading shows the port it probes). Invalid terminal values neither block the entry nor reach the check.
-  for (const [port, domain] of [["9999", "other.example.com"], ["invalid", "-invalid-"]] as const) {
+  for (const port of ["9999", "invalid"]) {
     await reset(old);
-    const result = await ops(["update"], { BOT_PORT: port, BOT_DOMAIN: domain });
-    expect(result.text).toContain("升级完成"); expect(result.text).not.toContain("端口无效"); expect(result.text).not.toContain("域名无效");
-    expect(result.text).toContain("健康检查（模式=直连，端口=2022）"); expect(result.text).not.toContain(`端口=${port}`);
+    const result = await ops(["update"], { BOT_PORT: port });
+    expect(result.text).toContain("升级完成"); expect(result.text).not.toContain("端口无效");
+    expect(result.text).toContain("健康检查（本机端口=2022）"); expect(result.text).not.toContain(`端口=${port}`);
     expect(await git("rev-parse", "HEAD")).toBe(target);
   }
 });
@@ -448,17 +428,16 @@ scenario("restoring only the code stops at a commit made after the upgrade and f
   expect(existsSync(pointer)).toBe(false); expect(await container("mixin-chatbot")).toBe("sha256:old true");
 });
 
-scenario("target upgrader: refusals before the stop leave code, data and service untouched; an unmanaged connector is confirmed first", "target-upgrader-refusals-", async fx => {
-  const { f, work, state, stage, git, env, upgrade, log, record, reset, candidateTags, old, target, processes } = fx;
+scenario("target upgrader: refusals before the stop leave code, data and service untouched", "target-upgrader-refusals-", async fx => {
+  const { f, work, state, stage, git, env, upgrade, log, reset, candidateTags, old, target, processes } = fx;
   const unchanged = unchangedCheck(fx);
   let result: { code: number; text: string };
   // Refusals before the stop leave code, data and service untouched, and release the candidate's reserved tag.
   await reset(old);
   result = await upgrade([target], { FIXTURE_PREVIEW: "fail" });
-  await unchanged(old, result); expect(result.text).toContain("迁移预览或配置校验未通过"); expect(result.text).toContain("服务尚未停止");
+  await unchanged(old, result); expect(result.text).toContain("数据版本或配置校验未通过"); expect(result.text).toContain("服务尚未停止");
+  expect(result.text).toContain("目录没有部署记录，不能升级");
   expect(await candidateTags()).toEqual([]);
-  // Decisions (exit 2) cannot be answered by flags through the upgrader; without a terminal it says where to answer them.
-  expect(result.text).toContain("迁移选择需要在交互终端中确认");
   // An interrupted preview (ops.sh forwards TERM to the upgrader) removes the named preview container before the
   // upgrader exits, so no Docker CLI or container is left behind, even when INT and TERM reach its whole process group
   // again during that cleanup; an interrupted build ends only this build's client. Windows cannot deliver the signal to bash.
@@ -480,7 +459,7 @@ scenario("target upgrader: refusals before the stop leave code, data and service
       expect(await fx.container("mixin-chatbot")).toBe("sha256:old true");
       return out + err;
     };
-    expect(await interrupt({ FIXTURE_PREVIEW: "hold", FIXTURE_RM_SIGNALS: "1" }, "preview")).toContain("迁移预览已中断并清理");
+    expect(await interrupt({ FIXTURE_PREVIEW: "hold", FIXTURE_RM_SIGNALS: "1" }, "preview")).toContain("数据预检已中断并清理");
     expect((await log()).filter(line => !/^(build|preview)/.test(line))).toEqual([expect.stringMatching(/^rm -f mixin-chatbot-preview-[0-9a-f]{12}$/)]);
     // The build's tag exists before its ID is known: it is claimed by the operation label and released.
     expect(await interrupt({ FIXTURE_BUILD: "hold" }, "build", join(fx.mock, "build-pid"))).toContain("镜像构建已中断");
@@ -490,8 +469,6 @@ scenario("target upgrader: refusals before the stop leave code, data and service
     for (let waited = 0; alive() && waited < 5000; waited += 50) await Bun.sleep(50);
     expect(alive()).toBe(false);
   }
-  result = await upgrade([target], { BOT_MODEL_CACHE_RETENTION: "short" });
-  await unchanged(old, result); expect(result.text).toContain("BOT_MODEL_CACHE_RETENTION 已移除");
   await writeFile(join(state, "bot-port"), "abc");
   result = await upgrade([target]);
   await unchanged(old, result); expect(result.text).toContain("端口无效");
@@ -500,20 +477,17 @@ scenario("target upgrader: refusals before the stop leave code, data and service
   result = await upgrade([target]);
   await unchanged(old, result); expect(result.text).toContain("缺少 data/config/models.json");
   await writeFile(join(work, "data/config/models.json"), "{}");
+  await rm(join(work, "data/config/app-bot.json"));
+  result = await upgrade([target]);
+  await unchanged(old, result); expect(result.text).toContain("缺少 data/config/app-bot.json"); expect(result.text).toContain("服务尚未停止");
+  await writeFile(join(work, "data/config/app-bot.json"), "{}");
   await writeFile(join(work, "version.txt"), "dirty");
   result = await upgrade([target]);
   await unchanged(old, result); expect(result.text).toContain("未提交的改动");
   await git("checkout", "--", "version.txt");
-  await writeFile(join(state, "update-transaction"), "legacy");
-  result = await upgrade([target]);
-  await unchanged(old, result); expect(result.text).toContain("旧版升级留下的停机记录");
-  await rm(join(state, "update-transaction"));
-  // An unmanaged connector is confirmed before the stop and recorded; declining cancels.
-  result = await upgrade([target], { FIXTURE_UNMANAGED: "1" }, "n\n");
-  await unchanged(old, result); expect(result.text).toContain("已取消升级");
   await reset(old);
-  result = await upgrade([target], { FIXTURE_UNMANAGED: "1" }, "y\n");
-  expect(result.code, result.text).toBe(0); expect((await record()).unmanaged_tunnel).toBe("direct");
+  result = await upgrade([target]);
+  expect(result.code, result.text).toBe(0);
 });
 
 // ops.sh starts the upgrader in the background, so the upgrader ignores the INT of a Ctrl+C and gets it from ops.sh
@@ -542,7 +516,7 @@ scenario("ops update interrupted by Ctrl+C, TERM or a hangup cleans up before th
     return out + err;
   };
   for (const [signal, extra] of [["group", {}], ["ops", {}], ["ops", { FIXTURE_RM_SIGNALS: "1" }]] as const) {
-    expect(await interrupt(signal, "preview", { FIXTURE_PREVIEW: "hold", ...extra })).toContain("迁移预览已中断并清理");
+    expect(await interrupt(signal, "preview", { FIXTURE_PREVIEW: "hold", ...extra })).toContain("数据预检已中断并清理");
     expect((await log()).filter(line => !/^(build|preview)/.test(line))).toEqual([expect.stringMatching(/^rm -f mixin-chatbot-preview-[0-9a-f]{12}$/)]);
     expect(await candidateTags()).toEqual([]);
   }
@@ -563,7 +537,7 @@ scenario("target upgrader: the operator is checked before any question and the s
   let result: { code: number; text: string };
   // A rootful daemon needs root and a rootless one its own user: refused before any question, build or change.
   await reset(old);
-  result = await upgrade([target], { FIXTURE_ROOTLESS: root ? "1" : "0", FIXTURE_UNMANAGED: "1" }, "y\n");
+  result = await upgrade([target], { FIXTURE_ROOTLESS: root ? "1" : "0" }, "y\n");
   await unchanged(old, result); expect(await log()).toEqual([]); expect(result.text).not.toContain("?>");
   expect(result.text).toContain(root ? "rootless 模式" : "sudo scripts/ops/ops.sh update");
   // The service identity comes from the original container, checked before anything else; an unclear one is refused.
@@ -709,12 +683,12 @@ scenario("target upgrader: untracked files on the switch route through main are 
   // Nothing in the way: the resumed upgrade stops the service, switches and hands over.
   result = await upgrade([target, "continue"]);
   expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级完成");
-  expect(await log()).toEqual([`stop mixin-chatbot head=${oldShort}`, `deploy action=continue handoff= token=none receipt=[] stdin= tty=no head=${target.slice(0, 7)}`]);
+  expect(await log()).toEqual([`stop mixin-chatbot head=${oldShort}`, `deploy action=continue receipt=[] stdin= tty=no head=${target.slice(0, 7)}`]);
   expect(await git("rev-parse", "HEAD")).toBe(target);
 });
 
 scenario("target upgrader: failures after the handoff roll back automatically, committed data keeps the new code, and a failed rollback waits for an explicit one", "target-upgrader-failures-", async fx => {
-  const { state, mock, git, upgrade, log, container, reset, old, target } = fx;
+  const { state, git, upgrade, log, container, reset, old, target } = fx;
   const short = target.slice(0, 7);
   let result: { code: number; text: string };
   // Failures after the handoff: still pending and uncommitted rolls back automatically, then the code is restored.
@@ -722,7 +696,7 @@ scenario("target upgrader: failures after the handoff roll back automatically, c
   result = await upgrade([target], { FIXTURE_DEPLOY: "pending" });
   expect(result.code, result.text).toBe(1); expect(result.text).toContain("升级失败，已回滚");
   let lines = await log();
-  expect(lines.filter(line => line.startsWith("deploy")).map(line => line.split(" ").slice(1, 3).join(" "))).toEqual(["action=continue handoff=" + (await readFile(join(mock, "snapshot"), "utf8")), "action=rollback handoff="]);
+  expect(lines.filter(line => line.startsWith("deploy")).map(line => line.split(" ")[1])).toEqual(["action=continue", "action=rollback"]);
   expect(await git("rev-parse", "HEAD")).toBe(old); expect(await container("mixin-chatbot")).toBe("sha256:old true");
   expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
   // The deploy script rolled back itself: only the code is restored.
@@ -745,7 +719,7 @@ scenario("target upgrader: failures after the handoff roll back automatically, c
   result = await upgrade([target, "rollback"]);
   expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级已回滚");
   lines = await log();
-  expect(lines[0]).toMatch(new RegExp(`^deploy action=rollback handoff= token=none receipt=\\[\\] stdin= tty=no head=${short}$`));
+  expect(lines[0]).toMatch(new RegExp(`^deploy action=rollback receipt=\\[\\] stdin= tty=no head=${short}$`));
   expect(await git("rev-parse", "HEAD")).toBe(old); expect(await container("mixin-chatbot")).toBe("sha256:old true");
   // Without a TTY a pending upgrade needs an explicit action; nothing is left to do afterwards.
   result = await upgrade([target, "continue"]);
@@ -776,10 +750,10 @@ scenario("target upgrader: an upgrade interrupted before the checkout continues 
   expect(result.text).toContain("scripts/deploy/deploy.sh"); expect(await log()).toEqual([]);
   expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(true);
   await git("checkout", "--", "scripts/deploy/deploy.sh");
-  // Continue checks out the recorded target and hands over without a marker or token.
+  // Continue checks out the recorded target and hands over without a marker.
   result = await upgrade([target, "continue"]);
   expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级完成");
-  expect(await log()).toEqual([`deploy action=continue handoff= token=none receipt=[] stdin= tty=no head=${short}`]);
+  expect(await log()).toEqual([`deploy action=continue receipt=[] stdin= tty=no head=${short}`]);
   expect(await git("rev-parse", "HEAD")).toBe(target);
   // Rollback before the checkout restores the snapshot and the original container without the deploy script,
   // unless this upgrade's migration already started.
@@ -874,7 +848,6 @@ scenario("target upgrader: a new upgrade builds the target once, previews in tha
   const { work, state, mock, stage, git, upgrade, log, record, reset, candidateTags, officialTag, sidecar, old, target } = fx;
   const short = target.slice(0, 7);
   const oldShort = old.slice(0, 7);
-  const groups = posix(join(work, "data/groups"));
   const unchanged = unchangedCheck(fx);
   // Non-root test runs see a rootless daemon, whose service runs as the mapped 0:0. Root runs see a rootful daemon and an
   // instance deployed by a docker group user: its 1000:1000 is kept, not replaced by the image's 1001.
@@ -884,13 +857,13 @@ scenario("target upgrader: a new upgrade builds the target once, previews in tha
   // that image with data mounted read-only, records every choice with the image and the identity, stops, checks out, then
   // hands over to the target deploy script with the snapshot as marker and stdin closed. Terminal overrides are ignored.
   await reset(old);
-  let result = await upgrade([target], { BOT_PORT: "9999", DEPLOY_MODE: "cloudflare", GROUP_DATA_ROOT: "/elsewhere", BOT_DEBUG: "1" }, "leftover\n");
+  let result = await upgrade([target], { BOT_PORT: "9999", WORKSPACE_ROOT: "/elsewhere", BOT_RUN_TIMEOUT_SECONDS: "5" }, "leftover\n");
   expect(result.code, result.text).toBe(0); expect(result.text).toContain(`升级完成：${oldShort} -> ${short}`);
-  expect(result.text).toContain("忽略当前终端的环境变量：BOT_PORT DEPLOY_MODE GROUP_DATA_ROOT BOT_DEBUG");
+  expect(result.text).toContain("忽略当前终端的环境变量：BOT_PORT WORKSPACE_ROOT BOT_RUN_TIMEOUT_SECONDS");
   expect(result.text).toContain("fixture-new");
   const snapshot = await readFile(join(mock, "snapshot"), "utf8");
   expect(await log()).toEqual([`build head=${oldShort} context=new`, `preview head=${oldShort}`, `stop mixin-chatbot head=${oldShort}`,
-    "rename mixin-chatbot mixin-chatbot-rollback", `deploy action=continue handoff=${snapshot} token=none receipt=[] stdin= tty=no head=${short}`]);
+    "rename mixin-chatbot mixin-chatbot-rollback", `deploy action=continue receipt=[] stdin= tty=no head=${short}`]);
   const candidate = await sidecar("candidate-image");
   expect(candidate).toEqual({ format: "1", source: "commit", target_sha: target, image_id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
     image_tag: expect.stringMatching(/^mixin-chatbot:candidate-[0-9a-f]{12}-[0-9a-f]{16}$/), daemon_id: "5eec1de4-4518-46da-a461-80c0866ec11d",
@@ -904,12 +877,12 @@ scenario("target upgrader: a new upgrade builds the target once, previews in tha
   const mounts = args.flatMap((arg, index) => args[index - 1] === "-v" ? [arg] : []);
   expect(mounts).toEqual([`${posix(work)}/data:/app/data:ro`, `${posix(work)}/logs:/app/logs`, `${posix(stage)}/preview:/preview`]);
   expect(args.slice(args.indexOf(candidate.image_id))).toEqual([candidate.image_id, "bun", "run", "scripts/runtime/data-current.ts",
-    "preview", "--project", "/app", "--groups", "/app/data/groups", "--plan", "/preview/data-plan.json"]);
-  expect(args).toContain("GROUP_DATA_ROOT=/app/data/groups");
+    "preview", "--project", "/app", "--plan", "/preview/data-plan.json", "--upgrade"]);
+  // The data gate reads data/ only: the shared workspace is not mounted.
+  expect(args.some(arg => arg.includes("/app/workspace"))).toBe(false);
   expect(args[args.indexOf("--user") + 1]).toBe(identity); expect(args[args.indexOf("--network") + 1]).toBe("none");
-  expect(await record()).toEqual({ format: "1", operation: "upgrade", snapshot, target_sha: target, original_sha: old, original_branch: "main",
-    original_group_root: groups, target_group_root: groups, was_running: "1", bot_port: "2022", deploy_mode: "direct", bot_domain: "bot.example.com",
-    domain_action: "persist", unmanaged_tunnel: "", platform_ip: expect.any(String), reconfigure_ai: "0" });
+  expect(await record()).toEqual({ format: "2", operation: "upgrade", snapshot, target_sha: target, original_sha: old, original_branch: "main",
+    original_workspace_root: "", target_workspace_root: "", was_running: "1", bot_port: "2022", reconfigure_ai: "0" });
   expect(await readFile(join(mock, "plan"), "utf8")).toBe('{"format":1,"fixture":"plan"}');
   expect(await git("rev-parse", "HEAD")).toBe(target);
   // The operation log records the build's duration and the start of the downtime (the deploy script records its end).
@@ -960,117 +933,28 @@ scenario("target upgrader: a failed code restore keeps the transaction, marked s
   expect(await git("rev-parse", "HEAD")).toBe(old); expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
 });
 
-scenario("target upgrader: an external group root is mounted read-only; missing registered roots stop before any change", "target-upgrader-roots-", async fx => {
-  const { f, work, state, mock, upgrade, record, reset, old, target } = fx;
-  const groups = posix(join(work, "data/groups"));
+scenario("target upgrader: an external workspace root is recorded for the handoff; a missing one stops before any change", "target-upgrader-roots-", async fx => {
+  const { f, state, upgrade, record, reset, old, target } = fx;
   const unchanged = unchangedCheck(fx);
   let result: { code: number; text: string };
-  // An external group root is mounted read-only at the service path.
-  const external = join(f.root, "external groups");
-  await mkdir(external); await writeFile(join(state, "group-data-root"), posix(external));
+  // The saved external workspace root goes into the record; the deploy script mounts it read-only.
+  const external = join(f.root, "external shared");
+  await mkdir(external); await writeFile(join(state, "workspace-root"), posix(external));
   await reset(old);
   result = await upgrade([target]);
   expect(result.code, result.text).toBe(0);
-  const externalArgs = (await readFile(join(mock, "preview-args"), "utf8")).trim().split("\n");
-  expect(externalArgs).toContain(`${posix(external)}:/app/group-data:ro`); expect(externalArgs).toContain("/app/group-data");
-  expect((await record()).target_group_root).toBe(posix(external));
+  expect(await record()).toMatchObject({ original_workspace_root: posix(external), target_workspace_root: posix(external) });
   // A missing external root stops before anything changes and is never recreated.
   await rm(external, { recursive: true });
   await reset(old);
   result = await upgrade([target]);
-  await unchanged(old, result); expect(result.text).toContain("群数据总根不存在"); expect(existsSync(external)).toBe(false);
-  // A registered default root is checked the same way: its loss is reported, not hidden behind a new empty directory.
-  // A registered default root that exists (in the single long sequence, earlier upgrades had created it).
-  await mkdir(join(work, "data/groups"), { recursive: true });
-  await writeFile(join(state, "group-data-root"), groups);
-  await rm(join(work, "data/groups"), { recursive: true });
-  result = await upgrade([target]);
-  await unchanged(old, result); expect(result.text).toContain("群数据总根不存在"); expect(existsSync(join(work, "data/groups"))).toBe(false);
-  await rm(join(state, "group-data-root"));
+  await unchanged(old, result); expect(result.text).toContain("已部署的共享资料目录不存在"); expect(existsSync(external)).toBe(false);
+  await rm(join(state, "workspace-root"));
 });
 
-scenario("target upgrader: reset consent precedes stop, target image freezes the ledger, freeze failure restores old service", "target-upgrader-reset-", async fx => {
-  const { work, mock, reset, upgrade, old, target, log, git, container } = fx;
-  await reset(old);
-  const cancelled = await upgrade([target], { FIXTURE_RESET: "1" }, "n\n");
-  await unchangedCheck(fx)(old, cancelled);
-  const failed = await upgrade([target], { FIXTURE_RESET: "1", FIXTURE_FREEZE: "failed" }, "y\n");
-  expect(failed.code, failed.text).toBe(1);
-  expect(failed.text).toContain("现有统计账本核对失败");
-  expect(await git("rev-parse", "HEAD")).toBe(old);
-  expect((await container("mixin-chatbot")).split(" ").slice(0, 2)).toEqual(["sha256:old", "true"]);
-  await reset(old);
-  const result = await upgrade([target], { FIXTURE_RESET: "1" }, "y\n");
-  expect(result.code, result.text).toBe(0);
-  const events = await log(), configure = events.indexOf(`configure head=${old.slice(0, 7)}`), stop = events.indexOf(`stop mixin-chatbot head=${old.slice(0, 7)}`);
-  const freeze = events.indexOf(`freeze head=${old.slice(0, 7)}`), deploy = events.findIndex(line => line.startsWith("deploy action=continue"));
-  expect(configure).toBeGreaterThan(-1); expect(stop).toBeGreaterThan(configure); expect(freeze).toBeGreaterThan(stop); expect(deploy).toBeGreaterThan(freeze);
-  const freezeArgs = (await readFile(join(mock, "freeze-args"), "utf8")).trim().split("\n");
-  const previewArgs = (await readFile(join(mock, "preview-args"), "utf8")).trim().split("\n");
-  expect(freezeArgs[freezeArgs.indexOf("bun") - 1]).toBe(previewArgs[previewArgs.indexOf("bun") - 1]);
-  expect(freezeArgs).not.toContain("sha256:old");
-  expect(freezeArgs.some(arg => arg.includes(":/upgrade"))).toBe(false);
-  const snapshot = await readFile(join(mock, "snapshot"), "utf8");
-  expect(await readFile(join(work, "backup/snapshots", snapshot, "stats-frozen.json"), "utf8")).toBe("frozen");
-  expect(events.indexOf("offer-models")).toBeGreaterThan(-1); expect(events.indexOf("offer-models")).toBeLessThan(configure);
-  // An accepted existing model configuration is kept by default (Enter) and reconfigured only on request, from an empty draft.
-  for (const [answer, configured] of [["", false], ["y", true]] as const) {
-    await reset(old);
-    const run = await upgrade([target], { FIXTURE_RESET: "1", FIXTURE_MODELS: "0" }, `y\n${answer}\n`);
-    expect(run.code, run.text).toBe(0); expect(run.text).toContain("是否重新配置模型");
-    const lines = await log(), configuredAt = lines.indexOf(`configure head=${old.slice(0, 7)}`);
-    expect(configuredAt > -1).toBe(configured);
-    expect(lines.includes("discard-models")).toBe(configured);
-    if (configured) expect(lines.indexOf("discard-models")).toBeLessThan(configuredAt);
-  }
-
-  // Same-code reset can be interrupted before the freeze, with HEAD already at the target.
-  await reset(target);
-  const pending = await upgrade([target], { FIXTURE_RESET: "1", FIXTURE_DEPLOY: "pending", FIXTURE_ROLLBACK: "fail" }, "y\n");
-  expect(pending.code, pending.text).toBe(1);
-  const pendingSnapshot = await readFile(join(mock, "snapshot"), "utf8");
-  await rm(join(work, "backup/snapshots", pendingSnapshot, "stats-frozen.json"));
-  const resumed = await upgrade([target, "continue"], { FIXTURE_RESET: "1" });
-  expect(resumed.code, resumed.text).toBe(0);
-  expect((await log())[0]).toBe(`freeze head=${target.slice(0, 7)}`);
-  expect(await readFile(join(work, "backup/snapshots", pendingSnapshot, "stats-frozen.json"), "utf8")).toBe("frozen");
-});
-
-scenario("target upgrader: a Cloudflare token is asked before the stop and handed over only in memory", "target-upgrader-token-", async fx => {
-  const { state, mock, upgrade, log, reset, old, target } = fx;
-  const unchanged = unchangedCheck(fx);
-  let result: { code: number; text: string };
-  // Cloudflare without a connector or saved token: the hidden token is asked before the stop and handed over only in memory.
-  await writeFile(join(state, "deploy-mode"), "cloudflare");
-  await reset(old);
-  result = await upgrade([target], {}, "");
-  await unchanged(old, result); expect(result.text).toContain("输入已结束");
-  result = await upgrade([target], {}, `${token}\n`);
-  expect(result.code, result.text).toBe(0);
-  expect((await log()).at(-1)).toMatch(/^deploy action=continue handoff=deploy-\w+ token=match receipt=\[\] stdin= tty=no /);
-  expect(result.text).not.toContain(token);
-  expect(await readFile(join(mock, "record"), "utf8")).not.toContain(token);
-  await writeFile(join(state, "deploy-mode"), "direct");
-});
-
-scenario("target upgrader: never runs from inside the work tree; the documented bootstrap command performs a complete upgrade", "target-upgrader-bootstrap-", async fx => {
-  const { f, work, run, git, env, reset, old, target } = fx;
-  let result: { code: number; text: string };
+scenario("target upgrader: never runs from inside the work tree", "target-upgrader-bootstrap-", async fx => {
+  const { work, run, env, target } = fx;
   // The upgrader never runs from inside the work tree.
-  result = await run([bash!, posix(join(work, "scripts/deploy/upgrade.sh")), posix(work), target], env());
+  const result = await run([bash!, posix(join(work, "scripts/deploy/upgrade.sh")), posix(work), target], env());
   expect(result.code, result.text).toBe(2); expect(result.text).toContain("导出后运行");
-
-  // The documented one-time bootstrap command performs a complete upgrade from origin/main.
-  const origin = join(f.root, "origin.git");
-  await git("init", "--bare", origin); await git("remote", "add", "origin", origin); await git("push", "origin", `${target}:refs/heads/main`);
-  await reset(old);
-  const bootstrap = await run([bash!, "-c", `. '${posix(join(project, "scripts/lib/common.sh"))}'; upgrade_bootstrap_command`], env());
-  expect(bootstrap.code, bootstrap.text).toBe(0);
-  result = await run([bash!, "-c", `set -e\n${bootstrap.text.trim()}`], env());
-  expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级完成");
-  expect(await git("rev-parse", "HEAD")).toBe(target);
-  const exports = (await readdir(join(work, "tmp"))).filter(name => name !== "upgrade-fixture");
-  expect(exports).toHaveLength(1); expect(exports[0]).toMatch(/^upgrade-[A-Za-z0-9]{8}$/);
-  // The one-time command keeps its exact export available for recovery; the fixture owns its eventual cleanup.
-  expect(existsSync(join(work, "tmp", exports[0]!, "scripts/deploy/upgrade.sh"))).toBe(true);
 });

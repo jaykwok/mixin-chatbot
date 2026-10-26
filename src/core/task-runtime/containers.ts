@@ -1,9 +1,8 @@
 // The task daemon: identity checks, the deployment mapping probe, and creating, inspecting and retiring a receipt's
 // containers. Every container is checked against the receipt (labels, nonce, isolation flags, exact mounts) before it
 // is trusted; a missing answer is never taken as a removal.
-import { lstat } from "node:fs/promises";
-import { randomBytes, randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { lstat, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import type { Receipt, TaskMount } from "../../contracts/task-receipt.ts";
 import { holdDirectory } from "../held-directory.ts";
 import type { TaskPaths } from "../task-deployment.ts";
@@ -21,6 +20,10 @@ function mount(source: string, target: string, readonly: boolean): string {
 
 /** `--mount` values for a worker's bindings; throws on a path the CLI syntax cannot carry. */
 export const mountArguments = (bindings: readonly TaskMount[]) => bindings.map(value => mount(value.source, value.target, !value.writable));
+
+/** Run by the pinned image's bun inside the mapping helper: the identity of its read-only mount point, nothing else. */
+const MAPPING_PROBE = "const s=require('fs').lstatSync('/mapping-proof',{bigint:true});" +
+  "process.stdout.write(JSON.stringify({directory:s.isDirectory(),dev:String(s.dev),ino:String(s.ino)}))";
 
 const absent = (output: string, cid: string) => output.includes(`No such container: ${cid}`) || output.includes(`No such object: ${cid}`);
 
@@ -52,24 +55,48 @@ export class TaskContainers {
     return facts.ID;
   }
 
-  /** A string mapping alone cannot prove both views name the same storage: a worker reads back a fresh nonce. */
+  /**
+   * A string mapping alone cannot prove both views name the same storage. The proof only reads, so a read-only root
+   * (an external workspace) is verified like a writable one: the control plane holds each root open and takes its
+   * identity; a short worker of the pinned image, started by the task daemon with that root's daemon-side source
+   * mounted read-only (a missing source fails, it is never created), reports the identity of the directory it sees.
+   * Both must name the same entity, and the control plane's path must still name the held directory afterwards. Same
+   * host, same kernel: a bind mount reports the device and inode of the underlying directory in both views (checked on
+   * the rootless and the rootful + task-daemon topologies); where they differ the mapping is refused, never assumed.
+   * Neither side writes, lists or reads the materials.
+   */
   async verifyMappings(): Promise<void> {
     for (const root of this.paths!.roots) {
       const held = await holdDirectory(root, [], false);
       try {
-        await held.use(async entries => {
-          const name = ".task-mapping-" + randomUUID(), probe = await entries.create(name), nonce = randomBytes(32).toString("hex");
-          try {
-            await probe.handle.writeFile(nonce); await probe.handle.sync();
-            const actual = await this.must(["run", "--rm", "--pull", "never", "--no-healthcheck", "--read-only", "--network", "none",
-              "--ipc", "private", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "0:0", "--pids-limit", "32", "--memory", "128m",
-              "--mount", mount(this.source(join(root, name)), "/mapping-proof", true), "--entrypoint", "/usr/local/bin/bun", this.image,
-              "-e", "process.stdout.write(require('fs').readFileSync('/mapping-proof','utf8'))"]);
-            if (actual !== nonce) throw new Error("控制面与任务 daemon 的目录映射不指向同一实体：" + root);
-          } finally { await probe.close(true); }
-        });
+        const expected = { dev: String(held.identity.dev), ino: String(held.identity.ino) };
+        const seen = await this.#probeIdentity(this.source(root));
+        if (seen.dev !== expected.dev || seen.ino !== expected.ino)
+          throw new Error(`控制面与任务 daemon 的目录映射不指向同一实体：${root}（管理侧 ${expected.dev}/${expected.ino}，任务 daemon 侧 ${seen.dev}/${seen.ino}）`);
+        const now = await stat(root, { bigint: true });
+        if (!now.isDirectory() || String(now.dev) !== expected.dev || String(now.ino) !== expected.ino)
+          throw new Error(`目录映射核验期间 ${root} 已被替换`);
       } finally { await held.release(); }
     }
+  }
+
+  /** The identity of `source` as a worker of the task daemon sees it: a named, bounded, network-less container. */
+  async #probeIdentity(source: string): Promise<{ dev: string; ino: string }> {
+    const name = "mixin-mapping-" + randomUUID();
+    let output: string;
+    try {
+      output = await this.must(["run", "--rm", "--name", name, "--pull", "never", "--no-healthcheck", "--read-only", "--network", "none",
+        "--ipc", "private", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "0:0", "--pids-limit", "32", "--memory", "128m",
+        "--label", "org.mixin-chatbot.mapping-probe=1", "--mount", mount(source, "/mapping-proof", true), "--entrypoint", "/usr/local/bin/bun", this.image,
+        "-e", MAPPING_PROBE], { timeoutMs: 60_000 });
+    } catch (error) {
+      // A CLI that timed out or lost its daemon may leave the helper behind: remove it by name, best effort.
+      await this.driver.run(["container", "rm", "--force", name], { timeoutMs: 15_000 }).catch(() => undefined);
+      throw error;
+    }
+    const match = /^\{"directory":true,"dev":"(\d{1,20})","ino":"(\d{1,20})"\}$/.exec(output);
+    if (!match) throw new Error("任务 daemon 的目录映射核验结果无效：" + output.slice(0, 200));
+    return { dev: match[1]!, ino: match[2]! };
   }
 
   /** The container exactly as the receipt registered it, or an error. */

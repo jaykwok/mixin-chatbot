@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # 量子密信群聊协作机器人部署脚本 (Debian + Docker, Bun)
-# AI 配置（provider/key/model）由 data/config/models.json 承载，容器内 TUI 生成；
-# 无必需 .env/config.json。访问控制由应用 secret + 网络层（直连=UFW / Cloudflare=WAF）共同承担。
-# 两种部署模式：直连（公网 IP + UFW 限平台 IP）/ Cloudflare（cloudflared 隧道 + WAF）。
+# 应用机器人凭据（data/config/app-bot.json）和 AI 配置（data/config/models.json）由容器内的配置向导生成；
+# 无必需 .env/config.json。消息经平台事件 Stream 主动连出接收，不需要入站端口：HTTP 只监听本机回环，
+# 供 TUI、/health 和 /_admin/shutdown 使用。出站需能访问 imtwo.zdxlz.com 与 imfl.zdxlz.com 的 443 端口。
 
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -19,12 +19,8 @@ fi
 operation_start deploy
 trap 'operation_finish "$?"' EXIT
 cd "$PROJECT_DIR"
-# 升级器在同一次升级中交接的隧道 token 和交接标记（事务快照名）。只有标记与事务记录一致时才采用该 token，
-# 见续做分支；读入后立即移出环境，避免 token 传给后续子进程。
-PREPARED_TUNNEL_INPUT="${DEPLOY_TUNNEL_TOKEN_INPUT:-}"
-TRANSACTION_HANDOFF="${DEPLOY_TRANSACTION_HANDOFF:-}"
 LEGACY_REUSE_REQUEST="${DEPLOY_REUSE_SETTINGS:-0}"
-unset DEPLOY_TUNNEL_TOKEN_INPUT DEPLOY_TRANSACTION_HANDOFF DEPLOY_REUSE_SETTINGS
+unset DEPLOY_REUSE_SETTINGS
 # 未完成事务的处理方式（ops resume / rollback 和升级器指定，否则下方询问）；续做和回滚只使用事务记录中的设置。
 TRANSACTION_ACTION="${DEPLOY_TRANSACTION_ACTION:-}"
 unset DEPLOY_TRANSACTION_ACTION
@@ -32,20 +28,17 @@ case "$TRANSACTION_ACTION" in
     ''|continue|rollback) ;;
     *) echo "DEPLOY_TRANSACTION_ACTION 只能是 continue 或 rollback" >&2; exit 1 ;;
 esac
-# 旧版运维脚本的升级先停机，再以 DEPLOY_REUSE_SETTINGS=1 调用部署脚本；它不写事务记录，也没有停机前的迁移预览。
-# 在改动任何状态之前拒绝，旧脚本随后恢复原代码和原运行状态；新版升级器需要引导一次。
+# 旧版（webhook）运维脚本的升级先停机，再以 DEPLOY_REUSE_SETTINGS=1 调用部署脚本。旧版不支持升级到应用机器人版本：
+# 在改动任何状态之前拒绝，旧脚本随后恢复原代码和原运行状态。
 if [ "$LEGACY_REUSE_REQUEST" = 1 ] && [ -z "$TRANSACTION_ACTION" ]; then
     operation_event error "legacy upgrade entry refused"
     {
-        echo "[-] 旧版运维脚本不能直接升级到此版本：新版升级在停机前预览迁移并记录全部设置，需由新版升级器执行。"
-        echo "    本次未改动数据和配置；旧脚本将恢复原代码和原运行状态。请在项目目录运行一次以下引导命令，之后照常使用 ops.sh update："
-        echo "      cd '$PROJECT_DIR'"
-        upgrade_bootstrap_command | sed 's/^/      /'
+        echo "[-] 旧版（webhook）部署不支持升级到应用机器人版本，请在新目录全新部署（见 docs/data-migrations.md）。"
+        echo "    本次未改动数据和配置；旧脚本将恢复原代码和原运行状态。"
     } >&2
     exit 1
 fi
 RECORDED=0
-PREPARED_UNMANAGED_MODE=""
 # 只有升级的续做保持原停止状态（续做分支设置）；部署完成后总是启动。
 DEPLOY_PRESERVE_STOPPED=0
 DATA_DIR="${PROJECT_DIR}/data"
@@ -53,15 +46,13 @@ CONFIG_DIR="${DATA_DIR}/config"
 STATE_DIR="${DATA_DIR}/state"
 RUNTIME_DIR="${DATA_DIR}/runtime"
 RUNTIME_HOME_DIR="${RUNTIME_DIR}/home"
-DEFAULT_GROUP_DATA_ROOT="${DATA_DIR}/groups"
 LOG_DIR="${PROJECT_DIR}/logs"
 MODELS_FILE="${CONFIG_DIR}/models.json"
-WEBHOOK_SECRET_FILE="${CONFIG_DIR}/webhook-secret"
+APP_BOT_FILE="${CONFIG_DIR}/app-bot.json"
 BOT_PORT_FILE="${STATE_DIR}/bot-port"
-DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
-BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
-GROUP_DATA_ROOT_FILE="${STATE_DIR}/group-data-root"
-TUNNEL_PID_FILE="${STATE_DIR}/cloudflared.pid"
+WORKSPACE_ROOT_FILE="${STATE_DIR}/workspace-root"
+# HTTP 只供本机管理；rootless Docker 另见启动容器处的端口发布。
+BOT_HOST=127.0.0.1
 # 本次事务的镜像和服务身份：新部署在构建后固定 image ID、沿用原容器的数值 UID:GID（见 determine_service_user）；
 # 续做和回滚取自事务快照（load_transaction_runtime）。事务内的容器都只按它们运行，不按 mixin-chatbot 标签选择。
 IMAGE_ID=''
@@ -139,21 +130,15 @@ choose_transaction_action() {
     done
 }
 
-# Project UFW helpers and the deployment transaction are shared in scripts/lib/deployment.sh.
-# Connector identity and bounded stop are shared in scripts/lib/lifecycle.sh.
+# The deployment transaction is shared in scripts/lib/deployment.sh.
 
-# 项目内群根使用 data 挂载，项目外群根单独挂到 /app/group-data。
-group_root_mount() {
-    GROUP_ROOT_ARGS=()
-    if [ "$1" = "$DEFAULT_GROUP_DATA_ROOT" ]; then
-        GROUP_ROOT_ENV_VAL="/app/data/groups"
-    else
-        GROUP_ROOT_ARGS+=(-v "$1:/app/group-data")
-        GROUP_ROOT_ENV_VAL="/app/group-data"
-    fi
+# 共享资料默认在 data/workspace（随 data 挂载）；外置资料目录只读挂到 /app/workspace，从不改属主。
+workspace_mount() {
+    WORKSPACE_ARGS=()
+    if [ -n "$1" ]; then WORKSPACE_ARGS+=(-v "$1:/app/workspace:ro" -e WORKSPACE_ROOT=/app/workspace); fi
 }
 
-# The target image owns data_preparation semantics, including the first unversioned upgrade.
+# The target image owns data_preparation semantics (data-current.ts of that release).
 data_preparation_docker() {
     # 候选镜像已不存在时只允许回滚本事务从未开始迁移的操作（见 rollback_pending_deployment）：没有本事务的迁移可查或撤销。
     if [ "$CANDIDATE_PRESENT" = 0 ]; then
@@ -164,17 +149,16 @@ data_preparation_docker() {
         esac
     fi
     docker run --rm -i --user "$SERVICE_USER" \
-      -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -e BOT_OPERATION_LOG -e PI_CACHE_RETENTION -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
-      "${GROUP_ROOT_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" -v "$PROJECT_DIR/backup:/app/backup" -v "$PROJECT_DIR/logs:/app/logs" \
-      "$IMAGE_ID" bun run scripts/runtime/data-current.ts "$@" --groups "$GROUP_ROOT_ENV_VAL"
+      -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -e BOT_OPERATION_LOG -e PI_CACHE_RETENTION \
+      -v "$PROJECT_DIR/data:/app/data" -v "$PROJECT_DIR/backup:/app/backup" -v "$PROJECT_DIR/logs:/app/logs" \
+      "$IMAGE_ID" bun run scripts/runtime/data-current.ts "$@"
 }
 DATA_PREPARATION_APPLY_ATTEMPTED=0
 DATA_PREPARATION_PLAN=/app/data/state/data-plan.json
-DATA_PREPARATION_PREVIEW_MODE=()
 rollback_current_data() {
     [ "$DATA_PREPARATION_APPLY_ATTEMPTED" = 1 ] || return 0
     # Without a journal there is nothing to restore, and the image may never have been built.
-    [ -e "$STATE_DIR/release-data.json" ] || [ -e "$DEPLOY_SNAPSHOT/reset.json" ] || return 0
+    [ -e "$STATE_DIR/release-data.json" ] || return 0
     local result=0
     data_preparation_docker rollback --deployment "$BOT_DEPLOY_BACKUP_ID" || result=$?
     if [ "$result" = 42 ]; then
@@ -187,43 +171,35 @@ rollback_current_data() {
 # begin_deployment 发布事务指针前调用：记录停机前确认的全部选择，以及固定的镜像和服务身份（独立文件，事务记录保持
 # format 1）；续做和回滚只读这些记录。
 record_deployment_transaction() {
-    local snapshot="$1" domain_action=keep unmanaged=''
+    local snapshot="$1"
     write_candidate_record "$snapshot" && write_service_user_record "$snapshot" || return 1
     task_runtime_record "$snapshot/task-runtime" || return 1
     task_runtime_record_previous "$snapshot" || return 1
-    if [ "$PERSIST_BOT_DOMAIN" = 1 ]; then domain_action=persist
-    elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = 1 ]; then domain_action=clear; fi
-    if [ "$UNMANAGED_TUNNEL_CONFIRMED" = 1 ]; then unmanaged="$DEPLOY_MODE"; fi
-    declare -gA TRANSACTION=([format]=1 [operation]=deploy [snapshot]="$(basename -- "$snapshot")"
+    declare -gA TRANSACTION=([format]=2 [operation]=deploy [snapshot]="$(basename -- "$snapshot")"
         [target_sha]="$(cat "$snapshot/target-sha")" [original_sha]='' [original_branch]=''
-        [original_group_root]="$ORIGINAL_GROUP_DATA_ROOT" [target_group_root]="$HOST_GROUP_DATA_ROOT" [was_running]="$PREVIOUS_RUNNING"
-        [bot_port]="$BOT_PORT" [deploy_mode]="$DEPLOY_MODE" [bot_domain]="$PUBLIC_DOMAIN" [domain_action]="$domain_action"
-        [unmanaged_tunnel]="$unmanaged" [platform_ip]="$PLATFORM_IP" [reconfigure_ai]="$RECONFIGURE_AI")
+        [original_workspace_root]="$ORIGINAL_WORKSPACE_ROOT" [target_workspace_root]="$HOST_WORKSPACE_ROOT" [was_running]="$PREVIOUS_RUNNING"
+        [bot_port]="$BOT_PORT" [reconfigure_ai]="$RECONFIGURE_AI")
     write_transaction_record "$snapshot" || return 1
     if [ "$DATA_PREPARATION_PLANNED" = 1 ]; then cp -- "$STATE_DIR/data-plan.json" "$snapshot/data-plan.json" || return 1; fi
 }
 
 # 回滚未完成的事务。数据已提交时拒绝，只能继续完成新实例启动；判定在改动任何容器之前。
 rollback_pending_deployment() {
-    local original="${TRANSACTION[original_group_root]}" target="${TRANSACTION[target_group_root]}"
-    case "$original" in
-        "$PROJECT_DIR"/*) ;;
-        *) [ -d "$original" ] || { print_error "原群数据总根不存在：$original；旧容器依赖它，请恢复原挂载后再回滚"; exit 1; } ;;
-    esac
-    group_root_mount "$target"
+    local original="${TRANSACTION[original_workspace_root]}" target="${TRANSACTION[target_workspace_root]}"
+    [ -z "$original" ] || [ -d "$original" ] || { print_error "原共享资料目录不存在：$original；旧容器依赖它，请恢复原挂载后再回滚"; exit 1; }
+    workspace_mount "$target"
     # 候选镜像已不存在：本事务从未开始迁移时不需要撤销数据，用原容器回滚；否则需要完全相同的镜像，不能重新构建代替。
     if [ "$CANDIDATE_PRESENT" = 0 ] && data_preparation_mentions_deployment "${TRANSACTION[snapshot]}"; then
         print_error "上次操作的数据迁移已经开始，查看或撤销它需要记录的候选镜像 ${IMAGE_ID}，但它已不存在；请恢复完全相同的镜像（同一 image ID）后重试，重新构建的镜像不能代替；服务和数据保持现状"
         exit 1
     fi
     if [ -e "$STATE_DIR/release-data.json" ]; then
-        [ -d "$target" ] || { print_error "本次操作的群数据总根不存在：$target；恢复迁移前的数据需要它，请恢复挂载后再回滚"; exit 1; }
         if data_preparation_docker committed --deployment "${TRANSACTION[snapshot]}"; then
             print_error "上次操作的数据已经提交，不能回滚；请选择继续（$(ops_command_hint resume)）完成新实例启动"
             exit 1
         fi
     fi
-    HOST_GROUP_DATA_ROOT="$target"
+    HOST_WORKSPACE_ROOT="$target"
     ROLLBACK_REQUESTED=1
     print_status "回滚上次操作：恢复数据、配置、容器、网络入口和原运行状态"
     begin_deployment
@@ -259,9 +235,6 @@ activate_committed_deployment() {
         print_error "数据已经提交，新版本已启用，但正式标签 mixin-chatbot 未能指向 ${IMAGE_ID}（原因见上方）；保留事务，处理后使用 $(ops_command_hint resume) 重试"
         exit 1
     }
-    data_preparation_docker finish-reset --deployment "$(basename -- "$DEPLOY_SNAPSHOT")" || {
-        print_error '新版本已启用，但旧会话副本清理未完成；保留事务，请使用 resume 重试'; exit 1;
-    }
     rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"
     release_transaction_candidate
     cleanup_completed_backup "$DEPLOY_SNAPSHOT" keep-root || print_warning "部署已完成，但备份清理未完成，请检查 $DEPLOY_SNAPSHOT 和 $PROJECT_DIR/backup/rm"
@@ -275,6 +248,7 @@ activate_committed_deployment() {
         fi
     fi
     release_previous_image
+    task_runtime_cleanup_images || print_warning '部署已完成，但独立任务 daemon 的旧镜像清理未完成；下次成功部署会重试（原因见上方）'
 }
 
 # 数据已在中断前提交：配置、网络入口和状态文件都已写入，旧数据不能再用。
@@ -309,21 +283,7 @@ finish_committed_transaction() {
 # 普通部署读取的环境变量，只在没有未完成的事务时校验。续做和回滚只使用事务记录和已保存的 runtime.json，
 # 新终端里的这些变量既不能挡住恢复，也不会被采用。
 check_deploy_environment() {
-    if [ -n "${BOT_MODEL_CACHE_RETENTION:-}" ]; then
-        print_error 'BOT_MODEL_CACHE_RETENTION 已移除；请先迁移配置并移除旧环境变量，再部署。'
-        exit 1
-    fi
-    # 量子密信平台出口 IP（webhook 来源；UFW/WAF 按此放行）：默认值见 scripts/lib/common.sh，可用环境变量覆盖。
-    PLATFORM_IP="${PLATFORM_IP:-$DEFAULT_PLATFORM_IP}"
-    if ! transaction_value_valid platform_ip "$PLATFORM_IP"; then
-        print_error "PLATFORM_IP 无效：$PLATFORM_IP（需要 IPv4 或 IPv6 地址，可带前缀长度）"
-        exit 1
-    fi
-    local debug="${BOT_DEBUG:-0}" active="${BOT_MAX_ACTIVE_REQUESTS:-32}"
-    if [ "$debug" != 0 ] && [ "$debug" != 1 ]; then
-        print_error 'BOT_DEBUG 只能是 0 或 1'
-        exit 1
-    fi
+    local active="${BOT_MAX_ACTIVE_REQUESTS:-32}"
     if ! [[ "$active" =~ ^[0-9]+$ ]] || [ "$active" -lt 1 ] || [ "$active" -gt 1000 ]; then
         print_error 'BOT_MAX_ACTIVE_REQUESTS 必须是 1–1000 的整数'
         exit 1
@@ -368,7 +328,7 @@ determine_service_user() {
 build_workspace_candidate() {
     local previous head status=0 path paths=()
     previous="$(docker container inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null)" || previous=''
-    for path in "$DATA_DIR" "$HOST_GROUP_DATA_ROOT" "$PROJECT_DIR/backup"; do [ ! -e "$path" ] || paths+=("$path"); done
+    for path in "$DATA_DIR" "$PROJECT_DIR/backup"; do [ ! -e "$path" ] || paths+=("$path"); done
     print_status "检查构建所需的磁盘空间..."
     check_build_disk_space "$previous" "${paths[@]}" ||
         { print_error "磁盘空间不足或无法确认镜像存储位置（原因见上方）；服务尚未停止，未做任何改动"; exit 1; }
@@ -423,7 +383,7 @@ print_success "环境检查通过"
 command -v flock >/dev/null || { print_error "需要 util-linux flock"; exit 1; }
 acquire_deploy_lock || { print_error "另一个部署或升级正在进行"; exit 1; }
 # 先处理未完成的事务，再读取普通部署设置：续做和回滚只使用事务记录，不重新读取默认值或环境变量。
-ORIGINAL_GROUP_DATA_ROOT="$(saved_group_data_root)"
+ORIGINAL_WORKSPACE_ROOT="$(saved_workspace_root)"
 if [ -e "$STATE_DIR/deploy-transaction" ]; then
     load_pending_transaction || { print_error "未完成部署的事务记录无法读取（原因见上方）；保持现状，请人工检查 backup/snapshots"; exit 1; }
     print_warning "$(describe_pending_transaction)"
@@ -459,43 +419,25 @@ if [ -e "$STATE_DIR/deploy-transaction" ]; then
         print_error "当前代码不是上次操作的目标提交 ${TRANSACTION[target_sha]:0:7}；请切回该提交后继续，或回滚"
         exit 1
     fi
-    # 挂载缺失时明确停止，绝不在续做中重新创建空的群数据总根。
-    [ -d "${TRANSACTION[target_group_root]}" ] || {
-        print_error "事务记录的群数据总根不存在：${TRANSACTION[target_group_root]}；请恢复挂载后重试继续，或回滚"; exit 1; }
+    # 挂载缺失时明确停止：Docker 会把不存在的挂载源建成 root 所有的空目录。
+    HOST_WORKSPACE_ROOT="${TRANSACTION[target_workspace_root]}"
+    [ -z "$HOST_WORKSPACE_ROOT" ] || [ -d "$HOST_WORKSPACE_ROOT" ] || {
+        print_error "事务记录的共享资料目录不存在：$HOST_WORKSPACE_ROOT；请恢复挂载后重试继续，或回滚"; exit 1; }
     BOT_PORT="${TRANSACTION[bot_port]}"
-    DEPLOY_MODE="${TRANSACTION[deploy_mode]}"
-    GROUP_DATA_ROOT="${TRANSACTION[target_group_root]}"
-    PLATFORM_IP="${TRANSACTION[platform_ip]}"
     # 运行参数沿用 runtime.json；当前终端的环境变量不校验，也不写入。
-    unset "${RUNTIME_ENV_KEYS[@]}" BOT_MODEL_CACHE_RETENTION
-    PREPARED_UNMANAGED_MODE="${TRANSACTION[unmanaged_tunnel]}"
-    # 只有同一次升级的升级器知道快照名：交接标记一致才采用它在停机前确认的 token。
-    # 重启后的续做（ops resume、新终端）没有标记，只接受已保存的 token 来源。
-    if [ -z "$TRANSACTION_HANDOFF" ] || [ "$TRANSACTION_HANDOFF" != "${TRANSACTION[snapshot]}" ]; then PREPARED_TUNNEL_INPUT=""; fi
-    DATA_PREPARATION_PREVIEW_MODE=()
+    unset "${RUNTIME_ENV_KEYS[@]}"
     # 升级沿用原运行状态；部署完成后总是启动。
     [ "${TRANSACTION[operation]}" != upgrade ] || DEPLOY_PRESERVE_STOPPED=1
-    group_root_mount "${TRANSACTION[target_group_root]}"
+    workspace_mount "$HOST_WORKSPACE_ROOT"
     if [ -e "$STATE_DIR/release-data.json" ] && data_preparation_docker committed --deployment "${TRANSACTION[snapshot]}"; then
         finish_committed_transaction
     fi
-    if [ -d "$TRANSACTION_SNAPSHOT/reset-config" ]; then
-        # Resume a partial reset before any preflight reads old/half-replaced user configuration.
-        begin_deployment
-        cp -- "$TRANSACTION_SNAPSHOT/data-plan.json" "$STATE_DIR/data-plan.json"
-        grant_service_access "$STATE_DIR/data-plan.json"
-        DATA_PREPARATION_APPLY_ATTEMPTED=1
-        data_preparation_docker apply --plan "$DATA_PREPARATION_PLAN"
-    fi
-    print_status "继续上次操作：端口、入口模式、群数据总根、域名、平台 IP 和隧道确认均取自事务记录，运行参数沿用 runtime.json"
+    print_status "继续上次操作：端口和共享资料目录取自事务记录，运行参数沿用 runtime.json"
 elif [ -n "$TRANSACTION_ACTION" ]; then
     print_success "没有未完成的部署或升级"
     exit 0
 else
-    # 新部署在下方询问隧道 token；环境中残留的交接值一律不用。
-    PREPARED_TUNNEL_INPUT=""
     check_deploy_environment
-    verify_deployed_group_root
     determine_service_user || exit 1
     grant_operation_log_access || true
 fi
@@ -503,181 +445,79 @@ print_warning "转换数据前先预览；应用变更时保持停机，提交�
 # 容器挂载的目录都先由部署脚本创建：不存在的 bind mount 源会被 Docker 以 root 身份创建，服务身份随后无法在其中写入
 # （全新克隆没有 backup/）。snapshots/ 和 rm/ 也在这里建好：成功的部署会删掉空的 snapshots/，迁移容器要在其中写备份。
 # 只有本次新建的目录交给服务身份，已有目录和数据的属主不变。
-make_service_directories "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR" "$PROJECT_DIR/backup/snapshots" "$PROJECT_DIR/backup/rm" ||
+make_service_directories "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup/snapshots" "$PROJECT_DIR/backup/rm" ||
     { print_error "无法创建数据目录"; exit 1; }
-# rootless Docker 通常不能发布 1024 以下的端口（见 rootless_port_publishable）：没有指定或已保存的端口时默认改用高端口。
+# 本机管理端口不再询问：续做用事务记录，其余依次取显式 BOT_PORT（高级覆盖）、已保存端口、默认 1011。
+# rootless Docker 通常不能发布 1024 以下的端口（见 rootless_port_publishable），这时默认改用 11011。
+# 无效、发布不了或被其他程序占用的端口在停机前停止并说明改法，不自动换成别的端口。
 FALLBACK_PORT=1011
 if [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$FALLBACK_PORT"; then FALLBACK_PORT=11011; fi
-if [ -n "${BOT_PORT:-}" ]; then
-    PORT_DEFAULT_SOURCE="BOT_PORT"
-    PORT_DEFAULT="$(trim_input "$BOT_PORT")"
+SAVED_PORT=""
+[ ! -f "$BOT_PORT_FILE" ] || SAVED_PORT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"
+if [ "$RECORDED" = 1 ]; then
+    PORT_SOURCE="事务记录"
+elif [ -n "$(trim_input "${BOT_PORT:-}")" ]; then
+    PORT_SOURCE="BOT_PORT"
+    BOT_PORT="$(trim_input "$BOT_PORT")"
 elif [ -f "$BOT_PORT_FILE" ]; then
-    PORT_DEFAULT_SOURCE="data/state/bot-port"
-    PORT_DEFAULT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"
+    PORT_SOURCE="data/state/bot-port"
+    BOT_PORT="$SAVED_PORT"
 else
-    PORT_DEFAULT_SOURCE=""
-    PORT_DEFAULT="$FALLBACK_PORT"
-fi
-if ! [[ "$PORT_DEFAULT" =~ ^[0-9]+$ ]] || [ "$PORT_DEFAULT" -lt 1 ] || [ "$PORT_DEFAULT" -gt 65535 ]; then
-    print_warning "${PORT_DEFAULT_SOURCE} 中的端口无效，已改用安全默认值 ${FALLBACK_PORT}：${PORT_DEFAULT}"
-    PORT_DEFAULT="$FALLBACK_PORT"
+    PORT_SOURCE=""
+    BOT_PORT="$FALLBACK_PORT"
 fi
 if [ "$RECORDED" = 1 ]; then
-    BOT_PORT="$PORT_DEFAULT"
-    # 续做沿用事务记录的端口，不能在这里修改；在构建和启动之前说明处理方法。
-    if [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$BOT_PORT"; then
-        print_error "$(rootless_port_hint "$BOT_PORT")"
-        print_error "续做沿用事务记录的端口 ${BOT_PORT}：放开低端口后重试继续，或用 $(ops_command_hint rollback) 回滚后再用 $(ops_command_hint deploy) 改端口"
-        exit 1
-    fi
+    PORT_FIX="续做沿用事务记录的端口 ${BOT_PORT}：放开低端口后重试继续，或用 $(ops_command_hint rollback) 回滚后再设置 BOT_PORT 重新部署改端口"
 else
-    while true; do
-        read_input "机器人监听端口 [默认 ${PORT_DEFAULT}]：" port_in
-        port_in="$(trim_input "$port_in")"
-        BOT_PORT="${port_in:-$PORT_DEFAULT}"
-        if ! [[ "$BOT_PORT" =~ ^[0-9]+$ ]] || [ "$BOT_PORT" -lt 1 ] || [ "$BOT_PORT" -gt 65535 ]; then
-            print_warning "端口必须是 1–65535 的整数，请重新输入"
-        elif [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$BOT_PORT"; then
-            print_warning "$(rootless_port_hint "$BOT_PORT")"
-        else
-            break
+    PORT_FIX="改端口：设置环境变量 BOT_PORT=<端口> 后重新部署（$(ops_command_hint deploy)）；服务尚未停止"
+fi
+if ! [[ "$BOT_PORT" =~ ^[0-9]+$ ]] || [ "$BOT_PORT" -lt 1 ] || [ "$BOT_PORT" -gt 65535 ]; then
+    print_error "${PORT_SOURCE} 中的端口无效（应为 1–65535 的整数）：${BOT_PORT}；${PORT_FIX}"
+    exit 1
+fi
+if [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$BOT_PORT"; then
+    print_error "$(rootless_port_hint "$BOT_PORT")"
+    print_error "$PORT_FIX"
+    exit 1
+fi
+# 沿用的端口可能正由原服务监听，不探测；新端口（含首次部署）要先确认没有其他程序占用。
+if [ "$RECORDED" != 1 ] && [ "$BOT_PORT" != "$SAVED_PORT" ] && local_port_in_use "$BOT_PORT"; then
+    print_error "本机端口 ${BOT_PORT} 已被其他程序占用；${PORT_FIX}"
+    exit 1
+fi
+print_success "本机管理端口：127.0.0.1:$BOT_PORT${PORT_SOURCE:+（来自 ${PORT_SOURCE}）}"
+
+# ---- 共享资料目录（WORKSPACE_ROOT；默认 data/workspace）----
+# 续做沿用事务记录；否则取 WORKSPACE_ROOT 环境变量（设为空恢复默认），未设置时沿用已保存设置。
+# 外置目录必须已存在：只读挂到容器 /app/workspace，部署不创建、不改属主；服务身份需能读取其中的资料。
+if [ "$RECORDED" != 1 ]; then
+    HOST_WORKSPACE_ROOT="$(trim_input "${WORKSPACE_ROOT-$ORIGINAL_WORKSPACE_ROOT}")"
+    if [ -n "$HOST_WORKSPACE_ROOT" ]; then
+        if ! HOST_WORKSPACE_ROOT="$(realpath -e -- "$HOST_WORKSPACE_ROOT" 2>/dev/null)" || [ ! -d "$HOST_WORKSPACE_ROOT" ]; then
+            print_error "WORKSPACE_ROOT 不存在或不是目录：${WORKSPACE_ROOT-$ORIGINAL_WORKSPACE_ROOT}；服务尚未停止"
+            exit 1
         fi
-    done
-fi
-print_success "监听端口：$BOT_PORT"
-
-# ---- 部署模式 ----
-
-# 上次成功部署记录的模式，只用于判断是否可能遗留直连防火墙规则。
-PREVIOUS_DEPLOY_MODE=""
-if [ -f "$DEPLOY_MODE_FILE" ]; then PREVIOUS_DEPLOY_MODE="$(tr '[:upper:]' '[:lower:]' < "$DEPLOY_MODE_FILE" | tr -d '[:space:]')"; fi
-if [ -n "${DEPLOY_MODE:-}" ]; then
-    DEPLOY_MODE_DEFAULT_SOURCE="DEPLOY_MODE"
-    DEPLOY_MODE_DEFAULT="$(trim_input "${DEPLOY_MODE,,}")"
-elif [ -f "$DEPLOY_MODE_FILE" ]; then
-    DEPLOY_MODE_DEFAULT_SOURCE="data/state/deploy-mode"
-    DEPLOY_MODE_DEFAULT="$(tr '[:upper:]' '[:lower:]' < "$DEPLOY_MODE_FILE" | tr -d '[:space:]')"
-else
-    DEPLOY_MODE_DEFAULT_SOURCE=""
-    DEPLOY_MODE_DEFAULT="direct"
-fi
-if [ "$DEPLOY_MODE_DEFAULT" != "direct" ] && [ "$DEPLOY_MODE_DEFAULT" != "cloudflare" ]; then
-    print_warning "${DEPLOY_MODE_DEFAULT_SOURCE} 中的部署模式无效，已改用安全默认值 direct：${DEPLOY_MODE_DEFAULT}"
-    DEPLOY_MODE_DEFAULT="direct"
-fi
-if [ "$DEPLOY_MODE_DEFAULT" = "cloudflare" ]; then
-    DEPLOY_MODE_DEFAULT_CHOICE="2"
-    DEPLOY_MODE_DEFAULT_LABEL="Cloudflare"
-else
-    DEPLOY_MODE_DEFAULT_CHOICE="1"
-    DEPLOY_MODE_DEFAULT_LABEL="直连"
-fi
-
-if [ "$RECORDED" = 1 ]; then
-    DEPLOY_MODE="$DEPLOY_MODE_DEFAULT"
-else
-    echo ""
-    print_prompt "选择部署模式："
-    echo "  1) 直连模式 — 服务器有公网 IP，直接暴露 :${BOT_PORT}（UFW 只放行平台 IP）"
-    echo "  2) Cloudflare 模式 — 经 cloudflared 隧道 + WAF（无公网 IP / 想要边缘防护）"
-    while true; do
-        read_input "输入 1 或 2 [默认 ${DEPLOY_MODE_DEFAULT_CHOICE} / ${DEPLOY_MODE_DEFAULT_LABEL}]：" mode_choice
-        mode_choice="$(trim_input "$mode_choice")"
-        mode_choice="${mode_choice:-$DEPLOY_MODE_DEFAULT_CHOICE}"
-        case "$mode_choice" in
-            1) DEPLOY_MODE="direct"; break ;;
-            2) DEPLOY_MODE="cloudflare"; break ;;
-            *) print_warning "请输入 1 或 2" ;;
-        esac
-    done
-fi
-if [ "$DEPLOY_MODE" = "cloudflare" ]; then
-    BOT_HOST="127.0.0.1"
-    DEPLOY_MODE_LABEL="Cloudflare"
-else
-    BOT_HOST="0.0.0.0"
-    DEPLOY_MODE_LABEL="直连"
-fi
-print_status "部署模式：$DEPLOY_MODE_LABEL"
-if [ "$DEPLOY_MODE" = "cloudflare" ]; then
-    print_warning "请把 Cloudflare Tunnel 的 Published application 服务地址设为 http://127.0.0.1:${BOT_PORT}"
-fi
-
-# ---- Pi 群数据总根（<group>/workspace + <group>/durable.sqlite + <group>/users/<phone>/tmp）----
-GROUP_DATA_ROOT_ENV="$(trim_input "${GROUP_DATA_ROOT:-}")"
-if [ -n "$GROUP_DATA_ROOT_ENV" ]; then
-    GROUP_DATA_ROOT_DEFAULT="$GROUP_DATA_ROOT_ENV"
-elif [ -s "$GROUP_DATA_ROOT_FILE" ]; then
-    GROUP_DATA_ROOT_DEFAULT="$(trim_input "$(tr -d '\r\n' < "$GROUP_DATA_ROOT_FILE")")"
-else
-    GROUP_DATA_ROOT_DEFAULT="$DEFAULT_GROUP_DATA_ROOT"
-fi
-GROUP_DATA_ROOT="$GROUP_DATA_ROOT_DEFAULT"
-GROUP_ROOT_CHECKED=0
-while true; do
-    # 沿用的群数据根只检查一次；不可用时停止，而不是在停机期间反复询问。
-    if [ "$RECORDED" = 1 ] && [ "$GROUP_ROOT_CHECKED" = 1 ]; then
-        print_error "群数据总根不可用（原因见上方）；$(settings_fixed_hint)"
-        exit 1
     fi
-    GROUP_ROOT_CHECKED=1
-    cwd_in=""
-    if [ "$RECORDED" != 1 ]; then
-        read_input "Pi 群数据总根 [默认 ${GROUP_DATA_ROOT_DEFAULT}；首次为 ${DEFAULT_GROUP_DATA_ROOT}]：" cwd_in
-    fi
-    cwd_in="$(trim_input "$cwd_in")"
-    GROUP_DATA_ROOT="${cwd_in:-$GROUP_DATA_ROOT_DEFAULT}"
-    if ! HOST_GROUP_DATA_ROOT="$(realpath -m -- "$GROUP_DATA_ROOT")"; then
-        print_warning "群数据总根路径无效：$GROUP_DATA_ROOT"
-        continue
-    fi
-    if [ "$HOST_GROUP_DATA_ROOT" = "/" ] || [ "$HOST_GROUP_DATA_ROOT" = "$PROJECT_DIR" ]; then
-        print_warning "群数据总根不能是文件系统根目录或项目根目录：$HOST_GROUP_DATA_ROOT"
-        continue
-    fi
-    case "$HOST_GROUP_DATA_ROOT" in
-        "$PROJECT_DIR"/*)
-            if [ "$HOST_GROUP_DATA_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
-                print_warning "项目内群数据目录固定为 data/groups；如需自定义，请选择项目外的路径：$HOST_GROUP_DATA_ROOT"
-                continue
-            fi
-            ;;
-    esac
-    if [ -e "$HOST_GROUP_DATA_ROOT" ] && [ ! -d "$HOST_GROUP_DATA_ROOT" ]; then
-        print_warning "群数据总根不是目录：$HOST_GROUP_DATA_ROOT"
-        continue
-    fi
-    if ! make_service_directories "$HOST_GROUP_DATA_ROOT"; then
-        print_warning "无法创建群数据总根：$HOST_GROUP_DATA_ROOT"
-        continue
-    fi
-    HOST_GROUP_DATA_ROOT="$(realpath -- "$HOST_GROUP_DATA_ROOT")"
-    if ! chmod 755 "$HOST_GROUP_DATA_ROOT"; then
-        print_warning "无法设置群数据总根权限：$HOST_GROUP_DATA_ROOT"
-        continue
-    fi
-    [ -w "$HOST_GROUP_DATA_ROOT" ] || { print_warning '群数据根不可写'; continue; }
-    break
-done
-group_root_mount "$HOST_GROUP_DATA_ROOT"
-if [ "$HOST_GROUP_DATA_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
-    # 项目外的群根只交出这一级目录（不递归），其中已有数据的属主不变。
-    grant_service_access "$HOST_GROUP_DATA_ROOT"
-    print_warning "主机群数据目录挂到容器 /app/group-data"
 fi
-print_status "Pi 群数据总根：$HOST_GROUP_DATA_ROOT（容器内：$GROUP_ROOT_ENV_VAL）"
+workspace_mount "$HOST_WORKSPACE_ROOT"
+print_status "共享资料目录：${HOST_WORKSPACE_ROOT:-$DATA_DIR/workspace}${HOST_WORKSPACE_ROOT:+（只读挂到容器 /app/workspace）}"
 echo ""
 
 # ---- 目录 ----
 
-print_status "设置目录权限..."
-# 真正的首次部署沿用原有做法：root 部署把刚建立的目录整体交给默认身份 appuser(1001)。沿用原容器身份时不批量改属主，
+# 真正的首次部署沿用原有做法：root 部署把刚建立的目录整体交给默认身份 appuser(1001)。data/ 只交出本身（不递归）：
+# 任务隔离预检以服务身份在其顶层建文件，data/ 可能在部署前已由 root 建立。沿用原容器身份时不批量改属主，
 # 已有数据本来就属于这个身份，本次新建的目录已在创建时交出。
-if [ "$SERVICE_USER_SOURCE" = default ] && [ "$(id -u)" -eq 0 ]; then
-    chown -R "$SERVICE_USER" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup"
-    chown "$SERVICE_USER" "$HOST_GROUP_DATA_ROOT"
-fi
-chmod 755 "$DATA_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$RUNTIME_HOME_DIR" "$DEFAULT_GROUP_DATA_ROOT" "$LOG_DIR"
+prepare_service_directories() {
+    if [ "$SERVICE_USER_SOURCE" = default ] && [ "$(id -u)" -eq 0 ]; then
+        chown -R "$SERVICE_USER" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup" || return 1
+        chown "$SERVICE_USER" "$DATA_DIR" || return 1
+    fi
+    chmod 755 "$DATA_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$RUNTIME_HOME_DIR" "$LOG_DIR"
+}
+
+print_status "设置目录权限..."
+prepare_service_directories
 print_success "目录就绪（服务身份 ${SERVICE_USER}）"
 
 # ---- 构建镜像 ----
@@ -693,16 +533,17 @@ verify_container_storage() {
     docker run --rm \
       --user "$SERVICE_USER" \
       -e HOME=/app/data/runtime/home \
-      -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
-      "${GROUP_ROOT_ARGS[@]}" \
+      "${WORKSPACE_ARGS[@]}" \
       -v "$(pwd)/logs:/app/logs" \
       -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" \
       --entrypoint sh \
       "$IMAGE_ID" \
-      -c 'for directory in /app/data/config /app/data/state /app/data/runtime /app/data/runtime/home /app/logs "$GROUP_DATA_ROOT"; do
+      -c 'for directory in /app/data /app/data/config /app/data/state /app/data/runtime /app/data/runtime/home /app/logs; do
               [ -d "$directory" ] && [ -w "$directory" ] || { echo "容器用户不可写: $directory" >&2; exit 1; }
           done
-          for file in /app/data/config/models.json /app/data/runtime/pi/settings.json /app/data/config/webhook-secret; do
+          [ -z "${WORKSPACE_ROOT:-}" ] || { [ -d "$WORKSPACE_ROOT" ] && [ -r "$WORKSPACE_ROOT" ] && [ -x "$WORKSPACE_ROOT" ]; } ||
+              { echo "容器用户不可读: $WORKSPACE_ROOT" >&2; exit 1; }
+          for file in /app/data/config/models.json /app/data/runtime/pi/settings.json /app/data/config/app-bot.json; do
               [ ! -e "$file" ] || { [ -r "$file" ] && [ -w "$file" ]; } || { echo "容器用户不可读写: $file" >&2; exit 1; }
           done'
 }
@@ -710,7 +551,7 @@ verify_container_storage() {
 print_status "验证容器用户对持久化目录的权限..."
 if ! verify_container_storage; then
     print_error "服务身份（${SERVICE_USER}）无法读写持久化目录；服务尚未停止"
-    echo "  部署沿用原容器的运行身份，不批量改已有数据的属主；请让 data/、logs/ 与群数据根可被该身份读写后重试。"
+    echo "  部署沿用原容器的运行身份，不批量改已有数据的属主；请让 data/、logs/ 可被该身份读写、外置资料目录可被它读取后重试。"
     exit 1
 fi
 print_success "持久化目录权限正常"
@@ -718,29 +559,24 @@ print_success "持久化目录权限正常"
 print_status "验证任务隔离、固定镜像与宿主目录映射..."
 task_runtime_prepare || { print_error "任务隔离预检失败，原服务未因本次预检停止"; exit 1; }
 
-# 跨数据版本只能由升级器重置并重新配置模型。部署不做重置，也不能因为检测到旧 models.json 就沿用它，停机前直接拒绝。
+print_status "按宿主路径核对共享资料目录的边界..."
+check_workspace_layout || { print_error "共享资料目录不能使用（原因见上方）；服务尚未停止"; exit 1; }
+
+# 数据版本在停机前核对：有数据但没有有效版本标记（含旧版 webhook 数据）时拒绝，原服务不受影响。
 if [ "$RECORDED" = 0 ]; then
-    DATA_VERSION_STATUS=0
-    data_preparation_docker probe >/dev/null || DATA_VERSION_STATUS=$?
-    if [ "$DATA_VERSION_STATUS" = 20 ]; then
-        print_error "数据版本较旧，重新部署不会沿用旧模型配置和会话；请运行 $(ops_command_hint update)，确认后重置旧会话并重新配置模型。服务尚未停止"
-        exit 1
-    elif [ "$DATA_VERSION_STATUS" != 0 ]; then
-        print_error "数据版本检查失败（原因见上方）；服务尚未停止"
-        exit 1
-    fi
+    data_preparation_docker check || { print_error "数据版本核对未通过（原因见上方）；服务尚未停止"; exit 1; }
 fi
 DATA_PREPARATION_PLANNED=0
 if [ "$RECORDED" = 1 ] && [ -f "$TRANSACTION_SNAPSHOT/data-plan.json" ]; then
-    # 续做沿用停机前确认的迁移计划；apply 会重新核对配置和版本标记，变化即中止。
+    # 续做沿用停机前的数据预检计划；apply 会重新核对版本标记，变化即中止。
     # 快照目录仅部署用户可读，计划复制回容器可读的状态目录。
-    cp -- "$TRANSACTION_SNAPSHOT/data-plan.json" "$STATE_DIR/data-plan.json" || { print_error "无法恢复停机前确认的迁移计划"; exit 1; }
-    # root 复制出的文件属 root；迁移容器以服务身份读取它。
+    cp -- "$TRANSACTION_SNAPSHOT/data-plan.json" "$STATE_DIR/data-plan.json" || { print_error "无法恢复停机前的数据预检计划"; exit 1; }
+    # root 复制出的文件属 root；数据准备容器以服务身份读取它。
     grant_service_access "$STATE_DIR/data-plan.json"
     DATA_PREPARATION_PLANNED=1
 elif [ -f "$MODELS_FILE" ] && [ -f "$RUNTIME_DIR/pi/settings.json" ]; then
-    if ! data_preparation_docker preview "${DATA_PREPARATION_PREVIEW_MODE[@]}" --plan "$DATA_PREPARATION_PLAN"; then
-        if [ "$RECORDED" = 1 ]; then print_error "续做无法沿用迁移确认（原因见上方）；$(settings_fixed_hint)"; fi
+    if ! data_preparation_docker preview --plan "$DATA_PREPARATION_PLAN"; then
+        if [ "$RECORDED" = 1 ]; then print_error "续做无法沿用数据预检（原因见上方）；$(settings_fixed_hint)"; fi
         exit 1
     fi
     DATA_PREPARATION_PLANNED=1
@@ -749,8 +585,8 @@ fi
 RECONFIGURE_AI=0
 if [ "$RECORDED" = 1 ]; then
     # 配置向导需要交互；续做从不运行向导，缺少模型配置时停止。
-    if [ ! -f "$MODELS_FILE" ]; then
-        print_error "缺少 data/config/models.json；$(settings_fixed_hint)"
+    if [ ! -f "$MODELS_FILE" ] || [ ! -f "$APP_BOT_FILE" ]; then
+        print_error "缺少 data/config/models.json 或 data/config/app-bot.json；$(settings_fixed_hint)"
         exit 1
     fi
     print_status "续做沿用现有 AI 配置"
@@ -763,127 +599,10 @@ elif [ -f "$MODELS_FILE" ]; then
     fi
 fi
 
-# 域名接受 hostname 或仅含 hostname 的 http(s) 根 URL，并统一规范化为 hostname。
-# 显式环境变量会在部署成功后持久化，方便 ops 脚本在后续 shell 中继续做公网健康检查。
-PERSIST_BOT_DOMAIN=0
-CLEAR_PERSISTED_BOT_DOMAIN=0
-INVALID_CONFIGURED_DOMAIN=""
-DOMAIN_SOURCE=""
-if [ -n "${BOT_DOMAIN:-}" ]; then
-    RAW_PUBLIC_DOMAIN="$BOT_DOMAIN"
-    DOMAIN_SOURCE="BOT_DOMAIN"
-elif [ -f "$BOT_DOMAIN_FILE" ]; then
-    RAW_PUBLIC_DOMAIN="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$BOT_DOMAIN_FILE")"
-    DOMAIN_SOURCE="data/state/bot-domain"
-else
-    RAW_PUBLIC_DOMAIN=""
-fi
-PUBLIC_DOMAIN=""
-if [ -n "$RAW_PUBLIC_DOMAIN" ]; then
-    if PUBLIC_DOMAIN="$(normalize_hostname_input "$RAW_PUBLIC_DOMAIN")"; then
-        if [ "$DOMAIN_SOURCE" = "BOT_DOMAIN" ] || [ "$PUBLIC_DOMAIN" != "$RAW_PUBLIC_DOMAIN" ]; then
-            PERSIST_BOT_DOMAIN=1
-        fi
-    else
-        INVALID_CONFIGURED_DOMAIN="$RAW_PUBLIC_DOMAIN"
-        PUBLIC_DOMAIN=""
-        if [ "$DOMAIN_SOURCE" = "data/state/bot-domain" ]; then
-            CLEAR_PERSISTED_BOT_DOMAIN=1
-        fi
-    fi
-fi
-if [ "$RECORDED" = 1 ]; then
-    # 续做使用停机前确认的域名及其写回方式。
-    PUBLIC_DOMAIN="${TRANSACTION[bot_domain]}"
-    PERSIST_BOT_DOMAIN=0
-    CLEAR_PERSISTED_BOT_DOMAIN=0
-    case "${TRANSACTION[domain_action]}" in
-        persist) PERSIST_BOT_DOMAIN=1 ;;
-        clear) CLEAR_PERSISTED_BOT_DOMAIN=1 ;;
-    esac
-elif [ -n "$INVALID_CONFIGURED_DOMAIN" ]; then
-    print_warning "$DOMAIN_SOURCE 中的域名无效，已忽略：$INVALID_CONFIGURED_DOMAIN"
-fi
-if [ "$DEPLOY_MODE" = "cloudflare" ] && [ "$RECORDED" != 1 ]; then
-    echo "Cloudflare 公网域名准备："
-    echo "  1) 将根域名（如 example.com）添加到 Cloudflare，按指引在域名注册商修改 NS，等待状态变为 Active（已激活）。域名无需转移注册商，但 DNS 需托管到 Cloudflare。"
-    echo "  2) 下面填写机器人使用的子域名，例如 bot.example.com。"
-    echo "  3) 在同一 Cloudflare 账户的 Networking → Tunnels 中创建或选择 Cloudflared 隧道；Published application 路由填相同子域名，服务地址设为 http://127.0.0.1:${BOT_PORT}。"
-    echo "DNS 接入和公开路由需在控制台完成；此处填写域名不会自动创建它们。可留空稍后配置，公网回调需配置完成后才能使用。"
-    DOMAIN_DEFAULT="$PUBLIC_DOMAIN"
-    while true; do
-        if [ -n "$DOMAIN_DEFAULT" ]; then
-            read_input "Cloudflare 公网域名 [默认 ${DOMAIN_DEFAULT}；支持完整根 URL]：" domain_in
-        else
-            read_input "Cloudflare 公网域名（可留空；支持 im-bot.example.com 或 https://im-bot.example.com）：" domain_in
-        fi
-        if [ -z "$domain_in" ]; then
-            PUBLIC_DOMAIN="$DOMAIN_DEFAULT"
-            break
-        fi
-        if PUBLIC_DOMAIN="$(normalize_hostname_input "$domain_in")"; then
-            PERSIST_BOT_DOMAIN=1
-            if [ "$PUBLIC_DOMAIN" != "$domain_in" ]; then
-                print_success "已规范化公网域名：$PUBLIC_DOMAIN"
-            fi
-            break
-        fi
-        print_warning "域名格式无效；请输入纯 hostname，或只含 hostname 的 http(s) URL（不能带端口、路径、查询参数）"
-    done
-fi
-
-# 外部 connector 不能仅凭进程名认领；此时尚未停止服务，拒绝不会改动部署。
-UNMANAGED_TUNNEL_CONFIRMED=0
-if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1; then
-    unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
-    if [ "$PREPARED_UNMANAGED_MODE" = "$DEPLOY_MODE" ]; then
-        # 事务记录中已有停机前按同一模式确认的归属。
-        print_status "沿用停机前对未托管 cloudflared（pid ${unmanaged_pid}）的确认"
-    elif [ "$DEPLOY_MODE" = "cloudflare" ]; then
-        print_warning "检测到未由本项目记录的 cloudflared（pid ${unmanaged_pid}），无法自动确认它连接的是当前隧道"
-        unmanaged_prompt="确认该 connector 正在服务本项目，继续沿用？[y/N]："
-    else
-        print_warning "系统有未由本项目记录的 cloudflared（pid ${unmanaged_pid}）；不会自动停止，以免影响其他隧道"
-        unmanaged_prompt="确认该 connector 与本项目无关或其入口仍受保护，继续直连部署？[y/N]："
-    fi
-    if [ "$PREPARED_UNMANAGED_MODE" != "$DEPLOY_MODE" ]; then
-        # 续做不提问：停机前没有确认过的 connector 只能处理后重试，或回滚。
-        if [ "$RECORDED" = 1 ]; then print_error "停机前没有确认过这个 cloudflared；$(settings_fixed_hint)"; exit 1; fi
-        if ! ask_yes_no "$unmanaged_prompt" "n"; then
-            print_error "未确认未托管 cloudflared 的安全边界；部署已取消，配置未改动"
-            exit 1
-        fi
-    fi
-    UNMANAGED_TUNNEL_CONFIRMED=1
-fi
-
-# 缺少 connector 时在停机前确定 token 来源（输入隐藏）；部署验证实例就绪后只启动一次。
-TUNNEL_TOKEN_INPUT=""
-if [ "$DEPLOY_MODE" = "cloudflare" ] && ! managed_cloudflared_pid >/dev/null 2>&1 && ! pgrep -x cloudflared >/dev/null 2>&1; then
-    if [ -n "$PREPARED_TUNNEL_INPUT" ] && (load_tunnel_token "$PREPARED_TUNNEL_INPUT") >/dev/null 2>&1; then
-        TUNNEL_TOKEN_INPUT="$PREPARED_TUNNEL_INPUT"
-        print_status "未运行 cloudflared；沿用升级器在停机前确认的隧道 token，部署验证实例就绪后启动"
-    elif (load_tunnel_token) >/dev/null 2>&1; then
-        print_status "未运行 cloudflared；将使用已保存的隧道 token，部署验证实例就绪后启动"
-    elif [ "$RECORDED" = 1 ]; then
-        # 停机前输入的 token 不写入事务记录；重启后的续做只能使用已保存的来源。
-        print_error "续做需要隧道 token，但没有可用的已保存 token；请保存到 data/config/cloudflared-token 后重试继续，或回滚（$(ops_command_hint rollback)）"
-        exit 1
-    else
-        print_status "未运行 cloudflared；请先提供隧道 token，部署验证实例就绪后启动"
-        show_tunnel_token_help
-        while true; do
-            read_input "隧道 token 或文件路径（输入隐藏；留空自动读取，默认 data/config/cloudflared-token）：" TUNNEL_TOKEN_INPUT 1
-            if (load_tunnel_token "$TUNNEL_TOKEN_INPUT"); then break; fi
-        done
-    fi
-fi
-PREPARED_TUNNEL_INPUT=""
-
 # Decisions precede persistent changes; a continued transaction reopens its original snapshot.
 if [ "$RECORDED" != 1 ]; then
     print_status "停机前复核剩余空间..."
-    check_stop_disk_space "$HOST_GROUP_DATA_ROOT" ||
+    check_stop_disk_space "$DATA_DIR" ||
         { print_error "剩余空间不够写入停机后的快照（原因见上方）；服务尚未停止，未做任何改动"; exit 1; }
 fi
 begin_deployment
@@ -896,20 +615,27 @@ if [ "$DATA_PREPARATION_PLANNED" = 1 ]; then
     data_preparation_docker apply --plan "$DATA_PREPARATION_PLAN"
 fi
 
-# ---- AI 配置（容器内 TUI 写 data/config/models.json）----
-# 首次必须配置；已存在时按停机前的选择决定是否重配。
+# ---- 应用机器人凭据与 AI 配置（容器内向导写 data/config/app-bot.json 和 models.json）----
+# 首次必须配置（configure 缺应用机器人配置时先问它）；已存在时按停机前的选择决定是否重配 AI。
 
 if [ ! -f "$MODELS_FILE" ]; then
-    print_status "首次配置 AI（provider/key/model）..."
+    print_status "首次配置应用机器人凭据和 AI（provider/key/model）..."
     if ! docker run --rm -it --user "$SERVICE_USER" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" "$IMAGE_ID" bun run configure; then
-        print_error "AI 配置命令执行失败"
+        print_error "配置命令执行失败"
         exit 1
     fi
     if [ ! -f "$MODELS_FILE" ]; then
         print_error "未生成 data/config/models.json，已中止"
         exit 1
     fi
-elif [ "$RECONFIGURE_AI" = 1 ]; then
+elif [ ! -f "$APP_BOT_FILE" ]; then
+    print_status "配置应用机器人凭据（AppID/AppSecret）..."
+    if ! docker run --rm -it --user "$SERVICE_USER" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" "$IMAGE_ID" bun run configure-app-bot; then
+        print_error "应用机器人配置命令执行失败"
+        exit 1
+    fi
+fi
+if [ "$RECONFIGURE_AI" = 1 ]; then
     print_status "重新配置 AI（provider/key/model）..."
     if ! docker run --rm -it --user "$SERVICE_USER" -e HOME=/app/data/runtime/home -e BOT_DEPLOY_BACKUP_ID -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" "$IMAGE_ID" bun run configure; then
         print_error "AI 配置命令执行失败"
@@ -919,121 +645,21 @@ fi
 validate_model_configuration "$IMAGE_ID" "$SERVICE_USER" || { print_error "模型配置无效，正在恢复原部署"; exit 1; }
 grant_service_access "$MODELS_FILE"
 chmod 600 "$MODELS_FILE"
-
-# ---- Webhook 随机密钥路径（两模式共用，应用层鉴权）----
-# data/config/webhook-secret 存 64hex（256bit）；应用启动读它，存在则启用 /webhook/<secret>。
-if [ ! -f "$WEBHOOK_SECRET_FILE" ]; then
-    print_status "生成 webhook 随机密钥路径..."
-    if SECRET=$(openssl rand -hex 32 2>/dev/null) && [ -n "$SECRET" ]; then
-        : # openssl 可用
-    else
-        SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n') # 回退
-    fi
-    printf '%s' "$SECRET" > "$WEBHOOK_SECRET_FILE"
-    grant_service_access "$WEBHOOK_SECRET_FILE"
-    chmod 600 "$WEBHOOK_SECRET_FILE"
-    print_success "已生成 webhook 密钥"
-    SHOW_SECRET=1
-else
-    SECRET="$(tr -d '[:space:]' < "$WEBHOOK_SECRET_FILE")"
-    if ! [[ "$SECRET" =~ ^[0-9a-fA-F]{64}$ ]]; then
-        print_error "data/config/webhook-secret 格式无效（应为 64 位十六进制）；请停机并将该文件移入 backup/rm 后重新部署"
-        exit 1
-    fi
-    SHOW_SECRET=0
-    print_status "检测到已有 data/config/webhook-secret（沿用）"
-fi
-if ! verify_container_storage; then
-    print_error "models.json 或 webhook-secret 对服务身份（${SERVICE_USER}）不可读写；请修复目录/文件权限后重试"
+if [ ! -f "$APP_BOT_FILE" ]; then
+    print_error "未生成 data/config/app-bot.json（应用机器人凭据），正在恢复原部署"
     exit 1
 fi
-
-SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-SERVER_IP="${SERVER_IP:-<服务器IP>}"
-
-echo ""
-print_prompt "把回调地址填到 IM 平台（webhook URL）："
-if [ "$DEPLOY_MODE" = "direct" ]; then
-    if [ "$SHOW_SECRET" = "1" ]; then
-        echo "    http://${SERVER_IP}:${BOT_PORT}/webhook/$SECRET"
-    else
-        echo "    http://${SERVER_IP}:${BOT_PORT}/webhook/<secret>（密钥未变；忘记可 cat data/config/webhook-secret）"
-    fi
-    echo ""
-    print_warning "直连走 HTTP：secret 在 URL 里明文经「平台→服务器」传输，网络层必须只允许配置的回调来源访问"
-    if [ "${ALLOW_UNMANAGED_FIREWALL:-0}" = "1" ]; then
-        print_warning "已显式跳过 UFW 安全基线；请确认云防火墙/其他系统防火墙已限制 TCP ${BOT_PORT}"
-    else
-        print_warning "确认 UFW：sudo ufw status（应仅允许配置的回调来源访问 TCP ${BOT_PORT}）"
-    fi
-    print_warning "有域名想加密可自行套 nginx/caddy + 证书反代到 :${BOT_PORT}（URL 改 https://<域名>/webhook/<secret>）"
-else
-    PUBLIC_DOMAIN_DISPLAY="${PUBLIC_DOMAIN:-<你的域名>}"
-    if [ "$SHOW_SECRET" = "1" ]; then
-        echo "    https://${PUBLIC_DOMAIN_DISPLAY}/webhook/$SECRET"
-    else
-        echo "    https://${PUBLIC_DOMAIN_DISPLAY}/webhook/<secret>（密钥未变；忘记可 cat data/config/webhook-secret）"
-    fi
-    echo ""
-    print_status "Cloudflare 模式仅监听 127.0.0.1:${BOT_PORT}，不会直接暴露公网端口"
-    print_warning "部署末尾会启动 cloudflared connector；远程管理隧道的源站端口需在 Cloudflare 控制台配置为 http://127.0.0.1:${BOT_PORT}"
-    print_warning "WAF 应只限制 /webhook/ 前缀：平台 IP + POST 放行，其他 webhook 请求 Block；可保留 /favicon.svg 供健康检查"
-fi
-if [ "$SHOW_SECRET" = "1" ]; then
-    print_warning "密钥仅本次显示、不进容器日志；轮换时停机并将 data/config/webhook-secret 移入 backup/rm 后重新部署"
-fi
-echo ""
-
-# ---- 切换网络入口 ----
-# 旧容器已在修改配置之前停止并备份，后续失败由部署事务恢复。
-if [ "$DEPLOY_MODE" = "direct" ]; then
-    if command -v ufw >/dev/null 2>&1 && can_manage_ufw; then
-        print_status "同步 UFW 规则到端口 ${BOT_PORT}..."
-        # 先写入新入口；旧规则到新部署提交时才删除，失败回滚仍保留原入口。
-        UFW_RULE_WRITTEN=0
-        if run_ufw allow from "$PLATFORM_IP" to any port "$BOT_PORT" proto tcp comment 'Mixin-Chatbot (平台IP)'; then
-            UFW_RULE_WRITTEN=1
-        else
-            if [ "${ALLOW_UNMANAGED_FIREWALL:-0}" != "1" ]; then
-                print_error "无法写入 UFW 规则；直连模式拒绝在 0.0.0.0 上启动"
-                echo "  修复 UFW/sudo，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。"
-                exit 1
-            fi
-            print_warning "ALLOW_UNMANAGED_FIREWALL=1：UFW 规则写入失败，依赖你已配置的外部防火墙"
-        fi
-        if [ "$UFW_RULE_WRITTEN" = "1" ]; then
-            # 旧入口保留到新容器健康且模式切换完成，便于失败时恢复旧容器。
-            CLEANUP_UFW_AFTER_HEALTH=1
-        fi
-        if [ "$UFW_RULE_WRITTEN" = "1" ] && run_ufw status | grep -q "Status: active"; then
-            print_success "UFW 已确认允许配置的回调来源访问 TCP ${BOT_PORT}"
-        elif [ "${ALLOW_UNMANAGED_FIREWALL:-0}" = "1" ]; then
-            print_warning "ALLOW_UNMANAGED_FIREWALL=1：UFW 未启用，依赖你已配置的外部防火墙"
-        else
-            print_error "UFW 未启用；直连模式拒绝在 0.0.0.0 上启动"
-            echo "  请按主机运维策略配置防火墙，或确认已有等效云防火墙后设置 ALLOW_UNMANAGED_FIREWALL=1。"
-            exit 1
-        fi
-    elif [ "${ALLOW_UNMANAGED_FIREWALL:-0}" = "1" ]; then
-        print_warning "ALLOW_UNMANAGED_FIREWALL=1：UFW 不可管理，依赖你已配置的外部防火墙"
-    else
-        print_error "UFW 不可用或当前用户没有 root/sudo 权限；直连模式拒绝在 0.0.0.0 上启动"
-        echo "  修复 UFW/sudo，或确认已有等效云防火墙后显式设置 ALLOW_UNMANAGED_FIREWALL=1。"
-        exit 1
-    fi
-else
-    if command -v ufw >/dev/null 2>&1 && can_manage_ufw; then
-        CLEANUP_UFW_AFTER_HEALTH=1
-    elif [ "$PREVIOUS_DEPLOY_MODE" = direct ]; then
-        # 只有从直连模式切换过来时才可能遗留本项目的直连规则。
-        print_warning "UFW 不可用或当前用户没有 root/sudo 权限；无法自动清理原直连模式的防火墙规则"
-    fi
+grant_service_access "$APP_BOT_FILE"
+chmod 600 "$APP_BOT_FILE"
+if ! verify_container_storage; then
+    print_error "models.json 或 app-bot.json 对服务身份（${SERVICE_USER}）不可读写；请修复目录/文件权限后重试"
+    exit 1
 fi
 
 # 旧容器和配置已在 begin_deployment 中保存。
 
 if [ "$DATA_PREPARATION_PLANNED" = 0 ]; then
-    data_preparation_docker preview "${DATA_PREPARATION_PREVIEW_MODE[@]}" --plan "$DATA_PREPARATION_PLAN"
+    data_preparation_docker preview --plan "$DATA_PREPARATION_PLAN"
     if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
     DATA_PREPARATION_APPLY_ATTEMPTED=1
     data_preparation_docker apply --plan "$DATA_PREPARATION_PLAN"
@@ -1047,7 +673,7 @@ for runtime_key in "${RUNTIME_ENV_KEYS[@]}"; do
     if [ -n "${!runtime_key:-}" ]; then runtime_env_args+=(-e "$runtime_key"); fi
 done
 docker run --rm --user "$SERVICE_USER" \
-  -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" -e BOT_PORT="$BOT_PORT" -e BOT_HOST="$BOT_HOST" \
+  -e BOT_PORT="$BOT_PORT" -e BOT_HOST="$BOT_HOST" \
   -e BOT_DEPLOY_BACKUP_ID "${runtime_env_args[@]}" -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" \
   "$IMAGE_ID" bun run scripts/config/runtime-settings.ts
 
@@ -1057,12 +683,11 @@ task_runtime_manifest write
 task_runtime_record "$STATE_DIR/task-runtime"
 grant_service_access "$STATE_DIR/task-runtime"
 print_status "启动容器..."
-# rootless Docker 的 host 网络连不到宿主机，平台回调和隧道都到不了：改为把端口发布到原监听地址，容器内监听所有接口。
+# rootless Docker 的 host 网络是独立的命名空间，宿主机上的 TUI 和健康检查连不到容器的回环地址：
+# 改为只把端口发布到宿主机 127.0.0.1，容器内监听所有接口（BOT_CONTAINER_BIND_ALL，不来自用户配置）。
 network_args=(--network host)
-container_bot_host="$BOT_HOST"
 if [ "$DOCKER_ROOTLESS" = 1 ]; then
-    network_args=(-p "$BOT_HOST:$BOT_PORT:$BOT_PORT")
-    container_bot_host=0.0.0.0
+    network_args=(-p "127.0.0.1:$BOT_PORT:$BOT_PORT" -e BOT_CONTAINER_BIND_ALL=1)
 fi
 NEW_CONTAINER_ATTEMPTED=1
 if docker run -d \
@@ -1071,10 +696,9 @@ if docker run -d \
   "${TASK_RUNTIME_ARGS[@]}" \
   "${network_args[@]}" \
   -e HOME=/app/data/runtime/home \
-  -e GROUP_DATA_ROOT="$GROUP_ROOT_ENV_VAL" \
   -e BOT_PORT="$BOT_PORT" \
-  -e BOT_HOST="$container_bot_host" \
-  "${GROUP_ROOT_ARGS[@]}" \
+  -e BOT_HOST="$BOT_HOST" \
+  "${WORKSPACE_ARGS[@]}" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/data:/app/data" -v "$(pwd)/backup:/app/backup" \
   --restart unless-stopped \
@@ -1120,100 +744,15 @@ for i in $(seq 1 18); do
     sleep 5
 done
 
-# ---- Cloudflare 模式：确保 cloudflared 在线 ----
-# 停机后不再询问：token 已在停机前确认，connector 只启动一次，失败或出现未确认的 connector 即回滚。
-if [ "$DEPLOY_MODE" = "cloudflare" ]; then
-    print_status "Cloudflare 模式：确保 cloudflared 隧道在线..."
-    if managed_pid="$(managed_cloudflared_pid)"; then
-        print_success "本项目 cloudflared 已在运行（pid ${managed_pid}）"
-    elif pgrep -x cloudflared >/dev/null 2>&1; then
-        unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
-        if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ]; then
-            print_error "部署期间出现未托管的 cloudflared（pid ${unmanaged_pid}），无法确认它连接的是当前隧道；部署将回滚。确认其归属后重新部署。"
-            exit 1
-        fi
-    elif [ -f scripts/tunnel/start-tunnel.sh ]; then
-        mkdir -p "$LOG_DIR"
-        # 下载在前台完成，不占用后台连接器的 30 秒启动等待窗口。
-        ensure_cloudflared "$PROJECT_DIR" >/dev/null
-        print_status "启动 cloudflared 隧道连接器（使用停机前确认的 token 来源）..."
-        tunnel_startup_log="$(mktemp "$STATE_DIR/cloudflared-start-XXXXXX")"
-        # 提交前运行的是验证实例；连接器启动检查需要明确放行它，否则会判定为本机没有机器人。
-        CLOUDFLARED_BACKGROUND=1 MIXIN_TUNNEL_ALLOW_VERIFICATION=1 MIXIN_TUNNEL_TOKEN_INPUT="$TUNNEL_TOKEN_INPUT" BOT_PORT="$BOT_PORT" nohup bash ./scripts/tunnel/start-tunnel.sh >"$tunnel_startup_log" 2>&1 9>&- &
-        tunnel_launcher_pid=$!
-        TUNNEL_TOKEN_INPUT=""
-        tunnel_launcher_start="$(process_start_identity "$tunnel_launcher_pid")"
-        TUNNEL_STARTED_BY_DEPLOY=1
-        for attempt in $(seq 1 30); do
-            managed_cloudflared_pid >/dev/null 2>&1 && break
-            kill -0 "$tunnel_launcher_pid" 2>/dev/null || break
-            sleep 1
-        done
-        if ! managed_pid="$(managed_cloudflared_pid)"; then
-            stop_tunnel_launcher || { print_error "无法结束连接器启动进程"; exit 1; }
-            tunnel_launcher_pid=""
-            print_warning "cloudflared 未能启动，启动检查输出："
-            tail -n 10 "$tunnel_startup_log" 2>/dev/null || true
-            rm -f -- "$tunnel_startup_log"
-            tunnel_startup_log=""
-            if [ "$(cloudflared_logging)" = on ]; then tail -n 10 "$LOG_DIR/cloudflared.log" 2>/dev/null || true; fi
-            print_error "cloudflared 未能启动（见上方输出）；部署将回滚。确认 token 后重新部署或升级。"
-            exit 1
-        fi
-        rm -f -- "$tunnel_startup_log"
-        tunnel_startup_log=""
-        print_success "cloudflared 已后台启动（pid ${managed_pid}）"
-        if [ "$(cloudflared_logging)" = on ]; then
-            print_success "隧道日志：logs/cloudflared.log（自动轮转）"
-        else
-            print_status "隧道文件日志已关闭，可在 TUI「系统 → 设置」开启"
-        fi
-        print_warning "持久化建议：配 systemd 服务（开机自启 + 崩溃重启）；当前 nohup 仅本次运行"
-    else
-        print_error "未找到 scripts/tunnel/start-tunnel.sh，无法启动 Cloudflare 隧道"
-        exit 1
-    fi
-else
-    if managed_pid="$(managed_cloudflared_pid)"; then
-        print_status "直连模式：停止本项目记录的 cloudflared（pid ${managed_pid}）..."
-        if stop_managed_cloudflared; then
-            print_success "本项目 cloudflared 已停止，旧隧道入口不再由本机 connector 提供"
-        else
-            print_error "无法停止本项目 cloudflared（pid ${managed_pid}）；为避免保留旧隧道入口，部署未完成"
-            exit 1
-        fi
-    elif pgrep -x cloudflared >/dev/null 2>&1; then
-        unmanaged_pid="$(pgrep -x cloudflared | head -n1)"
-        if [ "$UNMANAGED_TUNNEL_CONFIRMED" != "1" ]; then
-            print_error "部署期间出现未由本项目记录的 cloudflared（pid ${unmanaged_pid}），无法确认遗留隧道的安全边界；部署将回滚。确认其归属后重新部署。"
-            exit 1
-        fi
-    fi
-fi
-
-if [ "${CLEANUP_UFW_AFTER_HEALTH:-0}" = "1" ]; then
-    if [ "$DEPLOY_MODE" = "direct" ]; then
-        remove_managed_ufw_rules "$BOT_PORT" "$PLATFORM_IP"
-        if [ "$REMOVED_UFW_RULES" -gt 0 ]; then print_success "已删除 ${REMOVED_UFW_RULES} 条本项目旧 UFW 规则，只保留当前机器人入口"; fi
-    else
-        remove_managed_ufw_rules
-        if [ "$REMOVED_UFW_RULES" -gt 0 ]; then print_success "Cloudflare 模式已删除 ${REMOVED_UFW_RULES} 条本项目旧直连 UFW 规则"; fi
-    fi
-fi
-
-# 只有部署预检通过且部署模式切换完成后才提交状态，避免运维脚本读取到半完成配置。
+# 只有部署预检通过后才提交状态，避免运维脚本读取到半完成配置。
 print_status "提交部署..."
 printf '%s' "$BOT_PORT" > "$BOT_PORT_FILE"
-printf '%s' "$DEPLOY_MODE" > "$DEPLOY_MODE_FILE"
-printf '%s' "$HOST_GROUP_DATA_ROOT" > "$GROUP_DATA_ROOT_FILE"
-if [ "$PERSIST_BOT_DOMAIN" = "1" ]; then
-    printf '%s' "$PUBLIC_DOMAIN" > "$BOT_DOMAIN_FILE"
-elif [ "$CLEAR_PERSISTED_BOT_DOMAIN" = "1" ]; then
-    archive_project_path "$BOT_DOMAIN_FILE"
-fi
+printf '%s' "$HOST_WORKSPACE_ROOT" > "$WORKSPACE_ROOT_FILE"
 
 # Stop the verification-only process before committing. Normal work starts after commit.
 docker stop --time 30 mixin-chatbot >/dev/null
+# 预检之后资料目录可能被替换或改挂：提交前按宿主路径再核对一次，失败时按未提交的事务回滚。
+check_workspace_layout || { print_error "共享资料目录在预检后发生变化（原因见上方），部署未提交，正在恢复原部署"; exit 1; }
 data_preparation_docker commit
 commit_deployment
 activate_committed_deployment
@@ -1230,23 +769,18 @@ elif docker ps --format '{{.Names}}' | grep -q '^mixin-chatbot$'; then
     echo "  量子密信群聊协作机器人部署完成"
     echo "=========================================="
     echo ""
-    if [ "$DEPLOY_MODE" = "direct" ]; then
-        echo "  模式:      直连（来源 IP 闸门）"
-        echo "  回调地址:   http://${SERVER_IP}:${BOT_PORT}/webhook/<secret>"
-    else
-        echo "  模式:      Cloudflare（隧道 + WAF）"
-        echo "  回调地址:   https://${PUBLIC_DOMAIN_DISPLAY}/webhook/<secret>"
-    fi
+    echo "  消息接收:  平台事件 Stream（主动连出，不需要入站端口；出站需访问 imtwo.zdxlz.com、imfl.zdxlz.com 的 443）"
+    echo "  应用凭据:  $(pwd)/data/config/app-bot.json（改凭据：$(ops_command_hint configure-app-bot)）"
     echo "  AI 配置:   $(pwd)/data/config/models.json"
     echo "  日志:      $(pwd)/logs/"
     echo "  数据:      $(pwd)/data/"
-    echo "  群数据根:  $HOST_GROUP_DATA_ROOT"
+    echo "  共享资料:  ${HOST_WORKSPACE_ROOT:-$(pwd)/data/workspace}"
     echo "  可选外链:  bun run tui → 系统 → 设置 → 外链配置"
-    echo "  监听:      $BOT_HOST:$BOT_PORT"
+    echo "  本机管理:  $BOT_HOST:$BOT_PORT"
     echo ""
     echo "  内存限制: 512MB | CPU: 1核"
     echo ""
-    echo "  常用操作（带健康检查、隧道判断和失败回滚）:"
+    echo "  常用操作（带健康检查和失败回滚）:"
     echo "    体检: $(ops_command_hint doctor)"
     echo "    日志: $(ops_command_hint logs)"
     echo "    重启: $(ops_command_hint restart)"

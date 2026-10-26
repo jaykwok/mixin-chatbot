@@ -46,19 +46,19 @@ for (const shell of ["powershell", "bash"] as const) {
               "$tokens=$null; $errors=$null",
               "$ast=[Management.Automation.Language.Parser]::ParseFile(" + psQuote(join(project, "scripts/ops/ops.ps1")) + ",[ref]$tokens,[ref]$errors)",
               "if($errors){throw 'ops syntax error'}",
-              "$fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-ModelConfiguration'},$true)",
+              "$fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-ConfigureWizard'},$true)",
               "if(-not $fn){throw 'missing model configuration entry'}",
               ". ([scriptblock]::Create($fn.Extent.Text))",
               "$helper=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-BotRunState'},$true)",
               ". ([scriptblock]::Create($helper.Extent.Text))",
               // The deployment lock is held for the whole wizard and released afterwards.
-              "try { Invoke-ModelConfiguration } catch { Write-Output $_.Exception.Message; $code=1 }",
+              "try { Invoke-ConfigureWizard 'scripts\\config\\configure.ts' '模型配置' } catch { Write-Output $_.Exception.Message; $code=1 }",
               "$lock=[IO.File]::Open((Join-Path $Project 'data\\state\\deploy.lock'),'OpenOrCreate','ReadWrite','None'); $lock.Dispose()",
               "exit $(if($code){$code}else{0})",
             ].join("\n"));
           } else {
             const source = (await readFile(join(project, "scripts/ops/ops.sh"), "utf8")).replaceAll("\r\n", "\n");
-            const from = source.indexOf("model_configure() (\n"), until = source.indexOf("\n)\n", from);
+            const from = source.indexOf("wizard_configure() (\n"), until = source.indexOf("\n)\n", from);
             expect(from).toBeGreaterThan(0); expect(until).toBeGreaterThan(from);
             await writeFile(runner, [
               "#!/usr/bin/env bash", "set -uo pipefail",
@@ -79,7 +79,7 @@ for (const shell of ["powershell", "bash"] as const) {
               '}',
               'start_bot() { record start; [ "$FIXTURE_SCENARIO" != restart-fail ] || return 1; printf running > "$FIXTURE_STATE"; }',
               source.slice(from, until + 3),
-              "model_configure",
+              "wizard_configure configure 模型配置",
             ].join("\n") + "\n");
           }
           const pathForShell = shell === "powershell" ? (value: string) => value : posixPath;

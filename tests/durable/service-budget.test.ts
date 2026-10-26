@@ -1,22 +1,23 @@
 import { afterAll, expect, spyOn, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
-import { DeliveryStore } from "../../src/agent/delivery-store.ts";
-import { DurableService, type DurableServiceOptions, type Outbound } from "../../src/durable/service.ts";
-import { GroupHarnesses } from "../../src/durable/groups.ts";
-import { admitUserRequest, bindMessageService, hasUserRequestCapacity } from "../../src/server/webhook.ts";
+import { DurableService, type DurableServiceOptions } from "../../src/durable/service.ts";
+import { SpaceHarnesses } from "../../src/durable/spaces.ts";
+import { pendingDeliveries } from "../../src/durable/records.ts";
+import { InboundRouter } from "../../src/server/inbound.ts";
 import { fauxModels, harnessOptions } from "../helpers/durable.ts";
+import { recordingOutbound, replyTexts } from "../helpers/recording-outbound.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
+import { appLayout, scopeKey } from "../../src/core/layout.ts";
 
 const fixture = await tempFixture("service-budget-");
 afterAll(() => fixture.cleanup());
 let sequence = 0;
-const URL = "https://example.invalid/callback";
-async function until(check: () => boolean, label: string) {
+async function until(check: () => boolean | Promise<boolean>, label: string) {
   const deadline = Date.now() + 20000;
-  while (!check()) { if (Date.now() > deadline) throw new Error("Timed out: " + label); await Bun.sleep(20); }
+  while (!await check()) { if (Date.now() > deadline) throw new Error("Timed out: " + label); await Bun.sleep(20); }
 }
 function blocked() {
   const release = Promise.withResolvers<void>();
@@ -35,71 +36,80 @@ function blocked() {
   return { state, step, release: () => release.resolve() };
 }
 function setup(max = 1, options: Partial<DurableServiceOptions> = {}) {
-  const stateDb = new Database(":memory:"), deliveries = new DeliveryStore(stateDb);
   const { faux, models, model } = fauxModels();
   const root = join(fixture.root, String(++sequence));
-  const replies: string[] = [];
-  const outbound: Outbound = { sendText: async () => true, sendReply: async text => { replies.push(text); return true; },
-    rate: () => ({ used: 0, limit: 20 }), refresh: async item => item.text };
+  const out = recordingOutbound();
   const limits = { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, tickMs: 20, activeRequests: max };
   const selection = { runtime: models as never, settings: undefined as never, model: models.getModel(model.provider, model.modelId)!,
-    ref: model, thinkingLevel: "off" as const, harnessSettings: {}, notices: [] };
-  const service = new DurableService({ root, stateDb, deliveries, modules: [], relay: null, materials: false,
-    limits, selection, outbound, ...options });
-  return { service, stateDb, deliveries, faux, models, root, replies, limits, selection, outbound };
+    ref: model, thinkingLevel: "off" as const, harnessSettings: {} };
+  const service = new DurableService({ layout: appLayout(root), modules: [], relay: null, materials: false, limits, selection, outbound: out.outbound, ...options });
+  const replies = () => replyTexts(out.sent);
+  return { service, faux, models, root, out, replies, limits, selection };
 }
 
-test("webhook capacity includes unfinished work after the durable HTTP receipt", async () => {
+test("an inbound message beyond capacity gets the busy notice and is not admitted; after /stop the next one is", async () => {
   const f = setup(), gate = blocked(); f.faux.setResponses([gate.step, gate.step]);
-  bindMessageService(f.service);
+  const controller = new AbortController();
+  const ids: Record<string, string> = { "im-a": "13800000001", "im-b": "13800000002" };
+  const router = new InboundRouter({ service: f.service, outbound: f.out.outbound, signal: controller.signal, onUnknown: () => {},
+    directory: { initializing: false, lookup: id => ids[id] ? { phone: ids[id]!, imUserId: id, name: id } : undefined } });
+  let serial = 0;
+  const event = (user: string, text: string) => ({ receivedAt: Date.now(), sentAt: Date.now(), payload: {
+    eventType: "callback:alt", groupId: "100", userId: user, msgUid: `uid-${++serial}`, type: "text", content: { content: text }, extraContent: "" } });
   try {
-    await admitUserRequest("first", "1001", "a", URL, "127.0.0.1");
+    router.handle(event("im-a", "first"));
     await until(() => gate.state.active === 1, "first provider");
-    const capacity = hasUserRequestCapacity();
-    const second = admitUserRequest("second", "1002", "b", URL, "127.0.0.1");
-    if (second) { await second; await until(() => gate.state.active === 2, "second provider"); }
-    console.log(JSON.stringify({ probe: "capacity", capacity, peak: gate.state.peak }));
-    expect(capacity).toBe(false); expect(second).toBeUndefined(); expect(gate.state.peak).toBe(1);
-    await f.service.control("1001", "a", "/stop", URL);
-    await until(() => hasUserRequestCapacity(), "released cancellation capacity");
-    expect(admitUserRequest("second", "1002", "b", URL, "127.0.0.1")).toBeDefined();
+    expect(f.service.hasUserRequestCapacity()).toBe(false);
+    const busy = event("im-b", "second");
+    router.handle(busy); await router.drain();
+    expect(f.out.sent.filter(item => item.kind === "notice").map(item => item.text)).toEqual(["⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。"]);
+    // A redelivery of the refused message is dropped in process; it is not admitted later either.
+    router.handle(busy); await router.drain();
+    expect(f.out.sent.filter(item => item.kind === "notice")).toHaveLength(1);
+    router.handle(event("im-a", "/stop")); await router.drain();
+    await until(() => f.service.hasUserRequestCapacity(), "released cancellation capacity");
+    router.handle(event("im-b", "second again")); await router.drain();
     await until(() => gate.state.calls === 2, "next provider");
-  } finally { bindMessageService(undefined); gate.release(); await f.service.close(); f.stateDb.close(); }
+    expect(gate.state.peak).toBe(1);
+  } finally { controller.abort(); gate.release(); await router.drain(); await f.service.close(); }
 }, 60000);
 
-test("queued requests occupy capacity, duplicates and rejected admissions release their reservations", async () => {
+test("queued requests occupy capacity; a duplicate message is not admitted twice and takes no slot", async () => {
   const f = setup(2), gate = blocked(); f.faux.setResponses([gate.step, fauxAssistantMessage("queued"), fauxAssistantMessage("other")]);
   try {
-    expect((await f.service.admit("1001", "a", "first", URL, true)).status).toBe("accepted");
+    const first = f.out.message("100", "1001", "first");
+    expect((await f.service.admit(first)).status).toBe("accepted");
     await until(() => gate.state.active === 1, "running head");
-    expect((await f.service.admit("1001", "a", "first", URL, true)).status).toBe("accepted");
-    expect((await f.service.admit("1001", "a", "queued", URL, true)).status).toBe("accepted");
-    expect((await f.service.admit("1001", "a", "first", URL, true)).status).toBe("accepted");
-    expect((await f.service.admit("1002", "b", "other", URL)).status).toBe("full");
-    gate.release(); await until(() => f.replies.length === 2, "queue drained");
-    expect((await f.service.admit("1002", "b", "other", URL)).status).toBe("accepted");
-    await until(() => f.replies.length === 3, "released completion capacity");
+    expect((await f.service.admit(first)).status).toBe("duplicate");
+    expect((await f.service.admit(f.out.message("100", "1001", "queued"))).status).toBe("accepted");
+    expect((await f.service.admit(first)).status).toBe("duplicate");
+    expect((await f.service.admit(f.out.message("200", "1002", "other"))).status).toBe("full");
+    gate.release(); await until(() => f.replies().length === 2, "queue drained");
+    await until(() => f.service.hasUserRequestCapacity(), "capacity released");
+    expect((await f.service.admit(f.out.message("200", "1002", "other"))).status).toBe("accepted");
+    await until(() => f.replies().length === 3, "released completion capacity");
     expect(gate.state.calls).toBe(1);
-  } finally { gate.release(); await f.service.close(); f.stateDb.close(); }
+  } finally { gate.release(); await f.service.close(); }
 }, 60000);
 
-test("evicted Harnesses are collectable and idle members release their callback references", async () => {
-  const f = setup(2, { maxIdleGroups: 0 }); f.faux.setResponses([fauxAssistantMessage("a"), fauxAssistantMessage("b")]);
+test("evicted Harnesses are collectable", async () => {
+  const f = setup(2, { maxIdleSpaces: 0 }); f.faux.setResponses([fauxAssistantMessage("a"), fauxAssistantMessage("b")]);
   const seen = new Map<string, WeakRef<object>>();
-  const acquire = GroupHarnesses.prototype.acquire, sweep = GroupHarnesses.prototype.sweep;
+  const acquire = SpaceHarnesses.prototype.acquire, sweep = SpaceHarnesses.prototype.sweep;
   let open = -1;
-  GroupHarnesses.prototype.acquire = async function(group) { const handle = await acquire.call(this, group); seen.set(group, new WeakRef(handle.harness)); return handle; };
-  GroupHarnesses.prototype.sweep = async function() { await sweep.call(this); open = this.openGroups.length; };
+  SpaceHarnesses.prototype.acquire = async function(scope) { const handle = await acquire.call(this, scope); seen.set(scopeKey(scope), new WeakRef(handle.harness)); return handle; };
+  SpaceHarnesses.prototype.sweep = async function() { await sweep.call(this); open = this.openSpaces.length; };
   try {
-    for (const group of ["a", "b"]) {
-      await f.service.admit("1001", group, "hello", URL);
-      await until(() => f.replies.length === seen.size, "reply");
+    for (const group of ["100", "200"]) {
+      await f.service.admit(f.out.message(group, "1001", "hello"));
+      await until(() => f.replies().length === seen.size, "reply");
+      await until(() => f.service.hasUserRequestCapacity(), "delivery finished");
       await f.service.maintain(); await until(() => open === 0, "eviction");
     }
-    GroupHarnesses.prototype.acquire = acquire; GroupHarnesses.prototype.sweep = sweep;
+    SpaceHarnesses.prototype.acquire = acquire; SpaceHarnesses.prototype.sweep = sweep;
     await f.service.maintain();
-    const control = new GroupHarnesses({ root: join(f.root, "control"), maxIdle: 0, harnessOptions: harnessOptions(f.models) });
-    const controlRef = await (async () => { const handle = await control.acquire("control"); const ref = new WeakRef(handle.harness); handle.release(); return ref; })();
+    const control = new SpaceHarnesses({ layout: appLayout(join(f.root, "control")), maxIdle: 0, harnessOptions: harnessOptions(f.models) });
+    const controlRef = await (async () => { const handle = await control.acquire(scopeOf("control")); const ref = new WeakRef(handle.harness); handle.release(); return ref; })();
     await control.sweep();
     // A full-suite run can need more than five collections for the otherwise unreachable control Harness.
     // Observe release across event-loop turns, with a bound that still fails for a real retained reference.
@@ -109,75 +119,78 @@ test("evicted Harnesses are collectable and idle members release their callback 
     const retained = [...seen].filter(([, ref]) => ref.deref() !== undefined).map(([group]) => group);
     console.log(JSON.stringify({ probe: "retention", open, retained, controlRetained: controlRef.deref() !== undefined }));
     expect(controlRef.deref()).toBeUndefined(); expect(retained).toHaveLength(0);
-    expect(f.service.callbackUrl("1001", "a", "fallback")).toBe("fallback");
-    expect(f.service.callbackUrl("1001", "b", "fallback")).toBe("fallback");
     await control.closeAll();
-  } finally { GroupHarnesses.prototype.acquire = acquire; GroupHarnesses.prototype.sweep = sweep; await f.service.close(); f.stateDb.close(); }
+  } finally { SpaceHarnesses.prototype.acquire = acquire; SpaceHarnesses.prototype.sweep = sweep; await f.service.close(); }
 }, 60000);
 
 test("parallel admissions reserve before opening and identity failure releases the slot", async () => {
   const f = setup(), gate = blocked(); f.faux.setResponses([gate.step]);
   try {
-    const results = await Promise.all(Array.from({ length: 6 }, (_, i) => f.service.admit(String(i), "a", String(i), URL)));
+    const results = await Promise.all(Array.from({ length: 6 }, (_, i) => f.service.admit(f.out.message("100", String(i), String(i)))));
     expect(results.filter(result => result.status === "accepted")).toHaveLength(1);
     await until(() => gate.state.active === 1, "only admitted provider");
-    await f.service.control("0", "a", "/stop", URL);
+    await f.service.control(f.out.message("100", "0", "/stop"));
     await until(() => f.service.hasUserRequestCapacity(), "stop frees slot");
     const storage = await import("../../src/agent/storage-identity.ts");
     const identity = spyOn(storage, "ensureStorageIdentity").mockRejectedValueOnce(new Error("synthetic identity failure"));
-    try { await expect(f.service.admit("1002", "b", "failed", URL)).rejects.toThrow("synthetic identity failure"); }
+    try { await expect(f.service.admit(f.out.message("200", "1002", "failed"))).rejects.toThrow("synthetic identity failure"); }
     finally { identity.mockRestore(); }
     expect(f.service.hasUserRequestCapacity()).toBe(true);
-  } finally { gate.release(); await f.service.close(); f.stateDb.close(); }
+  } finally { gate.release(); await f.service.close(); }
 }, 60000);
 
-test("capacity stays reserved while final reply delivery is still cleaning up", async () => {
+test("capacity stays reserved while the final reply is still being sent", async () => {
   const f = setup(), sending = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   f.faux.setResponses([fauxAssistantMessage("answer")]);
-  f.outbound.sendReply = async () => { sending.resolve(); await release.promise; return true; };
+  const send = f.out.outbound.send;
+  f.out.outbound.send = async (target, message, options) => {
+    if (message.msgType === "markdown" && message.content.content.endsWith("answer")) { sending.resolve(); await release.promise; }
+    return send(target, message, options);
+  };
   try {
-    await f.service.admit("1001", "a", "first", URL); await sending.promise;
+    await f.service.admit(f.out.message("100", "1001", "first")); await sending.promise;
     expect(f.service.hasUserRequestCapacity()).toBe(false);
-    expect((await f.service.admit("1002", "b", "second", URL)).status).toBe("full");
-    release.resolve(); await until(() => f.service.hasUserRequestCapacity(), "reply cleanup completed");
-  } finally { release.resolve(); await f.service.close(); f.stateDb.close(); }
+    expect((await f.service.admit(f.out.message("200", "1002", "second"))).status).toBe("full");
+    release.resolve(); await until(() => f.service.hasUserRequestCapacity(), "reply delivery completed");
+  } finally { release.resolve(); await f.service.close(); }
 }, 60000);
 
 test("cold recovery bounds old running tasks after a lower limit and stop can cancel a waiting member", async () => {
   const f = setup(2), old = blocked(); f.faux.setResponses([old.step, old.step]);
-  await f.service.admit("1001", "a", "first", URL);
-  await f.service.admit("1002", "b", "second", URL);
+  await f.service.admit(f.out.message("100", "1001", "first"));
+  await f.service.admit(f.out.message("200", "1002", "second"));
   await until(() => old.state.active === 2, "two old tasks");
   await f.service.close(); old.release();
   const gate = blocked(); f.faux.setResponses([gate.step, gate.step]);
-  const resumed = new DurableService({ root: f.root, stateDb: f.stateDb, deliveries: f.deliveries,
-    selection: f.selection, modules: [], relay: null, materials: false, outbound: f.outbound, limits: { ...f.limits, activeRequests: 1 } });
+  const resumed = new DurableService({ layout: appLayout(f.root), selection: f.selection, modules: [], relay: null, materials: false,
+    outbound: f.out.outbound, limits: { ...f.limits, activeRequests: 1 } });
   try {
-    expect(await resumed.start()).toEqual(["a", "b"]);
+    expect(await resumed.start()).toEqual([scopeOf("100"), scopeOf("200")]);
     await until(() => gate.state.active === 1, "one resumed provider"); await Bun.sleep(100);
     expect(gate.state.peak).toBe(1); expect(resumed.hasUserRequestCapacity()).toBe(false);
-    expect((await resumed.admit("1003", "c", "new", URL)).status).toBe("full");
-    await resumed.control("1002", "b", "/stop", URL);
+    expect((await resumed.admit(f.out.message("300", "1003", "new"))).status).toBe("full");
+    await resumed.control(f.out.message("200", "1002", "/stop"));
     expect(gate.state.calls).toBe(1);
-    await resumed.control("1001", "a", "/stop", URL);
+    await resumed.control(f.out.message("100", "1001", "/stop"));
     await until(() => resumed.hasUserRequestCapacity(), "recovered cancellations cleaned up");
     expect(gate.state.calls).toBe(1); expect(gate.state.peak).toBe(1);
-  } finally { gate.release(); await resumed.close(); f.stateDb.close(); }
+  } finally { gate.release(); await resumed.close(); }
 }, 60000);
 
-test("eviction preserves a failed reply until deliver, then releases idle state without resending", async () => {
-  const f = setup(1, { maxIdleGroups: 0 }); f.faux.setResponses([fauxAssistantMessage("answer")]);
+test("a refused reply survives maintenance with no idle groups kept, and its retry sends it once", async () => {
+  const f = setup(1, { maxIdleSpaces: 0, limits: { runTimeoutMs: 120000, modelIdleMs: 120000, modelResponseMs: 120000, tickMs: 20, activeRequests: 1,
+    deliveryRetryMs: [500] } });
+  f.faux.setResponses([fauxAssistantMessage("answer")]);
   let attempts = 0;
-  f.outbound.sendReply = async () => { attempts++; return false; };
+  f.out.state.failWhen = item => item.kind === "reply" && ++attempts === 1 ? "failed" : false;
   try {
-    await f.service.admit("1001", "a", "first", URL);
+    await f.service.admit(f.out.message("100", "1001", "first"));
     await until(() => attempts === 1 && f.service.hasUserRequestCapacity(), "saved failed reply");
     await f.service.maintain();
-    expect(f.service.callbackUrl("1001", "a", "fallback")).toBe(URL);
-    expect(f.deliveries.pending(JSON.stringify(["a", "1001"]))).toHaveLength(1);
-    await f.service.control("1001", "a", "/deliver", URL);
+    expect(pendingDeliveries(await f.service.records(scopeOf("100"), "1001"))).toHaveLength(1);
+    await until(async () => pendingDeliveries(await f.service.records(scopeOf("100"), "1001")).length === 0, "the retry");
     await f.service.maintain();
-    await until(() => f.service.callbackUrl("1001", "a", "fallback") === "fallback", "idle member removed");
-    expect(f.deliveries.pending(JSON.stringify(["a", "1001"]))).toHaveLength(0); expect(attempts).toBe(1);
-  } finally { await f.service.close(); f.stateDb.close(); }
+    expect(attempts).toBe(2); expect(f.replies()).toEqual(["answer"]);
+    expect(f.out.sent.filter(item => item.kind === "notice")).toEqual([]);
+  } finally { await f.service.close(); }
 }, 60000);

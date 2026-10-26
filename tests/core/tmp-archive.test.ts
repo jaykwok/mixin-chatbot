@@ -6,46 +6,54 @@ import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { durableMemberScope } from "../../src/durable/maintenance-view.ts";
 import { applyArchiveRemoval, applyTmpArchive, previewArchiveRemoval, previewTmpArchive } from "../../src/maintenance/archive.ts";
 import { archiveEntry } from "../../src/core/archive-entry.ts";
-import { DeliveryStore } from "../../src/agent/delivery-store.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
-import { withGroupSnapshot } from "../../src/durable/diagnostics.ts";
+import { withSpaceSnapshot } from "../../src/durable/diagnostics.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
+import { referTo } from "../helpers/pending-reply.ts";
+import { recordsOf } from "../../src/durable/records.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 async function fixture(durable = false) {
-  const f = await tempFixture("tmp-archive-"), root = join(f.root, "groups"), temp = join(root, "group-a/users/alice/tmp");
+  const f = await tempFixture("tmp-archive-"), root = join(f.root, "data"), temp = join(root, "tmp/groups/group-a/alice");
   await mkdir(temp, { recursive: true });
-  const state = join(f.root, "state.sqlite"), db = new Database(state), deliveries = new DeliveryStore(db);
-  const path = join(root, "group-a/durable.sqlite");
+  const state = join(f.root, "state.sqlite"), db = new Database(state);
+  const path = join(root, "conversations/groups/group-a/durable.sqlite");
   if (durable) {
     const { models, model } = fauxModels(), group = await openGroupHarness(path, models);
     try {
-      await memberConversation(group.harness, "group-a", "alice", { model }, context);
-      await memberConversation(group.harness, "group-a", "bob", { model }, context);
+      await memberConversation(group.harness, scopeOf("group-a"), "alice", { model }, context);
+      await memberConversation(group.harness, scopeOf("group-a"), "bob", { model }, context);
       await group.harness.commit(async tx => { (await tx.doc(ResultsDoc)).calls["1-result"] = { phone: "alice", createdAt: 1 }; }, context);
     } finally { await group.close(); }
   }
-  return { f, root, temp, path, deliveries, options: { root, state, archive: join(root, ".reclamation/backup/rm"), scope: durableMemberScope },
+  /** Bob's run record naming a path, written in the closed group database. */
+  const refer = async (target: string | undefined) => {
+    const group = await openGroupHarness(path, fauxModels().models);
+    try { await referTo(group.harness, "bob", "msg:pending", target); } finally { await group.close(); }
+  };
+  return { f, root, temp, path, refer, options: { root, state, archive: join(root, "state/reclamation/backup/rm"), scope: durableMemberScope },
     async close() { db.close(); await f.cleanup(); } };
 }
 
-test("archive rechecks another member's outbox, then settles the precise result ownership", async () => {
+test("archive rechecks another member's pending replies, then settles the precise result ownership", async () => {
   const f = await fixture(true), source = join(f.temp, "codemode");
   try {
     await mkdir(join(source, "1-result"), { recursive: true }); await writeFile(join(source, "1-result/output"), "kept bytes");
     await writeFile(join(f.temp, "bash.log"), "log");
     const plan = await previewTmpArchive(f.options, 0);
     expect(plan.items.filter(item => item.status === "ready")).toHaveLength(2);
-    f.deliveries.put(JSON.stringify(["group-a", "bob"]), "pending", join(source, "1-result/output"));
+    await f.refer(join(source, "1-result/output"));
     const first = await applyTmpArchive(f.options, plan.id, plan.digest);
     expect(Object.values(first.outcomes).filter(item => item.status === "archived")).toHaveLength(1);
     expect(await readFile(join(source, "1-result/output"), "utf8")).toBe("kept bytes");
-    f.deliveries.acknowledge(["pending"]);
+    await f.refer(undefined);
     const second = await applyTmpArchive(f.options, plan.id, plan.digest);
+    console.log(JSON.stringify(second.outcomes));
     expect(Object.values(second.outcomes).every(item => item.status === "archived")).toBe(true);
-    await withGroupSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls).toEqual({}));
+    await withSpaceSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls).toEqual({}));
     expect(await applyTmpArchive(f.options, plan.id, plan.digest)).toEqual(second);
     const target = plan.items.find(item => item.source === source)!.destination;
     expect(await readFile(join(target, "1-result/output"), "utf8")).toBe("kept bytes");
@@ -154,6 +162,39 @@ test("archive keeps entries whose owner changed, a destination without this oper
     expect(outcome("moved.txt").reason).toContain("没有本操作的持久意图");
     expect(outcome("resumed.txt").reason).toContain("归档后的内容或实体不符");
     expect(await readFile(join(f.temp, "codemode/1-result/output"), "utf8")).toBe("owned");
-    await withGroupSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls["1-result"]?.createdAt).toBe(2));
+    await withSpaceSnapshot(f.path, async harness => expect((await harness.snapshot(ResultsDoc, context))!.calls["1-result"]?.createdAt).toBe(2));
+  } finally { await f.close(); }
+});
+
+test("a direct-chat attachment that is not void protects its received file; a void one does not", async () => {
+  const f = await fixture(true), dir = join(f.temp, "received"), file = join(dir, "0123456789abcdef-a.txt");
+  const record = async (state: "ready" | "void") => {
+    const group = await openGroupHarness(f.path, fauxModels().models);
+    try {
+      await group.harness.commit(async tx => {
+        const now = Date.now();
+        (await recordsOf(tx, "alice")).attachments["0123456789abcdef"] = {
+          id: "0123456789abcdef", msgUid: "uid-1", receivedAt: now, epoch: 1, fileId: "file-1", kind: "file", name: "a.txt", state, at: now,
+          reply: { kind: "direct", receiveId: "im-alice", senderImUserId: "im-alice", msgUid: "uid-1", summary: "[文件]", receivedAt: now },
+          ...(state === "ready" ? { path: file, actualSize: 5 } : {}),
+        };
+      }, context);
+    } finally { await group.close(); }
+  };
+  try {
+    await mkdir(dir, { recursive: true }); await writeFile(file, "bytes");
+    await record("ready");
+    const plan = await previewTmpArchive(f.options, 0);
+    expect(plan.items.find(item => item.source === dir)).toMatchObject({ status: "kept" });
+    const first = await applyTmpArchive(f.options, plan.id, plan.digest);
+    expect(Object.values(first.outcomes).some(item => item.status === "archived")).toBe(false);
+    expect(await readFile(file, "utf8")).toBe("bytes");
+    // Void: the record keeps no path, so a new plan may archive the file.
+    await record("void");
+    const again = await previewTmpArchive(f.options, 0);
+    expect(again.items.find(item => item.source === dir)).toMatchObject({ status: "ready" });
+    const second = await applyTmpArchive(f.options, again.id, again.digest);
+    expect(Object.values(second.outcomes).every(item => item.status === "archived")).toBe(true);
+    await expect(lstat(file)).rejects.toThrow();
   } finally { await f.close(); }
 });

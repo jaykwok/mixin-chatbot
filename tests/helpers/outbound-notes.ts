@@ -1,12 +1,23 @@
-import type { DeliveryAttachment } from "../../src/agent/delivery-store.ts";
-import type { OutboundNotes } from "../../src/agent/send-tools.ts";
+import type { OutboundNotes, SendChannel } from "../../src/agent/send-tools.ts";
+import type { LinkNote } from "../../src/durable/records.ts";
 
-/** In-memory test outbox; production notes are persisted by DurableService. */
-export function createOutboundNotes(onAdd?: (note: string, attachment?: DeliveryAttachment) => void): OutboundNotes {
-  let notes: string[] = [], attachments: DeliveryAttachment[] = [];
-  return {
-    add(note, attachment) { onAdd?.(note, attachment); notes.push(note); if (attachment) attachments.push(attachment); },
-    peek: () => [...notes], references: () => [...attachments],
-    clear() { notes = []; attachments = []; },
+/** In-memory link notes; production notes are persisted in the request record by DurableService. */
+export function createOutboundNotes() {
+  const items: LinkNote[] = [];
+  const notes: OutboundNotes & { peek(): string[]; references(): LinkNote[] } = {
+    async add(note) { items.push(note); },
+    peek: () => items.map(note => note.original),
+    references: () => [...items],
   };
+  return notes;
+}
+
+/** A send channel that records what the tools sent directly. */
+export function recordingChannel() {
+  const sent: { kind: "file" | "image"; name: string; size: number }[] = [];
+  const channel: SendChannel = {
+    async file(file, signal, dispatched) { signal?.throwIfAborted(); dispatched(); sent.push({ kind: "file", name: file.name, size: file.size }); },
+    async image(image, signal, dispatched) { signal?.throwIfAborted(); dispatched(); sent.push({ kind: "image", name: image.name, size: image.size }); },
+  };
+  return { sent, channel };
 }

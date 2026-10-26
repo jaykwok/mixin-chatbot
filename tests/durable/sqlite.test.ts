@@ -92,6 +92,8 @@ describe("group database facade", () => {
 
   test("close checkpoints, releases the file at once and is idempotent; later calls reject", async () => {
     const path = nextPath();
+    // A conversation database (Durable's schema), so the reopen below passes the schema gate (schema-gate.ts).
+    await (await openGroupStorage(path)).close(BACKGROUND_CONTEXT);
     const db = await openGroupDatabase(path);
     await db.exec("CREATE TABLE t (v TEXT)");
     await db.run("INSERT INTO t VALUES (?)", "kept");
@@ -111,7 +113,7 @@ describe("group database facade", () => {
     await (await openGroupDatabase(path)).close();
     chmodSync(path, 0o444);
     try {
-      await expect(openGroupDatabase(path)).rejects.toThrow("群数据库不可写");
+      await expect(openGroupDatabase(path)).rejects.toThrow("会话库不可写");
       // The refused open closed its connection: the file can still be moved.
       renameSync(path, `${path}.moved`);
       renameSync(`${path}.moved`, path);
@@ -123,7 +125,7 @@ describe("group database facade", () => {
     await (await openGroupDatabase(path)).close();
     const directory = join(path, "..");
     chmodSync(directory, 0o555);
-    try { await expect(openGroupDatabase(path)).rejects.toThrow("无法打开群数据库"); }
+    try { await expect(openGroupDatabase(path)).rejects.toThrow("无法打开会话库"); }
     finally { chmodSync(directory, 0o755); }
   });
 
@@ -132,7 +134,7 @@ describe("group database facade", () => {
     const samples: number[] = [];
     try {
       const { createSession, defineDoc } = await import("@earendil-works/pi-durable");
-      const Counter = defineDoc<{ n: number }>({ kind: "test.counter", version: 1, scope: "session", initial: () => ({ n: 0 }) });
+      const Counter = defineDoc<{ n: number }>({ kind: "test.counter", version: 1, checkpointWhen: () => false, scope: "session", initial: () => ({ n: 0 }) });
       const session = createSession(storage);
       try {
         for (let i = 0; i < 40; i++) {

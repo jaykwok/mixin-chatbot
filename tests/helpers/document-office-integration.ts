@@ -1,6 +1,6 @@
 /**
- * Real LibreOffice previews and crops from deep group directories, through the document tools and the controlled read
- * tool as production builds them: a long group data root, a group directory named by its hash, two members' jobs at
+ * Real LibreOffice previews and crops from deep member directories, through the document tools and the controlled read
+ * tool as production builds them: a long data directory, a group space named by its hash, two members' jobs at
  * once, and a job cancelled while LibreOffice runs.
  * Usage: bun tests/helpers/document-office-integration.ts <test venv> [--root <run directory>]
  * soffice must be on PATH or in the standard Windows install directory.
@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import { buildLocalTools } from "../helpers/native-tools.ts";
 import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
-import { groupWorkspaceDir, materialsIndexPath, userTempDir } from "../../src/agent/paths.ts";
+import { appLayout, groupScope, userTmp } from "../../src/core/layout.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { documentToolchainReady, venvPythonPath } from "../../src/agent/python-toolchain.ts";
 import { application } from "../../src/core/lifecycle.ts";
@@ -41,23 +41,23 @@ const scenarios = [
   { name: "hashed-group", groupId: "mixin:group/需要哈希的群", phone: "13800000001" },
   { name: "long-root", groupId: "group-long-root", phone: "13800000002" },
 ].map((scenario) => {
-  const below = userTempDir("", scenario.groupId, scenario.phone).length + 1;
+  const below = userTmp(appLayout(""), groupScope(scenario.groupId), scenario.phone).length + 1;
   const padding = USER_TMP_LENGTH - below - root.length - 1 - scenario.name.length - 1;
   if (padding < 1) throw new Error(`run directory too deep for a ${USER_TMP_LENGTH}-character member tmp; pass a shorter --root`);
   const dataRoot = join(root, scenario.name + "-" + "d".repeat(padding));
-  const tempDir = userTempDir(dataRoot, scenario.groupId, scenario.phone);
+  const layout = appLayout(dataRoot), tempDir = userTmp(layout, groupScope(scenario.groupId), scenario.phone);
   assert.equal(tempDir.length, USER_TMP_LENGTH);
-  return { ...scenario, dataRoot, tempDir, workspace: groupWorkspaceDir(dataRoot, scenario.groupId) };
+  return { ...scenario, dataRoot, tempDir, workspace: layout.workspace, indexPath: layout.materialsIndex };
 });
-assert.match(basename(dirname(dirname(dirname(scenarios[0]!.tempDir)))), /^sha256-[0-9a-f]{64}$/);
+assert.match(basename(dirname(scenarios[0]!.tempDir)), /^sha256-[0-9a-f]{64}$/);
 
 const fixtureScript = fileURLToPath(new URL("./document-fixtures.py", import.meta.url));
 const [hashed, longRoot] = await Promise.all(scenarios.map(async (scenario) => {
-  await Promise.all([scenario.workspace, scenario.tempDir, dirname(materialsIndexPath(scenario.dataRoot, scenario.groupId))].map((path) => mkdir(path, { recursive: true })));
+  await Promise.all([scenario.workspace, scenario.tempDir, dirname(scenario.indexPath)].map((path) => mkdir(path, { recursive: true })));
   const tools = buildDocumentWorkTools({ workspaceDir: scenario.workspace, tempDir: scenario.tempDir, venvDir,
-    indexPath: materialsIndexPath(scenario.dataRoot, scenario.groupId) });
-  const local = await buildLocalTools({ workspaceDir: scenario.workspace, tempDir: scenario.tempDir, phone: scenario.phone, groupId: scenario.groupId,
-    venvDir, materialsIndexPath: materialsIndexPath(scenario.dataRoot, scenario.groupId) });
+    indexPath: scenario.indexPath });
+  const local = await buildLocalTools({ workspaceDir: scenario.workspace, tempDir: scenario.tempDir, phone: scenario.phone, scope: groupScope(scenario.groupId),
+    venvDir, materialsIndexPath: scenario.indexPath });
   const call = async (name: string, params: object, signal?: AbortSignal): Promise<any> =>
     (await tools.find((tool) => tool.name === name)!.execute("verify", params as never, signal, undefined, {} as never)).structuredContent;
   const read = async (path: string) => (await local.find((tool) => tool.name === "read")!.execute("verify", { path } as never, undefined, undefined, {} as never)).content;

@@ -1,8 +1,8 @@
-// 外链与回调路由。
+// 外链与通讯录同步。
 //
 // 这两页不自己解析数据，而是把现有命令的原文输出显示在执行面板里。理由是那两个脚本的输出
-// 本来就是为人读的中文说明——外链那段会讲清「到期是删文件还是只让签名失效」，路由那段会
-// 讲清指纹冲突意味着什么。把它们拆成表格，等于把这些说明丢掉，再自己编一套同样意思的话。
+// 本来就是为人读的中文说明——外链那段会讲清「到期是删文件还是只让签名失效」，通讯录那段会
+// 讲清待确认撤销是哪一轮、多少人。把它们拆成表格，等于把这些说明丢掉，再自己编一套同样意思的话。
 //
 // 界面在这里提供的是「不用记参数」：每条命令要什么参数、危险在哪，列成菜单并在执行前问清楚。
 
@@ -14,8 +14,8 @@ interface Command {
   label: string;
   summary: string;
   status: StatusName;
-  /** 按顺序询问必填参数，群名中的空格不会被拆成多个参数。 */
-  ask?: string[];
+  /** 按顺序询问参数，群名中的空格不会被拆成多个参数；默认必填，optional 的可以留空（传空字符串）。 */
+  ask?: (string | { label: string; optional: true })[];
   /** 不需确认、但会改动外部状态的操作，替代「只读查看」的说明。 */
   effect?: string;
   /** 向导类命令需要真正的终端（隐藏输入、确认提问），交给 runInteractive。 */
@@ -30,6 +30,8 @@ interface Command {
   };
   args(values: string[]): string[];
 }
+
+const askLabel = (question: NonNullable<Command["ask"]>[number]) => typeof question === "string" ? question : question.label;
 
 class CommandMenu implements View {
   private selected = 0;
@@ -66,13 +68,13 @@ class CommandMenu implements View {
     if (!command) return false;
 
     const values: string[] = [];
-    for (const label of command.ask ?? []) {
-      const answer = await app.ask(label);
+    for (const question of command.ask ?? []) {
+      const answer = await app.ask(askLabel(question));
       if (answer === null) {
         app.toast("idle", "已取消");
         return true;
       }
-      if (!answer.trim()) {
+      if (!answer.trim() && typeof question === "string") {
         app.toast("warn", "此项不能为空，操作未执行");
         return true;
       }
@@ -109,7 +111,7 @@ class CommandMenu implements View {
         ctx.theme.bold(command.summary),
         ctx.theme.c(command.danger || command.interactive ? "warn" : "ok", command.danger ? "修改操作 · 执行前需确认" : command.effect ?? "只读查看"),
         "",
-        ...(command.ask?.length ? ["需要提供：" + command.ask.join("、"), ""] : []),
+        ...(command.ask?.length ? ["需要提供：" + command.ask.map(askLabel).join("、"), ""] : []),
         this.intro,
       ],
       note: command.danger ? "Enter 填写范围并查看确认步骤" : "Enter 查看结果 · 支持滚动回看完整输出",
@@ -185,53 +187,61 @@ export function createRelayView(): View {
   );
 }
 
-export function createRoutesView(): View {
+export function createDirectoryView(): View {
   return new CommandMenu(
-    "routes",
-    "回调路由",
-    "回调路由",
-    "一个 callback key 同时对应多个群就是冲突，机器人会拒绝跨群广播。" +
-      "reset 前必须先在平台侧把配置改对，否则下一条入站消息会把冲突重新建起来。",
+    "directory",
+    "通讯录",
+    "通讯录同步",
+    "机器人按开放平台通讯录把成员的平台 ID 对应到手机号，统计和会话都按手机号归属。每天 03:00 完整同步一次，" +
+      "遇到未知成员时也会触发。一轮里缺席的成员太多时（例如接口异常或权限变化），本轮不撤销，等管理员核对后确认。" +
+      "通讯录很大时可以只同步选定的部门及其子部门：先「列出部门」找到部门 ID，再「设置同步范围」。",
     [
       {
-        label: "列出绑定与冲突",
-        summary: "含完整指纹、冲突标记和容量",
+        label: "查看 Stream 与同步状态",
+        summary: "事件 Stream 连接、映射数量、最近同步和待确认撤销",
         status: "idle",
-        args: () => ["routes", "list"],
+        args: () => ["directory"],
       },
       {
-        label: "重绑到指定群",
-        summary: "清除冲突并把指纹绑到一个群，需停机",
+        label: "确认暂停的撤销",
+        summary: "填写状态里显示的轮次；服务重新完整扫描后才撤销",
         status: "warn",
-        ask: ["指纹（日志里的 12 位前缀即可）", "目标群号"],
-        danger: ([fingerprint, group]) => {
-          return {
-            subject: `把 ${fingerprint} 重新绑定到群 ${group}`,
-            steps: [
-              "要求维护租约，运行中的机器人会阻止本操作",
-              "清除该指纹上的冲突记录",
-              "绑定到指定群",
-            ],
-            untouched: ["其他指纹的绑定", "会话历史"],
-            recovery: "平台侧配置若仍是错的，下一条入站消息会重新造成冲突",
-          };
-        },
-        args: ([fingerprint, group]) => {
-          return ["routes", "reset", fingerprint!, "--group", group!];
-        },
-      },
-      {
-        label: "移除废弃绑定",
-        summary: "释放容量；该 key 再次入站会重新建立绑定",
-        status: "warn",
-        ask: ["指纹（日志里的 12 位前缀即可）"],
-        danger: ([value]) => ({
-          subject: `移除指纹 ${value} 的绑定`,
-          steps: ["要求维护租约，运行中的机器人会阻止本操作", "删除该绑定并释放一个容量位"],
-          untouched: ["其他指纹的绑定", "会话历史"],
-          recovery: "该 key 若再次入站，会自动重新建立绑定",
+        ask: ["待确认撤销的轮次（见「查看 Stream 与同步状态」）"],
+        danger: ([scanId]) => ({
+          subject: `确认第 ${scanId} 轮暂停的撤销`,
+          steps: [
+            "只接受最近一次暂停的那一轮；之后又同步过时需要重新查看",
+            "服务立即重新完整扫描通讯录",
+            "缺席成员全部在该轮名单内时撤销他们的映射；名单外又有人缺席时再次暂停",
+          ],
+          untouched: ["统计账本和会话历史", "仍在通讯录中的成员"],
+          recovery: "被撤销的成员重新出现在通讯录后，下一次同步自动恢复映射",
         }),
-        args: ([value]) => ["routes", "forget", value!],
+        args: ([scanId]) => ["directory-confirm", scanId!],
+      },
+      {
+        label: "列出部门",
+        summary: "某个部门的直属子部门：ID、人数、名称；用来选择同步范围",
+        status: "idle",
+        ask: [{ label: "上级部门 ID（留空为根部门）", optional: true }],
+        args: ([parent]) => parent ? ["directory-departments", parent] : ["directory-departments"],
+      },
+      {
+        label: "设置同步范围",
+        summary: "只同步选定的部门及其子部门，留空为整个通讯录；范围有变化时立即重新同步",
+        status: "warn",
+        ask: [{ label: "部门 ID（多个用逗号分隔；留空为整个通讯录）", optional: true }],
+        danger: ([departments]) => ({
+          subject: departments ? `只同步部门 ${departments} 及其子部门` : "同步整个通讯录",
+          steps: [
+            ...(departments ? ["服务先向平台核对每个部门，任何一个不存在或无权读取都不改"] : []),
+            "与现有范围相同则不改、不重新同步；否则保存范围，正在进行的同步中止，按新范围立即重新同步",
+            "范围外成员的映射在这一轮完整同步后撤销；超过撤销阈值时暂停，等你确认",
+          ],
+          untouched: ["统计账本和会话历史", "范围内成员已有的映射"],
+          recovery: "重新设置范围（留空为整个通讯录）后，下一轮同步恢复被撤销成员的映射",
+        }),
+        args: ([departments]) => departments ? ["directory-scope", departments] : ["directory-scope"],
       },
     ]
   );

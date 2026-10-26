@@ -79,10 +79,11 @@ const { resultsRoot } = await import("../../src/durable/results/files.ts");
 const { memberConversation } = await import("../../src/durable/identity.ts");
 const { baseMemberTools, memberPlaces, memberRegistration } = await import("../../src/durable/tools.ts");
 const { openGroupHarness } = await import("./durable.ts");
+const { appLayout, groupScope } = await import("../../src/core/layout.ts");
 
 const root = process.argv[2]!;
 const WINDOWS = process.platform === "win32";
-const GROUP = "race-group", ALICE = "+8613800000201", BOB = "+8613800000202";
+const GROUP = groupScope("race-group"), ALICE = "+8613800000201", BOB = "+8613800000202";
 const LINK = WINDOWS ? "junction" : "dir";
 // A 1x1 GIF.
 const GIF = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
@@ -114,14 +115,14 @@ async function group() {
   const models = createModels();
   models.setProvider(faux.provider);
   const model = faux.getModel();
-  const base = { models, root: join(root, `group-${n}`), groupId: GROUP };
+  const base = { layout: appLayout(join(root, `group-${n}`)), scope: GROUP };
   const members = baseMemberTools(base);
   const extensions = [
     defineExtension({ name: "mixin.base", tools: members.map(memberRegistration) }),
     defineExtension({ name: "fixture.module", tools: tools.map(memberRegistration) }),
     codemodeExtension({ members: base, tools: [...members, ...tools] }),
   ];
-  const opened = await openGroupHarness(join(root, `db-${n}.sqlite`), models, { group: GROUP, extensions, settings: { retry: { baseDelayMs: 5, maxAgentDelayMs: 20 } } });
+  const opened = await openGroupHarness(join(root, `db-${n}.sqlite`), models, { scope: GROUP, extensions, settings: { retry: { baseDelayMs: 5, maxAgentDelayMs: 20 } } });
   const alice = (await memberConversation(opened.harness, GROUP, ALICE, { model: { provider: model.provider, modelId: model.id } }, context)).conversation;
   const aliceTmp = memberPlaces(base, GROUP, ALICE).tempDir, bobTmp = memberPlaces(base, GROUP, BOB).tempDir;
   await actual.mkdir(aliceTmp, { recursive: true });

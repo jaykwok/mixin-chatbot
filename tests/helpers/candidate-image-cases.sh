@@ -71,6 +71,8 @@ docker() {
                     *) shift ;;
                 esac
             done
+            # Like Docker: the iidfile is removed when the build starts and written only on success.
+            rm -f -- "$iid"
             [ -z "${BUILD_FAIL:-}" ] || { echo 'build failed' >&2; return 1; }
             id="$(cat "$DSTATE/next-id")"
             printf '%s\n' "$id" > "$iid"
@@ -645,36 +647,36 @@ disk_cases() {
 snapshot_cases() {
     . "$here/../../scripts/lib/deployment.sh"
     PROJECT_DIR="$fixture/project"
-    local groups="$fixture/groups" size
-    mkdir -p "$PROJECT_DIR/data/config" "$PROJECT_DIR/data/state" "$PROJECT_DIR/data/runtime/pi" "$groups/g1"
+    local conversation="$fixture/project/data/conversations/groups/g1" size
+    mkdir -p "$PROJECT_DIR/data/config" "$PROJECT_DIR/data/state" "$PROJECT_DIR/data/runtime/pi" "$PROJECT_DIR/data/workspace" "$conversation"
     sized() { head -c "$2" /dev/zero > "$1"; }
-    # Counted: configuration, markers, the state databases, the group statistics and the groups' Durable databases.
+    # Counted: configuration, the deployment record and the state databases (the statistics ledger among them).
     sized "$PROJECT_DIR/data/config/models.json" 100000
     sized "$PROJECT_DIR/data/runtime/pi/settings.json" 20000
     sized "$PROJECT_DIR/data/state/data-version.json" 3000
     sized "$PROJECT_DIR/data/state/bot.sqlite" 400000
     sized "$PROJECT_DIR/data/state/bot.sqlite-wal" 50000
-    sized "$groups/stats.sqlite" 600000
-    sized "$groups/data-version.json" 7000
-    sized "$groups/g1/durable.sqlite" 300000
-    sized "$groups/g1/durable.sqlite-wal" 20000
-    # Not in the snapshot: group workspaces and other state.
-    sized "$groups/g1/big" 5000000
+    sized "$PROJECT_DIR/data/state/stats.sqlite" 600000
+    sized "$PROJECT_DIR/data/state/stats.sqlite-wal" 327000
+    # Not in the snapshot: conversation databases, which a release of the same data format leaves alone, the shared
+    # workspace and other state.
+    sized "$conversation/durable.sqlite" 5000000
+    sized "$PROJECT_DIR/data/workspace/big" 5000000
     sized "$PROJECT_DIR/data/state/other.log" 5000000
-    size="$(snapshot_size_estimate "$groups")"
+    size="$(snapshot_size_estimate)"
     result estimate-at-least "$([ "$size" -ge 1500000 ] && echo yes || echo "no:$size")"
     result estimate-at-most "$([ "$size" -lt 1700000 ] && echo yes || echo "no:$size")"
-    result estimate-empty "$(PROJECT_DIR="$fixture/none"; snapshot_size_estimate "$fixture/empty-groups")"
+    result estimate-empty "$(PROJECT_DIR="$fixture/none"; snapshot_size_estimate)"
     check_free_space() { printf '%s\n' "$*" | sed "s#$fixture#<f>#g" > "$fixture/free-args"; }
     snapshot_size_estimate() { echo 5000; }
-    check stop-no-backup check_stop_disk_space "$groups" "$fixture/upgrader"
+    check stop-no-backup check_stop_disk_space "$fixture/upgrader"
     result stop-no-backup-args "$(cat "$fixture/free-args")"
     mkdir -p "$PROJECT_DIR/backup"
-    check stop check_stop_disk_space "$groups"
+    check stop check_stop_disk_space
     result stop-args "$(cat "$fixture/free-args")"
     snapshot_size_estimate() { echo 'du: cannot access' >&2; return 1; }
     rm -f -- "$fixture/free-args"
-    check stop-unknown check_stop_disk_space "$groups"
+    check stop-unknown check_stop_disk_space
     result stop-unknown-checked "$([ -e "$fixture/free-args" ] && echo yes || echo no)"
 }
 

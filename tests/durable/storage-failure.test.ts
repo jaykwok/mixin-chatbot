@@ -10,7 +10,7 @@ import { tempFixture } from "../helpers/temp.ts";
 
 const fixture = await tempFixture("durable-storage-failure-");
 afterAll(() => fixture.cleanup());
-const Counter = defineDoc<{ value: number; text: string }>({ kind: "test.fatal-counter", version: 1, scope: "session", initial: () => ({ value: 0, text: "" }) });
+const Counter = defineDoc<{ value: number; text: string }>({ kind: "test.fatal-counter", version: 1, checkpointWhen: () => false, scope: "session", initial: () => ({ value: 0, text: "" }) });
 let n = 0;
 async function open() {
   const path = join(fixture.root, `db-${++n}.sqlite`), db = await openGroupDatabase(path), storage = await SqliteStorage.open(db);

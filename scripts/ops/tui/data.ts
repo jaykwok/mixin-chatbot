@@ -1,13 +1,12 @@
 import { matchesInstance } from "../../../src/core/health.ts";
-import { Database } from "bun:sqlite";
-import { assertCloseoutSchema } from "../../../src/agent/deliverables.ts";
 // 统计、会话和临时目录直接读取宿主机文件，无需 npm 依赖。
 // 健康诊断复用 ops 的 JSON 接口，容器和服务维护转交对应平台脚本。
 
 import { readdir, lstat, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { collectAll, type GroupStats, type Window } from "../stats-admin.ts";
-import { lastActivity, scanHistory, type GroupHistory } from "../../lib/history-scan.ts";
+import { lastActivity, scanHistory, spaceName, type SpaceHistory } from "../../lib/history-scan.ts";
+import { healthProgram, type ProgramVersion } from "../version-info.ts";
 import { scanTmp, type UserTmp } from "../../lib/tmp-scan.ts";
 import { capture, parseJson, type RunResult } from "./exec.ts";
 import { LOG_FILE, PROJECT_DIR, opsCommand, type Deployment } from "./platform.ts";
@@ -16,17 +15,12 @@ import { readRuntimeSettings } from "../../config/runtime-settings.ts";
 import { validateRelayConfig } from "../../../src/integrations/relay-s3.ts";
 import { readAuxiliaryConfig } from "../../../src/core/auxiliary-config.ts";
 import { readMcpConfig } from "../../../src/core/mcp-config.ts";
+import { parseAppBotConfig } from "../../../src/integrations/open-platform/config.ts";
+import type { StreamStatus } from "../../../src/integrations/open-platform/stream.ts";
+import type { DirectoryStatus } from "../../../src/integrations/open-platform/identity-directory.ts";
+import type { AttentionStatus } from "../../../src/durable/attention.ts";
 
-/** Read-only: opening the operator overview must not initialize or recover the send ledger. */
-export async function loadCloseoutState(): Promise<{ pending: number; uncertain: number }> {
-  const path = join(PROJECT_DIR, "data/state/agent.sqlite");
-  try { await lstat(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { pending: 0, uncertain: 0 }; throw error; }
-  const db = new Database(path, { readonly: true, strict: true });
-  try {
-    if (!assertCloseoutSchema(db)) return { pending: 0, uncertain: 0 };
-    return db.query("SELECT count(*) AS pending, coalesce(sum(state IN ('uncertain','sending')),0) AS uncertain FROM file_sends WHERE state!='sent' AND delivery_id IS NOT NULL").get() as { pending: number; uncertain: number };
-  } finally { db.close(); }
-}
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 
 // ===== 体检 =====
 
@@ -48,13 +42,13 @@ export interface Health {
 /**
  * 跑一次体检。
  *
- * 超时给到 90 秒：隧道模式下这一步要打公网，几次 curl 叠起来很容易超过默认值，
+ * 超时给到 90 秒：模型校验要起一次性容器，外链检查要连对象存储，叠起来很容易超过默认值，
  * 而超时被当成「体检失败」比真失败更难排查。
  */
 export async function loadHealth(deployment: Deployment, signal?: AbortSignal): Promise<Health> {
   const { command, args, env } = opsCommand(deployment.platform, ["doctor", "--json"]);
   const result = await capture(command, args, { timeout: 90_000, signal, env });
-  if (result.timedOut) throw new Error("体检超时（90 秒）；隧道或外链后端可能无响应");
+  if (result.timedOut) throw new Error("体检超时（90 秒）；外链后端或 Docker 可能无响应");
   const health = parseJson<Health>(result, "体检");
   if (!health || !Array.isArray(health.checks) || !health.checks.every(check =>
     check && ["pass", "warn", "fail"].includes(check.status) && typeof check.name === "string" && typeof check.detail === "string"
@@ -72,6 +66,13 @@ export interface Service {
   latency?: number;
   /** 从通过完整身份校验的实例记录取得的启动时刻。 */
   startedAt?: number;
+  /** 事件 Stream 与通讯录同步状态，取自同一次 /health；验证实例没有 Stream。 */
+  stream?: StreamStatus;
+  directory?: DirectoryStatus;
+  /** 自服务本次启动以来需要留意的事件（停住或出错的任务、超时放弃的交付等），取自同一次 /health。 */
+  attention?: AttentionStatus;
+  /** 运行中程序的版本与构建，取自同一次 /health（appVersion、build）。 */
+  program?: ProgramVersion;
 }
 
 export async function probeService(port: number, instanceFile = join(PROJECT_DIR, "data", "state", "instance.json")): Promise<Service> {
@@ -84,12 +85,17 @@ export async function probeService(port: number, instanceFile = join(PROJECT_DIR
     const instance = await Bun.file(instanceFile).json();
     if (!matchesInstance(body, instance, port) || (!response.ok && body.status !== "stopping")) return { state: "unreachable" };
     const startedAt = instance.startedAt;
+    const extra = body as unknown as Record<string, unknown>;
 
     return {
       state: body.status === "stopping" ? "stopping" : body.verificationOnly ? "verifying" : "ready",
       pid: body.pid,
       latency: Date.now() - started,
       startedAt,
+      ...(isRecord(extra.stream) ? { stream: extra.stream as unknown as StreamStatus } : {}),
+      ...(isRecord(extra.directory) ? { directory: extra.directory as unknown as DirectoryStatus } : {}),
+      ...(isRecord(extra.attention) ? { attention: extra.attention as unknown as AttentionStatus } : {}),
+      ...(healthProgram(body) ? { program: healthProgram(body) } : {}),
     };
   } catch {
     return { state: "unreachable" };
@@ -220,11 +226,12 @@ export interface DailyPoint {
   day: string;
   asks: number;
   people: number;
-  files: number;
+  /** 当天入账的 token 合计（按同步日）。 */
+  tokens: number;
 }
 
 export interface RecentStats {
-  today: { asks: number; people: number; files: number; images: number; groups: number };
+  today: { asks: number; people: number; tokens: number; groups: number };
   /** 从最早到今天，长度恒等于请求的天数；没有记录的那天补 0，趋势线不会因为缺天而变短。 */
   trend: DailyPoint[];
 }
@@ -244,9 +251,9 @@ export async function loadRecentStats(root: string, days: number, now = Date.now
   for (let offset = 0; offset < days; offset++) {
     const date = new Date(since);
     date.setDate(date.getDate() + offset);
-    byDay.set(day(date.getTime()), { day: day(date.getTime()), asks: 0, people: 0, files: 0 });
+    byDay.set(day(date.getTime()), { day: day(date.getTime()), asks: 0, people: 0, tokens: 0 });
   }
-  const today = { asks: 0, people: 0, files: 0, images: 0, groups: 0 };
+  const today = { asks: 0, people: 0, tokens: 0, groups: 0 };
   const people = new Map<string, Set<string>>();
   for (const group of groups) {
     for (const [date, daily] of group.daily) {
@@ -255,17 +262,19 @@ export async function loadRecentStats(root: string, days: number, now = Date.now
         point.asks += daily.asks;
         let users = people.get(date);
         if (!users) people.set(date, users = new Set());
-        for (const user of daily.users) users.add(user);
+        for (const user of daily.askers) users.add(user);
         point.people = users.size;
-        point.files += daily.files;
       }
       if (date === day(now)) {
         today.asks += daily.asks;
         today.people = people.get(date)?.size ?? 0;
-        today.files += daily.files;
-        today.images += daily.images;
-        if (daily.users.size > 0 || daily.files > 0 || daily.images > 0) today.groups++;
+        if (daily.askers.size > 0) today.groups++;
       }
+    }
+    for (const [date, tokens] of group.tokenDays) {
+      const point = byDay.get(date);
+      if (point) point.tokens += tokens.totalTokens;
+      if (date === day(now)) today.tokens += tokens.totalTokens;
     }
   }
   return { today, trend: [...byDay.values()] };
@@ -273,10 +282,11 @@ export async function loadRecentStats(root: string, days: number, now = Date.now
 
 // ===== 会话历史与临时目录 =====
 
-export type { GroupHistory, UserTmp };
-export { lastActivity };
+export type { SpaceHistory, UserTmp };
+export { lastActivity, spaceName };
 
-export async function loadHistory(root: string): Promise<GroupHistory[]> {
+/** root 是数据目录：会话库在 conversations/ 下，临时目录在 tmp/ 下。 */
+export async function loadHistory(root: string): Promise<SpaceHistory[]> {
   return scanHistory(root);
 }
 
@@ -286,7 +296,7 @@ export async function loadTmp(root: string): Promise<UserTmp[]> {
 
 // ===== 磁盘占用 =====
 
-/** data/ 与群数据根的总占用。给总览一个「这台机器被吃掉了多少」的数字。 */
+/** data/ 的总占用。给总览一个「这台机器被吃掉了多少」的数字。 */
 export async function loadDiskUsage(paths: string[]): Promise<number> {
   let total = 0;
   const seen = new Set<string>();
@@ -325,38 +335,31 @@ export interface LogLine {
   level: "debug" | "info" | "warn" | "error" | "other";
 }
 
-export type TunnelLogging = "off" | "on";
-export type TunnelProtocol = "auto" | "http2" | "quic";
-
-export async function loadTunnelProtocol(project = PROJECT_DIR, signal?: AbortSignal): Promise<TunnelProtocol> {
-  let value: string;
-  try {
-    value = (await readFile(join(project, "data", "config", "cloudflared-protocol"), { encoding: "utf8", signal })).trim();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "auto";
-    throw error;
-  }
-  if (value !== "auto" && value !== "http2" && value !== "quic") throw new Error("cloudflared-protocol 只接受 auto、http2 或 quic");
-  return value;
-}
-
-export async function loadTunnelLogging(project = PROJECT_DIR, signal?: AbortSignal): Promise<TunnelLogging> {
-  let value: string;
-  try {
-    value = (await readFile(join(project, "data", "config", "cloudflared-logging"), { encoding: "utf8", signal })).trim();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "off";
-    throw error;
-  }
-  if (value !== "off" && value !== "on") throw new Error("cloudflared-logging 只接受 off 或 on");
-  return value;
-}
-
 /** 设置页展示的外链状态：只含可显示字段，凭据不离开配置文件。 */
 export type RelaySummary = { enabled: false } | {
   enabled: true; endpoint: string; region: string; bucket: string; prefix: string; pathStyle: boolean;
   maxBytes: number; expireHours: number; cleanupGraceMinutes: number; sessionToken: boolean;
 };
+
+/** 设置页展示的应用机器人状态：只有平台环境，AppID 和 AppSecret 不离开配置文件。 */
+export type AppBotSummary = { configured: false } | { configured: true; environment: "production" | "staging" };
+
+export async function loadAppBotSummary(project = PROJECT_DIR, signal?: AbortSignal): Promise<AppBotSummary> {
+  let raw: string;
+  try {
+    raw = await readFile(join(project, "data", "config", "app-bot.json"), { encoding: "utf8", signal });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { configured: false };
+    if (code === "ABORT_ERR") throw error;
+    throw new Error("app-bot.json 无法读取" + (code ? `（${code}）` : ""));
+  }
+  let doc: unknown;
+  // 解析错误的原文可能带出配置片段（含密钥），只给固定说明。
+  try { doc = JSON.parse(raw); } catch { throw new Error("app-bot.json 不是有效 JSON，请重新运行应用机器人配置"); }
+  try { return { configured: true, environment: parseAppBotConfig(doc).environment }; }
+  catch { throw new Error("app-bot.json 内容无效，请重新运行应用机器人配置"); }
+}
 
 export async function loadRelaySummary(project = PROJECT_DIR, signal?: AbortSignal): Promise<RelaySummary> {
   let raw: string;
@@ -434,25 +437,6 @@ export function loadRuntimeSettings(project = PROJECT_DIR, signal?: AbortSignal)
 }
 
 function parseLogLine(text: string): LogLine {
-  // Cloudflared's rolling files contain JSON with UTC timestamps. Display local time
-  // alongside the bot's local timestamps, retaining cfRay and request/response fields.
-  if (text.startsWith("{")) {
-    try {
-      const row = JSON.parse(text) as Record<string, unknown>;
-      const level: LogLine["level"] = row.level === "debug" || row.level === "info" || row.level === "warn"
-        ? row.level : ["error", "fatal", "panic"].includes(String(row.level)) ? "error" : "other";
-      const date = new Date(String(row.time));
-      const two = (n: number) => String(n).padStart(2, "0");
-      const time = Number.isNaN(date.getTime()) ? String(row.time ?? "")
-        : `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())}`;
-      const fields = Object.entries(row).filter(([key]) => !["time", "level", "message"].includes(key))
-        .map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(" ");
-      const message = `${time} - ${String(row.level ?? "other").toUpperCase()} - ${String(row.message ?? "")}${fields ? " " + fields : ""}`;
-      // Parsing JSON must not reintroduce terminal escapes or forged multi-line records.
-      return { level, text: message.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu,
-        character => "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0")) };
-    } catch { /* Older text logs and partially written JSON remain readable. */ }
-  }
   return {
     text,
     level: text.includes(" - ERROR - ") ? "error"

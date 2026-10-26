@@ -1,4 +1,4 @@
-// Online result maintenance for one idle member: the service supplies the group harness, member, reference snapshot
+// Online result maintenance for one idle member: the service supplies the space harness, member, reference snapshot
 // and shutdown signal; this decides what expires and drives the removal, settlement and queue steps.
 //
 // One pass, in order:
@@ -10,7 +10,7 @@
 // 6. retry a bounded batch of the queue, rotating deferred items;
 // 7. sweep isolated task receipts no live or queued ownership claims.
 import type { Context } from "@earendil-works/chord";
-import type { DocumentReader, Harness } from "@earendil-works/pi-durable";
+import type { Harness } from "@earendil-works/pi-durable";
 import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ResultOwnership } from "../../contracts/maintenance.ts";
@@ -18,7 +18,7 @@ import type { ReferenceText } from "../../core/reference-text.ts";
 import { configuredRootlessTasks } from "../../core/task-backend.ts";
 import { removeResultDirectories } from "./files.ts";
 import { RESULT_PRESSURE, ResultsDoc } from "./ownership.ts";
-import { handoffResults, reclamationBatch, ReclamationItems, ReclamationQueues, settleReclamation } from "./queue.ts";
+import { handoffResults, reclamationBatch, ReclamationItems, settleReclamation } from "./queue.ts";
 import { referencedResults } from "./references.ts";
 
 /** Expired receipts kept visible after removal. */
@@ -51,15 +51,6 @@ function retryRecord(status: "deferred" | "refused", result: { reason?: string; 
     attemptedAt, nextAttemptAt: attemptedAt + RETRY_DELAY_MS };
 }
 
-/** The member's lines of /status: requested expiries, queued records and everything still awaiting removal. */
-export async function memberResultStatus(reader: DocumentReader, phone: string, context: Context) {
-  const calls = (await reader.snapshot(ResultsDoc, context))?.calls ?? {};
-  const expired = Object.entries(calls).filter(([, call]) => call.phone === phone && call.expiryRequestedAt !== undefined).map(([name]) => name);
-  const backlog = (await reader.snapshot(ReclamationQueues, phone, context))?.count ?? 0;
-  const pending = backlog + Object.values(calls).filter(call => call.phone === phone && call.reclamation !== undefined).length;
-  return { expired, backlog, pending };
-}
-
 export interface ResultMaintenanceOptions {
   context: Context;
   /** Service shutdown: the queue retry stops between items. */
@@ -67,7 +58,7 @@ export interface ResultMaintenanceOptions {
   warn(line: string): void;
 }
 
-/** The caller holds the idle-group gate and the member: no new call can start while a pass deletes. */
+/** The caller holds the idle-space gate and the member: no new call can start while a pass deletes. */
 export class ResultMaintenance {
   constructor(private readonly options: ResultMaintenanceOptions) {}
 

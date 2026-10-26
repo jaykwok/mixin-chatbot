@@ -51,12 +51,13 @@ test("零基数不显示无限增长，下降与持平给出准确比例", () =>
 
 test("每日补零、周月去重、跨群排行、空本期比较与报表脱敏一致", async () => {
   const f = await tempFixture("stats-summary-");
+  const data = join(f.root, "data");
   try {
     const put = async (group: string, user: string, entries: [string, number, string?][]) => {
-      const dir = join(f.root, group, "users", user); await mkdir(dir, { recursive: true });
+      const dir = join(data, group, "users", user); await mkdir(dir, { recursive: true });
       await writeFile(join(dir, "stats.records"), entries.flatMap(([date, count, role = "user"]) => Array.from({ length: count }, () => JSON.stringify({
         type: "message", timestamp: new Date(at(date) + 12 * 3600000).toISOString(),
-        message: { role, content: [{ type: "text", text: "fixture question" }] },
+        message: { role, content: [{ type: "text", text: "fixture question" }], usage: { input: 40, output: 2 } },
       }))).join("\n") + "\n");
     };
     await put("a", "13812345678", [["2026-10-01", 2], ["2026-10-03", 1], ["2026-09-28", 1], ["2025-10-01", 1]]);
@@ -64,53 +65,55 @@ test("每日补零、周月去重、跨群排行、空本期比较与报表脱�
     await put("b", "13912345678", [["2026-10-03", 2]]);
     await put("a", "13712345678", [["2026-10-02", 1, "assistant"]]);
     await put("prior-only", "13612345678", [["2026-09-29", 2]]);
-    const window = range("2026-10-01", "2026-10-03"), groups = await collectAll(f.root, window);
+    const window = range("2026-10-01", "2026-10-03"), groups = await collectAll(data, window);
     const summary = summarize(groups);
     expect(summary.asks).toBe(7); expect(summary.people).toBe(2); expect(summary.average).toBe(3.5);
-    const recent = await loadRecentStats(f.root, 3, at("2026-10-03") + 23 * 3600000);
+    const recent = await loadRecentStats(data, 3, at("2026-10-03") + 23 * 3600000);
     expect(recent.today.people).toBe(2);
-    expect(recent.trend.map(day => day.people)).toEqual([1, 1, 2]);
+    expect(recent.trend.map(day => day.people)).toEqual([1, 0, 2]);
     expect(summary.ranking.map(user => [user.user, user.asks, user.days.size, user.groups.size])).toEqual([
       ["13812345678", 5, 2, 2], ["13912345678", 2, 1, 1],
     ]);
-    expect(trend(groups, window).map(row => [row.date, row.asks, row.askers.size, row.replies])).toEqual([
-      ["2026-10-01", 3, 1, 0], ["2026-10-02", 0, 0, 1], ["2026-10-03", 4, 2, 0],
+    expect(trend(groups, window).map(row => [row.date, row.asks, row.askers.size, row.tokens.totalTokens])).toEqual([
+      ["2026-10-01", 3, 1, 0], ["2026-10-02", 0, 0, 42], ["2026-10-03", 4, 2, 0],
     ]);
     expect(trend(groups, window, "week").map(row => [row.date, row.asks, row.askers.size])).toEqual([["2026-09-28", 7, 2]]);
     expect(trend(groups, window, "month")[0]!.askers.size).toBe(2);
     const activity = engagement(groups, window);
     expect(activity.dailyAverage).toBeCloseTo(7 / 3); expect(activity.activeRate).toBeCloseTo(2 / 3);
     expect(activity.peak?.date).toBe("2026-10-03"); expect(activity.topFiveShare).toBe(1);
-    const comparison = await collectComparisons(f.root, window);
+    const comparison = await collectComparisons(data, window);
     expect(comparisons(comparison).map(row => [row.asks, row.people])).toEqual([[3, 2], [1, 1]]);
     expect(comparisons(comparison, new Set(["a"])).map(row => row.asks)).toEqual([1, 1]);
     const emptyWindow = range("2026-10-04", "2026-10-06");
-    expect(await collectAll(f.root, emptyWindow)).toEqual([]);
+    expect(await collectAll(data, emptyWindow)).toEqual([]);
     expect(trend([], emptyWindow).map(row => row.asks)).toEqual([0, 0, 0]);
-    expect(comparisons(await collectComparisons(f.root, emptyWindow))[0]!.asks).toBe(7);
+    expect(comparisons(await collectComparisons(data, emptyWindow))[0]!.asks).toBe(7);
     const path = await writeReport({ groups, detail: groups[0]!, window, comparisons: comparison,
-      unmasked: false, dir: f.root, deployment: { platform: "linux", runtime: "docker", port: 1011, mode: "direct", domain: "", groupDataRoot: f.root, groupDataRootIsCustom: false } });
+      unmasked: false, dir: data, deployment: { platform: "linux", runtime: "docker", port: 1011, dataRoot: data, workspaceRoot: "" } });
     const html = await Bun.file(path).text();
-    for (const text of ["每日明细", "每周（周一为起点）明细", "每月明细", "2026-10-02", "+133.3%", "覆盖提问人数", "提问高峰日", "前五名提问占比", "138****5678"]) expect(html).toContain(text);
+    for (const text of ["每日明细", "每周（周一为起点）明细", "每月明细", "2026-10-02", "+133.3%", "覆盖提问人数", "提问高峰日", "前五名提问占比", "138****5678", "模型用量", "模型与工具用量"]) expect(html).toContain(text);
+    expect(html).not.toMatch(/金额|\$\d|¥/);
     expect(html).not.toContain("13812345678");
     expect(html).not.toContain("13612345678");
     expect(html).not.toMatch(/(?:src|href)\s*=\s*["']https?:/i);
     const unmaskedPath = await writeReport({ groups, detail: groups.find(group => group.group === "a")!, window, comparisons: comparison,
-      unmasked: true, dir: f.root, deployment: { platform: "linux", runtime: "docker", port: 1011, mode: "direct", domain: "", groupDataRoot: f.root, groupDataRootIsCustom: false } });
+      unmasked: true, dir: data, deployment: { platform: "linux", runtime: "docker", port: 1011, dataRoot: data, workspaceRoot: "" } });
     const unmaskedHtml = await Bun.file(unmaskedPath).text();
     expect(unmaskedHtml).toContain("13812345678");
     expect(unmaskedHtml).not.toContain("13912345678");
+    expect(unmaskedHtml).toContain("unknown/unknown");
     expect(unmaskedHtml.split("群 a · 概况")[0]).not.toContain("13812345678");
     const script = fileURLToPath(new URL("../../scripts/ops/stats-admin.ts", import.meta.url));
-    const cli = await executeProcess({ command: process.execPath, args: [script, "--since", "2026-10-01", "--until", "2026-10-03"], cwd: process.cwd(), env: { ...process.env, GROUP_DATA_ROOT: f.root }, timeoutMs: 30000 });
+    const cli = await executeProcess({ command: process.execPath, args: [script, "--since", "2026-10-01", "--until", "2026-10-03"], cwd: f.root, env: process.env, timeoutMs: 30000 });
     expect(cli.exitCode).toBe(0);
     expect(cli.stdout).toContain("总提问数 7 次 · 覆盖提问人数 2 人");
-    expect(cli.stdout).toContain("2026-10-02  0 次  0 人  1 轮");
+    expect(cli.stdout).toContain("2026-10-02  0 次  0 人  42");
     expect(cli.stdout).toContain("基期 3 次 / 2 人");
     expect(cli.stdout).toContain("138****5678");
     expect(cli.stdout).not.toContain("13812345678");
     expect(cli.stdout).not.toContain("13912345678");
-    const invalid = await executeProcess({ command: process.execPath, args: [script, "--period", "month", "--since", "2026-10-01"], cwd: process.cwd(), env: { ...process.env, GROUP_DATA_ROOT: f.root }, timeoutMs: 30000 });
+    const invalid = await executeProcess({ command: process.execPath, args: [script, "--period", "month", "--since", "2026-10-01"], cwd: f.root, env: process.env, timeoutMs: 30000 });
     expect(invalid.exitCode).toBe(1);
     expect(invalid.stderr).toContain("不能同时使用");
   } finally { await f.cleanup(); }

@@ -1,7 +1,7 @@
 # Bun 运行时镜像
 FROM ghcr.io/astral-sh/uv:0.11.29 AS uv
 FROM docker:29.1.3-cli AS docker_cli
-FROM oven/bun:1.4.3-debian
+FROM oven/bun:1.4.4-debian
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer libreoffice-impress fonts-noto-cjk fonts-liberation && \
     rm -rf /var/lib/apt/lists/*
@@ -27,7 +27,6 @@ RUN bun install --frozen-lockfile --production
 
 # Explicit build inputs prevent local credentials and tool workspaces entering image layers.
 COPY --chown=appuser:appgroup src ./src
-COPY --chown=appuser:appgroup public ./public
 COPY --chown=appuser:appgroup scripts/config ./scripts/config
 COPY --chown=appuser:appgroup scripts/ops/*.ts ./scripts/ops/
 COPY --chown=appuser:appgroup scripts/lib/*.ts ./scripts/lib/
@@ -38,7 +37,7 @@ RUN mkdir -p \
       /app/data/config \
       /app/data/state \
       /app/data/runtime/pi \
-      /app/data/groups \
+      /app/data/workspace \
       /app/data/runtime/tmp \
       /app/backup/snapshots \
       /app/backup/rm \
@@ -48,6 +47,10 @@ RUN mkdir -p \
 
 USER appuser
 ENV TZ=Asia/Shanghai
+
+# 构建标识（构建所用的提交，工作区有改动时带 -dirty）；放在最后，不影响前面各层的缓存。
+ARG APP_BUILD=""
+ENV APP_BUILD=$APP_BUILD
 
 # 健康检查（bun fetch，无需额外装 curl）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

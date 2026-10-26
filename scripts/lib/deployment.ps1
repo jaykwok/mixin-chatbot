@@ -25,27 +25,11 @@ function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
         throw '检测到前台机器人实例。请先停止前台实例，再用部署脚本创建计划任务。'
     }
     $taskXml = if ($task) { Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop } else { $null }
-    $firewall = @()
-    foreach ($rule in @(Get-NetFirewallRule -Group 'mixin-chatbot' -ErrorAction SilentlyContinue)) {
-        $port = $rule | Get-NetFirewallPortFilter -ErrorAction Stop
-        $address = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
-        $firewall += @{
-            Name = $rule.Name; DisplayName = $rule.DisplayName; Group = $rule.Group;
-            Direction = [string]$rule.Direction; Action = [string]$rule.Action; Enabled = [string]$rule.Enabled;
-            Profile = [string]$rule.Profile; Protocol = $port.Protocol; LocalPort = $port.LocalPort;
-            RemotePort = $port.RemotePort; LocalAddress = $address.LocalAddress; RemoteAddress = $address.RemoteAddress
-        }
-    }
-    $connector = New-CloudflaredSnapshot $ProjectRoot $snapshot
-    $tunnel = $connector.Tunnel
-    $cloudConfigPath = $connector.CloudConfigPath
     $state = [pscustomobject]@{
         Project = $ProjectRoot; Path = $snapshot; Paths = $paths; TaskName = $TaskName; TaskXml = $taskXml;
         WasRunning = [bool]($task -and $task.State -eq 'Running');
-        Firewall = $firewall; Tunnel = $tunnel;
-        TunnelManaged = (Test-Path -LiteralPath (Join-Path $ProjectRoot 'data\state\cloudflared-managed'));
         DependenciesMoved = $false; DependenciesAttempted = $false;
-        Lock = $deploymentLock; CloudConfigPath = $cloudConfigPath; PreviousBackupId = $previousBackupId
+        Lock = $deploymentLock; PreviousBackupId = $previousBackupId
     }
     Save-DeploymentSnapshot $state
     return $state
@@ -73,32 +57,26 @@ function Save-DeploymentSnapshot($Snapshot) {
 }
 
 # 部署/升级事务记录：快照目录中的 transaction 文件，与 Linux 同一格式（每行 key=value）。
-# 记录停机前确认的全部选择；续做和回滚只使用记录值，不重新读取默认值。隧道 token 永不写入。
+# 记录停机前确认的全部选择；续做和回滚只使用记录值，不重新读取默认值。凭据永不写入。
 function Get-TransactionKeys {
-    return @('format', 'operation', 'snapshot', 'target_sha', 'original_sha', 'original_branch', 'original_group_root',
-        'target_group_root', 'was_running', 'bot_port', 'deploy_mode', 'bot_domain', 'domain_action', 'unmanaged_tunnel', 'platform_ip', 'reconfigure_ai')
+    return @('format', 'operation', 'snapshot', 'target_sha', 'original_sha', 'original_branch', 'original_workspace_root',
+        'target_workspace_root', 'was_running', 'bot_port', 'reconfigure_ai')
 }
 
 function Test-TransactionValue([string]$Key, [string]$Value) {
     if ($Value -match '[\x00-\x1f\x7f]') { return $false }
     switch -CaseSensitive ($Key) {
-        'format' { return $Value -ceq '1' }
+        'format' { return $Value -ceq '2' }
         'operation' { return $Value -cin @('deploy', 'upgrade') }
         'snapshot' { return $Value -cmatch '^deploy-[A-Za-z0-9]+$' }
         'target_sha' { return $Value -cmatch '^([0-9a-f]{40}|[0-9a-f]{64})?$' }
         'original_sha' { return $Value -cmatch '^([0-9a-f]{40}|[0-9a-f]{64})?$' }
         'original_branch' { return $Value -cmatch '^[^\s~^:?*\[\\]*$' }
-        'original_group_root' { return [IO.Path]::IsPathRooted($Value) }
-        'target_group_root' { return [IO.Path]::IsPathRooted($Value) }
+        'original_workspace_root' { return -not $Value -or [IO.Path]::IsPathRooted($Value) }
+        'target_workspace_root' { return -not $Value -or [IO.Path]::IsPathRooted($Value) }
         'was_running' { return $Value -cin @('0', '1') }
         'reconfigure_ai' { return $Value -cin @('0', '1') }
         'bot_port' { $number = 0; return ($Value -cmatch '^[1-9][0-9]{0,4}$') -and [int]::TryParse($Value, [ref]$number) -and $number -le 65535 }
-        'deploy_mode' { return $Value -cin @('direct', 'cloudflare') }
-        'bot_domain' { return (-not $Value) -or ((ConvertTo-Hostname $Value) -ceq $Value) }
-        'domain_action' { return $Value -cin @('keep', 'persist', 'clear') }
-        'unmanaged_tunnel' { return $Value -cin @('', 'direct', 'cloudflare') }
-        # 直连防火墙放行的来源：IPv4 或 IPv6，可带前缀长度。
-        'platform_ip' { return $Value.Length -le 64 -and $Value -cmatch '^(([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-Fa-f]*:[0-9A-Fa-f:.]*)(/[0-9]{1,3})?$' }
     }
     return $false
 }
@@ -114,7 +92,7 @@ function Write-DeploymentTransaction([string]$Directory, [hashtable]$Record) {
     Save-FileAtomically (Join-Path $Directory 'transaction') { param($temporary) [IO.File]::WriteAllText($temporary, $text, [Text.UTF8Encoding]::new($false)) }.GetNewClosure()
 }
 
-# 当前发布必须有完整记录；格式不匹配时用对应旧版完成原操作。
+# 当前发布必须有完整记录；其他格式的记录（旧版发布）不被识别。
 function Read-DeploymentTransaction([string]$Directory) {
     $path = Join-Path $Directory 'transaction'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw '事务格式不匹配：缺少当前发布记录' }
@@ -131,20 +109,18 @@ function Read-DeploymentTransaction([string]$Directory) {
     return $record
 }
 
-# 已提交部署保存的群根；未保存时为默认 data\groups。
-function Get-SavedGroupDataRoot([string]$ProjectRoot) {
-    $file = Join-Path $ProjectRoot 'data\state\group-data-root'
-    $root = if (Test-Path -LiteralPath $file -PathType Leaf) { "$(Get-Content -LiteralPath $file -Raw)".Trim() } else { '' }
-    if (-not $root) { $root = 'data\groups' }
-    return [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($root)) { $root } else { Join-Path $ProjectRoot $root }))
+# 已提交部署保存的外置共享资料目录（绝对路径）；为空表示默认的 data\workspace。
+function Get-SavedWorkspaceRoot([string]$ProjectRoot) {
+    $file = Join-Path $ProjectRoot 'data\state\workspace-root'
+    if (Test-Path -LiteralPath $file -PathType Leaf) { return "$(Get-Content -LiteralPath $file -Raw)".Trim() }
+    return ''
 }
 
 function Format-DeploymentTransaction($Record) {
     $kind = if ($Record.operation -eq 'upgrade') { '升级' } else { '部署' }
     $state = if ($Record.was_running -eq '1') { '运行' } else { '停止' }
     $sha = if ($Record.target_sha) { $Record.target_sha.Substring(0, 7) } else { '（非 git 部署）' }
-    $entry = if ($Record.deploy_mode -eq 'direct') { "direct（来源 $($Record.platform_ip)）" } else { $Record.deploy_mode }
-    return "未完成的$($kind)：目标提交 $($sha)；群数据总根 $($Record.target_group_root)（原 $($Record.original_group_root)）；端口 $($Record.bot_port)；入口 $($entry)；原运行状态：$($state)"
+    return "未完成的$($kind)：目标提交 $($sha)；共享资料目录 $(if ($Record.target_workspace_root) { $Record.target_workspace_root } else { 'data\workspace' })（原 $(if ($Record.original_workspace_root) { $Record.original_workspace_root } else { 'data\workspace' })）；本机端口 $($Record.bot_port)；原运行状态：$($state)"
 }
 
 # Reopen an interrupted deployment with its original snapshot, lock and recorded choices.
@@ -187,7 +163,7 @@ function Publish-DeploymentTransaction($Snapshot, [hashtable]$Record, [string]$P
 }
 
 # An interrupted upgrade reuses its original snapshot and original running state.
-function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha, [hashtable]$Record = $null, [string]$DataPreparationPlan = '', [string]$Confirmation = '', [string]$Action = '', [string]$ResetConfig = '') {
+function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha, [hashtable]$Record = $null, [string]$DataPreparationPlan = '', [string]$Confirmation = '', [string]$Action = '') {
     $pointer = Join-Path $ProjectRoot 'data\state\upgrade-transaction'
     if (Test-Path -LiteralPath $pointer) {
         $deploymentLock = [IO.File]::Open((Join-Path $ProjectRoot 'data\state\deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -220,7 +196,6 @@ function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$
             Copy-Item -LiteralPath $DataPreparationPlan -Destination (Join-Path $state.Path 'data-plan.json') -ErrorAction Stop
         }
         $name = Split-Path $state.Path -Leaf
-        if ($ResetConfig) { Copy-Item -LiteralPath $ResetConfig -Destination (Join-Path $state.Path 'reset-config') -Recurse -ErrorAction Stop }
         # Create only: never replace the pointer of another unfinished transaction.
         Save-FileAtomically $pointer { param($temporary) [IO.File]::WriteAllText($temporary, $name) }.GetNewClosure() -CreateOnly
         return $state
@@ -463,7 +438,6 @@ function Save-DeploymentDependencies($Snapshot) {
 function Restore-DeploymentSnapshot($Snapshot) {
     $root = $Snapshot.Project
     if (-not (Stop-ProjectBot $root $Snapshot.TaskName -KeepDisabled)) { throw '新进程尚未停止，拒绝覆盖运行中的配置或依赖' }
-    Restore-CloudflaredSnapshot $Snapshot -DeferStart
     Restore-DeploymentFiles $root $Snapshot.Path $Snapshot.Paths
     if ($Snapshot.DependenciesAttempted) {
         if ($Snapshot.DependenciesMoved) {
@@ -475,101 +449,11 @@ function Restore-DeploymentSnapshot($Snapshot) {
             } elseif (-not (Test-Path -LiteralPath (Join-Path $root 'node_modules'))) { throw '原依赖及其备份都缺失' }
         } else { Move-ToProjectArchive (Join-Path $root 'node_modules') $root }
     }
-    foreach ($rule in @(Get-NetFirewallRule -Group 'mixin-chatbot' -ErrorAction SilentlyContinue)) {
-        if ($Snapshot.Firewall.Name -notcontains $rule.Name) { $rule | Remove-NetFirewallRule -ErrorAction Stop }
-    }
-    foreach ($parameters in $Snapshot.Firewall) {
-        if (-not (Get-NetFirewallRule -Name $parameters.Name -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule @parameters -ErrorAction Stop | Out-Null
-        }
-    }
     if ($Snapshot.TaskXml) {
         Register-ScheduledTask -TaskName $Snapshot.TaskName -Xml $Snapshot.TaskXml -Force -ErrorAction Stop | Out-Null
     } elseif (Get-ScheduledTask -TaskName $Snapshot.TaskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $Snapshot.TaskName -Confirm:$false -ErrorAction Stop
     }
-    if ($Snapshot.Tunnel -and $Snapshot.Tunnel.Started) { Start-Service Cloudflared -ErrorAction Stop }
     if ($Snapshot.WasRunning) { Start-ScheduledTask -TaskName $Snapshot.TaskName -ErrorAction Stop }
-    Write-Warning '已恢复配置、启动定义、依赖、网络入口和原运行状态；回滚快照保留在 backup/snapshots。'
-}
-
-# Snapshot the service, project token and any ProgramData configuration for rollback.
-function New-CloudflaredSnapshot([string]$ProjectRoot, [string]$Directory = '') {
-    $previousBackupId = $env:BOT_DEPLOY_BACKUP_ID
-    try {
-    if (-not $Directory) {
-        $Directory = New-TransactionSnapshotPath $ProjectRoot 'tunnel-'
-        $env:BOT_DEPLOY_BACKUP_ID = Split-Path $Directory -Leaf
-    }
-    New-Item -ItemType Directory -Force -Path $Directory | Out-Null
-    Protect-ProjectSecretPath $Directory
-    $tunnel = Get-CimInstance Win32_Service -Filter "Name='Cloudflared'" -ErrorAction SilentlyContinue
-    $marker = Join-Path $ProjectRoot 'data\state\cloudflared-managed'
-    $managed = Test-Path -LiteralPath $marker
-    $configPath = Join-Path $env:ProgramData 'cloudflared'
-    $projectToken = Join-Path $ProjectRoot 'data\config\cloudflared-token'
-    if (Test-Path -LiteralPath $projectToken -PathType Leaf) {
-        Copy-Item -LiteralPath $projectToken -Destination (Join-Path $Directory 'project-cloudflared-token') -ErrorAction Stop
-    }
-    if ($managed) { Copy-Item -LiteralPath $marker -Destination (Join-Path $Directory 'cloudflared-managed') -ErrorAction Stop }
-    if (($managed -or -not $tunnel) -and (Test-Path -LiteralPath $configPath)) {
-        Copy-Item -LiteralPath $configPath -Destination (Join-Path $Directory 'cloudflared-config') -Recurse -ErrorAction Stop
-        Get-Acl -LiteralPath $configPath | Export-Clixml -LiteralPath (Join-Path $Directory 'cloudflared-acl.xml')
-    }
-    $state = [pscustomobject]@{ Project = $ProjectRoot; Path = $Directory; Tunnel = $tunnel; TunnelManaged = $managed; CloudConfigPath = $configPath; PreviousBackupId = $previousBackupId }
-    $state | Export-Clixml -LiteralPath (Join-Path $Directory 'tunnel.xml')
-    return $state
-    } catch { $env:BOT_DEPLOY_BACKUP_ID = $previousBackupId; throw }
-}
-
-function Restore-CloudflaredSnapshot($Snapshot, [switch]$DeferStart) {
-    $root = $Snapshot.Project
-    # Revert connector state before restoring its ownership marker.
-    $currentTunnel = Get-Service -Name Cloudflared -ErrorAction SilentlyContinue
-    if ($Snapshot.TunnelManaged -and $Snapshot.Tunnel) {
-        if ($currentTunnel -and $currentTunnel.Status -ne 'Stopped') { Stop-Service Cloudflared -ErrorAction Stop }
-        $startup = switch ($Snapshot.Tunnel.StartMode) { 'Auto' { 'Automatic' } 'Disabled' { 'Disabled' } default { 'Manual' } }
-        if ($currentTunnel) {
-            Set-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\Cloudflared' -Name ImagePath -Value $Snapshot.Tunnel.PathName
-            Set-Service Cloudflared -StartupType $startup -ErrorAction Stop
-        } else {
-            New-Service -Name Cloudflared -BinaryPathName $Snapshot.Tunnel.PathName -StartupType $startup -ErrorAction Stop | Out-Null
-        }
-    } elseif (-not $Snapshot.Tunnel -and $currentTunnel -and (Test-Path -LiteralPath (Join-Path $root 'data\state\cloudflared-managed'))) {
-        Stop-Service Cloudflared -ErrorAction Stop
-        & "$env:SystemRoot\System32\sc.exe" delete Cloudflared | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw '清理本次新装的 Cloudflared 服务失败' }
-    } elseif ($Snapshot.Tunnel -and $currentTunnel -and -not $Snapshot.Tunnel.Started -and $currentTunnel.Status -ne 'Stopped') {
-        Stop-Service Cloudflared -ErrorAction Stop
-    }
-    if ($Snapshot.TunnelManaged -or -not $Snapshot.Tunnel) {
-        $projectToken = Join-Path $root 'data\config\cloudflared-token'
-        Move-ToProjectArchive $projectToken $root
-        $savedProjectToken = Join-Path $Snapshot.Path 'project-cloudflared-token'
-        if (Test-Path -LiteralPath $savedProjectToken -PathType Leaf) {
-            New-Item -ItemType Directory -Force -Path (Split-Path $projectToken -Parent) | Out-Null
-            Copy-Item -LiteralPath $savedProjectToken -Destination $projectToken -ErrorAction Stop
-            Protect-ProjectSecretPath $projectToken
-        }
-        Move-ToProjectArchive $Snapshot.CloudConfigPath $root $Snapshot.CloudConfigPath
-        $savedCloudConfig = Join-Path $Snapshot.Path 'cloudflared-config'
-        if (Test-Path -LiteralPath $savedCloudConfig) {
-            Copy-Item -LiteralPath $savedCloudConfig -Destination $Snapshot.CloudConfigPath -Recurse -ErrorAction Stop
-            if (Test-Path -LiteralPath (Join-Path $Snapshot.Path 'cloudflared-acl.xml')) {
-                $acl = Import-Clixml -LiteralPath (Join-Path $Snapshot.Path 'cloudflared-acl.xml')
-                $security = Get-Acl -LiteralPath $Snapshot.CloudConfigPath
-                $security.SetSecurityDescriptorSddlForm($acl.Sddl, [Security.AccessControl.AccessControlSections]::Access)
-                Set-ProjectAcl $Snapshot.CloudConfigPath $security
-                Get-ChildItem -LiteralPath $Snapshot.CloudConfigPath -File -Recurse | ForEach-Object { Protect-ProjectSecretPath $_.FullName }
-            }
-        }
-    }
-
-    $marker = Join-Path $root 'data\state\cloudflared-managed'
-    Move-ToProjectArchive $marker $root
-    if ($Snapshot.TunnelManaged) {
-        New-Item -ItemType Directory -Force -Path (Split-Path $marker -Parent) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $Snapshot.Path 'cloudflared-managed') -Destination $marker -ErrorAction Stop
-    }
-    if (-not $DeferStart -and $Snapshot.Tunnel -and $Snapshot.Tunnel.Started) { Start-Service Cloudflared -ErrorAction Stop }
+    Write-Warning '已恢复配置、启动定义、依赖和原运行状态；回滚快照保留在 backup/snapshots。'
 }

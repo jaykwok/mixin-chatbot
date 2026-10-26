@@ -2,11 +2,13 @@ import { afterAll, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { GroupHarnesses, groupDatabasePath } from "../../src/durable/groups.ts";
+import { SpaceHarnesses } from "../../src/durable/spaces.ts";
 import { IdentityDoc, MemberDirectory } from "../../src/durable/identity.ts";
 import { openGroupDatabase } from "../../src/durable/sqlite.ts";
 import { fauxModels, harnessOptions } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { databaseOf, scopeOf } from "../helpers/layout.ts";
+import { appLayout } from "../../src/core/layout.ts";
 
 const fixture = await tempFixture("durable-kill-");
 afterAll(() => fixture.cleanup());
@@ -18,16 +20,17 @@ import { BACKGROUND_CONTEXT } from ${resolve("@earendil-works/chord/context")};
 import { createModels } from ${resolve("@earendil-works/pi-ai")};
 import { fauxProvider } from ${resolve("@earendil-works/pi-ai/providers/faux")};
 import { createRegistry } from ${resolve("@earendil-works/pi-durable")};
-import { GroupHarnesses } from ${resolve("../../src/durable/groups.ts")};
+import { SpaceHarnesses } from ${resolve("../../src/durable/spaces.ts")};
+import { appLayout, groupScope } from ${resolve("../../src/core/layout.ts")};
 import { memberConversation } from ${resolve("../../src/durable/identity.ts")};
 const faux = fauxProvider();
 const models = createModels();
 models.setProvider(faux.provider);
 const model = { provider: faux.getModel().provider, modelId: faux.getModel().id };
-const groups = new GroupHarnesses({ root: process.argv[2], harnessOptions: () => ({ models, registry: createRegistry() }) });
-const { harness } = await groups.acquire("kill-group");
+const groups = new SpaceHarnesses({ layout: appLayout(process.argv[2]), harnessOptions: () => ({ models, registry: createRegistry() }) });
+const { harness } = await groups.acquire(groupScope("kill-group"));
 for (let i = 1; ; i++) {
-  await memberConversation(harness, "kill-group", "member-" + i, { model }, BACKGROUND_CONTEXT);
+  await memberConversation(harness, groupScope("kill-group"), "member-" + i, { model }, BACKGROUND_CONTEXT);
   process.stdout.write("ack " + i + "\\n");
 }
 `;
@@ -35,7 +38,7 @@ for (let i = 1; ; i++) {
 test("a force-killed writer leaves an intact database with every acknowledged commit", async () => {
   const script = join(fixture.root, "writer.ts");
   await writeFile(script, child);
-  const root = join(fixture.root, "groups");
+  const root = join(fixture.root, "data");
   const process_ = Bun.spawn([process.execPath, script, root], { stdout: "pipe", stderr: "pipe", windowsHide: true });
   let acked = 0;
   let buffer = "";
@@ -54,19 +57,19 @@ test("a force-killed writer leaves an intact database with every acknowledged co
   reader.releaseLock();
   expect(process_.signalCode ?? process_.exitCode).not.toBe(0);
 
-  const path = groupDatabasePath(root, "kill-group");
+  const path = databaseOf(root, "kill-group");
   const db = await openGroupDatabase(path);
   try { expect(await db.get("PRAGMA integrity_check")).toEqual({ integrity_check: "ok" }); }
   finally { await db.close(); }
 
-  const groups = new GroupHarnesses({ root, harnessOptions: harnessOptions(fauxModels().models) });
+  const groups = new SpaceHarnesses({ layout: appLayout(root), harnessOptions: harnessOptions(fauxModels().models) });
   try {
-    const { harness, release } = await groups.acquire("kill-group");
+    const { harness, release } = await groups.acquire(scopeOf("kill-group"));
     for (let i = 1; i <= acked; i++) {
       const member = await harness.snapshot(MemberDirectory, `member-${i}`, BACKGROUND_CONTEXT);
       expect(member?.conversationId).toBeGreaterThan(0);
       expect(await harness.snapshot(IdentityDoc, member!.conversationId as never, BACKGROUND_CONTEXT))
-        .toEqual({ groupId: "kill-group", phone: `member-${i}`, version: 1 });
+        .toEqual({ space: "group:kill-group", phone: `member-${i}`, version: 1 });
     }
     console.log(`force kill after ${acked} acknowledged commits: integrity ok, all present`);
     release();

@@ -1,7 +1,7 @@
 // S3 Signature V4 comes from Bun; HTTP stays here so cancellation covers every request.
 import { readFileSync } from "node:fs";
 import { S3Client } from "bun";
-import { MAX_ATTACHMENT_BYTES, RELAY_HTTP_TIMEOUT, RELAY_PROBE_TIMEOUT } from "../core/transfer-limits.ts";
+import { NATIVE_FILE_MAX_BYTES, RELAY_HTTP_TIMEOUT, RELAY_PROBE_TIMEOUT } from "../core/transfer-limits.ts";
 
 export interface RelayConfig {
   provider: "s3";
@@ -75,8 +75,8 @@ export function validateRelayConfig(doc: unknown, path = "data/config/relay.json
   }
   const maxBytes = f.maxBytes === undefined ? DEFAULT_RELAY_MAX_BYTES : f.maxBytes;
   // Single PUT is intentionally bounded: no multipart uploads to strand or abort on another API.
-  if (typeof maxBytes !== "number" || !Number.isSafeInteger(maxBytes) || maxBytes <= MAX_ATTACHMENT_BYTES || maxBytes > 5 * 1024 ** 3) {
-    throw new Error(`${path} 的 maxBytes 必须是大于 ${MAX_ATTACHMENT_BYTES} 且不超过 5 GiB 的整数`);
+  if (typeof maxBytes !== "number" || !Number.isSafeInteger(maxBytes) || maxBytes <= NATIVE_FILE_MAX_BYTES || maxBytes > 5 * 1024 ** 3) {
+    throw new Error(`${path} 的 maxBytes 必须是大于 ${NATIVE_FILE_MAX_BYTES} 且不超过 5 GiB 的整数`);
   }
   const expireHours = f.expireHours === undefined ? DEFAULT_RELAY_EXPIRE_HOURS : f.expireHours;
   if (typeof expireHours !== "number" || !Number.isFinite(expireHours) || expireHours * 3600 < 1 || expireHours > 168) {
@@ -129,11 +129,14 @@ export function storedObjectUrl(config: RelayConfig, objectName: string): string
   return url.href;
 }
 
+/** A stored link that can no longer be sent: retrying does not help, the file has to be sent again. */
+export class LinkUnavailable extends Error {}
+
 export function downloadUrl(config: RelayConfig, storedUrl: string, expiresAt: string): string {
   const objectName = objectNameFromUrl(config, storedUrl);
-  if (!objectName) throw new Error("外链账本与当前 S3 后端不匹配，记录已保留");
+  if (!objectName) throw new LinkUnavailable("外链账本与当前 S3 后端不匹配");
   const seconds = Math.min(604800, Math.floor(Date.parse(expiresAt) / 1000) - Math.floor(Date.now() / 1000));
-  if (!(seconds >= 1)) throw new Error("附件下载链接已过期，待补发记录已保留，请重新发送文件");
+  if (!(seconds >= 1)) throw new LinkUnavailable("附件下载链接已过期，请重新发送文件");
   return signed(config, objectName, "GET", seconds);
 }
 

@@ -2,7 +2,7 @@ import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import { stateDatabase } from "../core/state.ts";
-import { groupSegment, userSegment } from "./paths.ts";
+import { groupSegment, scopeKey, spaceTmp, userSegment, userTmp, type Layout, type Scope } from "../core/layout.ts";
 const initialized = new WeakSet<Database>();
 
 /** Lists the parent on every call. A directory's stat stamp is not proof its entries are unchanged: on Windows it often
@@ -16,19 +16,24 @@ async function checkExistingSpelling(parent: string, segment: string): Promise<v
 }
 
 /** Keep existing readable paths, while refusing aliases even after a service restart. */
-export async function ensureStorageIdentity(root: string, groupId: string, phone: string, db: Database = stateDatabase()): Promise<void> {
-  const group = groupSegment(groupId);
+export async function ensureStorageIdentity(layout: Pick<Layout, "conversations" | "tmp">, scope: Scope, phone: string,
+  db: Database = stateDatabase()): Promise<void> {
   const user = userSegment(phone);
-  await checkExistingSpelling(root, group);
-  await checkExistingSpelling(join(root, group, "users"), user);
+  if (scope.kind === "group") {
+    const group = groupSegment(scope.groupId);
+    await checkExistingSpelling(join(layout.conversations, "groups"), group);
+    await checkExistingSpelling(join(layout.tmp, "groups"), group);
+  }
+  await checkExistingSpelling(spaceTmp(layout, scope), user);
   if (!initialized.has(db)) {
     db.exec("CREATE TABLE IF NOT EXISTS storage_identity (path TEXT PRIMARY KEY COLLATE NOCASE, identity TEXT NOT NULL)");
     initialized.add(db);
   }
+  const space = scopeKey(scope);
   db.transaction(() => {
     for (const [path, identity] of [
-      [resolve(root, group), groupId],
-      [resolve(root, group, "users", user), JSON.stringify([groupId, phone])],
+      [resolve(spaceTmp(layout, scope)), space],
+      [resolve(userTmp(layout, scope, phone)), JSON.stringify([space, phone])],
     ]) {
       const existing = db.query("SELECT identity FROM storage_identity WHERE path = ?").get(path) as { identity: string } | null;
       if (existing && existing.identity !== identity) throw new Error("群/用户标识映射到已有数据目录，已拒绝读取和写入");

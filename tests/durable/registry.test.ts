@@ -1,6 +1,6 @@
 // The group registry (D2-4, src/durable/registry.ts): the system prompt against the AgentSession engine's, the tool
 // catalogue, what scripts may call, module selection, and the send and document tools run for the calling member.
-// Faux models and a fake IM endpoint (globalThis.fetch); no network, no Python.
+// Faux models and a recording outbound; no network, no Python.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -14,15 +14,18 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import type { Conversation, Extension } from "@earendil-works/pi-durable";
 import { buildLocalTools } from "../helpers/native-tools.ts";
 import { type AgentModuleDefinition, loadModuleDefinitions } from "../../src/agent/modules.ts";
-import { groupWorkspaceDir } from "../../src/agent/paths.ts";
 import { buildChatContext } from "../../src/agent/prompt.ts";
-import { createOutboundNotes } from "../helpers/outbound-notes.ts";
+import { recordingOutbound } from "../helpers/recording-outbound.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
-import { groupExtensions } from "../../src/durable/registry.ts";
-import { memberPlaces, type Member } from "../../src/durable/tools.ts";
+import { InboxDoc } from "../../src/durable/inbox.ts";
+import { recordsOf } from "../../src/durable/records.ts";
+import { spaceExtensions } from "../../src/durable/registry.ts";
+import { memberPlaces } from "../../src/durable/tools.ts";
 import type { RelayConfig } from "../../src/integrations/relay.ts";
 import { type GroupHarness, openGroupHarness } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
+import { appLayout, groupScope } from "../../src/core/layout.ts";
 
 const fixture = await tempFixture("durable-registry-");
 afterAll(() => fixture.cleanup());
@@ -34,7 +37,6 @@ const RELAY: RelayConfig = {
   accessKeyId: "bot", secretAccessKey: "secret", prefix: "relay/", forcePathStyle: false,
   maxBytes: 2 * 1024 ** 3, expireHours: 2, cleanupGraceMinutes: 30,
 };
-const callback = (phone: string) => `https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=key-${phone.slice(-1)}`;
 
 const [documentWork] = await loadModuleDefinitions({ documentWorkEnabled: true }) as [AgentModuleDefinition];
 let counter = 0;
@@ -45,7 +47,7 @@ type Group = {
   model: { provider: string; modelId: string };
   root: string;
   extensions: Extension[];
-  notes: Map<string, ReturnType<typeof createOutboundNotes>>;
+  out: ReturnType<typeof recordingOutbound>;
 };
 
 async function openGroup(options: { modules?: readonly AgentModuleDefinition[]; relay?: RelayConfig | null } = {}): Promise<Group> {
@@ -55,28 +57,29 @@ async function openGroup(options: { modules?: readonly AgentModuleDefinition[]; 
   models.setProvider(faux.provider);
   const model = faux.getModel();
   const root = join(fixture.root, `群数据-${n}`);
-  const notes = new Map<string, ReturnType<typeof createOutboundNotes>>();
-  const extensions = groupExtensions({
-    root, groupId: GROUP, modules: options.modules ?? [documentWork], relay: options.relay ?? null,
-    delivery: {
-      callbackUrl: (member: Member) => callback(member.phone),
-      notes: (member: Member) => {
-        const existing = notes.get(member.phone);
-        if (existing) return existing;
-        const created = createOutboundNotes();
-        notes.set(member.phone, created);
-        return created;
-      },
-    },
+  const out = recordingOutbound();
+  const extensions = spaceExtensions({
+    layout: appLayout(root), scope: groupScope(GROUP), modules: options.modules ?? [documentWork], relay: options.relay ?? null, outbound: out.outbound,
   });
   const opened = await openGroupHarness(join(fixture.root, `db-${n}.sqlite`), models, {
     group: GROUP, extensions, settings: { retry: { baseDelayMs: 5, maxAgentDelayMs: 20 } },
   });
-  return { opened, faux, model: { provider: model.provider, modelId: model.id }, root, extensions, notes };
+  return { opened, faux, model: { provider: model.provider, modelId: model.id }, root, extensions, out };
 }
 
 async function member(group: Group, phone = ALICE): Promise<Conversation> {
-  return (await memberConversation(group.opened.harness, GROUP, phone, { model: group.model }, context)).conversation;
+  return (await memberConversation(group.opened.harness, scopeOf(GROUP), phone, { model: group.model }, context)).conversation;
+}
+
+/** Put a started request with its run record at the head of the member's inbox, as the service's worker would. */
+async function activate(group: Group, conversation: Conversation, phone: string): Promise<string> {
+  const { reply } = group.out.message(GROUP, phone, "发文件");
+  const requestId = `msg:${crypto.randomUUID()}`, now = Date.now();
+  await group.opened.harness.commit(async tx => {
+    (await tx.doc(InboxDoc, conversation.id)).items = [{ requestId, content: "发文件", receivedAt: now, startedAt: now }];
+    (await recordsOf(tx, phone)).requests[requestId] = { requestId, reply, createdAt: now, notes: [], deliverables: [], files: [], events: {} };
+  }, context);
+  return reply.msgUid;
 }
 
 /** `prompt` without the official codemode section (pi-durable/codemode), which `section` holds. */
@@ -122,7 +125,7 @@ async function call(group: Group, conversation: Conversation, name: string, args
 
 /** The AgentSession engine's prompt for the same group and member (src/agent/session-factory.ts wiring). */
 async function agentSessionPrompt(root: string, modules: readonly AgentModuleDefinition[], relayEnabled: boolean): Promise<Seen> {
-  const places = memberPlaces({ root }, GROUP, ALICE);
+  const places = memberPlaces({ layout: appLayout(root) }, groupScope(GROUP), ALICE);
   for (const dir of [places.workspaceDir, places.tempDir]) await mkdir(dir, { recursive: true });
   const runtime = await ModelRuntime.create({ modelsPath: null, credentials: new InMemoryCredentialStore(),
     modelsStore: new InMemoryModelsStore(), refreshOnCreate: false });
@@ -140,7 +143,7 @@ async function agentSessionPrompt(root: string, modules: readonly AgentModuleDef
     appendSystemPromptOverride: () => [],
   });
   await resourceLoader.reload();
-  const customTools = await buildLocalTools({ workspaceDir: places.workspaceDir, tempDir: places.tempDir, phone: ALICE, groupId: GROUP,
+  const customTools = await buildLocalTools({ workspaceDir: places.workspaceDir, tempDir: places.tempDir, phone: ALICE, scope: groupScope(GROUP),
     venvDir: places.venvDir, materialsIndexPath: places.indexPath, resourceReadDirs: module?.readOnlyDirs ?? [] });
   const { session } = await createAgentSession({
     cwd: places.workspaceDir, agentDir, modelRuntime: runtime, model: faux.getModel(), thinkingLevel: "off",
@@ -170,7 +173,7 @@ describe("Durable group registry", () => {
         // The pieces, so a difference is readable: the project prompt, the skill list, the group workspace.
         expect(durable.prompt.startsWith(buildChatContext({ relayEnabled: relay !== null, ...(modules.length ? { modulePrompt: documentWork.prompt } : {}) }))).toBe(true);
         expect(durable.prompt.includes("<skills>")).toBe(modules.length > 0);
-        expect(durable.prompt.endsWith(`<cwd>\n${resolve(groupWorkspaceDir(group.root, GROUP)).replace(/\\/g, "/")}\n</cwd>`)).toBe(true);
+        expect(durable.prompt.endsWith(`<cwd>\n${resolve(appLayout(group.root).workspace).replace(/\\/g, "/")}\n</cwd>`)).toBe(true);
         expect(durable.prompt).not.toContain("Guidelines:");
         expect(durable.prompt).not.toContain("expert coding assistant");
         // The Durable engine appends the official codemode section: the tools scripts can call, never the send tools.
@@ -222,40 +225,31 @@ describe("Durable group registry", () => {
     } finally { await group.opened.close(); }
   });
 
-  test("send_file sends from the caller's tmp to the caller's callback and refuses another member's tmp", async () => {
+  test("send_file sends from the caller's tmp to the caller's own request and refuses another member's tmp", async () => {
     const group = await openGroup();
-    const originalFetch = globalThis.fetch;
-    const requests: string[] = [];
-    globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
-      const url = String(input);
-      requests.push(url);
-      return new Response(JSON.stringify({ ok: true, code: 200, data: { id: `file-${requests.length}` } }), {
-        status: 200, headers: { "Content-Type": "application/json" },
-      });
-    }) as unknown as typeof fetch;
     try {
       const [alice, bob] = [await member(group, ALICE), await member(group, BOB)];
-      const own = memberPlaces({ root: group.root }, GROUP, ALICE), other = memberPlaces({ root: group.root }, GROUP, BOB);
+      const own = memberPlaces({ layout: appLayout(group.root) }, groupScope(GROUP), ALICE), other = memberPlaces({ layout: appLayout(group.root) }, groupScope(GROUP), BOB);
       await mkdir(other.tempDir, { recursive: true });
       await writeFile(join(other.tempDir, "bob.txt"), "Bob 的草稿");
       // Alice's tmp exists once her first call resolved her places.
       await call(group, alice, "read", { path: join(own.workspaceDir, "absent.txt") });
       await writeFile(join(own.tempDir, "报告.txt"), "Alice 的报告");
+      const aliceMessage = await activate(group, alice, ALICE);
       const sent = await call(group, alice, "send_file", { source: join(own.tempDir, "报告.txt") });
       expect(sent).toMatchObject({ isError: false, text: "已发送文件: 报告.txt" });
-      expect(requests.length).toBe(2);
-      expect(requests.every((url) => url.startsWith("https://imtwo.zdxlz.com/"))).toBe(true);
-      expect(requests[1]).toBe(callback(ALICE));
-      requests.length = 0;
+      expect(group.out.sent.map(({ kind, text, phone, space, msgUid }) => ({ kind, text, phone, space, msgUid })))
+        .toEqual([{ kind: "file", text: "报告.txt", phone: ALICE, space: GROUP, msgUid: aliceMessage }]);
+      group.out.sent.length = 0;
       const refused = await call(group, alice, "send_file", { source: join(other.tempDir, "bob.txt") });
-      expect(refused).toMatchObject({ isError: true, text: "只能发送本群 workspace 或当前调用用户 tmp 目录内的文件" });
-      expect(requests).toEqual([]);
-      // Bob sends his own file to his own callback.
+      expect(refused).toMatchObject({ isError: true, text: "只能发送共享资料 workspace 或当前调用用户 tmp 目录内的文件" });
+      expect(group.out.sent).toEqual([]);
+      // Bob's file goes to Bob's own request.
+      const bobMessage = await activate(group, bob, BOB);
       const bobs = await call(group, bob, "send_file", { source: join(other.tempDir, "bob.txt") });
       expect(bobs.isError).toBe(false);
-      expect(requests[1]).toBe(callback(BOB));
+      expect(group.out.sent.map(item => [item.phone, item.msgUid])).toEqual([[BOB, bobMessage]]);
     } finally {
-      globalThis.fetch = originalFetch;
       await group.opened.close();
     }
   });
@@ -264,12 +258,12 @@ describe("Durable group registry", () => {
     const group = await openGroup();
     try {
       const alice = await member(group, ALICE);
-      const other = memberPlaces({ root: group.root }, GROUP, BOB);
+      const other = memberPlaces({ layout: appLayout(group.root) }, groupScope(GROUP), BOB);
       await mkdir(other.tempDir, { recursive: true });
       await writeFile(join(other.tempDir, "bob.docx"), "not a real document");
       const refused = await call(group, alice, "document_extract", { source: join(other.tempDir, "bob.docx") });
-      expect(refused).toMatchObject({ isError: true, text: "只能解析本群 workspace 或当前用户 tmp 中的文档" });
-      const own = memberPlaces({ root: group.root }, GROUP, ALICE);
+      expect(refused).toMatchObject({ isError: true, text: "只能解析共享资料 workspace 或当前用户 tmp 中的文档" });
+      const own = memberPlaces({ layout: appLayout(group.root) }, groupScope(GROUP), ALICE);
       await writeFile(join(own.tempDir, "notes.txt"), "plain");
       const unsupported = await call(group, alice, "document_extract", { source: join(own.tempDir, "notes.txt") });
       expect(unsupported).toMatchObject({ isError: true, text: "仅支持 PDF、DOCX、PPTX、XLSX；扫描件需要 OCR" });

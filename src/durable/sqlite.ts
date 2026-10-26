@@ -3,6 +3,7 @@
 // the per-connection queue stays held until the native COMMIT/ROLLBACK acknowledgement. Close releases native handles
 // before acknowledging and the last connection waits for natural worker exit. The storage algorithm is not forked.
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { assertDurableSchema } from "./schema-gate.ts";
 import { sqliteClient, type SqliteWorkerLost } from "./sqlite-client.ts";
 import { BunSqliteDatabase } from "./sqlite-facade.ts";
 export { BunSqliteDatabase } from "./sqlite-facade.ts";
@@ -12,13 +13,16 @@ const WAL_AUTOCHECKPOINT_PAGES = 1_000;
 const SYNCHRONOUS_FULL = 2;
 const ignore = (): void => {};
 
-/** WAL/FULL on every open, including a rolled-back page-write probe for silently read-only SQLite opens. */
+/** WAL/FULL on every open, including a rolled-back page-write probe for silently read-only SQLite opens. First, before
+ * anything is written: an existing database of another Durable schema is refused before the official open could
+ * migrate it (schema-gate.ts). */
 export async function openGroupDatabase(path: string, onFailure?: (error: SqliteWorkerLost) => void): Promise<BunSqliteDatabase> {
   let adapter: BunSqliteDatabase | undefined;
   try {
     const client = sqliteClient();
     adapter = new BunSqliteDatabase(client, await client.open(path, onFailure));
     await adapter.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    await assertDurableSchema(adapter, path);
     await adapter.exec("PRAGMA journal_mode = WAL");
     await adapter.exec("PRAGMA synchronous = FULL");
     await adapter.exec(`PRAGMA wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`);
@@ -31,11 +35,11 @@ export async function openGroupDatabase(path: string, onFailure?: (error: Sqlite
       await adapter.exec("BEGIN IMMEDIATE");
       try { await adapter.exec(`PRAGMA user_version = ${user_version}`); }
       finally { await adapter.exec("ROLLBACK"); }
-    } catch (error) { throw new Error("群数据库不可写（只读文件或只读挂载）", { cause: error }); }
+    } catch (error) { throw new Error("会话库不可写（只读文件或只读挂载）", { cause: error }); }
     return adapter;
   } catch (error) {
     await adapter?.close().catch(ignore);
-    throw new Error(`无法打开群数据库：${path}：${(error as Error).message}`, { cause: error });
+    throw new Error(`无法打开会话库：${path}：${(error as Error).message}`, { cause: error });
   }
 }
 

@@ -10,7 +10,7 @@ const cases = [
 test.each(cases)("document tool results follow one structured protocol ($kind)", async ({ kind, script, marker }) => {
   const fixture = await tempFixture("document-" + kind + "-");
   const child = Bun.spawn([process.execPath, fileURLToPath(script)], {
-    cwd: fixture.root, env: { ...process.env, GROUP_DATA_ROOT: "data/groups", BOT_DEPLOY_BACKUP_ID: undefined },
+    cwd: fixture.root, env: { ...process.env, BOT_DEPLOY_BACKUP_ID: undefined },
     stdout: "pipe", stderr: "pipe", windowsHide: true,
   });
   const timer = setTimeout(() => child.kill(), 40000);

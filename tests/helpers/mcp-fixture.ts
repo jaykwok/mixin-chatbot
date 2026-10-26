@@ -19,7 +19,7 @@ if (process.argv[2] === "descendant") {
     if (request.method === "initialize") result = { protocolVersion: request.params.protocolVersion, serverInfo: { name: "synthetic", version: "1" }, capabilities: { tools: {} } };
     else if (request.method === "tools/list") result = { tools: [{ name: "echo", description: "synthetic echo", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } }] };
     else if (request.method === "tools/call") result = { content: [{ type: "text", text: JSON.stringify({ args: request.params.arguments,
-      group: process.env.MIXIN_GROUP_ID, phone: process.env.MIXIN_MEMBER_PHONE, cwd: process.cwd(), secret: process.env.MIXIN_TEST_AMBIENT_SECRET ?? null }) }] };
+      chat: process.env.MIXIN_CHAT_KIND, group: process.env.MIXIN_GROUP_ID, phone: process.env.MIXIN_MEMBER_PHONE, cwd: process.cwd(), secret: process.env.MIXIN_TEST_AMBIENT_SECRET ?? null }) }] };
     else { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "unknown method" } }) + "\n"); return; }
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n");
   });

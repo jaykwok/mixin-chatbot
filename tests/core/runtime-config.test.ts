@@ -10,14 +10,14 @@ test("runtime settings retain previous values and validate explicit overrides", 
   const path = join(fixture.root, "runtime.json");
   try {
     await writeFile(path, JSON.stringify({ BOT_BASH_TIMEOUT: 123, BOT_INDEX_MAX_DEPTH: 4 }));
-    await saveRuntimeSettings(path, { BOT_BASH_TIMEOUT: "456", BOT_DEBUG: "1", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "240", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "540", API_KEY: "must-not-copy" });
-    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ BOT_BASH_TIMEOUT: "456", BOT_INDEX_MAX_DEPTH: "4", BOT_DEBUG: "1", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "240", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "540" });
-    await saveRuntimeSettings(path, { BOT_DEBUG: "0" });
+    await saveRuntimeSettings(path, { BOT_BASH_TIMEOUT: "456", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "240", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "540", API_KEY: "must-not-copy" });
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ BOT_BASH_TIMEOUT: "456", BOT_INDEX_MAX_DEPTH: "4", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_MODEL_IDLE_TIMEOUT_SECONDS: "240", BOT_MODEL_RESPONSE_TIMEOUT_SECONDS: "540" });
+    await saveRuntimeSettings(path, { BOT_DOCUMENT_WORK_ENABLED: "0" });
     await saveRuntimeSettings(path, { BOT_DOCUMENT_WORK_ENABLED: "0" });
     expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_DOCUMENT_WORK_ENABLED", "0");
     expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_MODEL_IDLE_TIMEOUT_SECONDS", "240");
     expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_MODEL_RESPONSE_TIMEOUT_SECONDS", "540");
-    for (const value of [{ BOT_DEBUG: "yes" }, { BOT_SHUTDOWN_TIMEOUT_SECONDS: 999 }, { BOT_HOST: "https://host" }, { UNUSED: "1" }]) {
+    for (const value of [{ BOT_DOCUMENT_WORK_ENABLED: "yes" }, { BOT_SHUTDOWN_TIMEOUT_SECONDS: 999 }, { BOT_HOST: "https://host" }, { UNUSED: "1" }]) {
       expect(() => validateRuntimeConfig(value)).toThrow();
     }
     for (const value of [0, 1, "0", "1"]) expect(validateRuntimeConfig({ BOT_DOCUMENT_WORK_ENABLED: value })).toHaveProperty("BOT_DOCUMENT_WORK_ENABLED", String(value));
@@ -29,7 +29,6 @@ test("runtime settings retain previous values and validate explicit overrides", 
     for (const policy of ["short", "long"]) expect(validateRuntimeConfig({ PI_CACHE_RETENTION: policy })).toHaveProperty("PI_CACHE_RETENTION", policy);
     for (const policy of ["", "auto", "none", "24h", "LONG", false]) expect(() => validateRuntimeConfig({ PI_CACHE_RETENTION: policy })).toThrow();
     expect(() => validateRuntimeConfig({ BOT_MODEL_CACHE_RETENTION: "auto" })).toThrow();
-    await expect(saveRuntimeSettings(path, { BOT_MODEL_CACHE_RETENTION: "none" })).rejects.toThrow(/已移除/);
     for (const value of [1, 2, 8]) expect(validateRuntimeConfig({ BOT_ATTACHMENT_CONCURRENCY: value })).toHaveProperty("BOT_ATTACHMENT_CONCURRENCY", String(value));
     for (const value of [0, 9, 1.5]) expect(() => validateRuntimeConfig({ BOT_ATTACHMENT_CONCURRENCY: value })).toThrow();
     const absolute = join(fixture.root, "公司", "模板.POTX");
@@ -64,7 +63,7 @@ test("LibreOffice program path is absolute and survives runtime settings persist
     }
     await saveRuntimeSettings(path, { BOT_DOCUMENT_OFFICE_PATH: program });
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ BOT_DOCUMENT_OFFICE_PATH: program });
-    await saveRuntimeSettings(path, { BOT_DEBUG: "1" });
+    await saveRuntimeSettings(path, { BOT_DOCUMENT_WORK_ENABLED: "1" });
     expect(JSON.parse(await readFile(path, "utf8"))).toHaveProperty("BOT_DOCUMENT_OFFICE_PATH", program);
   } finally { await fixture.cleanup(); }
 });
@@ -140,3 +139,16 @@ test.skipIf(process.platform !== "win32")("runtime settings tolerate brief Windo
     });
   } finally { await fixture.cleanup(); }
 }, 90000);
+
+test("the HTTP listener is loopback only; binding all addresses comes from the container deployment, never from configuration", async () => {
+  for (const host of ["127.0.0.1", "::1", "localhost"]) expect(validateRuntimeConfig({ BOT_HOST: host })).toHaveProperty("BOT_HOST", host);
+  for (const host of ["0.0.0.0", "::", "192.168.1.10", "10.0.0.1", "example.com"]) expect(() => validateRuntimeConfig({ BOT_HOST: host })).toThrow("回环地址");
+  const fixture = await tempFixture("runtime-host-");
+  try {
+    const config = JSON.stringify(Bun.pathToFileURL(join(import.meta.dir, "../../src/core/config.ts")).href);
+    const host = (env: Record<string, string>) => Bun.spawnSync([process.execPath, "-e", `console.log((await import(${config})).HOST)`],
+      { cwd: fixture.root, env: { ...process.env, BOT_HOST: "", BOT_CONTAINER_BIND_ALL: "", ...env } }).stdout.toString().trim();
+    expect(host({})).toBe("127.0.0.1");
+    expect(host({ BOT_CONTAINER_BIND_ALL: "1" })).toBe("0.0.0.0");
+  } finally { await fixture.cleanup(); }
+});

@@ -119,8 +119,8 @@ describe("组件宽度不变量", () => {
           note: "2026-08-01 ~ 2026-09-13",
           accent: "accent",
           body: [
-            ...fields(current, [["群数据根", "/srv/mixin/groups"], ["占用", "5.8 GB"]], size - 4, 10),
-            status(current, "warn", "cloudflared 未记录归属"),
+            ...fields(current, [["会话目录", "/srv/mixin/conversations"], ["占用", "5.8 GB"]], size - 4, 10),
+            status(current, "warn", "S3 外链未配置"),
             sparkline(current, [1, 5, 9, 2, 0, 7]),
             meter(current, [{ value: 3, color: "warn" }, { value: 5, color: "accent" }], 10, 12),
             ...table(current, {

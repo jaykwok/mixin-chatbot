@@ -37,7 +37,9 @@ export function header(input: HeaderInput): string[] {
   const { theme, width: total, deployment, service } = input;
   const { name, label } = serviceStatus(service);
 
-  const left = ` ${theme.bold("mixin-chatbot")} ${theme.c("muted", "/ 管理台")}  ${status(theme, name, label)}`;
+  // 运行中的程序自己报告的版本（/health 的 appVersion），不是本地检出的代码版本。
+  const running = service && service.state !== "unreachable" && service.program ? theme.c("muted", ` v${service.program.appVersion}`) : "";
+  const left = ` ${theme.bold("mixin-chatbot")} ${theme.c("muted", "/ 管理台")}  ${status(theme, name, label)}${running}`;
   const uptime = input.uptime ? theme.c("muted", ` · ${fmt.duration(input.uptime)}`) : "";
   const mode = ` ${theme.c("muted", describeMode(deployment))} ${theme.c("muted", `· :${deployment.port}`)} `;
 

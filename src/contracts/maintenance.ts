@@ -19,7 +19,7 @@ export function validTreeEvidence(value: unknown): value is TreeEvidence {
     && Number.isSafeInteger(v.files) && v.files >= 0 && v.files <= 100_000 && Number.isFinite(v.newest);
 }
 
-/** A result's owner as the group's results document and the maintenance plans record it. */
+/** A result's owner as the space's results document and the maintenance plans record it. */
 export type ResultOwnership = { phone: string; createdAt: number; isolatedTask?: string; expiryRequestedAt?: number; expiredAt?: number;
   reclamation?: { status: "deferred" | "refused"; reason?: string; identity?: { dev: string; ino: string }; attemptedAt: number; nextAttemptAt: number } };
 
@@ -47,6 +47,13 @@ type Fields = Record<string, unknown>;
 const isRecord = (value: unknown): value is Fields => !!value && typeof value === "object" && !Array.isArray(value);
 const isId = (value: unknown): value is string => typeof value === "string" && ID_PATTERN.test(value);
 const isSegment = (value: unknown): value is string => typeof value === "string" && SEGMENT.test(value);
+/** A space's storage path below tmp/ and conversations/: `direct` or `groups/<segment>` (src/core/layout.ts `spacePath`). */
+export const isSpacePath = (value: unknown): value is string =>
+  value === "direct" || (typeof value === "string" && value.startsWith("groups/") && isSegment(value.slice("groups/".length)));
+/** A member's tmp below the data root (src/core/layout.ts `userTmp`). */
+export function memberTmpDir(root: string, space: string, user: string): string {
+  return join(root, "tmp", ...space.split("/"), user);
+}
 const isDigits = (value: unknown): value is string => typeof value === "string" && /^\d+$/.test(value);
 const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 const oneOf = <T extends string>(values: readonly T[], value: unknown): value is T => values.includes(value as T);
@@ -66,7 +73,7 @@ function digested(value: Fields, expected: string): boolean {
 
 // ---- Archive plans (backup/rm/.tmp-plans/<id>.json) and their progress ----
 
-export type ArchiveItem = { group: string; user: string; source: string; destination: string; task?: string; evidence?: TreeEvidence;
+export type ArchiveItem = { space: string; user: string; source: string; destination: string; task?: string; evidence?: TreeEvidence;
   owners: Record<string, ResultOwnership>; status: PlanStatus; reason?: string };
 export interface TmpArchivePlan { version: 1; id: string; root: string; rootIdentity: string; archive: string; recordedRoot: string;
   createdAt: number; before: number; items: ArchiveItem[]; digest: string; }
@@ -91,8 +98,8 @@ export function decodeArchivePlan(value: unknown, view: ArchivePlanView): TmpArc
   value.items.forEach((item: unknown, index: number) => {
     const at = `items[${index}]`;
     need(isRecord(item), at);
-    need(isSegment(item.group) && isSegment(item.user), `${at}.group/user`);
-    const member = join(view.root, item.group, "users", item.user, "tmp");
+    need(isSpacePath(item.space) && isSegment(item.user), `${at}.space/user`);
+    const member = memberTmpDir(view.root, item.space, item.user);
     need(typeof item.source === "string" && isPathInside(item.source, member) && resolve(item.source) === item.source, `${at}.source`);
     need(!(item.source === member && item.status === "ready"), `${at}.source（成员 tmp 本身不能归档）`);
     need(item.destination === join(view.archive, `tmp-${view.id}-${index}`), `${at}.destination`);
@@ -176,7 +183,7 @@ export function decodeRemovalProgress(value: unknown, removal: Pick<ArchiveRemov
 
 // ---- Physical reclamation plans (.reclamation/plans/<id>.json) and their progress ----
 
-export type ReclaimItem = { group: string; user: string; path: string; task?: string; token?: string; result?: string; owner?: ResultOwnership;
+export type ReclaimItem = { space: string; user: string; path: string; task?: string; token?: string; result?: string; owner?: ResultOwnership;
   evidence?: TreeEvidence; status: PlanStatus; reason?: string };
 export interface ReclamationPlan { version: 1; id: string; root: string; recordedRoot: string; rootIdentity: string; legacy: boolean;
   createdAt: number; before: number; items: ReclaimItem[]; digest: string; }
@@ -186,7 +193,7 @@ export type ReclaimProgress = { version: 1; plan: string; outcomes: Record<strin
 
 /** `recordedRoot` is the name the plan must record (the host's own root when not given). The root's identity stays with the caller. */
 export function decodeReclaimPlan(value: unknown, view: { id: string; digest: string; root: string; recordedRoot: string; legacy: boolean }): ReclamationPlan {
-  const need: Check = checker("回收清单、摘要或群根实体已变化，拒绝执行");
+  const need: Check = checker("回收清单、摘要或数据目录实体已变化，拒绝执行");
   need(isRecord(value), "清单");
   need(value.version === 1, "version");
   need(value.id === view.id, "id");
@@ -199,7 +206,7 @@ export function decodeReclaimPlan(value: unknown, view: { id: string; digest: st
   value.items.forEach((item: unknown, index: number) => {
     const at = `items[${index}]`;
     need(isRecord(item), at);
-    need(isSegment(item.group) && isSegment(item.user), `${at}.group/user`);
+    need(isSpacePath(item.space) && isSegment(item.user), `${at}.space/user`);
     need(typeof item.path === "string" && resolve(item.path) === item.path, `${at}.path`);
     need(oneOf(PLAN_STATUSES, item.status), `${at}.status`);
     need(item.evidence === undefined || validTreeEvidence(item.evidence), `${at}.evidence`);

@@ -21,12 +21,13 @@ for (const entry of ["current-data", ...(process.platform === "win32" ? ["powers
   for (const status of [0, 1]) test(`${entry} announces one operation log, repeating it only on failure (exit ${status})`, async () => {
     const f = await tempFixture("operation-log-chain-");
     try {
-      const groups = join(f.root, "groups"), migration = join(project, "scripts/runtime/data-current.ts");
+      const migration = join(project, "scripts/runtime/data-current.ts");
       await mkdir(join(f.root, "data/runtime/pi"), { recursive: true });
       await writeFile(join(f.root, "data/runtime/pi/settings.json"), JSON.stringify({ defaultProvider: "fixture", defaultModel: "fixture" }));
-      if (status === 0) { await mkdir(groups); await writeCurrentConfig(f.root); }
-      else { await mkdir(join(groups, "g", "users"), { recursive: true }); }
-      let args = [process.execPath, migration, "preview", "--project", f.root, "--groups", groups];
+      // Failure: conversations without a deployment record are refused before any configuration is read.
+      if (status === 0) await writeCurrentConfig(f.root);
+      else await mkdir(join(f.root, "data/conversations/direct"), { recursive: true });
+      let args = [process.execPath, migration, "preview", "--project", f.root];
       if (entry === "powershell") {
         const header = `\ufeff$ErrorActionPreference='Stop'\n[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)\n. ${quotePS(join(project, "scripts/lib/operation-log.ps1"))}\n`;
         const child = join(f.root, "child.ps1"), parent = join(f.root, "parent.ps1");
@@ -52,9 +53,9 @@ for (const entry of ["current-data", ...(process.platform === "win32" ? ["powers
       const text = await readFile(join(directory, logs[0]!), "utf8");
       expect(text).toContain(`data-finished: exit=${status}`);
       if (entry !== "current-data") expect(text).toContain(`operation finished; exit=${status}`);
-      if (status) expect(text).toContain("未登记的群根含运行数据");
+      if (status) expect(text).toContain("目录中已有数据但没有有效的版本标记");
       else {
-        expect(result.text).toContain("当前格式 6：新实例");
+        expect(result.text).toContain("数据格式 1：全新安装");
         expect(result.text).not.toContain('"decisions"');
         expect(text).toContain("action=preview");
       }
@@ -86,11 +87,11 @@ for (const writer of ["typescript", ...(process.platform === "win32" ? ["powersh
     } finally { await f.cleanup(); }
   }, 15000);
 
-  test(`${writer} startup rotation preserves upgrade, deploy and migration evidence`, async () => {
+  test(`${writer} startup rotation preserves upgrade and deploy evidence`, async () => {
     const f = await tempFixture("log-families-");
     try {
       const directory = join(f.root, "logs/operations"); await mkdir(directory, { recursive: true });
-      for (const kind of ["startup", "upgrade", "deploy", "migration"]) for (let i = 0; i < 23; i++) {
+      for (const kind of ["startup", "upgrade", "deploy"]) for (let i = 0; i < 23; i++) {
         const path = join(directory, `${kind}-20200101T000000Z-${i}.log`);
         await writeFile(path, "failure evidence"); await utimes(path, i, i);
       }
@@ -105,7 +106,7 @@ for (const writer of ["typescript", ...(process.platform === "win32" ? ["powersh
       }
       const names = await readdir(directory);
       expect(names.filter(name => name.startsWith("startup-"))).toHaveLength(20);
-      for (const kind of ["upgrade", "deploy", "migration"]) expect(names.filter(name => name.startsWith(kind + "-"))).toHaveLength(23);
+      for (const kind of ["upgrade", "deploy"]) expect(names.filter(name => name.startsWith(kind + "-"))).toHaveLength(23);
     } finally { await f.cleanup(); }
   }, 15000);
 }
@@ -129,7 +130,7 @@ test("bootstrap diagnostics redact errors and causes, cap log size and retain on
     for (const value of ["private-api-value", "private-bearer-value", "private-token-value", "private-password", "private-query", "a".repeat(64)]) expect(text).not.toContain(value);
     expect((await readdir(directory)).filter(file => file.endsWith(".log"))).toHaveLength(20);
     expect(await readFile(join(directory, "keep.txt"), "utf8")).toBe("unrelated");
-    const inherited = openOperationLog(f.root, "migration", log.name);
+    const inherited = openOperationLog(f.root, "deploy", log.name);
     expect(inherited.path).toBe(log.path);
     inherited.event("info", "apply", "same operation");
     await writeFile(log.path!, "x".repeat(1024 * 1024));
@@ -145,17 +146,17 @@ test("bootstrap diagnostics redact errors and causes, cap log size and retain on
   } finally { await f.cleanup(); }
 });
 
-test("migration preflight records failures without loading project configuration or losing its exit code", async () => {
-  const f = await tempFixture("migration-log-failure-");
+test("the data preflight records failures without loading project configuration or losing its exit code", async () => {
+  const f = await tempFixture("data-log-failure-");
   try {
     await mkdir(join(f.root, "data/config"), { recursive: true });
     await writeFile(join(f.root, "data/config/runtime.json"), "invalid-json");
-    await mkdir(join(f.root, "groups/g/users"), { recursive: true });
-    const result = await run([process.execPath, join(project, "scripts/runtime/data-current.ts"), "preview", "--project", f.root, "--groups", join(f.root, "groups")], f.root);
+    await mkdir(join(f.root, "data/conversations/groups/g"), { recursive: true });
+    const result = await run([process.execPath, join(project, "scripts/runtime/data-current.ts"), "preview", "--project", f.root], f.root);
     expect(result.code, result.text).toBe(1);
     const logs = await readdir(join(f.root, "logs/operations")); expect(logs).toHaveLength(1);
     const text = await readFile(join(f.root, "logs/operations", logs[0]!), "utf8");
-    expect(text).toContain("未登记的群根含运行数据"); expect(text).toContain("data-finished: exit=1");
+    expect(text).toContain("目录中已有数据但没有有效的版本标记"); expect(text).toContain("data-finished: exit=1");
     expect(result.text).toContain(logs[0]!);
     expect(existsSync(join(f.root, "data/state/release-data.json"))).toBe(false);
   } finally { await f.cleanup(); }
@@ -172,7 +173,7 @@ test.skipIf(process.platform !== "win32")("PowerShell 5.1 diagnostics retain nat
 if($PSVersionTable.PSVersion.Major -ne 5){throw 'test requires Windows PowerShell 5.1'}
 $before=$env:BOT_OPERATION_LOG
 $context=Start-OperationLog $PSScriptRoot 'upgrade'
-$nested=Start-OperationLog $PSScriptRoot 'migration'
+$nested=Start-OperationLog $PSScriptRoot 'deploy'
 if($nested.Path -ne $context.Path){throw 'nested operation split logs'}
 Stop-OperationLog $nested 0
 Set-OperationStage 'install-dependencies'

@@ -1,27 +1,25 @@
-// The service side of offline maintenance: one member's protected view over the outbox ledger and a group database
-// snapshot. The ledger and group write reservations (apply) are held for the whole callback; only the view leaves it.
+// The service side of offline maintenance: one member's protected view over a space database snapshot. The database's write
+// reservation (apply) is held for the whole callback; only the view leaves it.
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { Harness, Storage } from "@earendil-works/pi-durable";
-import { Database } from "bun:sqlite";
-import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { assertDataDirectory } from "../../scripts/lib/group-data.ts";
-import { assertDeliverySchema } from "../agent/delivery-store.ts";
-import { closeoutReferences } from "../agent/deliverables.ts";
-import { groupSegment, userSegment } from "../agent/paths.ts";
+import { scopeKey, spacePath, userSegment } from "../core/layout.ts";
 import type { ResultOwnership } from "../contracts/maintenance.ts";
 import { exists } from "../maintenance/plans.ts";
 import { reclamationReferences, type MemberScope } from "../maintenance/scope.ts";
-import { withGroupSnapshot } from "./diagnostics.ts";
-import { databaseGroup, IdentityDoc } from "./identity.ts";
+import { withSpaceSnapshot } from "./diagnostics.ts";
+import { databaseSpace, IdentityDoc } from "./identity.ts";
 import { ControlsDoc, InboxDoc } from "./inbox.ts";
+import { memberRecords } from "./records.ts";
 import { ResultsDoc } from "./results/ownership.ts";
 import { ReclamationItems, settleOfflineResults } from "./results/queue.ts";
 
-/** Entire group context is considered: private paths can occur in forked or another member's persisted state. */
-async function reclamationView(harness: Harness, storage: Storage, segment: string, user: string) {
-  const groupId = await databaseGroup(harness, context);
-  if (!groupId || groupSegment(groupId) !== segment) throw new Error("回收群库身份与目录不符");
+/** Entire space context is considered: private paths can occur in forked or another member's persisted state. */
+async function reclamationView(harness: Harness, storage: Storage, path: string, user: string) {
+  const scope = await databaseSpace(harness, context);
+  if (!scope || spacePath(scope) !== path) throw new Error("回收会话库身份与目录不符");
+  const space = scopeKey(scope);
   const references: unknown[] = [], phones = new Set<string>();
   let busy = !!(await harness.snapshot(ControlsDoc, context))?.pending.length;
   let cursor: Parameters<Storage["scanConversations"]>[2];
@@ -30,13 +28,15 @@ async function reclamationView(harness: Harness, storage: Storage, segment: stri
     for (const record of page.items) {
       if ((await harness.snapshot(InboxDoc, record.id, context))?.items.length) busy = true;
       const identity = await harness.snapshot(IdentityDoc, record.id, context);
-      if (identity?.groupId === groupId && userSegment(identity.phone) === user) phones.add(identity.phone);
+      if (identity?.space === space && userSegment(identity.phone) === user) phones.add(identity.phone);
+      // Run records (replies still being sent, link notes, file snapshots) of every member may name result files.
+      if (identity?.phone) references.push(await memberRecords(harness, identity.phone, context));
       const conversation = await harness.conversation(record.id, context);
       if (conversation) references.push((await conversation.context(context)).messages);
     }
     if (!page.next) break; cursor = page.next;
   }
-  if (phones.size !== 1) throw new Error("回收成员在群库中缺失或身份不唯一");
+  if (phones.size !== 1) throw new Error("回收成员在会话库中缺失或身份不唯一");
   const phone = [...phones][0]!;
   const calls: Record<string, ResultOwnership> = Object.fromEntries(Object.entries((await harness.snapshot(ResultsDoc, context))?.calls ?? {})
     .filter(([, call]) => call.phone === phone && call.expiredAt === undefined));
@@ -54,39 +54,25 @@ async function reclamationView(harness: Harness, storage: Storage, segment: stri
     }
     if (!page.next) break; documents = page.next;
   }
-  return { groupId, phone, calls, references, busy };
+  return { phone, calls, references, busy };
 }
 
-/** Keep the outbox write reservation while deleting. Missing/corrupt ledgers fail closed. */
-async function withDeliveries<T>(path: string, exclusive: boolean, read: (values: unknown[]) => Promise<T>): Promise<T> {
-  const info = await lstat(path);
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error("待交付账本必须是普通文件");
-  const db = new Database(path, { readonly: !exclusive, strict: true });
-  try {
-    db.exec(exclusive ? "BEGIN IMMEDIATE" : "BEGIN"); assertDeliverySchema(db);
-    const exists = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'").get();
-    const rows = exists ? db.query("SELECT text, attachments FROM deliveries ORDER BY id").all() as { text: string; attachments: string }[] : [];
-    return await read([...rows.map(row => ({ text: row.text, attachments: JSON.parse(row.attachments) })), ...closeoutReferences(db)]);
-  } finally { db.close(); }
-}
-
-/** Shared by deletion and reversible archival. The source DB and outbox keep their write reservations throughout. */
+/** Shared by deletion and reversible archival. The source DB keeps its write reservation throughout. */
 export const durableMemberScope: MemberScope = {
   async withMember(paths, user, { exclusive, requireGroup }, run) {
     await assertDataDirectory(user.dir, paths.root);
-    const path = join(paths.root, user.group, "durable.sqlite");
+    const path = join(paths.root, "conversations", ...user.space.split("/"), "durable.sqlite");
     if (!requireGroup && !await exists(path)) {
-      const read = (references: unknown[]) => run({ calls: {}, liveWork: false, protectedPath: reclamationReferences(references, paths), settle: async () => {} });
-      return await exists(paths.state) ? withDeliveries(paths.state, exclusive, read) : read([]);
+      return run({ calls: {}, liveWork: false, protectedPath: reclamationReferences([], paths), settle: async () => {} });
     }
-    return withDeliveries(paths.state, exclusive, deliveries => withGroupSnapshot(path, async (harness, storage, liveWork, commit) => {
-      const view = await reclamationView(harness, storage, user.group, user.user);
-      const referenced = reclamationReferences([...deliveries, ...view.references], paths);
+    return withSpaceSnapshot(path, async (harness, storage, liveWork, commit) => {
+      const view = await reclamationView(harness, storage, user.space, user.user);
+      const referenced = reclamationReferences(view.references, paths);
       return run({ calls: view.calls, liveWork, protectedPath: path => liveWork || view.busy || referenced(path),
         settle: async owners => {
           if (!commit) throw new Error("只读预览不能结算回收账本");
           await commit(tx => settleOfflineResults(tx, view.phone, owners));
         } });
-    }, exclusive));
+    }, exclusive);
   },
 };

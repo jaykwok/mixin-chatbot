@@ -4,7 +4,7 @@
 set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# 与部署、隧道脚本共用校验、健康检查和生命周期函数。
+# 与部署脚本共用校验、健康检查和生命周期函数。
 COMMON_LIB="${PROJECT_DIR}/scripts/lib/common.sh"
 if [ ! -f "$COMMON_LIB" ]; then
     echo "缺少 ${COMMON_LIB}；请从仓库完整获取脚本目录后重试。" >&2
@@ -18,35 +18,18 @@ ROLLBACK_CONTAINER="${CONTAINER}-rollback"
 DATA_DIR="${PROJECT_DIR}/data"
 CONFIG_DIR="${DATA_DIR}/config"
 STATE_DIR="${DATA_DIR}/state"
-DEFAULT_GROUP_DATA_ROOT="${DATA_DIR}/groups"
 MODELS_FILE="${CONFIG_DIR}/models.json"
-WEBHOOK_SECRET_FILE="${CONFIG_DIR}/webhook-secret"
+APP_BOT_FILE="${CONFIG_DIR}/app-bot.json"
 RELAY_CONFIG_FILE="${CONFIG_DIR}/relay.json"
 BOT_PORT_FILE="${STATE_DIR}/bot-port"
-DEPLOY_MODE_FILE="${STATE_DIR}/deploy-mode"
-BOT_DOMAIN_FILE="${STATE_DIR}/bot-domain"
-GROUP_DATA_ROOT_FILE="${STATE_DIR}/group-data-root"
-TUNNEL_PID_FILE="${STATE_DIR}/cloudflared.pid"
-# 已保存的端口、入口、域名和群根。普通操作再叠加 BOT_PORT/BOT_DOMAIN 环境变量（见文件末尾的入口判断）；
+# 已保存的本机端口和外置共享资料目录（空为默认 data/workspace）。普通操作再叠加 BOT_PORT 环境变量（见文件末尾的入口判断）；
 # 升级、继续和回滚只用已保存设置或事务记录，升级结束后的体检也重新读取这里。
 load_saved_settings() {
     PORT="1011"
     if [ -f "$BOT_PORT_FILE" ]; then PORT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"; fi
-    DEPLOY_MODE="direct"
-    if [ -f "$DEPLOY_MODE_FILE" ]; then DEPLOY_MODE="$(tr -d '[:space:]' < "$DEPLOY_MODE_FILE")"; fi
-    DOMAIN=""
-    if [ -f "$BOT_DOMAIN_FILE" ]; then DOMAIN="$(tr -d '[:space:]' < "$BOT_DOMAIN_FILE")"; fi
-    DEPLOYED_GROUP_DATA_ROOT="$DEFAULT_GROUP_DATA_ROOT"
-    if [ -s "$GROUP_DATA_ROOT_FILE" ]; then DEPLOYED_GROUP_DATA_ROOT="$(tr -d '\r\n' < "$GROUP_DATA_ROOT_FILE")"; fi
+    DEPLOYED_WORKSPACE_ROOT="$(saved_workspace_root)"
 }
 load_saved_settings
-resolve_group_data_root() {
-    local value="$1"
-    case "$value" in
-        /*) realpath -m -- "$value" ;;
-        *) realpath -m -- "${PROJECT_DIR}/${value}" ;;
-    esac
-}
 # 普通操作使用已保存设置，入口处先校验。部署脚本自行校验并提供修正；
 # 继续或回滚只使用事务记录（use_transaction_settings），普通设置损坏不能挡住恢复入口。
 check_ordinary_settings() {
@@ -54,28 +37,14 @@ check_ordinary_settings() {
         echo "BOT_PORT/data/state/bot-port 中的端口无效：$PORT" >&2
         exit 1
     fi
-    if [ "$DEPLOY_MODE" != "direct" ] && [ "$DEPLOY_MODE" != "cloudflare" ]; then
-        echo "data/state/deploy-mode 中的部署模式无效：$DEPLOY_MODE" >&2
-        exit 1
-    fi
-    if [ -n "$DOMAIN" ]; then
-        if NORMALIZED_DOMAIN="$(normalize_hostname_input "$DOMAIN")"; then
-            DOMAIN="$NORMALIZED_DOMAIN"
-        else
-            echo "BOT_DOMAIN/data/state/bot-domain 中的域名无效：$DOMAIN" >&2
-            exit 1
-        fi
-    fi
 }
 
-# 未完成的部署事务：端口、入口、域名和群根取自记录（续做结束后的体检也用它们）。
+# 未完成的部署事务：端口和共享资料目录取自记录（续做结束后的体检也用它们）。
 # 记录无法读取时保持原值，由部署脚本报告原因。
 use_transaction_settings() {
     [ -e "$STATE_DIR/deploy-transaction" ] && load_pending_transaction >/dev/null 2>&1 || return 0
     PORT="${TRANSACTION[bot_port]}"
-    DEPLOY_MODE="${TRANSACTION[deploy_mode]}"
-    DOMAIN="${TRANSACTION[bot_domain]}"
-    DEPLOYED_GROUP_DATA_ROOT="${TRANSACTION[target_group_root]}"
+    DEPLOYED_WORKSPACE_ROOT="${TRANSACTION[target_workspace_root]}"
 }
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -102,7 +71,7 @@ ask_yes_no() {
     done
 }
 
-# doctor --json 让运维界面复用同一套体检，而不是自己再实现一遍 docker/隧道/配置的判断。
+# doctor --json 让运维界面复用同一套体检，而不是自己再实现一遍 docker/配置的判断。
 # 逐项结果在 check() 里顺手攒起来，人类可读的输出一个字不改。
 JSON_OUTPUT=0
 JSON_ROWS=""
@@ -145,11 +114,6 @@ if [ "${1:-}" = "doctor" ] || [ "${1:-}" = "status" ]; then
     esac
 fi
 
-# 获取 URL 的 HTTP 状态码（curl 连接失败时输出 "000"）。
-code_of() {
-    curl -s -o /dev/null -w "%{http_code}" -m "${2:-10}" "$1" 2>/dev/null || true
-}
-
 wait_for_local() {
     local attempt
     for attempt in $(seq 1 10); do
@@ -158,8 +122,6 @@ wait_for_local() {
     done
     return 1
 }
-
-# Connector identity and bounded stop are shared in scripts/lib/lifecycle.sh.
 
 has_container() {
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"
@@ -186,19 +148,16 @@ check_relay() {
 }
 
 doctor() {
-    local mode_label="直连"
-    [ "$DEPLOY_MODE" = "cloudflare" ] && mode_label="Cloudflare"
-    P "mixin-chatbot 健康检查（模式=$mode_label，端口=$PORT）"
+    P "mixin-chatbot 健康检查（本机端口=$PORT）"
     PASS=0; FAIL=0; CHECK_WARN=0; JSON_ROWS=""
 
-    local resolved_group_root=""
-    resolved_group_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null || true)"
-    local group_root_ok="0" group_root_detail="目录不存在或路径无效：$DEPLOYED_GROUP_DATA_ROOT"
-    if [ -n "$resolved_group_root" ] && [ -d "$resolved_group_root" ]; then
-        group_root_ok="1"
-        group_root_detail="$resolved_group_root"
+    # 外置资料目录缺失时服务拒绝启动（不会当成空资料目录）；默认目录由服务创建。
+    local workspace_ok="1" workspace_detail="${DATA_DIR}/workspace（默认）"
+    if [ -n "$DEPLOYED_WORKSPACE_ROOT" ]; then
+        workspace_detail="$DEPLOYED_WORKSPACE_ROOT（只读挂载）"
+        [ -d "$DEPLOYED_WORKSPACE_ROOT" ] || { workspace_ok="0"; workspace_detail="外置目录不存在：$DEPLOYED_WORKSPACE_ROOT"; }
     fi
-    check "群数据总根" "$group_root_ok" "$group_root_detail" "通过 $(ops_command_hint deploy) 确认群数据目录。"
+    check "共享资料目录" "$workspace_ok" "$workspace_detail" "恢复该目录或挂载；改用其他目录请用 WORKSPACE_ROOT=<目录> $(ops_command_hint deploy)。"
 
     local cstate="缺少"
     if has_container; then
@@ -219,25 +178,41 @@ doctor() {
     else check "本地机器人健康" 0 "未就绪或实例身份不匹配" \
         "使用 $(ops_command_hint restart)，再到 $(ops_command_hint logs) 查看日志。"; fi
 
-    if [ "$DEPLOY_MODE" = "cloudflare" ]; then
-        local crunning="0" cdetail="未运行"
-        local managed_pid=""
-        if managed_pid="$(managed_cloudflared_pid)"; then
-            crunning="1"; cdetail="本项目 pid $managed_pid"
-        elif pgrep -x cloudflared >/dev/null 2>&1; then
-            crunning="1"; cdetail="未记录归属的 pid $(pgrep -x cloudflared | head -n1)"
-            WA "检测到 cloudflared，但它没有本项目 PID 记录；请确认该进程连接的是当前隧道"
-        fi
-        check "cloudflared 运行状态" "$crunning" "$cdetail" "通过 $(ops_command_hint deploy) 选择 Cloudflare 模式，确认 token 并重建隧道。"
-
-        if [ -n "$DOMAIN" ]; then
-            local pc; pc="$(code_of "https://${DOMAIN}/favicon.svg")"
-            check "公网 CF→隧道→机器人" "$([ "$pc" = "200" ] && echo 1 || echo 0)" "HTTP $pc" \
-                "先检查本地实例与隧道；部署修复入口为 $(ops_command_hint deploy)。域名、DNS 和公开路由需在 Cloudflare 控制台核对。"
+    # Stream 与通讯录状态只读运行中服务的 /health，不另开 Stream 连接（同一应用只能有一条）。
+    if [ "$health_status" = 0 ]; then
+        local row_status row_name row_detail row_fix rows
+        if rows="$(service_bun scripts/ops/directory-admin.ts doctor 2>/dev/null)"; then
+            while IFS=$'\t' read -r row_status row_name row_detail; do
+                [ -n "$row_name" ] || continue
+                row_fix=""
+                case "$row_name" in
+                    事件\ Stream) row_fix="检查出站访问 imtwo.zdxlz.com 的 443 端口和应用凭据（$(ops_command_hint configure-app-bot)），再查看 $(ops_command_hint logs)。" ;;
+                    通讯录同步) row_fix="有待确认撤销时，核对后使用 $(ops_command_hint directory-confirm) <轮次>；同步不完整时查看日志。" ;;
+                    运行状况) row_fix="在 $(ops_command_hint logs) 中查看对应记录（Durable 报告、交付超时放弃、统计累计值回退等）；停住的任务由成员用 /status 查看、/stop 或 /clear 结束。" ;;
+                esac
+                case "$row_status" in pass) row_status=1 ;; warn) ;; *) row_status=0 ;; esac
+                check "$row_name" "$row_status" "$row_detail" "$row_fix"
+            done <<< "$rows"
         else
-            WA "BOT_DOMAIN/data/state/bot-domain 未设置，跳过公网健康检查"
+            check "事件 Stream" warn "无法读取服务状态" "查看 $(ops_command_hint logs)。"
         fi
     fi
+    # 版本取自运行中服务的 /health；服务未运行时取部署记录。本地代码不同于运行版本时另起一行说明。
+    local version_rows version_name version_value health_body=""
+    [ "$health_status" = 0 ] && health_body="$(curl --noproxy '*' --max-time 3 -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    if version_rows="$(printf '%s' "$health_body" | service_bun scripts/ops/version-info.ts --health-stdin 2>/dev/null)"; then
+        while IFS=$'\t' read -r version_name version_value; do
+            [ -n "$version_name" ] || continue
+            case "$version_value" in
+                未知：*) check "$version_name" 0 "$version_value" "部署记录无法读取；不要在此目录覆盖部署，参见 docs/data-migrations.md。" ;;
+                *) check "$version_name" 1 "$version_value" ;;
+            esac
+        done <<< "$version_rows"
+    else
+        check "应用机器人" warn "无法读取版本信息"
+    fi
+    if [ -s "$APP_BOT_FILE" ]; then check "data/config/app-bot.json" 1 "已配置（不显示凭据）"
+    else check "data/config/app-bot.json" 0 "缺少（服务拒绝启动）" "使用 $(ops_command_hint configure-app-bot) 填写 AppID 和 AppSecret。"; fi
 
     # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
     # 校验在一次性容器中按正式标签运行：部署、升级或未完成的事务期间标签可能是旧版本，跳过并说明。
@@ -250,18 +225,11 @@ doctor() {
     elif validate_model_configuration >/dev/null 2>&1; then models_ok="1"; models_detail='有效'; fi
     check "模型配置（models.json + Pi 设置）" "$models_ok" "$models_detail" "$models_fix"
 
-    local secret_ok="0"
-    [ -f "$WEBHOOK_SECRET_FILE" ] &&
-        grep -Eq '^[0-9a-fA-F]{64}$' "$WEBHOOK_SECRET_FILE" &&
-        secret_ok="1"
-    check "data/config/webhook-secret" "$secret_ok" "$([ "$secret_ok" = "1" ] && echo 有效 || echo '缺少或无效（生产服务拒绝启动）')" \
-        "使用 $(ops_command_hint deploy)；密钥变化后还必须更新 IM webhook URL。"
-
     check_relay
 
     if [ "$JSON_OUTPUT" = "1" ]; then
-        printf '{"pass":%s,"warn":%s,"fail":%s,"mode":"%s","port":%s,"domain":"%s","checks":[%s]}\n' \
-            "$PASS" "$CHECK_WARN" "$FAIL" "$DEPLOY_MODE" "$PORT" "$(json_escape "$DOMAIN")" "$JSON_ROWS"
+        printf '{"pass":%s,"warn":%s,"fail":%s,"port":%s,"checks":[%s]}\n' \
+            "$PASS" "$CHECK_WARN" "$FAIL" "$PORT" "$JSON_ROWS"
         [ "$FAIL" -gt 0 ] && return 1
         return 0
     fi
@@ -269,12 +237,9 @@ doctor() {
     echo ""
     echo -e "结果：${GREEN}${PASS} 项通过${NC}，${YELLOW}${CHECK_WARN} 项待核验${NC}，${RED}${FAIL} 项失败${NC}"
     if [ "$FAIL" -gt 0 ]; then
-        [ "$group_root_ok" = "1" ] || WA "       群数据根失败 -> 使用 $(ops_command_hint deploy) 并确认目录；"
-        if [ "$DEPLOY_MODE" = "cloudflare" ]; then
-            WA "提示：公网 530/1033 通常表示隧道断开；公网 502 表示隧道到达但机器人源站不可用。"
-        fi
+        [ "$workspace_ok" = "1" ] || WA "       共享资料目录失败 -> 恢复外置目录或挂载；"
         WA "       本地失败 -> 使用 $(ops_command_hint restart)；"
-        WA "       secret 缺少 -> 使用 $(ops_command_hint deploy)"
+        WA "       应用凭据缺少 -> 使用 $(ops_command_hint configure-app-bot)"
         return 1
     else
         if [ "$CHECK_WARN" -gt 0 ]; then WA "基础检查完成，请处理待核验项"; else OK "全部检查通过"; fi
@@ -308,7 +273,7 @@ start_bot() {
 # 未完成的事务。锁由调用的进程持有到一次性容器结束，检查之后不会出现新的事务。
 guard_one_off_container() {
     acquire_deploy_lock || { ER "部署或升级正在进行；服务未运行时不能用一次性容器执行，请等它结束后重试"; return 1; }
-    if [ -e "$STATE_DIR/deploy-transaction" ] || [ -e "$STATE_DIR/update-transaction" ]; then
+    if [ -e "$STATE_DIR/deploy-transaction" ]; then
         ER "有未完成的部署或升级，正式镜像可能与数据不一致；请先用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
         return 1
     fi
@@ -318,7 +283,7 @@ guard_one_off_container() {
 # 本进程自己持有的锁（升级结束后的体检）不算。
 deployment_in_progress() {
     local lock_path
-    [ ! -e "$STATE_DIR/deploy-transaction" ] && [ ! -e "$STATE_DIR/update-transaction" ] || return 0
+    [ ! -e "$STATE_DIR/deploy-transaction" ] || return 0
     lock_path="$(realpath -m -- "$STATE_DIR")/deploy.lock"
     [ -e "$lock_path" ] && [ "${BOT_DEPLOY_LOCK_HELD:-}" != "$lock_path" ] || return 1
     ! flock -n "$lock_path" true
@@ -409,37 +374,43 @@ relay_configure() (
     if [ "$was_running" = 0 ]; then OK "外链设置将在下次启动机器人时生效；已保持停止状态"; fi
 )
 
-# 模型配置向导在维护租约下运行，要求机器人停止；整个过程持有部署锁，结束后恢复原运行状态。
-# 向导在草稿中填写，确认后才一起替换配置文件，取消或失败时原配置不变。
-model_configure() (
-    local user="" state="" was_running=0 terminal=(-i)
+# 配置向导（模型或应用机器人凭据）在维护租约下运行，要求机器人停止；整个过程持有部署锁，结束后恢复原运行状态。
+# 向导在草稿中填写，确认后才替换配置文件，取消或失败时原配置不变。应用机器人向导只取一次应用 token 验证凭据，不连 Stream。
+wizard_configure() (
+    local script="$1" label="$2" user="" state="" was_running=0 terminal=(-i)
     if ! command -v docker >/dev/null 2>&1; then ER "找不到 docker"; return 1; fi
     guard_one_off_container || return 1
     cd "$PROJECT_DIR" || return 1
     user="$(service_container_user)" || return 1
     state="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.State}}')" || {
-        ER "无法查询容器状态，模型配置未开始"; return 1;
+        ER "无法查询容器状态，${label}未开始"; return 1;
     }
-    restore_model_service() {
+    restore_wizard_service() {
         local code=$?
         trap - EXIT INT TERM
         if [ "$was_running" = 1 ]; then start_bot || code=1; fi
         exit "$code"
     }
-    trap restore_model_service EXIT
+    trap restore_wizard_service EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     if [ "$state" = "running" ]; then
         was_running=1
-        P "停止机器人以配置模型；向导结束后恢复运行"
-        docker stop "$CONTAINER" >/dev/null || { ER "停止容器失败，模型配置未开始"; return 1; }
+        P "停止机器人以进行${label}；向导结束后恢复运行"
+        docker stop "$CONTAINER" >/dev/null || { ER "停止容器失败，${label}未开始"; return 1; }
     fi
     if [ -t 0 ] && [ -t 1 ]; then terminal+=(-t); fi
     docker run --rm "${terminal[@]}" --user "$user" -e HOME=/app/data/runtime/home \
         -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
-        mixin-chatbot bun run configure || { ER "模型配置未完成；原配置保持不变"; return 1; }
-    if [ "$was_running" = 0 ]; then OK "模型配置将在下次启动机器人时生效；已保持停止状态"; fi
+        mixin-chatbot bun run "$script" || { ER "${label}未完成；原配置保持不变"; return 1; }
+    if [ "$was_running" = 0 ]; then OK "${label}将在下次启动机器人时生效；已保持停止状态"; fi
 )
+
+# 读本机服务状态的 Bun 脚本：宿主机有 Bun 时直接运行，否则在运行中的容器里执行（与 bot_local_ready 一致）。
+service_bun() {
+    if command -v bun >/dev/null 2>&1; then (cd "$PROJECT_DIR" && bun run "$@")
+    else docker exec "$CONTAINER" bun run "$@"; fi
+}
 
 # 应用 TUI 已确认的运行参数；整个停机、发布和恢复过程与部署互斥。
 runtime_configure() (
@@ -498,10 +469,7 @@ runtime_configure() (
         # 只传递受支持的高级参数以检查实际容器的环境覆盖，不输出其他环境变量或凭据。
         while IFS= read -r setting; do
             case "${setting%%=*}" in
-                BOT_MODEL_CACHE_RETENTION)
-                    ER '容器仍有旧 BOT_MODEL_CACHE_RETENTION 环境变量；请先停机迁移并移除该覆盖'
-                    return 1 ;;
-                BOT_DEBUG|BOT_MAX_ACTIVE_REQUESTS|BOT_BASH_TIMEOUT|BOT_INDEX_TTL_MINUTES|BOT_INDEX_MAX_FILES|BOT_INDEX_MAX_DEPTH|BOT_RUN_TIMEOUT_SECONDS|BOT_MODEL_IDLE_TIMEOUT_SECONDS|BOT_MODEL_RESPONSE_TIMEOUT_SECONDS|BOT_SHUTDOWN_TIMEOUT_SECONDS|BOT_DELIVERY_TIMEOUT_SECONDS|BOT_DOCUMENT_ENV|BOT_DOCUMENT_WORK_ENABLED|BOT_DOCUMENT_PPTX_TEMPLATE|BOT_DOCUMENT_DOCX_TEMPLATE|PI_CACHE_RETENTION|BOT_ATTACHMENT_CONCURRENCY)
+                BOT_MAX_ACTIVE_REQUESTS|BOT_BASH_TIMEOUT|BOT_INDEX_TTL_MINUTES|BOT_INDEX_MAX_FILES|BOT_INDEX_MAX_DEPTH|BOT_RUN_TIMEOUT_SECONDS|BOT_MODEL_IDLE_TIMEOUT_SECONDS|BOT_MODEL_RESPONSE_TIMEOUT_SECONDS|BOT_SHUTDOWN_TIMEOUT_SECONDS|BOT_DOCUMENT_ENV|BOT_DOCUMENT_WORK_ENABLED|BOT_DOCUMENT_PPTX_TEMPLATE|BOT_DOCUMENT_DOCX_TEMPLATE|PI_CACHE_RETENTION|BOT_ATTACHMENT_CONCURRENCY)
                     runtime_env+=(-e "$setting") ;;
             esac
         done <<< "$environment"
@@ -518,9 +486,9 @@ runtime_configure() (
     committed=1
 )
 
-# 群数据操作由 Bun 统一管理存储边界；一次性容器必须按部署时的规则映射
-# GROUP_DATA_ROOT，防止自定义群数据根被误认为容器中的默认 /app/data/groups。
-group_data_admin() {
+# 数据操作由 Bun 统一管理存储边界；一次性容器按部署时的规则只读挂载外置共享资料目录，
+# 与服务看到的资料一致。
+data_admin() {
     local script="$1"; shift
     if ! command -v docker >/dev/null 2>&1; then
         ER "找不到 docker"
@@ -532,28 +500,22 @@ group_data_admin() {
     fi
     guard_one_off_container || return 1
     WA "容器未在运行，改用一次性容器执行"
-    local resolved_root="" group_root_env="/app/data/groups" user
-    local group_root_args=() TASK_RUNTIME_ARGS=() TASK_DOCKER_ENDPOINT='' TASK_DOCKER_ID='' task_rootless=0
+    local user workspace_args=() TASK_RUNTIME_ARGS=() TASK_DOCKER_ENDPOINT='' TASK_DOCKER_ID='' task_rootless=0
     # 任务 socket 必须属于服务身份，先确定身份再核对。
     user="$(service_container_user)" || return 1
     if [ -f "$PROJECT_DIR/data/config/task-deployment.json" ]; then
         if docker_rootless; then task_rootless=1; fi
         task_runtime_read "$PROJECT_DIR/data/state/task-runtime" && task_runtime_check_endpoint "$user" "$task_rootless" || return 1
     fi
-    if ! resolved_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null)"; then
-        ER "群数据总根路径无效：$DEPLOYED_GROUP_DATA_ROOT"
-        return 1
-    fi
-    if [ "$resolved_root" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
-        group_root_args+=(-v "$resolved_root:/app/group-data")
-        group_root_env="/app/group-data"
+    if [ -n "$DEPLOYED_WORKSPACE_ROOT" ]; then
+        [ -d "$DEPLOYED_WORKSPACE_ROOT" ] || { ER "共享资料目录不存在：$DEPLOYED_WORKSPACE_ROOT"; return 1; }
+        workspace_args=(-v "$DEPLOYED_WORKSPACE_ROOT:/app/workspace:ro" -e WORKSPACE_ROOT=/app/workspace)
     fi
     docker run --rm \
         --user "$user" \
         -e HOME=/app/data/runtime/home \
         "${TASK_RUNTIME_ARGS[@]}" \
-        -e GROUP_DATA_ROOT="$group_root_env" \
-        "${group_root_args[@]}" \
+        "${workspace_args[@]}" \
         -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
         mixin-chatbot bun run "$script" "$@"
 }
@@ -590,7 +552,7 @@ tmp_admin() (
         case "$argument" in --digest|--digest=*) confirming=1 ;; esac
     done
     if [ "${1:-}" = list ] || { [ "$confirming" = 0 ] && [ "${1:-}" != purge ]; }; then
-        group_data_admin scripts/ops/tmp-admin.ts "$@"; return $?
+        data_admin scripts/ops/tmp-admin.ts "$@"; return $?
     fi
     local was_running=0 restored=0
     restore_tmp_service() {
@@ -608,15 +570,15 @@ tmp_admin() (
         stop_bot || return 1
     fi
     local code=0
-    group_data_admin scripts/ops/tmp-admin.ts "$@" || code=$?
+    data_admin scripts/ops/tmp-admin.ts "$@" || code=$?
     if [ "$was_running" = 1 ]; then start_bot || return 1; fi
     restored=1
     return "$code"
 )
 
-# 清历史先停服务（运行中的机器人独占群库）；完成后恢复调用前的运行或停止状态。
+# 清历史先停服务（运行中的机器人独占会话库）；完成后恢复调用前的运行或停止状态。
 history_clear() (
-    if [ -z "${1:-}" ]; then ER "history-${HISTORY_OPERATION:-clear} 需要群号"; return 1; fi
+    if [ -z "${1:-}" ]; then ER "history-${HISTORY_OPERATION:-clear} 需要群号或 --direct"; return 1; fi
     local was_running=0 restored=0
     restore_history_service() {
         local code=$?
@@ -634,7 +596,43 @@ history_clear() (
         stop_bot || return 1
     fi
     local code=0
-    group_data_admin scripts/ops/history-admin.ts "${HISTORY_OPERATION:-clear}" "$@" || code=$?
+    data_admin scripts/ops/history-admin.ts "${HISTORY_OPERATION:-clear}" "$@" || code=$?
+    if [ "$was_running" = 1 ]; then start_bot || return 1; fi
+    restored=1
+    return "$code"
+)
+
+# 一次性导入旧版统计：旧账本可在任意位置（TUI 统计页按 i 浏览选择）。一次性容器只挂载 data/ 和 backup/，
+# 所以先把所选文件（连同未合并的 -wal）复制进 backup/ 下的私有临时目录，导入后删除；原文件不改动。
+# 停机导入后恢复原运行状态。
+stat_import() (
+    local file="${1:-}" stage="" user="" was_running=0 restored=0
+    [ -n "$file" ] || { ER "stat-import 需要旧统计账本的路径，例如 ops.sh stat-import /srv/old/data/groups/stats.sqlite"; return 1; }
+    [ -f "$file" ] && [ ! -L "$file" ] || { ER "找不到旧统计账本（或它是链接）：$file"; return 1; }
+    restore_import_service() {
+        local code=$?
+        trap - EXIT INT TERM
+        if [ "$was_running" = 1 ] && [ "$restored" = 0 ]; then start_bot || code=1; fi
+        if [ -n "$stage" ]; then rm -rf -- "$stage" || code=1; fi
+        exit "$code"
+    }
+    trap restore_import_service EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    guard_one_off_container || return 1
+    mkdir -p -- "$PROJECT_DIR/backup" || return 1
+    stage="$(mktemp -d "$PROJECT_DIR/backup/.stat-import-XXXXXX")" || return 1
+    cp -- "$file" "$stage/stats.sqlite" || { ER "无法复制旧统计账本：$file"; return 1; }
+    if [ -f "$file-wal" ]; then cp -- "$file-wal" "$stage/stats.sqlite-wal" || { ER "无法复制旧统计账本的 -wal：$file-wal"; return 1; }; fi
+    # 一次性容器以服务身份读取副本；rootless 下副本本来就属于部署用户（容器里的 0:0）。
+    user="$(service_container_user)" || return 1
+    if [ "$(id -u)" = 0 ]; then chown -R "$user" "$stage" || return 1; fi
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
+        was_running=1
+        stop_bot || return 1
+    fi
+    local code=0
+    data_admin scripts/ops/stats-import.ts "/app/backup/$(basename "$stage")/stats.sqlite" || code=$?
     if [ "$was_running" = 1 ]; then start_bot || return 1; fi
     restored=1
     return "$code"
@@ -781,15 +779,12 @@ update() {
         bun "$PROJECT_DIR/scripts/lib/confirmed-transaction.ts" "$PROJECT_DIR" "$action" "$UPDATE_TRANSACTION_CONFIRMATION" || return 1
     fi
     # 未完成的事务最先处理，早于检查改动和拉取：继续固定使用记录的目标提交（本地已有），离线也能继续或回滚。
-    if [ -e "$STATE_DIR/update-transaction" ] || [ -e "$STATE_DIR/deploy-transaction" ]; then
+    if [ -e "$STATE_DIR/deploy-transaction" ]; then
         if [ -n "$confirmed" ]; then ER '预览后出现未完成的事务，请刷新后继续或回滚'; return 1; fi
-        if [ -e "$STATE_DIR/deploy-transaction" ]; then
-            load_pending_transaction || { ER '未完成事务的记录无法读取（原因见上方），请人工检查 backup/snapshots'; return 1; }
-            WA "$(describe_pending_transaction)"
-        fi
+        load_pending_transaction || { ER '未完成事务的记录无法读取（原因见上方），请人工检查 backup/snapshots'; return 1; }
+        WA "$(describe_pending_transaction)"
         if [ -z "$action" ]; then choose_pending_action || return 1; action="$PENDING_ACTION"; fi
         # 仅恢复当前事务格式；后续脚本关闭标准输入，沿用已保存的决定。
-        if [ -e "$STATE_DIR/update-transaction" ]; then ER "事务格式不匹配，请用对应旧版完成原操作"; return 1; fi
         if [ "${TRANSACTION[operation]}" = upgrade ]; then resume_recorded_upgrade "$action"; return; fi
         # 中断的是部署：交给部署脚本按事务记录继续或回滚。
         DEPLOY_TRANSACTION_ACTION="$action" bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" </dev/null
@@ -803,7 +798,7 @@ update() {
     require_git_checkout || return 1
     # 已跟踪文件的改动会被升级器的 checkout 冲掉，必须先拦下来。只看已跟踪文件：
     # 未跟踪文件不会被这些操作动到，拿它们挡住升级只会让这条命令永远跑不起来。
-    # data/ 和 logs/ 都在 .gitignore 里，配置与群数据本来就不算改动。
+    # data/ 和 logs/ 都在 .gitignore 里，配置与数据本来就不算改动。
     local dirty target
     dirty="$(git_here status --porcelain --untracked-files=no 2>&1)"
     if [ -n "$dirty" ]; then
@@ -825,7 +820,7 @@ update() {
         target="$(git_here rev-parse --verify --quiet 'origin/main^{commit}')" || { ER "无法解析 origin/main；请确认远端存在 main 分支"; return 1; }
     fi
     operation_event info "original=$(git_here rev-parse HEAD 2>/dev/null) target=$target"
-    # 停机前的预检、隧道确认和迁移预览，停机、切换代码和回滚都由目标版本的升级器负责。
+    # 停机前的预检和迁移预览，停机、切换代码和回滚都由目标版本的升级器负责。
     run_target_upgrader "$target" || return $?
     after_upgrade
 }
@@ -838,8 +833,6 @@ show_logs() {
 
 uninstall() {
     P "卸载 mixin-chatbot"
-    local resolved_group_root=""
-    resolved_group_root="$(resolve_group_data_root "$DEPLOYED_GROUP_DATA_ROOT" 2>/dev/null || true)"
     if has_container; then
         if ! docker stop "$CONTAINER" >/dev/null 2>&1; then
             ER "容器停止失败；为避免删除仍在使用的数据，卸载已停止"
@@ -870,20 +863,7 @@ uninstall() {
         if docker rmi mixin-chatbot >/dev/null 2>&1; then OK "镜像已删除"; else WA "镜像删除失败"; fi
     fi
 
-    local managed_pid=""
-    if managed_pid="$(managed_cloudflared_pid)"; then
-        if ask_yes_no "是否停止本项目 cloudflared（pid ${managed_pid}）？[y/N] "; then
-            if stop_managed_cloudflared; then OK "本项目 cloudflared 已停止"; else WA "结束 pid ${managed_pid} 失败"; fi
-        fi
-    elif pgrep -x cloudflared >/dev/null 2>&1; then
-        WA "检测到未记录归属的 cloudflared；不会用 pkill 批量停止，请先确认进程归属"
-    fi
-
-    if ask_yes_no "是否删除 data/（配置、部署状态、runtime、默认群数据）和 logs/？[y/N] "; then
-        if managed_pid="$(managed_cloudflared_pid)"; then
-            ER "本项目 cloudflared（pid ${managed_pid}）仍在运行；为避免删除其归属/token 状态，已保留 data/ 和 logs/"
-            return 1
-        fi
+    if ask_yes_no "是否删除 data/（配置、部署状态、runtime、默认共享资料、会话、临时文件和统计）和 logs/？[y/N] "; then
         if archive_project_path "${PROJECT_DIR}/data" && archive_project_path "${PROJECT_DIR}/logs" &&
             [ ! -e "${PROJECT_DIR}/data" ] && [ ! -e "${PROJECT_DIR}/logs" ]; then
             OK "data/ 和 logs/ 已移入 backup/rm"
@@ -892,22 +872,21 @@ uninstall() {
             return 1
         fi
     else
-        OK "已保留 data/ 和 logs/（配置、状态与默认群数据保留）"
+        OK "已保留 data/ 和 logs/（配置、状态、资料、会话与统计保留）"
     fi
-    if [ -n "$resolved_group_root" ] && [ "$resolved_group_root" != "$DEFAULT_GROUP_DATA_ROOT" ]; then
-        WA "自定义群数据根未删除：$resolved_group_root"
+    if [ -n "$DEPLOYED_WORKSPACE_ROOT" ]; then
+        WA "外置共享资料目录不属于本项目，未删除：$DEPLOYED_WORKSPACE_ROOT"
     fi
     OK "卸载流程完成。"
 }
 
-# 升级、继续和回滚忽略当前终端的 BOT_PORT/BOT_DOMAIN，入口也不校验普通设置：有未完成事务时用事务记录，
+# 升级、继续和回滚忽略当前终端的 BOT_PORT，入口也不校验普通设置：有未完成事务时用事务记录，
 # 新升级由升级器在停机前校验已保存设置。部署脚本自行校验设置；其余操作采用环境变量并先校验。
 case "${1:-}" in
     update|upgrade|resume|rollback) use_transaction_settings ;;
-    deploy|tunnel-update) ;;
+    deploy) ;;
     *)
         if [ -n "${BOT_PORT:-}" ]; then PORT="$BOT_PORT"; fi
-        if [ -n "${BOT_DOMAIN:-}" ]; then DOMAIN="$BOT_DOMAIN"; fi
         check_ordinary_settings
         ;;
 esac
@@ -922,11 +901,13 @@ case "${1:-}" in
     stop)      stop_bot ;;
     start)     start_bot ;;
     logs)      show_logs ;;
-    tunnel-logging) configure_tunnel_logging "${2:-}" ;;
-    tunnel-protocol) configure_tunnel_protocol "${2:-}" ;;
-    tunnel-update) . "$PROJECT_DIR/scripts/lib/cloudflared-update.sh"; update_cloudflared ;;
     relay-configure) relay_configure ;;
-    model-configure) model_configure ;;
+    model-configure) wizard_configure configure 模型配置 ;;
+    configure-app-bot) wizard_configure configure-app-bot 应用机器人配置 ;;
+    directory) service_bun scripts/ops/directory-admin.ts status ;;
+    directory-confirm) service_bun scripts/ops/directory-admin.ts confirm "${2:-}" ;;
+    directory-departments) service_bun scripts/ops/directory-admin.ts departments "${2:-}" ;;
+    directory-scope) service_bun scripts/ops/directory-admin.ts scope "${2:-}" ;;
     runtime-configure) runtime_configure "${2:-}" ;;
     relay-ls)    relay_admin list ;;
     relay-test)  relay_admin test ;;
@@ -936,9 +917,9 @@ case "${1:-}" in
     tmp-preview) shift; tmp_admin preview "$@" ;;
     tmp-reclaim) shift; tmp_admin reclaim "$@" ;;
     tmp-discard) shift; tmp_admin discard "$@" ;;
-    routes)        shift; group_data_admin scripts/ops/route-admin.ts "$@" ;;
-    stat)          shift; group_data_admin scripts/ops/stats-admin.ts "$@" ;;
-    history-ls)    shift; group_data_admin scripts/ops/history-admin.ts list "$@" ;;
+    stat)          shift; data_admin scripts/ops/stats-admin.ts "$@" ;;
+    stat-import)   stat_import "${2:-}" ;;
+    history-ls)    shift; data_admin scripts/ops/history-admin.ts list "$@" ;;
     history-clear) shift; history_clear "$@" ;;
     history-compact) shift; HISTORY_OPERATION=compact history_clear "$@" ;;
     # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具在容器内逐条重新检查。
@@ -957,12 +938,12 @@ case "${1:-}" in
         echo "用法：./scripts/ops/ops.sh <命令>"
         echo "运维界面：在项目根目录运行 bun run tui；需宿主机安装 Bun（安装指引：https://bun.sh/docs/installation）。"
         echo ""
-        echo "  doctor     健康检查：群数据根、容器、:$PORT、配置；隧道模式额外检查 Cloudflare"
+        echo "  doctor     健康检查：共享资料目录、容器、本机 :$PORT、版本、事件 Stream、通讯录同步、配置"
         echo "             加 --json 输出单行 JSON，供运维界面消费"
         echo "  deploy     配置并部署当前代码；已有部署可用于重建修复，失败自动回滚"
-        echo "  update     同步 origin/main，由目标版本的升级器在停机前预检、确认隧道并预览迁移，"
-        echo "             再停机重建并切换容器；提交前失败自动回滚。沿用现有端口、入口模式、群数据根、"
-        echo "             域名和 AI 配置；改配置请用 deploy"
+        echo "  update     同步 origin/main，由目标版本的升级器在停机前检查部署记录与配置，"
+        echo "             再停机重建并切换容器；提交前失败自动回滚。沿用现有端口、共享资料目录、"
+        echo "             应用凭据和 AI 配置；改配置请用 deploy"
         echo "  resume     继续中断的部署或升级：使用事务记录中的目标提交和设置，不拉取新的 main"
         echo "  rollback   回滚中断的部署或升级：恢复数据、配置、代码和原运行状态；数据已提交时拒绝"
         echo "  restart    重启 Docker 容器"
@@ -972,36 +953,40 @@ case "${1:-}" in
         echo "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
         echo "  model-configure 停止机器人，运行模型配置向导，结束后恢复原运行状态"
         echo "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
-        echo "  tunnel-logging off|on 关闭或开启隧道日志，重启正在运行的本项目隧道"
-        echo "  tunnel-protocol auto|http2|quic 设置隧道连接模式，默认 auto"
-        echo "  tunnel-update 更新本项目 cloudflared 到官方稳定版；校验后切换，失败恢复旧版本（需宿主机 Bun）"
+        echo "  configure-app-bot 停止机器人，填写应用机器人 AppID/AppSecret 并验证，结束后恢复原运行状态"
+        echo "  directory  查看事件 Stream 与通讯录同步状态（同步范围、映射数、最近同步、待确认撤销）"
+        echo "  directory-confirm <轮次> 确认该轮暂停的大批撤销；服务重新完整扫描后才撤销"
+        echo "  directory-departments [部门ID]"
+        echo "             列出该部门（默认根部门）的直属子部门：ID、人数、名称，用来选择同步范围"
+        echo "  directory-scope [部门ID,…]"
+        echo "             只同步这些部门及其子部门，留空为整个通讯录；范围有变化时立即重新同步"
         echo "  relay-ls   列出已发出、仍在册的大文件外链"
         echo "  relay-test 上传并删除一个随机测试文件，验收外链签名、私有访问和删除权限"
         echo "  relay-purge <关键字>|--all"
         echo "             删除匹配的外链对象并清掉索引记录"
-        echo "  tmp-ls [--user <手机号>] [--group <群号>]"
-        echo "             列出各用户临时目录的占用（缓存、中间产物、截断日志）"
-        echo "  tmp-purge --days <天数>|--all [--user <手机号>] [--group <群号>]"
+        echo "  tmp-ls [--user <手机号>] [--group <群号>|direct]"
+        echo "             列出各会话空间里各成员临时目录的占用（收到的文件、任务目录、中间产物）"
+        echo "  tmp-purge --days <天数>|--all [--user <手机号>] [--group <群号>|direct]"
         echo "             清理用户临时目录；--days 只删这些天没改动过的条目"
         echo "  tmp-preview --days <天数>|--all  核对引用并保存归档清单（服务照常运行）"
         echo "  tmp-purge --plan <ID> --digest <摘要>  停机执行或继续归档清单，再恢复原状态"
         echo "  tmp-reclaim --days <天数>|--all  预览物理回收；核对后用 --plan/--digest 确认"
         echo "  tmp-discard  预览可永久删除的归档；核对后用 --plan/--digest 确认，释放磁盘空间"
-        echo "             --user 与 --group 可组合，把范围限到某个群里的某个成员"
-        echo "  stat [群号] [--period today|yesterday|week|last-week|month|last-month|7d|30d|all]"
+        echo "             --user 与 --group 可组合，把范围限到某个群（direct 为单聊空间）里的某个成员"
+        echo "  stat [群号|direct] [--period today|yesterday|week|last-week|month|last-month|7d|30d|all]"
         echo "              或 [--since <日期>] [--until <日期>]"
-        echo "             使用统计：多少人用过、提问多少次、发了多少份资料；日期格式 YYYY-MM-DD"
-        echo "  routes     回调路由：list 查看绑定与冲突，reset/forget 需停机"
-        echo "  history-ls 列出各群的会话历史（群库与旧会话文件的占用、最后活动）"
-        echo "  history-clear <群号>"
-        echo "             清空该群全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
+        echo "             使用统计：多少人用过、提问多少次、模型用了多少 token；日期格式 YYYY-MM-DD"
+        echo "  stat-import <旧账本路径>  一次性导入旧版统计（提问数与 token）；停机导入后恢复原运行状态（TUI 统计页按 i 可浏览选择）"
+        echo "  history-ls 列出各会话空间（单聊与各群）的会话库占用和最后活动"
+        echo "  history-clear <群号>|--direct"
+        echo "             清空该群（或单聊空间）全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         echo "             群选择可加 --group-id（原始群号）或 --storage-segment（目录段）"
-        echo "  history-clear --all  清空所有群全部成员的上下文；一次停机完成，某个群失败时其余群照常清空"
-        echo "  history-compact <群号> <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
+        echo "  history-clear --all  清空单聊和所有群全部成员的上下文；一次停机完成，某个空间失败时其余照常清空"
+        echo "  history-compact <群号>|--direct <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
         echo "  backup-scan 只读扫描 backup/rm 和 backup/snapshots，分类后在 tmp/backup-cleanup 生成清单，不删除"
         echo "  backup-clean <报告名> [--confirm <确认码>]"
         echo "             不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"
-        echo "  uninstall  删除容器（可选镜像、cloudflared、data/、logs/）"
+        echo "  uninstall  删除容器（可选镜像、data/、logs/）"
         # 显式 exit：case 分支的退出码取决于最后一条命令，靠自然结束会把 [ ] 的结果漏出去。
         [ "$UNKNOWN" = "1" ] && exit 1
         exit 0

@@ -1,5 +1,5 @@
 import { mkdir } from "node:fs/promises";
-import { Type, type ClassifierContext, type ClassifierResult, type ImageContent } from "@earendil-works/pi-ai";
+import { Type, type ClassifierContext, type ClassifierResult, type ImageContent, type Usage } from "@earendil-works/pi-ai";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import type { AuxiliaryConfig } from "../core/auxiliary-config.ts";
 import type { RequestDoor } from "./door.ts";
@@ -28,6 +28,19 @@ export class AuxiliaryBudget {
     try { return await work(); }
     finally { this.#active--; [...this.#waiting][0]?.(); }
   }
+}
+
+/** The usage the provider returned for every attempt of one call: the tool result carries it into `pi.usage.tools`. */
+function sumUsage(results: readonly { usage?: Usage }[]): Usage | undefined {
+  let total: Usage | undefined;
+  for (const { usage } of results) {
+    if (usage === undefined) continue;
+    if (total === undefined) { total = structuredClone(usage); continue; }
+    for (const field of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) total[field] += usage[field];
+    for (const field of ["cacheWrite1h", "reasoning"] as const) if (usage[field] !== undefined) total[field] = (total[field] ?? 0) + usage[field];
+    for (const field of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) total.cost[field] += usage.cost[field];
+  }
+  return total;
 }
 
 const IMAGE = Type.Object({ type: Type.Literal("image"), data: Type.String({ maxLength: 12 * 1024 * 1024 }),
@@ -66,10 +79,12 @@ export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoo
         route: { type: "choice", instructions: "Choose the minimal processing route needed to preserve the supplied document's information.",
           criteria: { text: "Existing text is readable; extract text.", ocr: "A scanned page or image needs OCR to obtain text.", layout: "Tables, diagrams, slides, or spatial layout require preserving structure." } },
       } };
+      const attempts: ClassifierResult[] = [];
       const result = await run(call, async () => {
         let result: ClassifierResult;
         for (let attempt = 0; ; attempt++) {
           result = await call.api.models.classify(model, context);
+          attempts.push(result);
           if (result.stopReason !== "error" || attempt >= config.classifierRetries
             || !isRetryableAssistantError({ stopReason: "error", errorMessage: result.errorMessage } as never)) return result;
           await new Promise<void>((resolve, reject) => {
@@ -82,12 +97,13 @@ export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoo
         }
       });
       call.signal?.throwIfAborted();
-      if (result.stopReason !== "stop") return { content: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, details: undefined };
+      const usage = sumUsage(attempts);
+      const charged = usage === undefined ? {} : { usage };
+      if (result.stopReason !== "stop") return { content: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, details: undefined, ...charged };
       const answer = result.answers.route;
       if (answer?.type !== "choice" || !["text", "ocr", "layout"].includes(answer.choice)) throw new Error("分类模型没有返回有效处理路线");
       const value = { route: answer.choice, confidence: answer.confidence };
-      // Usage is persisted/charged by AuxiliaryDoc, never attached again to the parent tool's combined usage.
-      return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value, details: { provider: ref.provider, model: ref.modelId } };
+      return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value, details: { provider: ref.provider, model: ref.modelId }, ...charged };
     },
   });
   if (config.image) tools.push({
@@ -105,7 +121,8 @@ export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoo
       if (!model) throw new Error(`没有图片模型 ${ref.provider}/${ref.modelId}`);
       const result = await run(call, () => call.api.models.generateImages(model, { input: [{ type: "text", text: args.prompt }, ...images(args.images)] }));
       call.signal?.throwIfAborted();
-      if (result.stopReason !== "stop") return { content: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, details: undefined };
+      const charged = result.usage === undefined ? {} : { usage: result.usage };
+      if (result.stopReason !== "stop") return { content: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, details: undefined, ...charged };
       await mkdir(places.tempDir, { recursive: true });
       const name = resultsDirName(call.api.taskId as number, `image-${call.callId}`);
       const files = new ResultFiles(places.tempDir, name, resultRegistration(call.api, call.context, phone, name));
@@ -120,7 +137,7 @@ export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoo
         }
         const stale = await files.recheck();
         if (stale.size) throw new Error("生成图片目录发生变化，结果路径已撤回");
-        return { content, details: { provider: ref.provider, model: ref.modelId } };
+        return { content, details: { provider: ref.provider, model: ref.modelId }, ...charged };
       } finally { await files.release(); }
     },
   });

@@ -6,13 +6,10 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { buildSendTools } from "../../src/agent/send-tools.ts";
-import { createOutboundNotes } from "../helpers/outbound-notes.ts";
-import { MAX_ATTACHMENT_BYTES } from "../../src/core/config.ts";
+import { createOutboundNotes, recordingChannel } from "../helpers/outbound-notes.ts";
+import { NATIVE_FILE_MAX_BYTES } from "../../src/core/config.ts";
 import type { RelayConfig } from "../../src/integrations/relay.ts";
 import { openRelayIndex, type RelayIndex } from "../../src/integrations/relay-index.ts";
-
-const CALLBACK_URL =
-  "https://imtwo.zdxlz.com/im-external/v1/webhook/send?key=send-tools-test";
 
 const RELAY: RelayConfig = {
   provider: "s3", endpoint: "https://s3.example.test", region: "test-region", bucket: "test-bucket",
@@ -23,7 +20,7 @@ const RELAY: RelayConfig = {
 /** 一个刚好越过 IM 单条附件上限的文件，用来触发外链分支。 */
 async function writeOversizedFile(dir: string, name: string): Promise<string> {
   const path = join(dir, name);
-  await writeFile(path, Buffer.alloc(MAX_ATTACHMENT_BYTES + 1024));
+  await writeFile(path, Buffer.alloc(NATIVE_FILE_MAX_BYTES + 1024));
   return path;
 }
 
@@ -42,8 +39,7 @@ describe("attachment send tools", () => {
     const controller = new AbortController();
     controller.abort();
     const imageTool = buildSendTools({
-      getCallbackUrl: () => CALLBACK_URL,
-      groupId: "group-a",
+      channel: recordingChannel().channel,
       workspaceDir: ".",
       tempDir: ".",
       notes: createOutboundNotes(),
@@ -85,7 +81,7 @@ describe("attachment send tools", () => {
       });
       // S3 上传后必须核验对象大小。
       if (init?.method === "PUT") return new Response(null, { status: 201 });
-      if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "Content-Length": String(MAX_ATTACHMENT_BYTES + 1024) } });
+      if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "Content-Length": String(NATIVE_FILE_MAX_BYTES + 1024) } });
       return new Response(JSON.stringify({ ok: true, code: 200 }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -96,8 +92,7 @@ describe("attachment send tools", () => {
       await writeOversizedFile(workspace, "report.bin");
       const notes = createOutboundNotes();
       const fileTool = buildSendTools({
-        getCallbackUrl: () => CALLBACK_URL,
-        groupId: "group-a",
+        channel: recordingChannel().channel,
         notes,
         workspaceDir: workspace,
         tempDir: userTemp,
@@ -127,12 +122,11 @@ describe("attachment send tools", () => {
       expect(details.mode).toBe("relay");
       expect(new URL(details.url).hostname).toBe("test-bucket.s3.example.test");
 
-      // 链接交给运行时并入那条唯一的回复，工具自己不再单独发一条消息——否则一次发送
-      // 要吃掉两条出站配额。
+      // 链接交给运行时保存，最终回复之后作为单独一条文本发出；工具自己不发消息。
       const drained = notes.peek();
       expect(drained).toHaveLength(1);
       expect(drained[0]).toContain(details.url);
-      expect(requests.some((r) => r.method === "POST" || r.url.includes("webhook"))).toBe(false);
+      expect(requests.some((r) => r.method === "POST")).toBe(false);
       // 附件上传端点不该被碰过——大文件根本没进 IM 的通道。
       expect(requests.some((r) => r.url.includes("upload"))).toBe(false);
       expect(drained[0]).toContain("（北京时间）前下载");
@@ -157,7 +151,7 @@ describe("attachment send tools", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       if (init?.method === "PUT") return new Response(null, { status: 201 });
-      if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "Content-Length": String(MAX_ATTACHMENT_BYTES + 1024) } });
+      if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "Content-Length": String(NATIVE_FILE_MAX_BYTES + 1024) } });
       return new Response(JSON.stringify({ ok: true, code: 200 }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -168,8 +162,7 @@ describe("attachment send tools", () => {
       await writeOversizedFile(workspace, "report.bin");
       const notes = createOutboundNotes();
       const fileTool = buildSendTools({
-        getCallbackUrl: () => CALLBACK_URL,
-        groupId: "group-a",
+        channel: recordingChannel().channel,
         notes,
         workspaceDir: workspace,
         tempDir: userTemp,
@@ -212,15 +205,14 @@ describe("attachment send tools", () => {
       if (init?.method === "PUT") {
         return new Response(null, { status: 201 });
       }
-      return new Response(null, { status: 200, headers: { "Content-Length": String(MAX_ATTACHMENT_BYTES + 1024) } });
+      return new Response(null, { status: 200, headers: { "Content-Length": String(NATIVE_FILE_MAX_BYTES + 1024) } });
     }) as unknown as typeof fetch;
 
     try {
       await writeOversizedFile(workspace, "report.bin");
       const notes = createOutboundNotes();
       const fileTool = buildSendTools({
-        getCallbackUrl: () => CALLBACK_URL,
-        groupId: "group-a",
+        channel: recordingChannel().channel,
         notes,
         workspaceDir: workspace,
         tempDir: userTemp,
@@ -260,8 +252,7 @@ describe("attachment send tools", () => {
     try {
       await writeOversizedFile(workspace, "report.bin");
       const fileTool = buildSendTools({
-        getCallbackUrl: () => CALLBACK_URL,
-        groupId: "group-a",
+        channel: recordingChannel().channel,
         notes: createOutboundNotes(),
         workspaceDir: workspace,
         tempDir: userTemp,
@@ -282,8 +273,8 @@ describe("attachment send tools", () => {
         );
       expect(error).toBeInstanceOf(Error);
       // 这句话会被模型转述进群里：要有人能读的单位，不能是原始字节数。
-      expect(error!.message).toContain(formatSize(MAX_ATTACHMENT_BYTES));
-      expect(error!.message).not.toContain(String(MAX_ATTACHMENT_BYTES));
+      expect(error!.message).toContain(formatSize(NATIVE_FILE_MAX_BYTES));
+      expect(error!.message).not.toContain(String(NATIVE_FILE_MAX_BYTES));
       // 工具描述不能提外链，否则模型会向用户承诺一个不存在的能力。
       expect(fileTool.description).not.toContain("外链");
       expect(fileTool.description).not.toContain("链接");
@@ -315,8 +306,7 @@ describe("attachment send tools", () => {
     try {
       const outsideFile = await writeOversizedFile(outside, "secret.bin");
       const fileTool = buildSendTools({
-        getCallbackUrl: () => CALLBACK_URL,
-        groupId: "group-a",
+        channel: recordingChannel().channel,
         notes: createOutboundNotes(),
         workspaceDir: workspace,
         tempDir: userTemp,
@@ -340,17 +330,4 @@ describe("attachment send tools", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 20_000);
-});
-
-describe("outbound notes", () => {
-  test("retains delivery notes until explicit acknowledgement", () => {
-    const saved: string[] = [];
-    const notes = createOutboundNotes((note) => saved.push(note));
-    notes.add("a"); notes.add("b");
-    expect(notes.peek()).toEqual(["a", "b"]);
-    expect(notes.peek()).toEqual(saved);
-    notes.clear();
-    expect(notes.peek()).toEqual([]);
-    expect(saved).toEqual(["a", "b"]);
-  });
 });

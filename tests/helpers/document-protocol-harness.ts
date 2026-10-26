@@ -127,7 +127,7 @@ await mkdir(otherGroup);
 const elsewhere = buildDocumentWorkTools({ ...options, workspaceDir: otherGroup }, { pptx: "模板/默认.potx" });
 const absent = await call("document_build", { format: "pptx", content: "## 新页" }, "build-default-missing", elsewhere);
 assert.deepEqual([absent.build.defaultTemplate, lastTemplate()], ["missing", undefined]);
-assert.ok(absent.warnings.includes("本群 workspace 中没有默认模板 模板/默认.potx，已使用默认版式"));
+assert.ok(absent.warnings.includes("共享资料 workspace 中没有默认模板 模板/默认.potx，已使用默认版式"));
 const run = (list: ToolDefinition[], params: Record<string, unknown>) =>
   list.find((tool) => tool.name === "document_build")!.execute("call", params as never, undefined, undefined, {} as never);
 await assert.rejects(run(elsewhere, { format: "pptx", content: "## 新页", keepSlides: [1] }), /需要指定模板/);
@@ -139,7 +139,7 @@ await writeFile(join(outside, "模板", "默认.potx"), "outside potx");
 await mkdir(linked);
 await symlink(join(outside, "模板"), join(linked, "模板"), "junction");
 const escaping = buildDocumentWorkTools({ ...options, workspaceDir: linked }, { pptx: "模板/默认.potx" });
-await assert.rejects(run(escaping, { format: "pptx", content: "## 新页" }), /本群 workspace 内/);
+await assert.rejects(run(escaping, { format: "pptx", content: "## 新页" }), /共享资料 workspace 内/);
 // outline comes only from document_inspect, build only from document_build (always) and document_compose (PPT with
 // content, only the three page lists), so only they declare it.
 const toolNamed = (name: string) => tools.find((tool) => tool.name === name)!;
@@ -212,7 +212,7 @@ for (const name of ["document_extract", "document_inspect"]) assert.equal(annota
 for (const name of ["document_patch", "document_compose", "document_build", "document_render", "document_images"]) {
   assert.deepEqual([annotations[name]?.readOnlyHint, annotations[name]?.destructiveHint, annotations[name]?.openWorldHint], [false, false, false], name);
 }
-const send = buildSendTools({ getCallbackUrl: () => "https://im.zdxlz.com/x", groupId: "group", workspaceDir: workspace, tempDir,
+const send = buildSendTools({ channel: { file: async () => {}, image: async () => {} }, workspaceDir: workspace, tempDir,
   notes: { add() {} } as never });
 for (const tool of send) {
   assert.equal(tool.exposure, "model-only", tool.name);

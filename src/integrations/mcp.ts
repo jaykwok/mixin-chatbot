@@ -4,8 +4,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { McpClient, StdioTransport, StreamableHttpTransport, type AuthProvider, type CallToolResult, type McpTransport, type McpTransportSendOptions, type Tool } from "@earendil-works/pi-mcp";
 import type { McpConfig, McpServerConfig } from "../core/mcp-config.ts";
 import { mcpOAuth } from "./mcp-oauth.ts";
+import type { Scope } from "../core/layout.ts";
+import { APP_VERSION } from "../core/version.ts";
 
-export interface McpMember { groupId: string; phone: string; workspaceDir: string; tempDir: string }
+/** The calling member; `tempDir` is the directory a stdio server starts in (the request's directory in a run). */
+export interface McpMember { scope: Scope; phone: string; workspaceDir: string; tempDir: string }
 export type ExternalGate = <T>(dispatch: () => Promise<T>, signal: AbortSignal) => Promise<T>;
 export interface McpCatalogueTool { server: McpServerConfig; tool: Tool }
 /** Every request except tools/call ends after requestMs; a tools/call after callMs. */
@@ -60,7 +63,7 @@ export class McpTools {
     const requestSignal = AbortSignal.any([signal, this.#closing.signal]);
     return this.#scope.run({ signal: requestSignal, gate }, async () => {
       requestSignal.throwIfAborted();
-      const client = new McpClient({ name: "mixin-chatbot", version: "1.1.0", requestTimeoutMs: this.#timeouts.requestMs,
+      const client = new McpClient({ name: "mixin-chatbot", version: APP_VERSION, requestTimeoutMs: this.#timeouts.requestMs,
         roots: member ? [{ uri: pathToFileURL(member.workspaceDir).href, name: "workspace (read only)" }, { uri: pathToFileURL(member.tempDir).href, name: "member tmp" }] : [],
       });
       this.#clients.add(client);
@@ -88,7 +91,8 @@ export class McpTools {
     if (server.transport === "stdio") {
       const env: Record<string, string> = {};
       for (const name of ["PATH", "Path", "SystemRoot", "WINDIR", "PATHEXT", "TEMP", "TMP", "LANG"]) if (process.env[name]) env[name] = process.env[name]!;
-      Object.assign(env, server.env, { MIXIN_GROUP_ID: member?.groupId ?? "", MIXIN_MEMBER_PHONE: member?.phone ?? "" });
+      Object.assign(env, server.env, { MIXIN_CHAT_KIND: member?.scope.kind ?? "", MIXIN_GROUP_ID: member?.scope.kind === "group" ? member.scope.groupId : "",
+        MIXIN_MEMBER_PHONE: member?.phone ?? "" });
       const transport = new StdioTransport({ command: process.execPath, args: [supervisor, "--stdio", server.command!, ...server.args ?? []],
         cwd: member?.tempDir ?? this.discoveryDir, env, inheritEnv: false, maxMessageBytes: 8 * 1024 * 1024, maxStderrBytes: 65536, closeTimeoutMs: 2000 });
       return new Proxy(transport, { get: (target, property) => {
@@ -115,8 +119,9 @@ export class McpTools {
       if (!value) throw new Error(`MCP ${server.name} 缺少管理员配置的请求凭证`);
       headers[name] = value;
     }
-    for (const name of Object.keys(headers)) if (["x-mixin-group", "x-mixin-member"].includes(name.toLowerCase())) delete headers[name];
-    if (member) Object.assign(headers, { "x-mixin-group": encodeURIComponent(member.groupId), "x-mixin-member": encodeURIComponent(member.phone) });
+    for (const name of Object.keys(headers)) if (["x-mixin-chat", "x-mixin-group", "x-mixin-member"].includes(name.toLowerCase())) delete headers[name];
+    if (member) Object.assign(headers, { "x-mixin-chat": member.scope.kind, "x-mixin-member": encodeURIComponent(member.phone),
+      ...(member.scope.kind === "group" ? { "x-mixin-group": encodeURIComponent(member.scope.groupId) } : {}) });
     return new StreamableHttpTransport({ url: server.url!, headers, authProvider: this.#auth.get(server.name),
       maxMessageBytes: 8 * 1024 * 1024, openGetStream: false,
       fetch: (url, init) => {

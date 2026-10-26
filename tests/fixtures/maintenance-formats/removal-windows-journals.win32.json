@@ -1,7 +1,7 @@
 [
   {
     "version": 1,
-    "path": "<ROOT0>/groups/.reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-0",
+    "path": "<ROOT0>/data/state/reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-0",
     "proof": {
       "dev": "<string>",
       "ino": "<string>",
@@ -35,7 +35,7 @@
   },
   {
     "version": 1,
-    "path": "<ROOT0>/groups/.reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-1",
+    "path": "<ROOT0>/data/state/reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-1",
     "proof": {
       "dev": "<string>",
       "ino": "<string>",
@@ -57,7 +57,7 @@
   },
   {
     "version": 1,
-    "path": "<ROOT0>/groups/.reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-2",
+    "path": "<ROOT0>/data/state/reclamation/backup/rm/tmp-11111111-1111-4111-8111-111111111111-2",
     "proof": {
       "dev": "<string>",
       "ino": "<string>",

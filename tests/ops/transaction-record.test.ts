@@ -13,15 +13,13 @@ const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-
 const quotePS = (text: string) => "'" + text.replaceAll("'", "''") + "'";
 
 const record: TransactionRecord = {
-  format: "1", operation: "deploy", snapshot: "deploy-abc123", target_sha: "a".repeat(40), original_sha: "", original_branch: "",
-  original_group_root: "/srv/old groups", target_group_root: "/srv/new", was_running: "1", bot_port: "2022", deploy_mode: "cloudflare",
-  bot_domain: "bot.example.com", domain_action: "persist", unmanaged_tunnel: "", platform_ip: "203.0.113.17", reconfigure_ai: "0",
+  format: "2", operation: "deploy", snapshot: "deploy-abc123", target_sha: "a".repeat(40), original_sha: "", original_branch: "",
+  original_workspace_root: "/srv/old shared", target_workspace_root: "/srv/new", was_running: "1", bot_port: "2022", reconfigure_ai: "0",
 };
+// Records of earlier releases (the webhook versions wrote format 1) are not recognised; legacy directories are deployed fresh.
+const legacy = { ...record, format: "1", deploy_mode: "cloudflare", bot_domain: "bot.example.com", domain_action: "persist",
+  unmanaged_tunnel: "", platform_ip: "203.0.113.17" };
 const serialize = (value: Record<string, string>) => Object.entries(value).map(([key, item]) => `${key}=${item}`).join("\n") + "\n";
-// All three parsers must agree: an address one side accepts must never be refused by another after the stop.
-const platformIps = ["203.0.113.17", "203.0.113.0/24", "2001:db8::1", "::1", "2001:db8::/32", "", "localhost", "203.0.113.17 ",
-  "1.2.3.4;ufw disable", "1.2.3", "1".repeat(65)];
-const platformIpVerdicts = () => platformIps.map(value => `${JSON.stringify(value)}=${transactionValueValid("platform_ip", value) ? 1 : 0}`).join(" ");
 
 async function execute(args: string[], cwd: string, env: Record<string, string | undefined> = process.env) {
   const child = Bun.spawn(args, { cwd, env, stdout: "pipe", stderr: "pipe", windowsHide: true });
@@ -31,17 +29,18 @@ async function execute(args: string[], cwd: string, env: Record<string, string |
 
 test("事务记录逐键校验：重复、未知、缺失或非法的值拒绝整份记录", () => {
   expect(parseTransactionRecord(serialize(record))).toEqual(record);
-  expect(parseTransactionRecord(serialize({ ...record, target_group_root: "D:\\groups", original_branch: "feature/x" })).target_group_root).toBe("D:\\groups");
+  expect(parseTransactionRecord(serialize({ ...record, target_workspace_root: "D:\\shared", original_branch: "feature/x" })).target_workspace_root).toBe("D:\\shared");
+  // An empty root is the default data/workspace.
+  expect(parseTransactionRecord(serialize({ ...record, target_workspace_root: "", original_workspace_root: "" })).target_workspace_root).toBe("");
   const invalid: Record<string, string>[] = [
     { ...record, bot_port: "70000" }, { ...record, bot_port: "0080" }, { ...record, target_sha: "abc" },
-    { ...record, target_group_root: "groups" }, { ...record, snapshot: "../deploy-x" }, { ...record, bot_domain: "Bot.Example.com" },
-    { ...record, bot_domain: "https://bot.example.com" }, { ...record, deploy_mode: "tunnel" }, { ...record, domain_action: "drop" },
-    { ...record, original_branch: "bad branch" }, { ...record, target_group_root: "/srv/new\u0007" }, { ...record, extra: "1" },
-    { ...record, platform_ip: "" }, { ...record, platform_ip: "localhost" }, { ...record, platform_ip: "1.2.3.4;ufw disable" },
+    { ...record, target_workspace_root: "shared" }, { ...record, snapshot: "../deploy-x" }, { ...record, was_running: "2" },
+    { ...record, original_branch: "bad branch" }, { ...record, target_workspace_root: "/srv/new\u0007" }, { ...record, extra: "1" },
+    { ...record, platform_ip: "203.0.113.17" }, { ...record, deploy_mode: "direct" }, { ...record, target_group_root: "/srv/new" },
   ];
   for (const value of invalid) expect(() => parseTransactionRecord(serialize(value)), JSON.stringify(value)).toThrow();
-  for (const platform_ip of ["203.0.113.0/24", "2001:db8::1"]) expect(parseTransactionRecord(serialize({ ...record, platform_ip })).platform_ip).toBe(platform_ip);
-  expect(platformIpVerdicts()).toContain('"203.0.113.17"=1'); expect(platformIpVerdicts()).toContain('"1.2.3"=0');
+  expect(transactionValueValid("format", "1")).toBe(false);
+  expect(() => parseTransactionRecord(serialize(legacy))).toThrow("事务记录无效：format");
   const { reconfigure_ai: _, ...missing } = record;
   expect(() => parseTransactionRecord(serialize(missing))).toThrow("缺少");
   expect(() => parseTransactionRecord(serialize(record) + "bot_port=2022\n")).toThrow("bot_port");
@@ -60,14 +59,15 @@ test("运维界面按指针读取事务，数据已提交只看本事务的当�
     await writeFile(join(snapshot, "code-restore"), "");
     expect(loadPendingTransaction(root)?.codeRestorePending).toBe(true);
     await Bun.file(join(snapshot, "code-restore")).delete();
-    // Direct entries show the recorded firewall source that continuing will use.
-    await writeFile(join(snapshot, "transaction"), serialize({ ...record, deploy_mode: "direct", bot_domain: "" }));
-    expect(describePendingTransaction(loadPendingTransaction(root)!).record).toContain("端口 2022 · 入口 直连（来源 203.0.113.17）");
+    expect(describePendingTransaction(loadPendingTransaction(root)!).record).toContain("本机端口 2022");
+    expect(describePendingTransaction(loadPendingTransaction(root)!).record).toContain("共享资料目录：/srv/new（原 /srv/old shared）");
+    await writeFile(join(snapshot, "transaction"), serialize(legacy));
+    expect(() => loadPendingTransaction(root)).toThrow("事务记录无效：format");
     await Bun.file(join(snapshot, "transaction")).delete();
     expect(() => loadPendingTransaction(root)).toThrow("事务格式不匹配");
     await writeFile(join(snapshot, "transaction"), serialize(record));
     // A committed journal from another deployment does not block rolling back this one.
-    const journal = { format: 1, phase: "committed", groups: "/srv/new", deployment: "deploy-older" };
+    const journal = { format: 1, phase: "committed", deployment: "deploy-older", previous: null };
     await writeFile(join(state, "release-data.json"), JSON.stringify(journal));
     expect(loadPendingTransaction(root)?.committed).toBe(false);
     await writeFile(join(state, "release-data.json"), JSON.stringify({ ...journal, deployment: "deploy-abc123" }));
@@ -83,13 +83,8 @@ test("运维界面按指针读取事务，数据已提交只看本事务的当�
     await Bun.file(join(snapshot, "transaction")).delete();
     await writeFile(join(snapshot, "target-sha"), "b".repeat(40));
     expect(() => loadPendingTransaction(root)).toThrow("事务格式不匹配");
-    // Legacy Linux upgrade stopped before the deployment began: only the stop record and receipt exist.
+    // A Windows upgrade pointer whose snapshot has no current record is refused too.
     await Bun.file(join(state, "deploy-transaction")).delete(); await Bun.file(join(state, "release-data.json")).delete();
-    await writeFile(join(state, "update-transaction"), ["1", "c".repeat(40), "main", "d".repeat(40), "-", "1", ""].join("\n"));
-    await writeFile(join(state, "update-commit"), "");
-    expect(() => loadPendingTransaction(root)).toThrow("事务格式不匹配");
-    await Bun.file(join(state, "update-transaction")).delete(); await Bun.file(join(state, "update-commit")).delete();
-    // Historical Windows snapshots are refused too.
     await Bun.file(join(snapshot, "target-sha")).delete();
     await writeFile(join(state, "upgrade-transaction"), "deploy-abc123");
     await writeFile(join(snapshot, "deployment.xml"), `<Objs><Obj><MS><S N="UpgradeTarget">${"e".repeat(40)}</S></MS></Obj></Objs>`);
@@ -105,29 +100,24 @@ test.skipIf(!bash || !existsSync(bash))("Docker 事务记录可往返读写，�
 set -euo pipefail
 . '${posixPath(join(project, "scripts/lib/common.sh"))}'
 PROJECT_DIR="$1"; snap="$PROJECT_DIR/backup/snapshots/deploy-abc123"
-declare -gA TRANSACTION=([format]=1 [operation]=upgrade [snapshot]=deploy-abc123 [target_sha]="$(printf 'a%.0s' {1..40})"
-  [original_sha]="$(printf 'b%.0s' {1..40})" [original_branch]=main [original_group_root]=/srv/old [target_group_root]="/srv/new groups"
-  [was_running]=1 [bot_port]=2022 [deploy_mode]=cloudflare [bot_domain]=bot.example.com [domain_action]=keep [unmanaged_tunnel]=''
-  [platform_ip]=203.0.113.17 [reconfigure_ai]=0)
+declare -gA TRANSACTION=([format]=2 [operation]=upgrade [snapshot]=deploy-abc123 [target_sha]="$(printf 'a%.0s' {1..40})"
+  [original_sha]="$(printf 'b%.0s' {1..40})" [original_branch]=main [original_workspace_root]= [target_workspace_root]="/srv/new shared"
+  [was_running]=1 [bot_port]=2022 [reconfigure_ai]=0)
 write_transaction_record "$snap"
-verdicts=''
-for value in ${platformIps.map(value => `'${value}'`).join(" ")}; do
-    if transaction_value_valid platform_ip "$value"; then ok=1; else ok=0; fi
-    verdicts+="$(printf '"%s"=%s ' "$value" "$ok")"
-done
-echo "VERDICTS \${verdicts% }"
 # Values that could not be read back are refused before anything is written.
 TRANSACTION[bot_port]=70000
 if write_transaction_record "$snap" 2>/dev/null; then echo 'invalid value written'; exit 1; fi
 printf deploy-abc123 > "$PROJECT_DIR/data/state/deploy-transaction"
 unset TRANSACTION
 load_pending_transaction
-echo "RECORD port=\${TRANSACTION[bot_port]} root=\${TRANSACTION[target_group_root]} platform=\${TRANSACTION[platform_ip]}"
+echo "RECORD port=\${TRANSACTION[bot_port]} root=\${TRANSACTION[target_workspace_root]}"
 cp "$snap/transaction" "$snap/transaction.good"
 printf 'bot_port=2023\\n' >> "$snap/transaction"
 if load_pending_transaction 2>/dev/null; then echo 'duplicate accepted'; exit 1; fi
-sed 's/^deploy_mode=.*/deploy_mode=tunnel/' "$snap/transaction.good" > "$snap/transaction"
-if load_pending_transaction 2>/dev/null; then echo 'invalid mode accepted'; exit 1; fi
+sed 's/^was_running=.*/was_running=2/' "$snap/transaction.good" > "$snap/transaction"
+if load_pending_transaction 2>/dev/null; then echo 'invalid value accepted'; exit 1; fi
+{ echo format=1; sed 1d "$snap/transaction.good"; echo deploy_mode=cloudflare; } > "$snap/transaction"
+if load_pending_transaction; then echo 'legacy record accepted'; exit 1; fi
 sed 's/^snapshot=.*/snapshot=deploy-other/' "$snap/transaction.good" > "$snap/transaction"
 if load_pending_transaction 2>/dev/null; then echo 'foreign record accepted'; exit 1; fi
 # Historical fragments cannot synthesize current release choices.
@@ -138,8 +128,8 @@ if load_pending_transaction; then echo 'old snapshot accepted'; exit 1; fi
   try {
     const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toContain("RECORD port=2022 root=/srv/new groups platform=203.0.113.17");
-    expect(result.output).toContain(`VERDICTS ${platformIpVerdicts()}\n`);
+    expect(result.output).toContain("RECORD port=2022 root=/srv/new shared");
+    expect(result.output).toContain("事务记录无效：format");
     expect(result.output).toContain("事务格式不匹配");
   } finally { await fixture.cleanup(); }
 }, 30000);
@@ -154,19 +144,22 @@ test.skipIf(process.platform !== "win32")("Windows 事务记录与 Docker 同一
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
 $snapshot=${quotePS(snapshot)}; $pointer=Join-Path $PSScriptRoot 'data\\state\\deploy-transaction'
 try { Read-DeploymentTransaction $snapshot; throw 'old snapshot accepted' } catch { if ($_.Exception.Message -notmatch '事务格式不匹配') { throw } }
-$verdicts=foreach ($value in @(${platformIps.map(value => `'${value}'`).join(", ")})) { '"' + $value + '"=' + [int](Test-TransactionValue 'platform_ip' $value) }
-Write-Output ('VERDICTS ' + ($verdicts -join ' '))
-$record=@{ format='1'; operation='deploy'; snapshot=(Split-Path $snapshot -Leaf); target_sha=''; original_sha=''; original_branch=''
-    original_group_root='D:\\old groups'; target_group_root='E:\\groups'; was_running='0'; bot_port='2022'; deploy_mode='direct'
-    bot_domain=''; domain_action='clear'; unmanaged_tunnel='direct'; platform_ip='203.0.113.17'; reconfigure_ai='1' }
+$record=@{ format='2'; operation='deploy'; snapshot=(Split-Path $snapshot -Leaf); target_sha=''; original_sha=''; original_branch=''
+    original_workspace_root=''; target_workspace_root='E:\\shared'; was_running='0'; bot_port='2022'; reconfigure_ai='1' }
+$legacy=$record.Clone(); $legacy.format='1'; $legacy.platform_ip='203.0.113.17'
+try { Publish-DeploymentTransaction ([pscustomobject]@{Path=$snapshot}) $legacy $pointer; throw 'legacy record published' } catch { if ($_.Exception.Message -eq 'legacy record published') { throw } }
 $bad=$record.Clone(); $bad.bot_port='70000'
 try { Publish-DeploymentTransaction ([pscustomobject]@{Path=$snapshot}) $bad $pointer; throw 'invalid record published' } catch { if ($_.Exception.Message -eq 'invalid record published') { throw } }
 if (Test-Path -LiteralPath $pointer) { throw 'pointer published without a valid record' }
 Publish-DeploymentTransaction ([pscustomobject]@{Path=$snapshot}) $record $pointer (Join-Path $PSScriptRoot 'plan.json')
 if (-not (Test-Path -LiteralPath (Join-Path $snapshot 'data-plan.json'))) { throw 'plan not kept with the snapshot' }
 $read=Read-DeploymentTransaction $snapshot
-if ($read.target_group_root -cne 'E:\\groups' -or $read.unmanaged_tunnel -cne 'direct' -or $read.platform_ip -cne '203.0.113.17') { throw 'record not read back' }
+if ($read.target_workspace_root -cne 'E:\\shared' -or $read.original_workspace_root -cne '' -or $read.bot_port -cne '2022') { throw 'record not read back' }
 Write-Output (Format-DeploymentTransaction $read)
+$good=Get-Content -LiteralPath (Join-Path $snapshot 'transaction') -Raw
+Set-Content -LiteralPath (Join-Path $snapshot 'transaction') ($good -replace '^format=2', 'format=1') -NoNewline
+try { $null = Read-DeploymentTransaction $snapshot; throw 'legacy record accepted' } catch { if ($_.Exception.Message -notmatch '事务记录无效：format') { throw } }
+Set-Content -LiteralPath (Join-Path $snapshot 'transaction') $good -NoNewline
 Add-Content -LiteralPath (Join-Path $snapshot 'transaction') 'bot_port=2023' -NoNewline
 try { $null = Read-DeploymentTransaction $snapshot; throw 'duplicate accepted' } catch { if ($_.Exception.Message -eq 'duplicate accepted') { throw } }
 # Empty pointers are refused by name and an empty saved root means the default; neither is dereferenced as null.
@@ -175,15 +168,14 @@ try { $null = Open-DeploymentTransaction $PSScriptRoot; throw 'empty pointer ope
 $upgradePointer=Join-Path $PSScriptRoot 'data\\state\\upgrade-transaction'
 Set-Content -LiteralPath $upgradePointer '' -NoNewline
 try { $null = Open-UpgradeSnapshot $PSScriptRoot 'task' '' '' ''; throw 'empty upgrade pointer opened' } catch { if ($_.Exception.Message -ne '升级事务快照名称无效') { throw } }
-Set-Content -LiteralPath (Join-Path $PSScriptRoot 'data\\state\\group-data-root') '' -NoNewline
-if ((Get-SavedGroupDataRoot $PSScriptRoot) -ne [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'data\\groups'))) { throw 'empty saved root not defaulted' }
+Set-Content -LiteralPath (Join-Path $PSScriptRoot 'data\\state\\workspace-root') '' -NoNewline
+if ((Get-SavedWorkspaceRoot $PSScriptRoot) -ne '') { throw 'empty saved root not defaulted' }
 Write-Output 'RECORD_OK'
 `);
   try {
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0); expect(result.output).toContain("RECORD_OK");
-    expect(result.output).toContain(`VERDICTS ${platformIpVerdicts()}\r\n`);
-    expect(result.output).toContain("入口 direct（来源 203.0.113.17）");
+    expect(result.output).toContain("本机端口 2022");
     // The UI parses the Windows record with the same rules (UTF-8 without BOM, LF lines).
     const text = await readFile(join(snapshot, "transaction"), "utf8");
     expect(text.charCodeAt(0)).not.toBe(0xfeff);
@@ -199,7 +191,7 @@ async function entryFixture(prefix: string, entry: string) {
   await mkdir(join(root, "scripts/ops"), { recursive: true }); await mkdir(join(root, "scripts/deploy"), { recursive: true });
   await copyFile(join(project, entry), join(root, entry));
   await mkdir(state, { recursive: true });
-  await writeFile(join(state, "bot-port"), "invalid"); await writeFile(join(state, "deploy-mode"), "bogus");
+  await writeFile(join(state, "bot-port"), "invalid");
   return fixture;
 }
 
@@ -214,7 +206,7 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
     // An exported function, not a PATH stub: the Windows CI runner did not find a stub script written just before.
     const lock = process.platform === "win32" ? { "BASH_FUNC_flock%%": "() { return 0\n}" } : {};
     const ops = (command: string, entry = "scripts/ops/ops.sh") => execute([bash!, posixPath(join(root, entry)), command], root,
-      { ...process.env, ...lock, MSYS_NO_PATHCONV: "1", BOT_PORT: "", BOT_DOMAIN: "" });
+      { ...process.env, ...lock, MSYS_NO_PATHCONV: "1", BOT_PORT: "" });
     for (const [command, action] of [["resume", "continue"], ["rollback", "rollback"]]) {
       const result = await ops(command!);
       expect(result.code, result.output).toBe(0); expect(result.output).toContain(`DISPATCHED action=${action}`);
@@ -224,9 +216,9 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
     const source = await readFile(join(root, "scripts/ops/ops.sh"), "utf8");
     // Everything before the command dispatch (the last case), including the entry's settings gate.
     await writeFile(join(root, "scripts/ops/settings.sh"), source.slice(0, source.lastIndexOf('\ncase "${1:-}" in\n')) +
-      '\necho "SETTINGS port=$PORT mode=$DEPLOY_MODE domain=$DOMAIN root=$DEPLOYED_GROUP_DATA_ROOT"\n');
+      '\necho "SETTINGS port=$PORT root=$DEPLOYED_WORKSPACE_ROOT"\n');
     const settings = await ops("resume", "scripts/ops/settings.sh");
-    expect(settings.output).toContain("SETTINGS port=2022 mode=cloudflare domain=bot.example.com root=/srv/new\n");
+    expect(settings.output).toContain("SETTINGS port=2022 root=/srv/new\n");
     // The deployment script validates and offers to correct saved settings itself.
     expect((await ops("deploy")).output).toContain("DISPATCHED action=\n");
     // Ordinary operations still refuse to run on broken settings.

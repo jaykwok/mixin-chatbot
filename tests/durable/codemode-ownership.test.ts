@@ -25,8 +25,10 @@ import { registerResult, requestMemberExpiry, ResultsDoc } from "../../src/durab
 import { referencedResults, resultReferences } from "../../src/durable/results/references.ts";
 import { memberPlaces } from "../../src/durable/tools.ts";
 import { fauxModels, type GroupHarness, openGroupHarness } from "../helpers/durable.ts";
+import { appLayout, groupScope } from "../../src/core/layout.ts";
 import { stubResultsBackend } from "../helpers/results-backend.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 const fixture = await tempFixture("durable-codemode-ownership-");
 afterAll(() => fixture.cleanup());
@@ -159,10 +161,10 @@ let databases = 0;
 async function run(points: Point[]): Promise<Run> {
   const { models, faux, model } = fauxModels();
   const root = join(fixture.root, `run-${++databases}`);
-  const members = { root: join(root, "groups"), groupId: GROUP };
+  const members = { layout: appLayout(join(root, "data")), scope: groupScope(GROUP) };
   const open = () => openGroupHarness(join(root, "db.sqlite"), models, { extensions: [pausing, codemodeExtension({ members, tools: [] })] });
   let group = await open();
-  const { conversation } = await memberConversation(group.harness, GROUP, PHONE, { model }, context);
+  const { conversation } = await memberConversation(group.harness, scopeOf(GROUP), PHONE, { model }, context);
   const id = "cm-files";
   faux.setResponses([fauxAssistantMessage([fauxToolCall("codemode", { code: `text("x".repeat(${OUTPUT}));` }, { id })], { stopReason: "toolUse" })]);
   const outputDirs: (string | undefined)[] = [];
@@ -184,7 +186,7 @@ async function run(points: Point[]): Promise<Run> {
   const entry = (await again.entries({}, 1000, undefined, context)).items
     .find((each) => each.kind === "pi.tool-result" && (each.model?.[0] as { toolCallId?: string })?.toolCallId === id);
   const result = entry?.model?.[0] as Run["result"];
-  const tempDir = memberPlaces(members, GROUP, PHONE).tempDir;
+  const tempDir = memberPlaces(members, members.scope, PHONE).tempDir;
   return { group, conversation: again, tempDir, name: Object.keys((await group.harness.snapshot(ResultsDoc, context))!.calls)[0]!, result, outputDirs };
 }
 

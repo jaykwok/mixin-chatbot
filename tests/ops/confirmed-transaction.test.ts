@@ -23,9 +23,8 @@ async function synthetic(root: string) {
     const directory = join(root, "backup/snapshots", name!);
     await mkdir(directory, { recursive: true });
     await writeFile(join(directory, "transaction"), Object.entries({
-      format: "1", operation: "deploy", snapshot: name!, target_sha: sha!, original_sha: "", original_branch: "",
-      original_group_root: root, target_group_root: root, was_running: "0", bot_port: "2022", deploy_mode: "direct",
-      bot_domain: "", domain_action: "keep", unmanaged_tunnel: "", platform_ip: "203.0.113.17", reconfigure_ai: "0",
+      format: "2", operation: "deploy", snapshot: name!, target_sha: sha!, original_sha: "", original_branch: "",
+      original_workspace_root: "", target_workspace_root: "", was_running: "0", bot_port: "2022", reconfigure_ai: "0",
     }).map(([key, value]) => `${key}=${value}`).join("\n") + "\n");
   }
   await writeFile(join(state, "deploy-transaction"), first);
@@ -59,7 +58,7 @@ for (const action of ["resume", "rollback"] as const) test(`TUI ${action} carrie
   const pendingSpy = spyOn(transaction, "loadPendingTransaction").mockImplementation(() => load(fixture.root));
   const gitSpy = spyOn(data, "loadGit").mockResolvedValue(null);
   let subject = "", args: string[] = [];
-  const app = { deployment: { platform: "windows", runtime: "scheduled-task", mode: "direct", port: 1011, domain: "", groupDataRoot: fixture.root, groupDataRootIsCustom: true },
+  const app = { deployment: { platform: "windows", runtime: "scheduled-task", port: 1011, dataRoot: fixture.root, workspaceRoot: "" },
     theme: createTheme("none"), redraw() {}, go() {}, toast() {},
     async confirm(spec: { subject: string }) { subject = spec.subject; await writeFile(join(fixture.root, "data/state/deploy-transaction"), second); return true; },
     async runInteractive(_title: string, sent: string[]) { args = sent; return 1; },

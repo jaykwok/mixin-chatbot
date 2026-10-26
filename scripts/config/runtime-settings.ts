@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chown, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   ADVANCED_RUNTIME_KEYS, RUNTIME_DEFAULTS, RUNTIME_KEYS, RUNTIME_RANGES, validateRuntimeConfig,
   type AdvancedRuntimeKey, type RuntimeConfig,
 } from "../../src/core/runtime-schema.ts";
-import { RUNTIME_CONFIG_PATH } from "../../src/core/storage.ts";
+import { DATA_DIR, RUNTIME_CONFIG_PATH } from "../../src/core/storage.ts";
 
 export interface RuntimeSnapshot { hash: string | null; values: RuntimeConfig }
 export type RuntimeChanges = Partial<Record<AdvancedRuntimeKey, string | null>>;
@@ -79,9 +79,10 @@ async function writeAtomic(path: string, raw: string): Promise<void> {
 
 /** Persist explicit deployment settings, including supported values inherited from the shell. */
 export async function saveRuntimeSettings(path = RUNTIME_CONFIG_PATH, env = process.env): Promise<void> {
-  if (env.BOT_MODEL_CACHE_RETENTION?.trim()) throw new Error("BOT_MODEL_CACHE_RETENTION 已移除；请先迁移配置并移除旧环境变量，再部署");
   const settings = (await readRuntimeSettings(path)).values;
   for (const name of RUNTIME_KEYS) if (env[name]?.trim()) settings[name] = env[name]!.trim();
+  // The default workspace is not a setting: naming it (the Windows deployment does, to return from an external one) drops the key.
+  if (settings.WORKSPACE_ROOT && resolve(settings.WORKSPACE_ROOT) === resolve(DATA_DIR, "workspace")) delete settings.WORKSPACE_ROOT;
   await writeAtomic(path, JSON.stringify(validateRuntimeConfig(settings), null, 2) + "\n");
 }
 

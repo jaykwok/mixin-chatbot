@@ -11,10 +11,10 @@ import { stream as bedrockStream } from "@earendil-works/pi-ai/api/bedrock-conve
 import { estimateTextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
-import { AttemptsDoc } from "../../src/durable/attempts.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { scopeOf } from "../helpers/layout.ts";
 
 const fixture = await tempFixture("pi110-behavior-"); afterAll(() => fixture.cleanup());
 let n = 0;
@@ -41,7 +41,7 @@ test("tier pricing uses the whole request's input plus cache and never rewrites 
   expect(official.every(model => model.cost.tiers?.every(tier => tier.inputTokensAbove > 0) ?? true)).toBe(true);
 });
 
-test.each(["server_busy", "servers are currently busy", "the engine is currently overloaded", "503 service unavailable", "exceeded request buffer limit while retrying upstream", "unable to forward upstream"])("native retry %s has a fresh start and SDK retries zero", async error => {
+test.each(["server_busy", "servers are currently busy", "the engine is currently overloaded", "503 service unavailable", "exceeded request buffer limit while retrying upstream", "unable to forward upstream"])("native retry %s goes through the door again and SDK retries zero", async error => {
   const { faux, models, model } = fauxModels();
   expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage: error }))).toBe(true);
   const options: number[] = [];
@@ -50,12 +50,10 @@ test.each(["server_busy", "servers are currently busy", "the engine is currently
   const opened = await openGroupHarness(join(fixture.root, `retry-${++n}.sqlite`), models,
     { settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1, maxAgentDelayMs: 1 }, stream: { maxRetries: 0, timeoutMs: 120000 } } });
   try {
-    const { conversation } = await memberConversation(opened.harness, "group-a", "alice", { model }, context);
+    const { conversation } = await memberConversation(opened.harness, scopeOf("group-a"), "alice", { model }, context);
     expect((await (await conversation.submit({ type: "input", content: "retry" }, context)).wait(context)).status).toBe("done");
     expect(options).toEqual([0, 0]); expect(faux.state.callCount).toBe(2);
-    const starts = Object.values((await opened.harness.snapshot(AttemptsDoc, conversation.id, context))!.starts);
-    expect(starts).toHaveLength(2); expect(starts.map(start => start.attempt)).toEqual([1, 2]);
-    expect(starts[0]!.usage).toBeUndefined(); expect(starts[1]!.usage).toBeDefined();
+    expect(opened.door!.dispatched).toBe(2);
     const response = (await conversation.entries({}, 30, undefined, context)).items.flatMap(entry => entry.model ?? []).find(message => message.role === "assistant" && message.stopReason === "stop")!;
     expect(response.role === "assistant" && response.durationMs! >= 0).toBe(true);
   } finally { await opened.close(); }

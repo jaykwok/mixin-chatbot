@@ -35,11 +35,12 @@ describe("agent slash commands", () => {
   });
 
   test("advertises every supported command in help", () => {
-    expect([...SUPPORTED_COMMANDS.keys()]).toEqual(["/help", "/clear", "/stop", "/status", "/compact", "/deliver"]);
+    expect([...SUPPORTED_COMMANDS.keys()]).toEqual(["/help", "/clear", "/stop", "/status", "/compact"]);
     for (const command of SUPPORTED_COMMANDS.keys()) {
       expect(HELP_TEXT).toContain(command);
     }
     expect(HELP_TEXT).toContain("大小写不敏感");
-    expect(HELP_TEXT).toContain("@机器人名");
+    expect(HELP_TEXT).toContain("群里需 @机器人");
+    expect(HELP_TEXT).toContain("单聊直接发送");
   });
 });

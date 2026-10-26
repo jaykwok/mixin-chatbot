@@ -1,28 +1,22 @@
 #!/usr/bin/env bash
 # 部署/升级事务记录：快照目录中的 transaction 文件，每行一个 key=value。
-# 记录停机前确认的全部选择；续做和回滚只使用记录值，不重新读取默认值。隧道 token 永不写入。
-# Windows 写入同一格式，运维界面按同一规则读取。
-TRANSACTION_KEYS=(format operation snapshot target_sha original_sha original_branch original_group_root target_group_root
-    was_running bot_port deploy_mode bot_domain domain_action unmanaged_tunnel platform_ip reconfigure_ai)
+# 记录停机前确认的全部选择；续做和回滚只使用记录值，不重新读取默认值。凭据永不写入。
+# Windows 写入同一格式，运维界面按同一规则读取。format 2 起没有入口模式、域名和平台 IP（应用机器人不需要入站入口）。
+TRANSACTION_KEYS=(format operation snapshot target_sha original_sha original_branch original_workspace_root target_workspace_root
+    was_running bot_port reconfigure_ai)
 
 transaction_value_valid() {
     local key="$1" value="$2"
     [[ ! "$value" =~ [[:cntrl:]] ]] || return 1
     case "$key" in
-        format) [ "$value" = 1 ] ;;
+        format) [ "$value" = 2 ] ;;
         operation) [[ "$value" =~ ^(deploy|upgrade)$ ]] ;;
         snapshot) [[ "$value" =~ ^deploy-[A-Za-z0-9]+$ ]] ;;
         target_sha|original_sha) [[ "$value" =~ ^([0-9a-f]{40}|[0-9a-f]{64})?$ ]] ;;
         original_branch) [ -z "$value" ] || [ "$value" = HEAD ] || git check-ref-format --branch "$value" >/dev/null 2>&1 ;;
-        original_group_root|target_group_root) [[ "$value" == /* ]] ;;
+        original_workspace_root|target_workspace_root) [ -z "$value" ] || [[ "$value" == /* ]] ;;
         was_running|reconfigure_ai) [[ "$value" =~ ^[01]$ ]] ;;
         bot_port) [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$value" -le 65535 ] ;;
-        deploy_mode) [[ "$value" =~ ^(direct|cloudflare)$ ]] ;;
-        bot_domain) [ -z "$value" ] || [ "$(normalize_hostname_input "$value" 2>/dev/null)" = "$value" ] ;;
-        domain_action) [[ "$value" =~ ^(keep|persist|clear)$ ]] ;;
-        unmanaged_tunnel) [[ "$value" =~ ^(direct|cloudflare)?$ ]] ;;
-        # 直连防火墙放行的来源：IPv4 或 IPv6，可带前缀长度。
-        platform_ip) [ "${#value}" -le 64 ] && [[ "$value" =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-Fa-f]*:[0-9A-Fa-f:.]*)(/[0-9]{1,3})?$ ]] ;;
         *) return 1 ;;
     esac
 }
@@ -61,14 +55,10 @@ read_transaction_record() {
     done
 }
 
-# 已提交部署保存的群根；相对路径按项目目录解析，未保存时为默认 data/groups。
-saved_group_data_root() {
-    local root="$PROJECT_DIR/data/groups" file="$PROJECT_DIR/data/state/group-data-root"
-    if [ -s "$file" ]; then
-        root="$(tr -d '\r\n' < "$file")"
-        case "$root" in /*) ;; *) root="$PROJECT_DIR/$root" ;; esac
-    fi
-    realpath -m -- "$root"
+# 已提交部署保存的外置共享资料目录（宿主绝对路径）；为空表示默认的 data/workspace。
+saved_workspace_root() {
+    local file="$PROJECT_DIR/data/state/workspace-root"
+    [ ! -s "$file" ] || tr -d '\r\n' < "$file"
 }
 
 # Current release transactions require their complete recorded choices; no historical snapshot reconstruction.
@@ -86,13 +76,12 @@ load_pending_transaction() {
 
 # 供菜单和日志显示的一行摘要。
 describe_pending_transaction() {
-    local kind='部署' state='停止' entry="${TRANSACTION[deploy_mode]}"
+    local kind='部署' state='停止'
     [ "${TRANSACTION[operation]}" = deploy ] || kind='升级'
     [ "${TRANSACTION[was_running]}" = 0 ] || state='运行'
-    [ "$entry" != direct ] || entry="direct（来源 ${TRANSACTION[platform_ip]}）"
-    printf '未完成的%s：目标提交 %s；群数据总根 %s（原 %s）；端口 %s；入口 %s；原运行状态：%s' "$kind" \
-        "${TRANSACTION[target_sha]:0:7}" "${TRANSACTION[target_group_root]}" "${TRANSACTION[original_group_root]}" \
-        "${TRANSACTION[bot_port]}" "$entry" "$state"
+    printf '未完成的%s：目标提交 %s；共享资料目录 %s（原 %s）；本机端口 %s；原运行状态：%s' "$kind" \
+        "${TRANSACTION[target_sha]:0:7}" "${TRANSACTION[target_workspace_root]:-data/workspace}" "${TRANSACTION[original_workspace_root]:-data/workspace}" \
+        "${TRANSACTION[bot_port]}" "$state"
     ! transaction_code_restore_pending || printf '；数据、配置和容器已经回滚，只剩代码待恢复到升级前的 %s（只能完成回滚）' "${TRANSACTION[original_sha]:0:7}"
 }
 

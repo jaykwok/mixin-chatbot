@@ -1,30 +1,42 @@
 import { expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { tempFixture } from "../helpers/temp.ts";
+import { CURRENT_APPLICATION } from "../helpers/current-config.ts";
 
 const CONFIGURE = fileURLToPath(new URL("../../scripts/config/configure.ts", import.meta.url));
 const VALIDATE = fileURLToPath(new URL("../../scripts/config/validate-models.ts", import.meta.url));
 const MODELS_JSON = join("data", "config", "models.json");
 const PI_SETTINGS = join("data", "runtime", "pi", "settings.json");
 const MODEL_CATALOG = join("data", "runtime", "models-store.json");
+const APP_BOT = join("data", "config", "app-bot.json");
 
 /**
  * 子进程只替换交互控件，实际运行 configure 入口并读回它落盘的完整配置。mock 限制在
  * 子进程，不污染同进程里的 SDK 或其他测试。PI_OFFLINE 关掉 Pi 的目录联网刷新。
+ * 应用机器人凭据只在缺少时询问；除 askAppBot 外预先放好，取 token 的平台请求由 mock 应答，不联网。
  */
-async function runConfigure(root: string, answers: Record<string, string | boolean>, faults: {
-  cancelAt?: string; failPublishTarget?: string;
+async function runConfigure(root: string, answers: Record<string, string | boolean | string[]>, faults: {
+  cancelAt?: string; failPublishTarget?: string; askAppBot?: boolean;
 } = {}): Promise<{ stdout: string; stderr: string; code: number }> {
+  if (!faults.askAppBot && !existsSync(join(root, APP_BOT))) {
+    await mkdir(join(root, "data", "config"), { recursive: true });
+    await writeFile(join(root, APP_BOT), JSON.stringify({ environment: "production", appId: "test-app", appSecret: "test-only-secret" }));
+  }
   const preload = join(root, `prompts-${Math.random().toString(36).slice(2)}.ts`);
   await writeFile(preload, `
     import { mock } from "bun:test";
     import * as maintenance from ${JSON.stringify(import.meta.resolve("../../src/core/maintenance.ts"))};
+    import * as client from ${JSON.stringify(import.meta.resolve("../../src/integrations/open-platform/client.ts"))};
     const answers = ${JSON.stringify(answers)};
     const faults = ${JSON.stringify(faults)};
     const cancelled = Symbol("cancelled");
+    mock.module(${JSON.stringify(import.meta.resolve("../../src/integrations/open-platform/client.ts"))}, () => ({ ...client,
+      PlatformClient: class { appToken = { get: async () => "fixture-token" }; close() {} },
+    }));
     if (faults.failPublishTarget) {
       const replace = maintenance.replaceFile;
       let failed = false;
@@ -41,15 +53,16 @@ async function runConfigure(root: string, answers: Record<string, string | boole
     // 按 message 子串匹配，测试里不用重复向导的完整提示文案。
     const pick = (options) => {
       if (options.message === faults.cancelAt) return cancelled;
-      for (const [key, value] of Object.entries(answers)) if (String(options.message).includes(key)) return value;
+      // An array answers the same prompt several times, in order.
+      for (const [key, value] of Object.entries(answers)) if (String(options.message).includes(key)) return Array.isArray(value) ? value.shift() : value;
       return undefined;
     };
     const fallback = (options) => options.initialValue ?? options.defaultValue;
     const noop = () => {};
     mock.module(${JSON.stringify(import.meta.resolve("@clack/prompts"))}, () => ({
       cancel: noop, intro: noop, note: noop, outro: noop, isCancel: (value) => value === cancelled,
-      log: { info: noop, success: noop, warn: (message) => console.log("WARN " + message) },
-      password: async () => "test-only-key",
+      log: { info: noop, step: noop, success: noop, warn: (message) => console.log("WARN " + message), error: (message) => console.log("ERROR " + message) },
+      password: async (options) => String(options.message).startsWith("AppSecret") ? "fixture-app-secret" : "test-only-key",
       select: async (options) => pick(options) ?? fallback(options),
       confirm: async (options) => pick(options) ?? fallback(options),
       text: async (options) => pick(options) ?? fallback(options),
@@ -111,6 +124,43 @@ test("内置方式只写凭证，模型资料全部来自 Pi 随包目录", asyn
     const validated = await runValidate(files.root);
     expect(validated.code).toBe(0);
     expect(validated.stdout).toContain(`zai-coding-cn/glm-5.3-flash (api=${source.api}`);
+  } finally {
+    await files.cleanup();
+  }
+}, 30000);
+
+test("缺少应用机器人凭据时先填写 AppID/AppSecret，再配置模型；凭据不出现在输出里", async () => {
+  const files = await tempFixture("pi-configure-app-bot-");
+  try {
+    const result = await runConfigure(files.root, {
+      "AppID": "fixture-app", "平台环境": "staging",
+      "模型接入方式": "builtin", "内置服务商": "zai-coding-cn", "模型": "glm-5.3-flash",
+    }, { askAppBot: true });
+    expect({ code: result.code, stderr: result.stderr }).toEqual({ code: 0, stderr: "" });
+    expect(JSON.parse(await readFile(join(files.root, APP_BOT), "utf8"))).toEqual({
+      environment: "staging", appId: "fixture-app", appSecret: "fixture-app-secret",
+    });
+    expect(result.stdout).not.toContain("fixture-app-secret");
+    expect(JSON.parse(await readFile(join(files.root, PI_SETTINGS), "utf8"))).toMatchObject({ defaultModel: "glm-5.3-flash" });
+  } finally {
+    await files.cleanup();
+  }
+}, 30000);
+
+test("已部署的目录只接受原应用：另一个 AppID 被拒绝并重新填写，部署记录不变", async () => {
+  const files = await tempFixture("pi-configure-app-bot-bound-");
+  try {
+    const record = JSON.stringify({ dataVersion: 1, appVersion: "1.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
+    await mkdir(join(files.root, "data", "state"), { recursive: true });
+    await writeFile(join(files.root, "data", "state", "data-version.json"), record);
+    const result = await runConfigure(files.root, {
+      "AppID": ["another-app", "test-app"], "平台环境": "production",
+      "模型接入方式": "builtin", "内置服务商": "zai-coding-cn", "模型": "glm-5.3-flash",
+    }, { askAppBot: true });
+    expect({ code: result.code, stderr: result.stderr }).toEqual({ code: 0, stderr: "" });
+    expect(result.stdout).toContain("ERROR 这个目录的数据登记在另一个应用或平台环境下");
+    expect(JSON.parse(await readFile(join(files.root, APP_BOT), "utf8"))).toMatchObject({ environment: "production", appId: "test-app" });
+    expect(await readFile(join(files.root, "data", "state", "data-version.json"), "utf8")).toBe(record);
   } finally {
     await files.cleanup();
   }

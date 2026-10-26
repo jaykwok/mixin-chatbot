@@ -17,10 +17,8 @@ const DEPLOYMENT = {
   platform: "linux" as const,
   runtime: "docker" as const,
   port: 1011,
-  mode: "cloudflare" as const,
-  domain: "bot.example.com",
-  groupDataRoot: "/srv/groups",
-  groupDataRootIsCustom: true,
+  dataRoot: "/srv/mixin/data",
+  workspaceRoot: "",
 };
 
 async function makeRoot(group: string): Promise<string> {

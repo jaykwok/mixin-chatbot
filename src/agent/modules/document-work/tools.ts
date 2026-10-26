@@ -96,7 +96,7 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
     const locate = async (value: string): Promise<string> => {
       const original = await realpath(resolveToolPath(value, workspace));
       await assertTaskPathAllowed(original);
-      if (![workspace, temp].some(root => isPathInside(original, root))) throw new Error("只能读取本群 workspace 或当前用户 tmp 中的文件");
+      if (![workspace, temp].some(root => isPathInside(original, root))) throw new Error("只能读取共享资料 workspace 或当前用户 tmp 中的文件");
       return original;
     };
     const copy = async (original: string, expected?: string): Promise<Source> => {
@@ -133,13 +133,13 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
       },
       async defaultTemplate(configured, format) {
         budget.throwIfAborted();
-        // An absolute path is the administrator's shared file; a relative one must stay inside this group's workspace.
+        // An absolute path is the administrator's own file; a relative one must stay inside the shared workspace.
         let original: string;
         try { original = await realpath(isAbsolute(configured) ? configured : resolve(workspace, configured)); }
         catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
         if (!isAbsolute(configured)) {
           await assertTaskPathAllowed(original);
-          if (!isPathInside(original, workspace)) throw new Error("默认模板的相对路径必须位于本群 workspace 内");
+          if (!isPathInside(original, workspace)) throw new Error("默认模板的相对路径必须位于共享资料 workspace 内");
         }
         templateFormat(original, format);
         return copy(original);
@@ -242,7 +242,7 @@ const buildSchema = Type.Object({
   generatedPages: Type.Optional(pages), keptPages: Type.Optional(pages),
   layouts: Type.Optional(layoutEntries), attention: Type.Optional(attentionEntries),
   defaultTemplate: Type.Optional(Type.Union([Type.Literal("used"), Type.Literal("missing")],
-    { description: "未传 template 而管理员配置了默认模板时出现：used 已套用，missing 本群没有该文件，使用了默认版式" })),
+    { description: "未传 template 而管理员配置了默认模板时出现：used 已套用，missing 资料库没有该文件，使用了默认版式" })),
 });
 const composedSchema = Type.Object({ generatedPages: pages, layouts: layoutEntries, attention: attentionEntries },
   { additionalProperties: false, description: "PPT 含 content 项时返回：content 新生成的页，页码为输出文件的页码；复用的来源页不在其中" });
@@ -486,11 +486,11 @@ export function buildDocumentWorkTools(options: DocumentOptions, templates: Docu
   });
   const build = defineTool({
     name: "document_build", label: "按模板生成文档", namespace: NAMESPACE, exposure: SCRIPT_ONLY, annotations: WRITES_COPY, outputSchema: buildOutput,
-    description: "用 Markdown 内容在本群模板（任意同格式 DOCX/PPTX）的母版、版式与样式上生成可编辑的新 Word 或 PPT；无模板时用管理员默认模板，未配置则用默认中文版式。PPT 中 #/## 起新页，keepSlides 保留模板指定页（封面、封底等），sequence 决定保留页与新页顺序。build.layouts 列出新生成页中实际排成图示的页，描述新页版式时以它为准；build.attention 列出需要重点看图的页。生成后仍需 document_render 检查。" + SKILL_POINTER,
+    description: "用 Markdown 内容在资料库或用户提供的模板（任意同格式 DOCX/PPTX）的母版、版式与样式上生成可编辑的新 Word 或 PPT；无模板时用管理员默认模板，未配置则用默认中文版式。PPT 中 #/## 起新页，keepSlides 保留模板指定页（封面、封底等），sequence 决定保留页与新页顺序。build.layouts 列出新生成页中实际排成图示的页，描述新页版式时以它为准；build.attention 列出需要重点看图的页。生成后仍需 document_render 检查。" + SKILL_POINTER,
     parameters: Type.Object({
       format: Type.Union([Type.Literal("docx"), Type.Literal("pptx")]),
       content: Type.String({ minLength: 1, maxLength: 200000 }),
-      template: Type.Optional(Type.String({ description: "本群 workspace 或本用户 tmp 中同格式的模板或样例文件（DOCX/DOTX、PPTX/POTX）；省略时使用默认模板" })),
+      template: Type.Optional(Type.String({ description: "共享资料 workspace 或本用户 tmp 中同格式的模板或样例文件（DOCX/DOTX、PPTX/POTX）；省略时使用默认模板" })),
       title: Type.Optional(Type.String({ maxLength: 200 })), subtitle: Type.Optional(Type.String({ maxLength: 300 })),
       filename: Type.Optional(Type.String()),
       keepSlides: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { maxItems: 50, description: "PPT：保留模板中的这些页（实际页码）" })),
@@ -518,7 +518,7 @@ export function buildDocumentWorkTools(options: DocumentOptions, templates: Docu
           title: params.title, subtitle: params.subtitle, cover: params.cover ?? true, sequence, styleFrom: params.styleFrom };
         const { result, report } = await job.python<Inspection>("build", request);
         result.warnings = [...new Set([...result.warnings, ...content.warnings,
-          ...configured && !chosen ? [`${isAbsolute(configured) ? "" : "本群 workspace 中"}没有默认模板 ${configured}，已使用默认版式`] : []])];
+          ...configured && !chosen ? [`${isAbsolute(configured) ? "" : "共享资料 workspace 中"}没有默认模板 ${configured}，已使用默认版式`] : []])];
         if (configured) result.build = { ...result.build, defaultTemplate: chosen ? "used" : "missing" };
         const record = await provenance(job, "build", sources, output,
           { template: params.template ?? chosen?.original, defaultTemplate: configured !== undefined, keepSlides: keep, sequence, images: Object.keys(content.assets) });
@@ -544,7 +544,7 @@ export function buildDocumentWorkTools(options: DocumentOptions, templates: Docu
     name: "document_images", label: "提取图片素材", namespace: NAMESPACE, exposure: SCRIPT_ONLY, annotations: WRITES_COPY, outputSchema: imagesOutput,
     description: "从 PDF、PPTX、DOCX 提取位图素材。DOCX 默认返回图片序号、段落、标题路径、图注和前后文；先 extract:false 配合 match 关键词查图，再按 orders 提取，next 非空时传 after 翻页。重复图片只保存一次并列出最多三处出现位置。PDF/PPTX 用 pages 分页，矢量图用 crops 截图。每次最多 60 张。",
     parameters: Type.Object({
-      source: Type.String({ description: "本群 workspace 或本用户 tmp 中的 PDF/PPTX/DOCX" }),
+      source: Type.String({ description: "共享资料 workspace 或本用户 tmp 中的 PDF/PPTX/DOCX" }),
       context: Type.Optional(Type.Boolean({ default: true })), contextChars: Type.Optional(Type.Integer({ minimum: 0, maximum: 300, default: 80 })),
       match: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 100 }), { maxItems: 10, description: "DOCX 上下文中的字面关键词，任一命中即可" })),
       extract: Type.Optional(Type.Boolean({ default: true })),

@@ -120,15 +120,20 @@ candidate_export_context() {
 
 # 用本次独占的标签构建，按 --iidfile 取得完整 image ID（CANDIDATE_IMAGE_ID）；构建期间不动正式标签。
 candidate_build() {
-    local context="$1" tag="$2" sha="$3" project_id="$4" operation_id="$5" source="$6" iidfile id status=0
-    local runner=()
+    local context="$1" tag="$2" sha="$3" project_id="$4" operation_id="$5" source="$6" iidfile id='' status=0
+    local runner=() build="${3:0:12}"
+    # 构建标识（src/core/version.ts 的 APP_BUILD）：工作区构建在已跟踪文件有改动时带 -dirty，同一提交的不同代码可以区分。
+    if [ "$source" = workspace ] && [ -n "$build" ] && [ -n "$(git -C "$context" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        build+="-dirty"
+    fi
     CANDIDATE_IMAGE_ID=''
     if declare -F operation_capture >/dev/null; then runner=(operation_capture); fi
     iidfile="$(mktemp)" || return 1
-    ${runner[@]+"${runner[@]}"} docker build --iidfile "$iidfile" --tag "$tag" \
+    ${runner[@]+"${runner[@]}"} docker build --iidfile "$iidfile" --tag "$tag" --build-arg "APP_BUILD=$build" \
         --label "$CANDIDATE_LABEL_REVISION=$sha" --label "$CANDIDATE_LABEL_PROJECT=$project_id" \
         --label "$CANDIDATE_LABEL_OPERATION=$operation_id" --label "$CANDIDATE_LABEL_SOURCE=$source" "$context" || status=$?
-    id="$(tr -d '[:space:]' < "$iidfile" 2>/dev/null)" || id=''
+    # Docker removes the iidfile when the build starts and writes it only on success.
+    if [ "$status" = 0 ]; then id="$(tr -d '[:space:]' < "$iidfile")" || id=''; fi
     rm -f -- "$iidfile"
     [ "$status" = 0 ] || { echo "候选镜像构建失败（退出码 ${status}）" >&2; return 1; }
     candidate_value_valid image_id "$id" || { echo "构建没有给出有效的镜像 ID：${id:-空}" >&2; return 1; }
@@ -637,7 +642,7 @@ check_free_space() {
     return "$failed"
 }
 
-# 构建前的磁盘预检。previous 为原镜像（没有时留空）；其余参数是数据路径（data/、群根、backup/、导出目录）。
+# 构建前的磁盘预检。previous 为原镜像（没有时留空）；其余参数是数据路径（data/、backup/、导出目录）。
 # 每组共享剩余空间的 Docker 存储需要（原镜像解压后大小与下限取大）× 1.5 + 余量，同一组只算一次；组内其余路径
 # 以 0 的需求参与检查，它们可能受更小的配额限制（ZFS 数据集），可用空间取组内最小值。数据路径所在的文件系统另外
 # 保留 CANDIDATE_DATA_RESERVE_BYTES，与构建需求共享剩余空间时相加。

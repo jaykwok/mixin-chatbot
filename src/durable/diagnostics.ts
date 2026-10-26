@@ -1,44 +1,44 @@
 import { Database } from "bun:sqlite";
 import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, createSession, Harness, type ConversationId, type EntryId, type Storage, type Tx } from "@earendil-works/pi-durable";
-import { CURRENT_SQLITE_SCHEMA_VERSION, SqliteStorage, type SqliteDatabase, type SqliteExecutor } from "@earendil-works/pi-durable/storage/sqlite";
+import { SqliteStorage, type SqliteDatabase, type SqliteExecutor } from "@earendil-works/pi-durable/storage/sqlite";
+import { memorySnapshot } from "../core/sqlite-snapshot.ts";
 import { MemberDirectory } from "./identity.ts";
+import { assertDurableSchema, unsupportedSchema } from "./schema-gate.ts";
+import { LIVE_TASK_STATES } from "./task-states.ts";
 
-/** Larger group databases are snapshotted into a private file instead of memory (the service container's /tmp is small). */
+/** Larger conversation databases are snapshotted into a private file instead of memory (the service container's /tmp is small). */
 const MEMORY_SNAPSHOT_BYTES = 256 * 1024 * 1024;
 
 /** Read the source connection only; official migrations/recovery run against a disposable snapshot (memory, or a private file
- * under the group data root's `.reclamation/snapshots` for large databases). */
-export async function withGroupSnapshot<T>(path: string, read: (harness: Harness, storage: Storage, liveWork: boolean,
+ * under the data directory's `state/reclamation/snapshots` for large databases). */
+export async function withSpaceSnapshot<T>(path: string, read: (harness: Harness, storage: Storage, liveWork: boolean,
   commit?: (work: (tx: Tx) => Promise<void>) => Promise<void>) => Promise<T>, exclusive = false, memoryLimit = MEMORY_SNAPSHOT_BYTES): Promise<T> {
   const info = await lstat(path);
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error("诊断只接受普通群数据库文件");
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("诊断只接受普通会话库文件");
   // Offline reclamation keeps a write reservation until its reference checks and physical
   // operations finish. Opening/recovering the Harness still only changes the memory copy.
   const source = new Database(path, { readonly: !exclusive, strict: true });
   let memory: Database, scratch: string | undefined;
   try {
     source.exec(exclusive ? "BEGIN IMMEDIATE" : "BEGIN");
-    const version = (source.query("SELECT version FROM durable_schema WHERE singleton = 1").get() as { version: number } | null)?.version;
-    if (version !== CURRENT_SQLITE_SCHEMA_VERSION) throw new Error("群库 SQLite 版本不匹配，请先升级");
+    // The same gate as the service: the snapshot's official open would otherwise migrate another schema in memory.
+    // An empty file is no conversation database here (diagnostics never creates one).
+    if (!(source.query("SELECT count(*) AS n FROM sqlite_master").get() as { n: number }).n) throw unsupportedSchema(undefined, path);
+    await assertDurableSchema({ get: <T extends object>(sql: string) => (source.query(sql).get() as T | null) ?? undefined }, path);
     const pages = source.query("SELECT page_count * page_size AS bytes FROM pragma_page_count(), pragma_page_size()").get() as { bytes: number };
     if (pages.bytes > memoryLimit) {
       // VACUUM INTO cannot run inside the source transaction. Under its write reservation (exclusive) a second
       // connection reads exactly that state; a read-only preview just needs any consistent state.
       scratch = await mkdtemp(join(await snapshotRoot(path), "snapshot-"));
-      const file = join(scratch, "group.sqlite"), copier = new Database(path, { readonly: true, strict: true });
+      const file = join(scratch, "space.sqlite"), copier = new Database(path, { readonly: true, strict: true });
       try { copier.query("VACUUM INTO ?").run(file); } finally { copier.close(); }
       memory = new Database(file, { strict: true });
       memory.exec("PRAGMA journal_mode = DELETE");
-    } else {
-      const bytes = source.serialize();
-      // sqlite3_deserialize cannot read WAL images; only the private snapshot changes its journal header.
-      bytes[18] = 1; bytes[19] = 1;
-      memory = Database.deserialize(bytes, { strict: true });
-    }
+    } else memory = memorySnapshot(source, { strict: true });
   } catch (error) { source.close(); await discard(scratch); throw error; }
   const adapter = snapshotAdapter(memory, false);
   let harness: Harness;
@@ -47,7 +47,7 @@ export async function withGroupSnapshot<T>(path: string, read: (harness: Harness
   try {
     storage = await SqliteStorage.open(adapter);
     // Recovery may change interrupted tasks. Decide protection from the source state first.
-    for (const status of ["pending", "running", "waiting", "completing"] as const) {
+    for (const status of LIVE_TASK_STATES) {
       if ((await storage.scanTasks({ status }, 1, undefined, context)).items.length) liveWork = true;
     }
     for (const status of ["queued", "placed"] as const) {
@@ -69,7 +69,11 @@ export async function withGroupSnapshot<T>(path: string, read: (harness: Harness
 
 /** Private (0700) scratch space on the data volume; each snapshot gets its own directory, removed afterwards. */
 async function snapshotRoot(path: string): Promise<string> {
-  const groups = await realpath(dirname(dirname(resolve(path)))), root = join(groups, ".reclamation", "snapshots");
+  // <data>/conversations/{direct | groups/<group>}/durable.sqlite → <data>/state/reclamation/snapshots
+  let conversations = dirname(dirname(resolve(path)));
+  if (basename(conversations) === "groups") conversations = dirname(conversations);
+  if (basename(conversations) !== "conversations") throw new Error("会话库不在数据目录的 conversations 下，无法确定快照目录");
+  const root = join(await realpath(dirname(conversations)), "state", "reclamation", "snapshots");
   await mkdir(root, { recursive: true, mode: 0o700 });
   const info = await lstat(root);
   if (!info.isDirectory() || info.isSymbolicLink() || await realpath(root) !== root) throw new Error("快照目录不是原位普通目录");
@@ -106,14 +110,14 @@ function snapshotAdapter(database: Database, nested: boolean): SqliteDatabase {
 
 async function memberId(harness: Harness, phone: string): Promise<ConversationId> {
   const record = await harness.snapshot(MemberDirectory, phone, context);
-  if (!record) throw new Error("群库中没有该成员");
+  if (!record) throw new Error("会话库中没有该成员");
   return record.conversationId as ConversationId;
 }
 
 /** Same historical model context as fork(at), without creating a fork or sending a request. */
 export async function historicalContext(path: string, phone: string, at?: number) {
   if (at !== undefined && (!Number.isSafeInteger(at) || at < 1)) throw new Error("条目编号必须是正整数");
-  return withGroupSnapshot(path, async harness => {
+  return withSpaceSnapshot(path, async harness => {
     const conversation = await harness.conversation(await memberId(harness, phone), context);
     if (!conversation) throw new Error("会话不存在");
     return conversation.context(context, at === undefined ? undefined : { at: at as EntryId });
@@ -131,9 +135,9 @@ function add(bucket: DurationBucket, value: number | undefined): void {
   bucket.meanMs = bucket.totalMs / bucket.known;
 }
 
-/** Derived read-only view; costs and entry cursors in stats.sqlite stay authoritative and unchanged. */
+/** Derived read-only view of response and tool timings; the stats ledger is neither read nor changed. */
 export async function conversationTimings(path: string, phone: string) {
-  return withGroupSnapshot(path, async (harness, storage) => {
+  return withSpaceSnapshot(path, async (harness, storage) => {
     const conversationId = await memberId(harness, phone);
     const response = empty(), tools: Record<string, DurationBucket> = Object.create(null), taskSpans: Record<string, DurationBucket> = Object.create(null);
     let taskCursor: Parameters<Storage["scanTasks"]>[2];

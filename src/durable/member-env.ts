@@ -1,18 +1,33 @@
 // Per-invocation filesystem capability and supervised shell for Durable's native tools.
 import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, win32 } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { err, ok, ExecutionError, FileError, StreamDecoder, type ExecutionEnv, type ShellExecOptions, type Result, type ShellExecResult } from "@earendil-works/pi-durable/env";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
+import { scopeKey, type Scope } from "../core/layout.ts";
 import { isPathInside } from "../contracts/paths.ts";
 import { venvPythonPath } from "../agent/python-toolchain.ts";
 import { runProcess, timedCommand } from "../core/process.ts";
 import { ProcessFailure } from "../../scripts/lib/process.ts";
 import { holdDirectory } from "../core/held-directory.ts";
 import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../core/task-backend.ts";
+
+/**
+ * The shell for string commands: Pi's discovery (Git Bash first on Windows). Both WSL launchers it can find are refused:
+ * their bash runs inside WSL, with other paths and processes the supervised runner cannot reap. Since Pi 1.4.0 the
+ * legacy launcher (System32\bash.exe) comes back with `commandTransport: "stdin"`, which the argv-only runner cannot
+ * carry either, and an app execution alias (…\WindowsApps\bash.exe, which starts wsl.exe) counts as found on PATH.
+ * @internal Exported for tests only; knip --production skips `@internal`.
+ */
+export function memberShell(config: ReturnType<typeof getShellConfig> = getShellConfig()): { shell: string; args: string[] } {
+  if (config.commandTransport === "stdin" || (process.platform === "win32" && /(^|\\)windowsapps\\[^\\]+$/i.test(win32.normalize(config.shell)))) {
+    throw new Error(`${config.shell} 是 Windows 自带的 WSL 启动器，不能运行 bash 工具；请安装 Git for Windows，并让它的 bash.exe 在 PATH 中排在前面`);
+  }
+  return { shell: config.shell, args: config.args };
+}
 
 function shellQuote(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
 class AllowedPathGuard {
@@ -43,7 +58,7 @@ class AllowedPathGuard {
 
   private assertInside(path: string): void {
     if (!this.roots.some((root) => isPathInside(path, root))) {
-      throw new Error("写入仅允许当前用户 tmp；本群 workspace 和 index 只读");
+      throw new Error("写入仅允许本次请求的 tmp 目录；应用共享资料 workspace 和 index 只读");
     }
   }
 
@@ -109,18 +124,23 @@ class AllowedPathGuard {
 
 
 export interface MemberEnvOptions {
-  workspaceDir: string; tempDir: string; phone: string; groupId: string; venvDir: string;
+  /** The member's tmp: readable (attachments, earlier requests' files), its caches, the managed task directories. */
+  tempDir: string;
+  /** The request's own directory below the member's tmp: the only write root, and the model's temp directory. */
+  requestDir?: string;
+  workspaceDir: string; phone: string; scope: Scope; venvDir: string;
   materialsIndexPath: string; resourceReadDirs?: readonly string[]; inputPaths?: readonly string[];
 }
 
 export async function createMemberEnv(options: MemberEnvOptions): Promise<ExecutionEnv> {
-  const { workspaceDir: cwd, tempDir, phone, groupId, venvDir, materialsIndexPath } = options;
-  const guard = await AllowedPathGuard.create([tempDir], [cwd, dirname(materialsIndexPath), ...options.resourceReadDirs ?? []]);
+  const { workspaceDir: cwd, tempDir, phone, scope, venvDir, materialsIndexPath } = options;
+  const work = options.requestDir ?? tempDir;
+  const guard = await AllowedPathGuard.create([work], [tempDir, cwd, dirname(materialsIndexPath), ...options.resourceReadDirs ?? []]);
   const node = new NodeExecutionEnv({ cwd });
   const callerEnvironment = {
-    TMPDIR: tempDir,
-    TMP: tempDir,
-    TEMP: tempDir,
+    TMPDIR: work,
+    TMP: work,
+    TEMP: work,
     XDG_CACHE_HOME: join(tempDir, ".cache"),
     npm_config_cache: join(tempDir, ".npm"),
     BUN_INSTALL_CACHE_DIR: join(tempDir, ".bun-install-cache"),
@@ -143,9 +163,9 @@ export async function createMemberEnv(options: MemberEnvOptions): Promise<Execut
     // The basic REPL handles that EOF without starting the console-only _pyrepl.
     PYTHON_BASIC_REPL: "1",
     PI_CALLER_PHONE: phone,
-    PI_GROUP_ID: groupId,
-    PI_USER_TMP: tempDir,
-    // 解释器路径与索引位置都随群/平台变化，写死在提示词里迟早会过期；导出成变量后
+    PI_SPACE: scopeKey(scope),
+    PI_USER_TMP: work,
+    // 解释器路径与索引位置都随部署/平台变化，写死在提示词里迟早会过期；导出成变量后
     // 模型只要 "$PI_PYTHON"、"$PI_MATERIALS_INDEX" 即可，也不用再去探测 Scripts/ 还是 bin/。
     PI_PYTHON: configuredRootlessTasks() ? ISOLATED_PYTHON : venvPythonPath(venvDir),
     PI_MATERIALS_INDEX: materialsIndexPath,
@@ -208,17 +228,21 @@ async function executeMember(command: string | readonly string[], opts: ShellExe
   let failure: unknown, code = 0;
   try {
     file = await held.use(entries => entries.create(name, true));
-    const shell = getShellConfig();
+    const shell = typeof command === "string" ? memberShell() : undefined;
     const backend = configuredRootlessTasks();
     const task = await backend?.create(member.tempDir);
     try {
       const explicit = { ...opts.env, ...callerEnvironment };
-      if (task) for (const [key, value] of Object.entries(explicit)) if (value && (value === member.tempDir || value.startsWith(member.tempDir + "/") || value.startsWith(member.tempDir + "\\"))) explicit[key] = task.path + value.slice(member.tempDir.length);
+      // The task directory stands in for the request's directory, or for the member's tmp outside a run.
+      if (task) for (const [key, value] of Object.entries(explicit)) {
+        const base = [member.requestDir, member.tempDir].find(dir => dir !== undefined && value && (value === dir || value.startsWith(dir + "/") || value.startsWith(dir + "\\")));
+        if (base !== undefined) explicit[key] = task.path + value.slice(base.length);
+      }
       const environment = { ...(task || opts.inheritEnv === false ? {} : process.env), ...explicit };
       const exports = Object.entries(explicit).filter((entry): entry is [string, string] => typeof entry[1] === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(entry[0]))
         .map(([key, value]) => "export " + key + "=" + shellQuote(value)).join("\n");
-      const processOptions = { command: typeof command === "string" ? shell.shell : command[0]!,
-        args: typeof command === "string" ? [...shell.args, exports + "\n" + command] : [...command.slice(1)],
+      const processOptions = { command: typeof command === "string" ? shell!.shell : command[0]!,
+        args: typeof command === "string" ? [...shell!.args, exports + "\n" + command] : [...command.slice(1)],
         cwd: opts.cwd ?? member.workspaceDir, env: environment, signal: context.abortSignal, timeoutMs: seconds * 1000,
         onOutput: (data: Buffer, stream: "stdout" | "stderr") => {
           bytes += data.length; for (const byte of data) if (byte === 10) lines++;

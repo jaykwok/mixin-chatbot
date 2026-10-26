@@ -2,9 +2,9 @@
 # 目标版本升级器（Linux / Docker）。ops.sh update 把它连同共用脚本从目标提交导出到 tmp/upgrade-*
 # （见 UPGRADER_EXPORT_PATHS）后运行；它不在工作区内执行，切换代码不会改动正在运行的脚本。
 #
-# 新升级：停机前完成全部准备——预检、确认原服务的运行身份、未托管 connector 的归属和缺失的隧道 token、从目标提交
-# 构建候选镜像并按 image ID 固定、在这个镜像中只读预览迁移并校验配置、停机前复核——再写入镜像和身份记录、事务记录
-# 并把迁移计划存入快照；随后停机、切换代码，交给目标版本的 deploy.sh 按记录继续（不重新构建），标准输入接
+# 新升级：停机前完成全部准备——预检、确认原服务的运行身份、从目标提交
+# 构建候选镜像并按 image ID 固定、在这个镜像中只读核对数据版本并校验配置、停机前复核——再写入镜像和身份记录、事务记录
+# 并把数据预检计划存入快照；随后停机、切换代码，交给目标版本的 deploy.sh 按记录继续（不重新构建），标准输入接
 # /dev/null，执行阶段不再交互。提交前失败自动回滚数据、配置、容器和代码。
 # 未完成的升级：按事务记录继续或回滚，不重新询问，只用记录的镜像和身份。
 #
@@ -32,10 +32,8 @@ cd "$PROJECT_DIR"
 DATA_DIR="$PROJECT_DIR/data"
 CONFIG_DIR="$DATA_DIR/config"
 STATE_DIR="$DATA_DIR/state"
-DEFAULT_GROUP_DATA_ROOT="$DATA_DIR/groups"
 MODELS_FILE="$CONFIG_DIR/models.json"
 LOG_DIR="$PROJECT_DIR/logs"
-TUNNEL_PID_FILE="$STATE_DIR/cloudflared.pid"
 PENDING_POINTER="$STATE_DIR/deploy-transaction"
 BUILD_CONTEXT="$UPGRADER_DIR/build-context"
 PREVIEW_DIR="$UPGRADER_DIR/preview"
@@ -51,11 +49,9 @@ ORIGINAL_SHA=''
 ORIGINAL_BRANCH=''
 ORIGINAL_MAIN=''
 TARGET_SHA=''
-TUNNEL_INPUT=''
 DEPLOY_PID=''
 PREVIEW_PID=''
 PREVIEW_CONTAINER=''
-RESET_CONFIG=''
 DEPLOY_STATUS=0
 DEPLOY_RECEIPT="$UPGRADER_DIR/commit-receipt"
 INTERRUPTED=0
@@ -165,19 +161,17 @@ forward_signal() {
 }
 
 # 交给工作区（目标版本）的部署脚本按事务记录执行。它在后台运行以便转发中断：收到 TERM 后由它自行回滚。
-# 隧道 token 只经子进程环境交接，交接标记（快照名）只在同一次升级中传入。
 run_deploy() {
-    local action="$1" handoff="${2:-}"
+    local action="$1"
     : > "$DEPLOY_RECEIPT"
     INTERRUPTED=0
     trap 'INTERRUPTED=130; forward_signal' INT
     trap 'INTERRUPTED=143; forward_signal' TERM
     # 断线时同样等部署脚本回滚，再恢复代码。
     trap 'INTERRUPTED=129; forward_signal' HUP
-    DEPLOY_TRANSACTION_ACTION="$action" DEPLOY_TRANSACTION_HANDOFF="$handoff" DEPLOY_TUNNEL_TOKEN_INPUT="$TUNNEL_INPUT" \
+    DEPLOY_TRANSACTION_ACTION="$action" \
         BOT_UPDATE_COMMIT_FILE="$DEPLOY_RECEIPT" bash "$PROJECT_DIR/scripts/deploy/deploy.sh" </dev/null &
     DEPLOY_PID=$!
-    TUNNEL_INPUT=''
     # 部署脚本已接手事务：之后的失败由它回滚，升级器只按结果处理代码。
     trap 'operation_finish "$?"' EXIT
     [ "$INTERRUPTED" = 0 ] || forward_signal
@@ -233,10 +227,10 @@ rollback_before_checkout() {
         print_error "本次升级的数据迁移已经开始，但当前代码不是目标提交；请先切换到目标提交 ${TARGET_SHA:0:7} 后重试回滚"
         exit 1
     fi
-    [ -d "${TRANSACTION[original_group_root]}" ] || {
-        print_error "原群数据总根不存在：${TRANSACTION[original_group_root]}；旧容器依赖它，请恢复原挂载后再回滚"; exit 1; }
-    print_status "回滚上次升级：代码尚未切换，恢复原容器、网络入口和原运行状态"
-    HOST_GROUP_DATA_ROOT="${TRANSACTION[target_group_root]}"
+    [ -z "${TRANSACTION[original_workspace_root]}" ] || [ -d "${TRANSACTION[original_workspace_root]}" ] || {
+        print_error "原共享资料目录不存在：${TRANSACTION[original_workspace_root]}；旧容器依赖它，请恢复原挂载后再回滚"; exit 1; }
+    print_status "回滚上次升级：代码尚未切换，恢复原容器和原运行状态"
+    HOST_WORKSPACE_ROOT="${TRANSACTION[target_workspace_root]}"
     ROLLBACK_REQUESTED=1
     begin_deployment
     # begin_deployment 安装的 EXIT 处理恢复快照并报告结果。
@@ -275,8 +269,8 @@ resume_upgrade() {
             print_error "没有回滚：恢复升级前的代码会覆盖升级后的工作区改动（见上方），数据、配置和容器保持现状。把改动提交到其他分支、备份或撤销后重试 $(ops_command_hint rollback)"
             exit 1
         }
-        # 代码已切换：由目标版本的部署脚本恢复数据、配置、容器和网络入口，再恢复升级前的代码。
-        print_status "回滚上次升级：恢复数据、配置、容器、网络入口、代码和原运行状态"
+        # 代码已切换：由目标版本的部署脚本恢复数据、配置和容器，再恢复升级前的代码。
+        print_status "回滚上次升级：恢复数据、配置、容器、代码和原运行状态"
         run_deploy rollback
         finish_after_deploy rollback
     fi
@@ -291,24 +285,19 @@ resume_upgrade() {
         switch_ready || { print_error "不能切换到目标提交 ${TARGET_SHA:0:7}（原因见上方）；服务和代码保持现状，处理后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
     fi
     DEPLOY_SNAPSHOT="$TRANSACTION_SNAPSHOT"
-    GROUP_ROOT="${TRANSACTION[target_group_root]}"
-    # Code may already be current while its data still needs reset. Resume the freeze independently of checkout.
-    if [ "$head" != "$TARGET_SHA" ] || { [ -d "$DEPLOY_SNAPSHOT/reset-config" ] && [ ! -f "$DEPLOY_SNAPSHOT/reset.json" ]; }; then
-        # 中断发生在停机完成之前时服务可能仍在运行；冻结统计或切换代码前先停止。
+    if [ "$head" != "$TARGET_SHA" ]; then
+        # 中断发生在停机完成之前时服务可能仍在运行；切换代码前先停止。
         if [ "$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then
             print_status "停止机器人服务后再切换代码..."
             operation_capture docker stop --time 30 mixin-chatbot || { print_error "旧容器停止失败，未切换代码；可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
             downtime_begins
         fi
-        freeze_reset_stats || { print_error '现有统计账本核对失败；请处理后继续或回滚'; exit 1; }
-    fi
-    if [ "$head" != "$TARGET_SHA" ]; then
         checkout_target || {
             print_error "无法切换到目标提交 ${TARGET_SHA:0:7}；服务保持停止，处理后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
         print_success "代码已更新：${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}"
     fi
     tracked_files_clean || exit 1
-    print_status "继续上次升级 ${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}：设置和迁移计划取自事务记录，不再询问"
+    print_status "继续上次升级 ${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}：设置和数据预检计划取自事务记录，不再询问"
     run_deploy continue
     finish_after_deploy continue
 }
@@ -317,83 +306,26 @@ resume_upgrade() {
 
 # 升级沿用已保存的设置；无效时在停机前停止，由部署脚本修正。
 read_saved_settings() {
-    local raw hint="升级沿用现有配置，请先用 $(ops_command_hint deploy) 修正（服务尚未停止）"
+    local hint="升级沿用现有配置，请先用 $(ops_command_hint deploy) 修正（服务尚未停止）"
     BOT_PORT=1011
-    DEPLOY_MODE=direct
-    PUBLIC_DOMAIN=''
-    DOMAIN_ACTION=keep
     if [ -f "$STATE_DIR/bot-port" ]; then BOT_PORT="$(tr -d '[:space:]' < "$STATE_DIR/bot-port")"; fi
-    if [ -f "$STATE_DIR/deploy-mode" ]; then DEPLOY_MODE="$(tr '[:upper:]' '[:lower:]' < "$STATE_DIR/deploy-mode" | tr -d '[:space:]')"; fi
     transaction_value_valid bot_port "$BOT_PORT" || { print_error "data/state/bot-port 中的端口无效：${BOT_PORT}；${hint}"; exit 1; }
-    transaction_value_valid deploy_mode "$DEPLOY_MODE" || { print_error "data/state/deploy-mode 中的部署模式无效：${DEPLOY_MODE}；${hint}"; exit 1; }
-    if [ -f "$STATE_DIR/bot-domain" ]; then
-        raw="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$STATE_DIR/bot-domain")"
-        # 与部署脚本一致：需要规范化的写回规范值，无效域名在提交时清除。
-        if [ -z "$raw" ]; then :
-        elif PUBLIC_DOMAIN="$(normalize_hostname_input "$raw")"; then
-            [ "$PUBLIC_DOMAIN" = "$raw" ] || DOMAIN_ACTION=persist
-        else
-            PUBLIC_DOMAIN=''
-            DOMAIN_ACTION=clear
-            print_warning "data/state/bot-domain 中的域名无效，升级提交时清除：$raw"
-        fi
-    fi
-    GROUP_ROOT="$(saved_group_data_root)"
-    # 已登记的群根（包括默认的 data/groups）缺失时在停机前停止：绝不创建空目录，掩盖丢失的历史。
-    # 从未登记过时才按首次部署创建默认目录，交给服务身份。
-    if [ -s "$STATE_DIR/group-data-root" ]; then
-        [ -d "$GROUP_ROOT" ] || {
-            print_error "已部署的群数据总根不存在：$GROUP_ROOT；请恢复原目录或挂载后重试（服务尚未停止）"; exit 1; }
-    else
-        make_service_directories "$GROUP_ROOT" || { print_error "无法创建群数据总根：$GROUP_ROOT（服务尚未停止）"; exit 1; }
-    fi
+    WORKSPACE_ROOT_SAVED="$(saved_workspace_root)"
+    # 外置共享资料目录缺失时在停机前停止：Docker 会把缺失的挂载源建成空目录。
+    [ -z "$WORKSPACE_ROOT_SAVED" ] || [ -d "$WORKSPACE_ROOT_SAVED" ] || {
+        print_error "已部署的共享资料目录不存在：$WORKSPACE_ROOT_SAVED；请恢复原目录或挂载后重试（服务尚未停止）"; exit 1; }
 }
 
 # 运行参数沿用 runtime.json；当前终端的设置类环境变量不采用，与续做一致。
 check_upgrade_environment() {
     local key ignored=()
-    if [ -n "${BOT_MODEL_CACHE_RETENTION:-}" ]; then
-        print_error 'BOT_MODEL_CACHE_RETENTION 已移除；请先迁移配置并移除旧环境变量，再升级（服务尚未停止）。'
-        exit 1
-    fi
-    # 直连防火墙放行的来源写入事务记录；默认值见 scripts/lib/common.sh，可用 PLATFORM_IP 覆盖。
-    PLATFORM_IP="${PLATFORM_IP:-$DEFAULT_PLATFORM_IP}"
-    transaction_value_valid platform_ip "$PLATFORM_IP" || {
-        print_error "PLATFORM_IP 无效：$PLATFORM_IP（需要 IPv4 或 IPv6 地址，可带前缀长度；服务尚未停止）"; exit 1; }
-    for key in BOT_PORT DEPLOY_MODE GROUP_DATA_ROOT BOT_DOMAIN "${RUNTIME_ENV_KEYS[@]}"; do
+    for key in BOT_PORT WORKSPACE_ROOT "${RUNTIME_ENV_KEYS[@]}"; do
         [ -z "${!key:-}" ] || ignored+=("$key")
     done
     if [ "${#ignored[@]}" -gt 0 ]; then
         print_warning "升级沿用已保存的设置和 runtime.json，忽略当前终端的环境变量：${ignored[*]}；修改请用 $(ops_command_hint deploy)"
     fi
-    unset BOT_PORT DEPLOY_MODE GROUP_DATA_ROOT BOT_DOMAIN "${RUNTIME_ENV_KEYS[@]}"
-}
-
-# 未托管 connector 的归属和缺失的 token 在停机前确认；token 只在内存中交给部署脚本。
-confirm_tunnel() {
-    UNMANAGED_MODE=''
-    local pid
-    if ! managed_cloudflared_pid >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1; then
-        pid="$(pgrep -x cloudflared | head -n1)"
-        if [ "$DEPLOY_MODE" = cloudflare ]; then
-            print_warning "检测到未由本项目记录的 cloudflared（pid ${pid}），无法自动确认它连接的是当前隧道"
-            ask_yes_no "确认该 connector 正在服务本项目，继续升级？[y/N] " || { print_warning '已取消升级；代码和配置未改动'; exit 1; }
-        else
-            print_warning "系统有未由本项目记录的 cloudflared（pid ${pid}）；不会自动停止，以免影响其他隧道"
-            ask_yes_no "确认该 connector 与本项目无关或其入口仍受保护，继续升级？[y/N] " || { print_warning '已取消升级；代码和配置未改动'; exit 1; }
-        fi
-        UNMANAGED_MODE="$DEPLOY_MODE"
-    elif [ "$DEPLOY_MODE" = cloudflare ] && ! managed_cloudflared_pid >/dev/null 2>&1 && ! (load_tunnel_token) >/dev/null 2>&1; then
-        print_status '未运行 cloudflared 且没有可用的已保存 token；请先提供，升级验证实例就绪后启动'
-        show_tunnel_token_help
-        while true; do
-            if ! IFS= read -r -s -p '隧道 token 或文件路径（输入隐藏）：' TUNNEL_INPUT; then
-                echo ""; print_warning '输入已结束，已取消升级；代码和配置未改动'; exit 1
-            fi
-            echo ""
-            if (load_tunnel_token "$TUNNEL_INPUT"); then break; fi
-        done
-    fi
+    unset BOT_PORT WORKSPACE_ROOT "${RUNTIME_ENV_KEYS[@]}"
 }
 
 # 原服务的运行身份：停机前从原容器（运行或停止）读取并核对，之后写入事务快照的 service-user；预览、迁移、验证实例、
@@ -408,7 +340,7 @@ determine_service_user() {
     esac
     service_user_from_container "$DOCKER_ROOTLESS" ||
         { print_error "无法可靠确定原服务的运行身份（原因见上方）；尚未应用升级，服务和数据未改动"; exit 1; }
-    ORIGINAL_CONTAINER_FACTS="${ORIGINAL_CONTAINER_ID}|${ORIGINAL_CONTAINER_USER}|${ORIGINAL_CONTAINER_IMAGE}|${ORIGINAL_CONTAINER_DATA}|${ORIGINAL_CONTAINER_GROUPS}"
+    ORIGINAL_CONTAINER_FACTS="${ORIGINAL_CONTAINER_ID}|${ORIGINAL_CONTAINER_USER}|${ORIGINAL_CONTAINER_IMAGE}|${ORIGINAL_CONTAINER_DATA}"
     print_status "沿用原容器的运行身份 ${SERVICE_USER}"
 }
 
@@ -444,7 +376,7 @@ build_candidate() {
     rm -rf -- "$BUILD_CONTEXT"
     candidate_export_context "$PROJECT_DIR" "$TARGET_SHA" "$BUILD_CONTEXT" ||
         { print_error "无法导出目标提交的构建上下文（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
-    for path in "$DATA_DIR" "$GROUP_ROOT" "$PROJECT_DIR/backup" "$UPGRADER_DIR"; do [ ! -e "$path" ] || paths+=("$path"); done
+    for path in "$DATA_DIR" "$PROJECT_DIR/backup" "$UPGRADER_DIR"; do [ ! -e "$path" ] || paths+=("$path"); done
     print_status "检查构建所需的磁盘空间..."
     check_build_disk_space "$ORIGINAL_CONTAINER_IMAGE" "${paths[@]}" ||
         { print_error "磁盘空间不足或无法确认镜像存储位置（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
@@ -463,87 +395,43 @@ stop_preview() {
     kill "$PREVIEW_PID" 2>/dev/null || true
     wait "$PREVIEW_PID" 2>/dev/null || true
     PREVIEW_PID=''
-    print_warning '迁移预览已中断并清理；服务尚未停止，代码和数据未改动'
+    print_warning '数据预检已中断并清理；服务尚未停止，代码和数据未改动'
 }
 
-# 在候选镜像中预览迁移，并在配置投影上校验目标版本的配置（run.ts preview）。data/ 和群根只读挂载，容器内路径与
-# 正式迁移相同，计划中的输入摘要可直接用于停机后的 apply；暂存目录和计划写在导出目录的 preview/ 下。容器以服务身份
-# 运行、没有网络；它要写入的 preview/ 和本次操作日志交给服务身份，已有数据的属主不变。
+# 在候选镜像中核对数据版本，并校验目标版本的配置（data-current.ts preview）。data/ 只读挂载，计划中的版本标记摘要
+# 用于停机后的 apply；计划写在导出目录的 preview/ 下。容器以服务身份运行、没有网络；它要写入的 preview/ 和本次操作
+# 日志交给服务身份，已有数据的属主不变。没有程序版本的旧版（webhook）数据在这里被拒绝，旧服务不受影响。
 preview_data_preparation() {
-    local groups mounts=() mode=() status=0
+    local status=0
     rm -rf -- "$PREVIEW_DIR"
     (umask 077 && mkdir -- "$PREVIEW_DIR") && grant_service_access "$PREVIEW_DIR" && grant_operation_log_access ||
-        { print_error "无法准备迁移预览目录或操作日志；服务尚未停止，代码和数据未改动"; exit 1; }
-    if [ "$GROUP_ROOT" = "$DEFAULT_GROUP_DATA_ROOT" ]; then
-        groups=/app/data/groups
-    else
-        groups=/app/group-data
-        mounts=(-v "$GROUP_ROOT:/app/group-data:ro")
+        { print_error "无法准备数据预检目录或操作日志；服务尚未停止，代码和数据未改动"; exit 1; }
+    if [ ! -f "$CONFIG_DIR/app-bot.json" ]; then
+        print_error "缺少 data/config/app-bot.json；升级沿用现有应用机器人凭据，请先使用 $(ops_command_hint deploy) 完成配置（服务尚未停止）"; exit 1
     fi
-    # Only the application's data generation requests a reset, never a dependency version number.
-    docker run --rm -i --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp \
-        -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" "$IMAGE_ID" \
-        bun run scripts/runtime/data-current.ts probe --project /app --groups "$groups" || status=$?
-    if [ "$status" = 20 ]; then
-        ask_yes_no '数据版本不兼容。保留 stats.sqlite、workspace 和其他资料、webhook/Cloudflare 入口；外链、文档、隧道、辅助模型、MCP 等管理员设置经新版本校验后保留，不接受的丢弃并需重新设置；模型配置能被新版 Pi 读取时可选择沿用，否则重新配置；仅清理各群直属的其他 SQLite 数据库、index、成员 session.jsonl 和 tmp。未入账消息和待处理任务不再补算；成功后删除本次回滚副本。继续？[y/N] ' || {
-            print_warning '已取消；旧服务、配置和数据未改动'; exit 1;
-        }
-        docker run --rm -i --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp \
-            -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" -v "$PREVIEW_DIR:/preview" "$IMAGE_ID" \
-            bun run scripts/runtime/data-current.ts prepare-reset --project /app --groups "$groups" --reset-config /preview/reset-config || exit 1
-        # 只有新版 Pi 能完整读取（选中的模型存在、实际解析出凭证）才提供沿用；文件存在本身不算数。
-        # 检查子进程使用草稿 cwd，并把待重建的服务 HOME 映射到草稿；需要网络的命令在这里会失败，转入配置向导。
-        local models=0
-        docker run --rm -i --network none --user "$SERVICE_USER" -w /app -e HOME=/app/data/runtime/home \
-            -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" -v "$PREVIEW_DIR:/preview" "$IMAGE_ID" \
-            bun run scripts/runtime/data-current.ts offer-models --project /app --groups "$groups" --reset-config /preview/reset-config || models=$?
-        if [ "$models" = 0 ]; then
-            print_warning '校验只能发现新版 Pi 拒绝的配置；Pi 发布说明若提到模型配置含义变化，请选择重新配置。'
-            if ! ask_yes_no '是否重新配置模型（provider/key/model）？[y/N] '; then models=kept
-            else
-                docker run --rm --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp -v "$PREVIEW_DIR:/preview" "$IMAGE_ID" \
-                    bun run scripts/runtime/data-current.ts discard-models --reset-config /preview/reset-config || exit 1
-            fi
-        elif [ "$models" != 21 ]; then
-            print_error '模型配置检查失败，未停止旧服务'; exit 1
-        fi
-        if [ "$models" != kept ]; then
-            print_status '在隔离目录配置模型；旧服务继续运行。新版本不接受的设置已在上方列出，可在升级后重新设置。'
-            docker run --rm -it --user "$SERVICE_USER" -e HOME=/app/data/runtime/home \
-                -v "$PREVIEW_DIR/reset-config/data:/app/data" -v "$PREVIEW_DIR/reset-config/backup:/app/backup" "$IMAGE_ID" bun run configure || exit 1
-        fi
-        RESET_CONFIG="$PREVIEW_DIR/reset-config"
-        mode=(--reset-config /preview/reset-config)
-        status=0
-    elif [ "$status" != 0 ]; then
-        print_error '数据版本检查失败，未停止旧服务'; exit 1
-    fi
-    print_status "在目标版本的镜像中预览迁移并校验配置（只读挂载数据，服务尚未停止）..."
+    print_status "在目标版本的镜像中核对数据版本并校验配置（只读挂载数据，服务尚未停止）..."
     # 预览容器有名称并在后台运行，升级器等待它：中断（ops.sh 转发的 TERM、终端 Ctrl+C、断线）时由 cleanup_before_pointer
-    # 先删除容器再退出。在前台运行时 docker CLI 会随升级器退出变成孤儿，容器（例如正在等待迁移确认）一直留着。
+    # 先删除容器再退出。在前台运行时 docker CLI 会随升级器退出变成孤儿，容器一直留着。
     PREVIEW_CONTAINER="mixin-chatbot-preview-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
     docker run --rm -i --name "$PREVIEW_CONTAINER" --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp -e BOT_OPERATION_LOG \
-        -e GROUP_DATA_ROOT="$groups" -v "$PROJECT_DIR/data:/app/data:ro" "${mounts[@]}" -v "$PROJECT_DIR/logs:/app/logs" -v "$PREVIEW_DIR:/preview" \
-        "$IMAGE_ID" bun run scripts/runtime/data-current.ts preview "${mode[@]}" \
-        --project /app --groups "$groups" --plan /preview/data-plan.json <&0 &
+        -v "$PROJECT_DIR/data:/app/data:ro" -v "$PROJECT_DIR/logs:/app/logs" -v "$PREVIEW_DIR:/preview" \
+        "$IMAGE_ID" bun run scripts/runtime/data-current.ts preview --project /app --plan /preview/data-plan.json --upgrade <&0 &
     PREVIEW_PID=$!
     wait "$PREVIEW_PID" || status=$?
     PREVIEW_PID=''
     if [ "$status" != 0 ]; then
-        print_error "迁移预览或配置校验未通过（原因见上方）；服务尚未停止，代码和数据未改动"
-        # 退出码 2：有需要确认的迁移选择。升级不接受命令行确认参数，只能在交互终端中回答。
-        if [ "$status" = 2 ] && [ ! -t 0 ]; then print_warning "迁移选择需要在交互终端中确认；请在终端中运行 $(ops_command_hint update)"; fi
+        print_error "数据版本或配置校验未通过（原因见上方）；服务尚未停止，代码和数据未改动"
         exit 1
     fi
     PREVIEW_PLAN="$PREVIEW_DIR/data-plan.json"
-    [ -s "$PREVIEW_PLAN" ] || { print_error "迁移预览没有生成计划；服务尚未停止，代码和数据未改动"; exit 1; }
+    [ -s "$PREVIEW_PLAN" ] || { print_error "数据预检没有生成计划；服务尚未停止，代码和数据未改动"; exit 1; }
 }
 
-# 停机前复核的依据：迁移计划的输入（配置和两处版本标记）的摘要，在预览之前取得。
+# 停机前复核的依据：数据预检的输入（配置和版本标记）的摘要，在预览之前取得。
 prepared_inputs() {
     local path
     for path in "$CONFIG_DIR/runtime.json" "$MODELS_FILE" "$DATA_DIR/runtime/pi/settings.json" "$DATA_DIR/runtime/models-store.json" \
-        "$STATE_DIR/data-version.json" "$GROUP_ROOT/data-version.json"; do
+        "$STATE_DIR/data-version.json" "$STATE_DIR/workspace-root"; do
         if [ -e "$path" ] || [ -L "$path" ]; then printf '%s %s\n' "$(sha256sum < "$path" | cut -d' ' -f1)" "$path"
         else printf 'absent %s\n' "$path"; fi
     done
@@ -574,45 +462,29 @@ recheck_before_stop() {
     [ "$(prepared_inputs)" = "$PREPARED_INPUTS" ] ||
         { print_error "预览之后配置或版本标记发生了变化；服务尚未停止，请重新运行升级"; exit 1; }
     original_service_container || status=$?
-    [ "$status" = 0 ] && [ "${ORIGINAL_CONTAINER_ID}|${ORIGINAL_CONTAINER_USER}|${ORIGINAL_CONTAINER_IMAGE}|${ORIGINAL_CONTAINER_DATA}|${ORIGINAL_CONTAINER_GROUPS}" = "$ORIGINAL_CONTAINER_FACTS" ] ||
+    [ "$status" = 0 ] && [ "${ORIGINAL_CONTAINER_ID}|${ORIGINAL_CONTAINER_USER}|${ORIGINAL_CONTAINER_IMAGE}|${ORIGINAL_CONTAINER_DATA}" = "$ORIGINAL_CONTAINER_FACTS" ] ||
         { print_error "原容器 mixin-chatbot 在准备期间被删除、替换或改动；服务和数据未改动，请重新运行升级"; exit 1; }
     status=0
     candidate_verify || status=$?
     [ "$status" = 0 ] || { print_error "候选镜像核对未通过（原因见上方）；服务尚未停止，请重新运行升级"; exit 1; }
-    check_stop_disk_space "$GROUP_ROOT" "$UPGRADER_DIR" ||
+    check_stop_disk_space "$UPGRADER_DIR" ||
         { print_error "剩余空间不够写入停机后的快照（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
 }
 
-# begin_deployment 在发布事务指针前调用：先写固定的镜像和服务身份（独立文件，事务记录保持 format 1），再记录停机前
-# 确认的全部选择，并把迁移计划存入快照。
+# begin_deployment 在发布事务指针前调用：先写固定的镜像和服务身份（独立文件，不进事务记录），再记录停机前
+# 确认的全部选择，并把数据预检计划存入快照。
 record_deployment_transaction() {
     local snapshot="$1"
     write_candidate_record "$snapshot" && write_service_user_record "$snapshot" || return 1
     task_runtime_record "$snapshot/task-runtime" && task_runtime_record_previous "$snapshot" || return 1
-    declare -gA TRANSACTION=([format]=1 [operation]=upgrade [snapshot]="$(basename -- "$snapshot")" [target_sha]="$TARGET_SHA"
-        [original_sha]="$ORIGINAL_SHA" [original_branch]="$ORIGINAL_BRANCH" [original_group_root]="$GROUP_ROOT" [target_group_root]="$GROUP_ROOT"
-        [was_running]="$PREVIOUS_RUNNING" [bot_port]="$BOT_PORT" [deploy_mode]="$DEPLOY_MODE" [bot_domain]="$PUBLIC_DOMAIN"
-        [domain_action]="$DOMAIN_ACTION" [unmanaged_tunnel]="$UNMANAGED_MODE" [platform_ip]="$PLATFORM_IP" [reconfigure_ai]=0)
+    declare -gA TRANSACTION=([format]=2 [operation]=upgrade [snapshot]="$(basename -- "$snapshot")" [target_sha]="$TARGET_SHA"
+        [original_sha]="$ORIGINAL_SHA" [original_branch]="$ORIGINAL_BRANCH" [original_workspace_root]="$WORKSPACE_ROOT_SAVED" [target_workspace_root]="$WORKSPACE_ROOT_SAVED"
+        [was_running]="$PREVIOUS_RUNNING" [bot_port]="$BOT_PORT" [reconfigure_ai]=0)
     write_transaction_record "$snapshot" || return 1
     cp -- "$PREVIEW_PLAN" "$snapshot/data-plan.json"
-    if [ -n "$RESET_CONFIG" ]; then cp -a -- "$RESET_CONFIG" "$snapshot/reset-config"; fi
 }
 
-# Freeze the existing ledger with the target image, without reading discarded session formats.
-freeze_reset_stats() {
-    [ -d "$DEPLOY_SNAPSHOT/reset-config" ] || return 0
-    [ ! -f "$DEPLOY_SNAPSHOT/reset.json" ] || return 0
-    grant_service_access "$DEPLOY_SNAPSHOT" || return 1
-    local groups=/app/data/groups mounts=()
-    if [ "$GROUP_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then groups=/app/group-data; mounts=(-v "$GROUP_ROOT:/app/group-data"); fi
-    print_status '核对并冻结现有统计账本；不读取或补算旧会话...'
-    docker run --rm --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp -e GROUP_DATA_ROOT="$groups" \
-        -v "$PROJECT_DIR/data:/app/data" "${mounts[@]}" -v "$PROJECT_DIR/backup:/app/backup" \
-        "$IMAGE_ID" bun run scripts/runtime/stats-freeze.ts --groups "$groups" \
-        --receipt "/app/backup/snapshots/$(basename -- "$DEPLOY_SNAPSHOT")/stats-frozen.json"
-}
-
-# 部署脚本接手之前失败：恢复升级前的代码，再由事务恢复原容器、网络入口和原运行状态。
+# 部署脚本接手之前失败：恢复升级前的代码，再由事务恢复原容器和原运行状态。
 abort_before_handoff() {
     local status=$?
     set +e
@@ -665,7 +537,7 @@ fresh_upgrade() {
     switch_preflight "$ORIGINAL_SHA" "$ORIGINAL_MAIN" "$TARGET_SHA" "$UPGRADER_DIR" ||
         { print_error "切换代码会覆盖工作区中未跟踪的内容（见上方）；服务尚未停止，未构建镜像，请处理后重试"; exit 1; }
     if [ "$ORIGINAL_SHA" = "$TARGET_SHA" ]; then
-        print_success "代码已经最新，仍检查数据版本并完成必要迁移"
+        print_success "代码已经最新，仍检查数据版本并重新部署"
     else
         echo ""
         echo -e "${CYAN}将要应用的提交：${NC}"
@@ -677,22 +549,22 @@ fresh_upgrade() {
     check_upgrade_environment
     determine_service_user
     read_saved_settings
-    print_status "升级沿用现有设置：端口 ${BOT_PORT}；入口 ${DEPLOY_MODE}；群数据总根 ${GROUP_ROOT}；域名 ${PUBLIC_DOMAIN:-未设置}"
+    print_status "升级沿用现有设置：本机管理端口 ${BOT_PORT}；共享资料目录 ${WORKSPACE_ROOT_SAVED:-$DATA_DIR/workspace}"
     # rootless Docker 要到停机后启动容器时才拒绝发布低端口：沿用的端口发布不了就在这里停止。
     if [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$BOT_PORT"; then
         print_error "$(rootless_port_hint "$BOT_PORT")"
         print_error "升级沿用已保存的端口 ${BOT_PORT}；改端口请用 $(ops_command_hint deploy)（服务尚未停止）"
         exit 1
     fi
-    confirm_tunnel
     # 此后到事务指针发布之前，失败、取消或中断只清理本次的预览容器和保留标签。
     trap cleanup_before_pointer EXIT
     trap_preparation_signals
     build_candidate
-    HOST_GROUP_DATA_ROOT="$GROUP_ROOT"
-    GROUP_ROOT_ARGS=()
-    if [ "$GROUP_ROOT" != "$DEFAULT_GROUP_DATA_ROOT" ]; then GROUP_ROOT_ARGS=(-v "$GROUP_ROOT:/app/group-data"); fi
+    HOST_WORKSPACE_ROOT="$WORKSPACE_ROOT_SAVED"
+    WORKSPACE_ARGS=()
+    if [ -n "$HOST_WORKSPACE_ROOT" ]; then WORKSPACE_ARGS=(-v "$HOST_WORKSPACE_ROOT:/app/workspace:ro" -e WORKSPACE_ROOT=/app/workspace); fi
     task_runtime_prepare || { print_error "任务隔离预检失败，原服务保持运行状态"; exit 1; }
+    check_workspace_layout || { print_error "共享资料目录不能使用（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
     PREPARED_INPUTS="$(prepared_inputs)"
     preview_data_preparation
     recheck_before_stop
@@ -701,15 +573,13 @@ fresh_upgrade() {
         { print_error "无法创建 backup/ 下的快照目录；服务尚未停止，代码和数据未改动"; exit 1; }
 
     print_status "记录升级事务并停止机器人服务；此后切换代码和迁移期间服务保持停止，不再构建镜像"
-    HOST_GROUP_DATA_ROOT="$GROUP_ROOT"
     begin_deployment "$TARGET_SHA"
     trap abort_before_handoff EXIT
-    freeze_reset_stats || { print_error '现有统计账本核对失败，恢复原服务；未清理旧会话'; exit 1; }
     if [ "$PREVIOUS_RUNNING" = 0 ]; then print_status "机器人服务升级前未运行，升级后保持停止"; fi
     checkout_target || { print_error "切换到目标提交 ${TARGET_SHA:0:7} 失败，正在恢复升级前的状态"; exit 1; }
     [ "$ORIGINAL_SHA" = "$TARGET_SHA" ] || print_success "代码已更新：${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}"
-    print_status "交给目标版本的部署脚本：按事务记录用候选镜像迁移并验证新实例，不再询问"
-    run_deploy continue "$(basename -- "$DEPLOY_SNAPSHOT")"
+    print_status "交给目标版本的部署脚本：按事务记录用候选镜像验证并启用新实例，不再询问"
+    run_deploy continue
     finish_after_deploy fresh
 }
 
@@ -719,10 +589,6 @@ command -v flock >/dev/null || { print_error "需要 util-linux flock"; exit 1; 
 acquire_deploy_lock || { print_error "另一个部署或升级正在进行"; exit 1; }
 if ! git_here rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if refusal="$(git_ownership_refusal)"; then print_error "$refusal"; else print_error "${PROJECT_DIR} 不是 git 仓库，无法升级"; fi
-    exit 1
-fi
-if [ -e "$STATE_DIR/update-transaction" ]; then
-    print_error "发现旧版升级留下的停机记录 data/state/update-transaction；请先用 $(ops_command_hint update) 完成或回滚上次升级，再重新运行"
     exit 1
 fi
 # rootful Docker 要求 root，rootless Docker 要求它所属的普通用户（设置 DOCKER_ROOTLESS）：在任何提问、构建和停机之前。

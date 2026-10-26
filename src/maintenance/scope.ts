@@ -1,4 +1,4 @@
-// The protected business view offline maintenance acts under. The service layer implements it (durable group snapshot
+// The protected business view offline maintenance acts under. The service layer implements it (durable space snapshot
 // plus the outbox ledger, `src/durable/maintenance-view.ts`) and the entry injects it; maintenance never opens a
 // business database itself.
 import type { UserTmp } from "../../scripts/lib/tmp-scan.ts";
@@ -9,19 +9,20 @@ import { ReferenceText } from "../core/reference-text.ts";
 export interface MemberView {
   /** This member's result ownership records, active and queued for reclamation. */
   readonly calls: Readonly<Record<string, ResultOwnership>>;
-  /** The group database has recoverable tasks or unsettled submissions. */
+  /** The space database has recoverable tasks or unsettled submissions. */
   readonly liveWork: boolean;
-  /** Referenced by a context or a pending delivery, or anything while the group is busy. */
+  /** Referenced by a context or a pending delivery, or anything while the space is busy. */
   protectedPath(path: string): boolean;
   /** Settle the given confirmed-removed owners in the source transaction (refused in a read-only view). */
   settle(owners: ReadonlyMap<string, ResultOwnership>): Promise<void>;
 }
 
+/** `root` is the data directory (conversations/ and tmp/ below it); `recordedRoot` the name the service saw for it. */
 export interface ViewPaths { root: string; state: string; recordedRoot?: string }
 
 export interface MemberScope {
   /** `exclusive` takes the write reservations (apply) instead of reading (preview). Without `requireGroup` a missing
-   * group database reads as a member with no ownership and only ledger references. */
+   * space database reads as a member with no ownership and only ledger references. */
   withMember<T>(paths: ViewPaths, user: UserTmp, mode: { exclusive: boolean; requireGroup: boolean }, run: (view: MemberView) => Promise<T>): Promise<T>;
 }
 

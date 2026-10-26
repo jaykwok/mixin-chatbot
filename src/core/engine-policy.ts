@@ -36,7 +36,7 @@ export function enginePolicy(value: unknown): EnginePolicy {
   keys(retry, ["enabled", "maxRetries", "baseDelayMs", "maxAgentDelayMs"], "durable.retry");
   const stream = object(policy.stream ?? {}, "durable.stream");
   keys(stream, ["timeoutMs", "maxRetries", "maxRetryDelayMs", "cacheRetention"], "durable.stream");
-  if (stream.maxRetries !== undefined && stream.maxRetries !== 0) throw new Error("durable.stream.maxRetries 必须为 0；每次请求必须有独立开始回执");
+  if (stream.maxRetries !== undefined && stream.maxRetries !== 0) throw new Error("durable.stream.maxRetries 必须为 0；重试由 Durable 发起，每次都经过请求门");
   if (stream.cacheRetention !== undefined && !["none", "short", "long"].includes(stream.cacheRetention as string)) throw new Error("durable.stream.cacheRetention 无效");
   const compaction = object(policy.compaction ?? {}, "durable.compaction");
   keys(compaction, ["enabled", "reserveTokens", "keepRecentTokens", "backgroundTokens", "modelOverrides"], "durable.compaction");
