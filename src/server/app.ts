@@ -115,16 +115,15 @@ try {
   const app = createApp({ isStopping: () => stopping, adminToken, instanceId, startedAt, shutdown: () => void shutdown("local control"),
     health: () => ({ stream: stream?.status(), directory: directory.status(), attention: messages?.attention() }),
     confirmRevocations: (scanId) => directory.confirmRevocations(scanId, directoryClient, application.signal),
-    listDepartments: (parent) => directoryClient.childDepartments(parent, application.signal),
-    changeScope: async (departments) => {
+    listDepartments: (parent, signal) => directoryClient.childDepartments(parent, AbortSignal.any([signal, application.signal])),
+    describeDepartments: (ids, signal) => directoryClient.describe(ids, AbortSignal.any([signal, application.signal])),
+    changeScope: async (departments, signal) => {
       // The same set again (order aside) neither rewrites the file nor restarts a full scan.
       if (sameScope(directory.status().scope, departments)) return "unchanged";
-      // Every department must exist and be visible to the app before anything is saved.
-      const checked = [];
-      for (const id of departments ?? []) {
-        try { checked.push(await directoryClient.department(id, application.signal)); }
-        catch (error) { throw new Error(`部门 ${id} 不存在或应用无权读取（${(error as Error).message}）；范围未改`); }
-      }
+      // Every department must exist and be visible to the app before anything is saved; a caller that went away saves nothing.
+      const checking = AbortSignal.any([signal, application.signal]);
+      const checked = await directoryClient.verify(departments ?? [], checking);
+      checking.throwIfAborted();
       await writeDirectoryScope(departments);
       await directory.changeScope(departments, directoryClient, application.signal);
       return checked;

@@ -1,7 +1,7 @@
 // The member directory (plan 5.8) against the local fake platform: paging, revocation rules, ID replacement, conflicts.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { PlatformClient } from "../../src/integrations/open-platform/client.ts";
+import { PlatformClient, PlatformRequestError } from "../../src/integrations/open-platform/client.ts";
 import { DirectoryClient } from "../../src/integrations/open-platform/directory.ts";
 import { IdentityDirectory } from "../../src/integrations/open-platform/identity-directory.ts";
 import { FakePlatform, json } from "../helpers/fake-platform.ts";
@@ -347,6 +347,118 @@ test("departments list with names and counts over every page; the detail of an u
   const listed = await directoryClient().childDepartments("1");
   expect(listed).toHaveLength(40);
   expect(listed.slice(0, 3)).toEqual([{ id: "100", name: "总部", count: 12 }, { id: "101", name: "保密部" }, { id: "102", name: "" }]);
-  expect(await directoryClient().department("100")).toEqual({ id: "100", name: "总部", count: 12, fullName: "集团/总部" });
-  await expect(directoryClient().department("999")).rejects.toThrow("code=404002");
+  expect(await directoryClient().department("100")).toEqual({ id: "100", name: "总部", count: 12, fullName: "集团/总部", parentId: "1" });
+  await expect(directoryClient().department("999")).rejects.toThrow("code=422010");
+});
+
+test("department descriptions walk parent_id up to the root once per ancestor; a refused department or an unreadable chain stays local", async () => {
+  // 1 → 100 → 110 → 111; 1 → 200; 450 (not readable) → 451; 600 has no parent_id; 700 and 701 are each other's parent.
+  fake.directory = { children: { "1": ["100", "200"], "100": ["110"], "110": ["111"], "450": ["451"], "700": ["701"], "701": ["700"] }, members: {}, ids: {},
+    info: { "100": { name: "总部" }, "110": { name: "研发中心", count: 20 }, "111": { name: "平台组", count: 8, fullName: "集团|总部|研发中心|平台组" },
+      "200": { name: "华东" }, "451": { name: "孤立组" }, "600": { name: "无上级" }, "700": { name: "环甲" }, "701": { name: "环乙" } } };
+  const before = fake.requests.length;
+  const described = await directoryClient().describe(["111", "110", "200", "451", "600", "700", "999"]);
+  expect(described.departments).toEqual([
+    { id: "111", name: "平台组", count: 8, fullName: "集团|总部|研发中心|平台组", parentId: "110", ancestors: [{ id: "100", name: "总部" }, { id: "110", name: "研发中心" }] },
+    { id: "110", name: "研发中心", count: 20, fullName: "研发中心", parentId: "100", ancestors: [{ id: "100", name: "总部" }] },
+    { id: "200", name: "华东", fullName: "华东", parentId: "1", ancestors: [] },
+    // The parent 450 is refused: the department is still described, without a chain.
+    { id: "451", name: "孤立组", fullName: "孤立组", parentId: "450" },
+    { id: "600", name: "无上级", fullName: "无上级" },
+    { id: "700", name: "环甲", fullName: "环甲", parentId: "701" },
+  ]);
+  expect(described.unavailable).toHaveLength(1);
+  expect(described.unavailable[0]).toMatchObject({ id: "999" });
+  expect(described.unavailable[0]!.message).toContain("code=422010");
+  // Shared ancestors are read once, the root never.
+  const asked = fake.requests.slice(before).filter(request => request.path === "/open/v2/dept/get").map(request => (request.body as { dept_id: string }).dept_id);
+  expect(asked.toSorted()).toEqual(["100", "110", "111", "200", "450", "451", "600", "700", "701", "999"]);
+  expect(described.unavailable[0]!.message).toBe("部门不属于当前组织（code=422010）");
+});
+
+test("department descriptions: the organisation's own root, the parent of every top-level department, is not part of a path", async () => {
+  // As on the real platform: the children API's 1 is the root department 9000, which top-level departments name as their parent.
+  fake.directory = { children: { "1": ["100", "200"], "100": ["110"] }, members: {}, ids: {}, root: "9000",
+    info: { "9000": { name: "集团", count: 30 }, "100": { name: "总部" }, "110": { name: "研发中心", fullName: "集团|总部|研发中心" }, "200": { name: "华东" } } };
+  const before = fake.requests.length;
+  const described = await directoryClient().describe(["110", "200"]);
+  expect(described.departments.map(item => [item.id, item.parentId, item.ancestors])).toEqual([
+    ["110", "100", [{ id: "100", name: "总部" }]], ["200", "9000", []]]);
+  // The root is read once, to learn that it is the root.
+  const asked = fake.requests.slice(before).filter(request => request.path === "/open/v2/dept/get").map(request => (request.body as { dept_id: string }).dept_id);
+  expect(asked.toSorted()).toEqual(["100", "110", "200", "9000"]);
+});
+
+/** dept/get answers: `fail` gives the code for one department, the others wait for `gate` and then answer under the root. */
+function gatedDetails(fail: Record<string, () => Response>) {
+  const gate = Promise.withResolvers<void>();
+  fake.route("POST /open/v2/dept/get", async (_request, body) => {
+    const id = (body as { dept_id: string }).dept_id;
+    if (fail[id]) return fail[id]();
+    await gate.promise;
+    return fake.encrypted({ dept_id: id, parent_id: "1", name: "部门" + id });
+  });
+  const asked = () => fake.requestsTo("/open/v2/dept/get").map(request => (request.body as { dept_id: string }).dept_id);
+  return { gate, asked };
+}
+const eight = Array.from({ length: 8 }, (_, i) => String(100 + i));
+
+test("department descriptions: a failure that is not an explicit refusal fails the lookup, names the department and stops the queued ones", async () => {
+  // A code outside the documented refusals (a platform fault, or an undocumented permission code) says nothing about the department.
+  for (const answer of [() => json({ code: 500009, msg: "查询部门失败" }), () => json({ code: 403001, msg: "无权限" }), () => json({ code: 500, msg: "boom" }, 503)]) {
+    fake.requests.length = 0;
+    const { gate, asked } = gatedDetails({ "100": answer });
+    const failed = await directoryClient().describe(eight).then(() => new Error("没有失败"), (error: Error) => error);
+    expect(failed.message).toMatch(/^部门 100：通讯录 \/open\/v2\/dept\/get 失败：HTTP \d+ code=\d+$/);
+    // Four lookups at a time: the four still queued never start (the three in flight are cancelled, maybe before the platform reads them).
+    gate.resolve();
+    await Bun.sleep(20);
+    expect(asked()).toContain("100");
+    expect(asked().filter(id => Number(id) >= 104)).toEqual([]);
+  }
+  // A network failure is not a refusal either.
+  class Offline extends DirectoryClient {
+    override async department(): Promise<never> { throw new PlatformRequestError("通讯录 /open/v2/dept/get：连接失败（ECONNREFUSED）", "unsent"); }
+  }
+  await expect(new Offline({} as PlatformClient).describe(["100", "200"])).rejects.toThrow("部门 100：通讯录 /open/v2/dept/get：连接失败");
+});
+
+test("department descriptions: cancelling rejects with the reason, cancels queued lookups and returns no partial result", async () => {
+  const reason = new Error("选择器已关闭");
+  const aborted = new AbortController();
+  aborted.abort(reason);
+  await expect(directoryClient().describe(["100"], aborted.signal)).rejects.toBe(reason);
+  expect(fake.requestsTo("/open/v2/dept/get")).toHaveLength(0);
+
+  const { gate, asked } = gatedDetails({});
+  const client = directoryClient(), controller = new AbortController();
+  const waitFor = async (count: number) => { for (const end = Date.now() + 3000; asked().length < count && Date.now() < end;) await Bun.sleep(5); };
+  const pending = client.describe(eight, controller.signal);
+  await waitFor(4);
+  controller.abort(reason);
+  await expect(pending).rejects.toBe(reason);
+  // The four in flight were cancelled as well: their slots (shared by the client's lookups) are free before the platform answers them.
+  const again = client.describe(["100"], AbortSignal.timeout(2000));
+  await waitFor(5);
+  expect(asked()).toHaveLength(5);
+  gate.resolve();
+  expect((await again).departments.map(department => department.id)).toEqual(["100"]);
+  await Bun.sleep(20);
+  expect(asked()).toHaveLength(5);
+});
+
+test("checking departments before saving the scope tells a refusal from a failed check and stops when cancelled", async () => {
+  fake.directory = { children: { "1": ["100"] }, members: {}, ids: {}, info: { "100": { name: "总部" } } };
+  expect(await directoryClient().verify(["100"])).toEqual([{ id: "100", name: "总部", fullName: "总部", parentId: "1" }]);
+  await expect(directoryClient().verify(["100", "999"])).rejects.toThrow("部门 999：部门不属于当前组织（code=422010）；范围未改");
+  // The documented refusal codes count as well.
+  fake.route("POST /open/v2/dept/get", () => json({ code: 404002, msg: "部门不存在" }));
+  await expect(directoryClient().verify(["100"])).rejects.toThrow("部门 100：部门不存在（code=404002）；范围未改");
+  fake.route("POST /open/v2/dept/get", () => json({ code: 400002, msg: "dept_id格式无效: 100" }));
+  await expect(directoryClient().verify(["100"])).rejects.toThrow("部门 100：部门 ID 格式无效（code=400002）；范围未改");
+  fake.route("POST /open/v2/dept/get", () => json({ code: 500009, msg: "查询部门失败" }));
+  await expect(directoryClient().verify(["100"])).rejects.toThrow("没能向平台核对部门 100（通讯录 /open/v2/dept/get 失败：HTTP 200 code=500009）；范围未改");
+  const reason = new Error("caller gone"), controller = new AbortController();
+  controller.abort(reason);
+  await expect(directoryClient().verify(["100"], controller.signal)).rejects.toBe(reason);
 });

@@ -38,6 +38,7 @@ function fakeApp(root: string, choices: (string | null)[], answers: (string | nu
     toast(_status, text) { calls.toasts.push(text); }, redraw() {}, go() {},
     async ask(label) { calls.prompts.push(label); return answers.shift() ?? null; },
     async choose(spec) { calls.menus.push(spec); return choices.shift() ?? null; },
+    async dialog() { throw new Error("统计导入不打开自定义浮层"); },
     async confirm(spec) { calls.confirms.push(spec); return !spec.blocked; },
     async run(_title, args) { calls.commands.push(args); return 0; },
     async runInteractive() { throw new Error("测试不得执行真实运维命令"); },

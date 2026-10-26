@@ -19,6 +19,16 @@ export function parseDepartmentIds(value: unknown, label = "departments"): strin
   return [...value] as string[];
 }
 
+/**
+ * 要保存的同步范围：在 parseDepartmentIds 之外拒绝根部门 1（ROOT_DEPARTMENT；不从 directory.ts 取值，管理台也加载本文件）。
+ * 1 只是列子部门时的别名，平台的部门详情答回组织根部门自己的 ID，保存前的核对必然对不上。查询部门的接口照常接受 1。
+ */
+export function parseScopeDepartments(value: unknown): string[] {
+  const departments = parseDepartmentIds(value);
+  if (departments.includes("1")) throw new Error("部门 1 是根部门的查询别名，不能作为同步范围；留空即同步整个通讯录");
+  return departments;
+}
+
 /** 两个范围是否相同（`undefined` 为整个通讯录，部门顺序不计）。 */
 export function sameScope(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
   if (a === undefined || b === undefined) return a === b;

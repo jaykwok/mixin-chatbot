@@ -1,5 +1,6 @@
 // 通讯录接口：部门与成员分页、按手机号查 imUserId。响应是 decryptV2 密文，签名用 AppID 派生的密钥校验。
 import { createDecipheriv, createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { AsyncSemaphore } from "../../core/async-semaphore.ts";
 import { accepted, PlatformRequestError, responseData, type ApiResponse, type PlatformClient } from "./client.ts";
 
 export const ROOT_DEPARTMENT = "1";
@@ -33,8 +34,42 @@ export interface DepartmentInfo {
   readonly name: string;
   /** 部门完整路径（只有部门详情接口返回）。 */
   readonly fullName?: string;
+  /** 上级部门 ID，根部门为 "0"（只有部门详情接口返回）。 */
+  readonly parentId?: string;
   /** 部门人数；平台隐藏人数时没有。 */
   readonly count?: number;
+}
+
+/** 带上级链的部门详情：ancestors 从一级部门到直属上级，不含根部门（1 或组织根部门自己的 ID）；上级链读不到时没有。 */
+export interface DepartmentDetail extends DepartmentInfo {
+  readonly ancestors?: readonly { readonly id: string; readonly name: string }[];
+}
+
+/** 一组部门的详情；平台明确拒绝的部门（见 departmentRefusal）单列，不影响其余部门。 */
+export interface DepartmentDescription {
+  readonly departments: readonly DepartmentDetail[];
+  readonly unavailable: readonly { readonly id: string; readonly message: string }[];
+}
+
+/** 比任何真实组织都深的上级链：更长的视为响应有误（或成环），不给上级链。 */
+const MAX_DEPARTMENT_DEPTH = 32;
+/** 查部门详情时同时进行的请求数；同一服务里的各次查询共用。 */
+const DESCRIBE_CONCURRENCY = 4;
+
+/**
+ * 部门详情接口对部门本身的明确拒绝。真实平台对不是本组织部门的 ID（含不存在的）答复 422010「部门不属于当前组织」，
+ * 文档里没有这个码（2026-10-26 实测）；文档列出的 404002 没有见到，照样认。网络、token、限流、5xx、验签或格式问题，
+ * 以及其他错误码，只说明这一次没查成，不说明部门本身。用 Map：平台给的码是任意字符串，普通对象会命中 toString 等继承属性。
+ */
+const DEPARTMENT_REFUSALS: ReadonlyMap<string, string> = new Map([
+  ["422010", "部门不属于当前组织"], ["404002", "部门不存在"], ["400002", "部门 ID 格式无效"],
+]);
+
+/** 平台明确拒绝这个部门时的原因；其他失败为 undefined。 */
+function departmentRefusal(error: unknown): string | undefined {
+  if (!(error instanceof PlatformRequestError) || error.kind !== "rejected" || error.code === undefined) return undefined;
+  const reason = DEPARTMENT_REFUSALS.get(error.code);
+  return reason && `${reason}（code=${error.code}）`;
 }
 
 export interface Page<T> {
@@ -51,6 +86,7 @@ export interface PhoneDetail {
 }
 
 export class DirectoryClient {
+  readonly #lookups = new AsyncSemaphore(DESCRIBE_CONCURRENCY);
   constructor(private readonly client: PlatformClient) {}
 
   async departments(deptId: string, page: number, signal?: AbortSignal): Promise<Page<string>> {
@@ -71,7 +107,89 @@ export class DirectoryClient {
     const plain = await this.#open("/open/v2/dept/get", { dept_id: deptId }, "app", signal);
     const info = departmentInfo(plain);
     if (!info || info.id !== deptId) throw new PlatformRequestError("部门详情与查询不符", "rejected");
-    return { ...info, ...(typeof plain.full_name === "string" && plain.full_name ? { fullName: plain.full_name } : {}) };
+    const parent = plain.parent_id;
+    return { ...info, ...(typeof plain.full_name === "string" && plain.full_name ? { fullName: plain.full_name } : {}),
+      ...((typeof parent === "string" && parent) || typeof parent === "number" ? { parentId: String(parent) } : {}) };
+  }
+
+  /**
+   * 部门详情及其上级链（显示同步范围用）。上级沿 parent_id 逐级查详情，到根部门为止；真实平台上一级部门的 parent_id
+   * 是组织根部门自己的 ID（子部门接口里的 1，它的 parent_id 为 "0"），根部门不算在上级链里。同一次查询里共同的上级只查一次。
+   * 平台明确拒绝的部门单列；其他失败（见 departmentRefusal）使整次查询失败，其余查询随即取消，错误里带部门 ID。
+   * 上级读不到、链条成环或过深时只缺这个部门的上级链。取消时抛出 signal 的原因，不交回部分结果。
+   */
+  async describe(ids: readonly string[], signal?: AbortSignal): Promise<DepartmentDescription> {
+    const batch = new AbortController(), requested = new Set(ids);
+    const scoped = signal ? AbortSignal.any([signal, batch.signal]) : batch.signal;
+    const cache = new Map<string, Promise<DepartmentInfo>>();
+    const lookup = (id: string): Promise<DepartmentInfo> => {
+      let pending = cache.get(id);
+      if (!pending) {
+        pending = this.#lookups.acquire(scoped).then(async release => {
+          try { return await this.department(id, scoped); }
+          catch (error) {
+            // A requested department that failed other than by a refusal voids the batch before its slot goes back, so no queued lookup starts.
+            if (requested.has(id) && !scoped.aborted && !departmentRefusal(error)) {
+              batch.abort(new Error(`部门 ${id}：${error instanceof Error ? error.message : String(error)}`, { cause: error }));
+            }
+            throw error;
+          } finally { release(); }
+        });
+        pending.catch(() => {});
+        cache.set(id, pending);
+      }
+      return pending;
+    };
+    const ancestors = async (info: DepartmentInfo): Promise<DepartmentDetail["ancestors"]> => {
+      const chain: { id: string; name: string }[] = [];
+      for (let parent = info.parentId; parent !== "0" && parent !== ROOT_DEPARTMENT;) {
+        if (parent === undefined || parent === info.id || chain.some(item => item.id === parent) || chain.length >= MAX_DEPARTMENT_DEPTH) return undefined;
+        let above: DepartmentInfo;
+        try { above = await lookup(parent); }
+        catch (error) { if (scoped.aborted) throw error; return undefined; }
+        // The organisation's own root department (parent "0") is what the children API calls 1: the top, not part of the path.
+        if (above.parentId === "0") break;
+        chain.push({ id: above.id, name: above.name });
+        parent = above.parentId;
+      }
+      return chain.reverse();
+    };
+    try {
+      const results = await Promise.all(ids.map(async id => {
+        let info: DepartmentInfo;
+        try { info = await lookup(id); }
+        catch (error) {
+          const refusal = scoped.aborted ? undefined : departmentRefusal(error);
+          if (refusal) return { unavailable: { id, message: refusal } };
+          throw error;
+        }
+        const chain = await ancestors(info);
+        return { department: { ...info, ...(chain ? { ancestors: chain } : {}) } };
+      }));
+      return { departments: results.flatMap(result => result.department ? [result.department] : []),
+        unavailable: results.flatMap(result => result.unavailable ? [result.unavailable] : []) };
+    } catch (error) {
+      batch.abort(error);
+      throw signal?.aborted ? signal.reason : batch.signal.reason;
+    }
+  }
+
+  /**
+   * 保存同步范围前逐个核对部门：都存在且应用可见才返回详情。失败时说明是哪个部门，并分清平台明确拒绝与没核对成；
+   * 取消时抛出 signal 的原因。
+   */
+  async verify(ids: readonly string[], signal?: AbortSignal): Promise<DepartmentInfo[]> {
+    const checked = [];
+    for (const id of ids) {
+      try { checked.push(await this.department(id, signal)); }
+      catch (error) {
+        if (signal?.aborted) throw signal.reason;
+        const refusal = departmentRefusal(error);
+        throw new Error(refusal ? `部门 ${id}：${refusal}；范围未改`
+          : `没能向平台核对部门 ${id}（${error instanceof Error ? error.message : String(error)}）；范围未改`, { cause: error });
+      }
+    }
+    return checked;
   }
 
   async #children(deptId: string, page: number, signal?: AbortSignal): Promise<Page<DepartmentInfo>> {
@@ -116,7 +234,9 @@ export class DirectoryClient {
   /** 验签并解密；任何不一致都抛错，不返回部分结果。 */
   decode(response: ApiResponse, path: string): Record<string, unknown> {
     if (!accepted(response)) {
-      throw new PlatformRequestError(`通讯录 ${path} 失败：HTTP ${response.status} code=${String(response.json?.code)}`, "rejected", response.status);
+      const code = response.json?.code;
+      throw new PlatformRequestError(`通讯录 ${path} 失败：HTTP ${response.status} code=${String(code)}`, "rejected", response.status,
+        typeof code === "number" || typeof code === "string" ? String(code) : undefined);
     }
     const data = responseData(response);
     const { encrypt, sign, timeStamp, nonce } = data;

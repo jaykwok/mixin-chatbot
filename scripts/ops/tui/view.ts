@@ -57,6 +57,22 @@ export interface SelectSpec {
 /** value 对应本页 onKey 的键名，菜单与快捷键共用同一份操作逻辑。 */
 export type ViewAction = Choice;
 
+/**
+ * 自己处理按键的浮层（如部门选择器）。App 负责画框、居中和重绘；打开期间所有按键都交给它，
+ * 包括 Esc 和 Ctrl+C，由它决定何时关闭并交回结果。
+ */
+export interface Dialog<T> {
+  title(): string;
+  /** 标题右侧的附注，如已选数量。 */
+  note?(): string;
+  /** 后台读取进行中；为 true 时 App 持续重绘加载动画。 */
+  busy?(): boolean;
+  /** 框内的行；width 是框内可用宽度，height 是最多可用的行数。 */
+  render(theme: Theme, width: number, height: number): string[];
+  /** 返回 { done } 关闭浮层，并把 done 交给打开它的调用方。 */
+  onKey(key: Key): { done: T } | void;
+}
+
 export interface AppApi {
   theme: Theme;
   deployment: Deployment;
@@ -68,6 +84,8 @@ export interface AppApi {
   ask(label: string, initial?: string): Promise<string | null>;
   /** 支持方向键与文字筛选的选择菜单，Esc 返回 null。 */
   choose(spec: SelectSpec): Promise<string | null>;
+  /** 打开自定义浮层，等它交回结果。 */
+  dialog<T>(dialog: Dialog<T>): Promise<T>;
   /** 跑一条运维命令，实时显示每一行输出；返回退出码。仅用于不会向用户提问的命令。 */
   run(title: string, args: string[]): Promise<number>;
   /**

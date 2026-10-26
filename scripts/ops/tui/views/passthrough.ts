@@ -9,8 +9,16 @@
 import type { StatusName } from "../render/theme.ts";
 import type { AppApi, View, ViewAction, ViewContext } from "../view.ts";
 import { actionWorkbench, moveSelection } from "./common.ts";
+import { pickDirectoryScope, scopeConfirmation } from "./directory-scope.ts";
 
-interface Command {
+type Command = CommandBase & (
+  /** 跑一条运维命令；参数按 ask 依次询问。 */
+  | { args(values: string[]): string[] }
+  /** 自带界面的操作（如部门选择器），自己负责确认和执行。 */
+  | { open(app: AppApi): Promise<void> }
+);
+
+interface CommandBase {
   label: string;
   summary: string;
   status: StatusName;
@@ -28,7 +36,6 @@ interface Command {
     recovery?: string;
     typeToConfirm?: string;
   };
-  args(values: string[]): string[];
 }
 
 const askLabel = (question: NonNullable<Command["ask"]>[number]) => typeof question === "string" ? question : question.label;
@@ -53,7 +60,7 @@ class CommandMenu implements View {
 
   actions(): ViewAction[] {
     return this.commands.map((command, index) => ({
-      value: `command:${index}`, label: command.label, description: command.summary, danger: !!command.danger,
+      value: `command:${index}`, label: command.label, description: command.summary, danger: !!command.danger || "open" in command,
     }));
   }
 
@@ -66,6 +73,10 @@ class CommandMenu implements View {
     const command = key.name === "enter" ? this.commands[this.selected]
       : this.commands.find((_, index) => key.name === `command:${index}`);
     if (!command) return false;
+    if ("open" in command) {
+      await command.open(app);
+      return true;
+    }
 
     const values: string[] = [];
     for (const question of command.ask ?? []) {
@@ -104,17 +115,17 @@ class CommandMenu implements View {
   }
 
   render(ctx: ViewContext): string[] {
-    const command = this.commands[this.selected]!;
+    const command = this.commands[this.selected]!, changes = !!command.danger || "open" in command;
     return actionWorkbench(ctx, {
       title: this.title, items: this.commands, selected: this.selected,
       details: [
         ctx.theme.bold(command.summary),
-        ctx.theme.c(command.danger || command.interactive ? "warn" : "ok", command.danger ? "修改操作 · 执行前需确认" : command.effect ?? "只读查看"),
+        ctx.theme.c(changes || command.interactive ? "warn" : "ok", changes ? "修改操作 · 执行前需确认" : command.effect ?? "只读查看"),
         "",
         ...(command.ask?.length ? ["需要提供：" + command.ask.map(askLabel).join("、"), ""] : []),
         this.intro,
       ],
-      note: command.danger ? "Enter 填写范围并查看确认步骤" : "Enter 查看结果 · 支持滚动回看完整输出",
+      note: "open" in command ? "Enter 打开选择界面，选好后查看确认步骤" : command.danger ? "Enter 填写范围并查看确认步骤" : "Enter 查看结果 · 支持滚动回看完整输出",
     });
   }
 }
@@ -194,13 +205,20 @@ export function createDirectoryView(): View {
     "通讯录同步",
     "机器人按开放平台通讯录把成员的平台 ID 对应到手机号，统计和会话都按手机号归属。每天 03:00 完整同步一次，" +
       "遇到未知成员时也会触发。一轮里缺席的成员太多时（例如接口异常或权限变化），本轮不撤销，等管理员核对后确认。" +
-      "通讯录很大时可以只同步选定的部门及其子部门：先「列出部门」找到部门 ID，再「设置同步范围」。",
+      "通讯录很大时可以只同步选定的部门及其子部门：用「选择同步范围」逐层展开部门并勾选，任意层级、跨分支都可以；" +
+      "也可以先「列出部门」查到部门 ID，再「手动设置同步范围」。",
     [
       {
         label: "查看 Stream 与同步状态",
-        summary: "事件 Stream 连接、映射数量、最近同步和待确认撤销",
+        summary: "事件 Stream 连接、映射数量、同步范围（部门名称）、最近同步和待确认撤销",
         status: "idle",
         args: () => ["directory"],
+      },
+      {
+        label: "选择同步范围",
+        summary: "逐层展开部门并勾选，任意层级、跨分支多选；每个选中的部门含其全部子部门，不选为整个通讯录",
+        status: "warn",
+        open: app => pickDirectoryScope(app),
       },
       {
         label: "确认暂停的撤销",
@@ -227,20 +245,11 @@ export function createDirectoryView(): View {
         args: ([parent]) => parent ? ["directory-departments", parent] : ["directory-departments"],
       },
       {
-        label: "设置同步范围",
-        summary: "只同步选定的部门及其子部门，留空为整个通讯录；范围有变化时立即重新同步",
+        label: "手动设置同步范围",
+        summary: "填写部门 ID：只同步这些部门及其子部门，留空为整个通讯录；范围有变化时立即重新同步",
         status: "warn",
         ask: [{ label: "部门 ID（多个用逗号分隔；留空为整个通讯录）", optional: true }],
-        danger: ([departments]) => ({
-          subject: departments ? `只同步部门 ${departments} 及其子部门` : "同步整个通讯录",
-          steps: [
-            ...(departments ? ["服务先向平台核对每个部门，任何一个不存在或无权读取都不改"] : []),
-            "与现有范围相同则不改、不重新同步；否则保存范围，正在进行的同步中止，按新范围立即重新同步",
-            "范围外成员的映射在这一轮完整同步后撤销；超过撤销阈值时暂停，等你确认",
-          ],
-          untouched: ["统计账本和会话历史", "范围内成员已有的映射"],
-          recovery: "重新设置范围（留空为整个通讯录）后，下一轮同步恢复被撤销成员的映射",
-        }),
+        danger: ([departments]) => scopeConfirmation(departments ? `只同步部门 ${departments} 及其子部门` : "同步整个通讯录", !!departments),
         args: ([departments]) => departments ? ["directory-scope", departments] : ["directory-scope"],
       },
     ]

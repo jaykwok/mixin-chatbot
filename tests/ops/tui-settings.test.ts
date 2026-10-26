@@ -29,6 +29,7 @@ function stub() {
   const app: AppApi = {
     deployment, theme: createTheme("truecolor"), redraw() {}, toast(_status, text) { messages.push(text); }, go() {},
     ask: async () => answers.shift() ?? null, choose: async () => choices.shift() ?? null, confirm: async () => true,
+    dialog: async () => { throw new Error("设置页不打开自定义浮层"); },
     run: async () => { throw new Error("不得执行真实维护命令"); },
     runInteractive: async () => { throw new Error("不得启动交互子进程"); }, openFile: async () => {},
   };

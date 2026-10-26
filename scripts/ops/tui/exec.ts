@@ -22,10 +22,17 @@ export interface CaptureOptions {
 }
 
 let queries = new QueryPool();
-export function startQueries(): void { if (queries.closed) queries = new QueryPool(); }
+/** 管理台进程里直接发给服务的请求（部门选择器）；退出时取消，在途的请求不拖住进程。 */
+let requests = new AbortController();
+export function startQueries(): void {
+  if (queries.closed) queries = new QueryPool();
+  if (requests.signal.aborted) requests = new AbortController();
+}
+export function consoleRequests(): AbortSignal { return requests.signal; }
 
 /** 取消只读查询，同时等待维护事务完成恢复；各自的进程生命周期互不影响。 */
 export async function shutdownTui(): Promise<void> {
+  requests.abort(new Error("管理台已退出"));
   const results = await Promise.allSettled([queries.stop(), drainMaintenance()]);
   const failure = results.find(result => result.status === "rejected");
   if (failure?.status === "rejected") throw failure.reason;

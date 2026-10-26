@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ATTENTION_RECENT_MS, changeScope, confirmRevocations, departmentRow, describeAttention, describeDirectory, doctorRows, listDepartments, readServiceStatus } from "../../scripts/ops/directory-admin.ts";
+import { ATTENTION_RECENT_MS, changeScope, confirmRevocations, departmentPath, departmentRow, describeAttention, describeDepartments, describeDirectory, doctorRows,
+  listDepartments, readServiceStatus, scopeRows } from "../../scripts/ops/directory-admin.ts";
 import { readDirectoryScope, sameScope, writeDirectoryScope } from "../../src/integrations/open-platform/directory-scope.ts";
 import { createApp } from "../../src/server/http-app.ts";
 import type { ScanSummary } from "../../src/integrations/open-platform/identity-directory.ts";
@@ -79,7 +80,7 @@ test("departments and scope changes go to the recorded instance; malformed IDs a
   const app = createApp({ isStopping: () => false, adminToken: token, shutdown: () => {}, instanceId, startedAt,
     listDepartments: async parent => { parents.push(parent); return [{ id: "100", name: "总部", count: 12 }, { id: "101", name: "保密\t部" }]; },
     changeScope: async departments => {
-      if (departments?.includes("999")) throw new Error("部门 999 不存在或应用无权读取（code=404002）；范围未改");
+      if (departments?.includes("999")) throw new Error("部门 999：部门不属于当前组织（code=422010）；范围未改");
       if (departments?.[0] === "300") return "unchanged";
       scopes.push(departments);
       return (departments ?? []).map(id => ({ id, name: "部门" + id, fullName: "集团/部门" + id }));
@@ -97,14 +98,66 @@ test("departments and scope changes go to the recorded instance; malformed IDs a
     expect(checked !== "unchanged" && checked.map(departmentRow)).toEqual(["100\t-\t集团/部门100", "101\t-\t集团/部门101"]);
     expect(await changeScope(undefined, undefined, file)).toEqual([]);
     expect(await changeScope(["300"], undefined, file)).toBe("unchanged");
-    await expect(changeScope(["100", "999"], undefined, file)).rejects.toThrow("部门 999 不存在");
+    await expect(changeScope(["100", "999"], undefined, file)).rejects.toThrow("部门 999：部门不属于当前组织");
     await expect(changeScope(["100", "100"], undefined, file)).rejects.toThrow("重复");
     await expect(changeScope([], undefined, file)).rejects.toThrow("1 到 200 个部门 ID");
+    // The root's alias 1 lists departments (above) but is no scope: the service is never asked to check it.
+    await expect(changeScope(["100", "1"], undefined, file)).rejects.toThrow("部门 1 是根部门的查询别名，不能作为同步范围；留空即同步整个通讯录");
     expect(scopes).toEqual([["100", "101"], undefined]);
     await writeFile(file, JSON.stringify({ port: server.port, token: "other", instanceId, pid: process.pid, startedAt }));
     await expect(changeScope(["100"], undefined, file)).rejects.toThrow("实例口令不符");
     expect(scopes).toHaveLength(2);
   } finally { await server.stop(true); await fixture.cleanup(); }
+});
+
+test("department details: paths from the ancestors, refused departments listed apart; the status rows survive a failed lookup", async () => {
+  const fixture = await tempFixture("directory-details-");
+  const token = "test-admin-token", instanceId = randomUUID(), startedAt = now;
+  const asked: string[][] = [];
+  let mode: "ok" | "fail" | "hang" = "ok", release = () => {};
+  const app = createApp({ isStopping: () => false, adminToken: token, shutdown: () => {}, instanceId, startedAt,
+    describeDepartments: async ids => {
+      asked.push(ids);
+      if (mode === "fail") throw new Error("通讯录 /open/v2/dept/get 失败：HTTP 502");
+      if (mode === "hang") await new Promise<void>(resolve => { release = resolve; });
+      return { departments: ids.filter(id => id !== "999").map(id => id === "111"
+        ? { id, name: "平台\t组", count: 8, fullName: "集团|总部|研发中心|平台组", parentId: "110", ancestors: [{ id: "100", name: "总部" }, { id: "110", name: "" }] }
+        : { id, name: "部门" + id, fullName: "集团|部门" + id }),
+      unavailable: ids.includes("999") ? [{ id: "999", message: "部门不属于当前组织（code=422010）" }] : [] };
+    } });
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+  const file = join(fixture.root, "instance.json");
+  try {
+    await writeFile(file, JSON.stringify({ port: server.port, token, instanceId, pid: process.pid, startedAt }));
+    const described = await describeDepartments(["111", "200", "999"], undefined, file);
+    // A nameless ancestor shows its ID; without a chain the platform's full path stands in.
+    expect(described.departments.map(departmentPath)).toEqual(["总部 / 110 / 平台\t组", "集团|部门200"]);
+    expect(described.unavailable.map(item => item.id)).toEqual(["999"]);
+    expect(await scopeRows(["111", "200", "999"], undefined, file)).toEqual(["范围内的部门（ID、人数、路径）：", "111\t8\t总部 / 110 / 平台 组",
+      "200\t-\t集团|部门200", "999\t-\t平台拒绝：部门不属于当前组织（code=422010）"]);
+    await expect(describeDepartments(["a b"], undefined, file)).rejects.toThrow("无效的部门 ID");
+    await expect(describeDepartments([], undefined, file)).rejects.toThrow("1 到 200 个部门 ID");
+    expect(asked).toHaveLength(2);
+    mode = "fail";
+    expect(await scopeRows(["111"], undefined, file)).toEqual(["范围内部门的名称未能读取：读取部门详情失败：通讯录 /open/v2/dept/get 失败：HTTP 502"]);
+    mode = "hang";
+    await expect(describeDepartments(["111"], undefined, file, 200)).rejects.toThrow("服务 1 秒内没有答复");
+    release();
+    // A caller that cancels (the console closing the picker) gets its own reason back, not a dead port.
+    const reason = new Error("选择器已关闭"), caller = new AbortController();
+    const cancelled = describeDepartments(["111"], undefined, file, undefined, caller.signal);
+    for (const end = Date.now() + 3000; asked.length < 5 && Date.now() < end;) await Bun.sleep(5);
+    caller.abort(reason);
+    await expect(cancelled).rejects.toBe(reason);
+    release();
+    await writeFile(file, JSON.stringify({ port: server.port, token: "other", instanceId, pid: process.pid, startedAt }));
+    expect((await scopeRows(["111"], undefined, file))[0]).toContain("实例口令不符");
+    expect(asked).toHaveLength(5);
+  } finally { release(); await server.stop(true); }
+  // Nothing listening on the recorded port.
+  await writeFile(file, JSON.stringify({ port: server.port, token, instanceId, pid: process.pid, startedAt }));
+  try { await expect(describeDepartments(["111"], undefined, file)).rejects.toThrow(`本机端口 ${server.port} 无响应`); }
+  finally { await fixture.cleanup(); }
 });
 
 test("the scope file: absent means the whole directory; written atomically; anything malformed is refused", async () => {

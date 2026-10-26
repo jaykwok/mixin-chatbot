@@ -14,15 +14,16 @@ import { footer, header, navbar, subnav } from "./frame.ts";
 import { loadGit, probeService, type GitState, type Service } from "./data.ts";
 import { PROJECT_DIR, loadDeployment, opsCommand, type Deployment } from "./platform.ts";
 import { openLocalFile, stream, trackMaintenance, startQueries, shutdownTui } from "./exec.ts";
-import type { AppApi, Choice, ConfirmSpec, Section, SelectSpec, View, ViewContext } from "./view.ts";
+import type { AppApi, Choice, ConfirmSpec, Dialog, Section, SelectSpec, View, ViewContext } from "./view.ts";
 import { moveSelection, windowStart } from "./views/common.ts";
 
 const TOAST_MS = 6000;
 
 interface Modal {
-  kind: "confirm" | "ask" | "help" | "select";
+  kind: "confirm" | "ask" | "help" | "select" | "dialog";
   spec?: ConfirmSpec;
   selection?: SelectSpec;
+  dialog?: Dialog<unknown>;
   label?: string;
   /** typeToConfirm 或 ask 的当前输入。 */
   input: string;
@@ -93,7 +94,7 @@ export class App implements AppApi {
         this.toastState = null;
         this.redraw();
       }
-      if ((this.action && !this.action.done) || !this.service || this.currentActivity() ||
+      if ((this.action && !this.action.done) || !this.service || this.currentActivity() || this.modal?.dialog?.busy?.() ||
         (this.service.startedAt && nextSecond !== second)) this.redraw();
       second = nextSecond;
       this.paint();
@@ -295,6 +296,14 @@ export class App implements AppApi {
     });
   }
 
+  dialog<T>(dialog: Dialog<T>): Promise<T> {
+    return new Promise(resolve => {
+      this.modal = { kind: "dialog", dialog, input: "", choice: 0, scroll: new Viewport(), resolve: resolve as (value: unknown) => void };
+      this.redraw();
+      this.paint();
+    });
+  }
+
   /**
    * 跑一条运维命令并实时显示输出。
    *
@@ -482,6 +491,16 @@ export class App implements AppApi {
   private handleModalKey(key: Key): void {
     const modal = this.modal!;
     if (modal.kind === "select") return this.handleSelectKey(key, modal);
+    if (modal.kind === "dialog") {
+      const result = modal.dialog!.onKey(key);
+      if (result) {
+        this.modal = null;
+        modal.resolve(result.done);
+      }
+      this.redraw();
+      this.paint();
+      return;
+    }
     if (["up", "down", "pageup", "pagedown", "home", "end"].includes(key.name) && modal.scroll.onKey(key.name)) {
       this.redraw();
       return;
@@ -695,6 +714,12 @@ export class App implements AppApi {
   private renderModal(columns: number, height: number): string[] {
     const modal = this.modal!;
     if (modal.kind === "select") return this.renderSelect(columns, height, modal);
+    if (modal.kind === "dialog") {
+      const size = Math.min(columns - 6, 100), dialog = modal.dialog!;
+      const room = Math.max(1, height - 4);
+      return box(this.theme, { width: size, title: dialog.title(), note: dialog.note?.(), accent: "accent",
+        body: dialog.render(this.theme, size - 4, room).slice(0, room) });
+    }
     const size = Math.min(columns - 6, 72);
     const inner = size - 4;
     const inputLine = () => {
@@ -729,6 +754,7 @@ export class App implements AppApi {
         "统计：w 选择常用日期，d 自定义区间，e 导出，o 打开报表。",
         "会话：c 清空当前空间，a 清空全部，Enter 看成员，p 压缩选中成员的上下文。",
         "临时文件：d 选择天数，Enter 看文件，p 清当前成员，a 清全部。",
+        "通讯录选择同步范围：→ 展开，← 上级，Space 勾选，Tab 看已选，Enter 保存。",
         "详情先按 Esc 返回列表，再按 Esc 清除筛选。",
         "清空会话不删除文件（旧上下文留在会话库）；临时文件归档到 data/state/reclamation/backup/rm；",
         "外链对象删除不可恢复。"

@@ -88,7 +88,7 @@ test("通讯录的部门列表和同步范围可以留空：分别为根部门�
   const view = createDirectoryView(), { app, calls } = fakeApp();
   const press = (label: string) => view.onKey!(key(view.actions!().find(action => action.label === label)!.value), app);
   calls.answers.push("", " ", "100, 200", "");
-  await press("列出部门"); await press("设置同步范围"); await press("设置同步范围"); await press("确认暂停的撤销");
+  await press("列出部门"); await press("手动设置同步范围"); await press("手动设置同步范围"); await press("确认暂停的撤销");
   expect(calls.commands.map(command => command.args)).toEqual([["directory-departments"], ["directory-scope"], ["directory-scope", "100, 200"]]);
   expect(calls.confirms.map(confirm => confirm.subject)).toEqual(["同步整个通讯录", "只同步部门 100, 200 及其子部门"]);
   expect(calls.toasts.at(-1)).toBe("此项不能为空，操作未执行");
@@ -165,6 +165,7 @@ function fakeApp(root = "unused") {
     redraw() {}, go(id, focus) { calls.destinations.push(id); if (focus) calls.focuses.push(focus); }, toast(_status, text) { calls.toasts.push(text); },
     async ask(label) { calls.prompts.push(label); return calls.answers.shift() ?? null; },
     async choose(spec) { calls.menus.push(spec); return calls.choices.shift() ?? null; },
+    async dialog() { throw new Error("测试没有准备自定义浮层"); },
     async confirm(spec) { calls.confirms.push(spec); return true; },
     async run(title, args) {
       calls.commands.push({ title, args });

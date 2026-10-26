@@ -20,8 +20,13 @@ export interface FakeDirectory {
   readonly members: Record<string, { phone: string; name: string }[]>;
   /** 手机号 → imUserId。 */
   readonly ids: Record<string, string>;
-  /** 部门 ID → 名称、人数、完整路径；部门详情只认这里列出的部门（其余返回 404002）。 */
+  /** 部门 ID → 名称、人数、完整路径；部门详情只认这里列出的部门（其余像真实平台一样返回 422010）。 */
   readonly info?: Record<string, { name: string; count?: number; fullName?: string }>;
+  /**
+   * 组织根部门自己的 ID（像真实平台）：子部门接口里的 1 就是它，一级部门的 parent_id 是它，它的 parent_id 为 "0"。
+   * 没有时一级部门的 parent_id 为 1。
+   */
+  readonly root?: string;
 }
 
 /** 平台的 decryptV2 逆运算（按文档独立实现）：AES-256-CBC，密钥 sha256(base64(sha512(appSecret)):timeStamp:nonce)，IV 在前。 */
@@ -218,8 +223,13 @@ export class FakePlatform {
     }
     if (request.method === "POST" && url.pathname === "/open/v2/dept/get") {
       const id = (body as { dept_id: string }).dept_id, info = this.directory.info?.[id];
-      if (!info) return json({ code: 404002, msg: "部门不存在" });
-      return this.encrypted({ dept_id: id, name: info.name, full_name: info.fullName ?? info.name, count: info.count ?? 0, hide_count: info.count === undefined ? 1 : 0 });
+      // As the real platform answers for an ID that is not a department of the organisation (not the documented 404002).
+      if (!info) return json({ code: 422010, msg: "部门不属于当前组织" });
+      // The parent comes from the children lists; the root's is "0", a department in none of them has no parent_id.
+      const listed = Object.entries(this.directory.children).find(([, list]) => list.includes(id))?.[0], root = this.directory.root;
+      const parent = id === "1" || id === root ? "0" : listed === "1" && root ? root : listed;
+      return this.encrypted({ dept_id: id, ...(parent ? { parent_id: parent } : {}), name: info.name, full_name: info.fullName ?? info.name,
+        count: info.count ?? 0, hide_count: info.count === undefined ? 1 : 0 });
     }
     if (request.method === "POST" && url.pathname === "/open/v2/dept/users/list") {
       const { dept_id, page_num, page_size } = body as { dept_id: string; page_num: number; page_size: number };

@@ -115,6 +115,7 @@ Invoke-Update -ConfirmedTarget $request.Target | Out-Null
         deployment: { platform, runtime: platform === "windows" ? "scheduled-task" : "docker", port: 1011,
           dataRoot: fixture.root, workspaceRoot: "" },
         theme: createTheme("none"), redraw() {}, go() {}, toast() {}, async ask() { return null; }, async choose() { return null; },
+        async dialog() { throw new Error("Unexpected dialog"); },
         async confirm(spec) { confirmation = spec; await git("update-ref", "refs/remotes/origin/main", later); return true; }, async openFile() {},
         async run() { throw new Error("Unexpected non-interactive dispatch"); },
         async runInteractive(_title, args) {

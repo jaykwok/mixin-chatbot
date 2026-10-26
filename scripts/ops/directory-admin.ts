@@ -1,11 +1,11 @@
 // 事件 Stream 与通讯录同步的状态查看、暂停的大批撤销的确认，以及同步范围（选定部门，留空为整个通讯录）的修改。只经本机控制接口
-// 读写运行中的服务：不另开 Stream 连接（同一应用只能有一条），不直接调用平台接口（部门列表由服务代查），输出不含凭据。
+// 读写运行中的服务：不另开 Stream 连接（同一应用只能有一条），不直接调用平台接口（部门列表和名称由服务代查），输出不含凭据。
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { matchesInstance } from "../../src/core/health.ts";
 import type { StreamStatus } from "../../src/integrations/open-platform/stream.ts";
 import type { DirectoryStatus } from "../../src/integrations/open-platform/identity-directory.ts";
-import type { DepartmentInfo } from "../../src/integrations/open-platform/directory.ts";
+import type { DepartmentDescription, DepartmentDetail, DepartmentInfo } from "../../src/integrations/open-platform/directory.ts";
 import { ATTENTION_KINDS, type AttentionKind, type AttentionStatus } from "../../src/durable/attention.ts";
 import { describeAge } from "../lib/age.ts";
 
@@ -18,13 +18,17 @@ async function instance(file: string): Promise<{ port: number; token: string; in
   catch { throw new Error("读不到服务实例记录（data/state/instance.json）；服务可能没有运行"); }
 }
 
-/** 从运行中实例的 /health 读取 Stream 与通讯录状态；实例身份不符时报错。 */
-export async function readServiceStatus(port?: number, file = INSTANCE_FILE): Promise<ServiceStatus> {
+/** 请求的时限，再加上调用方的取消（管理台关闭选择器或退出）。 */
+const limited = (timeoutMs: number, signal?: AbortSignal) => signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
+
+/** 从运行中实例的 /health 读取 Stream 与通讯录状态；实例身份不符时报错。调用方取消时抛出取消的原因。 */
+export async function readServiceStatus(port?: number, file = INSTANCE_FILE, signal?: AbortSignal): Promise<ServiceStatus> {
   const expected = await instance(file);
   const target = port ?? expected.port;
-  const response = await fetch(`http://127.0.0.1:${target}/health`, { signal: AbortSignal.timeout(3000), redirect: "error" })
-    .catch(() => { throw new Error(`本机端口 ${target} 无响应；服务可能没有运行`); });
+  const response = await fetch(`http://127.0.0.1:${target}/health`, { signal: limited(3000, signal), redirect: "error" })
+    .catch(() => { signal?.throwIfAborted(); throw new Error(`本机端口 ${target} 无响应；服务可能没有运行`); });
   const body = await response.json().catch(() => undefined) as Record<string, unknown> | undefined;
+  signal?.throwIfAborted();
   if (!matchesInstance(body, expected, target)) throw new Error("本机端口上的服务不是当前实例");
   return { stream: body.stream as StreamStatus | undefined, directory: body.directory as DirectoryStatus | undefined,
     attention: body.attention as AttentionStatus | undefined, verificationOnly: body.verificationOnly === true };
@@ -37,28 +41,61 @@ export async function confirmRevocations(scanId: number, port?: number, file = I
   throw new Error(typeof body.message === "string" ? body.message : `服务拒绝了确认（HTTP ${status}）`);
 }
 
-/** POST 到运行中实例的本机控制接口；404 表示口令不符或接口不存在（验证实例）。 */
-async function admin(path: string, body: unknown, port: number | undefined, file: string, timeoutMs: number): Promise<{ status: number; body: Record<string, unknown> }> {
+/**
+ * 服务等平台的接口自己限时 60 秒（src/server/http-app.ts 的 PLATFORM_WAIT_MS），到时答复超时；这里多等一些，
+ * 好让服务的说明先到。管理台关闭请求时服务随即取消对应的平台查询。
+ */
+const PLATFORM_ROUTE_TIMEOUT_MS = 75_000;
+
+/**
+ * POST 到运行中实例的本机控制接口；404 表示口令不符或接口不存在（验证实例）。`signal` 是调用方的取消：
+ * 取消时抛出取消的原因，连接随之关闭。
+ */
+async function admin(path: string, body: unknown, port: number | undefined, file: string, timeoutMs: number,
+  signal?: AbortSignal): Promise<{ status: number; body: Record<string, unknown> }> {
   const expected = await instance(file);
-  const response = await fetch(`http://127.0.0.1:${port ?? expected.port}${path}`, {
+  const target = port ?? expected.port;
+  const response = await fetch(`http://127.0.0.1:${target}${path}`, {
     method: "POST", headers: { Authorization: `Bearer ${expected.token}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs), redirect: "error",
+    body: JSON.stringify(body), signal: limited(timeoutMs, signal), redirect: "error",
+  }).catch((error: unknown) => {
+    signal?.throwIfAborted();
+    throw new Error((error as Error).name === "TimeoutError" ? `服务 ${Math.ceil(timeoutMs / 1000)} 秒内没有答复，请稍后重试`
+      : `本机端口 ${target} 无响应；服务可能没有运行`);
   });
   const parsed = await response.json().catch(() => ({})) as Record<string, unknown>;
+  signal?.throwIfAborted();
   if (response.status === 404) throw new Error("服务拒绝了请求：实例口令不符（服务可能刚重启，请重新查看），或这是不连接平台的验证实例");
   return { status: response.status, body: parsed };
 }
 
 /** 部门 `parent`（缺省为根部门 1）的直属子部门，由服务向平台查询。 */
-export async function listDepartments(parent = "1", port?: number, file = INSTANCE_FILE): Promise<DepartmentInfo[]> {
-  const { status, body } = await admin("/_admin/directory/departments", { parent }, port, file, 60_000);
+export async function listDepartments(parent = "1", port?: number, file = INSTANCE_FILE, signal?: AbortSignal): Promise<DepartmentInfo[]> {
+  const { status, body } = await admin("/_admin/directory/departments", { parent }, port, file, PLATFORM_ROUTE_TIMEOUT_MS, signal);
   if (status !== 200) throw new Error(typeof body.message === "string" ? body.message : `服务拒绝了查询（HTTP ${status}）`);
   return body.departments as DepartmentInfo[];
 }
 
+/**
+ * 部门的名称、完整路径和上级链，由服务向平台查询。平台明确拒绝的部门（不存在等）单列；
+ * 其他失败（网络、平台故障）使整次查询失败，可以重试。
+ */
+export async function describeDepartments(ids: readonly string[], port?: number, file = INSTANCE_FILE, timeoutMs = PLATFORM_ROUTE_TIMEOUT_MS,
+  signal?: AbortSignal): Promise<DepartmentDescription> {
+  const { status, body } = await admin("/_admin/directory/department-details", { ids }, port, file, timeoutMs, signal);
+  if (status !== 200) throw new Error(typeof body.message === "string" ? body.message : `服务拒绝了查询（HTTP ${status}）`);
+  return { departments: body.departments as DepartmentDetail[], unavailable: body.unavailable as DepartmentDescription["unavailable"] };
+}
+
+/** 部门的显示路径：一级部门到本部门的名称（不含根部门）；上级链未知时用平台的完整路径。 */
+export function departmentPath(department: DepartmentDetail): string {
+  const name = department.name || department.id;
+  return department.ancestors ? [...department.ancestors.map(item => item.name || item.id), name].join(" / ") : department.fullName ?? name;
+}
+
 /** 改同步范围（`undefined` 为整个通讯录）；服务核对部门、保存后立即重新扫描。返回核对过的部门，与现有范围相同时为 "unchanged"。 */
 export async function changeScope(departments: string[] | undefined, port?: number, file = INSTANCE_FILE): Promise<DepartmentInfo[] | "unchanged"> {
-  const { status, body } = await admin("/_admin/directory/scope", { departments: departments ?? null }, port, file, 60_000);
+  const { status, body } = await admin("/_admin/directory/scope", { departments: departments ?? null }, port, file, PLATFORM_ROUTE_TIMEOUT_MS);
   if (status === 200 && body.status === "unchanged") return "unchanged";
   if (status !== 202) throw new Error(typeof body.message === "string" ? body.message : `服务拒绝了修改（HTTP ${status}）`);
   return body.departments as DepartmentInfo[];
@@ -68,6 +105,21 @@ export async function changeScope(departments: string[] | undefined, port?: numb
 export function departmentRow(department: DepartmentInfo): string {
   return [department.id, department.count === undefined ? "-" : String(department.count), department.fullName ?? department.name]
     .map(field => field.replace(/[\t\r\n]/g, " ")).join("\t");
+}
+
+/** 同步范围内各部门的一行（ID、人数、路径）；服务查不到名称时说明原因，范围本身照常按 ID 显示。 */
+export async function scopeRows(scope: readonly string[], port?: number, file = INSTANCE_FILE): Promise<string[]> {
+  let described: DepartmentDescription;
+  try { described = await describeDepartments(scope, port, file, 30_000); }
+  catch (error) { return [`范围内部门的名称未能读取：${error instanceof Error ? error.message : String(error)}`]; }
+  const found = new Map(described.departments.map(department => [department.id, department]));
+  const refused = new Map(described.unavailable.map(item => [item.id, item.message]));
+  return ["范围内的部门（ID、人数、路径）：", ...scope.map(id => {
+    const department = found.get(id);
+    const refusal = refused.get(id);
+    return departmentRow(department ? { ...department, fullName: departmentPath(department) }
+      : { id, name: refusal ? `平台拒绝：${refusal}` : "读取失败：服务没有返回这个部门" });
+  })];
 }
 
 export function describeStream(stream: StreamStatus | undefined, verificationOnly = false): string {
@@ -137,6 +189,7 @@ if (import.meta.main) {
       const status = await readServiceStatus();
       console.log(`事件 Stream：${describeStream(status.stream, status.verificationOnly)}`);
       for (const line of describeDirectory(status.directory)) console.log(line);
+      if (status.directory?.scope?.length) for (const line of await scopeRows(status.directory.scope)) console.log(line);
       if (status.attention) for (const event of describeAttention(status.attention)) console.log(`自本次启动：${event.text}`);
       if (status.directory?.pending) console.log(`确认撤销：directory-confirm ${status.directory.pending.scanId}`);
     } else if (action === "confirm" && value && /^[1-9][0-9]*$/.test(value)) {

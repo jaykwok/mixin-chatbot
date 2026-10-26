@@ -18,7 +18,8 @@ const MAX_COOLDOWN_MS = 60_000;
 export type FailureKind = "unsent" | "uncertain" | "rejected";
 
 export class PlatformRequestError extends Error {
-  constructor(message: string, readonly kind: FailureKind, readonly status?: number) {
+  /** code：平台响应里的业务错误码（有时）；按它区分错误，不按文案。 */
+  constructor(message: string, readonly kind: FailureKind, readonly status?: number, readonly code?: string) {
     super(message);
     this.name = "PlatformRequestError";
   }
