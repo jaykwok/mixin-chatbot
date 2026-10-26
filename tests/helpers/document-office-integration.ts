@@ -258,7 +258,7 @@ assert.deepEqual(remainingOffice, [], "a completed conversion left a LibreOffice
 await checkRetiredProfiles();
 // The controlled read tool keeps members apart: own preview readable, the other member's refused.
 assert.ok((await hashed.read(hashedWord.images[0].path)).some((part: { type: string }) => part.type === "image"));
-await assert.rejects(hashed.read(longDeck.images[0].path), /仅允许当前用户 tmp/);
+await assert.rejects(hashed.read(longDeck.images[0].path), /仅允许本次请求的 tmp 目录/);
 
 // 3. Cancel while LibreOffice runs: writers exit, cleanup is recorded, and earlier results stay readable.
 const jobsBefore = (await readdir(hashed.tempDir)).sort();
