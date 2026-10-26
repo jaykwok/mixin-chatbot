@@ -8,7 +8,7 @@
 
 | 名称 | 来源 | 用途 |
 | --- | --- | --- |
-| 程序版本 | `package.json` 的 `version`（当前 1.0.0） | 发布与升级判断、TUI 显示 |
+| 程序版本 | `package.json` 的 `version`（当前 1.0.1） | 发布与升级判断、TUI 显示 |
 | 数据格式 | `src/core/version.ts` 的 `DATA_VERSION`（当前 1） | 程序能否打开现有数据 |
 | 构建 | Git 提交（12 位，有已跟踪改动时带 `-dirty`） | 区分同一版本号的不同构建 |
 | 会话存储 schema | Pi Durable 的 SQLite schema（当前 2） | 依赖库内部格式，由数据格式一并约束 |
@@ -68,7 +68,7 @@ Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版�
    - 直连模式：Linux 删除注释为 `Mixin-Chatbot (平台IP)` 的 UFW 规则（`sudo ufw status numbered` 后按编号 `sudo ufw delete <编号>`）；Windows 以管理员运行 `Remove-NetFirewallRule -Group mixin-chatbot`。
    - 在 Mixin 后台停用旧的 webhook 回调。
 4. **让出全局名称**：容器名 `mixin-chatbot` 和 Windows 计划任务 `mixin-chatbot` 是全机唯一的。Linux 执行 `docker rm mixin-chatbot`（还有 `mixin-chatbot-rollback` 时一并删除；数据在旧目录的挂载里，不受影响）；Windows 以管理员执行 `Unregister-ScheduledTask -TaskName mixin-chatbot -Confirm:$false`。新部署发现属于其他目录的容器时会拒绝继续。
-5. **全新部署 1.0.0**：在新目录克隆仓库并按[部署与配置](deployment.md)部署，配置应用机器人凭据和模型。外链、MCP、辅助模型和运行参数在 TUI 中重新设置。
+5. **全新部署当前版本**：在新目录克隆仓库并按[部署与配置](deployment.md)部署，配置应用机器人凭据和模型。外链、MCP、辅助模型和运行参数在 TUI 中重新设置。
 6. **验收**：在客户端做最小验收（单聊、群里提问、文件回复）；新部署的统计从零开始，需要旧数字时按下一节导入。
 
 ### 导入旧版统计

@@ -1,6 +1,6 @@
 [project]
 name = "mixin-chatbot-documents"
-version = "1.0.0"
+version = "1.0.1"
 description = "Fixed document tooling for the group collaboration agent"
 requires-python = ">=3.14,<3.15"
 dependencies = [

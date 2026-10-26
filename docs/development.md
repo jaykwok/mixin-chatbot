@@ -222,7 +222,7 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 
 ## 数据版本与升级
 
-程序版本取自 `package.json`（1.0.0），数据格式 `DATA_VERSION` 为 1，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`scripts/runtime/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。旧数据中只有统计可一次性导入，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。
+程序版本取自 `package.json`（1.0.1），数据格式 `DATA_VERSION` 为 1，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`scripts/runtime/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。旧数据中只有统计可一次性导入，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。
 
 六个直接 Pi 依赖精确锁为 1.4.0，内部包使用官方精确依赖和 Bun 锁文件，不重复设置 Pi overrides，也不打补丁。请求门（[door.ts](../src/durable/door.ts)）按官方随每次生成与压缩请求传入的 `sessionId`（会话的 `pi.provider`）找到会话和成员：映射只取成员目录、会话身份与 `pi.provider` 三者一致的已提交数据，空间开启时在恢复调度前载入，新建成员会话提交后登记，遇到未知 `sessionId` 重读一次，仍未知或被两个会话占用则不发送；分叉不继承身份，没有发送资格。门在最后一次同步检查（取消、关闭、总时限、待执行控制命令）之后直接交给 provider，中间没有 await；凭证解析等异步步骤都在检查之前。门本身不写记录，用量由 Durable 记入 `pi.usage`。升级 Pi 时需要重新验证 `sessionId` 仍随生成与压缩请求传入，以及取消、恢复语义。
 
