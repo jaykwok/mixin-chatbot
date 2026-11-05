@@ -1,6 +1,7 @@
 """Real editable Office fixtures and assertions for the document tool integration."""
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -12,11 +13,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docx import Document
+from docx.oxml import OxmlElement
 from docx.shared import Inches as WordInches
 from PIL import Image, ImageDraw
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
+from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.util import Inches, Pt
 from pypdf import PdfWriter
 from lxml import etree
@@ -415,8 +418,59 @@ def check(root, results):
         assert preview["images"] and not preview["unrenderedPages"]
         assert preview["visuallyReviewed"] is False
     check_builds(root, results)
+    check_pictures_and_headings(root)
     run_guide_examples(root, results)
     print("DOCUMENT_ARTIFACTS_PASSED")
+
+
+def check_pictures_and_headings(root):
+    """A picture in a placeholder is a picture; one that cannot be read costs only itself; a heading is known by its style's
+    name or its outline level, whatever the locale made of the style's ID."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src/agent/modules/document-work/scripts"))
+    import document_build
+    import document_ops
+
+    def png(color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (256, 256), color).save(buffer, "PNG")
+        buffer.seek(0)
+        return buffer
+
+    folder = root / "picture-cases"
+    (folder / "pptx").mkdir(parents=True)
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[8])
+    next(p for p in slide.placeholders if p.placeholder_format.type == PP_PLACEHOLDER.PICTURE).insert_picture(png("red"))
+    slide.shapes.add_picture(png("blue"), Inches(0), Inches(0), Inches(3), Inches(3))
+    linked = slide.shapes.add_picture(png("green"), Inches(4), Inches(0), Inches(3), Inches(3))
+    blip = linked._element.xpath(".//a:blip")[0]
+    relation = blip.get(qn("r:embed"))
+    del blip.attrib[qn("r:embed")]
+    blip.set(qn("r:link"), relation)
+    deck.save(folder / "pictures.pptx")
+    found = document_ops.images({"source": str(folder / "pictures.pptx"), "directory": str(folder / "pptx"), "minSize": 16})
+    assert len(found["images"]) == 2, found
+    assert found["skipped"]["unsupported"] == 1 and any("无法读取" in w for w in found["warnings"]), found
+    assert document_build.outline(str(folder / "pictures.pptx"), "pptx")["slides"][0]["pictures"] == 3
+
+    document = Document()
+    document.add_heading("第一章", 1)
+    for style in document.styles.element.findall(qn("w:style")):
+        if style.get(qn("w:styleId")) == "Heading1":
+            style.set(qn("w:styleId"), "1")
+    for node in document.element.body.iter(qn("w:pStyle")):
+        if node.get(qn("w:val")) == "Heading1":
+            node.set(qn("w:val"), "1")
+    level = OxmlElement("w:outlineLvl")
+    level.set(qn("w:val"), "1")
+    document.add_paragraph("按大纲级别的小节")._p.get_or_add_pPr().append(level)
+    document.add_paragraph("正文")
+    document.add_paragraph().add_run().add_picture(png("red"))
+    document.save(folder / "localized.docx")
+    headings = document_build.outline(str(folder / "localized.docx"), "docx")["headings"]
+    assert [(h["level"], h["text"]) for h in headings] == [(1, "第一章"), (2, "按大纲级别的小节")], headings
+    contexts = document_ops.word_image_contexts(Document(folder / "localized.docx"))
+    assert contexts[0]["headingPath"] == ["第一章", "按大纲级别的小节"], contexts
 
 
 def first_text(slide):
@@ -673,6 +727,17 @@ def run_flowchart_script(root, results, scratch):
     bad.write_text("A -- B -- \n", encoding="utf-8")
     failed = run("--check", spec_path=bad)
     assert failed.returncode == 1 and "无法解析" in json.loads(failed.stderr)["error"], failed.stderr
+    # Trapezoids in both directions; capitalised node IDs are nodes, Mermaid's own lines are skipped with a warning.
+    shapes_spec = scratch / "shapes.mmd"
+    shapes_spec.write_text("flowchart TB\n  A[/上传\\] --> B[\\下载/]\n  B --> End\n  End --> C[结束处理]\n  Click --> C\n"
+                           "  Style([样式])\n  C --> Style\n  style A fill:#fff\n  click B \"x\"\n", encoding="utf-8")
+    parsed = run("--check", spec_path=shapes_spec)
+    assert parsed.returncode == 0, parsed.stderr
+    parsed = json.loads(parsed.stdout)
+    kinds = {n["id"]: n["kind"] for n in parsed["nodes"]}
+    assert kinds["A"] == "data" and kinds["B"] == "data" and kinds["Style"] == "terminator", kinds
+    assert {"End", "C", "Click"} <= set(kinds) and {"src": "End", "dst": "C"}.items() <= next(e for e in parsed["edges"] if e["src"] == "End").items(), parsed
+    assert any("style" in w for w in parsed["warnings"]) and any("click" in w for w in parsed["warnings"]), parsed["warnings"]
     before = Presentation(scratch / "成稿.pptx")
     target = next(i for i, s in enumerate(before.slides) if first_text(s) == "客户交流目标")
     drawn = run("--pptx", str(scratch / "成稿.pptx"), "--slide", str(target + 1), "--out", str(scratch / "成稿-流程.pptx"))

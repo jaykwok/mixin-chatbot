@@ -10,9 +10,10 @@ import type { Inbound } from "../../src/durable/service.ts";
 
 /**
  * notice: a summary-carrying notice (receipts, late-message notes, errors without @);
- * reply: a reply segment (the lead one carries `mention` in a group); links: the link-note text; file: a file message.
+ * reply: a reply segment (the lead one carries `mention` in a group); links: the link-note text; file: a file message;
+ * card: an interactive card (title and content).
  */
-export type SentKind = "notice" | "reply" | "links" | "file";
+export type SentKind = "notice" | "reply" | "links" | "file" | "card";
 /** The direct space in `message` and `Sent.space`; anything else is a group id. */
 export const DIRECT_SPACE = "direct";
 
@@ -42,6 +43,7 @@ export function recordingOutbound() {
     if (message.msgType === "text") {
       return { ...base, kind: "notice", text: message.content.content };
     }
+    if (message.msgType === "card") return { ...base, kind: "card", text: `${message.content.title}\n${message.content.content}` };
     const body = message.content.content;
     const mention = message.content.a?.[0]?.i;
     const summary = /^> 回复[^\n]*\n\n/.exec(body);

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { access, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { mock } from "bun:test";
+import { runMemberTool, toolNamed } from "./member-tools.ts";
 
 let next = 0, exitCode = 0;
 const records = new Map<string, { path: string; seals: string[]; reclaimed: boolean }>();
@@ -22,14 +23,15 @@ const backend = {
 const { finishTask } = await import("../../src/core/task-backend.ts");
 mock.module("../../src/core/task-backend.ts", () => ({ configuredRootlessTasks: () => backend, assertTaskPathAllowed: async () => {}, finishTask, ISOLATED_PYTHON: "/fixture/python" }));
 const { buildLocalTools } = await import("../helpers/native-tools.ts");
-const { buildDocumentEnvironmentTool } = await import("../../src/agent/document-extract.ts");
-const { buildDocumentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
+const { documentTools } = await import("../../src/agent/document-extract.ts");
+const { documentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
 
 const root = process.cwd(), workspace = join(root, "workspace"), temp = join(root, "tmp"), index = join(root, "index");
 await Promise.all([workspace, temp, index].map(path => mkdir(path)));
 await writeFile(join(index, "materials.md"), "synthetic index");
 await writeFile(join(workspace, "source.docx"), "synthetic docx");
 const ctx = {} as never;
+const places = { workspaceDir: workspace, tempDir: temp, indexPath: join(index, "materials.md"), venvDir: join(root, "absent-venv") };
 
 // bash: kept, whatever the command's exit code.
 const tools = await buildLocalTools({ workspaceDir: workspace, tempDir: temp, phone: "synthetic", scope: { kind: "group", groupId: "synthetic" }, venvDir: join(root, "absent-venv"), materialsIndexPath: join(index, "materials.md") });
@@ -42,15 +44,14 @@ for (const id of ["1", "2"]) {
 }
 
 // document_environment: a probe delivers nothing, so it is reclaimed whether it passes or fails.
-const environment = buildDocumentEnvironmentTool(join(root, "absent-venv"));
-await environment.execute("environment", {} as never, undefined, undefined, ctx);
-exitCode = 1; await assert.rejects(environment.execute("environment", {} as never, undefined, undefined, ctx), /文档环境不可用/); exitCode = 0;
+const environment = toolNamed(documentTools(), "document_environment");
+await runMemberTool(environment, {}, { places });
+exitCode = 1; await assert.rejects(runMemberTool(environment, {}, { places }), /文档环境不可用/); exitCode = 0;
 for (const id of ["3", "4"]) { assert.deepEqual(records.get(id)!.seals, ["keep-scratch"]); assert.equal(records.get(id)!.reclaimed, true); }
 
 // A failed document job has no deliverable and is reclaimed.
-const inspect = buildDocumentWorkTools({ workspaceDir: workspace, tempDir: temp, indexPath: join(index, "materials.md"), venvDir: join(root, "absent-venv") })
-  .find(tool => tool.name === "document_inspect")!;
-exitCode = 1; await assert.rejects(inspect.execute("inspect", { source: "source.docx" } as never, undefined, undefined, ctx), /文档操作失败/); exitCode = 0;
+const inspect = toolNamed(documentWorkTools(), "document_inspect");
+exitCode = 1; await assert.rejects(runMemberTool(inspect, { source: "source.docx" }, { places }), /文档操作失败/); exitCode = 0;
 assert.deepEqual(records.get("5")!.seals, ["keep-scratch"]); assert.equal(records.get("5")!.reclaimed, true);
 assert.equal(records.size, 5);
 console.log("ISOLATED_FRONTDOORS_PASSED");

@@ -1,139 +1,111 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { mkdir, readFile, utimes, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { discardRuntimeDraft, readRuntimeSettings, writeRuntimeDraft } from "../../scripts/config/runtime-settings.ts";
+import { nextRuntimeDraft, readRuntimeSettings, sweepRuntimeDrafts, validateRuntimeDraft, writeRuntimeDraft } from "../../scripts/config/runtime-draft.ts";
 import { RUNTIME_KEYS } from "../../src/core/runtime-schema.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const script = fileURLToPath(new URL("../../scripts/config/runtime-settings.ts", import.meta.url));
 const configFile = (root: string) => join(root, "data/config/runtime.json");
 
-async function run(root: string, mode: string, draft: string, overrides: Record<string, string> = {}, preload?: string) {
-  const env = { ...process.env };
-  for (const key of RUNTIME_KEYS) delete env[key];
-  const child = Bun.spawn([process.execPath, ...(preload ? ["--preload", preload] : []), script, mode, basename(draft)], {
-    cwd: root, env: { ...env, ...overrides }, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
-  });
-  const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  return { code, output: output + error };
-}
-
 async function seed(root: string, value: object | string) {
   await mkdir(join(root, "data/config"), { recursive: true });
   await writeFile(configFile(root), typeof value === "string" ? value : JSON.stringify(value));
   return readRuntimeSettings(configFile(root));
 }
+/** The draft as runtime-apply.ts reads it, and the runtime.json it would publish. */
+const saved = async (path: string) => validateRuntimeDraft(JSON.parse(await readFile(path, "utf8")));
+const values = (text: string) => JSON.parse(text) as Record<string, string>;
 
-test("运行参数按需读取、形成独立草稿，预检不写配置，应用保留部署字段和未编辑项", async () => {
+test("运行参数按需读取、形成独立草稿；结果保留部署字段和未编辑项，放弃的草稿一天后只删草稿", async () => {
   const fixture = await tempFixture("runtime-draft-");
   try {
     expect(await readRuntimeSettings(configFile(fixture.root))).toEqual({ hash: null, values: {} });
     expect(existsSync(configFile(fixture.root))).toBe(false);
+    // A first runtime.json: the draft expects none, and one that appeared meanwhile is not overwritten.
+    const first = await saved(await writeRuntimeDraft({ hash: null, values: {} }, { BOT_BASH_TIMEOUT: "333" }, configFile(fixture.root)));
+    expect(nextRuntimeDraft(null, first, {})).toBe('{\n  "BOT_BASH_TIMEOUT": "333"\n}\n');
+    expect(() => nextRuntimeDraft("{}", first, {})).toThrow("已被其他操作修改");
+
     const old = { BOT_PORT: 8888, BOT_HOST: "127.0.0.1", WORKSPACE_ROOT: "/srv/materials", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_INDEX_MAX_DEPTH: 14 };
-    const snapshot = await seed(fixture.root, old);
+    const snapshot = await seed(fixture.root, old), raw = await readFile(configFile(fixture.root), "utf8");
     const draft = await writeRuntimeDraft(snapshot, { BOT_MAX_ACTIVE_REQUESTS: "64", PI_CACHE_RETENTION: "long" }, configFile(fixture.root));
-    const checked = await run(fixture.root, "--check", draft);
-    expect(checked.code, checked.output).toBe(0);
-    expect(JSON.parse(await readFile(configFile(fixture.root), "utf8"))).toEqual(old);
-    const applied = await run(fixture.root, "--apply", draft, { BOT_PORT: "1234", BOT_ATTACHMENT_CONCURRENCY: "8" });
-    expect(applied.code, applied.output).toBe(0);
-    expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({
+    // Explicit environment values of keys the draft leaves alone neither block it nor enter the result.
+    expect(values(nextRuntimeDraft(raw, await saved(draft), { BOT_PORT: "1234", BOT_ATTACHMENT_CONCURRENCY: "8" }))).toEqual({
       BOT_PORT: "8888", BOT_HOST: "127.0.0.1", WORKSPACE_ROOT: "/srv/materials", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_INDEX_MAX_DEPTH: "14",
       BOT_MAX_ACTIVE_REQUESTS: "64", PI_CACHE_RETENTION: "long",
     });
-    await rm(draft + ".rollback");
-    await discardRuntimeDraft(draft);
+    expect(await readFile(configFile(fixture.root), "utf8")).toBe(raw);
+    // An abandoned preview's draft goes on a later preview once it is a day old; newer drafts and runtime.json stay.
+    const abandoned = new Date(Date.now() - 25 * 3600_000);
+    await utimes(draft, abandoned, abandoned);
+    await utimes(configFile(fixture.root), abandoned, abandoned);
+    const fresh = await writeRuntimeDraft(snapshot, { BOT_MAX_ACTIVE_REQUESTS: "32" }, configFile(fixture.root));
+    await sweepRuntimeDrafts(configFile(fixture.root));
     expect(existsSync(draft)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(await readFile(configFile(fixture.root), "utf8")).toBe(raw);
   } finally { await fixture.cleanup(); }
-}, 30000);
+});
 
-test("恢复默认会删除该覆盖值；环境冲突在停机前校验，取消草稿不影响原配置", async () => {
+test("恢复默认会删除该覆盖值；显式环境与结果不同时拒绝，数值相同则放行", async () => {
   const fixture = await tempFixture("runtime-reset-");
   try {
     const snapshot = await seed(fixture.root, { BOT_MAX_ACTIVE_REQUESTS: "64", BOT_DOCUMENT_WORK_ENABLED: "1", BOT_DOCUMENT_ENV: "/app/custom-env" });
-    const draft = await writeRuntimeDraft(snapshot, { BOT_MAX_ACTIVE_REQUESTS: null, BOT_DOCUMENT_ENV: null }, configFile(fixture.root));
-    const conflict = await run(fixture.root, "--check", draft, { BOT_MAX_ACTIVE_REQUESTS: "64" });
-    expect(conflict.code).toBe(1);
-    expect(conflict.output).toContain("被显式环境变量覆盖");
-    expect((await readRuntimeSettings(configFile(fixture.root))).hash).toBe(snapshot.hash);
-    const applied = await run(fixture.root, "--apply", draft, { BOT_MAX_ACTIVE_REQUESTS: "032" });
-    expect(applied.code, applied.output).toBe(0);
-    expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({ BOT_DOCUMENT_WORK_ENABLED: "1" });
-    const rollback = await run(fixture.root, "--rollback", draft);
-    expect(rollback.code, rollback.output).toBe(0);
-    expect(await readRuntimeSettings(configFile(fixture.root))).toEqual(snapshot);
-    await discardRuntimeDraft(draft);
-    expect(existsSync(draft)).toBe(false);
+    const raw = await readFile(configFile(fixture.root), "utf8");
+    const draft = await saved(await writeRuntimeDraft(snapshot, { BOT_MAX_ACTIVE_REQUESTS: null, BOT_DOCUMENT_ENV: null }, configFile(fixture.root)));
+    expect(() => nextRuntimeDraft(raw, draft, { BOT_MAX_ACTIVE_REQUESTS: "64" })).toThrow("被显式环境变量覆盖");
+    // The default is 32.
+    expect(values(nextRuntimeDraft(raw, draft, { BOT_MAX_ACTIVE_REQUESTS: "032" }))).toEqual({ BOT_DOCUMENT_WORK_ENABLED: "1" });
   } finally { await fixture.cleanup(); }
-}, 30000);
+});
 
-test("拒绝非法值、部署字段和过期草稿，避免覆盖并发修改", async () => {
+test("拒绝非法值、部署字段、格式不符和过期的草稿，避免覆盖并发修改", async () => {
   const fixture = await tempFixture("runtime-conflict-");
   try {
     const snapshot = await seed(fixture.root, { BOT_INDEX_TTL_MINUTES: "5" });
     for (const changes of [{ BOT_ATTACHMENT_CONCURRENCY: "9" }, { BOT_DOCUMENT_WORK_ENABLED: "true" }, { BOT_INDEX_MAX_FILES: "99" }, { BOT_PORT: "8080" }, {}]) {
       await expect(writeRuntimeDraft(snapshot, changes, configFile(fixture.root))).rejects.toThrow();
     }
-    const draft = await writeRuntimeDraft(snapshot, { BOT_INDEX_TTL_MINUTES: "10" }, configFile(fixture.root));
-    await seed(fixture.root, { BOT_INDEX_TTL_MINUTES: "15" });
-    const conflict = await run(fixture.root, "--apply", draft);
-    expect(conflict.code).toBe(1);
-    expect(conflict.output).toContain("已被其他操作修改");
-    expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({ BOT_INDEX_TTL_MINUTES: "15" });
-    expect(existsSync(draft + ".rollback")).toBe(false);
-    await writeFile(draft, JSON.stringify({ expectedHash: (await readRuntimeSettings(configFile(fixture.root))).hash, changes: { BOT_HOST: "0.0.0.0" } }));
-    const tampered = await run(fixture.root, "--apply", draft);
-    expect(tampered.code).toBe(1);
-    expect(tampered.output).toContain("不可在高级运行参数中修改");
+    const draft = await saved(await writeRuntimeDraft(snapshot, { BOT_INDEX_TTL_MINUTES: "10" }, configFile(fixture.root)));
+    const changed = await seed(fixture.root, { BOT_INDEX_TTL_MINUTES: "15" }), raw = await readFile(configFile(fixture.root), "utf8");
+    expect(() => nextRuntimeDraft(raw, draft, {})).toThrow("已被其他操作修改");
+    expect(() => validateRuntimeDraft({ expectedHash: changed.hash, changes: { BOT_HOST: "0.0.0.0" } })).toThrow("不可在高级运行参数中修改");
+    for (const value of [null, [], { expectedHash: "x", changes: { BOT_INDEX_TTL_MINUTES: "10" } }, { expectedHash: changed.hash, changes: {} },
+      { expectedHash: changed.hash, changes: { BOT_INDEX_TTL_MINUTES: "10" }, extra: 1 }]) expect(() => validateRuntimeDraft(value)).toThrow();
   } finally { await fixture.cleanup(); }
-}, 30000);
+});
 
-test("发布失败保留原文件并可恢复，首次创建的配置可以回滚为缺失", async () => {
-  const fixture = await tempFixture("runtime-rollback-");
+test("不带参数按当前环境保存（Windows 本机运行）；多余参数或 Docker 主机上的调用不写入", async () => {
+  const fixture = await tempFixture("runtime-save-cli-");
   try {
-    const snapshot = await seed(fixture.root, '{\r\n  "BOT_BASH_TIMEOUT": 111\r\n}\r\n');
-    const original = await readFile(configFile(fixture.root), "utf8");
-    const draft = await writeRuntimeDraft(snapshot, { BOT_BASH_TIMEOUT: "222" }, configFile(fixture.root));
-    const preload = join(fixture.root, "fault.ts");
-    await writeFile(preload, [
-      'import { mock } from "bun:test";',
-      "import * as maintenance from " + JSON.stringify(import.meta.resolve("../../src/core/maintenance.ts")) + ";",
-      "mock.module(" + JSON.stringify(import.meta.resolve("../../src/core/maintenance.ts")) +
-        ', () => ({ ...maintenance, replaceFile: async () => { throw new Error("injected publish failure"); } }));',
-    ].join("\n"));
-    const failed = await run(fixture.root, "--apply", draft, {}, preload);
-    expect(failed.code).toBe(1);
-    expect(failed.output).toContain("injected publish failure");
-    expect(await readFile(configFile(fixture.root), "utf8")).toBe(original);
-    expect((await run(fixture.root, "--rollback", draft)).code).toBe(0);
-    expect(await readFile(configFile(fixture.root), "utf8")).toBe(original);
-    await discardRuntimeDraft(draft);
-
-    await rm(configFile(fixture.root));
-    const fresh = await writeRuntimeDraft(await readRuntimeSettings(configFile(fixture.root)), { BOT_BASH_TIMEOUT: "333" }, configFile(fixture.root));
-    expect((await run(fixture.root, "--apply", fresh)).code).toBe(0);
-    expect(existsSync(configFile(fixture.root))).toBe(true);
-    expect((await run(fixture.root, "--rollback", fresh)).code).toBe(0);
-    expect(existsSync(configFile(fixture.root))).toBe(false);
-  } finally { await fixture.cleanup(); }
-}, 30000);
-
-test("回滚遇到后续修改时保留现场；未恢复的草稿不会被 TUI 清理", async () => {
-  const fixture = await tempFixture("runtime-rollback-conflict-");
-  try {
-    const snapshot = await seed(fixture.root, { BOT_DOCUMENT_WORK_ENABLED: "0" });
-    const draft = await writeRuntimeDraft(snapshot, { BOT_DOCUMENT_WORK_ENABLED: "1" }, configFile(fixture.root));
-    expect((await run(fixture.root, "--apply", draft)).code).toBe(0);
-    await seed(fixture.root, { BOT_DOCUMENT_WORK_ENABLED: "1", BOT_BASH_TIMEOUT: "123" });
-    const rollback = await run(fixture.root, "--rollback", draft);
-    expect(rollback.code).toBe(1);
-    expect(rollback.output).toContain("又被修改");
-    await discardRuntimeDraft(draft);
-    expect(existsSync(draft)).toBe(true);
-    expect(existsSync(draft + ".rollback")).toBe(true);
-    expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({ BOT_DOCUMENT_WORK_ENABLED: "1", BOT_BASH_TIMEOUT: "123" });
+    await seed(fixture.root, { BOT_INDEX_TTL_MINUTES: "5" });
+    const raw = await readFile(configFile(fixture.root), "utf8");
+    const run = async (...args: string[]) => {
+      const env = { ...process.env };
+      for (const key of RUNTIME_KEYS) delete env[key];
+      const child = Bun.spawn([process.execPath, "--no-env-file", script, ...args], {
+        cwd: fixture.root, env: { ...env, BOT_BASH_TIMEOUT: "456" }, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
+      });
+      const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      return { code, output: output + error };
+    };
+    for (const args of [["--apply", ".runtime-draft-11111111-1111-1111-1111-111111111111.json"], ["--check"], ["extra"]]) {
+      const refused = await run(...args);
+      expect(refused.code, refused.output).toBe(1);
+      expect(await readFile(configFile(fixture.root), "utf8")).toBe(raw);
+    }
+    const result = await run();
+    if (process.platform === "win32") {
+      expect(result.code, result.output).toBe(0);
+      expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({ BOT_INDEX_TTL_MINUTES: "5", BOT_BASH_TIMEOUT: "456" });
+    } else {
+      expect(result.code).toBe(1);
+      expect(result.output).toContain("由部署入口写入");
+      expect(await readFile(configFile(fixture.root), "utf8")).toBe(raw);
+    }
   } finally { await fixture.cleanup(); }
 }, 30000);
 

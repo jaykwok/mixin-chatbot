@@ -1,11 +1,12 @@
 ﻿function Protect-OperationMessage([string]$Message) {
+    # Same rules and order as scripts/lib/redact.ts and operation-log.sh; tests/ops/redaction-parity.test.ts runs one sample table through all three.
     $text = $Message -replace '\x1b\[[0-?]*[ -/]*[@-~]', ''
-    $text = $text -replace '(?i)(Bearer\s+)[^\s"'',;]+', '$1[redacted]'
-    $text = $text -replace '(?i)((?:api[_-]?key|token|secret|password|authorization)["'']?\s*[:=]\s*["'']?)[^\s"'',;&}]+', '$1[redacted]'
-    $text = $text -replace '(?i)(https?://)[^\s/@]+:[^\s/@]+@', '$1[redacted]@'
-    $text = $text -replace '(?i)([?&](?:key|token|secret|password)=)[^\s&#"'']+', '$1[redacted]'
-    $text = $text -replace '(?i)/webhook/[a-f\d]{64}\b', '/webhook/[redacted]'
-    return ($text -replace '(?i)\b((?:sk|pk|ghp|xoxb|hf)[-_]|github_pat_)[A-Za-z0-9_-]{6,}', '$1[redacted]')
+    $text = $text -replace '(?i)\b((?:sk|pk|ghp|xoxb|hf)[-_]|github_pat_)[A-Za-z0-9_-]{6,}', '$1***'
+    $text = $text -replace '(?i)(Bearer\s+)[^\s"'',;]+', '$1***'
+    $text = $text -replace '(?i)(["'']?(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|authorization)["'']?\s*[:=]\s*["'']?(?:(?:Bearer|Basic)\s+)?)[^"''\s,;}&]+', '$1***'
+    $text = $text -replace '(?i)([?&](?:key|token|secret|sig|sign|signature|password)=)[^&\s"'']+', '$1***'
+    $text = $text -replace '(?i)(https?://)[^\s/@]+:[^\s/@]+@', '$1***@'
+    return $text
 }
 
 function Write-OperationEvent([string]$Level, [string]$Message) {
@@ -70,26 +71,4 @@ function Stop-OperationLog($Context, [int]$ExitCode) {
     $env:BOT_OPERATION_LOG = $Context.Name
     $env:BOT_OPERATION_PROJECT = $Context.Project
     $env:BOT_OPERATION_STAGE = $Context.Stage
-}
-
-# Only noninteractive commands use this pipe; prompts retain their original terminal.
-# -Quiet keeps routine output (for example git's diffstat) in the operation log and
-# shows it on the terminal only when the command fails.
-function Invoke-OperationNative([string]$Executable, [string[]]$Arguments, [switch]$Quiet) {
-    $previous = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        # Native commands update the global automatic variable in Windows PowerShell 5.1.
-        $global:LASTEXITCODE = 1
-        $captured = [Collections.Generic.List[string]]::new()
-        & $Executable @Arguments 2>&1 | ForEach-Object {
-            $line = [string]$_
-            if ($Quiet) { $captured.Add($line) } else { Write-Host $line }
-            Write-OperationEvent 'output' $line
-        }
-        $code = $LASTEXITCODE
-        Write-OperationEvent 'info' ((Split-Path $Executable -Leaf) + '; exit=' + $code)
-        if ($Quiet -and $code -ne 0) { foreach ($line in $captured) { Write-Host $line } }
-        return [int]$code
-    } finally { $ErrorActionPreference = $previous }
 }

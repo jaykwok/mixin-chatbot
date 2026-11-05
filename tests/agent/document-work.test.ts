@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
+import { documentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
+import { runMemberTool, toolNamed } from "../helpers/member-tools.ts";
 import { buildLocalTools } from "../helpers/native-tools.ts";
 import { loadModuleDefinitions } from "../../src/agent/modules.ts";
 import { buildChatContext } from "../../src/agent/prompt.ts";
@@ -23,7 +24,7 @@ describe("project document resources", () => {
       const options = { workspaceDir: workspace, tempDir: userTemp, venvDir: join(fixture.root, "venv"),
         indexPath: join(fixture.root, "index/materials.md") };
       const [module] = await loadModuleDefinitions({ documentWorkEnabled: enabled });
-      const resources = { tools: module?.tools(options) ?? [], skills: module?.skills ?? { skills: [], diagnostics: [] },
+      const resources = { tools: module?.tools ?? [], skills: module?.skills ?? { skills: [], diagnostics: [] },
         readOnlyDirs: module?.readOnlyDirs ?? [], prompt: module?.prompt ?? "" };
       const loader = new DefaultResourceLoader({ cwd: workspace, agentDir: fixture.root,
         settingsManager: SettingsManager.inMemory(), noExtensions: true, noSkills: true,
@@ -72,9 +73,9 @@ describe("project document resources", () => {
     try {
       const workspace = join(fixture.root, "workspace"), own = join(fixture.root, "own"), other = join(fixture.root, "other");
       await Promise.all([workspace, own, other].map(p => mkdir(p)));
-      const tools = buildDocumentWorkTools({ workspaceDir: workspace, tempDir: own,
-        indexPath: join(fixture.root, "index/materials.md"), venvDir: join(fixture.root, "absent-venv") });
-      const call = (name: string, params: object) => tools.find(t => t.name === name)!.execute("test", params, undefined, undefined, {} as never);
+      const places = { workspaceDir: workspace, tempDir: own,
+        indexPath: join(fixture.root, "index/materials.md"), venvDir: join(fixture.root, "absent-venv") };
+      const call = (name: string, params: object) => runMemberTool(toolNamed(documentWorkTools(), name), params, { places });
       const foreign = join(other, "private.docx");
       await writeFile(foreign, "private");
       await expect(call("document_inspect", { source: foreign })).rejects.toThrow("共享资料 workspace 或当前用户 tmp");
@@ -102,7 +103,8 @@ describe("project document resources", () => {
           expect(receipt.status).toBe("deferred"); expect(receipt.reason).toBe("shared-parent-writers-not-isolated");
         }
       } else expect(retained).toEqual([]);
-      expect(await readdir(join(own, ".office-jobs"))).toEqual([]);
+      // No Office profile was created, so recovery before each call found no journal and created none.
+      expect(await readdir(own)).not.toContain(".office-jobs");
     } finally { await fixture.cleanup(); }
   });
 });

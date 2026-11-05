@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# 目标版本升级器（Linux / Docker）。ops.sh update 把它连同共用脚本从目标提交导出到 tmp/upgrade-*
+# 目标版本升级器（Linux / Docker）的终端部分。ops.sh update 把它连同共用脚本从目标提交导出到 tmp/upgrade-*
 # （见 UPGRADER_EXPORT_PATHS）后运行；它不在工作区内执行，切换代码不会改动正在运行的脚本。
 #
-# 新升级：停机前完成全部准备——预检、确认原服务的运行身份、从目标提交
-# 构建候选镜像并按 image ID 固定、在这个镜像中只读核对数据版本并校验配置、停机前复核——再写入镜像和身份记录、事务记录
-# 并把数据预检计划存入快照；随后停机、切换代码，交给目标版本的 deploy.sh 按记录继续（不重新构建），标准输入接
-# /dev/null，执行阶段不再交互。提交前失败自动回滚数据、配置、容器和代码。
-# 未完成的升级：按事务记录继续或回滚，不重新询问，只用记录的镜像和身份。
+# 新升级：停机前完成全部准备——预检、确认原服务的运行身份、从目标提交导出完整源码树并构建候选镜像（按 image ID
+# 固定）、在这个镜像中只读核对数据版本并校验配置、预览旧修订链并确定停机后整理还是跳过、选择通讯录同步范围、停机前
+# 复核——再把这些事实、选择和计划交给源码树中的共享运维核心（scripts/ops/core，由宿主机的 Bun 运行）。核心沿用本进程
+# 持有的部署锁，在锁内逐项复核后记录事务、停机、切换代码、迁移、验证并提交；提交前失败自动回滚数据、配置、容器和
+# 代码。执行阶段标准输入接 /dev/null，不再交互。
+# 未完成的升级：由核心按事务记录继续或回滚（改用事务固定的运维运行包），不重新询问，只用记录的镜像和身份。
 #
 # 用法：bash <导出目录>/scripts/deploy/upgrade.sh <项目目录> <目标提交> [continue|rollback]
 set -euo pipefail
@@ -28,33 +29,29 @@ if [ "$UPGRADER_DIR" = "$PROJECT_DIR" ]; then
 fi
 # 共用脚本取自导出的目标版本；它们在调用时读取 PROJECT_DIR，操作的是工作区。
 . "$UPGRADER_DIR/scripts/lib/deployment.sh"
+. "$UPGRADER_DIR/scripts/lib/ops-runtime.sh"
+. "$UPGRADER_DIR/scripts/lib/core-handoff.sh"
 cd "$PROJECT_DIR"
 DATA_DIR="$PROJECT_DIR/data"
 CONFIG_DIR="$DATA_DIR/config"
 STATE_DIR="$DATA_DIR/state"
 MODELS_FILE="$CONFIG_DIR/models.json"
-LOG_DIR="$PROJECT_DIR/logs"
 PENDING_POINTER="$STATE_DIR/deploy-transaction"
-BUILD_CONTEXT="$UPGRADER_DIR/build-context"
+# 目标提交的完整源码树（见 prepare_core）：新升级用它构建候选镜像，停机后的升级由其中的运维核心执行。
+TARGET_TREE="$UPGRADER_DIR/target"
 PREVIEW_DIR="$UPGRADER_DIR/preview"
-# 本次升级的镜像和服务身份：新升级在停机前构建并按 image ID 固定、沿用原容器的数值 UID:GID；续做和回滚取自
-# 事务快照（load_transaction_runtime）。
+UNCHANGED='服务尚未停止，代码和数据未改动'
+# 本次升级的镜像和服务身份：停机前构建并按 image ID 固定、沿用原容器的数值 UID:GID；核心在部署锁内复核后写入事务快照。
 IMAGE_ID=''
 SERVICE_USER=''
 SERVICE_USER_SOURCE=''
-CANDIDATE_PRESENT=1
 ORIGINAL_CONTAINER_FACTS=''
 PREPARED_INPUTS=''
 ORIGINAL_SHA=''
 ORIGINAL_BRANCH=''
 ORIGINAL_MAIN=''
 TARGET_SHA=''
-DEPLOY_PID=''
-PREVIEW_PID=''
-PREVIEW_CONTAINER=''
-DEPLOY_STATUS=0
-DEPLOY_RECEIPT="$UPGRADER_DIR/commit-receipt"
-INTERRUPTED=0
+HOST_BUN=''
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,6 +65,9 @@ print_warning() { echo -e "${YELLOW}[!] $1${NC}"; operation_event warn "$1"; }
 print_error() { echo -e "${RED}[-] $1${NC}"; operation_event error "$1"; }
 
 ask_yes_no() {
+    if [ "${MIXIN_OPS_CONSOLE:-}" = 1 ]; then
+        print_error '控制台操作遇到未提供的交互选择，请重新预览；未自动采用默认值'; exit 2
+    fi
     local answer
     while true; do
         echo -en "${CYAN}?> $1${NC}"
@@ -85,19 +85,17 @@ ask_yes_no() {
     done
 }
 
-# 未完成的升级只能继续或回滚；非交互调用必须明确指定。只剩代码待恢复时只能完成回滚。
+# 未完成的升级只能继续或回滚；非交互调用必须明确指定。
 choose_pending_action() {
-    local choice menu='1 继续上次操作  2 回滚到操作前  0 退出 [默认 0]：' restore_only=0
-    if transaction_code_restore_pending; then restore_only=1; menu='2 完成回滚（只恢复代码）  0 退出 [默认 0]：'; fi
+    local choice
     if [ ! -t 0 ]; then
-        if [ "$restore_only" = 1 ]; then print_error "上次升级只剩代码待恢复；请使用 $(ops_command_hint rollback) 完成回滚"
-        else print_error "发现未完成的升级；请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"; fi
+        print_error "发现未完成的升级；请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
         exit 1
     fi
     while true; do
-        IFS= read -r -p "$menu" choice || choice=0
+        IFS= read -r -p '1 继续上次操作  2 回滚到操作前  0 退出 [默认 0]：' choice || choice=0
         case "$(printf '%s' "$choice" | tr -d '[:space:]')" in
-            1) if [ "$restore_only" = 1 ]; then print_warning '数据、配置和容器已经回滚，不能继续；请输入 2 或 0'; else ACTION=continue; return; fi ;;
+            1) ACTION=continue; return ;;
             2) ACTION=rollback; return ;;
             ''|0) print_warning '未处理上次操作，服务保持当前状态'; exit 1 ;;
             *) print_warning '请输入 1、2 或 0' ;;
@@ -105,201 +103,47 @@ choose_pending_action() {
     done
 }
 
-# 已跟踪文件有改动时不切换：快进会保留目标提交没有改动的文件上的改动，执行的就不是目标版本。
-tracked_files_clean() {
-    local dirty
-    dirty="$(git_here status --porcelain --untracked-files=no 2>&1)" && [ -z "$dirty" ] && return 0
-    print_error "已跟踪文件有未提交的改动，不切换代码："
-    printf '%s\n' "$dirty" | sed 's/^/      /'
-    return 1
+# 停机后的升级由目标提交中的共享运维核心执行，宿主机的 Bun 运行它（没有可用的 Bun 时下载固定版本并核对摘要）。
+# 源码树从提交导出（保留该提交的 .dockerignore），不读工作区：未跟踪文件、本地改动和之后的 fetch 都进不了它。
+prepare_core() {
+    local unchanged="$1"
+    HOST_BUN="$(ops_bun)" || { print_error "宿主机没有可用的 Bun（原因见上方）；${unchanged}"; return 1; }
+    rm -rf -- "$TARGET_TREE"
+    candidate_export_context "$PROJECT_DIR" "$TARGET_SHA" "$TARGET_TREE" &&
+        [ -f "$TARGET_TREE/scripts/ops/core/cli.ts" ] && [ ! -L "$TARGET_TREE/scripts/ops/core/cli.ts" ] ||
+        { print_error "无法从目标提交 ${TARGET_SHA:0:7} 导出运维核心（原因见上方）；${unchanged}"; return 1; }
 }
 
-# 续做在停机之前确认切换能完成：已跟踪文件没有改动、main 能快进到目标提交、经 main 的两步切换不会覆盖未跟踪的内容。
-switch_ready() {
-    local main
-    tracked_files_clean || return 1
-    main="$(git_here rev-parse --verify --quiet 'refs/heads/main^{commit}')" || { print_error "本地 main 分支不存在，不切换代码"; return 1; }
-    git_here merge-base --is-ancestor "$main" "$TARGET_SHA" ||
-        { print_error "本地 main（${main:0:7}）无法快进到目标提交 ${TARGET_SHA:0:7}，不切换代码"; return 1; }
-    switch_preflight "$(git_here rev-parse HEAD)" "$main" "$TARGET_SHA" "$UPGRADER_DIR"
-}
+run_target_core() { run_core "$TARGET_TREE/scripts/ops/core/cli.ts" deployment upgrade --project "$PROJECT_DIR" "$@"; }
 
-checkout_target() {
-    operation_stage checkout
-    tracked_files_clean || return 1
-    operation_capture_quiet git_here checkout --quiet main || return 1
-    operation_capture_quiet git_here merge --ff-only --quiet "$TARGET_SHA" || return 1
-    [ "$(git_here rev-parse HEAD)" = "$TARGET_SHA" ]
-}
-
-# 数据、配置、容器和原运行状态已由部署脚本恢复（事务处于“待恢复代码”阶段），再恢复升级前的代码。
-# 代码恢复后才清除事务指针；失败或工作区有人工改动时保留该阶段，处理后重试回滚只恢复代码。这是回滚的最后一步，
-# 在独立的进程组中进行（run_shielded），再来的中断打断不了它。
-complete_code_restore() {
-    local status=0
-    run_shielded restore_code_after_rollback || status=$?
-    [ "$status" = 0 ] || exit "$status"
-}
-
-restore_code_after_rollback() {
-    if [ "$(git_here rev-parse HEAD 2>/dev/null)" != "$ORIGINAL_SHA" ]; then
-        operation_stage rollback-code
-        code_restore_safe "$ORIGINAL_BRANCH" "$ORIGINAL_SHA" "$TARGET_SHA" || {
-            print_error "代码没有恢复：升级后的工作区改动（见上方）会被覆盖；数据、配置和原运行状态已恢复。把改动提交到其他分支、备份或撤销后运行 $(ops_command_hint rollback)，只恢复代码"
-            exit 1
-        }
-        restore_checkout "$ORIGINAL_BRANCH" "$ORIGINAL_SHA" || {
-            print_error "代码未能恢复到升级前的 ${ORIGINAL_SHA:0:7}（原因见上方）；数据、配置和原运行状态已恢复。处理 git 问题（如残留的 .git/index.lock）后运行 $(ops_command_hint rollback)，只恢复代码"
-            exit 1
-        }
+# 核心已在上方报告结果（升级含原提交和目标提交）；这里只补充未完成时的下一步，退出码与核心相同。
+finish_core() {
+    if [ "$CORE_STATUS" != 0 ] && [ -e "$PENDING_POINTER" ]; then
+        print_error "升级未完成，事务已保留（原因见上方）；处理后可用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚（数据已提交时只能继续）"
     fi
-    rm -f -- "$PENDING_POINTER" || { print_error "代码已恢复，但事务指针 ${PENDING_POINTER} 清除失败；请重试 $(ops_command_hint rollback)"; exit 1; }
-}
-
-forward_signal() {
-    [ -z "$DEPLOY_PID" ] || kill -TERM "$DEPLOY_PID" 2>/dev/null || true
-}
-
-# 交给工作区（目标版本）的部署脚本按事务记录执行。它在后台运行以便转发中断：收到 TERM 后由它自行回滚。
-run_deploy() {
-    local action="$1"
-    : > "$DEPLOY_RECEIPT"
-    INTERRUPTED=0
-    trap 'INTERRUPTED=130; forward_signal' INT
-    trap 'INTERRUPTED=143; forward_signal' TERM
-    # 断线时同样等部署脚本回滚，再恢复代码。
-    trap 'INTERRUPTED=129; forward_signal' HUP
-    DEPLOY_TRANSACTION_ACTION="$action" \
-        BOT_UPDATE_COMMIT_FILE="$DEPLOY_RECEIPT" bash "$PROJECT_DIR/scripts/deploy/deploy.sh" </dev/null &
-    DEPLOY_PID=$!
-    # 部署脚本已接手事务：之后的失败由它回滚，升级器只按结果处理代码。
-    trap 'operation_finish "$?"' EXIT
-    [ "$INTERRUPTED" = 0 ] || forward_signal
-    while :; do
-        if wait "$DEPLOY_PID"; then DEPLOY_STATUS=0; else DEPLOY_STATUS=$?; fi
-        kill -0 "$DEPLOY_PID" 2>/dev/null || break
-    done
-    DEPLOY_PID=''
-}
-
-receipt_committed() { [ "$(cat "$DEPLOY_RECEIPT" 2>/dev/null)" = committed ]; }
-
-# 部署脚本结束后按事务状态收尾：事务仍在则保留目标代码并说明下一步；已提交则保留新版本；
-# 数据等已回滚（只剩代码待恢复）则恢复升级前的代码。同一次升级失败且数据未提交时先自动回滚。
-finish_after_deploy() {
-    local mode="$1" code=1
-    [ "$INTERRUPTED" = 0 ] || code="$INTERRUPTED"
-    if [ "$mode" != rollback ] && [ "$DEPLOY_STATUS" = 0 ]; then
-        print_success "升级完成：${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}"
-        exit 0
-    fi
-    if [ "$mode" = fresh ] && [ -e "$PENDING_POINTER" ] && ! transaction_code_restore_pending && ! receipt_committed; then
-        print_warning "升级未完成（原因见上方），正在回滚到升级前的版本..."
-        run_deploy rollback
-        mode=failed-rollback
-    fi
-    if [ -e "$PENDING_POINTER" ] && ! transaction_code_restore_pending; then
-        if [ "$mode" = continue ]; then
-            print_error "升级未完成（原因见上方）；保留目标代码和停机状态。处理后可用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
-        else
-            print_error "升级未能回滚（原因见上方）；保留目标代码和停机状态。处理后可重试 $(ops_command_hint rollback)；数据已提交时只能 $(ops_command_hint resume)"
-        fi
-        exit "$code"
-    fi
-    if receipt_committed; then
-        print_error "数据已经提交，新版本已启用，但后续步骤未完成（原因见上方）；保留新代码，请用 $(ops_command_hint doctor) 检查"
-        exit "$code"
-    fi
-    complete_code_restore
-    if [ "$mode" = rollback ] && [ "$DEPLOY_STATUS" = 0 ]; then
-        print_success "升级已回滚：代码恢复到 ${ORIGINAL_SHA:0:7}，数据、配置和原运行状态已恢复"
-        exit 0
-    fi
-    print_error "升级失败，已回滚：代码恢复到 ${ORIGINAL_SHA:0:7}，数据、配置和原运行状态已恢复"
-    exit "$code"
+    exit "$CORE_STATUS"
 }
 
 # ---- 未完成的升级：按事务记录继续或回滚 ----
 
-# 代码尚未切换：部署脚本从未接手，只需恢复升级器开始事务时停止并改名的原容器。
-rollback_before_checkout() {
-    if data_preparation_mentions_deployment "${TRANSACTION[snapshot]}"; then
-        print_error "本次升级的数据迁移已经开始，但当前代码不是目标提交；请先切换到目标提交 ${TARGET_SHA:0:7} 后重试回滚"
-        exit 1
-    fi
-    [ -z "${TRANSACTION[original_workspace_root]}" ] || [ -d "${TRANSACTION[original_workspace_root]}" ] || {
-        print_error "原共享资料目录不存在：${TRANSACTION[original_workspace_root]}；旧容器依赖它，请恢复原挂载后再回滚"; exit 1; }
-    print_status "回滚上次升级：代码尚未切换，恢复原容器和原运行状态"
-    HOST_WORKSPACE_ROOT="${TRANSACTION[target_workspace_root]}"
-    ROLLBACK_REQUESTED=1
-    begin_deployment
-    # begin_deployment 安装的 EXIT 处理恢复快照并报告结果。
-    exit 1
-}
-
 resume_upgrade() {
-    local head
-    TARGET_SHA="${TRANSACTION[target_sha]}"
+    local args
     ORIGINAL_SHA="${TRANSACTION[original_sha]}"
     ORIGINAL_BRANCH="${TRANSACTION[original_branch]}"
-    [ -n "$TARGET_SHA" ] && [ -n "$ORIGINAL_SHA" ] || { print_error "升级事务缺少原提交或目标提交；请人工检查 backup/snapshots/${TRANSACTION[snapshot]}"; exit 1; }
-    if transaction_code_restore_pending; then
-        if [ "$ACTION" = continue ]; then
-            print_error "上次升级的数据、配置和容器已经回滚，只剩代码待恢复，不能继续；请使用 $(ops_command_hint rollback) 完成回滚后重新升级"
-            exit 1
-        fi
-        print_status "完成上次升级的回滚：数据、配置、容器和原运行状态已经恢复，只恢复代码到 ${ORIGINAL_SHA:0:7}"
-        complete_code_restore
-        print_success "升级已回滚：代码恢复到 ${ORIGINAL_SHA:0:7}，数据、配置和原运行状态已恢复"
-        exit 0
-    fi
-    # 已在目标提交的续做仍会执行宿主工作区的部署脚本，不能跳过已跟踪改动检查。
-    if [ "$ACTION" = continue ]; then tracked_files_clean || exit 1; fi
-    # 先读记录的镜像和服务身份，再停机、回滚或运行任何容器；只剩代码待恢复时（上方）不需要它们，镜像可能已释放。
-    load_transaction_runtime || exit 1
-    head="$(git_here rev-parse HEAD)"
-    if [ "$head" != "$TARGET_SHA" ] && [ "$head" != "$ORIGINAL_SHA" ]; then
-        print_error "当前代码 ${head:0:7} 既不是升级前的 ${ORIGINAL_SHA:0:7}，也不是目标 ${TARGET_SHA:0:7}；请切回其中之一后重试"
-        exit 1
-    fi
+    [ "${TRANSACTION[target_sha]}" = "$TARGET_SHA" ] || {
+        print_error "事务记录的目标提交 ${TRANSACTION[target_sha]:0:7} 不是本升级器的版本 ${TARGET_SHA:0:7}；请用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
+    [ -f "$TRANSACTION_SNAPSHOT/host-runtime" ] || {
+        print_error "这次升级不是由运维核心开始的（快照中没有固定运行包记录 host-runtime），本版本不能继续或回滚它；服务和数据保持现状，请人工检查 ${TRANSACTION_SNAPSHOT}"; exit 1; }
+    prepare_core "服务和数据保持现状" || exit 1
+    args=(--original "$ORIGINAL_SHA" --target "$TARGET_SHA" --branch "$ORIGINAL_BRANCH")
     if [ "$ACTION" = rollback ]; then
-        [ "$head" = "$TARGET_SHA" ] || rollback_before_checkout
-        # 回滚最后要恢复代码：工作区有升级后的人工改动时，在恢复任何内容之前停止。
-        code_restore_safe "$ORIGINAL_BRANCH" "$ORIGINAL_SHA" "$TARGET_SHA" || {
-            print_error "没有回滚：恢复升级前的代码会覆盖升级后的工作区改动（见上方），数据、配置和容器保持现状。把改动提交到其他分支、备份或撤销后重试 $(ops_command_hint rollback)"
-            exit 1
-        }
-        # 代码已切换：由目标版本的部署脚本恢复数据、配置和容器，再恢复升级前的代码。
         print_status "回滚上次升级：恢复数据、配置、容器、代码和原运行状态"
-        run_deploy rollback
-        finish_after_deploy rollback
+        args+=(--rollback)
+    else
+        print_status "继续上次升级 ${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}：设置和数据预检计划取自事务记录，不再询问"
     fi
-    if [ "$CANDIDATE_PRESENT" = 0 ]; then
-        print_error "继续需要记录的候选镜像 ${IMAGE_ID}，但它已不存在；请恢复完全相同的镜像（同一 image ID）后重试，重新构建的镜像不能代替。本次升级尚未开始迁移时也可以用 $(ops_command_hint rollback) 回滚"
-        exit 1
-    fi
-    if [ "$head" != "$TARGET_SHA" ]; then
-        # 停机之前先确认能切换过去：不能切换时服务和代码保持现状。
-        git_here cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null ||
-            { print_error "目标提交 ${TARGET_SHA:0:7} 在本地不存在；服务和代码保持现状，取回该提交后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
-        switch_ready || { print_error "不能切换到目标提交 ${TARGET_SHA:0:7}（原因见上方）；服务和代码保持现状，处理后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
-    fi
-    DEPLOY_SNAPSHOT="$TRANSACTION_SNAPSHOT"
-    if [ "$head" != "$TARGET_SHA" ]; then
-        # 中断发生在停机完成之前时服务可能仍在运行；切换代码前先停止。
-        if [ "$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then
-            print_status "停止机器人服务后再切换代码..."
-            operation_capture docker stop --time 30 mixin-chatbot || { print_error "旧容器停止失败，未切换代码；可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
-            downtime_begins
-        fi
-        checkout_target || {
-            print_error "无法切换到目标提交 ${TARGET_SHA:0:7}；服务保持停止，处理后可重试继续，或 $(ops_command_hint rollback) 回滚"; exit 1; }
-        print_success "代码已更新：${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}"
-    fi
-    tracked_files_clean || exit 1
-    print_status "继续上次升级 ${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}：设置和数据预检计划取自事务记录，不再询问"
-    run_deploy continue
-    finish_after_deploy continue
+    run_target_core "${args[@]}"
+    finish_core
 }
 
 # ---- 新升级：停机前完成全部确认 ----
@@ -328,8 +172,8 @@ check_upgrade_environment() {
     unset BOT_PORT WORKSPACE_ROOT "${RUNTIME_ENV_KEYS[@]}"
 }
 
-# 原服务的运行身份：停机前从原容器（运行或停止）读取并核对，之后写入事务快照的 service-user；预览、迁移、验证实例、
-# 正式实例和续做都沿用它。找不到原容器或身份不明时在任何改动之前拒绝，不猜成默认值，也不改已有数据的属主。
+# 原服务的运行身份：停机前从原容器（运行或停止）读取并核对，之后由核心写入事务快照的 service-user；预览、迁移、
+# 验证实例、正式实例和续做都沿用它。找不到原容器或身份不明时在任何改动之前拒绝，不猜成默认值，也不改已有数据的属主。
 determine_service_user() {
     local status=0
     original_service_container || status=$?
@@ -344,65 +188,25 @@ determine_service_user() {
     print_status "沿用原容器的运行身份 ${SERVICE_USER}"
 }
 
-# 事务指针发布之前（构建、预览、复核）收到中断：按信号退出，由 cleanup_before_pointer 收尾。
-trap_preparation_signals() {
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    trap 'exit 129' HUP
-}
-
-# 事务指针发布之前的失败、取消或中断：删除预览容器，只移除本次的保留标签；构建上下文和预览目录随导出目录删除。
-# 服务和数据未改动。指针发布后由 begin_deployment 安装的回滚接手。
-# 收尾期间再来的中断不打断它：终端 Ctrl+C 发给整个前台进程组，ops.sh 还会把它转成 TERM 转发过来，所以删除容器和
-# 标签在独立的进程组中进行（run_shielded）。
-cleanup_before_pointer() {
-    local status=$?
-    trap - EXIT
-    trap : INT TERM HUP
-    run_shielded discard_preparation || true
-    stop_preview
-    operation_finish "$status"
-}
-
-discard_preparation() {
-    [ -z "$PREVIEW_PID" ] || docker rm -f "$PREVIEW_CONTAINER" >/dev/null 2>&1 || true
-    [ -e "$PENDING_POINTER" ] || release_transaction_candidate
-}
-
-# 停机前从目标提交导出完整构建上下文，构建一次候选镜像：先检查磁盘空间，构建后按 image ID 固定。此后预览、迁移、
-# 验证实例和正式实例都只用这个 ID，停机后不再构建；正式标签 mixin-chatbot 到数据提交后才指向它。
+# 停机前用目标提交的源码树构建一次候选镜像：先检查磁盘空间，构建后按 image ID 固定。此后预览、迁移、验证实例和
+# 正式实例都只用这个 ID，停机后不再构建；正式标签 mixin-chatbot 到数据提交后才指向它。
 build_candidate() {
     local status=0 path paths=()
-    rm -rf -- "$BUILD_CONTEXT"
-    candidate_export_context "$PROJECT_DIR" "$TARGET_SHA" "$BUILD_CONTEXT" ||
-        { print_error "无法导出目标提交的构建上下文（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
     for path in "$DATA_DIR" "$PROJECT_DIR/backup" "$UPGRADER_DIR"; do [ ! -e "$path" ] || paths+=("$path"); done
     print_status "检查构建所需的磁盘空间..."
     check_build_disk_space "$ORIGINAL_CONTAINER_IMAGE" "${paths[@]}" ||
         { print_error "磁盘空间不足或无法确认镜像存储位置（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
     print_status "构建目标版本 ${TARGET_SHA:0:7} 的镜像（服务尚未停止）..."
-    prepare_candidate_image "$BUILD_CONTEXT" "$TARGET_SHA" commit "$PROJECT_DIR" || status=$?
+    prepare_candidate_image "$TARGET_TREE" "$TARGET_SHA" commit "$PROJECT_DIR" || status=$?
     if [ "$status" -ge 128 ]; then print_warning "镜像构建已中断；服务尚未停止，代码和数据未改动"; exit "$status"; fi
     [ "$status" = 0 ] || { print_error "镜像构建失败（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
     IMAGE_ID="${CANDIDATE[image_id]}"
-    rm -rf -- "$BUILD_CONTEXT"
     print_success "镜像构建成功：${IMAGE_ID}"
 }
 
-# 预览容器已由 discard_preparation 删除：结束仍在等待它的 docker 客户端。
-stop_preview() {
-    [ -n "$PREVIEW_PID" ] || return 0
-    kill "$PREVIEW_PID" 2>/dev/null || true
-    wait "$PREVIEW_PID" 2>/dev/null || true
-    PREVIEW_PID=''
-    print_warning '数据预检已中断并清理；服务尚未停止，代码和数据未改动'
-}
-
-# 在候选镜像中核对数据版本，并校验目标版本的配置（data-current.ts preview）。data/ 只读挂载，计划中的版本标记摘要
-# 用于停机后的 apply；计划写在导出目录的 preview/ 下。容器以服务身份运行、没有网络；它要写入的 preview/ 和本次操作
-# 日志交给服务身份，已有数据的属主不变。没有程序版本的旧版（webhook）数据在这里被拒绝，旧服务不受影响。
+# 在候选镜像中核对数据版本，并校验目标版本的配置（data-current.ts preview）。计划中的版本标记摘要用于停机后的 apply，
+# 计划写在导出目录的 preview/ 下；这个目录和本次操作日志交给服务身份，已有数据的属主不变。
 preview_data_preparation() {
-    local status=0
     rm -rf -- "$PREVIEW_DIR"
     (umask 077 && mkdir -- "$PREVIEW_DIR") && grant_service_access "$PREVIEW_DIR" && grant_operation_log_access ||
         { print_error "无法准备数据预检目录或操作日志；服务尚未停止，代码和数据未改动"; exit 1; }
@@ -410,28 +214,17 @@ preview_data_preparation() {
         print_error "缺少 data/config/app-bot.json；升级沿用现有应用机器人凭据，请先使用 $(ops_command_hint deploy) 完成配置（服务尚未停止）"; exit 1
     fi
     print_status "在目标版本的镜像中核对数据版本并校验配置（只读挂载数据，服务尚未停止）..."
-    # 预览容器有名称并在后台运行，升级器等待它：中断（ops.sh 转发的 TERM、终端 Ctrl+C、断线）时由 cleanup_before_pointer
-    # 先删除容器再退出。在前台运行时 docker CLI 会随升级器退出变成孤儿，容器一直留着。
-    PREVIEW_CONTAINER="mixin-chatbot-preview-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
-    docker run --rm -i --name "$PREVIEW_CONTAINER" --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp -e BOT_OPERATION_LOG \
-        -v "$PROJECT_DIR/data:/app/data:ro" -v "$PROJECT_DIR/logs:/app/logs" -v "$PREVIEW_DIR:/preview" \
-        "$IMAGE_ID" bun run scripts/runtime/data-current.ts preview --project /app --plan /preview/data-plan.json --upgrade <&0 &
-    PREVIEW_PID=$!
-    wait "$PREVIEW_PID" || status=$?
-    PREVIEW_PID=''
-    if [ "$status" != 0 ]; then
-        print_error "数据版本或配置校验未通过（原因见上方）；服务尚未停止，代码和数据未改动"
-        exit 1
-    fi
+    preview_data preview --plan /preview/data-plan.json --upgrade ||
+        { print_error "数据版本或配置校验未通过（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
     PREVIEW_PLAN="$PREVIEW_DIR/data-plan.json"
     [ -s "$PREVIEW_PLAN" ] || { print_error "数据预检没有生成计划；服务尚未停止，代码和数据未改动"; exit 1; }
 }
 
-# 停机前复核的依据：数据预检的输入（配置和版本标记）的摘要，在预览之前取得。
+# 停机前复核的依据：数据预检的输入（配置和版本标记）和通讯录同步范围的摘要，在预览之前取得。
 prepared_inputs() {
     local path
     for path in "$CONFIG_DIR/runtime.json" "$MODELS_FILE" "$DATA_DIR/runtime/pi/settings.json" "$DATA_DIR/runtime/models-store.json" \
-        "$STATE_DIR/data-version.json" "$STATE_DIR/workspace-root"; do
+        "$STATE_DIR/data-version.json" "$STATE_DIR/workspace-root" "$CONFIG_DIR/directory.json"; do
         if [ -e "$path" ] || [ -L "$path" ]; then printf '%s %s\n' "$(sha256sum < "$path" | cut -d' ' -f1)" "$path"
         else printf 'absent %s\n' "$path"; fi
     done
@@ -447,8 +240,9 @@ checkout_as_checked() {
         dirty="$(git_here status --porcelain --untracked-files=no 2>&1)" && [ -z "$dirty" ]
 }
 
-# 预览之后、停机之前再核对一次：检出和输入未变、原容器未被替换、候选镜像仍在且未被改动、剩余空间够写快照。
-# 任何一项不符都在停机之前停止，重新运行升级即可。
+# 预览之后、交给核心之前再核对一次：检出和输入未变、原容器未被替换、候选镜像仍在且未被改动、剩余空间够写快照。
+# 任何一项不符都在停机之前停止，重新运行升级即可。核心在部署锁内再复核检出、代码切换会覆盖的未跟踪内容（构建期间
+# 出现的也在内）、原容器、候选镜像和任务 daemon。
 recheck_before_stop() {
     local status=0
     print_status "停机前复核：代码、配置、原容器、候选镜像和剩余空间..."
@@ -457,8 +251,6 @@ recheck_before_stop() {
         git_here status --short --branch --untracked-files=no 2>&1 | sed 's/^/      /' || true
         exit 1
     fi
-    switch_preflight "$ORIGINAL_SHA" "$ORIGINAL_MAIN" "$TARGET_SHA" "$UPGRADER_DIR" ||
-        { print_error "准备期间工作区出现了切换代码会覆盖的未跟踪内容（见上方）；服务尚未停止，请处理后重新运行升级"; exit 1; }
     [ "$(prepared_inputs)" = "$PREPARED_INPUTS" ] ||
         { print_error "预览之后配置或版本标记发生了变化；服务尚未停止，请重新运行升级"; exit 1; }
     original_service_container || status=$?
@@ -468,47 +260,24 @@ recheck_before_stop() {
     candidate_verify || status=$?
     [ "$status" = 0 ] || { print_error "候选镜像核对未通过（原因见上方）；服务尚未停止，请重新运行升级"; exit 1; }
     check_stop_disk_space "$UPGRADER_DIR" ||
-        { print_error "剩余空间不够写入停机后的快照（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
+        { print_error "剩余空间不够写入停机后的快照和修订整理的备份（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
 }
 
-# begin_deployment 在发布事务指针前调用：先写固定的镜像和服务身份（独立文件，不进事务记录），再记录停机前
-# 确认的全部选择，并把数据预检计划存入快照。
-record_deployment_transaction() {
-    local snapshot="$1"
-    write_candidate_record "$snapshot" && write_service_user_record "$snapshot" || return 1
-    task_runtime_record "$snapshot/task-runtime" && task_runtime_record_previous "$snapshot" || return 1
-    declare -gA TRANSACTION=([format]=2 [operation]=upgrade [snapshot]="$(basename -- "$snapshot")" [target_sha]="$TARGET_SHA"
-        [original_sha]="$ORIGINAL_SHA" [original_branch]="$ORIGINAL_BRANCH" [original_workspace_root]="$WORKSPACE_ROOT_SAVED" [target_workspace_root]="$WORKSPACE_ROOT_SAVED"
-        [was_running]="$PREVIOUS_RUNNING" [bot_port]="$BOT_PORT" [reconfigure_ai]=0)
-    write_transaction_record "$snapshot" || return 1
-    cp -- "$PREVIEW_PLAN" "$snapshot/data-plan.json"
-}
-
-# 部署脚本接手之前失败：恢复升级前的代码，再由事务恢复原容器和原运行状态。
-abort_before_handoff() {
-    local status=$?
-    set +e
-    trap - EXIT
-    # 恢复代码和回滚期间再来的中断不打断它们：两者都在独立的进程组中进行（见 cleanup_before_pointer）。
-    trap : INT TERM HUP
-    run_shielded restore_code_before_handoff
-    (exit "$status")
-    rollback_deployment
-}
-
-restore_code_before_handoff() {
-    [ "$(git_here rev-parse HEAD 2>/dev/null)" != "$ORIGINAL_SHA" ] || return 0
-    # 失败时事务保留“待恢复代码”阶段（见 rollback_deployment），处理后重试回滚只恢复代码。
-    { code_restore_safe "$ORIGINAL_BRANCH" "$ORIGINAL_SHA" "$TARGET_SHA" && restore_checkout "$ORIGINAL_BRANCH" "$ORIGINAL_SHA"; } ||
-        print_error "代码未能恢复到升级前的 ${ORIGINAL_SHA:0:7}（原因见上方）；恢复数据和服务后，处理 git 问题或工作区改动再运行 $(ops_command_hint rollback)，只恢复代码"
+# 停机前确认的事实交给核心：候选镜像记录（与事务快照中的格式相同），以及原容器（ID、运行身份、镜像、数据挂载）、
+# main 和任务 daemon。核心在部署锁内逐项复核，不符时在停机之前拒绝。
+write_upgrade_records() {
+    local facts="$UPGRADER_DIR/upgrade-facts"
+    write_candidate_record "$UPGRADER_DIR" || return 1
+    (umask 077 && printf 'format=1\ncontainer=%s\nuser=%s\nimage=%s\ndata=%s\nmain=%s\nendpoint=%s\ndaemon=%s\n' \
+        "$ORIGINAL_CONTAINER_ID" "$ORIGINAL_CONTAINER_USER" "$ORIGINAL_CONTAINER_IMAGE" "$ORIGINAL_CONTAINER_DATA" \
+        "$ORIGINAL_MAIN" "$TASK_DOCKER_ENDPOINT" "$TASK_DOCKER_ID" > "$facts.tmp") && mv -f -- "$facts.tmp" "$facts"
 }
 
 fresh_upgrade() {
-    local dirty
-    TARGET_SHA="$(git_here rev-parse --verify --quiet "${TARGET_REF}^{commit}")" || {
-        print_error "目标提交 ${TARGET_REF} 在本地不存在；请先 git fetch origin main"; exit 1; }
+    local dirty args
     ORIGINAL_SHA="$(git_here rev-parse HEAD)"
     ORIGINAL_BRANCH="$(git_here rev-parse --abbrev-ref HEAD)"
+    assert_console_lifecycle update "$ORIGINAL_BRANCH" || exit 1
     operation_event info "original=$ORIGINAL_SHA target=$TARGET_SHA"
     operation_stage upgrade-preflight
     # 已跟踪文件的改动会被切换代码冲掉；未跟踪文件和 data/、logs/ 不受影响。
@@ -522,7 +291,9 @@ fresh_upgrade() {
     if [ "$ORIGINAL_BRANCH" != main ]; then
         if [ "$ORIGINAL_BRANCH" = HEAD ]; then print_warning "当前是游离 HEAD（${ORIGINAL_SHA:0:7}），不在任何分支上"
         else print_warning "当前在分支 ${ORIGINAL_BRANCH}，不是 main"; fi
-        ask_yes_no "切换到 main 并继续升级？[y/N] " || { print_warning "已取消升级"; exit 1; }
+        if [ "${MIXIN_OPS_CONSOLE:-}" != 1 ]; then
+            ask_yes_no "切换到 main 并继续升级？[y/N] " || { print_warning "已取消升级"; exit 1; }
+        fi
     fi
     # 只接受快进。本地有未推送的提交时停下来，而不是替用户决定怎么合并。
     ORIGINAL_MAIN="$(git_here rev-parse --verify --quiet refs/heads/main)" || { print_error "本地 main 分支不存在，请先建立 main 后重试"; exit 1; }
@@ -533,9 +304,6 @@ fresh_upgrade() {
         print_warning "请先推送或丢弃这些提交后重试"
         exit 1
     fi
-    # git 要到切换时才拒绝覆盖未跟踪的文件（被忽略的文件则直接覆盖），那时服务已经停止：先预演，构建之前列出冲突。
-    switch_preflight "$ORIGINAL_SHA" "$ORIGINAL_MAIN" "$TARGET_SHA" "$UPGRADER_DIR" ||
-        { print_error "切换代码会覆盖工作区中未跟踪的内容（见上方）；服务尚未停止，未构建镜像，请处理后重试"; exit 1; }
     if [ "$ORIGINAL_SHA" = "$TARGET_SHA" ]; then
         print_success "代码已经最新，仍检查数据版本并重新部署"
     else
@@ -556,9 +324,15 @@ fresh_upgrade() {
         print_error "升级沿用已保存的端口 ${BOT_PORT}；改端口请用 $(ops_command_hint deploy)（服务尚未停止）"
         exit 1
     fi
-    # 此后到事务指针发布之前，失败、取消或中断只清理本次的预览容器和保留标签。
+    # 此后到核心发布事务指针之前，失败、取消或中断只清理本次的预览容器和保留标签。
     trap cleanup_before_pointer EXIT
     trap_preparation_signals
+    prepare_core "服务尚未停止，代码和数据未改动" || exit 1
+    # 部署锁、未完成的事务或运维任务、main、原容器和代码切换先由核心只读检查一次，构建之前就能拒绝；交接后它在锁内再查。
+    # git 要到切换时才拒绝覆盖未跟踪的文件（被忽略的文件则直接覆盖），那时服务已经停止，所以切换途经的冲突在这里预演。
+    "$HOST_BUN" --no-env-file "$TARGET_TREE/scripts/ops/core/cli.ts" deployment upgrade --project "$PROJECT_DIR" \
+        --original "$ORIGINAL_SHA" --target "$TARGET_SHA" --branch "$ORIGINAL_BRANCH" --preflight </dev/null ||
+        { print_error "升级预检未通过（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
     build_candidate
     HOST_WORKSPACE_ROOT="$WORKSPACE_ROOT_SAVED"
     WORKSPACE_ARGS=()
@@ -567,30 +341,31 @@ fresh_upgrade() {
     check_workspace_layout || { print_error "共享资料目录不能使用（原因见上方）；服务尚未停止，代码和数据未改动"; exit 1; }
     PREPARED_INPUTS="$(prepared_inputs)"
     preview_data_preparation
+    preview_revision_cleanup
+    choose_directory_scope
     recheck_before_stop
-    # 迁移容器以服务身份在 backup/snapshots 中写备份；begin_deployment 的 mkdir 不能先以 root 建出它们。
-    make_service_directories "$PROJECT_DIR/backup/snapshots" "$PROJECT_DIR/backup/rm" ||
-        { print_error "无法创建 backup/ 下的快照目录；服务尚未停止，代码和数据未改动"; exit 1; }
-
-    print_status "记录升级事务并停止机器人服务；此后切换代码和迁移期间服务保持停止，不再构建镜像"
-    begin_deployment "$TARGET_SHA"
-    trap abort_before_handoff EXIT
-    if [ "$PREVIOUS_RUNNING" = 0 ]; then print_status "机器人服务升级前未运行，升级后保持停止"; fi
-    checkout_target || { print_error "切换到目标提交 ${TARGET_SHA:0:7} 失败，正在恢复升级前的状态"; exit 1; }
-    [ "$ORIGINAL_SHA" = "$TARGET_SHA" ] || print_success "代码已更新：${ORIGINAL_SHA:0:7} -> ${TARGET_SHA:0:7}"
-    print_status "交给目标版本的部署脚本：按事务记录用候选镜像验证并启用新实例，不再询问"
-    run_deploy continue
-    finish_after_deploy fresh
+    write_upgrade_records || { print_error "无法写入停机前的准备记录；服务尚未停止，代码和数据未改动"; exit 1; }
+    if [ "$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" != true ]; then
+        print_status "机器人服务升级前未运行，升级后保持停止"
+    fi
+    print_status "交给运维核心：在部署锁内复核后记录事务并停止机器人服务；此后切换代码、迁移和验证期间服务保持停止，不再构建镜像"
+    args=(--original "$ORIGINAL_SHA" --target "$TARGET_SHA" --branch "$ORIGINAL_BRANCH" --plan "$PREVIEW_PLAN"
+        --cleanup "$REVISION_CLEANUP_CHOICE" --candidate "$UPGRADER_DIR/candidate-image" --facts "$UPGRADER_DIR/upgrade-facts")
+    [ -z "$DIRECTORY_SCOPE_PLAN" ] || args+=(--directory-plan "$DIRECTORY_SCOPE_PLAN")
+    run_target_core "${args[@]}"
+    finish_core
 }
 
 operation_start upgrade
 trap 'operation_finish "$?"' EXIT
 command -v flock >/dev/null || { print_error "需要 util-linux flock"; exit 1; }
-acquire_deploy_lock || { print_error "另一个部署或升级正在进行"; exit 1; }
+acquire_deploy_lock || { [ $? = 2 ] || print_error "另一个部署、升级或维护操作正在进行"; exit 1; }
 if ! git_here rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if refusal="$(git_ownership_refusal)"; then print_error "$refusal"; else print_error "${PROJECT_DIR} 不是 git 仓库，无法升级"; fi
     exit 1
 fi
+TARGET_SHA="$(git_here rev-parse --verify --quiet "${TARGET_REF}^{commit}")" || {
+    print_error "目标提交 ${TARGET_REF} 在本地不存在；请先 git fetch origin main"; exit 1; }
 # rootful Docker 要求 root，rootless Docker 要求它所属的普通用户（设置 DOCKER_ROOTLESS）：在任何提问、构建和停机之前。
 require_docker_operator() {
     local command=update
@@ -602,11 +377,10 @@ if [ -e "$PENDING_POINTER" ]; then
     load_pending_transaction || { print_error "未完成事务的记录无法读取（原因见上方）；保持现状，请人工检查 backup/snapshots"; exit 1; }
     print_warning "$(describe_pending_transaction)"
     if [ "${TRANSACTION[operation]}" != upgrade ]; then
-        print_error "未完成的是部署而不是升级；请先运行 $(ops_command_hint deploy) 继续或回滚上次部署，再升级"
+        print_error "未完成的是部署而不是升级；请先用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚上次部署，再升级"
         exit 1
     fi
-    # 只剩代码待恢复时不再操作 Docker。
-    transaction_code_restore_pending || require_docker_operator
+    require_docker_operator
     [ -n "$ACTION" ] || choose_pending_action
     resume_upgrade
 fi

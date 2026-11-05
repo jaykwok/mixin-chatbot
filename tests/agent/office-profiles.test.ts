@@ -1,5 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -20,6 +21,22 @@ test("a live registered profile is retained; normal close removes only its own p
     expect((await readdir(join(fixture.root, ".office-jobs"))).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(process.platform === "linux" ? 1 : 0);
     if (process.platform === "linux") expect(await readFile(join(profile.path, "work"), "utf8")).toBe("owned");
   } finally { await profile.close(); await fixture.cleanup(); }
+});
+test("recovery without a receipt creates no journal and changes nothing; a journal that is not a directory is still refused", async () => {
+  const fixture = await tempFixture("office-none-");
+  try {
+    expect(await recoverOfficeProfiles(join(fixture.root, "missing"))).toBe(0);
+    expect(await recoverOfficeProfiles(fixture.root)).toBe(0);
+    expect(await readdir(fixture.root)).toEqual([]);
+    // A journal without receipts (every profile closed) has nothing to recover either.
+    await mkdir(join(fixture.root, ".office-jobs"));
+    await writeFile(join(fixture.root, ".office-jobs", "0123456789abcdef.deferred.json"), "{}");
+    expect(await recoverOfficeProfiles(fixture.root)).toBe(0);
+    expect(await readdir(join(fixture.root, ".office-jobs"))).toEqual(["0123456789abcdef.deferred.json"]);
+    await rm(join(fixture.root, ".office-jobs"), { recursive: true });
+    await writeFile(join(fixture.root, ".office-jobs"), "not a directory");
+    await expect(recoverOfficeProfiles(fixture.root)).rejects.toThrow("Office 清理记录目录不是普通目录");
+  } finally { await fixture.cleanup(); }
 });
 test("SIGKILL leaves a receipt; supervision stops the descendant; cold recovery cleans only the recorded Office profile", async () => {
   const fixture = await tempFixture("office-kill-"), unowned = await mkdtemp(join(tmpdir(), "mixin-office-"));
@@ -92,6 +109,43 @@ test("cleanup keeps its authorized entity across a directory replacement after t
     else await profile.close();
     await fixture.cleanup();
   }
+});
+
+test("a profile gone before its cleanup: off Linux its receipt retires; on Linux an absent name proves nothing and the receipt stays", async () => {
+  const fixture = await tempFixture("office-gone-"), journal = join(fixture.root, ".office-jobs");
+  const receipts = async () => (await readdir(journal)).filter(name => /^[a-f0-9]{16}\.json$/.test(name));
+  const profile = await createOfficeProfile(fixture.root);
+  try {
+    await rm(profile.path, { recursive: true });
+    expect(await profile.close()).toMatchObject(process.platform === "linux" ? { status: "deferred" } : { status: "removed", completedEarlier: true });
+    expect(await receipts()).toHaveLength(process.platform === "linux" ? 1 : 0);
+    // An owner killed between its receipt and the mkdir left only the receipt.
+    const id = "0123456789abcdef";
+    await writeFile(join(journal, id + ".json"), JSON.stringify({ version: 1, id, owner: "a".repeat(32), pid: 2147483647,
+      tempRoot: await realpath(fixture.root), systemRoot: await realpath(tmpdir()) }));
+    expect(await recoverOfficeProfiles(fixture.root)).toBe(process.platform === "linux" ? 0 : 1);
+    expect((await receipts()).includes(id + ".json")).toBe(process.platform === "linux");
+  } finally { await fixture.cleanup(); }
+});
+
+test("a failed mkdir takes its receipt back", async () => {
+  const fixture = await tempFixture("office-mkdir-"), make = fsPromises.mkdir;
+  const failing = spyOn(fsPromises, "mkdir").mockImplementation((async (path: string, options?: { mode?: number }) => {
+    if (path.includes("mixin-office-")) throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    return make(path, options);
+  }) as never);
+  try {
+    await expect(createOfficeProfile(fixture.root)).rejects.toThrow("no space left on device");
+    expect(await readdir(join(fixture.root, ".office-jobs"))).toEqual([]);
+  } finally { failing.mockRestore(); await fixture.cleanup(); }
+});
+
+test("a marker created but never written counts as none: the otherwise empty profile is still cleaned", async () => {
+  const fixture = await tempFixture("office-unwritten-"), profile = await createOfficeProfile(fixture.root);
+  try {
+    await writeFile(join(profile.path, ".mixin-office-owner.json"), "");
+    expect((await profile.close()).status).toBe(process.platform === "linux" ? "deferred" : "removed");
+  } finally { await rm(profile.path, { recursive: true, force: true }); await fixture.cleanup(); }
 });
 
 test("a junction or an unmarked replacement is retained with its recovery receipt", async () => {

@@ -470,7 +470,7 @@ test("the committed timing tables name project test files with whole millisecond
     const table = JSON.parse(readFileSync(join(project, "tests", "timings", `${platform}.json`), "utf8")) as { version: number; files: Record<string, unknown> };
     expect(table.version).toBe(1);
     for (const [key, ms] of Object.entries(table.files)) {
-      expect(key).toMatch(/^tests\/[\w./-]+\.test\.ts$/);
+      expect(key).toMatch(/^tests\/[\w./-]+\.test\.tsx?$/);
       expect(Number.isInteger(ms) && (ms as number) >= 0, key).toBe(true);
     }
   }

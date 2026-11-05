@@ -5,7 +5,8 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildMaterialsTools } from "../../src/agent/materials-search.ts";
+import { materialsTools } from "../../src/agent/materials-search.ts";
+import { runMemberTool, toolNamed } from "../helpers/member-tools.ts";
 import { extractDocument } from "../../src/agent/document-extract.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -16,9 +17,9 @@ async function setup() {
   const options = { workspaceDir: join(root, "workspace"), tempDir: join(root, "tmp"), indexPath: join(root, "index/materials.md"),
     ignorePath: join(root, "index/ignore.txt"), venvDir: join(root, "absent-venv") };
   await Promise.all([options.workspaceDir, options.tempDir, join(root, "index")].map(dir => mkdir(dir, { recursive: true })));
-  const tools = buildMaterialsTools(options);
+  const tools = materialsTools(options.ignorePath);
   async function call(name: string, args: object) {
-    return (await tools.find(t => t.name === name)!.execute("test", args, undefined, undefined, {} as never)).details as any;
+    return (await runMemberTool(toolNamed(tools, name), args, { places: options })).details as any;
   }
   return { options, root, call };
 }
@@ -125,8 +126,8 @@ test("an exhausted search budget returns partial progress, while caller cancella
     expect(result.incomplete).toBe(true); expect(result.unscanned).toBe(1); expect(result.hits).toEqual([]);
   } finally { timeout.mockRestore(); }
   const caller = new AbortController(); caller.abort(new Error("caller stopped"));
-  const grep = buildMaterialsTools(f.options).find(t => t.name === "materials_grep")!;
-  await expect(grep.execute("cancel", { keywords: ["keyword"] }, caller.signal, undefined, {} as never)).rejects.toThrow("caller stopped");
+  const grep = toolNamed(materialsTools(f.options.ignorePath), "materials_grep");
+  await expect(runMemberTool(grep, { keywords: ["keyword"] }, { places: f.options, signal: caller.signal })).rejects.toThrow("caller stopped");
 });
 
 test.skipIf(process.platform === "win32")("directory symlinks cannot escape into another group's files", async () => {

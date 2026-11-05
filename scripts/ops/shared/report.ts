@@ -1,0 +1,467 @@
+import { formatCacheRate } from "../../lib/usage.ts";
+import { byName } from "../../lib/group-data.ts";
+// 统计报表导出：一份自包含的静态 HTML，由控制台的导出任务生成。
+//
+// 这份东西的用途是「发给别人看」和「贴进汇报材料」：静态文件双击就开、能直接当附件发走，
+// 不需要打开控制台。
+//
+// 文件里没有任何外链：CSS 内联、图形用 HTML 盒子而不是图表库、悬浮提示用纯 CSS。断网、
+// 内网、别人的电脑上打开都是同一个样子。
+//
+// 图形的形式和配色遵循项目的数据可视化规范：
+//   · 比大小的量一律单一色相（分类槽 1 的蓝），不用彩虹，不按数值改色相；
+//   · token 用量那三个数量级差很远的数字做成三块数字卡，而不是硬凑一张三系列图；
+//   · 每张图旁边都有可展开的表格视图，任何数值都不只存在于悬浮提示里；
+//   · 文字一律用文字色，不穿数据色——浅色相当文字在浅底上读不清。
+
+import * as fmt from "./format.ts";
+import type { GroupStats, Window } from "../stats-admin.ts";
+import { change, comparisons, describeStatsWindow, engagement, STATS_NOTE, summarize, TOKEN_NOTE, trend, type ComparisonData } from "../stats-summary.ts";
+import type { TokenTotals } from "../../../src/agent/stats-ledger.ts";
+
+export interface ReportInput {
+  groups: GroupStats[];
+  /** 当前下钻的群；有的话报表里多一节该群的明细。 */
+  detail: GroupStats | null;
+  window: Window;
+  /**
+   * 控制台的身份模式：整份报表（含跨群汇总与排行）都用它标注成员。
+   * `label` 是成员的显示文字，`note` 说明本报表的身份范围，`banner` 写在标题下（如"含个人信息 · 默认身份"）。
+   */
+  identity: { label(user: string): string; note: string; banner: string };
+  comparisons?: ComparisonData | null;
+  /** 群的显示名（控制台给登记过的群用群名）；不给时用账本里的群段。 */
+  groupTitle?: (group: string) => string;
+  /** When filtering, compare the same selected groups in both periods. Absent means all groups. */
+  comparisonScope?: string[];
+}
+
+/** HTML 转义。群号可以带任意 Unicode，成员标识来自外部输入，一律当不可信文本处理。 */
+function esc(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+/**
+ * 横向条。
+ *
+ * 数据端 4px 圆角、基线端见方，条厚封顶 16px 不填满行高（留出的空白就是相邻条之间的
+ * 间隔，不画边框去分隔）。数值直接标在条尾，不依赖悬浮提示。
+ */
+function hbar(label: string, value: number, max: number, display: string, tip: string): string {
+  const ratio = max > 0 && value > 0 ? Math.max(0.004, value / max) : 0;
+  return `
+        <div class="row">
+          <div class="row-label" title="${esc(label)}">${esc(label)}</div>
+          <div class="track">
+            <div class="fill" style="width:${(ratio * 100).toFixed(2)}%" data-tip="${esc(tip)}"></div>
+          </div>
+          <div class="row-value">${esc(display)}</div>
+        </div>`;
+}
+
+/** 纵向柱。值标在柱顶，横轴标签在下方——容器高度含轴标签，不让它被裁掉。 */
+function column(label: string, value: number, max: number, display: string, tip: string): string {
+  const ratio = max > 0 && value > 0 ? Math.max(0.004, value / max) : 0;
+  return `
+          <div class="col">
+            <div class="col-value">${esc(display)}</div>
+            <div class="col-track">
+              <div class="col-fill" style="height:${(ratio * 100).toFixed(2)}%" data-tip="${esc(tip)}"></div>
+            </div>
+            <div class="col-label">${esc(label)}</div>
+          </div>`;
+}
+
+/** 数字卡。大数字用比例数字（tabular 会让 121 在大字号下显得松散）。 */
+function tile(label: string, value: string, note = ""): string {
+  return `
+        <div class="tile">
+          <div class="tile-label">${esc(label)}</div>
+          <div class="tile-value">${esc(value)}</div>
+          ${note ? `<div class="tile-note">${esc(note)}</div>` : ""}
+        </div>`;
+}
+
+/** 表格视图。每张图都配一份，保证任何数值都不只能靠悬浮读到。 */
+function tableView(headers: string[], rows: string[][], caption: string, open = false): string {
+  return `
+        <details class="table-view"${open ? " open" : ""}>
+          <summary>表格视图 · ${esc(caption)}</summary>
+          <table>
+            <thead><tr>${headers.map((head) => `<th>${esc(head)}</th>`).join("")}</tr></thead>
+            <tbody>${rows
+              .map((row) => `<tr>${row.map((cell) => `<td>${esc(cell)}</td>`).join("")}</tr>`)
+              .join("")}</tbody>
+          </table>
+        </details>`;
+}
+
+function describeWindow(window: Window): string {
+  if (window.since === undefined && window.until === undefined) return "全部区间";
+  const from = window.since === undefined ? "最早" : fmt.day(window.since);
+  const to = window.until === undefined ? "至今" : fmt.day(window.until);
+  return `${from} ~ ${to}`;
+}
+
+const STYLE = `
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --plane: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --series-1: #2a78d6;
+    --track: #cde2fb;
+    --border: rgba(11,11,11,0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --plane: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --series-1: #3987e5;
+      --track: #184f95;
+      --border: rgba(255,255,255,0.10);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --plane: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --series-1: #3987e5;
+    --track: #184f95;
+    --border: rgba(255,255,255,0.10);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 24px 64px;
+    background: var(--plane);
+    color: var(--text-primary);
+    font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; }
+  header.page { margin-bottom: 28px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 6px; }
+  .subtitle { color: var(--text-secondary); font-size: 13px; }
+  .meta { color: var(--text-muted); font-size: 12px; margin-top: 4px; }
+
+  section {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 22px;
+    margin-bottom: 18px;
+  }
+  h2 { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+  .section-note { color: var(--text-muted); font-size: 12px; margin-bottom: 16px; }
+
+  /* 主数字：一个视图只有一个，和正文同一个无衬线字族，比例数字。 */
+  .hero { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
+  .hero-value { font-size: 52px; font-weight: 600; letter-spacing: -0.02em; line-height: 1; }
+  .hero-unit { color: var(--text-secondary); font-size: 14px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; }
+  .tile { border-left: 2px solid var(--grid); padding-left: 12px; }
+  .tile-label { color: var(--text-muted); font-size: 12px; }
+  .tile-value { font-size: 26px; font-weight: 600; line-height: 1.2; }
+  .tile-note { color: var(--text-muted); font-size: 11px; }
+
+  /* 横向条：标签 / 轨道 / 数值三列。轨道左侧那条竖线就是基线，1px 实线不虚线。 */
+  .row { display: grid; grid-template-columns: minmax(80px, 22%) 1fr auto; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .row-label { color: var(--text-secondary); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .track { border-left: 1px solid var(--baseline); padding-left: 0; height: 16px; display: flex; align-items: center; }
+  .fill { background: var(--series-1); height: 16px; border-radius: 0 4px 4px 0; position: relative; }
+  .row-value { color: var(--text-secondary); font-size: 13px; font-variant-numeric: tabular-nums; }
+
+  /* 纵向柱：容器高度含轴标签，柱顶 4px 圆角、底边见方。 */
+  .cols { display: flex; align-items: flex-end; gap: 10px; padding-top: 8px; border-bottom: 1px solid var(--baseline); }
+  .col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .col-value { color: var(--text-secondary); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .col-track { height: 128px; width: 100%; max-width: 24px; display: flex; align-items: flex-end; }
+  .col-fill { background: var(--series-1); width: 100%; border-radius: 4px 4px 0 0; position: relative; }
+  .trend-cols { overflow-x: auto; padding-top: 36px; }
+  .trend-cols .col { min-width: 76px; }
+  .col-label { color: var(--text-muted); font-size: 11px; padding-top: 4px; }
+  .axis-labels { display: flex; }
+
+  /* 悬浮提示是增强，不是唯一读数途径：同样的数字已经标在条上并列在表格里。 */
+  [data-tip] { cursor: default; }
+  [data-tip]:hover::after {
+    content: attr(data-tip);
+    position: absolute; left: 100%; top: 50%; transform: translate(8px, -50%);
+    background: var(--text-primary); color: var(--surface-1);
+    font-size: 12px; white-space: nowrap; padding: 4px 8px; border-radius: 6px;
+    z-index: 2; pointer-events: none;
+  }
+  .col-fill[data-tip]:hover::after { left: 50%; top: 0; transform: translate(-50%, -120%); }
+
+  .table-view { margin-top: 16px; max-height: 520px; overflow: auto; }
+  .table-view summary { color: var(--text-muted); font-size: 12px; cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+  th { color: var(--text-muted); font-weight: 500; font-size: 12px; }
+  td { font-variant-numeric: tabular-nums; }
+  td:first-child, th:first-child { font-variant-numeric: normal; }
+
+  footer.page { color: var(--text-muted); font-size: 12px; line-height: 1.7; margin-top: 8px; }
+  .toggle {
+    position: fixed; top: 16px; right: 16px;
+    background: var(--surface-1); color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 14px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  @media print {
+    body { background: #fff; padding: 0; }
+    .toggle { display: none; }
+    section { break-inside: avoid; border-color: #ddd; }
+    .table-view[open] summary { display: none; }
+    .table-view { max-height: none; overflow: visible; }
+  }
+`;
+
+/** 深浅切换：唯一的脚本，8 行，失效了也不影响任何内容的可读性。 */
+const SCRIPT = `
+  document.querySelector(".toggle").addEventListener("click", function () {
+    var root = document.documentElement;
+    var dark = getComputedStyle(root).getPropertyValue("--surface-1").trim() === "#1a1a19";
+    root.setAttribute("data-theme", dark ? "light" : "dark");
+  });
+`;
+
+function overviewSection(input: ReportInput): string {
+  const { groups } = input;
+  const asks = groups.reduce((sum, group) => sum + group.asks, 0);
+  const summary = summarize(groups);
+  const tokens = groups.reduce((sum, group) => sum + group.tokens.totalTokens, 0);
+  const days = new Set(groups.flatMap((group) => [...group.days])).size;
+  const max = Math.max(0, ...groups.map((group) => group.asks));
+  const title = input.groupTitle ?? ((group: string) => group);
+
+  return `
+      <section>
+        <div class="hero">
+          <div class="hero-value">${fmt.grouped(asks)}</div>
+          <div class="hero-unit">次提问</div>
+        </div>
+        <div class="section-note">${esc(describeWindow(input.window))}</div>
+        <div class="tiles">
+          ${tile("使用群数", String(groups.length))}
+          ${tile("覆盖提问人数", String(summary.people), "跨群去重，不代表群总人数")}
+          ${tile("人均提问", summary.average.toFixed(1), "次 / 提问成员")}
+          ${tile("模型用量", fmt.count(tokens), "token 合计")}
+          ${tile("活跃天数", String(days))}
+        </div>
+      </section>
+
+      <section>
+        <h2>各群提问次数</h2>
+        <div class="section-note">按提问次数从多到少。</div>
+        ${groups
+          .map((group) =>
+            hbar(
+              title(group.group),
+              group.asks,
+              max,
+              fmt.grouped(group.asks),
+              `${title(group.group)}：${group.asks} 次提问 · ${summarize([group]).people} 人提问`
+            )
+          )
+          .join("")}
+        ${tableView(
+          ["群", "提问人数", "提问", "token 合计", "活跃天数", "首次", "最后"],
+          groups.map((group) => [
+            title(group.group),
+            String(summarize([group]).people),
+            String(group.asks),
+            String(group.tokens.totalTokens),
+            String(group.days.size),
+            fmt.day(group.firstAt),
+            fmt.day(group.lastAt),
+          ]),
+          "各群汇总"
+        )}
+      </section>`;
+}
+
+function analysisSections(input: ReportInput, groups: GroupStats[], title: string, scope?: Set<string>): string {
+  const summary = summarize(groups);
+  const activity = engagement(groups, input.window);
+  const name = (user: string) => input.identity.label(user);
+  const periods = comparisons(input.comparisons, scope);
+  const comparison = periods.length ? tableView(
+    ["对比", "基期区间", "本期提问", "基期提问", "提问变化", "本期人数", "基期人数", "人数变化"],
+    periods.map(period => [period.label, describeStatsWindow(period.window), String(summary.asks), String(period.asks), change(summary.asks, period.asks), String(summary.people), String(period.people), change(summary.people, period.people)]),
+    "同比与环比", true) : `<div class="section-note">全部或单边区间不计算同比环比，请选择日、周、月或完整自定义区间。</div>`;
+  const charts = ([ ["day", "每日"], ["week", "每周（周一为起点）"], ["month", "每月"] ] as const).map(([grain, label]) => {
+    const points = trend(groups, input.window, grain);
+    const shown = points.slice(-90);
+    const max = Math.max(0, ...shown.map(point => point.asks));
+    return `<section><h2>${esc(title)} · ${label}明细</h2>
+      <div class="section-note">无记录日期补 0；周、月首尾只统计所选区间内的日期。${points.length > 90 ? "图中展示最后 90 个周期，表格保留完整数据。" : ""}</div>
+      <div class="cols trend-cols">${shown.map(point => column(point.date, point.asks, max, String(point.asks), `${point.date}：${point.asks} 次提问 · ${point.askers.size} 人`)).join("")}</div>
+      ${tableView(["日期", "提问", "提问人数", "人均提问", "入账 token 合计"], points.map(point => [point.date, String(point.asks), String(point.askers.size), point.askers.size ? (point.asks / point.askers.size).toFixed(1) : "0.0", String(point.tokens.totalTokens)]), label, grain === "day")}
+    </section>`;
+  }).join("");
+  return `<section><h2>${esc(title)} · 同比与环比</h2>
+    <div class="section-note">${esc(STATS_NOTE)}</div>${comparison}</section>
+    <section><h2>${esc(title)} · 使用频率</h2><div class="section-note">日均包含无提问的日期；不限日期时，以首末有记录的日期为范围。</div>
+    <div class="tiles">${tile("日均提问", activity.dailyAverage.toFixed(1), `${activity.days} 个自然日`)}${tile("活跃天数占比", (activity.activeRate * 100).toFixed(1) + "%", `${summary.activeDays} 天有提问`)}${tile("提问高峰日", activity.peak?.date ?? "—", activity.peak ? `${activity.peak.asks} 次；并列峰值取最早一天` : "无提问记录")}${tile("前五名提问占比", (activity.topFiveShare * 100).toFixed(1) + "%", "观察提问是否集中于少数成员")}</div></section>
+    <section><h2>${esc(title)} · 提问排行</h2>
+    <div class="tiles">${tile("提问最多", summary.ranking[0] ? name(summary.ranking[0].user) : "—", summary.ranking[0] ? `${summary.ranking[0].asks} 次；并列者见下表` : "区间内无提问")}${tile("总提问数", String(summary.asks))}${tile("覆盖提问人数", String(summary.people))}${tile("人均提问", summary.average.toFixed(1))}</div>
+    <div class="section-note">按提问次数降序，跨群合并；图表显示前 20 位，完整排行见表格。${esc(input.identity.note)}</div>
+    ${summary.ranking.slice(0, 20).map(user => hbar(name(user.user), user.asks, summary.ranking[0]!.asks, String(user.asks), `${name(user.user)}：${user.asks} 次`)).join("")}
+    ${tableView(["排名", "成员", "提问", "占比", "活跃天数", "参与群数"], summary.ranking.map((user, index) => [String(index + 1), name(user.user), String(user.asks), (100 * user.asks / summary.asks).toFixed(1) + "%", String(user.days.size), String(user.groups.size)]), "完整提问排行")}</section>${charts}`;
+}
+
+function detailSection(input: ReportInput, stats: GroupStats): string {
+  const months = [...stats.months].sort((a, b) => a[0].localeCompare(b[0]));
+  const monthMax = Math.max(0, ...months.map(([, data]) => data.asks));
+  const members = stats.users;
+  const memberMax = Math.max(0, ...members.map((user) => user.asks));
+  const name = (user: string): string => input.identity.label(user);
+
+  const byTotal = (map: Map<string, TokenTotals>) => [...map].sort((a, b) => b[1].totalTokens - a[1].totalTokens || byName(a[0], b[0]));
+  const tokenRow = (key: string, u: TokenTotals) => [key, String(u.input), String(u.output), String(u.cacheRead), String(u.cacheWrite), String(u.totalTokens), formatCacheRate(u)];
+  const tokenHeader = ["输入", "输出", "缓存读", "缓存写", "合计", "加权缓存读率"];
+
+  return `
+      <section>
+        <h2>${esc(input.groupTitle ? input.groupTitle(stats.group) : `群 ${stats.group}`)} · 概况</h2>
+        <div class="section-note">${esc(fmt.day(stats.firstAt))} ~ ${esc(fmt.day(stats.lastAt))} · ${esc(describeWindow(input.window))}</div>
+        <div class="tiles">
+          ${tile("使用人数", `${members.length} 人`)}
+          ${tile("提问次数", fmt.grouped(stats.asks), members.length > 0 ? `人均 ${(stats.asks / members.length).toFixed(1)} 次` : "")}
+          ${tile("活跃天数", `${stats.days.size} 天`)}
+        </div>
+      </section>
+
+      <section>
+        <h2>模型用量</h2>
+        <div class="section-note">${esc(TOKEN_NOTE)}</div>
+        <div class="tiles">
+          ${tile("输入", fmt.count(stats.tokens.input), "token")}
+          ${tile("输出", fmt.count(stats.tokens.output), "token")}
+          ${tile("缓存命中", fmt.count(stats.tokens.cacheRead), "token")}
+          ${tile("缓存写入", fmt.count(stats.tokens.cacheWrite), "token")}
+          ${tile("合计", fmt.count(stats.tokens.totalTokens), "totalTokens，按模型原样累计")}
+          ${tile("加权缓存读率", formatCacheRate(stats.tokens), "cacheRead / (input + cacheRead + cacheWrite)")}
+        </div>
+      </section>
+      <section><h2>模型与工具用量</h2>
+        <div class="section-note">对话与压缩按 provider/model 计；辅助分类、生图等工具自身调用的模型按工具名计。</div>
+        ${tableView(["provider/model", ...tokenHeader], byTotal(stats.models).map(([key, u]) => tokenRow(key, u)), "模型用量")}
+        ${stats.tools.size ? tableView(["工具", ...tokenHeader], byTotal(stats.tools).map(([key, u]) => tokenRow(key, u)), "工具用量") : ""}
+        ${tableView(["入账日期", ...tokenHeader], [...stats.tokenDays].sort(([a], [b]) => a.localeCompare(b)).map(([day, u]) => tokenRow(day, u)), "每日用量")}
+      </section>
+${
+  months.length > 0
+    ? `
+      <section>
+        <h2>按月提问</h2>
+        <div class="section-note">数值标在柱顶；横轴为自然月。</div>
+        <div class="cols">
+          ${months
+            .map(([month, data]) =>
+              column(month.slice(2), data.asks, monthMax, fmt.grouped(data.asks), `${month}：${data.asks} 次 · ${data.users.size} 人`)
+            )
+            .join("")}
+        </div>
+        ${tableView(
+          ["月份", "提问", "人数"],
+          months.map(([month, data]) => [month, String(data.asks), String(data.users.size)]),
+          "按月"
+        )}
+      </section>`
+    : ""
+}
+      <section>
+        <h2>成员</h2>
+        <div class="section-note">${esc(input.identity.note)}</div>
+        ${members
+          .slice(0, 20)
+          .map((user) =>
+            hbar(
+              name(user.user),
+              user.asks,
+              memberMax,
+              fmt.grouped(user.asks),
+              `${name(user.user)}：${user.asks} 次提问 · ${user.days.size} 天活跃`
+            )
+          )
+          .join("")}
+        ${members.length > 20 ? `<div class="section-note">图中仅列前 20 位，完整名单见下方表格。</div>` : ""}
+        ${tableView(
+          ["成员", "提问", "活跃天数", "首次", "最后"],
+          members.map((user) => [
+            name(user.user),
+            String(user.asks),
+            String(user.days.size),
+            fmt.day(user.firstAt),
+            fmt.day(user.lastAt),
+          ]),
+          "按成员"
+        )}
+      </section>`;
+}
+
+/** 标题用的时间戳：YYYY-MM-DD-HHMMSS（本地时间）。 */
+function reportStamp(at: number): string {
+  const now = new Date(at);
+  return `${fmt.day(at)}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
+}
+
+/** 整份报表的 HTML（自包含，无外链）。 */
+export function renderReport(input: ReportInput, at: number = Date.now()): string {
+  const stamp = reportStamp(at);
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>量子密信应用机器人使用统计 ${esc(stamp)}</title>
+<style>${STYLE}</style>
+</head>
+<body>
+<button class="toggle" type="button">深/浅</button>
+<main>
+  <header class="page">
+    <h1>量子密信应用机器人使用统计</h1>
+    <div class="subtitle">${esc(describeWindow(input.window))}</div>
+    <div class="meta">导出于 ${esc(fmt.day(at))} ${esc(fmt.clock(at))}</div>
+    <div class="meta">${esc(input.identity.banner)}</div>
+  </header>
+${overviewSection(input)}
+${analysisSections(input, input.groups, "所选群汇总", input.comparisonScope ? new Set(input.comparisonScope) : undefined)}
+${input.detail ? detailSection(input, input.detail) : ""}
+${input.detail ? analysisSections(input, [input.detail], "群 " + input.detail.group, new Set([input.detail.group])) : ""}
+  <footer class="page">
+    统计口径：一条发给机器人的消息算一次提问（含干活途中的插话），/help /clear 等指令不计入。<br>
+    数据来自使用统计账本，清空上下文或归档历史不影响已入账的数字。附件数只算带 fileId 的成功工具结果，生成链接不等于送达。<br>
+    ${esc(STATS_NOTE)}
+  </footer>
+</main>
+<script>${SCRIPT}</script>
+</body>
+</html>
+`;
+}

@@ -30,7 +30,7 @@ function Invoke-BotSupervision {
         for ($attempt = 0; ; $attempt++) {
             $env:APP_BUILD = Get-CheckoutBuild $GitPath (Get-Location).Path
             $global:LASTEXITCODE = 1
-            try { & $BunPath run $Entry | Out-Host; $exitCode = $global:LASTEXITCODE }
+            try { & $BunPath --no-env-file run $Entry | Out-Host; $exitCode = $global:LASTEXITCODE }
             catch { Write-Warning $_.Exception.Message; $exitCode = 1 }
             if ($exitCode -eq 0 -or $attempt -ge $RestartLimit) { return [int]$exitCode }
             Write-Warning "Bot exited with code $exitCode; restarting in $RestartDelaySeconds seconds (retry $($attempt + 1)/$RestartLimit)."

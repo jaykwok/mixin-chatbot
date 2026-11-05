@@ -1,4 +1,4 @@
-// 只读临时目录扫描，不加载维护/归档模块；宿主机 TUI 无需安装 npm 依赖。
+// 只读临时目录扫描，不加载维护/归档模块；宿主机控制台读取时无需加载服务依赖。
 
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -73,7 +73,7 @@ export async function scanTmp(root: string, userFilter?: string, spaceFilter?: s
   let spaces: string[];
   if (spaceFilter === "direct" && selection === "auto") spaces = ["direct"];
   else if (spaceFilter) {
-    // TUI 传的是已扫描到的目录名：精确匹配优先，不能同时命中其再次编码后的另一个目录。
+    // 调用方传的可能是已扫描到的目录名：精确匹配优先，不能同时命中其再次编码后的另一个目录。
     const group = await resolveGroupName(spaceFilter, groupsDir, selection, root);
     spaces = group === null ? [] : ["groups/" + group];
   } else spaces = ["direct", ...(await dataDirectoryNames(groupsDir, root)).map(group => "groups/" + group)];

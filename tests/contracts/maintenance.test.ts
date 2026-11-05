@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
-  ContractError, decodeArchivePlan, decodeArchiveProgress, decodeLegacyJournal, decodePlanSummary, decodeProgressSummary, decodeReclaimPlan,
+  ContractError, decodeArchivePlan, decodeArchiveProgress, decodeLegacyJournal, decodePlanSummary, decodeReclaimPlan,
   decodeReclaimProgress, decodeRemovalPlan, decodeRemovalProgress, decodeWindowsJournal, journalRecordsDeletion, planDigest, type TreeEvidence,
 } from "../../src/contracts/maintenance.ts";
 
@@ -232,20 +232,15 @@ describe("platform journals", () => {
 });
 
 describe("host summaries", () => {
-  test("any plan kind; progress by digest or plan", () => {
+  test("any plan kind", () => {
     const plan = sealed({ version: 1, id, items: [{ status: "ready", evidence: { bytes: 7 } }, { status: "kept" }, { status: "deferred" }] });
-    expect(decodePlanSummary(plan, id)).toEqual({ id, digest: plan.digest, ready: 1, bytes: 7, kept: 1, deferred: 1 });
+    expect(decodePlanSummary(plan, id)).toEqual({ id, digest: plan.digest, ready: 1, bytes: 7, kept: 1, deferred: 1, reasons: [] });
+    // Why nothing (or less) can be processed: grouped, most frequent first, ready items never counted.
+    const why = sealed({ version: 1, id, items: [{ status: "ready", reason: "ignored" }, { status: "deferred", reason: "task-owner-live" },
+      { status: "kept", reason: "仍被引用" }, { status: "deferred", reason: "task-owner-live" }] });
+    expect(decodePlanSummary(why, id).reasons).toEqual([{ reason: "task-owner-live", count: 2 }, { reason: "仍被引用", count: 1 }]);
     expect(failure(() => decodePlanSummary({ ...plan, items: [] }, id)).message).toBe("清单摘要或条目无效：digest");
     expect(failure(() => decodePlanSummary(sealed({ version: 1, id, items: [{ status: "ready", evidence: null }] }), id)).message)
       .toBe("清单摘要或条目无效：items[0].evidence");
-    const outcomes = { 0: { status: "removed", bytes: 7 }, 1: { status: "missing", bytes: 0 }, 2: { status: "removed", bytes: 0, finishing: true } };
-    // A finishing outcome is counted on its own, never as a removal of this list.
-    expect(decodeProgressSummary({ version: 1, plan: plan.digest, outcomes }, plan.digest, "removed"))
-      .toEqual({ done: 1, bytes: 7, finishing: 1, kept: 0, deferred: 0, failed: 0, missing: 1 });
-    for (const bad of [{ status: "removed", bytes: 5, finishing: true }, { status: "deferred", bytes: 0, finishing: true }, { status: "removed", bytes: 0, finishing: 1 }]) {
-      expect(failure(() => decodeProgressSummary({ version: 1, plan: plan.digest, outcomes: { 0: bad } }, plan.digest, "removed")).message).toBe("清单结果无效");
-    }
-    expect(failure(() => decodeProgressSummary({ version: 1, digest: "b".repeat(64), outcomes }, plan.digest, "removed")).message).toBe("结果与清单不符");
-    expect(failure(() => decodeProgressSummary({ version: 1, digest: plan.digest, outcomes }, plan.digest, "archived")).message).toBe("清单结果无效");
   });
 });

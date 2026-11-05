@@ -28,6 +28,13 @@ const commandHelp = [...SUPPORTED_COMMANDS]
 export const HELP_TEXT = `可用指令（群里需 @机器人，@ 放在指令前后均可；单聊直接发送。指令以 / 开头，大小写不敏感）：
 ${commandHelp}
 
+回复推送时（先点推送卡片上的「回复」；群里同样需 @机器人）：
+/完成   提交回复，和点卡片上的「已回复」一样
+/取消   放弃这次还没提交的回复
+
+推送管理员在群里：
+/登记群 群名   登记这个群，推送人之后可以按群名推送到群
+
 提示：你在每个群和单聊里的消息分别按顺序处理；/stop 不会撤回已发出的内容。回复没发出去时机器人会自动重发。`;
 
 export function unknownCommandText(content: string): string {

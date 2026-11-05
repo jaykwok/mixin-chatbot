@@ -80,22 +80,12 @@ record_cases() {
     SERVICE_USER=1000:1000 SERVICE_USER_SOURCE=container
     check write write_service_user_record "$base/written"
     result write-tmp-left "$([ -e "$base/written/service-user.tmp" ] && echo yes || echo no)"
-    SERVICE_USER='' SERVICE_USER_SOURCE=''
-    check read-written read_service_user_record "$base/written"
-    result read-written-value "$SERVICE_USER|$SERVICE_USER_SOURCE"
     # Values that could not be read back are refused before anything is written.
     SERVICE_USER=appuser SERVICE_USER_SOURCE=container
     check write-bad-user write_service_user_record "$base/bad-user"
     SERVICE_USER=1000:1000 SERVICE_USER_SOURCE=guessed
     check write-bad-source write_service_user_record "$base/bad-source"
     result refused-left "$(find "$base/bad-user" "$base/bad-source" -mindepth 1 | wc -l | tr -d ' ')"
-    # Each prepared directory under read/ is read in turn; a refused read leaves nothing behind.
-    for dir in "$base"/read/*/; do
-        dir="${dir%/}"
-        SERVICE_USER=stale SERVICE_USER_SOURCE=stale
-        check "read-${dir##*/}" read_service_user_record "$dir"
-        result "left-${dir##*/}" "$SERVICE_USER|$SERVICE_USER_SOURCE"
-    done
 }
 
 identity_cases() {
@@ -185,7 +175,6 @@ container_cases() {
     owner 1234:1234
     : > "$fixture/calls"
     check validate-default validate_model_configuration
-    check validate-pinned validate_model_configuration "sha256:$(printf 'c%.0s' {1..64})" 1000:1000
     owner ''
     check validate-unreadable validate_model_configuration
     result validate-runs "$(grep '^run ' "$fixture/calls" | sed "s#$PROJECT_DIR#<p>#g" | tr '\n' ';')"

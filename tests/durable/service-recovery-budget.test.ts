@@ -1,8 +1,8 @@
 import { afterAll, expect, test } from "bun:test";
 import { join } from "node:path";
-import { Type } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { defineExtension, type Extension, wrapTool } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import { pendingDeliveries } from "../../src/durable/records.ts";
 import { DurableService, type DurableServiceOptions } from "../../src/durable/service.ts";
 import { fauxModels } from "../helpers/durable.ts";
@@ -38,7 +38,7 @@ function safeTools() {
   const extensions = (scope: Scope) => {
     const group = scope.kind === "group" ? scope.groupId : "direct";
     const extension = defineExtension({ name: "test.safe-tool", tools: [{ name: "safe_wait",
-    description: "A synthetic cancellable safe read.", parameters: Type.Object({}), replay: "safe",
+    description: "A synthetic cancellable safe read.", parameters: obj({}, { open: true }), replay: "safe",
     async execute(_args, api, context) {
       const count = counts[phase]!; count.calls.push(group); count.active++; count.peak = Math.max(count.peak, count.active);
       const key = `${group}:${api.callId}`;

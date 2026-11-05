@@ -4,20 +4,28 @@
   "includeEntryExports": true,
   "entry": [
     "src/server/index.ts!",
-    "src/core/process-supervisor.ts!",
+    "scripts/lib/process-supervisor.ts!",
     "src/durable/sqlite-worker.ts!",
     "src/agent/modules/*/scripts/*.ts!",
-    "scripts/config/{configure,configure-relay,runtime-settings,validate-models}.ts!",
-    "scripts/ops/{*,tui/preview}.ts!",
+    "scripts/config/{configure,configure-relay,configuration-check,configuration-apply,configuration-install,directory-scope,directory-query,runtime-apply,runtime-settings,validate-models}.ts!",
+    "scripts/ops/{*,console/main,console/executor,console/read-cli,console/check-plan}.ts!",
+    "scripts/ops/core/cli.ts!",
+    "scripts/lib/confirmed-transaction.ts!",
+    "ui/console/src/main.tsx!",
     "scripts/runtime/*.ts!",
-    "tests/**/*.test.ts",
+    "tests/**/*.test.{ts,tsx}",
     "tests/helpers/document-work-integration.ts",
     "tests/helpers/document-durable-integration.ts",
-    "tests/helpers/document-office-integration.ts"
+    "tests/helpers/document-office-integration.ts",
+    "tests/helpers/console-ops-fixture.ts",
+    "tests/helpers/console-task-racer.ts",
+    "tests/helpers/console-screenshots.ts",
+    "tests/helpers/console-screenshots-demo.ts"
   ],
   "project": [
     "src/**/*.ts!",
     "scripts/{config,ops,lib,runtime}/**/*.ts!",
-    "tests/**/*.ts"
+    "ui/console/src/**/*.{ts,tsx}!",
+    "tests/**/*.{ts,tsx}"
   ]
 }

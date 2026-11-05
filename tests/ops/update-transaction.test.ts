@@ -87,7 +87,7 @@ test.skipIf(process.platform !== "linux")("Linux update holds its real flock thr
           else if (mode === "signal-int") process.kill(updatePid, "SIGINT");
           else {
             const competitor = await run(["bash", launcher], { FIXTURE_WORK: work, FIXTURE_MARKERS: markers, FIXTURE_MODE: mode });
-            expect(competitor.code).toBe(1); expect(competitor.text).toContain("另一个部署或升级");
+            expect(competitor.code).toBe(1); expect(competitor.text).toContain("另一个部署、升级或维护操作正在进行");
             await writeFile(join(markers, "release"), "go");
           }
         }

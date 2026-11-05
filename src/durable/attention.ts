@@ -1,10 +1,10 @@
 import { scopeLabel, type Scope } from "../core/layout.ts";
 
 /**
- * Events since this process started that an operator should look at. `/health` exposes them for the doctor and the TUI
+ * Events since this process started that an operator should look at. `/health` exposes them for the doctor and the console
  * overview; the log has the details. Only counts, the time and the space label: no phones, no contents.
  */
-export const ATTENTION_KINDS = ["parked", "faulted", "deliveryAbandoned", "notSent", "statsRegressed"] as const;
+export const ATTENTION_KINDS = ["interrupted", "faulted", "deliveryAbandoned", "notSent", "statsRegressed"] as const;
 export type AttentionKind = typeof ATTENTION_KINDS[number];
 export interface AttentionEntry { count: number; lastAt: number; space: string }
 export type AttentionStatus = Partial<Record<AttentionKind, AttentionEntry>>;

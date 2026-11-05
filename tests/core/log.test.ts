@@ -4,7 +4,7 @@ import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { LOG_BACKUP_COUNT, LOG_FILE, LOG_MAX_BYTES } from "../../src/core/config.ts";
+import { LOG_BACKUP_COUNT, LOG_FILE, LOG_MAX_BYTES } from "../../src/core/log.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 describe("log sanitization", () => {
@@ -20,7 +20,8 @@ test("log rotation retains only the configured backups without accumulating an a
   const module = fileURLToPath(new URL("../../src/core/log.ts", import.meta.url));
   const script = join(fixture.root, "rotate.ts");
   await writeFile(script, `import {log} from ${JSON.stringify(module)};
-    import {writeFileSync} from 'node:fs';
+    import {mkdirSync, writeFileSync} from 'node:fs';
+    mkdirSync('logs', {recursive: true});
     for(let i=0;i<${LOG_BACKUP_COUNT + 3};i++) {
       writeFileSync(${JSON.stringify(join("logs", LOG_FILE))},Buffer.alloc(${LOG_MAX_BYTES},65+i));
       log.info('rotation '+i);
@@ -37,6 +38,28 @@ test("log rotation retains only the configured backups without accumulating an a
     expect(bytes).toBeLessThanOrEqual(LOG_MAX_BYTES * (LOG_BACKUP_COUNT + 1));
     expect(await readFile(join(fixture.root, "logs", LOG_FILE), "utf8")).toContain(`rotation ${LOG_BACKUP_COUNT + 2}`);
     expect(existsSync(join(fixture.root, "backup/rm"))).toBe(false);
+  } finally { clearTimeout(timer); child.kill(); await child.exited; await fixture.cleanup(); }
+}, 20000);
+
+test("importing the logger has no side effects; a tool can keep its log lines off stdout and out of the project", async () => {
+  const fixture = await tempFixture("log-sink-");
+  const module = fileURLToPath(new URL("../../src/core/log.ts", import.meta.url));
+  const script = join(fixture.root, "sink.ts");
+  await writeFile(script, `import {configureLog, log} from ${JSON.stringify(module)};
+    import {existsSync} from 'node:fs';
+    if (existsSync('logs')) throw new Error('logs created at import');
+    configureLog({ file: null, stream: 'stderr' });
+    log.warn('fixture line');
+    if (existsSync('logs')) throw new Error('logs created without a file');
+    process.stdout.write('result');`);
+  const child = Bun.spawn([process.execPath, script], { cwd: fixture.root, stdout: "pipe", stderr: "pipe", windowsHide: true });
+  const timer = setTimeout(() => child.kill(), 15000);
+  try {
+    const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code, out + err).toBe(0);
+    expect(out).toBe("result");
+    expect(err).toContain("WARN - fixture line");
+    expect(existsSync(join(fixture.root, "logs"))).toBe(false);
   } finally { clearTimeout(timer); child.kill(); await child.exited; await fixture.cleanup(); }
 }, 20000);
 

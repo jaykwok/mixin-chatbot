@@ -127,7 +127,7 @@ test("a file followed at once by a question is bound to it; a /status and a refu
     await service.admit(ask(out, ALICE, "first question"));
     await until(() => m.prompts.length === 1, "the first run");
     const file = attachment(out, ALICE, { fileId: upload("hello attachment", "a.txt"), size: 16 });
-    expect(await service.attach(file)).toEqual({ status: "accepted" });
+    expect(await service.attach(file)).toMatchObject({ status: "accepted", attachment: expect.any(String) });
     // The queue holds one message: this one is refused and must leave the attachment for the next.
     expect((await service.admit(ask(out, ALICE, "refused question"))).status).toBe("full");
     expect(await service.control(ask(out, ALICE, "/status"))).toContain("待处理附件：1 个");
@@ -201,7 +201,7 @@ test("no project size limit: a file larger than the event declared lands whole; 
     expect(m.prompts[0]).toContain("- 文件「big.bin」，31.0 MiB");
     expect(m.prompts[0]).toContain("- 文件「third.txt」，1 B");
     // Consumed: room again.
-    expect(await service.attach(attachment(out, ALICE, { fileId: upload("t"), name: "again.txt" }))).toEqual({ status: "accepted" });
+    expect(await service.attach(attachment(out, ALICE, { fileId: upload("t"), name: "again.txt" }))).toMatchObject({ status: "accepted", attachment: expect.any(String) });
   } finally { await service.close(); }
 });
 
@@ -296,11 +296,40 @@ test("an attachment whose registration commits after a /clear that arrived later
     await entered.promise;
     await service.control(ask(out, ALICE, "/clear"));
     release.resolve();
-    expect(await registering).toEqual({ status: "accepted" });
+    expect(await registering).toMatchObject({ status: "accepted", attachment: expect.any(String) });
     expect((await stateOf(service, file.reply.msgUid))!.state).toBe("void");
     await Bun.sleep(100);
     expect(downloads(fileId)).toBe(0);
     expect(notices(out).some(text => text.startsWith("已收到"))).toBe(false);
+  } finally { release.resolve(); spy.mockRestore(); await service.close(); }
+});
+
+test("an attachment whose registration commits after a /stop that arrived later stays for the next message", async () => {
+  const where = root(), m = model(), out = recordingOutbound();
+  const { service } = open(where, m, out.outbound);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const acquire = SpaceHarnesses.prototype.acquire;
+  let armed = false;
+  const { spyOn } = await import("bun:test");
+  const spy = spyOn(SpaceHarnesses.prototype, "acquire").mockImplementation(async function (this: SpaceHarnesses, scope) {
+    if (armed && /\bat (?:\S+\.)?attach \(/.test(new Error().stack ?? "")) { armed = false; entered.resolve(); await release.promise; }
+    return acquire.call(this, scope);
+  });
+  try {
+    await service.admit(ask(out, ALICE, "warm-up"));
+    await until(() => replyTexts(out.sent).length === 1, "the warm-up");
+    const file = attachment(out, ALICE, { fileId: upload("late", "late.txt") });
+    armed = true;
+    const registering = service.attach(file);
+    await entered.promise;
+    await service.control(ask(out, ALICE, "/stop"));
+    release.resolve();
+    await registering;
+    await until(async () => (await stateOf(service, file.reply.msgUid))?.state === "ready", "the download");
+    expect(notices(out).some(text => text.startsWith("已收到"))).toBe(true);
+    await service.admit(ask(out, ALICE, "use it"));
+    await until(() => m.prompts.length === 2, "the next message");
+    expect(m.prompts[1]).toContain("late.txt");
   } finally { release.resolve(); spy.mockRestore(); await service.close(); }
 });
 

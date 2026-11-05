@@ -1,13 +1,15 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import * as data from "../../scripts/ops/tui/data.ts";
-import { opsCommand, type Platform } from "../../scripts/ops/tui/platform.ts";
-import { createTheme } from "../../scripts/ops/tui/render/theme.ts";
-import type { AppApi, ConfirmSpec } from "../../scripts/ops/tui/view.ts";
-import { MaintainView } from "../../scripts/ops/tui/views/maintain.ts";
+import { opsCommand, type Platform } from "../../scripts/ops/shared/platform.ts";
+import { upgradeRoutes } from "../../scripts/ops/console/upgrade-routes.ts";
+import { operationArgs } from "../../scripts/ops/console/operations.ts";
+import { operationPreparer } from "../../scripts/ops/console/prepare-operation.ts";
+import { Views } from "../../scripts/ops/console/views.ts";
+import type { RouteContext } from "../../scripts/ops/console/routes.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { opsShellFunctions } from "../helpers/ops-shell.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const posix = (value: string) => value.replaceAll(String.fromCharCode(92), "/");
@@ -21,9 +23,8 @@ async function execute(command: string[], cwd: string) {
 }
 
 for (const platform of ["linux", "windows"] as Platform[]) test.skipIf(platform === "windows" ? process.platform !== "win32" : process.platform !== "linux")(
-  `${platform}: TUI dispatch retains confirmed SHA after origin/main changes; plain CLI still fetches latest`, async () => {
+  `${platform}: console dispatch retains confirmed SHA after origin/main changes; plain CLI still fetches latest`, async () => {
     const fixture = await tempFixture("upgrade-target-");
-    const spies: { mockRestore(): void }[] = [];
     try {
       const repo = join(fixture.root, "repo"), marker = join(fixture.root, "target"), fetches = join(fixture.root, "fetches");
       await mkdir(repo);
@@ -33,6 +34,8 @@ for (const platform of ["linux", "windows"] as Platform[]) test.skipIf(platform 
         return result.output.trim();
       };
       await git("init", "-b", "main"); await git("config", "user.name", "Fixture"); await git("config", "user.email", "fixture@example.invalid");
+      await mkdir(join(repo, "scripts/lib"), { recursive: true });
+      await writeFile(join(repo, "scripts/lib/console-lifecycle.json"), '{"protocol":"mixin-console-lifecycle","version":1}');
       const commits: string[] = [];
       for (const value of ["original", "confirmed", "later"]) {
         await writeFile(join(repo, "version.txt"), value); await git("add", "."); await git("commit", "--quiet", "-m", value);
@@ -45,7 +48,8 @@ for (const platform of ["linux", "windows"] as Platform[]) test.skipIf(platform 
       const source = (await readFile(join(project, sourcePath), "utf8")).replaceAll("\r\n", "\n");
       const script = join(fixture.root, platform === "windows" ? "dispatch.ps1" : "dispatch.sh");
       if (platform === "linux") {
-        const start = source.indexOf("update() {"), end = source.indexOf("\n}\n", start);
+        const start = source.indexOf("\nupdate() {") + 1, end = source.indexOf("\n}\n", start);
+        expect(start).toBeGreaterThan(0);
         expect(end).toBeGreaterThan(start);
         await writeFile(script, `#!/usr/bin/env bash
 set -euo pipefail
@@ -62,6 +66,7 @@ remove_upgrade_stage() { :; }; acquire_deploy_lock() { :; }; require_git_checkou
 P() { :; }; ER() { printf '%s\\n' "$*" >&2; }; WA() { :; }; OK() { :; }; after_upgrade() { :; }
 run_target_upgrader() { printf '%s' "$1" > ${quote(marker)}; }
 docker() { printf '%s\\n' 'real Docker forbidden' >&2; return 97; }
+${await opsShellFunctions("core_reported", "finish_update", "finish_lifecycle_result")}
 ${source.slice(start, end + 3)}
 shift
 update "$@"
@@ -74,7 +79,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $Project = ${quotePS(repo)}
 function Start-OperationLog {}; function Stop-OperationLog {}; function Set-OperationStage {}; function Write-OperationEvent {}
-function Write-OperationFailure {}; function IsAdmin { $true }; function Get-GitPath { 'git' }; function Get-BunPath { 'synthetic-bun' }
+function Write-OperationFailure {}; function Test-Administrator { $true }; function Get-GitPath { 'git' }; function Get-BunPath { 'synthetic-bun' }
 function Err($text) { Write-Host $text }; function Done {}; function Warn {}; function Remove-UpgradeStage {}
 function Invoke-GitCapture([string[]]$Arguments) {
     if ($Arguments[0] -eq 'archive') {
@@ -106,28 +111,25 @@ Invoke-Update -ConfirmedTarget $request.Target | Out-Null
           : [process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : "bash", posix(script), ...command.args.slice(1)];
         return execute(cmd, fixture.root);
       };
-      const gitState: data.GitState = { sha: original, subject: "original", branch: "main", dirty: false, ahead: 0, behind: 1,
-        incoming: [{ sha: confirmed.slice(0, 7), subject: "confirmed" }] };
-      spies.push(spyOn(data, "loadGit").mockResolvedValue(gitState));
-      spies.push(spyOn(data, "loadUpgrade").mockResolvedValue({ git: gitState, targetSha: confirmed }));
-      let confirmation: ConfirmSpec | undefined;
-      const app: AppApi = {
-        deployment: { platform, runtime: platform === "windows" ? "scheduled-task" : "docker", port: 1011,
-          dataRoot: fixture.root, workspaceRoot: "" },
-        theme: createTheme("none"), redraw() {}, go() {}, toast() {}, async ask() { return null; }, async choose() { return null; },
-        async dialog() { throw new Error("Unexpected dialog"); },
-        async confirm(spec) { confirmation = spec; await git("update-ref", "refs/remotes/origin/main", later); return true; }, async openFile() {},
-        async run() { throw new Error("Unexpected non-interactive dispatch"); },
-        async runInteractive(_title, args) {
-          expect(args).toEqual(["update", confirmed]);
-          const result = await dispatch(args); expect(result.code, result.output).toBe(0); return result.code;
-        },
-      };
-      const view = new MaintainView();
-      await view.refresh(app); await view.onKey({ name: "update" }, app); await view["checkUpgrade"](app); await view.onKey({ name: "enter" }, app);
-      view.onLeave();
-      expect(confirmation?.subject).toContain(confirmed.slice(0, 7));
-      expect(await readFile(marker, "utf8")).toBe(confirmed); expect(await readFile(fetches, "utf8")).toBe("");
+      let checkedFetches = 0;
+      const routes = upgradeRoutes(repo, async argv => {
+        // The remote response is local synthetic Git data; every other check uses the actual repository.
+        if (argv[3] === "fetch") { checkedFetches++; return { code: 0, stdout: "", stderr: "" }; }
+        const result = await execute(argv, repo);
+        return { code: result.code, stdout: result.output, stderr: "" };
+      });
+      const context: RouteContext = { body: {}, signal: new AbortController().signal, session: {} as RouteContext["session"] };
+      const checked = await routes["POST /api/lifecycle/check-update"]!.run(context) as { target: string };
+      expect(checked.target).toBe(confirmed); expect(checkedFetches).toBe(1);
+      const params = await operationPreparer(repo, new Views())("update", {
+        target: checked.target, switchMain: true, cleanup: "apply", directory: "all",
+      }, "fixture");
+      await git("update-ref", "refs/remotes/origin/main", later);
+      const args = operationArgs("update", params);
+      expect(args).toEqual(["update", confirmed]);
+      const result = await dispatch(args); expect(result.code, result.output).toBe(0);
+      expect(await readFile(marker, "utf8"), result.output).toBe(confirmed); expect(await readFile(fetches, "utf8")).toBe("");
+      expect(checkedFetches).toBe(1);
       const ordinary = await dispatch(["update"]);
       expect(ordinary.code, ordinary.output).toBe(0); expect(await readFile(marker, "utf8")).toBe(later);
       expect(await readFile(fetches, "utf8")).toBe("fetch");
@@ -139,6 +141,6 @@ Invoke-Update -ConfirmedTarget $request.Target | Out-Null
       const pending = await dispatch(["update", confirmed]);
       expect(pending.output).toContain("预览后出现未完成的事务"); expect(await readFile(marker, "utf8")).toBe("");
       expect(await git("rev-parse", "HEAD")).toBe(original); expect(await readFile(join(repo, "version.txt"), "utf8")).toBe("original");
-    } finally { for (const spy of spies) spy.mockRestore(); await fixture.cleanup(); }
+    } finally { await fixture.cleanup(); }
   }, 120000,
 );

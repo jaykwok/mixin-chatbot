@@ -1,23 +1,24 @@
 // Own the service lease, the app bot's event stream, the Durable message service (src/durable/service.ts) and the single
 // bounded shutdown sequence.
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { randomBytes, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { CacheRetention } from "@earendil-works/pi-ai";
 import { createApp } from "./http-app.ts";
 import { application } from "../core/lifecycle.ts";
-import { acquireLease, archiveFile } from "../core/maintenance.ts";
-import { HOST, LAYOUT, MODEL_IDLE_TIMEOUT_MS, MODEL_RESPONSE_TIMEOUT_MS, PORT, MAINTENANCE_INTERVAL_MS,
+import { acquireLease } from "../core/maintenance.ts";
+import { ACKNOWLEDGE_IDLE_MS, HOST, LAYOUT, MODEL_IDLE_TIMEOUT_MS, MODEL_RESPONSE_TIMEOUT_MS, PORT, MAINTENANCE_INTERVAL_MS,
   RUN_TIMEOUT_MS, SHUTDOWN_TIMEOUT_MS, CLOSEOUT_MS, DELIVERY_RESERVE_MS, FALLBACK_SEND_MS } from "../core/config.ts";
-import { APP_BOT_CONFIG_PATH, RUNTIME_DIR, STATE_DIR } from "../core/storage.ts";
+import { APP_BOT_CONFIG_PATH, RUNTIME_DIR, STATE_DATABASE_PATH, STATE_DIR } from "../core/storage.ts";
 import { log } from "../core/log.ts";
 import { stateDatabase } from "../core/state.ts";
 import { getRelayConfig, initializeRelay, sweepExpiredRelayObjects } from "../integrations/relay.ts";
 import { PlatformClient } from "../integrations/open-platform/client.ts";
 import { readAppBotConfig } from "../integrations/open-platform/config.ts";
 import { DirectoryClient } from "../integrations/open-platform/directory.ts";
-import { IdentityDirectory } from "../integrations/open-platform/identity-directory.ts";
-import { readDirectoryScope, sameScope, writeDirectoryScope } from "../integrations/open-platform/directory-scope.ts";
+import { IdentityDirectory, type ScanTrigger } from "../integrations/open-platform/identity-directory.ts";
+import { readDirectoryScope, sameScope, scopeChoiceHint, scopeDepartments } from "../integrations/open-platform/directory-scope.ts";
+import { writeDirectoryScope } from "../integrations/open-platform/directory-scope-write.ts";
 import { MessageSender } from "../integrations/open-platform/messages.ts";
 import { StreamConnection } from "../integrations/open-platform/stream.ts";
 import { platformOutbound } from "../durable/outbound.ts";
@@ -28,15 +29,21 @@ import { runtimeSetting } from "../core/runtime-config.ts";
 import { RUNTIME_DEFAULTS } from "../core/runtime-schema.ts";
 import { openModelSelection } from "../durable/models.ts";
 import { DurableService } from "../durable/service.ts";
+import { slowSqlLog, watchSql } from "../durable/sql-timing.ts";
+import { ReadChannel } from "../durable/read/client.ts";
 import { codemodeWorkers } from "../durable/codemode/workers.ts";
 import { readAuxiliaryConfig } from "../core/auxiliary-config.ts";
 import { readMcpConfig } from "../core/mcp-config.ts";
 import { McpTools } from "../integrations/mcp.ts";
 import { configuredRootlessTasks } from "../core/task-backend.ts";
+import { PushService } from "../push/service.ts";
+import { PushStore } from "../push/store.ts";
+import { PUSH_EXTENSION, pushExtension } from "../push/tools.ts";
 
 import { applicationBinding, assertDataVersion } from "../core/data-version.ts";
 import { APP_BUILD, APP_VERSION, DATA_VERSION } from "../core/version.ts";
 import { validateCurrentData } from "../core/data-validation.ts";
+import { openOperationLog, operationError } from "../../scripts/lib/operation-log.ts";
 
 let stopping = false;
 let server: ReturnType<typeof Bun.serve> | undefined;
@@ -48,12 +55,25 @@ let messages: DurableService | undefined;
 let mcp: McpTools | undefined;
 let platform: PlatformClient | undefined;
 let stream: StreamConnection | undefined;
+let reads: ReadChannel | undefined;
 let router: InboundRouter | undefined;
+let push: PushService | undefined;
 let dailyScan: ReturnType<typeof setTimeout> | undefined;
 const instanceFile = join(STATE_DIR, "instance.json");
 const adminToken = randomBytes(32).toString("hex");
 const instanceId = randomUUID();
-const startedAt = Date.now() - process.uptime() * 1000;
+const startedAt = Math.round(Date.now() - process.uptime() * 1000);
+
+/**
+ * Only this process's own record. It names a live process and carries the admin token: nothing to keep once it stops,
+ * and archiving it put one more file into backup/rm at every stop.
+ */
+async function removeInstanceFile(): Promise<void> {
+  let ours = false;
+  try { ours = JSON.parse(await readFile(instanceFile, "utf8"))?.instanceId === instanceId; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; if (!(error instanceof SyntaxError)) throw error; }
+  if (ours) await rm(instanceFile, { force: true });
+}
 
 async function shutdown(reason: string, code = 0): Promise<void> {
   if (stopping) return;
@@ -74,12 +94,12 @@ async function shutdown(reason: string, code = 0): Promise<void> {
   }, SHUTDOWN_TIMEOUT_MS);
   try {
     const results = await Promise.allSettled([
-      server?.stop(), streamStopped, router?.drain(), messages?.close(), mcp?.close(), application.drain(),
+      server?.stop(), streamStopped, router?.drain(), push?.close(), messages?.close(), mcp?.close(), reads?.close(), application.drain(),
     ]);
     if (results.some((result) => result.status === "rejected")) code = 1;
     await codemodeWorkers.drain();
     if (releaseLease) {
-      await archiveFile(instanceFile);
+      await removeInstanceFile();
       await releaseLease();
     }
   } catch (error) {
@@ -112,22 +132,29 @@ try {
   const outbound = platformOutbound(platform, new MessageSender(platform));
   const directoryClient = new DirectoryClient(platform);
   const directory = new IdentityDirectory(stateDatabase(), applicationBinding(appBot), { scope: readDirectoryScope() });
+  // The host console's reads: a thread and read-only connections of their own, never the service's SQL queue.
+  reads = new ReadChannel({ conversations: resolve(LAYOUT.conversations), state: resolve(STATE_DATABASE_PATH) });
   const app = createApp({ isStopping: () => stopping, adminToken, instanceId, startedAt, shutdown: () => void shutdown("local control"),
+    read: reads,
     health: () => ({ stream: stream?.status(), directory: directory.status(), attention: messages?.attention() }),
-    confirmRevocations: (scanId) => directory.confirmRevocations(scanId, directoryClient, application.signal),
     listDepartments: (parent, signal) => directoryClient.childDepartments(parent, AbortSignal.any([signal, application.signal])),
     describeDepartments: (ids, signal) => directoryClient.describe(ids, AbortSignal.any([signal, application.signal])),
-    changeScope: async (departments, signal) => {
-      // The same set again (order aside) neither rewrites the file nor restarts a full scan.
-      if (sameScope(directory.status().scope, departments)) return "unchanged";
+    scopePaths: () => directory.scopePaths(),
+    changeScope: async (scope, signal) => {
+      // The saved scope again, already in effect, neither rewrites the file nor rescans.
+      if (directory.settled && directory.scope && sameScope(directory.scope, scope)) return { status: "unchanged" };
       // Every department must exist and be visible to the app before anything is saved; a caller that went away saves nothing.
       const checking = AbortSignal.any([signal, application.signal]);
-      const checked = await directoryClient.verify(departments ?? [], checking);
+      const departments = scopeDepartments(scope);
+      const checked = departments ? await directoryClient.verify([...departments], checking) : [];
       checking.throwIfAborted();
-      await writeDirectoryScope(departments);
-      await directory.changeScope(departments, directoryClient, application.signal);
-      return checked;
-    } });
+      const status = await directory.changeScope(scope, directoryClient, application.signal, writeDirectoryScope);
+      return status === "unchanged" ? { status } : { status, departments: checked };
+    },
+    // The server listens only once everything below exists.
+    push: { settings: () => push!.settings(), saveSettings: roles => push!.saveSettings(roles), list: query => push!.list(query), detail: id => push!.detail(id),
+      remind: (id, members) => push!.remind(id, members), setCc: (id, people) => push!.setCc(id, people), remove: id => push!.remove(id),
+      package: (id, member, signal) => push!.package(id, member, signal), groups: () => push!.groups(), saveGroup: (id, change) => push!.saveGroup(id, change) } });
   // One model for the instance, checked before any message is accepted; the Pi model catalogue cache lives in data/runtime.
   await mkdir(RUNTIME_DIR, { recursive: true });
   const retention = runtimeSetting("PI_CACHE_RETENTION") as CacheRetention | undefined;
@@ -145,14 +172,25 @@ try {
   const documentEnv = runtimeSetting("BOT_DOCUMENT_ENV");
   const mcpConfig = readMcpConfig();
   if (mcpConfig?.servers.length) { mcp = new McpTools(mcpConfig); await mcp.initialize(application.signal); }
+  // Slow requests of the service's SQL thread and long transactions, with where the time went (process-wide, once).
+  watchSql(slowSqlLog(line => log.warn(line)));
+  const pushes = push = new PushService({ store: new PushStore(stateDatabase()), directory, outbound, layout: LAYOUT, relay: getRelayConfig(),
+    signal: application.signal, onReport: (error) => log.error("推送后台错误: " + String(error)) });
+  const venvDir = documentEnv ? resolve(documentEnv) : undefined;
   messages = new DurableService({
     layout: LAYOUT, selection, modules, relay: getRelayConfig(), outbound,
+    // Pushes start from the direct chat, and only pushers' conversations get the push tools.
+    memberExtensions: {
+      install: scope => scope.kind === "direct" ? [pushExtension(pushes, { layout: LAYOUT, ...(venvDir ? { venvDir } : {}) })] : [],
+      selected: (scope, phone) => scope.kind === "direct" && pushes.isPusher(phone) ? [PUSH_EXTENSION] : [],
+    },
     attachments: { source: (fileId, destination, options) => downloadFile(client, fileId, destination, options) },
-    ...(documentEnv ? { venvDir: resolve(documentEnv) } : {}),
+    ...(venvDir ? { venvDir } : {}),
     auxiliary: readAuxiliaryConfig(),
     mcp,
     limits: { runTimeoutMs: RUN_TIMEOUT_MS, modelIdleMs: MODEL_IDLE_TIMEOUT_MS, modelResponseMs: MODEL_RESPONSE_TIMEOUT_MS },
     closeout: { closeoutMs: CLOSEOUT_MS, reserveMs: DELIVERY_RESERVE_MS, fallbackMs: FALLBACK_SEND_MS },
+    ...(ACKNOWLEDGE_IDLE_MS > 0 ? { acknowledge: { idleMs: ACKNOWLEDGE_IDLE_MS } } : {}),
     onReport: (error) => log.error("消息服务后台错误: " + String(error)),
     onFatal: (error) => {
       log.error("会话存储发生无法确认的提交失败，立即退出，等待监督器重启: " + String(error) + "; cause: " + String(error.cause));
@@ -165,8 +203,11 @@ try {
   if (resumed.length) log.info(`恢复 ${resumed.length} 个空间的未完成工作`);
   application.signal.throwIfAborted();
   const service = messages;
+  // Card sends, reminders, deadlines, summaries and conversation notes pick up from the state database.
+  pushes.bind(service);
+  pushes.start();
   router = new InboundRouter({
-    service, directory, outbound, signal: application.signal,
+    service, push: pushes, directory, outbound, signal: application.signal,
     onUnknown: () => { directory.requestScan(directoryClient, application.signal); },
     onReport: (error) => log.error("入站处理失败: " + String(error)),
   });
@@ -174,14 +215,17 @@ try {
   // One service stream per app: this process holds it from here until shutdown.
   stream = new StreamConnection(platform, { onEvent: (event) => inbound.handle(event) });
   stream.start();
-  const scan = (trigger: "initial" | "daily") => application.track(directory.scan(trigger, directoryClient, application.signal))
+  const scan = (trigger: ScanTrigger) => application.track(directory.scan(trigger, directoryClient, application.signal))
     .catch(error => { if (!application.signal.aborted) log.error(`通讯录同步失败: ${String(error)}`); });
-  if (directory.initializing) void scan("initial");
-  // The daily scan runs at 03:00 local time.
+  // The saved scope not yet in effect (first deployment, an upgrade from 1.0.x, or an apply a restart interrupted): sync now.
+  const startup = directory.startupTrigger();
+  if (startup) void scan(startup);
+  if (directory.unset) log.warn(`还没有设置通讯录同步范围（data/config/directory.json），不同步通讯录；${scopeChoiceHint()}`);
+  // The daily scan runs at 03:00 local time; none while no scope is saved.
   const scheduleDaily = () => {
     const next = new Date(); next.setHours(3, 0, 0, 0);
     if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
-    dailyScan = setTimeout(() => { void scan("daily"); scheduleDaily(); }, next.getTime() - Date.now());
+    dailyScan = setTimeout(() => { if (!directory.unset) void scan("daily"); scheduleDaily(); }, next.getTime() - Date.now());
   };
   scheduleDaily();
   server = Bun.serve({ hostname: HOST, port: PORT, idleTimeout: 15, fetch: app.fetch });
@@ -209,5 +253,7 @@ try {
   log.info(`服务启动完成，监听地址: ${HOST}:${PORT}；程序 v${APP_VERSION}${APP_BUILD ? ` 构建 ${APP_BUILD}` : ""}，数据格式 ${DATA_VERSION}`);
 } catch (error) {
   log.error("服务启动失败: " + String(error));
+  // As for a failure before this module loaded (index.ts): a deployment's readiness wait reports the startup log.
+  openOperationLog(process.cwd(), "startup").event("error", "startup", operationError(error));
   await shutdown("startup failure", 1);
 }

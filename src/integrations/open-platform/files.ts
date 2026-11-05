@@ -29,10 +29,33 @@ function abortReason(signal: AbortSignal | undefined, client: PlatformClient): u
   return signal?.aborted ? signal.reason : client.closingSignal.aborted ? client.closingSignal.reason : undefined;
 }
 
+/** 整个文件的 MD5（小写十六进制）；文件长度与登记的大小不符时失败。 */
+async function fileMd5(source: UploadSource, signal?: AbortSignal): Promise<string> {
+  const md5 = createHash("md5"), buffer = Buffer.alloc(Math.min(CHUNK_BYTES, Math.max(1, source.size)));
+  const file = await open(source.path, "r");
+  try {
+    let total = 0;
+    for (;;) {
+      signal?.throwIfAborted();
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, total);
+      if (bytesRead === 0) break;
+      md5.update(buffer.subarray(0, bytesRead));
+      total += bytesRead;
+      if (total > source.size) break;
+    }
+    if (total !== source.size) throw new PlatformRequestError("上传前文件大小已改变", "rejected");
+  } finally {
+    await file.close();
+  }
+  return md5.digest("hex");
+}
+
 /** 上传本地文件，返回发送消息用的 fileId（平台称 fileKey）。任何一步失败都会尝试中止本次上传。 */
 export async function uploadFile(client: PlatformClient, source: UploadSource, signal?: AbortSignal): Promise<string> {
+  // 初始化带上整个文件的 MD5：平台已有同样的文件时直接返回 fileKey（秒传），不再上传分片。
+  const hash = await fileMd5(source, signal);
   const init = await client.request("POST", "/open-apis/v1/files/upload/init", {
-    body: { fileName: source.fileName, fileSize: source.size, mimeType: source.mimeType, chunkSize: CHUNK_BYTES, category: 1 },
+    body: { fileName: source.fileName, fileSize: source.size, mimeType: source.mimeType, chunkSize: CHUNK_BYTES, category: 1, fileHash: hash },
     signal, label: "文件上传初始化",
   });
   const data = responseData(init);
@@ -70,8 +93,11 @@ export async function uploadFile(client: PlatformClient, source: UploadSource, s
     } finally {
       await file.close();
     }
+    // complete 的摘要须与 init 的一致（平台文档）；两次读到的内容不同说明文件在上传期间被改过。
+    const uploaded = md5.digest("hex");
+    if (uploaded !== hash) throw new PlatformRequestError("上传期间文件被改动", "rejected");
     const complete = await client.request("POST", `/open-apis/v1/files/upload/${encodeURIComponent(uploadId)}/complete`, {
-      body: { parts: done, fileHash: md5.digest("hex") }, signal, label: "文件上传完成",
+      body: { parts: done, fileHash: uploaded }, signal, label: "文件上传完成",
     });
     const fileKey = responseData(complete).fileKey;
     if (!accepted(complete) || typeof fileKey !== "string" || !fileKey)

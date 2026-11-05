@@ -10,6 +10,7 @@ import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
 import { scopeKey, type Scope } from "../core/layout.ts";
 import { isPathInside } from "../contracts/paths.ts";
 import { venvPythonPath } from "../agent/python-toolchain.ts";
+import { fromShellPath } from "../agent/tool-path.ts";
 import { runProcess, timedCommand } from "../core/process.ts";
 import { ProcessFailure } from "../../scripts/lib/process.ts";
 import { holdDirectory } from "../core/held-directory.ts";
@@ -177,7 +178,7 @@ export async function createMemberEnv(options: MemberEnvOptions): Promise<Execut
 
   const absolute = (path: string) => resolve(cwd, path);
   const methods: Partial<ExecutionEnv> = { id: node.id, cwd,
-    absolutePath: node.absolutePath.bind(node), joinPath: node.joinPath.bind(node),
+    absolutePath: (path, context) => node.absolutePath(fromShellPath(path), context), joinPath: node.joinPath.bind(node),
     cleanup: async () => {},
     exec: (command, execOptions, context) => executeMember(command, execOptions, context, options, callerEnvironment),
   };

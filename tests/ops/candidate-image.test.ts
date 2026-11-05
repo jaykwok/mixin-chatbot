@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseTransactionRecord } from "../../scripts/ops/tui/transaction.ts";
+import { parseCandidateRecord } from "../../scripts/ops/core/docker-deployment.ts";
+import { parseTransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 // The candidate image library (scripts/lib/candidate-image.sh) with Docker and the filesystem stubbed; the scenarios
@@ -39,75 +40,60 @@ const candidate = {
 };
 const serialize = (value: Record<string, string>) => Object.entries(value).map(([key, item]) => `${key}=${item}`).join("\n") + "\n";
 
-test.skipIf(!available)("候选镜像记录：写入前逐项校验再原子改名，读取拒绝缺失、重复、未知或不一致的内容", async () => {
-  const fixture = await tempFixture("candidate-record-");
-  const read = join(fixture.root, "record/read");
-  const { operation_id: _, ...missing } = candidate;
-  const records: Record<string, string> = {
-    valid: serialize(candidate),
-    "legacy-daemon-id": serialize({ ...candidate, daemon_id: "ABCD:EFGH:IJKL:MNOP:QRST:UVWX:YZ23:4567:ABCD:EFGH:IJKL:MNOP" }),
-    "workspace-sha256": serialize({ ...candidate, source: "workspace", target_sha: "c".repeat(64) }),
-    // A standalone deployment may build from an unpacked directory that is not a git repository; a commit build may not.
-    "workspace-no-commit": serialize({ ...candidate, source: "workspace", target_sha: "" }),
-    "commit-no-commit": serialize({ ...candidate, target_sha: "" }),
-    "no-final-newline": serialize(candidate).trimEnd(),
-    extra: serialize(candidate) + "note=1\n",
-    duplicate: serialize(candidate) + `image_id=sha256:${"c".repeat(64)}\n`,
-    missing: serialize(missing),
-    "short-id": serialize({ ...candidate, image_id: "sha256:abc" }),
-    "upper-id": serialize({ ...candidate, image_id: "sha256:" + "B".repeat(64) }),
-    "other-project": serialize({ ...candidate, project_id: "ffffffffffff" }),
-    "floating-tag": serialize({ ...candidate, image_tag: "mixin-chatbot:latest" }),
-    "bad-source": serialize({ ...candidate, source: "tag" }),
-    "bad-daemon": serialize({ ...candidate, daemon_id: "not a daemon" }),
-    crlf: serialize(candidate).replaceAll("\n", "\r\n"),
-    "empty-key": "=x\n" + serialize(candidate),
-    "no-equals": "format\n" + serialize(candidate),
-  };
-  try {
-    for (const [name, content] of Object.entries(records)) {
-      await mkdir(join(read, name), { recursive: true });
-      await writeFile(join(read, name, "candidate-image"), content);
-    }
-    await mkdir(join(read, "absent"), { recursive: true });
-    await mkdir(join(read, "directory/candidate-image"), { recursive: true });
-    if (process.platform !== "win32") {
-      await mkdir(join(read, "link"), { recursive: true });
-      await symlink(join(read, "valid/candidate-image"), join(read, "link/candidate-image"));
-    }
-    const { results, message } = await scenarios("record", fixture.root);
+const { operation_id: _, ...missing } = candidate;
+const records: Record<string, string> = {
+  valid: serialize(candidate),
+  "legacy-daemon-id": serialize({ ...candidate, daemon_id: "ABCD:EFGH:IJKL:MNOP:QRST:UVWX:YZ23:4567:ABCD:EFGH:IJKL:MNOP" }),
+  "workspace-sha256": serialize({ ...candidate, source: "workspace", target_sha: "c".repeat(64) }),
+  // A standalone deployment may build from an unpacked directory that is not a git repository; a commit build may not.
+  "workspace-no-commit": serialize({ ...candidate, source: "workspace", target_sha: "" }),
+  "commit-no-commit": serialize({ ...candidate, target_sha: "" }),
+  "no-final-newline": serialize(candidate).trimEnd(),
+  extra: serialize(candidate) + "note=1\n",
+  duplicate: serialize(candidate) + `image_id=sha256:${"c".repeat(64)}\n`,
+  missing: serialize(missing),
+  "short-id": serialize({ ...candidate, image_id: "sha256:abc" }),
+  "upper-id": serialize({ ...candidate, image_id: "sha256:" + "B".repeat(64) }),
+  "other-project": serialize({ ...candidate, project_id: "ffffffffffff" }),
+  "floating-tag": serialize({ ...candidate, image_tag: "mixin-chatbot:latest" }),
+  "bad-source": serialize({ ...candidate, source: "tag" }),
+  "bad-daemon": serialize({ ...candidate, daemon_id: "not a daemon" }),
+  crlf: serialize(candidate).replaceAll("\n", "\r\n"),
+  "empty-key": "=x\n" + serialize(candidate),
+  "no-equals": "format\n" + serialize(candidate),
+};
 
-    // Written in key order, complete and readable back; the temporary file is gone after the rename.
-    expect({ write: results.write, tmp: results["write-tmp-left"], read: results["read-written"], tag: results["read-written-tag"] })
-      .toEqual({ write: "0", tmp: "no", read: "0", tag: candidate.image_tag });
-    expect(await readFile(join(fixture.root, "record/written/candidate-image"), "utf8")).toBe(serialize(candidate));
+test.skipIf(!available)("候选镜像记录：Bash 写入前逐项校验再原子改名，核心按同一格式读回", async () => {
+  const fixture = await tempFixture("candidate-record-");
+  try {
+    const { results, message } = await scenarios("record", fixture.root);
+    // Written in key order, complete and readable back by the core; the temporary file is gone after the rename.
+    expect({ write: results.write, tmp: results["write-tmp-left"] }).toEqual({ write: "0", tmp: "no" });
+    const written = await readFile(join(fixture.root, "record/written/candidate-image"), "utf8");
+    expect(written).toBe(serialize(candidate));
+    expect(parseCandidateRecord(written)).toEqual(candidate);
     if (process.platform !== "win32") expect((await stat(join(fixture.root, "record/written/candidate-image"))).mode & 0o777).toBe(0o600);
     // Refused values never reach the disk, not even as a temporary file.
     expect([results["write-bad-id"], results["write-missing-key"], results["write-tag-mismatch"], results["refused-left"]]).toEqual(["1", "1", "1", "0"]);
     expect(await message("write-missing-key")).toContain("缺少：daemon_id");
     expect(await message("write-tag-mismatch")).toContain("不一致");
-
-    const accepted = ["valid", "legacy-daemon-id", "workspace-sha256", "workspace-no-commit", "no-final-newline"];
-    const names = [...Object.keys(records), "absent", "directory", ...(process.platform === "win32" ? [] : ["link"])];
-    for (const name of names) {
-      expect({ name, code: results[`read-${name}`] }).toEqual({ name, code: accepted.includes(name) ? "0" : "1" });
-      if (!accepted.includes(name)) expect({ name, left: results[`left-${name}`] }).toEqual({ name, left: "0" });
-    }
-    expect(await message("read-absent")).toContain("缺少候选镜像记录");
-    expect(await message("read-directory")).toContain("不是普通文件");
-    if (process.platform !== "win32") expect(await message("read-link")).toContain("不是普通文件");
-    expect(await message("read-missing")).toContain("缺少：operation_id");
-    expect(await message("read-other-project")).toContain("不一致");
-    expect(await message("read-duplicate")).toContain("候选镜像记录无效：image_id");
-    expect(await message("read-commit-no-commit")).toContain("缺少提交");
-    // An empty key is refused as invalid, never used as an array subscript.
-    expect(await message("read-empty-key")).not.toContain("bad array subscript");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
-// Bash and the TUI agree on the record's key set and format 2. A record of another format is refused; image identity lives
+test("候选镜像记录：核心拒绝缺失、重复、未知或不一致的内容", () => {
+  const accepted = ["valid", "legacy-daemon-id", "workspace-sha256", "workspace-no-commit", "no-final-newline"];
+  const refusal = (text: string) => { try { parseCandidateRecord(text); return ""; } catch (error) { return (error as Error).message; } };
+  for (const [name, text] of Object.entries(records)) expect({ name, refused: !!refusal(text) }).toEqual({ name, refused: !accepted.includes(name) });
+  expect(refusal(records.missing!)).toBe("候选镜像记录不完整");
+  expect(refusal(records["other-project"]!)).toContain("不一致");
+  expect(refusal(records.duplicate!)).toBe("候选镜像记录无效：image_id");
+  expect(refusal(records["commit-no-commit"]!)).toContain("缺少提交");
+  expect(refusal(records["empty-key"]!)).toBe("候选镜像记录无效：");
+});
+
+// Bash and the host reader (parseTransactionRecord) agree on the record's key set and format 2. A record of another format is refused; image identity lives
 // in candidate-image beside the record.
-test.skipIf(!available)("事务记录为 format 2，Bash 与 TUI 的键集合一致；其他格式的记录和镜像键被拒绝", async () => {
+test.skipIf(!available)("事务记录为 format 2，Bash 与宿主读取的键集合一致；其他格式的记录和镜像键被拒绝", async () => {
   const keys = ["format", "operation", "snapshot", "target_sha", "original_sha", "original_branch", "original_workspace_root",
     "target_workspace_root", "was_running", "bot_port", "reconfigure_ai"];
   const fixture = await tempFixture("candidate-format-");
@@ -163,8 +149,6 @@ test.skipIf(!available)("候选镜像按 ID 构建和核对：daemon、归属、
     expect(await message("verify-tag-moved")).toContain("执行仍只按记录的 ID");
     expect(await message("verify-missing")).toContain("已不存在");
 
-    expect({ code: results.publish, published: results.published, unverified: results["publish-unverified"] }).toEqual({ code: "0", published: b, unverified: "1" });
-    expect(await message("publish-unverified")).toContain(`没有指向候选镜像 ${c}`);
     // A moved tag is kept; the reserved tag is removed by name only, so the image keeps its official tag.
     expect({ moved: results["release-moved"], kept: results["release-moved-tag"] }).toEqual({ moved: "2", kept: c });
     expect({ code: results.release, left: results["release-tag-left"], published: results["release-published"] }).toEqual({ code: "0", left: "no", published: b });
@@ -352,6 +336,15 @@ test.skipIf(!available)("停机前复核：备份目录要放得下停机后的�
     // Before the first backup the project directory stands in for backup/, which it will be made in.
     expect({ code: results["stop-no-backup"], args: results["stop-no-backup-args"] })
       .toEqual({ code: "0", args: `<f>/project ${reserve + 5000} <f>/project/data ${reserve} <f>/upgrader ${reserve}` });
+    expect({ code: results["stop-cleanup"], args: results["stop-cleanup-args"] })
+      .toEqual({ code: "0", args: `<f>/project/backup ${reserve + 5000 + 7000} <f>/project/data ${reserve + 300}` });
+    // Short of space with a cleanup: the way out is to skip it, never to drop its backup; without one nothing is said about it.
+    expect([results["stop-cleanup-short"], results["stop-short"]]).toEqual(["1", "1"]);
+    expect(await message("stop-cleanup-short")).toContain("BOT_REVISION_CLEANUP=skip 跳过整理（不会自动省略备份）");
+    expect(results["stop-cleanup-console"]).toBe("1");
+    expect(await message("stop-cleanup-console")).toContain("或重新预览并选择“跳过整理”（不会自动省略备份）");
+    expect(await message("stop-cleanup-console")).not.toContain("BOT_REVISION_CLEANUP");
+    expect(await message("stop-short")).not.toContain("修订整理");
     expect([results["stop-unknown"], results["stop-unknown-checked"]]).toEqual(["1", "no"]);
     expect(await message("stop-unknown")).toContain("无法估算快照的大小");
   } finally { await fixture.cleanup(); }

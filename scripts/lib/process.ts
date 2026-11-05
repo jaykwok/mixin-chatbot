@@ -1,10 +1,13 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
-import { monitorJob } from "./process-job.ts";
+import { monitorJob, type JobMonitor } from "./process-job.ts";
+import type { ProcessReceipt } from "./process-receipt.ts";
 
 const supervisor = fileURLToPath(new URL("./process-supervisor.ts", import.meta.url));
 export const PROCESS_CLEANUP_MS = 5_000;
+export const PROCESS_INPUT_MAX_BYTES = 40 * 1024 * 1024;
 /**
  * JIT reservation of a supervisor (16 MB). Some Windows security software (Huorong) checks a process's creator in
  * proportion to its RWX reservation, ~3 ms/MB; Bun's default 1 GB made every supervised command start ~3 s later. The
@@ -15,10 +18,17 @@ export const SUPERVISOR_ENV = { BUN_JSC_jitMemoryReservationSize: String(16 * 10
 export interface ProcessEvent { phase: string; elapsedMs: number; pid?: number; code?: number | null; signal?: string | null; detail?: string }
 export interface ProcessOptions {
   command: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal;
-  timeoutMs: number; deadline?: number; maxOutputBytes?: number;
+  timeoutMs: number; maxOutputBytes?: number;
+  /** Separate pipe from the parent's lifeline; never included in the command envelope or event log. */
+  input?: Uint8Array;
   onData?: (data: Buffer) => void;
   onOutput?: (data: Buffer, stream: "stdout" | "stderr") => void;
   observe?: (event: ProcessEvent) => void;
+  /** Durable host operations publish this unpredictable global name before spawning, for cross-session recovery. */
+  jobName?: string;
+  /** Linux only: durable parent authorization before handing the command to the subreaper. */
+  beforeCommand?: () => void;
+  reapReceipt?: ProcessReceipt;
 }
 export interface ProcessResult {
   exitCode: number; commandExitCode: number | null; commandSignal: string | null;
@@ -34,8 +44,13 @@ export class ProcessFailure extends Error {
 export async function executeProcess(options: ProcessOptions): Promise<ProcessResult> {
   if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) throw new Error("命令时限必须大于零");
   options.signal?.throwIfAborted();
-  const started = performance.now(), budget = Math.min(options.timeoutMs, options.deadline === undefined ? Infinity : options.deadline - started);
-  if (budget <= 0) throw new Error("命令截止时间已到");
+  if (options.input !== undefined && (!(options.input instanceof Uint8Array) || options.input.byteLength > PROCESS_INPUT_MAX_BYTES)) {
+    throw new Error("命令输入必须是最多 40 MiB 的字节数组");
+  }
+  const input = options.input === undefined ? undefined : Buffer.from(options.input);
+  if (options.jobName && !/^Global\\mixin-process-[a-f0-9-]{36}$/.test(options.jobName)) throw new Error("持久进程作业名称无效");
+  if (options.reapReceipt && process.platform !== "linux") throw new Error("进程收尾凭据仅适用于 Linux");
+  const started = performance.now();
   const result: ProcessResult = { exitCode: 1, commandExitCode: null, commandSignal: null, supervisorExitCode: null, supervisorSignal: null,
     stdout: "", stderr: "", output: "", lastPhase: "spawn-request" };
   let observationFailed: ((error: unknown) => void) | undefined;
@@ -45,12 +60,14 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
     catch (error) { if (observationFailed) observationFailed(error); else throw error; }
   };
   event("spawn-request");
-  const jobName = `Local\\mixin-process-${randomUUID()}`;
-  const child = spawn(process.execPath, [supervisor], { cwd: options.cwd, env: { ...process.env, ...SUPERVISOR_ENV, MIXIN_PROCESS_EVENTS: "1", MIXIN_PROCESS_JOB: jobName },
-    stdio: ["pipe", "pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
+  const jobName = options.jobName ?? `Local\\mixin-process-${randomUUID()}`;
+  const child = spawn(process.execPath, [supervisor], { cwd: options.cwd, env: { ...process.env, ...SUPERVISOR_ENV, MIXIN_PROCESS_EVENTS: "1", MIXIN_PROCESS_JOB: jobName,
+    MIXIN_PROCESS_REAP_RECEIPT: options.reapReceipt ? JSON.stringify(options.reapReceipt) : undefined },
+    stdio: ["pipe", "pipe", "pipe", "pipe", input === undefined ? "ignore" : "pipe"], detached: process.platform !== "win32", windowsHide: true });
+  const inputPipe = child.stdio[4] as import("node:stream").Writable | null;
   result.pid = child.pid;
   let failure: { kind: ProcessFailure["kind"]; message: string; cause?: unknown } | undefined;
-  let job: ReturnType<typeof monitorJob> | undefined, bytes = 0, protocol = "", commandExited = false, reaped = false, pipesClosed = false, requested = false;
+  let job: JobMonitor | undefined, bytes = 0, protocol = "", commandExited = false, reaped = false, pipesClosed = false, requested = false;
   let escalation: ReturnType<typeof setTimeout> | undefined, drain: ReturnType<typeof setTimeout> | undefined;
   const fail = (kind: ProcessFailure["kind"], message: string, cause?: unknown) => {
     failure ??= { kind, message, cause }; child.stdin?.end();
@@ -58,12 +75,18 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
   };
   const onAbort = () => fail("cancelled", String(options.signal?.reason ?? "Command cancelled"), options.signal?.reason);
   observationFailed = error => fail("supervisor", "进程阶段观察器失败：" + String(error), error);
-  const timer = setTimeout(() => fail("timeout", `Command timed out after ${budget / 1000} seconds`), budget);
+  const timer = setTimeout(() => fail("timeout", `Command timed out after ${options.timeoutMs / 1000} seconds`), options.timeoutMs);
   options.signal?.addEventListener("abort", onAbort, { once: true });
+  // One decoder per stream: a character split across two chunks is not turned into U+FFFD.
+  const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
+  const append = (stream: "stdout" | "stderr", text: string) => {
+    if (!text) return;
+    result[stream] = (result[stream] + text).slice(-64 * 1024);
+    result.output = (result.output + text).slice(-64 * 1024);
+  };
   const receive = (data: Buffer, stream: "stdout" | "stderr") => {
     bytes += data.length;
-    result[stream] = (result[stream] + data.toString("utf8")).slice(-64 * 1024);
-    result.output = (result.output + data.toString("utf8")).slice(-64 * 1024);
+    append(stream, decoders[stream].write(data));
     if (bytes > (options.maxOutputBytes ?? 16 * 1024 * 1024)) { fail("output-limit", "命令输出超过上限，已终止进程树"); return; }
     try { options.onOutput?.(data, stream); options.onData?.(data); } catch (error) { fail("supervisor", String(error), error); }
   };
@@ -78,9 +101,12 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
       try {
         const message = JSON.parse(line) as ProcessEvent;
         if (message.phase === "supervisor-ready" && process.platform === "win32") job = monitorJob(jobName);
-        if (message.phase === "supervisor-ready" && !failure) {
-          child.stdin?.write(JSON.stringify({ command: options.command, args: options.args, cwd: options.cwd, env: options.env ?? process.env }) + "\n");
+        if (message.phase === "supervisor-ready" && !failure && !requested) {
+          options.beforeCommand?.();
           requested = true;
+          child.stdin?.write(JSON.stringify({ command: options.command, args: options.args, cwd: options.cwd, env: options.env ?? process.env,
+            stdinBytes: input?.byteLength }) + "\n");
+          if (input !== undefined) inputPipe!.end(input);
         }
         if (message.phase === "command-exit") { commandExited = true; result.commandExitCode = message.code ?? null; result.commandSignal = message.signal ?? null; }
         if (message.phase === "spawn-error") fail("startup", message.detail ?? "Command spawn failed");
@@ -90,6 +116,11 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
     }
   });
   child.stdin?.on("error", error => { if (!failure && !commandExited) fail("supervisor", String(error), error); });
+  inputPipe?.on("error", error => {
+    // A command may close its input early. Its actual exit status remains authoritative; the lifeline is independent.
+    if (["EPIPE", "ECONNRESET", "ERR_STREAM_DESTROYED"].includes((error as NodeJS.ErrnoException).code ?? "")) return;
+    if (!failure && !commandExited) fail("supervisor", "命令输入管道失败", error);
+  });
   try {
     const exited = await new Promise<void>(done => {
       child.once("error", error => { fail("startup", String(error), error); done(); });
@@ -117,7 +148,8 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
   } catch (error) { failure = { kind: "reaping", message: String(error), cause: error }; }
   finally {
     clearTimeout(timer); if (escalation) clearTimeout(escalation); if (drain) clearTimeout(drain); options.signal?.removeEventListener("abort", onAbort);
-    child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy(); events.destroy();
+    child.stdin?.destroy(); inputPipe?.destroy(); child.stdout?.destroy(); child.stderr?.destroy(); events.destroy();
+    append("stdout", decoders.stdout.end()); append("stderr", decoders.stderr.end());
     try { job?.close(); } catch (error) { failure = { kind: "reaping", message: String(error), cause: error }; }
   }
   if (failure) throw new ProcessFailure(failure.kind, failure.message, result, failure.cause);

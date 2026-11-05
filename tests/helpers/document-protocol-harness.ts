@@ -1,51 +1,48 @@
-// Document tool result protocol with stubbed Python: every success carries structuredContent that matches the tool's
-// outputSchema exactly and equals the model-facing text and details; failures throw. Also checks the namespace,
-// descriptions and annotations that P1-B moved, and that the send tools are model-only.
+// Document tool result protocol with stubbed Python: every success carries structuredOutput that matches the tool's
+// structuredOutputSchema exactly and equals the model-facing text and details; failures throw. Also checks the
+// namespace and descriptions, and that the send tools are model-only.
 import assert from "node:assert/strict";
 import { mkdir, readdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
-import { validateToolArguments } from "@earendil-works/pi-ai";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { compile, type JsonSchema } from "@earendil-works/pi-schema";
+import type { MemberPlaces, MemberToolSpec } from "../../src/durable/tools.ts";
 import { stubDocumentPython } from "./document-python-stub.ts";
+import { runMemberTool } from "./member-tools.ts";
 
 const root = process.cwd(), configuredOffice = join(root, "Office files", "soffice.exe");
 await mkdir(join(root, "data/config"), { recursive: true });
 await writeFile(join(root, "data/config/runtime.json"), JSON.stringify({ BOT_DOCUMENT_OFFICE_PATH: configuredOffice }));
 delete process.env.BOT_DOCUMENT_OFFICE_PATH;
 const { calls, controls, requests } = await stubDocumentPython();
-const { buildDocumentTool } = await import("../../src/agent/document-extract.ts");
-const { buildDocumentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
-const { buildSendTools } = await import("../../src/agent/send-tools.ts");
+const { documentTools } = await import("../../src/agent/document-extract.ts");
+const { documentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
+const { sendTools } = await import("../../src/agent/send-tools.ts");
 const { application } = await import("../../src/core/lifecycle.ts");
 
 const workspace = join(root, "workspace"), tempDir = join(root, "user-tmp"), other = join(root, "other-tmp");
 await Promise.all([workspace, tempDir, other, join(root, "index")].map((path) => mkdir(path, { recursive: true })));
 for (const name of ["资料.docx", "方案.pptx", "补充.pptx", "页面.pdf", "many.pdf"]) await writeFile(join(workspace, name), "fixture " + name);
 await writeFile(join(other, "私有.docx"), "another member's file");
-const options = { workspaceDir: workspace, tempDir, indexPath: join(root, "index", "materials.md"), venvDir: join(root, "venv") };
-const moduleTools = buildDocumentWorkTools(options);
-const tools: ToolDefinition[] = [buildDocumentTool(options), ...moduleTools];
+const options: MemberPlaces = { workspaceDir: workspace, tempDir, indexPath: join(root, "index", "materials.md"), venvDir: join(root, "venv") };
+const moduleTools = documentWorkTools();
+const tools: MemberToolSpec[] = [documentTools().find((tool) => tool.name === "document_extract")!, ...moduleTools];
 
-/** Strict check: pi-ai's validator coerces and cleans, so the validated copy must equal the original untouched. */
-function conforms(tool: ToolDefinition, value: unknown): boolean {
-  try {
-    const validated = validateToolArguments({ name: tool.name, description: "", parameters: tool.outputSchema! },
-      { type: "toolCall", id: "check", name: tool.name, arguments: structuredClone(value) as never });
-    return JSON.stringify(validated) === JSON.stringify(value);
-  } catch { return false; }
+/** Strict check: pi-schema's validator without coercion. */
+function conforms(tool: MemberToolSpec, value: unknown): boolean {
+  return compile(tool.structuredOutputSchema as JsonSchema).check(value);
 }
 
 const results: Record<string, any> = {};
-async function call(name: string, params: Record<string, unknown>, label = name, list = tools) {
+async function call(name: string, params: Record<string, unknown>, label = name, list = tools, places = options) {
   const tool = list.find((candidate) => candidate.name === name)!;
-  assert.ok(tool.outputSchema, `${name} declares no outputSchema`);
-  const result = await tool.execute("call", params as never, undefined, undefined, {} as never);
-  const structured = result.structuredContent as Record<string, unknown>;
+  assert.ok(tool.structuredOutputSchema, `${name} declares no structuredOutputSchema`);
+  const result = await runMemberTool(tool, params, { places });
+  const structured = result.structuredOutput as Record<string, unknown>;
   assert.equal(result.isError, undefined, name);
-  assert.equal(result.content.length, 1);
-  assert.deepEqual(JSON.parse((result.content[0] as { text: string }).text), structured, `${name}: text and structuredContent differ`);
-  assert.deepEqual(result.details, structured, `${name}: details and structuredContent differ`);
-  assert.ok(conforms(tool, structured), `${label} does not match its outputSchema: ${JSON.stringify(structured)}`);
+  assert.equal(result.output!.length, 1);
+  assert.deepEqual(JSON.parse((result.output![0] as { text: string }).text), structured, `${name}: text and structuredOutput differ`);
+  assert.deepEqual(result.details, structured, `${name}: details and structuredOutput differ`);
+  assert.ok(conforms(tool, structured), `${label} does not match its structuredOutputSchema: ${JSON.stringify(structured)}`);
   results[label] = structured;
   return structured as any;
 }
@@ -106,7 +103,7 @@ await writeFile(join(workspace, "模板", "默认.potx"), "fixture potx");
 const shared = join(root, "shared", "公司.dotx");
 await mkdir(join(root, "shared"));
 await writeFile(shared, "fixture dotx");
-const defaults = buildDocumentWorkTools(options, { pptx: "模板/默认.potx", docx: shared });
+const defaults = documentWorkTools({ pptx: "模板/默认.potx", docx: shared });
 const lastTemplate = () => {
   const { request, template } = requests.at(-1)!;
   return template === undefined ? undefined : { extension: extname(request.template), content: template };
@@ -124,13 +121,13 @@ const namedTemplate = await call("document_build", { format: "pptx", template: "
 assert.deepEqual([namedTemplate.build.defaultTemplate, lastTemplate()], [undefined, { extension: ".potx", content: "fixture potx" }]);
 const otherGroup = join(root, "other-workspace");
 await mkdir(otherGroup);
-const elsewhere = buildDocumentWorkTools({ ...options, workspaceDir: otherGroup }, { pptx: "模板/默认.potx" });
-const absent = await call("document_build", { format: "pptx", content: "## 新页" }, "build-default-missing", elsewhere);
+const elsewhere = documentWorkTools({ pptx: "模板/默认.potx" }), otherPlaces = { ...options, workspaceDir: otherGroup };
+const absent = await call("document_build", { format: "pptx", content: "## 新页" }, "build-default-missing", elsewhere, otherPlaces);
 assert.deepEqual([absent.build.defaultTemplate, lastTemplate()], ["missing", undefined]);
 assert.ok(absent.warnings.includes("共享资料 workspace 中没有默认模板 模板/默认.potx，已使用默认版式"));
-const run = (list: ToolDefinition[], params: Record<string, unknown>) =>
-  list.find((tool) => tool.name === "document_build")!.execute("call", params as never, undefined, undefined, {} as never);
-await assert.rejects(run(elsewhere, { format: "pptx", content: "## 新页", keepSlides: [1] }), /需要指定模板/);
+const run = (list: MemberToolSpec[], params: Record<string, unknown>, places = options) =>
+  runMemberTool(list.find((tool) => tool.name === "document_build")!, params, { places });
+await assert.rejects(run(elsewhere, { format: "pptx", content: "## 新页", keepSlides: [1] }, otherPlaces), /需要指定模板/);
 await assert.rejects(run(moduleTools, { format: "docx", template: "模板/默认.potx", content: "# 标题" }), /模板格式必须与 format 一致/);
 // A relative default reached through a link out of the workspace is refused, not used and not reported missing.
 const linked = join(root, "linked-workspace"), outside = join(root, "outside");
@@ -138,12 +135,12 @@ await mkdir(join(outside, "模板"), { recursive: true });
 await writeFile(join(outside, "模板", "默认.potx"), "outside potx");
 await mkdir(linked);
 await symlink(join(outside, "模板"), join(linked, "模板"), "junction");
-const escaping = buildDocumentWorkTools({ ...options, workspaceDir: linked }, { pptx: "模板/默认.potx" });
-await assert.rejects(run(escaping, { format: "pptx", content: "## 新页" }), /共享资料 workspace 内/);
+const escaping = documentWorkTools({ pptx: "模板/默认.potx" });
+await assert.rejects(run(escaping, { format: "pptx", content: "## 新页" }, { ...options, workspaceDir: linked }), /共享资料 workspace 内/);
 // outline comes only from document_inspect, build only from document_build (always) and document_compose (PPT with
 // content, only the three page lists), so only they declare it.
 const toolNamed = (name: string) => tools.find((tool) => tool.name === name)!;
-const properties = (name: string) => (toolNamed(name).outputSchema as { properties: Record<string, any> }).properties;
+const properties = (name: string) => (toolNamed(name).structuredOutputSchema as { properties: Record<string, any> }).properties;
 for (const tool of moduleTools) {
   assert.equal("outline" in properties(tool.name), tool.name === "document_inspect", `${tool.name} and outline`);
   assert.equal("build" in properties(tool.name), ["document_build", "document_compose"].includes(tool.name), `${tool.name} and build`);
@@ -168,21 +165,21 @@ assert.deepEqual([many.truncated, many.images.length, many.skipped.limit], [true
 assert.match(many.warnings.join(""), /达到图片数量或上下文输出上限；请用 pages 分批继续/);
 
 // Failures throw with the reason; nothing comes back as a successful result.
-await assert.rejects(tools[0]!.execute("call", { source: join(other, "私有.docx") } as never, undefined, undefined, {} as never), /只能解析/);
+await assert.rejects(runMemberTool(tools[0]!, { source: join(other, "私有.docx") }, { places: options }), /只能解析/);
 const patch = tools.find((tool) => tool.name === "document_patch")!;
-await assert.rejects(patch.execute("call", { source: "资料.docx", digest: "0".repeat(64),
-  edits: [{ part: "word/document.xml", paragraph: 1, before: "客户A", after: "客户B" }] } as never, undefined, undefined, {} as never), /原文件已变化/);
+await assert.rejects(runMemberTool(patch, { source: "资料.docx", digest: "0".repeat(64),
+  edits: [{ part: "word/document.xml", paragraph: 1, before: "客户A", after: "客户B" }] }, { places: options }), /原文件已变化/);
 const compose = tools.find((tool) => tool.name === "document_compose")!;
-await assert.rejects(compose.execute("call", { items: [{ content: "# 无文件" }] } as never, undefined, undefined, {} as never), /第一项/);
+await assert.rejects(runMemberTool(compose, { items: [{ content: "# 无文件" }] }, { places: options }), /第一项/);
 // A compose that fails after building a content item, or whose assembled deck does not have the selected pages (so the
 // page numbers could not be mapped), leaves no job directory behind.
 const jobs = async () => (await readdir(tempDir)).sort();
 const jobsBefore = await jobs();
-await assert.rejects(compose.execute("call", { items: [{ source: "方案.pptx" }, { content: "## 新页" }, { source: "资料.docx" }] } as never,
-  undefined, undefined, {} as never), /相同格式/);
+await assert.rejects(runMemberTool(compose, { items: [{ source: "方案.pptx" }, { content: "## 新页" }, { source: "资料.docx" }] },
+  { places: options }), /相同格式/);
 controls.extraComposedPages = -1;
-await assert.rejects(compose.execute("call", { items: [{ source: "方案.pptx", slides: [1] }, { content: "## 新页" }] } as never,
-  undefined, undefined, {} as never), /组装结果 1 页，与选择的 2 页不符/);
+await assert.rejects(runMemberTool(compose, { items: [{ source: "方案.pptx", slides: [1] }, { content: "## 新页" }] },
+  { places: options }), /组装结果 1 页，与选择的 2 页不符/);
 controls.extraComposedPages = 0;
 if (process.platform === "linux") {
   const added = (await jobs()).filter(name => !jobsBefore.includes(name)); assert.equal(added.length, 2);
@@ -206,18 +203,10 @@ for (const phrase of ["<!-- notes:", "<!-- cards -->", "<!-- timeline -->", "```
 }
 assert.equal(tools[0]!.namespace, undefined, "document_extract stays outside the module namespace");
 
-// Annotations describe semantics only; the send tools are declared to the model but not callable from scripts.
-const annotations = Object.fromEntries(tools.map((tool) => [tool.name, tool.annotations]));
-for (const name of ["document_extract", "document_inspect"]) assert.equal(annotations[name]?.readOnlyHint, true, name);
-for (const name of ["document_patch", "document_compose", "document_build", "document_render", "document_images"]) {
-  assert.deepEqual([annotations[name]?.readOnlyHint, annotations[name]?.destructiveHint, annotations[name]?.openWorldHint], [false, false, false], name);
-}
-const send = buildSendTools({ channel: { file: async () => {}, image: async () => {} }, workspaceDir: workspace, tempDir,
-  notes: { add() {} } as never });
-for (const tool of send) {
-  assert.equal(tool.exposure, "model-only", tool.name);
-  assert.deepEqual(tool.annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }, tool.name);
-}
+// The send tools are declared to the model but not callable from scripts.
+const send =sendTools(null, () => ({ channel: { file: async () => {}, image: async () => {} }, workspaceDir: workspace, tempDir,
+  notes: { add() {} } as never }));
+for (const tool of send) assert.deepEqual(tool.callers, ["model"], tool.name);
 
 assert.deepEqual([...new Set(calls)].sort(), ["build", "compose_slides", "compose_word", "extract", "finalize_slides", "images", "inspect", "patch", "render"]);
 await writeFile(join(root, "protocol-results.json"), JSON.stringify(results, null, 2));

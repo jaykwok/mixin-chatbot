@@ -1,4 +1,4 @@
-// Pi 1.4.0 provider conversions the project relies on, checked on the requests a local fake provider receives (no network):
+// Pi provider conversions the project relies on, checked on the requests a local fake provider receives (no network):
 // a tool result of only whitespace is sent as a placeholder, so the conversation goes on, and a tool set that loses a tool
 // and later gets it back (an MCP server gone and back across restarts) is declared the way the model's compat allows.
 // The shapes only; nothing here measures cache hits or cost.
@@ -10,7 +10,7 @@ import { defineExtension, type Extension } from "@earendil-works/pi-durable";
 import { appLayout, groupScope } from "../../src/core/layout.ts";
 import { openModelRuntime } from "../../src/core/model-config.ts";
 import { memberConversation } from "../../src/durable/identity.ts";
-import { baseMemberTools, type BaseToolsOptions, memberPlaces, memberRegistration } from "../../src/durable/tools.ts";
+import { baseMemberTools, type BaseToolsOptions, memberPlaces } from "../../src/durable/tools.ts";
 import { openGroupHarness } from "../helpers/durable.ts";
 import { scopeOf } from "../helpers/layout.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -71,7 +71,7 @@ const model = (id: string, compat?: Record<string, boolean>) => ({ id, name: id,
 
 /** The member tools as the service registers them, optionally without some. */
 function memberTools(base: BaseToolsOptions, without: string[] = []): Extension {
-  return defineExtension({ name: "mixin.base", tools: baseMemberTools(base).filter((tool) => !without.includes(tool.definition.name)).map(memberRegistration) });
+  return defineExtension({ name: "mixin.base", tools: baseMemberTools(base).map((tool) => tool.registration).filter((tool) => !without.includes(tool.name)) });
 }
 
 async function turn(path: string, runtime: unknown, extensions: Extension[], ref: { provider: string; modelId: string }, content: string) {

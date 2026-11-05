@@ -1,13 +1,16 @@
 #!/usr/bin/env bun
-// 先交互形成草稿，运维脚本再停机并提交；填写和取消都不影响运行中的机器人。
+// 外链配置向导：服务继续运行，只读现有配置作为基准，回答写进暂存目录的 configuration-relay.json（0600）；运维核心随后与网页配置
+// 相同地停机、写入、核对就绪，失败时恢复原配置。填写和取消都不影响运行中的机器人。
+//
+// 用法：configure-relay.ts --stage <暂存目录>
 import { cancel, confirm, intro, isCancel, log, note, outro, password, select, text } from "@clack/prompts";
-import { createHash, randomUUID } from "node:crypto";
-import { chown, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { NATIVE_FILE_MAX_BYTES } from "../../src/core/config.ts";
-import { archiveFile, replaceFile, withMaintenance } from "../../src/core/maintenance.ts";
-import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../../src/core/storage.ts";
-import { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, relayBackendId, validateRelayConfig, type RelayConfig } from "../../src/integrations/relay.ts";
+import { join, resolve } from "node:path";
+import { NATIVE_FILE_MAX_BYTES } from "../../src/core/transfer-limits.ts";
+import { RELAY_INDEX_PATH } from "../../src/core/storage.ts";
+import { publish } from "../lib/atomic-file.ts";
+import { configurationSnapshot } from "./configuration-form.ts";
+import { serializeConfigurationStage, stageName } from "./configuration-stage.ts";
+import { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, relayBackendId, validateRelayConfig, type RelayConfig } from "../../src/integrations/relay-s3.ts";
 import { readRelayIndex, RelayIndexFormatError } from "../../src/integrations/relay-index.ts";
 import { normalizeRelayUrlInput, suggestRelayRegion } from "./relay-url.ts";
 
@@ -17,15 +20,6 @@ const CONFIG_FIELDS = ["provider", "endpoint", "region", "bucket", "accessKeyId"
 function bail<T>(value: T | symbol): T {
   if (isCancel(value)) throw new DOMException("配置已取消", "AbortError");
   return value as T;
-}
-
-async function currentFile(): Promise<string | null> {
-  try { return await readFile(RELAY_CONFIG_PATH, "utf8"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
-}
-
-function fingerprint(raw: string | null): string | null {
-  return raw === null ? null : createHash("sha256").update(raw).digest("hex");
 }
 
 function requireUrl(value: string | undefined): string | undefined {
@@ -73,11 +67,11 @@ function checkLedger(enabling: boolean) {
   }
 }
 
-async function prepare(draftPath: string): Promise<void> {
+async function stageRelay(project: string, stage: string): Promise<void> {
   intro("可选的大文件外链配置");
   note("超过 " + NATIVE_FILE_MAX_BYTES / MIB + " MiB 的本地文件可上传到私有 S3 存储桶，再发送限时下载链接。\n" +
     "填写期间机器人继续运行；确认保存后，原本运行中的机器人会短暂重启以应用配置。", "配置方式");
-  const raw = await currentFile();
+  const base = configurationSnapshot(project, "relay"), raw = base.files.relay ?? null;
   let fields: Record<string, unknown> = {};
   let previous: RelayConfig | null = null;
   if (raw !== null) {
@@ -93,7 +87,7 @@ async function prepare(draftPath: string): Promise<void> {
     message: "外链设置", initialValue: "configure",
     options: [
       { value: "configure", label: raw === null ? "启用外链" : "修改外链配置" },
-      ...(raw === null ? [] : [{ value: "disable", label: "停用外链", hint: "归档配置，保留远端文件和外链账本" }]),
+      ...(raw === null ? [] : [{ value: "disable", label: "停用外链", hint: "删除 relay.json，保留远端文件和外链账本" }]),
       { value: "cancel", label: "返回，不修改" },
     ],
   }));
@@ -101,7 +95,7 @@ async function prepare(draftPath: string): Promise<void> {
 
   let config: Record<string, unknown> | null = null;
   if (action === "disable") {
-    note("将停用大文件外链分发，并把 relay.json 归档到 backup/rm。\n" +
+    note("将停用大文件外链分发并删除 relay.json（应用失败时恢复原文件）。\n" +
       "远端文件和外链账本会保留；停用期间机器人不会执行到期清理，后端签名仍按自身期限失效。", "停用预览");
   } else {
     note([
@@ -188,62 +182,20 @@ async function prepare(draftPath: string): Promise<void> {
   const nextBackend = config ? relayBackendId(validateRelayConfig(config)) : null;
   const stranded = checkLedger(config !== null).filter(entry => !nextBackend || !entry.key.startsWith(nextBackend + ":"));
   if (stranded.length) log.warn(`账本仍有 ${stranded.length} 个对象不属于新设置；切换或停用后无法自动删除这些对象。` +
-    "建议取消，先在原设置下执行「数据 → 外链 → 清理全部外链」（命令行 relay-purge）；也可保存后在云端清理，或切回原设置再清理。");
+    "建议取消，先在原设置下用控制台「外链」页清理全部在册外链（命令行 relay-purge --all）；也可保存后在云端清理，或切回原设置再清理。");
   if (!bail<boolean>(await confirm({ message: "保存并应用以上外链设置？", initialValue: action !== "disable" }))) {
     throw new DOMException("配置已取消", "AbortError");
   }
-  await mkdir(dirname(draftPath), { recursive: true });
-  await writeFile(draftPath, JSON.stringify({ expectedHash: fingerprint(raw), config }) + "\n", { mode: 0o600, flag: "wx" });
-  outro("配置已确认，正在应用。");
-}
-
-async function apply(draftPath: string): Promise<void> {
-  let draft: { expectedHash: string | null; config: Record<string, unknown> | null };
-  try { draft = JSON.parse(await readFile(draftPath, "utf8")); }
-  catch { throw new Error("外链配置草稿无法读取，请重新打开配置向导"); }
-  if (!draft || (draft.expectedHash !== null && !/^[a-f0-9]{64}$/.test(draft.expectedHash)) ||
-      !(draft.config === null || (typeof draft.config === "object" && !Array.isArray(draft.config)))) {
-    throw new Error("外链配置草稿无效，请重新打开配置向导");
-  }
-  if (draft.config !== null) validateRelayConfig(draft.config);
-  await withMaintenance(async () => {
-    if (fingerprint(await currentFile()) !== draft.expectedHash) {
-      throw new Error("relay.json 已被其他操作修改，请重新打开配置向导；本次未覆盖配置");
-    }
-    if (draft.config === null) {
-      await archiveFile(RELAY_CONFIG_PATH);
-      console.log("外链已停用，原配置已归档到 backup/rm；远端文件和账本已保留。");
-      return;
-    }
-    // Recheck under the service lease: the ledger may have changed since the draft was confirmed.
-    checkLedger(true);
-    await mkdir(dirname(RELAY_CONFIG_PATH), { recursive: true });
-    const temporary = join(dirname(RELAY_CONFIG_PATH), ".relay-" + randomUUID() + ".tmp");
-    try {
-      await writeFile(temporary, JSON.stringify(draft.config, null, 2) + "\n", { mode: 0o600, flag: "wx" });
-      // sudo 下配置时保持原运行用户可读，避免 root 创建的 0600 文件阻止容器启动。
-      if (process.platform !== "win32") {
-        const owner = await stat(RELAY_CONFIG_PATH).catch(error => {
-          if (error.code === "ENOENT") return stat(dirname(RELAY_CONFIG_PATH));
-          throw error;
-        });
-        await chown(temporary, owner.uid, owner.gid);
-      }
-      await replaceFile(temporary, RELAY_CONFIG_PATH);
-    } finally { await rm(temporary, { force: true }); }
-    console.log("外链配置已保存到 " + RELAY_CONFIG_PATH);
-    console.log("云端权限或设置有变化时，请在「数据 → 外链 → 测试外链」（命令行 relay-test）上传测试文件验收。");
-  });
+  await publish(join(stage, stageName("relay")), serializeConfigurationStage({ version: 1, base,
+    next: { kind: "relay", binding: base.binding, files: { relay: config === null ? null : JSON.stringify(config, null, 2) + "\n" } } }), { createOnly: true });
+  outro("配置已确认，正在应用。云端权限或设置有变化时，应用后请在控制台「外链 → 测试外链存储」（命令行 relay-test）上传测试文件验收。");
 }
 
 if (import.meta.main) {
   try {
     const [mode, path, extra] = process.argv.slice(2);
-    if (!path || extra || !["--draft", "--apply"].includes(mode ?? "")) {
-      throw new Error("请从 TUI 的「系统 → 设置 → 外链配置」进入配置向导");
-    }
-    if (mode === "--draft") await prepare(path);
-    else await apply(path);
+    if (mode !== "--stage" || !path || extra) throw new Error("请用命令行 relay-configure 进入配置向导，或在控制台的「设置 → 外链配置」填写");
+    await stageRelay(".", resolve(path));
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") cancel("已取消，配置和服务保持原状。");
     else { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }

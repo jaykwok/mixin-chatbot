@@ -3,6 +3,7 @@ import { createApp } from "../../src/server/http-app.ts";
 import { APP_BUILD, APP_VERSION } from "../../src/core/version.ts";
 import type { PlatformClient } from "../../src/integrations/open-platform/client.ts";
 import { DirectoryClient } from "../../src/integrations/open-platform/directory.ts";
+import { type DirectoryScope, WHOLE_DIRECTORY } from "../../src/integrations/open-platform/directory-scope.ts";
 
 function app(options: { stopping?: boolean; shutdown?: () => void; health?: () => Record<string, unknown> } = {}) {
   return createApp({
@@ -39,29 +40,27 @@ test("shutdown requires the instance token and hides the route otherwise", async
   await called.promise;
 });
 
-test("the webhook entry no longer exists", async () => {
-  expect((await app().request("/webhook", { method: "POST", body: "{}" })).status).toBe(404);
-});
-
-test("directory confirmation requires the instance token and a valid round, and reports stale or busy rounds", async () => {
-  const calls: number[] = [];
-  let result: "started" | "stale" | "busy" = "started";
-  const confirming = createApp({ isStopping: () => false, adminToken: "test-admin-token", shutdown: () => {}, confirmRevocations: scanId => { calls.push(scanId); return result; } });
-  const post = (body: unknown, token = "test-admin-token") => confirming.request("/_admin/directory/confirm", {
+test("saving a scope requires the instance token and valid departments; started answers 202, unchanged and cancelled 200", async () => {
+  const calls: DirectoryScope[] = [];
+  let result: "started" | "cancelled" | "unchanged" = "started";
+  const saving = createApp({ isStopping: () => false, adminToken: "test-admin-token", shutdown: () => {},
+    changeScope: async scope => { calls.push(scope); return result === "unchanged" ? { status: result } : { status: result, departments: [] }; } });
+  const post = (body: unknown, token = "test-admin-token") => saving.request("/_admin/directory/scope", {
     method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  expect((await post({ scanId: 3 }, "wrong")).status).toBe(404);
-  // Without a directory (verification instance) the route does not exist.
-  expect((await app().request("/_admin/directory/confirm", { method: "POST", headers: { Authorization: "Bearer test-admin-token" }, body: "{}" })).status).toBe(404);
-  for (const scanId of [0, -1, 1.5, "3", null]) expect((await post({ scanId })).status).toBe(400);
+  expect((await post({ departments: ["100"] }, "wrong")).status).toBe(404);
+  // Without a directory (verification instance) the route does not exist; the confirmation of paused revocations is gone.
+  expect((await app().request("/_admin/directory/scope", adminPost({ departments: null }))).status).toBe(404);
+  expect((await saving.request("/_admin/directory/confirm", adminPost({ scanId: 3 }))).status).toBe(404);
+  for (const departments of [[], ["1"], ["a b"], ["100", "100"], "100", undefined]) expect((await post({ departments })).status).toBe(400);
+  // The whole directory is only ever an explicit {"all":true}: no departments, an empty body or a false flag are refused.
+  for (const body of [{ departments: null }, {}, { all: false }, { all: true, departments: ["100"] }, null]) expect((await post(body)).status).toBe(400);
   expect(calls).toEqual([]);
-  expect((await post({ scanId: 3 })).status).toBe(202);
-  result = "stale";
-  const stale = await post({ scanId: 4 });
-  expect(stale.status).toBe(409); expect((await stale.json() as { message: string }).message).toContain("已不是待确认的撤销");
-  result = "busy";
-  const busy = await post({ scanId: 3 });
-  expect(busy.status).toBe(409); expect((await busy.json() as { message: string }).message).toContain("正在进行");
-  expect(calls).toEqual([3, 4, 3]);
+  expect((await post({ departments: ["200", "100"] })).status).toBe(202);
+  result = "cancelled";
+  expect((await post({ all: true })).status).toBe(200);
+  result = "unchanged";
+  expect(await (await post({ all: true })).json()).toEqual({ status: "unchanged" });
+  expect(calls).toEqual([{ kind: "departments", departments: ["200", "100"] }, WHOLE_DIRECTORY, WHOLE_DIRECTORY]);
 });
 
 /** The three directory routes that wait on the platform, each with a body the route accepts. */
@@ -91,10 +90,9 @@ test("directory routes that wait on the platform answer 504 at their deadline, k
   // Bun.serve's idleTimeout would cut a quiet connection: these requests get the deadline plus ten seconds; others keep the server's limit.
   const limits: number[] = [];
   const server = { timeout: (_request: Request, seconds: number) => { limits.push(seconds); } };
-  const quick = createApp({ isStopping: () => false, adminToken: "test-admin-token", shutdown: () => {}, confirmRevocations: () => "stale",
-    listDepartments: async () => [], describeDepartments: async () => ({ departments: [], unavailable: [] }), changeScope: async () => "unchanged" });
+  const quick = createApp({ isStopping: () => false, adminToken: "test-admin-token", shutdown: () => {},
+    listDepartments: async () => [], describeDepartments: async () => ({ departments: [], unavailable: [] }), changeScope: async () => ({ status: "unchanged" }) });
   for (const [path, body] of waitingRoutes) expect((await quick.fetch(new Request("http://localhost" + path, adminPost(body)), server)).status).toBe(200);
-  await quick.fetch(new Request("http://localhost/_admin/directory/confirm", adminPost({ scanId: 1 })), server);
   await quick.fetch(new Request("http://localhost/health"), server);
   expect(limits).toEqual([70, 70, 70]);
 });

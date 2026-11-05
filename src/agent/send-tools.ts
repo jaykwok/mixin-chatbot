@@ -1,16 +1,13 @@
-// 发送工具定义：send_image / send_file（ToolDefinition）。
+// 发送工具：send_image / send_file。
 // agent 给 source（URL、共享资料 workspace 或当前用户 tmp 内路径），工具负责读取 + 上传 + 发送到当前请求的回复目标。
 //
 // 远程来源先限量下载到当前用户 tmp；超限本地文件由配置的外链后端分发，未配置则报大小限制。
 import { randomUUID } from "node:crypto";
 import { open, realpath, stat, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { Type } from "@earendil-works/pi-ai";
-import {
-  formatSize,
-  type ToolAnnotations,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { formatSize } from "@earendil-works/pi-coding-agent";
+import { num, obj, opt, str } from "@earendil-works/pi-schema";
+import type { Member, MemberCall, MemberToolSpec } from "../durable/tools.ts";
 import {
   ATTACHMENT_HTTP_TIMEOUT,
   NATIVE_FILE_MAX_BYTES,
@@ -246,39 +243,37 @@ export async function transferFile(source: ResolvedSource, name: string, options
   } finally { if (local.temporary) await unlink(local.path).catch(() => {}); }
 }
 
-// 消息发出就无法撤回：只允许模型逐条直接调用，脚本（codemode 等经 ctx.executeTool 的调用）拿不到这两个工具。
-// annotations 只是给权限扩展看的语义说明，实际约束仍是下面的路径、大小和上传检查。
-const SEND_EXPOSURE = "model-only";
-const SENDS: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
+// 消息发出就无法撤回：只允许模型逐条直接调用，脚本（codemode 经 executeTool 的调用）拿不到这两个工具。
+const SEND_CALLERS = ["model"] as const;
 
-export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
-  const { workspaceDir, tempDir, relay, notes } = options;
+const imageParams = obj({
+  source: str({ description: "图片来源：http(s) URL、共享资料 workspace 或当前用户 tmp 内的路径" }),
+  width: opt(num({ description: "宽度（像素，可选；默认从图片读取）" })),
+  height: opt(num({ description: "高度（像素，可选；默认从图片读取）" })),
+}, { open: true });
+const fileParams = obj({
+  source: str({ description: "文件来源：http(s) URL、共享资料 workspace 或当前用户 tmp 内的路径" }),
+  filename: opt(str({ description: "文件名（可选，默认从 source 推断）" })),
+}, { open: true });
 
-  const imageParams = Type.Object({
-    source: Type.String({
-      description: "图片来源：http(s) URL、共享资料 workspace 或当前用户 tmp 内的路径",
-    }),
-    width: Type.Optional(Type.Number({ description: "宽度（像素，可选；默认从图片读取）" })),
-    height: Type.Optional(Type.Number({ description: "高度（像素，可选；默认从图片读取）" })),
-  });
-  const fileParams = Type.Object({
-    source: Type.String({
-      description: "文件来源：http(s) URL、共享资料 workspace 或当前用户 tmp 内的路径",
-    }),
-    filename: Type.Optional(Type.String({ description: "文件名（可选，默认从 source 推断）" })),
-  });
+/** What one call sends with: everything but the relay, which is fixed per registry. */
+export type SendContext = Omit<SendToolsOptions, "relay">;
 
-  const sendImageTool: ToolDefinition<typeof imageParams> = {
+/**
+ * send_image and send_file. `relay` shapes send_file's description and carries large files; `context` gives the calling
+ * member's reply target, places and link notes.
+ */
+export function sendTools(relay: RelayConfig | null | undefined, context: (member: Member, call: MemberCall) => SendContext | Promise<SendContext>): MemberToolSpec[] {
+  const sendImageTool: MemberToolSpec<typeof imageParams> = {
     name: "send_image",
-    label: "发送图片",
     description:
       "向当前会话（提问所在的群或单聊）发送一张图片（PNG、JPEG、GIF、WebP、BMP），在聊天里直接显示；发送图片默认用本工具，包括资料库里的图片原件。source 为 http(s) URL、共享资料 workspace 或当前调用用户 tmp 内的路径。",
-    promptSnippet: "向当前会话发送图片",
-    exposure: SEND_EXPOSURE,
-    annotations: SENDS,
+    callers: SEND_CALLERS,
     constrainedSampling: { type: "json_schema", strict: "prefer" },
     parameters: imageParams,
-    async execute(_toolCallId, params, signal) {
+    async run(params, member, call) {
+      const { signal } = call;
+      const options = await context(member, call);
       if (
         (params.width !== undefined && (!Number.isInteger(params.width) || params.width <= 0)) ||
         (params.height !== undefined && (!Number.isInteger(params.height) || params.height <= 0))
@@ -287,20 +282,27 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
       }
       // 图片不走外链：群聊里图片的价值在于内联显示，换成一条链接就没有意义了，
       // 而且超过原生文件上限（NATIVE_FILE_MAX_BYTES）的图基本都是本该当文件发的东西。
-      const resolved = await resolveSource(params.source, workspaceDir, tempDir, signal);
+      const resolved = await resolveSource(params.source, options.workspaceDir, options.tempDir, signal);
       if (resolved.kind === "local" && resolved.size > NATIVE_FILE_MAX_BYTES) throw oversizeError("本地图片", resolved.size);
       const name = filenameFromSource(params.source);
-      const local = await localCopy(resolved, tempDir, name, signal);
-      try {
-        const info = await imageInfo(local.path);
-        if (!info) throw new Error(`无法识别图片格式或尺寸（支持 PNG、JPEG、GIF、WebP、BMP）: ${params.source}`);
-        const width = params.width ?? info.width, height = params.height ?? info.height;
-        await withSlot(signal, budget => options.channel.image({ path: local.path, name, size: local.size, ...info, width, height }, budget, () => {}));
-        return {
-          content: [{ type: "text", text: `已发送图片 (${width}×${height})` }],
-          details: { source: params.source, width, height },
-        };
-      } finally { if (local.temporary) await unlink(local.path).catch(() => {}); }
+      let width = 0, height = 0;
+      const send = async (source: ResolvedSource, beforeSend: () => void): Promise<FileTransfer> => {
+        const local = await localCopy(source, options.tempDir, name, signal);
+        try {
+          const info = await imageInfo(local.path);
+          if (!info) throw new Error(`无法识别图片格式或尺寸（支持 PNG、JPEG、GIF、WebP、BMP）: ${params.source}`);
+          width = params.width ?? info.width; height = params.height ?? info.height;
+          await withSlot(signal, budget => options.channel.image({ path: local.path, name, size: local.size, ...info, width, height }, budget, beforeSend));
+          return { mode: "direct" };
+        } finally { if (local.temporary) await unlink(local.path).catch(() => {}); }
+      };
+      // In the run record like a file, so the closeout's reminder and fallback know it went out.
+      const result = options.fileDelivery ? await options.fileDelivery(resolved, name, signal, send) : await send(resolved, () => {});
+      if (result.mode === "direct" && result.alreadySent) return { output: [{ type: "text", text: `该图片已发送，无需重复发送: ${name}` }], details: { source: params.source } };
+      return {
+        output: [{ type: "text", text: `已发送图片 (${width}×${height})` }],
+        details: { source: params.source, width, height },
+      };
     },
   };
 
@@ -308,28 +310,27 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
     ? ` 超过 ${formatSize(NATIVE_FILE_MAX_BYTES)} 的本地文件会上传外部存储，下载链接由系统保存并附在本轮回复末尾；工具生成链接不代表平台已确认送达。`
     : "";
 
-  const sendFileTool: ToolDefinition<typeof fileParams> = {
+  const sendFileTool: MemberToolSpec<typeof fileParams> = {
     name: "send_file",
-    label: "发送文件",
     description:
       "向当前会话（提问所在的群或单聊）发送一个文件。source 为 http(s) URL、共享资料 workspace 或当前调用用户 tmp 内的路径。" +
       "图片默认用 send_image 在聊天里显示，用户明确要文件形式时才用本工具发图片。" +
       relayNote,
-    promptSnippet: "向当前会话发送文件",
-    exposure: SEND_EXPOSURE,
-    annotations: SENDS,
+    callers: SEND_CALLERS,
     constrainedSampling: { type: "json_schema", strict: "prefer" },
     parameters: fileParams,
-    async execute(_toolCallId, params, signal) {
-      const resolved = await resolveSource(params.source, workspaceDir, tempDir, signal);
+    async run(params, member, call) {
+      const { signal } = call;
+      const options = { ...await context(member, call), relay };
+      const resolved = await resolveSource(params.source, options.workspaceDir, options.tempDir, signal);
       const name = sanitizeFilename(params.filename ?? filenameFromSource(params.source));
 
       const send = (source: ResolvedSource, beforeSend: () => void) => transferFile(source, name, options, signal, beforeSend);
       const result = options.fileDelivery ? await options.fileDelivery(resolved, name, signal, send) : await send(resolved, () => {});
       if (result.mode === "relay") {
-        await notes.add(result.attachment);
+        await options.notes.add(result.attachment);
         return {
-          content: [
+          output: [
             {
               type: "text",
               // 明确告诉模型别再贴一遍：链接会由代码原样附在回复末尾，模型复述一遍只会
@@ -343,7 +344,7 @@ export function buildSendTools(options: SendToolsOptions): ToolDefinition[] {
         };
       }
 
-      return { content: [{ type: "text", text: `${result.alreadySent ? "该版本已发送，无需重复发送" : "已发送文件"}: ${name}` }], details: { name } };
+      return { output: [{ type: "text", text: `${result.alreadySent ? "该版本已发送，无需重复发送" : "已发送文件"}: ${name}` }], details: { name } };
     },
   };
 

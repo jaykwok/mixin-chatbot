@@ -6,7 +6,8 @@ import { ResultFiles, removeResultDirectories } from "../../src/durable/results/
 import { configuredRootlessTasks } from "../../src/core/task-backend.ts";
 import { referencedResults, resultReferences } from "../../src/durable/results/references.ts";
 import { extractDocument } from "../../src/agent/document-extract.ts";
-import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
+import { documentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
+import { runMemberTool, toolNamed } from "./member-tools.ts";
 
 const root = process.argv[2]!, temp = join(root, "caller"), workspace = join(root, "workspace"), index = join(root, "index");
 await Promise.all([temp, workspace, index].map(path => mkdir(path)));
@@ -24,8 +25,7 @@ await symlink(join(root, "control"), join(workspace, "manager-alias"));
 for (const [workspaceDir, source] of [[root, "control/private.docx"], [workspace, "manager-alias/private.docx"]]) {
   const options = { workspaceDir: workspaceDir!, tempDir: temp, indexPath: join(index, "materials.md"), venvDir: join(root, "absent-venv") };
   await assert.rejects(extractDocument(options, source!), /管理目录与回执/);
-  const inspect = buildDocumentWorkTools(options).find(tool => tool.name === "document_inspect")!;
-  await assert.rejects(inspect.execute("private", { source: source! } as never, undefined, undefined, {} as never), /管理目录与回执/);
+  await assert.rejects(runMemberTool(toolNamed(documentWorkTools(), "document_inspect"), { source: source! }, { places: options }), /管理目录与回执/);
 }
 assert.equal(await readFile(join(root, "control/private.docx"), "utf8"), "synthetic private input");
 await assert.rejects(call("write", { path: join(path, "foreign"), content: "bad" }), /只读/);

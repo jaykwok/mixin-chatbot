@@ -1,10 +1,11 @@
-import { writeCurrentConfig } from "../helpers/current-config.ts";
+import { CURRENT_APPLICATION, writeCurrentConfig } from "../helpers/current-config.ts";
+import { DATA_VERSION } from "../../src/core/version.ts";
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { openOperationLog, operationError } from "../../scripts/lib/operation-log.ts";
+import { latestStartupError, openOperationLog, operationError } from "../../scripts/lib/operation-log.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
@@ -124,10 +125,10 @@ test("bootstrap diagnostics redact errors and causes, cap log size and retain on
     expect(log.path).toStartWith(directory);
     const error = new Error("failed api_key=private-api-value", { cause: new Error("Bearer private-bearer-value token=private-token-value") });
     log.event("error", "snapshot", operationError(error));
-    log.event("info", "native", "https://user:private-password@fixture.invalid/?key=private-query /webhook/" + "a".repeat(64));
+    log.event("info", "native", "https://user:private-password@fixture.invalid/?key=private-query");
     const text = await readFile(log.path!, "utf8");
     expect(text).toContain("snapshot"); expect(text).toContain("Caused by:");
-    for (const value of ["private-api-value", "private-bearer-value", "private-token-value", "private-password", "private-query", "a".repeat(64)]) expect(text).not.toContain(value);
+    for (const value of ["private-api-value", "private-bearer-value", "private-token-value", "private-password", "private-query"]) expect(text).not.toContain(value);
     expect((await readdir(directory)).filter(file => file.endsWith(".log"))).toHaveLength(20);
     expect(await readFile(join(directory, "keep.txt"), "utf8")).toBe("unrelated");
     const inherited = openOperationLog(f.root, "deploy", log.name);
@@ -162,11 +163,10 @@ test("the data preflight records failures without loading project configuration 
   } finally { await f.cleanup(); }
 }, 15000);
 
-test.skipIf(process.platform !== "win32")("PowerShell 5.1 diagnostics retain native failures and restore the caller environment", async () => {
+test.skipIf(process.platform !== "win32")("PowerShell 5.1 diagnostics redact events and failures and restore the caller environment", async () => {
   const f = await tempFixture("ps-operation-log-");
   try {
-    const native = join(f.root, "native.ps1"), script = join(f.root, "operation.ps1");
-    await writeFile(native, '\ufeff[Console]::Error.WriteLine("api_key=private-native-value"); Write-Output "native-detail"; exit 23');
+    const script = join(f.root, "operation.ps1");
     await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . ${quotePS(join(project, "scripts/lib/operation-log.ps1"))}
@@ -177,9 +177,10 @@ $nested=Start-OperationLog $PSScriptRoot 'deploy'
 if($nested.Path -ne $context.Path){throw 'nested operation split logs'}
 Stop-OperationLog $nested 0
 Set-OperationStage 'install-dependencies'
-$success=Invoke-OperationNative (Join-Path $PSHOME 'powershell.exe') @('-NoProfile','-Command','exit 0')
-if($success -ne 0){throw 'successful native command reported failure'}
-$code=Invoke-OperationNative (Join-Path $PSHOME 'powershell.exe') @('-NoProfile','-File',${quotePS(native)})
+# The output lines a native tool wrote (Invoke-MaintenanceTool logs them this way).
+Write-OperationEvent 'output' 'native-detail'
+Write-OperationEvent 'output' 'api_key=private-native-value'
+$code=23
 try { throw 'snapshot failure token=private-exception-value' } catch { Write-OperationFailure $_ }
 Stop-OperationLog $context $code
 if($env:BOT_OPERATION_LOG -ne $before){throw 'environment leaked'}
@@ -220,3 +221,89 @@ exit "$code"
     expect(text).not.toContain("private-build-value"); expect(result.text).toContain(logs[0]!);
   } finally { await f.cleanup(); }
 }, 30000);
+
+// rootful deployments hand logs/ to the service identity: what it plants there must not redirect root's writes (A3-18).
+test.skipIf(process.platform !== "linux")("Bash and TypeScript writers never write through a planted link or block on a FIFO", async () => {
+  const f = await tempFixture("operation-log-links-");
+  try {
+    const directory = join(f.root, "logs/operations"), victim = join(f.root, "victim"), name = "deploy-20260101T000000Z-planted.log";
+    await mkdir(directory, { recursive: true }); await writeFile(victim, "victim\n");
+    const script = join(f.root, "operation.sh");
+    await writeFile(script, `#!/usr/bin/env bash
+set -uo pipefail
+PROJECT_DIR="$1"
+. '${join(project, "scripts/lib/operation-log.sh")}'
+child() { bash -c '. "$1"; PROJECT_DIR="$2"; operation_start deploy; operation_event info "$3"' child '${join(project, "scripts/lib/operation-log.sh")}' "$PROJECT_DIR" "$1"; }
+operation_start deploy
+operation_event info before-swap
+child child-before
+if [ "\${FIXTURE_SWAP:-}" = 1 ]; then mv -- "$BOT_OPERATION_LOG_PATH" "$BOT_OPERATION_LOG_PATH.moved"; ln -s "$FIXTURE_VICTIM" "$BOT_OPERATION_LOG_PATH"; fi
+operation_event info after-swap
+child child-after
+`);
+    const go = (env: Record<string, string>) => run(["timeout", "10", "bash", script, f.root], f.root, { FIXTURE_VICTIM: victim, ...env });
+    // Swapped after the start: the writer keeps appending to the file it opened; a child adopts the inherited
+    // descriptor only while it still names the log, so after the swap it writes nowhere.
+    let result = await go({ BOT_OPERATION_LOG: "", FIXTURE_SWAP: "1" });
+    expect(result.code, result.text).toBe(0);
+    const moved = (await readdir(directory)).find(file => file.endsWith(".moved"))!;
+    const text = await readFile(join(directory, moved), "utf8");
+    for (const event of ["before-swap", "child-before", "after-swap"]) expect(text).toContain(event);
+    expect(text).not.toContain("child-after");
+    expect(await readFile(victim, "utf8")).toBe("victim\n");
+    // Inherited names planted as links (to an existing or a missing file) or as a FIFO: no log, nothing written or created.
+    for (const plant of ["link", "dangling", "fifo"] as const) {
+      await Bun.$`rm -f ${join(directory, name)} ${join(f.root, "missing")}`.quiet();
+      if (plant === "link") await symlink(victim, join(directory, name));
+      else if (plant === "dangling") await symlink(join(f.root, "missing"), join(directory, name));
+      else expect(Bun.spawnSync(["mkfifo", join(directory, name)]).exitCode).toBe(0);
+      result = await go({ BOT_OPERATION_LOG: name });
+      expect(result.code, plant + result.text).toBe(0);
+      const log = openOperationLog(f.root, "deploy", name);
+      log.event("error", "fixture", "typescript");
+      expect(await readFile(victim, "utf8"), plant).toBe("victim\n");
+      expect(existsSync(join(f.root, "missing")), plant).toBe(false);
+    }
+    // The TypeScript writer opens per event: a link swapped in after the start is refused, the victim untouched.
+    const log = openOperationLog(f.root, "deploy", "");
+    log.event("info", "fixture", "first");
+    await Bun.$`mv ${log.path!} ${log.path! + ".moved"} && ln -s ${victim} ${log.path!}`.quiet();
+    log.event("info", "fixture", "second");
+    expect(await readFile(victim, "utf8")).toBe("victim\n");
+    expect(await readFile(log.path! + ".moved", "utf8")).toContain("first");
+  } finally { await f.cleanup(); }
+}, 60000);
+
+test("latestStartupError reports the newest startup failure since the start request, first line only, redacted", async () => {
+  const f = await tempFixture("operation-log-startup-");
+  try {
+    expect(latestStartupError(f.root, 0)).toBeNull();
+    const old = openOperationLog(f.root, "startup", "");
+    old.event("error", "startup", "Error: old failure");
+    await utimes(old.path!, new Date(1000), new Date(1000));
+    const since = Date.now() - 1000, log = openOperationLog(f.root, "startup", "");
+    log.event("error", "startup", operationError(new Error("data version 9 unsupported token=private-startup-value")));
+    expect(latestStartupError(f.root, since)).toEqual({ path: log.path!, error: "Error: data version 9 unsupported token=***" });
+    expect(latestStartupError(f.root, Date.now() + 60_000)).toBeNull();
+  } finally { await f.cleanup(); }
+});
+
+test("服务模块加载后的启动失败同样写启动日志，部署的就绪等待能报出原因", async () => {
+  const f = await tempFixture("operation-log-app-startup-");
+  try {
+    // A current deployment record passes the entry's gate; the missing data then fails inside app.ts.
+    await mkdir(join(f.root, "data/state"), { recursive: true });
+    await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: DATA_VERSION, appVersion: "1.1.0", build: "",
+      transaction: "deploy-fixture", application: CURRENT_APPLICATION }));
+    const since = Date.now() - 1000, env = { ...process.env };
+    delete env.BOT_OPERATION_LOG;
+    const child = Bun.spawn([process.execPath, "--no-env-file", join(project, "src/server/index.ts")], { cwd: f.root, env, stdout: "pipe", stderr: "pipe", windowsHide: true });
+    const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code).toBe(1);
+    const reason = /服务启动失败: (.+)/.exec(out + err)?.[1]?.trim();
+    expect(reason).toBeTruthy();
+    const startup = latestStartupError(f.root, since);
+    expect(startup?.path).toContain(join(f.root, "logs/operations", "startup-"));
+    expect(reason).toContain(startup!.error.replace(/^\w+: /, ""));
+  } finally { await f.cleanup(); }
+}, 60000);

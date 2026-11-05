@@ -9,16 +9,16 @@ import { basename, dirname, join } from "node:path";
 import { deflateSync } from "node:zlib";
 import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { createModels, type Message, type Models, Type, type Usage } from "@earendil-works/pi-ai";
+import { createModels, type Message, type Models, type Usage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { CODEMODE_SOURCE_GRAMMAR, MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "@earendil-works/pi-codemode";
-import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   configure, type Conversation, DEFAULT_PROGRESS_POLICY, defineExtension, type Extension, type HarnessSettings, LiveDoc, type ModelRef, NestedCallDoc,
   type ProgressPolicy, type Storage, type ToolExecutionApi, type ToolRegistration, UsageDoc,
 } from "@earendil-works/pi-durable";
+import { obj, str } from "@earendil-works/pi-schema";
 import { openModelRuntime } from "../../src/core/model-config.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { type CodemodeDetails, codemodeExtension, CodemodeStoreDoc } from "../../src/durable/codemode/index.ts";
@@ -27,7 +27,7 @@ import { memberConversation } from "../../src/durable/identity.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { syncMemberStats } from "../../src/durable/projection.ts";
 import {
-  baseMemberTools, type BaseToolsOptions, type MemberCall, memberPlaces, memberRegistration, type MemberTool,
+  baseMemberTools, type BaseToolsOptions, type MemberCall, memberPlaces, memberTool, type MemberTool, type MemberToolResult, type MemberToolSpec,
 } from "../../src/durable/tools.ts";
 import { type GroupHarness, openGroupHarness, PROJECT_PROGRESS as PROGRESS } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -41,8 +41,10 @@ const ALICE = "+8613800000001";
 const BOB = "+8613800000002";
 let counter = 0;
 
-/** A fixture extension of member tools (registered as the registry registers them). */
-type Module = { name: string; tools: MemberTool[] };
+/** A fixture tool (see probe); `replay` overrides its registration's (member tools besides the official four are unsafe). */
+type Probe = MemberToolSpec & { readonly replay?: "safe" };
+/** A fixture extension of member tools (registered as the registry registers them, for the group's places). */
+type Module = { name: string; tools: Probe[] };
 type Setup = {
   /** Fixture extensions of member tools, installed after mixin.base; their tools are the codemode adapter's too. */
   modules?: Module[];
@@ -84,10 +86,14 @@ async function openGroup(setup: Setup = {}): Promise<Group> {
   const model = faux.getModel();
   const base: BaseToolsOptions = { layout: appLayout(join(fixture.root, `群数据-${n}`)), scope: groupScope(setup.toolsGroup ?? GROUP) };
   const members = baseMemberTools(base);
-  const modules = setup.modules ?? [];
+  const install = ({ replay, ...spec }: Probe): MemberTool => {
+    const tool = memberTool(spec, base);
+    return replay === undefined ? tool : { ...tool, registration: { ...tool.registration, replay } };
+  };
+  const modules = (setup.modules ?? []).map((module) => ({ name: module.name, tools: module.tools.map(install) }));
   const extensions = [
-    defineExtension({ name: "mixin.base", tools: members.map(memberRegistration) }),
-    ...modules.map((module) => defineExtension({ name: module.name, tools: module.tools.map(memberRegistration) })),
+    defineExtension({ name: "mixin.base", tools: members.map((tool) => tool.registration) }),
+    ...modules.map((module) => defineExtension({ name: module.name, tools: module.tools.map((tool) => tool.registration) })),
     ...setup.extensions ?? [],
     codemodeExtension({ members: base, tools: [...members, ...modules.flatMap((module) => module.tools)] }),
   ];
@@ -219,29 +225,24 @@ async function interrupt(group: Group, conversation: Conversation, code: string,
   return { id, result, request, conversation: again, outcome: await outcomeOf(group, id) };
 }
 
-/** A fixture tool reached only from scripts unless `definition` says otherwise; `run` gets the validated arguments. */
-function probe(name: string, run: (args: any, call: MemberCall) => Promise<AgentToolResult<unknown>> | AgentToolResult<unknown>,
-  definition: Partial<ToolDefinition> = {}, replay: "safe" | "unsafe" = "unsafe"): MemberTool {
+/** A fixture tool reached only from scripts unless `spec` says otherwise; `run` gets the validated arguments. */
+function probe(name: string, run: (args: any, call: MemberCall) => Promise<MemberToolResult> | MemberToolResult,
+  spec: Partial<MemberToolSpec> = {}, replay?: "safe"): Probe {
   return {
-    definition: {
-      name, label: name, description: `Fixture tool ${name}.`, exposure: "codemode",
-      parameters: Type.Object({}, { additionalProperties: true }),
-      execute: async () => { throw new Error("fixture tools run through MemberTool.run"); },
-      ...definition,
-    } as ToolDefinition,
-    replay,
-    outputLimits: { maxBytes: 64 * 1024, maxLines: 2200 },
-    run: async (args, call) => run(args, call),
+    name, description: `Fixture tool ${name}.`, callers: ["tools"], parameters: obj({}, { open: true }),
+    run: async (args, _member, call) => run(args, call),
+    ...spec,
+    ...replay === undefined ? {} : { replay },
   };
 }
 
-const text = (value: string): AgentToolResult<unknown> => ({ content: [{ type: "text", text: value }], details: undefined });
+const text = (value: string): MemberToolResult => ({ output: [{ type: "text", text: value }] });
 /** Never answers; rejects when the sub-call is cancelled. */
-const hang = (_args: unknown, call: MemberCall) => new Promise<AgentToolResult<unknown>>((_, reject) => {
+const hang = (_args: unknown, call: MemberCall) => new Promise<MemberToolResult>((_, reject) => {
   if (call.signal?.aborted) reject(new Error("aborted"));
   call.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
 });
-const module = (...tools: MemberTool[]): Module => ({ name: "fixture.module", tools });
+const module = (...tools: Probe[]): Module => ({ name: "fixture.module", tools });
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
@@ -291,14 +292,14 @@ const NAMESPACE = { name: "fixture_ns", description: "Fixture tools for the code
 let echoRuns = 0;
 const echo = probe("probe_echo", ({ text: value }) => {
   echoRuns++;
-  return { content: [{ type: "text", text: value }], details: undefined, structuredContent: { echo: value } };
+  return { output: [{ type: "text", text: value }], structuredOutput: { echo: value } };
 }, {
   description: "Echo the given text back as a structured value.",
-  parameters: Type.Object({ text: Type.String({ description: "Text to echo back" }) }),
-  outputSchema: Type.Object({ echo: Type.String() }),
+  parameters: obj({ text: str({ description: "Text to echo back" }) }, { open: true }),
+  structuredOutputSchema: obj({ echo: str() }, { open: true }),
   namespace: NAMESPACE,
 });
-const send = probe("send_probe", () => text("sent"), { exposure: "model-only", description: "Send something (model only)." });
+const send = probe("send_probe", () => text("sent"), { callers: ["model"], description: "Send something (model only)." });
 const sendModule: Module = { name: "fixture.send", tools: [send] };
 
 describe("Durable codemode: declarations and scope", () => {
@@ -314,7 +315,7 @@ describe("Durable codemode: declarations and scope", () => {
       // No models: the official description of the variant without models.* globals.
       expect(codemode.description).not.toContain("models.");
 
-      const original = Object.fromEntries(baseMemberTools(group.base).map((tool) => [tool.definition.name, tool.definition.description]));
+      const original = Object.fromEntries(baseMemberTools(group.base).map(({ registration }) => [registration.name, registration.description]));
       const request = await ask(group, await member(group));
       const declared = Object.fromEntries(getCurrentTools(request).map((tool) => [tool.name, tool]));
       // Script-only tools are not offered to the model; direct tools keep their own descriptions.
@@ -341,10 +342,12 @@ describe("Durable codemode: declarations and scope", () => {
   });
 
   test("scope: direct tools and script-only tools of selected extensions; deferred tools through searchTools(); no models", async () => {
-    const deferred = probe("probe_deferred", () => text("deferred ok"), { exposure: "deferred", description: "A deferred fixture tool." });
+    const deferred = probe("probe_deferred", () => text("deferred ok"), { callers: ["tools"], deferred: true, description: "A deferred fixture tool." });
+    // Found by a Chinese query too (pi-durable 1.5.0 segments non-ASCII words), as a Chinese MCP tool would be.
+    const weather = probe("probe_weather", () => text("晴"), { callers: ["tools"], deferred: true, description: "查询城市的天气预报。" });
     const off = probe("probe_off", () => text("off"));
     const offModule: Module = { name: "fixture.off", tools: [off] };
-    const group = await openGroup({ modules: [module(echo, deferred), offModule, sendModule] });
+    const group = await openGroup({ modules: [module(echo, deferred, weather), offModule, sendModule] });
     try {
       const alice = await member(group);
       await alice.configure({ extensions: { remove: [group.extension("fixture.off")] } }, context);
@@ -362,6 +365,7 @@ return {
   models: typeof models,
   search: (await searchTools("echo text back")).map((tool) => tool.name),
   deferredFound: (await searchTools("deferred fixture")).map((tool) => tool.name),
+  chinese: (await searchTools("天气预报")).map((tool) => tool.name),
   scoped: (await searchTools("fixture", { namespace: "fixture_ns" })).map((tool) => tool.name),
   sample: await describeTool("probe_echo"),
   namespace: await describeNamespace("fixture_ns"),
@@ -379,6 +383,7 @@ return {
       expect(value.models).toBe("undefined");
       expect(value.search[0]).toBe("probe_echo");
       expect(value.deferredFound).toContain("probe_deferred");
+      expect(value.chinese[0]).toBe("probe_weather");
       expect(value.scoped).toEqual(["probe_echo"]);
       expect(value.sample).toContain("probe_echo");
       expect(value.namespace).toMatchObject({ name: NAMESPACE.name, description: NAMESPACE.description, instructions: NAMESPACE.instructions, tools: ["probe_echo"] });
@@ -399,7 +404,7 @@ return {
 
   test("scope: a same-named tool another extension puts in place of a direct tool is what scripts call, never the member's", async () => {
     const other = {
-      name: "read", description: "Another extension's read.", parameters: Type.Object({ key: Type.String() }), replay: "safe",
+      name: "read", description: "Another extension's read.", parameters: obj({ key: str() }, { open: true }), replay: "safe",
       execute: async () => ({ output: [{ type: "text", text: "other read" }] }),
     } as unknown as ToolRegistration;
     const group = await openGroup({ extensions: [defineExtension({ name: "fixture.other-read", tools: [other] })] });
@@ -515,7 +520,7 @@ return { exit, timeout, ok };`);
     } finally { await group.close(); }
   }, 90_000);
 
-  test("read: scripts get native schema-less text and images remain model attachments", async () => {
+  test("read: scripts get the text, or an image as its image block", async () => {
     const group = await openGroup();
     try {
       const tmp = places(group).tempDir;
@@ -525,7 +530,8 @@ return { exit, timeout, ok };`);
       await writeFile(textFile, rows.join("\n"));
       const imageFile = join(tmp, "图.png");
       await writeFile(imageFile, png(3, 2));
-      const run = await script(group, await member(group), `
+      const alice = await member(group);
+      const run = await script(group, alice, `
 const whole = await tools.read({ path: ${JSON.stringify(textFile)} });
 const part = await tools.read({ path: ${JSON.stringify(textFile)}, offset: 2, limit: 1 });
 const shot = await tools.read({ path: ${JSON.stringify(imageFile)} });
@@ -535,11 +541,15 @@ return { whole, part, shot };`);
       expect(value.whole).toBe(rows.join("\n"));
       expect(value.part).toBe(rows[1]);
       expect(value.part).not.toContain(rows[2]!);
-      // Official Codemode omits images from schema-less values. Direct read still delivers model images.
-      expect(value.shot).toBe("");
+      // read declares a string or an image block as its output (pi-durable 1.5.0); image() would show the image.
+      expect(value.shot).toEqual({ type: "image", data: png(3, 2).toString("base64"), mimeType: "image/png" });
       // Nothing was saved for the call.
       expect(existsSync(resultsRoot(tmp))).toBe(false);
-
+      // The document-work skill shows rendered pages this way.
+      const shown = await script(group, alice, `image(await tools.read({ path: ${JSON.stringify(imageFile)} }));`);
+      expect(shown.result.isError).toBe(false);
+      expect(shown.result.content.filter((item) => item.type === "image").map((item) => [item.mimeType, item.data]))
+        .toEqual([["image/png", png(3, 2).toString("base64")]]);
     } finally { await group.close(); }
   }, 60_000);
 
@@ -686,7 +696,7 @@ return { a, b, hung };`, async () => nestedRunning(group, alice, "probe_hang"));
     const metered = probe("probe_metered", ({ n }) => { runs++; return { ...text(String(n)), usage: usage(n) }; });
     const body = `await tools.probe_metered({ n: 42 });\nawait tools.probe_hang({});\nreturn 1;`;
 
-    async function usageGroup(...tools: MemberTool[]) {
+    async function usageGroup(...tools: Probe[]) {
       runs = 0;
       delete hooks.found;
       delete hooks.afterOutcome;
@@ -1273,8 +1283,8 @@ describe("Durable codemode: results directory", () => {
     const PNG = pngBytes.toString("base64");
     const GIF = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
     // A tool whose structured value is an image block: the script passes it on with image().
-    const block = probe("probe_block", () => ({ ...text("图"), structuredContent: { type: "image", data: PNG, mimeType: "image/png" } }),
-      { outputSchema: Type.Object({ type: Type.String(), data: Type.String(), mimeType: Type.String() }) });
+    const block = probe("probe_block", () => ({ ...text("图"), structuredOutput: { type: "image", data: PNG, mimeType: "image/png" } }),
+      { structuredOutputSchema: obj({ type: str(), data: str(), mimeType: str() }, { open: true }) });
     const group = await openGroup({ modules: [module(block)], extensions: [prepared] });
     aliceTmp = places(group).tempDir;
     const labelled = (content: Content[]) => content.flatMap((item, index) => {

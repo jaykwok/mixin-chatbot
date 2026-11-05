@@ -66,7 +66,8 @@ export class ResultMaintenance {
   async member(harness: Harness, phone: string, tempDir: string, deadline: number, references: ReferenceText): Promise<void> {
     const calls = (await harness.snapshot(ResultsDoc, this.options.context))?.calls ?? {};
     const due = dueResults(calls, phone, deadline);
-    const protectedNames = referencedResults(tempDir, due.names, references, due.isolated);
+    // Only what may go now is looked up: a pass with nothing due never serializes the references.
+    const protectedNames = referencedResults(tempDir, due.eligible, references, due.isolated);
     const removed = await this.#removeDue(harness, tempDir, due, protectedNames);
     await this.#reconcileRemoved(calls, tempDir, due.names, removed);
     // Only successful removals may be retired. A failed deletion remains registered for the next sweep/clear retry.

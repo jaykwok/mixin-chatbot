@@ -1,9 +1,9 @@
 import { afterAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { type ConversationId, createSession, defineExtension, type Tx } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { memberConversation, MemberDirectory } from "../../src/durable/identity.ts";
 import { InboxDoc } from "../../src/durable/inbox.ts";
@@ -117,7 +117,7 @@ test("a failed part due later is sent at startup when its retry comes; a deliver
     expect(records.requests[expired.requestId]!.delivery!.abandoned).toEqual({ at: expect.any(Number), reason: "expired" });
     expect(records.requests[expired.requestId]!.delivery!.parts[0]!.attempts).toBe(0);
     expect(reports.map(String)).toContainEqual(expect.stringContaining("交付超时放弃"));
-    // /health carries the count for the doctor and the TUI overview: the space label only.
+    // /health carries the count for the doctor and the console overview: the space label only.
     expect(service.attention()).toEqual({ deliveryAbandoned: { count: 1, lastAt: expect.any(Number), space: `群 ${GROUP}` } });
   } finally { await service.close(); }
 }, 30000);
@@ -147,7 +147,7 @@ for (const phase of ["model", "safe-tool"] as const) test(`offline expiry cancel
   const f = setup(), first = gatedResponse("interrupted answer"), toolStarted = Promise.withResolvers<void>();
   let toolCalls = 0;
   const extensions = phase === "safe-tool" ? () => [defineExtension({ name: "deadline-fixture", tools: [{
-    name: "safe_wait", description: "Synthetic cancellable read", parameters: Type.Object({}), replay: "safe",
+    name: "safe_wait", description: "Synthetic cancellable read", parameters: obj({}, { open: true }), replay: "safe",
     async execute(_args, _api, context) {
       toolCalls++; toolStarted.resolve();
       await new Promise<void>((_resolve, reject) => {
@@ -184,6 +184,25 @@ for (const phase of ["model", "safe-tool"] as const) test(`offline expiry cancel
     }
     finally { ledger.close(); }
   } finally { first.open(); await resumed?.close(); await original.close(); }
+}, 30000);
+
+test("a watchdog abort committed just before a restart still answers the member, though its reason is gone", async () => {
+  const f = setup(), first = gatedResponse("never"), second = gatedResponse("never");
+  f.faux.setResponses([first.step, second.step]);
+  const original = new DurableService(f.common); let resumed: DurableService | undefined;
+  try {
+    await original.admit(f.out.message(GROUP, PHONE, "question")); await first.started; await original.close();
+    // What the abort commit leaves when the process ends before the closing commit: settled, and still in the inbox.
+    const opened = await openGroupHarness(databaseOf(f.common.layout.data, GROUP), f.models, { group: GROUP, door: false });
+    try {
+      const member = await opened.harness.snapshot(MemberDirectory, PHONE, context);
+      await (await opened.harness.conversation(member!.conversationId as ConversationId, context))!.abort(context);
+    } finally { second.open(); await opened.close(); }
+    resumed = new DurableService(f.common); await resumed.start();
+    await until(() => replyTexts(f.out.sent).some(text => text.includes("时限检查已中止本次运行")), "the failure reply");
+    await until(() => resumed!.hasUserRequestCapacity(), "item removed");
+    expect(replyTexts(f.out.sent).filter(text => text.includes("超过时限已被停止"))).toHaveLength(1);
+  } finally { first.open(); second.open(); await resumed?.close(); await original.close(); }
 }, 30000);
 
 for (const submitted of [false, true]) test(`offline expiry preserves an already settled answer but never submits an expired unstarted item; submitted=${submitted}`, async () => {

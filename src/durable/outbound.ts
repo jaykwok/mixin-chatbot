@@ -36,7 +36,7 @@ export function platformOutbound(client: PlatformClient, sender: MessageSender):
 }
 
 /** Messages older than this when received are maintenance redeliveries (plan 2.7). */
-export const LATE_MS = 60_000;
+const LATE_MS = 60_000;
 
 export function lateMinutes(reply: ReplyContext): number | undefined {
   if (reply.sentAt === undefined || reply.receivedAt - reply.sentAt <= LATE_MS) return undefined;
@@ -55,7 +55,7 @@ export function escapeInline(text: string): string {
   return text.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim().replace(MARKDOWN_SPECIAL, "\\$&");
 }
 
-export function summaryLine(reply: ReplyContext): string {
+function summaryLine(reply: ReplyContext): string {
   const name = reply.name ? ` ${escapeInline(reply.name)}` : "";
   return `> 回复${name}：${escapeInline(reply.summary)}\n\n`;
 }
@@ -76,27 +76,21 @@ export function replyMessage(reply: ReplyContext, segment: string, lead: boolean
   return lead ? markdownMessage(summaryLine(reply) + segment, reply.senderImUserId) : markdownMessage(segment);
 }
 
-/** A notice (status, receipt, error) as messages; `mention` only for terminal errors. */
-export function noticeMessages(reply: ReplyContext, text: string, mention = false): OutboundMessage[] {
+/** A notice (status, receipt, error) as messages. */
+function noticeMessages(reply: ReplyContext, text: string): OutboundMessage[] {
   if (reply.kind !== "group") return splitText(text).map(textMessage);
-  return replySegments(reply, text).map((segment, index) => index === 0
-    ? markdownMessage(summaryLine(reply) + segment, mention ? reply.senderImUserId : undefined)
-    : markdownMessage(segment));
+  return replySegments(reply, text).map((segment, index) => markdownMessage(index === 0 ? summaryLine(reply) + segment : segment));
 }
 
 /** Send a notice; false unless every segment was confirmed. Best effort: never throws for platform failures. */
-export async function sendNotice(outbound: Outbound, reply: ReplyContext, text: string, options: { mention?: boolean; signal?: AbortSignal } = {}): Promise<boolean> {
-  return outbound.sequence(targetOf(reply), send => noticeVia(send, reply, text, options), options.signal)
-    .catch(error => { if (options.signal?.aborted) return false; throw error; });
-}
-
-/** A notice through a held sequence's `send` (see Outbound.sequence); false unless every segment was confirmed. */
-export async function noticeVia(send: Send, reply: ReplyContext, text: string, options: { mention?: boolean; signal?: AbortSignal } = {}): Promise<boolean> {
-  for (const message of noticeMessages(reply, text, options.mention)) {
-    const outcome = await send(message, { replyMsgId: reply.msgUid, ...(options.signal ? { signal: options.signal } : {}) });
-    if (outcome.status !== "sent") return false;
-  }
-  return true;
+export async function sendNotice(outbound: Outbound, reply: ReplyContext, text: string, options: { signal?: AbortSignal } = {}): Promise<boolean> {
+  return outbound.sequence(targetOf(reply), async send => {
+    for (const message of noticeMessages(reply, text)) {
+      const outcome = await send(message, { replyMsgId: reply.msgUid, ...(options.signal ? { signal: options.signal } : {}) });
+      if (outcome.status !== "sent") return false;
+    }
+    return true;
+  }, options.signal).catch(error => { if (options.signal?.aborted) return false; throw error; });
 }
 
 const IMAGE_TYPES: Record<string, string> = { png: "png", jpg: "jpg", jpeg: "jpg", gif: "gif", webp: "webp", bmp: "bmp" };

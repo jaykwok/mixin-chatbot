@@ -29,6 +29,8 @@ RUN bun install --frozen-lockfile --production
 COPY --chown=appuser:appgroup src ./src
 COPY --chown=appuser:appgroup scripts/config ./scripts/config
 COPY --chown=appuser:appgroup scripts/ops/*.ts ./scripts/ops/
+# The rest of scripts/ops/shared serves the host console; the data tools import only the formatter.
+COPY --chown=appuser:appgroup scripts/ops/shared/format.ts ./scripts/ops/shared/format.ts
 COPY --chown=appuser:appgroup scripts/lib/*.ts ./scripts/lib/
 COPY --chown=appuser:appgroup scripts/runtime ./scripts/runtime
 COPY --chown=appuser:appgroup scripts/test.ts ./scripts/test.ts

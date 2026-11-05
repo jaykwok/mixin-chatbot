@@ -5,7 +5,7 @@
 // was admitted. The service counts it after the admission commit and again from the member's run records at every sync,
 // so a failed count catches up while the record still exists (closed records stay at least a day). Counted requestIds
 // are kept for ASK_ID_RETENTION_MS; the pruning moves a persisted horizon forward, and an ask from before the horizon is
-// never counted again, so a record that outlives the retention (a parked task) cannot count twice.
+// never counted again, so a record that outlives the retention cannot count twice.
 //
 // Tokens. Durable keeps cumulative totals per conversation in `pi.usage` (models: `provider/model`, tools: tool name).
 // A sync stores the latest totals per source (space database generation + conversation) and adds the difference to the
@@ -83,7 +83,7 @@ export function openStatsLedger(path: string): Database {
 }
 
 /**
- * 只读入口（stat、TUI）：只读连接、只读版本检查，不建库建表、不改日志模式。
+ * 只读入口（stat、控制台）：只读连接、只读版本检查，不建库建表、不改日志模式。
  * 以运维账户身份写库会留下服务写不了的文件，也打不开只读的账本快照。
  */
 export function openExistingStatsLedger(path: string): Database | null {
@@ -200,25 +200,28 @@ export function syncUsage(db: Database, source: UsageSource, state: UsageState, 
 /** Rows of the old ledger kept by the import tool: daily asks per member, daily tokens per member and model. */
 export interface ImportRows {
   asks: { day: string; space: string; user: string; asks: number; firstAt: number; lastAt: number }[];
-  usage: ({ day: string; space: string; user: string; key: string } & TokenTotals)[];
+  usage: ({ day: string; space: string; user: string; key: string; bucket?: UsageBucket } & TokenTotals)[];
 }
 
 /**
  * Add an old ledger's rows once, marked as imported. `digest` identifies the source file: the same file again adds
  * nothing ("already"); a second, different file is refused, since two old ledgers may overlap.
  */
-export function importRows(db: Database, digest: string, rows: ImportRows, now = Date.now()): "imported" | "already" {
+export function importRows(db: Database, digest: string, rows: ImportRows, now = Date.now(), requireEmpty = false): "imported" | "already" {
   return db.transaction(() => {
     const done = importedDigests(db);
     if (done.includes(digest)) return "already" as const;
     if (done.length) throw new Error("新账本已导入过另一份旧统计，拒绝再导入，以免重复计数");
+    if (requireEmpty && (db.query("SELECT 1 FROM asks_daily LIMIT 1").get() || db.query("SELECT 1 FROM usage_daily LIMIT 1").get())) {
+      throw new Error("同版本统计仅可恢复到空账本；当前已有统计，拒绝导入以免重复计数");
+    }
     const ask = db.query(ADD_ASKS);
     for (const row of rows.asks) ask.run(row.day, row.space, row.user, "import", row.asks, row.firstAt, row.lastAt);
     const usage = db.query(`INSERT INTO usage_daily (day, space, user, bucket, key, origin, input, output, cache_read, cache_write, total_tokens)
-      VALUES (?, ?, ?, 'models', ?, 'import', ?, ?, ?, ?, ?) ON CONFLICT(day, space, user, bucket, key, origin) DO UPDATE SET
+      VALUES (?, ?, ?, ?, ?, 'import', ?, ?, ?, ?, ?) ON CONFLICT(day, space, user, bucket, key, origin) DO UPDATE SET
         input = input + excluded.input, output = output + excluded.output, cache_read = cache_read + excluded.cache_read,
         cache_write = cache_write + excluded.cache_write, total_tokens = total_tokens + excluded.total_tokens`);
-    for (const row of rows.usage) usage.run(row.day, row.space, row.user, row.key, ...TOKEN_FIELDS.map(field => row[field]));
+    for (const row of rows.usage) usage.run(row.day, row.space, row.user, row.bucket ?? "models", row.key, ...TOKEN_FIELDS.map(field => row[field]));
     db.query("INSERT INTO imports (digest, at, asks, usage_rows) VALUES (?, ?, ?, ?)")
       .run(digest, now, rows.asks.reduce((sum, row) => sum + row.asks, 0), rows.usage.length);
     return "imported" as const;
@@ -250,9 +253,11 @@ export function dayWindow(window: { since?: number; until?: number }): DayWindow
 }
 
 /** 读出区间内的行（导入行与实时行合并）；排序固定，折算结果与平台和写入次序无关。 */
-export function readLedger(db: Database, window: DayWindow = {}, group?: string): LedgerRows {
+export function readLedger(db: Database, window: DayWindow = {}, group?: string, user?: string): LedgerRows {
   const filters: string[] = [], args: string[] = [];
   if (group !== undefined) { filters.push("space = ?"); args.push(group); }
+  if (user !== undefined) { filters.push("user = ?"); args.push(user); }
+  const spaceFilter = filters.length ? " WHERE " + filters.join(" AND ") : "", scopeArgs = [...args];
   if (window.since !== undefined) { filters.push("day >= ?"); args.push(window.since); }
   if (window.until !== undefined) { filters.push("day <= ?"); args.push(window.until); }
   const clause = filters.length ? " WHERE " + filters.join(" AND ") : "";
@@ -261,8 +266,7 @@ export function readLedger(db: Database, window: DayWindow = {}, group?: string)
   const usage = db.query(`SELECT space AS "group", user, day, bucket, key, SUM(input) AS input, SUM(output) AS output,
       SUM(cache_read) AS cacheRead, SUM(cache_write) AS cacheWrite, SUM(total_tokens) AS totalTokens
     FROM usage_daily${clause} GROUP BY space, user, day, bucket, key ORDER BY space, user, day, bucket, key`).all(...args) as UsageRow[];
-  const spaceFilter = group === undefined ? "" : " WHERE space = ?";
   const groups = (db.query(`SELECT space FROM asks_daily${spaceFilter} UNION SELECT space FROM usage_daily${spaceFilter} ORDER BY space`)
-    .all(...(group === undefined ? [] : [group, group])) as { space: string }[]).map(row => row.space);
+    .all(...scopeArgs, ...scopeArgs) as { space: string }[]).map(row => row.space);
   return { asks, usage, groups };
 }

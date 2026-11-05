@@ -1,7 +1,8 @@
-// The message service on Durable 1.4.0's sleeping and parked tasks (src/durable/service.ts): a retry backoff or a
-// deferred poll is no model idleness and survives a restart; /stop during a backoff sends nothing more; a crash loop
-// parks the run, /status says so and /stop ends it; a failed run keeps the member's next message, which runs once.
-// Each actual model call has exactly one start record. Faux models and a recording outbound; no network, no platform.
+// The message service on Durable's sleeping tasks and failed runs (src/durable/service.ts): a retry backoff or a
+// deferred poll is no model idleness and survives a restart; /stop during a backoff sends nothing more; crashes while
+// the model answers use up the retries and end the run with a failure reply; a failed run keeps the member's next
+// message, which runs once. Each actual model call has exactly one start record. Faux models and a recording outbound;
+// no network, no platform.
 import { afterAll, describe, expect, test } from "bun:test";
 import { renameSync } from "node:fs";
 import { join } from "node:path";
@@ -185,7 +186,7 @@ describe("durable service: sleeping tasks", () => {
   });
 });
 
-describe("durable service: failed runs and parked tasks", () => {
+describe("durable service: failed runs", () => {
   test("a failed run is answered with its failure and keeps the queued message, which runs once", async () => {
     const root = join(fixture.root, `root-${++counter}`);
     const { faux, models, model } = fauxModels();
@@ -206,18 +207,17 @@ describe("durable service: failed runs and parked tasks", () => {
     expect(usage(root)).toEqual({ asks: 2, buckets: ["models"] });
   });
 
-  for (const [command, receipt] of [["/stop", "⏹ 已停止你在本群的当前任务"], ["/clear", "🧹 已为你在本群开启新会话"]] as const)
-  test(`a run cut off by crashes restartLimit times is parked: reported, explained by /status, no request, and ${command} ends it`, async () => {
+  test("crashes while the model answers use up the retries: the run ends interrupted, reported and answered with the failure, and the next message runs", async () => {
     const root = join(fixture.root, `root-${++counter}`);
     const { faux, models, model } = fauxModels();
-    const settings: HarnessSettings = { restartLimit: 2 };
+    const settings: HarnessSettings = { retry: { maxRetries: 1, baseDelayMs: 10, maxAgentDelayMs: 20 } };
     const out = recordingOutbound();
-    let first = hanging();
+    const first = hanging();
     faux.setResponses([first.step]);
     let opened = open(root, models, model, settings, out);
     await opened.service.admit(out.message(GROUP, ALICE, "会崩溃的问题"));
     await until(() => first.state.started === 1, "the request");
-    // A close is no crash: the run goes back to pending, uncounted, and runs again.
+    // A close is no crash: the run goes back to pending, uncounted, and its request is sent again.
     await opened.service.close();
     expect((await stored(root)).tasks).toEqual([{ kind: expect.any(String), status: "pending", restarts: undefined }]);
     for (let crash = 1; crash <= 2; crash++) {
@@ -225,34 +225,33 @@ describe("durable service: failed runs and parked tasks", () => {
       faux.setResponses([round.step]);
       opened = open(root, models, model, settings, out);
       await opened.service.start();
+      // After the first crash, the next host counts the cut-off attempt as failed and sends the retry.
       await until(() => round.state.started === 1, `the request after restart ${crash}`);
       const image = crashImage(root);
       await opened.service.close();
       image.restore();
-      expect((await stored(root)).tasks).toEqual([{ kind: expect.any(String), status: "running", restarts: crash === 1 ? undefined : 1 }]);
-      first = round;
+      expect((await stored(root)).tasks).toEqual([{ kind: expect.any(String), status: "running", restarts: undefined }]);
     }
     expect(faux.state.callCount).toBe(3);
 
-    faux.setResponses([fauxAssistantMessage("停止之后的回答")]);
+    faux.setResponses([fauxAssistantMessage("之后的回答")]);
     opened = open(root, models, model, settings, out);
     try {
       await opened.service.start();
-      await until(() => opened.reports.some((line) => line.includes("task_parked")), "the parked report");
-      expect(opened.reports.filter((line) => line.includes("task_parked"))).toHaveLength(1);
-      expect(opened.reports[0]).toContain("/stop 或 /clear");
-      expect(opened.service.attention().parked).toEqual({ count: 1, lastAt: expect.any(Number), space: `群 ${GROUP}` });
-      const status = await opened.service.control(out.message(GROUP, ALICE, "/status"));
-      expect(status).toContain("状态：已停放");
-      expect(status).toMatch(/停放的任务：.+运行中连续 2 次被异常中断且没有进展，已停止自动重跑；发送 \/stop/);
-      await Bun.sleep(200);
+      // The second cut-off attempt leaves no retry: the run ends without another request, and the member is told why.
+      await until(() => failures(out.sent).length === 1, "the failure reply");
+      expect(failures(out.sent)[0]).toContain("机器人服务在模型回答途中意外停止");
+      expect(failures(out.sent)[0]).toContain("The host stopped while the model was answering, on attempt 2");
+      const interrupted = opened.reports.filter((line) => line.includes("task_interrupted"));
+      expect(interrupted).toHaveLength(1);
+      expect(interrupted[0]).toContain("服务在模型回答途中停止的次数超过重试次数");
+      expect(opened.service.attention().interrupted).toEqual({ count: 1, lastAt: expect.any(Number), space: `群 ${GROUP}` });
+      expect(await opened.service.control(out.message(GROUP, ALICE, "/status"))).toContain("状态：空闲");
       expect(faux.state.callCount).toBe(3);
-      expect(await opened.service.control(out.message(GROUP, ALICE, command))).toContain(receipt);
-      await opened.service.admit(out.message(GROUP, ALICE, "停止之后"));
+      await opened.service.admit(out.message(GROUP, ALICE, "之后"));
       await until(() => replies(out.sent).length === 1, "the next answer");
-      expect(replies(out.sent)).toEqual(["停止之后的回答"]);
+      expect(replies(out.sent)).toEqual(["之后的回答"]);
       expect(faux.state.callCount).toBe(4);
-      expect(await opened.service.control(out.message(GROUP, ALICE, "/status"))).not.toContain("停放");
     } finally { await opened.service.close(); }
     expect((await stored(root)).tasks).toEqual([]);
     // The crashed message counts once however often it ran; the cut-off requests returned no usage.

@@ -11,12 +11,12 @@
 param(
     [Parameter(Position = 0)]
     [string]$Command = "",
-    # relay-purge 的关键字、stat/history-clear 的群号、backup-clean 的报告名、directory-confirm 的轮次，
-    # 或 directory-departments / directory-scope 的部门 ID（多个用逗号分隔并加引号）。
+    # relay-purge 的关键字、stat/history-clear 的群号、backup-clean 的报告名，
+    # 或 directory-scope 的 all（部门在控制台的通讯录页勾选）。
     [Parameter(Position = 1)]
     [string]$Target = "",
     [switch]$Repair,
-    # doctor 以单行 JSON 输出逐项结果，供运维界面消费；人类可读的输出保持原样。
+    # doctor 以单行 JSON 输出逐项结果，供控制台读取；人类可读的输出保持原样。
     [switch]$Json,
     # tmp-purge 的范围。PowerShell 会把 --days 这种 token 当参数名去绑定，所以这里用原生
     # 开关，由脚本翻译成 tmp-admin.ts 的 --days/--all/--user/--group。
@@ -37,32 +37,40 @@ param(
     [switch]$Direct,
     # backup-clean 的确认码（预演时给出）；不用 -Confirm，那是 PowerShell 的通用参数名。
     [string]$ConfirmCode = "",
+    # revision-cleanup shrink / shrink-preview 只处理这些空间（direct 或 groups/<目录名>，多个用逗号分隔并加引号）；
+    # restore 从备份恢复的那一个空间；shrink-remove-old 加 -Yes 才删除。
+    [string]$Space = "",
+    [switch]$Yes,
     [string]$ConfirmedTransaction = "",
+    [string]$Expect = "",
     [string]$RequestBase64 = ""
 )
 
 $ErrorActionPreference = "Stop"
+$script:OpsInputNames = @($PSBoundParameters.Keys)
 
-# TUI 按 UTF-8 读取 stdout/stderr，不能沿用 Windows PowerShell 5.1 的系统代码页。
+# 控制台按 UTF-8 读取 stdout/stderr，不能沿用 Windows PowerShell 5.1 的系统代码页。
 if ($RequestBase64) {
     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
     $OutputEncoding = [Console]::OutputEncoding
 }
 
-# 先解码运维界面的请求：恢复入口要在读取普通设置之前识别。
+# 先解码控制台的请求：恢复入口要在读取普通设置之前识别。
 # Decode data after PowerShell parameter binding; no expression evaluation or token reparsing.
 if ($RequestBase64) {
     $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
     foreach ($property in $request.PSObject.Properties) {
-        if ($property.Name -notin @('Command', 'Target', 'Group', 'User', 'Since', 'Until', 'Period', 'Days', 'All', 'Json', 'Repair', 'StorageSegment', 'GroupId', 'Direct', 'ConfirmedTransaction', 'Plan', 'Digest')) {
+        if ($property.Name -notin @('Command', 'Target', 'Group', 'User', 'Days', 'All', 'Json', 'StorageSegment', 'Direct', 'ConfirmedTransaction', 'Plan', 'Digest', 'Expect', 'ConfirmCode')) {
             throw "无效的运维请求字段"
         }
+        $script:OpsInputNames += $property.Name
         Set-Variable -Name $property.Name -Value $property.Value
     }
 }
 if ($StorageSegment -and $GroupId) { throw "群目录选择参数互斥" }
 
-$Project  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$OpsSource = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$Project = if ($env:MIXIN_OPS_PROJECT) { [IO.Path]::GetFullPath($env:MIXIN_OPS_PROJECT) } else { $OpsSource }
 # 与其他 Windows 脚本共用的纯辅助函数（可执行文件发现、交互提示）。
 $CommonLib = Join-Path $PSScriptRoot "..\lib\common.ps1"
 if (-not (Test-Path -LiteralPath $CommonLib -PathType Leaf)) {
@@ -86,7 +94,6 @@ function Step($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Done($m) { Write-Host "[+] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
 function Err($m)  { Write-Host "[x] $m" -ForegroundColor Red; Write-OperationEvent 'error' $m }
-function IsAdmin  { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
 function Find-VersionedApplication([string]$Name, [string]$Pattern, [string[]]$AdditionalPaths = @()) {
     $candidates = @(Get-ApplicationPaths $Name)
     foreach ($extra in $AdditionalPaths) {
@@ -154,214 +161,123 @@ function Get-BunPath {
     return $script:BunPath
 }
 
-# 外链运维交给 scripts\ops\relay-admin.ts 执行，这边只负责把 bun 跑起来。
-#
-# 对象签名和精确删除由 TypeScript 管理，shell 不接触凭据。这些知识全在
-# src\integrations\relay.ts；在 PowerShell 里抄一遍等于把它维护成两份，而且凭据会出现在
-# 命令行参数里，同机器上任何用户都能用 WMI 读到别人进程的完整命令行。
+# 外链运维（列出、测试、清理）交给运维核心，这边只转交参数。对象签名和精确删除由 TypeScript 管理，shell 不接触凭据：
+# 这些知识全在 src\integrations\relay.ts；在 PowerShell 里抄一遍等于把它维护成两份，而且凭据会出现在命令行参数里，
+# 同机器上任何用户都能用 WMI 读到别人进程的完整命令行。
 function Invoke-RelayAdmin([string[]]$RelayArgs) {
-    if (-not (Test-Path -LiteralPath $RelayConfigFile -PathType Leaf)) {
-        Err "未配置 data\config\relay.json，外链分发未启用"
-        return $false
-    }
-    $bunPath = Get-BunPath
-    if (-not $bunPath) {
-        Err "找不到可用的 bun；请安装 Bun：https://bun.sh"
-        return $false
-    }
-    Push-Location $Project
+    $script:OpsCoreExitCode = 1
+    if (@($script:OpsInputNames | Where-Object { $_ -cnotin @('Command','RequestBase64','Json','Target','All','Expect') }).Count) { Err '外链维护含有不适用的参数'; return $false }
+    $action = if ($RelayArgs[0] -eq 'list') { 'relay-ls' } else { 'relay-' + $RelayArgs[0] }
+    $coreArgs = @('maintenance', $action)
+    if ($RelayArgs.Count -gt 1) { $coreArgs += $RelayArgs[1..($RelayArgs.Count-1)] }
+    return (Invoke-CoreMaintenance $coreArgs)
+}
+
+# 结构化结果（W2 计划 §2 第 3 条），与 ops.sh 的 ops_result 相同：调用方设置 MIXIN_OPS_RESULT_FILE 时写一份 JSON（先写
+# 临时文件再改名），人类可读的输出不变。写不进去时返回 $false。
+function Write-OpsResult([string]$Outcome, [bool]$WasRunning, [string]$FinalState, [int]$ExitCode, [string]$Message) {
+    $path = $env:MIXIN_OPS_RESULT_FILE
+    if (-not $path) { return $true }
+    $temporary = "$path.$PID.tmp"
     try {
-        $previous = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            # Out-Host 而不是直接写管道：调用点是 if (-not (Invoke-RelayAdmin ...))，
-            # 那对括号会把函数的全部输出当成返回值收走，bun 打印的清单也就一起被吞了。
-            # 外链清单里全是中文文件名，不切 UTF-8 就是一屏乱码，见 Invoke-WithUtf8Output。
-            Invoke-WithUtf8Output {
-                & $bunPath run "scripts\ops\relay-admin.ts" @RelayArgs 2>&1 | Out-Host
-            }
-            return ($LASTEXITCODE -eq 0)
-        } finally {
-            $ErrorActionPreference = $previous
-        }
-    } finally {
-        Pop-Location
+        $json = [ordered]@{ protocol = 'mixin-ops'; version = 1; command = $Command; outcome = $Outcome; wasRunning = $WasRunning
+            finalState = $FinalState; exitCode = $ExitCode; message = $Message } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($temporary, $json + "`n", [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $path -Force
+        return $true
+    } catch {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        Err "无法写入结构化结果：$path"
+        return $false
     }
 }
 
-# 停机维护前确认原运行方式。只有计划任务正在运行才是后台实例；有本项目机器人进程而任务不存在或
-# 未在运行（通常为 Ready），就是前台实例：Start-Bot 只能启动计划任务，会改变运行方式和账户环境。
-function Get-BotRunState($Task) {
-    $taskRunning = [bool]($Task -and $Task.State -eq 'Running')
-    $processes = @(Get-BotPids).Count -gt 0
-    return [pscustomobject]@{ Running = ($taskRunning -or $processes); Foreground = ($processes -and -not $taskRunning) }
-}
-
-# 先形成经确认的配置草稿，再停机提交并恢复服务；凭据只存在于隐藏输入和配置文件中。
-function Invoke-RelayConfiguration {
-    $bunPath = Get-BunPath
-    if (-not $bunPath) { throw "找不到可用的 bun；请安装 Bun：https://bun.sh" }
-    $draft = Join-Path $ConfigDir (".relay-draft-" + [guid]::NewGuid().ToString("N") + ".json")
-    $wasRunning = $false
-    $stopAttempted = $false
-    Push-Location $Project
-    $previousErrorActionPreference = $ErrorActionPreference
+# 机器人此刻是否在运行：计划任务正在运行，或有本项目的机器人进程（前台实例）时为 running，否则为 stopped。
+function Get-FinalRunState {
     try {
-        $ErrorActionPreference = "Continue"
-        # 直接继承终端，保留密码掩码和 Ctrl+C；不把凭据放进参数或输出管道。
-        Invoke-WithUtf8Output { & $bunPath run "scripts\config\configure-relay.ts" --draft $draft }
-        if ($LASTEXITCODE -ne 0) { throw "外链配置未完成；原配置和服务保持原状" }
-        if (-not (Test-Path -LiteralPath $draft -PathType Leaf)) { return }
-        $ErrorActionPreference = "Stop"
         $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        $run = Get-BotRunState $task
-        $wasRunning = $run.Running
-        if ($run.Foreground) {
-            throw "机器人以前台方式运行，无法自动恢复；请先停止前台实例，再重新配置外链"
-        }
-        if ($wasRunning) {
-            Step "外链配置已确认，短暂停止机器人以应用设置"
-            $stopAttempted = $true
-            if (-not (Stop-Bot)) { throw "无法停止机器人，外链配置未写入" }
-        }
-        $ErrorActionPreference = "Continue"
-        Invoke-WithUtf8Output { & $bunPath run "scripts\config\configure-relay.ts" --apply $draft }
-        if ($LASTEXITCODE -ne 0) { throw "外链配置应用失败，请查看上方错误" }
-        if (-not $wasRunning) { Done "外链设置将在下次启动机器人时生效；已保持停止状态" }
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-        try {
-            if ($wasRunning -and $stopAttempted) {
-                if (-not (Start-Bot)) { throw "外链配置操作已结束，但机器人恢复启动失败" }
-                if ((Wait-Local) -ne 200) { throw "机器人恢复后未通过健康检查，请在 $(Get-OpsCommandHint 'logs') 查看日志" }
-                Done "机器人已恢复运行，已重新读取外链设置"
-            }
-        } finally {
-            Remove-Item -LiteralPath $draft -Force -ErrorAction SilentlyContinue
-            Pop-Location
-        }
-    }
+        $running = [bool]($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
+    } catch { return 'unknown' }
+    if ($running) { return 'running' }
+    return 'stopped'
 }
 
-# 配置向导（模型、应用机器人凭据）在维护租约下运行，要求机器人停止；结束后按原运行状态恢复。
-# 向导在草稿中填写，确认后才一起替换配置文件，取消或失败时原配置不变。
-function Invoke-ConfigureWizard([string]$Script, [string]$Label) {
+function Test-PendingTransaction {
+    return [bool](@('deploy-transaction', 'upgrade-transaction') | Where-Object { Test-Path -LiteralPath (Join-Path $StateDir $_) })
+}
+
+# 启停、重启（与 ops.sh 的 service_command 相同）和 Windows 的修复都由运维核心执行，它写结构化结果。start、restart、repair
+# 先做与停机维护相同的检查（部署锁、未完成的事务、维护状态 service）；repair 只在本机实例未就绪时重启（包括已停止的实例），
+# 已就绪时不动。stop 只在部署、升级或维护正持锁时拒绝，不查事务：停止总是安全的，事务未完成时也要能停。
+function Invoke-ServiceCommand([string]$Action) {
+    $script:OpsCoreExitCode = 1
+    $allowed = @('Command','RequestBase64','Json') + @(if ($Action -ceq 'repair') { 'Repair' })
+    if ($Action -cnotin @('start','stop','restart','repair') -or @($script:OpsInputNames | Where-Object { $_ -cnotin $allowed }).Count) {
+        Err '启停命令含有不适用的参数，未执行操作'; return $false
+    }
+    $bunPath = if ($env:MIXIN_OPS_BUN) { $env:MIXIN_OPS_BUN } else { Get-BunPath }
+    if (-not $bunPath) { Err '找不到 Bun 1.4.4 或更高版本'; return $false }
+    $arguments = @('--no-env-file', (Join-Path $OpsSource 'scripts/ops/core/cli.ts'), 'service', $Action, '--project', $Project)
+    if ($Json) { $arguments += '--json' }
+    try { $script:OpsCoreExitCode = Invoke-ConsoleProcess $bunPath $arguments; return ($script:OpsCoreExitCode -eq 0) }
+    catch { Err $_.Exception.Message; return $false }
+}
+
+# 配置向导（模型、应用机器人凭据、外链）在服务继续运行时填写：用项目当前的依赖运行，只读取现有配置作为基准，回答写进私有
+# 暂存目录（含凭据，结束时删除）。确认后交给共用核心，与网页配置相同：停机前预检，停机、写入，按原运行状态启动并核对就绪，
+# 失败时恢复原配置。取消时向导不写暂存，配置和服务保持原状。
+function Invoke-ConfigureWizard([string]$Wizard, [string]$Label, [string]$Kind) {
+    $script:OpsCoreExitCode = 1
     $bunPath = Get-BunPath
-    if (-not $bunPath) { throw "找不到可用的 bun；请安装 Bun：https://bun.sh" }
+    if (-not $bunPath) { Err "找不到可用的 bun；请安装 Bun：https://bun.sh"; return $false }
+    if ([Console]::IsInputRedirected) { Err "$($Label)需要在终端里运行向导；配置和服务保持原状"; return $false }
     if ($pendingTransaction) {
-        throw "有未完成的部署或升级；请先用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 回滚"
+        Err "有未完成的部署或升级；请先用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 回滚"; return $false
     }
-    $statePath = Join-Path $Project 'data\state'
-    New-Item -ItemType Directory -Force -Path $statePath | Out-Null
-    $lock = [IO.File]::Open((Join-Path $statePath 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-    $wasRunning = $false
-    $stopAttempted = $false
-    Push-Location $Project
-    $previousErrorActionPreference = $ErrorActionPreference
+    $stage = Join-Path $Project ('tmp\configure-stage-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
-        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        $run = Get-BotRunState $task
-        $wasRunning = $run.Running
-        if ($run.Foreground) {
-            throw "机器人以前台方式运行，无法自动恢复；请先停止前台实例，再进行$($Label)"
-        }
-        if ($wasRunning) {
-            Step "停止机器人以进行$($Label)；向导结束后恢复运行"
-            $stopAttempted = $true
-            if (-not (Stop-Bot)) { throw "无法停止机器人，$($Label)未开始" }
-        }
-        $ErrorActionPreference = "Continue"
-        # 直接继承终端，保留密码掩码和 Ctrl+C；不把凭据放进参数或输出管道。
-        Invoke-WithUtf8Output { & $bunPath run $Script }
-        if ($LASTEXITCODE -ne 0) { throw "$($Label)未完成；原配置保持不变" }
-        if (-not $wasRunning) { Done "$($Label)将在下次启动机器人时生效；已保持停止状态" }
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-        try {
-            if ($wasRunning -and $stopAttempted) {
-                if (-not (Start-Bot)) { throw "$($Label)已结束，但机器人恢复启动失败" }
-                if ((Wait-Local) -ne 200) { throw "机器人恢复后未通过健康检查，请在 $(Get-OpsCommandHint 'logs') 查看日志" }
-                Done "机器人已恢复运行，已重新读取$($Label)"
-            }
-        } finally {
-            $lock.Dispose()
-            Pop-Location
-        }
-    }
-}
-
-# 应用 TUI 已确认的运行参数；预检在停机前完成，失败时恢复原配置和运行状态。
-function Invoke-RuntimeConfiguration([string]$DraftName) {
-    if ($DraftName -cnotmatch '^\.runtime-draft-[a-f0-9-]{36}\.json$') { throw '运行参数草稿名称无效' }
-    $bunPath = Get-BunPath
-    if (-not $bunPath) { throw '找不到可用的 bun' }
-    $draft = Join-Path $ConfigDir $DraftName
-    $receipt = $draft + '.rollback'
-    $statePath = Join-Path $Project 'data\state'
-    New-Item -ItemType Directory -Force -Path $statePath | Out-Null
-    $lock = [IO.File]::Open((Join-Path $statePath 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-    $wasRunning = $false
-    $stopAttempted = $false
-    $applyAttempted = $false
-    $preserve = Test-Path -LiteralPath $receipt -PathType Leaf
-    Push-Location $Project
-    function Invoke-RuntimeConfigStep([string]$Mode) {
+        Protect-ProjectSecretPath $stage
         $previous = $ErrorActionPreference
+        Push-Location $Project
         try {
             $ErrorActionPreference = 'Continue'
-            Invoke-WithUtf8Output { & $bunPath run 'scripts\config\runtime-settings.ts' $Mode $DraftName 2>&1 | Out-Host }
-            return ($LASTEXITCODE -eq 0)
-        } finally { $ErrorActionPreference = $previous }
+            $global:LASTEXITCODE = 1
+            # 直接继承终端，保留密码掩码和 Ctrl+C；不把凭据放进参数或输出管道。
+            Invoke-WithUtf8Output { & $bunPath --no-env-file run (Join-Path $Project "scripts\config\$Wizard") --stage $stage }
+            $code = $global:LASTEXITCODE
+        } finally { $ErrorActionPreference = $previous; Pop-Location }
+        $staged = Join-Path $stage "configuration-$Kind.json"
+        if (-not (Test-Path -LiteralPath $staged -PathType Leaf)) {
+            if ($code -in @(0, 2)) { Warn "$($Label)已取消；配置和服务保持原状"; $script:OpsCoreExitCode = 0; return $true }
+            Err "$($Label)未完成（原因见上方）；配置和服务保持原状"; return $false
+        }
+        return (Invoke-CoreMaintenance @('maintenance', 'configuration-apply', '--stage', $staged))
+    } finally { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# 应用控制台已确认的运行参数草稿，与 ops.sh 的 runtime_configure 相同：由运维核心持部署锁、拒绝未完成的事务，
+# 维护状态不允许启动时不停机，发布失败时恢复原配置和运行状态，并写结构化结果。
+function Invoke-RuntimeConfiguration([string]$DraftName) {
+    $script:OpsCoreExitCode = 1
+    if (@($script:OpsInputNames | Where-Object { $_ -cnotin @('Command','RequestBase64','Json','Target') }).Count) {
+        Err '运行参数维护含有不适用的参数'; return $false
     }
-    try {
-        if ($preserve) { throw '此草稿留有未完成的恢复材料，请先完成恢复后再重新保存' }
-        if (-not (Invoke-RuntimeConfigStep '--check')) { throw '运行参数校验失败，尚未停止机器人或写入配置' }
-        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        if ($task -and (@($task.Actions).Count -ne 1 -or -not $task.Actions[0].WorkingDirectory -or
-            [IO.Path]::GetFullPath($task.Actions[0].WorkingDirectory) -ne [IO.Path]::GetFullPath($Project))) {
-            throw '计划任务不属于当前项目，未修改配置或服务'
-        }
-        $run = Get-BotRunState $task
-        $wasRunning = $run.Running
-        if ($run.Foreground) { throw '机器人以前台方式运行，无法自动恢复；请先停止前台实例，再保存运行参数' }
-        if ($wasRunning) {
-            Step '运行参数已确认，短暂停止机器人以应用设置'
-            $stopAttempted = $true
-            if (-not (Stop-Bot)) { throw '无法停止机器人，运行参数未写入' }
-        }
-        $applyAttempted = $true
-        if (-not (Invoke-RuntimeConfigStep '--apply')) { throw '运行参数应用失败' }
-        if ($wasRunning) {
-            if (-not (Start-Bot)) { throw '应用运行参数后启动失败' }
-            if ((Wait-Local) -ne 200) { throw '应用运行参数后健康检查失败' }
-            Done '机器人已恢复运行，已重新读取运行参数'
-        } else { Done '运行参数已保存；机器人保持停止，下次启动生效' }
-    } catch {
-        $failure = $_.Exception.Message
-        try {
-            if ($applyAttempted -and (Test-Path -LiteralPath $receipt -PathType Leaf)) {
-                if ($wasRunning -and -not (Stop-Bot)) { throw '无法停止实例以恢复原参数' }
-                if (-not (Invoke-RuntimeConfigStep '--rollback')) { throw '原运行参数恢复失败' }
-            }
-            if ($wasRunning -and $stopAttempted) {
-                if (-not (Start-Bot)) { throw '原服务恢复启动失败' }
-                if ((Wait-Local) -ne 200) { throw '原服务恢复后未通过健康检查' }
-            }
-        } catch {
-            $preserve = $true
-            throw "$failure；恢复失败：$($_.Exception.Message)。请查看机器人日志，恢复材料保留在 $receipt"
-        }
-        throw "$failure；原配置及运行状态已保留或恢复"
-    } finally {
-        if (-not $preserve) {
-            Remove-Item -LiteralPath $draft, $receipt -Force -ErrorAction SilentlyContinue
-        }
-        Pop-Location
-        $lock.Dispose()
-    }
+    return (Invoke-CoreMaintenance @('maintenance','runtime-configure',$DraftName))
 }
 
 # 数据操作由 Bun 统一管理存储边界；外置共享资料目录保存在 data\config\runtime.json，工具与服务读同一份。
+function Invoke-ConfigurationChange([string]$Mode, [string]$DraftId, [string]$DraftDigest, [string]$ExpectedState = '') {
+    $script:OpsCoreExitCode = 1
+    if ($Mode -cnotin @('apply','restore')) { Err '配置动作无效'; return $false }
+    $allowed = @('Command','RequestBase64','Json','Target') + $(if ($Mode -ceq 'apply') { 'Digest' } else { 'Expect' })
+    if (@($script:OpsInputNames | Where-Object { $_ -cnotin $allowed }).Count) { Err '配置维护含有不适用的参数'; return $false }
+    $coreArgs = @('maintenance', ('configuration-' + $Mode), $DraftId)
+    if ($Mode -ceq 'apply') { $coreArgs += @('--digest', $DraftDigest) }
+    elseif ($ExpectedState) { $coreArgs += @('--expect', $ExpectedState) }
+    return (Invoke-CoreMaintenance $coreArgs)
+}
+
 function Invoke-DataAdmin([string]$Script, [string[]]$TmpArgs) {
     $bunPath = Get-BunPath
     if (-not $bunPath) {
@@ -388,40 +304,48 @@ function Invoke-DataAdmin([string]$Script, [string[]]$TmpArgs) {
 }
 
 function Invoke-TmpAdmin([string[]]$TmpArgs) {
-    # 预览只读取数据并保存清单，服务照常运行；执行清单（--digest）和一步完成的 purge 才停机。
-    if ($TmpArgs[0] -eq 'list' -or ($TmpArgs[0] -ne 'purge' -and $TmpArgs -notcontains '--digest')) {
-        return (Invoke-DataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs)
+    $script:OpsCoreExitCode = 1
+    if (@($script:OpsInputNames | Where-Object { $_ -cnotin @('Command','RequestBase64','Json','Days','All','Plan','Digest','User','Group','StorageSegment','GroupId') }).Count) {
+        Err '临时文件维护含有不适用的参数'; return $false
     }
-    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
-    $lock = [IO.File]::Open((Join-Path $StateDir 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-    $wasRunning = $false
-    $stopAttempted = $false
-    $completed = $false
-    $started = $true
-    try {
-        foreach ($record in @('deploy-transaction', 'upgrade-transaction')) {
-            if (Test-Path -LiteralPath (Join-Path $StateDir $record)) {
-                throw '存在未完成的部署或升级事务，请先继续或回滚，再维护临时文件'
-            }
-        }
-        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        if ($task -and (@($task.Actions).Count -ne 1 -or -not $task.Actions[0].WorkingDirectory -or
-            [IO.Path]::GetFullPath($task.Actions[0].WorkingDirectory) -ne [IO.Path]::GetFullPath($Project))) {
-            throw '计划任务不属于当前项目，未开始临时文件维护'
-        }
-        $run = Get-BotRunState $task
-        $wasRunning = $run.Running
-        if ($run.Foreground) { throw '机器人以前台方式运行，无法自动恢复；请先停止前台实例，再执行临时文件维护' }
-        if ($wasRunning) {
-            $stopAttempted = $true
-            if (-not (Stop-Bot)) { throw '无法停止机器人，未开始临时文件维护' }
-        }
-        $completed = Invoke-DataAdmin "scripts\ops\tmp-admin.ts" $TmpArgs
-    } finally {
-        try { if ($wasRunning -and $stopAttempted) { $started = Start-Bot } }
-        finally { $lock.Dispose() }
+    $action = if ($TmpArgs[0] -eq 'list') { 'tmp-ls' } else { 'tmp-' + $TmpArgs[0] }
+    $coreArgs = @('maintenance', $action)
+    if ($TmpArgs.Count -gt 1) { $coreArgs += $TmpArgs[1..($TmpArgs.Count - 1)] }
+    return (Invoke-CoreMaintenance $coreArgs)
+}
+
+# 修订整理（revision-chain plan §4、§8）与会话库文件收缩（§4.6）：预览和状态只读，服务照常运行；删除收缩保留的原库也
+# 不停机。整理、跳过、放弃、从备份恢复和收缩在停机时执行：停机之前先按维护状态判断这个动作现在能否执行（不能就不停机）；
+# 结束后只按重读的维护状态决定是否启动（不看命令自己的结果），允许才启动，并等实例身份与就绪检查通过才说「运行中」，
+# 没通过时只是「已请求启动」；不允许时保持停止。有未完成的部署或升级时只接受从备份恢复：自动回滚在恢复数据和代码之前
+# 停止，当前检出就是事务的目标代码，用它恢复，事务和停机状态不变。
+function Invoke-RevisionCleanupAdmin([string]$Action) {
+    $script:OpsCoreExitCode = 1
+    if (@($script:OpsInputNames | Where-Object { $_ -cnotin @('Command','RequestBase64','Json','Target','Space','Yes') }).Count) {
+        Err '修订维护含有不适用的参数'; return $false
     }
-    return ($completed -and $started)
+    $script = "scripts\runtime\revision-cleanup.ts"
+    $readOnly = @('preview', 'status', 'shrink-preview', 'shrink-status', 'shrink-remove-old')
+    $actions = @('preview', 'status', 'apply', 'skip', 'abandon', 'restore', 'shrink-preview', 'shrink', 'shrink-status', 'shrink-remove-old')
+    if ($Action -cnotin $actions) {
+        Err "用法：ops.ps1 revision-cleanup <$($actions -join '|')> [-Space <空间>] [-Yes]"
+        return $false
+    }
+    $cleanupArgs = @($Action, '--project', $Project)
+    $spaces = @("$Space" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($spaces.Count -and $Action -cnotin @('shrink-preview', 'shrink', 'restore')) { Err "-Space 只用于 revision-cleanup shrink-preview、shrink 和 restore"; return $false }
+    if ($Action -ceq 'restore' -and $spaces.Count -ne 1) { Err "revision-cleanup restore 需要 -Space <空间>，一次一个（见 revision-cleanup status）"; return $false }
+    foreach ($name in $spaces) { $cleanupArgs += @('--space', $name) }
+    if ($Yes) {
+        if ($Action -cne 'shrink-remove-old') { Err "-Yes 只用于 revision-cleanup shrink-remove-old"; return $false }
+        $cleanupArgs += '--yes'
+    }
+    if ($Action -cin $readOnly) {
+        if ($Json) { $cleanupArgs += '--json' }
+        return (Invoke-DataAdmin $script $cleanupArgs)
+    }
+    # 共用核心在部署锁内核对事务：有未完成的部署或升级时，从备份恢复由事务记录的版本执行（事务和停机状态不变），其余动作拒绝。
+    return (Invoke-CoreMaintenance (@('revision-cleanup', $Action) + @($cleanupArgs | Select-Object -Skip 3)))
 }
 
 # stat-import 不带路径时弹出系统“打开文件”对话框选择旧统计账本；没有桌面会话或取消时返回空。
@@ -451,29 +375,31 @@ function Select-LegacyStatsFile {
     } finally { $runspace.Dispose() }
 }
 
-# 清历史必须先把机器人停下来，不能只删文件：内存里已经建立的会话仍握着完整的消息列表，
-# 所以先停止实例，再归档会话，最后恢复调用前的运行或停止状态。
+# 维护动作交给共用核心（scripts/ops/core/cli.ts）：部署锁、未完成事务的检查、停机窗口、维护状态和结构化结果都在核心里，
+# 这里只负责找到 Bun 并把退出码带回。
+function Invoke-CoreMaintenance([string[]]$CoreArguments) {
+    $script:OpsCoreExitCode = 1
+    $bunPath = if ($env:MIXIN_OPS_BUN) { $env:MIXIN_OPS_BUN } else { Get-BunPath }
+    if (-not $bunPath) { Err '找不到 Bun 1.4.4 或更高版本'; return $false }
+    $arguments = @('--no-env-file', (Join-Path $OpsSource 'scripts/ops/core/cli.ts')) + $CoreArguments + @('--project', $Project)
+    if ($Json) { $arguments += '--json' }
+    try { $script:OpsCoreExitCode = Invoke-ConsoleProcess $bunPath $arguments; return ($script:OpsCoreExitCode -eq 0) }
+    catch { Err $_.Exception.Message; return $false }
+}
+
 function Clear-SpaceHistory([string]$SpaceValue, [string]$Operation = "clear") {
-    if (-not $SpaceValue) {
-        Err "history-$Operation 需要群号或 -Direct：ops.ps1 history-$Operation <群号>|-Direct"
-        return $false
-    }
-    if ($Operation -eq "compact" -and -not $User) { Err "history-compact 需要 -User <成员号码>"; return $false }
-    Step "先停止机器人：运行中的机器人独占会话库"
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
-    if (-not (Stop-Bot)) { return $false }
-    $historyArgs = @($Operation, $SpaceValue)
-    if ($Operation -eq "compact") {
-        $historyArgs += $User
-    }
-    if ($StorageSegment) { $historyArgs += "--storage-segment" }
-    elseif ($GroupId) { $historyArgs += "--group-id" }
-    try { $cleared = Invoke-DataAdmin "scripts\ops\history-admin.ts" $historyArgs }
-    finally {
-        if ($wasRunning) { $started = Start-Bot } else { $started = $true }
-    }
-    return ($cleared -and $started)
+    $script:OpsCoreExitCode = 1
+    $allowed = @('Command','RequestBase64','Json','Target','Direct','StorageSegment','GroupId','Expect')
+    if ($Operation -eq 'compact') { $allowed += 'User' } else { $allowed += 'All' }
+    if (@($script:OpsInputNames | Where-Object { $_ -cnotin $allowed }).Count) { Err '会话维护含有不适用的参数'; return $false }
+    if (-not $SpaceValue) { Err '会话维护需要明确指定空间'; return $false }
+    if ($Operation -eq 'compact' -and -not $User) { Err '压缩需要成员号码'; return $false }
+    $coreArgs = @('maintenance', "history-$Operation", $SpaceValue)
+    if ($Operation -eq 'compact') { $coreArgs += $User }
+    if ($StorageSegment) { $coreArgs += '--storage-segment' }
+    elseif ($GroupId) { $coreArgs += '--group-id' }
+    if ($Expect) { $coreArgs += @('--expect', $Expect) }
+    return (Invoke-CoreMaintenance $coreArgs)
 }
 
 # git 的返回码才是判据，但 $ErrorActionPreference="Stop" 下原生命令写 stderr 会直接抛异常，
@@ -505,55 +431,6 @@ function Invoke-GitCapture([string[]]$GitArgs) {
 
 
 
-function Resolve-ProjectPath([string]$Value) {
-    if ([System.IO.Path]::IsPathRooted($Value)) {
-        return [System.IO.Path]::GetFullPath($Value)
-    }
-    return [System.IO.Path]::GetFullPath((Join-Path $Project $Value))
-}
-
-# 通用 HTTP 探测，禁用系统代理；凭据通过 .NET 请求设置，不进入命令行或临时文件。
-# 返回 HTTP 状态码；连接失败返回 $null。
-function Invoke-HttpProbe {
-    param(
-        [Parameter(Mandatory = $true)][string]$Url,
-        [string]$Method = "HEAD",
-        [int]$TimeoutSec = 8,
-        [string]$Username,
-        [string]$Password,
-        [hashtable]$Headers
-    )
-    try {
-        $request = [System.Net.HttpWebRequest]::Create($Url)
-        $request.Method = $Method
-        $request.Proxy = $null
-        $request.Timeout = $TimeoutSec * 1000
-        $request.ReadWriteTimeout = $TimeoutSec * 1000
-        $request.AllowAutoRedirect = $false
-        # 必须先判空：$null.Keys 会得到 $null，@($null) 是含一个 $null 元素的数组，
-        # 于是 Headers.Add($null, ...) 抛异常，被下面的 catch 吞成「连不上」——
-        # 不带自定义头的探测会因此永远误报失败。
-        if ($Headers) {
-            foreach ($name in @($Headers.Keys)) { $request.Headers.Add($name, $Headers[$name]) }
-        }
-        if ($Username) {
-            $raw = "{0}:{1}" -f $Username, $Password
-            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($raw))
-            $request.Headers.Add("Authorization", "Basic $encoded")
-        }
-        $response = $request.GetResponse()
-        $status = [int]$response.StatusCode
-        $response.Close()
-        return $status
-    } catch [System.Net.WebException] {
-        # 4xx/5xx 也走这里，但带着 Response；没有 Response 才是真的没连上。
-        if ($_.Exception.Response) { return [int]$_.Exception.Response.StatusCode }
-        return $null
-    } catch {
-        return $null
-    }
-}
-
 # 这里只读检查 S3 必填项；完整格式由运行时校验，凭据不传入 curl 或命令行。
 function Get-RelayDoctorRows {
     if (-not (Test-Path -LiteralPath $RelayConfigFile -PathType Leaf)) { return @() }
@@ -582,7 +459,7 @@ function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]
 # 这里不读取普通设置，设置损坏或为空都不能挡住恢复入口。
 $pendingTransaction = (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) -or
     (Test-Path -LiteralPath (Join-Path $StateDir 'upgrade-transaction'))
-$recovering = $Command -in @('resume', 'rollback') -or ($pendingTransaction -and $Command -in @('update', 'upgrade'))
+$recovering = $Command -in @('resume', 'rollback', 'maintenance-recover') -or ($pendingTransaction -and $Command -in @('update', 'upgrade'))
 $Port = '1011'; $DeployedWorkspaceRoot = ''
 function Read-StateText([string]$Name) {
     $path = Join-Path $StateDir $Name
@@ -607,19 +484,6 @@ if (-not $recovering -and $Command -ne 'deploy') {
 # 使用启动时间和本地实例记录识别相对路径启动的机器人。
 function Get-BotPids { Get-ProjectBotPids $Project }
 function Stop-Bot { return (Stop-ProjectBot $Project $TaskName) }
-
-function Start-Bot {
-    $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $t) { Err "找不到计划任务 '$TaskName'；请先使用 $(Get-OpsCommandHint 'deploy')"; return $false }
-    try {
-        if ($t.State -eq "Disabled") { Enable-ScheduledTask -TaskName $TaskName | Out-Null }
-        Start-ScheduledTask -TaskName $TaskName | Out-Null
-        return $true
-    } catch {
-        Err "启动计划任务 '$TaskName' 失败：$($_.Exception.Message)"
-        return $false
-    }
-}
 
 function Test-Local {
     $verification = $false
@@ -656,6 +520,9 @@ function Show-Doctor {
     $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
 
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    # 任务在、没有运行且本机没有应答：多半是有意停止（stop 之后任务保持就绪），也可能是意外退出，两种处理都要说清。
+    $stoppedTask = $t -and $t.State -ne "Disabled" -and $t.State -ne "Running" -and $localStatus -ne 200 -and $localStatus -ne 503
+    $stoppedHint = "有意停止的使用 $(Get-OpsCommandHint 'start') 启动；意外退出时先在 $(Get-OpsCommandHint 'logs') 查看日志，再使用 $(Get-OpsCommandHint 'doctor -Repair')。"
     if (-not $t) {
         if ($localStatus -eq 200 -and $botPids.Count -gt 0) {
             $rows += New-DoctorRow "计划任务" "warn" "未安装；机器人当前以前台方式运行" "如需开机自启，请以管理员身份使用 $(Get-OpsCommandHint 'deploy')。"
@@ -673,12 +540,12 @@ function Show-Doctor {
         } elseif ($localStatus -eq 200) {
             $rows += New-DoctorRow "计划任务" "warn" "$taskDetail；机器人可能在任务外运行" "先通过 $(Get-OpsCommandHint 'stop') 停止手动启动的机器人，再使用 $(Get-OpsCommandHint 'start')。"
         } else {
-            $rows += New-DoctorRow "计划任务" "fail" $taskDetail "使用 $(Get-OpsCommandHint 'doctor -Repair')，或在 $(Get-OpsCommandHint 'logs') 查看日志。"
+            $rows += New-DoctorRow "计划任务" "fail" "$taskDetail；机器人没有运行" $stoppedHint
         }
     }
 
     if ($listeners.Count -eq 0) {
-        $rows += New-DoctorRow "机器人监听 :$Port" "fail" "没有监听" "使用 $(Get-OpsCommandHint 'doctor -Repair')。"
+        $rows += New-DoctorRow "机器人监听 :$Port" "fail" "没有监听" $(if ($stoppedTask) { $stoppedHint } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')。" })
     } else {
         $ownerPids = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { [int]$_ })
         $botOwnerPid = @($ownerPids | Where-Object { $botPids -contains $_ } | Select-Object -First 1)
@@ -693,7 +560,7 @@ function Show-Doctor {
         }
     }
 
-    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } elseif ($localStatus -eq 503) { "只验证实例，不处理消息" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } elseif ($localStatus -eq 503) { "使用 $(Get-OpsCommandHint 'resume') 继续上次操作并完成提交。" } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')，再到 $(Get-OpsCommandHint 'logs') 查看日志。" })
+    $rows += New-DoctorRow "本地机器人健康" $(if ($localStatus -eq 200) { "pass" } else { "fail" }) $(if ($localStatus -eq 200) { "就绪且实例身份匹配" } elseif ($localStatus -eq 503) { "只验证实例，不处理消息" } else { "未就绪或实例身份不匹配" }) $(if ($localStatus -eq 200) { "" } elseif ($localStatus -eq 503) { "使用 $(Get-OpsCommandHint 'resume') 继续上次操作并完成提交。" } elseif ($stoppedTask) { $stoppedHint } else { "使用 $(Get-OpsCommandHint 'doctor -Repair')，再到 $(Get-OpsCommandHint 'logs') 查看日志。" })
 
     # Stream 与通讯录状态只读运行中服务的 /health，不另开 Stream 连接（同一应用只能有一条）。
     if ($localStatus -eq 200) {
@@ -721,7 +588,7 @@ function Show-Doctor {
                 if ($parts.Count -lt 3 -or -not $parts[1]) { continue }
                 $fix = switch ($parts[1]) {
                     "事件 Stream" { "检查出站访问 imtwo.zdxlz.com 的 443 端口和应用凭据（$(Get-OpsCommandHint 'configure-app-bot')），再查看 $(Get-OpsCommandHint 'logs')。" }
-                    "通讯录同步" { "有待确认撤销时，核对后使用 $(Get-OpsCommandHint 'directory-confirm') <轮次>；同步不完整时查看日志。" }
+                    "通讯录同步" { "服务会自动重试和复核；用 $(Get-OpsCommandHint 'directory') 查看范围状态和原因，长时间没有恢复时查看 $(Get-OpsCommandHint 'logs')。" }
                     "运行状况" { "在 $(Get-OpsCommandHint 'logs') 中查看对应记录（Durable 报告、交付超时放弃、统计累计值回退等）；停住的任务由成员用 /status 查看、/stop 或 /clear 结束。" }
                     default { "" }
                 }
@@ -771,11 +638,11 @@ function Show-Doctor {
 
     # 一次检查整套模型配置：models.json 的服务商与凭证，加上 Pi 设置里的选型。
     $modelsOk = Test-ModelConfiguration $Project
-    $rows += New-DoctorRow "模型配置（models.json + Pi 设置）" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } elseif (-not (Test-Path -LiteralPath $ModelsFile)) { "通过 $(Get-OpsCommandHint 'deploy') 完成首次模型配置。" } else { "模型配置建议：$(Get-OpsCommandHint 'configure')。" })
+    $rows += New-DoctorRow "模型配置（models.json + Pi 设置）" $(if ($modelsOk) { "pass" } else { "fail" }) $(if ($modelsOk) { "有效" } else { "缺少或无效" }) $(if ($modelsOk) { "" } elseif (-not (Test-Path -LiteralPath $ModelsFile)) { "通过 $(Get-OpsCommandHint 'deploy') 完成首次模型配置。" } else { "先修正 data/config/models.json 与 data/runtime/pi/settings.json。" })
 
     $rows += Get-RelayDoctorRows
 
-    # doctor -Json 让运维界面复用这同一套体检，而不是自己再实现一遍计划任务/Stream/配置的判断。
+    # doctor -Json 让控制台复用这同一套体检，而不是自己再实现一遍计划任务/Stream/配置的判断。
     # stdout 必须只有 JSON，所以这里直接返回，不走下面的彩色输出。
     if ($Json) {
         $payload = [pscustomobject]@{
@@ -825,55 +692,72 @@ function Show-Doctor {
     }
 }
 
-function Invoke-DoctorRepair {
-    Step "修复失败的本地组件..."
-    $changed = $false
-    $ok = $true
-
-    if ((Test-Local) -ne 200) {
-        $changed = $true
-        if (-not (Restart-Bot)) { $ok = $false }
-    }
-
-    if (-not $changed) { Done "没有发现可自动修复的失败项" }
-    return $ok
-}
-
-function Restart-Bot {
-    Step "重新启动机器人..."
-    # 没停下来就别假装重启了：旧进程还占着端口，新实例起不来，健康检查却会因为旧进程
-    # 仍在应答而显示正常，得到一个「看起来成功、其实没换版本」的结果。
-    if (-not (Stop-Bot)) {
-        Err "机器人未能停止，已放弃重启"
-        return $false
-    }
-    Start-Sleep -Seconds 1
-    if (-not (Start-Bot)) { return $false }
-    $lc = Wait-Local
-    if ($lc -eq 200) { Done "机器人已恢复（:$Port 实例身份与就绪检查通过）"; return $true }
-    Warn "本地实例健康检查未通过；请在 $(Get-OpsCommandHint 'logs') 查看日志。"
-    return $false
-}
-
-
-
-# 部署事务由部署脚本自己继续或回滚；只使用事务记录，不重新提问。
+# 未完成的部署由运维核心继续或回滚：它取事务固定的运行包，只使用事务记录，不重新提问。
 function Invoke-PendingDeployment([string]$Action, [string]$Confirmation = '') {
-    $deployHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $switch = if ($Action -eq 'rollback') { '-Rollback' } else { '-Resume' }
-    $confirmedArgs = @(if ($Confirmation) { '-ConfirmedTransaction'; $Confirmation })
-    # Native output must stay out of the Boolean return value; inspect the exit code in the scope that ran it.
-    return (Invoke-WithUtf8Output {
-        & $deployHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Project 'scripts\deploy\deploy.ps1') $switch @confirmedArgs | Out-Host
-        return ($LASTEXITCODE -eq 0)
-    })
+    $script:OpsCoreExitCode = 1
+    $bunPath = if ($env:MIXIN_OPS_BUN) { $env:MIXIN_OPS_BUN } else { Get-BunPath }
+    if (-not $bunPath) { Err '找不到 Bun 1.4.4 或更高版本'; return $false }
+    $arguments = @('--no-env-file', (Join-Path $OpsSource 'scripts/ops/core/cli.ts'), 'deployment', 'deploy', '--project', $Project)
+    if ($Action -eq 'rollback') { $arguments += '--rollback' }
+    if ($Confirmation) { $arguments += @('--confirmation', $Confirmation) }
+    $gitPath = Get-GitPath
+    if ($gitPath) { $arguments += @('--git-path', $gitPath) }
+    try { $script:OpsCoreExitCode = Invoke-ConsoleProcess $bunPath $arguments; return ($script:OpsCoreExitCode -eq 0) }
+    catch { Err $_.Exception.Message; return $false }
 }
 
-# 继续或回滚未完成的部署/升级；Action 为空时交互选择。
+# The fixed release's deploy entry asks before the stop and hands the live project to the shared core, which owns the lock,
+# the transaction, its recovery and the result.
+function Invoke-DeployCommand {
+    $script:OpsCoreExitCode = 1
+    $deployHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $source = if ($env:MIXIN_OPS_CONSOLE -ceq '1') { $OpsSource } else { $Project }
+    $previousProject = $env:MIXIN_OPS_PROJECT
+    try {
+        if ($env:MIXIN_OPS_CONSOLE -ceq '1') { Assert-ConsoleLifecycle 'deploy' $Project; $env:MIXIN_OPS_PROJECT=$Project }
+        $script:OpsCoreExitCode = Invoke-ConsoleProcess $deployHost @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $source 'scripts\deploy\deploy.ps1'))
+        return ($script:OpsCoreExitCode -eq 0)
+    } finally { $env:MIXIN_OPS_PROJECT=$previousProject }
+}
+
+# 控制台的部署与升级：核心写了结果文件时沿用，否则按观察到的最终状态补写。
+# Lifecycle scripts alone own stop, commit and recovery. This wrapper reports the observed end state.
+function Invoke-LifecycleOperation([scriptblock]$Action) {
+    $script:OpsCoreExitCode = 1
+    if (-not $env:MIXIN_OPS_RESULT_FILE) { return (& $Action) }
+    $wasRunning = (Get-FinalRunState) -eq 'running'
+    $code = 1; $outcome = 'failed'; $message = '操作未完成，请查看任务日志和恢复状态'; $state = 'unknown'
+    try { if (& $Action) { $code = 0 } }
+    catch { $message = $_.Exception.Message; Err $message; $script:OpsCoreExitCode = 1 }
+    finally {
+        # The shared core wrote the result (original state, final state and readiness): do not overwrite it. Each console task
+        # has its own result path, so an existing file is this run's. Without it (a refusal before the hand-off, a core killed
+        # before writing, or an old release's upgrader) the observed state below is reported.
+        if (Test-Path -LiteralPath $env:MIXIN_OPS_RESULT_FILE -PathType Leaf) {
+            $code = $script:OpsCoreExitCode
+            $written = $true
+        } else {
+        $state = Get-FinalRunState
+        if ($state -eq 'running') {
+            try {
+                $saved = Read-StateText 'bot-port'; $Port = if ($null -eq $saved) { '1011' } else { $saved }
+                if ((Wait-Local) -ne 200) { $state = 'start-requested'; if ($code -eq 0) { $code = 1 } }
+            } catch { $state = 'unknown'; if ($code -eq 0) { $code = 1 } }
+        } elseif ($state -eq 'unknown' -and $code -eq 0) { $code = 1 }
+        if (Test-PendingTransaction) {
+            if ($code -eq 0) { $code = 1 }; $message = '事务尚未结束，请刷新维护页后继续或回滚'
+        } elseif ($code -eq 0) { $outcome = 'success'; $message = '操作完成' }
+        $written = Write-OpsResult $outcome $wasRunning $state $code $message
+        $script:OpsCoreExitCode = if ($code -eq 0 -and -not $written) { 1 } else { $code }
+        }
+    }
+    return ($code -eq 0 -and $written)
+}
+
 function Invoke-TransactionCommand([string]$Action, [string]$Confirmation = '') {
     if (Test-Path -LiteralPath (Join-Path $Project 'data\state\upgrade-transaction')) { return (Invoke-Update $Action '' $Confirmation) }
     if (Test-Path -LiteralPath (Join-Path $Project 'data\state\deploy-transaction')) {
-        if (-not (IsAdmin)) { Err "$Action 需要管理员 PowerShell"; return $false }
+        if (-not (Test-Administrator)) { Err "$Action 需要管理员 PowerShell"; return $false }
         return (Invoke-PendingDeployment $Action $Confirmation)
     }
     if ($Confirmation) { Err '确认后的事务已消失，请刷新预览'; return $false }
@@ -884,12 +768,13 @@ function Invoke-TransactionCommand([string]$Action, [string]$Confirmation = '') 
 # 获取目标提交并交给目标版本升级器；停机、迁移、回滚由升级器负责。
 # 有未完成的事务时先继续或回滚，使用记录的目标提交，不追随最新 main。
 function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [string]$Confirmation = '') {
+    $script:OpsCoreExitCode = 1
     $operation = Start-OperationLog $Project 'upgrade'
     $operationExit = 1
     try {
     Set-OperationStage 'upgrade-preflight'
     if ($ConfirmedTarget -and $ConfirmedTarget -cnotmatch '^[0-9a-f]{40}$') { Err '已确认的升级目标必须是完整提交 SHA；请重新检查版本'; return $false }
-    if (-not (IsAdmin)) { Err 'update 需要管理员 PowerShell'; return $false }
+    if (-not (Test-Administrator)) { Err 'update 需要管理员 PowerShell'; return $false }
     if (-not (Get-GitPath) -or -not (Get-BunPath)) { Err '需要 Git 和 Bun'; return $false }
     $pendingDeploy = Join-Path $Project 'data\state\deploy-transaction'
     $pendingUpgrade = Join-Path $Project 'data\state\upgrade-transaction'
@@ -911,14 +796,13 @@ function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [str
     $original = (Invoke-GitCapture @('rev-parse', 'HEAD')).Text
     if (Test-Path -LiteralPath $pendingUpgrade) {
         $pendingName = "$(Get-Content -LiteralPath $pendingUpgrade -Raw)".Trim()
-        if ($pendingName -notmatch '^deploy-[0-9a-f]{32}$') { Err '升级事务名称无效'; return $false }
-        $pendingPath = Join-Path $Project ('backup\snapshots\' + $pendingName)
-        $pendingState = Import-Clixml -LiteralPath (Join-Path $pendingPath 'deployment.xml')
-        $target = $pendingState.UpgradeTarget
-        if ($target -notmatch '^[0-9a-f]{40}$') { Err '中断事务目标无效'; return $false }
-        $pendingRecord = Read-DeploymentTransaction $pendingPath
-        if ($pendingRecord) { Warn (Format-DeploymentTransaction $pendingRecord) }
-        else { Warn ('未完成的升级（旧版事务，按已保存设置处理）：目标提交 ' + $target.Substring(0, 7)) }
+        if ($pendingName -cnotmatch '^deploy-[A-Za-z0-9]+$') { Err '升级事务名称无效'; return $false }
+        # 目标提交只取事务记录：核心要求升级入口的目标与记录一致。
+        try { $pendingRecord = Read-DeploymentTransaction (Join-Path $Project ('backup\snapshots\' + $pendingName)) }
+        catch { Err "未完成事务的记录无法读取：$($_.Exception.Message)；保持现状，请人工检查 backup\snapshots"; return $false }
+        $target = $pendingRecord.target_sha
+        if ($pendingRecord.operation -cne 'upgrade' -or $target -cnotmatch '^[0-9a-f]{40}$') { Err '中断事务目标无效'; return $false }
+        Warn (Format-DeploymentTransaction $pendingRecord)
         if (-not $Action) {
             $Action = Read-TransactionAction
             if (-not $Action) { Warn '未处理上次操作，服务保持当前状态。'; return $false }
@@ -928,6 +812,8 @@ function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [str
         Done '没有未完成的部署或升级'
         $operationExit = 0
         return $true
+    } elseif ($env:MIXIN_OPS_CONSOLE -ceq '1' -and -not $ConfirmedTarget) {
+        Err '控制台升级缺少已确认目标，未拉取或停止服务'; return $false
     } elseif ($ConfirmedTarget) {
         $resolved = Invoke-GitCapture @('rev-parse', '--verify', ($ConfirmedTarget + '^{commit}'))
         if ($resolved.ExitCode -ne 0 -or $resolved.Text -cne $ConfirmedTarget) { Err '已确认的提交在本地不存在，请重新检查版本'; return $false }
@@ -958,10 +844,11 @@ function Invoke-Update([string]$Action = '', [string]$ConfirmedTarget = '', [str
     if ($Action -eq 'rollback') { $arguments += '-Rollback' }
     if ($Confirmation) { $arguments += @('-ConfirmedTransaction', $Confirmation) }
     Set-OperationStage 'target-upgrader'
-    & $shell @arguments | Out-Host
-    $operationExit = $LASTEXITCODE
+    # 升级器在停机前要提问（修订整理、通讯录同步范围），所以直接使用控制台，不经 Out-Host 管道。
+    $operationExit = Invoke-ConsoleProcess $shell $arguments
+    $script:OpsCoreExitCode = $operationExit
     if ($operationExit -ne 0 -and (Test-Path -LiteralPath $pendingUpgrade)) {
-        Warn "升级未完成；处理上方原因后，可用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 回滚。"
+        Warn "升级未完成，事务已保留；处理上方原因后，可用 $(Get-OpsCommandHint 'resume') 继续，或 $(Get-OpsCommandHint 'rollback') 回滚（数据已提交时只能继续）。"
     }
     return ($operationExit -eq 0)
     } finally {
@@ -1010,7 +897,23 @@ function Run-Foreground {
 
 function Uninstall-Bot {
     Step "卸载 mixin-chatbot"
-    if (-not (IsAdmin)) { Warn "当前不是管理员，任务/服务删除可能失败；如失败请以管理员身份重跑。" }
+    if (-not (Test-Administrator)) { Warn "当前不是管理员，任务/服务删除可能失败；如失败请以管理员身份重跑。" }
+    # 部署锁（FileShare.None）持有到归档 data/ 之前，与部署、升级和运维任务互斥；核心在锁内拒绝仍需要本部署的未完成事务、
+    # 运维任务和配置提交。锁文件在 data\state 里，持有时无法移动 data/，所以归档前释放：这时若别的操作取得了锁，移动会因
+    # 文件占用失败，不会误删。
+    $lockPath = Join-Path $DataDir 'state\deploy.lock'
+    New-Item -ItemType Directory -Force -Path (Split-Path $lockPath -Parent) | Out-Null
+    try { $script:UninstallLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch { Err '部署、升级或另一个维护操作正在进行；卸载未开始'; return $false }
+    try {
+        $env:BOT_DEPLOY_LOCK_HELD = $lockPath
+        try { $checked = Invoke-CoreMaintenance @('uninstall-check') } finally { Remove-Item Env:BOT_DEPLOY_LOCK_HELD -ErrorAction SilentlyContinue }
+        if (-not $checked) { Err '卸载未开始（原因见上方）'; return $false }
+        return (Remove-BotInstallation)
+    } finally { if ($script:UninstallLock) { $script:UninstallLock.Dispose(); $script:UninstallLock = $null } }
+}
+
+function Remove-BotInstallation {
     if (-not (Stop-Bot)) { Err '停止机器人失败，卸载已停止。'; return $false }
     $remainingBotPids = @(Get-BotPids)
     if ($remainingBotPids.Count -gt 0) {
@@ -1018,22 +921,18 @@ function Uninstall-Bot {
         return $false
     }
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($t -and -not (IsAdmin)) {
+    if ($t -and -not (Test-Administrator)) {
         Err "检测到计划任务，但当前权限无法可靠注销；为避免留下指向已删除文件的孤立任务，卸载已停止。"
         Warn "请以管理员身份使用 $(Get-OpsCommandHint 'uninstall')。"
         return $false
     }
     if ($t) {
-        if (IsAdmin) {
-            try {
-                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-                Done "计划任务已注销"
-            } catch {
-                Err "注销计划任务失败：$($_.Exception.Message)"
-                return $false
-            }
-        } else {
-            Warn "未注销计划任务；请以管理员身份重新运行 uninstall"
+        try {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+            Done "计划任务已注销"
+        } catch {
+            Err "注销计划任务失败：$($_.Exception.Message)"
+            return $false
         }
     } else { Warn "没有可删除的计划任务" }
     $launcher = Join-Path $RuntimeDir "bot-launcher.ps1"
@@ -1045,6 +944,7 @@ function Uninstall-Bot {
     }
     if (Read-YesNo "是否删除 data/（配置、部署状态、runtime、默认共享资料、会话、临时文件和统计）和 logs/？[y/N]" $false) {
         $logsDir = Join-Path $Project "logs"
+        $script:UninstallLock.Dispose(); $script:UninstallLock = $null
         try {
             if (Test-Path -LiteralPath $DataDir) {
                 Move-ToProjectArchive $DataDir $Project
@@ -1080,15 +980,18 @@ if ($Json -and $Command -in @("doctor", "status")) {
 
 switch ($Command) {
     "deploy" {
-        $deployHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        Invoke-WithUtf8Output { & $deployHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Project 'scripts\deploy\deploy.ps1') }
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        if ($env:MIXIN_OPS_CONSOLE -ceq '1') { if (-not (Invoke-LifecycleOperation { Invoke-DeployCommand })) { exit 1 } }
+        else {
+            $deployHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            Invoke-WithUtf8Output { & $deployHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Project 'scripts\deploy\deploy.ps1') }
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        }
     }
     "doctor"    {
         $healthy = Show-Doctor
         if ($Repair) {
             Write-Host ""
-            $repairOk = Invoke-DoctorRepair
+            $repairOk = Invoke-ServiceCommand 'repair'
             Write-Host ""
             $healthy = Show-Doctor
             if (-not $repairOk -or -not $healthy) { exit 1 }
@@ -1097,80 +1000,56 @@ switch ($Command) {
         }
     }
     "status"    { if (-not (Show-Doctor)) { exit 1 } }
-    "update"    { if (-not (Invoke-Update -ConfirmedTarget $Target)) { exit 1 } }
-    "upgrade"   { if (-not (Invoke-Update -ConfirmedTarget $Target)) { exit 1 } }
-    "resume"    { if (-not (Invoke-TransactionCommand 'continue' $ConfirmedTransaction)) { exit 1 } }
-    "rollback"  { if (-not (Invoke-TransactionCommand 'rollback' $ConfirmedTransaction)) { exit 1 } }
-    "restart"   { if (-not (Restart-Bot)) { exit 1 } }
-    "stop"      {
-        Step "停止机器人..."
-        if (-not (Stop-Bot)) { exit 1 }
-        Done "机器人已停止"
-    }
+    "update"    { if (-not (Invoke-LifecycleOperation { Invoke-Update -ConfirmedTarget $Target })) { exit $script:OpsCoreExitCode } }
+    "upgrade"   { if (-not (Invoke-LifecycleOperation { Invoke-Update -ConfirmedTarget $Target })) { exit $script:OpsCoreExitCode } }
+    "resume"    { if (-not (Invoke-LifecycleOperation { Invoke-TransactionCommand 'continue' $ConfirmedTransaction })) { exit $script:OpsCoreExitCode } }
+    "rollback"  { if (-not (Invoke-LifecycleOperation { Invoke-TransactionCommand 'rollback' $ConfirmedTransaction })) { exit $script:OpsCoreExitCode } }
+    "repair"    { if (-not (Invoke-ServiceCommand 'repair')) { exit $script:OpsCoreExitCode } }
+    "restart"   { if (-not (Invoke-ServiceCommand 'restart')) { exit $script:OpsCoreExitCode } }
+    "stop"      { if (-not (Invoke-ServiceCommand 'stop')) { exit $script:OpsCoreExitCode } }
     "foreground" { if (-not (Run-Foreground)) { exit 1 } }
     "run-foreground" { if (-not (Run-Foreground)) { exit 1 } }
-    "start"     {
-        if (-not (Start-Bot)) { exit 1 }
-        $lc = Wait-Local
-        if ($lc -eq 200) { Done "机器人已启动（:$Port 实例身份与就绪检查通过）" }
-        else { Warn "本地实例健康检查未通过；请在 $(Get-OpsCommandHint 'logs') 查看日志。"; exit 1 }
-    }
+    "start"     { if (-not (Invoke-ServiceCommand 'start')) { exit $script:OpsCoreExitCode } }
     "logs"      {
         if (-not (Test-Path $LogPath)) { Warn "找不到日志文件 $LogPath（机器人可能从未启动）"; exit 1 }
         Show-Logs
     }
-    "relay-configure" {
-        try { Invoke-RelayConfiguration } catch { Err $_.Exception.Message; exit 1 }
-    }
-    "runtime-configure" {
-        try { Invoke-RuntimeConfiguration $Target } catch { Err $_.Exception.Message; exit 1 }
-    }
-    "model-configure" {
-        try { Invoke-ConfigureWizard "scripts\config\configure.ts" "模型配置" } catch { Err $_.Exception.Message; exit 1 }
-    }
-    "configure-app-bot" {
-        try { Invoke-ConfigureWizard "scripts\config\configure-app-bot.ts" "应用机器人配置" } catch { Err $_.Exception.Message; exit 1 }
-    }
+    "relay-configure" { if (-not (Invoke-ConfigureWizard 'configure-relay.ts' '外链配置' 'relay')) { exit $script:OpsCoreExitCode } }
+    "configuration-apply" { if (-not (Invoke-ConfigurationChange apply $Target $Digest)) { exit $script:OpsCoreExitCode } }
+    "configuration-restore" { if (-not (Invoke-ConfigurationChange restore $Target '' $Expect)) { exit $script:OpsCoreExitCode } }
+    "runtime-configure" { if (-not (Invoke-RuntimeConfiguration $Target)) { exit $script:OpsCoreExitCode } }
+    "model-configure" { if (-not (Invoke-ConfigureWizard 'configure.ts' '模型配置' 'models')) { exit $script:OpsCoreExitCode } }
+    "configure-app-bot" { if (-not (Invoke-ConfigureWizard 'configure-app-bot.ts' '应用机器人配置' 'app')) { exit $script:OpsCoreExitCode } }
     # 只经本机控制接口读写运行中的服务，不另开 Stream 连接。
     "directory" { if (-not (Invoke-DataAdmin "scripts\ops\directory-admin.ts" @("status"))) { exit 1 } }
-    "directory-confirm" {
-        if ($Target -notmatch '^[1-9][0-9]*$') { Err "directory-confirm 需要轮次编号"; exit 2 }
-        if (-not (Invoke-DataAdmin "scripts\ops\directory-admin.ts" @("confirm", $Target))) { exit 1 }
-    }
-    "directory-departments" { if (-not (Invoke-DataAdmin "scripts\ops\directory-admin.ts" @("departments", $Target))) { exit 1 } }
     "directory-scope" { if (-not (Invoke-DataAdmin "scripts\ops\directory-admin.ts" @("scope", $Target))) { exit 1 } }
-    "relay-ls" { if (-not (Invoke-RelayAdmin @("list"))) { exit 1 } }
-    "relay-test" { if (-not (Invoke-RelayAdmin @("test"))) { exit 1 } }
-    "relay-purge" {
-        if (-not $All -and -not $Target) {
-            Err "relay-purge 需要一个关键字，或用 -All 表示清理全部"
-            exit 1
-        }
-        $relayArgs = if ($All) { @("purge", "--all") } else { @("purge", "--keyword", $Target) }
-        if (-not (Invoke-RelayAdmin $relayArgs)) { exit 1 }
+    { $_ -in @('relay-ls','relay-test','relay-purge') } {
+        $relayAction = if ($Command -eq 'relay-ls') { 'list' } else { $Command.Substring(6) }
+        $relayArgs = @($relayAction)
+        if ($All) { $relayArgs += '--all' }
+        if ($Target) { $relayArgs += @('--keyword', $Target) }
+        if ($Expect) { $relayArgs += @('--expect', $Expect) }
+        if (-not (Invoke-RelayAdmin $relayArgs)) { exit $script:OpsCoreExitCode }
     }
     "tmp-ls" {
         $tmpArgs = @("list")
         if ($User) { $tmpArgs += "--user=$User" }
         if ($Group) { $tmpArgs += "--group=$Group" }
         if ($StorageSegment) { $tmpArgs += "--storage-segment" }
-        elseif ($GroupId) { $tmpArgs += "--group-id" }
-        if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
+        if ($GroupId) { $tmpArgs += "--group-id" }
+        if (-not (Invoke-TmpAdmin $tmpArgs)) { exit $script:OpsCoreExitCode }
     }
     { $_ -in @("tmp-purge", "tmp-preview", "tmp-reclaim", "tmp-discard") } {
-        if ($Command -ne "tmp-discard" -and -not $Digest -and -not $All -and $Days -lt 0) {
-            Err "$Command 需要 -Days <天数>、-All，或 -Plan <ID> -Digest <摘要>"
-            exit 1
-        }
         $tmpArgs = @($Command.Substring(4))
-        if ($All) { $tmpArgs += "--all" } elseif ($Days -ge 0) { $tmpArgs += @("--days", "$Days") }
+        if ($All) { $tmpArgs += "--all" }
+        if ($script:OpsInputNames -contains "Days") { $tmpArgs += @("--days", "$Days") }
         if ($Plan) { $tmpArgs += @("--plan", $Plan) }
         if ($Digest) { $tmpArgs += @("--digest", $Digest) }
         if ($User) { $tmpArgs += "--user=$User" }
         if ($Group) { $tmpArgs += "--group=$Group" }
         if ($StorageSegment) { $tmpArgs += "--storage-segment" }
-        elseif ($GroupId) { $tmpArgs += "--group-id" }
-        if (-not (Invoke-TmpAdmin $tmpArgs)) { exit 1 }
+        if ($GroupId) { $tmpArgs += "--group-id" }
+        if (-not (Invoke-TmpAdmin $tmpArgs)) { exit $script:OpsCoreExitCode }
     }
     "stat" {
         $statArgs = @()
@@ -1183,7 +1062,9 @@ switch ($Command) {
         if (-not (Invoke-DataAdmin "scripts\ops\stats-admin.ts" $statArgs)) { exit 1 }
     }
     "stat-import" {
-        # 一次性导入旧版统计：不带路径时弹出文件选择框；停机导入（维护租约），再恢复调用前的运行或停止状态。
+        # 文件选择留在原生入口；快照、停机、恢复与副本清理由共用核心负责。
+        if (@($script:OpsInputNames | Where-Object { $_ -cnotin @('Command','RequestBase64','Json','Target','Expect') }).Count) { Err '统计导入含有不适用的参数'; exit 1 }
+        if ($Json -and -not $Target) { Err 'JSON 调用需要明确指定统计文件路径'; exit 1 }
         $legacy = $Target
         if (-not $legacy) {
             Step "请在弹出的窗口中选择旧统计账本（旧部署的 data\groups\stats.sqlite）"
@@ -1192,13 +1073,8 @@ switch ($Command) {
         }
         if (-not (Test-Path -LiteralPath $legacy -PathType Leaf)) { Err "找不到旧统计账本：$legacy"; exit 1 }
         $legacy = (Resolve-Path -LiteralPath $legacy).Path
-        Step "导入旧统计账本：$legacy"
-        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        $wasRunning = ($task -and $task.State -eq 'Running') -or @(Get-BotPids).Count -gt 0
-        if (-not (Stop-Bot)) { exit 1 }
-        try { $imported = Invoke-DataAdmin "scripts\ops\stats-import.ts" @($legacy) }
-        finally { if ($wasRunning) { $started = Start-Bot } else { $started = $true } }
-        if (-not ($imported -and $started)) { exit 1 }
+        $importArgs = @('maintenance', 'stat-import', $legacy); if ($Expect) { $importArgs += @('--expect', $Expect) }
+        if (-not (Invoke-CoreMaintenance $importArgs)) { exit $script:OpsCoreExitCode }
     }
     "history-ls" {
         if (-not (Invoke-DataAdmin "scripts\ops\history-admin.ts" @("list"))) { exit 1 }
@@ -1207,28 +1083,34 @@ switch ($Command) {
         # -All 清空所有会话空间（history-admin 的 clear --all）；-Direct 为单聊空间；与群号或群选择参数同用时拒绝，漏写群号只报错。
         if ($All) {
             if ($Target -or $Direct -or $StorageSegment -or $GroupId) { Err "history-clear -All 不能再指定群、-Direct 或群选择参数"; exit 2 }
-            if (-not (Clear-SpaceHistory "--all")) { exit 1 }
+            if (-not (Clear-SpaceHistory "--all")) { exit $script:OpsCoreExitCode }
         }
         elseif ($Direct) {
             if ($Target -or $StorageSegment -or $GroupId) { Err "history-clear -Direct 不能再指定群或群选择参数"; exit 2 }
-            if (-not (Clear-SpaceHistory "--direct")) { exit 1 }
+            if (-not (Clear-SpaceHistory "--direct")) { exit $script:OpsCoreExitCode }
         }
-        elseif (-not (Clear-SpaceHistory $Target)) { exit 1 }
+        elseif (-not (Clear-SpaceHistory $Target)) { exit $script:OpsCoreExitCode }
     }
     "history-compact" {
         if (-not $User) { Err "history-compact 需要 -User <成员号码>"; exit 2 }
         if ($Direct -and ($Target -or $StorageSegment -or $GroupId)) { Err "history-compact -Direct 不能再指定群或群选择参数"; exit 2 }
-        if (-not (Clear-SpaceHistory $(if ($Direct) { "--direct" } else { $Target }) "compact")) { exit 1 }
+        if (-not (Clear-SpaceHistory $(if ($Direct) { "--direct" } else { $Target }) "compact")) { exit $script:OpsCoreExitCode }
+    }
+    "maintenance-recover" {
+        if (@($script:OpsInputNames | Where-Object { $_ -cnotin @('Command','RequestBase64','Json') }).Count) { Err '恢复命令不接受其他参数'; exit 1 }
+        if (-not (Invoke-CoreMaintenance @('maintenance-recover'))) { exit $script:OpsCoreExitCode }
+    }
+    "revision-cleanup" {
+        if (-not (Invoke-RevisionCleanupAdmin $Target)) { exit $script:OpsCoreExitCode }
     }
     # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具逐条重新检查。
-    "backup-scan" {
-        if (-not (Invoke-DataAdmin "scripts\ops\backup-cleanup.ts" @("scan"))) { exit 1 }
-    }
-    "backup-clean" {
-        if (-not $Target) { Err "backup-clean 需要报告名（tmp\backup-cleanup 下的目录名）"; exit 2 }
-        $cleanArgs = @("apply", $Target)
-        if ($ConfirmCode) { $cleanArgs += @("--confirm", $ConfirmCode) }
-        if (-not (Invoke-DataAdmin "scripts\ops\backup-cleanup.ts" $cleanArgs)) { exit 1 }
+    { $_ -in @('backup-scan','backup-clean') } {
+        if (@($script:OpsInputNames | Where-Object { $_ -cnotin @('Command','RequestBase64','Json','Target','ConfirmCode') }).Count) { Err '备份维护含有不适用的参数'; exit 1 }
+        if ($Command -eq 'backup-clean' -and -not $Target) { Err 'backup-clean 需要报告名（tmp\backup-cleanup 下的目录名）'; exit 2 }
+        $backupArgs = @('maintenance', $Command)
+        if ($Target) { $backupArgs += $Target }
+        if ($ConfirmCode) { $backupArgs += @('--confirm', $ConfirmCode) }
+        if (-not (Invoke-CoreMaintenance $backupArgs)) { exit $script:OpsCoreExitCode }
     }
     "uninstall" { if (-not (Uninstall-Bot)) { exit 1 } }
     default {
@@ -1237,7 +1119,7 @@ switch ($Command) {
         if ($unknown) { Err "无法识别的命令：$Command" }
         Write-Host "mixin-chatbot 运维工具（Windows Server）" -ForegroundColor Cyan
         Write-Host "用法：powershell -ExecutionPolicy Bypass -File scripts\ops\ops.ps1 <命令> [-Repair]"
-        Write-Host "运维界面：在项目根目录运行 bun run tui。"
+        Write-Host "运维控制台：在项目根目录运行 bun run console，在浏览器中打开。"
         Write-Host ""
         Write-Host "  doctor          只读诊断（含共享资料目录与运行版本）；-Json 输出 JSON；-Repair 自动修复"
         Write-Host "  deploy          配置并部署当前代码；已有部署可重建，失败自动回滚"
@@ -1250,16 +1132,14 @@ switch ($Command) {
         Write-Host "  start           启动机器人计划任务"
         Write-Host "  foreground      以前台方式运行 launcher（Ctrl+C 停止）"
         Write-Host "  logs            持续查看 logs\mixin-chatbot.log"
-        Write-Host "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
-        Write-Host "  model-configure 停止机器人，运行模型配置向导，结束后恢复原运行状态"
-        Write-Host "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
-        Write-Host "  configure-app-bot 停止机器人，填写应用机器人 AppID/AppSecret 并验证，结束后恢复原运行状态"
-        Write-Host "  directory       查看事件 Stream 与通讯录同步状态（同步范围、映射数、最近同步、待确认撤销）"
-        Write-Host "  directory-confirm <轮次> 确认该轮暂停的大批撤销；服务重新完整扫描后才撤销"
-        Write-Host "  directory-departments [部门ID]"
-        Write-Host "                  列出该部门（默认根部门）的直属子部门：ID、人数、名称，用来选择同步范围"
-        Write-Host "  directory-scope [""部门ID,…""]"
-        Write-Host "                  只同步这些部门及其子部门，留空为整个通讯录；范围有变化时立即重新同步"
+        Write-Host "  relay-configure 交互配置可选的大文件外链；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态"
+        Write-Host "  model-configure 运行模型配置向导；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态，失败时恢复原配置"
+        Write-Host "  runtime-configure <草稿名> 应用控制台「设置」中已确认的高级运行参数"
+        Write-Host "  configure-app-bot 填写应用机器人 AppID/AppSecret 并验证；之后与 model-configure 相同地应用"
+        Write-Host "  directory       查看事件 Stream 与通讯录同步状态（同步范围及是否生效、映射数、最近同步、待复核的缺席）"
+        Write-Host "  directory-scope all"
+        Write-Host "                  把同步范围设为整个通讯录并应用；只同步部分部门请在控制台的「通讯录」中逐层勾选。"
+        Write-Host "                  完整同步成功后一次切换，之前的名单在此前仍然生效"
         Write-Host "  relay-ls        列出已发出、仍在册的大文件外链"
         Write-Host "  relay-test      上传并删除一个随机测试文件，验收外链签名、私有访问和删除权限"
         Write-Host "  relay-purge <关键字>|-All"
@@ -1281,7 +1161,15 @@ switch ($Command) {
         Write-Host "  history-compact <群号>|-Direct -User <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
         Write-Host "                  群选择可加 -GroupId（原始群号）或 -StorageSegment（目录段）"
         Write-Host "  history-clear -All  清空所有会话空间全部成员的上下文；一次停机完成，某个空间失败时其余照常清空"
-        Write-Host "  backup-scan     只读扫描 backup\rm 和 backup\snapshots，分类后在 tmp\backup-cleanup 生成清单，不删除"
+        Write-Host "  maintenance-recover 回收中断的维护写入者，恢复原运行状态，不重复数据动作"
+        Write-Host "  revision-cleanup preview|status  只读：会话库中待整理的旧修订链、预计用时与空间；上次整理的状态"
+        Write-Host "  revision-cleanup apply|skip|abandon"
+        Write-Host "                  停机整理旧修订链（先备份到 backup\revision-cleanup）、跳过或放弃剩余整理；维护状态允许时恢复原运行状态"
+        Write-Host "  revision-cleanup restore -Space <空间>  整理发现基准与记录不同时，停机从备份恢复那个库（校验通过才执行）"
+        Write-Host "  revision-cleanup shrink-preview|shrink-status  只读：可收缩的会话库、空闲页与所需空间；上次收缩的状态与保留的原库"
+        Write-Host "  revision-cleanup shrink [-Space <空间>]  停机收缩会话库文件（原库保留为同目录的 .old），再恢复原运行状态"
+        Write-Host "  revision-cleanup shrink-remove-old [-Yes]  列出收缩保留的原库；确认机器人运行正常后加 -Yes 删除"
+        Write-Host "  backup-scan     只读扫描 backup\rm、snapshots 和 revision-cleanup，分类后在 tmp\backup-cleanup 生成清单，不删除"
         Write-Host "  backup-clean <报告名> [-ConfirmCode <确认码>]"
         Write-Host "                  不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"
         Write-Host "  uninstall       清理任务/进程/launcher，可选清理 data 和 logs"

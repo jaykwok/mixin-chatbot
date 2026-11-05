@@ -5,10 +5,10 @@ import { createHash, createHmac } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkRelayBackend, loadRelayConfig, validateRelayConfig, listRelayObjects, purgeRelayObjects, refreshRelayReference,
+import { checkRelayBackend, loadRelayConfig, listRelayObjects, purgeRelayObjects, refreshRelayReference,
   relayFile, relayNote, relayReference, sweepExpiredRelayObjects } from "../../src/integrations/relay.ts";
 import { refreshDeliveryText } from "../../src/agent/delivery-links.ts";
-import { downloadUrl, objectBaseUrl, objectNameFromUrl, storedObjectUrl } from "../../src/integrations/relay-s3.ts";
+import { downloadUrl, objectBaseUrl, objectNameFromUrl, storedObjectUrl, validateRelayConfig } from "../../src/integrations/relay-s3.ts";
 import { openRelayIndex } from "../../src/integrations/relay-index.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -414,7 +414,7 @@ async function check(f: Awaited<ReturnType<typeof fixture>>, bytes = 4096) {
   const steps: { status: string; text: string }[] = [];
   const passed = await checkRelayBackend((status, text) => steps.push({ status, text }), { config: f.config, index: f.index, tempDir: f.root, bytes });
   const output = steps.map(step => step.text).join("\n");
-  // Reports are printed to the operator and the TUI: no signed URLs, credentials or raw responses.
+  // Reports are printed to the operator and the console: no signed URLs, credentials or raw responses.
   for (const secret of ["X-Amz-", "http", credentials.accessKeyId, credentials.secretAccessKey, credentials.sessionToken]) expect(output).not.toContain(secret);
   return { passed, steps, failed: steps.filter(step => step.status === "fail").map(step => step.text) };
 }

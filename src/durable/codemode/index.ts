@@ -1,11 +1,11 @@
 // `mixin.codemode`: Durable's official code mode tool (`@earendil-works/pi-durable/codemode`), adapted to the members of
 // a group. The official tool runs the script in a pi-codemode sandbox, journals what it delivers and resumes a script
 // after a restart by replaying the journal (replay-safe); nested calls go through `api.executeTool()`, so they are
-// resolved among the conversation's callable tools (src/durable/tools.ts `callersOf`), validated, wrapped by the request
+// resolved among the conversation's callable tools (each tool's `callers`), validated, wrapped by the request
 // door and run as their own tool tasks with their own replay policy. Scripts call the direct tools the conversation is
 // offered and the script-only tools of the extensions it selects; never model-only tools (send_*) or codemode itself.
 // `models.*` stays off. The `codemode` prompt section lists the callable tools (deferred ones, MCP, are found with
-// `searchTools()`); namespaces come from the tool definitions.
+// `searchTools()`); namespaces come from the member tools (src/durable/tools.ts `MemberTool.namespace`).
 //
 // What this adapter adds around each call:
 // - Identity: the calling member is resolved first; a conversation without a member of this group runs nothing.
@@ -76,14 +76,9 @@ export interface CodemodeOptions {
   readonly sandbox?: CodemodeSandboxBase;
 }
 
-/** One namespace per namespaced tool, by its exact name: the definitions say which tools belong together. */
+/** One namespace per namespaced tool, by its exact name: the tools say which of them belong together. */
 function namespacesOf(tools: readonly MemberTool[]): CodemodeNamespace[] {
-  return tools.flatMap(({ definition }) => definition.namespace === undefined ? [] : [{
-    name: definition.namespace.name,
-    ...(definition.namespace.description === undefined ? {} : { description: definition.namespace.description }),
-    ...(definition.namespace.instructions === undefined ? {} : { instructions: definition.namespace.instructions }),
-    prefix: definition.name,
-  }]);
+  return tools.flatMap(({ registration, namespace }) => namespace === undefined ? [] : [{ ...namespace, prefix: registration.name }]);
 }
 
 /** `mixin.codemode`: the official codemode tool, run for the calling member, and the `codemode` prompt section. */

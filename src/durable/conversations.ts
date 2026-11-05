@@ -1,7 +1,6 @@
 import type { Context } from "@earendil-works/chord";
-import { type ConversationId, type Harness, InboxDoc as PiInboxDoc } from "@earendil-works/pi-durable";
+import type { ConversationId, Harness } from "@earendil-works/pi-durable";
 import { InboxDoc } from "./inbox.ts";
-import { LIVE_TASK_STATES } from "./task-states.ts";
 
 /** Scan once through the public transaction API; callers choose whether forks count. */
 export async function conversationIds(session: Pick<Harness, "commit">, context: Context, ownerless = false): Promise<ConversationId[]> {
@@ -17,20 +16,16 @@ export async function conversationIds(session: Pick<Harness, "commit">, context:
   }, context);
 }
 
-/** Call only while the space admission gate is held. Any recoverable work postpones physical reclamation. */
-export async function idleSpaceReferences(harness: Harness, context: Context): Promise<unknown[] | undefined> {
-  const busy = await harness.commit(async tx => {
-    for (const status of LIVE_TASK_STATES) {
-      if ((await tx.scanTasks({ status }, 1)).items.length) return true;
-    }
-    return false;
-  }, context);
-  if (busy) return undefined;
+/**
+ * Call only while the space admission gate is held. Any recoverable work postpones physical reclamation; `yielding` (a
+ * waiting admission) ends the read between conversations. Undefined in both cases.
+ */
+export async function idleSpaceReferences(harness: Harness, context: Context, yielding: () => boolean): Promise<unknown[] | undefined> {
+  const inspection = await harness.inspect(context);
+  if (inspection.tasks.length || inspection.submissions.length) return undefined;
   const references: unknown[] = [];
   for (const id of await conversationIds(harness, context)) {
-    // Tx does not expose scanSubmissions. Both project and SDK inboxes cover queued/placed inputs.
-    if ((await harness.snapshot(InboxDoc, id, context))?.items.length
-      || (await harness.snapshot(PiInboxDoc, id, context))?.items.length) return undefined;
+    if (yielding() || (await harness.snapshot(InboxDoc, id, context))?.items.length) return undefined;
     const conversation = await harness.conversation(id, context);
     if (conversation) references.push((await conversation.context(context)).messages);
   }

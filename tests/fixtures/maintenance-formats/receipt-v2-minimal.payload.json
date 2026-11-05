@@ -5,11 +5,13 @@
   "manager": "<MANAGER>",
   "daemon": "<DAEMON>",
   "image": "<IMAGE>",
+  "ownerEpoch": "<EPOCH>",
   "temp": "<TEMP>",
   "createdAt": 1,
   "pid": 1,
   "phase": "removed",
   "containers": [],
   "pendingNames": [],
+  "role": "worker",
   "mounts": {}
 }

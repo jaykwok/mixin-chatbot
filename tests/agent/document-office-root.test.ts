@@ -26,7 +26,7 @@ test("the Office acceptance script checks its venv from its run directory, not a
     await writeFile(join(venv, DOCUMENT_TOOLCHAIN_MARKER), documentMarker(DOCUMENT_TOOLCHAIN_PACKAGES,
       await readFile(join(project, "uv.lock"), "utf8"), (await readFile(join(project, ".python-version"), "utf8")).trim()));
     const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../helpers/document-office-integration.ts", import.meta.url)), venv, "--root", run], {
-      cwd: start, env: { ...process.env, BOT_DEPLOY_BACKUP_ID: undefined }, stdout: "pipe", stderr: "pipe", windowsHide: true,
+      cwd: start, stdout: "pipe", stderr: "pipe", windowsHide: true,
     });
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect(code, out + err).not.toBe(0);

@@ -5,7 +5,7 @@ import { isPathInside } from "../contracts/paths.ts";
 import { DATA_DIR } from "./storage.ts";
 
 /**
- * 应用数据布局的唯一解析入口。一个部署实例对应一个机器人应用：全部单聊和群聊读取同一份 workspace，
+ * 应用数据布局的唯一解析入口。一个部署实例对应一个应用机器人：全部单聊和群聊读取同一份 workspace，
  * 会话库按空间（单聊共用一个库、每群一个库）隔离，临时文件按空间、用户和请求隔离。
  *
  *   <data>/workspace                         默认共享资料（WORKSPACE_ROOT 可指向外置目录），模型只读

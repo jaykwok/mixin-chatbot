@@ -6,6 +6,7 @@ import type { McpConfig, McpServerConfig } from "../core/mcp-config.ts";
 import { mcpOAuth } from "./mcp-oauth.ts";
 import type { Scope } from "../core/layout.ts";
 import { APP_VERSION } from "../core/version.ts";
+import { SUPERVISOR_ENV } from "../../scripts/lib/process.ts";
 
 /** The calling member; `tempDir` is the directory a stdio server starts in (the request's directory in a run). */
 export interface McpMember { scope: Scope; phone: string; workspaceDir: string; tempDir: string }
@@ -13,7 +14,7 @@ export type ExternalGate = <T>(dispatch: () => Promise<T>, signal: AbortSignal) 
 export interface McpCatalogueTool { server: McpServerConfig; tool: Tool }
 /** Every request except tools/call ends after requestMs; a tools/call after callMs. */
 export interface McpTimeouts { requestMs: number; callMs: number }
-const supervisor = fileURLToPath(new URL("../core/process-supervisor.ts", import.meta.url));
+const supervisor = fileURLToPath(new URL("../../scripts/lib/process-supervisor.ts", import.meta.url));
 const sameSchema = (a: Tool, b: Tool) => JSON.stringify(a.inputSchema) === JSON.stringify(b.inputSchema) && JSON.stringify(a.outputSchema) === JSON.stringify(b.outputSchema);
 
 /** Official protocol/transports, short-lived member sessions, and a fixed administrator tool allowlist. */
@@ -93,6 +94,9 @@ export class McpTools {
       for (const name of ["PATH", "Path", "SystemRoot", "WINDIR", "PATHEXT", "TEMP", "TMP", "LANG"]) if (process.env[name]) env[name] = process.env[name]!;
       Object.assign(env, server.env, { MIXIN_CHAT_KIND: member?.scope.kind ?? "", MIXIN_GROUP_ID: member?.scope.kind === "group" ? member.scope.groupId : "",
         MIXIN_MEMBER_PHONE: member?.phone ?? "" });
+      // The supervisor starts with its small JIT region (SUPERVISOR_ENV); the server gets the administrator's value, or none.
+      const jit = server.env?.BUN_JSC_jitMemoryReservationSize;
+      Object.assign(env, SUPERVISOR_ENV, jit === undefined ? {} : { MIXIN_STDIO_COMMAND_JIT: jit });
       const transport = new StdioTransport({ command: process.execPath, args: [supervisor, "--stdio", server.command!, ...server.args ?? []],
         cwd: member?.tempDir ?? this.discoveryDir, env, inheritEnv: false, maxMessageBytes: 8 * 1024 * 1024, maxStderrBytes: 65536, closeTimeoutMs: 2000 });
       return new Proxy(transport, { get: (target, property) => {

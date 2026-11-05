@@ -1,4 +1,5 @@
 // S3 Signature V4 comes from Bun; HTTP stays here so cancellation covers every request.
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { S3Client } from "bun";
 import { NATIVE_FILE_MAX_BYTES, RELAY_HTTP_TIMEOUT, RELAY_PROBE_TIMEOUT } from "../core/transfer-limits.ts";
@@ -23,6 +24,10 @@ export interface RelayConfig {
 export const DEFAULT_RELAY_MAX_BYTES = 2 * 1024 ** 3;
 export const DEFAULT_RELAY_EXPIRE_HOURS = 2;
 export const DEFAULT_RELAY_CLEANUP_GRACE_MINUTES = 30;
+/** The storage a ledger key belongs to: the settings that decide where an object lives, never the credentials. */
+export function relayBackendId(config: RelayConfig): string {
+  return createHash("sha256").update(JSON.stringify(["s3", config.endpoint, config.region, config.bucket, config.prefix, config.forcePathStyle])).digest("hex");
+}
 
 function required(value: unknown, field: string, path: string): string {
   if (typeof value !== "string" || !value.trim() || value !== value.trim() || /[\x00-\x1f\x7f]/.test(value)) {

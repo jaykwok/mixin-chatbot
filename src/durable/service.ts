@@ -19,16 +19,16 @@
 // growing wait until the delivery's window ends; an uncertain one counts as sent and is never resent.
 //
 // Controls. /stop and /clear are committed to the control stream (with their receipt) before they run; the request door
-// holds the member's model requests from receipt until the removal is committed. /stop cancels the inbox and aborts the
-// run. /clear also holds the worker (new messages are admitted but not submitted), waits until the conversation is idle
-// (Durable's abort returns only then: no tool, codemode sub-call or store commit of the member is left), starts a new
-// context, removes the member's codemode result directories, then releases the worker. A restart executes waiting
-// controls again. Both end the sending of the member's earlier replies in the space.
+// holds the member's model requests from receipt until the removal is committed, and the worker starts nothing meanwhile
+// (new messages are admitted but not submitted). Both cancel the inbox and abort the run; the abort returns once the
+// conversation is idle (no tool, codemode sub-call or store commit of the member is left). /clear then starts a new context
+// and records the member's codemode results as expired for idle maintenance. A restart executes waiting controls again.
+// Both end the sending of the member's earlier replies in the space.
 //
 // Watchdog. The total deadline counts from the item's first submission (stored, so it survives restarts); model
 // progress is the committed partial of the current attempt (`pi.live`): no change for the idle limit, or one attempt
-// running longer than the response limit, aborts the run like the previous engine's limits. Tool rounds, retry
-// backoff, deferred polls and compactions are not model idleness.
+// running longer than the response limit, aborts the run. Tool rounds, retry backoff, deferred polls and compactions are
+// not model idleness. The abort's reason stays in memory; a run found aborted after a restart still gets a failure reply.
 //
 // Startup. Spaces with work are opened by discovery; before scheduling resumes, the door gets the waiting controls,
 // every member's storage identity is checked and delivery parts left `sending` become uncertain; then the controls run
@@ -41,18 +41,18 @@ import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, withCancel } from "@earendil-works/chord/context";
 import type { AssistantMessage, Models } from "@earendil-works/pi-ai";
 import {
-  AssistantEntry, CompactionEntry, InboxDoc as PiInboxDoc, type Conversation, type ConversationId, createRegistry, defineExtension, type Extension, GenerationTask, type Harness,
-  type HarnessOptions, hook, LiveDoc, type LiveState, type ReportInfo, type SettledSubmissionRecord, type Submission,
+  AssistantEntry, CompactionEntry, InboxDoc as PiInboxDoc, type Conversation, type ConversationId, createRegistry, defineExtension, type EntryDraft, type Extension,
+  GenerationTask, type Harness, type HarnessOptions, type HarnessSettings, hook, LiveDoc, type LiveState, type Report, type SettledSubmissionRecord, type Submission,
 } from "@earendil-works/pi-durable";
 import { canonicalCommand, HELP_TEXT, unknownCommandText } from "../agent/commands.ts";
 import { clearRunning, markRunning } from "./running-requests.ts";
-import { deleteSnapshots, fileDigest, releasableSnapshots } from "../agent/deliverables.ts";
+import { deleteSnapshots, fileDigest, releasableSnapshots, slotVersions } from "../agent/deliverables.ts";
 import { SendNotConfirmed, transferFile } from "../agent/send-tools.ts";
 import { closeoutExtension, closeoutTool, validateCloseout, type CloseoutTiming, type RecordWriter } from "./closeout.ts";
 import { describeRequestFailure, modelRequestError } from "../agent/failure.ts";
 import { ensureMaterialsIndex } from "../agent/materials-index.ts";
 import type { AgentModuleDefinition } from "../agent/modules.ts";
-import { ensureStorageIdentity } from "../agent/storage-identity.ts";
+import { ensureStorageIdentities, ensureStorageIdentity } from "../agent/storage-identity.ts";
 import { openStatsLedger, pruneAskIds, settledAsks } from "../agent/stats-ledger.ts";
 import { Attention, type AttentionStatus } from "./attention.ts";
 import { MAX_ACTIVE_REQUESTS, MEMBER_IDLE_MS } from "../core/config.ts";
@@ -62,7 +62,7 @@ import { AsyncSemaphore } from "../core/async-semaphore.ts";
 import { type Send, type SendOutcome, splitText, textMessage } from "../integrations/open-platform/messages.ts";
 import { LinkUnavailable, type RelayConfig } from "../integrations/relay.ts";
 import { RequestDoor, type ControlTicket } from "./door.ts";
-import { SpaceHarnesses } from "./spaces.ts";
+import { SpaceHarnesses, type SpaceOpenStep, type SpaceOpenTiming } from "./spaces.ts";
 import { IdentityDoc, memberConversation, MemberDirectory } from "./identity.ts";
 import { type ControlCommand, ControlsDoc, InboxDoc, type InboxItem, inboxItems, pendingControls, receivedBefore } from "./inbox.ts";
 import { spaceDoor, type ModelSelection } from "./models.ts";
@@ -83,14 +83,17 @@ import { conversationIds, idleSpaceReferences } from "./conversations.ts";
 import { lateMinutes, type Outbound, replyMessage, replySegments, sendNotice, targetOf } from "./outbound.ts";
 import { sendChannel } from "./send.ts";
 import { ATTACHMENT_LIMITS, AttachmentDownloads, type AttachmentEvent, type AttachmentLimits, type AttachmentSource, arrivedBefore, attachmentLabel,
-  attachmentPrompt, bindAttachments, expireAttachments, newAttachmentId, removeAttachmentFiles, unconsumed, voidWhere } from "./attachments.ts";
+  attachmentPrompt, bindAttachments, expireAttachments, newAttachmentId, releaseHeld, removeAttachmentFiles, unconsumed, voidWhere } from "./attachments.ts";
 import {
-  type Attachment, type Delivery, DELIVERY_RETRY_DELAYS_MS, DELIVERY_WINDOW_MS, deliveryEnd, type DeliveryPart, type MemberRecords, memberRecords, openPart, pendingDeliveries, pruneReceipts,
+  type Attachment, type Delivery, DELIVERY_RETRY_DELAYS_MS, DELIVERY_WINDOW_MS, deliveryEnd, type DeliveryPart, fileSendOutcome, type MemberRecords, memberRecords, openPart, pendingDeliveries, pruneReceipts,
   pruneRecords, ReceiptsDoc, recordsOf, deliveryRetryDelay, type ReplyContext, type RequestRecord, settleInterrupted, undelivered,
 } from "./records.ts";
 
-export const lateNotice = (minutes: number) => `这条消息约 ${minutes} 分钟前发出，服务维护后才收到，正在处理。`;
-const QUEUE_FULL = "本会话已有 8 条消息排队，请稍后重发";
+const lateNotice = (minutes: number) => `这条消息约 ${minutes} 分钟前发出，服务维护后才收到，正在处理。`;
+const queueFull = (limit: number) => `本会话已有 ${limit} 条消息排队，请稍后重发`;
+const ACKNOWLEDGED = "收到，正在处理，请稍候。处理时间较长时可以发送 /status 查看进度。";
+/** How long a model request waits for a materials index scan before it goes ahead without it. */
+const MATERIALS_WAIT_MS = 3000;
 const CAPACITY_FULL = "⚠️ 机器人现在比较忙，这条消息未加入队列，不会自动处理，请稍后重新发送。";
 
 export interface ServiceLimits {
@@ -113,6 +116,8 @@ export interface ServiceLimits {
   deliveryRetryMs: readonly number[];
   /** Automatic sending of a delivery ends this long after its creation. */
   deliveryWindowMs: number;
+  /** A space open that takes this long or longer is logged with its steps ("会话空间打开用时"). */
+  slowOpenMs: number;
 }
 
 export interface DurableServiceOptions {
@@ -128,14 +133,27 @@ export interface DurableServiceOptions {
   mcp?: McpTools;
   /** The document environment (BOT_DOCUMENT_ENV); default the layout's shared one. */
   venvDir?: string;
-  limits: Omit<ServiceLimits, "activeRequests" | "queue" | "tickMs" | "heartbeatMs" | "resultRetentionMs" | "memberIdleMs" | "deliveryRetryMs" | "deliveryWindowMs"> & Partial<ServiceLimits>;
+  limits: Omit<ServiceLimits, "activeRequests" | "queue" | "tickMs" | "heartbeatMs" | "resultRetentionMs" | "memberIdleMs" | "deliveryRetryMs" | "deliveryWindowMs" | "slowOpenMs"> & Partial<ServiceLimits>;
   /** Production supplies validated runtime settings; tiny lifecycle fixtures can omit closeout. */
   closeout?: CloseoutTiming;
+  /**
+   * A short "received, working on it" notice before the answer, so a slow first answer does not look like a hang: in a
+   * direct chat when the member is idle (nothing open, nothing asked or answered within `idleMs`); in a group for the
+   * first question of a window of `idleMs`, whoever asks it (later questions in the window, of anyone, get none).
+   * Absent: no such notice.
+   */
+  acknowledge?: { idleMs: number };
   /** The storage identity table (src/core/state.ts by default). */
   stateDb?: Database;
   /** Extensions installed after the project's (tests). */
   extensions?: (scope: Scope) => readonly Extension[];
-  /** Refresh the application's materials index before each run (default true). */
+  /**
+   * Extensions only some members' conversations select (the push tools, src/push/tools.ts): `install` gives a space's
+   * ones, which the space's default selection leaves out; `selected` names those a member's conversation adds. The
+   * selection is checked whenever the member's conversation is opened for a message, a command or an attachment.
+   */
+  memberExtensions?: { install(scope: Scope): readonly Extension[]; selected(scope: Scope, phone: string): readonly string[] };
+  /** Refresh the application's materials index before each model request (default true). */
   materials?: boolean;
   maxIdleSpaces?: number;
   context?: Context;
@@ -155,8 +173,11 @@ export interface Inbound {
   reply: ReplyContext;
 }
 
-/** A direct-chat image, file or video. */
-export type InboundAttachment = Omit<Inbound, "content"> & { attachment: AttachmentEvent };
+/** A direct-chat image, file or video; `hold` names the push reply it belongs to (src/push/service.ts) instead of the next request. */
+export type InboundAttachment = Omit<Inbound, "content"> & { attachment: AttachmentEvent; hold?: string };
+
+/** A registered attachment carries its ID. */
+export type AttachResult = { status: "accepted"; attachment: string } | { status: "duplicate" } | { status: "full"; message: string };
 
 type AbortReason = { kind: "task_timeout" | "model_idle" | "model_response_timeout"; error: Error };
 
@@ -176,6 +197,8 @@ type MemberState = {
   again: boolean;
   /** Admitted control boundary for this process, including messages whose admission is still in flight. */
   cancelBefore?: number;
+  /** The same for /clear alone: it also voids unbound attachments, which a /stop leaves for the next message. */
+  clearBefore?: number;
   /**
    * Set from a /stop's or /clear's arrival until it ran: the worker starts nothing, so a message that arrives after the
    * control is never started before it and aborted by it.
@@ -209,7 +232,26 @@ type MemberState = {
   lastUsed: number;
 };
 
-type SpaceRuntime = { door: RequestDoor; holder: { harness?: Harness }; refreshed: Map<number, Promise<void>>; epoch: number };
+type SpaceRuntime = { door: RequestDoor; holder: { harness?: Harness }; epoch: number; prepared?: Preparation;
+  /** The space's member extensions as installed (wrapped by the door), by name. */
+  optional: Map<string, Extension> };
+/** What `#prepare` spent its time on, in milliseconds by part, for the open log. */
+type Preparation = { members: number; parts: Map<PreparePart, number> };
+type PreparePart = "controls" | "sessions" | "members" | "identity" | "office" | "stats" | "inbox" | "records";
+
+const OPEN_STEPS: Record<SpaceOpenStep, string> = { storage: "库", recorded: "登记", harness: "Harness", claim: "认领", work: "检查待办", prepare: "准备" };
+const PREPARE_PARTS: Record<PreparePart, string> = {
+  controls: "控制", sessions: "会话索引", members: "成员列表", identity: "身份目录", office: "Office", stats: "统计", inbox: "收件箱", records: "交付记录",
+};
+const seconds = (ms: number) => (ms / 1000).toFixed(1);
+
+/** The open log line: steps, the preparation by part, and the database's SQL meanwhile, in seconds. No phone numbers. */
+function openTimingText(scope: Scope, { kept, total, steps, sql }: SpaceOpenTiming, prepared?: Preparation): string {
+  const parts = prepared ? `；准备 ${prepared.members} 位成员（秒）：${[...prepared.parts].map(([part, ms]) => `${PREPARE_PARTS[part]} ${seconds(ms)}`).join("，")}` : "";
+  return `会话空间${kept ? "打开" : "检查（没有待办，已关闭）"}用时 - ${scopeLabel(scope)}, 共 ${seconds(total)} 秒；分步（秒）：`
+    + steps.map(({ step, ms }) => `${OPEN_STEPS[step]} ${seconds(ms)}`).join("，") + parts
+    + `；SQL ${sql.requests} 次（秒）：库内排队 ${seconds(sql.queued)}，线程排队 ${seconds(sql.waited)}，执行 ${seconds(sql.exec)}，事务 ${sql.transactions} 个占用 ${seconds(sql.held)}`;
+}
 type ControlReceipt = { scope: Scope; phone: string; requestId: string; ticket?: ControlTicket };
 /** Held while maintenance reclaims a group's results. A waiting message or command sets `yield`. */
 type ReclamationGate = { promise: Promise<void>; resolve: () => void; yield: boolean };
@@ -259,7 +301,7 @@ export class DurableService {
     this.#options = options;
     this.#auxiliaryBudget = new AuxiliaryBudget(options.auxiliary?.maxConcurrent ?? 2);
     this.#limits = { activeRequests: MAX_ACTIVE_REQUESTS, queue: 8, tickMs: 1000, heartbeatMs: 60_000, resultRetentionMs: 7 * 24 * 3600_000,
-      memberIdleMs: MEMBER_IDLE_MS, deliveryRetryMs: DELIVERY_RETRY_DELAYS_MS, deliveryWindowMs: DELIVERY_WINDOW_MS, ...options.limits };
+      memberIdleMs: MEMBER_IDLE_MS, deliveryRetryMs: DELIVERY_RETRY_DELAYS_MS, deliveryWindowMs: DELIVERY_WINDOW_MS, slowOpenMs: 1_000, ...options.limits };
     if (!Number.isSafeInteger(this.#limits.activeRequests) || this.#limits.activeRequests < 1) throw new Error("普通请求总容量必须是正整数");
     this.#outbound = options.outbound;
     if (options.closeout) validateCloseout(options.closeout, this.#limits.runTimeoutMs);
@@ -277,6 +319,9 @@ export class DurableService {
       onReport: (error) => this.#report(error),
       onFatal: (error) => this.#fatal(error),
       onClosed: (scope, harness) => this.#closedSpace(scope, harness),
+      onOpened: (scope, timing) => {
+        if (timing.total >= this.#limits.slowOpenMs) this.#log(openTimingText(scope, timing, this.#runtimes.get(scopeKey(scope))?.prepared));
+      },
     });
     if (options.attachments) {
       this.#downloads = new AttachmentDownloads(options.attachments.source, {
@@ -351,7 +396,7 @@ export class DurableService {
       const handle = await this.#spaces.acquire(scope);
       let added: "added" | "duplicate" | "queue-full" | "capacity-full";
       let voided: Attachment[] = [];
-      let createdAt = 0;
+      let createdAt = 0, idle = false;
       try {
         const conversation = await this.#conversation(handle.harness, member);
         added = await handle.harness.commit(async (tx) => {
@@ -365,9 +410,22 @@ export class DurableService {
           const cancelled = receivedAt <= (member.cancelBefore ?? -Infinity);
           inbox.items.push({ requestId, content, receivedAt, epoch, ...(cancelled ? { cancelled: true } : {}) });
           const records = await recordsOf(tx, phone);
+          // Records and receipts stay a day (records.ts), so both rules hold across restarts.
+          const acknowledge = this.#options.acknowledge;
+          if (acknowledge && !cancelled) {
+            if (scope.kind === "group") {
+              // A group gets one notice per window, counted from the question that got it, whoever asks.
+              idle = !Object.values(receipts.items).some(receipt => receipt.acknowledged && now - receipt.at < acknowledge.idleMs);
+            } else {
+              // A direct chat: the member has nothing open and no question asked or answered within the window.
+              const previous = Object.values(records.requests);
+              idle = previous.every(record => record.closedAt !== undefined)
+                && previous.every(record => now - Math.max(record.createdAt, record.closedAt ?? 0) >= acknowledge.idleMs);
+            }
+          }
           records.requests[requestId] = { requestId, reply: structuredClone(reply), createdAt: now, notes: [], deliverables: [], files: [], events: {} };
           createdAt = now;
-          receipts.items[reply.msgUid] = { at: now, phone, request: requestId };
+          receipts.items[reply.msgUid] = { at: now, phone, request: requestId, ...(idle ? { acknowledged: true as const } : {}) };
           // The request takes the member's earlier attachments in its admission commit (a cancelled one voids them).
           voided = bindAttachments(records, requestId, { epoch, receivedAt }, cancelled, now);
           return "added" as const;
@@ -375,11 +433,13 @@ export class DurableService {
         retained = added === "added";
       } finally { handle.release(); }
       if (added === "duplicate") { this.#remember(reply.msgUid); return { status: "duplicate" }; }
-      if (added === "queue-full") return { status: "full", message: QUEUE_FULL };
+      if (added === "queue-full") return { status: "full", message: queueFull(this.#limits.queue) };
       if (added === "capacity-full") return { status: "full", reason: "capacity", message: CAPACITY_FULL };
       this.#remember(reply.msgUid);
       this.#countAsk(scope, phone, requestId, createdAt);
       this.#discard(scope, phone, voided);
+      // Queued for the chat before the run starts: the answer's sends line up behind it.
+      if (idle) this.#track(this.#notify(reply, ACKNOWLEDGED));
       this.#kick(member);
       return { status: "accepted" };
     } finally {
@@ -394,10 +454,12 @@ export class DurableService {
   /**
    * Register a direct-chat attachment with its receipt in arrival order, acknowledge it and start its download; the
    * member's next admitted request binds it. Everything up to the admission turn is synchronous, as for admit().
+   * A held attachment (a push reply) is registered the same way but belongs to its holder: it is not limited by the
+   * member's unconsumed count, is not acknowledged here (the push answers) and is never voided by an earlier control.
    */
-  async attach(message: InboundAttachment): Promise<AdmitResult> {
+  async attach(message: InboundAttachment): Promise<AttachResult> {
     this.#assertRunning();
-    const { scope: space, phone, reply, attachment: event } = message;
+    const { scope: space, phone, reply, attachment: event, hold } = message;
     if (this.#seen.has(reply.msgUid)) return { status: "duplicate" };
     const downloads = this.#downloads, limits = downloads?.limits ?? ATTACHMENT_LIMITS;
     const receivedAt = this.#arrival();
@@ -421,14 +483,14 @@ export class DurableService {
           const now = Date.now();
           receipts.items[reply.msgUid] = { at: now, phone };
           const records = await recordsOf(tx, phone);
-          if (unconsumed(records).length >= limits.memberCount) return { status: "full" as const };
+          if (hold === undefined && unconsumed(records).length >= limits.memberCount) return { status: "full" as const };
           const attachment: Attachment = {
             id: newAttachmentId(), msgUid: reply.msgUid, receivedAt, epoch: this.#runtimes.get(scopeKey(space))!.epoch, fileId: event.fileId, kind: event.kind,
             name: event.name, ...(event.size === undefined ? {} : { size: event.size }), ...(event.mimeType ? { mimeType: event.mimeType } : {}),
-            reply: structuredClone(reply), state: "pending", at: now,
+            reply: structuredClone(reply), state: "pending", at: now, ...(hold === undefined ? {} : { heldBy: hold }),
           };
-          // Like an inbox item, an attachment behind an admitted /stop or /clear boundary is cancelled by it.
-          if (receivedAt <= (member.cancelBefore ?? -Infinity)) attachment.state = "void";
+          // As when a /clear runs: an unbound attachment behind its admitted boundary is void; a /stop leaves it for the next message (a held one is not the request's).
+          if (hold === undefined && receivedAt <= (member.clearBefore ?? -Infinity)) attachment.state = "void";
           else if (downloads === undefined) Object.assign(attachment, { state: "rejected", error: "当前服务未开启附件接收" });
           records.attachments[attachment.id] = attachment;
           return { status: "added" as const, attachment: { ...attachment, reply: { ...attachment.reply } } };
@@ -442,12 +504,45 @@ export class DurableService {
       const { attachment } = outcome;
       if (attachment.state === "pending") {
         downloads!.schedule(space, phone, attachment.id);
-        this.#track(this.#notify(reply, `已收到${attachmentLabel(attachment)}，请说明要怎么处理。`));
-      } else if (attachment.state === "rejected") this.#track(this.#notify(reply, `未接收${attachmentLabel(attachment)}：${attachment.error}。`));
-      return { status: "accepted" };
+        if (hold === undefined) this.#track(this.#notify(reply, `已收到${attachmentLabel(attachment)}，请说明要怎么处理。`));
+      } else if (attachment.state === "rejected" && hold === undefined) this.#track(this.#notify(reply, `未接收${attachmentLabel(attachment)}：${attachment.error}。`));
+      return { status: "accepted", attachment: attachment.id };
     } finally {
       member.uses--;
       release?.();
+      this.#pruneMember(member);
+    }
+  }
+
+  /** Drop a holder's attachment records (attachments.ts `releaseHeld`); their files stay for the tmp lifecycle. */
+  async releaseAttachments(scope: Scope, phone: string, holder: string, ids: readonly string[]): Promise<number> {
+    this.#assertRunning();
+    if (!ids.length) return 0;
+    const handle = await this.#spaces.acquire(scope);
+    try { return await handle.harness.commit(async tx => releaseHeld(await recordsOf(tx, phone), holder, ids), this.#context); }
+    finally { handle.release(); }
+  }
+
+  /**
+   * A passive entry in the member's conversation (a push note, src/push/service.ts): no run starts, a busy conversation
+   * takes it at its next boundary, and `requestId` makes writing it again (a retry, a restart) a no-op. Creates the
+   * member's conversation when there is none yet. Resolves once the submission is durable.
+   */
+  async note(scope: Scope, phone: string, requestId: string, entry: EntryDraft): Promise<void> {
+    this.#assertRunning();
+    const member = this.#member(scope, phone);
+    member.uses++;
+    member.lastUsed = Date.now();
+    try {
+      await this.#yieldToReclamation(scope);
+      await ensureStorageIdentity(this.#options.layout, scope, phone, this.#options.stateDb);
+      const handle = await this.#spaces.acquire(scope);
+      try {
+        const conversation = await this.#conversation(handle.harness, member);
+        await conversation.submit({ type: "write", requestId, entry }, this.#context);
+      } finally { handle.release(); }
+    } finally {
+      member.uses--;
       this.#pruneMember(member);
     }
   }
@@ -467,15 +562,15 @@ export class DurableService {
    * receipt text, "" when nothing was sent (a redelivered command). The member's
    * command order is taken synchronously: call it in arrival order.
    */
-  async control(message: Inbound, onAdmitted?: () => void): Promise<string> {
+  async control(message: Inbound): Promise<string> {
     this.#assertRunning();
     const member = this.#member(message.scope, message.phone);
     member.uses++;
-    try { return await this.#controlMessage(member, message, onAdmitted); }
+    try { return await this.#controlMessage(member, message); }
     finally { member.uses--; this.#pruneMember(member); }
   }
 
-  async #controlMessage(member: MemberState, message: Inbound, onAdmitted?: () => void): Promise<string> {
+  async #controlMessage(member: MemberState, message: Inbound): Promise<string> {
     const { phone, scope, content, reply: context } = message;
     const command = canonicalCommand(content);
     const receivedAt = this.#arrival();
@@ -496,7 +591,7 @@ export class DurableService {
       const run = member.controls.then(async () => {
         await this.#yieldToReclamation(scope);
         await ensureStorageIdentity(this.#options.layout, scope, phone, this.#options.stateDb);
-        return this.#control(member, command, receivedAt, receipt, context, decided, onAdmitted);
+        return this.#control(member, command, receivedAt, receipt, context, decided);
       });
       member.controls = run.catch(() => {});
       let admitted: boolean;
@@ -533,7 +628,6 @@ export class DurableService {
       const { handle, queued } = await admission;
       try {
         if (queued === undefined) return "";
-        onAdmitted?.();
         const outcome = queued.submissionId !== undefined
           ? { status: "completed" as const, result: { submissionId: queued.submissionId, entryId: undefined } }
           : (await handle.harness.waitForTask(queued.taskId, this.#context)).state.outcome;
@@ -557,10 +651,8 @@ export class DurableService {
         await this.#syncStats(handle.harness, member);
       } finally { handle.release(); }
     } else if (command === "/status") {
-      onAdmitted?.();
       reply = await this.#status(member);
     } else {
-      onAdmitted?.();
       reply = command === "/help" ? HELP_TEXT : unknownCommandText(content);
     }
     await this.#notify(context, reply);
@@ -573,7 +665,7 @@ export class DurableService {
    * is known: after the cancellation boundary is set, or for a redelivery.
    */
   async #control(member: MemberState, command: ControlCommand, receivedAt: number, receipt: ControlReceipt, reply: ReplyContext,
-    decided: () => void, onAdmitted?: () => void): Promise<boolean> {
+    decided: () => void): Promise<boolean> {
     const handle = await this.#spaces.acquire(member.scope);
     try {
       await member.replaying;
@@ -603,6 +695,7 @@ export class DurableService {
         member.withdrawals++;
         door.controlAdmitted(ticket, seq);
         member.cancelBefore = Math.max(member.cancelBefore ?? -Infinity, receivedAt);
+        if (command === "/clear") member.clearBefore = Math.max(member.clearBefore ?? -Infinity, receivedAt);
         decided();
         // Each withdrawn delivery is looked at once more under the delivery lock (after a send in flight): that frees its snapshots.
         for (const id of withdrawn) this.#track(this.#autoDeliver(member, id));
@@ -611,7 +704,6 @@ export class DurableService {
           (await pendingControls(harness, this.#context)).find((control) => control.requestId === requestId)?.seq);
         throw error;
       }
-      onAdmitted?.();
       await this.#execute(harness, member, command, requestId, reply);
       return true;
     } finally { handle.release(); }
@@ -657,8 +749,9 @@ export class DurableService {
         const cancelled = new Set<string>();
         for (const item of inbox.items) if (receivedBefore(item, pending)) { item.cancelled = true; cancelled.add(item.requestId); }
         // Attachments go with the requests that bound them; a /clear also voids the unbound ones received before it.
+        // Held ones belong to a push reply, which a control of the model's work does not touch.
         return voidWhere(await recordsOf(tx, member.phone), attachment => attachment.boundTo !== undefined ? cancelled.has(attachment.boundTo)
-          : command === "/clear" && arrivedBefore(attachment, pending), Date.now());
+          : attachment.heldBy === undefined && command === "/clear" && arrivedBefore(attachment, pending), Date.now());
       }, this.#context);
       // Resolves once the conversation is idle: the run, its tools and codemode sub-calls have ended.
       await conversation.abort(this.#context, { background: true });
@@ -874,7 +967,7 @@ export class DurableService {
         const stored = (await tx.doc(InboxDoc, conversation.id)).items.find((each) => each.requestId === item.requestId);
         if (stored !== undefined) stored.startedAt = startedAt;
       }, this.#context);
-      // No "working on it" notice; only a message redelivered after an outage says why its answer comes late.
+      // The acknowledgement, when due, went out at admission; a message redelivered after an outage also says why its answer comes late.
       const late = lateMinutes(reply);
       if (late !== undefined) this.#track(sendNotice(this.#outbound, reply, lateNotice(late), { signal: this.#closing.signal }).catch(() => false));
     }
@@ -917,24 +1010,20 @@ export class DurableService {
       if (startedAt === undefined || member.aborted.has(submission.id.toString())) continue;
       const now = Date.now();
       let reason: AbortReason | undefined;
-      if (now - startedAt >= this.#limits.runTimeoutMs) {
-        reason = this.#totalTimeout(member.current?.requestId ?? "", startedAt, now);
-      } else {
-        const live = await harness.snapshot(LiveDoc, conversation.id, this.#context);
-        const model = modelActivity(live);
-        if (now - beat >= this.#limits.heartbeatMs) {
-          beat = now;
-          this.#log(`任务仍在运行 - ${taskText(member, member.current?.requestId ?? "")}, 已用: ${Math.floor((now - startedAt) / 1000)}秒, 阶段: ${livePhase(live)}`);
-        }
-        if (model === undefined) attempt = undefined;
-        else {
-          if (attempt?.key !== model.key) attempt = { key: model.key, since: now, progress: model.progress, changed: now };
-          else if (attempt.progress !== model.progress) { attempt.progress = model.progress; attempt.changed = now; }
-          if (now - attempt.since > this.#limits.modelResponseMs) {
-            reason = { kind: "model_response_timeout", error: new Error(`单次模型响应时限 ${this.#limits.modelResponseMs / 1000} 秒已到（任务：${task}）`) };
-          } else if (now - attempt.changed > this.#limits.modelIdleMs) {
-            reason = { kind: "model_idle", error: new Error(`模型连续 ${this.#limits.modelIdleMs / 1000} 秒无有效进展（任务：${task}）`) };
-          }
+      const live = await harness.snapshot(LiveDoc, conversation.id, this.#context);
+      const model = modelActivity(live);
+      if (now - beat >= this.#limits.heartbeatMs) {
+        beat = now;
+        this.#log(`任务仍在运行 - ${taskText(member, member.current?.requestId ?? "")}, 已用: ${Math.floor((now - startedAt) / 1000)}秒, 阶段: ${livePhase(live)}`);
+      }
+      if (model === undefined) attempt = undefined;
+      else {
+        if (attempt?.key !== model.key) attempt = { key: model.key, since: now, progress: model.progress, changed: now };
+        else if (attempt.progress !== model.progress) { attempt.progress = model.progress; attempt.changed = now; }
+        if (now - attempt.since > this.#limits.modelResponseMs) {
+          reason = { kind: "model_response_timeout", error: new Error(`单次模型响应时限 ${this.#limits.modelResponseMs / 1000} 秒已到（任务：${task}）`) };
+        } else if (now - attempt.changed > this.#limits.modelIdleMs) {
+          reason = { kind: "model_idle", error: new Error(`模型连续 ${this.#limits.modelIdleMs / 1000} 秒无有效进展（任务：${task}）`) };
         }
       }
       if (reason !== undefined) {
@@ -944,8 +1033,8 @@ export class DurableService {
     }
   }
 
-  #totalTimeout(requestId: string, startedAt: number | undefined, now = Date.now()): AbortReason | undefined {
-    if (startedAt === undefined || now - startedAt < this.#limits.runTimeoutMs) return;
+  #totalTimeout(requestId: string, startedAt: number | undefined): AbortReason | undefined {
+    if (startedAt === undefined || Date.now() - startedAt < this.#limits.runTimeoutMs) return;
     return { kind: "task_timeout", error: new Error(`任务总时限 ${this.#limits.runTimeoutMs / 1000} 秒已到（任务：${taskNumber(requestId)}）`) };
   }
 
@@ -964,9 +1053,8 @@ export class DurableService {
     // /clear received so far is known to be new (it sets cancelBefore) or a redelivery (it changes nothing).
     await this.#controlsDecided(member, item);
     const current = (await inboxItems(harness, conversation.id, this.#context)).find(x => x.requestId === item.requestId);
-    const cancelled = current?.cancelled === true || (member.cancelBefore ?? -Infinity) >= item.receivedAt;
-    const aborted = member.aborted.get(settled.id.toString());
-    member.aborted.delete(settled.id.toString());
+    const cancelled = item.cancelled === true || current?.cancelled === true || (member.cancelBefore ?? -Infinity) >= item.receivedAt;
+    const submission = settled.id.toString(), aborted = member.aborted.get(submission);
     const record = (await memberRecords(harness, member.phone, this.#context)).requests[item.requestId];
     if (record === undefined) throw new Error(`任务记录缺失 - ${taskText(member, item.requestId)}`);
     const now = Date.now();
@@ -976,15 +1064,18 @@ export class DurableService {
       // Explicit cancellation wins over a watchdog firing at the same time.
     } else if (aborted !== undefined) {
       failure = describeRequestFailure(aborted.error);
-    } else if (settled.status === "done" && item.cancelled !== true) {
+    } else if (settled.status === "done") {
       const answer = settled.type === "input" && settled.answer !== undefined
         ? await harness.commit(async (tx) => (await tx.entry(AssistantEntry, settled.answer!))?.model?.[0] as AssistantMessage | undefined, this.#context)
         : undefined;
-      const text = textOf(answer);
-      if (!text && !record.notes.length) failure = describeRequestFailure(new Error("Pi 未返回回复"));
-      else delivery = replyDelivery(record.reply, text || "文件链接已生成。", record.notes, now);
-    } else if (settled.status === "unanswered" && settled.reason !== "aborted" && item.cancelled !== true) {
-      failure = describeRequestFailure(await this.#failure(harness, conversation, settled));
+      const text = textOf(answer), sent = record.files.some(file => fileSendOutcome(file) !== undefined);
+      if (!text && !record.notes.length && !sent) failure = describeRequestFailure(new Error("Pi 未返回回复"));
+      else delivery = replyDelivery(record.reply, text || (record.notes.length ? "文件链接已生成。" : "文件已发出，没有收到的话请再说一声。"), record.notes, now);
+    } else if (settled.status === "unanswered") {
+      // Only the watchdog aborts an item that is not cancelled (a control commits the cancellation first). Its reason
+      // does not survive a restart, when only the total deadline can still tell it.
+      failure = describeRequestFailure(settled.reason !== "aborted" ? await this.#failure(harness, conversation, settled)
+        : this.#totalTimeout(item.requestId, item.startedAt)?.error ?? new Error(`时限检查已中止本次运行，服务随后重启（任务：${taskNumber(item.requestId)}）`));
     }
     if (failure !== undefined) {
       if (this.#options.closeout && !this.#closing.signal.aborted) {
@@ -1000,6 +1091,8 @@ export class DurableService {
     await this.#controlsDecided(member, item);
     const stopped = await this.#close(harness, member, conversation.id, item.requestId,
       { cancelled: cancelled || (member.cancelBefore ?? -Infinity) >= item.receivedAt, ...(delivery ? { delivery } : {}) });
+    // Only now: a failed step above is settled again by the worker's retry, which still needs the reason.
+    member.aborted.delete(submission);
     await this.#syncStats(harness, member);
     this.#log(`任务结束 - ${taskText(member, item.requestId)}, 结果: ${settled.status}${"reason" in settled && settled.reason ? `/${settled.reason}` : ""}`);
     if (delivery && !stopped) await this.#autoDeliver(member, item.requestId);
@@ -1018,31 +1111,31 @@ export class DurableService {
   /** The closeout fallback: the failure, what the run registered, and the files themselves. */
   async #fallback(record: Readonly<RequestRecord>, failure: string, fallbackMs: number, now: number): Promise<Delivery> {
     const candidates = await this.#validCandidates(record);
+    const sendOf = (sha256: string) => record.files.find(f => f.sha256 === sha256);
     const descriptions = candidates.map(x => {
-      const file = record.files.find(f => f.sha256 === x.sha256);
-      const status = file?.state === "sent" ? "；该版本已在任务中发出" : file?.state === "uncertain" || file?.state === "sending" ? "；该版本可能已发出" : "";
+      const file = sendOf(x.sha256), outcome = fileSendOutcome(file);
+      const status = outcome === "uncertain" ? "；该版本可能已发出" : outcome !== "sent" ? "" : file!.state === "sent" ? "；该版本已在任务中发出" : "；该版本的下载链接随后发出";
       return `· 《${x.name}》— ${x.status === "checked" ? "已检查版本" : "草稿"}；文件结构完整；检查记录（模型登记）：${x.checked.join("、") || "未登记"}；未检查：${x.unchecked.join("、") || "未登记"}；已知问题：${x.issues.join("、") || "无登记"}${status}。`;
     });
     const rejected = record.deliverables.some(x => x.status === "rejected" || !x.complete);
-    const text = [failure, candidates.length ? "系统将交付本任务已登记的可用版本：" : "本任务没有可交付的已登记版本。",
+    // Nothing about deliverables when the run registered none: a plain question that failed is only told why.
+    const text = [failure, candidates.length ? "系统将交付本任务已登记的可用版本：" : record.deliverables.length ? "本任务没有可交付的已登记版本。" : "",
       ...descriptions, rejected ? "存在已知错误或不完整的版本，未作为交付候选。" : "",
       candidates.some(x => x.status === "draft") ? "这是未完成全部检查的草稿，请核对后使用。" : ""].filter(Boolean).join("\n");
     const delivery = failureDelivery(record.reply, text, record.notes, now);
     candidates.forEach((x, index) => {
-      const sent = record.files.find(f => f.sha256 === x.sha256)?.state;
       delivery.parts.push({ id: `f${index}`, kind: "file", file: { name: x.name, path: x.path, size: x.size, sha256: x.sha256 },
-        state: sent === "sent" ? "sent" : sent === "uncertain" || sent === "sending" ? "uncertain" : "pending", attempts: 0 });
+        state: fileSendOutcome(sendOf(x.sha256)) ?? "pending", attempts: 0 });
     });
-    return { ...delivery, kind: "fallback", deadline: now + fallbackMs };
+    // The budget bounds file sends; a failure notice alone is retried for the delivery window, like any reply.
+    const files = delivery.parts.some(part => part.kind === "file" && openPart(part));
+    return { ...delivery, kind: "fallback", ...(files ? { deadline: now + fallbackMs } : {}) };
   }
 
-  /** Per slot the best complete, not rejected version whose snapshot still matches: checked before draft, newest first. */
+  /** Per slot the best version whose snapshot still matches. */
   async #validCandidates(record: Readonly<RequestRecord>): Promise<RequestRecord["deliverables"]> {
-    const all = record.deliverables, rejected = new Set(all.filter(x => x.status === "rejected").map(x => x.sha256));
     const selected: RequestRecord["deliverables"] = [];
-    for (const slot of new Set(all.map(x => x.slot))) {
-      const versions = all.filter(x => x.slot === slot && x.complete && !rejected.has(x.sha256)).sort((a, b) =>
-        Number(b.status === "checked") - Number(a.status === "checked") || b.seq - a.seq);
+    for (const versions of slotVersions(record)) {
       for (const version of versions) {
         try { if (await fileDigest(version.path, this.#closing.signal) === version.sha256) { selected.push(version); break; } }
         catch { this.#closing.signal.throwIfAborted(); }
@@ -1051,22 +1144,30 @@ export class DurableService {
     return selected;
   }
 
-  /** The model error of an unanswered input, for a member reply. */
+  /**
+   * Why an unanswered input got no answer, for a member reply: Durable's run failure (`reason` and `detail`, as in
+   * `pi.live.runFailure`), with the model's own error for `model_error`.
+   */
   async #failure(harness: Harness, conversation: Conversation, settled: SettledSubmissionRecord): Promise<Error> {
     const reason = "reason" in settled ? settled.reason : "unknown";
-    // A blocking compaction that did not complete ends the run before any model request: Durable settles the input
-    // `model_error` with "Compaction failed: …" (or "… was aborted") as its detail, and keeps the newest failure, with its
-    // task and kind, in the live document. Checked first: the newest assistant entry then belongs to an earlier turn.
     const detail = "detail" in settled && typeof settled.detail === "string" ? settled.detail : undefined;
-    if (reason === "model_error" && detail?.startsWith("Compaction ")) {
-      const compaction = (await harness.snapshot(LiveDoc, conversation.id, this.#context))?.compactionFailure;
-      const which = compaction === undefined ? "" : `任务 ${compaction.taskId}，${compactionReasonText(compaction.reason)}；`;
-      return new Error(`模型未能回答：会话历史压缩未完成（${which}${detail}）`);
+    if (reason === "model_error") {
+      // A blocking compaction that did not complete ends the run before any model request, with "Compaction failed: …"
+      // (or "… was aborted") as the detail; the live document keeps the newest failure with its task and trigger.
+      // Checked first: the newest assistant entry then belongs to an earlier turn.
+      if (detail?.startsWith("Compaction ")) {
+        const compaction = (await harness.snapshot(LiveDoc, conversation.id, this.#context))?.compactionFailure;
+        const which = compaction === undefined ? "" : `任务 ${compaction.taskId}，${compactionReasonText(compaction.trigger)}；`;
+        return new Error(`模型未能回答：会话历史压缩未完成（${which}${detail}）`);
+      }
+      // The failed response is the newest assistant entry; context overflow is judged on that message.
+      const page = await conversation.entries({}, 20, undefined, this.#context);
+      const last = page.items.find((entry) => AssistantEntry.is(entry))?.model?.[0] as AssistantMessage | undefined;
+      if (last?.errorMessage) return modelRequestError(last.errorMessage, [last], this.#options.selection.model.contextWindow);
     }
-    const page = await conversation.entries({}, 20, undefined, this.#context);
-    const last = page.items.find((entry) => AssistantEntry.is(entry))?.model?.[0] as AssistantMessage | undefined;
-    if (last?.errorMessage) return modelRequestError(last.errorMessage, [last], this.#options.selection.model.contextWindow);
-    return new Error(`模型未能回答（${reason}）`);
+    // Any other reason says what ended the run (`interrupted`: the host stopped while the model answered, more often than
+    // the retries; `restart_limit`: the run was cut off restartLimit times; `no_model`, `faulted`, `orphaned`, …).
+    return new Error(detail === undefined ? `模型未能回答（${reason}）` : detail);
   }
 
   /**
@@ -1285,8 +1386,8 @@ export class DurableService {
       : `🧹 已为你在${here}开启新会话，下条消息从新会话开始，之前的聊天记录留在${member.scope.kind === "direct" ? "单聊库" : "群库"}里。其他人的聊天记录不受影响。`;
   }
 
-  async #notify(reply: ReplyContext, text: string, mention = false): Promise<void> {
-    const sent = await sendNotice(this.#outbound, reply, text, { mention, signal: this.#closing.signal })
+  async #notify(reply: ReplyContext, text: string): Promise<void> {
+    const sent = await sendNotice(this.#outbound, reply, text, { signal: this.#closing.signal })
       .catch((error) => { this.#report(error); return false; });
     if (!sent && !this.#closing.signal.aborted) this.#report(new Error(`回执未送达 - 会话: ${reply.receiveId}, 消息: ${reply.msgUid}`));
   }
@@ -1311,7 +1412,6 @@ export class DurableService {
     let tools = "暂无";
     let attachments = "";
     let compaction: string | undefined;
-    let parked: string | undefined;
     if (member.conversationId !== undefined) {
       const handle = await this.#spaces.acquire(member.scope);
       try {
@@ -1325,22 +1425,13 @@ export class DurableService {
         const running = runningTools(live);
         if (running.length) tools = running.join("、");
         if (live?.compactions?.length) phase = "压缩会话历史";
-        // Durable's crash-loop guard: a task cut off restartLimit times in a row without progress is not run again.
-        const blocked = (await handle.harness.inspect(this.#context)).tasks.filter((task) => task.record.conversationId === member.conversationId
-          && task.state.kind === "blocked" && task.state.reason === "restart_limit");
-        if (blocked.length) {
-          phase = "已停放";
-          parked = `${blocked.map((task) => `${task.record.kind}#${task.record.id}`).join("、")}，运行中连续 ${Math.max(...blocked.map((task) => task.record.restarts ?? 0))} 次` +
-            "被异常中断且没有进展，已停止自动重跑；发送 /stop 结束本次任务（或 /clear 重新开始）后可继续对话";
-        }
         const failed = live?.compactionFailure;
-        if (failed !== undefined) compaction = `任务 ${failed.taskId}，${compactionReasonText(failed.reason)}：${failed.error.slice(0, 300)}`;
+        if (failed !== undefined) compaction = `任务 ${failed.taskId}，${compactionReasonText(failed.trigger)}：${failed.error.slice(0, 300)}`;
         const waitingFiles = unconsumed(await memberRecords(handle.harness, member.phone, this.#context));
         if (waitingFiles.length) attachments = `\n待处理附件：${waitingFiles.length} 个（下一条消息会一并处理）`;
       } finally { handle.release(); }
     }
     let text = "状态：" + phase + "\n等待处理的消息：" + waiting + "\n正在运行的工具：" + tools + attachments;
-    if (parked !== undefined) text += "\n停放的任务：" + parked;
     if (compaction !== undefined) text += "\n最近一次会话历史压缩失败：" + compaction;
     const retry = member.controlRetry ?? member.workerRetry;
     if (retry) text += `\n自动重试：第 ${retry.attempt} 次，约 ${Math.max(0, Math.ceil((retry.nextAt - Date.now()) / 1000))} 秒后\n最近错误：${retry.message}`;
@@ -1362,58 +1453,67 @@ export class DurableService {
     this.#maintenanceCursor = spaces.length ? (this.#maintenanceCursor + selected.length) % spaces.length : 0;
     for (const scope of selected) {
       if (this.#closing.signal.aborted) return;
-      const handle = await this.#spaces.acquire(scope);
-      try {
-        await this.#pruneSpace(scope, handle.harness, now).catch(error => this.#report(error));
-        // No await between the idle check and publishing the gate. Admissions reserve member.uses
-        // synchronously, and worker/control replay state covers work already admitted.
-        if (this.#reclaiming.has(scopeKey(scope)) || [...this.#members.values()].some(state => scopeKey(state.scope) === scopeKey(scope)
-          && (state.uses || state.worker || state.gate || state.starting || state.replaying || state.current))) continue;
-        const gate: ReclamationGate = { ...Promise.withResolvers<void>(), yield: false };
-        this.#reclaiming.set(scopeKey(scope), gate);
-        try {
-          const values = await idleSpaceReferences(handle.harness, this.#context);
-          if (!values) continue;
-          const members = await this.#memberList(handle.harness);
-          // Run records (reply texts, link notes, file paths) may name result files.
-          for (const member of members) values.push(await memberRecords(handle.harness, member.phone, this.#context));
-          // The gate keeps this snapshot of the whole space's references valid; it is searched, never rescanned per member.
-          const references = resultReferences(values);
-          const start = (this.#memberCursors.get(scopeKey(scope)) ?? 0) % Math.max(1, members.length);
-          let visited = 0;
-          for (const member of [...members.slice(start), ...members.slice(0, start)]) {
-            // A waiting admission ends the pass between members; the next pass resumes with the next member.
-            if (gate.yield || this.#closing.signal.aborted) break;
-            visited++;
-            // A persisted member visited only for maintenance has no new user activity.
-            const state = this.#member(scope, member.phone, 0);
-            state.uses++;
-            try {
-              state.conversationId = member.conversationId;
-              await this.#syncStats(handle.harness, state);
-              const live = await handle.harness.snapshot(LiveDoc, member.conversationId as ConversationId, this.#context);
-              const busy = state.worker !== undefined || state.gate !== undefined || state.current !== undefined
-                || (await inboxItems(handle.harness, member.conversationId, this.#context)).length > 0
-                || live?.run !== undefined || !!live?.compactions?.length;
-              if (busy) continue;
-              const release = this.#hold(state, false);
-              try {
-                // The hold precedes the context read: a newly admitted message cannot start a call during deletion.
-                if (state.starting || state.current || state.worker) continue;
-                const places = memberPlaces(this.#placesOptions(), scope, member.phone);
-                await recoverOfficeProfiles(places.tempDir, deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error));
-                await this.#results.member(handle.harness, state.phone, places.tempDir, now - this.#limits.resultRetentionMs, references).catch((error) => this.#report(error));
-              } finally { release(); }
-            } finally { state.uses--; this.#pruneMember(state, now); }
-          }
-          if (members.length) this.#memberCursors.set(scopeKey(scope), (start + visited) % members.length);
-          else this.#memberCursors.delete(scopeKey(scope));
-        } finally {
-          this.#reclaiming.delete(scopeKey(scope)); gate.resolve();
-        }
-      } finally { handle.release(); }
+      // One space that cannot be opened or read must not keep the others from their maintenance.
+      await this.#maintainSpace(scope, now).catch(error => { if (!this.#closing.signal.aborted) this.#report(error); });
     }
     for (const member of this.#members.values()) this.#pruneMember(member, now);
+  }
+
+  async #maintainSpace(scope: Scope, now: number): Promise<void> {
+    const handle = await this.#spaces.acquire(scope);
+    try {
+      await this.#pruneSpace(scope, handle.harness, now).catch(error => this.#report(error));
+      // No await between the idle check and publishing the gate. Admissions reserve member.uses
+      // synchronously, and worker/control replay state covers work already admitted.
+      if (this.#reclaiming.has(scopeKey(scope)) || [...this.#members.values()].some(state => scopeKey(state.scope) === scopeKey(scope)
+        && (state.uses || state.worker || state.gate || state.starting || state.replaying || state.current))) return;
+      const gate: ReclamationGate = { ...Promise.withResolvers<void>(), yield: false };
+      this.#reclaiming.set(scopeKey(scope), gate);
+      try {
+        // A waiting admission ends the pass, also while the references are read; the next pass resumes with the next member.
+        const yielding = () => gate.yield || this.#closing.signal.aborted;
+        const values = await idleSpaceReferences(handle.harness, this.#context, yielding);
+        if (!values) return;
+        const members = await this.#memberList(handle.harness);
+        // Run records (reply texts, link notes, file paths) may name result files.
+        for (const member of members) {
+          if (yielding()) return;
+          values.push(await memberRecords(handle.harness, member.phone, this.#context));
+        }
+        // The gate keeps this snapshot of the whole space's references valid; it is searched, never rescanned per member.
+        const references = resultReferences(values);
+        const start = (this.#memberCursors.get(scopeKey(scope)) ?? 0) % Math.max(1, members.length);
+        let visited = 0;
+        for (const member of [...members.slice(start), ...members.slice(0, start)]) {
+          if (yielding()) break;
+          visited++;
+          // A persisted member visited only for maintenance has no new user activity.
+          const state = this.#member(scope, member.phone, 0);
+          state.uses++;
+          try {
+            state.conversationId = member.conversationId;
+            await this.#syncStats(handle.harness, state);
+            const live = await handle.harness.snapshot(LiveDoc, member.conversationId as ConversationId, this.#context);
+            const busy = state.worker !== undefined || state.gate !== undefined || state.current !== undefined
+              || (await inboxItems(handle.harness, member.conversationId, this.#context)).length > 0
+              || live?.run !== undefined || !!live?.compactions?.length;
+            if (busy) continue;
+            const release = this.#hold(state, false);
+            try {
+              // The hold precedes the context read: a newly admitted message cannot start a call during deletion.
+              if (state.starting || state.current || state.worker) continue;
+              const places = memberPlaces(this.#placesOptions(), scope, member.phone);
+              await recoverOfficeProfiles(places.tempDir, deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error));
+              await this.#results.member(handle.harness, state.phone, places.tempDir, now - this.#limits.resultRetentionMs, references).catch((error) => this.#report(error));
+            } finally { release(); }
+          } finally { state.uses--; this.#pruneMember(state, now); }
+        }
+        if (members.length) this.#memberCursors.set(scopeKey(scope), (start + visited) % members.length);
+        else this.#memberCursors.delete(scopeKey(scope));
+      } finally {
+        this.#reclaiming.delete(scopeKey(scope)); gate.resolve();
+      }
+    } finally { handle.release(); }
   }
 
   /** Drop finished run records and old receipts. A receipt stays while its request is open or undelivered. */
@@ -1475,7 +1575,7 @@ export class DurableService {
     for (const receipt of this.#receipts.values()) {
       if (scopeKey(receipt.scope) === scopeKey(scope)) receipt.ticket = door.controlReceived(receipt.phone, receipt.requestId);
     }
-    const runtime: SpaceRuntime = { door, holder, refreshed: new Map(), epoch: 0 };
+    const runtime: SpaceRuntime = { door, holder, epoch: 0, optional: new Map() };
     this.#runtimes.set(scopeKey(scope), runtime);
     // Hooks observe through snapshots; their writes to the run record are commits of their own.
     const write: RecordWriter = async (phone, requestId, change) => {
@@ -1488,8 +1588,9 @@ export class DurableService {
     };
     const registry = createRegistry();
     const install = (extension: Extension) => registry.install(door.wrapTools(extension));
-    if (this.#options.closeout) install(closeoutExtension(write, this.#options.closeout, this.#limits.runTimeoutMs));
-    if (this.#options.materials !== false) install(this.#materials(runtime));
+    if (this.#options.closeout) install(closeoutExtension(write, this.#options.closeout, this.#limits.runTimeoutMs,
+      (phone, requestId) => memberPlaces(this.#placesOptions(), scope, phone, requestId).requestDir!));
+    if (this.#options.materials !== false) install(this.#materials());
     for (const extension of spaceExtensions({
       ...this.#placesOptions(), scope,
       modules: this.#options.modules, relay: this.#options.relay, outbound: this.#outbound,
@@ -1497,45 +1598,68 @@ export class DurableService {
       ...(this.#options.auxiliary ? { auxiliary: { config: this.#options.auxiliary, budget: this.#auxiliaryBudget, door } } : {}),
       ...(this.#options.mcp ? { mcp: { manager: this.#options.mcp, door } } : {}),
     })) install(extension);
+    for (const extension of this.#options.memberExtensions?.install(scope) ?? []) {
+      const wrapped = door.wrapTools(extension);
+      registry.install(wrapped);
+      runtime.optional.set(wrapped.name, wrapped);
+    }
     for (const extension of this.#options.extensions?.(scope) ?? []) install(extension);
-    return { models: door.wrap(selection.runtime as unknown as Models), registry, settings: selection.harnessSettings,
-      onReport: (error, info) => this.#durableReport(scope, error, info) };
+    // Member extensions are out of the default selection; a member's conversation adds them (#conversation).
+    const settings: HarnessSettings = runtime.optional.size === 0 ? selection.harnessSettings
+      : Object.defineProperty({ ...selection.harnessSettings }, "extensions", { enumerable: true,
+        get: () => registry.snapshot().installed().filter(extension => !runtime.optional.has(extension.name)) });
+    return { models: door.wrap(selection.runtime as unknown as Models), registry, settings,
+      onReport: (report) => this.#durableReport(scope, report) };
   }
 
-  /** Durable's own reports (faulted or parked tasks, failing hooks and listeners, a failed Session), with what they are about. */
-  #durableReport(scope: Scope, error: unknown, info: ReportInfo): void {
-    const task = "task" in info && info.task !== undefined ? `，任务 ${info.task.kind}#${info.task.id}，会话 ${info.task.conversationId}` : "";
-    const extension = "extension" in info && info.extension !== undefined ? `，扩展 ${info.extension}` : "";
-    const parked = info.type === "task_parked" ? "；已停止自动重跑，成员可用 /status 查看，/stop 或 /clear 结束" : "";
-    if (info.type === "task_parked") this.#attention.note("parked", scope);
-    else if (info.type === "task_faulted" || info.type === "session_failed" || info.type === "migration_failed") this.#attention.note("faulted", scope);
-    this.#report(new Error(`Durable 报告 ${info.type}（${scopeLabel(scope)}${task}${extension}）：${error instanceof Error ? error.message : String(error)}${parked}`, { cause: error }));
+  /**
+   * Durable's own reports (faulted or interrupted tasks, failing hooks and listeners, a failed Session), with what they
+   * are about. `task_interrupted`: crashes ended a tool call, a compaction or a generation; a generation's end also ended
+   * its run, and the member gets the failure reply when the worker settles it.
+   */
+  #durableReport(scope: Scope, report: Report): void {
+    const task = "task" in report && report.task !== undefined ? `，任务 ${report.task.kind}#${report.task.id}，会话 ${report.task.conversationId}` : "";
+    const extension = "extension" in report && report.extension !== undefined ? `，扩展 ${report.extension}` : "";
+    const interrupted = report.kind !== "task_interrupted" ? ""
+      : report.reason === "restart_limit" ? `；连续 ${report.restarts} 次被异常中断，已结束该任务` : "；服务在模型回答途中停止的次数超过重试次数，本次运行已结束";
+    if (report.kind === "task_interrupted") this.#attention.note("interrupted", scope);
+    else if (report.kind === "task_faulted" || report.kind === "storage_failed" || report.kind === "migration_failed") this.#attention.note("faulted", scope);
+    const { error } = report;
+    this.#report(new Error(`Durable 报告 ${report.kind}（${scopeLabel(scope)}${task}${extension}）：${error instanceof Error ? error.message : String(error)}${interrupted}`, { cause: error }));
   }
 
   /** Startup gate of a space: before scheduling resumes. */
   async #prepare(harness: Harness, scope: Scope, context: Context): Promise<void> {
     const runtime = this.#runtimes.get(scopeKey(scope))!;
     runtime.holder.harness = harness;
-    runtime.epoch = await harness.commit(async (tx) => {
-      const controls = await tx.doc(ControlsDoc), epoch = controls.epoch ?? 0;
-      if (!Number.isSafeInteger(epoch) || epoch < 0 || epoch >= Number.MAX_SAFE_INTEGER) throw new Error("会话库的控制世代无效");
-      return controls.epoch = epoch + 1;
-    }, context);
-    const controls = await pendingControls(harness, context);
+    const parts = new Map<PreparePart, number>();
+    const timed = async <T>(part: PreparePart, work: () => Promise<T>): Promise<T> => {
+      const started = performance.now();
+      try { return await work(); } finally { parts.set(part, (parts.get(part) ?? 0) + performance.now() - started); }
+    };
+    const controls = await timed("controls", async () => {
+      runtime.epoch = await harness.commit(async (tx) => {
+        const controls = await tx.doc(ControlsDoc), epoch = controls.epoch ?? 0;
+        if (!Number.isSafeInteger(epoch) || epoch < 0 || epoch >= Number.MAX_SAFE_INTEGER) throw new Error("会话库的控制世代无效");
+        return controls.epoch = epoch + 1;
+      }, context);
+      return pendingControls(harness, context);
+    });
     runtime.door.loadControls(controls.map(({ phone, requestId, seq }) => ({ phone, requestId, seq })));
     // A recovered generation or summarize request names its conversation only by its provider session.
-    await runtime.door.loadSessions(context);
+    await timed("sessions", () => runtime.door.loadSessions(context));
     const kicks: MemberState[] = [];
     const deliveries: { member: MemberState; requestId: string }[] = [];
     const downloads: { phone: string; id: string }[] = [];
-    for (const { phone, conversationId } of await this.#memberList(harness)) {
-      await ensureStorageIdentity(this.#options.layout, scope, phone, this.#options.stateDb);
-      await recoverOfficeProfiles(userTmp(this.#options.layout, scope, phone), deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error));
+    const members = await timed("members", () => this.#memberList(harness));
+    if (members.length) await timed("identity", () => ensureStorageIdentities(this.#options.layout, scope, members.map(member => member.phone), this.#options.stateDb));
+    for (const { phone, conversationId } of members) {
+      await timed("office", () => recoverOfficeProfiles(userTmp(this.#options.layout, scope, phone), deferred => log.warn(`Office 待物理回收：${deferred}`)).catch(error => this.#report(error)));
       const member = this.#member(scope, phone);
       member.conversationId = conversationId;
       // Usage committed since the last sync (a background compaction, a run before a crash) counts from here.
-      await this.#syncStats(harness, member);
-      const items = await inboxItems(harness, conversationId, context);
+      await timed("stats", () => this.#syncStats(harness, member));
+      const items = await timed("inbox", () => inboxItems(harness, conversationId, context));
       for (const item of items) this.#addRequest(item.requestId, member.key);
       const head = items[0];
       if (head?.startedAt !== undefined && head.cancelled !== true) {
@@ -1543,14 +1667,18 @@ export class DurableService {
         markRunning(member.scope, member.phone, taskNumber(head.requestId));
       }
       if (head !== undefined) kicks.push(member);
-      // Parts an ended process left `sending` may have reached the platform: uncertain, counted as sent.
-      const records = await memberRecords(harness, phone, context);
-      if (Object.values(records.requests).some(record => record.delivery?.parts.some(part => part.state === "sending") || record.files.some(file => file.state === "sending"))) {
-        await harness.commit(async tx => { settleInterrupted(await recordsOf(tx, phone)); }, context);
-      }
-      for (const record of pendingDeliveries(await memberRecords(harness, phone, context))) deliveries.push({ member, requestId: record.requestId });
+      const records = await timed("records", async () => {
+        // Parts an ended process left `sending` may have reached the platform: uncertain, counted as sent.
+        const records = await memberRecords(harness, phone, context);
+        if (Object.values(records.requests).some(record => record.delivery?.parts.some(part => part.state === "sending") || record.files.some(file => file.state === "sending"))) {
+          await harness.commit(async tx => { settleInterrupted(await recordsOf(tx, phone)); }, context);
+        }
+        for (const record of pendingDeliveries(await memberRecords(harness, phone, context))) deliveries.push({ member, requestId: record.requestId });
+        return records;
+      });
       for (const attachment of Object.values(records.attachments)) if (attachment.state === "pending") downloads.push({ phone, id: attachment.id });
     }
+    runtime.prepared = { members: members.length, parts };
     // Every restored head's original deadline is visible to the door before any task is scheduled.
     harness.resume();
     this.#track((async () => {
@@ -1596,28 +1724,23 @@ export class DurableService {
     return members;
   }
 
-  /** Refresh the application's materials index once per run, before its first request; every space shares it. */
-  #materials(runtime: SpaceRuntime): Extension {
+  /**
+   * Refresh the application's materials index before a model request; every space shares it, and its TTL and in-flight
+   * build keep repeated calls cheap. The index only speeds up lookups: a long scan goes on in the background instead of
+   * counting as model time.
+   */
+  #materials(): Extension {
     const { layout } = this.#options;
     return defineExtension({
       name: "mixin.materials",
       hooks: [hook(GenerationTask, {
-        async beforeRequest(_request, api, context: Context) {
-          const taskId = api.taskId as number;
-          let refresh = runtime.refreshed.get(taskId);
-          if (refresh === undefined) {
-            // The default workspace is created on demand; an external one must exist (the index reports its own errors).
-            const workspaceDir = resolve(layout.workspace);
-            refresh = Promise.all([...layout.externalWorkspace ? [] : [workspaceDir], layout.index].map((dir) => mkdir(dir, { recursive: true })))
-              .catch(() => {})
-              .then(() => ensureMaterialsIndex({
-                workspaceDir, indexPath: resolve(layout.materialsIndex), ignorePath: resolve(layout.materialsIgnore),
-              }))
-              .then(() => {});
-            runtime.refreshed.set(taskId, refresh);
-            if (runtime.refreshed.size > 256) runtime.refreshed.delete(runtime.refreshed.keys().next().value!);
-          }
-          await waitFor(refresh, context.abortSignal);
+        async beforeRequest(_request, _api, context: Context) {
+          // The default workspace is created on demand; an external one must exist (the index reports its own errors).
+          const workspaceDir = resolve(layout.workspace);
+          const refresh = Promise.all([...layout.externalWorkspace ? [] : [workspaceDir], layout.index].map((dir) => mkdir(dir, { recursive: true })))
+            .catch(() => {})
+            .then(() => ensureMaterialsIndex({ workspaceDir, indexPath: resolve(layout.materialsIndex), ignorePath: resolve(layout.materialsIgnore) }));
+          await waitFor(Promise.race([refresh, Bun.sleep(MATERIALS_WAIT_MS)]), context.abortSignal);
           return undefined;
         },
       })],
@@ -1646,8 +1769,11 @@ export class DurableService {
 
   /** The member's conversation, created if needed; once committed, its provider session may reach the provider. */
   async #conversation(harness: Harness, member: MemberState): Promise<Conversation> {
+    const optional = this.#runtimes.get(scopeKey(member.scope))?.optional;
+    const extensions = optional?.size
+      ? this.#options.memberExtensions!.selected(member.scope, member.phone).flatMap(name => optional.get(name) ?? []) : undefined;
     const { conversation } = await memberConversation(harness, member.scope, member.phone,
-      { model: this.#options.selection.ref, thinkingLevel: this.#options.selection.thinkingLevel }, this.#context);
+      { model: this.#options.selection.ref, thinkingLevel: this.#options.selection.thinkingLevel, ...(extensions ? { extensions } : {}) }, this.#context);
     member.conversationId = conversation.id;
     await this.#runtimes.get(scopeKey(member.scope))?.door.bind(conversation.id, this.#context);
     return conversation;
@@ -1688,7 +1814,6 @@ export class DurableService {
     // Remove the same instance before awaiting its door: a late close must not discard a newly opened runtime.
     this.#runtimes.delete(scopeKey(scope));
     runtime.holder.harness = undefined;
-    runtime.refreshed.clear();
     await runtime.door.close();
     for (const member of this.#members.values()) if (scopeKey(member.scope) === scopeKey(scope)) this.#pruneMember(member);
   }
@@ -1782,7 +1907,7 @@ export class DurableService {
 }
 
 /** The in-memory key of a member (space, phone). */
-export function memberKey(scope: Scope, phone: string): string {
+function memberKey(scope: Scope, phone: string): string {
   return JSON.stringify([scopeKey(scope), phone]);
 }
 
@@ -1810,7 +1935,7 @@ function retryWait(ms: number, signal: AbortSignal): Promise<void> {
 
 /**
  * The task number of a message: the first 8 hex digits of its request id. Logs write it as `任务: <number>`, the form
- * the log extraction scripts (scripts/ops/task-logs.*) and the TUI search for; /status and failure details show it.
+ * the log extraction scripts (scripts/ops/task-logs.*) and the console's log search use; /status and failure details show it.
  */
 function taskNumber(requestId: string): string {
   return requestId.replace(/^(?:msg|ctl):/, "").slice(0, 8);

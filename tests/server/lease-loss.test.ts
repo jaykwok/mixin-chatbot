@@ -99,10 +99,16 @@ describe("service lease loss", () => {
       let takeover: (() => Promise<void>) | undefined;
       try {
         const ready = JSON.parse((await service.line("SERVICE_READY=", 40_000)).split("SERVICE_READY=")[1]!) as { tool: number };
-        const before = snapshot(fixture.root);
-        // Idle at the gates: nothing changes on its own.
-        await Bun.sleep(300);
-        expect(snapshot(fixture.root)).toEqual(before);
+        // Idle at the gates: nothing changes on its own once Durable stored the progress commits it defers (at most
+        // persistWithinMs, 1 s, after they are made; the waiting run's attempt is one).
+        let before = snapshot(fixture.root);
+        for (const end = Date.now() + 10_000; ;) {
+          await Bun.sleep(1200);
+          const now = snapshot(fixture.root);
+          if (Bun.deepEquals(now, before)) break;
+          if (Date.now() > end) throw new Error("the stored data kept changing while idle");
+          before = now;
+        }
         expect(before["data/state/stats.sqlite"]).toBeDefined();
         expect(before["data/conversations/groups/100/durable.sqlite"]).toBeDefined();
         expect(alive(ready.tool)).toBe(true);
@@ -139,7 +145,7 @@ describe("service lease loss", () => {
     }, 60_000);
   }
 
-  test("a normal shutdown still records statistics, archives the instance file, reaps the tool and releases the lease", async () => {
+  test("a normal shutdown still records statistics, removes its instance file, reaps the tool and releases the lease", async () => {
     const fixture = await tempFixture("lease-shutdown-");
     const service = startService(fixture.root);
     try {
@@ -163,8 +169,9 @@ describe("service lease loss", () => {
         expect(users("asks_daily")).toEqual(expect.arrayContaining(["archive"]));
         expect(users("usage_daily")).toEqual(expect.arrayContaining(["archive"]));
       } finally { db.close(); }
-      const archived = readdirSync(join(fixture.root, "backup/rm"));
-      expect(archived.some((name) => name.endsWith("-instance.json"))).toBe(true);
+      // The record names a stopped process and carries the admin token: removed, never archived into backup/rm.
+      expect(existsSync(join(fixture.root, "data/state/instance.json"))).toBe(false);
+      expect(existsSync(join(fixture.root, "backup/rm")) ? readdirSync(join(fixture.root, "backup/rm")).filter((name) => name.endsWith("-instance.json")) : []).toEqual([]);
       expect(existsSync(join(fixture.root, "data/state/service.lock"))).toBe(false);
       expect(alive(ready.tool)).toBe(false);
       const last = beats(fixture.root);

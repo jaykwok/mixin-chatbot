@@ -10,6 +10,9 @@ import { ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { MODELS_JSON_PATH, MODELS_STORE_PATH, PI_SETTINGS_PATH } from "./storage.ts";
 import { validateEngineSettings } from "./engine-policy.ts";
 
+/** 部署的实例在控制台或用 model-configure 修改模型；没有部署的本地开发运行 bun run configure。 */
+export const MODEL_CONFIG_ENTRY = "控制台「设置」或 model-configure；本地开发运行 bun run configure";
+
 // Pi 没有从包入口导出这两个类型，用它自己的方法签名取，避免抄一份结构定义出来。
 type PiSettingsStorage = Parameters<typeof SettingsManager.fromStorage>[0];
 
@@ -110,11 +113,11 @@ export async function resolveModelSelection(
   const providerId = settings.getDefaultProvider();
   const modelId = settings.getDefaultModel();
   if (!providerId || !modelId) {
-    throw new Error(`${PI_SETTINGS_PATH} 未记录 defaultProvider/defaultModel，请运行 bun run configure`);
+    throw new Error(`${PI_SETTINGS_PATH} 未记录 defaultProvider/defaultModel，请重新配置模型（${MODEL_CONFIG_ENTRY}）`);
   }
   const model = runtime.getModel(providerId, modelId);
   if (!model) {
-    throw new Error(`Pi 未提供 ${providerId}/${modelId}，请运行 bun run configure 重新选择`);
+    throw new Error(`Pi 未提供 ${providerId}/${modelId}，请重新选择模型（${MODEL_CONFIG_ENTRY}）`);
   }
   if (model.api !== ("pi-virtual" as string) && (!Number.isSafeInteger(model.contextWindow) || model.contextWindow < 1 || !Number.isSafeInteger(model.maxTokens) || model.maxTokens < 1 || model.maxTokens > model.contextWindow))
     throw new Error("所选模型的上下文或输出上限无效，请重新配置");
@@ -122,7 +125,7 @@ export async function resolveModelSelection(
     throw new Error("kimi-coding 需要 openai-completions 协议和以 /v1 结尾的 baseUrl，请重新配置");
   const auth = await runtime.checkAuth(providerId, { signal: options.signal });
   if (!auth) {
-    throw new Error(`provider ${providerId} 未配置可用凭证，请运行 bun run configure`);
+    throw new Error(`provider ${providerId} 未配置可用凭证，请重新配置模型（${MODEL_CONFIG_ENTRY}）`);
   }
   const configured = settings.getModelThinkingLevel(providerId, modelId)
     ?? settings.getDefaultThinkingLevel()

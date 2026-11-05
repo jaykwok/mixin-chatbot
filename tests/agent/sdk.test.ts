@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemPrompt, InMemoryCredentialStore, InMemoryModelsStore, Type, type Tool } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { buildChatContext } from "../../src/agent/prompt.ts";
+import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import { fauxAssistantMessage, fauxToolCall, InMemoryCredentialStore, InMemoryModelsStore, type Message, type Tool } from "@earendil-works/pi-ai";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { defineExtension, type ToolRegistration } from "@earendil-works/pi-durable";
+import { memberConversation } from "../../src/durable/identity.ts";
+import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
+import { scopeOf } from "../helpers/layout.ts";
 import { enginePolicy } from "../../src/core/engine-policy.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
+import { int, obj, str } from "@earendil-works/pi-schema";
 
 describe("installed Pi SDK integration", () => {
   test("native key-only configuration preserves Pi ZAI transport, tools and thinking metadata", async () => {
@@ -110,73 +115,6 @@ describe("installed Pi SDK integration", () => {
     }
   });
 
-  test("creates, persists and resumes a session with the official fake provider", async () => {
-    const files = await tempFixture("pi-sdk-");
-    const cwd = join(files.root, "workspace");
-    const agentDir = join(files.root, "pi");
-    await Promise.all([mkdir(cwd), mkdir(agentDir)]);
-    const runtime = await ModelRuntime.create({
-      modelsPath: null,
-      credentials: new InMemoryCredentialStore(),
-      modelsStore: new InMemoryModelsStore(),
-      refreshOnCreate: false,
-    });
-    const faux = fauxProvider({ tokensPerSecond: 0 });
-    runtime.registerNativeProvider(faux.provider);
-    const history = join(files.root, "session.jsonl");
-    const appended = buildChatContext({ relayEnabled: false });
-    const create = async () => {
-      const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
-      const resourceLoader = new DefaultResourceLoader({
-        cwd, agentDir, settingsManager,
-        noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-        systemPromptOverride: () => appended,
-        appendSystemPromptOverride: () => [],
-      });
-      await resourceLoader.reload();
-      return (await createAgentSession({
-        cwd, agentDir, modelRuntime: runtime, model: faux.getModel(), thinkingLevel: "off",
-        tools: [], settingsManager, resourceLoader,
-        sessionManager: SessionManager.open(history, undefined, cwd),
-      })).session;
-    };
-    let session: Awaited<ReturnType<typeof create>> | undefined;
-    try {
-      let prompt = "";
-      faux.setResponses([(context) => { prompt = getCurrentSystemPrompt(context.messages) ?? ""; return fauxAssistantMessage("已记录"); }]);
-      session = await create();
-      const id = session.sessionManager.getSessionId();
-      await session.prompt("记住项目编号 Q-85");
-      expect(session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
-      expect(prompt).toContain(appended);
-      expect(prompt).not.toContain("Guidelines:");
-      expect(prompt).not.toContain("expert coding assistant");
-      expect(prompt).not.toContain("Pi documentation (read only when");
-      expect(JSON.parse((await readFile(history, "utf8")).split("\n")[0]!)).toMatchObject({ cwd });
-      await session.dispose();
-      session = undefined;
-      const lines = (await readFile(history, "utf8")).split("\n");
-      lines[0] = JSON.stringify({ ...JSON.parse(lines[0]!), cwd: join(files.root, "old-host-workspace") });
-      await writeFile(history, lines.join("\n"));
-      session = await create();
-      expect(session.sessionManager.getSessionId()).toBe(id);
-      expect(session.sessionManager.getCwd()).toBe(cwd);
-      faux.setResponses([(context) => {
-        expect(JSON.stringify(context.messages)).toContain("Q-85");
-        return fauxAssistantMessage("项目编号 Q-85");
-      }]);
-      await session.prompt("项目编号是什么？");
-      expect(session.messages.at(-1)).toMatchObject({ content: [{ type: "text", text: "项目编号 Q-85" }] });
-      expect(faux.state.callCount).toBe(2);
-    } finally {
-      try {
-        await session?.dispose();
-      } finally {
-        await files.cleanup();
-      }
-    }
-  });
-
   test.each([undefined, false, true])("Responses max_output_tokens respects compat=%s", async (supports) => {
     const files = await tempFixture("pi-sdk-");
     try {
@@ -218,7 +156,7 @@ describe("provider boundaries", () => {
     modelsStore: new InMemoryModelsStore(), refreshOnCreate: false });
   const fixtureTool = (name: string, strict: "prefer" | "require", bounded: boolean): Tool => ({
     name, description: "fixture " + name, constrainedSampling: { type: "json_schema", strict },
-    parameters: Type.Object(bounded ? { count: Type.Integer({ minimum: 1, maximum: 10 }) } : { path: Type.String() }),
+    parameters: bounded ? obj({ count: int({ minimum: 1, maximum: 10 }) }, { open: true }) : obj({ path: str() }, { open: true }),
   });
 
   test("Anthropic strict prefer falls back for rejected keywords and require fails before any request", async () => {
@@ -244,31 +182,24 @@ describe("provider boundaries", () => {
     expect(required.result.errorMessage).toContain('Tool "bounded" requires JSON-schema constrained sampling');
   });
 
-  test("Pi still validates arguments against keywords left out of strict sampling", async () => {
+  test("Durable still validates arguments against keywords left out of strict sampling", async () => {
     const files = await tempFixture("pi-validate-");
-    const cwd = join(files.root, "workspace"), agentDir = join(files.root, "pi");
-    await Promise.all([mkdir(cwd), mkdir(agentDir)]);
-    const runtime = await offlineRuntime();
-    const faux = fauxProvider({ tokensPerSecond: 0 });
-    runtime.registerNativeProvider(faux.provider);
-    const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
-    const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager,
-      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      systemPromptOverride: () => "validation", appendSystemPromptOverride: () => [] });
-    await resourceLoader.reload();
-    let executed = 0;
-    const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model: faux.getModel(), thinkingLevel: "off",
-      settingsManager, resourceLoader, sessionManager: SessionManager.inMemory(cwd), tools: ["bounded"],
-      customTools: [{ ...fixtureTool("bounded", "prefer", true), label: "bounded",
-        async execute() { executed++; return { content: [{ type: "text", text: "ran" }], details: {} }; } }] });
+    const { faux, models, model } = fauxModels();
+    let executed = 0, result: Message | undefined;
+    const bounded = { ...fixtureTool("bounded", "prefer", true), replay: "safe",
+      execute: async () => { executed++; return { output: [{ type: "text", text: "ran" }] }; } } as unknown as ToolRegistration;
+    const group = await openGroupHarness(join(files.root, "group.sqlite"), models, { extensions: [defineExtension({ name: "fixture.bounded", tools: [bounded] })] });
     try {
+      const conversation = (await memberConversation(group.harness, scopeOf("group-a"), "alice", { model }, context)).conversation;
       faux.setResponses([fauxAssistantMessage([fauxToolCall("bounded", { count: 99 })], { stopReason: "toolUse" }),
-        fauxAssistantMessage("done")]);
-      await session.prompt("use the bounded tool");
+        (transcript) => { result = transcript.messages.find(message => message.role === "toolResult"); return fauxAssistantMessage("done"); }]);
+      await (await conversation.submit({ type: "input", content: "use the bounded tool" }, context)).wait(context);
       expect(executed).toBe(0);
-      expect(session.messages.find(message => message.role === "toolResult")).toMatchObject({ isError: true, toolName: "bounded" });
+      expect(result).toMatchObject({ isError: true, toolName: "bounded" });
+      // Refused by the schema (count ≤ 10), not as an unknown tool.
+      expect(JSON.stringify(result)).toContain("count");
     } finally {
-      await session.dispose();
+      await group.close();
       await files.cleanup();
     }
   });

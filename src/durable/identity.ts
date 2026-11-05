@@ -3,15 +3,17 @@ import { randomUUID } from "node:crypto";
 // member by the directory; tools and prompt sections read the identity document, never model arguments or a changeable cwd.
 import type { Context } from "@earendil-works/chord";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { AgentDoc, configure, defineDoc, defineDocFamily, type Conversation, type ConversationId, type DocumentReader, type Harness, type ModelRef } from "@earendil-works/pi-durable";
+import { AgentDoc, configure, defineDoc, defineDocFamily, type AgentChange, type AgentState, type Conversation, type ConversationId, type DocumentReader,
+  type Extension, type Harness, type ModelRef } from "@earendil-works/pi-durable";
 import { parseScopeKey, scopeKey, type Scope } from "../core/layout.ts";
+import { checkpointDue } from "./checkpoint.ts";
 
 /** Which space a database belongs to (`scopeKey`): written once on first open, checked on every later open. */
 export type SpaceState = { space: string; generation: string; version: 1 };
 export const SpaceDoc = defineDoc<SpaceState>({
   kind: "mixin.space",
   version: 1,
-  checkpointWhen: () => false,
+  checkpointWhen: checkpointDue,
   scope: "session",
   initial: () => ({ space: "", generation: randomUUID(), version: 1 }),
 });
@@ -23,7 +25,7 @@ export type MemberRecord = { conversationId: number; createdAt: number };
 export const MemberDirectory = defineDocFamily<MemberRecord, MemberRecord>({
   kind: "mixin.member",
   version: 1,
-  checkpointWhen: () => false,
+  checkpointWhen: checkpointDue,
   scope: "session",
   family: true,
   initial: (seed) => ({ ...seed }),
@@ -34,7 +36,7 @@ export type IdentityState = { space: string; phone: string; version: 1 };
 export const IdentityDoc = defineDoc<IdentityState>({
   kind: "mixin.member-identity",
   version: 1,
-  checkpointWhen: () => false,
+  checkpointWhen: checkpointDue,
   scope: "conversation",
   history: "latest",
   // A fork must never inherit a member identity (no fork tool in the first cut either).
@@ -66,7 +68,30 @@ export async function databaseSpace(reader: DocumentReader, context: Context): P
   return scope;
 }
 
-export interface AgentSetup { model: ModelRef; thinkingLevel?: ModelThinkingLevel }
+export interface AgentSetup {
+  model: ModelRef;
+  thinkingLevel?: ModelThinkingLevel;
+  /**
+   * Member extensions the conversation adds to the default selection (DurableService `memberExtensions`); undefined
+   * leaves the stored selection as it is.
+   */
+  extensions?: readonly Extension[];
+}
+
+/** The added extensions a stored selection names, or undefined when it is not of the `{ add }` form this module writes. */
+function addedExtensions(stored: AgentState["extensions"]): string[] | undefined {
+  if (stored === undefined) return [];
+  if (Array.isArray(stored) || stored.remove?.length) return undefined;
+  return [...stored.add ?? []].sort();
+}
+
+/** The selection change `agent` asks for, or undefined when the stored one already matches. */
+function selectionChange(stored: AgentState["extensions"], agent: AgentSetup): Pick<AgentChange, "extensions"> | undefined {
+  if (agent.extensions === undefined) return undefined;
+  const wanted = agent.extensions.map(extension => extension.name).sort();
+  if (JSON.stringify(addedExtensions(stored)) === JSON.stringify(wanted)) return undefined;
+  return { extensions: wanted.length ? { add: agent.extensions } : null };
+}
 
 /**
  * Get or create a member's conversation in one commit: directory lookup, ownerless conversation creation (which runs the
@@ -89,13 +114,14 @@ export async function memberConversation(harness: Harness, scope: Scope, phone: 
       // The instance has one model: an existing member follows a changed selection from its next message on.
       const stored = await tx.doc(AgentDoc, id);
       const thinkingLevel = agent.thinkingLevel ?? "off";
+      const selection = selectionChange(stored.extensions, agent);
       if (stored.model?.provider !== agent.model.provider || stored.model?.modelId !== agent.model.modelId || stored.thinkingLevel !== thinkingLevel) {
-        await configure(tx, id, { model: agent.model, thinkingLevel });
-      }
+        await configure(tx, id, { model: agent.model, thinkingLevel, ...selection });
+      } else if (selection) await configure(tx, id, selection);
       return { id, created: false };
     }
     const record = await tx.createConversation({ ownership: { kind: "ownerless" } });
-    await configure(tx, record.id, { model: agent.model, thinkingLevel: agent.thinkingLevel ?? "off" });
+    await configure(tx, record.id, { model: agent.model, thinkingLevel: agent.thinkingLevel ?? "off", ...selectionChange(undefined, agent) });
     const identity = await tx.doc(IdentityDoc, record.id);
     identity.space = key;
     identity.phone = phone;

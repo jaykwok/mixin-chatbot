@@ -81,7 +81,7 @@ test("official cache scans only additions, preserves system-first requests and i
     await conversation.reset("handoff", context);
     const reset = await g.ask(conversation);
     expect(reset.messages[0]!.role).toBe("system"); expect(reset.messages.some(message => message.role === "user" && String(message.content).startsWith("history-"))).toBe(false);
-    console.log("Pi 1.1 context scan: " + JSON.stringify({ first: { pages: first.pages, rows: first.rows, sql: first.sql, ms: first.ms }, warm: { pages: warm.pages, rows: warm.rows, sql: warm.sql, ms: warm.ms } }));
+    console.log("context scan: " + JSON.stringify({ first: { pages: first.pages, rows: first.rows, sql: first.sql, ms: first.ms }, warm: { pages: warm.pages, rows: warm.rows, sql: warm.sql, ms: warm.ms } }));
   } finally { await g.close(); }
   const reopened = await open(600000, g.path);
   try { const cold = await reopened.ask(await reopened.member()); expect(cold.messages[0]!.role).toBe("system"); expect(cold.messages.some(message => message.role === "user" && message.content === "handoff")).toBe(true); }
@@ -107,5 +107,5 @@ test("retention zero and ten minutes produce the same requests; measure multi-me
   }
   expect(requests[0]).toEqual(requests[1]);
   expect((reports[1]!.rows as number)).toBeLessThan(reports[0]!.rows as number);
-  console.log("Pi 1.1 cache workload: " + JSON.stringify(reports));
+  console.log("cache workload: " + JSON.stringify(reports));
 }, 60000);

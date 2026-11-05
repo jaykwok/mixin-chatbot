@@ -4,10 +4,11 @@
 import type { Context } from "@earendil-works/chord";
 import { defineDoc, type Tx } from "@earendil-works/pi-durable";
 import type { ResultOwnership } from "../../contracts/maintenance.ts";
+import { checkpointDue } from "../checkpoint.ts";
 
 /** Session scope: /clear and context compaction must not erase ownership or pending-delivery references. */
 export const ResultsDoc = defineDoc<{ calls: Record<string, ResultOwnership> }>({
-  kind: "mixin.results", version: 1, checkpointWhen: () => false, scope: "session", initial: () => ({ calls: {} }),
+  kind: "mixin.results", version: 1, checkpointWhen: checkpointDue, scope: "session", initial: () => ({ calls: {} }),
 });
 
 /** Active records per space database. A full table refuses new results until maintenance hands old ones over. */

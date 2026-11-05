@@ -47,7 +47,7 @@ export function enginePolicy(value: unknown): EnginePolicy {
     modelOverrides[key] = Object.fromEntries(Object.entries(budgets).map(([field, amount]) => [field, integer(amount, 0, `durable.compaction.modelOverrides.${key}.${field}`)]));
   }
   const progress = object(policy.progress ?? {}, "durable.progress");
-  keys(progress, ["partialIntervalMs", "outputIntervalMs"], "durable.progress");
+  keys(progress, ["partialIntervalMs", "outputIntervalMs", "persistWithinMs"], "durable.progress");
   const timeoutMs = integer(stream.timeoutMs, 120000, "durable.stream.timeoutMs", 600000);
   if (timeoutMs === 0) throw new Error("durable.stream.timeoutMs 必须大于 0");
   return {
@@ -62,7 +62,8 @@ export function enginePolicy(value: unknown): EnginePolicy {
       ...(compaction.backgroundTokens === undefined ? {} : { backgroundTokens: integer(compaction.backgroundTokens, 0, "durable.compaction.backgroundTokens") }),
       ...(Object.keys(modelOverrides).length ? { modelOverrides } : {}) },
     progress: { partialIntervalMs: integer(progress.partialIntervalMs, 100, "durable.progress.partialIntervalMs", 10000),
-      outputIntervalMs: integer(progress.outputIntervalMs, 20, "durable.progress.outputIntervalMs", 10000) },
+      outputIntervalMs: integer(progress.outputIntervalMs, 20, "durable.progress.outputIntervalMs", 10000),
+      persistWithinMs: integer(progress.persistWithinMs, 1000, "durable.progress.persistWithinMs", 60000) },
     contextRetentionMs: integer(policy.contextRetentionMs, 600000, "durable.contextRetentionMs", 600000),
   };
 }

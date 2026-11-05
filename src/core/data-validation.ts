@@ -13,6 +13,7 @@ import { readDirectoryScope } from "../integrations/open-platform/directory-scop
 import { assertApplication, deploymentRecord } from "./data-version.ts";
 import { checkProjectLayout } from "./layout.ts";
 import { assertSpaceSchemas } from "../durable/space-databases.ts";
+import { assertMaintenanceAction } from "./maintenance-state.ts";
 
 export interface ValidationOptions {
   /**
@@ -20,6 +21,8 @@ export interface ValidationOptions {
    * WORKSPACE_ROOT the service will read (environment, then data/config/runtime.json), else data/workspace.
    */
   readonly workspace?: string;
+  /** Who asks, for the maintenance state (maintenance-state.ts): the service (default), the verification instance or a release commit. */
+  readonly intent?: "service" | "verify" | "release";
 }
 
 function configuredWorkspace(runtime: Record<string, string | undefined>, options: ValidationOptions): string | undefined {
@@ -55,9 +58,12 @@ export async function validateConfiguration(project: string, options: Validation
  * Used by the service, the verification instance and the release commit. No database creation, migrations or requests.
  * Besides the configuration: the relay index, the stats ledger and every existing conversation database must be in the
  * format this program opens, so an incompatible database is refused while the release can still be rolled back, not
- * when the committed service first opens it.
+ * when the committed service first opens it. First the maintenance state: a revision cleanup with a document in flight
+ * or a database to restore from its backup refuses, so do an unfinished shrink (which may have left a database away from
+ * its path) and a state file this version cannot read.
  */
 export async function validateCurrentData(project: string, options: ValidationOptions = {}): Promise<void> {
+  assertMaintenanceAction(project, options.intent ?? "service");
   await validateConfiguration(project, options);
   if (existsSync(join(project, "data/config/relay.json"))) readRelayIndex(join(project, "data/state/relay.sqlite"));
   const path = join(project, "data/state/stats.sqlite");

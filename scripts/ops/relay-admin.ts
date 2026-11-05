@@ -1,5 +1,7 @@
 import { describeAge } from "../lib/age.ts";
 import { withMaintenance } from "../../src/core/maintenance.ts";
+import { assertExpectedScope, relayScope } from "../lib/operation-scope.ts";
+import { relayOptions } from "../lib/relay-options.ts";
 // 外链账本只读展示与停机清理；复用 relay 的后端协议，凭据不传入 shell 参数。
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import {
@@ -88,37 +90,19 @@ async function purge(match: string | undefined): Promise<number> {
   return result.orphaned > 0 ? 1 : 0;
 }
 
-const [command, argument, keyword, ...extra] = process.argv.slice(2);
-
-let exitCode = 0;
-switch (command) {
-  case "list":
-  case "ls":
-    exitCode = await list();
-    break;
-  case "test":
-    exitCode = argument === undefined ? await test() : (usage(), 1);
-    break;
-  case "purge":
-    if (extra.length || (keyword !== undefined && argument !== "--keyword") || (argument === "--keyword" && !keyword)) {
-      console.error("用法：purge --all 或 purge --keyword <关键字>");
-      exitCode = 1;
-      break;
-    }
-    // --all 必须显式给出：一条不带参数的 purge 太容易在手滑时清空所有人的下载链接。
-    if (argument === "--all") {
-      exitCode = await withMaintenance(() => purge(undefined));
-    } else if (argument === "--keyword") {
-      exitCode = await withMaintenance(() => purge(keyword));
-    } else if (argument) {
-      exitCode = await withMaintenance(() => purge(argument));
-    } else {
-      console.error("purge 需要一个关键字，或用 --all 表示清理全部。");
-      exitCode = 1;
-    }
-    break;
-  default:
-    usage();
-    exitCode = command ? 1 : 0;
+async function main(args: string[]): Promise<number> {
+  const preflight = args[0] === "check", { command, keyword, expected } = relayOptions(preflight ? args.slice(1) : args);
+  const check = () => assertExpectedScope(expected, relayScope("data", command === "purge" ? keyword : undefined));
+  if (preflight) {
+    if (command === "help") throw new Error("预检需要明确的外链动作");
+    if (!getRelayConfig()) throw new Error("未配置外链分发（data/config/relay.json 不存在）");
+    check(); return 0;
+  }
+  switch (command) {
+    case "list": return list();
+    case "test": check(); return test();
+    case "purge": return withMaintenance(async () => { check(); return purge(keyword); });
+    default: usage(); return 0;
+  }
 }
-process.exit(exitCode);
+process.exit(await main(process.argv.slice(2)).catch(error => { console.error((error as Error).message); return 1; }));

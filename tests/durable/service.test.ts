@@ -4,13 +4,15 @@
 // recording outbound; no network, no platform.
 import { afterAll, describe, spyOn, test } from "bun:test";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
-import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { type AssistantMessage, type Message, type Models, Type } from "@earendil-works/pi-ai";
-import { fauxAssistantMessage, type FauxResponseFactory, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { Database } from "bun:sqlite";
+import { type AssistantMessage, createModels, type Message, type Models } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, type FauxResponseFactory, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { type ConversationId, createSession, defineExtension, type Harness, LiveDoc, type ModelRef, type Tx } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import { ReclamationItems } from "../../src/durable/results/queue.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
@@ -28,8 +30,8 @@ import { DurableService, type DurableServiceOptions } from "../../src/durable/se
 import type { Outbound } from "../../src/durable/outbound.ts";
 import { SqliteClient } from "../../src/durable/sqlite-client.ts";
 import { DurableStorageFailure } from "../../src/durable/storage-failure.ts";
-import { fauxModels, openGroupHarness, TEST_PROGRESS } from "../helpers/durable.ts";
-import { type Recording, recordingOutbound, replyTexts, type Sent } from "../helpers/recording-outbound.ts";
+import { fauxModels, openGroupHarness, PROJECT_PROGRESS, TEST_PROGRESS } from "../helpers/durable.ts";
+import { DIRECT_SPACE, type Recording, recordingOutbound, replyTexts, type Sent } from "../helpers/recording-outbound.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import "../helpers/restore-spies.ts";
 import { databaseOf, scopeOf, statsOf, tmpOf } from "../helpers/layout.ts";
@@ -298,6 +300,75 @@ describe("durable service: admission, worker and reply", () => {
     } finally { await service.close(); }
   });
 
+  const ACK = "收到，正在处理，请稍候。处理时间较长时可以发送 /status 查看进度。";
+  const acks = (sent: Sent[]) => sent.filter(item => item.kind === "notice" && item.text.includes(ACK)).map(item => item.msgUid);
+
+  test("acknowledge in a group: the first question of a window gets the notice before its answer; anyone's question in that window gets none", async () => {
+    const { faux, models, model } = fauxModels();
+    const where = place();
+    const out = recordingOutbound();
+    const held = gate("第一个回答");
+    const answer = () => fauxAssistantMessage("回答") as AssistantMessage;
+    faux.setResponses([held.step, ...Array.from({ length: 6 }, () => answer)]);
+    const idleMs = 1500;
+    const { service, reports } = open(where, models, model, out.outbound, { acknowledge: { idleMs } });
+    try {
+      const first = out.message(GROUP, ALICE, "第一个问题");
+      expect(await service.admit(first)).toEqual({ status: "accepted" });
+      await until(() => held.state.started === 1, "the first run");
+      // Sent before the answer, to the question it acknowledges (in a group under the question's summary line).
+      expect(out.sent.map(item => [item.kind, item.msgUid])).toEqual([["notice", first.reply.msgUid]]);
+      // Bob's first question in the same group, inside Alice's window: no notice. Another group has its own window.
+      const bob = out.message(GROUP, BOB, "Bob 的第一个问题"), elsewhere = out.message(GROUP_B, ALICE, "另一个群");
+      expect(await service.admit(bob)).toEqual({ status: "accepted" });
+      expect(await service.admit(elsewhere)).toEqual({ status: "accepted" });
+      held.open();
+      await until(() => replies(out.sent).length === 3, "three answers");
+      expect(acks(out.sent).sort()).toEqual([first.reply.msgUid, elsewhere.reply.msgUid].sort());
+      // The window counts from the acknowledged question: past it, whoever asks next gets the notice, the one after none.
+      await Bun.sleep(idleMs + 100);
+      const next = out.message(GROUP, BOB, "过了一会儿"), after = out.message(GROUP, ALICE, "紧接着");
+      expect(await service.admit(next)).toEqual({ status: "accepted" });
+      expect(await service.admit(after)).toEqual({ status: "accepted" });
+      await until(() => replies(out.sent).length === 5, "five answers");
+      expect(acks(out.sent).slice(2)).toEqual([next.reply.msgUid]);
+      expect(out.sent.filter(item => item.msgUid === next.reply.msgUid).map(item => item.kind)[0]).toBe("notice");
+      expect(reports).toEqual([]);
+    } finally { await service.close(); }
+  });
+
+  test("acknowledge in a direct chat: per member, when nothing is open and nothing was asked or answered within the window", async () => {
+    const { faux, models, model } = fauxModels();
+    const where = place();
+    const out = recordingOutbound();
+    const held = gate("第一个回答");
+    const answer = () => fauxAssistantMessage("回答") as AssistantMessage;
+    faux.setResponses([held.step, ...Array.from({ length: 6 }, () => answer)]);
+    const idleMs = 1500;
+    const { service, reports } = open(where, models, model, out.outbound, { acknowledge: { idleMs } });
+    try {
+      const first = out.message(DIRECT_SPACE, ALICE, "第一个问题"), bob = out.message(DIRECT_SPACE, BOB, "Bob 的问题");
+      expect(await service.admit(first)).toEqual({ status: "accepted" });
+      await until(() => held.state.started === 1, "the first run");
+      expect(await service.admit(bob)).toEqual({ status: "accepted" });
+      // Still running past the window: Alice's next question queues without a notice.
+      await Bun.sleep(idleMs + 100);
+      expect(await service.admit(out.message(DIRECT_SPACE, ALICE, "还在跑的时候"))).toEqual({ status: "accepted" });
+      held.open();
+      await until(() => replies(out.sent).length === 3, "three answers");
+      // Just answered: none.
+      expect(await service.admit(out.message(DIRECT_SPACE, ALICE, "刚答完"))).toEqual({ status: "accepted" });
+      await until(() => replies(out.sent).length === 4, "four answers");
+      expect(acks(out.sent).sort()).toEqual([first.reply.msgUid, bob.reply.msgUid].sort());
+      await Bun.sleep(idleMs + 100);
+      const later = out.message(DIRECT_SPACE, ALICE, "过了一会儿");
+      expect(await service.admit(later)).toEqual({ status: "accepted" });
+      await until(() => replies(out.sent).length === 5, "the last answer");
+      expect(acks(out.sent).at(-1)).toBe(later.reply.msgUid);
+      expect(reports).toEqual([]);
+    } finally { await service.close(); }
+  });
+
   test("one member's messages run one at a time in arrival order; another member is not queued behind them; the queue holds eight", async () => {
     const { faux, models, model } = fauxModels();
     const where = place();
@@ -318,7 +389,7 @@ describe("durable service: admission, worker and reply", () => {
     } finally { await service.close(); }
   });
 
-  test("a model error is delivered to the member as the AgentSession engine reports it, with the mention; nothing is left to send", async () => {
+  test("a model error is delivered to the member as the engine reports it, with the mention; nothing is left to send", async () => {
     const { faux, models, model } = fauxModels();
     const where = place();
     const out = recordingOutbound();
@@ -552,7 +623,7 @@ describe("durable service: controls", () => {
     const { promise: released, resolve: release } = Promise.withResolvers<void>();
     let started = false;
     const slow = defineExtension({ name: "test.slow", tools: [{
-      name: "slow", description: "Wait until the test releases it.", parameters: Type.Object({}),
+      name: "slow", description: "Wait until the test releases it.", parameters: obj({}, { open: true }),
       async execute() { started = true; await released; return { output: [{ type: "text", text: "done" }] }; },
     }] });
     faux.setResponses([fauxAssistantMessage([fauxToolCall("slow", {}, { id: "call_slow" })], { stopReason: "toolUse" }),
@@ -648,6 +719,31 @@ describe("durable service: watchdog", () => {
     } finally { await service.close(); }
   });
 
+  test("a slow space open is logged with its steps, the preparation by part and the database's SQL, without phone numbers", async () => {
+    const { faux, models, model } = fauxModels();
+    const where = place();
+    const out = recordingOutbound();
+    faux.setResponses([fauxAssistantMessage("第一次"), fauxAssistantMessage("第二次")]);
+    const logs: string[] = [];
+    const options = { limits: { runTimeoutMs: 60_000, modelIdleMs: 60_000, modelResponseMs: 60_000, tickMs: 20, slowOpenMs: 0 }, onLog: (line: string) => logs.push(line) };
+    const first = open(where, models, model, out.outbound, options);
+    try {
+      await first.service.admit(out.message(GROUP, ALICE, "问题"));
+      await until(() => replies(out.sent).length === 1, "the first answer");
+    } finally { await first.service.close(); }
+    const second = open(where, models, model, out.outbound, options);
+    try {
+      await second.service.admit(out.message(GROUP, ALICE, "再问"));
+      await until(() => replies(out.sent).length === 2, "the second answer");
+    } finally { await second.service.close(); }
+    const opens = logs.filter((line) => line.startsWith("会话空间打开用时"));
+    expect(opens).toHaveLength(2);
+    // The new database is claimed and has no member yet; on the second open the member is prepared.
+    expect(opens[0]).toMatch(/^会话空间打开用时 - 群 100, 共 \d+\.\d 秒；分步（秒）：库 \d+\.\d，登记 \d+\.\d，Harness \d+\.\d，认领 \d+\.\d，准备 \d+\.\d；准备 0 位成员（秒）：控制 \d+\.\d，会话索引 \d+\.\d，成员列表 \d+\.\d；SQL \d+ 次（秒）：库内排队 \d+\.\d，线程排队 \d+\.\d，执行 \d+\.\d，事务 \d+ 个占用 \d+\.\d$/);
+    expect(opens[1]).toMatch(/：库 \d+\.\d，登记 \d+\.\d，Harness \d+\.\d，准备 \d+\.\d；准备 1 位成员（秒）：控制 \d+\.\d，会话索引 \d+\.\d，成员列表 \d+\.\d，身份目录 \d+\.\d，Office \d+\.\d，统计 \d+\.\d，收件箱 \d+\.\d，交付记录 \d+\.\d；SQL/);
+    expect(opens.join("\n")).not.toContain(ALICE);
+  });
+
   test("a model request without progress for the idle limit is aborted", async () => {
     const { faux, models, model } = fauxModels();
     const where = place();
@@ -659,6 +755,42 @@ describe("durable service: watchdog", () => {
       await service.admit(out.message(GROUP, ALICE, "卡住"));
       await until(() => failures(out.sent).length === 1, "the idle text");
       expect(failures(out.sent)[0]).toContain("模型连续 0.3 秒无有效进展");
+    } finally { await service.close(); }
+  });
+
+  test("streamed progress counts once Durable adopts it, before it is stored: a steady answer longer than the idle limit runs to the end", async () => {
+    // Four characters every 100 ms for about 2 s against a 600 ms idle limit. Progress is stored at most once a minute
+    // here, so the watchdog keeps quiet only because harness.snapshot reads the progress Durable adopted in memory.
+    const faux = fauxProvider({ tokenSize: { min: 1, max: 1 }, tokensPerSecond: 10 });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const model = { provider: faux.getModel().provider, modelId: faux.getModel().id };
+    const answer = "流".repeat(80);
+    faux.setResponses([fauxAssistantMessage(answer)]);
+    const where = place();
+    const out = recordingOutbound();
+    const base = selection(models, model);
+    const { service } = open(where, models, model, out.outbound, {
+      selection: { ...base, harnessSettings: { ...base.harnessSettings, progress: { ...PROJECT_PROGRESS, persistWithinMs: 60_000 } } },
+      limits: { runTimeoutMs: 60_000, modelIdleMs: 600, modelResponseMs: 60_000, tickMs: 20 },
+    });
+    /** Whether any stored row of the group's database holds streamed text. */
+    const stored = () => {
+      const db = new Database(databaseOf(where.root, GROUP), { readonly: true });
+      try {
+        const tables = db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
+        return tables.some(({ name }) => db.query(`SELECT * FROM "${name}"`).all().some((row) => JSON.stringify(row).includes("流")));
+      } finally { db.close(); }
+    };
+    try {
+      await service.admit(out.message(GROUP, ALICE, "慢慢说"));
+      await until(() => faux.state.callCount === 1, "the request");
+      // About halfway: the answer is still streaming, and none of it is stored.
+      await Bun.sleep(1000);
+      expect(replyTexts(out.sent)).toEqual([]);
+      expect(stored()).toBe(false);
+      await until(() => replyTexts(out.sent).length === 1, "the answer");
+      expect(replies(out.sent)).toEqual([answer]);
     } finally { await service.close(); }
   });
 });
@@ -910,6 +1042,27 @@ describe("durable service: storage identity", () => {
       expect(await readdir(join(where.root, "tmp", "groups", GROUP))).toEqual(["Abc"]);
       expect(existsSync(databaseOf(where.root, GROUP))).toBe(false);
     } finally { await service.close(); }
+  });
+
+  test("a space's preparation checks every member at once: one member's directory renamed to another spelling refuses the open", async () => {
+    const where = place();
+    const { faux, models, model } = fauxModels();
+    const out = recordingOutbound();
+    faux.setResponses([fauxAssistantMessage("第一条的回复")]);
+    const first = open(where, models, model, out.outbound);
+    try {
+      await first.service.admit(out.message(GROUP, "abc", "第一条"));
+      await until(() => replies(out.sent).length === 1, "first reply");
+    } finally { await first.service.close(); }
+    const parent = join(where.root, "tmp", "groups", GROUP);
+    await mkdir(join(parent, "abc"), { recursive: true });
+    await rename(join(parent, "abc"), join(parent, "Abc"));
+    const second = open(where, models, model, out.outbound);
+    try {
+      // Another member's own check passes; the space's preparation finds the renamed directory of the first.
+      await expect(second.service.admit(out.message(GROUP, ALICE, "另一位成员"))).rejects.toThrow("标识大小写与已有目录 Abc 冲突");
+      expect(replies(out.sent)).toEqual(["第一条的回复"]);
+    } finally { await second.service.close(); }
   });
 });
 

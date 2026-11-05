@@ -106,8 +106,6 @@ record_cases() {
     valid_candidate
     check write write_candidate_record "$base/written"
     result write-tmp-left "$(exists "$base/written/candidate-image.tmp")"
-    check read-written read_candidate_record "$base/written"
-    result read-written-tag "${CANDIDATE[image_tag]:-}"
     # Values that could not be read back are refused before anything is written.
     valid_candidate; CANDIDATE[image_id]=sha256:abc
     check write-bad-id write_candidate_record "$base/bad-id"
@@ -116,12 +114,6 @@ record_cases() {
     valid_candidate; CANDIDATE[project_id]=ffffffffffff
     check write-tag-mismatch write_candidate_record "$base/tag-mismatch"
     result refused-left "$(find "$base/bad-id" "$base/missing-key" "$base/tag-mismatch" -mindepth 1 | wc -l | tr -d ' ')"
-    # Each prepared directory under read/ is read in turn; a refused read leaves nothing behind in CANDIDATE.
-    for dir in "$base"/read/*/; do
-        dir="${dir%/}"
-        check "read-${dir##*/}" read_candidate_record "$dir"
-        result "left-${dir##*/}" "${#CANDIDATE[@]}"
-    done
 }
 
 format_cases() {
@@ -196,9 +188,8 @@ docker_cases() {
     mv "$DSTATE/removed" "$DSTATE/images/${IMAGE_B#sha256:}"
     DOCKER_DOWN=1 check verify-down candidate_verify
 
-    check publish candidate_publish "$IMAGE_B" mixin-chatbot
-    result published "$(cat "$(ref_file mixin-chatbot)")"
-    TAG_NOOP=1 check publish-unverified candidate_publish "$IMAGE_C" mixin-chatbot
+    # The official tag the core published (core-docker-effects.test.ts); releasing the reserved tag leaves it alone.
+    printf '%s' "$IMAGE_B" > "$(ref_file mixin-chatbot)"
 
     printf '%s' "$IMAGE_C" > "$(ref_file "$TAG")"
     check release-moved candidate_release_tag "$TAG" "$IMAGE_B"
@@ -674,6 +665,16 @@ snapshot_cases() {
     mkdir -p "$PROJECT_DIR/backup"
     check stop check_stop_disk_space
     result stop-args "$(cat "$fixture/free-args")"
+    # A revision cleanup decided before the stop adds its backup to backup/ and the largest deletion's WAL to data/.
+    REVISION_CLEANUP_BACKUP_BYTES=7000; REVISION_CLEANUP_WAL_BYTES=300
+    check stop-cleanup check_stop_disk_space
+    result stop-cleanup-args "$(cat "$fixture/free-args")"
+    check_free_space() { return 1; }
+    check stop-cleanup-short check_stop_disk_space
+    # A console task cannot set the variable: it is told to preview again and choose to skip.
+    MIXIN_OPS_CONSOLE=1 check stop-cleanup-console check_stop_disk_space
+    REVISION_CLEANUP_BACKUP_BYTES=0; REVISION_CLEANUP_WAL_BYTES=0
+    check stop-short check_stop_disk_space
     snapshot_size_estimate() { echo 'du: cannot access' >&2; return 1; }
     rm -f -- "$fixture/free-args"
     check stop-unknown check_stop_disk_space

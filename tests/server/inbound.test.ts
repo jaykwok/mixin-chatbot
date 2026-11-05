@@ -4,13 +4,14 @@ import type { DirectoryIdentity } from "../../src/integrations/open-platform/ide
 import type { OutboundMessage, Target } from "../../src/integrations/open-platform/messages.ts";
 import type { Outbound } from "../../src/durable/outbound.ts";
 import { DIRECT_SCOPE, groupScope } from "../../src/core/layout.ts";
-import type { AdmitResult, Inbound, InboundAttachment } from "../../src/durable/service.ts";
-import { InboundRouter, type InboundService } from "../../src/server/inbound.ts";
+import type { AdmitResult, AttachResult, Inbound, InboundAttachment } from "../../src/durable/service.ts";
+import { type InboundPush, InboundRouter, type InboundService } from "../../src/server/inbound.ts";
 
 type Call = { kind: "admit" | "control"; message: Inbound } | { kind: "attach"; message: InboundAttachment };
 
-function harness(options: { initializing?: boolean; scoped?: boolean; admit?: (message: Inbound) => Promise<AdmitResult>; control?: (message: Inbound) => Promise<string>;
-  attach?: (message: InboundAttachment) => Promise<AdmitResult> } = {}) {
+function harness(options: { initializing?: boolean; scoped?: boolean; applying?: boolean; unset?: boolean; admit?: (message: Inbound) => Promise<AdmitResult>;
+  control?: (message: Inbound) => Promise<string>;
+  attach?: (message: InboundAttachment) => Promise<AttachResult>; push?: InboundPush } = {}) {
   const calls: Call[] = [], notices: { target: Target; text: string; replyMsgId?: string }[] = [], reports: unknown[] = [];
   const durable = new Set<string>();
   let unknown = 0;
@@ -22,7 +23,7 @@ function harness(options: { initializing?: boolean; scoped?: boolean; admit?: (m
     seen: msgUid => durable.has(msgUid),
     admit: message => { calls.push({ kind: "admit", message }); return options.admit?.(message) ?? Promise.resolve({ status: "accepted" }); },
     control: message => { calls.push({ kind: "control", message }); return options.control?.(message) ?? Promise.resolve("ok"); },
-    attach: message => { calls.push({ kind: "attach", message }); return options.attach?.(message) ?? Promise.resolve({ status: "accepted" }); },
+    attach: message => { calls.push({ kind: "attach", message }); return options.attach?.(message) ?? Promise.resolve({ status: "accepted", attachment: "att" }); },
   };
   const outbound: Outbound = {
     async send(target: Target, message: OutboundMessage, sendOptions) {
@@ -35,8 +36,9 @@ function harness(options: { initializing?: boolean; scoped?: boolean; admit?: (m
   };
   const abort = new AbortController();
   const router = new InboundRouter({
-    service, outbound, signal: abort.signal, onUnknown: () => { unknown++; }, onReport: error => reports.push(error),
-    directory: { lookup: id => identities[id], initializing: options.initializing ?? false, scoped: options.scoped ?? false },
+    service, outbound, ...(options.push ? { push: options.push } : {}), signal: abort.signal, onUnknown: () => { unknown++; }, onReport: error => reports.push(error),
+    directory: { lookup: id => identities[id], initializing: options.initializing ?? false, scoped: options.scoped ?? false, applying: options.applying ?? false,
+      unset: options.unset ?? false },
   });
   let serial = 0;
   const event = (payload: Record<string, unknown>, timing: { sentAt?: number; receivedAt?: number } = {}) => ({
@@ -86,6 +88,20 @@ test("an unknown sender, or a mapping with an invalid phone, gets a notice once 
   await scoped.router.drain();
   expect(scoped.notices[0]!.text).toContain("你可能不在机器人同步的部门范围内");
   expect(scoped.unknown()).toBe(1);
+  // While a saved scope is being applied the previous list still answers; a sender not on it is asked to retry later.
+  const applying = harness({ scoped: true, applying: true });
+  applying.router.handle(applying.event({ userId: "im-stranger" }));
+  applying.router.handle(applying.event({ userId: "im-alice", msgUid: "known" }));
+  await applying.router.drain();
+  expect(applying.notices.map(notice => notice.text)).toEqual([expect.stringContaining("通讯录同步范围正在更新，完成前暂时无法确认你的身份，请稍后重发。")]);
+  expect(applying.calls.map(call => call.message.phone)).toEqual(["13800000001"]);
+  // Without a saved scope nothing is synced: a stranger is sent to the administrator, and mapped members still get through.
+  const unset = harness({ unset: true });
+  unset.router.handle(unset.event({ userId: "im-stranger" }));
+  unset.router.handle(unset.event({ userId: "im-alice", msgUid: "mapped" }));
+  await unset.router.drain();
+  expect(unset.notices.map(notice => notice.text)).toEqual([expect.stringContaining("机器人还没有设置通讯录同步范围，暂时无法确认你的身份，请联系管理员。")]);
+  expect(unset.calls.map(call => call.message.phone)).toEqual(["13800000001"]);
 });
 
 test("quantum-session messages are skipped; unsupported, empty and overlong messages get a notice and never reach the service", async () => {
@@ -110,7 +126,7 @@ test("quantum-session messages are skipped; unsupported, empty and overlong mess
 
 test("direct images, files and videos are registered in arrival order with what the event declares; failures are answered", async () => {
   let fail = false;
-  const h = harness({ attach: async () => { if (fail) throw new Error("storage down"); return { status: "accepted" }; } });
+  const h = harness({ attach: async () => { if (fail) throw new Error("storage down"); return { status: "accepted", attachment: "att" }; } });
   const direct = { eventType: "callback:direct", groupId: "" };
   h.router.handle(h.event({ ...direct, type: "file", msgUid: "a-1", content: { fileId: "file-1", filename: "report.pdf", size: 2048, mimeType: "application/pdf" } }));
   h.router.handle(h.event({ ...direct, type: "image", msgUid: "a-2", content: { fileId: "file-2", width: 10, height: 10 } }));
@@ -178,4 +194,106 @@ test("a full queue is answered with the service's message and remembered; failur
   h.router.handle(h.event({})); h.router.handle(h.event({ content: { content: "/clear" } }));
   await h.router.drain();
   expect(h.reports).toHaveLength(2); expect(h.notices).toHaveLength(3);
+});
+
+/** A push service stand-in: members (and `group:<ID>`) in `replying` have their texts (and direct attachments) taken as reply items. */
+function fakePush(replying: Set<string>) {
+  const calls: string[] = [];
+  const items = new Set<string>();
+  const push: InboundPush = {
+    seen: msgUid => items.has(msgUid),
+    click: event => { calls.push(`click ${String(event.payload.msgUid)}`); },
+    directText: (identity, reply, text) => {
+      calls.push(`text ${text}`);
+      if (text === "/完成" || text === "/取消") return true;
+      if (!replying.has(identity.phone) || text.startsWith("/")) return false;
+      items.add(reply.msgUid);
+      return true;
+    },
+    directAttachment: (identity, reply, attachment) => {
+      calls.push(`attachment ${attachment.fileId}`);
+      if (!replying.has(identity.phone)) return false;
+      items.add(reply.msgUid);
+      return true;
+    },
+    groupText: (groupId, _identity, reply, text) => {
+      calls.push(`group ${groupId} ${text}`);
+      if (["/完成", "/取消"].includes(text) || text.startsWith("/登记群")) return true;
+      if (!replying.has(`group:${groupId}`) || text.startsWith("/")) return false;
+      items.add(reply.msgUid);
+      return true;
+    },
+  };
+  return { push, calls };
+}
+
+test("card clicks go to the push service only; without one they are dropped", async () => {
+  const fake = fakePush(new Set());
+  const h = harness({ push: fake.push });
+  h.router.handle(h.event({ eventType: "callback:card_interaction", msgUid: "card-1", content: { data: "{}" } }));
+  await h.router.drain();
+  expect(fake.calls).toEqual(["click card-1"]);
+  expect(h.calls).toEqual([]); expect(h.notices).toEqual([]);
+  const bare = harness();
+  bare.router.handle(bare.event({ eventType: "callback:card_interaction", msgUid: "card-2" }));
+  await bare.router.drain();
+  expect(bare.calls).toEqual([]); expect(bare.notices).toEqual([]);
+});
+
+test("a member replying to a push has direct texts and attachments taken by it; commands and other members are not; a group text is asked too", async () => {
+  const fake = fakePush(new Set(["13800000001"]));
+  const h = harness({ push: fake.push });
+  const direct = { eventType: "callback:direct", groupId: "" };
+  h.router.handle(h.event({ ...direct, msgUid: "r-1", content: { content: " my reply " } }));
+  h.router.handle(h.event({ ...direct, type: "file", msgUid: "r-2", content: { fileId: "file-9", filename: "r.pdf" } }));
+  h.router.handle(h.event({ ...direct, msgUid: "r-3", content: { content: "/status" } }));
+  h.router.handle(h.event({ msgUid: "g-1", content: { content: "group question" } }));
+  await h.router.drain();
+  expect(fake.calls).toEqual(["text my reply", "attachment file-9", "text /status", "group 100 group question"]);
+  expect(h.calls.map(call => [call.kind, call.message.reply.msgUid])).toEqual([["control", "r-3"], ["admit", "g-1"]]);
+  // A redelivered reply item is recognised by the push service and never reaches it or the model again.
+  h.router.handle(h.event({ ...direct, msgUid: "r-1", content: { content: " my reply " } }));
+  await h.router.drain();
+  expect(fake.calls).toHaveLength(4); expect(h.calls).toHaveLength(2);
+  // Without a reply in progress the push service declines and the message is admitted as usual.
+  const idle = fakePush(new Set());
+  const other = harness({ push: idle.push });
+  other.router.handle(other.event({ ...direct, msgUid: "q-1", content: { content: "question" } }));
+  other.router.handle(other.event({ ...direct, type: "image", msgUid: "q-2", content: { fileId: "file-8" } }));
+  await other.router.drain();
+  expect(idle.calls).toEqual(["text question", "attachment file-8"]);
+  expect(other.calls.map(call => [call.kind, call.message.reply.msgUid])).toEqual([["admit", "q-1"], ["attach", "q-2"]]);
+});
+
+test("/完成 and /取消 go to the push service in direct chats and groups, /登记群 in groups; all are ignored when late", async () => {
+  const fake = fakePush(new Set());
+  const h = harness({ push: fake.push }), now = Date.now();
+  const direct = { eventType: "callback:direct", groupId: "" };
+  h.router.handle(h.event({ ...direct, content: { content: "/完成" } }));
+  h.router.handle(h.event({ ...direct, content: { content: "/取消" } }, { sentAt: now - 5 * 60_000, receivedAt: now }));
+  h.router.handle(h.event({ content: { content: "/取消" } }));
+  h.router.handle(h.event({ content: { content: "/登记群 销售一部" } }));
+  h.router.handle(h.event({ content: { content: "/登记群 客服" } }, { sentAt: now - 5 * 60_000, receivedAt: now }));
+  h.router.handle(h.event({ content: { content: "/stop" } }));
+  await h.router.drain();
+  expect(fake.calls).toEqual(["text /完成", "group 100 /取消", "group 100 /登记群 销售一部", "group 100 /stop"]);
+  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("这条命令是 5 分钟前发的，已忽略"), expect.stringContaining("这条命令是 5 分钟前发的，已忽略")]);
+  expect(h.calls.map(call => [call.kind, call.message.scope, (call.message as Inbound).content])).toEqual([["control", groupScope("100"), "/stop"]]);
+});
+
+test("a group replying to a push has its members' texts taken by it; group media are still refused", async () => {
+  const fake = fakePush(new Set(["group:100"]));
+  const h = harness({ push: fake.push });
+  h.router.handle(h.event({ msgUid: "gr-1", content: { content: "我们组已盘点" } }));
+  h.router.handle(h.event({ msgUid: "gr-2", content: { content: "/status" } }));
+  h.router.handle(h.event({ msgUid: "gr-3", type: "file", content: { fileId: "file-7", filename: "x.pdf" } }));
+  h.router.handle(h.event({ msgUid: "gr-4", groupId: "200", content: { content: "其他群的问题" } }));
+  await h.router.drain();
+  expect(fake.calls).toEqual(["group 100 我们组已盘点", "group 100 /status", "group 200 其他群的问题"]);
+  expect(h.calls.map(call => [call.kind, call.message.reply.msgUid])).toEqual([["control", "gr-2"], ["admit", "gr-4"]]);
+  expect(h.notices.map(n => n.text)).toEqual([expect.stringContaining("群里暂不支持接收图片、文件和视频")]);
+  // Redelivered: the push service has it.
+  h.router.handle(h.event({ msgUid: "gr-1", content: { content: "我们组已盘点" } }));
+  await h.router.drain();
+  expect(fake.calls).toHaveLength(3);
 });

@@ -1,6 +1,6 @@
 # 运行设置与可选工具
 
-Pi 1.4.0 接入只运行 Durable。修改以下配置前停止服务，使用升级事务完成数据版本校验，再启动服务。未配置辅助模型和 MCP 时，这些工具不注册。从旧版 webhook 发布切换时这些配置不迁移，在新部署中按本页重新设置。
+Pi 1.5.0 接入只运行 Durable。修改以下配置前停止服务，使用升级事务完成数据版本校验，再启动服务。未配置辅助模型和 MCP 时，这些工具不注册。从旧版 webhook 发布切换时这些配置不迁移，在新部署中按本页重新设置。
 
 ## 原生运行设置
 
@@ -13,7 +13,7 @@ Pi 1.4.0 接入只运行 Durable。修改以下配置前停止服务，使用升
     "retry": { "enabled": true, "maxRetries": 3, "baseDelayMs": 1000, "maxAgentDelayMs": 5000 },
     "stream": { "timeoutMs": 120000, "maxRetries": 0, "maxRetryDelayMs": 5000 },
     "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000 },
-    "progress": { "partialIntervalMs": 100, "outputIntervalMs": 20 },
+    "progress": { "partialIntervalMs": 100, "outputIntervalMs": 20, "persistWithinMs": 1000 },
     "contextRetentionMs": 600000
   }
 }
@@ -21,7 +21,9 @@ Pi 1.4.0 接入只运行 Durable。修改以下配置前停止服务，使用升
 
 `retry.maxRetries` 是第一次之外的重试次数，最多 10；`stream.maxRetries` 必须为 0，使每次重试都由 Durable 重新发起并再次经过请求门。`timeoutMs` 是每次请求的期限，范围 1–600,000 毫秒；它不是用户消息的总处理期限。取消与未处理的控制命令继续阻止后续请求。
 
-`compaction.modelOverrides` 的键为 `provider/modelId`，值只能含 `reserveTokens / keepRecentTokens`。`backgroundTokens` 可选，语义由 Durable 管理。`stream.cacheRetention` 可设 `none / short / long`；未设时沿用 Pi 的 provider 默认和 `PI_CACHE_RETENTION`，环境变量具体优先级由相应 provider 实现。旧缓存保温设置不再属于生产配置。
+`compaction.modelOverrides` 的键为 `provider/modelId`，值只能含 `reserveTokens / keepRecentTokens`。`backgroundTokens` 可选，语义由 Durable 管理。`stream.cacheRetention` 可设 `none / short / long`；未设时沿用 Pi 的 provider 默认和 `PI_CACHE_RETENTION`，环境变量具体优先级由相应 provider 实现。
+
+`progress` 管运行中的进度：`partialIntervalMs` 是模型正在生成的回答两次提交之间的最短间隔，`outputIntervalMs` 是工具运行输出两次提交之间的最短间隔，范围都是 0–10,000 毫秒；服务内的看门狗和 `/status` 立即看到这些进度。`persistWithinMs`（0–60,000 毫秒）是这些进度最迟写入会话库的时间，阶段结束时（模型答完、工具返回）立即写入；服务异常退出时最多丢失这段时间的流式进度，已完成的回答和工具结果不受影响。控制台从会话库读取，运行中的进度最多晚这么久显示。
 
 `contextRetentionMs` 范围 0–600,000 毫秒，是官方任务上下文缓存的闲置保留时间；0 在任务闲置后释放。它减少历史条目读取，但增加内存占用，且不限制活跃成员数量。多成员大历史部署可设 0。运维端直接调用 `Conversation.context()` 的查询仍需读历史，不能用它的耗时代表任务缓存效果。
 

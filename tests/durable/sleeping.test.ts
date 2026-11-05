@@ -106,7 +106,7 @@ test("reclamation and maintenance views treat a sleeping task as live work", asy
   const groups = spaces(root, models, { delayMs: 60_000 });
   try {
     const handle = await groups.acquire(g("sleepy"));
-    try { expect(await idleSpaceReferences(handle.harness, context)).toBeUndefined(); }
+    try { expect(await idleSpaceReferences(handle.harness, context, () => false)).toBeUndefined(); }
     finally { handle.release(); }
   } finally { await groups.closeAll(); }
   expect(await liveStates(path)).toEqual(["sleeping"]);

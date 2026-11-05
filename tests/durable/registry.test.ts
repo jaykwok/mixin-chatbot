@@ -1,18 +1,15 @@
-// The group registry (D2-4, src/durable/registry.ts): the system prompt against the AgentSession engine's, the tool
-// catalogue, what scripts may call, module selection, and the send and document tools run for the calling member.
+// The group registry (src/durable/registry.ts): the system prompt's pieces, the tool catalogue, what scripts may call, module selection, and the send and document tools run for the calling member.
 // Faux models and a recording outbound; no network, no Python.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import {
-  createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemPrompt, InMemoryCredentialStore, InMemoryModelsStore,
+  createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemPrompt,
   type Message,
 } from "@earendil-works/pi-ai";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { Conversation, Extension } from "@earendil-works/pi-durable";
-import { buildLocalTools } from "../helpers/native-tools.ts";
 import { type AgentModuleDefinition, loadModuleDefinitions } from "../../src/agent/modules.ts";
 import { buildChatContext } from "../../src/agent/prompt.ts";
 import { recordingOutbound } from "../helpers/recording-outbound.ts";
@@ -123,54 +120,15 @@ async function call(group: Group, conversation: Conversation, name: string, args
   return result;
 }
 
-/** The AgentSession engine's prompt for the same group and member (src/agent/session-factory.ts wiring). */
-async function agentSessionPrompt(root: string, modules: readonly AgentModuleDefinition[], relayEnabled: boolean): Promise<Seen> {
-  const places = memberPlaces({ layout: appLayout(root) }, groupScope(GROUP), ALICE);
-  for (const dir of [places.workspaceDir, places.tempDir]) await mkdir(dir, { recursive: true });
-  const runtime = await ModelRuntime.create({ modelsPath: null, credentials: new InMemoryCredentialStore(),
-    modelsStore: new InMemoryModelsStore(), refreshOnCreate: false });
-  const faux = fauxProvider({ tokensPerSecond: 0 });
-  runtime.registerNativeProvider(faux.provider);
-  const agentDir = join(root, "pi-agent");
-  await mkdir(agentDir, { recursive: true });
-  const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
-  const [module] = modules;
-  const resourceLoader = new DefaultResourceLoader({
-    cwd: places.workspaceDir, agentDir, settingsManager,
-    noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-    skillsOverride: () => module?.skills ?? { skills: [], diagnostics: [] },
-    systemPromptOverride: () => buildChatContext({ relayEnabled, ...(module ? { modulePrompt: module.prompt } : {}) }),
-    appendSystemPromptOverride: () => [],
-  });
-  await resourceLoader.reload();
-  const customTools = await buildLocalTools({ workspaceDir: places.workspaceDir, tempDir: places.tempDir, phone: ALICE, scope: groupScope(GROUP),
-    venvDir: places.venvDir, materialsIndexPath: places.indexPath, resourceReadDirs: module?.readOnlyDirs ?? [] });
-  const { session } = await createAgentSession({
-    cwd: places.workspaceDir, agentDir, modelRuntime: runtime, model: faux.getModel(), thinkingLevel: "off",
-    noTools: "builtin", customTools, settingsManager, resourceLoader,
-    sessionManager: SessionManager.open(join(root, "session.jsonl"), undefined, places.workspaceDir),
-  });
-  let request: Seen | undefined;
-  try {
-    faux.setResponses([(transcript) => { request = seen(transcript.messages); return fauxAssistantMessage("好的"); }]);
-    await session.prompt("你好");
-  } finally { session.dispose(); }
-  if (request === undefined) throw new Error("no AgentSession request");
-  return request;
-}
-
 describe("Durable group registry", () => {
   for (const [label, modules, relay] of [
     ["document module on, no relay", [documentWork], null],
     ["document module off, relay configured", [], RELAY],
   ] as const) {
-    test(`the system prompt equals the AgentSession engine's (${label})`, async () => {
+    test(`the system prompt is the project prompt, the module's skills and the workspace (${label})`, async () => {
       const group = await openGroup({ modules, relay });
       try {
         const durable = await turn(group, await member(group));
-        const session = await agentSessionPrompt(group.root, modules, relay !== null);
-        expect(durable.prompt).toBe(session.prompt);
-        // The pieces, so a difference is readable: the project prompt, the skill list, the group workspace.
         expect(durable.prompt.startsWith(buildChatContext({ relayEnabled: relay !== null, ...(modules.length ? { modulePrompt: documentWork.prompt } : {}) }))).toBe(true);
         expect(durable.prompt.includes("<skills>")).toBe(modules.length > 0);
         expect(durable.prompt.endsWith(`<cwd>\n${resolve(appLayout(group.root).workspace).replace(/\\/g, "/")}\n</cwd>`)).toBe(true);

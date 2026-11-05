@@ -1,12 +1,14 @@
-// A process-wide SQL thread, with connections reserved before opening and released after native close.
+// A process-wide SQL thread, with connections reserved before opening and released after native close. Each reply's
+// timing goes to the SQL listeners (sql-timing.ts) when there are any.
 import { Worker } from "node:worker_threads";
-import { decodeError, type Command, type Reply } from "./sqlite-protocol.ts";
+import { reportSql, sqlWatched } from "./sql-timing.ts";
+import { decodeError, sharedNow, type Command, type Reply } from "./sqlite-protocol.ts";
 
 export class SqliteWorkerLost extends Error {
   constructor(cause: unknown) { super("SQLite worker stopped before an operation was acknowledged", { cause }); }
 }
 
-type Pending = { resolve(value: unknown): void; reject(error: unknown): void };
+type Pending = { resolve(value: unknown): void; reject(error: unknown): void; command: Command; queued: number; sent: number };
 let current: SqliteClient | undefined;
 export function sqliteClient(): SqliteClient {
   return current ??= new SqliteClient();
@@ -16,6 +18,7 @@ export class SqliteClient {
   readonly worker = new Worker(new URL("./sqlite-worker.ts", import.meta.url));
   private readonly pending = new Map<number, Pending>();
   private readonly references = new Map<number, ((error: SqliteWorkerLost) => void) | undefined>();
+  private readonly paths = new Map<number, string>();
   private nextRequest = 0;
   private nextConnection = 0;
   private stopping = false;
@@ -29,6 +32,7 @@ export class SqliteClient {
       const waiting = this.pending.get(reply.request);
       if (!waiting) return this.fail(new Error("Unexpected SQLite response identity"));
       this.pending.delete(reply.request);
+      if (sqlWatched()) this.report(waiting, reply);
       if (reply.ok) waiting.resolve(reply.value);
       else waiting.reject(decodeError(reply.error));
     });
@@ -39,24 +43,30 @@ export class SqliteClient {
     });
   }
 
-  request<T>(command: Command): Promise<T> {
+  /** `queued`: how long the request already waited behind its connection's earlier operation (sqlite-facade.ts). */
+  request<T>(command: Command, queued = 0): Promise<T> {
     if (this.failure) return Promise.reject(this.failure);
     if (this.stopping && command.kind !== "stop") return Promise.reject(new Error("SQLite worker is closing"));
     const request = ++this.nextRequest;
     const result = Promise.withResolvers<unknown>();
-    this.pending.set(request, result);
+    this.pending.set(request, { ...result, command, queued, sent: sharedNow() });
     try { this.worker.postMessage({ request, command }); }
     catch (error) { this.fail(error); }
     return result.promise as Promise<T>;
   }
 
+  /** The database file of an open connection. */
+  pathOf(connection: number): string | undefined { return this.paths.get(connection); }
+
   async open(path: string, onFailure?: (error: SqliteWorkerLost) => void): Promise<number> {
     if (this.stopping || this.failure) throw this.failure ?? new Error("SQLite worker is closing");
     const connection = ++this.nextConnection;
     this.references.set(connection, onFailure);
+    this.paths.set(connection, path);
     try { await this.request({ kind: "open", connection, path }); return connection; }
     catch (error) {
       this.references.delete(connection);
+      this.paths.delete(connection);
       await this.retire().catch(() => {});
       throw error;
     }
@@ -67,6 +77,7 @@ export class SqliteClient {
     try { await this.request({ kind: "close", connection }); }
     catch (error) { failed = true; original = error; }
     this.references.delete(connection);
+    this.paths.delete(connection);
     try { await this.retire(); }
     catch (error) {
       if (failed) throw new AggregateError([original, error], "Closing SQLite and stopping its worker both failed");
@@ -88,6 +99,15 @@ export class SqliteClient {
       if (code !== 0) throw new SqliteWorkerLost(new Error(`SQLite worker exited with code ${code}`));
     })();
     return this.retiring;
+  }
+
+  private report({ command, queued, sent }: Pending, { ok, timing }: Reply): void {
+    if (command.kind === "stop") return;
+    const path = this.paths.get(command.connection);
+    if (path === undefined) return;
+    const { received, started, ended } = timing;
+    reportSql({ type: "request", path, command, queued, waited: Math.max(0, received - sent), deferred: Math.max(0, started - received),
+      exec: Math.max(0, ended - started), returned: Math.max(0, sharedNow() - ended), ok });
   }
 
   private fail(cause: unknown): void {

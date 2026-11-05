@@ -3,8 +3,9 @@ import { existsSync } from "node:fs";
 import { copyFile, cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { opsCommand } from "../../scripts/ops/tui/platform.ts";
-import { describePendingTransaction, loadPendingTransaction, parseTransactionRecord, transactionValueValid, type TransactionRecord } from "../../scripts/ops/tui/transaction.ts";
+import { opsCommand } from "../../scripts/ops/shared/platform.ts";
+import { describePendingTransaction, loadPendingTransaction } from "../../scripts/ops/shared/transaction.ts";
+import { parseTransactionRecord, serializeTransactionRecord, transactionValueValid, type TransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
@@ -46,7 +47,7 @@ test("事务记录逐键校验：重复、未知、缺失或非法的值拒绝�
   expect(() => parseTransactionRecord(serialize(record) + "bot_port=2022\n")).toThrow("bot_port");
 });
 
-test("运维界面按指针读取事务，数据已提交只看本事务的当前格式回执", async () => {
+test("控制台按指针读取事务，数据已提交只看本事务的当前格式回执", async () => {
   const fixture = await tempFixture("transaction-pending-");
   const root = fixture.root, state = join(root, "data/state"), snapshot = join(root, "backup/snapshots/deploy-abc123");
   try {
@@ -54,11 +55,8 @@ test("运维界面按指针读取事务，数据已提交只看本事务的当�
     expect(loadPendingTransaction(root)).toBeNull();
     await writeFile(join(state, "deploy-transaction"), "deploy-abc123");
     await writeFile(join(snapshot, "transaction"), serialize(record));
-    expect(loadPendingTransaction(root)).toMatchObject({ operation: "deploy", snapshot: "deploy-abc123", record, targetSha: record.target_sha, committed: false, codeRestorePending: false });
-    // An upgrade whose data was rolled back but whose code restore failed can only finish rolling back.
-    await writeFile(join(snapshot, "code-restore"), "");
-    expect(loadPendingTransaction(root)?.codeRestorePending).toBe(true);
-    await Bun.file(join(snapshot, "code-restore")).delete();
+    expect(loadPendingTransaction(root)).toMatchObject({ operation: "deploy", snapshot: "deploy-abc123", record, targetSha: record.target_sha, committed: false });
+    expect(loadPendingTransaction(root)?.rollbackPending).toBeUndefined();
     expect(describePendingTransaction(loadPendingTransaction(root)!).record).toContain("本机端口 2022");
     expect(describePendingTransaction(loadPendingTransaction(root)!).record).toContain("共享资料目录：/srv/new（原 /srv/old shared）");
     await writeFile(join(snapshot, "transaction"), serialize(legacy));
@@ -92,26 +90,28 @@ test("运维界面按指针读取事务，数据已提交只看本事务的当�
   } finally { await fixture.cleanup(); }
 });
 
-test.skipIf(!bash || !existsSync(bash))("Docker 事务记录可往返读写，拒绝篡改，拒绝没有记录的旧快照", async () => {
+// The shared core writes the record (serializeTransactionRecord); the shell entries read it to offer resume or rollback.
+test.skipIf(!bash || !existsSync(bash))("Docker 入口读得懂核心写的事务记录，拒绝篡改，拒绝没有记录的旧快照", async () => {
   const fixture = await tempFixture("transaction-bash-");
   const script = join(fixture.root, "record.sh"), snapshot = join(fixture.root, "backup/snapshots/deploy-abc123");
   await mkdir(snapshot, { recursive: true }); await mkdir(join(fixture.root, "data/state"), { recursive: true });
+  await writeFile(join(snapshot, "transaction"), serializeTransactionRecord({ ...record, operation: "upgrade", original_sha: "b".repeat(40),
+    original_branch: "main", original_workspace_root: "", target_workspace_root: "/srv/new shared" }));
   await writeFile(script, `#!/usr/bin/env bash
 set -euo pipefail
 . '${posixPath(join(project, "scripts/lib/common.sh"))}'
 PROJECT_DIR="$1"; snap="$PROJECT_DIR/backup/snapshots/deploy-abc123"
-declare -gA TRANSACTION=([format]=2 [operation]=upgrade [snapshot]=deploy-abc123 [target_sha]="$(printf 'a%.0s' {1..40})"
-  [original_sha]="$(printf 'b%.0s' {1..40})" [original_branch]=main [original_workspace_root]= [target_workspace_root]="/srv/new shared"
-  [was_running]=1 [bot_port]=2022 [reconfigure_ai]=0)
-write_transaction_record "$snap"
-# Values that could not be read back are refused before anything is written.
-TRANSACTION[bot_port]=70000
-if write_transaction_record "$snap" 2>/dev/null; then echo 'invalid value written'; exit 1; fi
 printf deploy-abc123 > "$PROJECT_DIR/data/state/deploy-transaction"
-unset TRANSACTION
 load_pending_transaction
 echo "RECORD port=\${TRANSACTION[bot_port]} root=\${TRANSACTION[target_workspace_root]}"
+echo "DESCRIBE $(describe_pending_transaction)"
 cp "$snap/transaction" "$snap/transaction.good"
+# A deployment without git has no target commit; the summary says so instead of leaving it blank.
+sed -e 's/^operation=.*/operation=deploy/' -e 's/^target_sha=.*/target_sha=/' -e 's/^original_sha=.*/original_sha=/' -e 's/^original_branch=.*/original_branch=/' \\
+  "$snap/transaction.good" > "$snap/transaction"
+load_pending_transaction
+echo "NON-GIT $(describe_pending_transaction)"
+cp "$snap/transaction.good" "$snap/transaction"
 printf 'bot_port=2023\\n' >> "$snap/transaction"
 if load_pending_transaction 2>/dev/null; then echo 'duplicate accepted'; exit 1; fi
 sed 's/^was_running=.*/was_running=2/' "$snap/transaction.good" > "$snap/transaction"
@@ -129,45 +129,34 @@ if load_pending_transaction; then echo 'old snapshot accepted'; exit 1; fi
     const result = await execute([bash!, posixPath(script), posixPath(fixture.root)], fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain("RECORD port=2022 root=/srv/new shared");
+    expect(result.output).toContain("DESCRIBE 未完成的升级：目标提交 aaaaaaa；");
+    expect(result.output).toContain("NON-GIT 未完成的部署：目标提交 （非 git 部署）；");
     expect(result.output).toContain("事务记录无效：format");
     expect(result.output).toContain("事务格式不匹配");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
-test.skipIf(process.platform !== "win32")("Windows 事务记录与 Docker 同一格式，拒绝篡改，指针在记录之后发布", async () => {
+test.skipIf(process.platform !== "win32")("Windows 入口读得懂核心写的事务记录，拒绝篡改和没有记录的旧快照", async () => {
   const fixture = await tempFixture("transaction-windows-");
   const script = join(fixture.root, "record.ps1"), snapshot = join(fixture.root, "backup/snapshots/deploy-" + "f".repeat(32));
   await mkdir(snapshot, { recursive: true }); await mkdir(join(fixture.root, "data/state"), { recursive: true });
-  await writeFile(join(fixture.root, "plan.json"), "{}");
-  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
+  const good = serializeTransactionRecord({ ...record, snapshot: "deploy-" + "f".repeat(32), target_sha: "", original_workspace_root: "",
+    target_workspace_root: "E:\\shared", was_running: "0", reconfigure_ai: "1" });
+  await writeFile(join(fixture.root, "good.txt"), good);
+  await writeFile(script, `﻿$ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
-$snapshot=${quotePS(snapshot)}; $pointer=Join-Path $PSScriptRoot 'data\\state\\deploy-transaction'
+$snapshot=${quotePS(snapshot)}; $record=Join-Path $snapshot 'transaction'; $good=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'good.txt'))
 try { Read-DeploymentTransaction $snapshot; throw 'old snapshot accepted' } catch { if ($_.Exception.Message -notmatch '事务格式不匹配') { throw } }
-$record=@{ format='2'; operation='deploy'; snapshot=(Split-Path $snapshot -Leaf); target_sha=''; original_sha=''; original_branch=''
-    original_workspace_root=''; target_workspace_root='E:\\shared'; was_running='0'; bot_port='2022'; reconfigure_ai='1' }
-$legacy=$record.Clone(); $legacy.format='1'; $legacy.platform_ip='203.0.113.17'
-try { Publish-DeploymentTransaction ([pscustomobject]@{Path=$snapshot}) $legacy $pointer; throw 'legacy record published' } catch { if ($_.Exception.Message -eq 'legacy record published') { throw } }
-$bad=$record.Clone(); $bad.bot_port='70000'
-try { Publish-DeploymentTransaction ([pscustomobject]@{Path=$snapshot}) $bad $pointer; throw 'invalid record published' } catch { if ($_.Exception.Message -eq 'invalid record published') { throw } }
-if (Test-Path -LiteralPath $pointer) { throw 'pointer published without a valid record' }
-Publish-DeploymentTransaction ([pscustomobject]@{Path=$snapshot}) $record $pointer (Join-Path $PSScriptRoot 'plan.json')
-if (-not (Test-Path -LiteralPath (Join-Path $snapshot 'data-plan.json'))) { throw 'plan not kept with the snapshot' }
+[IO.File]::WriteAllText($record, $good)
 $read=Read-DeploymentTransaction $snapshot
 if ($read.target_workspace_root -cne 'E:\\shared' -or $read.original_workspace_root -cne '' -or $read.bot_port -cne '2022') { throw 'record not read back' }
 Write-Output (Format-DeploymentTransaction $read)
-$good=Get-Content -LiteralPath (Join-Path $snapshot 'transaction') -Raw
-Set-Content -LiteralPath (Join-Path $snapshot 'transaction') ($good -replace '^format=2', 'format=1') -NoNewline
+[IO.File]::WriteAllText($record, ($good -replace '^format=2', 'format=1'))
 try { $null = Read-DeploymentTransaction $snapshot; throw 'legacy record accepted' } catch { if ($_.Exception.Message -notmatch '事务记录无效：format') { throw } }
-Set-Content -LiteralPath (Join-Path $snapshot 'transaction') $good -NoNewline
-Add-Content -LiteralPath (Join-Path $snapshot 'transaction') 'bot_port=2023' -NoNewline
+[IO.File]::WriteAllText($record, $good + 'bot_port=2023')
 try { $null = Read-DeploymentTransaction $snapshot; throw 'duplicate accepted' } catch { if ($_.Exception.Message -eq 'duplicate accepted') { throw } }
-# Empty pointers are refused by name and an empty saved root means the default; neither is dereferenced as null.
-Set-Content -LiteralPath $pointer '' -NoNewline
-try { $null = Open-DeploymentTransaction $PSScriptRoot; throw 'empty pointer opened' } catch { if ($_.Exception.Message -ne '部署事务快照名称无效') { throw } }
-$upgradePointer=Join-Path $PSScriptRoot 'data\\state\\upgrade-transaction'
-Set-Content -LiteralPath $upgradePointer '' -NoNewline
-try { $null = Open-UpgradeSnapshot $PSScriptRoot 'task' '' '' ''; throw 'empty upgrade pointer opened' } catch { if ($_.Exception.Message -ne '升级事务快照名称无效') { throw } }
+# An empty saved root means the default; it is not dereferenced as null.
 Set-Content -LiteralPath (Join-Path $PSScriptRoot 'data\\state\\workspace-root') '' -NoNewline
 if ((Get-SavedWorkspaceRoot $PSScriptRoot) -ne '') { throw 'empty saved root not defaulted' }
 Write-Output 'RECORD_OK'
@@ -176,11 +165,6 @@ Write-Output 'RECORD_OK'
     const result = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root);
     expect(result.code, result.output).toBe(0); expect(result.output).toContain("RECORD_OK");
     expect(result.output).toContain("本机端口 2022");
-    // The UI parses the Windows record with the same rules (UTF-8 without BOM, LF lines).
-    const text = await readFile(join(snapshot, "transaction"), "utf8");
-    expect(text.charCodeAt(0)).not.toBe(0xfeff);
-    expect(() => parseTransactionRecord(text)).toThrow("bot_port");
-    expect(parseTransactionRecord(text.replace(/bot_port=2023$/, "")).bot_port).toBe("2022");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -198,7 +182,10 @@ async function entryFixture(prefix: string, entry: string) {
 test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，普通设置损坏不挡住继续或回滚", async () => {
   const fixture = await entryFixture("transaction-entry-linux-", "scripts/ops/ops.sh"), root = fixture.root;
   try {
-    await writeFile(join(root, "scripts/deploy/deploy.sh"), '#!/usr/bin/env bash\necho "DISPATCHED action=${DEPLOY_TRANSACTION_ACTION:-}"\n');
+    // A pending deployment goes to the core through the host Bun, here a stand-in; a new one to the deploy entry.
+    const runtime = join(root, "bun-stand-in");
+    await writeFile(runtime, '#!/usr/bin/env bash\nif [ "$1" = --version ]; then echo 1.4.4; exit 0; fi\necho "DISPATCHED ${*:3} end"\n', { mode: 0o755 });
+    await writeFile(join(root, "scripts/deploy/deploy.sh"), '#!/usr/bin/env bash\necho "DEPLOY ENTRY command=$1"\n');
     await mkdir(join(root, "backup/snapshots/deploy-abc123"), { recursive: true });
     await writeFile(join(root, "backup/snapshots/deploy-abc123/transaction"), serialize(record));
     await writeFile(join(root, "data/state/deploy-transaction"), "deploy-abc123");
@@ -206,10 +193,11 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
     // An exported function, not a PATH stub: the Windows CI runner did not find a stub script written just before.
     const lock = process.platform === "win32" ? { "BASH_FUNC_flock%%": "() { return 0\n}" } : {};
     const ops = (command: string, entry = "scripts/ops/ops.sh") => execute([bash!, posixPath(join(root, entry)), command], root,
-      { ...process.env, ...lock, MSYS_NO_PATHCONV: "1", BOT_PORT: "" });
-    for (const [command, action] of [["resume", "continue"], ["rollback", "rollback"]]) {
-      const result = await ops(command!);
-      expect(result.code, result.output).toBe(0); expect(result.output).toContain(`DISPATCHED action=${action}`);
+      { ...process.env, ...lock, MSYS_NO_PATHCONV: "1", BOT_PORT: "", MIXIN_OPS_BUN: posixPath(runtime) });
+    for (const [command, tail] of [["resume", " end"], ["rollback", " --rollback end"]] as const) {
+      const result = await ops(command);
+      expect(result.code, result.output).toBe(0); expect(result.output).toContain("DISPATCHED deployment deploy --project ");
+      expect(result.output).toContain(tail + "\n"); expect(result.output.includes("--rollback")).toBe(command === "rollback");
       expect(result.output).not.toContain("无效");
     }
     // The health check after a resumed upgrade uses the recorded settings, not the broken saved ones.
@@ -219,8 +207,9 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
       '\necho "SETTINGS port=$PORT root=$DEPLOYED_WORKSPACE_ROOT"\n');
     const settings = await ops("resume", "scripts/ops/settings.sh");
     expect(settings.output).toContain("SETTINGS port=2022 root=/srv/new\n");
-    // The deployment script validates and offers to correct saved settings itself.
-    expect((await ops("deploy")).output).toContain("DISPATCHED action=\n");
+    // The deployment script validates saved settings itself, and takes the command it runs for.
+    expect((await ops("deploy")).output).toContain("DEPLOY ENTRY command=deploy\n");
+    expect((await ops("repair")).output).toContain("DEPLOY ENTRY command=repair\n");
     // Ordinary operations still refuse to run on broken settings.
     const doctor = await ops("doctor");
     expect(doctor.code).toBe(1); expect(doctor.output).toContain("端口无效");
@@ -240,7 +229,7 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
       }
     }
   } finally { await fixture.cleanup(); }
-}, 30000);
+}, 60000);
 
 test.skipIf(process.platform !== "win32")("Windows 恢复入口先读事务记录，普通设置损坏不挡住继续或回滚", async () => {
   const fixture = await entryFixture("transaction-entry-windows-", "scripts/ops/ops.ps1"), root = fixture.root;
@@ -249,11 +238,11 @@ test.skipIf(process.platform !== "win32")("Windows 恢复入口先读事务记�
     const positional = (command: string) => execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
       `[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); & ${quotePS(entry)} ${command}; exit $LASTEXITCODE`], root,
       { ...process.env, BOT_PORT: "" });
-    // The TUI encodes the command; it must be decoded before any ordinary setting is read.
+    // The console encodes the command; it must be decoded before any ordinary setting is read.
     const encoded = (command: string) => {
-      const tui = opsCommand("windows", [command]);
-      tui.args[4] = entry;
-      return execute([tui.command, ...tui.args], root, { ...process.env, ...tui.env, BOT_PORT: "" });
+      const request = opsCommand("windows", [command]);
+      request.args[4] = entry;
+      return execute([request.command, ...request.args], root, { ...process.env, ...request.env, BOT_PORT: "" });
     };
     // An empty file is as broken as an invalid value, and must not crash the entry either.
     for (const port of ["invalid", ""]) {

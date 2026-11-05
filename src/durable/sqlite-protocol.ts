@@ -1,13 +1,19 @@
 // Messages of the SQL thread. Preserve diagnostic codes and causes without sharing native handles.
 import type { SqliteValue } from "@earendil-works/pi-durable/storage/sqlite";
 
-export type SqlMethod = "exec" | "run" | "get" | "all";
+export type SqlMethod = "exec" | "run" | "runCounted" | "get" | "all";
 export type Command = { kind: "open"; connection: number; path: string }
   | { kind: "sql"; connection: number; method: SqlMethod; sql: string; params: SqliteValue[] }
   | { kind: "close"; connection: number }
   | { kind: "stop" };
 export type Request = { request: number; command: Command };
-export type Reply = { request: number; ok: true; value: unknown } | { request: number; ok: false; error: RemoteError };
+/** When the SQL thread received, started and ended a request, on the clock of `sharedNow`. */
+export type ReplyTiming = { received: number; started: number; ended: number };
+export type Reply = ({ request: number; ok: true; value: unknown } | { request: number; ok: false; error: RemoteError }) & { timing: ReplyTiming };
+
+/** Milliseconds on a clock the service thread and the SQL thread read alike (each thread's own origin plus its own
+ *  monotonic time), so that stamps taken on one can be subtracted from stamps taken on the other. */
+export const sharedNow = (): number => performance.timeOrigin + performance.now();
 export type RemoteError = { name: string; message: string; stack?: string; code?: string | number; errno?: number; cause?: RemoteError };
 
 export function encodeError(error: unknown, depth = 0): RemoteError {

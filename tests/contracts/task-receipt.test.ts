@@ -6,15 +6,17 @@ import { ContractError } from "../../src/contracts/maintenance.ts";
 import { decodeReceipt, signReceipt, verifyReceiptEnvelope, type Receipt } from "../../src/contracts/task-receipt.ts";
 
 const id = "11111111-2222-4333-8444-555555555555", manager = "66666666-7777-4888-8999-aaaaaaaaaaaa", daemon = "daemon-1";
+const epoch = "77777777-8888-4999-8aaa-bbbbbbbbbbbb";
 const key = Buffer.alloc(32, 7), expected = { id, manager, daemon, deployment: undefined };
 const failure = (run: () => unknown) => { try { run(); } catch (error) { return error as Error; } throw new Error("decoded"); };
 
-/** The oldest receipt T0 accepts: every optional field left out. */
+/** A receipt with only the required fields. */
 async function minimal(): Promise<Record<string, any>> {
   const template = await readFile(join(import.meta.dir, "../fixtures/maintenance-formats/receipt-v2-minimal.payload.json"), "utf8");
   return JSON.parse(template.replace('"<ID>"', JSON.stringify(id)).replace('"<NONCE>"', JSON.stringify("e".repeat(64)))
     .replace('"<MANAGER>"', JSON.stringify(manager)).replace('"<DAEMON>"', JSON.stringify(daemon))
-    .replace('"<IMAGE>"', JSON.stringify("sha256:" + "f".repeat(64))).replace('"<TEMP>"', JSON.stringify(resolve("/srv/groups/g/users/u/tmp"))));
+    .replace('"<IMAGE>"', JSON.stringify("sha256:" + "f".repeat(64))).replace('"<TEMP>"', JSON.stringify(resolve("/srv/groups/g/users/u/tmp")))
+    .replace('"<EPOCH>"', JSON.stringify(epoch)));
 }
 
 describe("receipt envelopes", () => {
@@ -60,10 +62,12 @@ describe("receipt envelopes", () => {
       ["pendingNames", { pendingNames: [`mixin-task-${manager}-1`] }],
       ["mounts", { mounts: null }],
       ["role", { role: "admin" }],
+      ["role", { role: undefined }],
       ["resultName", { resultName: "1-r.txt" }],
       ["archive", { archive: { destination: "relative", evidence } }],
       ["archive（归档阶段缺少归档记录）", { phase: "archived" }],
       ["ownerEpoch", { ownerEpoch: "x" }],
+      ["ownerEpoch", { ownerEpoch: undefined }],
       ["role（结果回执不能有容器）", { role: "results", pendingNames: [`mixin-task-${id}-1`] }],
       ["allocation", { allocation: { step: "started" } }],
       ["allocation", { allocation: null }],

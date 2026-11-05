@@ -2,7 +2,7 @@
 import { join, resolve } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { describeAge } from "../lib/age.ts";
-import { cliArgs, groupOptions, groupSelection } from "../lib/cli.ts";
+import { tmpOptions } from "../lib/tmp-options.ts";
 import { type GroupSelection } from "../lib/group-data.ts";
 import { scanTmp, type UserTmp } from "../lib/tmp-scan.ts";
 import { spaceName } from "../lib/history-scan.ts";
@@ -61,19 +61,8 @@ function reportPlan(plan: { id: string; digest: string; items: { status: string;
 }
 
 const LABELS = { archived: "已归档", removed: "已物理回收", discarded: "已永久删除归档" } as const;
-const ARCHIVED_NOTE = "归档尚未释放磁盘空间；原路径、目标路径和每项结果保存在清单中。用 discard 预览并确认后永久删除归档。";
+const ARCHIVED_NOTE = "归档尚未释放磁盘空间；原路径、目标路径和每项结果保存在清单中。确认不再需要后，预览删除归档（网页控制台“预览删除归档”，命令行 tmp-discard），核对后永久删除。";
 const MESSAGES = {
-  oneCommand: "只能指定一个命令",
-  allAndDays: "--all 和 --days 不能同时使用",
-  days: "--days 需要一个不小于 0 的天数",
-  confirmScope: "执行清单只接受 --plan 和 --digest，不重新选择范围",
-  discardScope: "discard 按已完成的归档清单处理，不接受 --days/--all/--user/--group",
-  previewScope: "预览需要 --days <天数> 或 --all；执行原清单需要 --plan 和 --digest",
-  previewOnly: "preview 不执行清单",
-  legacyOnly: "--legacy/--journal 只用于物理回收或删除归档",
-  recordedOnly: "--recorded-root 只用于服务身份条目的宿主维护（--legacy）",
-  recordedRoot: "服务身份条目的宿主回收必须用 --recorded-root 指定服务看到的绝对数据目录，以核对容器路径引用",
-  journal: "旧共享目录回收必须指定宿主私有 --journal",
   reclaimNext: (id: string, digest: string) => `核对清单后，使用 reclaim --plan ${id} --digest ${digest}（保留本次 --legacy/--journal/--recorded-root 参数）。`,
   discardNext: (id: string, digest: string) => `删除不可撤销。核对清单后，使用 discard --plan ${id} --digest ${digest} 永久删除（保留本次 --legacy/--journal/--recorded-root 参数）。`,
 };
@@ -108,27 +97,9 @@ export async function purge(days: number, user?: string, root = DATA_DIR, group?
 }
 
 async function main(args: string[]): Promise<number> {
-  const { values, positionals } = cliArgs(args, { ...groupOptions, all: { type: "boolean" }, days: { type: "string" },
-    user: { type: "string" }, group: { type: "string" }, plan: { type: "string" }, digest: { type: "string" },
-    archive: { type: "string" }, journal: { type: "string" }, legacy: { type: "boolean" }, "recorded-root": { type: "string" } });
-  if (positionals.length > 1) throw new Error(MESSAGES.oneCommand);
-  const command = positionals[0], selection = groupSelection(values, values.group);
-  if (values.all && values.days !== undefined) throw new Error(MESSAGES.allAndDays);
-  const days = values.all ? 0 : values.days === undefined ? undefined : Number(values.days);
-  if (days !== undefined && (!Number.isFinite(days) || days < 0)) throw new Error(MESSAGES.days);
-  if (command === "list" || command === "ls") return list(values.user, values.group, selection);
+  const { values, command, selection, days, confirming } = tmpOptions(args);
+  if (command === "list") return list(values.user, values.group, selection);
   if (!["preview", "purge", "reclaim", "discard"].includes(command ?? "")) { usage(); return command ? 1 : 0; }
-  const confirming = values.digest !== undefined;
-  if (confirming && (!values.plan || days !== undefined || values.group || values.user)) throw new Error(MESSAGES.confirmScope);
-  if (command === "discard" && (days !== undefined || values.group || values.user)) throw new Error(MESSAGES.discardScope);
-  if (command !== "discard" && !confirming && days === undefined) throw new Error(MESSAGES.previewScope);
-  if (command === "preview" && confirming) throw new Error(MESSAGES.previewOnly);
-  if (!["reclaim", "discard"].includes(command!) && (values.legacy || values.journal)) throw new Error(MESSAGES.legacyOnly);
-  if (values["recorded-root"] && !values.legacy) throw new Error(MESSAGES.recordedOnly);
-  if (values.legacy && (!values["recorded-root"] || !values["recorded-root"].startsWith("/") || resolve(values["recorded-root"]) !== values["recorded-root"])) {
-    throw new Error(MESSAGES.recordedRoot);
-  }
-  if (values.legacy && !values.journal) throw new Error(MESSAGES.journal);
   const run = async () => {
     const input = options(DATA_DIR, values.archive, values.legacy);
     if (command === "reclaim") {

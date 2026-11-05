@@ -3,7 +3,7 @@ import { expectAsync as expect } from "../helpers/async-expect.ts";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
-import { type CommitPublication, Harness, ProviderDoc } from "@earendil-works/pi-durable";
+import { Harness, ProviderDoc, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { claimSpace, databaseSpace, IdentityDoc, memberConversation, MemberDirectory } from "../../src/durable/identity.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { fauxModels, harnessOptions } from "../helpers/durable.ts";
@@ -16,8 +16,9 @@ const { faux, models, model } = fauxModels();
 const UUIDV7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 let counter = 0;
 
-async function withHarness(use: (harness: Harness) => Promise<void>, path = join(fixture.root, `db-${++counter}.sqlite`)) {
-  const harness = await Harness.open(await openGroupStorage(path), harnessOptions(models)(), context);
+async function withHarness(use: (harness: Harness) => Promise<void>, path = join(fixture.root, `db-${++counter}.sqlite`),
+  wrap = (storage: Storage) => storage) {
+  const harness = await Harness.open(wrap(await openGroupStorage(path)), harnessOptions(models)(), context);
   try { await use(harness); } finally { await harness.close(context); }
   return path;
 }
@@ -85,23 +86,32 @@ describe("Durable identity documents", () => {
     const ids: Record<string, string | undefined> = {};
     const sent: unknown[] = [];
     faux.setResponses([(_transcript, options) => { sent.push(options?.sessionId); return fauxAssistantMessage("好"); }]);
+    // What storage stores while the member conversations are made: one batch of writes per commit.
+    let batches: (readonly StorageWrite[])[] | undefined;
+    const recording = (storage: Storage) => new Proxy(storage, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (property !== "commit") return typeof value === "function" ? value.bind(target) : value;
+        return (...args: Parameters<Storage["commit"]>) => { batches?.push(...args[0]); return target.commit(...args); };
+      },
+    });
     const path = await withHarness(async (harness) => {
       await claimSpace(harness, scopeOf("group-a"), context);
-      const commits: CommitPublication[] = [];
-      const unsubscribe = harness.subscribeCommits((publication) => commits.push(publication));
+      const stored: (readonly StorageWrite[])[] = batches = [];
       const members = { m1: await memberConversation(harness, scopeOf("group-a"), "m1", { model }, context), m2: await memberConversation(harness, scopeOf("group-a"), "m2", { model }, context) };
-      unsubscribe();
+      batches = undefined;
       for (const [phone, { conversation }] of Object.entries(members)) {
         ids[phone] = (await harness.snapshot(ProviderDoc, conversation.id, context))?.sessionId;
         expect(ids[phone]).toMatch(UUIDV7);
-        const creating = commits.find((publication) => publication.changes.some((change) => change.type === "conversation" && change.value.id === conversation.id));
-        expect(creating?.changes.some((change) => change.type === "document" && change.record.kind === "pi.provider" && change.conversationId === conversation.id)).toBe(true);
+        const creating = stored.find((batch) => batch.some((write) => write.type === "conversation" && write.value.id === conversation.id));
+        expect(creating?.some((write) => write.type === "document.create" && write.record.kind === "pi.provider"
+          && write.record.scope.kind === "conversation" && write.record.scope.conversationId === conversation.id)).toBe(true);
       }
       expect(ids.m1).not.toBe(ids.m2);
       const settled = await (await members.m1.conversation.submit({ type: "input", content: "你好" }, context)).wait(context);
       expect(settled.status).toBe("done");
       expect(sent).toEqual([ids.m1]);
-    });
+    }, undefined, recording);
     await withHarness(async (harness) => {
       const { conversation, created } = await memberConversation(harness, scopeOf("group-a"), "m1", { model }, context);
       expect(created).toBe(false);

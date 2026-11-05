@@ -10,7 +10,8 @@ const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" 
 const posix = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 
 // ops.sh update only routes: pending transactions first (no fetch), otherwise fetch and run the upgrader exported
-// from the target commit. The stub upgrader and deploy script record what they received.
+// from the target commit. A pending deployment and a rollback without its target go to the core. The stub upgrader and
+// core record what they received.
 test.skipIf(!bash || !existsSync(bash))("update handles pending transactions before fetching and runs the upgrader exported from the target", async () => {
   const f = await tempFixture("update-order-"), work = join(f.root, "work"), state = join(work, "data/state"), events = join(f.root, "events");
   const run = async (args: string[], env: Record<string, string> = {}, input?: string) => {
@@ -33,10 +34,18 @@ test.skipIf(!bash || !existsSync(bash))("update handles pending transactions bef
 set -uo pipefail
 PROJECT_DIR="$1"
 . '${posix(join(project, "scripts/lib/common.sh"))}'
-CONTAINER=mixin-chatbot; STATE_DIR="$PROJECT_DIR/data/state"; LOG_DIR="$PROJECT_DIR/logs"
+. '${posix(join(project, "scripts/lib/ops-runtime.sh"))}'
+CONTAINER=mixin-chatbot; STATE_DIR="$PROJECT_DIR/data/state"; LOG_DIR="$PROJECT_DIR/logs"; OPS_SOURCE_DIR=/fixed-source
 cd "$PROJECT_DIR"
 P(){ echo "$*"; }; OK(){ echo "$*"; }; WA(){ echo "$*"; }; ER(){ echo "$*" >&2; }
 acquire_deploy_lock(){ :; }; doctor(){ echo DOCTOR; }
+# The host Bun running the core: what it was handed, with the project and the fixed source masked.
+ops_bun(){ echo fixture_core; }
+fixture_core(){
+    input=''; IFS= read -r input || true
+    args="$*"; args="\${args//$PROJECT_DIR/<project>}"
+    printf 'core %s stdin=%s\\n' "$args" "$input" >> "$FIXTURE_EVENTS"
+}
 # The post-upgrade check reloads the persisted settings (see load_saved_settings in ops.sh).
 load_saved_settings(){ echo SETTINGS-RELOADED; }; check_ordinary_settings(){ :; }
 docker(){
@@ -74,17 +83,6 @@ if [ "\${FIXTURE_UPGRADER_HOLD:-0}" = 1 ]; then
     wait
 fi
 exit "\${FIXTURE_UPGRADER_EXIT:-0}"
-`);
-    await writeFile(join(work, "scripts/deploy/deploy.sh"), `#!/usr/bin/env bash
-input=''; IFS= read -r input || true
-printf 'deploy action=%s receipt=%s stdin=%s version=%s\\n' "\${DEPLOY_TRANSACTION_ACTION:-}" "\${BOT_UPDATE_COMMIT_FILE##*/}" "$input" "$(cat Dockerfile)" >> "$FIXTURE_EVENTS"
-case "\${FIXTURE_DEPLOY:-}" in
-    commit) printf 'committed\\n' > "$BOT_UPDATE_COMMIT_FILE"; rm -f data/state/deploy-transaction ;;
-    rollback) rm -f data/state/deploy-transaction ;;
-    # Like rollback_deployment for an upgrade still on the target code: the pointer stays, marked code-restore.
-    restore-data) : > "backup/snapshots/$(cat data/state/deploy-transaction)/code-restore" ;;
-    fail) exit 1 ;;
-esac
 `);
     await git("init", "--initial-branch=main");
     await git("config", "user.name", "Fixture"); await git("config", "user.email", "fixture@example.invalid");
@@ -157,32 +155,37 @@ esac
     expect(result.code, result.text).toBe(1); expect(result.text).toContain("resume"); expect(result.text).toContain("未完成的升级");
     expect(await events_()).toEqual([]);
 
-    // The recorded target is missing locally: continuing is impossible; rollback before the checkout uses the current deploy script.
+    // The recorded target is missing locally: continuing is impossible; rollback before the checkout is the pinned runtime's.
     await record({ target_sha: "b".repeat(40) });
     result = await update({ UPDATE_TRANSACTION_ACTION: "continue" });
     expect(result.code, result.text).toBe(1); expect(result.text).toContain("在本地不存在，无法继续"); expect(result.text).toContain("rollback");
     expect(await events_()).toEqual([]);
-    result = await update({ UPDATE_TRANSACTION_ACTION: "rollback", FIXTURE_DEPLOY: "rollback" }, "unexpected\n");
+    // A transaction without a pinned runtime was not started by the core: this release does not take it over.
+    result = await update({ UPDATE_TRANSACTION_ACTION: "rollback" }, "unexpected\n");
+    expect(result.code, result.text).toBe(1); expect(result.text).toContain("不是由运维核心开始的"); expect(await events_()).toEqual([]);
+    const pinnedRuntime = "a".repeat(64), pinned = `.console/runtime/source-${pinnedRuntime}/scripts/ops/core/cli.ts`;
+    await writeFile(join(snapshot, "host-runtime"), pinnedRuntime + "\n");
+    await mkdir(join(work, `.console/runtime/source-${pinnedRuntime}/scripts/ops/core`), { recursive: true }); await writeFile(join(work, pinned), "");
+    result = await update({ UPDATE_TRANSACTION_ACTION: "rollback" }, "unexpected\n");
     expect(result.code, result.text).toBe(0);
-    expect(await events_()).toEqual(["deploy action=rollback receipt= stdin= version=old"]);
-    await writeFile(join(state, "deploy-transaction"), "deploy-fixture");
+    expect(await events_()).toEqual([`core --no-env-file <project>/${pinned} deployment upgrade --project <project> --original ${old} --target ${"b".repeat(40)} --branch main --rollback stdin=`]);
+    await rm(join(snapshot, "host-runtime"));
     await record({ target_sha: "b".repeat(40), original_sha: target });
     result = await update({ UPDATE_TRANSACTION_ACTION: "rollback" });
     expect(result.code, result.text).toBe(1); expect(result.text).toContain("当前代码也不是升级前的"); expect(await events_()).toEqual([]);
-    // Only the code was left to restore and it is already the original: the transaction is cleared without the deploy script.
-    await record({ target_sha: "b".repeat(40) }); await writeFile(join(snapshot, "code-restore"), "");
-    result = await update({ UPDATE_TRANSACTION_ACTION: "rollback" });
-    expect(result.code, result.text).toBe(0); expect(result.text).toContain("升级已回滚"); expect(await events_()).toEqual([]);
-    expect(existsSync(join(state, "deploy-transaction"))).toBe(false);
-    await rm(join(snapshot, "code-restore")); await writeFile(join(state, "deploy-transaction"), "deploy-fixture");
 
-    // An interrupted deployment goes to the deploy script without a TTY, never to the upgrader.
+    // An interrupted deployment goes to the core without a TTY, never to the upgrader: the pinned runtime when it is there,
+    // otherwise this release's core, which accepts only byte-identical code.
     await record({ operation: "deploy", original_sha: "", original_branch: "" });
     for (const action of ["continue", "rollback"]) {
       result = await update({ UPDATE_TRANSACTION_ACTION: action }, "unexpected\n");
       expect(result.code, result.text).toBe(0); expect(result.text).toContain("未完成的部署");
-      expect(await events_()).toEqual([`deploy action=${action} receipt= stdin= version=old`]);
+      expect(await events_()).toEqual([`core --no-env-file /fixed-source/scripts/ops/core/cli.ts deployment deploy --project <project>${action === "rollback" ? " --rollback" : ""} stdin=`]);
     }
+    await writeFile(join(snapshot, "host-runtime"), pinnedRuntime + "\n");
+    result = await update({ UPDATE_TRANSACTION_ACTION: "continue" }, "unexpected\n");
+    expect(result.code, result.text).toBe(0);
+    expect(await events_()).toEqual([`core --no-env-file <project>/${pinned} deployment deploy --project <project> stdin=`]);
     await rm(join(state, "deploy-transaction"));
     result = await update({ UPDATE_TRANSACTION_ACTION: "continue" });
     expect(result.code, result.text).toBe(0); expect(result.text).toContain("没有未完成的部署或升级"); expect(await events_()).toEqual([]);

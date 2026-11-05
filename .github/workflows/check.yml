@@ -26,6 +26,10 @@ jobs:
           bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
+      # Ubuntu 24.04 restricts unprivileged user namespaces; the read-only mount tests (revision-cleanup.test.ts) need them.
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       # scripts/test.ts runs timing-balanced groups in parallel, one isolated run each (one per spare core, at most four on Windows and six elsewhere).
       # The recorded per-file times have the format of tests/timings/<platform>.json, which they can replace.
       - name: Isolated tests and JUnit report
@@ -95,6 +99,12 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
             --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/tests:/app/tests:ro" \
             mixin-chatbot-check bun run tests/helpers/document-work-integration.ts /app/.venv --office
+      - name: Test document work through the Durable engine in the restricted image
+        run: |
+          docker run --rm --init --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
+            --user "$(id -u):$(id -g)" -v "$PWD/tmp:/app/tmp" -v "$PWD/tests:/app/tests:ro" \
+            mixin-chatbot-check bun run tests/helpers/document-durable-integration.ts /app/.venv --office
       - name: Test Office previews from deep group directories, side by side and cancelled
         run: |
           # LibreOffice profiles live in the /tmp tmpfs, as in production.

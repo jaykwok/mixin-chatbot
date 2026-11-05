@@ -10,13 +10,22 @@ import { VERSION_FILE, RELEASE_FILE, applicationBinding, assertApplication, depl
 import { APP_BUILD, APP_VERSION, DATA_VERSION } from "../../src/core/version.ts";
 import { digest, publishJson } from "../lib/atomic-file.ts";
 import { openOperationLog, operationError } from "../lib/operation-log.ts";
+import { parseReleaseDataArgs, releaseDataResult, type ReleaseDataArgs } from "../lib/release-data-protocol.ts";
 
-const args = process.argv.slice(2), action = args.shift();
-const option = (name: string) => { const i = args.indexOf(name); return i < 0 ? undefined : args[i + 1]; };
-const project = resolve(option("--project") ?? process.cwd());
-const deployment = option("--deployment") ?? process.env.BOT_DEPLOY_BACKUP_ID ?? "";
-const planPath = option("--plan");
-const workspace = option("--workspace");
+const argv = process.argv.slice(2);
+let parsed: ReleaseDataArgs;
+try { parsed = parseReleaseDataArgs(argv); }
+catch (error) {
+  console.error((error as Error).message);
+  if (argv.includes("--json")) console.log(JSON.stringify(releaseDataResult(argv[0] ?? "unknown", 1)));
+  process.exit(1);
+}
+const action = parsed.action, machine = parsed.json;
+const say = (text: string) => machine ? console.error(text) : console.log(text);
+const project = resolve(parsed.project ?? process.cwd());
+const deployment = parsed.deployment ?? "";
+const planPath = parsed.plan;
+const workspace = parsed.workspace;
 const validation = workspace === undefined ? {} : { workspace };
 const data = join(project, "data");
 const markerPath = join(data, "state", VERSION_FILE), releasePath = join(data, "state", RELEASE_FILE);
@@ -41,11 +50,6 @@ async function withLease<T>(work: () => Promise<T>): Promise<T> {
 }
 
 async function main(): Promise<void> {
-  if (action === "committed") {
-    const release = readRelease(project);
-    process.exitCode = release?.deployment === deployment && release.phase === "committed" ? 0 : 1;
-    return;
-  }
   if (action === "check") {
     const { record } = inspect();
     // Before the stop: the configuration (when already written) must belong to the recorded application.
@@ -53,17 +57,17 @@ async function main(): Promise<void> {
     const app = readAppBotConfig(join(data, "config/app-bot.json"));
     if (app) assertApplication(record, app);
     if (workspace !== undefined) (await import("../../src/core/layout.ts")).checkProjectLayout(project, workspace);
-    console.log(describe(record));
+    say(describe(record));
     return;
   }
   if (action === "preview") {
     const state = inspect();
     // An upgrade needs the record of a deployment; an empty directory is a fresh install, never an upgrade.
-    if (args.includes("--upgrade") && !state.record) throw new Error("目录没有部署记录，不能升级；请先用部署命令全新安装（现场已保留）");
+    if (parsed.upgrade && !state.record) throw new Error("目录没有部署记录，不能升级；请先用部署命令全新安装（现场已保留）");
     const { validateConfiguration } = await import("../../src/core/data-validation.ts");
     await validateConfiguration(project, validation);
     if (planPath) await publishJson(resolve(planPath), { format: 1, dataVersion: DATA_VERSION, marker: state.marker });
-    console.log(describe(state.record));
+    say(describe(state.record));
     return;
   }
   if (action === "validate") {
@@ -105,7 +109,7 @@ async function main(): Promise<void> {
       const current = readDataVersion(markerPath);
       if (current?.transaction !== deployment) inspect();
       const { validateCurrentData } = await import("../../src/core/data-validation.ts");
-      await validateCurrentData(project, validation);
+      await validateCurrentData(project, { ...validation, intent: "release" });
       const { readAppBotConfig } = await import("../../src/integrations/open-platform/config.ts");
       const app = readAppBotConfig(join(data, "config/app-bot.json"))!;
       // The record names the program actually deployed and the application the data now belongs to (validated above
@@ -115,7 +119,7 @@ async function main(): Promise<void> {
       await publishJson(releasePath, { ...release, phase: "committed" });
       return;
     }
-    throw new Error("usage: data-current.ts check|preview|apply|validate|commit|committed|rollback --project PATH [--deployment ID] [--plan PATH] [--workspace PATH] [--upgrade]");
+    throw new Error("usage: data-current.ts check|preview|apply|validate|commit|rollback --project PATH [--deployment ID] [--plan PATH] [--workspace PATH] [--upgrade]");
   });
 }
 
@@ -124,4 +128,5 @@ catch (error) { operation.event("error", "current-data", operationError(error));
 finally {
   operation.event("info", "current-data", `data-finished: exit=${process.exitCode ?? 0}`);
   if (process.exitCode && operation.ownsLog && operation.name) console.error(`本次操作日志：${operation.name}`);
+  if (machine) console.log(JSON.stringify(releaseDataResult(action, Number(process.exitCode ?? 0))));
 }

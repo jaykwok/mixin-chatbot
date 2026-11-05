@@ -5,7 +5,8 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
-import { buildSendTools } from "../../src/agent/send-tools.ts";
+import { sendTools, type SendToolsOptions } from "../../src/agent/send-tools.ts";
+import { runMemberTool, toolNamed } from "../helpers/member-tools.ts";
 import { createOutboundNotes, recordingChannel } from "../helpers/outbound-notes.ts";
 import { NATIVE_FILE_MAX_BYTES } from "../../src/core/config.ts";
 import type { RelayConfig } from "../../src/integrations/relay.ts";
@@ -26,6 +27,11 @@ async function writeOversizedFile(dir: string, name: string): Promise<string> {
 
 async function indexFor(root: string, opened: RelayIndex[]) { const index = await openRelayIndex(join(root, "relay.sqlite")); opened.push(index); return index; }
 
+/** send_image or send_file for one reply target, the way durable/send.ts gives each call its context. */
+function sendTool(name: "send_image" | "send_file", { relay, ...context }: SendToolsOptions) {
+  return toolNamed(sendTools(relay, () => context), name);
+}
+
 describe("attachment send tools", () => {
   test("honors the Pi tool abort signal before downloading", async () => {
     const opened: RelayIndex[] = [];
@@ -38,22 +44,16 @@ describe("attachment send tools", () => {
 
     const controller = new AbortController();
     controller.abort();
-    const imageTool = buildSendTools({
+    const imageTool = sendTool("send_image", {
       channel: recordingChannel().channel,
       workspaceDir: ".",
       tempDir: ".",
       notes: createOutboundNotes(),
-    }).find((tool) => tool.name === "send_image")!;
+    });
 
     try {
       await expect(
-        imageTool.execute(
-          "send-aborted-image",
-          { source: "https://example.com/image.png" },
-          controller.signal,
-          undefined,
-          {} as never
-        )
+        runMemberTool(imageTool, { source: "https://example.com/image.png" }, { signal: controller.signal })
       ).rejects.toThrow();
       expect(fetched).toBe(false);
     } finally {
@@ -91,7 +91,7 @@ describe("attachment send tools", () => {
     try {
       await writeOversizedFile(workspace, "report.bin");
       const notes = createOutboundNotes();
-      const fileTool = buildSendTools({
+      const fileTool = sendTool("send_file", {
         channel: recordingChannel().channel,
         notes,
         workspaceDir: workspace,
@@ -99,15 +99,9 @@ describe("attachment send tools", () => {
         relay: RELAY,
         // 用临时索引，别把测试产物写进仓库的 data/runtime。
         relayIndex: await indexFor(root, opened),
-      }).find((tool) => tool.name === "send_file")!;
+      });
 
-      const result = await fileTool.execute(
-        "send-large-file",
-        { source: "report.bin" },
-        undefined,
-        undefined,
-        {} as never
-      );
+      const result = await runMemberTool(fileTool, { source: "report.bin" });
 
       const put = requests.find((r) => r.method === "PUT")!;
       expect(put).toBeDefined();
@@ -131,7 +125,7 @@ describe("attachment send tools", () => {
       expect(requests.some((r) => r.url.includes("upload"))).toBe(false);
       expect(drained[0]).toContain("（北京时间）前下载");
       // 工具结果里不再重复给出 URL，免得模型照抄一遍、同一条消息出现两个地址。
-      const text = (result.content[0] as { text: string }).text;
+      const text = (result.output![0] as { text: string }).text;
       expect(text).not.toContain(details.url);
       expect(text).toContain("重复粘贴");
     } finally {
@@ -141,59 +135,7 @@ describe("attachment send tools", () => {
     }
   }, 20_000);
 
-  test("tells the group when the link expires", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-relay-ttl-"));
-    const workspace = join(root, "workspace");
-    const userTemp = join(root, "user-tmp");
-    await Promise.all([mkdir(workspace), mkdir(userTemp)]);
-
-    const opened: RelayIndex[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-      if (init?.method === "PUT") return new Response(null, { status: 201 });
-      if (init?.method === "HEAD") return new Response(null, { status: 200, headers: { "Content-Length": String(NATIVE_FILE_MAX_BYTES + 1024) } });
-      return new Response(JSON.stringify({ ok: true, code: 200 }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }) as unknown as typeof fetch;
-
-    try {
-      await writeOversizedFile(workspace, "report.bin");
-      const notes = createOutboundNotes();
-      const fileTool = buildSendTools({
-        channel: recordingChannel().channel,
-        notes,
-        workspaceDir: workspace,
-        tempDir: userTemp,
-        relay: { ...RELAY, expireHours: 8 },
-        relayIndex: await indexFor(root, opened),
-      }).find((tool) => tool.name === "send_file")!;
-
-      await fileTool.execute(
-        "send-large-file-ttl",
-        { source: "report.bin" },
-        undefined,
-        undefined,
-        {} as never
-      );
-
-      // 到期时文件会被删掉，事后没有补救途径；群里必须当场看到期限。签名链接很长，
-      // 客户端会折叠它后面的内容，所以期限写在链接前面、链接放最后一行。
-      const announcement = notes.peek()[0]!;
-      expect(announcement).toContain("（北京时间）前下载");
-      expect(announcement).toContain("过期后链接失效");
-      const lines = announcement.split("\n");
-      expect(lines.at(-1)).toStartWith("https://");
-      expect(lines.findIndex((line) => line.includes("前下载"))).toBeLessThan(lines.length - 1);
-    } finally {
-      for (const index of opened) index.close();
-      globalThis.fetch = originalFetch;
-      await rm(root, { recursive: true, force: true });
-    }
-  }, 20_000);
-
-  test("announces a signed GET link with a fixed expiry and persists only its unsigned identity", async () => {
+  test("announces a signed GET link with its expiry before it and persists only its unsigned identity", async () => {
     const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-relay-sign-"));
     const workspace = join(root, "workspace");
     const userTemp = join(root, "user-tmp");
@@ -211,21 +153,26 @@ describe("attachment send tools", () => {
     try {
       await writeOversizedFile(workspace, "report.bin");
       const notes = createOutboundNotes();
-      const fileTool = buildSendTools({
+      const fileTool = sendTool("send_file", {
         channel: recordingChannel().channel,
         notes,
         workspaceDir: workspace,
         tempDir: userTemp,
         relay: { ...RELAY, expireHours: 8 },
         relayIndex: await indexFor(root, opened),
-      }).find((tool) => tool.name === "send_file")!;
+      });
 
-      await fileTool.execute("send-signed", { source: "report.bin" }, undefined, undefined, {} as never);
+      await runMemberTool(fileTool, { source: "report.bin" });
 
+      // 到期时文件会被删掉，事后没有补救途径；群里必须当场看到期限。签名链接很长，
+      // 客户端会折叠它后面的内容，所以期限写在链接前面、链接放最后一行。
       const announcement = notes.peek()[0]!;
       expect(announcement).toContain("X-Amz-Signature=");
       expect(announcement).toContain("（北京时间）前下载");
       expect(announcement).toContain("过期后链接失效");
+      const lines = announcement.split("\n");
+      expect(lines.at(-1)).toStartWith("https://");
+      expect(lines.findIndex((line) => line.includes("前下载"))).toBeLessThan(lines.length - 1);
       expect(notes.references()).toHaveLength(1);
       expect(notes.references()[0]!.reference.url).not.toContain("X-Amz-");
     } finally {
@@ -251,22 +198,15 @@ describe("attachment send tools", () => {
 
     try {
       await writeOversizedFile(workspace, "report.bin");
-      const fileTool = buildSendTools({
+      const fileTool = sendTool("send_file", {
         channel: recordingChannel().channel,
         notes: createOutboundNotes(),
         workspaceDir: workspace,
         tempDir: userTemp,
-      }).find((tool) => tool.name === "send_file")!;
+      });
 
       // 未配置外链时的完整契约：报错、说人话、不发任何网络请求、不承诺做不到的事。
-      const error = await fileTool
-        .execute(
-          "send-large-file-no-relay",
-          { source: "report.bin" },
-          undefined,
-          undefined,
-          {} as never
-        )
+      const error = await runMemberTool(fileTool, { source: "report.bin" })
         .then(
           () => null,
           (e: unknown) => e as Error
@@ -305,23 +245,17 @@ describe("attachment send tools", () => {
 
     try {
       const outsideFile = await writeOversizedFile(outside, "secret.bin");
-      const fileTool = buildSendTools({
+      const fileTool = sendTool("send_file", {
         channel: recordingChannel().channel,
         notes: createOutboundNotes(),
         workspaceDir: workspace,
         tempDir: userTemp,
         relay: RELAY,
         relayIndex: await indexFor(root, opened),
-      }).find((tool) => tool.name === "send_file")!;
+      });
 
       await expect(
-        fileTool.execute(
-          "send-outside-file",
-          { source: outsideFile },
-          undefined,
-          undefined,
-          {} as never
-        )
+        runMemberTool(fileTool, { source: outsideFile })
       ).rejects.toThrow("只能发送");
       expect(fetched).toBe(false);
     } finally {

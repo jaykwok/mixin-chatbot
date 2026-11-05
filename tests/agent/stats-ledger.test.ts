@@ -9,7 +9,7 @@ import { Database } from "bun:sqlite";
 import {
   ASK_ID_RETENTION_MS, dayKey, importRows, openExistingStatsLedger, openStatsLedger, pruneAskIds, readLedger, recordAsks, settledAsks, syncUsage, type UsageState,
 } from "../../src/agent/stats-ledger.ts";
-import { importDigest, importLegacyStats, previewLegacyStats, readLegacyLedger } from "../../scripts/ops/stats-import.ts";
+import { importDigest, importLegacyStats, previewLegacyStats, readImport } from "../../scripts/ops/stats-import-core.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { statsOf } from "../helpers/layout.ts";
 
@@ -23,6 +23,35 @@ const tokens = (input: number, output = 0, cacheRead = 0, cacheWrite = 0) =>
 const state = (models: Record<string, object>, tools: Record<string, object> = {}) => ({ models, tools }) as unknown as UsageState;
 
 describe("asks", () => {
+  test("member filtering applies to asks, model/tool usage and known groups together with dates and space", () => {
+    const db = fresh(), user = "u' OR 1=1 --";
+    try {
+      const asks = [
+        { requestId: "old", space: "g", user, at: at(6) },
+        { requestId: "selected", space: "g", user, at: at(7) },
+        { requestId: "other-space", space: "direct", user, at: at(7) },
+        { requestId: "other-user", space: "g", user: "v", at: at(7) },
+        { requestId: "other-user-space", space: "v-only", user: "v", at: at(7) },
+      ];
+      recordAsks(db, asks);
+      for (const ask of asks) syncUsage(db, { id: ask.requestId, space: ask.space, user: ask.user },
+        state({ "p/m": tokens(10, 1) }, { image: tokens(2, 1) }), ask.at);
+      syncUsage(db, { id: "only-usage", space: "usage-only", user }, state({ "p/m": tokens(5) }), at(6));
+      const selected = readLedger(db, { since: dayKey(at(7)), until: dayKey(at(7)) }, "g", user);
+      expect(selected.asks).toEqual([{ group: "g", user, day: dayKey(at(7)), asks: 1, firstAt: at(7), lastAt: at(7) }]);
+      expect(selected.usage.map(({ user, bucket, totalTokens }) => ({ user, bucket, totalTokens }))).toEqual([
+        { user, bucket: "models", totalTokens: 11 }, { user, bucket: "tools", totalTokens: 3 },
+      ]);
+      expect(selected.groups).toEqual(["g"]);
+      const allSpaces = readLedger(db, { since: dayKey(at(7)) }, undefined, user);
+      expect(allSpaces.groups).toEqual(["direct", "g", "usage-only"]);
+      expect(allSpaces.asks.map(row => row.group)).toEqual(["direct", "g"]);
+      expect(allSpaces.usage.every(row => row.user === user)).toBe(true);
+      expect(readLedger(db, {}, undefined, "absent")).toEqual({ asks: [], usage: [], groups: [] });
+      expect(readLedger(db).asks.reduce((n, row) => n + row.asks, 0)).toBe(5);
+    } finally { db.close(); }
+  });
+
   test("each requestId counts once, on its own day, with the day's first and last ask", () => {
     const db = fresh();
     try {
@@ -49,13 +78,13 @@ describe("asks", () => {
     const db = fresh();
     try {
       const day = 24 * 3600_000;
-      const old = { requestId: "parked", space: "g", user: "u", at: at(1) };
+      const old = { requestId: "old", space: "g", user: "u", at: at(1) };
       const recent = { requestId: "recent", space: "g", user: "u", at: at(20) };
       expect(recordAsks(db, [old, recent])).toBe(2);
       // Within the retention nothing goes.
       expect(pruneAskIds(db, at(1) + ASK_ID_RETENTION_MS - day)).toBe(0);
       expect(recordAsks(db, [old])).toBe(0);
-      // Past it the old id goes; the parked task's record still names it, yet it is not counted twice.
+      // Past it the old id goes; a record that still names it does not count it twice.
       const later = at(1) + ASK_ID_RETENTION_MS + day;
       expect(pruneAskIds(db, later)).toBe(1);
       expect(db.query("SELECT request_id FROM ask_ids").all()).toEqual([{ request_id: "recent" }]);
@@ -256,9 +285,9 @@ describe("import of the old ledger", () => {
   test("a ledger of another schema version is refused", async () => {
     const path = await legacyLedger();
     const db = new Database(path);
-    db.exec("UPDATE stats_schema SET version = 3");
+    db.exec("UPDATE stats_schema SET version = 4");
     db.close();
-    expect(() => readLegacyLedger(path)).toThrow("只接受旧版 schema 2");
+    expect(() => readLegacyLedger(path)).toThrow("只接受 schema 2 或 3");
   });
 
   test("an import of no rows still marks the ledger as imported", () => {
@@ -270,3 +299,5 @@ describe("import of the old ledger", () => {
     } finally { db.close(); }
   });
 });
+
+function readLegacyLedger(path: string) { return readImport(path).rows; }

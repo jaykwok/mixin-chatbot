@@ -13,12 +13,11 @@ GEMINI.md
 docs
 .pi
 .codefree
-__pycache__
+**/__pycache__
 node_modules
 logs
 data
-*.pyc
-*.pyo
+**/*.py[co]
 .env
 .env.*
 .github

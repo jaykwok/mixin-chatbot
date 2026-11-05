@@ -3,16 +3,18 @@
 # 用法：./scripts/ops/ops.sh <命令>；不带参数显示完整帮助。
 set -uo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+OPS_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PROJECT_DIR="${MIXIN_OPS_PROJECT:-$OPS_SOURCE_DIR}"
 # 与部署脚本共用校验、健康检查和生命周期函数。
-COMMON_LIB="${PROJECT_DIR}/scripts/lib/common.sh"
+COMMON_LIB="${OPS_SOURCE_DIR}/scripts/lib/common.sh"
 if [ ! -f "$COMMON_LIB" ]; then
     echo "缺少 ${COMMON_LIB}；请从仓库完整获取脚本目录后重试。" >&2
     exit 1
 fi
 # shellcheck source=../lib/common.sh
 . "$COMMON_LIB"
-. "${PROJECT_DIR}/scripts/lib/task-runtime.sh"
+. "${OPS_SOURCE_DIR}/scripts/lib/task-runtime.sh"
+. "${OPS_SOURCE_DIR}/scripts/lib/ops-runtime.sh"
 CONTAINER="mixin-chatbot"
 ROLLBACK_CONTAINER="${CONTAINER}-rollback"
 DATA_DIR="${PROJECT_DIR}/data"
@@ -71,7 +73,7 @@ ask_yes_no() {
     done
 }
 
-# doctor --json 让运维界面复用同一套体检，而不是自己再实现一遍 docker/配置的判断。
+# doctor --json 让控制台复用同一套体检，而不是自己再实现一遍 docker/配置的判断。
 # 逐项结果在 check() 里顺手攒起来，人类可读的输出一个字不改。
 JSON_OUTPUT=0
 JSON_ROWS=""
@@ -187,7 +189,7 @@ doctor() {
                 row_fix=""
                 case "$row_name" in
                     事件\ Stream) row_fix="检查出站访问 imtwo.zdxlz.com 的 443 端口和应用凭据（$(ops_command_hint configure-app-bot)），再查看 $(ops_command_hint logs)。" ;;
-                    通讯录同步) row_fix="有待确认撤销时，核对后使用 $(ops_command_hint directory-confirm) <轮次>；同步不完整时查看日志。" ;;
+                    通讯录同步) row_fix="服务会自动重试和复核；用 $(ops_command_hint directory) 查看范围状态和原因，长时间没有恢复时查看 $(ops_command_hint logs)。" ;;
                     运行状况) row_fix="在 $(ops_command_hint logs) 中查看对应记录（Durable 报告、交付超时放弃、统计累计值回退等）；停住的任务由成员用 /status 查看、/stop 或 /clear 结束。" ;;
                 esac
                 case "$row_status" in pass) row_status=1 ;; warn) ;; *) row_status=0 ;; esac
@@ -247,32 +249,41 @@ doctor() {
     fi
 }
 
-restart_bot() {
-    P "重新启动容器..."
-    if ! has_container; then ER "找不到容器 '$CONTAINER'；请先使用 $(ops_command_hint deploy)"; return 1; fi
-    docker restart "$CONTAINER" >/dev/null 2>&1 || { ER "docker restart 失败"; return 1; }
-    if wait_for_local; then OK "机器人已恢复（:${PORT} 实例身份与就绪检查通过）"
-    else WA "机器人未通过本地实例健康检查；请在 $(ops_command_hint logs) 查看日志"; return 1; fi
+# 结构化结果（W2 计划 §2 第 3 条）：调用方设置 MIXIN_OPS_RESULT_FILE 时，命令结束写一份 JSON（先写临时文件再改名），
+# 人类可读的输出不变。用法：ops_result <outcome> <原来在运行 0|1> <最终状态> <退出码> <说明>。
+ops_result() {
+    [ -n "${MIXIN_OPS_RESULT_FILE:-}" ] || return 0
+    local temporary="${MIXIN_OPS_RESULT_FILE}.$$.tmp" was_running=false
+    [ "$2" != 1 ] || was_running=true
+    if printf '{"protocol":"mixin-ops","version":1,"command":"%s","outcome":"%s","wasRunning":%s,"finalState":"%s","exitCode":%s,"message":"%s"}\n' \
+        "$(json_escape "${OPS_COMMAND:-}")" "$1" "$was_running" "$3" "$4" "$(json_escape "$5")" > "$temporary" &&
+        mv -f -- "$temporary" "$MIXIN_OPS_RESULT_FILE"; then return 0; fi
+    rm -f -- "$temporary"
+    ER "无法写入结构化结果：$MIXIN_OPS_RESULT_FILE"
+    return 1
 }
 
-stop_bot() {
-    P "停止容器..."
-    if docker stop "$CONTAINER" >/dev/null 2>&1; then OK "容器已停止"
-    else WA "没有正在运行的容器"; fi
+# 容器此刻的运行状态：running、stopped（不存在或没在运行），查询失败为 unknown。<就绪> 为 0 表示本次启动的就绪检查
+# 没有通过，运行中的容器记为 start-requested。
+final_run_state() {
+    local state
+    state="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.State}}' 2>/dev/null)" || { echo unknown; return; }
+    if [ "$state" != running ]; then echo stopped
+    elif [ "${1:-1}" = 0 ]; then echo start-requested
+    else echo running; fi
 }
 
-start_bot() {
-    P "启动容器..."
-    docker start "$CONTAINER" >/dev/null 2>&1 || { ER "启动失败；请先使用 $(ops_command_hint deploy)"; return 1; }
-    if wait_for_local; then OK "机器人已启动（:${PORT} 实例身份与就绪检查通过）"
-    else WA "机器人未通过本地实例健康检查；请在 $(ops_command_hint logs) 查看日志"; return 1; fi
+# start、restart 先做与停机维护相同的检查（部署锁、未完成的事务、维护状态 service），再启动。stop 只在部署或升级正持锁
+# 时拒绝，不查事务：停止总是安全的，事务未完成时也要能停。三者都写结构化结果。
+service_command() {
+    ops_core service "$@"
 }
 
 # 一次性容器按正式标签 mixin-chatbot 运行；部署或升级的事务期间它仍是旧镜像（数据提交后才指向新版本），用它处理
 # 迁移中或已迁移的数据会出错。服务未运行、需要一次性容器时先非阻塞地取得部署锁（部署或升级正在进行就停止），再检查
 # 未完成的事务。锁由调用的进程持有到一次性容器结束，检查之后不会出现新的事务。
 guard_one_off_container() {
-    acquire_deploy_lock || { ER "部署或升级正在进行；服务未运行时不能用一次性容器执行，请等它结束后重试"; return 1; }
+    acquire_deploy_lock || { [ $? = 2 ] || ER "部署或升级正在进行；服务未运行时不能用一次性容器执行，请等它结束后重试"; return 1; }
     if [ -e "$STATE_DIR/deploy-transaction" ]; then
         ER "有未完成的部署或升级，正式镜像可能与数据不一致；请先用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
         return 1
@@ -285,8 +296,8 @@ deployment_in_progress() {
     local lock_path
     [ ! -e "$STATE_DIR/deploy-transaction" ] || return 0
     lock_path="$(realpath -m -- "$STATE_DIR")/deploy.lock"
-    [ -e "$lock_path" ] && [ "${BOT_DEPLOY_LOCK_HELD:-}" != "$lock_path" ] || return 1
-    ! flock -n "$lock_path" true
+    [ "${BOT_DEPLOY_LOCK_HELD:-}" != "$lock_path" ] || return 1
+    deploy_lock_busy "$lock_path"
 }
 
 # 外链运维交给容器里的 bun 脚本执行，shell 这边只负责把它跑起来。
@@ -295,115 +306,38 @@ deployment_in_progress() {
 # src/integrations/relay.ts；在 shell 里抄一遍等于把它维护成两份，而且凭据会出现在命令行
 # 参数里，同机器上任何用户都能从 /proc/<pid>/cmdline 读到。
 #
-# 优先 exec 进正在运行的容器：网络命名空间、挂载和运行身份都与机器人自己完全一致，
-# 对象存储端点需同时可被机器人和群成员访问。
-# rootless Docker 下两种容器都在 rootlesskit 的网络里，到不了宿主机的 127.0.0.1（见部署文档）。
+# 外链的数据步骤、网络归属和中断回收交给共享核心。
 relay_admin() {
-    if [ ! -f "$RELAY_CONFIG_FILE" ]; then
-        ER "未配置 ${RELAY_CONFIG_FILE}，外链分发未启用"
-        return 1
-    fi
-    if ! command -v docker >/dev/null 2>&1; then
-        ER "找不到 docker"
-        return 1
-    fi
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
-        docker exec "$CONTAINER" bun run scripts/ops/relay-admin.ts "$@"
-        return $?
-    fi
-    guard_one_off_container || return 1
-    WA "容器未在运行，改用一次性容器执行"
-    local user
-    user="$(service_container_user)" || return 1
-    docker run --rm --network host \
-        --user "$user" \
-        -e HOME=/app/data/runtime/home \
-        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
-        mixin-chatbot bun run scripts/ops/relay-admin.ts "$@"
+    local action="$1"; shift
+    [ "$action" != list ] || action=ls
+    ops_core maintenance "relay-$action" "$@"
 }
 
-# 向导先生成确认过的草稿，随后才停机提交，退出时恢复原运行状态并移除草稿。
-relay_configure() (
-    local draft_dir="" draft_file="" container_draft="" user="" was_running=0 stop_attempted=0
-    if ! command -v docker >/dev/null 2>&1; then ER "找不到 docker"; return 1; fi
-    # 向导和写入都在一次性容器中执行，写入前还要停机：整个过程持有部署锁。
-    guard_one_off_container || return 1
-    mkdir -p -- "$CONFIG_DIR" || return 1
-    draft_dir="$(mktemp -d "${CONFIG_DIR}/.relay-config-XXXXXX")" || return 1
-    draft_file="${draft_dir}/draft.json"
-    restore_relay_service() {
-        local code=$?
-        trap - EXIT INT TERM
-        if [ "$was_running" = 1 ] && [ "$stop_attempted" = 1 ]; then start_bot || code=1; fi
-        rm -f -- "$draft_file" || code=1
-        rmdir -- "$draft_dir" || code=1
-        exit "$code"
-    }
-    trap restore_relay_service EXIT
+# 配置向导（模型、应用机器人凭据、外链）在服务继续运行时填写：在机器人容器的镜像（按 ID）中以服务身份运行，有网络（核对凭据、
+# 列出模型），只读挂载 data/ 作为基准，回答写进私有暂存目录（含凭据，退出时删除）。确认后交给共用核心，与网页配置相同：停机前
+# 预检，停机、写入，按原运行状态启动并核对就绪，失败时恢复原配置。取消时向导不写暂存，配置和服务保持原状。
+# 用法：configure_with_wizard <说明> <scripts/config 下的向导> <配置类型 models|app|relay>
+configure_with_wizard() (
+    local label="$1" wizard="$2" kind="$3" image='' user='' stage='' status=0
+    command -v docker >/dev/null 2>&1 || { ER "找不到 docker"; return 1; }
+    [ -t 0 ] && [ -t 1 ] || { ER "${label}需要在终端里运行向导；配置和服务保持原状"; return 1; }
+    if [ -e "$STATE_DIR/deploy-transaction" ]; then
+        ER "有未完成的部署或升级；请先用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"; return 1
+    fi
+    image="$(docker container inspect --format '{{.Image}}' "$CONTAINER" 2>/dev/null)" || { ER "机器人容器不存在，请先部署"; return 1; }
+    user="$(service_container_user)" || return 1
+    mkdir -p -- "$PROJECT_DIR/tmp" && stage="$(mktemp -d "$PROJECT_DIR/tmp/configure-stage-XXXXXXXX")" || { ER "无法创建配置暂存目录"; return 1; }
+    trap 'rm -rf -- "$stage"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    cd "$PROJECT_DIR" || return 1
-    # 一次性容器以服务的运行身份读写草稿；rootless 下草稿本来就属于部署用户（容器里的 0:0）。
-    user="$(service_container_user)" || return 1
-    if [ "$(id -u)" = 0 ]; then chown "$user" "$draft_dir" || return 1; fi
-    container_draft="/app/data/config/$(basename "$draft_dir")/draft.json"
-    relay_config_cli() {
-        local terminal=()
-        if [ "$1" = "--draft" ]; then
-            terminal=(-i)
-            if [ -t 0 ] && [ -t 1 ]; then terminal+=(-t); fi
-        fi
-        docker run --rm "${terminal[@]}" --user "$user" -e HOME=/app/data/runtime/home \
-            -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
-            mixin-chatbot bun run scripts/config/configure-relay.ts "$1" "$container_draft"
-    }
-    # 复用镜像内的 Bun 和依赖；向导在独立容器里填写草稿，不影响正在运行的机器人。
-    relay_config_cli --draft || return 1
-    [ -f "$draft_file" ] || return 0
-    local state=""
-    state="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.State}}')" || {
-        ER "无法查询容器状态，外链配置未写入"; return 1;
-    }
-    if [ "$state" = "running" ]; then
-        was_running=1
-        stop_attempted=1
-        P "外链配置已确认，短暂停止机器人以应用设置"
-        docker stop "$CONTAINER" >/dev/null || { ER "停止容器失败，外链配置未写入"; return 1; }
+    if [ "$(id -u)" = 0 ]; then chown -- "$user" "$stage" || return 1; fi
+    docker run --rm -it --user "$user" -w /app -e HOME=/tmp -v "$PROJECT_DIR/data:/app/data:ro" -v "$stage:/preview" \
+        "$image" bun run "scripts/config/$wizard" --stage /preview || status=$?
+    if [ ! -s "$stage/configuration-$kind.json" ]; then
+        if [ "$status" = 0 ] || [ "$status" = 2 ]; then WA "${label}已取消；配置和服务保持原状"; return 0; fi
+        ER "${label}未完成（原因见上方）；配置和服务保持原状"; return 1
     fi
-    relay_config_cli --apply || return 1
-    if [ "$was_running" = 0 ]; then OK "外链设置将在下次启动机器人时生效；已保持停止状态"; fi
-)
-
-# 配置向导（模型或应用机器人凭据）在维护租约下运行，要求机器人停止；整个过程持有部署锁，结束后恢复原运行状态。
-# 向导在草稿中填写，确认后才替换配置文件，取消或失败时原配置不变。应用机器人向导只取一次应用 token 验证凭据，不连 Stream。
-wizard_configure() (
-    local script="$1" label="$2" user="" state="" was_running=0 terminal=(-i)
-    if ! command -v docker >/dev/null 2>&1; then ER "找不到 docker"; return 1; fi
-    guard_one_off_container || return 1
-    cd "$PROJECT_DIR" || return 1
-    user="$(service_container_user)" || return 1
-    state="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.State}}')" || {
-        ER "无法查询容器状态，${label}未开始"; return 1;
-    }
-    restore_wizard_service() {
-        local code=$?
-        trap - EXIT INT TERM
-        if [ "$was_running" = 1 ]; then start_bot || code=1; fi
-        exit "$code"
-    }
-    trap restore_wizard_service EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    if [ "$state" = "running" ]; then
-        was_running=1
-        P "停止机器人以进行${label}；向导结束后恢复运行"
-        docker stop "$CONTAINER" >/dev/null || { ER "停止容器失败，${label}未开始"; return 1; }
-    fi
-    if [ -t 0 ] && [ -t 1 ]; then terminal+=(-t); fi
-    docker run --rm "${terminal[@]}" --user "$user" -e HOME=/app/data/runtime/home \
-        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
-        mixin-chatbot bun run "$script" || { ER "${label}未完成；原配置保持不变"; return 1; }
-    if [ "$was_running" = 0 ]; then OK "${label}将在下次启动机器人时生效；已保持停止状态"; fi
+    ops_core maintenance configuration-apply --stage "$stage/configuration-$kind.json"
 )
 
 # 读本机服务状态的 Bun 脚本：宿主机有 Bun 时直接运行，否则在运行中的容器里执行（与 bot_local_ready 一致）。
@@ -412,79 +346,27 @@ service_bun() {
     else docker exec "$CONTAINER" bun run "$@"; fi
 }
 
-# 应用 TUI 已确认的运行参数；整个停机、发布和恢复过程与部署互斥。
-runtime_configure() (
-    local draft_name="${1:-}" draft_file="" owner="" image="mixin-chatbot"
-    local was_running=0 stop_attempted=0 committed=0 state="" environment=""
-    local runtime_env=()
-    if ! [[ "$draft_name" =~ ^\.runtime-draft-[a-f0-9-]{36}\.json$ ]]; then ER '运行参数草稿名称无效'; return 1; fi
-    if ! command -v docker >/dev/null 2>&1; then ER '找不到 docker'; return 1; fi
-    acquire_deploy_lock || { ER '另一个部署或设置操作正在进行'; return 1; }
-    draft_file="${CONFIG_DIR}/${draft_name}"
-    [ -f "$draft_file" ] || { ER '找不到已确认的运行参数草稿'; return 1; }
-    [ ! -f "${draft_file}.rollback" ] || { ER '此草稿留有未完成的恢复材料，请先完成恢复后再重新保存'; return 1; }
-    cd "$PROJECT_DIR" || return 1
-    owner="$(stat -c '%u:%g' "$CONFIG_DIR")" || return 1
-    if [ "$(stat -c '%u:%g' "$draft_file")" != "$owner" ]; then chown "$owner" "$draft_file" || return 1; fi
-    runtime_config_cli() {
-        # 复用部署镜像的依赖，并挂载当前代码；git 更新后无需先重建镜像才能打开设置。
-        docker run --rm --user "$(container_user "$owner")" -e HOME=/app/data/runtime/home "${runtime_env[@]}" \
-            -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
-            -v "${PROJECT_DIR}/scripts:/app/scripts:ro" -v "${PROJECT_DIR}/src:/app/src:ro" \
-            "$image" bun run scripts/config/runtime-settings.ts "$1" "$draft_name"
-    }
-    restore_runtime_configuration() {
-        local code=$? recovered=1
-        trap - EXIT INT TERM
-        if [ "$committed" = 0 ]; then
-            if [ -f "${draft_file}.rollback" ]; then
-                if [ "$was_running" = 1 ]; then docker stop "$CONTAINER" >/dev/null || recovered=0; fi
-                if [ "$recovered" = 1 ]; then runtime_config_cli --rollback || recovered=0; fi
-            fi
-            if [ "$was_running" = 1 ] && [ "$stop_attempted" = 1 ] && [ "$recovered" = 1 ]; then
-                start_bot || recovered=0
-            fi
-        fi
-        if [ "$recovered" = 1 ]; then rm -f -- "$draft_file" "${draft_file}.rollback" || code=1
-        else ER "原参数或服务恢复失败，请查看日志；恢复材料：${draft_file}.rollback"; code=1; fi
-        exit "$code"
-    }
-    trap restore_runtime_configuration EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    # 未完成事务的容器和正式标签可能与数据不一致（见 guard_one_off_container）；已持有部署锁，只检查事务。
-    guard_one_off_container || return 1
-    state="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.State}}')" || {
-        ER '无法查询容器状态，运行参数未写入'; return 1;
-    }
-    case "$state" in ''|running|exited|created) ;; *) ER "容器处于 ${state} 状态，请恢复正常后再修改运行参数"; return 1 ;; esac
-    if [ -n "$state" ]; then
-        local mounted_data=""
-        mounted_data="$(docker container inspect --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER")" || return 1
-        if [ -z "$mounted_data" ] || [ "$(realpath -m -- "$mounted_data")" != "$(realpath -m -- "$DATA_DIR")" ]; then
-            ER '容器的数据目录不属于当前项目，未修改配置或服务'; return 1
-        fi
-        image="$(docker container inspect --format '{{.Image}}' "$CONTAINER")" || return 1
-        environment="$(docker container inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER")" || return 1
-        # 只传递受支持的高级参数以检查实际容器的环境覆盖，不输出其他环境变量或凭据。
-        while IFS= read -r setting; do
-            case "${setting%%=*}" in
-                BOT_MAX_ACTIVE_REQUESTS|BOT_BASH_TIMEOUT|BOT_INDEX_TTL_MINUTES|BOT_INDEX_MAX_FILES|BOT_INDEX_MAX_DEPTH|BOT_RUN_TIMEOUT_SECONDS|BOT_MODEL_IDLE_TIMEOUT_SECONDS|BOT_MODEL_RESPONSE_TIMEOUT_SECONDS|BOT_SHUTDOWN_TIMEOUT_SECONDS|BOT_DOCUMENT_ENV|BOT_DOCUMENT_WORK_ENABLED|BOT_DOCUMENT_PPTX_TEMPLATE|BOT_DOCUMENT_DOCX_TEMPLATE|PI_CACHE_RETENTION|BOT_ATTACHMENT_CONCURRENCY)
-                    runtime_env+=(-e "$setting") ;;
-            esac
-        done <<< "$environment"
+# 修改通讯录同步范围，经运行中服务保存，保存即开始应用：all 为整个通讯录；不带参数时在终端里逐层勾选部门（与部署向导同一套
+# 选择）。宿主机没有 Bun 或项目依赖（向导要用 @clack/prompts）时，向导在运行中的容器里交互执行（docker exec -it）。
+# 参数原样交给 directory-admin.ts，由它拒绝部门 ID、多余的参数和没有终端的情况（不默认整个通讯录）。
+directory_scope() {
+    if [ "$#" = 0 ] && [ -t 0 ] && [ -t 1 ] && ! { command -v bun >/dev/null 2>&1 && [ -d "$PROJECT_DIR/node_modules" ]; }; then
+        docker exec -it "$CONTAINER" bun run scripts/ops/directory-admin.ts scope
+    else
+        service_bun scripts/ops/directory-admin.ts scope "$@"
     fi
-    runtime_config_cli --check || return 1
-    if [ "$state" = running ]; then
-        was_running=1; stop_attempted=1
-        P '运行参数已确认，短暂停止机器人以应用设置'
-        docker stop "$CONTAINER" >/dev/null || { ER '停止容器失败，运行参数未写入'; return 1; }
-    fi
-    runtime_config_cli --apply || return 1
-    if [ "$was_running" = 1 ]; then start_bot || return 1
-    else OK '运行参数已保存；机器人保持停止，下次启动生效'; fi
-    committed=1
-)
+}
+
+# 应用控制台已确认的运行参数草稿：由运维核心执行，整个停机、发布和恢复过程与部署互斥。
+runtime_configure() {
+    ops_core maintenance runtime-configure "$@"
+}
+
+# 已确认的网页配置草稿；秘密只经 stdin 进入服务身份，控制台目录不挂载给容器。
+configuration_admin() {
+    local action="$1"; shift
+    ops_core maintenance "configuration-$action" "$@"
+}
 
 # 数据操作由 Bun 统一管理存储边界；一次性容器按部署时的规则只读挂载外置共享资料目录，
 # 与服务看到的资料一致。
@@ -499,7 +381,8 @@ data_admin() {
         return $?
     fi
     guard_one_off_container || return 1
-    WA "容器未在运行，改用一次性容器执行"
+    # 提示写到标准错误：脚本的标准输出可能是给调用方读取的结构化结果（--json、--shell）。
+    WA "容器未在运行，改用一次性容器执行" >&2
     local user workspace_args=() TASK_RUNTIME_ARGS=() TASK_DOCKER_ENDPOINT='' TASK_DOCKER_ID='' task_rootless=0
     # 任务 socket 必须属于服务身份，先确定身份再核对。
     user="$(service_container_user)" || return 1
@@ -522,138 +405,55 @@ data_admin() {
 
 # 清理清单始终落到宿主机 tmp/；运行中服务的只读容器没有该目录的可写挂载。
 backup_admin() {
-    command -v docker >/dev/null 2>&1 || { ER "找不到 docker"; return 1; }
-    guard_one_off_container || return 1
-    local user directory reports="$PROJECT_DIR/tmp/backup-cleanup"
-    user="$(service_container_user)" || return 1
-    for directory in "$PROJECT_DIR/tmp" "$reports"; do
-        if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then
-            ER "报告目录是链接或不是目录：$directory"; return 1
-        fi
-    done
-    if [ ! -d "$reports" ]; then
-        mkdir -p -- "$reports" || return 1
-        if [ "$(id -u)" = 0 ]; then chown "$user" "$reports" || return 1; fi
-    fi
-    docker run --rm --user "$user" -e HOME=/app/data/runtime/home \
-        -v "${PROJECT_DIR}/data:/app/data" -v "${PROJECT_DIR}/backup:/app/backup" \
-        -v "$reports:/app/tmp/backup-cleanup" \
-        mixin-chatbot bun run scripts/ops/backup-cleanup.ts "$@"
+    local action="$1"; shift
+    [ "$action" != apply ] || action=clean
+    ops_core maintenance "backup-$action" "$@"
 }
 
-tmp_admin() (
-    local argument
-    for argument in "$@"; do
-        case "$argument" in --legacy|--legacy=*) ER '旧共享目录回收必须在宿主独立停机维护中执行；ops 不自动恢复该操作'; return 1 ;; esac
-    done
-    # 预览只读取数据并保存清单，服务照常运行；执行清单（--digest）和一步完成的 purge 才停机。
-    local confirming=0
-    for argument in "$@"; do
-        case "$argument" in --digest|--digest=*) confirming=1 ;; esac
-    done
-    if [ "${1:-}" = list ] || { [ "$confirming" = 0 ] && [ "${1:-}" != purge ]; }; then
-        data_admin scripts/ops/tmp-admin.ts "$@"; return $?
-    fi
-    local was_running=0 restored=0
-    restore_tmp_service() {
-        local code=$?
-        trap - EXIT INT TERM
-        if [ "$was_running" = 1 ] && [ "$restored" = 0 ]; then start_bot || code=1; fi
-        exit "$code"
-    }
-    trap restore_tmp_service EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    guard_one_off_container || return 1
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
-        was_running=1
-        stop_bot || return 1
-    fi
-    local code=0
-    data_admin scripts/ops/tmp-admin.ts "$@" || code=$?
-    if [ "$was_running" = 1 ]; then start_bot || return 1; fi
-    restored=1
-    return "$code"
+tmp_admin() {
+    local action="$1"; shift
+    [ "$action" != list ] || action=ls
+    ops_core maintenance "tmp-$action" "$@"
+}
+
+# 清历史先停服务（运行中的机器人独占会话库）；共用核心在停机窗口中执行，完成后恢复调用前的运行或停止状态。
+history_clear() {
+    ops_core maintenance "history-${HISTORY_OPERATION:-clear}" "$@"
+}
+
+# 会话库旧修订链的整理（升级时跳过或中断后补做）、从备份恢复与会话库文件收缩：preview、status、shrink-preview、
+# shrink-status 只读，服务照常运行；shrink-remove-old 只删除已完成的收缩保留的原库（不加 --yes 只列出），也不停机；
+# apply、skip、abandon、restore、shrink 停机执行。机器人在运行时先问维护状态是否允许这个动作，不允许就不停机。动作
+# 结束后是否重新启动只看重读的维护状态（maintenance.ts assess --intent service），不看动作的结果：不允许（在途文档、
+# 要求从备份恢复、收缩未替换完等）或判断失败时保持停机，按提示处理。部署或升级事务未完成时 restore 由核心用事务记录的
+# 版本执行（事务中的整理要求恢复时，自动回滚在恢复数据之前停止）；其余动作拒绝。
+revision_cleanup() (
+    local action="${1:-}"
+    case "$action" in
+        preview|status|shrink-preview|shrink-status|shrink-remove-old) shift; data_admin scripts/runtime/revision-cleanup.ts "$action" --project /app "$@"; return $? ;;
+        apply|skip|abandon|restore|shrink) ;;
+        *) ER "用法：ops.sh revision-cleanup <preview|status|apply|skip|abandon|restore|shrink-preview|shrink|shrink-status|shrink-remove-old> [--space <空间>] [--yes]"; return 1 ;;
+    esac
+    shift
+    ops_core revision-cleanup "$action" "$@"
 )
 
-# 清历史先停服务（运行中的机器人独占会话库）；完成后恢复调用前的运行或停止状态。
-history_clear() (
-    if [ -z "${1:-}" ]; then ER "history-${HISTORY_OPERATION:-clear} 需要群号或 --direct"; return 1; fi
-    local was_running=0 restored=0
-    restore_history_service() {
-        local code=$?
-        trap - EXIT INT TERM
-        if [ "$was_running" = 1 ] && [ "$restored" = 0 ]; then start_bot || code=1; fi
-        exit "$code"
-    }
-    trap restore_history_service EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    # 停服务之前取得部署锁并检查事务，整个过程持有：停机后清理在一次性容器中执行。
-    guard_one_off_container || return 1
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
-        was_running=1
-        stop_bot || return 1
-    fi
-    local code=0
-    data_admin scripts/ops/history-admin.ts "${HISTORY_OPERATION:-clear}" "$@" || code=$?
-    if [ "$was_running" = 1 ]; then start_bot || return 1; fi
-    restored=1
-    return "$code"
-)
+# 同一核心负责统计快照/WAL 复制、停机、导入、恢复和副本清理；脚本不另行解释范围。
+stat_import() {
+    ops_core maintenance stat-import "$@"
+}
 
-# 一次性导入旧版统计：旧账本可在任意位置（TUI 统计页按 i 浏览选择）。一次性容器只挂载 data/ 和 backup/，
-# 所以先把所选文件（连同未合并的 -wal）复制进 backup/ 下的私有临时目录，导入后删除；原文件不改动。
-# 停机导入后恢复原运行状态。
-stat_import() (
-    local file="${1:-}" stage="" user="" was_running=0 restored=0
-    [ -n "$file" ] || { ER "stat-import 需要旧统计账本的路径，例如 ops.sh stat-import /srv/old/data/groups/stats.sqlite"; return 1; }
-    [ -f "$file" ] && [ ! -L "$file" ] || { ER "找不到旧统计账本（或它是链接）：$file"; return 1; }
-    restore_import_service() {
-        local code=$?
-        trap - EXIT INT TERM
-        if [ "$was_running" = 1 ] && [ "$restored" = 0 ]; then start_bot || code=1; fi
-        if [ -n "$stage" ]; then rm -rf -- "$stage" || code=1; fi
-        exit "$code"
-    }
-    trap restore_import_service EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    guard_one_off_container || return 1
-    mkdir -p -- "$PROJECT_DIR/backup" || return 1
-    stage="$(mktemp -d "$PROJECT_DIR/backup/.stat-import-XXXXXX")" || return 1
-    cp -- "$file" "$stage/stats.sqlite" || { ER "无法复制旧统计账本：$file"; return 1; }
-    if [ -f "$file-wal" ]; then cp -- "$file-wal" "$stage/stats.sqlite-wal" || { ER "无法复制旧统计账本的 -wal：$file-wal"; return 1; }; fi
-    # 一次性容器以服务身份读取副本；rootless 下副本本来就属于部署用户（容器里的 0:0）。
-    user="$(service_container_user)" || return 1
-    if [ "$(id -u)" = 0 ]; then chown -R "$user" "$stage" || return 1; fi
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
-        was_running=1
-        stop_bot || return 1
-    fi
-    local code=0
-    data_admin scripts/ops/stats-import.ts "/app/backup/$(basename "$stage")/stats.sqlite" || code=$?
-    if [ "$was_running" = 1 ]; then start_bot || return 1; fi
-    restored=1
-    return "$code"
-)
-
-# git_here 和 restore_checkout 在 scripts/lib/common.sh，升级器和旧版升级记录的回滚共用。
-
-# 未完成的部署或升级只能继续或回滚；非交互调用必须用 resume / rollback 明确指定。
-# 升级只剩代码待恢复时只能完成回滚。
+# 未完成的部署或升级只能继续或回滚；非交互调用必须用 resume / rollback 明确指定。已经开始回滚的事务由核心拒绝继续。
 choose_pending_action() {
-    local choice menu='1 继续上次操作  2 回滚到操作前  0 退出 [默认 0]：' restore_only=0
-    if transaction_code_restore_pending; then restore_only=1; menu='2 完成回滚（只恢复代码）  0 退出 [默认 0]：'; fi
+    local choice
     if [ ! -t 0 ]; then
-        if [ "$restore_only" = 1 ]; then ER "上次升级只剩代码待恢复；请使用 $(ops_command_hint rollback) 完成回滚"
-        else ER "发现未完成的部署或升级；请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"; fi
+        ER "发现未完成的部署或升级；请使用 $(ops_command_hint resume) 继续，或 $(ops_command_hint rollback) 回滚"
         return 1
     fi
     while true; do
-        IFS= read -r -p "$menu" choice || choice=0
+        IFS= read -r -p '1 继续上次操作  2 回滚到操作前  0 退出 [默认 0]：' choice || choice=0
         case "$(printf '%s' "$choice" | tr -d '[:space:]')" in
-            1) if [ "$restore_only" = 1 ]; then WA '数据、配置和容器已经回滚，不能继续；请输入 2 或 0'; else PENDING_ACTION=continue; return 0; fi ;;
+            1) PENDING_ACTION=continue; return 0 ;;
             2) PENDING_ACTION=rollback; return 0 ;;
             ''|0) WA '未处理上次操作，服务保持当前状态'; return 1 ;;
             *) WA '请输入 1、2 或 0' ;;
@@ -697,7 +497,29 @@ forward_to_upgrader() {
     [ -z "${UPGRADER_PID:-}" ] || kill -TERM "$UPGRADER_PID" 2>/dev/null || true
 }
 
-# 从目标提交导出升级器到 tmp/upgrade-*，在工作区外运行：停机、切换代码、迁移和回滚都由目标版本负责。
+# 在后台运行升级器（或运维核心）并等它结束，以便转发中断：收到 INT/TERM/HUP（Ctrl+C、终止信号、断线）时让它按所处
+# 阶段回滚。标准输入照常交给它（停机前要提问）。返回它的退出码。
+run_forwarding() {
+    local status=0 again=0
+    trap forward_to_upgrader INT TERM HUP
+    "$@" <&0 &
+    UPGRADER_PID=$!
+    while :; do
+        if wait "$UPGRADER_PID"; then status=0; else status=$?; fi
+        kill -0 "$UPGRADER_PID" 2>/dev/null || break
+    done
+    # 中断打断的 wait 返回 128+信号；它在那之后才结束时，它自己的退出码还在，再取一次。
+    if [ "$status" -gt 128 ]; then
+        wait "$UPGRADER_PID" 2>/dev/null || again=$?
+        [ "$again" = 127 ] || status="$again"
+    fi
+    UPGRADER_PID=''
+    trap - INT TERM HUP
+    return "$status"
+}
+
+# 从目标提交导出升级器到 tmp/upgrade-*，在工作区外运行：停机前的准备由它负责，停机、切换代码、迁移和回滚由它交给目标
+# 版本的运维核心。
 run_target_upgrader() {
     local target="$1" action="${2:-}" status=0
     mkdir -p "$PROJECT_DIR/tmp" || return 1
@@ -709,32 +531,54 @@ run_target_upgrader() {
         return 1
     fi
     operation_stage target-upgrader
-    # 升级器在后台运行以便转发中断：收到 INT/TERM/HUP（Ctrl+C、终止信号、断线）时让它按所处阶段回滚，等它结束后才清理
-    # 导出目录，升级器的提交回执也在其中。
-    trap forward_to_upgrader INT TERM HUP
-    bash "$UPGRADE_STAGE/scripts/deploy/upgrade.sh" "$PROJECT_DIR" "$target" ${action:+"$action"} <&0 &
-    UPGRADER_PID=$!
-    while :; do
-        if wait "$UPGRADER_PID"; then status=0; else status=$?; fi
-        kill -0 "$UPGRADER_PID" 2>/dev/null || break
-    done
-    UPGRADER_PID=''
-    trap - INT TERM HUP
+    # 升级器结束后才清理导出目录：它导出的源码树和交给核心的准备记录都在其中。
+    run_forwarding bash "$UPGRADE_STAGE/scripts/deploy/upgrade.sh" "$PROJECT_DIR" "$target" ${action:+"$action"} || status=$?
     remove_upgrade_stage
     return "$status"
 }
 
+# 运维核心已写入结构化结果（原运行状态、最终状态和就绪）。结果文件每个控制台任务一份，不会是旧的；核心在写入之前就被终止时，
+# 由 finish_lifecycle_result 按实际状态报告。
+core_reported() {
+    [ -n "${MIXIN_OPS_RESULT_FILE:-}" ] && [ -e "$MIXIN_OPS_RESULT_FILE" ]
+}
+
 # 升级前运行的服务会被重新启动：再做一次完整体检；原先停止的保持停止。
 # 升级按已保存设置或事务记录完成并写回：体检参数按持久化设置重新读取，不用当前终端的环境变量。
+# 控制台任务的结果由运维核心写入，它交还前已核对新实例就绪；退出码要与那份结果一致，这里不再体检。
 after_upgrade() {
+    if core_reported; then return 0; fi
     load_saved_settings
     check_ordinary_settings
     if [ "$(docker container inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; then doctor; return $?; fi
     OK "保留原停止状态，使用 start 可启动新版本"
 }
 
+# 运维核心开始的升级在目标提交不在本地时，由事务固定的运行包回滚（它在开始时冻结了目标版本的运维核心）。运行包也不在
+# 时无法回滚，保留现场。
+rollback_with_pinned_core() {
+    local core runtime
+    core="$(ops_pinned_core "$TRANSACTION_SNAPSHOT")" || {
+        ER "目标提交 ${TRANSACTION[target_sha]:0:7} 和事务固定的运维运行包都不在本地，无法回滚；请取回该提交（git fetch）后重试，服务和数据保持现状"; return 1; }
+    runtime="$(ops_bun)" || return 1
+    WA "目标提交 ${TRANSACTION[target_sha]:0:7} 在本地不存在；由事务固定的运维运行包回滚"
+    run_forwarding "$runtime" --no-env-file "$core" deployment upgrade --project "$PROJECT_DIR" --original "${TRANSACTION[original_sha]}" \
+        --target "${TRANSACTION[target_sha]}" --branch "${TRANSACTION[original_branch]}" --rollback </dev/null
+}
+
+# 未完成的部署：由事务固定的运维运行包按事务记录继续或回滚，不重新询问。运行包不在时用当前版本的核心，它只接受代码完全相同
+# 的版本。
+resume_recorded_deploy() {
+    local action="$1" core runtime args=()
+    core="$(ops_pinned_core "$TRANSACTION_SNAPSHOT")" || core="$OPS_SOURCE_DIR/scripts/ops/core/cli.ts"
+    runtime="$(ops_bun)" || return 1
+    [ "$action" != rollback ] || args=(--rollback)
+    run_forwarding "$runtime" --no-env-file "$core" deployment deploy --project "$PROJECT_DIR" "${args[@]}" </dev/null
+}
+
 # 未完成的升级：从记录的目标提交（本地已有，不拉取）导出升级器继续或回滚。
-# 目标提交在本地缺失时无法继续；此时代码必然尚未切换，回滚交给当前版本的部署脚本。
+# 目标提交在本地缺失时无法继续；此时代码必然尚未切换（或已经恢复），回滚交给事务固定的运维运行包。没有固定运行包记录的
+# 事务是旧版本脚本开始的，本版本不接手。
 resume_recorded_upgrade() {
     local action="$1" target="${TRANSACTION[target_sha]}"
     require_git_checkout || return 1
@@ -752,17 +596,65 @@ resume_recorded_upgrade() {
         ER "目标提交 ${target:0:7} 在本地不存在，当前代码也不是升级前的 ${TRANSACTION[original_sha]:0:7}；请人工检查 git 状态"
         return 1
     fi
-    if transaction_code_restore_pending; then
-        rm -f -- "$STATE_DIR/deploy-transaction" || { ER '事务指针清除失败，请重试'; return 1; }
-        OK "升级已回滚：代码已是升级前的 ${TRANSACTION[original_sha]:0:7}，数据、配置和原运行状态已恢复"
-        return 0
-    fi
-    WA "目标提交 ${target:0:7} 在本地不存在；代码尚未切换，由当前版本的部署脚本回滚"
-    DEPLOY_TRANSACTION_ACTION=rollback bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" </dev/null
+    if [ -f "$TRANSACTION_SNAPSHOT/host-runtime" ]; then rollback_with_pinned_core; return; fi
+    ER "这次升级不是由运维核心开始的（快照中没有固定运行包记录 host-runtime），本版本不能继续或回滚它；服务和数据保持现状，请人工检查 ${TRANSACTION_SNAPSHOT}"
+    return 1
 }
 
 # 在主 shell 中运行（不是子 shell）：发给 ops.sh 的 TERM 才能由升级器转发处理，否则只杀掉父进程，升级在后台继续。
 # 升级是 ops.sh 的最后一个命令，退出陷阱在脚本结束时运行。
+finish_lifecycle_result() {
+    local code="$1" was_running="$2" state outcome=failed message='操作未完成，请查看任务日志和恢复状态'
+    [ -n "${MIXIN_OPS_RESULT_FILE:-}" ] || return "$code"
+    # 运维核心执行的部署和升级自己写入结构化结果，退出码与它一致；不覆盖。
+    ! core_reported || return "$code"
+    state="$(final_run_state)"
+    # No start/stop here: lifecycle scripts own recovery. Re-read saved state after their last mutation.
+    if [ "$state" = running ]; then
+        load_saved_settings
+        if ! wait_for_local; then state=start-requested; [ "$code" != 0 ] || code=1; fi
+    elif [ "$state" = unknown ]; then [ "$code" != 0 ] || code=1; fi
+    # 没有取得部署锁（被占用、锁文件异常或计划复核未通过）：什么都没有执行。
+    if [ -n "${DEPLOY_LOCK_REFUSAL:-}" ]; then
+        outcome=refused; message="$DEPLOY_LOCK_REFUSAL"; [ "$code" != 0 ] || code=1
+    elif [ -e "$STATE_DIR/deploy-transaction" ] || [ -e "$STATE_DIR/upgrade-transaction" ]; then
+        [ "$code" != 0 ] || code=1
+        message='事务尚未结束，请刷新维护页后继续或回滚'
+    elif [ "$code" = 0 ]; then outcome=success; message='操作完成'; fi
+    ops_result "$outcome" "$was_running" "$state" "$code" "$message" || [ "$code" != 0 ] || code=1
+    return "$code"
+}
+
+finish_update() {
+    local status=$?
+    trap - EXIT
+    remove_upgrade_stage
+    if finish_lifecycle_result "$status" "${UPDATE_WAS_RUNNING:-0}"; then status=0; else status=$?; fi
+    operation_finish "$status"
+    exit "$status"
+}
+
+finish_deploy_command() {
+    local status=$?
+    trap - EXIT
+    if finish_lifecycle_result "$status" "${DEPLOY_WAS_RUNNING:-0}"; then status=0; else status=$?; fi
+    operation_finish "$status"
+    exit "$status"
+}
+
+# The deployer owns commit and rollback. Keep this fixed wrapper alive to report its actual final state. The wrapper takes
+# deploy.lock and rechecks the console plan first, so a refusal is reported as one; the deployer inherits the lock on fd 9.
+deploy_command() {
+    if [ "${MIXIN_OPS_CONSOLE:-}" != 1 ]; then exec bash "$PROJECT_DIR/scripts/deploy/deploy.sh" "$OPS_COMMAND"; fi
+    operation_start deploy
+    DEPLOY_WAS_RUNNING=0; UPGRADER_PID=''
+    [ "$(final_run_state)" != running ] || DEPLOY_WAS_RUNNING=1
+    trap finish_deploy_command EXIT
+    assert_console_lifecycle deploy || return 1
+    acquire_deploy_lock || { [ $? = 2 ] || ER "另一个部署、升级或维护操作正在进行；部署未开始"; return 1; }
+    MIXIN_OPS_PROJECT="$PROJECT_DIR" run_forwarding bash "$OPS_SOURCE_DIR/scripts/deploy/deploy.sh" "$OPS_COMMAND" </dev/null
+}
+
 update() {
     local confirmed="${1:-}"
     if [ -n "$confirmed" ] && ! [[ "$confirmed" =~ ^[0-9a-f]{40}$ ]]; then
@@ -771,12 +663,16 @@ update() {
     operation_start upgrade
     UPGRADE_STAGE=''
     UPGRADER_PID=''
-    trap 'status=$?; remove_upgrade_stage; operation_finish "$status"' EXIT
-    acquire_deploy_lock || { ER "另一个部署或升级正在进行"; return 1; }
+    UPDATE_WAS_RUNNING=0
+    if [ -n "${MIXIN_OPS_RESULT_FILE:-}" ] && [ "$(final_run_state)" = running ]; then UPDATE_WAS_RUNNING=1; fi
+    trap finish_update EXIT
+    acquire_deploy_lock || { [ $? = 2 ] || ER "另一个部署、升级或维护操作正在进行"; return 1; }
     local action="${UPDATE_TRANSACTION_ACTION:-}"
     # The lock remains held across dispatch and the child deployer.
     if [ -n "${UPDATE_TRANSACTION_CONFIRMATION:-}" ]; then
-        bun "$PROJECT_DIR/scripts/lib/confirmed-transaction.ts" "$PROJECT_DIR" "$action" "$UPDATE_TRANSACTION_CONFIRMATION" || return 1
+        local runtime
+        runtime="$(ops_bun)" || return 1
+        "$runtime" --no-env-file "$OPS_SOURCE_DIR/scripts/lib/confirmed-transaction.ts" "$PROJECT_DIR" "$action" "$UPDATE_TRANSACTION_CONFIRMATION" || return 1
     fi
     # 未完成的事务最先处理，早于检查改动和拉取：继续固定使用记录的目标提交（本地已有），离线也能继续或回滚。
     if [ -e "$STATE_DIR/deploy-transaction" ]; then
@@ -785,13 +681,14 @@ update() {
         WA "$(describe_pending_transaction)"
         if [ -z "$action" ]; then choose_pending_action || return 1; action="$PENDING_ACTION"; fi
         # 仅恢复当前事务格式；后续脚本关闭标准输入，沿用已保存的决定。
-        if [ "${TRANSACTION[operation]}" = upgrade ]; then resume_recorded_upgrade "$action"; return; fi
-        # 中断的是部署：交给部署脚本按事务记录继续或回滚。
-        DEPLOY_TRANSACTION_ACTION="$action" bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" </dev/null
+        if [ "${TRANSACTION[operation]}" = upgrade ]; then resume_recorded_upgrade "$action"; else resume_recorded_deploy "$action"; fi
         return
     elif [ -n "$action" ]; then
         OK '没有未完成的部署或升级'
         return 0
+    fi
+    if [ "${MIXIN_OPS_CONSOLE:-}" = 1 ] && [ -z "$confirmed" ]; then
+        ER '控制台升级缺少已确认目标，未拉取或停止服务'; return 1
     fi
 
     P "同步到 origin/main，由目标版本的升级器完成升级"
@@ -820,7 +717,7 @@ update() {
         target="$(git_here rev-parse --verify --quiet 'origin/main^{commit}')" || { ER "无法解析 origin/main；请确认远端存在 main 分支"; return 1; }
     fi
     operation_event info "original=$(git_here rev-parse HEAD 2>/dev/null) target=$target"
-    # 停机前的预检和迁移预览，停机、切换代码和回滚都由目标版本的升级器负责。
+    # 停机前的预检和预览由目标版本的升级器负责；停机、切换代码、迁移和回滚由它交给目标版本的运维核心。
     run_target_upgrader "$target" || return $?
     after_upgrade
 }
@@ -833,6 +730,10 @@ show_logs() {
 
 uninstall() {
     P "卸载 mixin-chatbot"
+    # 部署锁持有到卸载结束（fd 9），与部署、升级和运维任务互斥；核心在锁内拒绝仍需要本部署的未完成事务、运维任务和配置提交：
+    # 升级中断时回滚容器就是原服务，data/ 里有事务记录，删掉或归档后都无法续做或回滚。
+    acquire_deploy_lock || { [ $? = 2 ] || ER "部署、升级或另一个维护操作正在进行；卸载未开始"; return 1; }
+    ops_core uninstall-check || { ER "卸载未开始（原因见上方）"; return 1; }
     if has_container; then
         if ! docker stop "$CONTAINER" >/dev/null 2>&1; then
             ER "容器停止失败；为避免删除仍在使用的数据，卸载已停止"
@@ -884,33 +785,33 @@ uninstall() {
 # 新升级由升级器在停机前校验已保存设置。部署脚本自行校验设置；其余操作采用环境变量并先校验。
 case "${1:-}" in
     update|upgrade|resume|rollback) use_transaction_settings ;;
-    deploy) ;;
+    deploy|repair|maintenance-recover) ;;
     *)
         if [ -n "${BOT_PORT:-}" ]; then PORT="$BOT_PORT"; fi
         check_ordinary_settings
         ;;
 esac
 
+# 结构化结果里的命令名（ops_result）。
+OPS_COMMAND="${1:-}"
 case "${1:-}" in
-    deploy) exec bash "${PROJECT_DIR}/scripts/deploy/deploy.sh" ;;
+    deploy|repair) deploy_command ;;
     doctor|status) doctor ;;
     update|upgrade) update "${2:-}" ;;
     resume)    transaction_command continue "${@:2}" ;;
     rollback)  transaction_command rollback "${@:2}" ;;
-    restart)   restart_bot ;;
-    stop)      stop_bot ;;
-    start)     start_bot ;;
+    restart|stop|start) service_command "$@" ;;
     logs)      show_logs ;;
-    relay-configure) relay_configure ;;
-    model-configure) wizard_configure configure 模型配置 ;;
-    configure-app-bot) wizard_configure configure-app-bot 应用机器人配置 ;;
+    relay-configure) configure_with_wizard 外链配置 configure-relay.ts relay ;;
+    model-configure) configure_with_wizard 模型配置 configure.ts models ;;
+    configure-app-bot) configure_with_wizard 应用机器人配置 configure-app-bot.ts app ;;
     directory) service_bun scripts/ops/directory-admin.ts status ;;
-    directory-confirm) service_bun scripts/ops/directory-admin.ts confirm "${2:-}" ;;
-    directory-departments) service_bun scripts/ops/directory-admin.ts departments "${2:-}" ;;
-    directory-scope) service_bun scripts/ops/directory-admin.ts scope "${2:-}" ;;
-    runtime-configure) runtime_configure "${2:-}" ;;
-    relay-ls)    relay_admin list ;;
-    relay-test)  relay_admin test ;;
+    directory-scope) shift; directory_scope "$@" ;;
+    runtime-configure) shift; runtime_configure "$@" ;;
+    configuration-apply) shift; configuration_admin apply "$@" ;;
+    configuration-restore) shift; configuration_admin restore "$@" ;;
+    relay-ls)    shift; relay_admin list "$@" ;;
+    relay-test)  shift; relay_admin test "$@" ;;
     relay-purge) shift; relay_admin purge "$@" ;;
     tmp-ls)      shift; tmp_admin list "$@" ;;
     tmp-purge)   shift; tmp_admin purge "$@" ;;
@@ -918,12 +819,14 @@ case "${1:-}" in
     tmp-reclaim) shift; tmp_admin reclaim "$@" ;;
     tmp-discard) shift; tmp_admin discard "$@" ;;
     stat)          shift; data_admin scripts/ops/stats-admin.ts "$@" ;;
-    stat-import)   stat_import "${2:-}" ;;
+    stat-import)   shift; stat_import "$@" ;;
     history-ls)    shift; data_admin scripts/ops/history-admin.ts list "$@" ;;
     history-clear) shift; history_clear "$@" ;;
     history-compact) shift; HISTORY_OPERATION=compact history_clear "$@" ;;
+    maintenance-recover) ops_core "$@" ;;
+    revision-cleanup) shift; revision_cleanup "$@" ;;
     # 历史归档清理：扫描只写清单；删除只按确认过的清单执行，工具在容器内逐条重新检查。
-    backup-scan)   backup_admin scan ;;
+    backup-scan)   shift; backup_admin scan "$@" ;;
     backup-clean)  shift; backup_admin apply "$@" ;;
     uninstall) uninstall ;;
     *)
@@ -936,10 +839,10 @@ case "${1:-}" in
         esac
         echo -e "${CYAN}mixin-chatbot 运维工具（Linux/Docker）${NC}"
         echo "用法：./scripts/ops/ops.sh <命令>"
-        echo "运维界面：在项目根目录运行 bun run tui；需宿主机安装 Bun（安装指引：https://bun.sh/docs/installation）。"
+        echo "运维控制台：在项目根目录运行 bun run console，在浏览器中打开；需宿主机安装 Bun（安装指引：https://bun.sh/docs/installation）。"
         echo ""
         echo "  doctor     健康检查：共享资料目录、容器、本机 :$PORT、版本、事件 Stream、通讯录同步、配置"
-        echo "             加 --json 输出单行 JSON，供运维界面消费"
+        echo "             加 --json 输出单行 JSON，供控制台使用"
         echo "  deploy     配置并部署当前代码；已有部署可用于重建修复，失败自动回滚"
         echo "  update     同步 origin/main，由目标版本的升级器在停机前检查部署记录与配置，"
         echo "             再停机重建并切换容器；提交前失败自动回滚。沿用现有端口、共享资料目录、"
@@ -950,16 +853,15 @@ case "${1:-}" in
         echo "  stop       停止 Docker 容器"
         echo "  start      启动 Docker 容器"
         echo "  logs       持续查看最近 50 行 Docker 日志"
-        echo "  relay-configure 交互配置可选的大文件外链，确认后应用并恢复服务"
-        echo "  model-configure 停止机器人，运行模型配置向导，结束后恢复原运行状态"
-        echo "  runtime-configure <草稿名> 应用 TUI 中已确认的高级运行参数"
-        echo "  configure-app-bot 停止机器人，填写应用机器人 AppID/AppSecret 并验证，结束后恢复原运行状态"
-        echo "  directory  查看事件 Stream 与通讯录同步状态（同步范围、映射数、最近同步、待确认撤销）"
-        echo "  directory-confirm <轮次> 确认该轮暂停的大批撤销；服务重新完整扫描后才撤销"
-        echo "  directory-departments [部门ID]"
-        echo "             列出该部门（默认根部门）的直属子部门：ID、人数、名称，用来选择同步范围"
-        echo "  directory-scope [部门ID,…]"
-        echo "             只同步这些部门及其子部门，留空为整个通讯录；范围有变化时立即重新同步"
+        echo "  relay-configure 交互配置可选的大文件外链；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态"
+        echo "  model-configure 运行模型配置向导；填写期间机器人照常运行，确认后短暂停机应用并恢复原运行状态，失败时恢复原配置"
+        echo "  runtime-configure <草稿名> 应用控制台「设置」中已确认的高级运行参数"
+        echo "  configure-app-bot 填写应用机器人 AppID/AppSecret 并验证；之后与 model-configure 相同地应用"
+        echo "  directory  查看事件 Stream 与通讯录同步状态（同步范围及是否生效、映射数、最近同步、待复核的缺席）"
+        echo "  directory-scope [all]"
+        echo "             修改同步范围并应用：不带参数时在终端里逐层勾选部门（每个部门含其全部子部门，宿主机没有 Bun 时在容器里运行），"
+        echo "             带 all 时同步整个通讯录；不接受部门 ID。也可以在控制台的「通讯录」中勾选。"
+        echo "             完整同步成功后一次切换，之前的名单在此前仍然生效"
         echo "  relay-ls   列出已发出、仍在册的大文件外链"
         echo "  relay-test 上传并删除一个随机测试文件，验收外链签名、私有访问和删除权限"
         echo "  relay-purge <关键字>|--all"
@@ -976,14 +878,22 @@ case "${1:-}" in
         echo "  stat [群号|direct] [--period today|yesterday|week|last-week|month|last-month|7d|30d|all]"
         echo "              或 [--since <日期>] [--until <日期>]"
         echo "             使用统计：多少人用过、提问多少次、模型用了多少 token；日期格式 YYYY-MM-DD"
-        echo "  stat-import <旧账本路径>  一次性导入旧版统计（提问数与 token）；停机导入后恢复原运行状态（TUI 统计页按 i 可浏览选择）"
+        echo "  stat-import <旧账本路径>  一次性导入旧版统计（提问数与 token）；停机导入后恢复原运行状态（也可在控制台「统计 → 导入统计」上传或填写路径）"
         echo "  history-ls 列出各会话空间（单聊与各群）的会话库占用和最后活动"
         echo "  history-clear <群号>|--direct"
         echo "             清空该群（或单聊空间）全部成员的上下文；自动停机、清理，再恢复原运行或停止状态"
         echo "             群选择可加 --group-id（原始群号）或 --storage-segment（目录段）"
         echo "  history-clear --all  清空单聊和所有群全部成员的上下文；一次停机完成，某个空间失败时其余照常清空"
+        echo "  maintenance-recover 回收中断的维护写入者并恢复原运行状态；不重复数据动作"
         echo "  history-compact <群号>|--direct <成员号码>  停机登记压缩并恢复原运行状态（产生模型用量）"
-        echo "  backup-scan 只读扫描 backup/rm 和 backup/snapshots，分类后在 tmp/backup-cleanup 生成清单，不删除"
+        echo "  revision-cleanup preview|status  只读：会话库中待整理的旧修订链、预计用时与空间；上次整理的状态"
+        echo "  revision-cleanup apply|skip|abandon"
+        echo "             停机整理旧修订链（先备份到 backup/revision-cleanup）、跳过或放弃剩余整理；维护状态允许时恢复原运行状态"
+        echo "  revision-cleanup restore --space <空间>  整理发现基准与记录不同时，停机从备份恢复那个库（校验通过才执行）"
+        echo "  revision-cleanup shrink-preview|shrink-status  只读：可收缩的会话库、空闲页与所需空间；上次收缩的状态与保留的原库"
+        echo "  revision-cleanup shrink [--space <空间>]  停机收缩会话库文件（原库保留为同目录的 .old），再恢复原运行状态"
+        echo "  revision-cleanup shrink-remove-old [--yes]  列出收缩保留的原库；确认机器人运行正常后加 --yes 删除"
+        echo "  backup-scan 只读扫描 backup/rm、snapshots 和 revision-cleanup，分类后在 tmp/backup-cleanup 生成清单，不删除"
         echo "  backup-clean <报告名> [--confirm <确认码>]"
         echo "             不带确认码时预演并给出确认码；带确认码时按清单的精确路径删除，不可撤销"
         echo "  uninstall  删除容器（可选镜像、data/、logs/）"

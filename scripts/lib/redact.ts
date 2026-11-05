@@ -5,6 +5,5 @@ export function redactSecrets(text: string): string {
     .replace(/(Bearer\s+)[^\s"',;]+/gi, "$1***")
     .replace(/(["']?(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|authorization)["']?\s*[:=]\s*["']?(?:(?:Bearer|Basic)\s+)?)[^"'\s,;}&]+/gi, "$1***")
     .replace(/([?&](?:key|token|secret|sig|sign|signature|password)=)[^&\s"']+/gi, "$1***")
-    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1***@")
-    .replace(/\/webhook\/[a-f\d]{64}\b/gi, "/webhook/***");
+    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1***@");
 }

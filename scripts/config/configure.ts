@@ -10,7 +10,8 @@
 // 它预填上下文、能力和价格，管理员核对后落盘。
 //
 // models.json 里向导没问过的官方字段（headers、compat、authHeader）在重新
-// 配置时原样保留。部署脚本在停止旧实例后调用；本地停机时也可运行 bun run configure。
+// 配置时原样保留。部署和运维的 model-configure 以 --stage <暂存目录> 运行（服务照常运行）：不取维护租约、不改项目文件，
+// 回答写进暂存目录，停止服务后由部署或运维核心写入；没有部署的本地开发（bun run configure）在维护租约下直接写入。
 // 还没有应用机器人配置时（首次部署、升级重置），先填应用机器人凭据，再配模型。
 import {
   cancel,
@@ -26,7 +27,7 @@ import {
 } from "@clack/prompts";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   clampThinkingLevel,
   getSupportedThinkingLevels,
@@ -40,13 +41,13 @@ import { SettingsManager, type ModelRuntime } from "@earendil-works/pi-coding-ag
 import { openModelRuntime, openSettings, resolveModelSelection } from "../../src/core/model-config.ts";
 import { APP_BOT_CONFIG_PATH, MODELS_JSON_PATH, PI_SETTINGS_PATH } from "../../src/core/storage.ts";
 import { withMaintenance } from "../../src/core/maintenance.ts";
-import { withModelConfigurationDraft, type ModelConfigurationDraft } from "./model-config-draft.ts";
-import { configureAppBot } from "./configure-app-bot.ts";
+import { assertLocalConfigurationWrite } from "../../src/core/maintenance-state.ts";
+import { withModelConfigurationDraft, withStagedModelConfiguration, type ModelConfigurationDraft } from "./model-config-draft.ts";
+import { configureAppBot, stageAppBot } from "./configure-app-bot.ts";
+import { stageName } from "./configuration-stage.ts";
 
 
 type JsonObject = Record<string, unknown>;
-/** 向导之外手工调过的官方 provider 字段，重新配置时按原样带回。 */
-const PRESERVED_PROVIDER_FIELDS = ["headers", "compat", "authHeader"] as const;
 /** 列模型清单的等待上限；失败就退回手填 id，不阻塞配置。 */
 const DISCOVERY_TIMEOUT_MS = 15_000;
 
@@ -260,19 +261,15 @@ async function loadProviders(path: string): Promise<{ providers: Record<string, 
   }
 }
 
-function preserved(previous: JsonObject | undefined): JsonObject {
-  const kept: JsonObject = {};
-  for (const field of PRESERVED_PROVIDER_FIELDS) if (previous?.[field] !== undefined) kept[field] = previous[field];
-  return kept;
-}
-
-async function main(draft: ModelConfigurationDraft): Promise<void> {
+/** `stage`: a deployment's pre-stop run, which writes its answers to that directory and leaves the project's files alone. */
+async function main(draft: ModelConfigurationDraft, stage?: string): Promise<void> {
   // No emoji in console output: Windows Server consoles render them as "??".
-  if (!existsSync(APP_BOT_CONFIG_PATH)) {
-    intro(`应用机器人配置（写入 ${APP_BOT_CONFIG_PATH}）`);
-    await configureAppBot();
+  const target = stage ? "停止服务后写入" : "写入";
+  if (!existsSync(APP_BOT_CONFIG_PATH) && !(stage && existsSync(join(stage, stageName("app"))))) {
+    intro(`应用机器人配置（${target} ${APP_BOT_CONFIG_PATH}）`);
+    if (stage) await stageAppBot(".", stage); else await configureAppBot();
   }
-  intro(`AI 配置（写入 ${MODELS_JSON_PATH} 与 ${PI_SETTINGS_PATH}）`);
+  intro(`AI 配置（${target} ${MODELS_JSON_PATH} 与 ${PI_SETTINGS_PATH}）`);
 
   // 先离线建运行时：随包目录足够列出内置服务商，选定之后只刷新那一个。
   const runtime = await openModelRuntime({ ...draft, writableCatalog: true });
@@ -295,7 +292,8 @@ async function main(draft: ModelConfigurationDraft): Promise<void> {
   // 自定义方式在写盘前就定下了模型 id；内置方式要等目录刷新后才从清单里选。
   let providerId: string;
   let declaredModelId: string | undefined;
-  const providers: Record<string, JsonObject> = {};
+  // Other providers (an auxiliary model's, say) stay as they are; only the chosen one is rewritten.
+  const providers: Record<string, JsonObject> = { ...previousProviders };
   if (mode === "builtin") {
     const candidates = builtinProviders().filter((provider) => provider.auth.apiKey).sort((a, b) => a.id.localeCompare(b.id));
     providerId = bail<string>(await select({
@@ -303,6 +301,7 @@ async function main(draft: ModelConfigurationDraft): Promise<void> {
       initialValue: candidates.find((item) => item.id === previousProviderId)?.id ?? "openai",
       options: candidates.map((item) => ({ value: item.id, label: `${item.name} (${item.id})` })),
     }));
+    // Only the key: address, protocol and model data come from Pi's current catalogue, not from earlier overrides.
     providers[providerId] = { apiKey: await askApiKey() };
   } else {
     providerId = await askText("自定义 provider id（如 custom-gateway）", previousProviderId, requireText);
@@ -324,7 +323,11 @@ async function main(draft: ModelConfigurationDraft): Promise<void> {
     declaredModelId = await askCustomModelId(api, baseUrl, apiKey, previousId ?? previousModels[0]?.id as string | undefined);
     const previousModel = previousModels.find((item) => item.id === declaredModelId);
     const model = await describeCustomModel(runtime, declaredModelId, previousModel);
-    providers[providerId] = { ...preserved(previousEntry), api, baseUrl, apiKey, models: [model] };
+    // The same endpoint keeps the whole entry and its other models; native fields (headers may hold credentials) never
+    // follow the provider to another endpoint.
+    if (previousEntry && !sameEndpoint) log.warn("服务地址或协议已变，原有的 headers、compat、authHeader、modelOverrides 等字段不带到新端点；需要时请重新添加。");
+    providers[providerId] = { ...(sameEndpoint ? previousEntry : {}), api, baseUrl, apiKey,
+      models: previousModel ? previousModels.map((item) => item === previousModel ? model : item) : [...previousModels, model] };
   }
 
   await writeFile(draft.modelsPath, JSON.stringify({ ...(schema === undefined ? {} : { $schema: schema }), providers }, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
@@ -351,12 +354,25 @@ async function main(draft: ModelConfigurationDraft): Promise<void> {
     `地址=${model.baseUrl}\n协议=${model.api}\n上下文=${model.contextWindow}\n输出上限=${model.maxTokens}`,
     "完成"
   );
-  log.info("需要更细的服务商设置时，可按 Pi 的 models.json 格式手工添加 headers、compat、authHeader 或 modelOverrides；重新运行本向导不会覆盖它们。");
-  outro("AI 配置完成。");
+  log.info("需要更细的服务商设置时，可按 Pi 的 models.json 格式手工添加 headers、compat、authHeader 或 modelOverrides。重新运行本向导时其他服务商原样保留；自定义服务商在同一地址和协议下整条保留，内置服务商只保存 Key、使用 Pi 当前的官方资料。");
+  outro(stage ? "AI 配置已暂存，停止服务后写入。" : "AI 配置完成。");
+}
+
+/** 严格参数：没有参数（本地开发直接写入），或 `--stage <暂存目录>`（部署和 model-configure）。 */
+export function parseConfigureArgs(argv: readonly string[]): { stage?: string } {
+  if (argv.length === 0) return {};
+  if (argv.length === 2 && argv[0] === "--stage" && argv[1] && !argv[1].startsWith("--")) return { stage: argv[1] };
+  throw new Error("用法：configure.ts [--stage <暂存目录>]");
 }
 
 if (import.meta.main) {
-  withMaintenance(() => withModelConfigurationDraft(main)).catch((e) => {
+  Promise.resolve().then(() => {
+    const { stage } = parseConfigureArgs(process.argv.slice(2));
+    // Writing in place: refused while a deployment, an ops task, a configuration transaction or a revision cleanup is unfinished.
+    if (stage === undefined) return withMaintenance(() => { assertLocalConfigurationWrite("."); return withModelConfigurationDraft(draft => main(draft)); });
+    const directory = resolve(stage);
+    return withStagedModelConfiguration(".", directory, draft => main(draft, directory));
+  }).catch((e) => {
     if (e instanceof Error && e.name === "AbortError") return;
     console.error(e instanceof Error ? e.message : e);
     process.exitCode = 1;

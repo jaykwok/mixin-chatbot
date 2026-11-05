@@ -51,7 +51,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import {
   type AssistantMessage, type AssistantMessageEvent, type AssistantMessageEventStream, createAssistantMessageEventStream,
   createModels, type AnyModel, type AssistantImages, type ClassifierContext, type ClassifierModel, type ClassifierResult,
-  type ImageModel, type ImagesContext, type Model, type Models, normalizeContext, type Provider,
+  getOpenCodeSessionHeaders, type ImageModel, type ImagesContext, type Model, type Models, normalizeContext, type Provider,
 } from "@earendil-works/pi-ai";
 import { assertChatModel } from "@earendil-works/pi-ai/utils/model-operations";
 import type { Extension, Harness, ToolExecutionApi, ToolRegistration } from "@earendil-works/pi-durable";
@@ -137,6 +137,8 @@ export class RequestDoor {
   /** Sessions claimed by more than one conversation: never sent. */
   readonly #conflicts = new Set<string>();
   #reloading: Promise<void> | undefined;
+  /** One list per read of all sessions in progress: the binds that ended during it. */
+  readonly #loads = new Set<SessionBinding[]>();
   /** Admission attempts of controls, not yet resolved. */
   readonly #tickets = new Set<ControlTicket>();
   /** Controls waiting in the admission stream, by requestId. */
@@ -162,11 +164,16 @@ export class RequestDoor {
 
   /** Startup before scheduling: every member session of the space, so a recovered summarize request finds its member. */
   async loadSessions(context: Context): Promise<void> {
-    const found = await this.#options.sessions(this.#harness(), context);
-    this.#bySession.clear();
-    this.#byConversation.clear();
-    this.#conflicts.clear();
-    for (const binding of found) this.#add(binding);
+    // A bind that ends during this read may be missing from it: it is kept when the maps are replaced.
+    const bound: SessionBinding[] = [];
+    this.#loads.add(bound);
+    try {
+      const found = await this.#options.sessions(this.#harness(), context);
+      this.#bySession.clear();
+      this.#byConversation.clear();
+      this.#conflicts.clear();
+      for (const binding of [...found, ...bound]) this.#add(binding);
+    } finally { this.#loads.delete(bound); }
   }
 
   /** After a member conversation's creating (or verifying) commit returned: its session may be sent from now on. */
@@ -175,6 +182,7 @@ export class RequestDoor {
     const [binding] = await this.#options.sessions(this.#harness(), context, conversationId);
     if (binding === undefined) throw new Error(`request door: conversation ${conversationId} has no verified member session`);
     this.#add(binding);
+    for (const bound of this.#loads) bound.push(binding);
     if (this.#conflicts.has(binding.sessionId)) throw new Error(`request door: session of conversation ${conversationId} is claimed twice`);
   }
 
@@ -524,15 +532,13 @@ export class RequestDoor {
     const resolution = await models.getAuth(model as never, { apiKey: options?.apiKey, env: options?.env, signal: options?.signal } as never);
     if (resolution === undefined) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
     const auth = resolution.auth as { apiKey?: string; headers?: Record<string, string>; baseUrl?: string };
-    let headers = mergeHeaders(auth.headers, options?.headers);
+    const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+    // OpenCode's per-conversation routing header, below the credential's headers and the request's own.
+    let headers = mergeHeaders(mergeHeaders(getOpenCodeSessionHeaders(requestModel, options?.sessionId), auth.headers), options?.headers);
     if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
     const env = resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
     const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
-    return {
-      provider,
-      model: auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model,
-      options: { ...providerOptions, apiKey: options?.apiKey ?? auth.apiKey, headers, env },
-    };
+    return { provider, model: requestModel, options: { ...providerOptions, apiKey: options?.apiKey ?? auth.apiKey, headers, env } };
   }
 
   /** Wait while the member has a received, unfinished control; the control's abort ends the wait. */

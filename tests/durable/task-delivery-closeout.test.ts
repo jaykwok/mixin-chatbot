@@ -8,17 +8,20 @@ import { fauxAssistantMessage, fauxToolCall, type FauxResponseFactory } from "@e
 import * as deliverables from "../../src/agent/deliverables.ts";
 import { completeFile, deliverableCandidates, fileDigest, freezeFile, registerDeliverable, releasableSnapshots } from "../../src/agent/deliverables.ts";
 import { InboxDoc } from "../../src/durable/inbox.ts";
-import { createSession } from "@earendil-works/pi-durable";
+import { createSession, defineExtension, Harness } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { IdentityDoc, MemberDirectory } from "../../src/durable/identity.ts";
-import { closeoutExtension, deliverableTool } from "../../src/durable/closeout.ts";
+import { activeRequest, closeoutExtension, deliverableTool } from "../../src/durable/closeout.ts";
 import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
-import type { MemberCall } from "../../src/durable/tools.ts";
+import type { MemberCall, MemberTool } from "../../src/durable/tools.ts";
+import { sendTools } from "../../src/agent/send-tools.ts";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { fileDelivery } from "../../src/durable/file-delivery.ts";
-import { BASH_DEFAULT_TIMEOUT } from "../../src/core/config.ts";
-import { appendTiming, closeoutTool, validateCloseout } from "../../src/durable/closeout.ts";
+import { BASH_DEFAULT_TIMEOUT, NATIVE_FILE_MAX_BYTES } from "../../src/core/config.ts";
+import { formatSize } from "@earendil-works/pi-coding-agent";
+import { appendTiming, closeoutTool, localTime, validateCloseout } from "../../src/durable/closeout.ts";
 import { MemberRecordsDoc, pendingDeliveries, recordsOf, settleInterrupted, type DeliveryPart, type LinkNote, type MemberRecords, type RequestRecord }
   from "../../src/durable/records.ts";
 import { DurableService, type DurableServiceOptions } from "../../src/durable/service.ts";
@@ -37,6 +40,17 @@ async function until(predicate: () => boolean | Promise<boolean>, label: string)
   while (!await predicate()) { if (Date.now() > deadline) throw new Error("timeout: " + label); await Bun.sleep(10); }
 }
 const failModel = () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "Synthetic model error" });
+/** A tool that leaves in the run record what a run-time send commits there. */
+const seedSend = (change: (record: RequestRecord) => void) => () => [defineExtension({ name: "send-fixture", tools: [{
+  name: "seed_send", description: "Synthetic run-time send", parameters: obj({}, { open: true }), replay: "safe",
+  async execute(_args, api, invocation) {
+    const item = (await activeRequest(api, invocation))!;
+    await api.commit(async tx => change((await recordsOf(tx, item.phone)).requests[item.requestId]!), invocation);
+    return { output: [{ type: "text", text: "recorded" }] };
+  },
+}] })];
+const callSeed = () => fauxAssistantMessage([fauxToolCall("seed_send", {})], { stopReason: "toolUse" });
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
 
 async function setup(alias?: "case" | "link") {
   const actual = join(fixture.root, String(++seq)); await mkdir(actual);
@@ -69,12 +83,19 @@ function fakeRun(requestId: string, startedAt = Date.now()) {
     reply: { kind: "group", receiveId: GROUP, senderImUserId: "im-1001", msgUid: `uid-${requestId}`, summary: "问题", receivedAt: startedAt } };
   const records: MemberRecords = { requests: { [requestId]: record }, attachments: {} };
   const tx = { doc: async (doc: unknown) => { if (doc === MemberRecordsDoc) return records; throw new Error("unexpected document"); } };
-  const api = { conversationId: 1, taskId: 42, agent: async () => ({}),
+  const api = { conversationId: 1, taskId: 42, callId: requestId, agent: async () => ({}),
     snapshot: async (doc: unknown) => doc === InboxDoc ? { items: [{ requestId, startedAt }] }
       : doc === IdentityDoc ? { space: `group:${GROUP}`, phone: PHONE } : doc === MemberRecordsDoc ? structuredClone(records) : undefined,
     commit: async (fn: (t: typeof tx) => unknown) => fn(tx) };
   const write = async (_phone: string, _id: string, change: (r: RequestRecord) => void) => change(record);
   return { api, record, write, call: { api, context, callId: requestId, signal: undefined } as unknown as MemberCall };
+}
+
+/** deliverable_register as Durable calls it in the fake run; an error result rejects with its text. */
+async function register(tool: MemberTool, params: object, run: ReturnType<typeof fakeRun>) {
+  const result = await tool.registration.execute(params, run.api as never, context);
+  if (result.isError) throw new Error(result.output?.map((part) => part.type === "text" ? part.text : "").join(""));
+  return result;
 }
 
 test("model failure delivers only the registered immutable version, explanation first, then releases the snapshot", async () => {
@@ -90,6 +111,7 @@ test("model failure delivers only the registered immutable version, explanation 
     // The explanation leads with the @ of the asker, like a reply.
     expect(f.out.sent[explanation]!.mention).toBe("im-1001");
     await until(async () => pendingDeliveries(await f.service.records(scopeOf(GROUP), PHONE)).length === 0, "delivered");
+    expect((await f.record())!.delivery!.deadline).toBeDefined();
     const snapshot = (await f.record())!.deliverables[0]!.path;
     await until(async () => !await stat(snapshot).then(() => true, () => false), "snapshot removal");
   } finally { await f.service.close(); }
@@ -101,8 +123,10 @@ test.each(["unregistered", "rejected", "incomplete"])("failure never auto sends 
   f.faux.setResponses(kind === "unregistered" ? [failModel()] : [f.register(kind === "rejected" ? "rejected" : "draft"), failModel()]);
   try {
     await f.service.admit(f.message("make a report"));
-    await until(() => f.out.sent.some(x => x.text.includes("没有可交付")), "failure explanation");
+    await until(() => f.out.sent.some(x => x.text.includes("Synthetic model error")), "failure explanation");
     expect(f.files()).toEqual([]);
+    // A run that registered nothing is only told why it failed: a plain question is not steered towards files.
+    expect(f.out.sent.some(x => x.text.includes("没有可交付"))).toBe(kind !== "unregistered");
   } finally { await f.service.close(); }
 });
 
@@ -212,12 +236,11 @@ test("deliverable rules: a rejection covers every copy, limits per request, inte
       delivery: { kind: "fallback", createdAt: 1, parts: [
         { id: "m0", kind: "markdown", body: "explanation", lead: true, state: "sent", attempts: 1 },
         { id: "f0", kind: "file", file: { name: "report.txt", path: unsent.path, size: unsent.size, sha256: unsent.sha256 }, state: "sending", attempts: 1 }] } } } };
-    expect(settleInterrupted(records)).toBe(true);
+    settleInterrupted(records);
     const next = records.requests.next!;
     // Fallback file parts are registered versions.
     registerDeliverable(next, { ...unsent, slot: "report", complete: true, status: "draft", checked: [], unchecked: [], issues: [] });
     expect([next.files[0]!.state, next.delivery!.parts[1]!.state]).toEqual(["uncertain", "uncertain"]);
-    expect(settleInterrupted(records)).toBe(false);
     // An uncertain part counts as sent. A run-time send is not part of the plan: its snapshot goes either way.
     expect(releasableSnapshots(next).sort()).toEqual([sent.path, unsent.path].sort());
     // A file part still to be sent (failed, its retry due later) keeps its own; a final failure or an abandoned delivery does not.
@@ -253,12 +276,38 @@ test.each(["task_timeout", "model_idle", "model_response_timeout"])("watchdog %s
   } finally { await service.close(); }
 }, 30_000);
 
+test("a failing step of the settling is retried with the watchdog's reason", async () => {
+  const f = await setup(), logs: string[] = [], hang = Promise.withResolvers<void>();
+  let fail = true;
+  const open = Harness.open.bind(Harness);
+  const failing = spyOn(Harness, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+    const opened = await open(...args), commit = opened.commit.bind(opened);
+    opened.commit = ((work: never, invocation: never) => {
+      if (fail && /#close/.test(new Error().stack ?? "")) { fail = false; throw new Error("synthetic commit failure"); }
+      return commit(work, invocation);
+    }) as never;
+    return opened;
+  });
+  const service = new DurableService({ ...f.options, onLog: line => logs.push(line),
+    limits: { ...f.options.limits, modelIdleMs: 200, modelResponseMs: 60_000, runTimeoutMs: 60_000 } });
+  f.faux.setResponses([async (_context, options) => {
+    await new Promise<void>(done => { void hang.promise.then(done); options?.signal?.addEventListener("abort", () => done(), { once: true }); });
+    return failModel();
+  }]);
+  try {
+    await service.admit(f.message("question"));
+    await until(() => f.out.sent.some(x => x.text.includes("模型连续")), "the reason, after the retry");
+    expect(fail).toBe(false);
+    expect(f.out.sent.some(x => x.text.includes("时限检查已中止"))).toBe(false);
+  } finally { hang.resolve(); failing.mockRestore(); await service.close(); await f.service.close(); }
+}, 30_000);
+
 test("a stop during the first fallback attachment drops the rest and frees its snapshots", async () => {
   const f = await setup(), path2 = join(f.temp, "other.txt"); await writeFile(path2, "other version");
   const upload = f.out.outbound.upload; let stop = true;
   f.out.outbound.upload = async (source, signal) => {
     // Upload of the first file: the /stop is committed (the delivery withdrawn) before the send goes on.
-    if (stop) { stop = false; await new Promise<void>(admitted => void f.service.control(f.message("/stop"), admitted)); }
+    if (stop) { stop = false; await f.service.control(f.message("/stop")); }
     return upload(source, signal);
   };
   f.faux.setResponses([f.register(), fauxAssistantMessage([fauxToolCall("deliverable_register", { path: path2, status: "draft", checked: [], unchecked: [], issues: [] })], { stopReason: "toolUse" }), failModel()]);
@@ -284,6 +333,8 @@ test("every provider attempt gets fresh timing but stored conversation messages 
     await f.service.admit(f.message("make report"));
     await until(() => f.files().length > 0, "file");
     expect(seen).toHaveLength(2); for (const transcript of seen) expect(transcript).toContain("[任务计时]");
+    // The request's own directory below the member's tmp (the only write root of edit/write), with forward slashes.
+    for (const transcript of seen) expect(transcript).toContain(`\\n[临时目录] ${f.temp.replace(/\\/g, "/")}/tasks/msg-`);
     await f.service.close();
     const storage = await openGroupStorage(databaseOf(f.root, GROUP)), sessionView = createSession(storage);
     try {
@@ -291,6 +342,7 @@ test("every provider attempt gets fresh timing but stored conversation messages 
       const entries = await storage.scanEntries({ conversationId: member!.conversationId as never }, 200, undefined, context);
       // The stable system prompt explains the marker; only the dynamic countdown must stay out of history.
       expect(JSON.stringify(entries.items.map(x => x.model))).not.toContain("[任务计时] 剩余");
+      expect(JSON.stringify(entries.items.map(x => x.model))).not.toContain("[临时目录] ");
     } finally { await sessionView.close(context); }
   } finally { await f.service.close(); }
 });
@@ -352,14 +404,14 @@ test("layout checks require the same rendered digest; registrations are bounded 
   const run = fakeRun(`msg:${crypto.randomUUID()}`), tool = deliverableTool({ layout: appLayout(f.root), scope: groupScope(GROUP) });
   try {
     const params = { path: source, status: "checked", checked: ["版式看图", "正文与资料核对"], unchecked: [], issues: [] };
-    await tool.run(params, run.call);
+    await register(tool, params, run);
     const initial = run.record.deliverables[0]!;
     expect(initial.complete).toBe(true); expect(initial.status).toBe("draft"); expect(initial.checked).toEqual(["正文与资料核对"]);
     run.record.events.render = { name: "document_render", digest: await fileDigest(source), at: Date.now() };
-    await tool.run(params, run.call);
+    await register(tool, params, run);
     expect(run.record.deliverables[1]!.status).toBe("checked");
-    for (let n = 2; n < 8; n++) await tool.run({ ...params, status: "draft" }, run.call);
-    await expect(tool.run(params, run.call)).rejects.toThrow("8 个版本");
+    for (let n = 2; n < 8; n++) await register(tool, { ...params, status: "draft" }, run);
+    await expect(register(tool, params, run)).rejects.toThrow("8 个版本");
     await writeFile(source, "truncated"); expect(await fileDigest(initial.path)).toBe(initial.sha256);
     expect(await completeFile(source, "docx")).toBe(false);
   } finally { await f.service.close(); }
@@ -370,12 +422,12 @@ test("registration rejects cross-member paths and a source changed during copyin
   const run = fakeRun(`msg:${crypto.randomUUID()}`), tool = deliverableTool({ layout: appLayout(f.root), scope: groupScope(GROUP) });
   const params = { path: outside, status: "draft", checked: [], unchecked: [], issues: [] };
   try {
-    await expect(tool.run(params, run.call)).rejects.toThrow("只能发送共享资料");
+    await expect(register(tool, params, run)).rejects.toThrow("只能发送共享资料");
     const original = fs.copyFile;
     const copying = spyOn(fs, "copyFile").mockImplementation(async (source, target, flags) => {
       await writeFile(source, "changed while copying"); await original(source, target, flags);
     });
-    try { await expect(tool.run({ ...params, path: f.path }, run.call)).rejects.toThrow("复制期间源文件变化"); }
+    try { await expect(register(tool, { ...params, path: f.path }, run)).rejects.toThrow("复制期间源文件变化"); }
     finally { copying.mockRestore(); }
     expect(run.record.deliverables).toEqual([]);
   } finally { await f.service.close(); }
@@ -401,6 +453,114 @@ test("a run-time send_file records sent/uncertain, deduplicates identical bytes 
     run.record.closedAt = Date.now();
     await expect(deliver({ kind: "local", path: f.path, size: 15 }, "report.txt", undefined, send)).rejects.toThrow("任务已结束");
   } finally { await f.service.close(); }
+});
+
+test("a relay link of the run goes out once when the run then fails, and is not sent again as a file", async () => {
+  const f = await setup();
+  const note: LinkNote = { original: "report: https://relay.example/old", reference: { backend: "fixture", url: "https://relay.example/object", name: "report.txt", size: 16 } as never };
+  f.out.outbound.links = async notes => notes.map(each => each.original.replace("/old", "/fresh")).join("\n\n");
+  const service = new DurableService({ ...f.options, extensions: seedSend(record => {
+    const version = record.deliverables[0]!;
+    record.files.push({ id: "relay", name: version.name, path: version.path, sha256: version.sha256, size: version.size, mode: "relay", state: "planned", attempts: 1, at: Date.now(),
+      relay: { url: "https://relay.example/object", note: note.original, attachment: note, size: version.size } });
+    record.notes.push(note);
+  }) });
+  f.faux.setResponses([f.register(), callSeed(), failModel()]);
+  try {
+    await service.admit(f.message("large report"));
+    await until(async () => (await f.record(service))?.delivery !== undefined && pendingDeliveries(await service.records(scopeOf(GROUP), PHONE)).length === 0, "delivered");
+    expect(f.files()).toEqual([]);
+    expect(f.out.sent.filter(x => x.text.includes("relay.example/fresh"))).toHaveLength(1);
+    expect(f.out.sent.some(x => x.text.includes("下载链接随后发出"))).toBe(true);
+    expect((await f.record(service))!.delivery!.parts.find(part => part.kind === "file")!.state).toBe("sent");
+  } finally { await service.close(); await f.service.close(); }
+});
+
+test("a relay upload that failed during the run is sent by the fallback", async () => {
+  const f = await setup();
+  const service = new DurableService({ ...f.options, extensions: seedSend(record => {
+    const version = record.deliverables[0]!;
+    record.files.push({ id: "relay", name: version.name, path: version.path, sha256: version.sha256, size: version.size, mode: "relay", state: "failed", error: "upload failed", attempts: 1, at: Date.now() });
+  }) });
+  f.faux.setResponses([f.register(), callSeed(), failModel()]);
+  try {
+    await service.admit(f.message("large report"));
+    await until(() => f.files().length === 1, "the fallback file");
+  } finally { await service.close(); await f.service.close(); }
+});
+
+test.each(["sent", "uncertain"] as const)("a run that only sent a file (%s) and ended without text gets a short reply, not a failure", async state => {
+  const f = await setup();
+  const service = new DurableService({ ...f.options, extensions: seedSend(record => {
+    record.files.push({ id: "send", name: "report.txt", path: join(f.temp, ".deliverables", "gone.txt"), sha256: "0".repeat(64), size: 1, mode: "direct", state, attempts: 1, at: Date.now() });
+  }) });
+  f.faux.setResponses([callSeed(), fauxAssistantMessage("")]);
+  try {
+    await service.admit(f.message("send it"));
+    await until(() => f.out.sent.some(x => x.kind === "reply"), "the reply");
+    expect(f.out.sent.filter(x => x.kind === "reply").map(x => x.text)).toEqual([expect.stringContaining("文件已发出")]);
+  } finally { await service.close(); await f.service.close(); }
+});
+
+test("send_image is in the run record: a registered image that went out is not sent again by the fallback", async () => {
+  const f = await setup(), image = join(f.temp, "chart.png"); await writeFile(image, PNG);
+  f.faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("deliverable_register", { path: image, status: "draft", checked: [], unchecked: [], issues: [] })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("send_image", { source: image })], { stopReason: "toolUse" }), failModel()]);
+  try {
+    await f.service.admit(f.message("draw a chart"));
+    await until(async () => (await f.record())?.delivery !== undefined && pendingDeliveries(await f.service.records(scopeOf(GROUP), PHONE)).length === 0, "delivered");
+    // The image message only; no file message for the same bytes.
+    expect(f.files().map(x => x.text)).toEqual(["image"]);
+    expect((await f.record())!.files.map(x => x.state)).toEqual(["sent"]);
+  } finally { await f.service.close(); }
+});
+
+test("the reminder asks only for versions nothing reached the member of", async () => {
+  const run = fakeRun("reminder"), f = await setup();
+  const hooks = closeoutExtension(run.write, timing, 3000).hooks![0] as { handlers: import("@earendil-works/pi-durable").GenerationHooks };
+  const frozen = await freezeFile(f.path, f.temp, "reminder", 1024);
+  registerDeliverable(run.record, { ...frozen, slot: "report", complete: true, status: "draft", checked: [], unchecked: [], issues: [] });
+  const send = { id: "s", name: frozen.name, path: frozen.path, sha256: frozen.sha256, size: frozen.size, attempts: 1, at: 1 };
+  const remind = async () => { delete run.record.events.delivery_reminder; return hooks.handlers.onYield!({} as never, run.api as never, context); };
+  try {
+    run.record.files = [{ ...send, mode: "relay", state: "failed", error: "upload failed" }];
+    expect(await remind()).toMatchObject({ continue: expect.stringContaining("尚未发送") });
+    run.record.files = [{ ...send, mode: "relay", state: "planned", relay: { url: "u", note: "n", attachment: {} as never, size: 1 } }];
+    expect(await remind()).toBeUndefined();
+    for (const state of ["sent", "uncertain"] as const) {
+      run.record.files = [{ ...send, mode: "direct", state }];
+      expect(await remind()).toBeUndefined();
+    }
+  } finally { await f.service.close(); }
+});
+
+test("a failure notice without files keeps the reply's window instead of the fallback budget", async () => {
+  const f = await setup();
+  f.faux.setResponses([failModel()]);
+  try {
+    await f.service.admit(f.message("a plain question"));
+    await until(() => f.out.sent.some(x => x.text.includes("Synthetic model error")), "the failure reply");
+    const delivery = (await f.record())!.delivery!;
+    expect(delivery.kind).toBe("fallback"); expect(delivery.deadline).toBeUndefined();
+  } finally { await f.service.close(); }
+});
+
+test("send_file through the run record says how large a file too large for any delivery is, before hashing or copying it", async () => {
+  const f = await setup(), run = fakeRun("too-large"), large = join(f.temp, "large.bin");
+  const handle = await fs.open(large, "w"); await handle.truncate(NATIVE_FILE_MAX_BYTES + 1); await handle.close();
+  const member = { phone: PHONE, conversationId: 1 as never, places: { tempDir: f.temp, workspaceDir: appLayout(f.root).workspace, indexPath: "", venvDir: "" } };
+  await mkdir(member.places.workspaceDir, { recursive: true });
+  const unused = async () => { throw new Error("no send expected"); };
+  const sendFile = sendTools(null, async () => ({ channel: { file: unused, image: unused }, workspaceDir: member.places.workspaceDir, tempDir: f.temp,
+    notes: { add: unused }, fileDelivery: fileDelivery(member, run.call, { requestId: "too-large", phone: PHONE }) }))[1]!;
+  const opening = spyOn(fs, "open");
+  try {
+    opening.mockClear();
+    await expect(sendFile.run({ source: large }, member as never, run.call)).rejects.toThrow(formatSize(NATIVE_FILE_MAX_BYTES));
+    expect(opening).not.toHaveBeenCalled();
+    expect(run.record.files).toEqual([]);
+  } finally { opening.mockRestore(); await f.service.close(); }
 });
 
 test.each(["none", "text", "links"] as const)("a reply's link notes are refreshed on every attempt (failure: %s); a failure pauses the delivery until its retry, and the links go out once", async failure => {
@@ -565,6 +725,25 @@ test("bash always preserves delivery time, respects its configured default, and 
   const hooks = (extension.hooks![0] as { handlers: import("@earendil-works/pi-durable").GenerationHooks }).handlers;
   const result = await hooks.beforeRequest({ messages: [{ role: "user", content: "hello", timestamp: 1 }] }, run.api as never, context);
   expect(JSON.stringify(result!.messages)).toContain("[任务计时] 剩余"); expect(JSON.stringify(result!.messages)).not.toContain("截止");
+  // The current date and time to the minute in the server's zone; nothing generated, registered or sent yet, so no counts.
+  const clock = JSON.stringify(result!.messages).match(/；现在是 (\d{4}-\d{2}-\d{2} \d{2}:\d{2})（服务器时区 UTC[+-]\d{2}:\d{2}）。/);
+  expect(clock).not.toBeNull();
+  expect(Math.abs(new Date(clock![1].replace(" ", "T")).getTime() - Date.now())).toBeLessThan(120_000);
+  for (const count of ["已生成文档", "已登记交付物", "已发送"]) expect(JSON.stringify(result!.messages)).not.toContain(count);
+  // Without a temp-directory source (only tests build the extension so) the tail names none.
+  expect(JSON.stringify(result!.messages)).not.toContain("[临时目录]");
+  const named = closeoutExtension(run.write, t, 7200000, (phone, requestId) => `C:\\data\\tmp\\${phone}\\tasks\\${requestId}`);
+  const tail = await (named.hooks![0] as { handlers: import("@earendil-works/pi-durable").GenerationHooks }).handlers
+    .beforeRequest({ messages: [{ role: "user", content: "hello", timestamp: 1 }] }, run.api as never, context);
+  expect(JSON.stringify(tail!.messages)).toContain(`）。\\n[临时目录] C:/data/tmp/${PHONE}/tasks/bash-budget"`);
+});
+
+test("the clock is the server's local date and time to the minute with its UTC offset", () => {
+  const now = Date.UTC(2026, 10, 2, 23, 30, 59), date = new Date(now), offset = -date.getTimezoneOffset();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  expect(localTime(now)).toStartWith(`${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}（`);
+  expect(localTime(now)).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}（服务器时区 UTC[+-]\d{2}:\d{2}）$/);
+  if (offset === 480) expect(localTime(now)).toBe("2026-11-03 07:30（服务器时区 UTC+08:00）");
 });
 
 test("send_file reuses registered snapshots and duplicates without copying, and checks a new copy only once", async () => {

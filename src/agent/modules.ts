@@ -1,14 +1,14 @@
-import type { loadSkills, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { DocumentOptions } from "./document-extract.ts";
+import type { loadSkills } from "@earendil-works/pi-coding-agent";
+import type { MemberToolSpec } from "../durable/tools.ts";
 
 /**
- * An enabled module before it is bound to a member: the Durable engine builds its tools for the calling member on every
- * call; skills, read-only directories and the prompt are the same for everyone.
+ * An enabled module: its tools run in the calling member's places; skills, read-only directories and the prompt are the
+ * same for everyone.
  */
 export interface AgentModuleDefinition {
   /** Short name; the Durable extension is `mixin.<name>`. */
   name: string;
-  tools(options: DocumentOptions): ToolDefinition[];
+  tools: MemberToolSpec[];
   skills: ReturnType<typeof loadSkills>;
   readOnlyDirs: string[];
   prompt: string;

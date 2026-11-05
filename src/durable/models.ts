@@ -10,7 +10,7 @@ import type { Context } from "@earendil-works/chord";
 import type { Api, CacheRetention, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { type ConversationId, type Harness, type HarnessSettings, type ModelRef, ProviderDoc } from "@earendil-works/pi-durable";
-import { openModelRuntime, openSettings, resolveModelSelection } from "../core/model-config.ts";
+import { MODEL_CONFIG_ENTRY, openModelRuntime, openSettings, resolveModelSelection } from "../core/model-config.ts";
 import { conversationIds } from "./conversations.ts";
 import { RequestDoor, VIRTUAL_MODEL_API, type DoorOptions, type SessionBinding } from "./door.ts";
 import { IdentityDoc, MemberDirectory, SpaceDoc } from "./identity.ts";
@@ -52,7 +52,7 @@ export async function selectModel(runtime: ModelRuntime, settings: SettingsManag
   options: { signal?: AbortSignal; cacheRetention?: CacheRetention } = {}): Promise<ModelSelection> {
   const { model, thinkingLevel } = await resolveModelSelection(runtime, settings, { signal: options.signal });
   if (model.api === VIRTUAL_MODEL_API) {
-    throw new Error(`${model.provider}/${model.id} 是路由（虚拟）模型，Durable 运行时不支持，请运行 bun run configure 选择具体模型`);
+    throw new Error(`${model.provider}/${model.id} 是路由（虚拟）模型，Durable 运行时不支持，请选择具体模型（${MODEL_CONFIG_ENTRY}）`);
   }
   // Override keys are `provider/modelId`; a provider ID has no slash, a model ID may.
   const windowOf = (key: string) => {

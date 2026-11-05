@@ -12,7 +12,7 @@ const release = await acquireLease("verification");
 let server: ReturnType<typeof Bun.serve> | undefined;
 try {
   if (!verificationPending(process.cwd())) throw new Error("升级事务已提交或不再允许只验证启动");
-  await validateCurrentData(process.cwd());
+  await validateCurrentData(process.cwd(), { intent: "verify" });
   const { HOST, PORT } = await import("../core/config.ts");
   const token = randomBytes(32).toString("hex"), instanceId = randomUUID(), startedAt = Date.now();
   const path = join("data/state", "instance.json");

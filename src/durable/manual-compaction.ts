@@ -1,5 +1,6 @@
-// Atomic enqueue via public tokens/Tx, matching Pi's createCompaction admission step.
-// The official CompactionTask retains selection, retry, provider identity, placement and cancellation.
+// Atomic enqueue via public tokens/Tx, matching Pi's createCompaction admission step (Conversation.compact() commits on its
+// own; the /compact command queues it in the commit that records the message receipt). The official CompactionTask
+// retains selection, retry, provider identity, placement and cancellation.
 import { CompactionEntry, CompactionTask, type ConversationId, InboxDoc, LiveDoc, type Tx } from "@earendil-works/pi-durable";
 
 export async function queueManualCompaction(tx: Tx, conversationId: ConversationId) {
@@ -13,6 +14,6 @@ export async function queueManualCompaction(tx: Tx, conversationId: Conversation
     ownership: { kind: "conversation" }, conversationId, background: false,
   });
   live.compactions ??= [];
-  live.compactions.push({ taskId, reason: "manual", blocking: false, attempt: 1 });
+  live.compactions.push({ taskId, trigger: "manual", blocking: false, attempt: 1 });
   return { taskId, created: true };
 }

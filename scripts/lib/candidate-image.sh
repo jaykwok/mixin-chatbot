@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 候选镜像：升级在停机前从固定的目标提交构建一次镜像，之后预览、迁移、验证实例和正式实例都按 image ID 运行，
-# 不再按可变的 mixin-chatbot 标签选择。镜像身份写在事务快照的 candidate-image 文件中；事务记录（transaction）
-# 保持 format 1，因为恢复入口用当前检出的代码读取它，首次过渡时旧版入口必须仍能读懂。
+# 候选镜像：部署从工作区、升级从固定的目标提交，在停机前构建一次镜像，之后预览、迁移、验证实例和正式实例都按
+# image ID 运行，不再按可变的 mixin-chatbot 标签选择。镜像身份写进交接记录 candidate-image（部署的暂存目录或
+# 升级器的导出目录），由运维核心复制进事务快照。
 #
 # 函数只操作参数给出的路径和 Docker；出错时把原因写到标准错误并返回非零，由调用方决定如何报告。
 # 用法：. scripts/lib/candidate-image.sh
@@ -56,8 +56,8 @@ candidate_record_consistent() {
         { echo "从提交构建的候选镜像记录缺少提交" >&2; return 1; }
 }
 
-# 在发布事务指针之前调用：逐项校验后写临时文件并落盘（dd 用写入句柄 fsync），再改名；读者要么看不到文件，
-# 要么看到完整的一份。
+# 停机前写进交接目录（部署的暂存目录或升级器的导出目录；运维核心把它复制进快照后才发布事务指针）：逐项校验后写
+# 临时文件并落盘（dd 用写入句柄 fsync），再改名；读者要么看不到文件，要么看到完整的一份。
 write_candidate_record() {
     local directory="$1" key content='' temporary="$1/candidate-image.tmp"
     candidate_record_consistent || return 1
@@ -67,26 +67,6 @@ write_candidate_record() {
         return 1
     fi
     mv -- "$temporary" "$directory/candidate-image"
-}
-
-# 读取快照中的候选镜像记录到 CANDIDATE。缺失、不是普通文件、重复或未知的键、任何一项无效都拒绝整份记录。
-read_candidate_record() {
-    local file="$1/candidate-image" line key value
-    declare -gA CANDIDATE=()
-    if [ ! -e "$file" ] && [ ! -L "$file" ]; then echo "缺少候选镜像记录：$file" >&2; return 1; fi
-    [ -f "$file" ] && [ ! -L "$file" ] || { echo "候选镜像记录不是普通文件：$file" >&2; return 1; }
-    while IFS= read -r line || [ -n "$line" ]; do
-        key="${line%%=*}"
-        value="${line#*=}"
-        # 先按已知键校验，再查重：未知的键不会用作数组下标。
-        if [ "$key" = "$line" ] || ! candidate_value_valid "$key" "$value" || [ -n "${CANDIDATE[$key]+set}" ]; then
-            CANDIDATE=()
-            echo "候选镜像记录无效：${key}" >&2
-            return 1
-        fi
-        CANDIDATE[$key]="$value"
-    done < "$file"
-    candidate_record_consistent || { CANDIDATE=(); return 1; }
 }
 
 # 项目路径的摘要：同一台 Docker 上的多份部署各用各的候选标签。
@@ -185,14 +165,6 @@ candidate_verify() {
         { echo "保留标签 ${CANDIDATE[image_tag]} 已被改指向或删除；执行仍只按记录的 ID" >&2; return 6; }
 }
 
-# 正式标签（例如 mixin-chatbot）改指向候选镜像，并核对结果。
-candidate_publish() {
-    local image_id="$1" reference="$2" tagged
-    docker tag "$image_id" "$reference" >/dev/null || { echo "无法把 ${reference} 指向候选镜像" >&2; return 1; }
-    tagged="$(candidate_reference_id "$reference")" || tagged=''
-    [ "$tagged" = "$image_id" ] || { echo "${reference} 没有指向候选镜像 ${image_id}（当前 ${tagged:-不存在}）" >&2; return 1; }
-}
-
 # 移除本次的保留标签：只在它仍指向记录的 ID 时移除，且只删这个引用，不按 ID 删除镜像（仍有其他标签时镜像保留）。
 # 标签已不存在返回 0；被改指向其他镜像时保留并返回 2。
 candidate_release_tag() {
@@ -254,7 +226,7 @@ prepare_candidate_image() {
     idfile="$(mktemp)" || return 1
     started="$SECONDS"
     run_interruptible candidate_build_to "$idfile" "$context" "$tag" "$sha" "$project_id" "$operation_id" "$source" || status=$?
-    # 构建期间原服务照常运行；耗时与停机窗口（downtime_begins / downtime_ends）分别记录。
+    # 构建期间原服务照常运行；构建耗时在这里记录，停机窗口由共用核心记录。
     operation_event info "candidate build took $((SECONDS - started))s; exit=$status"
     id="$(tr -d '[:space:]' < "$idfile" 2>/dev/null)" || id=''
     rm -f -- "$idfile"

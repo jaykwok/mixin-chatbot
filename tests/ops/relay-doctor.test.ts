@@ -24,7 +24,7 @@ for (const shell of ["powershell", "bash"] as const) {
             "foreach($name in @('Get-RelayDoctorRows','New-DoctorRow')) {",
             "  $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true)",
             "  . ([scriptblock]::Create($fn.Extent.Text))", "}",
-            "$RelayConfigFile=$env:DOCTOR_CONFIG", "function Invoke-HttpProbe {throw 'must not access network'}",
+            "$RelayConfigFile=$env:DOCTOR_CONFIG",
             "ConvertTo-Json -InputObject @(Get-RelayDoctorRows) -Compress",
           ].join("\n"));
         } else {

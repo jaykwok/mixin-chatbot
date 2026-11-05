@@ -35,9 +35,10 @@ function lib(...args: string[]) {
   const id = /^CANDIDATE_IMAGE_ID=(.*)$/m.exec(result.out)?.[1] ?? "";
   return { ...result, id };
 }
-// Verifies against a candidate-image record written the way the upgrader writes it.
+// Verifies against a candidate-image record written the way the upgrader writes it (the core parses it; here it is loaded as is).
 function verify(directory: string) {
-  return run("bash", ["-c", '. "$1"; read_candidate_record "$2" && candidate_verify', "candidate-image", library, directory]);
+  return run("bash", ["-c", '. "$1"; declare -A CANDIDATE=(); while IFS="=" read -r key value; do CANDIDATE[$key]="$value"; done < "$2/candidate-image"; candidate_verify',
+    "candidate-image", library, directory]);
 }
 const exists = (reference: string) => docker("image", "inspect", "--format", "{{.Id}}", reference).code === 0;
 const tagsOf = (id: string) => {
@@ -135,7 +136,7 @@ describe.skipIf(!enabled)(`real Docker candidate image (uid ${process.getuid?.()
   step("the running deployment's image: built by ID, published and kept under its official and rollback tags", () => {
     const old = build("old", "old");
     images.old = old.id;
-    expect(lib("candidate_publish", old.id, `${repo}:current`).code).toBe(0);
+    expect(docker("tag", old.id, `${repo}:current`).code).toBe(0);
     expect(lib("candidate_release_tag", old.tag, old.id).code).toBe(0);
     must("docker", ["run", "-d", "--name", containers[0]!, `${repo}:current`, "sleep", "600"]);
     // The container records the image it actually runs, independent of the tag it was started from.
@@ -166,7 +167,7 @@ describe.skipIf(!enabled)(`real Docker candidate image (uid ${process.getuid?.()
   step("publishing switches the official tag while every image keeps a tag; releasing the reserved tag keeps the image", () => {
     must("docker", ["stop", "--time", "1", containers[0]!]);
     must("docker", ["rename", containers[0]!, containers[1]!]);
-    expect(lib("candidate_publish", images.new!, `${repo}:current`).code).toBe(0);
+    expect(docker("tag", images.new!, `${repo}:current`).code).toBe(0);
     expect(tagsOf(images.new!)).toEqual([`${repo}:current`, images.newTag!].sort());
     expect(tagsOf(images.old!)).toEqual([`${repo}:previous`]);
     expect(lib("candidate_release_tag", images.newTag!, images.new!).code).toBe(0);
@@ -187,7 +188,7 @@ describe.skipIf(!enabled)(`real Docker candidate image (uid ${process.getuid?.()
     expect(tagsOf(broken.id)).toEqual([broken.tag]);
     expect(tagsOf(images.new!)).toEqual([`${repo}:current`, `${repo}:previous`]);
     // Rollback restores the official tag to the previous image (it never moved here) and drops the candidate's tag.
-    expect(lib("candidate_publish", images.new!, `${repo}:current`).code).toBe(0);
+    expect(docker("tag", images.new!, `${repo}:current`).code).toBe(0);
     expect(lib("candidate_release_tag", broken.tag, broken.id).code).toBe(0);
     expect(exists(broken.tag)).toBe(false);
     expect(tagsOf(images.new!)).toEqual([`${repo}:current`, `${repo}:previous`]);

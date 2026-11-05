@@ -4,14 +4,15 @@ import type { Context } from "@earendil-works/chord";
 import { defineDocFamily, type DocumentReader, type Tx } from "@earendil-works/pi-durable";
 import { sameOwnership, type ResultOwnership } from "../../contracts/maintenance.ts";
 import { ResultsDoc } from "./ownership.ts";
+import { checkpointDue } from "../checkpoint.ts";
 
 type ReclamationItem = { name: string; call: ResultOwnership; next?: string };
 /** Individually indexed ownership records; moving out of the active quota never means physical deletion. */
 export const ReclamationItems = defineDocFamily<ReclamationItem, ReclamationItem>({
-  kind: "mixin.reclamation-item", version: 1, checkpointWhen: () => false, scope: "session", family: true, initial: seed => ({ ...seed }),
+  kind: "mixin.reclamation-item", version: 1, checkpointWhen: checkpointDue, scope: "session", family: true, initial: seed => ({ ...seed }),
 });
 export const ReclamationQueues = defineDocFamily<{ head?: string; tail?: string; count: number; removed: number }, null>({
-  kind: "mixin.reclamation-queue", version: 1, checkpointWhen: () => false, scope: "session", family: true, initial: () => ({ count: 0, removed: 0 }),
+  kind: "mixin.reclamation-queue", version: 1, checkpointWhen: checkpointDue, scope: "session", family: true, initial: () => ({ count: 0, removed: 0 }),
 });
 
 /** One commit publishes the new owner and releases the active quota. Failure rolls both changes back. */

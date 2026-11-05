@@ -42,7 +42,7 @@ async function recordedSpace(reader: Parameters<typeof databaseSpace>[0], path: 
  * Queue a /clear for every member conversation in a space's database (`<space dir>/durable.sqlite`), as if each member
  * had sent one now. At its next start the service runs them before any message: each member's waiting messages are
  * cancelled and the conversation is reset (the old context stays in the database, no space is freed), the member's
- * codemode results are removed and the usage is counted. A member with a /clear already waiting gets no second one;
+ * codemode results are recorded as expired for idle maintenance and the usage is counted. A member with a /clear already waiting gets no second one;
  * the waiting one is moved to now. Undefined when the space has no database; a database recording another space than
  * its directory's is refused.
  */

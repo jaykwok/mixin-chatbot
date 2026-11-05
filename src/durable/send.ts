@@ -1,15 +1,14 @@
-// `mixin.send`: send_image and send_file for the Durable engine. The send tools (src/agent/send-tools.ts) built for the
-// calling member, through the same `memberTool` entry as the base tools: the identity decides the member, and the
-// member's places decide which files may be sent.
+// `mixin.send`: send_image and send_file for the Durable engine (src/agent/send-tools.ts), run for the calling member
+// like every member tool: the identity decides the member, and the member's places decide which files may be sent.
 //
-// Model-only: the definitions say `exposure: "model-only"`, so codemode never lets a script call them (a message cannot
-// be taken back); the model calls them one by one. Replay unsafe: an interrupted send is never repeated on recovery.
+// Model-only (`callers: ["model"]`): codemode never lets a script call them (a message cannot be taken back); the model
+// calls them one by one. Replay unsafe: an interrupted send is never repeated on recovery.
 //
 // Every send goes to the reply context of the invocation's own request (its run record), never to a later message of
 // the member. Relay link notes and file send states are written to that run record in the invocation's commits.
 import type { RelayConfig } from "../integrations/relay.ts";
 import type { SendOutcome } from "../integrations/open-platform/messages.ts";
-import { buildSendTools, SendNotConfirmed, type SendChannel } from "../agent/send-tools.ts";
+import { sendTools, SendNotConfirmed, type SendChannel, type SendContext } from "../agent/send-tools.ts";
 import { type BaseToolsOptions, type Member, type MemberCall, memberTool, type MemberTool } from "./tools.ts";
 import { fileDelivery } from "./file-delivery.ts";
 import { activeRequest } from "./closeout.ts";
@@ -41,22 +40,15 @@ export function sendChannel(outbound: Outbound, reply: ReplyContext): SendChanne
   };
 }
 
-const catalogueChannel: SendChannel = { file: async () => { throw new Error("catalogue only"); }, image: async () => { throw new Error("catalogue only"); } };
-
-function catalogue(options: SendToolsOptions) {
-  return buildSendTools({ channel: catalogueChannel, workspaceDir: "catalogue", tempDir: "catalogue", relay: options.relay,
-    notes: { add: async () => { throw new Error("catalogue only"); } } });
-}
-
-async function definitions(options: SendToolsOptions, member: Member, call: MemberCall) {
+/** The calling member's sending context: its running request's reply target and run record. */
+async function sendContext(options: SendToolsOptions, member: Member, call: MemberCall): Promise<SendContext> {
   const item = await activeRequest(call.api, call.context);
   if (!item) throw new Error("没有正在执行的任务，不能发送");
   const active = { requestId: item.requestId, phone: item.phone };
-  return buildSendTools({
+  return {
     channel: sendChannel(options.outbound, item.record.reply),
     workspaceDir: member.places.workspaceDir,
     tempDir: member.places.tempDir,
-    relay: options.relay,
     fileDelivery: fileDelivery(member, call, active, options.relay?.maxBytes),
     notes: {
       add: note => call.api.commit(async tx => {
@@ -66,11 +58,10 @@ async function definitions(options: SendToolsOptions, member: Member, call: Memb
           && saved.reference.backend === note.reference.backend)) record.notes.push(structuredClone(note));
       }, call.context),
     },
-  });
+  };
 }
 
 /** The two send tools; `mixin.send` declares them to the model (./registry.ts). */
 export function sendMemberTools(options: SendToolsOptions): MemberTool[] {
-  return catalogue(options).map((definition) => memberTool(definition, options, async (member, call) =>
-    (await definitions(options, member, call)).filter(each => each.name === definition.name)));
+  return sendTools(options.relay, (member, call) => sendContext(options, member, call)).map((spec) => memberTool(spec, options));
 }

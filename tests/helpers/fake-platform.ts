@@ -64,6 +64,8 @@ export class FakePlatform {
   tokenExpiresIn = 7200;
   /** 接下来这么多次分片上传返回 503（字节不保存）。 */
   putFailures = 0;
+  /** 秒传：init 的 fileHash 与已存文件的 MD5 相同时直接返回它的 fileKey（平台“可能”这样答复，默认关闭）。 */
+  deduplicate = false;
   /** 拒绝 Stream 握手（模拟鉴权失败）。 */
   rejectStream = false;
   directory: FakeDirectory = { children: {}, members: {}, ids: {} };
@@ -171,7 +173,10 @@ export class FakePlatform {
       return json({ success: true, code: 200 });
     }
     if (request.method === "POST" && url.pathname === "/open-apis/v1/files/upload/init") {
-      const { fileSize, chunkSize } = body as { fileSize: number; chunkSize: number };
+      const { fileSize, chunkSize, fileHash } = body as { fileSize: number; chunkSize: number; fileHash?: unknown };
+      const existing = this.deduplicate && [...this.files].find(([, bytes]) => createHash("md5").update(bytes).digest("hex") === fileHash);
+      if (existing) return json({ success: true, code: 200, message: "SUCCESS", data: { deduplicatedHit: true, fileKey: existing[0],
+        fileSize: existing[1].byteLength, mimeType: "application/octet-stream", uploadComplete: true }, request_id: "" });
       const id = randomUUID();
       this.uploads.set(id, { parts: new Map(), aborted: false, completed: false });
       const parts = Array.from({ length: Math.max(1, Math.ceil(fileSize / chunkSize)) }, (_, index) =>

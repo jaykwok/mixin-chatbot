@@ -1,11 +1,13 @@
 import { mkdir } from "node:fs/promises";
-import { Type, type ClassifierContext, type ClassifierResult, type ImageContent, type Usage } from "@earendil-works/pi-ai";
+import type { ClassifierContext, ClassifierResult, ImageContent, Usage } from "@earendil-works/pi-ai";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
+import type { ModelRef } from "@earendil-works/pi-durable";
+import { arr, lit, num, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import type { AuxiliaryConfig } from "../core/auxiliary-config.ts";
 import type { RequestDoor } from "./door.ts";
 import { resultRegistration } from "./results/ownership.ts";
 import { ResultFiles, resultsDirName } from "./results/files.ts";
-import { resolveMember, type BaseToolsOptions, type MemberCall, type MemberTool } from "./tools.ts";
+import { memberTool, type BaseToolsOptions, type MemberCall, type MemberTool, type MemberToolSpec } from "./tools.ts";
 
 /** One instance per service, shared by all groups; queued calls are bounded and abort without a request. */
 export class AuxiliaryBudget {
@@ -43,8 +45,12 @@ function sumUsage(results: readonly { usage?: Usage }[]): Usage | undefined {
   return total;
 }
 
-const IMAGE = Type.Object({ type: Type.Literal("image"), data: Type.String({ maxLength: 12 * 1024 * 1024 }),
-  mimeType: Type.Union([Type.Literal("image/png"), Type.Literal("image/jpeg"), Type.Literal("image/webp"), Type.Literal("image/gif")]) });
+const IMAGE = obj({ type: lit("image"), data: str({ maxLength: 12 * 1024 * 1024 }),
+  mimeType: oneOf(["image/png", "image/jpeg", "image/webp", "image/gif"]) }, { open: true });
+const MODELS = { name: "models", description: "管理员配置的辅助模型" };
+const routeParams = obj({ text: str({ maxLength: 32768 }), images: opt(arr(IMAGE, { maxItems: 4 })) }, { open: true });
+const routeOutput = obj({ route: oneOf(["text", "ocr", "layout"]), confidence: num() }, { open: true });
+const imageParams = obj({ prompt: str({ minLength: 1, maxLength: 32768 }), images: opt(arr(IMAGE, { maxItems: 4 })) }, { open: true });
 function images(raw: ImageContent[] | undefined): ImageContent[] {
   if (!raw) return [];
   if (raw.length > 4) throw new Error("每次最多四张参考图片");
@@ -55,24 +61,15 @@ function images(raw: ImageContent[] | undefined): ImageContent[] {
   });
 }
 
-export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoor, config: AuxiliaryConfig, budget: AuxiliaryBudget): MemberTool[] {
-  const run = <T>(call: MemberCall, work: () => Promise<T>): Promise<T> => {
-    if (!call.signal) return Promise.reject(new Error("辅助模型需要可取消的任务"));
-    return budget.run(call.signal, () => door.withToolModels(call.api, call.context, call.callId, call.signal!, work));
-  };
-  const tools: MemberTool[] = [];
-  if (config.classifier) tools.push({
-    definition: {
-      name: "document_route", label: "判断文档处理路线", namespace: { name: "models", description: "管理员配置的辅助模型" },
-      description: "Classify a document or page as text extraction, OCR, or layout processing with the configured classifier. Images use image blocks returned by read. This starts a billed model request; use once for a representative page when the route is uncertain.",
-      parameters: Type.Object({ text: Type.String({ maxLength: 32768 }), images: Type.Optional(Type.Array(IMAGE, { maxItems: 4 })) }),
-      outputSchema: Type.Object({ route: Type.Union([Type.Literal("text"), Type.Literal("ocr"), Type.Literal("layout")]), confidence: Type.Number() }),
-      execute: async () => { throw new Error("Member invocation required"); },
-    }, replay: "unsafe", outputLimits: { maxBytes: 65536, maxLines: 2200 },
-    async run(raw, call) {
-      await resolveMember(options, call);
-      const args = raw as { text: string; images?: ImageContent[] };
-      const ref = config.classifier!;
+type Budgeted = <T>(call: MemberCall, work: () => Promise<T>) => Promise<T>;
+
+/** document_route: the configured classifier picks a processing route; transient errors are retried `retries` times. */
+function routeTool(ref: ModelRef, retries: number, run: Budgeted): MemberToolSpec<typeof routeParams> {
+  return {
+    name: "document_route", namespace: MODELS,
+    description: "Classify a document or page as text extraction, OCR, or layout processing with the configured classifier. Images use image blocks returned by read. This starts a billed model request; use once for a representative page when the route is uncertain.",
+    parameters: routeParams, structuredOutputSchema: routeOutput,
+    async run(args, _member, call) {
       const model = call.api.models.getModelOfType("classifier", ref.provider, ref.modelId);
       if (!model) throw new Error(`没有分类模型 ${ref.provider}/${ref.modelId}`);
       const context: ClassifierContext = { state: { text: args.text }, images: images(args.images), questions: {
@@ -85,7 +82,7 @@ export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoo
         for (let attempt = 0; ; attempt++) {
           result = await call.api.models.classify(model, context);
           attempts.push(result);
-          if (result.stopReason !== "error" || attempt >= config.classifierRetries
+          if (result.stopReason !== "error" || attempt >= retries
             || !isRetryableAssistantError({ stopReason: "error", errorMessage: result.errorMessage } as never)) return result;
           await new Promise<void>((resolve, reject) => {
             const signal = call.signal!;
@@ -99,30 +96,28 @@ export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoo
       call.signal?.throwIfAborted();
       const usage = sumUsage(attempts);
       const charged = usage === undefined ? {} : { usage };
-      if (result.stopReason !== "stop") return { content: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, details: undefined, ...charged };
+      if (result.stopReason !== "stop") return { output: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, ...charged };
       const answer = result.answers.route;
       if (answer?.type !== "choice" || !["text", "ocr", "layout"].includes(answer.choice)) throw new Error("分类模型没有返回有效处理路线");
       const value = { route: answer.choice, confidence: answer.confidence };
-      return { content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value, details: { provider: ref.provider, model: ref.modelId }, ...charged };
+      return { output: [{ type: "text", text: JSON.stringify(value) }], structuredOutput: value, details: { provider: ref.provider, model: ref.modelId }, ...charged };
     },
-  });
-  if (config.image) tools.push({
-    definition: {
-      name: "generate_image", label: "生成图片", namespace: { name: "models", description: "管理员配置的辅助模型" },
-      description: "Generate an image with the configured image model and save it into your own tmp. Starts a billed request. Supply a prompt and optional image blocks; send_image remains a separate model-only tool.",
-      parameters: Type.Object({ prompt: Type.String({ minLength: 1, maxLength: 32768 }), images: Type.Optional(Type.Array(IMAGE, { maxItems: 4 })) }),
-      execute: async () => { throw new Error("Member invocation required"); },
-    }, replay: "unsafe", outputLimits: { maxBytes: 65536, maxLines: 2200 },
-    async run(raw, call) {
-      const { phone, places } = await resolveMember(options, call);
-      const args = raw as { prompt: string; images?: ImageContent[] };
-      const ref = config.image!;
+  };
+}
+
+/** generate_image: the configured image model; its images are saved in the member's results directory. */
+function imageTool(ref: ModelRef, run: Budgeted): MemberToolSpec<typeof imageParams> {
+  return {
+    name: "generate_image", namespace: MODELS,
+    description: "Generate an image with the configured image model and save it into your own tmp. Starts a billed request. Supply a prompt and optional image blocks; send_image remains a separate model-only tool.",
+    parameters: imageParams,
+    async run(args, { phone, places }, call) {
       const model = call.api.models.getModelOfType("image", ref.provider, ref.modelId);
       if (!model) throw new Error(`没有图片模型 ${ref.provider}/${ref.modelId}`);
       const result = await run(call, () => call.api.models.generateImages(model, { input: [{ type: "text", text: args.prompt }, ...images(args.images)] }));
       call.signal?.throwIfAborted();
       const charged = result.usage === undefined ? {} : { usage: result.usage };
-      if (result.stopReason !== "stop") return { content: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, details: undefined, ...charged };
+      if (result.stopReason !== "stop") return { output: [{ type: "text", text: result.errorMessage ?? result.stopReason }], isError: true, ...charged };
       await mkdir(places.tempDir, { recursive: true });
       const name = resultsDirName(call.api.taskId as number, `image-${call.callId}`);
       const files = new ResultFiles(places.tempDir, name, resultRegistration(call.api, call.context, phone, name));
@@ -137,9 +132,21 @@ export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoo
         }
         const stale = await files.recheck();
         if (stale.size) throw new Error("生成图片目录发生变化，结果路径已撤回");
-        return { content, details: { provider: ref.provider, model: ref.modelId }, ...charged };
+        return { output: content, details: { provider: ref.provider, model: ref.modelId }, ...charged };
       } finally { await files.release(); }
     },
-  });
-  return tools;
+  };
+}
+
+/** The configured auxiliary model tools (document_route, generate_image), script-callable like any direct tool. */
+export function auxiliaryMemberTools(options: BaseToolsOptions, door: RequestDoor, config: AuxiliaryConfig, budget: AuxiliaryBudget): MemberTool[] {
+  const run: Budgeted = (call, work) => {
+    if (!call.signal) return Promise.reject(new Error("辅助模型需要可取消的任务"));
+    return budget.run(call.signal, () => door.withToolModels(call.api, call.context, call.callId, call.signal!, work));
+  };
+  const tools: MemberToolSpec[] = [
+    ...config.classifier ? [routeTool(config.classifier, config.classifierRetries, run)] : [],
+    ...config.image ? [imageTool(config.image, run)] : [],
+  ];
+  return tools.map((spec) => memberTool(spec, options));
 }

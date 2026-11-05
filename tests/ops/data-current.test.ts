@@ -49,11 +49,13 @@ test("an empty directory is a fresh install; the record names the deployed progr
     await sequence(f.root, ["apply", "apply", "validate"]);
     expect(existsSync(marker(f.root))).toBe(false);
     expect(inspectDataVersion(f.root).current).toBe(false);
-    await sequence(f.root, ["commit", "commit", "committed"]);
+    await sequence(f.root, ["commit", "commit"]);
+    expect(JSON.parse(await readFile(release(f.root), "utf8"))).toMatchObject({ phase: "committed", deployment });
     expect(await record(f.root)).toEqual({ dataVersion: DATA_VERSION, appVersion: APP_VERSION, build: BUILD, transaction: deployment, application: APPLICATION });
     expect(inspectDataVersion(f.root)).toEqual({ current: true, detail: `数据格式 ${DATA_VERSION}` });
     expect((await run(f.root, "rollback")).code).toBe(42);
-    expect((await run(f.root, "committed", "deploy-other")).code).toBe(1);
+    // The old committed probe is gone: an unknown action.
+    expect((await run(f.root, "committed")).code).toBe(1);
     expect(await readFile(join(f.root, "data/workspace/reference.txt"), "utf8")).toBe("keep");
   } finally { await f.cleanup(); }
   // Eleven sequential runner processes: 8 s alone, 28 s seen with a parallel group (Windows process start costs).
@@ -311,7 +313,8 @@ test("a conversation database of another Durable schema fails validate, the veri
     const group = join(f.root, "data/conversations/groups/g1");
     await mkdir(group, { recursive: true });
     await createSession(await openGroupStorage(join(group, "durable.sqlite"))).close(context);
-    await sequence(f.root, ["preview", "apply", "validate", "commit", "committed"]);
+    await sequence(f.root, ["preview", "apply", "validate", "commit"]);
+    expect(JSON.parse(await readFile(release(f.root), "utf8"))).toMatchObject({ phase: "committed", deployment });
     const committed = await record(f.root);
     expect(committed).toMatchObject({ transaction: deployment });
     // The next upgrade finds a schema-1 direct database (say, restored from an unreleased test directory).

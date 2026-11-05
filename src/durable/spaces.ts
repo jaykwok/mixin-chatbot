@@ -13,6 +13,8 @@
 //
 // Discovery skips only what is known not to exist. Anything else it cannot check (an unreadable path, an I/O error, a
 // symbolic link, a database path that is not a file) fails it, so a space with work is never silently left behind.
+//
+// Each open times its steps and counts its database's SQL meanwhile, for the service log (`onOpened`).
 import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
@@ -21,6 +23,7 @@ import { createSession, Harness, type HarnessOptions, type Storage } from "@eare
 import { scopeKey, spaceDatabase, spacePath, type Layout, type Scope } from "../core/layout.ts";
 import { claimSpace, databaseSpace } from "./identity.ts";
 import { missing, spaceDirectories } from "./space-databases.ts";
+import { countSql, type SqlTotals } from "./sql-timing.ts";
 import { openGroupStorage } from "./sqlite.ts";
 import { DurableStorageFailure, guardStorage } from "./storage-failure.ts";
 import { LIVE_TASK_STATES } from "./task-states.ts";
@@ -43,7 +46,7 @@ async function storedData(storage: Storage, context: Context): Promise<boolean> 
 }
 
 /**
- * The error that failed the Harness's Session, if one did. pi-durable (since 1.2.0, rechecked on 1.4.0) marks `failure` internal on the Session but
+ * The error that failed the Harness's Session, if one did. pi-durable (since 1.2.0, rechecked on 1.5.0) marks `failure` internal on the Session but
  * documents it as what close listeners read when a failure closes the Session (session.d.ts `fail`, `subscribeClose`);
  * the fail-stop test in tests/durable/spaces.test.ts depends on it.
  */
@@ -71,6 +74,37 @@ export interface SpaceHarnessesOptions {
   onFatal?: (error: DurableStorageFailure) => void;
   /** Every connection closure, including discovery, failed preparation and shutdown; the exact closed instance. */
   onClosed?: (scope: Scope, harness?: Harness) => void | Promise<void>;
+  /** The steps of every open that succeeded, and of every discovery that found no work and closed again. Must not throw. */
+  onOpened?: (scope: Scope, timing: SpaceOpenTiming) => void;
+}
+
+/** Steps of an open, in the order they run: the database, its recorded space, the Harness, claiming a new database,
+ *  the discovery's check for work, and `prepare`. */
+export type SpaceOpenStep = "storage" | "recorded" | "harness" | "claim" | "work" | "prepare";
+export interface SpaceOpenTiming {
+  /** False when discovery found no work and closed the database again. */
+  kept: boolean;
+  /** Milliseconds, as are the steps. */
+  total: number;
+  steps: { step: SpaceOpenStep; ms: number }[];
+  /** The database's SQL during the open (sql-timing.ts). */
+  sql: SqlTotals;
+}
+
+/** Times the steps of one open and counts its database's SQL until `end()`, which every path must call. */
+class OpenTimer {
+  readonly #started = performance.now();
+  readonly #steps: SpaceOpenTiming["steps"] = [];
+  readonly #sql: () => SqlTotals;
+  constructor(path: string) { this.#sql = countSql(path); }
+  async step<T>(step: SpaceOpenStep, work: () => Promise<T>): Promise<T> {
+    const started = performance.now();
+    try { return await work(); }
+    finally { this.#steps.push({ step, ms: performance.now() - started }); }
+  }
+  end(kept: boolean): SpaceOpenTiming {
+    return { kept, total: performance.now() - this.#started, steps: this.#steps, sql: this.#sql() };
+  }
 }
 
 export interface SpaceHandle {
@@ -293,7 +327,7 @@ export class SpaceHarnesses {
 
   /**
    * The recorded space, read without a Harness: a bare Session only reads (closing it would close the storage). It is
-   * never closed, so it keeps no document: with the default retention (ten minutes since pi-durable 1.2.0, rechecked on 1.4.0) its eviction
+   * never closed, so it keeps no document: with the default retention (ten minutes since pi-durable 1.2.0, rechecked on 1.5.0) its eviction
    * timer would hold the Session, and through the storage's failure callback the evicted Harness.
    */
   #recordedSpace(connection: Connection, storage: Storage): Promise<Scope | undefined> {
@@ -317,7 +351,7 @@ export class SpaceHarnesses {
       const failure = sessionFailure(harness);
       if (failure !== undefined) failed(failure.error);
     });
-    void harness.closed.then((end) => { if (end.reason === "failed") failed(end.error); }, () => {});
+    void harness.closed.then((end) => { if (end.kind === "failed") failed(end.error); }, () => {});
     return harness;
   }
 
@@ -336,22 +370,27 @@ export class SpaceHarnesses {
   }
 
   async #open(scope: Scope, connection: Connection): Promise<Harness> {
-    const path = spaceDatabase(this.#options.layout, scope);
+    const path = spaceDatabase(this.#options.layout, scope), timer = new OpenTimer(path);
     try {
-      const storage = await this.#openStorage(connection, path);
-      const recorded = await this.#recordedSpace(connection, storage);
-      if (recorded !== undefined && scopeKey(recorded) !== scopeKey(scope)) throw new Error("会话库属于另一个空间，已拒绝读取和写入");
-      // Only a database that holds nothing is new; one with data but no recorded space is refused, never claimed.
-      if (recorded === undefined && await this.#step(connection, () => storedData(storage, this.#context))) {
-        throw new Error(`会话库有数据但没有登记空间，已拒绝读取和写入：${path}`);
-      }
-      const harness = await this.#openHarness(connection, scope);
-      if (recorded === undefined) await claimSpace(harness, scope, this.#context);
+      const storage = await timer.step("storage", () => this.#openStorage(connection, path));
+      const recorded = await timer.step("recorded", async () => {
+        const recorded = await this.#recordedSpace(connection, storage);
+        if (recorded !== undefined && scopeKey(recorded) !== scopeKey(scope)) throw new Error("会话库属于另一个空间，已拒绝读取和写入");
+        // Only a database that holds nothing is new; one with data but no recorded space is refused, never claimed.
+        if (recorded === undefined && await this.#step(connection, () => storedData(storage, this.#context))) {
+          throw new Error(`会话库有数据但没有登记空间，已拒绝读取和写入：${path}`);
+        }
+        return recorded;
+      });
+      const harness = await timer.step("harness", () => this.#openHarness(connection, scope));
+      if (recorded === undefined) await timer.step("claim", () => claimSpace(harness, scope, this.#context));
       this.#known.set(scopeKey(scope), scope);
-      await this.#options.prepare?.(harness, scope, this.#context);
+      await timer.step("prepare", async () => { await this.#options.prepare?.(harness, scope, this.#context); });
       this.#assertOpen(connection);
+      this.#opened(scope, timer.end(true));
       return harness;
     } catch (error) {
+      timer.end(false);
       await this.#discard(connection);
       // Once closeAll has begun, a callback failing on its closed Harness is a consequence: report the shutdown.
       throw this.#stopped ?? error;
@@ -360,31 +399,40 @@ export class SpaceHarnesses {
 
   /** Open a database found by discovery and keep it open, returning its space, only if it has work. */
   async #discoverDatabase(path: string, directory: string): Promise<Scope | undefined> {
-    const connection = this.#connect();
+    const connection = this.#connect(), timer = new OpenTimer(path);
     let scope: Scope | undefined;
     try {
-      const storage = await this.#openStorage(connection, path);
-      scope = await this.#recordedSpace(connection, storage);
+      const storage = await timer.step("storage", () => this.#openStorage(connection, path));
+      scope = await timer.step("recorded", () => this.#recordedSpace(connection, storage));
       if (scope !== undefined) {
-        if (spacePath(scope) !== directory) throw new Error(`会话库登记的空间与所在目录不符，已拒绝：${path}`);
-        this.#known.set(scopeKey(scope), scope);
-        const harness = await this.#openHarness(connection, scope);
-        if (await this.#hasWork(harness, scope)) {
+        const found = scope;
+        if (spacePath(found) !== directory) throw new Error(`会话库登记的空间与所在目录不符，已拒绝：${path}`);
+        this.#known.set(scopeKey(found), found);
+        const harness = await timer.step("harness", () => this.#openHarness(connection, found));
+        if (await timer.step("work", () => this.#hasWork(harness, found))) {
           this.#assertOpen(connection);
-          await this.#options.prepare?.(harness, scope, this.#context);
+          await timer.step("prepare", async () => { await this.#options.prepare?.(harness, found, this.#context); });
           this.#assertOpen(connection);
-          this.#start(scope, connection, Promise.resolve(harness)).lastUsed = ++this.#uses;
-          return scope;
+          this.#start(found, connection, Promise.resolve(harness)).lastUsed = ++this.#uses;
+          this.#opened(found, timer.end(true));
+          return found;
         }
       }
     } catch (error) {
+      timer.end(false);
       await this.#discard(connection);
       // Once closeAll has begun, a callback failing on its closed Harness is a consequence: report the shutdown.
       throw this.#stopped ?? error;
     }
+    const timing = timer.end(false);
     if (scope === undefined) this.#options.onReport?.(new Error(`会话库没有登记空间：${path}`));
+    else this.#opened(scope, timing);
     await this.#closeConnection(connection);
     return undefined;
+  }
+
+  #opened(scope: Scope, timing: SpaceOpenTiming): void {
+    try { this.#options.onOpened?.(scope, timing); } catch {}
   }
 
   async #hasWork(harness: Harness, scope: Scope): Promise<boolean> {

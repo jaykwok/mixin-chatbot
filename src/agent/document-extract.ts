@@ -5,8 +5,8 @@ import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pipeline } from "node:stream/promises";
 import { Transform, addAbortSignal } from "node:stream";
-import { Type } from "@earendil-works/pi-ai";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { arr, bool, int, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
+import type { MemberToolSpec } from "../durable/tools.ts";
 import { application, waitFor } from "../core/lifecycle.ts";
 import { AsyncSemaphore } from "../core/async-semaphore.ts";
 import { runProcess, timedCommand } from "../core/process.ts";
@@ -259,54 +259,52 @@ export function createDocumentTextLookup(options: DocumentOptions, signal: Abort
   };
 }
 
-const extractOutput = Type.Object({
-  source: Type.String({ description: "原件的实际路径" }),
-  format: Type.Union([Type.Literal("pdf"), Type.Literal("docx"), Type.Literal("pptx"), Type.Literal("xlsx")]),
-  path: Type.String({ description: "提取出的文本文件，用 read/bash 按需读取" }),
-  digest: Type.String({ description: "原件内容的 SHA-256 摘要" }),
-  units: Type.Integer({ minimum: 0, description: "已提取的页（PDF）、正文块（DOCX）、幻灯片（PPTX）或工作表（XLSX）数" }),
-  characters: Type.Integer({ minimum: 0 }),
-  truncated: Type.Boolean({ description: "为 true 时文本不完整" }),
-  cacheHit: Type.Boolean(),
-  warnings: Type.Array(Type.String()),
-}, { additionalProperties: false });
+const extractOutput = obj({
+  source: str({ description: "原件的实际路径" }),
+  format: oneOf(["pdf", "docx", "pptx", "xlsx"]),
+  path: str({ description: "提取出的文本文件，用 read/bash 按需读取" }),
+  digest: str({ description: "原件内容的 SHA-256 摘要" }),
+  units: int({ minimum: 0, description: "已提取的页（PDF）、正文块（DOCX）、幻灯片（PPTX）或工作表（XLSX）数" }),
+  characters: int({ minimum: 0 }),
+  truncated: bool({ description: "为 true 时文本不完整" }),
+  cacheHit: bool(),
+  warnings: arr(str()),
+});
+const environmentParams = obj({}, { open: true });
+const extractParams = obj({ source: str(), maxChars: opt(int({ minimum: 1000, maximum: 2000000 })) }, { open: true });
 
-export function buildDocumentEnvironmentTool(venvDir: string): ToolDefinition {
-  return {
-    name: "document_environment", label: "文档解析环境", description: "查询并按需准备固定版本的共享文档解析环境；成功后返回解释器位置。失败时说明能力不可用，不自行安装或修改共享环境。",
-    parameters: Type.Object({}),
+/** document_environment and document_extract, run in the calling member's places. */
+export function documentTools(): MemberToolSpec[] {
+  const environment: MemberToolSpec<typeof environmentParams> = {
+    name: "document_environment", description: "查询并按需准备固定版本的共享文档解析环境；成功后返回解释器位置。失败时说明能力不可用，不自行安装或修改共享环境。",
+    parameters: environmentParams,
     // 按需建立固定版本的共享环境（会下载依赖），环境已就绪时重复调用不再改动。
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async execute(_id, _params, toolSignal) {
+    async run(_args, { places }, { signal }) {
       const backend = configuredRootlessTasks();
       if (backend) {
         const temp = resolve("data/runtime/tmp/document-toolchain"); await mkdir(temp, { recursive: true });
         const task = await backend.create(temp);
         try {
           const result = await task.run({ command: ISOLATED_PYTHON, args: ["-c", "import pptx,docx,openpyxl,pypdf,pandas,numpy,dateutil,xlsxwriter,PIL,docxcompose,pypdfium2,lxml"],
-            cwd: task.path, timeoutMs: 30_000, signal: toolSignal });
+            cwd: task.path, timeoutMs: 30_000, signal });
           if (result.exitCode !== 0) throw new Error("镜像中的文档环境不可用：" + result.output.slice(-1200));
-          return { content: [{ type: "text" as const, text: "解析环境已验证，PI_PYTHON=" + ISOLATED_PYTHON }], details: {} };
+          return { output: [{ type: "text", text: "解析环境已验证，PI_PYTHON=" + ISOLATED_PYTHON }], details: {} };
         } finally { await finishTask(backend, task, "discard"); }
       }
-      const ready = await ensureDocumentToolchain(venvDir, toolSignal);
+      const ready = await ensureDocumentToolchain(places.venvDir, signal);
       if (!ready) throw new Error("文档解析环境不可用，请联系管理员检查 uv、网络或部署依赖");
-      return { content: [{ type: "text", text: "解析环境已验证，PI_PYTHON=" + venvPythonPath(venvDir) }], details: {} };
+      return { output: [{ type: "text", text: "解析环境已验证，PI_PYTHON=" + venvPythonPath(places.venvDir) }], details: {} };
     },
   };
-}
-
-export function buildDocumentTool(options: DocumentOptions): ToolDefinition {
-  const parameters = Type.Object({ source: Type.String(), maxChars: Type.Optional(Type.Integer({ minimum: 1000, maximum: 2000000 })) });
-  const tool: ToolDefinition<typeof parameters> = { name: "document_extract", label: "提取文档", description: "提取资料库或当前用户 tmp 中的 PDF/DOCX/PPTX/XLSX 文本，按当前文件内容校验并复用缓存；保留页码、幻灯片或 sheet/行号。返回文本文件路径，再用 read/bash 按需检索。",
-    parameters, outputSchema: extractOutput,
+  const extract: MemberToolSpec<typeof extractParams> = {
+    name: "document_extract", description: "提取资料库或当前用户 tmp 中的 PDF/DOCX/PPTX/XLSX 文本，按当前文件内容校验并复用缓存；保留页码、幻灯片或 sheet/行号。返回文本文件路径，再用 read/bash 按需检索。",
+    parameters: extractParams, structuredOutputSchema: extractOutput,
     // 解析缓存是内部实现，对资料和用户文件只读。
-    annotations: { readOnlyHint: true, openWorldHint: false },
-    async execute(_id, params, signal) {
-      const { source, format, path, digest, units, characters, truncated, cacheHit } = await extractDocument(options, params.source, params.maxChars, signal);
+    async run(args, { places }, { signal }) {
+      const { source, format, path, digest, units, characters, truncated, cacheHit } = await extractDocument(places, args.source, args.maxChars, signal);
       return structuredResult({ source, format, path, digest, units, characters, truncated, cacheHit,
         warnings: truncated ? ["提取已截断；需要更多内容时提高 maxChars 或定向解析原件"] : [] });
     },
   };
-  return tool;
+  return [environment, extract];
 }

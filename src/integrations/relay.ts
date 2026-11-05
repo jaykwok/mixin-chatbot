@@ -7,13 +7,13 @@ import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { application, KeyedQueue } from "../core/lifecycle.ts";
-import { NATIVE_FILE_MAX_BYTES, RELAY_HTTP_TIMEOUT } from "../core/config.ts";
+import { NATIVE_FILE_MAX_BYTES, RELAY_HTTP_TIMEOUT } from "../core/transfer-limits.ts";
 import { log } from "../core/log.ts";
 import { RELAY_CONFIG_PATH, RELAY_INDEX_PATH } from "../core/storage.ts";
 import { openRelayIndex, relayCacheKey, type RelayIndex, type RelayIndexEntry } from "./relay-index.ts";
 import { deleteObject, downloadUrl, objectBaseUrl, objectNameFromUrl, putObject, remoteStillExists,
-  readRelayConfigFile, storedObjectUrl, S3RequestError, LinkUnavailable, type RelayConfig } from "./relay-s3.ts";
-export { DEFAULT_RELAY_MAX_BYTES, DEFAULT_RELAY_EXPIRE_HOURS, DEFAULT_RELAY_CLEANUP_GRACE_MINUTES, LinkUnavailable, validateRelayConfig, type RelayConfig } from "./relay-s3.ts";
+  readRelayConfigFile, relayBackendId, storedObjectUrl, S3RequestError, LinkUnavailable, type RelayConfig } from "./relay-s3.ts";
+export { LinkUnavailable, type RelayConfig } from "./relay-s3.ts";
 
 export function loadRelayConfig(path = RELAY_CONFIG_PATH): RelayConfig | null {
   return readRelayConfigFile(path);
@@ -33,9 +33,6 @@ export function getRelayConfig(): RelayConfig | null {
   return cachedConfig ?? null;
 }
 
-export function relayBackendId(config: RelayConfig): string {
-  return createHash("sha256").update(JSON.stringify(["s3", config.endpoint, config.region, config.bucket, config.prefix, config.forcePathStyle])).digest("hex");
-}
 const backend = relayBackendId;
 
 /** Durable references contain neither signing credentials nor transient query parameters. */

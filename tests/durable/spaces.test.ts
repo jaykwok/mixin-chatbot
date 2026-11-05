@@ -1,15 +1,16 @@
 import { afterAll, describe, mock, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, symlinkSync, type PathLike, type StatOptions } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, rmSync, symlinkSync, type PathLike, type StatOptions } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, createSession, defineExtension, Harness, type HarnessInspection, type SubmissionId } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import { appLayout, DIRECT_SCOPE, groupScope as g, groupSegment, scopeKey, spaceDatabase, type Scope } from "../../src/core/layout.ts";
-import { SpaceHarnesses, type SpaceHarnessesOptions } from "../../src/durable/spaces.ts";
+import { SpaceHarnesses, type SpaceHarnessesOptions, type SpaceOpenTiming } from "../../src/durable/spaces.ts";
+import { sqlWatched } from "../../src/durable/sql-timing.ts";
 import { memberConversation, MemberDirectory } from "../../src/durable/identity.ts";
 import { openGroupDatabase, openGroupStorage } from "../../src/durable/sqlite.ts";
 import { fauxModels, gatedResponse, harnessOptions } from "../helpers/durable.ts";
@@ -284,6 +285,44 @@ describe("per-space Harness cache", () => {
       expect((await (await handle.harness.submission(submissionId!, context))!.wait(context)).status).toBe("done");
       handle.release();
     } finally { await second.groups.closeAll(); }
+  });
+
+  test("every open reports its steps and its database's SQL; so does a discovery that closes the database again; a refused open reports nothing", async () => {
+    const opened: [string, SpaceOpenTiming][] = [];
+    const onOpened = (scope: Scope, timing: SpaceOpenTiming) => { opened.push([scopeKey(scope), timing]); };
+    const steps = (index: number) => opened[index]![1].steps.map(({ step }) => step);
+    const first = setup({ onOpened, prepare: async () => { await Bun.sleep(20); } });
+    const { root } = first;
+    try { (await first.groups.acquire(g("a"))).release(); } finally { await first.groups.closeAll(); }
+    expect(opened.map(([key]) => key)).toEqual(["group:a"]);
+    expect(steps(0)).toEqual(["storage", "recorded", "harness", "claim", "prepare"]);
+    const timing = opened[0]![1];
+    expect(timing.kept).toBe(true);
+    expect(timing.steps.find(({ step }) => step === "prepare")!.ms).toBeGreaterThanOrEqual(15);
+    expect(timing.total).toBeGreaterThanOrEqual(timing.steps.reduce((sum, { ms }) => sum + ms, 0) - 1);
+    expect(timing.sql.requests).toBeGreaterThan(5);
+    expect(timing.sql.transactions).toBeGreaterThan(0);
+    expect(timing.sql.exec).toBeGreaterThan(0);
+
+    // Group a's database (closed, so checkpointed) under group b's directory.
+    mkdirSync(spaceDir(root, "b"), { recursive: true });
+    copyFileSync(dbPath(root, "a"), dbPath(root, "b"));
+    const second = setup({ root, onOpened });
+    try {
+      (await second.groups.acquire(g("a"))).release();
+      expect(steps(1)).toEqual(["storage", "recorded", "harness", "prepare"]);
+      await expect(second.groups.acquire(g("b"))).rejects.toThrow("属于另一个空间");
+      expect(opened).toHaveLength(2);
+    } finally { await second.groups.closeAll(); }
+
+    rmSync(spaceDir(root, "b"), { recursive: true });
+    const third = setup({ root, onOpened });
+    try { expect(await third.groups.discover()).toEqual([]); } finally { await third.groups.closeAll(); }
+    expect(opened[2]![0]).toBe("group:a");
+    expect(opened[2]![1].kept).toBe(false);
+    expect(steps(2)).toEqual(["storage", "recorded", "harness", "work"]);
+    // Every open stopped counting its SQL, the refused one included.
+    expect(sqlWatched()).toBe(false);
   });
 
   test("after closeAll no group opens and discovery is refused", async () => {
@@ -561,7 +600,7 @@ describe("a failed Session", () => {
     const { promise: held, resolve: release } = Promise.withResolvers<void>();
     const { promise: started, resolve: start } = Promise.withResolvers<void>();
     const { faux, models, model } = fauxModels();
-    const hold = { name: "hold", description: "Waits until the test releases it.", parameters: Type.Object({}), replay: "unsafe" as const,
+    const hold = { name: "hold", description: "Waits until the test releases it.", parameters: obj({}, { open: true }), replay: "unsafe" as const,
       execute: async () => { start(); await held; return { output: [{ type: "text" as const, text: "done" }] }; } };
     const { groups, root } = setup({ onFatal: (error) => fatal.push(error), harnessOptions: () => {
       const registry = createRegistry();

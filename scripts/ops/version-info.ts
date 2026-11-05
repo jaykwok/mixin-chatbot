@@ -21,7 +21,7 @@ export interface VersionFacts {
   local: ProgramVersion;
 }
 
-/** The checkout's version and build, read now: a long-running TUI must not report the code it was started from. */
+/** The checkout's version and build, read now: a long-running console must not report the code it was started from. */
 export function localProgram(project: string, build?: string): ProgramVersion {
   let appVersion = "";
   try { appVersion = String(JSON.parse(readFileSync(join(project, "package.json"), "utf8")).version ?? ""); } catch { /* shown as unknown */ }

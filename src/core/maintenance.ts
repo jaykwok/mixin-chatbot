@@ -23,8 +23,7 @@ export async function archiveFile(path: string): Promise<string | null> {
   const source = resolve(path);
   try { await lstat(source); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
-  const backupId = process.env.BOT_DEPLOY_BACKUP_ID;
-  const trash = resolve("backup", "rm", backupId && /^deploy-[a-zA-Z0-9-]+$/.test(backupId) ? backupId : ".");
+  const trash = resolve("backup", "rm");
   if (source === trash || source.startsWith(trash + "/") || source.startsWith(trash + "\\")) {
     throw new Error("不能归档回收区本身");
   }

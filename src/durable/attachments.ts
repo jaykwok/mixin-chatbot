@@ -2,7 +2,8 @@
 // member's next admitted request in its admission commit.
 //
 // - Registration (DurableService.attach) commits the receipt and a `pending` record in one commit; a registration that
-//   arrives behind an admitted /stop or /clear boundary is void at once.
+//   arrives behind an admitted /clear boundary is void at once (a /stop leaves it for the next message, as it does an
+//   attachment registered before it).
 // - Download: `received/<id>.part` in the member's tmp (`userTmp`: `data/tmp/{direct | groups/<group>}/<member>/`), renamed
 //   to `<id>-<safe name>`, then `ready` is committed only if the record is still `pending`: a late completion never
 //   revives a void attachment. Left-overs of an interrupted download are removed before it starts again, so a crash
@@ -12,6 +13,8 @@
 // - Void: a /stop or /clear voids what its cancelled requests bound, a /clear also the unbound ones received before it,
 //   and unbound ones expire after `retentionMs`. Void records keep no path; their files are removed best effort here and
 //   otherwise by the tmp archive (non-void paths are protected as run-record references).
+// - Held: an attachment sent as a reply to a push belongs to that reply (`heldBy`), not to the member's next request:
+//   it is none of the above (not unconsumed, never bound, expired or voided by a control) until the push releases it.
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, realpath, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -41,7 +44,7 @@ const KIND_LABEL: Record<Attachment["kind"], string> = { image: "图片", file: 
 
 export const newAttachmentId = () => randomUUID().replaceAll("-", "").slice(0, 16);
 
-export function receivedDir(tempDir: string): string {
+function receivedDir(tempDir: string): string {
   return join(tempDir, "received");
 }
 
@@ -50,7 +53,7 @@ export function attachmentLabel(attachment: Pick<Attachment, "kind" | "name">): 
   return attachment.name && attachment.name !== KIND_LABEL[attachment.kind] ? `${KIND_LABEL[attachment.kind]}「${attachment.name}」` : KIND_LABEL[attachment.kind];
 }
 
-export function formatBytes(size: number): string {
+function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KiB`;
   return `${(size / 1024 / 1024).toFixed(1)} MiB`;
@@ -66,9 +69,20 @@ export function safeFileName(name: string, extension = ""): string {
   return base || `attachment${ext}`;
 }
 
-/** Registered, not yet bound by a request and not void. */
+/** Registered for the member's next request: not bound yet, not held by a push and not void. */
 export function unconsumed(records: Readonly<MemberRecords>): Attachment[] {
-  return Object.values(records.attachments).filter(attachment => attachment.boundTo === undefined && attachment.state !== "void");
+  return Object.values(records.attachments).filter(attachment => attachment.boundTo === undefined && attachment.heldBy === undefined && attachment.state !== "void");
+}
+
+/** Drop held records (the push released them); their files stay for the tmp lifecycle. Returns how many were dropped. */
+export function releaseHeld(records: MemberRecords, holder: string, ids: readonly string[]): number {
+  let released = 0;
+  for (const id of ids) {
+    if (records.attachments[id]?.heldBy !== holder) continue;
+    delete records.attachments[id];
+    released++;
+  }
+  return released;
 }
 
 /** Arrived before the given point (an inbox item or a control): an older epoch, or the same one and not later. */
@@ -88,7 +102,7 @@ export function bindAttachments(records: MemberRecords, requestId: string, item:
 }
 
 /** Returns the attachment as it was (its path is what to remove), or undefined when it was void already. */
-export function voidAttachment(attachment: Attachment, now: number): Attachment | undefined {
+function voidAttachment(attachment: Attachment, now: number): Attachment | undefined {
   if (attachment.state === "void") return undefined;
   const before = copy(attachment);
   attachment.state = "void";
@@ -110,7 +124,7 @@ export function expireAttachments(records: MemberRecords, now: number, retention
   for (const [id, attachment] of Object.entries(records.attachments)) {
     if (attachment.boundTo !== undefined && attachment.state !== "void" && records.requests[attachment.boundTo] === undefined) delete records.attachments[id];
   }
-  return voidWhere(records, attachment => attachment.boundTo === undefined && now - attachment.receivedAt > retentionMs, now);
+  return voidWhere(records, attachment => attachment.boundTo === undefined && attachment.heldBy === undefined && now - attachment.receivedAt > retentionMs, now);
 }
 
 /** The lines the model sees after the member's text. */
@@ -215,14 +229,14 @@ export class AttachmentDownloads {
         await rm(part, { force: true }).catch(() => {});
         // Shutdown: stays pending, the next start downloads it again. Void: the record already says so.
         if (signal.aborted) return;
-        await this.#settle(active, id, "failed", error instanceof Error ? error.message : String(error));
+        await this.#fail(active, id, error instanceof Error ? error.message : String(error));
         return;
       }
       const final = join(dir!, `${id}-${safeFileName(result.fileName || attachment.name, result.mimeType)}`);
       try { await rename(part, final); }
       catch (error) {
         await rm(part, { force: true }).catch(() => {});
-        await this.#settle(active, id, "failed", `保存文件失败（${(error as NodeJS.ErrnoException).code ?? String(error)}）`);
+        await this.#fail(active, id, `保存文件失败（${(error as NodeJS.ErrnoException).code ?? String(error)}）`);
         return;
       }
       const kept = await this.host.update(space, phone, own => {
@@ -236,11 +250,11 @@ export class AttachmentDownloads {
     } finally { release(); }
   }
 
-  async #settle(active: Active, id: string, state: "failed", error: string): Promise<void> {
+  async #fail(active: Active, id: string, error: string): Promise<void> {
     const reply = await this.host.update(active.space, active.phone, own => {
       const stored = own.attachments[id];
       if (stored?.state !== "pending") return undefined;
-      stored.state = state; stored.error = error; stored.at = Date.now();
+      stored.state = "failed"; stored.error = error; stored.at = Date.now();
       return stored.boundTo === undefined ? copy(stored.reply) : undefined;
     });
     // A bound attachment is explained in its request's prompt; an unbound one gets a notice now.

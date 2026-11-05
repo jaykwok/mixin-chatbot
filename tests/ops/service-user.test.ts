@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseServiceUser } from "../../scripts/ops/core/docker-deployment.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 // The service identity library (scripts/lib/service-user.sh), the deployment's choice of identity (deploy.sh) and the
@@ -16,7 +17,7 @@ const cases = posixPath(join(project, "tests/helpers/service-user-cases.sh"));
 
 async function scenarios(group: string, root: string) {
   const child = Bun.spawn([bash!, cases, group, posixPath(root)], {
-    cwd: root, env: { ...process.env, MIXIN_OPS_TUI: "" }, stdout: "pipe", stderr: "pipe", windowsHide: true,
+    cwd: root, env: { ...process.env, MIXIN_OPS_UI: undefined }, stdout: "pipe", stderr: "pipe", windowsHide: true,
   });
   const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
   expect(code, out + err).toBe(0);
@@ -28,9 +29,22 @@ async function scenarios(group: string, root: string) {
   return { results, message: (name: string) => readFile(join(root, `${name}.err`), "utf8") };
 }
 
-test.skipIf(!available)("服务身份记录：写入前校验再改名，读取拒绝缺失、重复、未知或无效的内容", async () => {
+test.skipIf(!available)("服务身份记录：Bash 写入前校验再改名，核心按同一格式读回", async () => {
   const fixture = await tempFixture("service-user-record-");
-  const read = join(fixture.root, "record/read");
+  try {
+    const { results, message } = await scenarios("record", fixture.root);
+    expect({ write: results.write, tmp: results["write-tmp-left"] }).toEqual({ write: "0", tmp: "no" });
+    const written = await readFile(join(fixture.root, "record/written/service-user"), "utf8");
+    expect(written).toBe("format=1\nuser=1000:1000\nsource=container\n");
+    expect(parseServiceUser(written)).toEqual({ format: "1", user: "1000:1000", source: "container" });
+    if (process.platform !== "win32") expect((await stat(join(fixture.root, "record/written/service-user"))).mode & 0o777).toBe(0o600);
+    // Refused values never reach the disk.
+    expect([results["write-bad-user"], results["write-bad-source"], results["refused-left"]]).toEqual(["1", "1", "0"]);
+    expect(await message("write-bad-user")).toContain("服务身份无效：appuser");
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+test("服务身份记录：核心拒绝缺失、重复、未知或无效的内容", () => {
   const records: Record<string, string> = {
     valid: "format=1\nuser=1000:1000\nsource=container\n",
     confirmed: "format=1\nuser=0:0\nsource=confirmed\n",
@@ -46,40 +60,16 @@ test.skipIf(!available)("服务身份记录：写入前校验再改名，读取�
     "no-equals": "format\nformat=1\nuser=1000:1000\nsource=container\n",
     "empty-key": "=x\nformat=1\nuser=1000:1000\nsource=container\n",
   };
-  try {
-    for (const [name, content] of Object.entries(records)) {
-      await mkdir(join(read, name), { recursive: true });
-      await writeFile(join(read, name, "service-user"), content);
-    }
-    await mkdir(join(read, "absent"), { recursive: true });
-    await mkdir(join(read, "directory/service-user"), { recursive: true });
-    if (process.platform !== "win32") {
-      await mkdir(join(read, "link"), { recursive: true });
-      await symlink(join(read, "valid/service-user"), join(read, "link/service-user"));
-    }
-    const { results, message } = await scenarios("record", fixture.root);
-    expect({ write: results.write, tmp: results["write-tmp-left"], read: results["read-written"], value: results["read-written-value"] })
-      .toEqual({ write: "0", tmp: "no", read: "0", value: "1000:1000|container" });
-    expect(await readFile(join(fixture.root, "record/written/service-user"), "utf8")).toBe("format=1\nuser=1000:1000\nsource=container\n");
-    if (process.platform !== "win32") expect((await stat(join(fixture.root, "record/written/service-user"))).mode & 0o777).toBe(0o600);
-    // Refused values never reach the disk.
-    expect([results["write-bad-user"], results["write-bad-source"], results["refused-left"]]).toEqual(["1", "1", "0"]);
-    expect(await message("write-bad-user")).toContain("服务身份无效：appuser");
-
-    const accepted: Record<string, string> = { valid: "1000:1000|container", confirmed: "0:0|confirmed", "no-final-newline": "1000:1000|default" };
-    const names = [...Object.keys(records), "absent", "directory", ...(process.platform === "win32" ? [] : ["link"])];
-    for (const name of names) {
-      expect({ name, code: results[`read-${name}`], left: results[`left-${name}`] })
-        .toEqual({ name, code: name in accepted ? "0" : "1", left: accepted[name] ?? "|" });
-    }
-    expect(await message("read-absent")).toContain("缺少服务身份记录");
-    expect(await message("read-directory")).toContain("不是普通文件");
-    if (process.platform !== "win32") expect(await message("read-link")).toContain("不是普通文件");
-    expect(await message("read-missing")).toContain("缺少：source");
-    expect(await message("read-duplicate")).toContain("服务身份记录无效：user");
-    expect(await message("read-empty-key")).not.toContain("bad array subscript");
-  } finally { await fixture.cleanup(); }
-}, 30000);
+  const accepted: Record<string, string> = { valid: "1000:1000|container", confirmed: "0:0|confirmed", "no-final-newline": "1000:1000|default" };
+  const read = (text: string) => { try { const record = parseServiceUser(text); return record.user + "|" + record.source; } catch (error) { return (error as Error).message; } };
+  for (const [name, text] of Object.entries(records)) {
+    const value = read(text);
+    expect({ name, value: name in accepted ? value : value.startsWith("服务身份记录") }).toEqual({ name, value: accepted[name] ?? true });
+  }
+  expect(read(records.missing!)).toBe("服务身份记录不完整");
+  expect(read(records.duplicate!)).toBe("服务身份记录无效：user");
+  expect(read(records["empty-key"]!)).toBe("服务身份记录无效：");
+});
 
 test.skipIf(!available)("身份取值和 Docker 模式：rootless 只用 0:0，rootful 不以 root 运行；rootful 的部署要求 root，rootless 不能用 root", async () => {
   const fixture = await tempFixture("service-user-identity-");
@@ -144,12 +134,9 @@ test.skipIf(!available)("原容器的身份：只认本项目的数据挂载和�
       container: results["one-off-container"], named: results["one-off-named"], owner: results["one-off-owner"],
       rootless: results["one-off-rootless"], unreadable: results["one-off-unreadable"],
     }).toEqual({ container: "0:1000:1000", named: "0:1234:1234", owner: "0:1234:1234", rootless: "0:0:0", unreadable: "1:" });
-    expect([results["validate-default"], results["validate-pinned"], results["validate-unreadable"]]).toEqual(["0", "0", "1"]);
-    // Offline and read-only, as the service identity; a deployment passes its image ID and identity.
-    const check = "-v <p>/data:/app/data:ro {image} bun run scripts/config/validate-models.ts /app;";
-    expect(results["validate-runs"]).toBe(
-      "run --rm --network none --user 1234:1234 " + check.replace("{image}", "mixin-chatbot") +
-      "run --rm --network none --user 1000:1000 " + check.replace("{image}", "sha256:" + "c".repeat(64)));
+    expect([results["validate-default"], results["validate-unreadable"]]).toEqual(["0", "1"]);
+    // Offline and read-only, in the released image, as the service identity.
+    expect(results["validate-runs"]).toBe("run --rm --network none --user 1234:1234 -v <p>/data:/app/data:ro mixin-chatbot bun run scripts/config/validate-models.ts /app;");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -203,9 +190,10 @@ test.skipIf(!available)("只把本次新建的目录和本次日志交给服务�
     expect([results["make-existing"], results["make-existing-chowns"], results["make-chown-fails"]]).toEqual(["0", "", "1"]);
     expect([results["make-user"], results["make-user-dirs"], results["make-user-chowns"]]).toEqual(["0", "yes", ""]);
     expect([results.grant, results["grant-chowns"], results["grant-user"], results["grant-user-chowns"]])
-      .toEqual(["0", "-- 1000:1000 <p>/a <p>/b;", "0", ""]);
+      .toEqual(["0", "-h -- 1000:1000 <p>/a <p>/b;", "0", ""]);
+    // -h: an entry swapped for a link after the check changes the link, never what it points to (A3-18).
     expect({ log: results["log-chowns"], link: results["log-link-chowns"], none: results["log-none"] + results["log-none-chowns"] }).toEqual({
-      log: "-- 1000:1000 <p>/logs <p>/logs/operation.log;", link: "-- 1000:1000 <p>/logs <p>/logs/operations;", none: "0",
+      log: "-h -- 1000:1000 <p>/logs <p>/logs/operation.log;", link: "-h -- 1000:1000 <p>/logs <p>/logs/operations;", none: "0",
     });
   } finally { await fixture.cleanup(); }
 }, 30000);

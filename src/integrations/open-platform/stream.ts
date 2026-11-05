@@ -35,6 +35,7 @@ export interface StreamOptions {
 
 const DEFAULT_WARN_AFTER_MS = 60_000;
 const DEFAULT_PING_INTERVAL_MS = 30_000;
+const NOT_CONNECTED = "尚未连接";
 
 export class StreamConnection {
   #socket: WebSocket | undefined;
@@ -64,7 +65,7 @@ export class StreamConnection {
   start(): void {
     if (!this.#stopped) return;
     this.#stopped = false;
-    this.#markDisconnected("尚未连接");
+    this.#markDisconnected(NOT_CONNECTED);
     void this.#connect();
   }
 
@@ -111,7 +112,9 @@ export class StreamConnection {
       token = await this.client.appToken.get(this.client.closingSignal);
     } catch (error) {
       if (this.#stopped) return;
-      this.#markDisconnected(`换取 token 失败：${error instanceof Error ? error.message : String(error)}`);
+      // The client's own errors already say what failed ("换取 token 失败：HTTP 401", "换取 token：连接失败").
+      const reason = error instanceof Error ? error.message : String(error);
+      this.#markDisconnected(reason.startsWith("换取 token") ? reason : `换取 token 失败：${reason}`);
       this.#schedule();
       return;
     }
@@ -137,7 +140,9 @@ export class StreamConnection {
       const downFor = this.#status.disconnectedSince === undefined ? 0 : now - this.#status.disconnectedSince;
       if (this.#everConnected) this.#status.reconnects++;
       this.#everConnected = true;
-      this.#status = { ...this.#status, connected: true, connectedAt: now, disconnectedSince: undefined };
+      // start() records "not connected yet" so the warning has a reason; once connected that was never a disconnect.
+      const lastDisconnect = this.#status.lastDisconnect?.reason === NOT_CONNECTED ? undefined : this.#status.lastDisconnect;
+      this.#status = { ...this.#status, connected: true, connectedAt: now, disconnectedSince: undefined, lastDisconnect };
       log.info(`Stream 已连接${downFor >= 1000 ? `（断开 ${Math.round(downFor / 1000)} 秒后恢复）` : ""}`);
       pinger = setInterval(() => {
         if (this.#socket !== socket) { clearInterval(pinger); return; }

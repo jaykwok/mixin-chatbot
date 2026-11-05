@@ -14,10 +14,10 @@ export type TaskMount = { source: string; target: string; writable: boolean };
 export interface Receipt {
   version: 2; id: string; nonce: string; manager: string; daemon: string; image: string;
   deployment?: string;
-  ownerEpoch?: string;
+  ownerEpoch: string;
   temp: string; createdAt: number; pid: number; phase: ReceiptPhase; containers: string[];
   pendingNames: string[];
-  role?: "worker" | "results";
+  role: "worker" | "results";
   resultName?: string;
   archive?: { destination: string; evidence: TreeEvidence };
   allocation?: { step: typeof ALLOCATION_STEPS[number]; error?: string };
@@ -67,12 +67,12 @@ export function decodeReceipt(payload: string, expected: { id: string; manager: 
   const pending = new RegExp(`^mixin-task-${id}-[0-9]+$`);
   need(Array.isArray(pendingNames) && pendingNames.every(name => typeof name === "string" && pending.test(name)), "pendingNames");
   need(isObject(receipt.mounts), "mounts");
-  need(receipt.role === undefined || receipt.role === "worker" || receipt.role === "results", "role");
+  need(receipt.role === "worker" || receipt.role === "results", "role");
   need(receipt.resultName === undefined || receipt.role === "results" && typeof receipt.resultName === "string" && RESULT_NAME.test(receipt.resultName), "resultName");
   const archive = receipt.archive;
   need(archive === undefined || isObject(archive) && resolved(archive.destination) && validTreeEvidence(archive.evidence), "archive");
   need(!(phase === "archiving" || phase === "archived") || archive !== undefined, "archive（归档阶段缺少归档记录）");
-  need(receipt.ownerEpoch === undefined || typeof receipt.ownerEpoch === "string" && ID_PATTERN.test(receipt.ownerEpoch), "ownerEpoch");
+  need(typeof receipt.ownerEpoch === "string" && ID_PATTERN.test(receipt.ownerEpoch), "ownerEpoch");
   need(receipt.role !== "results" || containers.length === 0 && pendingNames.length === 0, "role（结果回执不能有容器）");
   const allocation = receipt.allocation;
   need(allocation === undefined || isObject(allocation) && ALLOCATION_STEPS.includes(allocation.step as typeof ALLOCATION_STEPS[number])

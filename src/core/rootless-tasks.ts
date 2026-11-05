@@ -236,17 +236,10 @@ export class RootlessTasks {
       if (receipt.phase === "removed") return { name: id, status: "removed", completedEarlier: true };
       if (receipt.phase === "archiving" || receipt.phase === "archived") return { name: id, status: "deferred", reason: "task-owned-by-archive-plan" };
       await this.verify();
-      if (receipt.phase === "active" || receipt.phase === "allocating") {
-        const live = { name: id, status: "deferred" as const, reason: receipt.phase === "active" ? "task-owner-live" : "task-allocation-live" };
-        if (receipt.ownerEpoch !== undefined) {
-          // Acquiring this same process-lifetime kernel lock proves the previous controller exited,
-          // even when its PID is reused (or refers to another process in this container's namespace).
-          if (receipt.ownerEpoch === (await this.#control.initialize()).ownerEpoch) return live;
-        } else {
-          // Legacy controllers did not hold the kernel lock; do not infer their exit from an epoch.
-          try { process.kill(receipt.pid, 0); return live; }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
-        }
+      // Acquiring this same process-lifetime kernel lock proves the previous controller exited,
+      // even when its PID is reused (or refers to another process in this container's namespace).
+      if ((receipt.phase === "active" || receipt.phase === "allocating") && receipt.ownerEpoch === (await this.#control.initialize()).ownerEpoch) {
+        return { name: id, status: "deferred", reason: receipt.phase === "active" ? "task-owner-live" : "task-allocation-live" };
       }
       if (receipt.phase === "allocating" || receipt.phase === "allocation-failed") {
         const reason = await allocationProof(receipt);
@@ -277,7 +270,7 @@ export class RootlessTasks {
       if (receipt.phase === "archived") return;
       if (receipt.phase === "removed" || receipt.phase === "reclaiming") throw new Error("隔离任务已经进入物理回收，不能归档");
       if (["active", "allocating"].includes(receipt.phase)) {
-        if (!receipt.ownerEpoch || receipt.ownerEpoch === (await this.#control.initialize()).ownerEpoch) throw new Error("隔离任务的创建者仍在运行，保留");
+        if (receipt.ownerEpoch === (await this.#control.initialize()).ownerEpoch) throw new Error("隔离任务的创建者仍在运行，保留");
       }
       await this.verify(); await this.#retireWriters(receipt);
       const source = join(receipt.temp, ".isolated-work", id);

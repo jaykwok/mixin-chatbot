@@ -4,14 +4,15 @@ import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateToolArguments } from "@earendil-works/pi-ai";
-import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
+import { compile, type JsonSchema } from "@earendil-works/pi-schema";
+import { documentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
 import { documentToolchainReady, venvPythonPath } from "../../src/agent/python-toolchain.ts";
 import { runProcess } from "../../src/core/process.ts";
 import { application } from "../../src/core/lifecycle.ts";
 import { configuredRootlessTasks, ISOLATED_PYTHON } from "../../src/core/task-backend.ts";
 import { resultReferences } from "../../src/durable/results/references.ts";
 import { checkDocumentReclamation } from "./document-reclamation.ts";
+import { runMemberTool } from "./member-tools.ts";
 
 const environment = process.argv[2];
 if (!environment) throw new Error("Usage: bun tests/helpers/document-work-integration.ts <test venv> [--office]");
@@ -53,21 +54,18 @@ for (const name of ["source.docx", "source.pptx", "supplement.docx", "supplement
   sourceDigests[name] = createHash("sha256").update(await readFile(join(workspace, name))).digest("hex");
 }
 const options = { workspaceDir: workspace, tempDir, venvDir, indexPath: join(root, "index/materials.md") };
-const tools = buildDocumentWorkTools(options);
+const tools = documentWorkTools();
 // The administrator's default templates, as Office template files in the group's workspace.
-const defaults = buildDocumentWorkTools(options, { pptx: "company.potx", docx: "company.dotx" });
+const defaults = documentWorkTools({ pptx: "company.potx", docx: "company.dotx" });
 const call = async (name: string, params: object, list = tools): Promise<any> => {
   const before = new Set(await readdir(tempDir));
   const tool = list.find(t => t.name === name)!;
-  const result = await tool.execute("verify", params, undefined, undefined, {} as never);
+  const result = await runMemberTool(tool, params, { places: options });
   const details = result.details;
-  // The real scripts' results must match the declared protocol exactly: pi-ai's validator coerces and cleans,
-  // so the validated copy has to equal the original.
-  const validated = validateToolArguments({ name, description: "", parameters: tool.outputSchema! },
-    { type: "toolCall", id: "verify", name, arguments: structuredClone(result.structuredContent) as never });
-  assert.equal(JSON.stringify(validated), JSON.stringify(result.structuredContent), `${name} result does not match its outputSchema`);
-  assert.deepEqual(details, result.structuredContent);
-  assert.deepEqual(JSON.parse((result.content[0] as { text: string }).text), result.structuredContent);
+  // The real scripts' results must match the declared protocol exactly (pi-schema's validator, without coercion).
+  assert.ok(compile(tool.structuredOutputSchema as JsonSchema).check(result.structuredOutput), `${name} result does not match its structuredOutputSchema`);
+  assert.deepEqual(details, result.structuredOutput);
+  assert.deepEqual(JSON.parse((result.output![0] as { text: string }).text), result.structuredOutput);
   for (const job of await readdir(tempDir)) {
     if (backend && job === ".isolated-work" || job === ".office-jobs") continue;
     await checkDocumentReclamation(join(tempDir, job), before.has(job) ? undefined : true, !!backend);

@@ -13,7 +13,7 @@ import { mcpMemberTools } from "../../src/durable/mcp.ts";
 import { spaceDoor } from "../../src/durable/models.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
-import { memberPlaces, memberRegistration } from "../../src/durable/tools.ts";
+import { memberPlaces } from "../../src/durable/tools.ts";
 import { fauxModels } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { handoffFullResults, stubResultsBackend } from "../helpers/results-backend.ts";
@@ -47,8 +47,8 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
   try {
     await mkdir(members.layout.data); await manager.initialize(new AbortController().signal);
     const tools = mcpMemberTools(members, manager, door), registry = createRegistry();
-    expect(tools[0]!.definition.exposure).toBe("deferred"); expect(tools[0]!.replay).toBe("unsafe");
-    registry.install(defineExtension({ name: "mixin.mcp", tools: tools.map(memberRegistration) }));
+    expect(tools[0]!.registration).toMatchObject({ callers: ["tools"], deferred: true, replay: "unsafe" });
+    registry.install(defineExtension({ name: "mixin.mcp", tools: tools.map((tool) => tool.registration) }));
     registry.install(codemodeExtension({ members, tools }));
     harness = await Harness.open(await openGroupStorage(join(root, "group.sqlite")), { registry, models: door.wrap(models), settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);
     holder.harness = harness; await claimSpace(harness, scopeOf("group-a"), context);
@@ -56,7 +56,7 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
     for (const phone of ["alice", "bob"]) {
       const { conversation } = await memberConversation(harness, scopeOf("group-a"), phone, { model }, context);
       const callId = `report-${phone}`;
-      faux.setResponses([fauxAssistantMessage([fauxToolCall("codemode", { code: `return await tools.${tools[0]!.definition.name}({});` }, { id: callId })], { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
+      faux.setResponses([fauxAssistantMessage([fauxToolCall("codemode", { code: `return await tools.${tools[0]!.registration.name}({});` }, { id: callId })], { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
       await (await conversation.submit({ type: "input", content: "report" }, context)).wait(context);
       const output = (await conversation.entries({}, 200, undefined, context)).items.flatMap(entry => entry.model ?? [])
         .find(message => message.role === "toolResult" && message.toolCallId === callId) as ToolResultMessage;

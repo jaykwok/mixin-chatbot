@@ -13,6 +13,7 @@
 import type { Context } from "@earendil-works/chord";
 import { type ConversationId, defineDoc, type Harness } from "@earendil-works/pi-durable";
 import type { ReplyContext } from "./records.ts";
+import { checkpointDue } from "./checkpoint.ts";
 
 export type InboxItem = {
   requestId: string;
@@ -31,7 +32,7 @@ export type InboxItem = {
 export const InboxDoc = defineDoc<{ items: InboxItem[] }>({
   kind: "mixin.inbox",
   version: 1,
-  checkpointWhen: () => false,
+  checkpointWhen: checkpointDue,
   scope: "conversation",
   history: "latest",
   fork: "initial",
@@ -48,7 +49,7 @@ export type StoredControl = {
 export const ControlsDoc = defineDoc<{ seq: number; epoch?: number; pending: StoredControl[] }>({
   kind: "mixin.controls",
   version: 1,
-  checkpointWhen: () => false,
+  checkpointWhen: checkpointDue,
   scope: "session",
   initial: () => ({ seq: 0, epoch: 0, pending: [] }),
 });

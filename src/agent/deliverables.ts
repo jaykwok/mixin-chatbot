@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { copyFile, mkdir, open, stat, unlink, realpath, lstat } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { basename, extname, join } from "node:path";
+import { basename, join } from "node:path";
 import { isPathInside } from "../contracts/paths.ts";
 import { type Deliverable, openPart, type RequestRecord } from "../durable/records.ts";
 
@@ -38,7 +38,7 @@ export async function freezeFile(sourcePath: string, tempDir: string, requestId:
   try {
     await copyFile(sourcePath, path, constants.COPYFILE_EXCL);
     if (sha256 !== await fileDigest(path, signal, maxBytes)) throw new Error("复制期间源文件变化，请完成生成后重新登记");
-    return { sourcePath, path, name, sha256, size: (await stat(path)).size, format: extname(name).slice(1).toLowerCase() };
+    return { path, name, sha256, size: (await stat(path)).size };
   } catch (error) { await unlink(path).catch(() => {}); throw error; }
 }
 
@@ -86,14 +86,19 @@ export function registerDeliverable(record: RequestRecord, entry: Omit<Deliverab
   return next;
 }
 
-/** The best complete, not rejected version of every slot: checked before draft, newest first. */
-export function deliverableCandidates(record: Pick<RequestRecord, "deliverables">): Deliverable[] {
+/** The complete, not rejected versions of every slot that has any, best first: checked before draft, newest first. */
+export function slotVersions(record: Pick<RequestRecord, "deliverables">): Deliverable[][] {
   const all = record.deliverables, rejected = new Set(all.filter(x => x.status === "rejected").map(x => x.sha256));
   return [...new Set(all.map(x => x.slot))].flatMap(slot => {
-    const versions = all.filter(x => x.slot === slot && x.complete && !rejected.has(x.sha256)).reverse();
-    const best = versions.find(x => x.status === "checked") ?? versions.find(x => x.status === "draft");
-    return best ? [best] : [];
+    const versions = all.filter(x => x.slot === slot && x.complete && !rejected.has(x.sha256)).sort((a, b) =>
+      Number(b.status === "checked") - Number(a.status === "checked") || b.seq - a.seq);
+    return versions.length ? [versions] : [];
   });
+}
+
+/** The best version of every slot. */
+export function deliverableCandidates(record: Pick<RequestRecord, "deliverables">): Deliverable[] {
+  return slotVersions(record).map(versions => versions[0]!);
 }
 
 /** Snapshots of a closed request that no delivery part still to be sent needs. */

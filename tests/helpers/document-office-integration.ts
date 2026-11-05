@@ -12,7 +12,7 @@ import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import { buildLocalTools } from "../helpers/native-tools.ts";
-import { buildDocumentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
+import { documentWorkTools } from "../../src/agent/modules/document-work/tools.ts";
 import { appLayout, groupScope, userTmp } from "../../src/core/layout.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { documentToolchainReady, venvPythonPath } from "../../src/agent/python-toolchain.ts";
@@ -21,6 +21,7 @@ import { runProcess } from "../../src/core/process.ts";
 import { WindowsHandles } from "../../src/core/windows-handles.ts";
 import { launchOfficeAtBarrier } from "./office-start-gate.ts";
 import { checkDocumentReclamation, retainedOfficeProfiles } from "./document-reclamation.ts";
+import { runMemberTool, toolNamed } from "./member-tools.ts";
 
 const environment = process.argv[2];
 if (!environment) throw new Error("Usage: bun tests/helpers/document-office-integration.ts <test venv> [--root <run directory>]");
@@ -54,12 +55,11 @@ assert.match(basename(dirname(scenarios[0]!.tempDir)), /^sha256-[0-9a-f]{64}$/);
 const fixtureScript = fileURLToPath(new URL("./document-fixtures.py", import.meta.url));
 const [hashed, longRoot] = await Promise.all(scenarios.map(async (scenario) => {
   await Promise.all([scenario.workspace, scenario.tempDir, dirname(scenario.indexPath)].map((path) => mkdir(path, { recursive: true })));
-  const tools = buildDocumentWorkTools({ workspaceDir: scenario.workspace, tempDir: scenario.tempDir, venvDir,
-    indexPath: scenario.indexPath });
+  const places = { workspaceDir: scenario.workspace, tempDir: scenario.tempDir, venvDir, indexPath: scenario.indexPath };
   const local = await buildLocalTools({ workspaceDir: scenario.workspace, tempDir: scenario.tempDir, phone: scenario.phone, scope: groupScope(scenario.groupId),
     venvDir, materialsIndexPath: scenario.indexPath });
   const call = async (name: string, params: object, signal?: AbortSignal): Promise<any> =>
-    (await tools.find((tool) => tool.name === name)!.execute("verify", params as never, signal, undefined, {} as never)).structuredContent;
+    (await runMemberTool(toolNamed(documentWorkTools(), name), params, { places, signal })).structuredOutput;
   const read = async (path: string) => (await local.find((tool) => tool.name === "read")!.execute("verify", { path } as never, undefined, undefined, {} as never)).content;
   return { ...scenario, call, read };
 })) as [any, any];

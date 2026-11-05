@@ -91,11 +91,13 @@ function snapshotAdapter(database: Database, nested: boolean): SqliteDatabase {
   const executor: SqliteExecutor = {
     exec: async sql => { database.exec(sql); },
     run: async (sql, ...params) => { database.query(sql).run(...params); },
+    runCounted: async (sql, ...params) => database.query(sql).run(...params).changes,
     get: async <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => (database.query(sql).get(...params) ?? undefined) as R | undefined,
     all: async <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => database.query(sql).all(...params) as R[],
   };
   return {
     exec: sql => queue(() => executor.exec(sql)), run: (sql, ...params) => queue(() => executor.run(sql, ...params)),
+    runCounted: (sql, ...params) => queue(() => executor.runCounted(sql, ...params)),
     get: <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => queue(() => executor.get<R>(sql, ...params)),
     all: <R extends object>(sql: string, ...params: Parameters<SqliteExecutor["run"]> extends [string, ...infer P] ? P : never) => queue(() => executor.all<R>(sql, ...params)),
     transaction: work => queue(async () => {

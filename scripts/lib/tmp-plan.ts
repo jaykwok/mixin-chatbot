@@ -1,8 +1,8 @@
-// Host-side plan readers use only Node built-ins and the service-free contracts; TUI does not import the service or its dependencies.
+// Host-side plan readers use only Node built-ins and the service-free contracts; the console does not import the service or its dependencies.
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { decodePlanSummary, decodeProgressSummary, ID_PATTERN } from "../../src/contracts/maintenance.ts";
+import { decodePlanSummary, ID_PATTERN } from "../../src/contracts/maintenance.ts";
 
 /** Archive plans and their removal lists live with the archive; physical reclamation plans in their own directory. */
 /** Below the data directory (src/core/layout.ts `reclamation`). */
@@ -39,8 +39,5 @@ async function read(root: string, id: string, suffix: string, location = ARCHIVE
 }
 
 export async function readTmpPlan(root: string, id: string) { return decodePlanSummary(await read(root, id, ".json"), id); }
-export async function readTmpProgress(root: string, id: string, digest: string) { return decodeProgressSummary(await read(root, id, ".progress.json"), digest, "archived"); }
 export async function readRemovalPlan(root: string, id: string) { return decodePlanSummary(await read(root, id, ".removal.json"), id); }
-export async function readRemovalProgress(root: string, id: string, digest: string) { return decodeProgressSummary(await read(root, id, ".removal-progress.json"), digest, "removed"); }
 export async function readReclaimPlan(root: string, id: string) { return decodePlanSummary(await read(root, id, ".json", RECLAIM_PLANS), id); }
-export async function readReclaimProgress(root: string, id: string, digest: string) { return decodeProgressSummary(await read(root, id, ".progress.json", RECLAIM_PLANS), digest, "removed"); }

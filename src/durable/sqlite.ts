@@ -2,6 +2,8 @@
 // FULL writes, WAL checkpoints and busy waits never run on the service thread. Transaction callbacks remain here;
 // the per-connection queue stays held until the native COMMIT/ROLLBACK acknowledgement. Close releases native handles
 // before acknowledging and the last connection waits for natural worker exit. The storage algorithm is not forked.
+import { existsSync, readdirSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { assertDurableSchema } from "./schema-gate.ts";
 import { sqliteClient, type SqliteWorkerLost } from "./sqlite-client.ts";
@@ -13,12 +15,21 @@ const WAL_AUTOCHECKPOINT_PAGES = 1_000;
 const SYNCHRONOUS_FULL = 2;
 const ignore = (): void => {};
 
+function keptOriginalBeside(path: string): boolean {
+  const prefixes = [`${basename(path)}.shrink-`, `${basename(path)}.restore-`];
+  try { return readdirSync(dirname(path)).some(name => prefixes.some(prefix => name.startsWith(prefix)) && name.endsWith(".old")); }
+  catch { return false; }
+}
+
 /** WAL/FULL on every open, including a rolled-back page-write probe for silently read-only SQLite opens. First, before
  * anything is written: an existing database of another Durable schema is refused before the official open could
  * migrate it (schema-gate.ts). */
 export async function openGroupDatabase(path: string, onFailure?: (error: SqliteWorkerLost) => void): Promise<BunSqliteDatabase> {
   let adapter: BunSqliteDatabase | undefined;
   try {
+    // A database missing beside an original that a shrink or a restore kept (revision-cleanup/replace.ts) is not created
+    // afresh: their recovery puts the original or its copy back at this path.
+    if (!existsSync(path) && keptOriginalBeside(path)) throw new Error("会话库不在原路径，旁边有收缩或恢复保留的原库；请先再次运行收缩或恢复命令完成恢复");
     const client = sqliteClient();
     adapter = new BunSqliteDatabase(client, await client.open(path, onFailure));
     await adapter.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);

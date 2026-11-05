@@ -11,7 +11,7 @@ import { tempFixture } from "../helpers/temp.ts";
 
 const f = await tempFixture("mcp-"); afterAll(() => f.cleanup());
 const fixtureServer = fileURLToPath(new URL("../helpers/mcp-fixture.ts", import.meta.url));
-const supervisor = fileURLToPath(new URL("../../src/core/process-supervisor.ts", import.meta.url));
+const supervisor = fileURLToPath(new URL("../../scripts/lib/process-supervisor.ts", import.meta.url));
 let n = 0;
 const GROUP_ID = "群-A";
 const member: McpMember = { scope: { kind: "group", groupId: GROUP_ID }, phone: "+86 alice", workspaceDir: join(f.root, "workspace"), tempDir: join(f.root, "alice") };
@@ -219,12 +219,15 @@ test("administrator OAuth login aborts its discovery and scopes persisted creden
 
 test("stdio MCP inherits only selected environment and uses the member's cwd", async () => {
   const previous = process.env.MIXIN_TEST_AMBIENT_SECRET; process.env.MIXIN_TEST_AMBIENT_SECRET = "must-not-inherit";
-  const config: McpServerConfig = { name: `stdio${++n}`, transport: "stdio", command: process.execPath, args: [fixtureServer], tools: ["echo"] };
+  // The administrator's JIT size reaches the server past its supervisor's own (the gate test below sees Bun's default).
+  const config: McpServerConfig = { name: `stdio${++n}`, transport: "stdio", command: process.execPath, args: [fixtureServer], tools: ["echo"],
+    env: { BUN_JSC_jitMemoryReservationSize: "33554432" } };
   const manager = new McpTools({ format: 1, servers: [config] }, join(f.root, `discovery-${n}`));
   try {
     await manager.initialize(new AbortController().signal);
     const output = await manager.call(manager.catalogue[0]!, member, { text: "hello" }, new AbortController().signal, work => work());
-    expect(JSON.parse((output.content![0] as { text: string }).text)).toMatchObject({ chat: "group", group: GROUP_ID, phone: member.phone, cwd: member.tempDir, secret: null });
+    expect(JSON.parse((output.content![0] as { text: string }).text)).toMatchObject({ chat: "group", group: GROUP_ID, phone: member.phone, cwd: member.tempDir, secret: null,
+      jit: "33554432" });
   } finally { await manager.close(); if (previous === undefined) delete process.env.MIXIN_TEST_AMBIENT_SECRET; else process.env.MIXIN_TEST_AMBIENT_SECRET = previous; }
   // Supervisor and server are two Bun processes: alone about 13 s on this Windows host, past 30 s beside parallel test groups.
 }, 60000);
@@ -250,9 +253,9 @@ test.each(["timeout", "cancel"])("stdio MCP sends no tools/call the gate release
     if (mode === "cancel") caller.abort(new Error("synthetic cancel"));
     await failed;
     expect(await released.promise).toBeInstanceOf(Error);
-    // An answered request after it shows the server is reading.
+    // An answered request after it shows the server is reading. Nothing configured its JIT size: Bun's default, not the supervisor's.
     const output = await manager.call(manager.catalogue[0]!, member, { text: "next" }, new AbortController().signal, work => work());
-    expect(JSON.parse((output.content![0] as { text: string }).text)).toMatchObject({ args: { text: "next" } });
+    expect(JSON.parse((output.content![0] as { text: string }).text)).toMatchObject({ args: { text: "next" }, jit: null });
     const methods = (await readFile(log, "utf8")).trim().split("\n");
     expect(methods.filter(method => method === "tools/call")).toEqual(["tools/call"]);
   } finally { await manager.close(); }

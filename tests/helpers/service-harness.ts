@@ -49,6 +49,8 @@ const platform = new FakePlatform();
 platform.directory = { children: { "1": [] }, members: { "1": [{ phone: "archive", name: "Archive" }, { phone: "blocked", name: "Blocked" }] },
   ids: { archive: "im-archive", blocked: "im-blocked" } };
 await writeFile("data/config/app-bot.json", JSON.stringify(platform.config));
+// The whole directory, chosen explicitly (without a saved scope the service syncs nothing).
+await writeFile("data/config/directory.json", JSON.stringify({ format: 1, all: true }));
 const platformConfig = await import("../../src/integrations/open-platform/config.ts");
 mock.module("../../src/integrations/open-platform/config.ts", () => ({ ...platformConfig, platformEndpoints: () => platform.endpoints }));
 await writeFile("data/runtime/pi/settings.json", JSON.stringify({ defaultProvider: "fake", defaultModel: "fake" }));

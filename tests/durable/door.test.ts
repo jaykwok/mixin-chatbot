@@ -234,6 +234,28 @@ describe("request door: member sessions", () => {
     } finally { await opened.close(); }
   });
 
+  test("a conversation bound while a reload reads stays bound when the reload replaces the map", async () => {
+    const first = { sessionId: "s-a", conversationId: 1, phone: "100" }, late = { sessionId: "s-c", conversationId: 3, phone: "300" };
+    const reading = Promise.withResolvers<void>();
+    let committed = [first], lookups = 0;
+    const door = new RequestDoor({ harness: {} as never }, {
+      sessions: async (_harness, _context, conversationId) => {
+        if (conversationId !== undefined) { lookups++; return committed.filter(binding => binding.conversationId === conversationId); }
+        const snapshot = committed;
+        await reading.promise;
+        return snapshot;
+      },
+      onReport: error => { throw error; },
+    } as DoorOptions);
+    const reload = door.loadSessions(context);
+    committed = [first, late];
+    await door.bind(late.conversationId, context);
+    reading.resolve();
+    await reload;
+    await door.bind(late.conversationId, context);
+    expect(lookups).toBe(1);
+  });
+
   test("a session claimed by two conversations is sent for neither", async () => {
     const { faux, models, model } = fauxModels();
     faux.setResponses([fauxAssistantMessage("不应发出")]);
@@ -316,19 +338,22 @@ describe("request door: member sessions", () => {
 
 describe("request door: fail closed and parity (D0 P10 C, E, F)", () => {
   test("through the door the provider gets the same model, transcript and options as from Durable's direct call, with its conversation's pi.provider session id", async () => {
-    // Timestamps, the abort signal and the faux api id (random per faux instance) differ by construction.
-    const strip = (value: unknown): unknown => JSON.parse(JSON.stringify(value, (key, item) =>
+    // Timestamps, the abort signal and the faux api id (random per faux instance) differ by construction; so does the
+    // session id, also in OpenCode's routing header.
+    const strip = (value: unknown, own: unknown): unknown => JSON.parse(JSON.stringify(value, (key, item) =>
       key === "timestamp" || key === "signal" ? undefined
         : key === "api" && typeof item === "string" && item.startsWith("faux:") ? "faux:<instance>"
-          : typeof item === "function" ? `<function ${key}>` : item));
-    // Credential headers and request headers that differ only in case: the request's replaces the credential's.
+          : key === "x-opencode-session" && item === own ? "<own>"
+            : typeof item === "function" ? `<function ${key}>` : item));
+    // Credential headers and request headers that differ only in case: the request's replaces the credential's. The
+    // credential points the model at OpenCode, which gets the conversation's session in its routing header.
     const settings: HarnessSettings = { ...SETTINGS, stream: { headers: { "x-case": "from-request" } } };
     const seenWith = async (door: boolean) => {
       const { faux, models, model } = fauxModels();
       const getAuth = models.getAuth.bind(models);
       (models as MutableModels).getAuth = (async (...args: Parameters<typeof getAuth>) => {
         const resolution = await getAuth(...args);
-        return resolution && { ...resolution, auth: { ...resolution.auth, headers: { "X-Case": "from-auth", "X-Auth": "kept" } } };
+        return resolution && { ...resolution, auth: { ...resolution.auth, baseUrl: "https://opencode.ai/zen/v1", headers: { "X-Case": "from-auth", "X-Auth": "kept" } } };
       }) as typeof models.getAuth;
       let seen: unknown;
       let sessionId: unknown;
@@ -336,7 +361,7 @@ describe("request door: fail closed and parity (D0 P10 C, E, F)", () => {
       faux.setResponses([(transcript, options, _state, requestModel) => {
         sessionId = options?.sessionId;
         headers = options?.headers;
-        seen = strip({ messages: transcript.messages, options: { ...options, sessionId: "<own>" }, model: requestModel });
+        seen = strip({ messages: transcript.messages, options: { ...options, sessionId: "<own>" }, model: requestModel }, options?.sessionId);
         return fauxAssistantMessage("好");
       }]);
       const opened = await openGroupHarness(join(fixture.root, `db-${++counter}.sqlite`), models, { settings, door: door ? {} : false, group: GROUP });
@@ -352,7 +377,7 @@ describe("request door: fail closed and parity (D0 P10 C, E, F)", () => {
     expect([through.settled, direct.settled]).toEqual(["done", "done"]);
     expect(through.dispatched).toBe(1);
     expect(through.seen).toEqual(direct.seen);
-    expect(through.headers).toEqual({ "X-Auth": "kept", "x-case": "from-request" });
+    expect(through.headers).toEqual({ "x-opencode-session": through.own, "X-Auth": "kept", "x-case": "from-request" });
     expect(typeof through.own).toBe("string");
     expect(through.sessionId).toBe(through.own);
     expect(direct.sessionId).toBe(direct.own);
@@ -680,13 +705,13 @@ describe("request door: a commit settles only after storage did (D0 q02, project
           return async (...args: Parameters<Storage["commit"]>) => {
             if (!armed) return target.commit(...args);
             armed = false;
-            storageSignal = args[1].abortSignal !== undefined;
-            const seq = await target.commit(...args);
+            storageSignal = args[2].abortSignal !== undefined;
+            const committed = await target.commit(...args);
             entered.resolve();
             await release.promise;
             storageSettled = true;
             if (mode === "landed-error") throw new Error("synthetic reply failure after the SQLite commit");
-            return seq!;
+            return committed;
           };
         },
       }) as Storage;

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# 服务容器的运行身份（数值 UID:GID）。部署和升级沿用原容器的身份：停机前从原容器读取并核对，写入事务快照中的
-# service-user 文件（它自己的 format 1，与事务记录的 format 2 无关）；预览、数据准备、验证实例、正式实例和续做都用它。
+# 服务容器的运行身份（数值 UID:GID）。部署和升级沿用原容器的身份：部署停机前从原容器读取并核对，写进暂存目录的
+# service-user 交接记录（它自己的 format 1，与事务记录的 format 2 无关），由运维核心复制进事务快照；预览、数据准备、
+# 验证实例、正式实例和续做都用它。
 # 已有数据的属主不批量改动，只给本次新建的目录和文件设置属主。
 #
 # rootful Docker 由 root 运行部署，容器身份就是宿主机上的属主；rootless Docker 由它所属的普通用户运行，容器里的 0:0
 # 映射为这个用户，本次新建的文件本来就属于它，不需要改属主（见 require_deploy_operator）。
 # 用法：. scripts/lib/service-user.sh（调用方已导入 common.sh）
 
-SERVICE_USER_KEYS=(format user source)
 # 真正首次部署的默认身份：rootful 下是镜像中的 appuser，rootless 下是映射为部署用户的容器 root。
 DEFAULT_ROOTFUL_SERVICE_USER=1001:1001
 
@@ -106,7 +106,7 @@ service_user_from_data() {
     echo "$owner"
 }
 
-# 在发布事务指针之前调用：逐项校验后写临时文件并落盘，再改名。
+# 停机前写进部署的暂存目录（运维核心把它复制进快照后才发布事务指针）：逐项校验后写临时文件并落盘，再改名。
 write_service_user_record() {
     local directory="$1" temporary="$1/service-user.tmp" content
     service_user_value_valid user "${SERVICE_USER:-}" && service_user_value_valid source "${SERVICE_USER_SOURCE:-}" ||
@@ -119,33 +119,10 @@ write_service_user_record() {
     mv -- "$temporary" "$directory/service-user"
 }
 
-# 读取快照中的服务身份到 SERVICE_USER、SERVICE_USER_SOURCE。缺失、重复或未知的键、任何一项无效都拒绝。
-read_service_user_record() {
-    local file="$1/service-user" line key value
-    local -A record=()
-    SERVICE_USER='' SERVICE_USER_SOURCE=''
-    if [ ! -e "$file" ] && [ ! -L "$file" ]; then echo "缺少服务身份记录：$file" >&2; return 1; fi
-    [ -f "$file" ] && [ ! -L "$file" ] || { echo "服务身份记录不是普通文件：$file" >&2; return 1; }
-    while IFS= read -r line || [ -n "$line" ]; do
-        key="${line%%=*}"
-        value="${line#*=}"
-        if [ "$key" = "$line" ] || ! service_user_value_valid "$key" "$value" || [ -n "${record[$key]+set}" ]; then
-            echo "服务身份记录无效：${key}" >&2
-            return 1
-        fi
-        record[$key]="$value"
-    done < "$file"
-    for key in "${SERVICE_USER_KEYS[@]}"; do
-        [ -n "${record[$key]+set}" ] || { echo "服务身份记录缺少：$key" >&2; return 1; }
-    done
-    SERVICE_USER="${record[user]}"
-    SERVICE_USER_SOURCE="${record[source]}"
-}
-
 # 让服务身份能访问本次新建的文件或目录（不递归）：rootful 下由 root 改属主；rootless 下文件已属于部署用户，不需要改。
 grant_service_access() {
     [ "$(id -u)" = 0 ] || return 0
-    chown -- "$SERVICE_USER" "$@"
+    chown -h -- "$SERVICE_USER" "$@"
 }
 
 # 运维日志：logs/ 和 logs/operations 由部署用户的 operation_start 按需创建（root 运行时属于 root），服务身份要在其中

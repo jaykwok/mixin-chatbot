@@ -1,12 +1,12 @@
 import { parseArgs, type ParseArgsConfig } from "node:util";
 
-/** All administrative options are single-valued; never silently take the last one. */
+/** Administrative options are single-valued unless the action explicitly declares a repeatable value. */
 export function cliArgs<const T extends NonNullable<ParseArgsConfig["options"]>>(args: string[], options: T) {
   const parsed = parseArgs({ args, options, strict: true, allowPositionals: true, tokens: true });
   const seen = new Set<string>();
   for (const token of parsed.tokens) {
     if (token.kind !== "option") continue;
-    if (seen.has(token.name)) throw new Error(`参数不能重复：--${token.name}`);
+    if (seen.has(token.name) && !options[token.name]?.multiple) throw new Error(`参数不能重复：--${token.name}`);
     if (token.value === "") throw new Error(`--${token.name} 缺少值`);
     seen.add(token.name);
   }

@@ -2,21 +2,18 @@
 // untracked files only at that point, and overwrites or deletes ignored ones without asking. The preflight before the stop
 // walks the same route (current commit -> main -> target) against real repositories: local files on a path either step adds
 // (the path itself or any parent) are listed; everything else must survive the real switch. The preflight writes nothing.
-// Linux runs the bash upgrader's check; Windows runs upgrade.ps1's, with tracked links checked out as files
-// (core.symlinks=false) and untracked links as directory junctions, and again with real symbolic links where they can be made.
+// The check is the shared core's (DeploymentGit.switchConflicts): both upgraders run it through the core's preflight before
+// they build or ask, and the core repeats it under the lock before the stop. Windows runs with tracked links checked out as
+// files (core.symlinks=false) and untracked links as directory junctions, and again with real symbolic links where they can be made.
 import { expect, test } from "bun:test";
 import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { fileURLToPath } from "node:url";
 import { symlinkUnavailable } from "../helpers/links.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { DeploymentGit } from "../../scripts/ops/core/deployment-git.ts";
+import { windowsUpgradeFixture } from "../helpers/windows-upgrade.ts";
 
-const project = fileURLToPath(new URL("../../", import.meta.url));
-const bash = process.platform === "linux" ? Bun.which("bash") : null;
-const posix = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
-const quotePS = (value: string) => `'${value.replaceAll("'", "''")}'`;
-type Engine = "bash" | "powershell";
 type Files = Record<string, string>;
 /** A commit's content: file contents, or symbolic links by their target. */
 type Tree = Record<string, string | { link: string }>;
@@ -42,14 +39,13 @@ interface Scenario {
   netOnly?: boolean;
   /** Another git process holds the index lock meanwhile: the dry run works on its own copy and leaves the lock alone. */
   locked?: boolean;
-  only?: Engine;
-  /** Involves links: tracked ones (committed as links) or an untracked one. Bash on Windows skips these (not an upgrader there). */
+  /** Involves links: tracked ones (committed as links) or an untracked one. */
   links?: "tracked" | "untracked";
 }
 
 /** One run of the check. On Windows core.symlinks is set explicitly: false checks tracked links out as files holding their
  * target; true needs a process that can create symbolic links and runs only the scenarios with links. */
-interface Pass { engine: Engine; symlinks?: boolean }
+interface Pass { symlinks?: boolean }
 
 const toTarget = "未跟踪的文件会被目标版本覆盖：", viaMain = "未跟踪的文件会被切换途经的 main 分支覆盖：";
 const parentTaken = "未跟踪的文件或链接占着目标版本的目录位置：";
@@ -90,10 +86,10 @@ const scenarios: Scenario[] = [
   { name: "git-dry-run", head: {}, main: { "mid.txt": "main" }, target: { "mid.txt": "main" }, netOnly: true,
     local: dir => writeFile(join(dir, "mid.txt"), "notes"), blocked: ["git 试运行切换到 main 失败"], after: { "mid.txt": "notes" } },
   // Tracked changes: the fast-forward refuses a file the target changes, and silently keeps a change to one it does not —
-  // either way the switch does not reach the target version. upgrade.ps1 checks them itself; the bash upgrader beforehand.
-  { name: "tracked-change", head: { "a.txt": "old" }, target: { "a.txt": "new" }, only: "powershell",
+  // either way the switch does not reach the target version. The core checks them itself.
+  { name: "tracked-change", head: { "a.txt": "old" }, target: { "a.txt": "new" },
     local: dir => writeFile(join(dir, "a.txt"), "notes"), blocked: ["未提交的改动： M a.txt"], after: { "a.txt": "notes" } },
-  { name: "tracked-change-carried", head: { "a.txt": "old" }, target: { "a.txt": "old", "b.txt": "new" }, only: "powershell",
+  { name: "tracked-change-carried", head: { "a.txt": "old" }, target: { "a.txt": "old", "b.txt": "new" },
     local: dir => writeFile(join(dir, "a.txt"), "notes"), blocked: ["未提交的改动： M a.txt"], after: { "a.txt": "notes" } },
   // Safe: tracked content only, local files inside directories that stay directories, and files elsewhere.
   { name: "re-added-after-main", head: { "x.txt": "head" }, main: {}, target: { "x.txt": "target" }, blocked: null, after: {} },
@@ -117,12 +113,16 @@ const scenarios: Scenario[] = [
     local: async dir => { await mkdir(`${dir}-elsewhere`); await writeFile(`${dir}-elsewhere/child`, "operator"); await writeFile(`${dir}-elsewhere/sub`, "operator"); },
     blocked: null, after: {}, outside: { child: "operator", sub: "operator" } },
   { name: "index-locked", head: {}, main: { "mid.txt": "main" }, target: { "mid.txt": "main", "added.txt": "new" }, locked: true, blocked: null, after: {} },
+  // Touched, same bytes: git status and the real switch call the file clean, so the dry run on the index copy must as well,
+  // without refreshing the real index (the check below keeps its bytes and time).
+  { name: "touched-tracked-file", head: { "a.txt": "same" }, target: { "a.txt": "new" }, blocked: null, after: {},
+    local: async dir => { await writeFile(join(dir, "a.txt"), "same"); const later = new Date(Date.now() + 60_000); await utimes(join(dir, "a.txt"), later, later); } },
 ];
 
 async function run(command: string[], cwd: string, env: Record<string, string> = {}) {
   const child = Bun.spawn(command, { cwd, env: { ...process.env, MSYS_NO_PATHCONV: "1", ...env }, stdout: "pipe", stderr: "pipe", windowsHide: true });
   const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  return { code, out: out.trim(), output: `${out}${err}` };
+  return { code, out: out.trim(), stdout: out, output: `${out}${err}` };
 }
 
 async function git(dir: string, ...args: string[]) {
@@ -170,12 +170,12 @@ async function repository(dir: string, scenario: Scenario, pass: Pass) {
 }
 
 /** Every file under the checkout except .git, with its bytes (links by their target). */
-function snapshot(dir: string): Record<string, string> {
+function snapshot(dir: string, ignore: (key: string) => boolean = () => false): Record<string, string> {
   const files: Record<string, string> = {};
   const walk = (current: string) => {
     for (const name of readdirSync(current)) {
       const path = join(current, name), key = relative(dir, path).replaceAll("\\", "/");
-      if (key === ".git") continue;
+      if (key === ".git" || ignore(key)) continue;
       const info = lstatSync(path);
       if (info.isSymbolicLink()) files[key] = "link";
       else if (info.isDirectory()) { files[`${key}/`] = "dir"; walk(path); }
@@ -200,61 +200,37 @@ function outcomes(output: string): Map<string, { status: string; conflicts: stri
 
 interface Case { scenario: Scenario; dir: string; head: string; main: string; target: string }
 
-// bash: switch_preflight with the explicit route. PowerShell: Get-UpgradeSwitchConflicts, which reads HEAD and main itself
-// and also checks tracked changes; its dry run copies the index under the system temporary directory, pointed at <scratch>.
-async function check(engine: Engine, cases: Case[], root: string, scratch: string) {
-  if (engine === "bash") {
-    const script = join(root, "check.sh");
-    await writeFile(script, `set -u
-. '${posix(join(project, "scripts/lib/common.sh"))}'
-operation_event() { :; }
-rules="$(declare -f untracked_switch_conflicts)"
-while [ "$#" -gt 0 ]; do
-    name="$1" PROJECT_DIR="$2" head="$3" main="$4" target="$5" net="$6"; shift 6
-    eval "$rules"
-    [ "$net" = 0 ] || untracked_switch_conflicts() { :; }
-    echo "=== $name"
-    if switch_preflight "$head" "$main" "$target" '${scratch.replaceAll("\\", "/")}' 2>&1; then echo SAFE; else echo BLOCKED; fi
-done
-`);
-    // PROJECT_DIR as D:/... on Windows: the checks hand it to the native git.exe.
-    return run([bash!, posix(script), ...cases.flatMap(({ scenario, dir, head, main, target }) =>
-      [scenario.name, dir.replaceAll("\\", "/"), head, main, target, scenario.netOnly ? "1" : "0"])], root);
+// DeploymentGit.switchConflicts reads HEAD and main itself and also checks tracked changes; its dry run copies the index
+// under <scratch>.
+async function check(cases: Case[], scratch: string) {
+  const lines: string[] = [];
+  for (const { scenario, dir, target } of cases) {
+    const core = new DeploymentGit(dir, async request => {
+      const result = await run([request.command, ...request.args], request.cwd, request.env as Record<string, string>);
+      return { code: result.code, stdout: result.stdout };
+    }, scratch);
+    // Keep the original fallback case: Git's own dry run must still reject with the path rules disabled.
+    if (scenario.netOnly) core.pathConflicts = async () => [];
+    const { conflicts } = await core.switchConflicts(target);
+    lines.push("=== " + scenario.name, ...conflicts.map(value => "- " + value), conflicts.length ? "BLOCKED" : "SAFE");
   }
-  const script = join(root, "check.ps1");
-  await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
-[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
-. ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
-$rules=(Get-Item function:Get-UntrackedSwitchConflicts).ScriptBlock
-$cases=New-Object System.Collections.ArrayList
-${cases.map(({ scenario, dir, target }) => `[void]$cases.Add(@(${[scenario.name, dir, target, scenario.netOnly ? "1" : "0"].map(quotePS).join(",")}))`).join("\n")}
-foreach($case in $cases){
-    '=== ' + $case[0]
-    if($case[3] -eq '1'){ Set-Item function:Get-UntrackedSwitchConflicts { } } else { Set-Item function:Get-UntrackedSwitchConflicts $rules }
-    $conflicts=@(Get-UpgradeSwitchConflicts 'git' $case[1] $case[2])
-    foreach($conflict in $conflicts){ '- ' + $conflict }
-    if($conflicts.Count){ 'BLOCKED' } else { 'SAFE' }
-}
-`);
-  return run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], root, { TEMP: scratch, TMP: scratch });
+  return { code: 0, out: lines.join("\n"), output: lines.join("\n") };
 }
 
 const linkReason = process.platform === "win32" ? symlinkUnavailable() : null;
 const passes: { pass: Pass; available: boolean; label: string }[] = [
-  { pass: { engine: "bash" }, available: !!bash && existsSync(bash), label: "bash" },
-  { pass: { engine: "powershell", symlinks: false }, available: process.platform === "win32", label: "powershell (core.symlinks=false, junctions)" },
-  { pass: { engine: "powershell", symlinks: true }, available: process.platform === "win32" && !linkReason,
-    label: `powershell (core.symlinks=true, symbolic links${linkReason ? `; 跳过：${linkReason}` : ""})` },
+  { pass: process.platform === "win32" ? { symlinks: false } : {}, available: true, label: "shared TypeScript core" },
+  { pass: { symlinks: true }, available: process.platform === "win32" && !linkReason,
+    label: `shared TypeScript core (symbolic links${linkReason ? `; 跳过：${linkReason}` : ""})` },
 ];
 
 function selected(pass: Pass): Scenario[] {
-  return scenarios.filter(scenario => (!scenario.only || scenario.only === pass.engine) &&
-    (pass.symlinks !== true || !!scenario.links) && !(process.platform === "win32" && pass.engine === "bash" && scenario.links));
+  return scenarios.filter(scenario => pass.symlinks !== true || !!scenario.links);
 }
 
 for (const { pass, available, label } of passes) {
   test.skipIf(!available)(`${label} switch preflight lists local files on the route current -> main -> target without writing, and passes only switches that keep them`, async () => {
-    const fixture = await tempFixture(`switch-preflight-${pass.engine}-`);
+    const fixture = await tempFixture(`switch-preflight-${pass.symlinks ? "links-" : ""}`);
     try {
       const cases: Case[] = [];
       for (const scenario of selected(pass)) {
@@ -276,7 +252,7 @@ for (const { pass, available, label } of passes) {
       for (const { scenario, dir } of cases) if (scenario.locked) await writeFile(join(dir, ".git/index.lock"), "held elsewhere");
       const scratch = join(fixture.root, "scratch");
       await mkdir(scratch);
-      const result = await check(pass.engine, cases, fixture.root, scratch);
+      const result = await check(cases, scratch);
       expect(result.code, result.output).toBe(0);
       const seen = outcomes(result.output);
       expect(readdirSync(scratch)).toEqual([]);
@@ -326,7 +302,7 @@ async function expectRealSwitch(scenario: Scenario, dir: string, target: string)
 // before the stop after the preparation (snapshot, data decision). Only the service, the snapshot, Bun and the operation log
 // are stand-ins; the stand-in stop reports failure, so a run that reaches it changes nothing either.
 type UpgradeStage = "upgrade-preflight" | "switch-recheck";
-const stages = ["data-preparation-preview", "upgrade-preflight", "deployment-snapshot", "switch-recheck", "stop-service"];
+// A resume keeps the revision cleanup choice its snapshot recorded, so only a new upgrade asks for one.
 const upgradeCases: (Scenario & {
   /** An interrupted upgrade's transaction pointer is present. */
   resume?: boolean;
@@ -366,88 +342,39 @@ const upgradeCases: (Scenario & {
   { name: "resume-at-target-safe", resume: true, atTarget: true, head: { "a.txt": "old" }, target: { "a.txt": "old" }, blocked: null, after: {}, refusedAt: null },
 ];
 
-test.skipIf(process.platform !== "win32")("Windows upgrader refuses switch conflicts before the stop in new upgrades and resumes, and rechecks after the preparation", async () => {
+for (const scenario of upgradeCases) test.skipIf(process.platform !== "win32")(`Windows shared upgrader before stop: ${scenario.name}`, async () => {
   const fixture = await tempFixture("upgrade-switch-");
   try {
-    const pass: Pass = { engine: "powershell", symlinks: false };
-    const cases: Case[] = [];
-    for (const scenario of upgradeCases) {
-      const dir = join(fixture.root, scenario.name);
-      const refs = await repository(dir, scenario, pass);
+    const pass: Pass = { symlinks: false };
+    {
+      const dir = join(fixture.root, scenario.name), refs = await repository(dir, scenario, pass);
       if (scenario.atTarget) {
-        await gitOk(dir, "update-ref", "refs/heads/main", refs.target); await gitOk(dir, "checkout", "-qf", "main");
-        refs.head = refs.main = refs.target;
+        await gitOk(dir, "update-ref", "refs/heads/main", refs.target); await gitOk(dir, "checkout", "-qf", "main"); refs.head = refs.main = refs.target;
       }
-      if (scenario.resume) {
-        await mkdir(join(dir, "data/state"), { recursive: true }); await mkdir(join(dir, "data/groups"));
-        await writeFile(join(dir, "data/state/upgrade-transaction"), `deploy-${"a".repeat(32)}`);
-      }
-      // A new upgrade keeps the deployed app-bot credentials and refuses before any change without them.
-      await mkdir(join(dir, "data/config"), { recursive: true }); await writeFile(join(dir, "data/config/app-bot.json"), "{}");
-      cases.push({ scenario, dir, ...refs });
-    }
-    const before = cases.map(({ dir }) => ({ index: readFileSync(join(dir, ".git/index")), mtime: statSync(join(dir, ".git/index")).mtimeMs, files: snapshot(dir) }));
-    const scratch = join(fixture.root, "scratch");
-    await mkdir(scratch);
-    const script = join(fixture.root, "upgrade-harness.ps1");
-    await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
-[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
-. ${quotePS(join(project, "scripts/lib/common.ps1"))}
-$tokens=$null; $errors=$null
-$sourcePath=${quotePS(join(project, "scripts/deploy/upgrade.ps1"))}
-$ast=[Management.Automation.Language.Parser]::ParseFile($sourcePath,[ref]$tokens,[ref]$errors)
-if($errors.Count){throw ($errors | Out-String)}
-$body=(Get-Content -LiteralPath $sourcePath -Raw -Encoding UTF8).Substring($ast.ParamBlock.Extent.EndOffset)
-$body=(($body -split '\\r?\\n') | Where-Object { -not $_.StartsWith('. (Join-Path') }) -join [Environment]::NewLine
-$body=$body.Replace('$PSScriptRoot', "'" + $PSScriptRoot.Replace("'", "''") + "'")
-$run=[scriptblock]::Create($body)
-function Start-OperationLog { $null }; function Stop-OperationLog { }; function Write-OperationEvent { }; function Write-OperationFailure { }
-function Set-OperationStage([string]$Stage) { $script:stages += $Stage }
-function Get-ScheduledTask { [pscustomobject]@{State='Ready'} }
-function Get-SavedWorkspaceRoot { '' }
-function Read-DeploymentTransaction { @{ target_workspace_root = '' } }
-function fixture-bun { $global:LASTEXITCODE=0; if($script:stopped){throw 'Bun ran after the stop'}; if($args -contains '--version'){ '1.4.4' }; if($args -contains 'committed'){ $global:LASTEXITCODE=1 } }
-function Open-UpgradeSnapshot($root,$task,$original,$branch,$target) {
-    $script:opened=$true
-    if($script:during){ [IO.File]::WriteAllText((Join-Path $root $script:during[0]), $script:during[1]) }
-    [pscustomobject]@{WasRunning=$true;TaskXml='<Task/>';Path=(Join-Path $root 'backup\\snapshots\\fixture');Lock=(New-Object IO.MemoryStream);PreviousBackupId='previous';UpgradeOriginal=$original;UpgradeBranch=$branch}
-}
-function Stop-ProjectBot { $script:stopped=$true; $false }
-$cases=New-Object System.Collections.ArrayList
-${cases.map(({ scenario, dir, head, main, target }, index) => `[void]$cases.Add(@(${[scenario.name, dir, head, head === main ? "main" : "HEAD", target,
-  ...(upgradeCases[index]!.during ?? ["", ""])].map(quotePS).join(",")}))`).join("\n")}
-foreach($case in $cases){
-    $Project=$case[1]; $OriginalSha=$case[2]; $OriginalBranch=$case[3]; $TargetSha=$case[4]
-    $Rollback=$false; $BunPath='fixture-bun'; $GitPath='git'
-    $script:during=if($case[5]){ @($case[5],$case[6]) } else { $null }
-    $script:stages=@(); $script:opened=$false; $script:stopped=$false
-    $message=''
-    try { & $run } catch { $message=$_.Exception.Message }
-    'JSON ' + (ConvertTo-Json -Compress -InputObject @{ name=$case[0]; stages=($script:stages -join ','); opened=$script:opened; stopped=$script:stopped; message=$message })
-}
-`);
-    const result = await run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], fixture.root, { TEMP: scratch, TMP: scratch });
-    expect(result.code, result.output).toBe(0);
-    const reports = new Map<string, { stages: string; opened: boolean; stopped: boolean; message: string }>(result.output.split(/\r?\n/)
-      .filter(line => line.startsWith("JSON ")).map(line => JSON.parse(line.slice(5))).map(report => [report.name, report]));
-    expect(readdirSync(scratch)).toEqual([]);
-    for (const [index, { scenario, dir, head, main, target }] of cases.entries()) {
-      const { refusedAt, during } = upgradeCases[index]!;
-      const report = reports.get(scenario.name)!;
-      expect(report, result.output).toBeDefined();
-      const reached = stages.slice(0, stages.indexOf(refusedAt ?? "stop-service") + 1).join(",");
-      const conflicts = report.message.split("\n").map(line => line.trim()).filter(line => line.startsWith("- ")).map(line => line.slice(2));
-      expect({ name: scenario.name, stages: report.stages, opened: report.opened, stopped: report.stopped, conflicts }, report.message).toEqual({
-        name: scenario.name, stages: reached, opened: refusedAt !== "upgrade-preflight", stopped: refusedAt === null, conflicts: scenario.blocked ?? [] });
-      expect(report.message, scenario.name).toContain(refusedAt ? "本次升级没有停止服务" : "机器人服务未能停止，升级未改动代码和数据");
-      // Nothing written: index bytes and time, no lock, HEAD and main, every local file (plus the one that appeared meanwhile).
-      expect(readFileSync(join(dir, ".git/index")).equals(before[index]!.index), scenario.name).toBe(true);
-      expect(statSync(join(dir, ".git/index")).mtimeMs, scenario.name).toBe(before[index]!.mtime);
-      expect(existsSync(join(dir, ".git/index.lock")), scenario.name).toBe(false);
-      expect(snapshot(dir), scenario.name).toEqual({ ...before[index]!.files, ...(during ? { [during[0]]: during[1] } : {}) });
-      expect(await gitOk(dir, "rev-parse", "HEAD"), scenario.name).toBe(head);
-      expect(await gitOk(dir, "rev-parse", "main"), scenario.name).toBe(main);
-      await expectRealSwitch(scenario, dir, target);
+      const host = await windowsUpgradeFixture(true, { refuseStop: true,
+        checkout: { project: dir, original: refs.head, target: refs.target, branch: refs.head === refs.main ? "main" : "HEAD",
+          run: async command => { const value = await run([command.command, ...command.args], command.cwd, command.env as Record<string, string>);
+            return { code: value.code, stdout: value.stdout }; } },
+        beforePreflight: async () => { if (scenario.during) await writeFile(join(dir, scenario.during[0]), scenario.during[1]); },
+      });
+      try {
+        if (scenario.resume) await host.pending();
+        const owned = (key: string) => key === ".console" || key === "backup" || ["data/state/deploy.lock", "data/state/ops-deployment.json", "data/state/upgrade-transaction"].includes(key);
+        const before = { files: snapshot(dir, owned), index: readFileSync(join(dir, ".git/index")), mtime: statSync(join(dir, ".git/index")).mtimeMs };
+        const result = await host.run(); expect(result.exitCode, scenario.name + result.message).toBe(1);
+        expect(host.events.includes("effect:stop"), scenario.name + result.message).toBe(scenario.refusedAt === null);
+        expect(host.events).not.toContain("git:effect"); expect(host.events.some(value => value.startsWith("data:"))).toBe(false);
+        expect(host.events.includes("effect:capture"), scenario.name + result.message).toBe(!scenario.resume && scenario.refusedAt !== "upgrade-preflight");
+        if (scenario.blocked) for (const conflict of scenario.blocked) expect(result.message, scenario.name).toContain(conflict);
+        else expect(result.message).toContain("synthetic stop refused");
+        expect(readFileSync(join(dir, ".git/index")), scenario.name).toEqual(before.index);
+        expect(statSync(join(dir, ".git/index")).mtimeMs, scenario.name).toBe(before.mtime);
+        expect(existsSync(join(dir, ".git/index.lock")), scenario.name).toBe(false);
+        expect(snapshot(dir, owned), scenario.name).toEqual({ ...before.files, ...(scenario.during ? { [scenario.during[0]]: scenario.during[1] } : {}) });
+        expect(await gitOk(dir, "rev-parse", "HEAD"), scenario.name).toBe(refs.head);
+        expect(await gitOk(dir, "rev-parse", "main"), scenario.name).toBe(refs.main);
+        await expectRealSwitch(scenario, dir, refs.target);
+      } finally { await host.cleanup(); }
     }
   } finally { await fixture.cleanup(); }
 }, 120000);

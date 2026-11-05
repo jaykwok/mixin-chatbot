@@ -5,7 +5,8 @@
 import { test } from "bun:test";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
 import { Database } from "bun:sqlite";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
@@ -180,25 +181,33 @@ test.skipIf(process.platform !== "linux")("a signed task receipt keeps the basel
   } finally { db.close(); await f.cleanup(); }
 });
 
-test.skipIf(process.platform !== "linux")("a receipt written before the optional fields existed is still accepted, listed and kept by sweeps", async () => {
-  const f = await tempFixture("formats-old-receipt-"), temp = join(f.root, "data/tmp/groups/group-a/alice");
+test.skipIf(process.platform !== "linux")("a receipt with only the required fields is listed and retired by sweeps; one without the owner epoch and role is refused and kept", async () => {
+  const f = await tempFixture("formats-minimal-receipt-"), temp = join(f.root, "data/tmp/groups/group-a/alice");
   try {
     await mkdir(temp, { recursive: true });
     const control = join(f.root, "control"), backend = new RootlessTasks(control, image, driver);
     await backend.verify();
-    const { manager, key } = await json(join(control, "manager.json")), id = "44444444-4444-4444-8444-444444444444";
+    const { manager, key } = await json(join(control, "manager.json"));
     const template = await readFile(join(golden, "receipt-v2-minimal.payload.json"), "utf8");
-    const payload = JSON.stringify(JSON.parse(template.replace("<ID>", id).replace("<NONCE>", "b".repeat(64)).replace("<MANAGER>", manager)
-      .replace("<DAEMON>", "formats-fixture").replace("<IMAGE>", image).replace("<TEMP>", await realpath(temp))));
-    const signature = createHmac("sha256", Buffer.from(key, "hex")).update(payload).digest("hex");
-    await writeFile(join(control, "receipts", id + ".json"), JSON.stringify({ payload, signature }), { mode: 0o600 });
+    const save = async (id: string, change: (receipt: Record<string, unknown>) => void) => {
+      const receipt = JSON.parse(template.replace("<ID>", id).replace("<NONCE>", "b".repeat(64)).replace("<MANAGER>", manager)
+        .replace("<DAEMON>", "formats-fixture").replace("<IMAGE>", image).replace("<TEMP>", await realpath(temp)).replace("<EPOCH>", randomUUID()));
+      change(receipt);
+      const payload = JSON.stringify(receipt), signature = createHmac("sha256", Buffer.from(key, "hex")).update(payload).digest("hex");
+      await writeFile(join(control, "receipts", id + ".json"), JSON.stringify({ payload, signature }), { mode: 0o600 });
+      return { payload, signature };
+    };
+    const minimal = "44444444-4444-4444-8444-444444444444", old = "55555555-5555-4555-8555-555555555555";
+    await save(minimal, () => {});
+    const kept = await save(old, receipt => { delete receipt.ownerEpoch; delete receipt.role; });
     const inventory = await backend.inventory(temp);
-    expect(inventory.refused).toEqual([]);
-    expect(inventory.items.map(item => [item.id, item.phase])).toEqual([[id, "removed"]]);
-    // Old receipts do not record result ownership, so a sweep never discards their evidence.
-    expect(await backend.sweep(temp, Date.now() + 1, new ReferenceText(() => "", "/"))).toEqual([]);
+    expect(inventory.items.map(item => [item.id, item.phase])).toEqual([[minimal, "removed"]]);
+    expect(inventory.refused).toEqual([{ id: old, reason: expect.stringContaining("：role") }]);
     // Already removed before this call: only bookkeeping, so a reclamation list does not count its bytes again.
-    expect(await backend.reclaim(id, temp)).toEqual({ name: id, status: "removed", completedEarlier: true });
-    expect(await json(join(control, "receipts", id + ".json"))).toEqual({ payload, signature });
+    expect(await backend.reclaim(minimal, temp)).toEqual({ name: minimal, status: "removed", completedEarlier: true });
+    await expect(backend.reclaim(old, temp)).rejects.toThrow("：role");
+    expect(await backend.sweep(temp, Date.now() + 1, new ReferenceText(() => "", "/"))).toEqual([{ name: old, status: "refused", reason: expect.stringContaining("：role") }]);
+    expect(existsSync(join(control, "receipts", minimal + ".json"))).toBe(false);
+    expect(await json(join(control, "receipts", old + ".json"))).toEqual(kept);
   } finally { await f.cleanup(); }
 });

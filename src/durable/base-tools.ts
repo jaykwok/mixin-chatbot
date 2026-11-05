@@ -1,7 +1,7 @@
-import { Type } from "@earendil-works/pi-ai";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
+import { arr, str } from "@earendil-works/pi-schema";
 import { BASH_DEFAULT_TIMEOUT } from "../core/config.ts";
 import { configuredRootlessTasks } from "../core/task-backend.ts";
 
@@ -14,9 +14,10 @@ export function bashToolNote(isolated = configuredRootlessTasks() !== undefined)
 /** The only base tool implementation: official Durable factories, with host policy in ExecutionEnv. */
 export function nativeBaseTools(): ToolRegistration[] {
   const bash = createBashTool();
-  const parameters = configuredRootlessTasks() ? Type.Object({ ...bash.parameters.properties,
-    input_paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 128,
-      description: "Existing inputs under your own tmp. Only these inputs are copied into an isolated command." })) }) : bash.parameters;
+  // Isolated commands copy their inputs: bash's own schema with one more optional property.
+  const parameters = configuredRootlessTasks() ? { ...bash.parameters, properties: { ...bash.parameters.properties as object,
+    input_paths: arr(str({ minLength: 1 }), { maxItems: 128,
+      description: "Existing inputs under your own tmp. Only these inputs are copied into an isolated command." }) } } : bash.parameters;
   return [createReadTool({ images }), { ...bash, parameters, description: bash.description + bashToolNote(),
     execute: (args, api, context) => {
       const input = args as { command: string; timeout?: number };

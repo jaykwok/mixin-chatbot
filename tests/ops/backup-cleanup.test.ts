@@ -2,14 +2,12 @@ import { expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { existsSync } from "node:fs";
-import { appendFile, chmod, copyFile, cp, lstat, mkdir, readFile, readdir, rename, symlink, utimes, writeFile } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, readFile, readdir, rename, symlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { apply, scan, type Entry } from "../../scripts/ops/backup-cleanup.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = join(import.meta.dir, "../..");
-const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
-const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 // Directory junctions need no privilege on Windows; elsewhere an ordinary directory symlink.
 const link = (target: string, path: string) => symlink(target, path, process.platform === "win32" ? "junction" : "dir");
 async function put(root: string, path: string, content: string | Buffer): Promise<void> {
@@ -114,6 +112,42 @@ test("backup scan classifies archives by name and content evidence without chang
     expect(scanned.skipped).toEqual(["reports"]);
     const tsv = await readFile(join(root, "tmp/backup-cleanup", scanned.report!, "manifest.tsv"), "utf8");
     expect(tsv).toContain("可确认测试数据"); expect(tsv).toContain("疑似测试数据"); expect(tsv).toContain("业务归档"); expect(tsv).toContain("无法判断");
+  } finally { await fixture.cleanup(); }
+}, 30000);
+
+test("backup scan lists revision cleanup backups by run; the backups of a run that has not ended are kept", async () => {
+  const fixture = await tempFixture("backup-revision-");
+  try {
+    const root = fixture.root, [ended, open] = ["20261027-0123abcd", "20261027-4567cdef"];
+    const area = (name: string) => `backup/revision-cleanup/${name}`;
+    for (const run of [ended, open]) await put(root, `${area(run)}/direct.sqlite`, "SQLite format 3\0");
+    await put(root, `${area("notes")}/readme.txt`, "manual notes");
+    const journal = (state: string) => put(root, "data/state/revision-cleanup.json", JSON.stringify({ version: 2, run: open, state, databases: [] }, null, 2));
+    await journal("running");
+    const scanned = scan(root);
+    const entry = (path: string) => scanned.entries.find(item => item.path === path)!;
+    for (const run of [ended, open]) {
+      expect(entry(area(run)).category).toBe("business");
+      expect(entry(area(run)).basis[0]).toContain("修订整理前的会话库备份");
+    }
+    expect(entry(area(open)).basis.join(" ")).toContain("修订整理尚未结束");
+    expect(entry(area(ended)).basis.join(" ")).not.toContain("修订整理尚未结束");
+    expect(entry(area("notes")).category).toBe("unknown");
+    await editActions(root, scanned.report!, { [area(ended)]: "delete", [area(open)]: "delete", [area("notes")]: "delete" });
+    const preview = apply(root, scanned.report!), done = apply(root, scanned.report!, preview.code);
+    const outcome = (path: string) => done.results.find(result => result.path === path)!;
+    expect(outcome(area(ended)).outcome).toBe("deleted");
+    expect(outcome(area(open))).toMatchObject({ outcome: "refused", reason: expect.stringContaining("修订整理尚未结束") });
+    expect(outcome(area("notes")).reason).toContain("从不删除");
+    expect([existsSync(join(root, area(ended))), existsSync(join(root, area(open))), existsSync(join(root, area("notes")))]).toEqual([false, true, true]);
+    // Once the run has ended its backups may go too; a journal that cannot be read stops the scan.
+    await journal("finished");
+    const later = scan(root);
+    await editActions(root, later.report!, { [area(open)]: "delete" });
+    const again = apply(root, later.report!, apply(root, later.report!).code);
+    expect(again.results.find(result => result.path === area(open))!.outcome).toBe("deleted");
+    await put(root, "data/state/revision-cleanup.json", "{}");
+    expect(() => scan(root)).toThrow("修订整理日志格式不匹配");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -344,35 +378,6 @@ test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("backup sc
     await fixture.cleanup();
   }
 });
-
-test.skipIf(!bash || !existsSync(bash))("ops.sh backup-scan and backup-clean hand the report and confirmation code to the tool", async () => {
-  const fixture = await tempFixture("backup-ops-linux-");
-  const root = fixture.root, log = join(root, "docker.log");
-  try {
-    await cp(join(project, "scripts/lib"), join(root, "scripts/lib"), { recursive: true });
-    await mkdir(join(root, "scripts/ops"), { recursive: true }); await copyFile(join(project, "scripts/ops/ops.sh"), join(root, "scripts/ops/ops.sh"));
-    // Even with the service running, a one-off container binds the reports onto the host.
-    const docker = `() { echo "$*" >> '${posixPath(log)}'; case "$1" in ps) echo mixin-chatbot ;; container) echo 1001:1001 ;; esac\n}`;
-    const ops = async (...args: string[]) => {
-      const child = Bun.spawn([bash!, posixPath(join(root, "scripts/ops/ops.sh")), ...args], { cwd: root, stdout: "pipe", stderr: "pipe", windowsHide: true,
-        env: { ...process.env, MSYS_NO_PATHCONV: "1", "BASH_FUNC_docker%%": docker,
-          "BASH_FUNC_flock%%": "() { return 0;\n}", "BASH_FUNC_id%%": "() { echo 1000;\n}", BOT_PORT: "", BOT_DOMAIN: "" } });
-      const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-      expect(code, out + err).toBe(0);
-    };
-    // Each ops.sh start costs seconds under Git Bash; the preview differs from the confirmed call only by the passed-through code.
-    await ops("backup-scan");
-    await ops("backup-clean", "20260928T000000Z-abcdef", "--confirm", "0123456789abcdef");
-    const calls = (await readFile(log, "utf8")).split("\n").filter(line => /^(exec|run) /.test(line));
-    expect(calls).toHaveLength(2);
-    for (const call of calls) {
-      expect(call).toStartWith("run --rm --user 1001:1001");
-      expect(call).toContain(`-v ${posixPath(root)}/tmp/backup-cleanup:/app/tmp/backup-cleanup`);
-    }
-    expect(calls[0]).toEndWith("mixin-chatbot bun run scripts/ops/backup-cleanup.ts scan");
-    expect(calls[1]).toEndWith("mixin-chatbot bun run scripts/ops/backup-cleanup.ts apply 20260928T000000Z-abcdef --confirm 0123456789abcdef");
-  } finally { await fixture.cleanup(); }
-}, 30000);
 
 test("backup-cleanup command scans by default, previews with a confirmation code and deletes only when confirmed", async () => {
   const fixture = await tempFixture("backup-command-");

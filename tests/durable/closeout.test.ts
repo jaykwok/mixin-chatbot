@@ -1,5 +1,5 @@
 // Durable message receipts, offline/manual compaction, reference-aware expiry and backup/reopen.
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdir, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -21,7 +21,8 @@ import { recordingOutbound } from "../helpers/recording-outbound.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { databaseOf, statsOf, tmpOf } from "../helpers/layout.ts";
 import { awaitingRemoval } from "../helpers/results.ts";
-import { appLayout, groupScope } from "../../src/core/layout.ts";
+import { appLayout, groupScope, scopeKey } from "../../src/core/layout.ts";
+import { SpaceHarnesses } from "../../src/durable/spaces.ts";
 
 const fixture = await tempFixture("durable-closeout-");
 afterAll(() => fixture.cleanup());
@@ -137,28 +138,48 @@ test("offline compaction is deduplicated without calling a model; cold start res
   } finally { await service.close(); }
 });
 
-test("manual compaction reports admission before the summary ends, and stop cancels it", async () => {
+test("manual compaction shows in /status while the summary runs, and stop cancels it", async () => {
   const w = setup(), service = w.open(), held = gatedResponse("summary");
   w.faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second"), held.step]);
   let command: Promise<string> | undefined;
   try {
     await service.admit(w.message("one")); await until(() => w.replies().length === 1);
     await service.admit(w.message("two")); await until(() => w.replies().length === 2);
-    let admitted = false;
-    command = service.control(w.message("/compact"), () => { admitted = true; });
-    await held.started; expect(admitted).toBe(true);
+    command = service.control(w.message("/compact"));
+    await held.started;
     expect(await service.control(w.message("/status"))).toContain("压缩会话历史");
     await service.control(w.message("/stop")); expect(await command).toContain("未完成");
   } finally { held.open(); await command?.catch(() => {}); await service.close(); }
 });
 
-test("a /clear is committed before its admission is reported; execution can still be blocked", async () => {
-  const w = setup(), service = w.open(); let admitted = false;
+test("a /clear is committed to the control stream", async () => {
+  const w = setup(), service = w.open();
   try {
-    await service.control(w.message("/clear"), () => { admitted = true; });
-    expect(admitted).toBe(true); await service.close();
+    await service.control(w.message("/clear")); await service.close();
     await database(w.root, async session => { expect((await session.snapshot(ControlsDoc, context))!.seq).toBe(1); });
   } finally { await service.close(); }
+});
+
+test("a space that cannot be opened does not keep the others from their maintenance", async () => {
+  const w = setup(), service = w.open(), first = "100", second = "200";
+  w.faux.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+  const acquire = SpaceHarnesses.prototype.acquire;
+  let broken = false;
+  const spy = spyOn(SpaceHarnesses.prototype, "acquire").mockImplementation(function (this: SpaceHarnesses, scope) {
+    return broken && scopeKey(scope) === scopeKey(groupScope(first)) ? Promise.reject(new Error("synthetic open failure")) : acquire.call(this, scope);
+  });
+  const requests = async (id: string) => Object.keys((await service.records(groupScope(id), phone)).requests);
+  try {
+    await service.admit(w.out.message(first, phone, "one")); await until(() => w.replies().length === 1);
+    await service.admit(w.out.message(second, phone, "two")); await until(() => w.replies().length === 2);
+    broken = true;
+    // The broken space sorts first; past the retention the other one still drops its finished record.
+    await service.maintain(Date.now() + 2 * 24 * 3600_000);
+    expect(w.reports.map(String).join()).toContain("synthetic open failure");
+    broken = false;
+    expect(await requests(first)).toHaveLength(1);
+    expect(await requests(second)).toEqual([]);
+  } finally { spy.mockRestore(); await service.close(); }
 });
 
 test("cold maintenance finishes an expiry receipt left after bytes were already removed", async () => {

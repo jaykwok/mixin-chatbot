@@ -31,6 +31,8 @@ export function fileDelivery(member: Member, call: MemberCall, item: Active, max
         await writeFile(download, data, { flag: "wx" });
         source = { kind: "local", path: download, size: data.length };
       }
+      // Too large for any delivery: the transfer refuses it with its size, the message the member gets.
+      if (source.size > maxBytes) return await send(source, () => {});
       const sourcePath = source.path, sha256 = await fileDigest(sourcePath, signal, maxBytes);
       const record = (await memberRecords(call.api, item.phone, call.context)).requests[item.requestId];
       if (!record || record.closedAt !== undefined) throw new Error("任务已结束，不能发送文件");

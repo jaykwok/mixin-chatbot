@@ -7,10 +7,10 @@ import {
 } from "../../src/agent/failure.ts";
 
 describe("请求失败回执", () => {
-  test("排队已满时说明本条消息不会自动处理", () => {
-    const reply = describeRequestFailure(new Error("本会话已有 8 条消息排队，请稍后重发"));
-    expect(reply).toContain("这条消息没有加入队列");
-    expect(reply).toContain("再重新发送");
+  test("时限检查的中止原因随重启丢失时，仍说明是超过时限并带任务编号", () => {
+    const reply = describeRequestFailure(new Error("时限检查已中止本次运行，服务随后重启（任务：abcd1234）"));
+    expect(reply).toContain("超过时限已被停止");
+    expect(reply).toContain("abcd1234");
     expect(reply).not.toContain("暂时无法确定原因");
   });
   test("额度用尽给出续费/换模型的结论，并附带 provider 原文", () => {
@@ -126,15 +126,10 @@ describe("请求失败回执", () => {
       "无法读取 data/config/models.json。请先生成 AI 配置：运行 bun run configure",
       // Pi 存选型的文件读坏了，同样是配置问题，不该落到通用提示上。
       "data/runtime/pi/settings.json: JSON Parse error: Expected '}'",
-      "provider zai 未配置可用凭证，请运行 bun run configure",
+      "provider zai 未配置可用凭证，请重新配置模型（控制台「设置」或 model-configure；本地开发运行 bun run configure）",
     ]) {
       expect(describeRequestFailure(new Error(message))).toContain("模型配置有问题");
     }
-  });
-
-  test("模型生成成功但发送失败时不怪模型", () => {
-    const reply = describeRequestFailure(new Error("Pi 回复生成成功，但群聊消息发送失败"));
-    expect(reply).toContain("发到群里失败");
   });
 
   test("没有任何线索的空回复单独描述，可直接重发", () => {

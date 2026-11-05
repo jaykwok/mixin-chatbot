@@ -16,7 +16,7 @@ describe("supervised real subprocesses", () => {
   test.skipIf(process.platform !== "linux")("finishes reaping a detached process tree despite repeated termination signals", async () => {
     const fixture = await tempFixture("supervised-signals-");
     const command = join(fixture.root, "tree.cjs");
-    const supervisor = fileURLToPath(new URL("../../src/core/process-supervisor.ts", import.meta.url));
+    const supervisor = fileURLToPath(new URL("../../scripts/lib/process-supervisor.ts", import.meta.url));
     // Several generations require repeated adoption/reaping rounds, so later
     // signals arrive while cleanup is in progress, rather than after it exits.
     await writeFile(command, `const {spawn}=require('child_process'); const ids=[...JSON.parse(process.argv[2]),process.pid]; if(ids.length<8){spawn(process.execPath,[__filename,JSON.stringify(ids)],{detached:true,stdio:['ignore','inherit','inherit']}).unref()}else{console.log('READY:'+JSON.stringify(ids))} setTimeout(()=>process.exit(0),8000);`);
@@ -58,7 +58,7 @@ describe("supervised real subprocesses", () => {
     const fixture = await tempFixture("supervised-reap-race-");
     const command = join(fixture.root, "command.cjs");
     const reaped = join(fixture.root, "reaped.pid");
-    const supervisor = fileURLToPath(new URL("../../src/core/process-supervisor.ts", import.meta.url));
+    const supervisor = fileURLToPath(new URL("../../scripts/lib/process-supervisor.ts", import.meta.url));
     const preload = fileURLToPath(new URL("../helpers/process-reap-race.ts", import.meta.url));
     await writeFile(command, `const {spawn}=require('child_process'); console.log('DIRECT:'+process.pid); spawn(process.execPath,['-e',"console.log('READY:'+process.pid); setTimeout(()=>process.exit(0),8000)"],{detached:true,stdio:['ignore','inherit','inherit']}).unref(); setTimeout(()=>process.exit(0),10000);`);
     const child = Bun.spawn([process.execPath, "--preload", preload, supervisor, reaped], {
@@ -176,6 +176,21 @@ describe("supervised real subprocesses", () => {
       await fixture.cleanup();
     }
   }, 40000);
+});
+
+test("a character split across output chunks is decoded whole, stdout and stderr kept apart", async () => {
+  const fixture = await tempFixture("process-utf8-");
+  try {
+    // "中" is three bytes; each write carries part of it, with a pause so the parent reads them as separate chunks.
+    const command = join(fixture.root, "split.cjs");
+    await writeFile(command, `const b=Buffer.from("中文","utf8"), sleep=ms=>Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,ms);
+for (const part of [b.subarray(0,1), b.subarray(1,4), b.subarray(4)]) { process.stdout.write(part); sleep(60); }
+process.stderr.write(Buffer.from([0xe8, 0xad])); sleep(60); process.stderr.write(Buffer.from([0xa6, 0x0a]));`);
+    const result = await executeProcess({ command: process.execPath, args: [command], cwd: fixture.root, timeoutMs: 20_000 });
+    expect({ code: result.exitCode, stdout: result.stdout, stderr: result.stderr }).toEqual({ code: 0, stdout: "中文", stderr: "警\n" });
+    expect(result.output).not.toContain("\uFFFD");
+    expect(result.output.replace("警\n", "")).toBe("中文");
+  } finally { await fixture.cleanup(); }
 });
 
 describe("command start cost and timing log", () => {

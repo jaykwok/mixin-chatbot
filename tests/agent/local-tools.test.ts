@@ -15,13 +15,13 @@ test('string commands run with argv shells only; the stdin-only WSL launcher is 
 });
 
 const system32Bash=join(process.env.SystemRoot??'C:\\Windows','System32','bash.exe');
-test.skipIf(process.platform!=='win32'||!existsSync(system32Bash))('Pi 1.4.0 classifies the System32 launcher as stdin-only, and the member shell refuses it',()=>{
+test.skipIf(process.platform!=='win32'||!existsSync(system32Bash))('Pi classifies the System32 launcher as stdin-only, and the member shell refuses it',()=>{
  // Upstream's own classification of the real launcher path (no PATH search, no environment change).
  expect(getShellConfig(system32Bash).commandTransport).toBe('stdin');
  expect(()=>memberShell(getShellConfig(system32Bash))).toThrow('WSL 启动器');
 });
 
-// The app execution alias that starts wsl.exe: Pi 1.4.0 accepts it as an ordinary argv shell, the member shell does not.
+// The app execution alias that starts wsl.exe: Pi accepts it as an ordinary argv shell, the member shell does not.
 test.skipIf(process.platform!=='win32')('the WindowsApps bash alias is refused like the legacy launcher',()=>{
  expect(()=>memberShell({shell:'C:\\Users\\a\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe',args:['-c']})).toThrow('WSL 启动器');
  expect(memberShell({shell:'C:\\tools\\WindowsAppsKit\\bash.exe',args:['-c']}).shell).toBe('C:\\tools\\WindowsAppsKit\\bash.exe');

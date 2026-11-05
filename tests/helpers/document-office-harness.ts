@@ -8,13 +8,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { stubDocumentPython } from "./document-python-stub.ts";
+import { runMemberTool, toolNamed } from "./member-tools.ts";
 
 const root = process.cwd(), systemTemp = join(root, "system-temp");
 for (const name of ["TMPDIR", "TEMP", "TMP"]) process.env[name] = systemTemp;
 await mkdir(systemTemp);
 assert.equal(tmpdir(), systemTemp);
 const stub = await stubDocumentPython({ delayMs: 300 });
-const { buildDocumentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
+const { documentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
 const { application } = await import("../../src/core/lifecycle.ts");
 
 const workspace = join(root, "workspace");
@@ -23,9 +24,8 @@ for (const name of ["方案.pptx", "资料.docx", "页面.pdf", "fail.pptx"]) aw
 const user = async (name: string) => {
   const tempDir = join(root, name, "tmp");
   await mkdir(tempDir, { recursive: true });
-  const tools = buildDocumentWorkTools({ workspaceDir: workspace, tempDir, indexPath: join(root, "index", "materials.md"), venvDir: join(root, "venv") });
-  const call = (tool: string, params: object, signal?: AbortSignal) =>
-    tools.find((candidate) => candidate.name === tool)!.execute("call", params as never, signal, undefined, {} as never);
+  const places = { workspaceDir: workspace, tempDir, indexPath: join(root, "index", "materials.md"), venvDir: join(root, "venv") };
+  const call = (tool: string, params: object, signal?: AbortSignal) => runMemberTool(toolNamed(documentWorkTools(), tool), params, { places, signal });
   return { tempDir, call };
 };
 const alice = await user("alice"), bob = await user("bob");
@@ -52,7 +52,7 @@ assert.ok(!isPathInside(profile, alice.tempDir) && !isPathInside(profile, worksp
 await profilesRetained();
 const [job] = await jobs(alice.tempDir);
 assert.ok(job && (await readdir(join(alice.tempDir, job))).includes(".work") === (process.platform === "linux"));
-assert.equal((deck.structuredContent as { pages: number }).pages, 3);
+assert.equal((deck.structuredOutput as { pages: number }).pages, 3);
 
 // No LibreOffice, no profile: PDF previews and image extraction without crops.
 mark = stub.requests.length;

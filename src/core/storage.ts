@@ -19,7 +19,7 @@ export const APP_BOT_CONFIG_PATH = join(CONFIG_DIR, "app-bot.json");
 /** 可选：大文件临时分发的 S3 对象存储；缺失即关闭该特性。 */
 export const RELAY_CONFIG_PATH = join(CONFIG_DIR, "relay.json");
 export const RUNTIME_CONFIG_PATH = join(CONFIG_DIR, "runtime.json");
-/** 可选：通讯录同步范围（选定的部门）；缺失即同步整个通讯录。 */
+/** 通讯录同步范围（整个通讯录或选定的部门，见 directory-scope.ts）；缺失为未设置，服务不同步通讯录。 */
 export const DIRECTORY_CONFIG_PATH = join(CONFIG_DIR, "directory.json");
 /** Trusted administrator configuration; missing files leave these capabilities disabled. */
 export const AUXILIARY_CONFIG_PATH = join(CONFIG_DIR, "auxiliary.json");

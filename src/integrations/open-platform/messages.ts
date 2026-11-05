@@ -19,7 +19,45 @@ export type OutboundMessage =
   | { readonly msgType: "text"; readonly content: { readonly content: string } }
   | { readonly msgType: "markdown"; readonly content: { readonly title: string; readonly content: string; readonly a?: readonly { readonly i: string }[] } }
   | { readonly msgType: "image"; readonly content: ImageContent }
-  | { readonly msgType: "file"; readonly content: FileContent };
+  | { readonly msgType: "file"; readonly content: FileContent }
+  | { readonly msgType: "card"; readonly content: CardContent };
+
+/**
+ * 交互卡片（docs/dev/app-bot-card-probe-20261024.md、push-plan-20261103.md 第 11 节）。正文是 Markdown，实测上限约 5000 字符。
+ * 按钮点击经 Stream 推送 `callback:card_interaction`，带卡片 `msgUid` 和按钮的 `data`；带上 `msgUid` 再发一次即原地更新这张卡片。
+ */
+export interface CardContent {
+  readonly title: string;
+  readonly content: string;
+  readonly status: { readonly name: string; readonly color: string };
+  /** 显示为已失效，按钮不可再点。 */
+  readonly invalid: boolean;
+  /** 按钮排布：每行是一组按钮的 index。 */
+  readonly pcLayout: readonly (readonly number[])[];
+  readonly tailFields: readonly CardButton[];
+  readonly msgUid?: string;
+}
+
+export interface CardButton {
+  readonly name: string;
+  readonly type: "button";
+  readonly index: number;
+  readonly show: boolean;
+  readonly disabled: boolean;
+  readonly value: {
+    readonly placeholder: "action";
+    readonly value: string;
+    /** 1 主要，2 次要。 */
+    readonly style: 1 | 2;
+    readonly url: "";
+    readonly method: "POST";
+    readonly data: Readonly<Record<string, string | number>>;
+  };
+}
+
+export function cardMessage(content: CardContent): OutboundMessage {
+  return { msgType: "card", content };
+}
 
 export interface ImageContent {
   readonly fileId: string;
@@ -247,7 +285,7 @@ export class MessageSender {
     let started = false;
     try {
       const response = await this.client.request("POST", "/open-apis/v1/messages/v1/send", {
-        body, label, onSent: () => { started = true; },
+        body, label, onSent: () => { started = true; }, onUnsent: () => { started = false; },
       });
       if (accepted(response)) return { status: "sent" };
       const code = response.json?.code;

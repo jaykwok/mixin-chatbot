@@ -17,6 +17,7 @@ import { APP_VERSION, DATA_VERSION } from "../../src/core/version.ts";
 import { claimSpace, memberConversation } from "../../src/durable/identity.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { openState } from "../../src/core/state.ts";
+import { WHOLE_DIRECTORY } from "../../src/integrations/open-platform/directory-scope.ts";
 import { IdentityDirectory } from "../../src/integrations/open-platform/identity-directory.ts";
 import type { AppBotConfig } from "../../src/integrations/open-platform/config.ts";
 import { fauxModels, harnessOptions } from "../helpers/durable.ts";
@@ -62,7 +63,7 @@ async function deployedProject(root: string, record: Record<string, unknown>): P
   await writeFile(join(root, "data/runtime/pi/settings.json"), JSON.stringify({ defaultProvider: "fake", defaultModel: "fake" }));
   await writeFile(join(root, "data/state", VERSION_FILE), JSON.stringify(record));
   const state = openState(join(root, "data/state/agent.sqlite"));
-  try { new IdentityDirectory(state, applicationBinding(APP_A)); } finally { state.close(); }
+  try { new IdentityDirectory(state, applicationBinding(APP_A), { scope: WHOLE_DIRECTORY }); } finally { state.close(); }
   const { models, model } = fauxModels();
   const layout = appLayout(join(root, "data"));
   for (const scope of [DIRECT_SCOPE, groupScope("100")] as Scope[]) {

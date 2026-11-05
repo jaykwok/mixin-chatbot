@@ -551,15 +551,15 @@ def word_image_contexts(document, context_chars=80):
         for child in node:
             walk(child, paragraph)
     walk(document.element.body)
+    import document_build
     styles = {style.style_id: style.name or "" for style in document.styles}
     headings, previous = [], ""
     for p in paragraphs:
         p["raw"] = "".join(p.pop("parts"))
         p["text"] = p["raw"].strip()
         style = styles.get(p["style"], p["style"]).lower()
-        match = re.search(r"(?:heading|标题)\s*(\d+)", style)
-        level = p["level"] or (int(match.group(1)) if match else None)
-        if level and 1 <= level <= 9:
+        level = document_build.heading_level(style, p["level"])
+        if level:
             headings = [entry for entry in headings if entry[0] < level]
             headings.append((level, p["text"][:60]))
         p["headingPath"] = [text for _, text in headings]
@@ -685,6 +685,7 @@ def images(request):
         package(source)
         if kind == ".pptx":
             from pptx import Presentation
+            from pptx.shapes.picture import Picture
             presentation = Presentation(str(source))
             total = len(presentation.slides)
             selected = page_list(total, 50)
@@ -694,19 +695,24 @@ def images(request):
                 for shape in shapes:
                     if shape.shape_type == 6:
                         yield from walk(shape.shapes)
-                    elif shape.shape_type == 13:
+                    elif isinstance(shape, Picture):  # also a picture in a placeholder, whose shape_type differs
                         yield shape
 
             for number in selected:
                 for index, shape in enumerate(walk(presentation.slides[number - 1].shapes), 1):
-                    image = shape.image
-                    extension = image.ext.lower()
-                    if extension not in RASTER_TYPES:
+                    try:
+                        image = shape.image
+                        extension = image.ext.lower()
+                        if extension not in RASTER_TYPES:
+                            skipped["unsupported"] += 1
+                            unsupported.append({"page": number, "name": shape.name, "format": extension})
+                            continue
+                        picture = Image.open(io.BytesIO(image.blob))
+                        picture.load()
+                    except Exception as error:  # noqa: BLE001 - a linked picture or a broken stream
                         skipped["unsupported"] += 1
-                        unsupported.append({"page": number, "name": shape.name, "format": extension})
+                        warnings.append(f"第 {number} 页第 {index} 张图片无法读取：{type(error).__name__}")
                         continue
-                    picture = Image.open(io.BytesIO(image.blob))
-                    picture.load()
                     crop = (shape.crop_left or 0, shape.crop_top or 0, shape.crop_right or 0, shape.crop_bottom or 0)
                     if any(value > 0 for value in crop):
                         w, h = picture.size
@@ -743,9 +749,14 @@ def images(request):
                     skipped["unsupported"] += 1
                     unsupported.append({"index": index, "format": extension})
                     continue
-                picture = Image.open(io.BytesIO(part.blob))
-                if extract:
-                    picture.load()
+                try:
+                    picture = Image.open(io.BytesIO(part.blob))
+                    if extract:
+                        picture.load()
+                except Exception as error:  # noqa: BLE001 - a broken stream
+                    skipped["unsupported"] += 1
+                    warnings.append(f"第 {index} 张图片无法读取：{type(error).__name__}")
+                    continue
                 extra = {key: value for key, value in context.items() if key != "embed" and (context_enabled or key in ("order", "paragraph"))}
                 record(picture, index, None, f"w{index:03}.{'jpg' if extension in ('jpg', 'jpeg') else 'png'}", extra,
                        hashlib.sha256(part.blob).hexdigest())

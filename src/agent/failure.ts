@@ -66,10 +66,6 @@ interface FailureRule {
 // 的窗口纯属误导；空回复排最后，它只是「没别的线索」时的兜底描述。
 const FAILURE_RULES: readonly FailureRule[] = [
   {
-    pattern: /本会话已有 8 条消息排队/,
-    hint: "你在当前会话已有 8 条消息等待处理，这条消息没有加入队列。请等前面的消息处理完，再重新发送。",
-  },
-  {
     pattern: /模型连续\s+\d+\s+秒无有效进展/,
     hint: "模型长时间没有产生新的有效内容，本次处理已停止。请联系管理员，并提供下方的任务编号以便排查。",
   },
@@ -82,8 +78,8 @@ const FAILURE_RULES: readonly FailureRule[] = [
     hint: "这次处理超过了最长等待时间，已停止。请联系管理员，并提供下方的任务编号以便排查。",
   },
   {
-    pattern: /群聊消息发送失败/,
-    hint: "回复已经生成，但发到群里失败了。请联系管理员检查消息发送是否正常。",
+    pattern: /时限检查已中止本次运行/,
+    hint: "这次处理超过时限已被停止，服务随后重启。请重新发送一次问题；持续出现请联系管理员，并提供下方的任务编号以便排查。",
   },
   {
     // settings.json 是 Pi 存选型的地方，读坏了和 models.json 坏了一样属于配置问题。
@@ -135,6 +131,16 @@ const FAILURE_RULES: readonly FailureRule[] = [
   {
     statuses: [500, 502, 503, 504, 529],
     hint: "模型服务暂时故障或过载，请过几分钟再发送一次问题；持续出现请联系管理员。",
+  },
+  {
+    // Durable 结束了这次运行：模型回答途中服务意外停止（崩溃、断电、被强行结束），次数超过了重试次数。
+    pattern: /The host stopped while the (?:model was answering|deferred answer was fetched)/,
+    hint: "机器人服务在模型回答途中意外停止，这次回答没有完成。请重新发送一次问题；持续出现请联系管理员。",
+  },
+  {
+    // 生成任务连续 restartLimit 次被异常中断，Durable 结束了它。
+    pattern: /The generation was interrupted (?:once|\d+ times in a row) in its/,
+    hint: "这个任务连续多次被异常中断，已经结束。请重新发送一次问题；持续出现请联系管理员。",
   },
   {
     pattern: /未返回回复/,

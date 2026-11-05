@@ -1,19 +1,18 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertConfirmedTransaction, confirmTransaction, readTransaction } from "../../scripts/lib/confirmed-transaction.ts";
-import * as transaction from "../../scripts/ops/tui/transaction.ts";
-import * as data from "../../scripts/ops/tui/data.ts";
-import { opsCommand } from "../../scripts/ops/tui/platform.ts";
-import { MaintainView } from "../../scripts/ops/tui/views/maintain.ts";
-import { createTheme } from "../../scripts/ops/tui/render/theme.ts";
+import { opsCommand } from "../../scripts/ops/shared/platform.ts";
+import { operationPreparer } from "../../scripts/ops/console/prepare-operation.ts";
+import { operationArgs, operationScope } from "../../scripts/ops/console/operations.ts";
+import { Views } from "../../scripts/ops/console/views.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { opsShellFunctions } from "../helpers/ops-shell.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
 const posix = (value: string) => value.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
-const psQuote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
 const first = "deploy-" + "a".repeat(32), second = "deploy-" + "b".repeat(32);
 
 async function synthetic(root: string) {
@@ -37,82 +36,43 @@ for (const action of ["continue", "rollback"] as const) test(`confirmation binds
     const capture = readTransaction(fixture.root)!, token = confirmTransaction(capture, action);
     expect(() => assertConfirmedTransaction(fixture.root, action, token)).not.toThrow();
     expect(() => assertConfirmedTransaction(fixture.root, action === "continue" ? "rollback" : "continue", token)).toThrow();
-    for (const change of ["pointer", "same-id", "missing", "committed", "restore"] as const) {
+    for (const change of ["pointer", "same-id", "missing", "committed", "plan"] as const) {
       const state = join(fixture.root, "data/state"), directory = join(fixture.root, "backup/snapshots", first);
       await synthetic(fixture.root);
       if (change === "pointer") await writeFile(join(state, "deploy-transaction"), second);
       if (change === "same-id") await writeFile(join(directory, "transaction"), (await readFile(join(directory, "transaction"), "utf8")).replace("1".repeat(40), "3".repeat(40)));
       if (change === "missing") await rm(join(state, "deploy-transaction"));
       if (change === "committed") await writeFile(join(state, "release-data.json"), '{"phase":"committed"}');
-      if (change === "restore") await writeFile(join(directory, "code-restore"), "pending");
+      if (change === "plan") await writeFile(join(directory, "data-plan.json"), "{}\n");
       expect(() => assertConfirmedTransaction(fixture.root, action, token), change).toThrow("变化");
-      await rm(join(state, "release-data.json"), { force: true }); await rm(join(directory, "code-restore"), { force: true });
+      await rm(join(state, "release-data.json"), { force: true }); await rm(join(directory, "data-plan.json"), { force: true });
     }
   } finally { await fixture.cleanup(); }
 });
 
-for (const action of ["resume", "rollback"] as const) test(`TUI ${action} carries the exact previewed transaction after confirmation swaps the pointer`, async () => {
-  const fixture = await tempFixture("confirmed-tui-");
-  await synthetic(fixture.root);
-  const load = transaction.loadPendingTransaction;
-  const pendingSpy = spyOn(transaction, "loadPendingTransaction").mockImplementation(() => load(fixture.root));
-  const gitSpy = spyOn(data, "loadGit").mockResolvedValue(null);
-  let subject = "", args: string[] = [];
-  const app = { deployment: { platform: "windows", runtime: "scheduled-task", port: 1011, dataRoot: fixture.root, workspaceRoot: "" },
-    theme: createTheme("none"), redraw() {}, go() {}, toast() {},
-    async confirm(spec: { subject: string }) { subject = spec.subject; await writeFile(join(fixture.root, "data/state/deploy-transaction"), second); return true; },
-    async runInteractive(_title: string, sent: string[]) { args = sent; return 1; },
-  };
+for (const action of ["resume", "rollback"] as const) test(`console ${action} carries the exact previewed transaction after confirmation swaps the pointer`, async () => {
+  const fixture = await tempFixture("confirmed-console-");
   try {
-    const view = new MaintainView(); await view.refresh(app as never); await view.onKey({ name: action } as never, app as never); view.onLeave();
-    expect(subject).toContain("1111111"); expect(args.slice(0, 2)).toEqual([action, "--confirmed-transaction"]);
+    await synthetic(fixture.root);
+    const params = await operationPreparer(fixture.root, new Views())(action, {}, "fixture");
+    const preview = await operationScope(fixture.root, action, params);
+    expect(preview.summary.join("\n")).toContain("1111111");
+    await writeFile(join(fixture.root, "data/state/deploy-transaction"), second);
+    const args = operationArgs(action, params);
+    expect(args.slice(0, 2)).toEqual([action, "--confirmed-transaction"]);
     const token = args[2]!;
     expect(JSON.parse(Buffer.from(token, "base64").toString()).id).toBe(first);
+    await expect(operationScope(fixture.root, action, params)).rejects.toThrow("变化");
     expect(() => assertConfirmedTransaction(fixture.root, action === "resume" ? "continue" : "rollback", token)).toThrow("变化");
     const command = opsCommand("windows", args);
     expect(JSON.parse(Buffer.from(command.args.at(-1)!, "base64").toString()).ConfirmedTransaction).toBe(token);
-  } finally { pendingSpy.mockRestore(); gitSpy.mockRestore(); await fixture.cleanup(); }
+  } finally { await fixture.cleanup(); }
 });
 
-test.skipIf(process.platform !== "win32")("Windows deployment and upgrade check the confirmation only after acquiring the real lock", async () => {
-  const fixture = await tempFixture("confirmed-win-");
-  const root = join(fixture.root, "project"), lib = join(root, "scripts/lib");
-  await synthetic(root); await mkdir(lib, { recursive: true });
-  await copyFile(join(project, "scripts/lib/confirmed-transaction.ts"), join(lib, "confirmed-transaction.ts"));
-  const driver = join(fixture.root, "check.ps1");
-  await writeFile(driver, String.fromCharCode(0xfeff) + `param([string]$Root, [string]$Action, [string]$Token, [string]$Kind)
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-. ${psQuote(join(project, "scripts/lib/deployment.ps1"))}
-function Get-ApplicationPaths { ${psQuote(process.execPath)} }
-# The real comparison launches only while this exclusive lock is held.
-$original = (Get-Command Assert-ConfirmedTransaction).ScriptBlock
-function Assert-ConfirmedTransaction($ProjectRoot, $ChosenAction, $Confirmation) {
-  try { $probe = [IO.File]::Open((Join-Path $Root 'data/state/deploy.lock'), 'Open', 'ReadWrite', 'None'); $probe.Dispose(); throw 'not locked' }
-  catch [IO.IOException] { }
-  & $original $ProjectRoot $ChosenAction $Confirmation
-}
-try {
-  if ($Kind -eq 'deploy') { $snapshot = Open-DeploymentTransaction $Root $Token $Action }
-  else { $snapshot = Open-UpgradeSnapshot $Root 'test' '' '' '' $null '' $Token $Action }
-  if ($snapshot.Lock) { $snapshot.Lock.Dispose() }
-  throw 'unexpected dispatch'
-} catch { Write-Host $_; exit 7 }
-`);
-  try {
-    for (const kind of ["deploy", "upgrade"]) for (const action of ["continue", "rollback"] as const) {
-      await synthetic(root);
-      if (kind === "upgrade") await writeFile(join(root, "data/state/upgrade-transaction"), first);
-      const token = confirmTransaction(readTransaction(root)!, action);
-      await writeFile(join(root, `data/state/${kind}-transaction`), second);
-      const child = Bun.spawn(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", driver, root, action, token, kind], { stdout: "pipe", stderr: "pipe", windowsHide: true });
-      const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      expect(code, stdout + stderr).toBe(7); expect(stdout).toContain("变化"); expect(stdout).not.toContain("not locked");
-      await rm(join(root, "data/state/upgrade-transaction"), { force: true });
-    }
-  } finally { await fixture.cleanup(); }
-}, 60_000);
+// The shared core checks a console confirmation under deploy.lock before any write (deployment-host.ts); the refusal of a
+// changed transaction is covered by core-windows-deploy.test.ts and core-deployment-cli.test.ts.
 
+// The check runs with the ops runtime (ops_bun): the console's Bun when it names one, never a bare `bun` from PATH.
 test.skipIf(!bash)("Bash ops rejects a changed confirmation under its deployment lock before dispatch", async () => {
   const fixture = await tempFixture("confirmed-bash-");
   const root = join(fixture.root, "project"), lib = join(root, "scripts/lib");
@@ -124,26 +84,31 @@ test.skipIf(!bash)("Bash ops rejects a changed confirmation under its deployment
   const driver = join(fixture.root, "check.sh");
   await writeFile(driver, `#!/usr/bin/env bash
 set -uo pipefail
-PROJECT_DIR="$1"; STATE_DIR="$PROJECT_DIR/data/state"
+PROJECT_DIR="$1"; STATE_DIR="$PROJECT_DIR/data/state"; OPS_SOURCE_DIR="$PROJECT_DIR"
 . "$2/scripts/lib/common.sh"
+. "$2/scripts/lib/ops-runtime.sh"
 operation_start() { :; }; operation_finish() { :; }; remove_upgrade_stage() { :; }
 ER() { echo "$*" >&2; }; WA() { :; }
 load_pending_transaction() { echo 'unexpected dispatch'; return 9; }
+${await opsShellFunctions("core_reported", "finish_update", "finish_lifecycle_result")}
 ${update}
 ${command}
 transaction_command "$3" --confirmed-transaction "$4"
 `);
   try {
-    for (const action of ["continue", "rollback"] as const) {
+    for (const action of ["continue", "rollback"] as const) for (const named of [false, true]) {
       await synthetic(root); const token = confirmTransaction(readTransaction(root)!, action);
       await writeFile(join(root, "data/state/deploy-transaction"), second);
-      const env: Record<string, string | undefined> = { ...process.env, PATH: dirname(process.execPath) + delimiter + (process.env.PATH ?? "") };
+      const env: Record<string, string | undefined> = { ...process.env, PATH: dirname(process.execPath) + delimiter + (process.env.PATH ?? ""), MIXIN_OPS_BUN: "" };
+      // A function named bun shadows every bare `bun`; the named runtime is an absolute path and is not affected.
+      if (named) Object.assign(env, { MIXIN_OPS_BUN: process.execPath, "BASH_FUNC_bun%%": "() { echo 'bare bun' >&2; return 99;\n}" });
       delete env.MSYS_NO_PATHCONV; delete env.MSYS2_ARG_CONV_EXCL;
       // Ordinary Windows ops tests use a flock stub; Linux runs the real exclusive lock.
       if (process.platform === "win32") Object.assign(env, { "BASH_FUNC_flock%%": "() { return 0;\n}" });
       const child = Bun.spawn([bash!, driver, posix(root), posix(project), action, token], { env, stdout: "pipe", stderr: "pipe", windowsHide: true });
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       expect(code, stdout + stderr).toBe(1); expect(stderr).toContain("变化"); expect(stdout).not.toContain("unexpected dispatch");
+      expect(stderr).not.toContain("bare bun");
     }
   } finally { await fixture.cleanup(); }
 }, 60_000);

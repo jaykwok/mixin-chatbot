@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { tempFixture } from "../helpers/temp.ts";
 import { collectAll, collectComparisons, parseDate } from "../../scripts/ops/stats-admin.ts";
 import { change, comparisons, comparisonWindows, describeStatsWindow, engagement, periodWindow, summarize, trend } from "../../scripts/ops/stats-summary.ts";
-import { writeReport } from "../../scripts/ops/tui/report.ts";
+import { renderReport } from "../../scripts/ops/shared/report.ts";
+import { maskUser } from "../../scripts/ops/shared/format.ts";
 import { executeProcess } from "../../scripts/lib/process.ts";
 import { fileURLToPath } from "node:url";
-import { loadRecentStats } from "../../scripts/ops/tui/data.ts";
 
 const at = (date: string) => parseDate(date, false);
 const range = (from: string, to: string) => ({ since: at(from), until: parseDate(to, true) });
@@ -68,9 +68,6 @@ test("每日补零、周月去重、跨群排行、空本期比较与报表脱�
     const window = range("2026-10-01", "2026-10-03"), groups = await collectAll(data, window);
     const summary = summarize(groups);
     expect(summary.asks).toBe(7); expect(summary.people).toBe(2); expect(summary.average).toBe(3.5);
-    const recent = await loadRecentStats(data, 3, at("2026-10-03") + 23 * 3600000);
-    expect(recent.today.people).toBe(2);
-    expect(recent.trend.map(day => day.people)).toEqual([1, 0, 2]);
     expect(summary.ranking.map(user => [user.user, user.asks, user.days.size, user.groups.size])).toEqual([
       ["13812345678", 5, 2, 2], ["13912345678", 2, 1, 1],
     ]);
@@ -85,25 +82,28 @@ test("每日补零、周月去重、跨群排行、空本期比较与报表脱�
     const comparison = await collectComparisons(data, window);
     expect(comparisons(comparison).map(row => [row.asks, row.people])).toEqual([[3, 2], [1, 1]]);
     expect(comparisons(comparison, new Set(["a"])).map(row => row.asks)).toEqual([1, 1]);
+    // A member selection must also narrow comparison windows, model-only rows and per-group summaries.
+    const member = await collectAll(data, window, "13812345678");
+    expect(summarize(member)).toMatchObject({ asks: 5, people: 1, average: 5 });
+    expect(member.map(group => group.group)).toEqual(["a", "b"]);
+    expect(trend(member, window).map(row => [row.asks, row.tokens.totalTokens])).toEqual([[3, 0], [0, 0], [2, 0]]);
+    expect(comparisons(await collectComparisons(data, window, "13812345678")).map(row => [row.asks, row.people])).toEqual([[1, 1], [1, 1]]);
+    expect(comparisons(await collectComparisons(data, window, "13912345678")).map(row => row.asks)).toEqual([0, 0]);
+    const usageOnly = await collectAll(data, window, "13712345678");
+    expect(summarize(usageOnly).asks).toBe(0);
+    expect(usageOnly.map(group => [group.group, group.tokens.totalTokens])).toEqual([["a", 42]]);
+    expect(await collectAll(data, window, "absent")).toEqual([]);
     const emptyWindow = range("2026-10-04", "2026-10-06");
     expect(await collectAll(data, emptyWindow)).toEqual([]);
     expect(trend([], emptyWindow).map(row => row.asks)).toEqual([0, 0, 0]);
     expect(comparisons(await collectComparisons(data, emptyWindow))[0]!.asks).toBe(7);
-    const path = await writeReport({ groups, detail: groups[0]!, window, comparisons: comparison,
-      unmasked: false, dir: data, deployment: { platform: "linux", runtime: "docker", port: 1011, dataRoot: data, workspaceRoot: "" } });
-    const html = await Bun.file(path).text();
-    for (const text of ["每日明细", "每周（周一为起点）明细", "每月明细", "2026-10-02", "+133.3%", "覆盖提问人数", "提问高峰日", "前五名提问占比", "138****5678", "模型用量", "模型与工具用量"]) expect(html).toContain(text);
+    const html = renderReport({ groups, detail: groups.find(group => group.group === "a")!, window, comparisons: comparison,
+      identity: { label: maskUser, note: "手机号已打码。", banner: "不含个人信息" } });
+    for (const text of ["每日明细", "每周（周一为起点）明细", "每月明细", "2026-10-02", "+133.3%", "覆盖提问人数", "提问高峰日", "前五名提问占比", "138****5678", "模型用量", "模型与工具用量", "unknown/unknown"]) expect(html).toContain(text);
     expect(html).not.toMatch(/金额|\$\d|¥/);
     expect(html).not.toContain("13812345678");
     expect(html).not.toContain("13612345678");
     expect(html).not.toMatch(/(?:src|href)\s*=\s*["']https?:/i);
-    const unmaskedPath = await writeReport({ groups, detail: groups.find(group => group.group === "a")!, window, comparisons: comparison,
-      unmasked: true, dir: data, deployment: { platform: "linux", runtime: "docker", port: 1011, dataRoot: data, workspaceRoot: "" } });
-    const unmaskedHtml = await Bun.file(unmaskedPath).text();
-    expect(unmaskedHtml).toContain("13812345678");
-    expect(unmaskedHtml).not.toContain("13912345678");
-    expect(unmaskedHtml).toContain("unknown/unknown");
-    expect(unmaskedHtml.split("群 a · 概况")[0]).not.toContain("13812345678");
     const script = fileURLToPath(new URL("../../scripts/ops/stats-admin.ts", import.meta.url));
     const cli = await executeProcess({ command: process.execPath, args: [script, "--since", "2026-10-01", "--until", "2026-10-03"], cwd: f.root, env: process.env, timeoutMs: 30000 });
     expect(cli.exitCode).toBe(0);

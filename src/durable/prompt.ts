@@ -9,7 +9,8 @@
 //   coding-agent stores; pi-ai joins them before sending the request.
 //
 // The sections follow what the conversation selects: a module's text and skills appear only while its extension
-// (`mixin.<name>`) is selected. Nothing depends on the member: the member's tmp is named through $PI_USER_TMP.
+// (`mixin.<name>`) is selected. Nothing depends on the member or the request: the request's temp directory is named in
+// the tail of each model call (`closeout.ts`), which the prompt points to.
 import { resolve } from "node:path";
 import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 import { defineExtension, type Extension, type PromptInput, section } from "@earendil-works/pi-durable";
@@ -23,6 +24,8 @@ export interface PromptOptions {
   modules: readonly AgentModuleDefinition[];
   /** Whether a large-file relay is configured (the delivery paragraph differs). */
   relayEnabled: boolean;
+  /** Whether bash runs each command isolated, with its own PI_USER_TMP (the temp-directory paragraph differs). */
+  isolatedTasks?: boolean;
 }
 
 export const moduleExtensionName = (module: Pick<AgentModuleDefinition, "name">) => `mixin.${module.name}`;
@@ -39,7 +42,8 @@ export function promptExtension(options: PromptOptions): Extension {
     sections: [
       section("preamble", (input) => {
         const modulePrompt = selectedModules(options, input).map((module) => module.prompt).filter(Boolean).join("\n\n");
-        return buildChatContext({ relayEnabled: options.relayEnabled, ...(modulePrompt ? { modulePrompt } : {}) });
+        return buildChatContext({ relayEnabled: options.relayEnabled, ...(modulePrompt ? { modulePrompt } : {}),
+          ...(options.isolatedTasks ? { isolatedTasks: true } : {}) });
       }, { tag: false }),
       section("skills", (input) => {
         // coding-agent names the tool that reads a skill file: read when offered, else bash; without either, no list.

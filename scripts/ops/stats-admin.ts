@@ -6,7 +6,7 @@ import { formatCacheRate } from "../lib/usage.ts";
 import { addTokens, dayKey, dayWindow, emptyTokens, openExistingStatsLedger, readLedger, type DayWindow, type LedgerRows, type TokenTotals } from "../../src/agent/stats-ledger.ts";
 import { appLayout, groupSegment } from "../../src/core/layout.ts";
 import { DATA_DIR } from "../../src/core/storage.ts";
-import { maskUser } from "./tui/render/format.ts";
+import { maskUser } from "./shared/format.ts";
 import { change, comparisons, comparisonWindows, describeStatsWindow, engagement, periodWindow, STATS_NOTE, summarize, TOKEN_NOTE, trend, type ComparisonData, type StatsPeriod } from "./stats-summary.ts";
 
 export interface UserStats {
@@ -152,10 +152,10 @@ function rowsOf(rows: LedgerRows, group: string): LedgerRows {
 }
 
 /** root 是数据目录；服务还没建账本时按空账处理。 */
-function readRows(root: string, window: DayWindow = {}, group?: string): LedgerRows {
+function readRows(root: string, window: DayWindow = {}, group?: string, user?: string): LedgerRows {
   const db = openExistingStatsLedger(appLayout(root).stats);
   if (!db) return { asks: [], usage: [], groups: [] };
-  try { return db.transaction(() => readLedger(db, window, group))(); } finally { db.close(); }
+  try { return db.transaction(() => readLedger(db, window, group, user))(); } finally { db.close(); }
 }
 
 export async function collectGroup(
@@ -168,19 +168,20 @@ export async function collectGroup(
 
 export async function collectAll(
   root: string = DATA_DIR,
-  window: Window = {}
+  window: Window = {},
+  user?: string
 ): Promise<GroupStats[]> {
-  const rows = readRows(root, dayWindow(window));
+  const rows = readRows(root, dayWindow(window), undefined, user);
   return rows.groups
     .map(group => foldGroup(group, rowsOf(rows, group)))
     .filter(stats => stats.users.length > 0 || hasTokens(stats.tokens))
     .sort((a, b) => b.asks - a.asks || byName(a.group, b.group));
 }
 
-export async function collectComparisons(root: string, window: Window): Promise<ComparisonData | null> {
+export async function collectComparisons(root: string, window: Window, user?: string): Promise<ComparisonData | null> {
   const ranges = comparisonWindows(window);
   if (!ranges) return null;
-  const [previous, yearAgo] = await Promise.all([collectAll(root, ranges.previous), collectAll(root, ranges.yearAgo)]);
+  const [previous, yearAgo] = await Promise.all([collectAll(root, ranges.previous, user), collectAll(root, ranges.yearAgo, user)]);
   return { previous: { window: ranges.previous, groups: previous }, yearAgo: { window: ranges.yearAgo, groups: yearAgo } };
 }
 

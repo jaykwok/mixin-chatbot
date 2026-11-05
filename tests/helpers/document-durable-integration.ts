@@ -2,9 +2,8 @@
  * Real, offline document work through the Durable engine (D2-4; the D2-P re-check): the group registry as the service
  * will build it (src/durable/registry.ts) with the document module, a Durable group Harness with the request door, a
  * faux model that writes the scripts, the explicitly supplied test venv and, with --office, LibreOffice for previews.
- * The same scenarios as document-codemode-integration.ts (the AgentSession engine): comparing several materials in
- * parallel, selecting PPT pages with new content, and a Word patch through to its preview, which the model then reads
- * as an image. Synthetic documents only (document-fixtures.py).
+ * Scenarios: comparing several materials in parallel, selecting PPT pages with new content, and a Word patch through to
+ * its preview, which the model then reads as an image. Synthetic documents only (document-fixtures.py).
  * Usage: bun tests/helpers/document-durable-integration.ts <test venv> [--office]
  */
 import assert from "node:assert/strict";

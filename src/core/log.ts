@@ -1,4 +1,4 @@
-// 日志：console + 简单文件轮转。
+// 日志：终端 + 简单文件轮转。
 import {
   appendFileSync,
   existsSync,
@@ -7,17 +7,31 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { redactSecrets } from "../../scripts/lib/redact.ts";
-import {
-  LOG_BACKUP_COUNT,
-  LOG_DIR,
-  LOG_FILE,
-  LOG_MAX_BYTES,
-} from "./config.ts";
 
-mkdirSync(LOG_DIR, { recursive: true });
-const LOG_PATH = join(LOG_DIR, LOG_FILE);
+// 不依赖 config.ts：那里在导入时校验 runtime.json 和环境变量。部署恢复、维护和只读查询的宿主工具都写日志，配置损坏时
+// 它们仍要能运行（回滚正是恢复这份配置的办法）。
+export const LOG_FILE = "mixin-chatbot.log";
+export const LOG_MAX_BYTES = 5 * 1024 ** 2; // 5MB
+export const LOG_BACKUP_COUNT = 3;
+const LOG_DIR = "logs";
+
+/**
+ * 日志去向。服务按默认值写 logs/（相对工作目录，首次写入时才创建）并输出到 stdout；stdout 另有用途的宿主工具（维护协议的
+ * 机器模式、只读查询）在入口改到 stderr，不应在部署目录写东西的只读查询关掉文件。导入本模块没有副作用。
+ */
+export interface LogSink {
+  /** 日志文件；null 表示不写文件。 */
+  readonly file: string | null;
+  readonly stream: "stdout" | "stderr";
+}
+let sink: LogSink = { file: join(LOG_DIR, LOG_FILE), stream: "stdout" };
+let directoryReady: string | null = null;
+
+export function configureLog(options: Partial<LogSink>): void {
+  sink = { ...sink, ...options };
+}
 
 function timestamp(): string {
   const d = new Date();
@@ -42,18 +56,18 @@ export function sanitizeLogMessage(message: string): string {
 }
 
 /** 仅保留当前文件和固定份数的备份；过期日志直接删除，不进入业务归档。 */
-function rotateIfNeeded(): void {
+function rotateIfNeeded(path: string): void {
   try {
-    if (!existsSync(LOG_PATH) || statSync(LOG_PATH).size < LOG_MAX_BYTES) return;
-    const oldest = `${LOG_PATH}.${LOG_BACKUP_COUNT}`;
+    if (!existsSync(path) || statSync(path).size < LOG_MAX_BYTES) return;
+    const oldest = `${path}.${LOG_BACKUP_COUNT}`;
     rmSync(oldest, { force: true });
     // .(n-1) -> .n，从大到小依次上移
     for (let i = LOG_BACKUP_COUNT - 1; i >= 1; i--) {
-      const from = `${LOG_PATH}.${i}`;
-      if (existsSync(from)) renameSync(from, `${LOG_PATH}.${i + 1}`);
+      const from = `${path}.${i}`;
+      if (existsSync(from)) renameSync(from, `${path}.${i + 1}`);
     }
     // 当前 -> .1
-    renameSync(LOG_PATH, `${LOG_PATH}.1`);
+    renameSync(path, `${path}.1`);
   } catch {
     // 轮转失败不阻塞日志输出
   }
@@ -61,12 +75,15 @@ function rotateIfNeeded(): void {
 
 function write(level: string, msg: string): void {
   const line = `${timestamp()} - ${level} - ${sanitizeLogMessage(redactSecrets(msg))}`;
-  console.log(line);
+  (sink.stream === "stderr" ? console.error : console.log)(line);
+  const path = sink.file;
+  if (path === null) return;
   try {
-    rotateIfNeeded();
-    appendFileSync(LOG_PATH, line + "\n", "utf8");
+    if (directoryReady !== path) { mkdirSync(dirname(path), { recursive: true }); directoryReady = path; }
+    rotateIfNeeded(path);
+    appendFileSync(path, line + "\n", "utf8");
   } catch {
-    // 文件写入失败忽略（console 已输出）
+    // 文件写入失败忽略（终端已输出）
   }
 }
 

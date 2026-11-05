@@ -1,9 +1,8 @@
 // The one source of the program's version facts. Built-ins only: usable before runtime.json is valid.
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import manifest from "../../package.json";
 
-/** Program version (package.json of the running code): shown in the TUI and the basis of release and upgrade decisions. */
-export const APP_VERSION: string = JSON.parse(readFileSync(join(import.meta.dir, "../../package.json"), "utf8")).version;
+/** Program version (package.json of the running code): shown in the console and the basis of release and upgrade decisions. */
+export const APP_VERSION: string = manifest.version;
 
 /**
  * Data format version: whether this program can open the existing databases and directories. It changes only with the

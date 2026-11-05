@@ -18,20 +18,34 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync,
-  realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+  realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readQuietly } from "../../src/durable/revision-cleanup/inspect.ts";
+import { readJournal } from "../../src/durable/revision-cleanup/journal.ts";
+import type { Point } from "../../src/durable/revision-cleanup/run.ts";
+import { chainState, kindOf, writeLongChains, type ChainState } from "../helpers/revision-chains.ts";
+import { LifecycleConsole, taskResult } from "../helpers/console-lifecycle.ts";
+import { webHealthGate } from "../helpers/lifecycle-gates.ts";
+import { configurationSnapshot } from "../../scripts/config/configuration-form.ts";
+import { serializeConfigurationStage } from "../../scripts/config/configuration-stage.ts";
+import { readConfigurationState } from "../../src/core/configuration-state.ts";
+import { validateRelayConfig } from "../../src/integrations/relay-s3.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const enabled = process.env.MIXIN_REAL_DOCKER === "1" && process.platform === "linux";
+// A separate acceptance group: keep the original CLI lifecycle and its prerequisite order intact.
+const webLifecycle = process.env.MIXIN_REAL_DOCKER_CONSOLE === "1";
 const ROOT_PREFIX = "/var/tmp/mixin-real-docker-";
 const layouts = (["default", "external"] as const).filter(layout =>
   (process.env.MIXIN_REAL_DOCKER_LAYOUTS ?? "default,external").split(",").includes(layout));
 const baseImage = /^FROM\s+(oven\/bun:\S+)/m.exec(readFileSync(join(project, "Dockerfile"), "utf8"))?.[1] ?? "";
 // Scripts must take the Docker path of a host without Bun (validate-models falls back to the image).
 const hostPath = (process.env.PATH ?? "").split(":").filter(dir => dir && !existsSync(join(dir, "bun"))).join(":");
-const passthrough = Object.fromEntries(["HOME", "USER", "DOCKER_HOST", "XDG_RUNTIME_DIR"]
-  .filter(key => process.env[key]).map(key => [key, process.env[key]!]));
+// The ops core needs host Bun 1.4.4+: this test's own, handed over explicitly (only the ops core reads it), so that nothing is
+// downloaded and every other script still sees a host without Bun.
+const passthrough = { ...Object.fromEntries(["HOME", "USER", "DOCKER_HOST", "XDG_RUNTIME_DIR"]
+  .filter(key => process.env[key]).map(key => [key, process.env[key]!])), MIXIN_OPS_BUN: process.execPath };
 
 function run(command: string, args: string[], cwd = project, input?: string) {
   const result = spawnSync(command, args, { cwd, input, env: { ...passthrough, PATH: hostPath, LANG: "C.UTF-8" }, encoding: "utf8" });
@@ -94,8 +108,9 @@ function containers(): Container[] {
     sources: item.Mounts.map(mount => mount.Source), mounts: item.Mounts }));
 }
 // The task daemon's socket (scripts/lib/task-runtime.sh, rootless) is the only mount allowed outside the fixture.
-const ours = (container: Container) => container.mounts.some(mount => mount.Source.startsWith(ROOT_PREFIX))
-  && container.mounts.every(mount => mount.Source.startsWith(ROOT_PREFIX) || mount.Destination === "/run/mixin-task/docker.sock");
+const runRoots = new Set<string>();
+const ours = (container: Container) => [...runRoots].some(root => container.mounts.some(mount => mount.Source.startsWith(root + "/"))
+  && container.mounts.every(mount => mount.Source.startsWith(root + "/") || mount.Destination === "/run/mixin-task/docker.sock"));
 const previews = (root: string) => containers().filter(item => item.name.startsWith("mixin-chatbot-preview-") && item.sources.some(source => source.startsWith(root)));
 
 // Everything the tests create: every container whose mounts all lie in a fixture (the service, the rollback container,
@@ -122,7 +137,8 @@ function removeOurImages(): void {
   for (const image of unlabelled) docker("image", "rm", "--force", image);
 }
 
-interface Running { child: ChildProcess; done: Promise<{ code: number | null; signal: string | null; output: string }> }
+interface Ended { code: number | null; signal: string | null; output: string }
+interface Running { child: ChildProcess; done: Promise<Ended>; ended(): Ended | undefined }
 // Answers each "?> " prompt line once, matched by text; unmatched prompts (headings) need no input. A prefix runs the
 // script as another user (setpriv).
 function start(root: string, name: string, args: string[], cwd: string, env: Record<string, string>,
@@ -145,11 +161,12 @@ function start(root: string, name: string, args: string[], cwd: string, env: Rec
   };
   child.stdout!.on("data", collect);
   child.stderr!.on("data", collect);
-  const done = new Promise<{ code: number | null; signal: string | null; output: string }>(resolve => child.on("close", (code, signal) => {
+  let ended: Ended | undefined;
+  const done = new Promise<Ended>(resolve => child.on("close", (code, signal) => {
     writeFileSync(join(root, "logs", `${name}.log`), output);
-    resolve({ code, signal, output });
+    resolve(ended = { code, signal, output });
   }));
-  return { child, done };
+  return { child, done, ended: () => ended };
 }
 
 // Fixture files the operations must never change; the running service may add its own state beside them.
@@ -164,11 +181,15 @@ function digest(paths: string[]): Record<string, string> {
   return result;
 }
 
-async function until<T>(what: string, probe: () => T | undefined | false, timeout: number): Promise<T> {
+// With an operation that should still be running (held or about to be killed), stops waiting as soon as it ends: a build
+// that failed on the network then fails the step at once instead of after the whole timeout.
+async function until<T>(what: string, probe: () => T | undefined | false, timeout: number, running?: Running): Promise<T> {
   const deadline = Date.now() + timeout;
   for (;;) {
     const value = probe();
     if (value) return value;
+    const ended = running?.ended();
+    if (ended) throw new Error(`${what}: the operation ended first (code ${ended.code}, signal ${ended.signal}): ${ended.output.slice(-3000)}`);
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await Bun.sleep(250);
   }
@@ -277,6 +298,11 @@ const previewGate = 'if (process.argv.includes("preview") && (await import("node
 // not for the verification instance (verify-only marker, --allow-verification), only for the activation afterwards.
 // It marks the hold in data/state, which the service identity may write; data/ itself belongs to the deployer.
 const holdHealth = 'if ((await import("node:fs")).existsSync("data/hold-health") && !(await import("node:fs")).existsSync("data/state/verify-only") && !process.argv.includes("--allow-verification")) { (await import("node:fs")).writeFileSync("data/state/health-held", ""); while ((await import("node:fs")).existsSync("data/hold-health")) await Bun.sleep(200); } // fixture: hold health';
+// The revision cleanup of targets with this hook waits after the first commit of a document (the temporary key is
+// stored) while data/hold-cleanup exists, and writes its host name (the container ID) to data/state/cleanup-held.
+const cleanupPoint = "  async point(point: Point) { await this.options.hooks?.point?.(point); }";
+const heldCleanupPoint: Point = "committed";
+const holdCleanup = `  async point(point: Point) { const fs = await import("node:fs"); if (point === "${heldCleanupPoint}" && fs.existsSync("/app/data/hold-cleanup")) { fs.writeFileSync("/app/data/state/cleanup-held", (await import("node:os")).hostname()); while (fs.existsSync("/app/data/hold-cleanup")) await Bun.sleep(200); } await this.options.hooks?.point?.(point); } // fixture: hold cleanup`;
 
 // The working tree as a fresh repository: uncommitted changes under review are part of the deployed base.
 // Modes come from the index (a Windows checkout mounted into WSL reports every file as executable).
@@ -302,6 +328,14 @@ function exportWithFakePlatform(target: string): void {
   if (text.split(anchor).length !== 2) throw new Error("platformEndpoints() changed: update the fake platform hook");
   writeFileSync(path, text.replace(anchor, () => `  if (environment) return { api: "${origin}", stream: "${origin.replace(/^http:/, "ws:")}/open-apis/v1/events/stream", ` +
     `storage: url => url.origin === "${origin}" && url.pathname.startsWith("/storage/") }; // fixture: local fake platform\n` + anchor));
+  if (webLifecycle) {
+    // Shared fault gates start inert. Any selected web test can use the first deployment as its prerequisite;
+    // rerunning a later failure need not repeat the successful disconnect test just to install these hooks.
+    prepend(join(target, "scripts/ops/health-check.ts"), webHealthGate);
+    const runPath = join(target, "src/durable/revision-cleanup/run.ts"), runText = readFileSync(runPath, "utf8");
+    if (runText.split(cleanupPoint).length !== 2) throw new Error("cleanup hook changed");
+    writeFileSync(runPath, runText.replace(cleanupPoint, holdCleanup));
+  }
 }
 
 // The tests read and publish in checkouts that another user may own; the scripts get no such exception.
@@ -369,6 +403,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
     if (foreign.length) throw new Error(`refusing to run: containers of another deployment exist (${foreign.map(item => item.name).join(", ")})`);
     removeOurContainers();
     root = mkdtempSync(ROOT_PREFIX);
+    runRoots.add(root);
     // Another user deploys below it in the root run.
     chmodSync(root, 0o755);
     mkdirSync(join(root, "logs"));
@@ -427,7 +462,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         return { id, started, running: running === "true", image, user };
       };
       const marker = () => docker("exec", "mixin-chatbot", "cat", "/app/src/upgrade-marker.txt").out;
-      // Ready inside the container and reachable on the host port, where the health check and the TUI connect.
+      // Ready inside the container and reachable on the host port, where the health check and the console connect.
       const healthy = () => docker("exec", "mixin-chatbot", "bun", "run", "scripts/ops/health-check.ts").code === 0 &&
         spawnSync("curl", ["--noproxy", "*", "--max-time", "3", "-fsS", `http://127.0.0.1:${port}/health`]).status === 0;
       // The service holds the fake platform's Stream, has mapped the directory member and answers a direct /help over OpenAPI.
@@ -462,7 +497,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
       }, timeout);
       const dependent = (name: string, body: () => Promise<void>, timeout: number) => step(name, async () => {
         if (blocked) throw new Error(`前置失败，未执行（${layout}：${blocked}）`);
-        await body();
+        try { await body(); } catch (error) { blocked = name; throw error; }
       }, timeout);
       // The external workspace: every entry with its content and modification time, and the service cannot write it.
       const sharedEntries = () => {
@@ -494,10 +529,15 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         port = await freePort();
         fixture = syntheticData(work, shared);
         if (layout === "external") sharedBaseline = sharedEntries();
+        // The credentials are in place, so the directory scope is chosen before the stop; without a terminal it comes from
+        // BOT_DIRECTORY_SCOPE. Only this run gets it: a later step that asked again would fail.
         const deploy = start(root, `${layout}-deploy`, ["scripts/deploy/deploy.sh"], work,
-          { ...env(), ...(layout === "external" ? { WORKSPACE_ROOT: shared } : {}) }, deployAnswers);
+          { ...env(), BOT_DIRECTORY_SCOPE: "all", ...(layout === "external" ? { WORKSPACE_ROOT: shared } : {}) }, deployAnswers);
         const result = await deploy.done;
         expect({ code: result.code, tail: result.output.slice(-3000) }).toMatchObject({ code: 0 });
+        expect(result.output).toContain("选择通讯录同步范围（服务尚未停止）");
+        expect(JSON.parse(readFileSync(join(work, "data/config/directory.json"), "utf8"))).toEqual({ format: 1, all: true });
+        expect(existsSync(join(work, "data/state/directory-scope-plan.json"))).toBe(false);
         expect(bot()).toMatchObject({ running: true, user: identity });
         expect(await until("the deployed service", () => healthy(), 60_000)).toBe(true);
         await converses("the deployed service");
@@ -509,6 +549,239 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         baseline = digest(fixture);
         accepted = head();
       }, 1_800_000);
+
+      // The CLI redeploy and repair go through the shared core like the first deployment: the saved port, workspace and
+      // directory scope are kept (only the AI question is asked), the container is replaced from a fresh candidate image on
+      // the same commit, and the stage that held the answers is removed.
+      dependent("CLI redeploy and repair keep the saved choices and restart on the same commit", async () => {
+        for (const command of ["deploy", "repair"]) {
+          const before = bot();
+          const result = await start(root, `${layout}-cli-${command}`, ["scripts/ops/ops.sh", command], work, env(), deployAnswers).done;
+          expect({ code: result.code, tail: result.output.slice(-3000) }).toMatchObject({ code: 0 });
+          expect(result.output).not.toContain("选择通讯录同步范围");
+          expect(bot()).toMatchObject({ running: true, user: identity });
+          expect(bot().id).not.toBe(before.id);
+          expect(head()).toBe(accepted);
+          expect(await until("the redeployed service", () => healthy(), 60_000)).toBe(true);
+          expect(digest(fixture)).toEqual(baseline);
+          externalUnchanged();
+          const left = existsSync(join(work, "tmp")) ? readdirSync(join(work, "tmp")).filter(entry => entry.startsWith("deploy-stage-")) : [];
+          expect({ pending: pending(), left, previews: previews(root).length }).toEqual({ pending: false, left: [], previews: 0 });
+        }
+        await converses("after the CLI redeploy and repair");
+      }, 1_800_000);
+
+      // relay-configure, model-configure and configure-app-bot need a terminal for their wizard; what they hand over is a stage
+      // file, published by the core exactly as here: checked while the bot runs, a brief stop, written by the service identity
+      // in a data task, the original state restored and checked ready. Disabling removes relay.json again.
+      dependent("a configuration stage from a terminal wizard is published by the core with a brief stop", async () => {
+        const directory = join(work, "tmp/configure-stage-fixture"), stage = join(directory, "configuration-relay.json");
+        const relay = JSON.stringify(validateRelayConfig({ provider: "s3", endpoint: "https://s3.example.test", region: "test-region",
+          bucket: "test-bucket", accessKeyId: "fixture-ak", secretAccessKey: "fixture-sk" }), null, 2) + "\n";
+        for (const next of [relay, null]) {
+          mkdirSync(directory, { recursive: true, mode: 0o700 });
+          const base = configurationSnapshot(work, "relay"), before = bot();
+          writeFileSync(stage, serializeConfigurationStage({ version: 1, base, next: { ...base, files: { relay: next } } }), { mode: 0o600 });
+          const result = run(process.execPath, ["--no-env-file", join(work, "scripts/ops/core/cli.ts"), "--project", work,
+            "maintenance", "configuration-apply", "--stage", stage], work);
+          rmSync(directory, { recursive: true, force: true });
+          expect(result, result.out).toMatchObject({ code: 0 });
+          expect(result.out).not.toContain("fixture-sk");
+          const path = join(work, "data/config/relay.json");
+          if (next === null) expect(existsSync(path)).toBe(false);
+          else {
+            expect(readFileSync(path, "utf8")).toBe(next);
+            // Written in the data task as the service identity (rootless: the deploying user behind the mapped 0:0).
+            expect(statSync(path).uid).toBe(rootless ? process.getuid!() : 1001);
+          }
+          expect(readConfigurationState(work)).toBeNull();
+          expect(bot()).toMatchObject({ id: before.id, running: true, user: identity });
+          expect(bot().started).not.toBe(before.started);
+          expect(await until("the service after the configuration", () => healthy(), 60_000)).toBe(true);
+          expect(digest(fixture)).toEqual(baseline);
+        }
+        await converses("after publishing staged configurations");
+      }, 900_000);
+
+      if (webLifecycle) {
+        let consolePort = 0, consoleNumber = 0;
+        const sessions = new Set<LifecycleConsole>(), taskIds = new Set<string>();
+        const unitArgs = rootless ? ["--user"] : [];
+        const openConsole = async () => {
+          consolePort ||= await freePort();
+          const client = new LifecycleConsole(work, consolePort, join(root, "logs", `web-${++consoleNumber}.log`),
+            { ...passthrough, PATH: hostPath, LANG: "C.UTF-8", TERM: "dumb" });
+          sessions.add(client); await client.login(); return client;
+        };
+        const closeConsole = async (client: LifecycleConsole) => { await client.close(); sessions.delete(client); };
+        const submit = async (client: LifecycleConsole, operation: string, params: Record<string, unknown>) => {
+          const id = await client.submit(operation, params); taskIds.add(id); return id;
+        };
+        const update = async (client: LifecycleConsole, target: string) => {
+          const fetched = await client.json<{ target: string }>("/api/lifecycle/check-update", {});
+          expect(fetched.target).toBe(target);
+          return submit(client, "update", { target, switchMain: false, cleanup: "apply", directory: "saved" });
+        };
+        const finished = async (client: LifecycleConsole, id: string, outcome: "success" | "failed" = "success") => {
+          const view = await client.wait(id);
+          const log = await client.json<{ content: string }>(`/api/tasks/${id}/log`, {});
+          writeFileSync(join(root, "logs", `${id}.log`), log.content);
+          expect({ state: view.state, recovery: view.needsRecovery, result: view.result }, log.content.slice(-6000)).toMatchObject({
+            state: outcome === "success" ? "succeeded" : "failed", recovery: false,
+            result: { outcome, finalState: "running" },
+          });
+          expect(await until("the web task's ready service", () => healthy(), 60_000)).toBe(true);
+          expect(digest(fixture)).toEqual(baseline);
+          expect(pending()).toBe(false);
+          return log.content;
+        };
+        const checkedUnit = (id: string) => {
+          if (!taskIds.has(id)) throw new Error("not a task of this test");
+          const request = JSON.parse(readFileSync(join(work, ".console/tasks", id, "request.json"), "utf8"));
+          expect({ id: request.id, project: request.project, mechanism: request.mechanism }).toEqual({
+            id, project: work, mechanism: rootless ? "systemd-user" : "systemd-system",
+          });
+          return `mixin-console-${id}.service`;
+        };
+        const killTask = async (id: string) => {
+          const unit = checkedUnit(id);
+          must("systemctl", [...unitArgs, "kill", "--kill-whom=all", "--signal=SIGKILL", unit]);
+          await until("the killed task service", () => {
+            const state = run("systemctl", [...unitArgs, "show", "-p", "ActiveState", "--value", unit]);
+            return state.out.trim() === "inactive" || state.out.trim() === "failed";
+          }, 30_000);
+          expect(taskResult(work, id)).toBeUndefined();
+        };
+        afterAll(async () => {
+          for (const client of sessions) await client.close();
+          // Exactly the IDs returned by this fixture's HTTP submissions; never stop another console's service.
+          for (const id of taskIds) {
+            const unit = checkedUnit(id);
+            const state = run("systemctl", [...unitArgs, "show", "-p", "ActiveState", "--value", unit]).out.trim();
+            if (["active", "activating", "deactivating"].includes(state)) must("systemctl", [...unitArgs, "stop", unit]);
+          }
+        }, 120_000);
+
+        dependent("web console: upgrade survives console exit and the old page only reads task results", async () => {
+          const target = publish(upstream, "web target A", () => {
+            writeFileSync(join(upstream, "src/upgrade-marker.txt"), "W");
+          });
+          const hold = join(work, "data/hold-health"), held = join(work, "data/state/health-held");
+          writeFileSync(hold, "W");
+          const client = await openConsole(), id = await update(client, target);
+          await until("activation after the web upgrade's commit", () => {
+            const result = taskResult(work, id); if (result) throw new Error(JSON.stringify(result));
+            return existsSync(held);
+          }, 900_000);
+          expect(await client.json("/api/runtime")).toEqual({ current: false });
+          expect((await client.request("/api/overview")).status).toBe(409);
+          expect((await client.request("/api/plans", { operation: "stop", params: {} })).status).toBe(409);
+          expect((await client.json<{ state: string }>(`/api/tasks/${id}`)).state).toBe("running");
+          await closeConsole(client);
+          expect(existsSync(join(work, ".console/instance.json"))).toBe(false);
+          expect(run("systemctl", [...unitArgs, "show", "-p", "ActiveState", "--value", checkedUnit(id)]).out).toBe("active");
+          rmSync(hold);
+          await until("the detached web upgrade result", () => taskResult(work, id), 120_000);
+          const reopened = await openConsole();
+          await finished(reopened, id);
+          expect(await reopened.json("/api/runtime")).toEqual({ current: true });
+          expect({ head: head(), marker: marker() }).toEqual({ head: target, marker: "W" });
+          expect((await reopened.json<{ tasks: { id: string }[] }>("/api/tasks")).tasks.some(task => task.id === id)).toBe(true);
+          await converses("after the detached web upgrade");
+          rmSync(held); await closeConsole(reopened); accepted = target;
+        }, 1_200_000);
+
+        dependent("web console: redeploy and repair use saved choices and report ready", async () => {
+          const client = await openConsole();
+          for (const operation of ["deploy", "repair"]) {
+            const settings = await client.json<{ port: number; workspace: string }>("/api/lifecycle/deploy");
+            expect(settings.port).toBe(port);
+            const id = await submit(client, operation, { port: settings.port, workspace: settings.workspace,
+              cleanup: "apply", directory: "saved" });
+            await finished(client, id);
+            expect(head()).toBe(accepted);
+          }
+          await converses("after web redeploy and repair"); await closeConsole(client);
+        }, 1_800_000);
+
+        for (const action of ["resume", "rollback"] as const) dependent(`web console: SIGKILL during cleanup then ${action}`, async () => {
+          const path = join(work, "data/conversations/groups", `web-${action}`, "durable.sqlite");
+          await writeLongChains(path, 200);
+          if (operator === "root") must("chown", ["-R", identity, dirname(path)]);
+          const before = readQuietly(path, chainState), original = { head: head(), image: bot().image };
+          const target = publish(upstream, `web kill ${action}`, () => writeFileSync(join(upstream, "src/upgrade-marker.txt"), action));
+          const hold = join(work, "data/hold-cleanup"), held = join(work, "data/state/cleanup-held");
+          writeFileSync(hold, "");
+          const client = await openConsole(), id = await update(client, target);
+          const container = await until("the web cleanup commit", () => {
+            const result = taskResult(work, id); if (result) throw new Error(JSON.stringify(result));
+            return existsSync(held) && readFileSync(held, "utf8").trim();
+          }, 900_000);
+          await killTask(id);
+          expect(containers().some(item => ours(item) && item.id.startsWith(container))).toBe(true);
+          must("docker", ["kill", container]);
+          await until("the killed web cleanup container", () => docker("container", "inspect", container).code !== 0, 60_000);
+          rmSync(hold); rmSync(held);
+          expect(readJournal(join(work, "data"))?.current?.space).toBe(`groups/web-${action}`);
+          await closeConsole(client);
+          const recovery = await openConsole();
+          expect(await recovery.json(`/api/tasks/${id}`)).toMatchObject({ state: "interrupted", needsRecovery: true });
+          expect(await recovery.json("/api/lifecycle")).toMatchObject({ pending: { canResume: true, canRollback: true } });
+          const resumed = await submit(recovery, action, {});
+          await finished(recovery, resumed);
+          expect(head()).toBe(action === "resume" ? target : original.head);
+          if (action === "rollback") expect(bot().image).toBe(original.image);
+          expect(readQuietly(path, chainState).values).toEqual(before.values);
+          if (action === "resume") {
+            const after = readQuietly(path, chainState);
+            for (const [key, revisions] of Object.entries(before.chains)) {
+              const kind = readQuietly(path, db => kindOf(db, Number(key)));
+              expect([kind, after.chains[Number(key)]]).toEqual([kind, revisions > 64 && kind.startsWith("mixin.") ? 1 : revisions]);
+            }
+            accepted = target;
+          }
+          await closeConsole(recovery);
+        }, 1_800_000);
+
+        dependent("web console: committed interruption rejects rollback and resumes the recorded image", async () => {
+          const target = publish(upstream, "web committed", () => writeFileSync(join(upstream, "src/upgrade-marker.txt"), "committed"));
+          const hold = join(work, "data/hold-health"), held = join(work, "data/state/health-held");
+          writeFileSync(hold, "committed");
+          const client = await openConsole(), id = await update(client, target);
+          await until("the web committed activation", () => {
+            const result = taskResult(work, id); if (result) throw new Error(JSON.stringify(result));
+            return existsSync(held);
+          }, 900_000);
+          expect({ head: head(), phase: JSON.parse(readFileSync(join(work, "data/state/release-data.json"), "utf8")).phase }).toEqual({ head: target, phase: "committed" });
+          await killTask(id); await closeConsole(client);
+          const recovery = await openConsole(), image = bot().image;
+          expect(await recovery.json("/api/lifecycle")).toMatchObject({ pending: { committed: true, canResume: true, canRollback: false } });
+          expect((await recovery.request("/api/plans", { operation: "rollback", params: {} })).status).toBe(409);
+          expect({ head: head(), image: bot().image, pending: pending() }).toEqual({ head: target, image, pending: true });
+          rmSync(hold);
+          const resumed = await submit(recovery, "resume", {}), output = await finished(recovery, resumed);
+          expect(output).not.toContain("构建目标版本");
+          expect(bot().image).toBe(image); expect(head()).toBe(target);
+          rmSync(held); await closeConsole(recovery); accepted = target;
+        }, 1_200_000);
+
+        dependent("web console: bad target rolls back and a later good target upgrades", async () => {
+          const verify = join(upstream, "src/server/verify.ts"), originalVerify = readFileSync(verify, "utf8");
+          const broken = publish(upstream, "web bad target", () => prepend(verify, 'throw new Error("fixture: verification failure");'));
+          const before = bot().image, client = await openConsole();
+          await finished(client, await update(client, broken), "failed");
+          expect({ head: head(), image: bot().image }).toEqual({ head: accepted, image: before });
+          await closeConsole(client);
+          const target = publish(upstream, "web good target", () => {
+            writeFileSync(verify, originalVerify); writeFileSync(join(upstream, "src/upgrade-marker.txt"), "G");
+          });
+          const next = await openConsole();
+          await finished(next, await update(next, target));
+          expect({ head: head(), marker: marker() }).toEqual({ head: target, marker: "G" });
+          await converses("after web automatic rollback and good upgrade"); await closeConsole(next); accepted = target;
+        }, 1_800_000);
+        return;
+      }
 
       // F2: the final workspace is checked in host path space before the stop. A link that resolves into the project's
       // logs/ is refused there: the service keeps running unchanged, no transaction is recorded and the saved setting
@@ -556,7 +829,163 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         accepted = target;
       }, 900_000);
 
-      const labelled = (format: string) => docker("image", "ls", "--format", format, "--filter", `label=org.mixin-chatbot.project=${projectId(work)}`).out;
+      // A deployment without a directory scope (1.0.1 and earlier synced the whole directory without a record): the upgrade
+      // asks before the stop, in the candidate image as the service identity with data/ read-only. Without a terminal or
+      // BOT_DIRECTORY_SCOPE it stops there with the service untouched; with it, the plan is installed after the stop.
+      if (layout === "default") dependent("an upgrade without a directory scope asks for it before the stop and installs it after the stop", async () => {
+        const scopeFile = join(work, "data/config/directory.json");
+        rmSync(scopeFile);
+        const target = publish(upstream, "target S", () => writeFileSync(join(upstream, "src/upgrade-marker.txt"), "S"));
+        const before = bot();
+        const refused = await start(root, `${layout}-scope-refused`, ["scripts/ops/ops.sh", "update"], work, env()).done;
+        expect(refused.code === 0, refused.output.slice(-3000)).toBe(false);
+        expect(refused.output).toContain("请设置 BOT_DIRECTORY_SCOPE=all");
+        expect(refused.output).toContain("没有选定通讯录同步范围（原因见上方）；服务尚未停止，代码和数据未改动");
+        expect({ bot: bot(), head: head(), scope: existsSync(scopeFile), pending: pending(), stages: stages(), previews: previews(root).length })
+          .toEqual({ bot: before, head: accepted, scope: false, pending: false, stages: [], previews: 0 });
+        expect(healthy()).toBe(true);
+        const result = await start(root, `${layout}-scope-upgrade`, ["scripts/ops/ops.sh", "update"], work,
+          { ...env(), BOT_DIRECTORY_SCOPE: "all" }).done;
+        expect({ code: result.code, tail: result.output.slice(-3000) }).toMatchObject({ code: 0 });
+        expect({ head: head(), marker: marker(), user: bot().user }).toEqual({ head: target, marker: "S", user: identity });
+        expect(JSON.parse(readFileSync(scopeFile, "utf8"))).toEqual({ format: 1, all: true });
+        expect(await until("the upgraded service", () => healthy(), 60_000)).toBe(true);
+        await converses("the service with the chosen directory scope");
+        expect(digest(fixture)).toEqual(baseline);
+        expect({ pending: pending(), stages: stages(), previews: previews(root).length }).toEqual({ pending: false, stages: [], previews: 0 });
+        accepted = target;
+      }, 900_000);
+
+      /** Every value as before; each long chain of a bot document is one base, every other chain as before. */
+      const compacted = (path: string, before: ChainState) => {
+        const after = readQuietly(path, chainState);
+        expect(after.values).toEqual(before.values);
+        for (const [id, revisions] of Object.entries(before.chains)) {
+          const kind = readQuietly(path, db => kindOf(db, Number(id)));
+          expect([kind, after.chains[Number(id)]]).toEqual([kind, revisions > 64 && kind.startsWith("mixin.") ? 1 : revisions]);
+        }
+      };
+
+      // A database of long chains of its own, an upgrade to a target whose cleanup holds after the first commit of a
+      // document, and the upgrade and the cleanup's container killed there (a host that went down mid-document).
+      const killCleanup = async (name: string, mark: string) => {
+        const path = join(work, "data/conversations/groups", `fixture-cleanup-${name}`, "durable.sqlite");
+        await writeLongChains(path, 200);
+        if (operator === "root") must("chown", ["-R", identity, dirname(path)]);
+        const before = readQuietly(path, chainState);
+        const runPath = join(upstream, "src/durable/revision-cleanup/run.ts");
+        const target = publish(upstream, `cleanup ${name}`, () => {
+          const text = readFileSync(runPath, "utf8");
+          if (!text.includes("fixture: hold cleanup")) {
+            if (!text.includes(cleanupPoint)) throw new Error("run.ts has no point() to hold");
+            writeFileSync(runPath, text.replace(cleanupPoint, holdCleanup));
+          }
+          writeFileSync(join(upstream, "src/upgrade-marker.txt"), mark);
+        });
+        const hold = join(work, "data/hold-cleanup"), heldMark = join(work, "data/state/cleanup-held");
+        writeFileSync(hold, "");
+        const upgrade = start(root, `${layout}-cleanup-${name}`, ["scripts/ops/ops.sh", "update"], work, env(), [], true);
+        const container = await until("the held cleanup", () => existsSync(heldMark) && readFileSync(heldMark, "utf8").trim(), 900_000, upgrade);
+        process.kill(-upgrade.child.pid!, "SIGKILL");
+        const killed = await upgrade.done;
+        expect(killed.output).toContain("整理会话库的旧修订链（先备份并验证要修改的会话库）");
+        must("docker", ["kill", container]);
+        await until("the killed cleanup container to go away", () => docker("container", "inspect", container).code !== 0, 60_000);
+        rmSync(hold); rmSync(heldMark);
+        // The killed ops.sh could not remove its export directory; recovery exports its own.
+        for (const stage of stages()) rmSync(join(work, "tmp", stage), { recursive: true, force: true });
+        const journal = readJournal(join(work, "data"))!;
+        expect({ pending: pending(), state: journal.state, space: journal.current?.space })
+          .toEqual({ pending: true, state: "running", space: `groups/fixture-cleanup-${name}` });
+        return { path, before, target, journal, inFlight: journal.current!.document.id };
+      };
+
+      // An older release's long revision chains in a conversation database the running service has not opened (closed, so
+      // without -wal and -shm): the upgrade previews it with data/ mounted read-only, decides without a terminal to clean up
+      // after a backup, and after the stop cleans up in the candidate as the service identity, which writes the backup
+      // below backup/ (owned by root in the root run). Every value stays; the database records no space, so the restarted
+      // service reports it and leaves it alone.
+      if (layout === "default") dependent("an upgrade cleans up long revision chains after the stop, as the service identity, after a verified backup", async () => {
+        const groups = join(work, "data/conversations/groups"), path = join(groups, "fixture-long-chains", "durable.sqlite");
+        const created = existsSync(groups) ? dirname(path) : groups;
+        await writeLongChains(path, 200);
+        if (operator === "root") must("chown", ["-R", identity, created]);
+        const before = readQuietly(path, chainState);
+        const target = publish(upstream, "target L", () => writeFileSync(join(upstream, "src/upgrade-marker.txt"), "L"));
+        const result = await start(root, `${layout}-revision-cleanup`, ["scripts/ops/ops.sh", "update"], work, env()).done;
+        expect({ code: result.code, tail: result.output.slice(-3000) }).toMatchObject({ code: 0 });
+        expect(result.output).toMatch(/停机后整理旧修订链，约 \d+ 分钟；先备份要修改的会话库/);
+        expect(result.output).toMatch(/修订整理（运行 \S+）已完成：整理文档 10 份/);
+        expect({ head: head(), marker: marker(), user: bot().user }).toEqual({ head: target, marker: "L", user: identity });
+        expect(await until("the upgraded service", () => healthy(), 60_000)).toBe(true);
+        await converses("the service after the revision cleanup");
+        const journal = readJournal(join(work, "data"))!;
+        expect(journal.state).toBe("finished");
+        // The service identity on the host: the image's appuser in the root run, the deploying user under rootless.
+        const owner = operator === "root" ? 1001 : process.getuid!();
+        const backups = join(work, "backup/revision-cleanup"), backup = join(backups, journal.run, "groups-fixture-long-chains.sqlite");
+        expect({ directory: statSync(backups).uid, run: statSync(join(backups, journal.run)).uid, backup: statSync(backup).uid })
+          .toEqual({ directory: owner, run: owner, backup: owner });
+        expect(readQuietly(backup, chainState)).toEqual(before);
+        compacted(path, before);
+        expect(digest(fixture)).toEqual(baseline);
+        // Two day-to-day commands that run the image's scripts in a one-off container (the image once lacked a directory
+        // they import).
+        for (const [name, args, output] of [
+          ["revision-status", ["revision-cleanup", "status"], `修订整理（运行 ${journal.run}）已完成`],
+          ["stat", ["stat"], ""],
+        ] as const) {
+          const command = await start(root, `${layout}-${name}`, ["scripts/ops/ops.sh", ...args], work, env()).done;
+          expect({ name, code: command.code, tail: command.output.slice(-2000) }).toMatchObject({ name, code: 0 });
+          expect(command.output).toContain(output);
+        }
+        accepted = target;
+      }, 900_000);
+
+      // Resume runs the recorded cleanup again: it settles the document in flight, goes on with the same run and keeps the
+      // backup it verified before the kill.
+      if (layout === "default") dependent("an upgrade killed with a cleanup document in flight is finished by resume, which keeps the verified backup", async () => {
+        const { path, before, target, journal } = await killCleanup("resume", "R");
+        const backup = join(work, "backup/revision-cleanup", journal.run, "groups-fixture-cleanup-resume.sqlite");
+        const kept = () => ({ ...digest([backup]), mtime: statSync(backup).mtimeMs });
+        const saved = kept();
+        const resume = await start(root, `${layout}-cleanup-resume-continue`, ["scripts/ops/ops.sh", "resume"], work, env()).done;
+        expect({ code: resume.code, tail: resume.output.slice(-3000) }).toMatchObject({ code: 0 });
+        expect(resume.output).toContain(`修订整理（运行 ${journal.run}）已完成`);
+        expect({ head: head(), marker: marker(), pending: pending(), user: bot().user }).toEqual({ head: target, marker: "R", pending: false, user: identity });
+        expect(await until("the resumed service", () => healthy(), 60_000)).toBe(true);
+        await converses("the service after the resumed cleanup");
+        const finished = readJournal(join(work, "data"))!;
+        expect({ run: finished.run, state: finished.state, current: finished.current }).toEqual({ run: journal.run, state: "finished", current: undefined });
+        expect(kept()).toEqual(saved);
+        expect(readQuietly(backup, chainState)).toEqual(before);
+        compacted(path, before);
+        expect(digest(fixture)).toEqual(baseline);
+        accepted = target;
+      }, 1_800_000);
+
+      // Rollback ends the run first: the document in flight is settled in the recorded candidate, then the previous
+      // version's code, image and container come back. The rest of the chains stay as they were.
+      if (layout === "default") dependent("an upgrade killed with a cleanup document in flight rolls back after settling the document", async () => {
+        const previous = { image: bot().image, marker: marker() };
+        const { path, before, journal, inFlight } = await killCleanup("rollback", "Q");
+        const rollback = await start(root, `${layout}-cleanup-rollback-restore`, ["scripts/ops/ops.sh", "rollback"], work, env()).done;
+        expect({ code: rollback.code, tail: rollback.output.slice(-3000) }).toMatchObject({ code: 0 });
+        expect(rollback.output).toContain("回滚之前结束修订整理（先收尾在途文档）");
+        expect({ head: head(), pending: pending(), image: bot().image, marker: marker(), user: bot().user })
+          .toEqual({ head: accepted, pending: false, image: previous.image, marker: previous.marker, user: identity });
+        expect(await until("the restored service", () => healthy(), 60_000)).toBe(true);
+        await converses("the service after the rollback");
+        const ended = readJournal(join(work, "data"))!;
+        expect({ run: ended.run, state: ended.state, current: ended.current }).toEqual({ run: journal.run, state: "abandoned", current: undefined });
+        const after = readQuietly(path, chainState);
+        expect(after.values).toEqual(before.values);
+        expect({ ...after.chains, [inFlight]: 0 }).toEqual({ ...before.chains, [inFlight]: 0 });
+        expect(after.chains[inFlight]).toBe(1);
+        expect(digest(fixture)).toEqual(baseline);
+      }, 1_800_000);
+
+      const labelled =(format: string) => docker("image", "ls", "--format", format, "--filter", `label=org.mixin-chatbot.project=${projectId(work)}`).out;
       const imageId = (reference: string) => docker("image", "inspect", "--format", "{{.Id}}", reference).out;
       // An image of the test's own to move tags onto: the base image plus this project's label, so the cleanup removes it.
       let decoyId = "";
@@ -662,7 +1091,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         const before = bot(), count = snapshots(), other = decoy();
         writeFileSync(gate, "");
         const upgrade = start(root, `${layout}-reserved-tag`, ["scripts/ops/ops.sh", "update"], work, env());
-        await until("the held preview", () => held(), 900_000);
+        await until("the held preview", () => held(), 900_000, upgrade);
         const reserved = labelled("{{.Repository}}:{{.Tag}}").split("\n").filter(tag => tag.includes(":candidate-"));
         expect(reserved).toHaveLength(1);
         must("docker", ["tag", other, reserved[0]!]);
@@ -692,7 +1121,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         await Bun.sleep(1000);
         writeFileSync(gate, "");
         const upgrade = start(root, `${layout}-official-tag`, ["scripts/ops/ops.sh", "update"], work, { ...env(), PATH: observed.path });
-        await until("the held preview", () => held(), 900_000);
+        await until("the held preview", () => held(), 900_000, upgrade);
         must("docker", ["tag", base, "mixin-chatbot"]);
         rmSync(gate);
         const result = await upgrade.done;
@@ -726,7 +1155,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
         const previous = bot().image;
         writeFileSync(hold, "");
         const upgrade = start(root, `${layout}-kill-committed`, ["scripts/ops/ops.sh", "update"], work, env(), [], true);
-        await until("the held activation", () => existsSync(heldMark), 900_000);
+        await until("the held activation", () => existsSync(heldMark), 900_000, upgrade);
         process.kill(-upgrade.child.pid!, "SIGKILL");
         await upgrade.done;
         // The killed ops.sh could not remove its export directory; recovery exports its own.
@@ -798,7 +1227,7 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
           }
           const before = bot(), count = snapshots();
           const upgrade = start(root, `${layout}-cancel-${signal.startsWith("SIGINT") ? "int" : "term"}`, ["scripts/ops/ops.sh", "update"], work, env(), [], true);
-          const preview = await until("the preview container", () => previews(root)[0], 300_000);
+          const preview = await until("the preview container", () => previews(root)[0], 300_000, upgrade);
           // Offline, in the candidate image, as the service identity; data read-only.
           expect({ image: preview.image.startsWith("sha256:"), user: preview.user }).toEqual({ image: true, user: identity });
           const mounts = Object.fromEntries(preview.mounts.map(mount => [mount.Destination, mount.RW]));
@@ -833,20 +1262,23 @@ describe.skipIf(!enabled)(`real Docker upgrade lifecycle (uid ${process.getuid?.
           prepend(verify, 'throw new Error("fixture: verification failure");');
           writeFileSync(join(upstream, "src/upgrade-marker.txt"), "B");
         });
-        const before = bot(), kept = marker(), restored = "已恢复配置、容器、网络入口和原运行状态";
+        const before = bot(), kept = marker(), restored = "已自动恢复到操作前的状态";
         expect(kept).toMatch(/^[A-Z]$/);
         const upgrade = start(root, `${layout}-rollback`, ["scripts/ops/ops.sh", "update"], work, env(), [], true);
         let output = "", interrupts = 0;
         const watch = (chunk: Buffer) => { output += chunk.toString(); };
         upgrade.child.stdout!.on("data", watch);
         upgrade.child.stderr!.on("data", watch);
+        // The core announces the automatic rollback, with its cause, before the first restoration step.
         const timer = setInterval(() => {
-          if (!/部署预检失败|部署预检超时|容器启动失败/.test(output) || output.includes(restored)) return;
+          if (!output.includes("正在自动恢复到操作前的状态") || output.includes(restored)) return;
           try { process.kill(-upgrade.child.pid!, "SIGINT"); interrupts++; } catch { /* the group is gone */ }
         }, 200);
         const result = await upgrade.done.finally(() => clearInterval(timer));
         expect({ failed: result.code !== 0, interrupted: interrupts > 0, restored: result.output.includes(restored) })
           .toEqual({ failed: true, interrupted: true, restored: true });
+        // The instance never became ready: its own last log lines say why.
+        expect(result.output).toContain("fixture: verification failure");
         expect({ head: head(), pending: pending(), stages: stages() }).toEqual({ head: accepted, pending: false, stages: [] });
         expect(bot()).toMatchObject({ running: true, image: before.image, user: identity });
         expect(docker("image", "inspect", "--format", "{{.Id}}", "mixin-chatbot").out).toBe(before.image);

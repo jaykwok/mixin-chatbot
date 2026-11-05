@@ -29,7 +29,7 @@ test("two MCP servers whose names normalize alike remain independently callable 
   try {
     await mkdir(member.workspaceDir); await mkdir(member.tempDir); await manager.initialize(signal);
     const adapters = mcpMemberTools({ layout: appLayout(f.root), scope: member.scope }, manager, door);
-    const tools = adapters.map((adapter, i) => ({ name: adapter.definition.name,
+    const tools = adapters.map((adapter, i) => ({ name: adapter.registration.name,
       execute: (args: unknown) => manager.call(manager.catalogue[i]!, member, args as Record<string, unknown>, signal, dispatch => dispatch()),
     }));
     sandbox = new CodemodeSandbox({ tools });

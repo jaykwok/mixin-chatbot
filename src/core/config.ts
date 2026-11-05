@@ -31,7 +31,7 @@ export const LAYOUT = appLayout(DATA_DIR, runtimeSetting("WORKSPACE_ROOT"));
 // ===== 服务 =====
 export const PORT = integerEnv("BOT_PORT");
 /**
- * HTTP 只供本机的 TUI、/health 与 /_admin/shutdown：配置只接受回环地址。rootless 容器的端口发布要求容器内监听全部
+ * HTTP 只供本机的控制台、/health 与 /_admin/shutdown：配置只接受回环地址。rootless 容器的端口发布要求容器内监听全部
  * 地址，这由部署脚本设置 BOT_CONTAINER_BIND_ALL=1 决定（宿主只发布到 127.0.0.1），不来自用户配置。
  */
 export const HOST = process.env.BOT_CONTAINER_BIND_ALL === "1" ? "0.0.0.0" : runtimeSetting("BOT_HOST") || RUNTIME_DEFAULTS.BOT_HOST;
@@ -48,8 +48,6 @@ export const SHUTDOWN_TIMEOUT_MS = integerEnv("BOT_SHUTDOWN_TIMEOUT_SECONDS") * 
 // ===== 出站文件 =====
 export const ATTACHMENT_HTTP_TIMEOUT = 60_000;
 export { NATIVE_FILE_MAX_BYTES } from "./transfer-limits.ts";
-/** 外链分发总预算，包含快照、等锁、探测和 PUT；同时受整轮任务和 /stop 取消约束。 */
-export { RELAY_HTTP_TIMEOUT } from "./transfer-limits.ts";
 
 // ===== 入站 =====
 /** phone 合法字符集（用作群内用户目录名，同时防路径穿越）。 */
@@ -60,6 +58,11 @@ export const MAX_CONTENT_LENGTH = 16 * 1024;
 export const MEMBER_IDLE_MS = 30_000;
 /** 后台维护（空间回收、记录过期、附件过期）的间隔。 */
 export const MAINTENANCE_INTERVAL_MS = 300_000;
+/**
+ * “收到，正在处理”的间隔（BOT_ACKNOWLEDGE_IDLE_MINUTES，默认 30 分钟，0 关闭）：单聊里成员第一次提问或这么久没有对话时
+ * 先回一句；群里从回过这句的那条提问算起，这段时间内群里任何人的提问都不再回。上限 1440 分钟与回执、请求记录的保留期一致。
+ */
+export const ACKNOWLEDGE_IDLE_MS = integerEnv("BOT_ACKNOWLEDGE_IDLE_MINUTES") * 60_000;
 /** 已确认但尚未完成清理的 Pi 后台任务总数；超限时提示用户稍后重发。 */
 export const MAX_ACTIVE_REQUESTS = integerEnv("BOT_MAX_ACTIVE_REQUESTS");
 
@@ -91,9 +94,3 @@ export const DOCUMENT_TOOLCHAIN_PACKAGES: readonly string[] = documentPackages(r
 ));
 /** 建环境、装包与验证的总时限（ms）；失败由能力工具明确返回。 */
 export const DOCUMENT_TOOLCHAIN_TIMEOUT = 10 * 60_000;
-
-// ===== 日志 =====
-export const LOG_DIR = "logs";
-export const LOG_FILE = "mixin-chatbot.log";
-export const LOG_MAX_BYTES = 5 * 1024 ** 2; // 5MB
-export const LOG_BACKUP_COUNT = 3;

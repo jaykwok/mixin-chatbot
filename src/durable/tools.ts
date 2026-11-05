@@ -1,11 +1,10 @@
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { copyJson, type Context, type JsonValue } from "@earendil-works/chord";
-import {
-  type AgentToolResult, type ExtensionToolContext, type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
 import { defineExtension, type Extension, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration } from "@earendil-works/pi-durable";
-import { buildDocumentEnvironmentTool, buildDocumentTool } from "../agent/document-extract.ts";
+import type { CodemodeNamespace } from "@earendil-works/pi-durable/codemode";
+import type { Static } from "@earendil-works/pi-schema";
+import { documentTools } from "../agent/document-extract.ts";
 import { nativeBaseTools } from "./base-tools.ts";
 import { createMemberEnv } from "./member-env.ts";
 import { parseScopeKey, requestTmp, scopeKey, userTmp, type Layout, type Scope } from "../core/layout.ts";
@@ -62,29 +61,41 @@ export interface MemberCall {
   /** The Durable invocation: a model's call, or the codemode call a script's sub-call belongs to. */
   readonly api: Pick<ToolExecutionApi, "conversationId" | "taskId" | "snapshot" | "agent" | "models" | "commit">;
   readonly context: Context;
-  /** The call ID the official tool gets: the model's, or `<codemode call ID>/<n>` for a sub-call. */
+  /** The tool call's ID: the model's, or `<codemode call ID>/<n>` for a sub-call. */
   readonly callId: string;
   readonly signal: AbortSignal | undefined;
-  /** Raw bash output as it arrives. Must not throw. */
-  readonly onBashOutput?: (data: Buffer) => void;
 }
 
-/** A tool as the catalogue shows it (official definition fields), runnable for the calling member. */
-export interface AdaptedMemberTool extends Policy {
-  readonly definition: ToolDefinition;
-  /**
-   * Check the caller's identity and run the official tool for that member, returning its whole result (including
-   * `structuredContent`). Throws for refusals and failures; arguments are expected validated.
-   */
-  run(args: unknown, call: MemberCall): Promise<AgentToolResult<unknown>>;
-}
+/** The calling member, resolved from the conversation's identity. */
+export interface Member { phone: string; places: MemberPlaces; conversationId: MemberCall["api"]["conversationId"] }
 
-export type MemberTool = AdaptedMemberTool | {
-  readonly definition: Pick<ToolDefinition, "name" | "description" | "parameters" | "namespace" | "exposure">;
-  readonly native: ToolRegistration;
-  readonly replay: "safe" | "unsafe";
-  readonly outputLimits: NonNullable<ToolRegistration["outputLimits"]>;
+/** Groups tools in the `codemode` section and for `searchTools()` (./codemode/index.ts); the tool's name is the prefix. */
+export type ToolNamespace = Omit<CodemodeNamespace, "prefix">;
+
+/**
+ * What a member tool returns: Durable's result, with `structuredOutput` and `details` any JSON data (copied, undefined
+ * properties dropped). `structuredOutput` is kept only for a tool that declares `structuredOutputSchema`.
+ */
+export type MemberToolResult = Omit<ToolExecutionResult, "structuredOutput" | "details"> & {
+  readonly structuredOutput?: unknown;
+  readonly details?: unknown;
 };
+
+/**
+ * A tool of the space's members: its Durable registration fields (`callers` and `deferred` say who may call it) and how
+ * it runs for the calling member. `args` are validated against `parameters` and typed by them; `run` throws for refusals
+ * and failures, which become an error result.
+ */
+export type MemberToolSpec<P extends object = object> = Omit<ToolRegistration<P>, "execute" | "replay" | "outputLimits"> & {
+  readonly namespace?: ToolNamespace;
+  run(args: Static<P>, member: Member, call: MemberCall): Promise<MemberToolResult>;
+};
+
+/** A tool as the registry installs it, with the namespace the `codemode` section groups it by. */
+export interface MemberTool {
+  readonly registration: ToolRegistration;
+  readonly namespace?: ToolNamespace;
+}
 
 function json(value: unknown): JsonValue | undefined {
   return value === undefined ? undefined : copyJson(value as JsonValue, { omitUndefinedProperties: true }) as JsonValue;
@@ -104,61 +115,6 @@ export async function resolveMember(options: Pick<BaseToolsOptions, "layout" | "
   const dirs = [places.requestDir ?? places.tempDir, resolve(options.layout.index), ...options.layout.externalWorkspace ? [] : [places.workspaceDir]];
   for (const dir of dirs) await mkdir(dir, { recursive: true });
   return { phone: identity.phone, places };
-}
-
-/** The calling member, resolved from the conversation's identity. */
-export interface Member { phone: string; places: MemberPlaces; conversationId: MemberCall["api"]["conversationId"] }
-
-/** Builds the calling member's tools for one call; the one with the definition's name runs. */
-export type MemberToolBuilder = (member: Member, call: MemberCall) => ToolDefinition[] | Promise<ToolDefinition[]>;
-
-/**
- * A tool the catalogue shows as `definition`, run for the calling member: identity check, the member's places, then the
- * tool `build` makes for that member. Definitions must not depend on the member (tests check the catalogue against a
- * member's tools).
- */
-export function memberTool(definition: ToolDefinition, options: Pick<BaseToolsOptions, "layout" | "scope" | "venvDir">,
-  build: MemberToolBuilder): AdaptedMemberTool {
-  const policy = POLICY[definition.name] ?? OTHER_POLICY;
-  return {
-    definition,
-    ...policy,
-    async run(args, call) {
-      const { phone, places } = await resolveMember(options, call);
-      const tools = await build({ phone, places, conversationId: call.api.conversationId }, call);
-      const tool = tools.find((candidate) => candidate.name === definition.name);
-      if (tool === undefined) throw new Error(`tool ${definition.name} missing for the member`);
-      const agent = await call.api.agent(call.context);
-      const model = agent.model === undefined ? undefined : call.api.models.getModel(agent.model.provider, agent.model.modelId);
-      const ctx = { cwd: places.workspaceDir, model } as unknown as ExtensionToolContext;
-      return tool.execute(call.callId, args as never, call.signal, undefined, ctx);
-    },
-  };
-}
-
-/** Places that only fill a definition's builder; nothing runs there. */
-const CATALOGUE_PLACES: MemberPlaces = { workspaceDir: "catalogue", tempDir: "catalogue", indexPath: "catalogue", venvDir: "catalogue" };
-
-/** document_environment and document_extract (`mixin.base`), built per call for the member's places. */
-export function documentMemberTools(options: BaseToolsOptions): MemberTool[] {
-  const build = ({ places }: Member) => [buildDocumentEnvironmentTool(places.venvDir), buildDocumentTool(places)];
-  return build({ phone: "", places: CATALOGUE_PLACES, conversationId: 0 as Member["conversationId"] })
-    .map((definition) => memberTool(definition, options, build));
-}
-
-/**
- * Who may call a tool, from its coding-agent exposure: direct tools both the model and scripts (`executeTool()`),
- * model-only tools (send_*) only the model, script-only tools only scripts. A deferred tool is script-only and left out
- * of the codemode section's declarations: scripts find it with `searchTools()`.
- */
-export function callersOf(definition: Pick<ToolDefinition, "name" | "exposure">): Pick<ToolRegistration, "callers" | "deferred"> {
-  switch (definition.exposure ?? "direct") {
-    case "direct": return {};
-    case "model-only": return { callers: ["model"] };
-    case "codemode": return { callers: ["tools"] };
-    case "deferred": return { callers: ["tools"], deferred: true };
-    default: throw new Error(`tool ${definition.name}: exposure ${definition.exposure} has no Durable registration`);
-  }
 }
 
 /** The call ID of the tool call a nested call belongs to (`<parent>/<key>`), or undefined for a model's call. */
@@ -190,33 +146,21 @@ async function sequentialTurn(key: string, signal: AbortSignal | undefined): Pro
 }
 
 /**
- * The Durable registration of a member tool: what the model and scripts call. A tool's `outputSchema` is its
- * `structuredOutputSchema` and its `structuredContent` the `structuredOutput` scripts get (bash's exit code and output,
- * an MCP tool's declared value); a schema-less tool's scripts get its output.
+ * The Durable registration of a member tool: what the model and scripts call. Each call checks the caller's identity,
+ * resolves the member's places, then runs the tool for that member under the command log's label. `structuredOutput`
+ * is what scripts get from a tool with `structuredOutputSchema` (a schema-less tool's scripts get its output).
  */
-export function memberRegistration(tool: MemberTool): ToolRegistration {
-  if ("native" in tool) return tool.native;
-  const { definition } = tool;
-  const schema = definition.outputSchema;
-  const sequential = definition.executionMode === "sequential";
-  return {
-    name: definition.name,
-    description: definition.description,
-    parameters: definition.parameters,
-    // A pi-ai Tool field: it enters the transcript declaration and the request.
-    ...(definition.constrainedSampling === undefined ? {} : { constrainedSampling: definition.constrainedSampling }),
-    ...callersOf(definition),
-    replay: tool.replay,
-    outputLimits: tool.outputLimits,
-    ...(schema === undefined ? {} : { structuredOutputSchema: schema }),
-    ...(definition.executionMode === undefined ? {} : { executionMode: definition.executionMode }),
-    ...(definition.prepareArguments === undefined ? {} : { prepareArguments: definition.prepareArguments }),
-    async execute(args: unknown, api: ToolExecutionApi, context: Context): Promise<ToolExecutionResult> {
+export function memberTool<P extends object>(spec: MemberToolSpec<P>, options: Pick<BaseToolsOptions, "layout" | "scope" | "venvDir">): MemberTool {
+  const { namespace, run, ...fields } = spec;
+  const schema = spec.structuredOutputSchema;
+  const sequential = spec.executionMode === "sequential";
+  const registration: ToolRegistration = {
+    ...fields as Omit<ToolRegistration, "execute">,
+    ...POLICY[spec.name] ?? OTHER_POLICY,
+    async execute(args, api, context) {
       const signal = context.abortSignal;
       const parent = sequential ? parentCallOf(api.callId) : undefined;
       const release = parent === undefined ? undefined : await sequentialTurn(`${api.conversationId}:${parent}`, signal);
-      // Output arriving after the call settled is dropped (`api.output` rejects then); a throw here would stop the command.
-      const output = (data: string | Uint8Array) => { try { api.output(data); } catch {} };
       try {
         signal?.throwIfAborted();
         let label = "成员未知";
@@ -225,31 +169,36 @@ export function memberRegistration(tool: MemberTool): ToolRegistration {
           const space = identity?.phone ? parseScopeKey(identity.space) : undefined;
           if (space) label = memberTaskText(space, identity!.phone);
         } catch { /* Diagnostic identity must not change tool failure semantics. */ }
-        const scope = { tool: definition.name, toolTask: api.taskId as number, describe: async () => label };
-        const result = await commandScope.run(scope, () => tool.run(args, { api, context, callId: api.callId, signal, onBashOutput: output }));
-        const details = json(result.details);
-        const structured = schema === undefined ? undefined : json(result.structuredContent);
+        const scope = { tool: spec.name, toolTask: api.taskId as number, describe: async () => label };
+        const { structuredOutput, details, ...result } = await commandScope.run(scope, async () => {
+          const { phone, places } = await resolveMember(options, { api, context });
+          return run(args as Static<P>, { phone, places, conversationId: api.conversationId }, { api, context, callId: api.callId, signal });
+        });
+        const copied = json(details);
+        const structured = schema === undefined ? undefined : json(structuredOutput);
         return {
-          output: result.content,
+          ...result,
           ...(structured === undefined ? {} : { structuredOutput: structured }),
-          ...(details === undefined ? {} : { details }),
-          ...(result.isError ? { isError: true } : {}),
-          ...(result.usage === undefined ? {} : { usage: result.usage }),
-          ...(result.terminate ? { control: { terminate: true } } : {}),
+          ...(copied === undefined ? {} : { details: copied }),
         };
       } catch (error) {
         if (signal?.aborted) throw error;
         return { output: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true };
       } finally { release?.(); }
     },
-  } as ToolRegistration;
+  };
+  return { registration, ...(namespace === undefined ? {} : { namespace }) };
+}
+
+/** document_environment and document_extract (`mixin.base`). */
+export function documentMemberTools(options: BaseToolsOptions): MemberTool[] {
+  return documentTools().map((spec) => memberTool(spec, options));
 }
 
 /** The four tools for the space's members, in catalogue order. */
 export function baseMemberTools(options: BaseToolsOptions): MemberTool[] {
   return nativeBaseTools().map(official => {
-    const policy = POLICY[official.name]!;
-    const native: ToolRegistration = { ...official, ...policy, async execute(args, api, context) {
+    const registration: ToolRegistration = { ...official, ...POLICY[official.name]!, async execute(args, api, context) {
       const { phone, places } = await resolveMember(options, { api, context });
       const env = await createMemberEnv({ ...places, materialsIndexPath: places.indexPath, phone, scope: options.scope,
         resourceReadDirs: options.resourceReadDirs, inputPaths: (args as { input_paths?: string[] }).input_paths });
@@ -257,13 +206,8 @@ export function baseMemberTools(options: BaseToolsOptions): MemberTool[] {
       const scope = { tool: official.name, toolTask: api.taskId as number, describe: async () => label };
       return commandScope.run(scope, () => official.execute(args, { ...api, env }, context));
     } };
-    return { definition: official, native, ...policy };
+    return { registration };
   });
-}
-
-/** The registrations, in catalogue order. */
-export function baseTools(options: BaseToolsOptions): ToolRegistration[] {
-  return baseMemberTools(options).map(memberRegistration);
 }
 
 /**
@@ -271,5 +215,5 @@ export function baseTools(options: BaseToolsOptions): ToolRegistration[] {
  * document_extract, src/durable/registry.ts).
  */
 export function baseExtension(options: BaseToolsOptions, extra: readonly MemberTool[] = []): Extension {
-  return defineExtension({ name: "mixin.base", tools: [...baseTools(options), ...extra.map(memberRegistration)] });
+  return defineExtension({ name: "mixin.base", tools: [...baseMemberTools(options), ...extra].map((tool) => tool.registration) });
 }

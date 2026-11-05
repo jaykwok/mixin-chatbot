@@ -39,7 +39,6 @@ export class ReceiptSweep {
       // An archived receipt is the archive's ownership record: plan replay and `discardArchive` still need it.
       if (receipt.phase === "archived") continue;
       if (receipt.phase === "removed") {
-        if (receipt.role === undefined) continue; // Old receipts do not distinguish external result ownership.
         await this.queue.run(id, async () => {
           if ((await this.control.load(id)).phase !== "removed") throw new Error("回收回执状态已变化");
           await unlink(join(this.control.root, "receipts", name));

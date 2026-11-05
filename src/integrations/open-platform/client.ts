@@ -111,6 +111,8 @@ export interface RequestOptions {
   readonly label?: string;
   /** 每次真正发起 HTTP 请求前调用；之后的中止意味着平台可能已经收到。 */
   readonly onSent?: () => void;
+  /** 刚结束的这次请求确定没有被平台处理（鉴权拒绝、429、连接失败），接下来等待重试：此时的中止不算平台可能已收到。 */
+  readonly onUnsent?: () => void;
 }
 
 export interface ClientOptions {
@@ -243,11 +245,12 @@ export class PlatformClient {
           tokens.invalidate(token);
           authRetried = true;
           log.warn(`${label}：平台返回 401，重新换取 token`);
+          options.onUnsent?.();
           continue;
         }
         if (response.status === 429) {
           const delay = this.noteRateLimit(response.headers);
-          if (attempt < this.#retryDelays.length) { attempt++; await this.sleep(delay, options.signal); continue; }
+          if (attempt < this.#retryDelays.length) { attempt++; options.onUnsent?.(); await this.sleep(delay, options.signal); continue; }
           return result;
         }
         if (options.idempotent && response.status >= 500 && attempt < this.#retryDelays.length) {
@@ -263,6 +266,7 @@ export class PlatformClient {
       }
       if ((options.idempotent || failure.kind === "unsent") && attempt < this.#retryDelays.length) {
         log.warn(`${failure.message}，稍后重试`);
+        if (failure.kind === "unsent") options.onUnsent?.();
         await this.sleep(this.#retryDelays[attempt++]!, options.signal);
         continue;
       }

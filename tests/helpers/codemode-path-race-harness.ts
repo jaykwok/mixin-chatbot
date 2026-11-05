@@ -13,11 +13,11 @@ import { mock } from "bun:test";
 import * as fs from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { createModels, Type } from "@earendil-works/pi-ai";
+import { createModels } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type Conversation, defineExtension } from "@earendil-works/pi-durable";
-import type { MemberTool } from "../../src/durable/tools.ts";
+import { obj } from "@earendil-works/pi-schema";
+import type { MemberToolSpec } from "../../src/durable/tools.ts";
 import { junctionInPlace } from "./junction-in-place.ts";
 
 const actual = { ...fs };
@@ -77,7 +77,7 @@ mock.module("node:fs/promises", () => ({ ...actual,
 const { codemodeExtension } = await import("../../src/durable/codemode/index.ts");
 const { resultsRoot } = await import("../../src/durable/results/files.ts");
 const { memberConversation } = await import("../../src/durable/identity.ts");
-const { baseMemberTools, memberPlaces, memberRegistration } = await import("../../src/durable/tools.ts");
+const { baseMemberTools, memberPlaces, memberTool } = await import("../../src/durable/tools.ts");
 const { openGroupHarness } = await import("./durable.ts");
 const { appLayout, groupScope } = await import("../../src/core/layout.ts");
 
@@ -92,21 +92,9 @@ const BOB_FILES = ["keep.txt", "output.txt", "image-1.gif"];
 /** Where the same-inode scenarios move Alice's call directory (or file), in Bob's tmp. */
 const MOVED_INTO_BOB = "moved-alice";
 
-function probe(name: string, run: () => AgentToolResult<unknown> | Promise<AgentToolResult<unknown>>, definition: Partial<ToolDefinition> = {}): MemberTool {
-  return {
-    definition: {
-      name, label: name, description: `Fixture tool ${name}.`, exposure: "codemode",
-      parameters: Type.Object({}, { additionalProperties: true }),
-      execute: async () => { throw new Error("fixture tools run through MemberTool.run"); },
-      ...definition,
-    } as ToolDefinition,
-    replay: "unsafe",
-    outputLimits: { maxBytes: 64 * 1024, maxLines: 2200 },
-    run: async () => run(),
-  };
-}
-// A nested call's value goes to the script only: it saves no file of its own.
-const tools = [probe("probe_long", () => ({ content: [{ type: "text", text: "长".repeat(400) }], details: undefined }))];
+/** A script-only fixture tool. A nested call's value goes to the script only: it saves no file of its own. */
+const probeLong: MemberToolSpec = { name: "probe_long", description: "Fixture tool probe_long.", callers: ["tools"],
+  parameters: obj({}, { open: true }), run: async () => ({ output: [{ type: "text", text: "长".repeat(400) }] }) };
 
 let groups = 0;
 async function group() {
@@ -117,9 +105,10 @@ async function group() {
   const model = faux.getModel();
   const base = { layout: appLayout(join(root, `group-${n}`)), scope: GROUP };
   const members = baseMemberTools(base);
+  const tools = [memberTool(probeLong, base)];
   const extensions = [
-    defineExtension({ name: "mixin.base", tools: members.map(memberRegistration) }),
-    defineExtension({ name: "fixture.module", tools: tools.map(memberRegistration) }),
+    defineExtension({ name: "mixin.base", tools: members.map((tool) => tool.registration) }),
+    defineExtension({ name: "fixture.module", tools: tools.map((tool) => tool.registration) }),
     codemodeExtension({ members: base, tools: [...members, ...tools] }),
   ];
   const opened = await openGroupHarness(join(root, `db-${n}.sqlite`), models, { scope: GROUP, extensions, settings: { retry: { baseDelayMs: 5, maxAgentDelayMs: 20 } } });

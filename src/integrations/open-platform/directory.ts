@@ -2,8 +2,8 @@
 import { createDecipheriv, createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { AsyncSemaphore } from "../../core/async-semaphore.ts";
 import { accepted, PlatformRequestError, responseData, type ApiResponse, type PlatformClient } from "./client.ts";
+import { ROOT_DEPARTMENT } from "./directory-scope.ts";
 
-export const ROOT_DEPARTMENT = "1";
 export const DEPARTMENT_PAGE_SIZE = 32;
 export const MEMBER_PAGE_SIZE = 100;
 
@@ -32,7 +32,7 @@ export interface DirectoryMember {
 export interface DepartmentInfo {
   readonly id: string;
   readonly name: string;
-  /** 部门完整路径（只有部门详情接口返回）。 */
+  /** 部门完整路径，各级用“/”分隔（只有部门详情接口返回）。 */
   readonly fullName?: string;
   /** 上级部门 ID，根部门为 "0"（只有部门详情接口返回）。 */
   readonly parentId?: string;
@@ -89,9 +89,9 @@ export class DirectoryClient {
   readonly #lookups = new AsyncSemaphore(DESCRIBE_CONCURRENCY);
   constructor(private readonly client: PlatformClient) {}
 
-  async departments(deptId: string, page: number, signal?: AbortSignal): Promise<Page<string>> {
-    const { items, totalPages } = await this.#children(deptId, page, signal);
-    return { items: items.map(item => item.id), totalPages };
+  /** 直属子部门的一页，带名称（通讯录扫描用，部门树记下名称）。 */
+  async departments(deptId: string, page: number, signal?: AbortSignal): Promise<Page<DepartmentInfo>> {
+    return this.#children(deptId, page, signal);
   }
 
   /** 直属子部门的全部分页，带名称和人数。 */
@@ -108,7 +108,8 @@ export class DirectoryClient {
     const info = departmentInfo(plain);
     if (!info || info.id !== deptId) throw new PlatformRequestError("部门详情与查询不符", "rejected");
     const parent = plain.parent_id;
-    return { ...info, ...(typeof plain.full_name === "string" && plain.full_name ? { fullName: plain.full_name } : {}),
+    // The platform separates the levels with "|"; the department tree joins its subdepartments with "/", and so do people.
+    return { ...info, ...(typeof plain.full_name === "string" && plain.full_name ? { fullName: plain.full_name.replaceAll("|", "/") } : {}),
       ...((typeof parent === "string" && parent) || typeof parent === "number" ? { parentId: String(parent) } : {}) };
   }
 
@@ -221,7 +222,8 @@ export class DirectoryClient {
   async detailByPhone(phone: string, signal?: AbortSignal): Promise<PhoneDetail> {
     const plain = await this.#open("/open/applied/v1/user/detailByPhone", { loginId: phone }, "address", signal);
     const imUserId = plain.imUserId;
-    if (typeof imUserId !== "string" || !imUserId) throw new PlatformRequestError("detailByPhone 未返回 imUserId", "rejected");
+    // 答复本身正常（2xx、验签解密通过），只是这个号码没有平台 ID：是对这个号码的明确答复（identity-directory.ts 的 memberRefusal）。
+    if (typeof imUserId !== "string" || !imUserId) throw new PlatformRequestError("detailByPhone 未返回 imUserId", "rejected", 200);
     if (plain.phone !== phone && plain.loginId !== phone) throw new PlatformRequestError("detailByPhone 返回的手机号与查询不符", "rejected");
     return { imUserId, phone, name: typeof plain.userName === "string" ? plain.userName : "" };
   }

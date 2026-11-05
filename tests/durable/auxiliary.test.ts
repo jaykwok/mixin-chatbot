@@ -2,9 +2,10 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { Type, type AssistantImages, type ClassifierModel, type ClassifierOptions, type ClassifierResult, type ImageModel, type ToolResultMessage } from "@earendil-works/pi-ai";
+import { type AssistantImages, type ClassifierModel, type ClassifierOptions, type ClassifierResult, type ImageModel, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, defineExtension, Harness, UsageDoc, type Conversation } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import { openStatsLedger, readLedger } from "../../src/agent/stats-ledger.ts";
 import { AuxiliaryBudget, auxiliaryMemberTools } from "../../src/durable/auxiliary.ts";
 import { codemodeExtension } from "../../src/durable/codemode/index.ts";
@@ -14,7 +15,7 @@ import { spaceDoor } from "../../src/durable/models.ts";
 import { syncMemberStats } from "../../src/durable/projection.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
-import { memberPlaces, memberRegistration } from "../../src/durable/tools.ts";
+import { memberPlaces, memberTool } from "../../src/durable/tools.ts";
 import { fauxModels } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { handoffFullResults, stubResultsBackend } from "../helpers/results-backend.ts";
@@ -50,12 +51,10 @@ async function setup(options: { credentials?: boolean; vision?: boolean; budget?
   const members = { layout: appLayout(root), scope: groupScope("group-a") };
   const tools = auxiliaryMemberTools(members, door, { format: 1, classifier: { provider: "aux", modelId: "route" },
     image: { provider: "aux", modelId: "image" }, maxConcurrent: 1, classifierRetries: options.retry ?? 0 }, options.budget ?? new AuxiliaryBudget(1));
-  if (options.waitForStart) tools.push({ definition: { name: "wait_for_auxiliary_start", label: "fixture barrier", description: "Wait for the synthetic provider dispatch.",
-    parameters: Type.Object({}), execute: async () => { throw new Error("Member invocation required"); } }, replay: "safe", outputLimits: { maxBytes: 1024, maxLines: 10 },
-    async run() { await options.waitForStart!(); return { content: [{ type: "text", text: "ready" }], details: undefined }; },
-  });
+  if (options.waitForStart) tools.push(memberTool({ name: "wait_for_auxiliary_start", description: "Wait for the synthetic provider dispatch.",
+    parameters: obj({}, { open: true }), async run() { await options.waitForStart!(); return { output: [{ type: "text", text: "ready" }] }; } }, members));
   const registry = createRegistry();
-  registry.install(defineExtension({ name: "mixin.auxiliary", tools: tools.map(memberRegistration) }));
+  registry.install(defineExtension({ name: "mixin.auxiliary", tools: tools.map((tool) => tool.registration) }));
   registry.install(codemodeExtension({ members, tools }));
   const view = door.wrap(models), path = join(f.root, `db-${n}.sqlite`);
   const harness = await Harness.open(await openGroupStorage(path), { registry, models: view, settings: { compaction: { enabled: false }, retry: { maxRetries: 0 } } }, context);

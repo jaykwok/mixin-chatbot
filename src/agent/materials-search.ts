@@ -1,7 +1,7 @@
 import { lstat, open, realpath, stat } from "node:fs/promises";
 import { extname, resolve } from "node:path";
-import { Type } from "@earendil-works/pi-ai";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { arr, int, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
+import type { MemberToolSpec } from "../durable/tools.ts";
 import { materialsRecords, loadIgnorePrefixes, isIgnored } from "./materials-index.ts";
 import { createDocumentTextLookup, type DocumentOptions } from "./document-extract.ts";
 import { isPathInside } from "../contracts/paths.ts";
@@ -11,7 +11,11 @@ import { log } from "../core/log.ts";
 
 const plain = new Set([".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".log", ".yaml", ".yml", ".ini", ".rst"]);
 const binary = new Set([".docx", ".pptx", ".xlsx", ".pdf"]);
-const keywords = Type.Array(Type.String({ minLength: 1, maxLength: 100 }), { minItems: 1, maxItems: 10 });
+const keywords = arr(str({ minLength: 1, maxLength: 100 }), { minItems: 1, maxItems: 10 });
+const mode = oneOf(["any", "all"]);
+const findParams = obj({ keywords: opt(keywords), mode: opt(mode), limit: opt(int({ minimum: 1, maximum: 200, default: 50 })) }, { open: true });
+const grepParams = obj({ keywords, mode: opt(mode), paths: opt(arr(str({ maxLength: 1000 }), { maxItems: 200 })),
+  limit: opt(int({ minimum: 1, maximum: 50, default: 20 })) }, { open: true });
 function matches(value: string, terms: string[], mode = "any") {
   const text = value.toLocaleLowerCase(), hits = terms.map(term => text.includes(term.toLocaleLowerCase()));
   return mode === "all" ? hits.every(Boolean) : hits.some(Boolean);
@@ -36,39 +40,35 @@ async function boundedText(path: string, signal: AbortSignal): Promise<string> {
   } finally { await file.close(); }
 }
 
-/** All work stays in this process. Cache misses are returned, never silently turned into parser jobs. */
-export function buildMaterialsTools(options: DocumentOptions & { ignorePath: string }): ToolDefinition[] {
-  const findParams = Type.Object({ keywords: Type.Optional(keywords), mode: Type.Optional(Type.Union([Type.Literal("any"), Type.Literal("all")])),
-    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, default: 50 })) });
-  const grepParams = Type.Object({ keywords, mode: Type.Optional(Type.Union([Type.Literal("any"), Type.Literal("all")])),
-    paths: Type.Optional(Type.Array(Type.String({ maxLength: 1000 }), { maxItems: 200 })),
-    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, default: 20 })) });
-  async function index() {
-    const indexed = await materialsRecords(options), ignored = await loadIgnorePrefixes(options.ignorePath);
+/**
+ * materials_find and materials_grep over the calling member's workspace and index; `ignorePath` is the administrator's
+ * ignore list. All work stays in this process. Cache misses are returned, never silently turned into parser jobs.
+ */
+export function materialsTools(ignorePath: string): MemberToolSpec[] {
+  async function index(options: DocumentOptions) {
+    const indexed = await materialsRecords({ ...options, ignorePath }), ignored = await loadIgnorePrefixes(ignorePath);
     return { ...indexed, entries: indexed.entries.filter(x => safeName(x.path) && !isIgnored(x.path, ignored)) };
   }
-  const find: ToolDefinition<typeof findParams> = {
-    name: "materials_find", label: "查找资料文件", parameters: findParams,
+  const find: MemberToolSpec<typeof findParams> = {
+    name: "materials_find", parameters: findParams,
     description: "在共享资料索引内按文件名/路径的字面关键词查找（不启动进程）。返回相对路径、字节数、修改时间及索引完整性；any 任一关键词、all 全部关键词。索引可能滞后，未命中不代表不存在。",
-    annotations: { readOnlyHint: true, openWorldHint: false },
-    async execute(_id, params, signal) {
+    async run(params, { places }, { signal }) {
       const started = performance.now();
       signal?.throwIfAborted();
-      const data = await index(), all = data.entries.filter(x => !params.keywords?.length || matches(x.path, params.keywords, params.mode));
+      const data = await index(places), all = data.entries.filter(x => !params.keywords?.length || matches(x.path, params.keywords, params.mode));
       const value = { files: all.slice(0, params.limit ?? 50), totalMatched: all.length, generatedAt: data.summary.generatedAt,
         stale: data.stale, truncated: data.summary.truncated || all.length > (params.limit ?? 50) };
       searchTiming(started, data.entries.length, value.files.length);
-      return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
+      return { output: [{ type: "text", text: JSON.stringify(value) }], details: value };
     },
   };
-  const grep: ToolDefinition<typeof grepParams> = {
-    name: "materials_grep", label: "检索资料正文", parameters: grepParams,
-    description: "在共享资料的纯文本及有效的 document_extract 缓存中检索字面关键词，any 任一命中、all 同一行全部命中；返回文件、行号、前后文。不会启动解析或其他进程。缓存缺失/失效返回 notIndexed，请先单独 document_extract，再检索。最多 15 秒、16 KiB 结果，每文件最多 5 个命中。",
-    annotations: { readOnlyHint: true, openWorldHint: false },
-    async execute(_id, params, callerSignal) {
+  const grep: MemberToolSpec<typeof grepParams> = {
+    name: "materials_grep", parameters: grepParams,
+    description: "在共享资料的纯文本及有效的 document_extract 缓存中检索字面关键词，any 任一命中、all 同一行全部命中；返回文件、行号、前后文。不会启动解析或其他进程。缓存缺失/失效返回 notIndexed，请先单独 document_extract，再检索。最多 15 秒、12 KB 结果，每文件最多 5 个命中。",
+    async run(params, { places: options }, { signal: callerSignal }) {
       const started = performance.now();
       const budget = AbortSignal.timeout(15_000), signal = AbortSignal.any([budget, ...(callerSignal ? [callerSignal] : [])]);
-      const data = await index(), root = await realpath(options.workspaceDir);
+      const data = await index(options), root = await realpath(options.workspaceDir);
       const wanted = params.paths?.map(x => resolve(root, x));
       if (wanted?.some(x => !isPathInside(x, root))) throw new Error("只能检索共享资料索引中的路径");
       const entries = data.entries.filter(x => !wanted || wanted.includes(resolve(root, x.path)));
@@ -122,7 +122,7 @@ export function buildMaterialsTools(options: DocumentOptions & { ignorePath: str
       const value = { hits, notIndexed, notIndexedCount: missingCount, scanned, unscanned: Math.max(0, entries.length - scanned), incomplete,
         stale: data.stale, generatedAt: data.summary.generatedAt };
       searchTiming(started, scanned, hits.length);
-      return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
+      return { output: [{ type: "text", text: JSON.stringify(value) }], details: value };
     },
   };
   return [find, grep];

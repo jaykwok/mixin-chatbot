@@ -108,7 +108,7 @@ export async function previewReclamation(options: ReclamationOptions, days: numb
   const value = { version: 1 as const, id: requestedId ?? randomUUID(), root, recordedRoot: options.recordedRoot ?? root, rootIdentity: await identity(root), legacy: !!options.legacy, createdAt, before, items };
   const plan: ReclamationPlan = { ...value, digest: planDigest(value) };
   if (Buffer.byteLength(JSON.stringify(plan)) > 32 * 1024 * 1024) throw new Error("回收清单超过 32 MiB，请限定群或成员");
-  // A caller-chosen ID (the TUI reads the plan back by it) never replaces an existing plan.
+  // A caller-chosen ID (the console reads the plan back by it) never replaces an existing plan.
   if (requestedId !== undefined && await exists(join(directory, plan.id + ".json"))) throw new Error("回收清单 ID 已存在");
   await publishJson(join(directory, plan.id + ".json"), plan); return plan;
 }

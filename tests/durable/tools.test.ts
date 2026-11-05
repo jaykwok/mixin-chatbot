@@ -16,7 +16,7 @@ import {
 import { nativeBaseTools, bashToolNote } from "../../src/durable/base-tools.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { IdentityDoc, memberConversation } from "../../src/durable/identity.ts";
-import { baseExtension, baseTools, type BaseToolsOptions, memberPlaces, memberRegistration } from "../../src/durable/tools.ts";
+import { baseExtension, baseMemberTools, type BaseToolsOptions, memberPlaces, memberTool } from "../../src/durable/tools.ts";
 import { clearRunning, markRunning } from "../../src/durable/running-requests.ts";
 import { runProcess, timedCommand } from "../../src/core/process.ts";
 import { log } from "../../src/core/log.ts";
@@ -130,7 +130,7 @@ function png(width: number, height: number): Buffer {
 describe("Durable base tools", () => {
   test("registrations: the catalogue equals the member's tools; replay, output limits, constrained sampling", async () => {
     const options: BaseToolsOptions = { layout: appLayout(join(fixture.root, "目录")), scope: SPACE };
-    const registered = baseTools(options);
+    const registered = baseMemberTools(options).map((tool) => tool.registration);
     expect(registered.map((tool) => tool.name)).toEqual(["read", "bash", "edit", "write"]);
     const limits = { maxBytes: 64 * 1024, maxLines: 2200 };
     expect(Object.fromEntries(registered.map((tool) => [tool.name, { replay: tool.replay, outputLimits: tool.outputLimits }]))).toEqual({
@@ -348,13 +348,13 @@ describe("Durable base tools", () => {
     const info = spyOn(log, "info").mockImplementation(line => { lines.push(line); });
     markRunning(SPACE, BOB, "original");
     try {
-      const registration = memberRegistration({ definition: { name: "probe", description: "probe", parameters: {} } as never,
-        replay: "safe", outputLimits: {} as never, async run() {
-          markRunning(SPACE, BOB, "next");
-          await timedCommand(async () => ({ exitCode: 0 }));
-          return { content: [{ type: "text", text: "ok" }], details: undefined };
-        } });
-      const api = { taskId: 9, callId: "call", conversationId: 1, output() {}, snapshot: async () => ({ phone: BOB, space: `group:${GROUP}` }) };
+      const { registration } = memberTool({ name: "probe", description: "probe", parameters: {}, async run() {
+        markRunning(SPACE, BOB, "next");
+        await timedCommand(async () => ({ exitCode: 0 }));
+        return { output: [{ type: "text", text: "ok" }] };
+      } }, { layout: appLayout(join(fixture.root, "probe")), scope: SPACE });
+      const api = { taskId: 9, callId: "call", conversationId: 1, output() {},
+        snapshot: async (doc: unknown) => doc === IdentityDoc ? { phone: BOB, space: `group:${GROUP}` } : undefined };
       await registration.execute({}, api as never, context as never);
       await Bun.sleep(0);
       expect(lines).toHaveLength(1);
@@ -366,13 +366,12 @@ describe("Durable base tools", () => {
     const lines: string[] = [];
     const info = spyOn(log, "info").mockImplementation(line => { if (line.startsWith("命令耗时")) lines.push(line); });
     try {
-      const registration = memberRegistration({ definition: { name: "probe", description: "probe", parameters: {} } as never,
-        replay: "safe", outputLimits: {} as never, async run() {
-          await runProcess({ command: process.execPath, args: ["-e", "1"], cwd: process.cwd(), timeoutMs: 30000 });
-          return { content: [{ type: "text", text: "ok" }], details: undefined };
-        } });
+      const { registration } = memberTool({ name: "probe", description: "probe", parameters: {}, async run() {
+        await runProcess({ command: process.execPath, args: ["-e", "1"], cwd: process.cwd(), timeoutMs: 30000 });
+        return { output: [{ type: "text", text: "ok" }] };
+      } }, { layout: appLayout(join(fixture.root, "probe")), scope: SPACE });
       const api = { taskId: 9, callId: "call", conversationId: 1, output() {},
-        snapshot: async () => ({ phone: BOB, space: `group:${GROUP}` }) };
+        snapshot: async (doc: unknown) => doc === IdentityDoc ? { phone: BOB, space: `group:${GROUP}` } : undefined };
       const result = await registration.execute({}, api as never, context as never);
       expect(result.isError).toBeUndefined();
       const deadline = Date.now() + 5000;
@@ -453,16 +452,19 @@ describe("Durable base tools", () => {
     } finally { await group.close(); }
   }, 90_000);
 
-  test("bash progress: running output is committed at most every outputIntervalMs; the project's 20 ms commits more often than Durable's 100 ms and gives the same result", async () => {
+  test("bash progress: running output is published at most every outputIntervalMs and stored at most every persistWithinMs; the project's 20 ms publishes more often than Durable's 100 ms and gives the same result", async () => {
     // Use the supported runtime; production images need no test-only Perl dependency.
     const executable = "'" + posix(process.execPath).replaceAll("'", "'\\''") + "'";
     const command = `${executable} -e 'for(let i=1;i<=40;i++){console.log("line-"+i);await Bun.sleep(50)}'`;
-    /** Commits of a bash call that prints 40 lines over about 2 s, beyond those of one that prints once; its result. */
+    /**
+     * A bash call that prints 40 lines over about 2 s, beyond one that prints once: the commits the conversation's
+     * observers see (progress commits are deferred, observers get each at once), the Storage commit calls, and its result.
+     */
     const measure = async (progress: ProgressPolicy) => {
-      let commits = 0;
+      let stored = 0, published = 0;
       const counting = (storage: Storage): Storage => new Proxy(storage, {
         get: (target, property) => {
-          if (property === "commit") return (...args: Parameters<Storage["commit"]>) => { commits++; return target.commit(...args); };
+          if (property === "commit") return (...args: Parameters<Storage["commit"]>) => { stored++; return target.commit(...args); };
           const value = Reflect.get(target, property, target);
           return typeof value === "function" ? value.bind(target) : value;
         },
@@ -470,22 +472,28 @@ describe("Durable base tools", () => {
       const group = await openGroup({ progress, storage: counting });
       try {
         const conversation = await member(group, ALICE);
-        let before = commits;
-        await turn(group, conversation, [fauxToolCall("bash", { command: "echo once" }, { id: "once" })]);
-        const once = commits - before;
-        before = commits;
-        const started = Date.now();
-        const t = await turn(group, conversation, [fauxToolCall("bash", { command }, { id: "stream" })]);
-        return { extra: commits - before - once, ms: Date.now() - started, text: t.results.stream!.text };
+        const observation = await group.opened.harness.observeConversation(conversation.id, { advance: () => { published++; }, end: () => {} }, context);
+        try {
+          const count = async (id: string, line: string) => {
+            const before = { stored, published }, started = Date.now();
+            const t = await turn(group, conversation, [fauxToolCall("bash", { command: line }, { id })]);
+            return { stored: stored - before.stored, published: published - before.published, ms: Date.now() - started, text: t.results[id]!.text };
+          };
+          const once = await count("once", "echo once");
+          const stream = await count("stream", command);
+          return { published: stream.published - once.published, stored: stream.stored - once.stored, ms: stream.ms, text: stream.text };
+        } finally { observation.detach(); }
       } finally { await group.close(); }
     };
     const project = await measure(PROGRESS);
     const control = await measure(DEFAULT_PROGRESS_POLICY);
     for (const [name, policy, measured] of [["project", PROGRESS, project], ["Durable default", DEFAULT_PROGRESS_POLICY, control]] as const) {
-      console.log(`bash progress, ${name} outputIntervalMs=${policy.outputIntervalMs}: ${measured.extra} more commits over ${measured.ms} ms than a one-line bash`);
-      expect(measured.extra).toBeLessThanOrEqual(Math.ceil(measured.ms / policy.outputIntervalMs) + 5);
+      console.log(`bash progress, ${name} outputIntervalMs=${policy.outputIntervalMs} persistWithinMs=${policy.persistWithinMs}: `
+        + `${measured.published} more published and ${measured.stored} more stored commits over ${measured.ms} ms than a one-line bash`);
+      expect(measured.published).toBeLessThanOrEqual(Math.ceil(measured.ms / policy.outputIntervalMs) + 5);
+      expect(measured.stored).toBeLessThanOrEqual(Math.ceil(measured.ms / policy.persistWithinMs) + 5);
     }
-    expect(project.extra).toBeGreaterThan(control.extra);
+    expect(project.published).toBeGreaterThan(control.published);
     expect(project.text).toBe(control.text);
     expect(project.text).toContain("line-1\n");
     expect(project.text).toContain("line-40");

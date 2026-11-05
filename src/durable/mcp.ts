@@ -1,11 +1,9 @@
 import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
-import { copyJson } from "@earendil-works/chord";
 import { toLlmContent } from "@earendil-works/pi-mcp";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { McpTools } from "../integrations/mcp.ts";
 import type { RequestDoor } from "./door.ts";
-import { resolveMember, type BaseToolsOptions, type MemberTool } from "./tools.ts";
+import { memberTool, type BaseToolsOptions, type MemberTool } from "./tools.ts";
 import { ResultFiles, resultsDirName } from "./results/files.ts";
 import { resultRegistration } from "./results/ownership.ts";
 
@@ -14,16 +12,12 @@ export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, doo
     const suffix = createHash("sha256").update(JSON.stringify([entry.server.name, entry.tool.name])).digest("hex").slice(0, 8);
     const serverName = entry.server.name.replaceAll("-", "_");
     const name = `mcp_${serverName}_${entry.tool.name.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 48)}_${suffix}`;
-    return {
-      definition: { name, label: entry.tool.title ?? entry.tool.name,
-        description: entry.tool.description ?? `Call ${entry.tool.name} on ${entry.server.name}.`,
-        parameters: entry.tool.inputSchema as ToolDefinition["parameters"],
-        ...(entry.tool.outputSchema ? { outputSchema: entry.tool.outputSchema as ToolDefinition["outputSchema"] } : {}),
-        namespace: { name: `mcp.${entry.server.name}`, description: "管理员批准的外部工具" }, exposure: "deferred",
-        execute: async () => { throw new Error("Member invocation required"); },
-      }, replay: "unsafe", outputLimits: { maxBytes: 65536, maxLines: 2200 },
-      async run(args, call) {
-        const { phone, places } = await resolveMember(options, call);
+    return memberTool({
+      name, description: entry.tool.description ?? `Call ${entry.tool.name} on ${entry.server.name}.`,
+      parameters: entry.tool.inputSchema,
+      ...(entry.tool.outputSchema ? { structuredOutputSchema: entry.tool.outputSchema } : {}),
+      namespace: { name: `mcp.${entry.server.name}`, description: "管理员批准的外部工具" }, callers: ["tools"], deferred: true,
+      async run(args, { phone, places }, call) {
         if (!call.signal) throw new Error("MCP 工具需要可取消的任务");
         await mkdir(places.tempDir, { recursive: true });
         const result = await manager.call(entry, { scope: options.scope, phone, workspaceDir: places.workspaceDir, tempDir: places.requestDir ?? places.tempDir },
@@ -49,10 +43,10 @@ export function mcpMemberTools(options: BaseToolsOptions, manager: McpTools, doo
             content.splice(0, content.length, { type: "text", text: `${preview}\n[Full MCP result saved to ${path}]\n${imagePaths.map(path => `Image saved to ${path}`).join("\n")}` }, ...pictures);
           }
           if ((await files.recheck()).size) throw new Error("MCP 结果目录变化，结果路径已撤回");
-          return { content, details: { server: entry.server.name, tool: entry.tool.name },
-            ...(result.structuredContent !== undefined ? { structuredContent: copyJson(result.structuredContent) } : {}), ...(result.isError ? { isError: true } : {}) };
+          return { output: content, details: { server: entry.server.name, tool: entry.tool.name },
+            ...(result.structuredContent !== undefined ? { structuredOutput: result.structuredContent } : {}), ...(result.isError ? { isError: true } : {}) };
         } finally { await files.release(); }
       },
-    } satisfies MemberTool;
+    }, options);
   });
 }

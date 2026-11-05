@@ -12,10 +12,16 @@ function load() {
 }
 
 /** Held by the parent outside the job, so helper exit alone is never proof of descendant exit. */
-export function monitorJob(name: string) {
+export function monitorJob(name: string): JobMonitor;
+export function monitorJob(name: string, optional: true): JobMonitor | null;
+export function monitorJob(name: string, optional = false): JobMonitor | null {
   const win = native ??= load(), wide = Buffer.from(name + "\0", "utf16le");
   const handle = win.OpenJobObjectW(0x4 | 0x8, 0, ptr(wide));
-  if (!handle) throw new Error(`OpenJobObjectW failed (${win.GetLastError()})`);
+  if (!handle) {
+    const code = win.GetLastError();
+    if (optional && code === 2) return null; // ERROR_FILE_NOT_FOUND only; access denied is never absence.
+    throw new Error(`OpenJobObjectW failed (${code})`);
+  }
   let closed = false, closeFailure: Error | undefined;
   return {
     active(): number {
@@ -33,3 +39,5 @@ export function monitorJob(name: string) {
     },
   };
 }
+
+export interface JobMonitor { active(): number; terminate(): void; close(): void }

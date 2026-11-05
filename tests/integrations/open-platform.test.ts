@@ -85,6 +85,7 @@ describe("stream", () => {
     stream.start();
     try {
       await until(() => fake.sockets.size === 1 && stream.status().connected);
+      expect(stream.status().lastDisconnect).toBeUndefined(); // "not connected yet" was never a disconnect
       fake.push({ eventType: "stream.validate", eventId: "v-1", appId: "62964" });
       await until(() => fake.frames.length === 1);
       expect(fake.frames[0]).toEqual({ eventType: "stream.validate.ack", eventId: "v-1", success: true });
@@ -96,6 +97,16 @@ describe("stream", () => {
       expect(events[0]!.sentAt).toBe(1234567);
       expect(events[1]!.payload.msgUid).toBe("M-3");
       expect(fake.frames.length).toBe(1);
+    } finally { await stream.stop(); }
+  });
+
+  test("a rejected token is reported once, without a doubled prefix", async () => {
+    fake.route("POST /open-apis/v1/auth/token", () => json({ error: "invalid_client" }, 401));
+    const stream = new StreamConnection(client(), { onEvent: () => {}, initialBackoffMs: 20, maxBackoffMs: 40 });
+    stream.start();
+    try {
+      await until(() => stream.status().lastDisconnect?.reason !== "尚未连接");
+      expect(stream.status().lastDisconnect?.reason).toBe("换取 token 失败：HTTP 401");
     } finally { await stream.stop(); }
   });
 
@@ -283,6 +294,26 @@ describe("sending", () => {
     expect(calls).toBe(2);
   });
 
+  test("a close during the wait after a 429 ends the send as certainly not sent", async () => {
+    const api = client(), sender = new MessageSender(api), cooling = spyOn(api, "noteRateLimit");
+    fake.route("POST /open-apis/v1/messages/v1/send", () => json({ code: 429 }, 429, { "Retry-After": "30" }));
+    const sending = sender.send(direct, textMessage("x"));
+    await until(() => cooling.mock.calls.length === 1);
+    api.close();
+    expect((await sending).status).toBe("failed");
+    expect(fake.requestsTo("/open-apis/v1/messages/v1/send")).toHaveLength(1);
+  });
+
+  test("a close while the request is out leaves the send uncertain", async () => {
+    const api = client(), sender = new MessageSender(api), release = Promise.withResolvers<void>();
+    fake.route("POST /open-apis/v1/messages/v1/send", async () => { await release.promise; return json({ success: true, code: 200 }); });
+    const sending = sender.send(direct, textMessage("x"));
+    await until(() => fake.requestsTo("/open-apis/v1/messages/v1/send").length === 1);
+    api.close();
+    expect(await sending).toEqual({ status: "uncertain", reason: "发送过程中服务关闭" });
+    release.resolve();
+  });
+
   test("limits the per-conversation rate and keeps a transaction's messages together", async () => {
     const sender = new MessageSender(client(), { perTarget: 3, global: 100, windowMs: 300 });
     const started = Date.now();
@@ -327,6 +358,54 @@ describe("files", () => {
       const complete = fake.requests.find(request => request.path.endsWith("/complete"))!;
       expect((complete.body as { fileHash: string }).fileHash).toBe(createHash("md5").update(bytes).digest("hex"));
     } finally { await fixture.cleanup(); }
+  });
+
+  test("init carries the file's MD5; a deduplicated hit returns the stored fileKey without uploading any part", async () => {
+    const fixture = await tempFixture("open-platform-");
+    try {
+      const path = join(fixture.root, "same.bin");
+      const bytes = new Uint8Array(5 * 1024 * 1024 + 99).map((_, i) => (i * 13) % 256);
+      await writeFile(path, bytes);
+      const api = client(), source = { path, fileName: "same.bin", size: bytes.byteLength, mimeType: "application/octet-stream" };
+      fake.deduplicate = true;
+      const first = await uploadFile(api, source);
+      const digest = createHash("md5").update(bytes).digest("hex");
+      const inits = () => fake.requests.filter(request => request.path === "/open-apis/v1/files/upload/init");
+      expect((inits()[0]!.body as { fileHash: string }).fileHash).toBe(digest);
+      const puts = fake.requests.filter(request => request.method === "PUT").length;
+      expect(puts).toBe(2);
+      expect(await uploadFile(api, source)).toBe(first);
+      expect((inits()[1]!.body as { fileHash: string }).fileHash).toBe(digest);
+      expect(fake.requests.filter(request => request.method === "PUT").length).toBe(puts);
+      expect(fake.uploads.size).toBe(1);
+    } finally { await fixture.cleanup(); }
+  });
+
+  test("a file that changes after it was hashed or differs from its declared size is refused; a started upload is aborted", async () => {
+    const fixture = await tempFixture("open-platform-");
+    const path = join(fixture.root, "moving.bin");
+    const bytes = Buffer.alloc(1024, 1);
+    await writeFile(path, bytes);
+    const realOpen = fs.open;
+    let opens = 0;
+    // The second open is the part upload: the file is rewritten (same size) just before it.
+    const opening = spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      if (String(args[0]) === path && ++opens === 2) await writeFile(path, Buffer.alloc(1024, 2));
+      return realOpen(...args);
+    });
+    try {
+      const api = client();
+      await expect(uploadFile(api, { path, fileName: "moving.bin", size: 1024, mimeType: "application/octet-stream" })).rejects.toThrow("上传期间文件被改动");
+      const [id] = [...fake.uploads.keys()];
+      expect(fake.uploads.get(id!)!.completed).toBe(false);
+      expect(fake.requests.some(request => request.method === "DELETE" && request.path === `/open-apis/v1/files/upload/${id}`)).toBe(true);
+      expect(fake.requests.some(request => request.path.endsWith("/complete"))).toBe(false);
+      opening.mockRestore();
+      const before = fake.requests.length;
+      await expect(uploadFile(api, { path, fileName: "moving.bin", size: 1000, mimeType: "application/octet-stream" })).rejects.toThrow("上传前文件大小已改变");
+      await expect(uploadFile(api, { path, fileName: "moving.bin", size: 2000, mimeType: "application/octet-stream" })).rejects.toThrow("上传前文件大小已改变");
+      expect(fake.requests.length).toBe(before);
+    } finally { opening.mockRestore(); await fixture.cleanup(); }
   });
 
   test("a retried part is hashed once: the completed MD5 matches the bytes actually uploaded", async () => {
@@ -440,7 +519,7 @@ describe("directory", () => {
     expect(decryptV2("s", "1", "n", encryptV2("s", "1", "n", "明文"))).toBe("明文");
     fake.directory = { children: { "1": ["2", "3"] }, members: { "2": [{ phone: "13800000001", name: "甲" }] }, ids: { "13800000001": "im-1" } };
     const directory = new DirectoryClient(client());
-    expect(await directory.departments("1", 1)).toEqual({ items: ["2", "3"], totalPages: 1 });
+    expect(await directory.departments("1", 1)).toEqual({ items: [{ id: "2", name: "" }, { id: "3", name: "" }], totalPages: 1 });
     expect(await directory.members("2", 1)).toEqual({ items: [{ phone: "13800000001", name: "甲" }], totalPages: 1 });
     expect(await directory.detailByPhone("13800000001")).toEqual({ imUserId: "im-1", phone: "13800000001", name: "name-13800000001" });
     expect(fake.addressTokenCount).toBe(1);

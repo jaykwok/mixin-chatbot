@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { normalizeContext, Type } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { parseToolCallArguments } from "@earendil-works/pi-ai/utils/json-parse";
 import { transformMessages, splitErrorToolResultImages } from "@earendil-works/pi-ai/api/transform-messages";
 import { stream } from "@earendil-works/pi-ai/api/openai-completions";
@@ -9,6 +9,7 @@ import { kimiCodingProvider } from "@earendil-works/pi-ai/providers/kimi-coding"
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { defineExtension } from "@earendil-works/pi-durable";
+import { obj, str } from "@earendil-works/pi-schema";
 import { memberConversation } from "../../src/durable/identity.ts";
 import { fauxModels, openGroupHarness } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -20,7 +21,7 @@ test("finished malformed JSON cannot execute write/send/MCP; repaired Unicode es
   const called: unknown[] = [];
   const names = ["write", "send_file", "fixture_mcp"];
   const extension = defineExtension({ name: "strict-fixture", tools: names.map(name => ({ name, description: name,
-    parameters: Type.Object({ path: Type.String(), content: Type.String(), after: Type.String() }), replay: "unsafe" as const,
+    parameters: obj({ path: str(), content: str(), after: str() }, { open: true }), replay: "unsafe" as const,
     execute: async args => { called.push(args); return { output: [{ type: "text" as const, text: "executed" }] }; },
   })) });
   const opened = await openGroupHarness(join(f.root, "group.sqlite"), models, { extensions: [extension] });

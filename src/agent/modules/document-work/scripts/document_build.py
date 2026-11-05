@@ -1739,6 +1739,7 @@ def build(request):
 # ---------------------------------------------------------------- outlines
 
 def slide_outline(presentation):
+    from pptx.shapes.picture import Picture
     width, height = presentation.slide_width, presentation.slide_height
     outline = []
     for index, slide in enumerate(presentation.slides, 1):
@@ -1747,10 +1748,9 @@ def slide_outline(presentation):
         chars = 0
         pictures = tables = charts = groups = 0
         for shape in slide.shapes:
-            kind = shape.shape_type
-            if kind == 13:
+            if isinstance(shape, Picture):  # also a picture in a placeholder, whose shape_type differs
                 pictures += 1
-            elif kind == 6:
+            elif shape.shape_type == 6:
                 groups += 1
             if getattr(shape, "has_table", False) and shape.has_table:
                 tables += 1
@@ -1777,21 +1777,31 @@ def slide_outline(presentation):
             "size": {"widthInches": round(width / EMU_PER_INCH, 2), "heightInches": round(height / EMU_PER_INCH, 2)}}
 
 
+def heading_level(style_name, outline_level=None):
+    """A paragraph's heading level, 1 to 9, or None: its own outline level, else its style's name (not the style's ID,
+    which is locale-specific: Chinese Word writes "1" for "heading 1")."""
+    match = re.search(r"(?:heading|标题)\s*(\d+)", (style_name or "").lower())
+    level = outline_level or (int(match.group(1)) if match else None)
+    return level if level and 1 <= level <= 9 else None
+
+
 def word_outline(document):
     headings = []
+    style_names = {style.style_id: style.name or "" for style in document.styles}
     for index, block in enumerate(document.element.body, 1):
         if block.tag != "{%s}p" % NS_W:
             continue
-        style_node = block.find(".//{%s}pStyle" % NS_W)
-        style_id = style_node.get("{%s}val" % NS_W) if style_node is not None else ""
-        match = re.fullmatch(r"(?:Heading|heading|标题)\s*(\d?)", style_id or "")
-        if not match and style_id not in ("Title", "Subtitle"):
+        style_node = block.find("{%s}pPr/{%s}pStyle" % (NS_W, NS_W))
+        level_node = block.find("{%s}pPr/{%s}outlineLvl" % (NS_W, NS_W))
+        style_id = style_node.get("{%s}val" % NS_W, "") if style_node is not None else ""
+        name = style_names.get(style_id, style_id).lower()
+        level = heading_level(name, int(level_node.get("{%s}val" % NS_W, "9")) + 1 if level_node is not None else None)
+        if level is None and name not in ("title", "subtitle", "heading", "标题", "副标题"):
             continue
         text = "".join(block.xpath(".//w:t/text()")).strip()
         if not text:
             continue
-        level = int(match.group(1)) if match and match.group(1) else 0
-        headings.append({"block": index, "level": level, "text": text[:120]})
+        headings.append({"block": index, "level": level or 0, "text": text[:120]})
     names = {s.name for s in document.styles}
     styles = [n for n in ("Title", "Subtitle", "Heading 1", "Heading 2", "Heading 3", "List Bullet", "List Number", "Table Grid", "Caption", "Quote") if n in names]
     section = document.sections[-1]

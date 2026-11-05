@@ -4,7 +4,8 @@
 import { dlopen, FFIType, ptr, read as ffiRead } from "bun:ffi";
 import { spawn } from "node:child_process";
 import { readFile, readdir } from "node:fs/promises";
-import { writeSync } from "node:fs";
+import { createReadStream, writeSync } from "node:fs";
+import { assertReceiptDirectory, writeProcessReceipt, type ProcessReceipt } from "./process-receipt.ts";
 
 const startedAt = performance.now();
 function event(phase: string, data: Record<string, unknown> = {}) {
@@ -13,6 +14,9 @@ function event(phase: string, data: Record<string, unknown> = {}) {
 }
 
 let terminate: (code: number) => Promise<never>;
+const receipt: ProcessReceipt | undefined = process.env.MIXIN_PROCESS_REAP_RECEIPT && process.env.MIXIN_PROCESS_EVENTS === "1"
+  ? JSON.parse(process.env.MIXIN_PROCESS_REAP_RECEIPT) : undefined;
+if (receipt) assertReceiptDirectory(receipt);
 if (process.platform === "win32") {
   const { symbols: win } = dlopen("kernel32.dll", {
     CreateJobObjectW: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
@@ -62,7 +66,10 @@ if (process.platform === "win32") {
       do { waiting = libc.waitpid(-1, null, 1); } while (waiting > 0);
       // A /proc snapshot can omit children during exit/adoption. Only ECHILD
       // proves there is nothing left; 0 means a child is still running.
-      if (waiting === -1 && ffiRead.i32(libc.__errno_location()!) === 10) { event("reaped", { code }); process.exit(code); }
+      if (waiting === -1 && ffiRead.i32(libc.__errno_location()!) === 10) {
+        if (receipt) writeProcessReceipt(receipt, "reaped");
+        event("reaped", { code }); process.exit(code);
+      }
       await Bun.sleep(10);
     }
     process.stderr.write("子进程回收超过 1 秒，监督进程失败退出\n");
@@ -93,24 +100,49 @@ process.stdin.once("end", () => {
 }); // Parent died or cancelled, including forced parent exit.
 process.stdin.once("error", () => finish(143));
 
-let input = "";
+let input = Buffer.alloc(0);
 let started = false;
 process.stdin.on("data", (chunk) => {
   if (started || finishing) return;
-  input += String(chunk);
+  input = Buffer.concat([input, chunk]);
   if (input.length > 2 * 1024 * 1024) return finish(125);
-  const newline = input.indexOf("\n");
+  const newline = input.indexOf(10);
   if (newline < 0) return;
   started = true;
   try {
-    const request = JSON.parse(input.slice(0, newline)) as {
-      command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv;
+    const request = JSON.parse(input.subarray(0, newline).toString("utf8")) as {
+      command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; stdinBytes?: number;
     };
-    input = "";
+    input = Buffer.alloc(0);
+    if (request.stdinBytes !== undefined && (!Number.isSafeInteger(request.stdinBytes) || request.stdinBytes < 0 || request.stdinBytes > 40 * 1024 * 1024)) {
+      throw new Error("Invalid command input length");
+    }
     const child = spawn(request.command, request.args, {
       cwd: request.cwd, env: request.env, shell: false, windowsHide: true,
-      stdio: ["ignore", "inherit", "inherit"],
+      stdio: [request.stdinBytes === undefined ? "ignore" : "pipe", "inherit", "inherit"],
     });
+    if (request.stdinBytes !== undefined) {
+      // fd 0 stays responsive to parent death even while a slow command backpressures fd 4.
+      const source = createReadStream("", { fd: 4, autoClose: true });
+      let remaining = request.stdinBytes;
+      source.on("data", chunk => {
+        if (finishing) return;
+        const bytes = chunk as Buffer;
+        if (bytes.length > remaining) return finish(125);
+        remaining -= bytes.length;
+        if (!child.stdin!.write(bytes)) source.pause();
+      });
+      child.stdin!.on("drain", () => source.resume());
+      child.stdin!.on("error", error => {
+        source.destroy();
+        if (!finishing && !["EPIPE", "ECONNRESET", "ERR_STREAM_DESTROYED"].includes((error as NodeJS.ErrnoException).code ?? "")) finish(125);
+      });
+      source.once("end", () => {
+        if (remaining !== 0) return finish(125);
+        child.stdin!.end();
+      });
+      source.once("error", () => { if (!finishing) finish(125); });
+    }
     child.once("spawn", () => event("spawned", { pid: child.pid }));
     child.once("error", (error) => {
       // Our waitpid loop can reap this child before Bun's exit watcher does.
@@ -132,7 +164,9 @@ if (stdioMode) {
   const command = process.argv[3];
   if (!command) throw new Error("stdio supervisor needs a command");
   started = true;
-  stdioChild = spawn(command, process.argv.slice(4), { cwd: process.cwd(), env: process.env,
+  // The JIT region is this supervisor's own (SUPERVISOR_ENV): the server runs with the value its configuration gave, or Bun's default.
+  const { BUN_JSC_jitMemoryReservationSize: _, MIXIN_STDIO_COMMAND_JIT: jit, ...env } = process.env;
+  stdioChild = spawn(command, process.argv.slice(4), { cwd: process.cwd(), env: jit === undefined ? env : { ...env, BUN_JSC_jitMemoryReservationSize: jit },
     shell: false, windowsHide: true, stdio: ["pipe", "inherit", "inherit"] });
   stdioChild.once("error", error => { if (!finishing) { process.stderr.write(String(error)); finish(127); } });
   stdioChild.once("exit", code => finish(code ?? 1));

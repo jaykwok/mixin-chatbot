@@ -1,56 +1,6 @@
 ﻿. (Join-Path $PSScriptRoot 'operation-log.ps1')
 . (Join-Path $PSScriptRoot 'file-replace.ps1')
 
-# A deployment snapshot excludes live SQLite databases and conversation data.
-function New-DeploymentSnapshot([string]$ProjectRoot, [string]$TaskName) {
-    $previousBackupId = $env:BOT_DEPLOY_BACKUP_ID
-    $temporaryRoot = Join-Path $ProjectRoot 'backup\snapshots'
-    New-Item -ItemType Directory -Force -Path $temporaryRoot | Out-Null
-    $lockRoot = Join-Path $ProjectRoot 'data\state'
-    New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null
-    $deploymentLock = [IO.File]::Open((Join-Path $lockRoot 'deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-    try {
-    # Callers look for unfinished transactions before taking the lock (and a deployment asks its questions in between);
-    # another operation may have published and left one since. Check again under the lock before creating anything.
-    foreach ($name in @('deploy-transaction', 'upgrade-transaction')) {
-        if (Test-Path -LiteralPath (Join-Path $lockRoot $name)) {
-            throw "发现未完成的部署或升级（data\state\$name），可能刚由另一个操作留下；本次没有改动任何内容，请先继续或回滚那次操作。"
-        }
-    }
-    $snapshot = New-TransactionSnapshotPath $ProjectRoot 'deploy-'
-    $env:BOT_DEPLOY_BACKUP_ID = Split-Path $snapshot -Leaf
-    $paths = Save-DeploymentFiles $ProjectRoot $snapshot
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $task -and @(Get-ProjectBotPids $ProjectRoot).Count -gt 0) {
-        throw '检测到前台机器人实例。请先停止前台实例，再用部署脚本创建计划任务。'
-    }
-    $taskXml = if ($task) { Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop } else { $null }
-    $state = [pscustomobject]@{
-        Project = $ProjectRoot; Path = $snapshot; Paths = $paths; TaskName = $TaskName; TaskXml = $taskXml;
-        WasRunning = [bool]($task -and $task.State -eq 'Running');
-        DependenciesMoved = $false; DependenciesAttempted = $false;
-        Lock = $deploymentLock; PreviousBackupId = $previousBackupId
-    }
-    Save-DeploymentSnapshot $state
-    return $state
-    } catch { $env:BOT_DEPLOY_BACKUP_ID = $previousBackupId; $deploymentLock.Dispose(); throw }
-}
-
-# A successful operation removes backup\rm\<snapshot name> as its own archive; never adopt a name whose snapshot or
-# archive already exists (left by an earlier operation or restored by hand).
-function New-TransactionSnapshotPath([string]$ProjectRoot, [string]$Prefix) {
-    for ($attempt = 0; $attempt -lt 5; $attempt++) {
-        $name = $Prefix + [Guid]::NewGuid().ToString('N')
-        $taken = $false
-        foreach ($path in @((Join-Path $ProjectRoot "backup\snapshots\$name"), (Join-Path $ProjectRoot "backup\rm\$name"))) {
-            # GetAttributes reads the entry itself, so a link counts even when its target is gone.
-            try { [IO.File]::GetAttributes($path) | Out-Null; $taken = $true } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { }
-        }
-        if (-not $taken) { return Join-Path $ProjectRoot "backup\snapshots\$name" }
-    }
-    throw '无法分配新的快照名称：backup\rm 中已有同名归档'
-}
-
 function Save-DeploymentSnapshot($Snapshot) {
     $saved = $Snapshot | Select-Object * -ExcludeProperty Lock, Record
     Save-FileAtomically (Join-Path $Snapshot.Path 'deployment.xml') { param($temporary) $saved | Export-Clixml -LiteralPath $temporary }.GetNewClosure()
@@ -79,17 +29,6 @@ function Test-TransactionValue([string]$Key, [string]$Value) {
         'bot_port' { $number = 0; return ($Value -cmatch '^[1-9][0-9]{0,4}$') -and [int]::TryParse($Value, [ref]$number) -and $number -le 65535 }
     }
     return $false
-}
-
-# 逐项校验后先写临时文件再改名，读者不会看到半份记录。
-function Write-DeploymentTransaction([string]$Directory, [hashtable]$Record) {
-    $lines = foreach ($key in (Get-TransactionKeys)) {
-        $value = [string]$Record[$key]
-        if (-not (Test-TransactionValue $key $value)) { throw "事务记录值无效：$key=$value" }
-        "$key=$value"
-    }
-    $text = ($lines -join "`n") + "`n"
-    Save-FileAtomically (Join-Path $Directory 'transaction') { param($temporary) [IO.File]::WriteAllText($temporary, $text, [Text.UTF8Encoding]::new($false)) }.GetNewClosure()
 }
 
 # 当前发布必须有完整记录；其他格式的记录（旧版发布）不被识别。
@@ -123,85 +62,6 @@ function Format-DeploymentTransaction($Record) {
     return "未完成的$($kind)：目标提交 $($sha)；共享资料目录 $(if ($Record.target_workspace_root) { $Record.target_workspace_root } else { 'data\workspace' })（原 $(if ($Record.original_workspace_root) { $Record.original_workspace_root } else { 'data\workspace' })）；本机端口 $($Record.bot_port)；原运行状态：$($state)"
 }
 
-# Reopen an interrupted deployment with its original snapshot, lock and recorded choices.
-function Assert-ConfirmedTransaction([string]$ProjectRoot, [string]$Action, [string]$Confirmation) {
-    if (-not $Confirmation) { return }
-    $checker = Join-Path $ProjectRoot 'scripts\lib\confirmed-transaction.ts'
-    $checkerBun = @(Get-ApplicationPaths 'bun.exe' | Select-Object -First 1)[0]
-    if (-not $checkerBun -or -not (Test-Path -LiteralPath $checker -PathType Leaf)) { throw '无法核对已确认事务，请刷新预览' }
-    & $checkerBun $checker $ProjectRoot $Action $Confirmation
-    if ($LASTEXITCODE -ne 0) { throw '确认后事务或记录已变化，本次动作未执行；请刷新预览' }
-}
-
-function Open-DeploymentTransaction([string]$ProjectRoot, [string]$Confirmation = '', [string]$Action = '') {
-    try {
-        $deploymentLock = [IO.File]::Open((Join-Path $ProjectRoot 'data\state\deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-    } catch [IO.IOException] { throw '另一个部署或升级正在进行' }
-    try {
-        Assert-ConfirmedTransaction $ProjectRoot $Action $Confirmation
-        $name = "$(Get-Content -LiteralPath (Join-Path $ProjectRoot 'data\state\deploy-transaction') -Raw)".Trim()
-        if ($name -notmatch '^deploy-[0-9a-f]{32}$') { throw '部署事务快照名称无效' }
-        $path = Join-Path $ProjectRoot ('backup\snapshots\' + $name)
-        $state = Import-Clixml -LiteralPath (Join-Path $path 'deployment.xml')
-        if ($state.Project -ne $ProjectRoot -or $state.Path -ne $path) { throw '部署事务快照与当前项目不一致' }
-        $record = Read-DeploymentTransaction $path
-        if (-not $record -or $record.snapshot -ne $name) { throw '部署事务记录缺失或与快照不一致' }
-        $state | Add-Member -NotePropertyName Lock -NotePropertyValue $deploymentLock
-        $state | Add-Member -NotePropertyName Record -NotePropertyValue $record
-        $env:BOT_DEPLOY_BACKUP_ID = $name
-        return $state
-    } catch { $deploymentLock.Dispose(); throw }
-}
-
-# The pointer is published only after the confirmed choices are recorded; resume and rollback read only that record.
-function Publish-DeploymentTransaction($Snapshot, [hashtable]$Record, [string]$Pointer, [string]$DataPreparationPlan = '') {
-    Write-DeploymentTransaction $Snapshot.Path $Record
-    if ($DataPreparationPlan) { Copy-Item -LiteralPath $DataPreparationPlan -Destination (Join-Path $Snapshot.Path 'data-plan.json') -ErrorAction Stop }
-    $name = Split-Path $Snapshot.Path -Leaf
-    # Publishing only ever creates the pointer: an existing one belongs to another unfinished transaction.
-    Save-FileAtomically $Pointer { param($temporary) [IO.File]::WriteAllText($temporary, $name) }.GetNewClosure() -CreateOnly
-}
-
-# An interrupted upgrade reuses its original snapshot and original running state.
-function Open-UpgradeSnapshot([string]$ProjectRoot, [string]$TaskName, [string]$OriginalSha, [string]$OriginalBranch, [string]$TargetSha, [hashtable]$Record = $null, [string]$DataPreparationPlan = '', [string]$Confirmation = '', [string]$Action = '') {
-    $pointer = Join-Path $ProjectRoot 'data\state\upgrade-transaction'
-    if (Test-Path -LiteralPath $pointer) {
-        $deploymentLock = [IO.File]::Open((Join-Path $ProjectRoot 'data\state\deploy.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-        try {
-            Assert-ConfirmedTransaction $ProjectRoot $Action $Confirmation
-            $name = "$(Get-Content -LiteralPath $pointer -Raw)".Trim()
-            if ($name -notmatch '^deploy-[0-9a-f]{32}$') { throw '升级事务快照名称无效' }
-            $path = Join-Path $ProjectRoot ('backup\snapshots\' + $name)
-            $state = Import-Clixml -LiteralPath (Join-Path $path 'deployment.xml')
-            if ($state.Project -ne $ProjectRoot -or $state.Path -ne $path -or $state.UpgradeTarget -ne $TargetSha) { throw '中断升级必须使用原项目与原目标提交继续' }
-            $state | Add-Member -NotePropertyName Lock -NotePropertyValue $deploymentLock
-            $state | Add-Member -NotePropertyName Record -NotePropertyValue (Read-DeploymentTransaction $path)
-            $env:BOT_DEPLOY_BACKUP_ID = $name
-            return $state
-        } catch { $deploymentLock.Dispose(); throw }
-    }
-    if ($Confirmation) { throw '确认后的升级事务已消失，请刷新预览' }
-    $state = New-DeploymentSnapshot $ProjectRoot $TaskName
-    try {
-        $state | Add-Member -NotePropertyName UpgradeOriginal -NotePropertyValue $OriginalSha
-        $state | Add-Member -NotePropertyName UpgradeBranch -NotePropertyValue $OriginalBranch
-        $state | Add-Member -NotePropertyName UpgradeTarget -NotePropertyValue $TargetSha
-        Save-DeploymentSnapshot $state
-        if ($Record) {
-            $Record.snapshot = Split-Path $state.Path -Leaf
-            $Record.was_running = if ($state.WasRunning) { '1' } else { '0' }
-            Write-DeploymentTransaction $state.Path $Record
-        }
-        if ($DataPreparationPlan -and (Test-Path -LiteralPath $DataPreparationPlan -PathType Leaf)) {
-            Copy-Item -LiteralPath $DataPreparationPlan -Destination (Join-Path $state.Path 'data-plan.json') -ErrorAction Stop
-        }
-        $name = Split-Path $state.Path -Leaf
-        # Create only: never replace the pointer of another unfinished transaction.
-        Save-FileAtomically $pointer { param($temporary) [IO.File]::WriteAllText($temporary, $name) }.GetNewClosure() -CreateOnly
-        return $state
-    } catch { $state.Lock.Dispose(); $env:BOT_DEPLOY_BACKUP_ID = $state.PreviousBackupId; throw }
-}
-
 function Remove-UpgradeStage([string]$ProjectRoot, [string]$Stage) {
     $temporaryRoot = [IO.Path]::GetFullPath((Join-Path $ProjectRoot 'tmp')).TrimEnd('\')
     $target = [IO.Path]::GetFullPath($Stage).TrimEnd('\')
@@ -220,195 +80,6 @@ function Remove-UpgradeStage([string]$ProjectRoot, [string]$Stage) {
         }
     }
     Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
-}
-
-# 把检出从 <From> 切换到 <To> 时会被覆盖或删除的未跟踪内容（包括被忽略的文件：git 切换时直接覆盖或随目录删除它们），
-# 规则与 scripts/lib/common.sh 的 untracked_switch_conflicts 相同。<Label> 是 <To> 在说明中的名称，<Owner> 是“占着……的
-# 目录位置”中的写法。只看 <From> 到 <To> 新增的路径：路径本身已有的内容只能是当前提交 <Basis> 跟踪的文件或目录，目录中
-# 也不能有未跟踪或忽略的文件；各级父路径只能是目录、不存在，或 <Basis> 跟踪的文件（含链接），否则 git 会删掉占位的文件、
-# 链接或目录联接再建目录（或经它们写到别处）。<Basis> 跟踪的文件由调用方确认没有改动。父路径由外向内检查，第一个不是
-# 目录的父路径之下不再检查：工作区里没有这些路径，经链接看到的是别处的内容。只读取工作区和对象库。
-function Get-UntrackedSwitchConflicts([string]$GitPath, [string]$ProjectRoot, [string]$Basis, [string]$From, [string]$To, [string]$Label, [string]$Owner = $Label) {
-    $previous = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $conflicts = @()
-        # 属性不跟随链接；取不到（不存在）时为 $null。
-        $attributesOf = { param([string]$Path) try { [IO.File]::GetAttributes((Join-Path $ProjectRoot $Path)) } catch { $null } }
-        $realDirectory = { param($Attributes) $Attributes.HasFlag([IO.FileAttributes]::Directory) -and -not $Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) }
-        $trackedType = { param([string]$Path) "$(& $GitPath -C $ProjectRoot cat-file -t "${Basis}:$Path" 2>$null)".Trim() }
-        # -z 的输出被 PowerShell 按换行拆开：接回去再按 NUL 拆分，路径中的换行也保留。
-        $entries = { param($Lines) @((@($Lines) -join "`n").Split([char]0) | Where-Object { $_ }) }
-        $occupied = @{}
-        foreach ($path in (& $entries (& $GitPath -C $ProjectRoot diff --name-only --no-renames -z --diff-filter=A $From $To 2>$null))) {
-            $parent = ''
-            $covered = $false
-            $parts = $path.Split('/')
-            for ($index = 0; $index -lt $parts.Count - 1; $index++) {
-                $parent = if ($parent) { $parent + '/' + $parts[$index] } else { $parts[$index] }
-                if (-not $occupied.ContainsKey($parent)) {
-                    $occupied[$parent] = $false
-                    $attributes = & $attributesOf $parent
-                    if ($null -ne $attributes -and -not (& $realDirectory $attributes)) {
-                        $occupied[$parent] = $true
-                        if ((& $trackedType $parent) -ne 'blob') { $conflicts += "未跟踪的文件或链接占着${Owner}的目录位置：$parent" }
-                    }
-                }
-                if ($occupied[$parent]) { $covered = $true; break }
-            }
-            if ($covered) { continue }
-            $attributes = & $attributesOf $path
-            if ($null -eq $attributes) { continue }
-            $kind = & $trackedType $path
-            if ((& $realDirectory $attributes) -and $kind -eq 'tree') {
-                foreach ($other in (& $entries (& $GitPath -C $ProjectRoot --literal-pathspecs ls-files -z --others -- $path 2>$null))) {
-                    $conflicts += "未跟踪的文件会随目录删除（${Label}在 $path 是文件）：$other"
-                }
-            } elseif ($kind -ne 'blob') { $conflicts += "未跟踪的文件会被${Label}覆盖：$path" }
-        }
-        return $conflicts
-    } finally { $ErrorActionPreference = $previous }
-}
-
-# git read-tree -n -m -u：检查从 <From> 切换到 <To> 会不会失败，不写入；它把被忽略的文件也当作会被覆盖的未跟踪文件。
-# 在系统临时目录的索引副本上运行，工作区的索引、index.lock 和文件都不改动（--index-output 仍会锁住原索引）。
-# 能切换时返回 $null，否则返回 git 的说明。
-function Invoke-SwitchDryRun([string]$GitPath, [string]$ProjectRoot, [string]$From, [string]$To) {
-    $previous = $ErrorActionPreference
-    $previousIndex = $env:GIT_INDEX_FILE
-    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('mixin-switch-' + [Guid]::NewGuid().ToString('N'))
-    try {
-        $ErrorActionPreference = 'Continue'
-        $real = "$(& $GitPath -C $ProjectRoot rev-parse --git-path index 2>$null)".Trim()
-        if ($LASTEXITCODE -ne 0 -or -not $real) { return '无法定位索引' }
-        if (-not [IO.Path]::IsPathRooted($real)) { $real = Join-Path $ProjectRoot $real }
-        $copy = Join-Path $scratch 'index'
-        try { [void][IO.Directory]::CreateDirectory($scratch); [IO.File]::Copy($real, $copy) }
-        catch { return "无法复制索引 ${real}：$($_.Exception.Message)" }
-        $env:GIT_INDEX_FILE = $copy
-        $output = @(& $GitPath -C $ProjectRoot read-tree -n -m -u $From $To 2>&1 | ForEach-Object { "$_" })
-        if ($LASTEXITCODE -eq 0) { return $null }
-        return ($output -join ' ')
-    } finally {
-        if ($null -eq $previousIndex) { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue } else { $env:GIT_INDEX_FILE = $previousIndex }
-        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
-        $ErrorActionPreference = $previous
-    }
-}
-
-# 升级切换代码的实际路径：当前提交 <Head> -> main <Main>（checkout），再快进到目标 <Target>。规则与 scripts/lib/common.sh
-# 的 switch_preflight 相同：两步新增的路径逐项检查；规则没有列出时，再用 git 试运行能直接预演的两次切换（当前 -> main，
-# 当前 -> 目标：目标经 main 新增的路径都在其中），git 拒绝时同样列出。调用方已确认已跟踪文件没有改动、main 能快进到目标。
-function Get-SwitchConflicts([string]$GitPath, [string]$ProjectRoot, [string]$Head, [string]$Main, [string]$Target) {
-    $conflicts = @()
-    if ($Head -ne $Main) { $conflicts += @(Get-UntrackedSwitchConflicts $GitPath $ProjectRoot $Head $Head $Main '切换途经的 main 分支') }
-    if ($Main -ne $Target) { $conflicts += @(Get-UntrackedSwitchConflicts $GitPath $ProjectRoot $Head $Main $Target '目标版本') }
-    if (-not $conflicts.Count) {
-        $output = if ($Head -ne $Main) { Invoke-SwitchDryRun $GitPath $ProjectRoot $Head $Main }
-        if ($null -ne $output) { $conflicts += "git 试运行切换到 main 失败：$output" }
-        elseif ($Head -ne $Target) {
-            $output = Invoke-SwitchDryRun $GitPath $ProjectRoot $Head $Target
-            if ($null -ne $output) { $conflicts += "git 试运行切换到目标提交失败：$output" }
-        }
-    }
-    return $conflicts
-}
-
-# 升级停止服务之前确认切换代码（checkout main，再快进到 <TargetSha>）能完成：已跟踪文件没有改动、本地 main 存在且能快进
-# 到目标、经 main 的两步切换不会覆盖或删除未跟踪的内容。返回冲突列表。当前提交和 main 都已是目标时（同版本升级、切换
-# 之后的续做）没有切换步骤，仍检查已跟踪文件：同一提交的 checkout 和快进会保留这些改动，运行的就不是目标版本。
-# 只读取：状态检查不刷新索引（--no-optional-locks），试运行用索引副本。
-function Get-UpgradeCheckoutIdentity([string]$GitPath, [string]$ProjectRoot) {
-    $head = "$(& $GitPath --no-optional-locks -C $ProjectRoot rev-parse --verify 'HEAD^{commit}')".Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $head) { throw '无法读取当前提交；服务尚未停止' }
-    $branch = "$(& $GitPath --no-optional-locks -C $ProjectRoot rev-parse --abbrev-ref HEAD)".Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $branch) { throw '无法读取当前分支；服务尚未停止' }
-    $main = "$(& $GitPath --no-optional-locks -C $ProjectRoot rev-parse --verify 'refs/heads/main^{commit}')".Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $main) { throw '无法读取本地 main；服务尚未停止' }
-    return [pscustomobject]@{ Head = $head; Branch = $branch; Main = $main; Key = "$head`n$branch`n$main" }
-}
-
-function Get-UpgradeSwitchConflicts([string]$GitPath, [string]$ProjectRoot, [string]$TargetSha) {
-    $previous = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $short = { param([string]$Sha) if ($Sha.Length -gt 7) { $Sha.Substring(0, 7) } else { $Sha } }
-        $head = "$(& $GitPath -C $ProjectRoot rev-parse --verify --quiet 'HEAD^{commit}' 2>$null)".Trim()
-        $main = "$(& $GitPath -C $ProjectRoot rev-parse --verify --quiet 'refs/heads/main^{commit}' 2>$null)".Trim()
-        $conflicts = @()
-        foreach ($line in @(& $GitPath -C $ProjectRoot --no-optional-locks status --porcelain --untracked-files=no 2>&1)) {
-            if ("$line") { $conflicts += "未提交的改动：$line" }
-        }
-        if (-not $head) { $conflicts += '无法读取当前提交' }
-        if (-not $main) { $conflicts += '本地 main 分支不存在' }
-        else {
-            & $GitPath -C $ProjectRoot merge-base --is-ancestor $main $TargetSha 2>$null
-            if ($LASTEXITCODE -ne 0) { $conflicts += "本地 main（$(& $short $main)）无法快进到目标提交 $(& $short $TargetSha)" }
-        }
-        if ($conflicts.Count) { return $conflicts }
-        return @(Get-SwitchConflicts $GitPath $ProjectRoot $head $main $TargetSha)
-    } finally { $ErrorActionPreference = $previous }
-}
-
-# 恢复升级前的代码会丢弃工作区内容（reset --hard / checkout --force）：列出升级后的人工改动，调用方保留事务并停止。
-# 规则与 scripts/lib/common.sh 的 code_restore_safe 相同：当前提交和要重置的原分支只能停在升级前或目标提交；
-# 已跟踪文件不能有改动；升级前有、当前提交没有的路径由恢复重建，按 Get-UntrackedSwitchConflicts 检查路径本身和
-# 各级父路径：不能被未跟踪或忽略的文件、目录或链接（含目录联接）占用，恢复会替换的已跟踪链接之下不再检查。
-function Get-CodeRestoreConflicts([string]$GitPath, [string]$ProjectRoot, [string]$Branch, [string]$OriginalSha, [string]$TargetSha) {
-    $previous = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $short = { param([string]$Sha) if ($Sha.Length -gt 7) { $Sha.Substring(0, 7) } else { $Sha } }
-        $conflicts = @()
-        $head = "$(& $GitPath -C $ProjectRoot rev-parse --verify --quiet 'HEAD^{commit}')".Trim()
-        if ($head -ne $OriginalSha -and $head -ne $TargetSha) {
-            $conflicts += "当前提交 $(& $short $head) 既不是升级前的 $(& $short $OriginalSha)，也不是目标 $(& $short $TargetSha)：升级后有新的提交或切换"
-        }
-        if ($Branch -and $Branch -ne 'HEAD') {
-            $ref = "$(& $GitPath -C $ProjectRoot rev-parse --verify --quiet "refs/heads/$Branch^{commit}")".Trim()
-            if ($ref -ne $OriginalSha -and $ref -ne $TargetSha) {
-                $conflicts += "分支 $Branch 指向 $(& $short $ref)，不是升级前或目标提交：回滚会把它重置到 $(& $short $OriginalSha)"
-            }
-        }
-        foreach ($line in @(& $GitPath -C $ProjectRoot status --porcelain --untracked-files=no)) {
-            if ("$line") { $conflicts += "未提交的改动：$line" }
-        }
-        if ($head) { $conflicts += @(Get-UntrackedSwitchConflicts $GitPath $ProjectRoot $head $head $OriginalSha '升级前的版本' '升级前版本') }
-        return $conflicts
-    } finally { $ErrorActionPreference = $previous }
-}
-
-function Test-DeploymentDependenciesReusable([string]$ProjectRoot, [string]$GitPath, [string]$OldRevision, [string]$NewRevision) {
-    try {
-        if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot 'node_modules') -PathType Container)) { return $false }
-        $manifest = Get-Content -LiteralPath (Join-Path $ProjectRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-        # Compare lockfiles and install inputs as well as versions: a patch or transitive
-        # dependency change also requires installation. Unknown layouts fail closed.
-        $inputs = @('package.json', 'bun.lock', 'bun.lockb', 'bunfig.toml', '.npmrc', 'scripts/patches', 'patches')
-        foreach ($patch in @($manifest.patchedDependencies.PSObject.Properties)) {
-            if ($patch) { $inputs += [string]$patch.Value }
-        }
-        & $GitPath -C $ProjectRoot diff --quiet $OldRevision $NewRevision -- @inputs
-        if ($LASTEXITCODE -ne 0 -or $manifest.workspaces) { return $false }
-        foreach ($section in @('dependencies', 'devDependencies', 'optionalDependencies')) {
-            foreach ($entry in @($manifest.$section.PSObject.Properties)) {
-                if (-not $entry) { continue }
-                # This project pins exact versions; ranges/aliases need Bun's resolver.
-                if ([string]$entry.Value -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') { return $false }
-                $installedPath = Join-Path $ProjectRoot ('node_modules/' + $entry.Name + '/package.json')
-                if (-not (Test-Path -LiteralPath $installedPath -PathType Leaf)) { return $false }
-                $installed = Get-Content -LiteralPath $installedPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                if ($installed.name -cne $entry.Name -or $installed.version -cne [string]$entry.Value) { return $false }
-                foreach ($bin in @($installed.bin.PSObject.Properties)) {
-                    if ($installed.bin -is [string]) { $binPath = $installed.bin }
-                    elseif ($bin) { $binPath = [string]$bin.Value }
-                    else { continue }
-                    if (-not (Test-Path -LiteralPath (Join-Path (Split-Path $installedPath -Parent) $binPath) -PathType Leaf)) { return $false }
-                }
-            }
-        }
-        return $true
-    } catch { return $false }
 }
 
 function Save-DeploymentDependencies($Snapshot) {
@@ -435,25 +106,229 @@ function Save-DeploymentDependencies($Snapshot) {
     }
 }
 
-function Restore-DeploymentSnapshot($Snapshot) {
-    $root = $Snapshot.Project
-    if (-not (Stop-ProjectBot $root $Snapshot.TaskName -KeepDisabled)) { throw '新进程尚未停止，拒绝覆盖运行中的配置或依赖' }
-    Restore-DeploymentFiles $root $Snapshot.Path $Snapshot.Paths
-    if ($Snapshot.DependenciesAttempted) {
-        if ($Snapshot.DependenciesMoved) {
-            $saved = [IO.Path]::GetFullPath((Join-Path $Snapshot.Path 'node_modules'))
-            if (-not $saved.StartsWith([IO.Path]::GetFullPath($root).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '依赖快照路径无效' }
-            if (Test-Path -LiteralPath $saved) {
-                Move-ToProjectArchive (Join-Path $root 'node_modules') $root
-                Move-Item -LiteralPath $saved -Destination (Join-Path $root 'node_modules') -ErrorAction Stop
-            } elseif (-not (Test-Path -LiteralPath (Join-Path $root 'node_modules'))) { throw '原依赖及其备份都缺失' }
-        } else { Move-ToProjectArchive (Join-Path $root 'node_modules') $root }
+# ---- 部署入口：工具与配置向导 ----
+function Test-VersionedApplication([string]$Path, [string]$RequiredPattern = '') {
+    try {
+        $output = @(& $Path --version 2>$null)
+        $exitCode = $LASTEXITCODE
+    } catch {
+        return $null
     }
-    if ($Snapshot.TaskXml) {
-        Register-ScheduledTask -TaskName $Snapshot.TaskName -Xml $Snapshot.TaskXml -Force -ErrorAction Stop | Out-Null
-    } elseif (Get-ScheduledTask -TaskName $Snapshot.TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $Snapshot.TaskName -Confirm:$false -ErrorAction Stop
+    if ($exitCode -ne 0) { return $null }
+    $text = ($output -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    if ($RequiredPattern -and $text -notmatch $RequiredPattern) { return $null }
+    return [pscustomobject]@{ Path = $Path; Version = ($output | Select-Object -First 1) }
+}
+
+function Test-Administrator {
+    return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# 部署在停机前找到计划任务要运行的工具（git、GNU bash、Bun ≥ 1.4.4、原生 uv.exe），绝对路径记入暂存，之后不再从 PATH
+# 查找。缺少时抛出带安装提示的说明（服务尚未停止）。
+function Find-DeployTools {
+    $gitPaths = @(Get-ApplicationPaths "git")
+    $knownGitRoots = @()
+    if ($env:ProgramFiles) { $knownGitRoots += (Join-Path $env:ProgramFiles "Git") }
+    if (${env:ProgramFiles(x86)}) { $knownGitRoots += (Join-Path ${env:ProgramFiles(x86)} "Git") }
+    if ($env:LOCALAPPDATA) { $knownGitRoots += (Join-Path $env:LOCALAPPDATA "Programs\Git") }
+    foreach ($candidateRoot in $knownGitRoots) {
+        foreach ($candidateGit in @((Join-Path $candidateRoot "cmd\git.exe"), (Join-Path $candidateRoot "bin\git.exe"))) {
+            if ((Test-Path -LiteralPath $candidateGit -PathType Leaf) -and $gitPaths -notcontains $candidateGit) { $gitPaths += $candidateGit }
+        }
     }
-    if ($Snapshot.WasRunning) { Start-ScheduledTask -TaskName $Snapshot.TaskName -ErrorAction Stop }
-    Write-Warning '已恢复配置、启动定义、依赖和原运行状态；回滚快照保留在 backup/snapshots。'
+    $workingGitPaths = @($gitPaths | Where-Object { Test-VersionedApplication $_ '(?i)^git version\b' })
+    if ($workingGitPaths.Count -eq 0) { throw "缺少 git。请安装 Git for Windows（同时提供 agent bash 工具所需的 bash.exe）：`n  https://git-scm.com/download/win" }
+    $bashCandidates = @()
+    foreach ($candidateRoot in @($workingGitPaths | ForEach-Object { Split-Path (Split-Path $_ -Parent) -Parent }) + $knownGitRoots) {
+        if (-not $candidateRoot) { continue }
+        foreach ($candidateBash in @((Join-Path $candidateRoot "bin\bash.exe"), (Join-Path $candidateRoot "usr\bin\bash.exe"))) {
+            if ((Test-Path -LiteralPath $candidateBash -PathType Leaf) -and $bashCandidates -notcontains $candidateBash) { $bashCandidates += $candidateBash }
+        }
+    }
+    foreach ($candidateBash in @(Get-ApplicationPaths "bash")) {
+        # 排除 Windows 自带的 WSL 启动器；它不是 agent bash 工具需要的 GNU bash.exe。
+        if ($candidateBash -match '(?i)(\\Windows\\System32\\bash\.exe$|\\WindowsApps\\bash\.exe$)') { continue }
+        if ($bashCandidates -notcontains $candidateBash) { $bashCandidates += $candidateBash }
+    }
+    $bashPath = @($bashCandidates | Where-Object { Test-VersionedApplication $_ '(?i)GNU bash' } | Select-Object -First 1)
+    if ($bashPath.Count -ne 1) { throw '缺少 bash.exe。请安装并启用 Git Bash；agent bash 工具需要它。' }
+    # npm 风格的 Bun 安装可能同时暴露 bun.cmd 和 bun；逐个探测具体路径，避免 PowerShell 将多个匹配项拼成一个命令字符串。
+    $bunPaths = @(Get-ApplicationPaths "bun")
+    foreach ($knownBunPath in @($(if ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".bun\bin\bun.exe" }), $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\bun.exe" }))) {
+        if ($knownBunPath -and (Test-Path -LiteralPath $knownBunPath -PathType Leaf) -and $bunPaths -notcontains $knownBunPath) { $bunPaths += $knownBunPath }
+    }
+    if ($bunPaths.Count -eq 0) {
+        throw "缺少 bun。请选择一种方式安装：`n  powershell -c ""irm bun.sh/install.ps1 | iex""`n  winget install Oven-sh.Bun`n安装后请重新打开管理员 PowerShell，再运行部署脚本。"
+    }
+    $bun = $null
+    foreach ($bunPathCandidate in $bunPaths) {
+        $bun = Test-VersionedApplication $bunPathCandidate '^\d+(?:\.\d+)+'
+        if ($bun) { break }
+    }
+    if (-not $bun) { throw 'bun --version 执行失败；找到的 bun 命令都不可用。' }
+    if ([Version]($bun.Version -replace '-.*$', '') -lt [Version]'1.4.4') { throw "需要 Bun 1.4.4 或更高版本（当前 $($bun.Version)）。" }
+    $uvPath = @(Get-ApplicationPaths 'uv.exe' | Where-Object { Test-VersionedApplication $_ '^uv ' } | Select-Object -First 1)
+    if ($uvPath.Count -ne 1) { throw '缺少原生 uv.exe，请先安装 uv 并加入 PATH。' }
+    return [pscustomobject]@{ Git = $workingGitPaths[0]; Bash = $bashPath[0]; Bun = $bun.Path; BunVersion = $bun.Version; Uv = $uvPath[0] }
+}
+
+# 配置向导直接使用终端：作为语句调用，输出不经管道（见下方 Invoke-DirectoryScopeTool）。回答只写进部署暂存；取消时向导
+# 不写暂存文件。
+function Invoke-StagedWizard([string]$Bun, [string]$ProjectRoot, [string]$Stage, [string]$Label, [string]$Wizard, [string]$Staged) {
+    if ([Console]::IsInputRedirected) { throw "$($Label)需要在终端里运行向导；服务尚未停止，未做任何改动" }
+    Write-Host "[*] $Label（回答先暂存，停止服务后写入）..." -ForegroundColor Cyan
+    Set-OperationStage $Label
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = 1
+        Invoke-WithUtf8Output { & $Bun --no-env-file run (Join-Path $ProjectRoot "scripts\config\$Wizard") --stage $Stage }
+        $code = $global:LASTEXITCODE
+    } finally { $ErrorActionPreference = $previous }
+    if ($code -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $Stage $Staged) -PathType Leaf)) { throw '配置未完成（取消或失败，原因见上方）；服务尚未停止，未做任何改动' }
+}
+
+# ---- 通讯录同步范围（data\config\directory.json）----
+# 与 deploy.sh、upgrade.sh 相同：范围必须明确选择，没有默认值。已有应用机器人凭据而没有范围时（含从 1.0.1 及更早版本
+# 部署或升级）在停机前选择（scripts\config\directory-scope.ts choose --plan：设置了 BOT_DIRECTORY_SCOPE 时不交互，否则
+# 在终端里运行向导，没有终端就失败），计划随事务快照保存，停机后写入；续做沿用这份计划，不再选择。
+# 脚本的退出码留在 $LASTEXITCODE：0 已写入，1 失败，2 取消。向导直接使用终端：只能作为语句调用，输出不经管道也不被
+# 收集（收集输出会重定向标准输出，向导就没有终端，返回值也会混进输出），标准错误也不转成 PowerShell 错误。
+# 从 1.0.1 及更早版本升级时，由旧版 ops.ps1 经 `| Out-Host` 启动本升级器，标准输出已经是管道（标准输入仍是控制台）：
+# 要运行向导时（choose，没有设置 BOT_DIRECTORY_SCOPE）把工具直接接到控制台上，否则向导认为没有终端，
+# 只能选整个通讯录。
+function Invoke-DirectoryScopeTool([string]$Bun, [string]$Script, [string[]]$Arguments) {
+    if ($Arguments[0] -eq 'choose' -and -not "$env:BOT_DIRECTORY_SCOPE".Trim() -and
+        (Test-ConsoleOutputPiped)) {
+        $global:LASTEXITCODE = Invoke-ConsoleProcess $Bun (@('--no-env-file', 'run', $Script) + $Arguments) -Screen
+        return
+    }
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = 1
+        Invoke-WithUtf8Output { & $Bun --no-env-file run $Script @Arguments }
+    } finally { $ErrorActionPreference = $previous }
+}
+
+# 停机前：选定的范围写入计划文件；取消或失败时抛出（服务尚未停止）。作为语句调用（见上）。首次部署的应用凭据还在部署暂存
+# 里：-App 指向暂存的 configuration-app.json，向平台核对部门时用它。
+function Select-DirectoryScope([string]$Bun, [string]$Script, [string]$ProjectRoot, [string]$Plan, [string]$App = '') {
+    Remove-Item -LiteralPath $Plan -Force -ErrorAction SilentlyContinue
+    Invoke-DirectoryScopeTool $Bun $Script (@('choose', '--plan', $Plan, '--project', $ProjectRoot) + $(if ($App) { @('--app', $App) } else { @() }))
+    $code = $global:LASTEXITCODE
+    if ($code -eq 2) { throw '已取消选择通讯录同步范围；服务尚未停止，未做任何改动' }
+    if ($code -ne 0 -or -not (Test-Path -LiteralPath $Plan -PathType Leaf)) { throw '没有选定通讯录同步范围（原因见上方）；服务尚未停止，未做任何改动' }
+}
+
+# ---- 修订链首次整理（revision-chain plan §4、§8）----
+# 与 scripts/lib/deployment.sh 的同名一段相同：停机前用目标版本的代码只读预览（revision-cleanup.ts preview --json），
+# 决定停机后整理（先备份）或跳过（BOT_REVISION_CLEANUP=apply|skip；不设置时终端交互询问，默认整理，非交互也整理）。
+# 空间不足时停机前拒绝，由用户释放空间或显式选择跳过，不自动改变整理方式。选择写入事务快照的 revision-cleanup，续做
+# 沿用。整理在停机后、数据准备之后、验证实例之前运行；回滚先结束它（在途文档收尾），维护状态不允许启动时回滚在恢复
+# 数据之前停止、保持停机。
+
+# 维护命令的结构化结果（scripts/lib/maintenance-protocol.ts 的 --json）：标准输出只有一行协议。返回
+# @{ Outcome; Code; Result; Message }；输出不是一行 JSON、协议或版本不符、命令不符或 outcome 未知时 Outcome 为 incomplete。
+function ConvertFrom-MaintenanceResult([string[]]$Lines, [string]$Command, [int]$Code) {
+    $incomplete = @{ Outcome = 'incomplete'; Code = $Code; Result = $null; Message = '' }
+    $text = @($Lines | Where-Object { "$_".Trim() })
+    if ($text.Count -ne 1) { return $incomplete }
+    try { $value = ConvertFrom-Json -InputObject $text[0] -ErrorAction Stop } catch { return $incomplete }
+    if ($value -isnot [Management.Automation.PSCustomObject]) { return $incomplete }
+    if ($value.protocol -isnot [string] -or $value.protocol -cne 'mixin-maintenance') { return $incomplete }
+    if (-not ($value.version -is [int] -or $value.version -is [long]) -or $value.version -ne 1) { return $incomplete }
+    if ($value.command -isnot [string] -or $value.command -cne $Command) { return $incomplete }
+    if ($value.outcome -isnot [string] -or $value.outcome -cnotin @('success', 'refused', 'stopped', 'not-enough-space', 'failed')) { return $incomplete }
+    return @{ Outcome = $value.outcome; Code = $Code; Result = $value.result; Message = $(if ($value.message -is [string]) { $value.message } else { '' }) }
+}
+
+# 运行维护工具（revision-cleanup.ts、maintenance.ts）的一个命令并读取它的 --json 结果。标准输出和标准错误分开读：
+# 说明和进度在标准错误，按 UTF-8 解码后写向终端和运维日志；标准输出只交给协议解析，不会混进调用函数的返回值。
+# 结果不完整时把捕获的标准输出也显示出来，原因不会被吞掉。
+function Invoke-MaintenanceTool([string]$Bun, [string]$Script, [string]$Command, [string[]]$Arguments) {
+    $lines = [Collections.Generic.List[string]]::new()
+    $previous = $ErrorActionPreference
+    $encoding = $null
+    try { $encoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { $encoding = $null }
+    try {
+        # 原生命令写标准错误时，Windows PowerShell 5.1 在 Stop 下会把它当成终止错误。
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = 1
+        & $Bun --no-env-file run $Script $Command @Arguments --json 2>&1 | ForEach-Object {
+            if ($_ -is [Management.Automation.ErrorRecord]) {
+                $line = $_.Exception.Message
+                Write-Host $line
+                Write-OperationEvent 'output' $line
+            } else { $lines.Add([string]$_) }
+        }
+        $code = [int]$LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+        if ($null -ne $encoding) { try { [Console]::OutputEncoding = $encoding } catch { } }
+    }
+    Write-OperationEvent 'info' ((Split-Path $Script -Leaf) + " $Command; exit=$code")
+    $result = ConvertFrom-MaintenanceResult $lines.ToArray() $Command $code
+    if ($result.Outcome -ceq 'incomplete') {
+        foreach ($line in $lines) { Write-Host $line }
+        Write-Warning "$Command 的结果不完整或无法识别（退出码 $code），按失败处理"
+    }
+    return $result
+}
+
+# 只有退出码 0、结果完整且 outcome 为 success 才算成功。
+function Test-MaintenanceSuccess($Result) { return ($Result.Code -eq 0 -and $Result.Outcome -ceq 'success') }
+
+# 跳过修订整理的办法：控制台任务不能设置环境变量，要在升级或重新部署的表单里重新预览并选择跳过。
+function Get-RevisionCleanupSkipHint {
+    if ($env:MIXIN_OPS_CONSOLE -ceq '1') { return '重新预览并选择“跳过整理”' }
+    return '设置 BOT_REVISION_CLEANUP=skip 跳过整理'
+}
+
+# 停机前决定本次的整理方式（apply 或 skip），并确认这个选择需要的空间；在停止服务之前调用。<Script> 是目标版本的
+# revision-cleanup.ts。还没有会话库时不预览。维护状态不允许结束整理（要求从备份恢复、收缩未完成、日志格式不受支持）
+# 时预览答 refused，在这里拒绝。预览没能给出结果（例如升级导出沿用的旧依赖无法加载它）时按环境变量或默认值处理：
+# 整理在停机后自己检查维护状态和空间，不满足时不开始，部署随之回滚。
+function Select-RevisionCleanup([string]$Bun, [string]$Script, [string]$ProjectRoot) {
+    $choice = "$env:BOT_REVISION_CLEANUP".Trim()
+    if ($choice -and $choice -cnotin @('apply', 'skip')) { throw 'BOT_REVISION_CLEANUP 只能是 apply（默认）或 skip；服务尚未停止' }
+    if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot 'data\conversations') -PathType Container) -and
+        -not (Test-Path -LiteralPath (Join-Path $ProjectRoot 'data\state\revision-cleanup.json'))) {
+        return $(if ($choice) { $choice } else { 'apply' })
+    }
+    $result = Invoke-MaintenanceTool $Bun $Script 'preview' @('--project', $ProjectRoot)
+    if ($result.Outcome -ceq 'refused') { throw '修订整理预览被拒绝（原因见上方）；服务尚未停止' }
+    if (-not (Test-MaintenanceSuccess $result) -or $null -eq $result.Result) {
+        if ($env:MIXIN_OPS_CONSOLE -ceq '1') { throw '停机前无法预览修订整理，控制台操作已拒绝；服务尚未停止' }
+        $fallback = if ($choice) { $choice } else { 'apply' }
+        Write-Warning "停机前无法预览会话库的旧修订链（原因见上方）；按 $fallback 处理，整理在停机后自己检查维护状态和空间，不满足时不开始，部署随之回滚"
+        return $fallback
+    }
+    $preview = $result.Result
+    $runState = if ($null -ne $preview.run) { [string]$preview.run.state } else { 'none' }
+    if ($runState -ceq 'stopped' -and $choice -cne 'skip') {
+        throw "上次修订整理已停止，只能跳过剩余整理或回滚，不能续做；请先用 $(Get-OpsCommandHint 'revision-cleanup skip') 结束它，或$(Get-RevisionCleanupSkipHint)；服务尚未停止"
+    }
+    if ([long]$preview.documents -eq 0 -and $runState -ceq 'none') { return $(if ($choice) { $choice } else { 'apply' }) }
+    $minutes = [Math]::Max([long]1, [long][Math]::Ceiling([long]$preview.seconds / 60))
+    if (-not $choice) {
+        $choice = 'apply'
+        if (-not [Console]::IsInputRedirected -and -not (Read-YesNo "停机后整理这些文档的旧修订链？停机约延长 $minutes 分钟，跳过请输入 n [Y/n]" $true)) { $choice = 'skip' }
+    }
+    if ($choice -ceq 'skip') {
+        Write-Warning ("跳过修订整理：其中 $($preview.legacy) 份超过上限的旧长链在服务运行中保持现状（读入较慢，链继续变长），其余的由服务在下次变更时整理；" +
+            "之后可停机用 $(Get-OpsCommandHint 'revision-cleanup apply') 整理")
+        return $choice
+    }
+    # 续做的整理沿用已验证的备份（预览已按它计算）。
+    $backupBytes = [long]$preview.backupBytes
+    $space = Invoke-MaintenanceTool $Bun $Script 'space' @('--project', $ProjectRoot, '--backup-bytes', "$backupBytes", '--wal-bytes', "$([long]$preview.walBytes)")
+    if ($space.Outcome -ceq 'not-enough-space') { throw "剩余空间不够修订整理（见上方）；可以释放空间后重试，或$(Get-RevisionCleanupSkipHint)（不会自动省略备份）；服务尚未停止" }
+    if (-not (Test-MaintenanceSuccess $space)) { throw '修订整理的空间检查失败（原因见上方）；服务尚未停止' }
+    if ($backupBytes) {
+        Write-Host "停机后整理旧修订链，约 $minutes 分钟；先备份要修改的会话库（$([Math]::Round($backupBytes / 1MB, 1)) MB，备份留在 backup\revision-cleanup，确认后再删除）"
+    } else { Write-Host "停机后续做上次的修订整理，约 $minutes 分钟" }
+    return $choice
 }

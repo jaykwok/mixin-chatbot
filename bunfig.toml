@@ -1,3 +1,7 @@
+# 不自动读取工作目录里的 .env：运行参数只来自 data/config/runtime.json 和显式设置的环境变量（Windows 机器人、控制台、
+# 运维脚本都在项目根运行，多出一个 .env 会悄悄改变它们的取值）。
+env = false
+
 [test]
 # 只从 tests/ 发现用例。
 #

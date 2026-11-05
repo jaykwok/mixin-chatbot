@@ -15,6 +15,7 @@
 import type { Context } from "@earendil-works/chord";
 import { defineDoc, defineDocFamily, type DocumentReader, type Tx } from "@earendil-works/pi-durable";
 import type { RelayReference } from "../integrations/relay.ts";
+import { checkpointDue } from "./checkpoint.ts";
 
 /** Where the answers to one inbound message go, fixed when it arrives. */
 export type ReplyContext = {
@@ -39,17 +40,27 @@ export type LinkNote = { original: string; reference: RelayReference };
 export type ReviewStatus = "checked" | "draft" | "rejected";
 export type Deliverable = {
   id: string; slot: string; seq: number; name: string;
-  sourcePath: string; path: string; size: number; sha256: string; format: string; complete: boolean;
+  path: string; size: number; sha256: string; complete: boolean;
   status: ReviewStatus; checked: string[]; unchecked: string[]; issues: string[]; at: number;
 };
 
-/** A file the model sent during its run (send_file); state as for delivery parts. */
+/** A file or image the model sent during its run (send_file, send_image); state as for delivery parts. */
 export type FileSend = {
   id: string; name: string; path: string; sha256: string; size: number; mode: "direct" | "relay";
   state: "planned" | "sending" | "sent" | "failed" | "uncertain";
   attempts: number; error?: string; at: number;
   relay?: { url: string; note: string; attachment: LinkNote; size: number };
 };
+
+/**
+ * What a run-time send came to: sent (confirmed, or a relay link the reply's notes carry) or uncertain (counts as sent and is
+ * never resent, like `sending` after a restart). Undefined: nothing reached the member.
+ */
+export function fileSendOutcome(file: Readonly<FileSend> | undefined): "sent" | "uncertain" | undefined {
+  if (file === undefined) return undefined;
+  if (file.state === "sent" || (file.mode === "relay" && file.relay !== undefined)) return "sent";
+  return file.state === "uncertain" || file.state === "sending" ? "uncertain" : undefined;
+}
 
 /**
  * pending: not tried yet. failed: certainly not sent; tried again at `retryAt`, never again without it. uncertain: the
@@ -138,6 +149,12 @@ export type Attachment = {
   error?: string;
   /** The request that consumed it. */
   boundTo?: string;
+  /**
+   * A reply to a push (`push:<id>`, src/push/service.ts) holds it instead: never bound to a request, not counted among the
+   * member's unconsumed attachments, not expired and not voided by /clear. The push releases it (drops this record) once
+   * its summary is out; the file is then left to the tmp lifecycle.
+   */
+  heldBy?: string;
   at: number;
 };
 
@@ -147,19 +164,20 @@ export type MemberRecords = { requests: Record<string, RequestRecord>; attachmen
 export const MemberRecordsDoc = defineDocFamily<MemberRecords, null>({
   kind: "mixin.member-records",
   version: 1,
-  checkpointWhen: () => false,
+  checkpointWhen: checkpointDue,
   scope: "session",
   family: true,
   initial: () => ({ requests: {}, attachments: {} }),
 });
 
-export type Receipt = { at: number; phone: string; request?: string };
+/** `acknowledged`: the question got the "received, working on it" notice (a group sends one per window, service.ts). */
+export type Receipt = { at: number; phone: string; request?: string; acknowledged?: true };
 export const ReceiptsDoc = defineDoc<{ items: Record<string, Receipt> }>({
-  kind: "mixin.receipts", version: 1, checkpointWhen: () => false, scope: "session", initial: () => ({ items: {} }),
+  kind: "mixin.receipts", version: 1, checkpointWhen: checkpointDue, scope: "session", initial: () => ({ items: {} }),
 });
 
-export const RECEIPT_RETENTION_MS = 24 * 3600_000;
-export const CLOSED_RECORD_RETENTION_MS = 24 * 3600_000;
+const RECEIPT_RETENTION_MS = 24 * 3600_000;
+const CLOSED_RECORD_RETENTION_MS = 24 * 3600_000;
 
 export async function memberRecords(reader: Pick<DocumentReader, "snapshot">, phone: string, context: Context): Promise<Readonly<MemberRecords>> {
   return (await reader.snapshot(MemberRecordsDoc, phone, context)) ?? { requests: {}, attachments: {} };
@@ -180,17 +198,15 @@ export function pendingDeliveries(records: Readonly<MemberRecords>): RequestReco
 }
 
 /** Parts left `sending` by an ended process: their platform outcome is unknown, so they count as sent. */
-export function settleInterrupted(records: MemberRecords): boolean {
-  let changed = false;
+export function settleInterrupted(records: MemberRecords): void {
   for (const record of Object.values(records.requests)) {
     for (const part of record.delivery?.parts ?? []) {
-      if (part.state === "sending") { part.state = "uncertain"; part.error = "发送过程中服务中断，结果未知"; changed = true; }
+      if (part.state === "sending") { part.state = "uncertain"; part.error = "发送过程中服务中断，结果未知"; }
     }
     for (const file of record.files) {
-      if (file.state === "sending") { file.state = "uncertain"; file.error = "发送过程中服务中断，结果未知"; changed = true; }
+      if (file.state === "sending") { file.state = "uncertain"; file.error = "发送过程中服务中断，结果未知"; }
     }
   }
-  return changed;
 }
 
 /**

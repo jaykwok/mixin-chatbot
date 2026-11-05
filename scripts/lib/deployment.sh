@@ -1,70 +1,20 @@
 #!/usr/bin/env bash
-# Deployment transaction. Call begin_deployment only after read-only preflight succeeds.
+# 部署与升级入口停机前的只读检查（空间、共享资料目录、修订整理的选择）。事务本身（停机、快照、提交、回滚）由共用核心
+# scripts/ops/core 执行，入口经 core-handoff.sh 交给它。
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/candidate-image.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/service-user.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/task-runtime.sh"
-# 服务商、选型和动态目录缓存一起恢复，保证回滚后的实例仍能离线解析出原模型。
-DEPLOY_FILES=(data/config data/runtime/pi/settings.json data/runtime/models-store.json data/state/bot-port data/state/workspace-root data/state/task-runtime)
-
-# archive_project_path is shared with the ops scripts.
-
-# 原容器使用的镜像在事务期间另存这个标签：数据提交后正式标签 mixin-chatbot 改指向候选镜像，失去标签的镜像
-# 可能被清除（containerd 镜像存储的行为并无保证），回滚就无法按镜像 ID 找回原镜像。标签也可能被管理员清除，回滚时如实报告。
-PREVIOUS_IMAGE_TAG=mixin-chatbot:previous
-
-keep_previous_image() {
-    local image
-    image="$(docker container inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null)" || return 0
-    docker tag "$image" "$PREVIOUS_IMAGE_TAG" && return 0
-    print_error "无法为原容器的镜像添加回滚标签 $PREVIOUS_IMAGE_TAG；为保证能回滚，未做任何改动"
-    return 1
-}
-
-# 事务结束（提交或回滚完成）后移除回滚标签；提交后旧镜像不再被引用，随之释放。
-release_previous_image() {
-    docker image inspect "$PREVIOUS_IMAGE_TAG" >/dev/null 2>&1 || return 0
-    docker image rm "$PREVIOUS_IMAGE_TAG" >/dev/null 2>&1 ||
-        print_warning "回滚标签 $PREVIOUS_IMAGE_TAG 清理失败；确认不再需要后可手动 docker image rm $PREVIOUS_IMAGE_TAG"
-}
+# 停机后的修订整理：停机前决定的方式与要计入停机前空间检查的字节数（见 revision_cleanup_decide）。
+REVISION_CLEANUP_CHOICE=apply
+REVISION_CLEANUP_BACKUP_BYTES=0
+REVISION_CLEANUP_WAL_BYTES=0
 
 # 事务结束（提交并发布正式标签，或回滚完成）后移除本次候选镜像的保留标签；被改指向的标签保留并报告。
 release_transaction_candidate() {
     declare -p CANDIDATE >/dev/null 2>&1 && [ -n "${CANDIDATE[image_tag]:-}" ] || return 0
     release_candidate ||
         print_warning "候选镜像的保留标签 ${CANDIDATE[image_tag]} 未移除（原因见上方）；确认不再需要后可手动 docker image rm ${CANDIDATE[image_tag]}"
-}
-
-# 收尾（回滚、中断后的清理）一旦开始就要做完：在独立的进程组中运行命令，标准输入改为 /dev/null，忽略 INT/TERM/HUP
-# 等它结束，返回它的状态；此后这些信号保持忽略，只用于收尾。终端的 Ctrl+C 和断线只发给前台进程组，到不了收尾中的
-# docker 客户端、复制、git 和管道。只让本 shell 忽略信号不够：子进程会重设处理（docker 客户端自己处理 INT/TERM），
-# 管道和命令替换的子 shell 也会恢复默认处理。
-# run_shielded is defined in lifecycle.sh.
-
-# 未完成事务的镜像和服务身份（快照中的 candidate-image 与 service-user）。恢复入口在 committed 检查、回滚或任何运行
-# 容器的操作之前调用；此后只按记录的 image ID 和 UID:GID 运行容器，不重新构建、拉取，也不按标签选择。设置 IMAGE_ID、
-# SERVICE_USER 和 CANDIDATE_PRESENT：镜像已不存在时为 0，由调用方决定（续做和需要撤销数据的回滚都拒绝）。
-# 记录缺失或无效、与事务不符、daemon 已切换、镜像不是本次构建的都返回 1，不降级按标签运行。DOCKER_ROOTLESS 已设置。
-load_transaction_runtime() {
-    local snapshot="$TRANSACTION_SNAPSHOT" status=0 hint
-    hint="请人工检查 ${snapshot}；由旧版本开始的事务请切回它记录的目标提交 ${TRANSACTION[target_sha]:0:7} 后，用那个版本继续或回滚"
-    if ! read_candidate_record "$snapshot" || ! read_service_user_record "$snapshot"; then
-        print_error "事务缺少有效的候选镜像或服务身份记录（原因见上方）；不按标签猜测镜像，也不猜测运行身份。${hint}"
-        return 1
-    fi
-    [ "${CANDIDATE[target_sha]}" = "${TRANSACTION[target_sha]}" ] ||
-        { print_error "候选镜像记录的提交 ${CANDIDATE[target_sha]:0:7} 与事务的目标提交 ${TRANSACTION[target_sha]:0:7} 不一致；${hint}"; return 1; }
-    service_user_fits_daemon "$SERVICE_USER" "$DOCKER_ROOTLESS" ||
-        { print_error "记录的服务身份与当前 Docker 的模式不符（原因见上方）；请回到开始事务时的 Docker"; return 1; }
-    candidate_verify || status=$?
-    case "$status" in
-        0) CANDIDATE_PRESENT=1 ;;
-        6) CANDIDATE_PRESENT=1; print_warning "保留标签不再指向候选镜像；执行仍只按记录的 ID ${CANDIDATE[image_id]}" ;;
-        4) CANDIDATE_PRESENT=0 ;;
-        3) print_error "Docker daemon 与开始事务时不同：拒绝继续和自动回滚，不操作另一个 Docker 上的同名容器；请回到原来的 Docker 后重试"; return 1 ;;
-        *) print_error "候选镜像核对失败（原因见上方）；${hint}"; return 1 ;;
-    esac
-    IMAGE_ID="${CANDIDATE[image_id]}"
 }
 
 # 停机后写入 backup/ 的快照的预计大小（字节）：部署快照（配置和状态文件）与 data/state 中的数据库（含统计账本）。
@@ -79,16 +29,27 @@ snapshot_size_estimate() {
     du -scb -- "${files[@]}" | tail -n 1 | cut -f1
 }
 
+# 跳过修订整理的办法：控制台任务不能设置环境变量，要在升级或重新部署的表单里重新预览并选择跳过。
+revision_cleanup_skip_hint() {
+    if [ "${MIXIN_OPS_CONSOLE:-}" = 1 ]; then printf '%s' '重新预览并选择“跳过整理”'
+    else printf '%s' '设置 BOT_REVISION_CLEANUP=skip 跳过整理'; fi
+}
+
 # 停机前复核剩余空间：data/ 和参数中的路径（例如升级器的导出目录）所在文件系统各保留 CANDIDATE_DATA_RESERVE_BYTES，
-# backup/ 再加上快照的预计大小；共享剩余空间的路径需求相加（见 check_free_space）。
+# backup/ 再加上快照的预计大小；共享剩余空间的路径需求相加（见 check_free_space）。决定停机后整理修订链时
+# （revision_cleanup_decide），backup/ 另加会话库的备份，data/ 另加最大一次删除的 WAL。
 check_stop_disk_space() {
     local backup="$PROJECT_DIR/backup" estimate path args=()
     estimate="$(snapshot_size_estimate)" || estimate=''
     [[ "$estimate" =~ ^[0-9]+$ ]] || { echo "无法估算快照的大小" >&2; return 1; }
     [ -e "$backup" ] || backup="$PROJECT_DIR"
-    args=("$backup" $(( CANDIDATE_DATA_RESERVE_BYTES + estimate )))
-    for path in "$PROJECT_DIR/data" "$@"; do args+=("$path" "$CANDIDATE_DATA_RESERVE_BYTES"); done
-    check_free_space "${args[@]}"
+    args=("$backup" $(( CANDIDATE_DATA_RESERVE_BYTES + estimate + REVISION_CLEANUP_BACKUP_BYTES ))
+        "$PROJECT_DIR/data" $(( CANDIDATE_DATA_RESERVE_BYTES + REVISION_CLEANUP_WAL_BYTES )))
+    for path in "$@"; do args+=("$path" "$CANDIDATE_DATA_RESERVE_BYTES"); done
+    check_free_space "${args[@]}" && return 0
+    [ $(( REVISION_CLEANUP_BACKUP_BYTES + REVISION_CLEANUP_WAL_BYTES )) = 0 ] ||
+        echo "其中修订整理需要备份 $(human_bytes "$REVISION_CLEANUP_BACKUP_BYTES")、WAL $(human_bytes "$REVISION_CLEANUP_WAL_BYTES")；可以释放空间后重试，或$(revision_cleanup_skip_hint)（不会自动省略备份）" >&2
+    return 1
 }
 
 # 共享资料目录的边界在宿主路径空间核对：服务容器把外置资料目录改名挂到 /app/workspace，容器内看不出它在宿主上是否
@@ -118,236 +79,73 @@ check_workspace_layout() {
       "$IMAGE_ID" bun scripts/runtime/layout-check.ts --project "$project" --data "$data" --backup "$backup" --logs "$logs" --workspace "$workspace"
 }
 
-# 迁移日志是否属于这个事务：apply 以事务快照名记下 deployment。
-data_preparation_mentions_deployment() {
-    [ -f "$PROJECT_DIR/data/state/release-data.json" ] && grep -q "\"deployment\": \"$1\"" "$PROJECT_DIR/data/state/release-data.json"
-}
+# ---- 修订链首次整理（revision-chain plan §4、§8）----
+# 停机前在目标版本的代码里只读预览（revision-cleanup.ts preview --shell），决定停机后整理（先备份）或跳过
+# （BOT_REVISION_CLEANUP=apply|skip；不设置时终端交互询问，默认整理，非交互也整理）。空间不足时停机前拒绝，由用户
+# 释放空间或显式选择跳过，不自动改变整理方式。选择交给共用核心记入事务，续做沿用；整理本身由核心在停机后、数据准备
+# 之后、验证实例之前运行。
 
-# 停机窗口写进运维日志：停止正在运行的服务时记下时刻（经环境交给同一次操作中的部署脚本），服务重新就绪时
-# （新版本通过健康检查，或回滚后原容器重新启动）记录时长。中断后在新进程中续做时开始时刻已不可知，只记录恢复。
-downtime_begins() {
-    BOT_DOWNTIME_STARTED="$(date +%s)"
-    export BOT_DOWNTIME_STARTED
-    operation_event info "service stopped; downtime begins"
-}
-downtime_ends() {
-    local now
-    now="$(date +%s)"
-    if [[ "${BOT_DOWNTIME_STARTED:-}" =~ ^[0-9]+$ ]]; then
-        operation_event info "service back ($1); downtime $((now - BOT_DOWNTIME_STARTED))s"
-    else
-        operation_event info "service back ($1); the stop happened in an earlier process"
-    fi
-    unset BOT_DOWNTIME_STARTED
-}
-
-# 新事务的目标提交默认取当前代码；升级器在切换代码前开始事务，传入目标提交。
-begin_deployment() {
-    local target_sha="${1:-}"
-    mkdir -p "$PROJECT_DIR/backup/snapshots" "$PROJECT_DIR/backup/rm" "$PROJECT_DIR/data/state"
-    # util-linux flock owns the deployment lock; children launched as daemons close descriptor 9.
-    acquire_deploy_lock || { print_error "另一个部署正在进行"; return 1; }
-    ROLLBACK_CONTAINER="mixin-chatbot-rollback"
-    if [ -f "$PROJECT_DIR/data/state/deploy-transaction" ]; then
-        local saved_name
-        saved_name="$(cat "$PROJECT_DIR/data/state/deploy-transaction")"
-        [[ "$saved_name" =~ ^deploy-[a-zA-Z0-9]+$ ]] || { print_error "部署事务快照名称无效"; return 1; }
-        DEPLOY_SNAPSHOT="$PROJECT_DIR/backup/snapshots/$saved_name"
-        [ -d "$DEPLOY_SNAPSHOT" ] && [ ! -L "$DEPLOY_SNAPSHOT" ] || { print_error "部署快照缺失"; return 1; }
-        # Rollback restores the snapshot whatever code is checked out; only continuing needs the original target.
-        if [ "${ROLLBACK_REQUESTED:-0}" != 1 ] && [ -s "$DEPLOY_SNAPSHOT/target-sha" ] && [ "$(git -C "$PROJECT_DIR" rev-parse HEAD)" != "$(cat "$DEPLOY_SNAPSHOT/target-sha")" ]; then
-            print_error "中断部署必须使用原目标提交继续"; return 1
-        fi
-        PREVIOUS_RUNNING="$(cat "$DEPLOY_SNAPSHOT/was-running")"
-        [[ "$PREVIOUS_RUNNING" =~ ^[01]$ ]] || return 1
-        # 已提交的事务由部署脚本在读取设置前直接完成激活；这里不能重新开始事务或迁移。
-        if declare -F data_preparation_docker >/dev/null && data_preparation_docker committed --deployment "$saved_name"; then
-            print_error "上次操作的数据已经提交；请使用 $(ops_command_hint resume) 完成新实例启动"
-            return 1
-        fi
-        export BOT_DEPLOY_BACKUP_ID="$saved_name"
-        PREVIOUS_IMAGE="$(cat "$DEPLOY_SNAPSHOT/previous-image")"
-        PREVIOUS_CONTAINER_SAVED=0; PREVIOUS_STOP_ATTEMPTED=0
-        if docker container inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
-            PREVIOUS_CONTAINER_SAVED=1; PREVIOUS_STOP_ATTEMPTED=1
-            if docker container inspect mixin-chatbot >/dev/null 2>&1; then
-                docker stop --time 30 mixin-chatbot >/dev/null || return 1
-                docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || return 1
-            fi
-        elif [ -n "$PREVIOUS_IMAGE" ]; then
-            # 指针发布后、停机前中断：原服务可能仍在运行，停机从这里开始。
-            local running_now
-            running_now="$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)"
-            docker stop --time 30 mixin-chatbot >/dev/null || return 1
-            [ "$running_now" != true ] || downtime_begins
-            docker rename mixin-chatbot "$ROLLBACK_CONTAINER" || return 1
-            PREVIOUS_CONTAINER_SAVED=1; PREVIOUS_STOP_ATTEMPTED=1
-        elif docker container inspect mixin-chatbot >/dev/null 2>&1; then
-            docker stop --time 30 mixin-chatbot >/dev/null || return 1
-            docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || return 1
-        fi
-        NEW_CONTAINER_ATTEMPTED=0; DEPLOY_FILES_MUTATED=1; DEPLOYMENT_COMMITTED=0
-        DATA_PREPARATION_APPLY_ATTEMPTED=1
-        operation_event info "resuming snapshot=$DEPLOY_SNAPSHOT; originally_running=$PREVIOUS_RUNNING"
-        trap rollback_deployment EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
-        print_warning "继续中断的部署，沿用原快照和原运行状态：$saved_name"
-        return 0
-    fi
-    if docker ps -a --format '{{.Names}}' | grep -qx "$ROLLBACK_CONTAINER"; then
-        print_error "发现旧回滚容器，请先确认其状态"; return 1
-    fi
-    keep_previous_image || return 1
-    # A successful deployment removes backup/rm/<snapshot name> as its own archive; never adopt a name whose archive
-    # already exists (left by an earlier operation or restored by hand).
-    local attempt archive
-    for attempt in 1 2 3 4 5; do
-        DEPLOY_SNAPSHOT="$(mktemp -d "$PROJECT_DIR/backup/snapshots/deploy-XXXXXXXX")" || return 1
-        archive="$PROJECT_DIR/backup/rm/$(basename -- "$DEPLOY_SNAPSHOT")"
-        [ -e "$archive" ] || [ -L "$archive" ] || break
-        rmdir -- "$DEPLOY_SNAPSHOT"; DEPLOY_SNAPSHOT=""
-    done
-    [ -n "$DEPLOY_SNAPSHOT" ] || { print_error "无法分配新的部署快照名称；backup/rm 中已有同名归档"; return 1; }
-    export BOT_DEPLOY_BACKUP_ID="$(basename -- "$DEPLOY_SNAPSHOT")"
-    chmod 700 "$DEPLOY_SNAPSHOT"
-    # 提交、回滚等以服务身份运行的容器要读取快照；只交出快照目录本身，仍是 700。
-    grant_service_access "$DEPLOY_SNAPSHOT" || return 1
-    local relative
-    for relative in "${DEPLOY_FILES[@]}"; do
-        if [ -e "$PROJECT_DIR/$relative" ]; then
-            mkdir -p "$(dirname "$DEPLOY_SNAPSHOT/$relative")"
-            cp -a -- "$PROJECT_DIR/$relative" "$DEPLOY_SNAPSHOT/$relative"
-        fi
-    done
-    PREVIOUS_RUNNING=0
-    PREVIOUS_CONTAINER_SAVED=0
-    PREVIOUS_STOP_ATTEMPTED=0
-    PREVIOUS_IMAGE="$(docker container inspect --format '{{.Image}}' mixin-chatbot 2>/dev/null || true)"
-    if [ "$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)" = true ]; then PREVIOUS_RUNNING=1; fi
-    printf '%s' "$PREVIOUS_RUNNING" > "$DEPLOY_SNAPSHOT/was-running"
-    printf '%s' "$PREVIOUS_IMAGE" > "$DEPLOY_SNAPSHOT/previous-image"
-    if [ -n "$target_sha" ]; then printf '%s\n' "$target_sha" > "$DEPLOY_SNAPSHOT/target-sha"
-    else git -C "$PROJECT_DIR" rev-parse HEAD > "$DEPLOY_SNAPSHOT/target-sha" 2>/dev/null || : > "$DEPLOY_SNAPSHOT/target-sha"; fi
-    # The pointer is published only after the confirmed choices are recorded; resume and rollback read only that record.
-    if declare -F record_deployment_transaction >/dev/null; then record_deployment_transaction "$DEPLOY_SNAPSHOT" || return 1; fi
-    printf '%s' "$(basename -- "$DEPLOY_SNAPSHOT")" > "$PROJECT_DIR/data/state/deploy-transaction.tmp"
-    mv -- "$PROJECT_DIR/data/state/deploy-transaction.tmp" "$PROJECT_DIR/data/state/deploy-transaction"
-    NEW_CONTAINER_ATTEMPTED=0
-    DEPLOY_FILES_MUTATED=0
-    DEPLOYMENT_COMMITTED=0
-    operation_event info "snapshot=$DEPLOY_SNAPSHOT; originally_running=$PREVIOUS_RUNNING"
-    trap rollback_deployment EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    if [ -n "$PREVIOUS_IMAGE" ]; then
-        PREVIOUS_STOP_ATTEMPTED=1
-        # Announce only a stop made here; the container may already have been stopped.
-        local running_now
-        running_now="$(docker container inspect --format '{{.State.Running}}' mixin-chatbot 2>/dev/null || true)"
-        docker stop --time 30 mixin-chatbot >/dev/null
-        [ "$running_now" != true ] || downtime_begins
-        docker rename mixin-chatbot "$ROLLBACK_CONTAINER"
-        PREVIOUS_CONTAINER_SAVED=1
-        if [ "$running_now" = true ]; then print_success "已停止机器人服务（容器 mixin-chatbot）；部署完成前不处理消息"; fi
-    fi
-    DEPLOY_FILES_MUTATED=1
-}
-
-commit_deployment() {
-    # The upgrader must distinguish a committed deployment from a later diagnostic failure or signal.
-    if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then
-        printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE" || return 1
-    fi
-    DEPLOYMENT_COMMITTED=1
-    trap - EXIT INT TERM
-    if declare -F operation_finish >/dev/null; then trap 'operation_finish "$?"' EXIT; fi
-}
-
-upgrade_code_pending() {
-    declare -p TRANSACTION >/dev/null 2>&1 || return 1
-    [ "${TRANSACTION[operation]-}" = upgrade ] && [ -n "${TRANSACTION[original_sha]-}" ] &&
-        [ "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null)" != "${TRANSACTION[original_sha]}" ]
-}
-
-rollback_deployment() {
-    local status=$?
-    # Always runs as the exit handler. Further interrupts must not cut the rollback short: a terminal Ctrl+C or hangup
-    # reaches the whole foreground process group and the upgrader forwards it as TERM as well, so the steps run in their
-    # own process group (run_shielded).
-    trap - EXIT
-    trap : INT TERM HUP
-    [ "$DEPLOYMENT_COMMITTED" = 0 ] || { operation_finish "$status"; return "$status"; }
-    # A signal can arrive after the receipt write and before the local flag is assigned.
-    if [ "${DATA_PREPARATION_APPLY_ATTEMPTED:-0}" = 0 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ] && [ "$(cat "$BOT_UPDATE_COMMIT_FILE" 2>/dev/null)" = committed ]; then operation_finish "$status"; return "$status"; fi
-    operation_event error "deployment interrupted; exit=$status"
-    operation_stage rollback
-    set +e
-    run_shielded restore_deployment "$status"
-    status=$?
-    operation_finish "$status"
-    exit "$status"
-}
-
-# The rollback steps, run by rollback_deployment in their own process group; returns the operation's exit status.
-restore_deployment() {
-    local status="$1" failed=0
-    if [ "$DEPLOY_FILES_MUTATED" = 0 ]; then
-        if [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ] && docker start mixin-chatbot >/dev/null; then
-            downtime_ends 'previous version restarted'
-        fi
+# 预览的 --shell 结果（标准输入）读入 REVISION_CLEANUP；结果不完整、不是成功或缺项时返回 1（原因已写到标准错误）。
+revision_cleanup_read_preview() {
+    local key
+    if ! maintenance_result_read preview documents revisions longest legacy backup_bytes wal_bytes seconds run_state; then
+        echo "修订整理预览的结果不完整或无法识别" >&2
         return 1
     fi
-    if [ "$NEW_CONTAINER_ATTEMPTED" = 1 ] && docker container inspect mixin-chatbot >/dev/null 2>&1; then
-        if docker stop --time 30 mixin-chatbot >/dev/null; then
-            docker rename mixin-chatbot "mixin-chatbot-failed-$(date +%s)" || failed=1
-        else
-            print_error "新容器未停止，拒绝覆盖其配置；快照保留在 $DEPLOY_SNAPSHOT"
-            return 1
-        fi
-    fi
-    # Data must be restored before the old container can start. A committed data marker
-    # is authoritative even if the shell died before writing its deployment receipt.
-    if declare -F rollback_current_data >/dev/null; then
-        local data_preparation_status=0
-        rollback_current_data || data_preparation_status=$?
-        if [ "$data_preparation_status" != 0 ]; then
-            # The upgrader keeps the target code (and its recovery tools) on this receipt,
-            # even when data restoration itself failed.
-            if [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then printf 'committed\n' > "$BOT_UPDATE_COMMIT_FILE"; fi
-            print_error "数据回滚未完成或已经提交；保持停止，不恢复旧容器。"
-            return 1
-        fi
-    fi
-    rm -f -- "$PROJECT_DIR/data/state/verify-only"
-    local relative
-    for relative in "${DEPLOY_FILES[@]}"; do
-        archive_project_path "$PROJECT_DIR/$relative" || failed=1
-        if [ -e "$DEPLOY_SNAPSHOT/$relative" ]; then
-            mkdir -p "$(dirname "$PROJECT_DIR/$relative")"
-            cp -a -- "$DEPLOY_SNAPSHOT/$relative" "$PROJECT_DIR/$relative" || failed=1
-        fi
+    [ "${MAINTENANCE_RESULT[outcome]}" = success ] || return 1
+    declare -gA REVISION_CLEANUP=()
+    for key in documents revisions longest legacy backup_bytes wal_bytes seconds; do
+        [[ "${MAINTENANCE_RESULT[$key]}" =~ ^[0-9]+$ ]] || { echo "修订整理预览的 $key 无效" >&2; return 1; }
+        REVISION_CLEANUP[$key]="${MAINTENANCE_RESULT[$key]}"
     done
-    if [ -n "$PREVIOUS_IMAGE" ] && ! docker tag "$PREVIOUS_IMAGE" mixin-chatbot; then
-        failed=1
-        print_error "原镜像 ${PREVIOUS_IMAGE#sha256:} 已不存在（回滚标签 $PREVIOUS_IMAGE_TAG 缺失），无法恢复 mixin-chatbot 标签"
+    [[ "${MAINTENANCE_RESULT[run_state]}" =~ ^(none|running|stopped)$ ]] || { echo "修订整理预览的 run_state 无效" >&2; return 1; }
+    REVISION_CLEANUP[run_state]="${MAINTENANCE_RESULT[run_state]}"
+}
+
+# 按预览决定本次的整理方式（REVISION_CLEANUP_CHOICE），以及停机前空间检查要计入的备份和 WAL 字节数。在停机之前调用。
+revision_cleanup_decide() {
+    local choice="${BOT_REVISION_CLEANUP:-}" minutes answer
+    case "$choice" in
+        ''|apply|skip) ;;
+        *) print_error "BOT_REVISION_CLEANUP 只能是 apply（默认）或 skip"; return 1 ;;
+    esac
+    REVISION_CLEANUP_BACKUP_BYTES=0
+    REVISION_CLEANUP_WAL_BYTES=0
+    if [ "${REVISION_CLEANUP[run_state]}" = stopped ] && [ "$choice" != skip ]; then
+        print_error "上次修订整理已停止，只能跳过剩余整理或回滚，不能续做；请先用 $(ops_command_hint revision-cleanup) skip 结束它，或$(revision_cleanup_skip_hint)"
+        return 1
     fi
-    if [ "$PREVIOUS_CONTAINER_SAVED" = 1 ]; then docker rename "$ROLLBACK_CONTAINER" mixin-chatbot || failed=1; fi
-    if [ "$failed" = 0 ] && [ "$PREVIOUS_STOP_ATTEMPTED" = 1 ] && [ "$PREVIOUS_RUNNING" = 1 ]; then
-        if docker start mixin-chatbot >/dev/null; then downtime_ends 'previous version restarted'; else failed=1; fi
+    if [ "${REVISION_CLEANUP[documents]}" = 0 ] && [ "${REVISION_CLEANUP[run_state]}" = none ]; then
+        REVISION_CLEANUP_CHOICE="${choice:-apply}"
+        return 0
     fi
-    if [ "$failed" = 0 ]; then
-        if [ "${DATA_PREPARATION_APPLY_ATTEMPTED:-0}" = 1 ] && [ -n "${BOT_UPDATE_COMMIT_FILE:-}" ]; then : > "$BOT_UPDATE_COMMIT_FILE"; fi
-        # 升级的代码由升级器恢复：代码还不是升级前的提交时保留事务指针，记下“待恢复代码”阶段
-        # （见 transaction_code_restore_pending），代码恢复后才清除，恢复失败时回滚仍可重试。
-        if upgrade_code_pending; then : > "$DEPLOY_SNAPSHOT/code-restore" || failed=1
-        else rm -f -- "$PROJECT_DIR/data/state/deploy-transaction"; fi
+    minutes=$(( (${REVISION_CLEANUP[seconds]} + 59) / 60 ))
+    [ "$minutes" -gt 0 ] || minutes=1
+    if [ -z "$choice" ]; then
+        choice=apply
+        if [ -t 0 ]; then
+            while true; do
+                echo -en "${CYAN}?> 停机后整理这些文档的旧修订链？停机约延长 ${minutes} 分钟，跳过请输入 n [Y/n] ${NC}"
+                if ! IFS= read -r answer; then echo ""; print_warning "输入已结束，按默认值“整理”处理"; break; fi
+                case "$(printf '%s' "$answer" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+                    ''|y|yes|是) break ;;
+                    n|no|否) choice=skip; break ;;
+                    *) print_warning "请输入 y 或 n（也可直接回车采用默认值）" ;;
+                esac
+            done
+        fi
     fi
-    if [ "$failed" = 0 ]; then
-        release_previous_image
-        release_transaction_candidate
-        print_warning "已恢复配置、容器、网络入口和原运行状态；快照在 $DEPLOY_SNAPSHOT"
-    else print_error "自动回滚未完成；请检查保留的快照 $DEPLOY_SNAPSHOT"; fi
-    # An operator-requested rollback that completed is a success; any other rollback reports the failure.
-    if [ "${ROLLBACK_REQUESTED:-0}" = 1 ] && [ "$failed" = 0 ]; then status=0
-    elif [ "$status" -eq 0 ]; then status=1; fi
-    return "$status"
+    REVISION_CLEANUP_CHOICE="$choice"
+    if [ "$choice" = skip ]; then
+        print_warning "跳过修订整理：其中 ${REVISION_CLEANUP[legacy]} 份超过上限的旧长链在服务运行中保持现状（读入较慢，链继续变长），其余的由服务在下次变更时整理；之后可停机用 $(ops_command_hint revision-cleanup) apply 整理"
+        return 0
+    fi
+    REVISION_CLEANUP_WAL_BYTES="${REVISION_CLEANUP[wal_bytes]}"
+    # 续做的整理沿用已验证的备份（预览已按它计算）。
+    REVISION_CLEANUP_BACKUP_BYTES="${REVISION_CLEANUP[backup_bytes]}"
+    if [ "$REVISION_CLEANUP_BACKUP_BYTES" != 0 ]; then
+        print_status "停机后整理旧修订链，约 ${minutes} 分钟；先备份要修改的会话库（$(human_bytes "$REVISION_CLEANUP_BACKUP_BYTES")，备份留在 backup/revision-cleanup，确认后再删除）"
+    else
+        print_status "停机后续做上次的修订整理，约 ${minutes} 分钟"
+    fi
 }

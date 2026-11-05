@@ -67,6 +67,24 @@ test.skipIf(process.platform !== "linux")("explicit document inputs bypass unrel
   } finally { await task.seal(); await tasks.reclaim(task.id); await f.cleanup(); }
 });
 
+// The Docker CLI warns on stderr (create --memory without swap accounting, for one); answers come from stdout alone.
+test.skipIf(process.platform !== "linux")("CLI warnings on stderr do not corrupt container identities, inspections or the mapping proof", async () => {
+  const f = await tempFixture("task-cli-warnings-"), temp = join(f.root, "caller"), control = join(f.root, "control");
+  await mkdir(temp);
+  const backend = syntheticDriver(), warning = "WARNING: Your kernel does not support swap limit capabilities or the cgroup is not mounted.\n";
+  const driver: TaskDriver = { async run(args, options) {
+    const result = await backend.driver.run(args, options);
+    return { exitCode: result.exitCode, output: warning + result.output, stdout: result.output };
+  } };
+  const tasks = new RootlessTasks(control, image, driver), task = await tasks.create(temp);
+  try {
+    await task.run({ command: "bun", args: [], cwd: task.path, timeoutMs: 1000 });
+    await task.seal({ discardScratch: true });
+    expect(await readFile(join(task.path, "output"), "utf8")).toBe("owned");
+    expect((await tasks.reclaim(task.id)).status).toBe("removed");
+  } finally { await task.seal(); await tasks.reclaim(task.id); await f.cleanup(); }
+});
+
 test.skipIf(process.platform !== "linux")("a mount path the CLI cannot carry fails before a pending name is saved", async () => {
   const f = await tempFixture("task-mount-syntax-"), temp = join(f.root, "caller"), control = join(f.root, "control"), shared = join(f.root, "a,b");
   await mkdir(temp); await mkdir(shared);

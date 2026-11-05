@@ -15,8 +15,8 @@ type WindowOf = (key: string) => number | undefined;
  *
  * Two run semantics are stated rather than left to defaults. A failed run keeps whatever Durable queued behind it
  * (`keep`): the member worker submits one inbox item at a time and answers a failure itself, so nothing is withdrawn
- * or sent on without it. A task cut off by crashes `DEFAULT_RESTART_LIMIT` times in a row without progress is parked
- * (never `Infinity`): /status names it and /stop, /clear or the total deadline end it (service.ts).
+ * or sent on without it. A task cut off by crashes `DEFAULT_RESTART_LIMIT` times in a row without progress ends (never
+ * `Infinity`): a tool call with an error result, a run with `restart_limit`, which the member is told (service.ts).
  */
 export function durableSettings(settings: SettingsManager, model: Model<Api>, cacheRetention?: CacheRetention, windowOf?: WindowOf): HarnessSettings {
   const policy = enginePolicy((settings.getGlobalSettings() as { durable?: unknown }).durable);

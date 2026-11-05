@@ -31,6 +31,9 @@ test("runtime settings retain previous values and validate explicit overrides", 
     expect(() => validateRuntimeConfig({ BOT_MODEL_CACHE_RETENTION: "auto" })).toThrow();
     for (const value of [1, 2, 8]) expect(validateRuntimeConfig({ BOT_ATTACHMENT_CONCURRENCY: value })).toHaveProperty("BOT_ATTACHMENT_CONCURRENCY", String(value));
     for (const value of [0, 9, 1.5]) expect(() => validateRuntimeConfig({ BOT_ATTACHMENT_CONCURRENCY: value })).toThrow();
+    // 0 turns the acknowledgement off; the upper bound is the receipts' and records' one-day retention.
+    for (const value of [0, 30, 1440]) expect(validateRuntimeConfig({ BOT_ACKNOWLEDGE_IDLE_MINUTES: value })).toHaveProperty("BOT_ACKNOWLEDGE_IDLE_MINUTES", String(value));
+    for (const value of [-1, 1441, 2.5, "abc"]) expect(() => validateRuntimeConfig({ BOT_ACKNOWLEDGE_IDLE_MINUTES: value })).toThrow();
     const absolute = join(fixture.root, "公司", "模板.POTX");
     for (const value of ["模板/默认.potx", "默认.PPTX", absolute]) {
       expect(validateRuntimeConfig({ BOT_DOCUMENT_PPTX_TEMPLATE: value })).toHaveProperty("BOT_DOCUMENT_PPTX_TEMPLATE", value);

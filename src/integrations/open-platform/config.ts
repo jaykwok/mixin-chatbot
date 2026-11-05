@@ -58,6 +58,11 @@ export function readAppBotConfig(path = APP_BOT_CONFIG_PATH): AppBotConfig | und
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
+  return parseAppBotText(raw, path);
+}
+
+/** 解析配置文件的文本；JSON 错误只报路径（解析器停下处的字节可能就是密钥）。 */
+export function parseAppBotText(raw: string, path = APP_BOT_CONFIG_PATH): AppBotConfig {
   let parsed: unknown;
   try { parsed = JSON.parse(raw); }
   catch { throw new Error(`${path} 不是有效的 JSON`); }

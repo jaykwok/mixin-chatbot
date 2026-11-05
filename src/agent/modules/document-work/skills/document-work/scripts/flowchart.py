@@ -34,7 +34,8 @@ IDENT = re.compile(r"[A-Za-z0-9_\u00c0-\u024f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u
 EDGE_MID = re.compile(r"(?P<open>--|==|-\.)\s*(?P<label>[^\s\-=.>|][^>]*?)\s*(?P<close>-->|---|--|==>|===|==|\.->|\.-|->|=>)")
 EDGE = re.compile(r"(?P<line>-{2,}|={2,}|-\.+-|-|=)(?P<head>>)?(?:\s*\|(?P<label>[^|]*)\|)?")
 HEADER = re.compile(r"^(?:graph|flowchart)\b\s*(?P<dir>TB|TD|BT|LR|RL)?\s*$", re.I)
-IGNORED = re.compile(r"^(?:subgraph\b|end\b|style\b|classDef\b|class\b|click\b|linkStyle\b|%%\{)", re.I)
+# Mermaid's own lines: lower-case keywords with their arguments, so that nodes called End, Click or style stay nodes.
+IGNORED = re.compile(r"^(?:subgraph\b|end$|(?:style|classDef|class|click|linkStyle)\s+(?![-=]))")
 TERMINAL = re.compile(r"^(开始|结束|完成|流程开始|流程结束|start|end|begin|stop|finish|done)$", re.I)
 
 
@@ -64,22 +65,30 @@ def parse_node(graph, line, pos):
     if not match:
         raise ValueError(f"期望节点，得到“{line[pos:pos + 12]}”")
     ident, pos = match.group(), match.end()
-    label = kind = None
-    for opener, closer, shape in SHAPES:
-        if line.startswith(opener, pos):
-            start = pos + len(opener)
-            if line.startswith('"', start):
-                quote = line.find('"', start + 1)
-                if quote < 0 or not line.startswith(closer, quote + 1):
-                    raise ValueError(f"节点 {ident} 的引号或括号不匹配")
-                label, pos = line[start + 1:quote], quote + 1 + len(closer)
-            else:
-                end = line.find(closer, start)
-                if end < 0:
-                    raise ValueError(f"节点 {ident} 缺少 {closer}")
+    label = kind = missing = None
+    # The longest opener with a closer in the line; of an opener's closers ([/ takes /] and \]) the nearest.
+    for opener in dict.fromkeys(entry[0] for entry in SHAPES):
+        if not line.startswith(opener, pos):
+            continue
+        start = pos + len(opener)
+        closers = [(closer, shape) for candidate, closer, shape in SHAPES if candidate == opener]
+        if line.startswith('"', start):
+            quote = line.find('"', start + 1)
+            found = next(((closer, shape) for closer, shape in closers if quote >= 0 and line.startswith(closer, quote + 1)), None)
+            if found:
+                label, pos, kind = line[start + 1:quote], quote + 1 + len(found[0]), found[1]
+                break
+            missing = missing or f"节点 {ident} 的引号或括号不匹配"
+        else:
+            ends = [(line.find(closer, start), closer, shape) for closer, shape in closers if closer in line[start:]]
+            if ends:
+                end, closer, kind = min(ends)
                 label, pos = line[start:end], end + len(closer)
-            kind = shape
-            break
+                break
+            missing = missing or f"节点 {ident} 缺少 {closers[0][0]}"
+    else:
+        if missing:
+            raise ValueError(missing)
     if label is not None:
         label = re.sub(r"<br\s*/?>", "\n", label).strip().strip('"').strip()
     graph.node(ident, label, kind)
@@ -136,8 +145,10 @@ def parse(text):
                 graph.direction = header.group("dir").upper().replace("TD", "TB")
             continue
         if IGNORED.match(line):
-            if line.lower().startswith("subgraph"):
-                graph.warnings.append("已忽略 subgraph 分组，节点按同一张图处理")
+            keyword = line.split()[0]
+            note = "已忽略 subgraph 分组，节点按同一张图处理" if keyword == "subgraph" else f"已忽略 {keyword} 行，样式和点击不会画出来"
+            if keyword != "end" and note not in graph.warnings:
+                graph.warnings.append(note)
             continue
         try:
             parse_chain(graph, line)

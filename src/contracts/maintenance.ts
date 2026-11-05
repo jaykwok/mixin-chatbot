@@ -1,5 +1,5 @@
 // Saved maintenance documents: archive plans, removal lists, physical reclamation plans, their progress files and the
-// platform deletion journals. Pure decoders over parsed JSON, loadable by the host TUI: no file system, SQLite, FFI or
+// platform deletion journals. Pure decoders over parsed JSON, loadable by the host console: no file system, SQLite, FFI or
 // service code. The rules are those of the readers they replaced; a failure keeps the reader's message and names the
 // first rule that failed. Digests cover the saved fields in their saved order — nothing is sorted, added or dropped.
 import { createHash } from "node:crypto";
@@ -291,13 +291,13 @@ export function journalRecordsDeletion(value: unknown, path: string, proof: Tree
     && oneOf(["deleting", "removed", "restored"], value.phase);
 }
 
-// ---- Host summaries (TUI): any plan kind and its progress, without the service's root and identity checks ----
+// ---- Host summaries (console previews): any plan kind, without the service's root and identity checks ----
 
-const INVALID_PLAN = "清单摘要或条目无效", PROGRESS_MISMATCH = "结果与清单不符", INVALID_RESULT = "清单结果无效";
+const INVALID_PLAN = "清单摘要或条目无效";
 
-export interface PlanSummary { id: string; digest: string; ready: number; bytes: number; kept: number; deferred: number }
-/** Totals of one whole list (all its runs so far), not of the last run. `done`/`bytes` exclude finishing outcomes. */
-export interface ProgressSummary { done: number; bytes: number; finishing: number; kept: number; deferred: number; failed: number; missing: number }
+export interface PlanSummary { id: string; digest: string; ready: number; bytes: number; kept: number; deferred: number;
+  /** Why items stay (kept or deferred), most frequent first: at most five recorded texts with their counts. */
+  reasons: { reason: string; count: number }[] }
 
 /** All three plan kinds: an ID, a digest over everything else, and items with a status and byte evidence. */
 export function decodePlanSummary(value: unknown, id: string): PlanSummary {
@@ -311,25 +311,14 @@ export function decodePlanSummary(value: unknown, id: string): PlanSummary {
     need(isRecord(item) && oneOf(PLAN_STATUSES, item.status), `items[${index}].status`);
     need(item.evidence === undefined || isRecord(item.evidence) && isCount(item.evidence.bytes), `items[${index}].evidence`);
   });
-  const typed = items as { status: PlanStatus; evidence?: { bytes: number } }[];
-  const ready = typed.filter(item => item.status === "ready");
+  const typed = items as { status: PlanStatus; evidence?: { bytes: number }; reason?: unknown }[];
+  const ready = typed.filter(item => item.status === "ready"), reasons = new Map<string, number>();
+  for (const item of typed) {
+    if (item.status === "ready" || typeof item.reason !== "string" || !item.reason) continue;
+    const reason = item.reason.slice(0, 200); reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+  }
   return { id, digest: value.digest, ready: ready.length, bytes: ready.reduce((sum, item) => sum + (item.evidence?.bytes ?? 0), 0),
-    kept: typed.filter(item => item.status === "kept").length, deferred: typed.filter(item => item.status === "deferred").length };
+    kept: typed.filter(item => item.status === "kept").length, deferred: typed.filter(item => item.status === "deferred").length,
+    reasons: [...reasons].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([reason, count]) => ({ reason, count })) };
 }
 
-/** Archive/removal progress names the plan by `digest`, reclamation progress by `plan`. */
-export function decodeProgressSummary(value: unknown, digest: string, done: "archived" | "removed"): ProgressSummary {
-  if (!isRecord(value) || value.version !== 1 || (value.digest ?? value.plan) !== digest || !isRecord(value.outcomes)) {
-    throw new ContractError(PROGRESS_MISMATCH);
-  }
-  const outcomes = Object.values(value.outcomes);
-  if (!outcomes.every(item => isRecord(item) && oneOf([done, "kept", "deferred", "failed", "missing"], item.status) && isCount(item.bytes))) {
-    throw new ContractError(INVALID_RESULT);
-  }
-  if (!outcomes.every(item => validFinishing(item as Record<string, unknown>, done))) throw new ContractError(INVALID_RESULT);
-  const typed = outcomes as { status: string; bytes: number; finishing?: true }[];
-  const count = (status: string) => typed.filter(item => item.status === status).length;
-  const finished = typed.filter(item => item.status === done && !item.finishing);
-  return { done: finished.length, bytes: finished.reduce((sum, item) => sum + item.bytes, 0), finishing: typed.filter(item => item.finishing).length,
-    kept: count("kept"), deferred: count("deferred"), failed: count("failed"), missing: count("missing") };
-}

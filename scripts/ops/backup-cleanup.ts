@@ -1,4 +1,5 @@
-// 历史归档清理：扫描 backup/rm 和 backup/snapshots 的顶层条目，分类后写出清单；只按清单列出的精确路径删除。
+// 历史归档清理：扫描 backup/rm、backup/snapshots 和 backup/revision-cleanup 的顶层条目，分类后写出清单；只按清单列出的
+// 精确路径删除。
 //
 //   scan（默认）                    只读扫描，写出 tmp/backup-cleanup/<报告名>/manifest.json 和便于查看的 manifest.tsv
 //   apply <报告名>                  预演：逐条重新检查选为删除的条目，列出结果和确认码，不删除任何内容
@@ -13,7 +14,7 @@ import {
   rmdirSync, unlinkSync, writeFileSync, type BigIntStats,
 } from "node:fs";
 import { join } from "node:path";
-import { cliArgs } from "../lib/cli.ts";
+import { backupOptions } from "../lib/backup-options.ts";
 
 type Category = "confirmed-test" | "suspected-test" | "business" | "unknown";
 type Kind = "directory" | "file" | "link" | "other";
@@ -26,7 +27,7 @@ interface Manifest { format: 2; created: string; integrity: string; entries: Ent
 type Outcome = "deleted" | "would-delete" | "kept" | "changed" | "refused" | "missing" | "failed";
 export interface Result { path: string; category: Category; bytes: number; outcome: Outcome; reason: string }
 
-const AREAS = ["rm", "snapshots"] as const;
+const AREAS = ["rm", "snapshots", "revision-cleanup"] as const;
 const LABELS: Record<Category, string> = { "confirmed-test": "可确认测试数据", "suspected-test": "疑似测试数据", business: "业务归档", unknown: "无法判断" };
 const OUTCOMES: Record<Outcome, string> = {
   deleted: "已删除", "would-delete": "将删除", kept: "保留", changed: "扫描后有变化，跳过", refused: "拒绝", missing: "已不存在", failed: "删除失败",
@@ -42,7 +43,9 @@ const TRANSACTION_NAME = /^(?:deploy-[A-Za-z0-9]{8}|(?:deploy|tunnel)-[0-9a-f]{3
 const MIGRATION_NAME = new RegExp(`^migration-${UUID}$`);
 const POINTERS = ["deploy-transaction", "upgrade-transaction"];
 const REPORT_NAME = /^\d{8}T\d{6}Z-[0-9a-f]{6}$/;
-const ENTRY_PATH = /^backup\/(rm|snapshots)\/([^/\\\u0000-\u001f\u007f]+)$/;
+const ENTRY_PATH = /^backup\/(rm|snapshots|revision-cleanup)\/([^/\\\u0000-\u001f\u007f]+)$/;
+// 修订整理的运行（src/durable/revision-cleanup/run.ts 的 newJournal）：日期-8 位十六进制，每次运行一个目录。
+const CLEANUP_RUN = /^\d{8}-[0-9a-f]{8}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 const SMALL_FILE = 256 * 1024, FILLER_MIN = 1024 * 1024, FILLER_MAX = 64 * 1024 * 1024;
 // mkdtemp 的 6 位随机后缀；要求含大写字母或数字，排除恰好以 6 个小写字母结尾的普通名称。
@@ -139,6 +142,15 @@ function protectedPaths(project: string): Map<string, string> {
       throw new Error("发布状态格式不匹配，无法确认备份是否可清理");
     for (const area of AREAS) paths.set(`backup/${area}/${release.deployment}`, "当前格式发布回执正在引用");
   }
+  // 尚未结束的修订整理（运行中或已停止）还要用它的备份：续做复用，人工处理也可能需要。
+  const cleanupText = readText(join(project, "data/state/revision-cleanup.json"));
+  if (cleanupText) {
+    const journal = JSON.parse(cleanupText);
+    if (typeof journal?.run !== "string" || typeof journal.state !== "string") throw new Error("修订整理日志格式不匹配，无法确认备份是否可清理");
+    if ((journal.state === "running" || journal.state === "stopped") && CLEANUP_RUN.test(journal.run)) {
+      paths.set(`backup/revision-cleanup/${journal.run}`, "修订整理尚未结束（data/state/revision-cleanup.json）");
+    }
+  }
   return paths;
 }
 
@@ -183,7 +195,10 @@ function inspect(project: string, area: typeof AREAS[number], name: string, prot
   let category: Category, basis: string[];
   if (!top) [category, basis] = ["unknown", [`无法读取：${tree.unreadable[0]}`]];
   else if (type === "link") [category, basis] = ["unknown", ["条目本身是链接或目录联接；工具不跟随链接"]];
-  else if (area === "snapshots") {
+  else if (area === "revision-cleanup") {
+    if (type === "directory" && CLEANUP_RUN.test(name)) [category, basis] = ["business", ["修订整理前的会话库备份：确认整理后机器人运行正常后可以删除"]];
+    else [category, basis] = ["unknown", ["不是修订整理运行的备份目录"]];
+  } else if (area === "snapshots") {
     if (type === "directory" && TRANSACTION_NAME.test(name)) [category, basis] = ["business", ["部署、升级（或旧版隧道操作）快照：操作失败、回滚或清理未完成时保留，用于恢复"]];
     else if (type === "directory" && MIGRATION_NAME.test(name)) [category, basis] = ["business", ["旧版数据迁移快照：迁移前的数据库和配置副本"]];
     else [category, basis] = ["unknown", ["不是已知格式的快照"]];
@@ -243,11 +258,12 @@ function reportDirectory(project: string, report: string): string {
   return directory;
 }
 
-export interface ScanReport { report: string | null; entries: Entry[]; skipped: string[] }
+/** `protected` maps entry paths that a cleanup would refuse right now to the reason. */
+export interface ScanReport { report: string | null; entries: Entry[]; skipped: string[]; protected: ReadonlyMap<string, string> }
 
 /** 只读扫描；唯一的写入是 tmp/backup-cleanup/<报告名>/ 下的清单。 */
 export function scan(project: string, progress?: (done: number, total: number) => void): ScanReport {
-  if (!realDirectory(join(project, "backup"), "backup")) return { report: null, entries: [], skipped: [] };
+  if (!realDirectory(join(project, "backup"), "backup")) return { report: null, entries: [], skipped: [], protected: new Map() };
   realDirectory(join(project, "tmp"), "tmp");
   realDirectory(join(project, "tmp/backup-cleanup"), "tmp/backup-cleanup");
   const skipped = readdirSync(join(project, "backup")).filter(name => !(AREAS as readonly string[]).includes(name)).sort();
@@ -272,7 +288,7 @@ export function scan(project: string, progress?: (done: number, total: number) =
     ["动作", "分类", "大小", "字节", "文件数", "路径", "依据"].join("\t"),
     ...rows.map(e => [e.action, LABELS[e.category], size(e.bytes), e.bytes, e.files, e.path, e.basis.join("；")].map(tsvCell).join("\t")),
   ].join("\n") + "\n");
-  return { report, entries, skipped };
+  return { report, entries, skipped, protected: protect };
 }
 
 function parseManifest(bytes: Buffer): Manifest {
@@ -346,6 +362,21 @@ function evaluate(project: string, entry: Entry, execute: boolean): Result {
 
 export interface ApplyReport { code: string; results: Result[]; resultFile: string | null }
 
+/** UI selection changes only action fields. The old report digest binds indexes to the exact preview the user saw. */
+export function selectEntries(project: string, report: string, expected: string, indexes: number[]): string {
+  const path = join(reportDirectory(project, report), "manifest.json"), stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("备份清单不是普通文件");
+  const bytes = readFileSync(path), manifest = parseManifest(bytes);
+  if (sha256(bytes).slice(0, 16) !== expected) throw new Error("备份清单已变化，请重新扫描");
+  const selected = new Set(indexes);
+  if (selected.size !== indexes.length || indexes.some(index => !Number.isSafeInteger(index) || index < 0 || index >= manifest.entries.length)) throw new Error("备份选择无效");
+  for (const [index, entry] of manifest.entries.entries()) {
+    if (selected.has(index) && !["confirmed-test", "business"].includes(entry.category)) throw new Error("疑似测试数据或无法判断的条目必须人工处理");
+    entry.action = selected.has(index) ? "delete" : "keep";
+  }
+  const next = manifestText(manifest); publish(path, next); return sha256(Buffer.from(next)).slice(0, 16);
+}
+
 /** 预演（不传确认码）或执行。确认码是 manifest.json 的 SHA-256 前 16 位：预演后改动清单会使它失效。 */
 export function apply(project: string, report: string, confirm?: string, progress?: (done: number, total: number) => void): ApplyReport {
   const directory = reportDirectory(project, report);
@@ -386,7 +417,7 @@ function totals<T>(items: T[], key: (item: T) => string, bytes: (item: T) => num
 function printScan(scanned: ScanReport): void {
   if (!scanned.report) { console.log("没有 backup 目录，无需清理。"); return; }
   const byCategory = totals(scanned.entries, entry => entry.category, entry => entry.bytes);
-  console.log(`已扫描 backup/rm 和 backup/snapshots 的 ${scanned.entries.length} 个顶层条目；没有删除任何内容。`);
+  console.log(`已扫描 backup/rm、backup/snapshots 和 backup/revision-cleanup 的 ${scanned.entries.length} 个顶层条目；没有删除任何内容。`);
   for (const category of Object.keys(LABELS) as Category[]) {
     const total = byCategory.get(category) ?? { count: 0, bytes: 0 };
     console.log(`  ${LABELS[category]}：${total.count} 个，${size(total.bytes)}`);
@@ -440,25 +471,22 @@ function printApply(report: string, applied: ApplyReport, execute: boolean): num
 function usage(): void {
   console.log("用法：bun run scripts/ops/backup-cleanup.ts [scan | apply <报告名> [--confirm <确认码>]]");
   console.log("");
-  console.log("  scan                         只读扫描 backup/rm 和 backup/snapshots，分类并写出清单（默认）");
+  console.log("  scan                         只读扫描 backup/rm、snapshots 和 revision-cleanup，分类并写出清单（默认）");
   console.log("  apply <报告名>               预演：重新检查清单中选为删除的条目，给出确认码，不删除");
   console.log("  apply <报告名> --confirm <码> 按清单的精确路径删除；执行前逐条重新检查，结果写入报告目录");
 }
 
 async function main(args: string[]): Promise<number> {
-  const { values, positionals } = cliArgs(args, { confirm: { type: "string" } });
-  const [command = "scan", report, ...extra] = positionals;
-  if (extra.length) throw new Error("参数过多");
+  const { command, report, confirm } = backupOptions(args);
   const progress = (done: number, total: number) => console.error(`…… ${done}/${total}`);
   const project = process.cwd();
   switch (command) {
     case "scan":
-      if (report !== undefined || values.confirm !== undefined) throw new Error("scan 不接受其他参数");
       printScan(scan(project, progress));
       return 0;
     case "apply":
       if (!report) throw new Error("apply 需要报告名（tmp/backup-cleanup 下的目录名）");
-      return printApply(report, apply(project, report, values.confirm, progress), values.confirm !== undefined);
+      return printApply(report, apply(project, report, confirm, progress), confirm !== undefined);
     default:
       usage();
       return command === "help" ? 0 : 1;

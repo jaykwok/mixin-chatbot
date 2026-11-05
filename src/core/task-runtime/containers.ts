@@ -9,8 +9,13 @@ import type { TaskPaths } from "../task-deployment.ts";
 import { workPath } from "./entities.ts";
 
 export interface DriverOptions { signal?: AbortSignal; timeoutMs?: number; onData?: (data: Buffer) => void }
+/**
+ * `output` is stdout and stderr interleaved, for messages. Answers are parsed from `stdout` alone: the Docker CLI prints
+ * warnings on stderr (for example `create --memory` on hosts without swap accounting). A driver that does not separate
+ * the streams may omit it.
+ */
 export interface TaskDriver {
-  run(args: string[], options?: DriverOptions): Promise<{ exitCode: number; output: string }>;
+  run(args: string[], options?: DriverOptions): Promise<{ exitCode: number; output: string; stdout?: string }>;
 }
 
 function mount(source: string, target: string, readonly: boolean): string {
@@ -38,7 +43,7 @@ export class TaskContainers {
   async must(args: string[], options?: DriverOptions) {
     const result = await this.driver.run(args, options);
     if (result.exitCode !== 0) throw new Error(`任务容器操作失败 (${result.exitCode}): ${result.output.slice(-4096)}`);
-    return result.output.trim();
+    return (result.stdout ?? result.output).trim();
   }
 
   async checkDaemon(): Promise<string> {
@@ -103,7 +108,7 @@ export class TaskContainers {
   async inspect(receipt: Receipt, cid: string) {
     const result = await this.driver.run(["container", "inspect", cid]);
     if (result.exitCode !== 0) throw new Error(`无法证明容器 ${cid} 已回收；保留任务 ${receipt.id}`);
-    const containers = JSON.parse(result.output), container = containers[0];
+    const containers = JSON.parse(result.stdout ?? result.output), container = containers[0];
     if (containers.length !== 1 || container.Id !== cid || container.Image !== receipt.image || container.Config?.Labels?.["org.mixin-chatbot.task"] !== receipt.id
       || container.Config?.Labels?.["org.mixin-chatbot.manager"] !== receipt.manager || container.Config?.Labels?.["org.mixin-chatbot.nonce"] !== receipt.nonce) throw new Error("容器与管理回执不匹配");
     const work = workPath(receipt);

@@ -6,10 +6,17 @@ import { join } from "node:path";
 import { formatSize } from "@earendil-works/pi-coding-agent";
 import { DATA_DIR } from "../../src/core/storage.ts";
 import { withMaintenance } from "../../src/core/maintenance.ts";
+import { assertMaintenanceAction } from "../../src/core/maintenance-state.ts";
 import { queueMemberCompaction, queueSpaceClear } from "../../src/durable/offline.ts";
 import { assertDataDirectory, byName, resolveGroupName, type GroupSelection } from "../lib/group-data.ts";
 import { DATABASE, historySpaces, lastActivity, scanHistory, scanSpaceHistory, spaceName, type SpaceHistory } from "../lib/history-scan.ts";
 import { conversationTimings, historicalContext } from "../../src/durable/diagnostics.ts";
+import { assertExpectedScope, historyScope, takeExpected } from "../lib/operation-scope.ts";
+
+// Clearing and compaction write the conversation databases: refused while a revision cleanup has a document in flight or a
+// database to restore, or a shrink is unfinished (asked under the maintenance lease; the project is the working directory).
+const writing = <T>(work: () => Promise<T>): Promise<T> =>
+  withMaintenance(async () => { assertMaintenanceAction(".", "conversation-write"); return work(); });
 
 function usage(): void {
   console.log("用法：bun run history <命令>");
@@ -28,7 +35,7 @@ function usage(): void {
 }
 
 
-/** 扫描本身在 scripts/lib/history-scan.ts，宿主机上的运维界面直接调那一份。root 是数据目录。 */
+/** 扫描本身在 scripts/lib/history-scan.ts。root 是数据目录。 */
 export async function collect(root: string = DATA_DIR): Promise<SpaceHistory[]> {
   return scanHistory(root);
 }
@@ -171,8 +178,18 @@ function selection(value: string | undefined): GroupSelection {
   return value === "--storage-segment" ? "segment" : value === "--group-id" ? "id" : "auto";
 }
 
-async function main(args: string[]): Promise<number> {
+async function main(rawArgs: string[]): Promise<number> {
+  const { args, expected } = takeExpected(rawArgs);
   const command = args[0];
+  if (expected !== undefined && command !== "clear" && command !== "compact") throw new Error("--expect 只用于清空或压缩");
+  const checked = (value: string, kind: GroupSelection, phone: string | undefined, work: () => Promise<number>) => writing(async () => {
+    if (expected !== undefined) {
+      const space = value === "--all" ? "all" : await resolveSpace(value, DATA_DIR, kind);
+      if (!space) throw new Error("选择的会话空间不存在");
+      assertExpectedScope(expected, await historyScope(DATA_DIR, space, phone));
+    }
+    return work();
+  });
   switch (command) {
     case "context":
     case "timings": {
@@ -195,7 +212,7 @@ async function main(args: string[]): Promise<number> {
       }
       const kind = selection(option);
       if ((option && (kind === "auto" || value === "--direct")) || args[4]) { console.error("无法识别的 compact 参数"); return 1; }
-      return withMaintenance(() => compactMember(value, phone, DATA_DIR, kind));
+      return checked(value, kind, phone, () => compactMember(value, phone, DATA_DIR, kind));
     }
     case "list":
     case "ls":
@@ -208,7 +225,7 @@ async function main(args: string[]): Promise<number> {
           console.error(`--all 不能再指定群或其他参数：${args[2]}`);
           return 1;
         }
-        return withMaintenance(() => clearAllSpaces(DATA_DIR));
+        return checked(value, "auto", undefined, () => clearAllSpaces(DATA_DIR));
       }
       if (!value || (value.startsWith("--") && value !== "--direct")) {
         console.error("clear 需要群号，或用 --direct 清空单聊空间、--all 清空全部：bun run history clear <群号>|--direct|--all");
@@ -221,7 +238,7 @@ async function main(args: string[]): Promise<number> {
         console.error(`无法识别的参数：${unknown}`);
         return 1;
       }
-      return withMaintenance(() => clearSpace(value, DATA_DIR, kind));
+      return checked(value, kind, undefined, () => clearSpace(value, DATA_DIR, kind));
     }
     default:
       usage();

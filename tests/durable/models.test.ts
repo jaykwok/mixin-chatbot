@@ -134,11 +134,11 @@ describe("model selection and Durable settings", () => {
       compaction: { enabled: true, reserveTokens: 1024, keepRecentTokens: 2048, backgroundTokens: 4000 },
       followUpMode: "one-at-a-time",
       steeringMode: "one-at-a-time",
-      // Stated, not defaulted: a failed run keeps what Durable queued behind it; a crash loop parks after 5 cut-offs.
+      // Stated, not defaulted: a failed run keeps what Durable queued behind it; a crash loop ends after 5 cut-offs.
       afterFailedRun: "keep",
       restartLimit: 5,
-      // Pi 1.0.3: tool progress every 20 ms (codemode sub-calls wait for it), answer progress at Durable's 100 ms.
-      progress: { partialIntervalMs: 100, outputIntervalMs: 20 },
+      // Tool progress every 20 ms (codemode sub-calls wait for it), answer progress at Durable's 100 ms.
+      progress: { partialIntervalMs: 100, outputIntervalMs: 20, persistWithinMs: 1000 },
       contextRetentionMs: 600000,
     });
     const reasoning = await openModelSelection({ modelsPath, modelsStorePath, settingsPath: await settingsFile({ defaultProvider: "local-key", defaultModel: "tuned", defaultThinkingLevel: "high" }) });
