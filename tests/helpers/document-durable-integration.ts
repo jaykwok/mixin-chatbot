@@ -27,6 +27,7 @@ const office = process.argv.includes("--office");
 const venvDir = resolve(environment), project = fileURLToPath(new URL("../../", import.meta.url));
 const root = join(project, "tmp", "document-validation", "durable-" + crypto.randomUUID());
 await mkdir(root, { recursive: true });
+process.chdir(root);
 globalThis.fetch = (() => { throw new Error("Unexpected network request"); }) as unknown as typeof fetch;
 
 assert.equal(await documentToolchainReady(venvDir), true, "test venv must match uv.lock and Python 3.14");

@@ -100,7 +100,8 @@ test("配置核心：预检失败不停机，动作失败先恢复，就绪失�
       }
     } finally { await f.close(); }
   }
-}, 30_000);
+  // Each case checks the .console ACL through PowerShell on Windows, a few seconds apiece on a busy CI runner.
+}, 120_000);
 
 test.skipIf(process.platform !== "win32")("Windows 实际配置发布与健康失败回退：秘密只走输入管道，完成后删除恢复材料", async () => {
   for (const mode of ["running", "stopped", "ready-failed"]) {
@@ -118,7 +119,7 @@ test.skipIf(process.platform !== "win32")("Windows 实际配置发布与健康�
       expect(readOpsMaintenanceRecord(f.root)?.writer?.phase).toBe("reaped");
     } finally { await f.close(); }
   }
-}, 45_000);
+}, 90_000);
 
 // model-configure, configure-app-bot and relay-configure hand over the stage their wizard wrote; the core publishes it like a draft.
 test.skipIf(process.platform !== "win32")("Windows 实际发布终端向导的暂存：与网页草稿同一流程；暂存损坏或基准已变时停机前拒绝", async () => {

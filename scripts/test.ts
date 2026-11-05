@@ -221,8 +221,9 @@ async function execute(run: Run, args: string[], live: boolean, children: Set<Re
   // 夹具归档到本次工作目录的 trash/，不进项目的 backup/rm：成功后随工作目录删除，失败时作为现场保留。
   const fixtures = join(run.cwd, "fixtures"), trash = join(run.cwd, "trash");
   writeSync(run.logFile, `工作目录 ${run.cwd}\n参数 ${JSON.stringify(args)}\n开始 ${new Date().toISOString()}\n\n`);
+  // The work root can lie inside this checkout (the project's tmp/ on Linux and macOS): git in a fixture must not find it.
   const child = Bun.spawn([process.execPath, "test", ...args], { cwd: run.cwd, env: { ...process.env, TEMP: fixtures, TMP: fixtures,
-    TMPDIR: fixtures, TEST_TEMP_ROOT: fixtures, TEST_TRASH_DIR: trash },
+    TMPDIR: fixtures, TEST_TEMP_ROOT: fixtures, TEST_TRASH_DIR: trash, GIT_CEILING_DIRECTORIES: run.cwd },
     stdin: "inherit", stdout: "pipe", stderr: "pipe", windowsHide: true });
   children.add(child);
   // 输出照常显示（或留待该组结束后整体显示），同时写入诊断日志。

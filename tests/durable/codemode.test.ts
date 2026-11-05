@@ -15,7 +15,7 @@ import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { CODEMODE_SOURCE_GRAMMAR, MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "@earendil-works/pi-codemode";
 import {
-  configure, type Conversation, DEFAULT_PROGRESS_POLICY, defineExtension, type Extension, type HarnessSettings, LiveDoc, type ModelRef, NestedCallDoc,
+  configure, type Conversation, DEFAULT_PROGRESS_POLICY, defineExtension, type Extension, type HarnessSettings, LiveDoc, type ModelRef,
   type ProgressPolicy, type Storage, type ToolExecutionApi, type ToolRegistration, UsageDoc,
 } from "@earendil-works/pi-durable";
 import { obj, str } from "@earendil-works/pi-schema";
@@ -759,7 +759,7 @@ return { a, b, hung };`, async () => nestedRunning(group, alice, "probe_hang"));
       }, 60_000);
     }
 
-    test("an earlier attempt's sub-call finishes on its own while the rerun is refused: the refusal charges it too", async () => {
+    test("an earlier attempt's sub-call around a refused rerun: it is charged once if it finishes first, and dropped otherwise", async () => {
       let waits = 0;
       const found = Promise.withResolvers<void>();
       const wait = probe("probe_wait", async (args, call) => {
@@ -775,18 +775,22 @@ await tools.probe_wait({});
 return 1;`;
         const recovered = await interrupt(group, alice, code, async () => {
           if (!await nestedRunning(group, alice, "probe_wait")) return false;
-          // After the rerun's first commit, the earlier call finishes (its replay is safe), then the sandbox is refused.
-          hooks.found = async (start, taskId) => {
+          // After the rerun's first commit the earlier call may finish (its replay is safe); the sandbox is refused. Durable
+          // resumes that call on its own schedule: before the refusal settles, or not at all once it has (both seen under
+          // load). Holding the rerun to force the first order can hold the call as well.
+          hooks.found = (start) => {
             found.resolve();
-            await until(async () => (await group.opened.harness.snapshot(NestedCallDoc, taskId as never, "c2", context))?.result !== undefined, "c2 finished");
             start.fingerprint = "fixture-fingerprint";
           };
           return true;
         });
         expect(recovered.result.text).toContain("The script cannot resume: the sandbox changed since it started");
-        expect(recovered.result.details!.usage).toEqual(usage(50));
-        expect([runs, waits]).toEqual([1, 2]);
-        expect(await charged(group, alice)).toEqual([{ input: 50, output: 100 }]);
+        const finished = recovered.result.details!.usage?.input === 50;
+        expect(recovered.result.details!.usage).toEqual(usage(finished ? 50 : 42));
+        // A dropped call does not run later.
+        await Bun.sleep(1_000);
+        expect([runs, waits]).toEqual([1, finished ? 2 : 1]);
+        expect(await charged(group, alice)).toEqual([finished ? { input: 50, output: 100 } : { input: 42, output: 84 }]);
       } finally { await group.close(); }
     }, 60_000);
 

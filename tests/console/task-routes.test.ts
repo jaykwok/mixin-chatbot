@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { readdirSync, writeFileSync } from "node:fs";
+import { readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { AuditLog } from "../../scripts/ops/console/audit.ts";
 import { Auth } from "../../scripts/ops/console/auth.ts";
@@ -85,6 +85,8 @@ test("过期一小时后的计划和中断写入的临时文件在新建计划�
     const old = await plans.create("stop", {}), dir = join(fixture.root, ".console", "plans");
     const broken = join(dir, `plan-${"0".repeat(32)}.json`), temporary = join(dir, `${old.id}.json.${randomUUID()}.tmp`);
     writeFileSync(broken, "{broken"); writeFileSync(temporary, "{}");
+    // The temporary file ages by its mtime: pin it to the test clock (2 s ahead, so a coarse or skewed file clock cannot age it early).
+    const written = new Date(time.at + 2000); utimesSync(temporary, written, written);
     time.at += 600_000 + 3_600_000 - 1;
     const kept = await plans.create("stop", {});
     expect(readdirSync(dir).sort()).toEqual([`${old.id}.json`, `${kept.id}.json`, basename(temporary), basename(broken)].sort());
