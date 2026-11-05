@@ -135,6 +135,8 @@ function harness(options: { dailyLimit?: number | null; limits?: Partial<PushLim
   });
   const settle = async () => {
     for (let round = 0; round < 50; round++) { await Bun.sleep(5); }
+    // Summaries write workbooks and archives: on a busy Windows runner they can outlast the rounds.
+    await service.idle();
   };
   const prepare = (input: Partial<PrepareInput> = {}) => service.prepare({ phone: PUSHER, reply: reply(PUSHER) }, {
     recipients: [{ name: "张三", phone: ZHANG }, { name: "李四", phone: LI }], subject: "机房盘点", body: "请回复本周机房盘点结果。", mode: "ack", ...input });

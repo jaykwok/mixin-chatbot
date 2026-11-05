@@ -285,6 +285,11 @@ export class PushService {
   async close(): Promise<void> {
     this.#closing = true;
     clearInterval(this.#timer);
+    await this.idle();
+  }
+
+  /** Resolves once no work is left: the sends, updates and summaries running now and any they start. */
+  async idle(): Promise<void> {
     while (this.#work.size) await Promise.allSettled([...this.#work]);
   }
 
