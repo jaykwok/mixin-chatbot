@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 候选镜像：部署从工作区、升级从固定的目标提交，在停机前构建一次镜像，之后预览、迁移、验证实例和正式实例都按
-# image ID 运行，不再按可变的 mixin-chatbot 标签选择。镜像身份写进交接记录 candidate-image（部署的暂存目录或
+# image ID 运行，不再按可变的 mixin-bot 标签选择。镜像身份写进交接记录 candidate-image（部署的暂存目录或
 # 升级器的导出目录），由运维核心复制进事务快照。
 #
 # 函数只操作参数给出的路径和 Docker；出错时把原因写到标准错误并返回非零，由调用方决定如何报告。
@@ -8,9 +8,9 @@
 
 CANDIDATE_RECORD_KEYS=(format source target_sha image_id image_tag daemon_id project_id operation_id)
 CANDIDATE_LABEL_REVISION=org.opencontainers.image.revision
-CANDIDATE_LABEL_PROJECT=org.mixin-chatbot.project
-CANDIDATE_LABEL_OPERATION=org.mixin-chatbot.operation
-CANDIDATE_LABEL_SOURCE=org.mixin-chatbot.source
+CANDIDATE_LABEL_PROJECT=org.mixin-bot.project
+CANDIDATE_LABEL_OPERATION=org.mixin-bot.operation
+CANDIDATE_LABEL_SOURCE=org.mixin-bot.source
 # 读取本机进程、文件锁和挂载信息的位置，以及当前的有效用户（测试替换为 fixture）。
 PROC_ROOT=/proc
 MOUNTINFO_FILE=/proc/self/mountinfo
@@ -220,7 +220,7 @@ prepare_candidate_image() {
     local context="$1" sha="$2" source="$3" project="$4" project_id operation_id daemon tag idfile id status=0 started
     project_id="$(candidate_project_id "$project")" && operation_id="$(candidate_operation_id)" || return 1
     daemon="$(candidate_daemon_id)" || return 1
-    tag="$(candidate_tag mixin-chatbot "$project_id" "$operation_id")"
+    tag="$(candidate_tag mixin-bot "$project_id" "$operation_id")"
     declare -gA CANDIDATE=([format]=1 [source]="$source" [target_sha]="$sha" [image_id]='' [image_tag]="$tag"
         [daemon_id]="$daemon" [project_id]="$project_id" [operation_id]="$operation_id")
     idfile="$(mktemp)" || return 1

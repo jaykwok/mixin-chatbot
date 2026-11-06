@@ -5,18 +5,18 @@ import { expect } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
-import { configurationSnapshot } from "../../scripts/config/configuration-form.ts";
-import { installConfigurationStage, parseConfigurationStage, serializeConfigurationStage, stageName, type StagedKind } from "../../scripts/config/configuration-stage.ts";
-import { installRuntimeValues } from "../../scripts/config/runtime-settings.ts";
-import { RUNTIME_VALUES_FILE, runtimeDigest, serializeRuntimeValues } from "../../scripts/config/runtime-values.ts";
-import { DEPLOY_CHOICES_FILE, type DeployChoices } from "../../scripts/ops/core/deploy-stage.ts";
-import type { DeployInput } from "../../scripts/ops/core/deployment-host.ts";
-import { runNative, type NativeResult, type NativeRunner } from "../../scripts/ops/core/native-process.ts";
-import type { OpsResult } from "../../scripts/ops/core/result.ts";
-import { serializeWindowsTools, type WindowsTools } from "../../scripts/ops/core/windows-deployment.ts";
-import { preflightWindowsDeploy, runWindowsLifecycle } from "../../scripts/ops/core/windows-lifecycle.ts";
-import { PROTOCOL, PROTOCOL_VERSION } from "../../scripts/lib/maintenance-protocol.ts";
-import { releaseDataResult } from "../../scripts/lib/release-data-protocol.ts";
+import { configurationSnapshot } from "../../ops/config/configuration-form.ts";
+import { installConfigurationStage, parseConfigurationStage, serializeConfigurationStage, stageName, type StagedKind } from "../../ops/config/configuration-stage.ts";
+import { installRuntimeValues } from "../../ops/config/runtime-settings.ts";
+import { RUNTIME_VALUES_FILE, runtimeDigest, serializeRuntimeValues } from "../../ops/config/runtime-values.ts";
+import { DEPLOY_CHOICES_FILE, type DeployChoices } from "../../ops/core/deploy-stage.ts";
+import type { DeployInput } from "../../ops/core/deployment-host.ts";
+import { runNative, type NativeResult, type NativeRunner } from "../../ops/core/native-process.ts";
+import type { OpsResult } from "../../ops/core/result.ts";
+import { serializeWindowsTools, type WindowsTools } from "../../ops/core/windows-deployment.ts";
+import { preflightWindowsDeploy, runWindowsLifecycle } from "../../ops/core/windows-lifecycle.ts";
+import { PROTOCOL, PROTOCOL_VERSION } from "../../ops/lib/maintenance-protocol.ts";
+import { releaseDataResult } from "../../ops/lib/release-data-protocol.ts";
 import { APP, DIRECTORY, MODELS } from "./docker-upgrade.ts";
 import { tempFixture } from "./temp.ts";
 
@@ -43,7 +43,6 @@ export interface WindowsStageOptions {
   target?: string;
   port?: number;
   workspace?: string;
-  cleanup?: "apply" | "skip";
   runtime?: Record<string, string>;
   /** A first deployment answers both configurations and the directory scope and previews after the stop; a redeployment keeps its configuration and previews before. */
   app?: string | null;
@@ -90,7 +89,7 @@ export async function windowsDeployFixture(options: WindowsDeployOptions = {}) {
   const instance = { instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(): Response {
     if (!running) return new Response("no instance", { status: 503 });
-    return Response.json({ ...instance, service: "mixin-chatbot", version: 1, build,
+    return Response.json({ ...instance, service: "mixin-bot", version: 1, build,
       status: verification && failures.has("verification-health") ? "starting" : "ready", verificationOnly: verification, port: server.port });
   } });
   const instanceFile = join(project, "data/state/instance.json"), instanceText = JSON.stringify({ ...instance, port: server.port });
@@ -188,11 +187,6 @@ export async function windowsDeployFixture(options: WindowsDeployOptions = {}) {
       if (action === "commit") { writeRelease("committed"); return { ...reply(0), lost: failures.delete("commit-reply") }; }
       expect(action).toBe("rollback"); rmSync(join(project, "data/state/release-data.json"), { force: true }); return reply(0);
     }
-    if (name === "revision-cleanup") {
-      writeFileSync(join(project, "data/state/revision-cleanup.json"), JSON.stringify({ version: 2, run: "fixture-cleanup", databases: [], interval: 64,
-        startedAt: new Date().toISOString(), state: action === "abandon" ? "abandoned" : "finished" }));
-      return maintenanceReply(action, 0);
-    }
     if (name === "directory-scope") { writeFileSync(join(project, "data/config/directory.json"), readFileSync(option("--plan"))); return maintenanceReply(action, 0); }
     unexpected.push("tool " + path); return { code: 1, stdout: "" };
   };
@@ -228,7 +222,7 @@ export async function windowsDeployFixture(options: WindowsDeployOptions = {}) {
     const pick = <T>(value: T | null | undefined, fallback: T | null) => value === undefined ? fallback : value;
     const app = pick(choices.app, first ? APP : null), models = pick(choices.models, first ? MODELS : null);
     const values: Record<string, string | null> = {
-      [DEPLOY_CHOICES_FILE]: JSON.stringify({ format: 1, target: choices.target ?? head, port, workspace: choices.workspace ?? "", cleanup: choices.cleanup ?? "skip" } satisfies DeployChoices),
+      [DEPLOY_CHOICES_FILE]: JSON.stringify({ format: 1, target: choices.target ?? head, port, workspace: choices.workspace ?? "" } satisfies DeployChoices),
       [RUNTIME_VALUES_FILE]: serializeRuntimeValues({ format: 1, base: runtimeDigest(current("data/config/runtime.json")), values: { BOT_PORT: String(port), ...choices.runtime } }),
       "data-plan.json": pick(choices.plan, first ? null : "{}\n"), "directory-scope-plan.json": pick(choices.directory, first ? DIRECTORY : null),
       [stageName("app")]: app === null ? null : staged("app", { app }),
@@ -247,7 +241,6 @@ export async function windowsDeployFixture(options: WindowsDeployOptions = {}) {
     deploy: (directory: string, command: "deploy" | "repair" = "deploy", overrides: Overrides = {}) => lifecycle({ stage: directory, command }, overrides),
     resume: (overrides: Overrides = {}, confirmation?: string) => lifecycle({ command: "resume", ...(confirmation ? { confirmation } : {}) }, overrides),
     rollback: (overrides: Overrides = {}, confirmation?: string) => lifecycle({ command: "rollback", rollback: true, ...(confirmation ? { confirmation } : {}) }, overrides),
-    restore: (space: string) => lifecycle({ command: "revision-cleanup", restore: space }),
     preflight: () => preflightWindowsDeploy({ operation: "deploy", command: "deploy" }, { project, source, native }),
     async cleanup() { await server.stop(true); await f.cleanup(); } };
 }

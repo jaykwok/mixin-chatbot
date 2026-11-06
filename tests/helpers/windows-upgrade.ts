@@ -4,25 +4,24 @@ import { expect } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { preflightWindowsUpgrade, runWindowsLifecycle, type WindowsUpgradeInput } from "../../scripts/ops/core/windows-lifecycle.ts";
-import { loadDeploymentState } from "../../scripts/ops/core/deployment-state.ts";
+import { preflightWindowsUpgrade, runWindowsLifecycle, type WindowsUpgradeInput } from "../../ops/core/windows-lifecycle.ts";
+import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
 import { assessMaintenanceAction, readMaintenanceState } from "../../src/core/maintenance-state.ts";
-import { releaseDataResult } from "../../scripts/lib/release-data-protocol.ts";
-import type { NativeRunner } from "../../scripts/ops/core/native-process.ts";
-import type { OpsResult } from "../../scripts/ops/core/result.ts";
-import { tempFixture } from "../helpers/temp.ts";
-import { deploymentRuntime } from "../../scripts/ops/core/deployment-runtime.ts";
-import { serializeTransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
+import { releaseDataResult } from "../../ops/lib/release-data-protocol.ts";
+import type { NativeRunner } from "../../ops/core/native-process.ts";
+import type { OpsResult } from "../../ops/core/result.ts";
+import { tempFixture } from "./temp.ts";
+import { deploymentRuntime } from "../../ops/core/deployment-runtime.ts";
+import { serializeTransactionRecord } from "../../ops/core/transaction-record.ts";
 
 const source = resolve(import.meta.dir, "../.."), identity = "c".repeat(64);
 interface FixtureOptions {
   checkout?: { project: string; original: string; target: string; branch: string; run: NativeRunner };
   beforePreflight?(): Promise<void>;
   refuseStop?: boolean;
-  failure?: "main-missing" | "diverged" | "task-missing" | "switch" | "switch-late" | "code" | "install" | "scope-install" | "apply" | "cleanup" | "health" | "commit" | "postcommit" | "dirty-on-apply";
+  failure?: "main-missing" | "diverged" | "task-missing" | "switch" | "switch-late" | "code" | "install" | "scope-install" | "apply" | "health" | "commit" | "postcommit" | "dirty-on-apply";
   reuse?: boolean;
   directory?: boolean;
-  cleanup?: "apply" | "skip";
 }
 export async function windowsUpgradeFixture(running: boolean, options: FixtureOptions = {}) {
   const f = await tempFixture("core-windows-upgrade-"), project = options.checkout?.project ?? f.root;
@@ -42,7 +41,7 @@ export async function windowsUpgradeFixture(running: boolean, options: FixtureOp
   const instance = { instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(): Response {
     const verificationOnly = existsSync(join(project, "data/state/verify-only"));
-    return Response.json({ ...instance, service: "mixin-chatbot", version: 1, build: head.slice(0, 12),
+    return Response.json({ ...instance, service: "mixin-bot", version: 1, build: head.slice(0, 12),
       status: (verificationOnly ? !verifyReady || options.failure === "health" : !botReady) ? "starting" : "ready", verificationOnly, port: server.port });
   } });
   writeFileSync(join(project, "data/state/instance.json"), JSON.stringify({ ...instance, port: server.port }));
@@ -114,7 +113,7 @@ export async function windowsUpgradeFixture(running: boolean, options: FixtureOp
     }
     if (command.command === process.execPath && command.args.some(value => value.endsWith("data-current.ts"))) {
       const script = command.args.findIndex(value => value.endsWith("data-current.ts")), action = command.args[script + 1]!;
-      expect(command.args[script]).toContain("source-"); expect(command.args[script]).not.toBe(join(project, "scripts/runtime/data-current.ts"));
+      expect(command.args[script]).toContain("source-"); expect(command.args[script]).not.toBe(join(project, "ops/tools/data-current.ts"));
       expect(command.env?.APP_BUILD).toBe(target.slice(0, 12));
       expect(loadDeploymentState(project)?.execution?.writer?.phase).toBe("prepared");
       events.push("data:" + action);
@@ -130,25 +129,18 @@ export async function windowsUpgradeFixture(running: boolean, options: FixtureOp
     if (command.command === process.execPath && command.args[0] === "install") {
       expect(service).toBe(false); events.push("dependencies:install"); return { code: options.failure === "install" ? 1 : 0, stdout: "" };
     }
-    for (const tool of ["directory-scope", "revision-cleanup"]) {
-      const index = command.args.findIndex(value => value.endsWith(tool + ".ts")); if (index < 0) continue;
+    const index = command.args.findIndex(value => value.endsWith("directory-scope.ts"));
+    if (index >= 0) {
       const action = command.args[index + 1]!; expect(service).toBe(false); expect(loadDeploymentState(project)?.execution?.writer?.phase).toBe("prepared");
-      events.push(tool + ":" + action); let code = 0;
-      if (tool === "directory-scope") {
-        const plan = command.args[command.args.indexOf("--plan") + 1]!;
-        expect(plan).toContain("backup"); writeFileSync(directoryFile, readFileSync(plan)); code = options.failure === "scope-install" ? 1 : 0;
-      } else {
-        const fail = action === "apply" && options.failure === "cleanup";
-        writeFileSync(join(project, "data/state/revision-cleanup.json"), JSON.stringify({ version: 2, run: "fixture-cleanup", databases: [],
-          interval: 64, startedAt: new Date().toISOString(), state: fail ? "stopped" : action === "abandon" ? "abandoned" : "finished",
-          ...(fail ? { current: { space: "direct" } } : {}) })); code = fail ? 3 : 0;
-      }
-      return { code, stdout: JSON.stringify({ protocol: "mixin-maintenance", version: 1, command: action,
-        outcome: code === 3 ? "stopped" : code ? "failed" : "success", result: null }) };
+      events.push("directory-scope:" + action);
+      const plan = command.args[command.args.indexOf("--plan") + 1]!;
+      expect(plan).toContain("backup"); writeFileSync(directoryFile, readFileSync(plan));
+      const code = options.failure === "scope-install" ? 1 : 0;
+      return { code, stdout: JSON.stringify({ protocol: "mixin-maintenance", version: 1, command: action, outcome: code ? "failed" : "success", result: null }) };
     }
     throw new Error("Unexpected command boundary: " + command.command);
   };
-  const input: WindowsUpgradeInput = { original, target, branch: originalBranch, plan, cleanup: options.cleanup ?? "skip", ...(options.directory ? { directoryPlan } : {}) };
+  const input: WindowsUpgradeInput = { original, target, branch: originalBranch, plan, ...(options.directory ? { directoryPlan } : {}) };
   const run = (value = input) => runWindowsLifecycle(value, { project, source, native, output: () => {}, readyTimeoutMs: 25,
     async verify() {}, async finish(result) { results.push(result); } });
   return { project, plan, input, run, events, results, get running() { return service; }, get head() { return head; },
@@ -162,9 +154,9 @@ export async function windowsUpgradeFixture(running: boolean, options: FixtureOp
         original_sha: original, original_branch: originalBranch, original_workspace_root: "", target_workspace_root: "", was_running: running ? "1" : "0",
         bot_port: "1011", reconfigure_ai: "0" }));
       writeFileSync(join(dir, "deployment.xml"), "fixture native metadata"); writeFileSync(join(dir, "data-plan.json"), "{}");
-      writeFileSync(join(dir, "revision-cleanup"), "skip\n"); writeFileSync(join(dir, "host-runtime"), pinned.digest + "\n");
+      writeFileSync(join(dir, "host-runtime"), pinned.digest + "\n");
       writeFileSync(join(project, "data/state/upgrade-transaction"), snapshot + "\n");
-      delete input.plan; delete input.cleanup; delete input.directoryPlan; input.command = "resume";
+      delete input.plan; delete input.directoryPlan; input.command = "resume";
       if (phase) {
         service = false; head = main = target;
         writeFileSync(release, JSON.stringify({ format: 1, deployment: snapshot, phase, previous: null }));

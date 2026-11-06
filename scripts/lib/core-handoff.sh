@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 部署入口和升级器共用的停机前步骤与核心交接。两者都在服务运行时用候选镜像核对、预览和选择，全部确定后才把事务交给运维
-# 核心（scripts/ops/core），由它在部署锁内复核、停机、提交或回滚；入口只保留引导和这些提问。
+# 核心（ops/core），由它在部署锁内复核、停机、提交或回滚；入口只保留引导和这些提问。
 # 调用方已导入 deployment.sh，定义了 print_status 等输出函数，并设置 PROJECT_DIR、HOST_BUN、IMAGE_ID、SERVICE_USER、
 # UNCHANGED（失败时说明现状的短语）和 PREVIEW_DIR（本次操作私有的目录，容器里是 /preview）。
 
@@ -49,7 +49,7 @@ stop_preview() {
 # 留着。参数接在 docker run 之后：挂载、镜像和命令。
 run_preview() {
     local status=0
-    PREVIEW_CONTAINER="mixin-chatbot-preview-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+    PREVIEW_CONTAINER="mixin-bot-preview-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
     docker run --rm --name "$PREVIEW_CONTAINER" --network none --user "$SERVICE_USER" -w /app -e HOME=/tmp "$@" </dev/null &
     PREVIEW_PID=$!
     wait "$PREVIEW_PID" || status=$?
@@ -58,28 +58,15 @@ run_preview() {
 }
 
 # 在候选镜像中核对数据版本（data-current.ts）。data/ 只读挂载，计划写到 /preview；它要写入的预览目录和本次操作日志由调用方
-# 交给服务身份。没有程序版本的旧版（webhook）数据在这里被拒绝，旧服务不受影响。
+# 交给服务身份。部署记录不受支持时在这里被拒绝，原服务不受影响。
 preview_data() {
     local action="$1"
     shift
     run_preview -e BOT_OPERATION_LOG -v "$PROJECT_DIR/data:/app/data:ro" -v "$PROJECT_DIR/logs:/app/logs" -v "$PREVIEW_DIR:/preview" \
-        "$IMAGE_ID" bun run scripts/runtime/data-current.ts "$action" --project /app "$@"
+        "$IMAGE_ID" bun run ops/tools/data-current.ts "$action" --project /app "$@"
 }
 
-# 修订整理的预览与数据预检相同：只读挂载 data/、没有网络、可中断。说明写到终端，--shell 结果写到预览目录；随后决定停机后
-# 整理或跳过（revision_cleanup_decide）。维护状态不允许结束整理时（要求从备份恢复、收缩未完成、日志格式不受支持）预览即拒绝。
-preview_revision_cleanup() {
-    local status=0 output="$PREVIEW_DIR/revision-cleanup"
-    print_status "在目标版本的镜像中预览会话库的旧修订链（只读，服务尚未停止）..."
-    run_preview -v "$PROJECT_DIR/data:/app/data:ro" "$IMAGE_ID" bun run scripts/runtime/revision-cleanup.ts preview --project /app --shell > "$output" || status=$?
-    if [ "$status" != 0 ] || ! revision_cleanup_read_preview < "$output"; then
-        print_error "修订整理预览失败或被拒绝（原因见上方）；${UNCHANGED}"
-        exit 1
-    fi
-    revision_cleanup_decide || { print_error "$UNCHANGED"; exit 1; }
-}
-
-# 通讯录同步范围必须明确选择：没有 data/config/directory.json（首次部署，或 1.0.1 及更早版本的整个通讯录）时在停机前选择，
+# 通讯录同步范围必须明确选择：没有 data/config/directory.json（首次部署）时在停机前选择，
 # 计划写到预览目录，由核心存入快照并在停机后写入。设置了 BOT_DIRECTORY_SCOPE 时不交互，否则在终端里运行向导（前台运行，不是
 # 终端时失败并提示设置它）。容器以服务身份运行，只读挂载 data/（读取应用凭据），有网络（向平台核对部门）。参数接在
 # directory-scope.ts choose 之后：首次部署的应用凭据还在预览目录里。
@@ -91,7 +78,7 @@ choose_directory_scope() {
     docker run --rm "$terminal" --user "$SERVICE_USER" -w /app -e HOME=/tmp -e BOT_DIRECTORY_SCOPE \
         -e MIXIN_OPS_CONSOLE -e MIXIN_OPS_TASK_ID -e MIXIN_OPS_DIRECTORY -e MIXIN_OPS_DIRECTORY_INPUT -e MIXIN_OPS_DIRECTORY_APP \
         -v "$PROJECT_DIR/data:/app/data:ro" -v "$PREVIEW_DIR:/preview" \
-        "$IMAGE_ID" bun run scripts/config/directory-scope.ts choose --plan /preview/directory-scope-plan.json --project /app "$@" || status=$?
+        "$IMAGE_ID" bun run ops/config/directory-scope.ts choose --plan /preview/directory-scope-plan.json --project /app "$@" || status=$?
     if [ "$status" = 2 ]; then print_warning "已取消选择通讯录同步范围；${UNCHANGED}"; exit 1; fi
     [ "$status" = 0 ] && [ -s "$PREVIEW_DIR/directory-scope-plan.json" ] ||
         { print_error "没有选定通讯录同步范围（原因见上方）；${UNCHANGED}"; exit 1; }

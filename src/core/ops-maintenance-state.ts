@@ -1,13 +1,46 @@
 // Public, non-secret recovery metadata for host orchestration. The service reads this without importing any host API.
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { MaintenanceCheckpoint } from "../../scripts/ops/core/maintenance.ts";
-import type { OpsResult } from "../../scripts/ops/core/result.ts";
-import type { StatsStageRecord } from "../../scripts/ops/core/stats-stage.ts";
+import type { OpsResult } from "../contracts/ops-result.ts";
+import type { MaintenanceIntent } from "./maintenance-state.ts";
 import { validateOpsRuntimeDraft, type OpsRuntimeDraft } from "../contracts/ops-runtime-draft.ts";
 import { validateOpsWriter, type DockerTaskRecord, type WindowsTaskRecord } from "../contracts/ops-writer.ts";
 
 export const OPS_MAINTENANCE_FILE = "data/state/ops-maintenance.json";
+export interface ServiceFacts {
+  /** Stable deployment identity (container or task plus project); must not contain a changing PID or health state. */
+  identity: string;
+  state: "running" | "stopped" | "absent" | "unsupported";
+  owned: boolean;
+  ready: boolean;
+  pending: boolean;
+}
+export interface MaintenanceRequest {
+  id: string;
+  runtime: string;
+  command: string;
+  intent: MaintenanceIntent;
+  label: string;
+  /** Read/preview or explicitly online-safe work still holds the same lock and tracks its process across interruption. */
+  online?: true;
+  /** Identifier only. Configuration bytes never enter the host journal. */
+  configuration?: string;
+}
+export interface MaintenanceCheckpoint {
+  version: 1;
+  request: MaintenanceRequest;
+  original: ServiceFacts;
+  phase: "prepared" | "stopping" | "acting" | "recovering" | "starting" | "completing";
+}
+export interface StatsStageRecord {
+  version: 1;
+  kind: "stats-import";
+  id: string;
+  owner: { uid: number; gid: number };
+  phase: "prepared" | "created" | "ready" | "removed";
+  directory?: { dev: string; ino: string };
+  digest?: string;
+}
 export interface OpsMaintenanceRecord {
   version: 1;
   checkpoint: MaintenanceCheckpoint;
@@ -34,7 +67,7 @@ export function validateOpsMaintenanceRecord(value: unknown): OpsMaintenanceReco
     || (["configuration-apply", "configuration-restore", "runtime-configure"].includes(request.command)
       ? typeof request.configuration !== "string" || !/^config-[a-f0-9]{32}$/.test(request.configuration)
       : request.configuration !== undefined)
-    || !["service", "cleanup", "skip", "rollback", "shrink", "restore", "conversation-write", "configuration", "configuration-restore"].includes(request.intent)
+    || !["service", "conversation-write", "configuration", "configuration-restore"].includes(request.intent)
     || !["prepared", "stopping", "acting", "recovering", "starting", "completing"].includes(c.phase)
     || !hash(original?.identity) || !["running", "stopped", "absent"].includes(original.state) || original.owned !== true
     || original.pending !== false || typeof original.ready !== "boolean") throw new Error("运维恢复记录格式不支持或不完整");

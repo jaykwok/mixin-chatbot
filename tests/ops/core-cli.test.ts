@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { runCore } from "../../scripts/ops/core/cli.ts";
-import type { ServiceHostOptions } from "../../scripts/ops/core/service-host.ts";
-import type { ServiceControlHost } from "../../scripts/ops/core/service.ts";
+import { runCore } from "../../ops/core/cli.ts";
+import type { ServiceHostOptions } from "../../ops/core/service-host.ts";
+import type { ServiceControlHost } from "../../ops/core/service.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test("核心 CLI 只接受当前动作参数；未知参数和拼错的动作在平台初始化前拒绝", async () => {
@@ -59,12 +59,12 @@ async function staticClosure(entry: string): Promise<{ modules: Set<string>; pac
 }
 
 test("恢复路径不依赖服务配置：核心和事务中途运行的工具不在导入时读 runtime.json，也不校验终端变量", async () => {
-  for (const entry of ["scripts/ops/core/cli.ts", "scripts/runtime/data-current.ts", "scripts/runtime/revision-cleanup.ts", "scripts/config/runtime-settings.ts",
-    "scripts/config/runtime-apply.ts", "scripts/config/configuration-apply.ts", "scripts/config/configuration-install.ts", "scripts/config/directory-scope.ts", "scripts/config/directory-query.ts"])
+  for (const entry of ["ops/core/cli.ts", "ops/tools/data-current.ts", "ops/config/runtime-settings.ts",
+    "ops/config/runtime-apply.ts", "ops/config/configuration-apply.ts", "ops/config/configuration-install.ts", "ops/config/directory-scope.ts", "ops/config/directory-query.ts"])
     expect((await staticClosure(entry)).modules.has(resolve(repo, "src/core/config.ts")), entry).toBe(false);
   const f = await tempFixture("core-cli-damaged-");
   try {
-    const snapshot = "deploy-damaged", project = join(f.root, "含空格 项目"), core = join(repo, "scripts/ops/core/cli.ts");
+    const snapshot = "deploy-damaged", project = join(f.root, "含空格 项目"), core = join(repo, "ops/core/cli.ts");
     await mkdir(join(project, "data/state"), { recursive: true }); await mkdir(join(project, "data/config"), { recursive: true });
     await mkdir(join(project, "backup/snapshots", snapshot), { recursive: true });
     await writeFile(join(project, "data/state/upgrade-transaction"), snapshot + "\n");
@@ -93,7 +93,7 @@ test("恢复路径不依赖服务配置：核心和事务中途运行的工具�
 }, 60_000);
 
 test("应用机器人和外链配置的工具不在导入时加载 Pi；只有模型配置和模型目录才加载", async () => {
-  for (const entry of ["scripts/config/configuration-check.ts", "scripts/config/configuration-apply.ts", "scripts/config/configuration-install.ts"]) {
+  for (const entry of ["ops/config/configuration-check.ts", "ops/config/configuration-apply.ts", "ops/config/configuration-install.ts"]) {
     const { packages, modules } = await staticClosure(entry);
     expect([...packages].filter(name => name.startsWith("@earendil-works/")), entry).toEqual([]);
     expect(modules.has(resolve(repo, "src/core/model-config.ts")), entry).toBe(false);

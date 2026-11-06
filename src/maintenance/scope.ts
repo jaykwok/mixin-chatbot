@@ -1,7 +1,7 @@
 // The protected business view offline maintenance acts under. The service layer implements it (durable space snapshot
 // plus the outbox ledger, `src/durable/maintenance-view.ts`) and the entry injects it; maintenance never opens a
 // business database itself.
-import type { UserTmp } from "../../scripts/lib/tmp-scan.ts";
+import type { UserTmp } from "../lib/tmp-scan.ts";
 import type { ResultOwnership } from "../contracts/maintenance.ts";
 import { ReferenceText } from "../core/reference-text.ts";
 

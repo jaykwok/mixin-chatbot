@@ -2,18 +2,18 @@ import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { serviceReady } from "../../scripts/ops/core/readiness.ts";
-import { createServiceHost, type ServiceHostOptions } from "../../scripts/ops/core/service-host.ts";
-import { runServiceCommand } from "../../scripts/ops/core/service.ts";
-import { recoverMaintenance } from "../../scripts/ops/core/maintenance-recovery.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
+import { serviceReady } from "../../ops/core/readiness.ts";
+import { createServiceHost, type ServiceHostOptions } from "../../ops/core/service-host.ts";
+import { runServiceCommand } from "../../ops/core/service.ts";
+import { recoverMaintenance } from "../../ops/core/maintenance-recovery.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test("真实本机就绪探针核对实例身份，不接受验证实例、重定向、无限正文或读取中更换实例", async () => {
   const f = await tempFixture("core-readiness-");
   let reply: () => Response | Promise<Response> = () => Response.json(body);
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => reply() });
-  const body = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+  const body = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const record = { ...body, port: server.port };
   const path = join(f.root, "data/state/instance.json");
   try {
@@ -63,14 +63,14 @@ test("维护记录损坏或版本未知仍可明确停止归属实例；启动�
 
 test("真实部署锁、磁盘维护状态和 HTTP 就绪通过后，服务控制才发布成功", async () => {
   const f = await tempFixture("core-service-host-");
-  const body = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+  const body = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(body) });
   const facts = { identity: "fixture", owned: true, state: "stopped" as "stopped" | "running" };
   const published: string[] = [], effects: string[] = [];
   try {
     await mkdir(join(f.root, "data/state"), { recursive: true });
     await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...body, port: server.port }));
-    await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+    await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
     const options: ServiceHostOptions = { project: f.root, source: f.root, readyTimeoutMs: 50,
       verify: async () => { expect(() => acquireDeploymentLock(f.root)).toThrow(); },
       finish: async result => { expect(() => acquireDeploymentLock(f.root)).toThrow(); published.push(result.outcome); },

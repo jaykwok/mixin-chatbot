@@ -5,8 +5,8 @@ import { validateHostProcess, type LinuxTaskRecord } from "./ops-host-process.ts
 const TRANSACTION_NAME = /^deploy-[A-Za-z0-9]+$/;
 
 export const DEPLOYMENT_STEPS = ["stop", "switch-code", "prepare-dependencies", "configure-runtime", "configure-app", "configure-models",
-  "configure-directory", "prepare-data", "cleanup-revisions", "enable-verification", "install-candidate", "start-verification",
-  "commit-data", "retire-previous-writers", "disable-verification", "start-candidate", "publish-target", "settle-revisions",
+  "configure-directory", "prepare-data", "enable-verification", "install-candidate", "start-verification",
+  "commit-data", "retire-previous-writers", "disable-verification", "start-candidate", "publish-target",
   "restore-data", "restore-code", "restore-dependencies", "restore-configuration", "restore-service", "start-original"] as const;
 export type DeploymentStep = typeof DEPLOYMENT_STEPS[number];
 export type DeploymentDirection = "forward" | "rollback";

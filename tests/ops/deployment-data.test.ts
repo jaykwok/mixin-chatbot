@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { deploymentDataPath, ownsDataMount } from "../../scripts/ops/core/deployment-data.ts";
+import { deploymentDataPath, ownsDataMount } from "../../ops/core/deployment-data.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test("数据目录是链接时按真实路径认定容器归属，与核心一致；只认唯一的可写绑定", async () => {

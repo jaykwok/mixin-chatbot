@@ -2,11 +2,11 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tempFixture } from "../helpers/temp.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { MaintenanceRecord } from "../../scripts/ops/core/maintenance-record.ts";
-import { newDockerTask } from "../../scripts/ops/core/docker-task.ts";
-import type { MaintenanceCheckpoint } from "../../scripts/ops/core/maintenance.ts";
-import type { OpsResult } from "../../scripts/ops/core/result.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { MaintenanceRecord } from "../../ops/core/maintenance-record.ts";
+import { newDockerTask } from "../../ops/core/docker-task.ts";
+import type { MaintenanceCheckpoint } from "../../ops/core/maintenance.ts";
+import type { OpsResult } from "../../ops/core/result.ts";
 import { OPS_MAINTENANCE_FILE, readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
 import { assessMaintenanceAction, readMaintenanceState, MAINTENANCE_INTENTS } from "../../src/core/maintenance-state.ts";
 

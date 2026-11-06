@@ -1,4 +1,4 @@
-// Release gate of the current data format (scripts/runtime/data-current.ts): new install versus upgrade, the deployment
+// Release gate of the current data format (ops/tools/data-current.ts): new install versus upgrade, the deployment
 // record written only at commit, and refusal (leaving everything as it is) of data without a valid record.
 import { expect, test } from "bun:test";
 import { mkdir, readFile, symlink, writeFile, rm } from "node:fs/promises";
@@ -15,7 +15,7 @@ import { APP_VERSION, DATA_VERSION } from "../../src/core/version.ts";
 import { CURRENT_APPLICATION, writeCurrentConfig } from "../helpers/current-config.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
-const runner = fileURLToPath(new URL("../../scripts/runtime/data-current.ts", import.meta.url));
+const runner = fileURLToPath(new URL("../../ops/tools/data-current.ts", import.meta.url));
 const verifier = fileURLToPath(new URL("../../src/server/verify.ts", import.meta.url));
 const deployment = "deploy-current123";
 const BUILD = "abc1234def5678";

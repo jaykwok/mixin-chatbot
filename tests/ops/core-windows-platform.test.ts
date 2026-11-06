@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { runNative, nativePayload, type NativeResult } from "../../scripts/ops/core/native-process.ts";
+import { runNative, nativePayload, type NativeResult } from "../../ops/core/native-process.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const source = resolve(import.meta.dir, "../..");
@@ -49,7 +49,7 @@ async function fixture() {
   const root = join(f.root, "中文 project"), script = join(f.root, "invoke.ps1");
   const facts = join(f.root, "facts.json"), effects = join(f.root, "effects.json");
   await writeFile(script, "\ufeff" + harness.replace(/\r?\n/g, "\r\n"));
-  const task = { TaskName: "mixin-chatbot", TaskPath: "\\", State: "Ready",
+  const task = { TaskName: "mixin-bot", TaskPath: "\\", State: "Ready",
     Principal: { UserId: "test-user", GroupId: null, LogonType: "S4U", RunLevel: "Highest" },
     Actions: [{ Execute: "powershell.exe", Arguments: "-File fixture.ps1", WorkingDirectory: root }] };
   const call = async (action: string, fields: Record<string, unknown> = {}, expected?: string) => {
@@ -57,8 +57,8 @@ async function fixture() {
     let stderr = "";
     const result = await runNative({ command: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script],
       cwd: f.root, protocol: true, env: { ...process.env, FIXTURE_FACTS: facts, FIXTURE_EFFECTS: effects, FIXTURE_ROOT: root,
-        FIXTURE_PLATFORM: join(source, "scripts/ops/core/windows-platform.ps1"),
-        FIXTURE_REQUEST: Buffer.from(JSON.stringify({ action, project: root, task: "mixin-chatbot", ...(expected ? { expected } : {}) })).toString("base64") },
+        FIXTURE_PLATFORM: join(source, "ops/core/windows-platform.ps1"),
+        FIXTURE_REQUEST: Buffer.from(JSON.stringify({ action, project: root, task: "mixin-bot", ...(expected ? { expected } : {}) })).toString("base64") },
     }, (text, stream) => { expect(stream).toBe("stderr"); stderr += text; });
     return { ...result, stderr, effects: JSON.parse(await readFile(effects, "utf8")) as string[] };
   };
@@ -107,19 +107,5 @@ test.skipIf(!windows)("真实 Windows 状态读取拒绝清单错误、前台进
     await writeFile(join(f.root, "data/state/instance.json"), '{"token":"fixture-token-never-print", broken');
     const malformed = await f.call("inspect");
     expect(malformed.code).toBe(1); expect(malformed.stdout).toBe(""); expect(malformed.stderr).not.toContain("fixture-token-never-print");
-  } finally { await f.cleanup(); }
-}, 30_000);
-
-test.skipIf(!windows)("真实 Windows 状态读取接受带小数的 startedAt（1.0.1 及更早的服务这样写），按记录识别前台进程", async () => {
-  const f = await fixture();
-  try {
-    const created = Date.now() - 60_000;
-    await mkdir(join(f.root, "data/state"), { recursive: true });
-    await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ pid: 4242, port: 12011, token: "fixture-token", host: "127.0.0.1",
-      cwd: f.root, instanceId: "630fe401-1f9e-40f1-b4c4-deb9fb196d74", startedAt: created + 812.2942 }));
-    const running = await f.call("inspect", { task: { ...f.task, State: "Running" }, recorded: { pid: 4242, created } });
-    expect(running.code).toBe(0); expect(service(running).state).toBe("running");
-    expect(service(await f.call("inspect", { recorded: { pid: 4242, created } })).state).toBe("unsupported");
-    expect(service(await f.call("inspect", { recorded: { pid: 4242, created: created - 3_600_000 } })).state).toBe("stopped");
   } finally { await f.cleanup(); }
 }, 30_000);

@@ -11,15 +11,15 @@ import { fileURLToPath } from "node:url";
 import { loadRelayConfig } from "../../src/integrations/relay.ts";
 import { validateRelayConfig } from "../../src/integrations/relay-s3.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
-import { configurationSnapshot } from "../../scripts/config/configuration-form.ts";
-import { serializeConfigurationStage } from "../../scripts/config/configuration-stage.ts";
-import { configurationStageDraft } from "../../scripts/ops/core/configuration.ts";
+import { configurationSnapshot } from "../../ops/config/configuration-form.ts";
+import { serializeConfigurationStage } from "../../ops/config/configuration-stage.ts";
+import { configurationStageDraft } from "../../ops/core/configuration.ts";
 import { runCommand, ScenarioProcesses } from "../helpers/concurrent-scenarios.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { openRelayIndex } from "../../src/integrations/relay-index.ts";
 
-const wizard = fileURLToPath(new URL("../../scripts/config/configure-relay.ts", import.meta.url));
-const applyTool = fileURLToPath(new URL("../../scripts/config/configuration-apply.ts", import.meta.url));
+const wizard = fileURLToPath(new URL("../../ops/config/configure-relay.ts", import.meta.url));
+const applyTool = fileURLToPath(new URL("../../ops/config/configuration-apply.ts", import.meta.url));
 const base = validateRelayConfig({ provider: "s3", endpoint: "https://s3.example.test", region: "test-region", bucket: "test-bucket", accessKeyId: "fixture-ak", secretAccessKey: "fixture-sk" });
 const answers = { "S3 服务端点": "s3.example.test", "S3 区域": "test-region", "私有存储桶": "test-bucket", "Access Key ID": "fixture-ak", "Secret Access Key": "fixture-sk" };
 const file = (root: string) => join(root, "data/config/relay.json");
@@ -35,7 +35,7 @@ type Faults = { cancelAt?: string; failPublish?: boolean; hangAt?: string; unrea
 
 /** Prompts answered from the table, no network; optional injected ledger and publication faults. */
 async function preload(root: string, answers: Record<string, string | boolean>, faults: Faults): Promise<string> {
-  const path = join(root, "prompts.ts"), atomic = import.meta.resolve("../../scripts/lib/atomic-file.ts");
+  const path = join(root, "prompts.ts"), atomic = import.meta.resolve("../../src/lib/atomic-file.ts");
   await writeFile(path, [
     'import { mock } from "bun:test";',
     'import { writeFileSync } from "node:fs";',

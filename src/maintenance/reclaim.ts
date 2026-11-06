@@ -5,9 +5,9 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { publishJson } from "../../scripts/lib/atomic-file.ts";
-import { scanTmp, type UserTmp } from "../../scripts/lib/tmp-scan.ts";
-import type { GroupSelection } from "../../scripts/lib/group-data.ts";
+import { publishJson } from "../lib/atomic-file.ts";
+import { scanTmp, type UserTmp } from "../lib/tmp-scan.ts";
+import type { GroupSelection } from "../lib/group-data.ts";
 import { memberTmpDir, decodeReclaimPlan, decodeReclaimProgress, DIGEST_PATTERN, finishedEarlier, ID_PATTERN, journalRecordsDeletion, planDigest, RESULT_NAME,
   type ReclaimItem as Item, type ReclaimOutcome as Outcome, type ReclaimProgress as Progress, type ReclamationPlan,
   type ResultOwnership } from "../contracts/maintenance.ts";

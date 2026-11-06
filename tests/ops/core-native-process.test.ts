@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { runNative, nativePayload } from "../../scripts/ops/core/native-process.ts";
-import { WindowsPlatform } from "../../scripts/ops/core/windows-host.ts";
+import { runNative, nativePayload } from "../../ops/core/native-process.ts";
+import { WindowsPlatform } from "../../ops/core/windows-host.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test("原生适配同时排空大 stderr 与协议 stdout，跨字节块中文完整", async () => {
@@ -44,7 +44,7 @@ test("Windows 平台适配参数不经表达式求值，未知或破损协议不
   const adapter = new WindowsPlatform("D:\\含 空格\\项目", "D:\\source", async command => {
     seen.push(command.args);
     const request = JSON.parse(Buffer.from(command.args.at(-1)!, "base64").toString("utf8"));
-    expect(request.task).toBe("mixin-chatbot");
+    expect(request.task).toBe("mixin-bot");
     return { code: 0, stdout: JSON.stringify({ protocol: "mixin-platform", version: 1, action: request.action, ok: true,
       value: request.action === "inspect" ? { identity: "a".repeat(64), state: "stopped", rawState: "Ready", owned: true } : null }) };
   });

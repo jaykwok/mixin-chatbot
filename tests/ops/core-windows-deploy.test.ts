@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { runtimeText } from "../../scripts/config/runtime-values.ts";
-import { confirmTransaction } from "../../scripts/lib/confirmed-transaction.ts";
-import { STAGE_UNCHANGED } from "../../scripts/ops/core/deploy-stage.ts";
-import { loadDeploymentState } from "../../scripts/ops/core/deployment-state.ts";
+import { runtimeText } from "../../ops/config/runtime-values.ts";
+import { confirmTransaction } from "../../ops/lib/confirmed-transaction.ts";
+import { STAGE_UNCHANGED } from "../../ops/core/deploy-stage.ts";
+import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
 import { APP, DIRECTORY, MODELS } from "../helpers/docker-upgrade.ts";
 import { TOOLS, windowsDeployFixture as fixture } from "../helpers/windows-deploy.ts";
 
@@ -58,14 +58,14 @@ test.skipIf(!windows)("Windows 重新部署：沿用原配置时只写运行参�
   }
 }, 120_000);
 
-test.skipIf(!windows)("Windows 重新部署重配了模型并整理修订，验证未就绪时显示任务结果并自动回滚：先撤销整理和数据，再恢复原配置、运行参数和原任务", async () => {
+test.skipIf(!windows)("Windows 重新部署重配了模型，验证未就绪时显示任务结果并自动回滚：先撤销数据，再恢复原配置、运行参数和原任务", async () => {
   const f = await fixture({ original: true, running: true, failures: ["verification-health"] });
   try {
     const next = { models: '{"providers":{"next":{}}}\n', settings: '{"defaultProvider":"next"}\n' };
-    const result = await f.deploy(f.stage({ port: 1012, models: next, cleanup: "apply" }));
+    const result = await f.deploy(f.stage({ port: 1012, models: next }));
     expect(result).toMatchObject({ outcome: "failed", exitCode: 1, finalState: "running", wasRunning: true, message: "验证实例未就绪，未提交数据；已自动恢复到操作前的状态" });
     expect(f.events).toEqual(["capture", "stop:original", "prepare-directories", "save-dependencies", "dependencies:install", "runtime-settings:values",
-      "configuration-install:models", "data-current:apply", "revision-cleanup:apply", "install-task", "start:verification", "stop:candidate", "revision-cleanup:abandon",
+      "configuration-install:models", "data-current:apply", "install-task", "start:verification", "stop:candidate",
       "data-current:rollback", "restore-dependencies", "restore-configuration", "restore-task", "start:original"]);
     expect(f.unexpected).toEqual([]);
     const output = f.outputs.join("");
@@ -123,15 +123,12 @@ test.skipIf(!windows)("Windows 首次部署在指针发布后中断：不接受�
   } finally { await g.cleanup(); }
 }, 120_000);
 
-test.skipIf(!windows)("Windows 提交回复丢失保留已提交事务，续做只启动新实例不重复写数据；事务中从备份恢复由记录的版本执行，事务不变", async () => {
+test.skipIf(!windows)("Windows 提交回复丢失保留已提交事务，续做只启动新实例不重复写数据", async () => {
   const f = await fixture({ original: true, running: true, failures: ["commit-reply"] });
   try {
-    expect(await f.restore("groups/g1")).toMatchObject({ outcome: "refused", message: expect.stringContaining("没有未完成的部署或升级") });
     expect(await f.deploy(f.stage())).toMatchObject({ outcome: "failed", exitCode: 1 });
     expect(loadDeploymentState(f.project)?.committed).toBe(true);
-    expect(await f.restore("groups/g1")).toMatchObject({ command: "revision-cleanup", outcome: "success", exitCode: 0, finalState: "stopped",
-      message: "已从备份恢复；事务和停机状态不变，之后回滚（会先结束整理）或继续" });
-    expect(f.events.at(-1)).toBe("revision-cleanup:restore"); expect(f.running).toBe(false);
+    expect(f.running).toBe(false);
     expect(existsSync(pointer(f))).toBe(true); expect(loadDeploymentState(f.project)!.committed).toBe(true);
     const before = f.events.length;
     // Refused before any effect: the service, the task and the data stay as the commit left them.

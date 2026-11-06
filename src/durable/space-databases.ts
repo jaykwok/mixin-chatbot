@@ -4,7 +4,7 @@ import type { Dirent } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { assertDataDirectory } from "../../scripts/lib/group-data.ts";
+import { assertDataDirectory } from "../lib/group-data.ts";
 import { isSegment } from "../core/layout.ts";
 import { assertDurableSchema } from "./schema-gate.ts";
 

@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tempFixture } from '../helpers/temp.ts';
-import { publishJson } from '../../scripts/lib/atomic-file.ts';
+import { publishJson } from '../../src/lib/atomic-file.ts';
 import { validateCurrentData } from '../../src/core/data-validation.ts';
 import { applicationBinding } from '../../src/core/data-version.ts';
 import { APP_VERSION, DATA_VERSION } from '../../src/core/version.ts';

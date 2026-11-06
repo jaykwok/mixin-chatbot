@@ -2,20 +2,20 @@ import { expect, test } from "bun:test";
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { configurationRequest, runConfiguration } from "../../scripts/ops/core/configuration.ts";
-import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../scripts/ops/core/maintenance-host.ts";
-import { runCore } from "../../scripts/ops/core/cli.ts";
-import { MaintenanceRecord } from "../../scripts/ops/core/maintenance-record.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { recoverMaintenance } from "../../scripts/ops/core/maintenance-recovery.ts";
-import { ConfigurationDrafts } from "../../scripts/ops/console/configuration-drafts.ts";
-import { applyConfiguration } from "../../scripts/config/configuration-transaction.ts";
+import { configurationRequest, runConfiguration } from "../../ops/core/configuration.ts";
+import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../ops/core/maintenance-host.ts";
+import { runCore } from "../../ops/core/cli.ts";
+import { MaintenanceRecord } from "../../ops/core/maintenance-record.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { recoverMaintenance } from "../../ops/core/maintenance-recovery.ts";
+import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
+import { applyConfiguration } from "../../ops/config/configuration-transaction.ts";
 import { readConfigurationState, CONFIGURATION_STATE_FILE } from "../../src/core/configuration-state.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
 import { applicationBinding } from "../../src/core/data-version.ts";
-import { prepareConsoleDir } from "../../scripts/ops/console/state.ts";
-import { configurationSnapshot } from "../../scripts/config/configuration-form.ts";
-import { serializeConfigurationStage } from "../../scripts/config/configuration-stage.ts";
+import { prepareConsoleDir } from "../../ops/core/console-state.ts";
+import { configurationSnapshot } from "../../ops/config/configuration-form.ts";
+import { serializeConfigurationStage } from "../../ops/config/configuration-stage.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const repo = join(import.meta.dir, "../.."), id = "config-" + "a".repeat(32), digest = "b".repeat(64), secret = "synthetic-private-secret";
@@ -44,9 +44,9 @@ test("配置入口按动作拒绝多余、错拼、重复和不完整参数，�
 
 async function fixture() {
   const f = await tempFixture("core-configuration-");
-  for (const tree of ["scripts", "src", "ui"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};"); }
+  for (const tree of ["console", "ops", "scripts", "src"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};"); }
   await mkdir(join(f.root, "data/state"), { recursive: true });
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture", transaction: "deploy-fixture", application: applicationBinding({ appId: "fixture", environment: "production" }) }));
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: applicationBinding({ appId: "fixture", environment: "production" }) }));
   prepareConsoleDir(join(f.root, ".console"));
   const drafts = new ConfigurationDrafts(f.root), view = drafts.create("app", "test");
   drafts.edit(view.id, "test", 0, { appId: "fixture", environment: "production", secret: { mode: "set", value: secret } });
@@ -54,7 +54,7 @@ async function fixture() {
   const prepared = drafts.prepare(view.id, "test"), selected = configurationRequest("configuration-apply", [view.id, "--digest", prepared.digest]);
   const facts = { identity: "a".repeat(64), owned: true, state: "running" as "running" | "stopped" };
   const effects: string[] = [], readiness = { okay: true, failFirst: false, starts: 0, stream: true, streamFailFirst: false };
-  const ready = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+  const ready = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json({ ...ready, stream: readiness.stream ? { connected: true, reconnects: 0 }
     : { connected: false, reconnects: 0, lastDisconnect: { at: 1, reason: "换取 token 失败：HTTP 401 token=fixture-hidden" } } }, { status: readiness.okay ? 200 : 503 }) });
   await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...ready, port: server.port }));

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { MaintenanceRefused, type ServiceFacts } from "../../scripts/ops/core/maintenance.ts";
-import { runServiceCommand, type ServiceAction, type ServiceControlHost } from "../../scripts/ops/core/service.ts";
+import { MaintenanceRefused, type ServiceFacts } from "../../ops/core/maintenance.ts";
+import { runServiceCommand, type ServiceAction, type ServiceControlHost } from "../../ops/core/service.ts";
 
 function fixture() {
   const facts: ServiceFacts = { identity: "test", owned: true, state: "running", ready: true, pending: false };

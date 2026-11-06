@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { cp, mkdir, readdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tempFixture } from "../helpers/temp.ts";
-import { prepareConsoleDir } from "../../scripts/ops/console/state.ts";
+import { prepareConsoleDir } from "../../ops/core/console-state.ts";
 
 const project = resolve(import.meta.dir, "../..");
 
@@ -18,13 +18,13 @@ function freePort(): number {
 test("绑定端口后保存端口失败：关闭端口、不打印登录链接、不留实例记录、以非零状态退出", async () => {
   const fixture = await tempFixture("console-entry-");
   try {
-    await Promise.all(["scripts", "src", "ui", "package.json"].map(name => cp(join(project, name), join(fixture.root, name), { recursive: true })));
+    await Promise.all(["console", "ops", "scripts", "src", "package.json"].map(name => cp(join(project, name), join(fixture.root, name), { recursive: true })));
     // A directory where the port file goes: the port is saved only after the bind succeeded, so this fails after it.
     // Apply the same initial security descriptor as a real startup (0700 / protected Windows DACL).
     prepareConsoleDir(join(fixture.root, ".console"));
     await mkdir(join(fixture.root, ".console", "port"));
     const port = freePort();
-    const child = Bun.spawn([process.execPath, join(fixture.root, "scripts/ops/console.ts"), "--port", String(port), "--no-open"], {
+    const child = Bun.spawn([process.execPath, join(fixture.root, "console/server/start.ts"), "--port", String(port), "--no-open"], {
       cwd: fixture.root, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env, BOT_PORT: "1011" },
     });
     const [stdout, stderr] = [new Response(child.stdout).text(), new Response(child.stderr).text()];
@@ -46,9 +46,9 @@ test("真实控制台进程固定页面和后端：替换源文件后继续显�
   const fixture = await tempFixture("console-replaced-");
   let child: ReturnType<typeof Bun.spawn> | undefined;
   try {
-    await Promise.all(["scripts", "src", "ui", "package.json"].map(name => cp(join(project, name), join(fixture.root, name), { recursive: true })));
+    await Promise.all(["console", "ops", "scripts", "src", "package.json"].map(name => cp(join(project, name), join(fixture.root, name), { recursive: true })));
     const port = freePort(), origin = "http://127.0.0.1:" + port;
-    child = Bun.spawn([process.execPath, "--no-env-file", join(fixture.root, "scripts/ops/console.ts"), "--port", String(port), "--no-open"], {
+    child = Bun.spawn([process.execPath, "--no-env-file", join(fixture.root, "console/server/start.ts"), "--port", String(port), "--no-open"], {
       cwd: fixture.root, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env, BOT_PORT: "1011" },
     });
     const errors = new Response(child.stderr as ReadableStream<Uint8Array>).text(), reader = (child.stdout as ReadableStream<Uint8Array>).getReader();

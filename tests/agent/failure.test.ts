@@ -1,4 +1,4 @@
-import { redactSecrets } from "../../scripts/lib/redact.ts";
+import { redactSecrets } from "../../src/lib/redact.ts";
 import { describe, expect, test } from "bun:test";
 import {
   describeRequestFailure,

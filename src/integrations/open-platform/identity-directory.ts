@@ -5,7 +5,7 @@
 //   - 应用新范围：保存的范围（directory-scope.ts）与生效范围不同。表里已有的号码沿用 ID，新号码解析进临时名单；遍历完整、
 //     没有冲突、新号码没有临时性的解析失败时，在一个事务里整表换成新名单并记下生效范围，不受撤销人数的限制。否则（或被
 //     更新的范围取代）一行不改，旧范围继续生效。
-//   - 日常同步（含还没有生效记录时：首次部署和从 1.0.x 升级后的第一轮）：表里没有的号码在遍历中一出现就解析并加入（ID 已
+//   - 日常同步（含还没有生效记录时：首次部署后的第一轮）：表里没有的号码在遍历中一出现就解析并加入（ID 已
 //     属于别的号码的那些等遍历完再定，遍历后发现冲突的撤回）；完整且无冲突的一轮撤销缺席的手机号。一次缺席超过有效映射 10%
 //     且多于 20 条时先不撤销，过一段时间再完整同步一轮复核，两轮都缺席的才撤销。
 // 不完整、有冲突或新号码没查成的一轮自动重试。每次扫描另复核约 1/30 的已有映射。只保存当前有效映射；被撤销或替换的旧 ID
@@ -35,7 +35,6 @@ export type ScanMode = "apply" | "routine";
 export interface ScanSummary {
   readonly id: number;
   readonly trigger: ScanTrigger;
-  /** 1.0.x 记下的扫描没有这两项。 */
   readonly mode?: ScanMode;
   readonly scope?: DirectoryScope;
   readonly startedAt: number;
@@ -69,7 +68,7 @@ export interface DirectoryStatus {
   /** 保存的范围；未设置时没有。 */
   readonly scope?: DirectoryScope;
   readonly state: ScopeState;
-  /** 名单按哪个范围建成、何时生效；还没有完成过（首次同步，或从 1.0.x 升级后的第一轮）时没有。 */
+  /** 名单按哪个范围建成、何时生效；还没有完成过首次同步时没有。 */
   readonly effective?: { readonly scope: DirectoryScope; readonly since: number };
   /** 上一轮没成的原因（没有扫描在进行时）。 */
   readonly failure?: string;
@@ -107,8 +106,6 @@ CREATE TABLE IF NOT EXISTS directory_scans (
   complete INTEGER NOT NULL DEFAULT 0, summary TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS directory_failures (phone TEXT PRIMARY KEY, attempts INTEGER NOT NULL, error TEXT NOT NULL, at INTEGER NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS directory_effective (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), scope TEXT NOT NULL, since INTEGER NOT NULL) STRICT;
--- 1.0.x 暂停待人工确认的撤销名单：不再执行，下一轮同步按复核规则重新判断。
-DROP TABLE IF EXISTS directory_pending_revocations;
 `;
 const KEEP_SCANS = 50;
 const REVOKE_RATIO = 0.1;

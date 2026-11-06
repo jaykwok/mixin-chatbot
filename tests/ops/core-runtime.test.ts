@@ -2,20 +2,20 @@ import { expect, test } from "bun:test";
 import { chmod, link, mkdir, readFile, rename, symlink, utimes, writeFile } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { randomUUID } from "node:crypto";
-import { runRuntime, runtimeRequest } from "../../scripts/ops/core/runtime-configure.ts";
-import { captureRuntimeInput, removeRuntimeInput } from "../../scripts/ops/core/runtime-input.ts";
-import { runtimeEnvironment, runtimeEnvironmentDigest } from "../../scripts/ops/core/runtime-environment.ts";
-import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../scripts/ops/core/maintenance-host.ts";
-import { runCore } from "../../scripts/ops/core/cli.ts";
-import { readRuntimeSettings, writeRuntimeDraft, sweepRuntimeDrafts } from "../../scripts/config/runtime-draft.ts";
-import { applyConfiguration } from "../../scripts/config/configuration-transaction.ts";
-import { configurationSnapshot } from "../../scripts/config/configuration-form.ts";
+import { runRuntime, runtimeRequest } from "../../ops/core/runtime-configure.ts";
+import { captureRuntimeInput, removeRuntimeInput } from "../../ops/core/runtime-input.ts";
+import { runtimeEnvironment, runtimeEnvironmentDigest } from "../../ops/core/runtime-environment.ts";
+import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../ops/core/maintenance-host.ts";
+import { runCore } from "../../ops/core/cli.ts";
+import { readRuntimeSettings, writeRuntimeDraft, sweepRuntimeDrafts } from "../../ops/config/runtime-draft.ts";
+import { applyConfiguration } from "../../ops/config/configuration-transaction.ts";
+import { configurationSnapshot } from "../../ops/config/configuration-form.ts";
 import { readConfigurationState, CONFIGURATION_STATE_FILE } from "../../src/core/configuration-state.ts";
-import { MaintenanceRecord } from "../../scripts/ops/core/maintenance-record.ts";
+import { MaintenanceRecord } from "../../ops/core/maintenance-record.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { recoverMaintenance } from "../../scripts/ops/core/maintenance-recovery.ts";
-import { prepareConsoleDir } from "../../scripts/ops/console/state.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { recoverMaintenance } from "../../ops/core/maintenance-recovery.ts";
+import { prepareConsoleDir } from "../../ops/core/console-state.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import type { OpsRuntimeDraft } from "../../src/contracts/ops-runtime-draft.ts";
 
@@ -35,14 +35,14 @@ test("运行参数入口严格拒绝额外参数；仅选择原服务受支持�
 
 async function fixture() {
   const f = await tempFixture("core-runtime-");
-  for (const tree of ["scripts", "src", "ui"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};"); }
+  for (const tree of ["console", "ops", "scripts", "src"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};"); }
   for (const dir of ["data/config", "data/state"]) await mkdir(join(f.root, dir), { recursive: true });
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
   const config = join(f.root, "data/config/runtime.json"); await writeFile(config, original);
   const draft = await writeRuntimeDraft(await readRuntimeSettings(config), { BOT_MAX_ACTIVE_REQUESTS: "64" }, config);
   prepareConsoleDir(join(f.root, ".console"));
   const effects: string[] = [], facts = { identity: "a".repeat(64), owned: true, state: "running" as "running" | "stopped" | "absent" | "unsupported" };
-  const ready = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+  const ready = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const readiness = { failFirst: false, okay: true, starts: 0 };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(ready, { status: readiness.okay ? 200 : 503 }) });
   await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...ready, port: server.port }));
@@ -105,7 +105,7 @@ test.skipIf(process.platform !== "win32")("运行参数实际发布：运行/停
         const context = createMaintenanceHost(options, operation);
         return { ...context, data: async (step, signal) => {
           if (mode === "env" && step.script.endsWith("runtime-apply.ts")) {
-            const { runNative } = await import("../../scripts/ops/core/native-process.ts");
+            const { runNative } = await import("../../ops/core/native-process.ts");
             return runNative({ command: process.execPath, args: ["--no-env-file", join(repo, step.script), ...step.args], cwd: f.root, protocol: true,
               input: step.input, env: { ...process.env, BOT_MAX_ACTIVE_REQUESTS: "8" } }, () => {});
           }

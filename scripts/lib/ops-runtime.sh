@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host runtime bootstrap only. All service/maintenance policy belongs to scripts/ops/core.
+# Host runtime bootstrap only. All service/maintenance policy belongs to ops/core.
 # Downloads are pinned to an explicit release and the SHA-256 published on that GitHub release.
 ops_bun_usable() {
     local version
@@ -93,7 +93,7 @@ ops_bun() (
 ops_core() {
     local runtime
     runtime="$(ops_bun)" || return 1
-    "$runtime" --no-env-file "$OPS_SOURCE_DIR/scripts/ops/core/cli.ts" --project "$PROJECT_DIR" "$@"
+    "$runtime" --no-env-file "$OPS_SOURCE_DIR/ops/core/cli.ts" --project "$PROJECT_DIR" "$@"
 }
 
 # 运维核心开始的事务在快照中记下固定运行包的摘要（host-runtime），续做和回滚只用它：.console/runtime/source-<摘要>
@@ -103,7 +103,7 @@ ops_pinned_core() {
     [ -f "$record" ] && [ ! -L "$record" ] || return 1
     digest="$(tr -d '\n' < "$record")"
     [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || return 1
-    core="$PROJECT_DIR/.console/runtime/source-$digest/scripts/ops/core/cli.ts"
+    core="$PROJECT_DIR/.console/runtime/source-$digest/ops/core/cli.ts"
     [ -f "$core" ] && [ ! -L "$core" ] || return 1
     printf '%s\n' "$core"
 }

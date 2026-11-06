@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
-import { ConfigurationDrafts } from "../../scripts/ops/console/configuration-drafts.ts";
-import { configurationQuery, configurationRoutes } from "../../scripts/ops/console/configuration-routes.ts";
-import type { RouteContext } from "../../scripts/ops/console/routes.ts";
+import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
+import { configurationQuery, configurationRoutes } from "../../console/server/configuration-routes.ts";
+import type { RouteContext } from "../../console/server/routes.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { join } from "node:path";
-import { SOURCE_DIR } from "../../scripts/ops/shared/platform.ts";
+import { SOURCE_DIR } from "../../ops/core/platform.ts";
 
 /** The bot container reports its data bind by the real path it was created with. */
 const dataMount = (root: string) => { mkdirSync(join(root, "data"), { recursive: true }); return { Type: "bind", RW: true, Destination: "/app/data", Source: realpathSync(join(root, "data")) }; };
@@ -76,11 +76,11 @@ test("校验进程的协议必须完整成功；秘密经 stdin，参数和环�
     await expect(query("check", { secret })).resolves.toMatchObject({ success: true });
     if (process.platform !== "win32") {
       expect(calls.at(-1)!.args).toContain("--read-only");
-      expect(calls.at(-1)!.args).toContain(`${join(SOURCE_DIR, "scripts")}:/app/scripts:ro`);
+      expect(calls.at(-1)!.args).toContain(`${join(SOURCE_DIR, "ops")}:/app/ops:ro`);
       expect(calls.at(-1)!.args).toContain(`${join(f.root, "data")}:/app/data:ro`);
       for (const name of ["pyproject.toml", "uv.lock", ".python-version"]) expect(calls.at(-1)!.args).toContain(`type=bind,source=${join(SOURCE_DIR, name)},target=/app/${name},readonly`);
-      expect(calls.at(-1)!.args).not.toContain(`${join(f.root, "scripts")}:/app/scripts:ro`);
-    } else expect(calls.at(-1)!.args[0]).toBe(join(SOURCE_DIR, "scripts/config/configuration-check.ts"));
+      expect(calls.at(-1)!.args).not.toContain(`${join(f.root, "ops")}:/app/ops:ro`);
+    } else expect(calls.at(-1)!.args[0]).toBe(join(SOURCE_DIR, "ops/config/configuration-check.ts"));
     const refused = configurationQuery(f.root, async (_command, args) => {
       if (args[0] === "container") return { code: 0, stdout: JSON.stringify([{ Image: "sha256:" + "a".repeat(64), Config: { User: "1001:1001" }, Mounts: [dataMount(f.root)] }]), stderr: "", timedOut: false };
       return { code: 1, stdout: '{"protocol":"mixin-configuration","version":1,"success":true}', stderr: secret, timedOut: false };

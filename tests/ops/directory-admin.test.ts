@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { copyFile, cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ATTENTION_RECENT_MS, changeScope, departmentPath, departmentRow, describeAttention, describeDepartments, describeDirectory, describeScope,
-  describeScopeChange, describeScopeState, directoryStatus, doctorRows, listDepartments, main, readScopePaths, readServiceStatus, scopeRows } from "../../scripts/ops/directory-admin.ts";
+  describeScopeChange, describeScopeState, directoryStatus, doctorRows, listDepartments, main, readScopePaths, readServiceStatus, scopeRows } from "../../ops/tools/directory-admin.ts";
 import { type DirectoryScope, parseScopeRequest, readDirectoryScope, sameScope, scopeChoiceHint, scopeDepartments, WHOLE_DIRECTORY } from "../../src/integrations/open-platform/directory-scope.ts";
 import { writeDirectoryScope } from "../../src/integrations/open-platform/directory-scope-write.ts";
 import { createApp } from "../../src/server/http-app.ts";
@@ -66,16 +66,6 @@ test("the scope state says whether the saved scope is in effect, and what is in 
   // The reason of a failed apply is part of the state; an unfinished routine sync gets its own line.
   expect(describeDirectory(failed).some(line => line.startsWith("上一轮没有完成"))).toBe(false);
   expect(describeDirectory({ ...settled, failure: "部门遍历失败", retryAt: Date.now() + 15 * 60_000 })).toContain("上一轮没有完成：部门遍历失败（15 分钟后自动重试）");
-});
-
-test("a 1.0.x service's /health (running until the restart after a pull) reads as in effect; its paused round is explained", () => {
-  expect(directoryStatus({ mappings: 40, lastScan: { ...scan(true), suspected: undefined, pendingRevocations: 25 }, lastCompleteAt: now, pending: { scanId: 7, count: 25 },
-    scope: ["100"], running: { trigger: "daily", startedAt: now, phase: "遍历部门", departments: 1, members: 2, resolved: 0 } })).toMatchObject({
-    mappings: 40, scope: depts("100"), state: "effective", lastCompleteAt: now, running: { mode: "routine", phase: "遍历部门" },
-    failure: "运行中的旧版服务暂停了第 7 轮的 25 个撤销；升级后按新规则重新同步，不再需要确认" });
-  expect(directoryStatus({ mappings: 3, lastScan: scan(false) })).toEqual({ mappings: 3, scope: WHOLE_DIRECTORY, state: "effective", failure: "部门遍历失败", lastScan: scan(false) });
-  expect(directoryStatus(settled)).toBe(settled as unknown as DirectoryStatus);
-  for (const garbage of [undefined, null, [], { mappings: "40" }]) expect(directoryStatus(garbage)).toBeUndefined();
 });
 
 test("status goes only to the recorded instance over the local control port", async () => {
@@ -242,7 +232,7 @@ test("without a saved scope the status reads unset, the doctor fails and points 
   // Linux has the terminal wizard (ops.sh directory-scope); ops.ps1 has no terminal, so Windows ticks departments in the console only.
   expect(scopeChoiceHint("win32")).toBe("在控制台「通讯录」中选择，或用 directory-scope all 同步整个通讯录");
   expect(scopeChoiceHint("linux")).toBe("在控制台「通讯录」或终端（不带参数的 directory-scope）中逐层勾选部门，或用 directory-scope all 同步整个通讯录");
-  // The unset state passes through as it is; it is no 1.0.x status to translate.
+  // The unset state passes through as it is.
   expect(directoryStatus(unset)).toBe(unset as unknown as DirectoryStatus);
 });
 
@@ -310,13 +300,13 @@ test.skipIf(!bash || !existsSync(bash))("ops.sh directory-scope passes its argum
   const root = fixture.root, log = join(root, "calls.log");
   try {
     await cp(join(project, "scripts/lib"), join(root, "scripts/lib"), { recursive: true });
-    await mkdir(join(root, "scripts/ops"), { recursive: true }); await copyFile(join(project, "scripts/ops/ops.sh"), join(root, "scripts/ops/ops.sh"));
-    const record = (name: string) => `() { echo "${name} $*" >> '${posixPath(log)}'; case "$1" in ps) echo mixin-chatbot ;; esac\n}`;
+    await mkdir(join(root, "scripts/ops"), { recursive: true }); await copyFile(join(project, "scripts/ops.sh"), join(root, "scripts/ops.sh"));
+    const record = (name: string) => `() { echo "${name} $*" >> '${posixPath(log)}'; case "$1" in ps) echo mixin-bot ;; esac\n}`;
     const ops = async (hostBun: boolean, ...args: string[]) => {
       // Exported functions stand in for the tools (PATH stubs are not reliable under Git Bash); "command -v bun" fails without host Bun.
       const tools = hostBun ? { "BASH_FUNC_bun%%": record("bun") }
         : { "BASH_FUNC_command%%": '() { if [ "$1" = -v ] && [ "$2" = bun ]; then return 1; fi; builtin command "$@"\n}' };
-      const child = Bun.spawn([bash!, posixPath(join(root, "scripts/ops/ops.sh")), "directory-scope", ...args], { cwd: root, stdin: "ignore", stdout: "pipe",
+      const child = Bun.spawn([bash!, posixPath(join(root, "scripts/ops.sh")), "directory-scope", ...args], { cwd: root, stdin: "ignore", stdout: "pipe",
         stderr: "pipe", windowsHide: true, env: { ...process.env, MSYS_NO_PATHCONV: "1", "BASH_FUNC_docker%%": record("docker"), ...tools,
           "BASH_FUNC_flock%%": "() { return 0;\n}", BOT_PORT: "", BOT_DOMAIN: "" } });
       const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
@@ -327,9 +317,9 @@ test.skipIf(!bash || !existsSync(bash))("ops.sh directory-scope passes its argum
     await ops(false);
     await ops(false, "111", "all");
     expect((await readFile(log, "utf8")).trim().split("\n").filter(line => !line.startsWith("docker ps"))).toEqual([
-      "bun run scripts/ops/directory-admin.ts scope all",
-      "docker exec mixin-chatbot bun run scripts/ops/directory-admin.ts scope",
-      "docker exec mixin-chatbot bun run scripts/ops/directory-admin.ts scope 111 all",
+      "bun run ops/tools/directory-admin.ts scope all",
+      "docker exec mixin-bot bun run ops/tools/directory-admin.ts scope",
+      "docker exec mixin-bot bun run ops/tools/directory-admin.ts scope 111 all",
     ]);
   } finally { await fixture.cleanup(); }
 }, 30000);

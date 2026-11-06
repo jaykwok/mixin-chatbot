@@ -2,23 +2,23 @@ import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { parseDeployArgs, parseRestoreArgs, parseUpgradeArgs, runDeploymentCli } from "../../scripts/ops/core/deployment-cli.ts";
-import { runCore } from "../../scripts/ops/core/cli.ts";
-import { loadDeploymentState } from "../../scripts/ops/core/deployment-state.ts";
-import { serializeTransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
-import { MaintenanceRefused } from "../../scripts/ops/core/maintenance.ts";
-import type { preflightWindowsUpgrade } from "../../scripts/ops/core/windows-lifecycle.ts";
-import type { DockerInput, DockerUpgradeInput, preflightDockerDeploy, runDockerLifecycle } from "../../scripts/ops/core/docker-lifecycle.ts";
-import type { OpsResult } from "../../scripts/ops/core/result.ts";
+import { parseDeployArgs, parseUpgradeArgs, runDeploymentCli } from "../../ops/core/deployment-cli.ts";
+import { runCore } from "../../ops/core/cli.ts";
+import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
+import { serializeTransactionRecord } from "../../ops/core/transaction-record.ts";
+import { MaintenanceRefused } from "../../ops/core/maintenance.ts";
+import type { preflightWindowsUpgrade } from "../../ops/core/windows-lifecycle.ts";
+import type { DockerInput, DockerUpgradeInput, preflightDockerDeploy, runDockerLifecycle } from "../../ops/core/docker-lifecycle.ts";
+import type { OpsResult } from "../../ops/core/result.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import { confirmTransaction } from "../../scripts/lib/confirmed-transaction.ts";
-import { TaskStore } from "../../scripts/ops/console/tasks.ts";
-import { consoleDir } from "../../scripts/ops/console/state.ts";
+import { confirmTransaction } from "../../ops/lib/confirmed-transaction.ts";
+import { TaskStore } from "../../ops/core/tasks.ts";
+import { consoleDir } from "../../ops/core/console-state.ts";
 
 const original = "a".repeat(40), target = "b".repeat(40);
 const args = (project: string) => ["upgrade", "--project", project, "--original", original, "--target", target, "--branch", "main"];
 /** A new upgrade's choices on this platform; Docker also takes the candidate-image record and the facts prepared before the stop. */
-const fresh = (root: string) => ["--plan", join(root, "plan.json"), "--cleanup", "apply", ...(process.platform === "win32" ? [] : ["--candidate", join(root, "candidate-image"), "--facts", join(root, "upgrade-facts")])];
+const fresh = (root: string) => ["--plan", join(root, "plan.json"), ...(process.platform === "win32" ? [] : ["--candidate", join(root, "candidate-image"), "--facts", join(root, "upgrade-facts")])];
 const done: OpsResult = { protocol: "mixin-ops", version: 1, command: "update", outcome: "success", exitCode: 0,
   wasRunning: false, finalState: "stopped", message: "合成部署完成" };
 
@@ -33,12 +33,12 @@ async function pending(project: string, operation: "deploy" | "upgrade" = "upgra
 }
 
 test("升级入口逐动作拒绝未知、重复和无值参数，不把错误选择变成默认值", () => {
-  expect(parseUpgradeArgs([...args("/fixture"), "--plan", "p.json", "--cleanup", "skip", "--json"]))
-    .toMatchObject({ project: "/fixture", cleanup: "skip", json: true, rollback: false });
-  for (const tail of [["--no-backup"], ["--cleanupp", "skip"], ["--cleanup", "no-backup"], ["--plan"], ["--plan", "--json"],
+  expect(parseUpgradeArgs([...args("/fixture"), "--plan", "p.json", "--json"]))
+    .toMatchObject({ project: "/fixture", plan: "p.json", json: true, rollback: false });
+  for (const tail of [["--no-backup"], ["--cleanup", "skip"], ["--plan"], ["--plan", "--json"],
     ["--json", "--json"], ["--original", original], ["--branch", "other"], ["extra"], ["--confirmation", "bad"],
-    ["--rollback", "--plan", "p"], ["--rollback", "--cleanup", "skip"], ["--rollback", "--directory-plan", "d"],
-    ["--preflight", "--preflight"], ["--preflight", "--rollback"], ["--preflight", "--plan", "p"], ["--preflight", "--cleanup", "skip"],
+    ["--rollback", "--plan", "p"], ["--rollback", "--directory-plan", "d"],
+    ["--preflight", "--preflight"], ["--preflight", "--rollback"], ["--preflight", "--plan", "p"],
     ["--preflight", "--directory-plan", "d"], ["--preflight", "--confirmation", "bad"]]) {
     expect(() => parseUpgradeArgs([...args("/fixture"), ...tail]), tail.join(" ")).toThrow("用法");
   }
@@ -59,7 +59,7 @@ test("共享入口转交部署命令且保留结果文件、退出码与中文�
     const result = await runCore(["deployment", ...input], { env: { MIXIN_OPS_RESULT_FILE: file },
       deployment: (argv, options, signal) => runDeploymentCli(argv, { ...options, host }, signal) });
     expect(result).toEqual({ result: done, json: true }); expect(JSON.parse(await readFile(file, "utf8"))).toEqual(done);
-    expect(calls).toHaveLength(1); expect(calls[0]).toMatchObject({ command: "update", original, target, branch: "main", cleanup: "apply", plan: join(f.root, "plan.json"),
+    expect(calls).toHaveLength(1); expect(calls[0]).toMatchObject({ command: "update", original, target, branch: "main", plan: join(f.root, "plan.json"),
       ...(process.platform === "win32" ? {} : { candidate: join(f.root, "candidate-image"), facts: join(f.root, "upgrade-facts") }) });
     await expect(runDeploymentCli(args(f.root), { host })).rejects.toThrow("新升级必须"); expect(calls).toHaveLength(1);
     await expect(runDeploymentCli([...input, "--no-backup"], { host })).rejects.toThrow("用法"); expect(calls).toHaveLength(1);
@@ -70,7 +70,7 @@ test("Docker 新升级缺停机前的候选镜像记录或准备记录时拒绝�
   const f = await tempFixture("core-deployment-platform-cli-");
   try {
     const calls: unknown[] = [], host: typeof runDockerLifecycle = async input => { calls.push(input); return done; };
-    const base = [...args(f.root), "--plan", "p.json", "--cleanup", "skip"];
+    const base = [...args(f.root), "--plan", "p.json"];
     for (const extra of [[], ["--candidate", "c"], ["--facts", "f"]])
       await expect(runDeploymentCli([...base, ...extra], { host, platform: "linux" }), extra.join(" ")).rejects.toThrow("候选镜像记录和准备记录");
     for (const extra of [["--candidate", "c"], ["--facts", "f"], ["--candidate", "c", "--facts", "f"]])
@@ -110,7 +110,7 @@ test("续做和回滚只读原事务选择；兼容旧包装传来的当前 HEAD
     expect(calls[1]!.confirmation).toBe(confirmation);
     expect(() => parseUpgradeArgs([...input, "--confirmation", confirmation])).toThrow("用法");
     expect((calls as DockerUpgradeInput[]).map(value => [value.original, value.branch])).toEqual([[original, "original-branch"], [original, "original-branch"]]);
-    for (const extra of [["--cleanup", "skip"], ["--plan", "new.json"], ["--directory-plan", "new.json"]])
+    for (const extra of [["--plan", "new.json"], ["--directory-plan", "new.json"]])
       await expect(runDeploymentCli([...input, ...extra], { host })).rejects.toThrow("只使用事务中记录");
     await expect(runDeploymentCli(input.map(value => value === target ? "c".repeat(40) : value), { host })).rejects.toThrow("目标不一致");
     expect(calls).toHaveLength(2);
@@ -144,7 +144,7 @@ test("部署入口：新部署只接受暂存目录和命令，续做和回滚�
     const project = join(f.root, "project"), stage = join(f.root, "stage"), calls: DockerInput[] = [];
     const host: typeof runDockerLifecycle = async (input, options) => { await options.verify(); calls.push(input); return { ...done, command: input.command! }; };
     await mkdir(project); await mkdir(stage);
-    await writeFile(join(stage, "deployment.json"), JSON.stringify({ format: 1, target: "", port: 1011, workspace: "", cleanup: "apply" }));
+    await writeFile(join(stage, "deployment.json"), JSON.stringify({ format: 1, target: "", port: 1011, workspace: "" }));
     await writeFile(join(stage, "runtime-values.json"), JSON.stringify({ format: 1, base: null, values: { BOT_PORT: "1011" } }));
     await expect(runDeploymentCli(["deploy", "--project", project], { host })).rejects.toThrow("确认过的部署事务不存在");
     expect((await runDeploymentCli(["deploy", "--project", project, "--stage", stage, "--command", "repair"], { host })).result.command).toBe("repair");
@@ -153,10 +153,9 @@ test("部署入口：新部署只接受暂存目录和命令，续做和回滚�
     const store = new TaskStore(consoleDir(project)), task = (params: Record<string, unknown>, key: string) => store.create({ planId: "plan-" + key,
       operation: "deploy", params: { directory: "saved", ...params }, project, mechanism: "systemd-user" }, key).id;
     const accepted = (id: string) => ({ host, checkPlan: async () => {}, env: { MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_TASK_ID: id, MIXIN_OPS_EXPECT_CODE: "code" } });
-    const argv = ["deploy", "--project", project, "--stage", stage, "--command", "deploy"], same = task({ port: 1011, workspace: "", cleanup: "apply" }, "same");
+    const argv = ["deploy", "--project", project, "--stage", stage, "--command", "deploy"], same = task({ port: 1011, workspace: "" }, "same");
     expect((await runDeploymentCli(argv, accepted(same))).result.command).toBe("deploy");
-    for (const [key, params] of [["port", { port: 1012, workspace: "", cleanup: "apply" }], ["cleanup", { port: 1011, workspace: "", cleanup: "skip" }],
-      ["workspace", { port: 1011, workspace: f.root, cleanup: "apply" }]] as const)
+    for (const [key, params] of [["port", { port: 1012, workspace: "" }], ["workspace", { port: 1011, workspace: f.root }]] as const)
       await expect(runDeploymentCli(argv, accepted(task(params, key))), key).rejects.toThrow("与已接单任务不一致");
     await expect(runDeploymentCli([...argv.slice(0, -1), "repair"], accepted(same))).rejects.toThrow("与已接单任务不一致");
     // A plan that no longer holds stops the task before anything changes: a refusal, with the plan check's own reason.
@@ -188,40 +187,11 @@ test("部署预检只做只读检查：不进入宿主、不写结果文件，�
   try {
     const file = join(f.root, "result.json"), calls: unknown[] = [];
     const host: typeof runDockerLifecycle = async () => { throw new Error("preflight entered the deployment host"); };
-    const refused: OpsResult = { ...done, command: "deploy", outcome: "refused", exitCode: 1, finalState: "unknown", message: "发现旧回滚容器 mixin-chatbot-rollback" };
+    const refused: OpsResult = { ...done, command: "deploy", outcome: "refused", exitCode: 1, finalState: "unknown", message: "发现旧回滚容器 mixin-bot-rollback" };
     const preflightDeploy: typeof preflightDockerDeploy = async (input, options) => { calls.push([input, options]); return refused; };
     const result = await runCore(["deployment", "deploy", "--project", f.root, "--preflight"], { env: { MIXIN_OPS_RESULT_FILE: file }, source: "/fixture/release",
       deployment: (argv, options, signal) => runDeploymentCli(argv, { ...options, host, preflightDeploy }, signal) });
     expect(result).toEqual({ result: refused, json: false }); expect(existsSync(file)).toBe(false);
     expect(calls).toEqual([[{ operation: "deploy", command: "deploy" }, { project: resolve(f.root), source: "/fixture/release" }]]);
-  } finally { await f.cleanup(); }
-});
-
-test("从备份恢复：有未完成的事务时由核心交给事务记录的版本，没有事务时走普通整理；空间不合法或参数不全时拒绝", async () => {
-  expect(parseRestoreArgs(["restore", "--project", "/p", "--space", "groups/g1", "--json"])).toMatchObject({ project: "/p", space: "groups/g1", json: true });
-  for (const tail of [[], ["--space", "../etc"], ["--space", "groups/g1", "--rollback"], ["--space", "groups/g1", "--space", "direct"], ["--space"]])
-    expect(() => parseRestoreArgs(["restore", "--project", "/p", ...tail]), tail.join(" ")).toThrow();
-  const f = await tempFixture("core-restore-cli-");
-  try {
-    const project = join(f.root, "project"), calls: DockerInput[] = [], routed: string[][] = [], ordinary: string[][] = [];
-    await mkdir(project);
-    const host: typeof runDockerLifecycle = async (input, options) => { await options.verify(); calls.push(input); return { ...done, command: input.command! }; };
-    const restore = ["restore", "--project", project, "--space", "groups/g1"];
-    await expect(runDeploymentCli(restore, { host })).rejects.toThrow("没有未完成的部署或升级");
-    const core = (env: NodeJS.ProcessEnv = {}) => runCore(["revision-cleanup", "restore", "--space", "groups/g1", "--project", project, "--json"], { env,
-      deployment: async (argv, options, signal) => { routed.push(argv); return runDeploymentCli(argv, { ...options, host }, signal); },
-      revision: async request => { ordinary.push([request.action, ...request.args]); return { ...done, command: "revision-cleanup" }; } });
-    expect((await core()).json).toBe(true);
-    expect(ordinary).toEqual([["restore", "--space", "groups/g1"]]); expect(routed).toEqual([]);
-
-    await pending(project, "deploy");
-    expect((await core()).result.command).toBe("revision-cleanup");
-    expect(routed).toEqual([["restore", "--project", resolve(project), "--space", "groups/g1", "--json"]]); expect(ordinary).toHaveLength(1);
-    expect(calls).toEqual([{ operation: "deploy", command: "revision-cleanup", restore: "groups/g1" }]);
-    await expect(core({ MIXIN_OPS_CONSOLE: "1" })).rejects.toThrow("控制台恢复缺少接单记录");
-
-    const upgrading = join(f.root, "upgrading"); await pending(upgrading);
-    await runDeploymentCli(["restore", "--project", upgrading, "--space", "direct"], { host });
-    expect(calls[1]).toEqual({ original, target, branch: "original-branch", command: "revision-cleanup", restore: "direct" });
   } finally { await f.cleanup(); }
 });

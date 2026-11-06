@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { directoryAppHash, consoleDirectoryScope } from "../../scripts/lib/directory-choice.ts";
-import { deploymentEnvironment } from "../../scripts/ops/console/deployment-options.ts";
-import { parseDirectoryQuery, queryDeploymentDirectory } from "../../scripts/config/directory-query.ts";
+import { directoryAppHash, consoleDirectoryScope } from "../../ops/lib/directory-choice.ts";
+import { deploymentEnvironment } from "../../ops/core/deployment-options.ts";
+import { parseDirectoryQuery, queryDeploymentDirectory } from "../../ops/config/directory-query.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { FakePlatform, json } from "../helpers/fake-platform.ts";
 import { PlatformClient } from "../../src/integrations/open-platform/client.ts";
@@ -32,7 +32,7 @@ test("部门查询 CLI 的 stdout 只留结果，失败时不在部署目录或�
   const f = await tempFixture("directory-query-cli-"), project = join(f.root, "project"), cwd = join(f.root, "cwd");
   try {
     mkdirSync(join(project, "data/config"), { recursive: true }); mkdirSync(cwd);
-    const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../../scripts/config/directory-query.ts"), "children", project],
+    const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../../ops/config/directory-query.ts"), "children", project],
       { cwd, stdin: Buffer.from(JSON.stringify({ ids: ["1"] })), stdout: "pipe", stderr: "pipe", windowsHide: true });
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect(code).toBe(1); expect(out).toBe(""); expect(err).toContain("部门查询未完成");
@@ -53,11 +53,11 @@ test("真实 CLI 把已核对选择写入事务计划；配置变化或传输错
   const f = await tempFixture("console-directory-cli-");
   try {
     mkdirSync(join(f.root, "data/config"), { recursive: true }); writeFileSync(join(f.root, "data/config/app-bot.json"), '{"synthetic":true}');
-    const params = { port: 2022, workspace: "", cleanup: "skip", directory: { departments: ["department-a"], names: ["合成部门"], appHash: directoryAppHash(f.root) } };
+    const params = { port: 2022, workspace: "", directory: { departments: ["department-a"], names: ["合成部门"], appHash: directoryAppHash(f.root) } };
     const env = { ...process.env, ...deploymentEnvironment("deploy", params, f.root), MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_TASK_ID: "fixture" };
     const path = join(f.root, "plan.json"), scope = join(f.root, "data/config/directory.json");
     const run = async (action: string, overrides: NodeJS.ProcessEnv = {}) => {
-      const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../../scripts/config/directory-scope.ts"), action, "--project", f.root, "--plan", path],
+      const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../../ops/config/directory-scope.ts"), action, "--project", f.root, "--plan", path],
         { cwd: f.root, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...env, ...overrides } });
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]); return { code, out, err };
     };

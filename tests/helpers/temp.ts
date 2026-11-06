@@ -7,7 +7,7 @@ import { isPathInside } from "../../src/contracts/paths.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const fixtures = resolve(process.env.TEST_TEMP_ROOT ?? join(project, "tmp/test-fixtures"));
-// scripts/test.ts archives into its own run directory; a direct `bun test` stays under tmp/ too, never the project's backup/rm.
+// tests/run.ts archives into its own run directory; a direct `bun test` stays under tmp/ too, never the project's backup/rm.
 const archive = resolve(process.env.TEST_TRASH_DIR ?? join(project, "tmp/test-trash"));
 mkdirSync(fixtures, { recursive: true });
 export function testTempDir(): string { return fixtures; }
@@ -22,7 +22,7 @@ export async function archiveFixture(path: string, options?: { force?: boolean; 
   } catch (error) { if (options?.force && (error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
 }
 
-/** Tests use only tmp/ and archive fixtures into the run's trash directory (see scripts/test.ts). */
+/** Tests use only tmp/ and archive fixtures into the run's trash directory (see tests/run.ts). */
 export async function tempFixture(prefix: string) {
   const root = await mkdtemp(join(fixtures, prefix));
   return {

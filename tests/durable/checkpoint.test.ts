@@ -6,8 +6,8 @@ import { afterAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { createSession, defineDoc, type SessionDocToken } from "@earendil-works/pi-durable";
-import { CHECKPOINT_INTERVAL, checkpointDue, checkpointPolicy, LEGACY_CHAIN_LIMIT } from "../../src/durable/checkpoint.ts";
+import { createSession, defineDoc } from "@earendil-works/pi-durable";
+import { CHECKPOINT_INTERVAL, checkpointDue, checkpointPolicy } from "../../src/durable/checkpoint.ts";
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { BOT_DOCUMENTS } from "../helpers/checkpoint-policy.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -35,15 +35,12 @@ test("every bot document uses the shared policy", () => {
   for (const definition of BOT_DOCUMENTS) expect(definition.checkpointWhen === checkpointDue).toBe(true);
 });
 
-test("the policy: a base for the 64th revision of a chain, never online for a chain at or beyond the legacy limit", () => {
+test("the policy: a base for the 64th revision of a chain", () => {
   const due = (deltasSinceBase: number) => checkpointDue({}, [], { deltasSinceBase });
   expect(CHECKPOINT_INTERVAL).toBe(64);
-  expect(LEGACY_CHAIN_LIMIT).toBe(1_024);
   expect([0, 1, 62].map(due)).toEqual([false, false, false]);
-  expect([63, 64, 500, 1_023].map(due)).toEqual([true, true, true, true]);
-  expect([1_024, 1_025, 440_000].map(due)).toEqual([false, false, false]);
+  expect([63, 64, 1_024, 440_000].map(due)).toEqual([true, true, true, true]);
   expect(() => checkpointPolicy({ interval: 0 })).toThrow();
-  expect(() => checkpointPolicy({ interval: 8, legacyLimit: 4 })).toThrow();
 });
 
 // A small deterministic generator (mulberry32): a failure names its seed.
@@ -121,36 +118,3 @@ for (const [interval, steps] of [[1, 40], [2, 40], [64, 150]] as const) {
     }
   });
 }
-
-test("an older release's chain: at or beyond the legacy limit it keeps receiving deltas; below it the next change compacts it", async () => {
-  const policy = checkpointPolicy({ interval: 4, legacyLimit: 10 }), path = nextPath();
-  const kind = { version: 1, scope: "session", initial: () => ({ n: 0 }) } as const;
-  const OldLong = defineDoc<{ n: number }>({ kind: "legacy.long", checkpointWhen: () => false, ...kind });
-  const OldShort = defineDoc<{ n: number }>({ kind: "legacy.short", checkpointWhen: () => false, ...kind });
-  const NewLong = defineDoc<{ n: number }>({ kind: "legacy.long", checkpointWhen: policy, ...kind });
-  const NewShort = defineDoc<{ n: number }>({ kind: "legacy.short", checkpointWhen: policy, ...kind });
-  const commits = async (changes: Array<[SessionDocToken<{ n: number }>, number]>) => {
-    const storage = await openGroupStorage(path);
-    const session = createSession(storage);
-    try {
-      for (const [token, times] of changes) for (let i = 0; i < times; i++) await session.commit(async tx => { (await tx.doc(token)).n++; }, context);
-    } finally { await session.close(context); await storage.close(context); }
-  };
-  // The older release: the long chain reaches the limit (1 base + 10 deltas), the short one stays below it.
-  await commits([[OldLong, 11], [OldShort, 7]]);
-  expect(chain(path, "legacy.long")).toEqual({ revisions: 11, bases: 1 });
-  expect(chain(path, "legacy.short")).toEqual({ revisions: 7, bases: 1 });
-  await commits([[NewLong, 1], [NewShort, 1]]);
-  expect(chain(path, "legacy.long")).toEqual({ revisions: 12, bases: 1 });
-  expect(chain(path, "legacy.short")).toEqual({ revisions: 1, bases: 1 });
-  // From then on the compacted chain stays within the interval; the long one still only grows.
-  await commits([[NewLong, 5], [NewShort, 9]]);
-  expect(chain(path, "legacy.long")).toEqual({ revisions: 17, bases: 1 });
-  expect(chain(path, "legacy.short").revisions).toBeLessThanOrEqual(4);
-  const storage = await openGroupStorage(path);
-  const session = createSession(storage);
-  try {
-    expect(await session.snapshot(NewLong, context)).toEqual({ n: 17 });
-    expect(await session.snapshot(NewShort, context)).toEqual({ n: 17 });
-  } finally { await session.close(context); await storage.close(context); }
-});

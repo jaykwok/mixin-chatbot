@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
-import { TaskStore } from "../../scripts/ops/console/tasks.ts";
-import type { TaskRequest } from "../../scripts/ops/console/tasks.ts";
+import { TaskStore } from "../../ops/core/tasks.ts";
+import type { TaskRequest } from "../../ops/core/tasks.ts";
 
 const [root, inputPath, mode] = process.argv.slice(2) as [string, string, string];
 const input = JSON.parse(readFileSync(inputPath, "utf8")) as { ids: string[]; at: number; input: Omit<TaskRequest, "version" | "id" | "createdAt" | "acceptBy"> };

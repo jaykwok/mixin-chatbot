@@ -31,7 +31,7 @@ function Test-TransactionValue([string]$Key, [string]$Value) {
     return $false
 }
 
-# 当前发布必须有完整记录；其他格式的记录（旧版发布）不被识别。
+# 当前发布必须有完整记录；其他格式的记录不被识别。
 function Read-DeploymentTransaction([string]$Directory) {
     $path = Join-Path $Directory 'transaction'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw '事务格式不匹配：缺少当前发布记录' }
@@ -184,27 +184,19 @@ function Invoke-StagedWizard([string]$Bun, [string]$ProjectRoot, [string]$Stage,
     try {
         $ErrorActionPreference = 'Continue'
         $global:LASTEXITCODE = 1
-        Invoke-WithUtf8Output { & $Bun --no-env-file run (Join-Path $ProjectRoot "scripts\config\$Wizard") --stage $Stage }
+        Invoke-WithUtf8Output { & $Bun --no-env-file run (Join-Path $ProjectRoot "ops\config\$Wizard") --stage $Stage }
         $code = $global:LASTEXITCODE
     } finally { $ErrorActionPreference = $previous }
     if ($code -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $Stage $Staged) -PathType Leaf)) { throw '配置未完成（取消或失败，原因见上方）；服务尚未停止，未做任何改动' }
 }
 
 # ---- 通讯录同步范围（data\config\directory.json）----
-# 与 deploy.sh、upgrade.sh 相同：范围必须明确选择，没有默认值。已有应用机器人凭据而没有范围时（含从 1.0.1 及更早版本
-# 部署或升级）在停机前选择（scripts\config\directory-scope.ts choose --plan：设置了 BOT_DIRECTORY_SCOPE 时不交互，否则
+# 与 deploy.sh、upgrade.sh 相同：范围必须明确选择，没有默认值。已有应用机器人凭据而没有范围时在停机前选择
+# （ops\config\directory-scope.ts choose --plan：设置了 BOT_DIRECTORY_SCOPE 时不交互，否则
 # 在终端里运行向导，没有终端就失败），计划随事务快照保存，停机后写入；续做沿用这份计划，不再选择。
 # 脚本的退出码留在 $LASTEXITCODE：0 已写入，1 失败，2 取消。向导直接使用终端：只能作为语句调用，输出不经管道也不被
 # 收集（收集输出会重定向标准输出，向导就没有终端，返回值也会混进输出），标准错误也不转成 PowerShell 错误。
-# 从 1.0.1 及更早版本升级时，由旧版 ops.ps1 经 `| Out-Host` 启动本升级器，标准输出已经是管道（标准输入仍是控制台）：
-# 要运行向导时（choose，没有设置 BOT_DIRECTORY_SCOPE）把工具直接接到控制台上，否则向导认为没有终端，
-# 只能选整个通讯录。
 function Invoke-DirectoryScopeTool([string]$Bun, [string]$Script, [string[]]$Arguments) {
-    if ($Arguments[0] -eq 'choose' -and -not "$env:BOT_DIRECTORY_SCOPE".Trim() -and
-        (Test-ConsoleOutputPiped)) {
-        $global:LASTEXITCODE = Invoke-ConsoleProcess $Bun (@('--no-env-file', 'run', $Script) + $Arguments) -Screen
-        return
-    }
     $previous = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
@@ -221,114 +213,4 @@ function Select-DirectoryScope([string]$Bun, [string]$Script, [string]$ProjectRo
     $code = $global:LASTEXITCODE
     if ($code -eq 2) { throw '已取消选择通讯录同步范围；服务尚未停止，未做任何改动' }
     if ($code -ne 0 -or -not (Test-Path -LiteralPath $Plan -PathType Leaf)) { throw '没有选定通讯录同步范围（原因见上方）；服务尚未停止，未做任何改动' }
-}
-
-# ---- 修订链首次整理（revision-chain plan §4、§8）----
-# 与 scripts/lib/deployment.sh 的同名一段相同：停机前用目标版本的代码只读预览（revision-cleanup.ts preview --json），
-# 决定停机后整理（先备份）或跳过（BOT_REVISION_CLEANUP=apply|skip；不设置时终端交互询问，默认整理，非交互也整理）。
-# 空间不足时停机前拒绝，由用户释放空间或显式选择跳过，不自动改变整理方式。选择写入事务快照的 revision-cleanup，续做
-# 沿用。整理在停机后、数据准备之后、验证实例之前运行；回滚先结束它（在途文档收尾），维护状态不允许启动时回滚在恢复
-# 数据之前停止、保持停机。
-
-# 维护命令的结构化结果（scripts/lib/maintenance-protocol.ts 的 --json）：标准输出只有一行协议。返回
-# @{ Outcome; Code; Result; Message }；输出不是一行 JSON、协议或版本不符、命令不符或 outcome 未知时 Outcome 为 incomplete。
-function ConvertFrom-MaintenanceResult([string[]]$Lines, [string]$Command, [int]$Code) {
-    $incomplete = @{ Outcome = 'incomplete'; Code = $Code; Result = $null; Message = '' }
-    $text = @($Lines | Where-Object { "$_".Trim() })
-    if ($text.Count -ne 1) { return $incomplete }
-    try { $value = ConvertFrom-Json -InputObject $text[0] -ErrorAction Stop } catch { return $incomplete }
-    if ($value -isnot [Management.Automation.PSCustomObject]) { return $incomplete }
-    if ($value.protocol -isnot [string] -or $value.protocol -cne 'mixin-maintenance') { return $incomplete }
-    if (-not ($value.version -is [int] -or $value.version -is [long]) -or $value.version -ne 1) { return $incomplete }
-    if ($value.command -isnot [string] -or $value.command -cne $Command) { return $incomplete }
-    if ($value.outcome -isnot [string] -or $value.outcome -cnotin @('success', 'refused', 'stopped', 'not-enough-space', 'failed')) { return $incomplete }
-    return @{ Outcome = $value.outcome; Code = $Code; Result = $value.result; Message = $(if ($value.message -is [string]) { $value.message } else { '' }) }
-}
-
-# 运行维护工具（revision-cleanup.ts、maintenance.ts）的一个命令并读取它的 --json 结果。标准输出和标准错误分开读：
-# 说明和进度在标准错误，按 UTF-8 解码后写向终端和运维日志；标准输出只交给协议解析，不会混进调用函数的返回值。
-# 结果不完整时把捕获的标准输出也显示出来，原因不会被吞掉。
-function Invoke-MaintenanceTool([string]$Bun, [string]$Script, [string]$Command, [string[]]$Arguments) {
-    $lines = [Collections.Generic.List[string]]::new()
-    $previous = $ErrorActionPreference
-    $encoding = $null
-    try { $encoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { $encoding = $null }
-    try {
-        # 原生命令写标准错误时，Windows PowerShell 5.1 在 Stop 下会把它当成终止错误。
-        $ErrorActionPreference = 'Continue'
-        $global:LASTEXITCODE = 1
-        & $Bun --no-env-file run $Script $Command @Arguments --json 2>&1 | ForEach-Object {
-            if ($_ -is [Management.Automation.ErrorRecord]) {
-                $line = $_.Exception.Message
-                Write-Host $line
-                Write-OperationEvent 'output' $line
-            } else { $lines.Add([string]$_) }
-        }
-        $code = [int]$LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previous
-        if ($null -ne $encoding) { try { [Console]::OutputEncoding = $encoding } catch { } }
-    }
-    Write-OperationEvent 'info' ((Split-Path $Script -Leaf) + " $Command; exit=$code")
-    $result = ConvertFrom-MaintenanceResult $lines.ToArray() $Command $code
-    if ($result.Outcome -ceq 'incomplete') {
-        foreach ($line in $lines) { Write-Host $line }
-        Write-Warning "$Command 的结果不完整或无法识别（退出码 $code），按失败处理"
-    }
-    return $result
-}
-
-# 只有退出码 0、结果完整且 outcome 为 success 才算成功。
-function Test-MaintenanceSuccess($Result) { return ($Result.Code -eq 0 -and $Result.Outcome -ceq 'success') }
-
-# 跳过修订整理的办法：控制台任务不能设置环境变量，要在升级或重新部署的表单里重新预览并选择跳过。
-function Get-RevisionCleanupSkipHint {
-    if ($env:MIXIN_OPS_CONSOLE -ceq '1') { return '重新预览并选择“跳过整理”' }
-    return '设置 BOT_REVISION_CLEANUP=skip 跳过整理'
-}
-
-# 停机前决定本次的整理方式（apply 或 skip），并确认这个选择需要的空间；在停止服务之前调用。<Script> 是目标版本的
-# revision-cleanup.ts。还没有会话库时不预览。维护状态不允许结束整理（要求从备份恢复、收缩未完成、日志格式不受支持）
-# 时预览答 refused，在这里拒绝。预览没能给出结果（例如升级导出沿用的旧依赖无法加载它）时按环境变量或默认值处理：
-# 整理在停机后自己检查维护状态和空间，不满足时不开始，部署随之回滚。
-function Select-RevisionCleanup([string]$Bun, [string]$Script, [string]$ProjectRoot) {
-    $choice = "$env:BOT_REVISION_CLEANUP".Trim()
-    if ($choice -and $choice -cnotin @('apply', 'skip')) { throw 'BOT_REVISION_CLEANUP 只能是 apply（默认）或 skip；服务尚未停止' }
-    if (-not (Test-Path -LiteralPath (Join-Path $ProjectRoot 'data\conversations') -PathType Container) -and
-        -not (Test-Path -LiteralPath (Join-Path $ProjectRoot 'data\state\revision-cleanup.json'))) {
-        return $(if ($choice) { $choice } else { 'apply' })
-    }
-    $result = Invoke-MaintenanceTool $Bun $Script 'preview' @('--project', $ProjectRoot)
-    if ($result.Outcome -ceq 'refused') { throw '修订整理预览被拒绝（原因见上方）；服务尚未停止' }
-    if (-not (Test-MaintenanceSuccess $result) -or $null -eq $result.Result) {
-        if ($env:MIXIN_OPS_CONSOLE -ceq '1') { throw '停机前无法预览修订整理，控制台操作已拒绝；服务尚未停止' }
-        $fallback = if ($choice) { $choice } else { 'apply' }
-        Write-Warning "停机前无法预览会话库的旧修订链（原因见上方）；按 $fallback 处理，整理在停机后自己检查维护状态和空间，不满足时不开始，部署随之回滚"
-        return $fallback
-    }
-    $preview = $result.Result
-    $runState = if ($null -ne $preview.run) { [string]$preview.run.state } else { 'none' }
-    if ($runState -ceq 'stopped' -and $choice -cne 'skip') {
-        throw "上次修订整理已停止，只能跳过剩余整理或回滚，不能续做；请先用 $(Get-OpsCommandHint 'revision-cleanup skip') 结束它，或$(Get-RevisionCleanupSkipHint)；服务尚未停止"
-    }
-    if ([long]$preview.documents -eq 0 -and $runState -ceq 'none') { return $(if ($choice) { $choice } else { 'apply' }) }
-    $minutes = [Math]::Max([long]1, [long][Math]::Ceiling([long]$preview.seconds / 60))
-    if (-not $choice) {
-        $choice = 'apply'
-        if (-not [Console]::IsInputRedirected -and -not (Read-YesNo "停机后整理这些文档的旧修订链？停机约延长 $minutes 分钟，跳过请输入 n [Y/n]" $true)) { $choice = 'skip' }
-    }
-    if ($choice -ceq 'skip') {
-        Write-Warning ("跳过修订整理：其中 $($preview.legacy) 份超过上限的旧长链在服务运行中保持现状（读入较慢，链继续变长），其余的由服务在下次变更时整理；" +
-            "之后可停机用 $(Get-OpsCommandHint 'revision-cleanup apply') 整理")
-        return $choice
-    }
-    # 续做的整理沿用已验证的备份（预览已按它计算）。
-    $backupBytes = [long]$preview.backupBytes
-    $space = Invoke-MaintenanceTool $Bun $Script 'space' @('--project', $ProjectRoot, '--backup-bytes', "$backupBytes", '--wal-bytes', "$([long]$preview.walBytes)")
-    if ($space.Outcome -ceq 'not-enough-space') { throw "剩余空间不够修订整理（见上方）；可以释放空间后重试，或$(Get-RevisionCleanupSkipHint)（不会自动省略备份）；服务尚未停止" }
-    if (-not (Test-MaintenanceSuccess $space)) { throw '修订整理的空间检查失败（原因见上方）；服务尚未停止' }
-    if ($backupBytes) {
-        Write-Host "停机后整理旧修订链，约 $minutes 分钟；先备份要修改的会话库（$([Math]::Round($backupBytes / 1MB, 1)) MB，备份留在 backup\revision-cleanup，确认后再删除）"
-    } else { Write-Host "停机后续做上次的修订整理，约 $minutes 分钟" }
-    return $choice
 }

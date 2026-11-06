@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { validateRuntimeConfig } from "../../src/core/runtime-schema.ts";
-import { saveRuntimeSettings } from "../../scripts/config/runtime-settings.ts";
+import { saveRuntimeSettings } from "../../ops/config/runtime-settings.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test("runtime settings retain previous values and validate explicit overrides", async () => {

@@ -27,7 +27,7 @@ describe("bash default timeout", () => {
     const { createMemberEnv } = await import("../../src/durable/member-env.ts");
     const { BACKGROUND_CONTEXT } = await import("@earendil-works/chord/context");
     expect(BASH_DEFAULT_TIMEOUT).toBe(10);
-    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-bash-timeout-"));
+    const root = await mkdtemp(join(tmpdir(), "mixin-bot-bash-timeout-"));
     const workspace = join(root, "workspace");
     const userTemp = join(root, "user-tmp");
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);

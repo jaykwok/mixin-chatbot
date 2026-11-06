@@ -3,7 +3,7 @@
 import { afterAll, beforeEach, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BotLink, BotOffline, BotReadError } from "../../scripts/ops/console/bot.ts";
+import { BotLink, BotOffline, BotReadError } from "../../console/server/bot.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const fixture = await tempFixture("console-bot-");
@@ -21,7 +21,7 @@ const server = Bun.serve({
     const path = new URL(request.url).pathname;
     if (path === "/health") {
       fake.healthCalls++;
-      return Response.json({ service: "mixin-chatbot", version: 1, status: "ready", instanceId: fake.instanceId, pid: process.pid, startedAt: fake.startedAt, ...fake.health });
+      return Response.json({ service: "mixin-bot", version: 1, status: "ready", instanceId: fake.instanceId, pid: process.pid, startedAt: fake.startedAt, ...fake.health });
     }
     if (request.headers.get("authorization") !== `Bearer ${fake.token}`) return new Response("404 Not Found", { status: 404 });
     fake.inFlight++;

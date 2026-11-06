@@ -3,10 +3,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { lstat, mkdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { acquireDeploymentLock, DeploymentBusy, withDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
+import { acquireDeploymentLock, DeploymentBusy, withDeploymentLock } from "../../ops/core/deployment-lock.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
-const modulePath = fileURLToPath(new URL("../../scripts/ops/core/deployment-lock.ts", import.meta.url));
+const modulePath = fileURLToPath(new URL("../../ops/core/deployment-lock.ts", import.meta.url));
 const source = fileURLToPath(new URL("../../", import.meta.url));
 async function readReady(child: ReturnType<typeof Bun.spawn<"pipe", "pipe", "pipe">>) {
   const reader = child.stdout.getReader(); let result = "";

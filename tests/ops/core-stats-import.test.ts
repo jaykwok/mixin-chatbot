@@ -3,15 +3,15 @@ import { link, lstat, mkdir, readFile, readdir, rename, symlink, writeFile } fro
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { openStatsLedger, readLedger, recordAsks } from "../../src/agent/stats-ledger.ts";
-import { statsFileScope } from "../../scripts/lib/operation-scope.ts";
-import { prepareStatsStage, removeStatsStage, statsStagePath, validateStatsSource, type StatsStageRecord } from "../../scripts/ops/core/stats-stage.ts";
-import { runStatsImport, statsImportRequest } from "../../scripts/ops/core/stats-import.ts";
-import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../scripts/ops/core/maintenance-host.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { MaintenanceRecord } from "../../scripts/ops/core/maintenance-record.ts";
-import { recoverMaintenance } from "../../scripts/ops/core/maintenance-recovery.ts";
+import { statsFileScope } from "../../src/lib/operation-scope.ts";
+import { prepareStatsStage, removeStatsStage, statsStagePath, validateStatsSource, type StatsStageRecord } from "../../ops/core/stats-stage.ts";
+import { runStatsImport, statsImportRequest } from "../../ops/core/stats-import.ts";
+import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../ops/core/maintenance-host.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { MaintenanceRecord } from "../../ops/core/maintenance-record.ts";
+import { recoverMaintenance } from "../../ops/core/maintenance-recovery.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
-import { runCore } from "../../scripts/ops/core/cli.ts";
+import { runCore } from "../../ops/core/cli.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 async function stageFixture() {
@@ -101,10 +101,10 @@ test("目录替换或夹入其他文件时拒绝清理，保留原副本和新�
 
 async function hostFixture() {
   const f = await stageFixture();
-  for (const tree of ["src", "scripts", "ui"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};\n"); }
+  for (const tree of ["console", "ops", "scripts", "src"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};\n"); }
   await mkdir(join(f.root, "data/state"), { recursive: true });
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
-  const ready = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+  const ready = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(ready) });
   await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...ready, port: server.port }));
   const facts = { state: "running" as "running" | "stopped", identity: "a".repeat(64), owned: true }, effects: string[] = [];

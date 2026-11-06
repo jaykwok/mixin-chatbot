@@ -2,17 +2,17 @@ import { expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { historyRequest, runHistory } from "../../scripts/ops/core/history.ts";
-import { runCore } from "../../scripts/ops/core/cli.ts";
+import { historyRequest, runHistory } from "../../ops/core/history.ts";
+import { runCore } from "../../ops/core/cli.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
-import { recoverMaintenance } from "../../scripts/ops/core/maintenance-recovery.ts";
-import { maintenanceRequest, type MaintenanceHostOptions } from "../../scripts/ops/core/maintenance-host.ts";
-import { MaintenanceRecord } from "../../scripts/ops/core/maintenance-record.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
+import { recoverMaintenance } from "../../ops/core/maintenance-recovery.ts";
+import { maintenanceRequest, type MaintenanceHostOptions } from "../../ops/core/maintenance-host.ts";
+import { MaintenanceRecord } from "../../ops/core/maintenance-record.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import { freezeRuntime } from "../../scripts/ops/console/runtime.ts";
-import { prepareConsoleDir, consoleDir } from "../../scripts/ops/console/state.ts";
-import { operationScope } from "../../scripts/ops/console/operations.ts";
+import { freezeRuntime } from "../../ops/core/source-runtime.ts";
+import { prepareConsoleDir, consoleDir } from "../../ops/core/console-state.ts";
+import { operationScope } from "../../ops/core/operations.ts";
 
 test("会话维护在停机前严格校验范围；CLI 不吞拼错参数，也不隐式变成全部空间", async () => {
   expect(historyRequest("history-clear", ["--all"])).toEqual({ action: "history-clear", args: ["--all"] });
@@ -30,12 +30,13 @@ test("会话维护在停机前严格校验范围；CLI 不吞拼错参数，也�
 
 async function fixture() {
   const f = await tempFixture("core-history-");
-  for (const dir of ["scripts/ops", "src", "ui", "data/state"]) await mkdir(join(f.root, dir), { recursive: true });
-  await writeFile(join(f.root, "src/fixture.ts"), "export {};\n"); await writeFile(join(f.root, "ui/fixture.ts"), "export {};\n");
-  await writeFile(join(f.root, "scripts/ops/history-admin.ts"), `import {writeFileSync} from "node:fs";
+  for (const dir of ["console", "ops/tools", "scripts", "src", "data/state"]) await mkdir(join(f.root, dir), { recursive: true });
+  await writeFile(join(f.root, "src/fixture.ts"), "export {};\n"); await writeFile(join(f.root, "console/fixture.ts"), "export {};\n");
+  await writeFile(join(f.root, "scripts/fixture.ts"), "export {};\n");
+  await writeFile(join(f.root, "ops/tools/history-admin.ts"), `import {writeFileSync} from "node:fs";
 writeFileSync("data/action.json",JSON.stringify(process.argv.slice(2))); console.log("会话维护合成步骤完成");`);
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
-  const body = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+  const body = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(body) });
   await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...body, port: server.port }));
   const facts = { identity: "a".repeat(64), state: "running" as "running" | "stopped", owned: true }, effects: string[] = [];

@@ -2,11 +2,11 @@ import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { decodeReleaseData, parseReleaseDataArgs, releaseDataResult, type ReleaseDataCommand } from "../../scripts/lib/release-data-protocol.ts";
+import { decodeReleaseData, parseReleaseDataArgs, releaseDataResult, type ReleaseDataCommand } from "../../ops/lib/release-data-protocol.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { writeCurrentConfig } from "../helpers/current-config.ts";
 
-const runner = join(import.meta.dir, "../../scripts/runtime/data-current.ts");
+const runner = join(import.meta.dir, "../../ops/tools/data-current.ts");
 async function execute(root: string, action: string, extra: string[] = []) {
   const child = Bun.spawn([process.execPath, "--no-env-file", runner, action, "--json", "--project", root, "--deployment", "deploy-protocol", ...extra], {
     cwd: root, stdout: "pipe", stderr: "pipe", stdin: "ignore", windowsHide: true, env: { ...process.env, BOT_OPERATION_LOG: "", APP_BUILD: "synthetic" },

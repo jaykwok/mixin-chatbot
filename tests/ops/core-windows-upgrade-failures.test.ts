@@ -4,14 +4,14 @@ import { expect, test } from "bun:test";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { windowsUpgradeFixture } from "../helpers/windows-upgrade.ts";
-import { loadDeploymentState } from "../../scripts/ops/core/deployment-state.ts";
-import { acquireDeploymentLock, DeploymentBusy } from "../../scripts/ops/core/deployment-lock.ts";
+import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
+import { acquireDeploymentLock, DeploymentBusy } from "../../ops/core/deployment-lock.ts";
 
-const modes = ["none", "main-missing", "diverged", "task-missing", "switch", "switch-late", "code", "install", "scope-install", "apply", "cleanup", "health", "commit", "postcommit"] as const;
+const modes = ["none", "main-missing", "diverged", "task-missing", "switch", "switch-late", "code", "install", "scope-install", "apply", "health", "commit", "postcommit"] as const;
 for (const mode of modes) test.skipIf(process.platform !== "win32")(`Windows shared upgrade failure matrix: ${mode}`, async () => {
   for (const reuse of [true, false]) for (const running of [true, false]) {
     if (mode === "install" && reuse || mode === "postcommit" && !running) continue;
-    const f = await windowsUpgradeFixture(running, { reuse, directory: true, cleanup: "apply", ...(mode !== "none" ? { failure: mode } : {}) });
+    const f = await windowsUpgradeFixture(running, { reuse, directory: true, ...(mode !== "none" ? { failure: mode } : {}) });
     try {
       const result = await f.run(), events = f.events, label = `${mode} reuse=${reuse} running=${running}: ${result.message}`;
       expect(result.exitCode === 0, label).toBe(mode === "none");
@@ -30,8 +30,7 @@ for (const mode of modes) test.skipIf(process.platform !== "win32")(`Windows sha
         expect(events.filter(value => value === "effect:save-dependencies")).toHaveLength(reuse ? 0 : 1);
         expect(events).not.toContain("data:rollback"); expect(events).not.toContain("effect:restore-configuration");
         expect(events.indexOf("directory-scope:install")).toBeLessThan(events.indexOf("data:apply"));
-        expect(events.indexOf("data:apply")).toBeLessThan(events.indexOf("revision-cleanup:apply"));
-        expect(events.indexOf("revision-cleanup:apply")).toBeLessThan(events.indexOf("start:verify"));
+        expect(events.indexOf("data:apply")).toBeLessThan(events.indexOf("start:verify"));
         expect(events.indexOf("start:verify")).toBeLessThan(events.indexOf("data:commit"));
         expect(events.includes("start:target")).toBe(running);
         expect(loadDeploymentState(f.project)?.committed ?? mode === "none").toBe(true);
@@ -39,9 +38,6 @@ for (const mode of modes) test.skipIf(process.platform !== "win32")(`Windows sha
         expect(events, label).toContain("data:rollback"); expect(events, label).toContain("effect:restore-configuration");
         expect(events.indexOf("data:rollback")).toBeLessThan(events.indexOf("git:reset"));
         expect(events.indexOf("git:reset")).toBeLessThan(events.indexOf("effect:restore-configuration"));
-        if (events.includes("revision-cleanup:apply")) {
-          expect(events).toContain("revision-cleanup:abandon"); expect(events.indexOf("revision-cleanup:abandon")).toBeLessThan(events.indexOf("data:rollback"));
-        }
         if (running) expect(events.indexOf("effect:restore-configuration")).toBeLessThan(events.indexOf("start:original"));
         expect(f.running, label).toBe(running); expect(loadDeploymentState(f.project), label).toBeNull();
         expect(existsSync(join(f.project, "data/config/directory.json"))).toBe(false);
@@ -84,7 +80,7 @@ test.skipIf(process.platform !== "win32")("Windows 显式回滚使用原记录�
       await f.pending(mode === "committed" ? "committed" : "prepared"); if (mode === "manual") f.dirty();
       const result = await f.run({ ...f.input, rollback: true, command: "rollback" });
       expect(result.exitCode === 0, result.message).toBe(mode === "prepared");
-      for (const event of ["effect:capture", "dependencies:install", "directory-scope:install", "revision-cleanup:apply", "data:apply", "effect:cleanup"]) expect(f.events).not.toContain(event);
+      for (const event of ["effect:capture", "dependencies:install", "directory-scope:install", "data:apply", "effect:cleanup"]) expect(f.events).not.toContain(event);
       if (mode === "prepared") {
         expect(f.events).toContain("data:rollback"); expect(f.events).toContain("git:reset"); expect(f.events).toContain("start:original");
         expect(loadDeploymentState(f.project)).toBeNull(); expect(f.running).toBe(true);

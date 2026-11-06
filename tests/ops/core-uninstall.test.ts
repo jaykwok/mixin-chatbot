@@ -3,9 +3,9 @@ import { existsSync, readdirSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { serializeTransactionRecord, type TransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
-import { checkUninstall } from "../../scripts/ops/core/uninstall.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { serializeTransactionRecord, type TransactionRecord } from "../../ops/core/transaction-record.ts";
+import { checkUninstall } from "../../ops/core/uninstall.ts";
 import { CONFIGURATION_STATE_FILE } from "../../src/core/configuration-state.ts";
 import { OPS_MAINTENANCE_FILE } from "../../src/core/ops-maintenance-state.ts";
 import { opsShellFunctions } from "../helpers/ops-shell.ts";
@@ -80,13 +80,13 @@ test.skipIf(process.platform !== "win32")("真实 PowerShell 卸载持锁运行�
     await writeFile(driver, "\ufeff" + [
       "param([string]$Project,[string]$Archive)", "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
       `. ${ps(join(repo, "scripts/lib/common.ps1"))}`,
-      `$OpsSource=${ps(repo)}; $DataDir=Join-Path $Project 'data'; $RuntimeDir=Join-Path $DataDir 'runtime'; $TaskName='mixin-chatbot-fixture'; $DeployedWorkspaceRoot=''; $Json=$false`,
+      `$OpsSource=${ps(repo)}; $DataDir=Join-Path $Project 'data'; $RuntimeDir=Join-Path $DataDir 'runtime'; $TaskName='mixin-bot-fixture'; $DeployedWorkspaceRoot=''; $Json=$false`,
       `function Get-BunPath { ${ps(process.execPath)} }`,
       "foreach($name in @('Step','Err','Warn','Done')) { Set-Item \"function:$name\" { param($text) [Console]::Error.WriteLine($text) } }",
       "function Get-OpsCommandHint($name) { \"ops.ps1 $name\" }; function Test-Administrator { $true }",
       "function Stop-Bot { [Console]::Out.WriteLine('STOP'); $true }; function Get-BotPids { @() }; function Get-ScheduledTask { $null }",
       "function Read-YesNo { $Archive -eq 'y' }",
-      `$tokens=$null; $errors=$null; $ast=[Management.Automation.Language.Parser]::ParseFile(${ps(join(repo, "scripts/ops/ops.ps1"))},[ref]$tokens,[ref]$errors); if($errors){throw 'syntax'}`,
+      `$tokens=$null; $errors=$null; $ast=[Management.Automation.Language.Parser]::ParseFile(${ps(join(repo, "scripts/ops.ps1"))},[ref]$tokens,[ref]$errors); if($errors){throw 'syntax'}`,
       "foreach($name in @('Uninstall-Bot','Remove-BotInstallation','Invoke-CoreMaintenance')) {",
       "$definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)",
       ". ([scriptblock]::Create($definition.Extent.Text)) }",
@@ -135,7 +135,7 @@ test.skipIf(process.platform !== "linux")("真实 Shell 卸载经 fd 9 持锁运
   try {
     const driver = join(f.root, "uninstall.sh"), events = join(f.root, "events.txt");
     await writeFile(driver, [
-      "set -uo pipefail", 'PROJECT_DIR="$1"; OPS_SOURCE_DIR="$2"; CONTAINER=mixin-chatbot; ROLLBACK_CONTAINER=mixin-chatbot-rollback; DEPLOYED_WORKSPACE_ROOT=""',
+      "set -uo pipefail", 'PROJECT_DIR="$1"; OPS_SOURCE_DIR="$2"; CONTAINER=mixin-bot; ROLLBACK_CONTAINER=mixin-bot-rollback; DEPLOYED_WORKSPACE_ROOT=""',
       `. ${JSON.stringify(join(repo, "scripts/lib/common.sh"))}`, `. ${JSON.stringify(join(repo, "scripts/lib/ops-runtime.sh"))}`,
       'P() { printf "%s\\n" "$1" >&2; }; OK() { printf "%s\\n" "$1" >&2; }; WA() { printf "%s\\n" "$1" >&2; }; ER() { printf "%s\\n" "$1" >&2; }',
       'has_container() { return 0; }; has_rollback_container() { return 1; }',
@@ -153,7 +153,7 @@ test.skipIf(process.platform !== "linux")("真实 Shell 卸载经 fd 9 持锁运
     };
     const archived = await project(join(f.root, "归档 数据"), "clean");
     let value = await run(archived, "y");
-    expect(value.code, value.err).toBe(0); expect(value.events).toBe("docker stop mixin-chatbot\ndocker rm mixin-chatbot");
+    expect(value.code, value.err).toBe(0); expect(value.events).toBe("docker stop mixin-bot\ndocker rm mixin-bot");
     expect(value.out).toContain("卸载前检查通过"); expect(existsSync(join(archived, "data"))).toBe(false);
     const pending = await project(join(f.root, "未完成 升级"), "transaction");
     value = await run(pending, "y");

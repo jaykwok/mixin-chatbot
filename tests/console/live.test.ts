@@ -12,19 +12,19 @@ import { ReadChannel } from "../../src/durable/read/client.ts";
 import type { ReadOp } from "../../src/durable/read/protocol.ts";
 import { PushStore } from "../../src/push/store.ts";
 import { createApp } from "../../src/server/http-app.ts";
-import { AuditLog } from "../../scripts/ops/console/audit.ts";
-import { Auth } from "../../scripts/ops/console/auth.ts";
-import { BotLink, BotOffline, BotReadError, type BotReader } from "../../scripts/ops/console/bot.ts";
-import type { Bundle } from "../../scripts/ops/console/bundle.ts";
-import { Exports } from "../../scripts/ops/console/exports.ts";
-import { guardConfig } from "../../scripts/ops/console/guard.ts";
-import { createHandler } from "../../scripts/ops/console/server.ts";
-import { statsRoutes } from "../../scripts/ops/console/stats.ts";
-import { conversationRoutes, Views } from "../../scripts/ops/console/views.ts";
+import { AuditLog } from "../../console/server/audit.ts";
+import { Auth } from "../../console/server/auth.ts";
+import { BotLink, BotOffline, BotReadError, type BotReader } from "../../console/server/bot.ts";
+import type { Bundle } from "../../console/server/bundle.ts";
+import { Exports } from "../../console/server/exports.ts";
+import { guardConfig } from "../../console/server/guard.ts";
+import { createHandler } from "../../console/server/server.ts";
+import { statsRoutes } from "../../console/server/stats.ts";
+import { conversationRoutes, Views } from "../../console/server/views.ts";
 import type {
   EntryPage, ExportStatus, ExportTicket, GlobalSearchCursor, GlobalSearchHit, GlobalSearchResponse, GlobalSearchViewResponse, MemberRow, MembersResponse,
   Overview, RequestsResponse, SearchResponse, SpacesResponse, SpaceViewResponse, StatsResponse, ViewInfo,
-} from "../../ui/console/src/contract.ts";
+} from "../../console/ui/src/contract.ts";
 import { fauxModels, TEST_PROGRESS } from "../helpers/durable.ts";
 import { recordingOutbound, replyTexts } from "../helpers/recording-outbound.ts";
 import { tempFixture } from "../helpers/temp.ts";

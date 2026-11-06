@@ -2,21 +2,21 @@ import { expect, test } from "bun:test";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
-import { operationArgs, operationCommand, operationScope } from "../../scripts/ops/console/operations.ts";
-import { operationPreparer } from "../../scripts/ops/console/prepare-operation.ts";
-import { PlanStore } from "../../scripts/ops/console/plans.ts";
-import { Views } from "../../scripts/ops/console/views.ts";
-import { assertExpectedScope, historyScope, statsFileScope, takeExpected } from "../../scripts/lib/operation-scope.ts";
+import { operationArgs, operationCommand, operationScope } from "../../ops/core/operations.ts";
+import { operationPreparer } from "../../console/server/prepare-operation.ts";
+import { PlanStore } from "../../ops/core/plans.ts";
+import { Views } from "../../console/server/views.ts";
+import { assertExpectedScope, historyScope, statsFileScope, takeExpected } from "../../src/lib/operation-scope.ts";
 import { openStatsLedger, importRows, readLedger } from "../../src/agent/stats-ledger.ts";
-import { importLegacyStats, previewLegacyStats } from "../../scripts/ops/stats-import-core.ts";
+import { importStats, previewStatsImport } from "../../ops/tools/stats-import-core.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { planDigest as manifestDigest } from "../../src/contracts/maintenance.ts";
-import { BackupForms } from "../../scripts/ops/console/backup-forms.ts";
-import { apply as applyBackups } from "../../scripts/ops/backup-cleanup.ts";
-import type { RouteContext } from "../../scripts/ops/console/routes.ts";
-import { FormRoutes } from "../../scripts/ops/console/form-routes.ts";
-import { AuditLog } from "../../scripts/ops/console/audit.ts";
-import { MemberCodes } from "../../scripts/ops/console/identity.ts";
+import { BackupForms } from "../../console/server/backup-forms.ts";
+import { apply as applyBackups } from "../../ops/tools/backup-cleanup.ts";
+import type { RouteContext } from "../../console/server/routes.ts";
+import { FormRoutes } from "../../console/server/form-routes.ts";
+import { AuditLog } from "../../console/server/audit.ts";
+import { MemberCodes } from "../../console/server/identity.ts";
 
 const sha = "a".repeat(64);
 test("匿名会话压缩预览沿用匿名编号，临时文件范围以会话内随机键传递", async () => {
@@ -211,10 +211,10 @@ test("schema 3 统计在全新部署恢复模型和工具汇总；重复导入�
     importRows(db, "fixture", { asks: [{ day: "2026-10-29", space: "direct", user: "13800138000", asks: 3, firstAt: 1, lastAt: 2 }],
       usage: ["models", "tools"].map(bucket => ({ bucket: bucket as "models" | "tools", day: "2026-10-29", space: "direct", user: "13800138000", key: "fixture", input: 4, output: 2, cacheRead: 3, cacheWrite: 1, totalTokens: 10 })) });
     const before = statsFileScope(source), expected = readLedger(db), root = join(f.root, "fresh/data");
-    expect(previewLegacyStats(source, root)).toMatchObject({ asks: 3, usageRows: 2, totalTokens: 20, status: "new" });
+    expect(previewStatsImport(source, root)).toMatchObject({ asks: 3, usageRows: 2, totalTokens: 20, status: "new" });
     expect((await operationScope(join(f.root, "fresh"), "stat-import", { path: source })).summary[0]).toBe("3 次提问，2 行用量，20 tokens");
-    expect(importLegacyStats(source, root).result).toBe("imported");
-    expect(importLegacyStats(source, root).result).toBe("already");
+    expect(importStats(source, root).result).toBe("imported");
+    expect(importStats(source, root).result).toBe("already");
     // The console refuses the preview instead of stopping the bot to count nothing.
     await expect(operationScope(join(f.root, "fresh"), "stat-import", { path: source })).rejects.toThrow("已经导入");
     const target = openStatsLedger(join(root, "state/stats.sqlite"));
@@ -224,10 +224,10 @@ test("schema 3 统计在全新部署恢复模型和工具汇总；重复导入�
     expect(statsFileScope(copy)).toBe(before);
     db.exec("UPDATE asks_daily SET asks = asks + 1");
     expect(() => assertExpectedScope(before, statsFileScope(source))).toThrow("范围已变化");
-    expect(() => importLegacyStats(source, root)).toThrow("拒绝再导入");
+    expect(() => importStats(source, root)).toThrow("拒绝再导入");
     const occupied = join(f.root, "occupied"), busy = openStatsLedger(join(occupied, "state/stats.sqlite"));
     busy.exec("INSERT INTO asks_daily VALUES ('2026-10-29','direct','fixture','live',1,1,2)"); busy.close();
-    expect(() => previewLegacyStats(source, occupied)).toThrow("空账本");
-    expect(() => importLegacyStats(source, occupied)).toThrow("空账本");
+    expect(() => previewStatsImport(source, occupied)).toThrow("空账本");
+    expect(() => importStats(source, occupied)).toThrow("空账本");
   } finally { db.close(); await f.cleanup(); }
 });

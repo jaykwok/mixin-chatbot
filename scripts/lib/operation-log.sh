@@ -21,7 +21,7 @@ operation_event() {
     return 0
 }
 
-# 与 scripts/lib/redact.ts 和 operation-log.ps1 的规则、顺序相同，都替换为 ***；tests/ops/redaction-parity.test.ts 让三者
+# 与 src/lib/redact.ts 和 operation-log.ps1 的规则、顺序相同，都替换为 ***；tests/ops/redaction-parity.test.ts 让三者
 # 跑同一组样例。字节序区间：en_US.UTF-8 等按排序规则解释 [ -/] 会编译失败，set -e 的调用方随之退出，所以用 LC_ALL=C。
 OPERATION_REDACT_SED=(
     -e 's/\x1b\[[0-?]*[ -/]*[@-~]//g'

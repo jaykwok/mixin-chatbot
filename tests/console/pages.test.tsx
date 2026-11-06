@@ -7,14 +7,14 @@ import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import type {
   EntryView, ExportStatus, MemberRow, MembersResponse, Overview, RequestsResponse, SessionResponse, SpacesResponse, SpaceViewResponse, StatsResponse,
-} from "../../ui/console/src/contract.ts";
-import { dateTime, stamp } from "../../ui/console/src/format.ts";
+} from "../../console/ui/src/contract.ts";
+import { dateTime, stamp } from "../../console/ui/src/format.ts";
 
 const registered = !GlobalRegistrator.isRegistered;
 if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:11012/" });
 const { render } = await import("preact");
-const { Root } = await import("../../ui/console/src/app.tsx");
-const { Markdown } = await import("../../ui/console/src/markdown.tsx");
+const { Root } = await import("../../console/ui/src/app.tsx");
+const { Markdown } = await import("../../console/ui/src/markdown.tsx");
 
 type Call = { path: string; method: string; headers: Record<string, string>; body: Record<string, unknown> | undefined };
 type Reply = { status: number; body: unknown } | "offline";

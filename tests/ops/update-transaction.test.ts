@@ -23,21 +23,21 @@ test.skipIf(process.platform !== "linux")("Linux update holds its real flock thr
   };
   const exports = async () => existsSync(join(work, "tmp")) ? (await readdir(join(work, "tmp"))).filter(name => name.startsWith("upgrade-")) : [];
   try {
-    for (const dir of ["scripts/ops", "scripts/lib", "scripts/deploy", "scripts/runtime", "src/core"]) await mkdir(join(work, dir), { recursive: true });
-    const ops = await readFile(join(project, "scripts/ops/ops.sh"), "utf8");
+    for (const dir of ["scripts/lib", "ops/tools", "src/core"]) await mkdir(join(work, dir), { recursive: true });
+    const ops = await readFile(join(project, "scripts/ops.sh"), "utf8");
     const dispatch = ops.indexOf('\ncase "${1:-}" in\n');
     expect(dispatch).toBeGreaterThan(0);
     // Source the original function definitions without the CLI dispatcher's explicit exit.
-    await writeFile(join(work, "scripts/ops/ops.sh"), ops.slice(0, dispatch));
+    await writeFile(join(work, "scripts/ops.sh"), ops.slice(0, dispatch));
     for (const name of await readdir(join(project, "scripts/lib"))) {
       if (name.endsWith(".sh")) await copyFile(join(project, "scripts/lib", name), join(work, "scripts/lib", name));
     }
-    await writeFile(join(work, "scripts/runtime/fixture.ts"), ""); await writeFile(join(work, "src/core/data-version.ts"), ""); await writeFile(join(work, "Dockerfile"), "");
+    await writeFile(join(work, "ops/tools/fixture.ts"), ""); await writeFile(join(work, "src/core/data-version.ts"), ""); await writeFile(join(work, "Dockerfile"), "");
     await writeFile(join(work, ".gitignore"), "data/\nbackup/\ntmp/\nlogs/\n");
     // The upgrader exported from the target re-enters the lock held by update through the inherited descriptor.
-    await writeFile(join(work, "scripts/deploy/upgrade.sh"), [
+    await writeFile(join(work, "scripts/upgrade.sh"), [
       "#!/usr/bin/env bash", "set -euo pipefail",
-      'here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"',
+      'here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"',
       'PROJECT_DIR="$1"',
       '. "$here/scripts/lib/common.sh"',
       'acquire_deploy_lock || exit 20',
@@ -53,7 +53,7 @@ test.skipIf(process.platform !== "linux")("Linux update holds its real flock thr
     ].join("\n") + "\n");
     const launcher = join(fixture.root, "launch.sh");
     await writeFile(launcher, [
-      'source "$FIXTURE_WORK/scripts/ops/ops.sh" help >/dev/null',
+      'source "$FIXTURE_WORK/scripts/ops.sh" help >/dev/null',
       'docker() { case "$1 $2" in "container inspect") echo true ;; *) return 1 ;; esac; }',
       'doctor() { if flock -n "$FIXTURE_WORK/data/state/deploy.lock" true; then echo "update lock released before doctor"; return 22; fi; return 0; }',
       'update',

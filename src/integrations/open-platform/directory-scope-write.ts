@@ -1,5 +1,5 @@
 // Keep writes separate: the host console bundles the read/schema module without installed robot dependencies.
-import { publish } from "../../../scripts/lib/atomic-file.ts";
+import { publish } from "../../lib/atomic-file.ts";
 import { DIRECTORY_CONFIG_PATH } from "../../core/storage.ts";
 import { scopeFileText, type DirectoryScope } from "./directory-scope.ts";
 

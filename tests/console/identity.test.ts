@@ -3,8 +3,8 @@ import { afterAll, expect, test } from "bun:test";
 import { readdirSync, statSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { AuditLog, AuditUnavailable } from "../../scripts/ops/console/audit.ts";
-import { identityOf, MemberCodes, namesStatus, redactPhones } from "../../scripts/ops/console/identity.ts";
+import { AuditLog, AuditUnavailable } from "../../console/server/audit.ts";
+import { identityOf, MemberCodes, namesStatus, redactPhones } from "../../console/server/identity.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const fixture = await tempFixture("console-identity-");

@@ -3,11 +3,11 @@ import { afterAll, expect, spyOn, test } from "bun:test";
 import { dlopen, FFIType } from "bun:ffi";
 import { join } from "node:path";
 import { MessageChannel, Worker } from "node:worker_threads";
-import { QueryPool } from "../../scripts/ops/shared/exec-client.ts";
-import { ownQueryHost, QueryHandleCleanupError } from "../../scripts/ops/shared/exec-owner.ts";
-import { observeQueryProcess } from "../../scripts/ops/shared/exec-observe.ts";
-import type { CaptureOptions } from "../../scripts/ops/shared/query.ts";
-import type { FromReaper } from "../../scripts/ops/shared/exec-protocol.ts";
+import { QueryPool } from "../../console/server/exec-client.ts";
+import { ownQueryHost, QueryHandleCleanupError } from "../../console/server/exec-owner.ts";
+import { observeQueryProcess } from "../../console/server/exec-observe.ts";
+import type { CaptureOptions } from "../../console/server/query.ts";
+import type { FromReaper } from "../../console/server/exec-protocol.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { treeFixture, waitFor } from "../helpers/process-tree.ts";
 
@@ -226,7 +226,7 @@ if (process.argv[1]?.endsWith("exec-host.ts")) { appendFileSync(${JSON.stringify
 
 test("UI 线程阻塞时新查询宿主照常取得执行许可，查询不会因此失败", async () => {
   // Ownership and exit confirmation travel between the spawner and the reaper; the UI thread never opens a process.
-  const client = await Bun.file(join(import.meta.dir, "../../scripts/ops/shared/exec-client.ts")).text();
+  const client = await Bun.file(join(import.meta.dir, "../../console/server/exec-client.ts")).text();
   expect(client).not.toMatch(/from "(?:bun:ffi|\.\/exec-owner\.ts)"/);
   const blocked = new QueryPool();
   try {
@@ -278,15 +278,15 @@ test("句柄关闭失败经回收线程传到 UI，任意顺序的退出确认�
   await Bun.write(workerFile, `
 import { mock } from "bun:test";
 import { workerData } from "node:worker_threads";
-import * as owner from ${JSON.stringify(new URL("../../scripts/ops/shared/exec-owner.ts", import.meta.url).href)};
+import * as owner from ${JSON.stringify(new URL("../../console/server/exec-owner.ts", import.meta.url).href)};
 const CleanupError = owner.QueryHandleCleanupError;
-mock.module(${JSON.stringify(new URL("../../scripts/ops/shared/exec-owner.ts", import.meta.url).href)}, () => ({
+mock.module(${JSON.stringify(new URL("../../console/server/exec-owner.ts", import.meta.url).href)}, () => ({
   ...owner, ownQueryHost: () => ({ stop: async () => {
     throw new CleanupError(new Error("synthetic handle cleanup failure"),
       workerData.unconfirmed ? new Error("synthetic unconfirmed exit") : undefined);
   } }),
 }));
-await import(${JSON.stringify(new URL("../../scripts/ops/shared/exec-reaper.ts", import.meta.url).href)});
+await import(${JSON.stringify(new URL("../../console/server/exec-reaper.ts", import.meta.url).href)});
 `);
   try {
     for (const scenario of [
@@ -461,7 +461,7 @@ test.skipIf(process.platform !== "win32")("Windows 回收忽略被复用 PID 的
 test.skipIf(process.platform !== "win32")("Windows 回收句柄打开阻塞数秒后仍等待已终止的查询进程退出", async () => {
   // A blocked Worker cannot deliver EOF or the exit ack, and a cold OpenProcess can block for seconds: the reclaim
   // deadline must start after termination, not while opening the handle.
-  const host = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../scripts/ops/shared/exec-host.ts"), String(process.pid)],
+  const host = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../console/server/exec-host.ts"), String(process.pid)],
     { stdin: "pipe", stdout: "pipe", stderr: "ignore", windowsHide: true });
   try {
     const reader = host.stdout.getReader();
@@ -492,7 +492,7 @@ test.skipIf(process.platform !== "win32")("Windows 回收句柄打开阻塞数�
 test.skipIf(process.platform !== "win32")("Windows 回收兜底失败时，排在它后面的退出确认仍算回收成功", async () => {
   // The host exits while the reclaim thread is inside a blocked native call that then fails. The exit
   // acknowledgement is queued behind that call; a confirmed exit is final, whatever the fallback reports.
-  const host = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../scripts/ops/shared/exec-host.ts"), String(process.pid)],
+  const host = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../console/server/exec-host.ts"), String(process.pid)],
     { stdin: "pipe", stdout: "pipe", stderr: "ignore", windowsHide: true });
   try {
     const reader = host.stdout.getReader();
@@ -536,7 +536,7 @@ test.skipIf(process.platform !== "win32")("Windows 回收兜底失败且退出�
 }, 20000);
 
 test.skipIf(process.platform !== "win32")("Windows 退出确认只免除进程回收错误，句柄关闭失败仍然报告", async () => {
-  const host = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../scripts/ops/shared/exec-host.ts"), String(process.pid)],
+  const host = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../console/server/exec-host.ts"), String(process.pid)],
     { stdin: "pipe", stdout: "pipe", stderr: "ignore", windowsHide: true });
   const { symbols } = dlopen("kernel32.dll", { CloseHandle: { args: [FFIType.ptr], returns: FFIType.i32 } });
   try {

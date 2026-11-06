@@ -3,11 +3,11 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { nextRuntimeDraft, readRuntimeSettings, sweepRuntimeDrafts, validateRuntimeDraft, writeRuntimeDraft } from "../../scripts/config/runtime-draft.ts";
+import { nextRuntimeDraft, readRuntimeSettings, sweepRuntimeDrafts, validateRuntimeDraft, writeRuntimeDraft } from "../../ops/config/runtime-draft.ts";
 import { RUNTIME_KEYS } from "../../src/core/runtime-schema.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
-const script = fileURLToPath(new URL("../../scripts/config/runtime-settings.ts", import.meta.url));
+const script = fileURLToPath(new URL("../../ops/config/runtime-settings.ts", import.meta.url));
 const configFile = (root: string) => join(root, "data/config/runtime.json");
 
 async function seed(root: string, value: object | string) {

@@ -1,15 +1,15 @@
 import { expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { serializeConfigurationStage, stageName } from "../../scripts/config/configuration-stage.ts";
-import { parseRuntimeValues, RUNTIME_VALUES_FILE, runtimeDigest, runtimeText, serializeRuntimeValues } from "../../scripts/config/runtime-values.ts";
-import { DEPLOY_CHOICES_FILE, readDeployStage, STAGE_UNCHANGED } from "../../scripts/ops/core/deploy-stage.ts";
-import { DeploymentGit } from "../../scripts/ops/core/deployment-git.ts";
-import { MaintenanceRefused } from "../../scripts/ops/core/maintenance.ts";
+import { serializeConfigurationStage, stageName } from "../../ops/config/configuration-stage.ts";
+import { parseRuntimeValues, RUNTIME_VALUES_FILE, runtimeDigest, runtimeText, serializeRuntimeValues } from "../../ops/config/runtime-values.ts";
+import { DEPLOY_CHOICES_FILE, readDeployStage, STAGE_UNCHANGED } from "../../ops/core/deploy-stage.ts";
+import { DeploymentGit } from "../../ops/core/deployment-git.ts";
+import { MaintenanceRefused } from "../../ops/core/maintenance.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const head = "c".repeat(40), digest = "d".repeat(64);
-const choices = { format: 1 as const, target: head, port: 1011, workspace: "", cleanup: "apply" as const };
+const choices = { format: 1 as const, target: head, port: 1011, workspace: "" };
 const runtime = serializeRuntimeValues({ format: 1, base: null, values: { BOT_PORT: "1011" } });
 const app = { version: 1, base: { kind: "app", binding: null, files: { app: null } },
   next: { kind: "app", binding: null, files: { app: JSON.stringify({ appId: "fixture", appSecret: "fixture-secret", environment: "production" }) } } } as const;
@@ -31,10 +31,10 @@ test("部署暂存读出选择、运行参数、计划、配置暂存和平台�
     expect(minimal).toEqual({ choices, runtime: { text: runtime, value: { format: 1, base: null, values: { BOT_PORT: "1011" } } }, plan: null,
       directoryPlan: null, configuration: {}, platform: {} });
     const workspace = join(f.root, "shared"), full = readDeployStage(await stage(f.root, "full", {
-      [DEPLOY_CHOICES_FILE]: JSON.stringify({ ...choices, target: "", workspace, cleanup: "skip" }), [RUNTIME_VALUES_FILE]: runtime,
+      [DEPLOY_CHOICES_FILE]: JSON.stringify({ ...choices, target: "", workspace }), [RUNTIME_VALUES_FILE]: runtime,
       "data-plan.json": '{"plan":1}', "directory-scope-plan.json": '{"kind":"all"}', [stageName("app")]: serializeConfigurationStage(app),
       "candidate-image": "image=sha256:x\n", facts: "format=1\n", unrelated: "ignored" }));
-    expect(full).toMatchObject({ choices: { target: "", workspace, cleanup: "skip" }, plan: '{"plan":1}', directoryPlan: '{"kind":"all"}',
+    expect(full).toMatchObject({ choices: { target: "", workspace }, plan: '{"plan":1}', directoryPlan: '{"kind":"all"}',
       configuration: { app: { text: serializeConfigurationStage(app), stage: app } }, platform: { "candidate-image": "image=sha256:x\n", facts: "format=1\n" } });
     expect(Object.keys(full.platform).sort()).toEqual(["candidate-image", "facts"]);
   } finally { await f.cleanup(); }
@@ -50,7 +50,7 @@ test("部署暂存的每种缺陷都在停机前拒绝，并说明服务尚未�
       ["部署暂存不完整", { [DEPLOY_CHOICES_FILE]: good[DEPLOY_CHOICES_FILE] }], ["部署暂存不完整", { [RUNTIME_VALUES_FILE]: runtime }],
       ["部署选择无法读取", { ...good, [DEPLOY_CHOICES_FILE]: "{" }],
       ...[{ ...choices, command: "deploy" }, { ...choices, format: 2 }, { ...choices, port: 0 }, { ...choices, port: "1011" }, { ...choices, workspace: "relative" },
-        { ...choices, workspace: "/a\nb" }, { ...choices, cleanup: "no-backup" }, { ...choices, target: "c".repeat(39) }]
+        { ...choices, workspace: "/a\nb" }, { ...choices, cleanup: "apply" }, { ...choices, target: "c".repeat(39) }]
         .map(value => ["部署选择格式不支持", { ...good, [DEPLOY_CHOICES_FILE]: JSON.stringify(value) }] as [string, Record<string, string>]),
       ["端口与部署选择不一致", { ...good, [DEPLOY_CHOICES_FILE]: JSON.stringify({ ...choices, port: 1012 }) }],
       ["运行参数暂存格式不支持", { ...good, [RUNTIME_VALUES_FILE]: JSON.stringify({ format: 1, base: "x", values: { BOT_PORT: "1011" } }) }],

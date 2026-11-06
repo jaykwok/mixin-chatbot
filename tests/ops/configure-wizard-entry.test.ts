@@ -18,7 +18,7 @@ const COMMANDS = ["relay-configure", "model-configure", "configure-app-bot"] as 
 
 /** label, wizard and kind of each command, read from the entry's dispatch. */
 async function dispatch(shell: "bash" | "powershell"): Promise<Record<string, [string, string, string]>> {
-  const text = await source(shell === "bash" ? "scripts/ops/ops.sh" : "scripts/ops/ops.ps1"), result: Record<string, [string, string, string]> = {};
+  const text = await source(shell === "bash" ? "scripts/ops.sh" : "scripts/ops.ps1"), result: Record<string, [string, string, string]> = {};
   for (const command of COMMANDS) {
     const match = shell === "bash" ? new RegExp(`\\n    ${command}\\) configure_with_wizard (\\S+) (\\S+) (\\S+) ;;\\n`).exec(text)
       : new RegExp(`\\n    "${command}" \\{ if \\(-not \\(Invoke-ConfigureWizard '([^']+)' '([^']+)' '([^']+)'\\)\\) \\{ exit \\$script:OpsCoreExitCode \\} \\}\\n`).exec(text);
@@ -31,13 +31,13 @@ async function dispatch(shell: "bash" | "powershell"): Promise<Record<string, [s
 async function runner(shell: "bash" | "powershell", root: string): Promise<string> {
   const path = join(root, shell === "bash" ? "run.sh" : "run.ps1");
   if (shell === "bash") {
-    const text = await source("scripts/ops/ops.sh"), from = text.indexOf("configure_with_wizard() (\n"), until = text.indexOf("\n)\n", from);
+    const text = await source("scripts/ops.sh"), from = text.indexOf("configure_with_wizard() (\n"), until = text.indexOf("\n)\n", from);
     if (from < 0 || until < 0) throw new Error("configure_with_wizard not found");
     const body = text.slice(from, until + 3);
     if (!body.includes("[ -t 0 ] && [ -t 1 ] ||")) throw new Error("terminal check not found");
     await writeFile(path, [
       "#!/usr/bin/env bash", "set -uo pipefail",
-      'PROJECT_DIR="$FIXTURE_ROOT"; STATE_DIR="$PROJECT_DIR/data/state"; CONTAINER=mixin-chatbot',
+      'PROJECT_DIR="$FIXTURE_ROOT"; STATE_DIR="$PROJECT_DIR/data/state"; CONTAINER=mixin-bot',
       'ER() { printf "ER %s\\n" "$*"; }; WA() { printf "WA %s\\n" "$*"; }',
       'ops_command_hint() { printf "%s" "$1"; }',
       'record() { printf "%s\\n" "$1" >> "$FIXTURE_EVENTS"; }',
@@ -80,7 +80,7 @@ async function runner(shell: "bash" | "powershell", root: string): Promise<strin
       "  if($env:FIXTURE_SCENARIO -eq 'core-fail'){$script:OpsCoreExitCode=3; return $false}; $script:OpsCoreExitCode=0; return $true",
       "}",
       "$tokens=$null; $errors=$null",
-      "$ast=[Management.Automation.Language.Parser]::ParseFile(" + psQuote(join(project, "scripts/ops/ops.ps1")) + ",[ref]$tokens,[ref]$errors)",
+      "$ast=[Management.Automation.Language.Parser]::ParseFile(" + psQuote(join(project, "scripts/ops.ps1")) + ",[ref]$tokens,[ref]$errors)",
       "if($errors){throw 'ops syntax error'}",
       "$fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-ConfigureWizard'},$true)",
       "if(-not $fn -or -not $fn.Extent.Text.Contains('[Console]::IsInputRedirected')){throw 'missing configuration wizard entry'}",
@@ -131,8 +131,8 @@ for (const shell of ["bash", "powershell"] as const) {
             // The wizard writes only into a fresh stage under tmp/; Docker runs it in the bot's image by ID as the service identity,
             // with data/ read-only; Windows runs it with the project's dependencies from the project root.
             if (shell === "bash") expect(line).toBe(`wizard run --rm -it --user 1234:1234 -w /app -e HOME=/tmp -v ${forShell(root)}/data:/app/data:ro `
-              + `-v ${stage}:/preview sha256:fixture-image bun run scripts/config/${wizard} --stage /preview`);
-            else expect(line).toBe(`wizard --no-env-file run ${join(root, "scripts\\config", wizard)} --stage ${stage} cwd=${root}`);
+              + `-v ${stage}:/preview sha256:fixture-image bun run ops/config/${wizard} --stage /preview`);
+            else expect(line).toBe(`wizard --no-env-file run ${join(root, "ops\\config", wizard)} --stage ${stage} cwd=${root}`);
             if (handed) expect(recorded[1]).toBe(`core maintenance configuration-apply --stage ${stage}${shell === "bash" ? "/" : "\\"}configuration-${kind}.json content=staged`);
           }
           if (["cancel", "abort"].includes(scenario)) expect(output).toContain(`WA ${label}已取消；配置和服务保持原状`);

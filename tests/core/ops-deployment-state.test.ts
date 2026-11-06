@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { OPS_DEPLOYMENT_FILE, readOpsDeploymentRecord, deploymentAllows } from "../../src/core/ops-deployment-state.ts";
 import { readMaintenanceState, assessMaintenanceAction, MAINTENANCE_INTENTS } from "../../src/core/maintenance-state.ts";
 import { type DeploymentExecution, type DeploymentStep } from "../../src/contracts/ops-deployment.ts";
-import { loadDeploymentState } from "../../scripts/ops/core/deployment-state.ts";
-import { newDockerTask } from "../../scripts/ops/core/docker-task.ts";
+import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
+import { newDockerTask } from "../../ops/core/docker-task.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const initial: DeploymentExecution = { version: 1, checkpoint: { version: 1, snapshot: "deploy-synthetic", runtime: "a".repeat(64), direction: "forward", step: "prepare-data" } };
@@ -14,7 +14,7 @@ const writer = newDockerTask({ daemon: "fixture", endpoint: "unix:///fixture/doc
 
 test("部署阶段只允许对应的验证、提交或业务启动；数据写入者未回收不能启动", () => {
   for (const [step, allowed] of [
-    ["prepare-data", []], ["cleanup-revisions", []], ["install-candidate", []], ["start-verification", ["verify"]], ["commit-data", ["release"]],
+    ["prepare-data", []], ["install-candidate", []], ["start-verification", ["verify"]], ["commit-data", ["release"]],
     ["retire-previous-writers", []], ["disable-verification", []], ["start-candidate", ["service"]], ["publish-target", ["service"]],
   ] as [DeploymentStep, string[]][]) {
     for (const active of [false, true]) for (const intent of ["service", "verify", "release"] as const) {

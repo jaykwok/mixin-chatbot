@@ -4,10 +4,10 @@ import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, stat, utimes, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
-import { collect, purge } from "../../scripts/ops/tmp-admin.ts";
+import { collect, purge } from "../../ops/tools/tmp-admin.ts";
 import { groupSegment, userSegment } from "../../src/core/layout.ts";
 
-const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-tmp-admin-"));
+const root = await mkdtemp(join(tmpdir(), "mixin-bot-tmp-admin-"));
 
 const DAY = 24 * 60 * 60_000;
 // u1 in group g1, u2 in the direct space.

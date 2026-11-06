@@ -4,7 +4,7 @@ import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { commandScope, runProcess, timedCommand } from "../../src/core/process.ts";
 import { log } from "../../src/core/log.ts";
-import { executeProcess, ProcessFailure, SUPERVISOR_ENV } from "../../scripts/lib/process.ts";
+import { executeProcess, ProcessFailure, SUPERVISOR_ENV } from "../../src/lib/process.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { fileURLToPath } from "node:url";
 
@@ -16,7 +16,7 @@ describe("supervised real subprocesses", () => {
   test.skipIf(process.platform !== "linux")("finishes reaping a detached process tree despite repeated termination signals", async () => {
     const fixture = await tempFixture("supervised-signals-");
     const command = join(fixture.root, "tree.cjs");
-    const supervisor = fileURLToPath(new URL("../../scripts/lib/process-supervisor.ts", import.meta.url));
+    const supervisor = fileURLToPath(new URL("../../src/lib/process-supervisor.ts", import.meta.url));
     // Several generations require repeated adoption/reaping rounds, so later
     // signals arrive while cleanup is in progress, rather than after it exits.
     await writeFile(command, `const {spawn}=require('child_process'); const ids=[...JSON.parse(process.argv[2]),process.pid]; if(ids.length<8){spawn(process.execPath,[__filename,JSON.stringify(ids)],{detached:true,stdio:['ignore','inherit','inherit']}).unref()}else{console.log('READY:'+JSON.stringify(ids))} setTimeout(()=>process.exit(0),8000);`);
@@ -58,7 +58,7 @@ describe("supervised real subprocesses", () => {
     const fixture = await tempFixture("supervised-reap-race-");
     const command = join(fixture.root, "command.cjs");
     const reaped = join(fixture.root, "reaped.pid");
-    const supervisor = fileURLToPath(new URL("../../scripts/lib/process-supervisor.ts", import.meta.url));
+    const supervisor = fileURLToPath(new URL("../../src/lib/process-supervisor.ts", import.meta.url));
     const preload = fileURLToPath(new URL("../helpers/process-reap-race.ts", import.meta.url));
     await writeFile(command, `const {spawn}=require('child_process'); console.log('DIRECT:'+process.pid); spawn(process.execPath,['-e',"console.log('READY:'+process.pid); setTimeout(()=>process.exit(0),8000)"],{detached:true,stdio:['ignore','inherit','inherit']}).unref(); setTimeout(()=>process.exit(0),10000);`);
     const child = Bun.spawn([process.execPath, "--preload", preload, supervisor, reaped], {

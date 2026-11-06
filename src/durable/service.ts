@@ -181,7 +181,7 @@ export type AttachResult = { status: "accepted"; attachment: string } | { status
 
 type AbortReason = { kind: "task_timeout" | "model_idle" | "model_response_timeout"; error: Error };
 
-/** Log labels of the watchdog's aborts, as the task log extraction (scripts/ops/task-logs.*) looks for them. */
+/** Log labels of the watchdog's aborts, as the task log extraction (scripts/task-logs.*) looks for them. */
 const ABORT_LABELS: Record<AbortReason["kind"], string> = {
   task_timeout: "任务总时限到达",
   model_idle: "模型无有效进展超时",
@@ -1935,7 +1935,7 @@ function retryWait(ms: number, signal: AbortSignal): Promise<void> {
 
 /**
  * The task number of a message: the first 8 hex digits of its request id. Logs write it as `任务: <number>`, the form
- * the log extraction scripts (scripts/ops/task-logs.*) and the console's log search use; /status and failure details show it.
+ * the log extraction scripts (scripts/task-logs.*) and the console's log search use; /status and failure details show it.
  */
 function taskNumber(requestId: string): string {
   return requestId.replace(/^(?:msg|ctl):/, "").slice(0, 8);

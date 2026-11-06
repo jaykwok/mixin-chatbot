@@ -1,4 +1,4 @@
 *.sh text eol=lf
 Dockerfile text eol=lf
 # Vendored browser runtime: byte-compared with node_modules in tests, never converted.
-ui/console/vendor/** -text
+console/ui/vendor/** -text

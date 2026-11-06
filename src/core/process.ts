@@ -1,9 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { application } from "./lifecycle.ts";
 import { log } from "./log.ts";
-import { executeProcess, ProcessFailure, type ProcessEvent, type ProcessOptions } from "../../scripts/lib/process.ts";
+import { executeProcess, ProcessFailure, type ProcessEvent, type ProcessOptions } from "../lib/process.ts";
 
-export type { ProcessOptions } from "../../scripts/lib/process.ts";
+export type { ProcessOptions } from "../lib/process.ts";
 
 /** The member tool call commands run for; src/durable/tools.ts sets it around each call. */
 export interface CommandScope {

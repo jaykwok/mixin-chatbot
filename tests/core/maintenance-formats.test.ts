@@ -1,7 +1,7 @@
 // Persisted maintenance formats, pinned against golden files produced by the refactoring baseline (T0′).
 // Each scenario runs the real preview/apply code in a temporary root and compares the files it leaves behind
 // after normalizing paths, IDs and identities. Key order is part of the contract: plan digests hash the JSON text.
-// Regenerate only on purpose: MIXIN_WRITE_FORMAT_GOLDEN=1 bun run scripts/test.ts tests/core/maintenance-formats.test.ts
+// Regenerate only on purpose: MIXIN_WRITE_FORMAT_GOLDEN=1 bun run tests/run.ts tests/core/maintenance-formats.test.ts
 import { test } from "bun:test";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
 import { Database } from "bun:sqlite";

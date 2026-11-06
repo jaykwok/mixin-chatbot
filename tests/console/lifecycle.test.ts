@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { recoveryPlan, recoveryView, assertLifecycleTarget } from "../../scripts/ops/console/lifecycle.ts";
-import { operationArgs, operationScope } from "../../scripts/ops/console/operations.ts";
-import { operationPreparer } from "../../scripts/ops/console/prepare-operation.ts";
-import { Views } from "../../scripts/ops/console/views.ts";
-import { assertConfirmedTransaction } from "../../scripts/lib/confirmed-transaction.ts";
+import { recoveryPlan, recoveryView, assertLifecycleTarget } from "../../ops/core/recovery-plan.ts";
+import { operationArgs, operationScope } from "../../ops/core/operations.ts";
+import { operationPreparer } from "../../console/server/prepare-operation.ts";
+import { Views } from "../../console/server/views.ts";
+import { assertConfirmedTransaction } from "../../ops/lib/confirmed-transaction.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 async function fixture() {
@@ -15,11 +15,11 @@ async function fixture() {
   writeFileSync(join(state, "deploy-transaction"), id);
   writeFileSync(join(snapshot, "transaction"), Object.entries({ format: "2", operation: "deploy", snapshot: id, target_sha: "a".repeat(40), original_sha: "",
     original_branch: "", original_workspace_root: "", target_workspace_root: "", was_running: "1", bot_port: "2022", reconfigure_ai: "0" }).map(([k, v]) => `${k}=${v}\n`).join(""));
-  writeFileSync(join(snapshot, "revision-cleanup"), "apply\n");
+  writeFileSync(join(snapshot, "data-plan.json"), "{}\n");
   return { ...f, state, snapshot, id };
 }
 
-test("恢复只接受动作，服务器生成凭据；整理选择、指针和提交状态改变都拒绝旧预览", async () => {
+test("恢复只接受动作，服务器生成凭据；数据计划、指针和提交状态改变都拒绝旧预览", async () => {
   const f = await fixture();
   try {
     const prepare = operationPreparer(f.root, new Views());
@@ -30,7 +30,7 @@ test("恢复只接受动作，服务器生成凭据；整理选择、指针和�
     expect(() => operationArgs("resume", {})).toThrow();
     expect(recoveryView(f.root)).toMatchObject({ canResume: true, canRollback: true });
     expect(() => assertConfirmedTransaction(f.root, "continue", String(params.confirmation))).not.toThrow();
-    writeFileSync(join(f.snapshot, "revision-cleanup"), "skip\n");
+    writeFileSync(join(f.snapshot, "data-plan.json"), "{\"changed\":1}\n");
     await expect(operationScope(f.root, "resume", params)).rejects.toThrow("变化");
     expect(() => assertConfirmedTransaction(f.root, "continue", String(params.confirmation))).toThrow("变化");
     const refreshed = await prepare("resume", {}, "fixture");

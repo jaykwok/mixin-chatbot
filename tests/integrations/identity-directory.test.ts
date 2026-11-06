@@ -332,30 +332,6 @@ test("a service stop in the middle of an apply changes nothing, and the restarte
   expect(open({ scope: depts("2") }).startupTrigger()).toBe("initial");
 });
 
-test("after an upgrade from 1.0.x the paused revocations are dropped; the first routine sync records the effective scope once rechecked", async () => {
-  // 1.0.x left thirty mappings, a complete scan without the new summary fields and a paused round; no effective record.
-  const all = members(30);
-  open();
-  const insert = db.query("INSERT INTO member_directory (phone, im_user_id, name, last_verified_at) VALUES (?, ?, ?, 1)");
-  for (const member of all) insert.run(member.phone, `im-${member.phone}`, member.name);
-  db.query("INSERT INTO directory_scans (trigger, started_at, finished_at, complete, summary) VALUES ('daily', 1, 2, 1, ?)")
-    .run(JSON.stringify({ id: 1, trigger: "daily", startedAt: 1, finishedAt: 2, complete: true, pendingRevocations: 25 }));
-  db.exec("CREATE TABLE directory_pending_revocations (scan_id INTEGER NOT NULL, phone TEXT NOT NULL); INSERT INTO directory_pending_revocations VALUES (1, 'x')");
-  let clock = 1_000_000;
-  const directory = open({ now: () => clock, recheckDelayMs: 600_000 });
-  expect(db.query("SELECT name FROM sqlite_master WHERE name = 'directory_pending_revocations'").get()).toBeNull();
-  expect(directory.startupTrigger()).toBe("initial");
-  expect(directory.status()).toMatchObject({ state: "applying", mappings: 30 });
-  expect(directory.status().effective).toBeUndefined();
-  // Twenty-five are absent: rechecked, not revoked, and the scope is not recorded as effective yet.
-  members(5);
-  expect(await directory.scan("initial", directoryClient(), service.signal)).toMatchObject({ mode: "routine", revoked: 0, suspected: 25 });
-  expect(directory.status()).toMatchObject({ state: "applying", recheck: { count: 25 } });
-  clock += 600_000;
-  expect(await directory.scan("recheck", directoryClient(), service.signal)).toMatchObject({ revoked: 25 });
-  expect(directory.status()).toMatchObject({ state: "effective", effective: { scope: WHOLE_DIRECTORY, since: clock }, mappings: 5 });
-});
-
 test("an unreadable effective record counts as none: the next sync is routine and writes it again", async () => {
   members(4);
   await open().scan("initial", directoryClient(), service.signal);
@@ -492,7 +468,7 @@ test("a scope walks only the chosen departments and their subdepartments", async
 });
 
 test("without a saved scope nothing is synced: existing mappings stay and answer, no scan starts, and saving any scope starts one", async () => {
-  // A 1.0.1 deployment synced the whole directory and has no data/config/directory.json.
+  // A deployment without data/config/directory.json has no saved scope.
   const all = members(4);
   await open().scan("initial", directoryClient(), service.signal);
   const before = fake.requests.length;

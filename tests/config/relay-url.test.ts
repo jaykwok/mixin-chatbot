@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { normalizeRelayUrlInput, suggestRelayRegion } from "../../scripts/config/relay-url.ts";
+import { normalizeRelayUrlInput, suggestRelayRegion } from "../../ops/config/relay-url.ts";
 
 test.each([
   ["s3.example.test", "https://s3.example.test"],

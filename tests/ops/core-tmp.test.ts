@@ -2,14 +2,14 @@ import { expect, test } from "bun:test";
 import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { tmpRequest, runTmp, TMP_ACTIONS } from "../../scripts/ops/core/tmp.ts";
-import { runCore } from "../../scripts/ops/core/cli.ts";
-import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../scripts/ops/core/maintenance-host.ts";
-import { MaintenanceRecord } from "../../scripts/ops/core/maintenance-record.ts";
-import { recoverMaintenance } from "../../scripts/ops/core/maintenance-recovery.ts";
+import { tmpRequest, runTmp, TMP_ACTIONS } from "../../ops/core/tmp.ts";
+import { runCore } from "../../ops/core/cli.ts";
+import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../ops/core/maintenance-host.ts";
+import { MaintenanceRecord } from "../../ops/core/maintenance-record.ts";
+import { recoverMaintenance } from "../../ops/core/maintenance-recovery.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { readTmpPlan, readRemovalPlan } from "../../scripts/lib/tmp-plan.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { readTmpPlan, readRemovalPlan } from "../../ops/lib/tmp-plan.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const plan = "a".repeat(8) + "-aaaa-aaaa-aaaa-" + "a".repeat(12), digest = "b".repeat(64);
@@ -32,10 +32,10 @@ test("临时文件范围在取锁前完整校验；拼错参数、范围冲突�
 
 async function fixture() {
   const f = await tempFixture("core-tmp-");
-  for (const dir of ["scripts", "src", "ui", "data/state"]) await mkdir(join(f.root, dir), { recursive: true });
-  for (const dir of ["scripts", "src", "ui"]) await writeFile(join(f.root, dir, "fixture.ts"), "export {};\n");
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
-  const ready = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+  for (const dir of ["console", "ops", "scripts", "src", "data/state"]) await mkdir(join(f.root, dir), { recursive: true });
+  for (const dir of ["console", "ops", "scripts", "src"]) await writeFile(join(f.root, dir, "fixture.ts"), "export {};\n");
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+  const ready = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(ready) });
   await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...ready, port: server.port }));
   const facts = { identity: "a".repeat(64), owned: true, state: "running" as "running" | "stopped" }, effects: string[] = [];
@@ -57,7 +57,7 @@ test("真实共用宿主：查询不停止，执行清单才停止并恢复；�
           const context = createMaintenanceHost(options, operation);
           return { ...context, data: async step => {
             expect(() => acquireDeploymentLock(f.root)).toThrow();
-            expect(step).toEqual({ script: "scripts/ops/tmp-admin.ts", args: request.args, readOnly: !request.mutating });
+            expect(step).toEqual({ script: "ops/tools/tmp-admin.ts", args: request.args, readOnly: !request.mutating });
             expect(f.facts.state).toBe(running && !request.mutating ? "running" : "stopped");
             expect(readOpsMaintenanceRecord(f.root)?.checkpoint.phase).toBe("acting");
             return { code: 17, stdout: "" };

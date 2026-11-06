@@ -14,20 +14,20 @@ import { DATA_VERSION } from "../../src/core/version.ts";
 import { DurableService } from "../../src/durable/service.ts";
 import { ReadChannel } from "../../src/durable/read/client.ts";
 import { createApp } from "../../src/server/http-app.ts";
-import { AuditLog } from "../../scripts/ops/console/audit.ts";
-import { Auth } from "../../scripts/ops/console/auth.ts";
-import { BotLink } from "../../scripts/ops/console/bot.ts";
-import { buildBundle } from "../../scripts/ops/console/bundle.ts";
-import { Exports } from "../../scripts/ops/console/exports.ts";
-import { guardConfig } from "../../scripts/ops/console/guard.ts";
-import type { Route } from "../../scripts/ops/console/routes.ts";
-import { startServer } from "../../scripts/ops/console/server.ts";
-import { statsRoutes } from "../../scripts/ops/console/stats.ts";
-import { serviceView } from "../../scripts/ops/console/status.ts";
-import { conversationRoutes, Views } from "../../scripts/ops/console/views.ts";
-import { probeService } from "../../scripts/ops/shared/data.ts";
-import { versionRows } from "../../scripts/ops/version-info.ts";
-import type { Overview } from "../../ui/console/src/contract.ts";
+import { AuditLog } from "../../console/server/audit.ts";
+import { Auth } from "../../console/server/auth.ts";
+import { BotLink } from "../../console/server/bot.ts";
+import { buildBundle } from "../../console/server/bundle.ts";
+import { Exports } from "../../console/server/exports.ts";
+import { guardConfig } from "../../console/server/guard.ts";
+import type { Route } from "../../console/server/routes.ts";
+import { startServer } from "../../console/server/server.ts";
+import { statsRoutes } from "../../console/server/stats.ts";
+import { serviceView } from "../../console/server/status.ts";
+import { conversationRoutes, Views } from "../../console/server/views.ts";
+import { probeService } from "../../console/server/data.ts";
+import { versionRows } from "../../ops/tools/version-info.ts";
+import type { Overview } from "../../console/ui/src/contract.ts";
 import { PROJECT_PROGRESS } from "./durable.ts";
 import { recordingOutbound, replyTexts } from "./recording-outbound.ts";
 import { writeTestData } from "./stats-fixture.ts";
@@ -265,7 +265,7 @@ try {
   const overview = async (): Promise<Overview> => ({
     checkedAt: Date.now(),
     console: { version: VERSION, build: BUILD, hostname: "mixin-bot", platform: "linux", port: 11012, pid: process.pid, startedAt: consoleStarted },
-    deployment: { platform: "linux", runtime: "docker", mode: "Docker", port: 3000, dataRoot: "/opt/mixin-chatbot/data", workspaceRoot: "/opt/mixin-chatbot/data/workspace" },
+    deployment: { platform: "linux", runtime: "docker", mode: "Docker", port: 3000, dataRoot: "/opt/mixin-bot/data", workspaceRoot: "/opt/mixin-bot/data/workspace" },
     deploymentError: null, recovery: null, pending: null,
     service: serviceView(await probeService(bot.port!, instanceFile)),
     versions: versionRows({ source: "running", program, dataVersion: DATA_VERSION, local: program }),

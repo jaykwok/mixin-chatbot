@@ -2,12 +2,12 @@ import { expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { opsCommand, type Platform } from "../../scripts/ops/shared/platform.ts";
-import { upgradeRoutes } from "../../scripts/ops/console/upgrade-routes.ts";
-import { operationArgs } from "../../scripts/ops/console/operations.ts";
-import { operationPreparer } from "../../scripts/ops/console/prepare-operation.ts";
-import { Views } from "../../scripts/ops/console/views.ts";
-import type { RouteContext } from "../../scripts/ops/console/routes.ts";
+import { opsCommand, type Platform } from "../../ops/core/platform.ts";
+import { upgradeRoutes } from "../../console/server/upgrade-routes.ts";
+import { operationArgs } from "../../ops/core/operations.ts";
+import { operationPreparer } from "../../console/server/prepare-operation.ts";
+import { Views } from "../../console/server/views.ts";
+import type { RouteContext } from "../../console/server/routes.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { opsShellFunctions } from "../helpers/ops-shell.ts";
 
@@ -44,7 +44,7 @@ for (const platform of ["linux", "windows"] as Platform[]) test.skipIf(platform 
       const [original, confirmed, later] = commits as [string, string, string];
       await git("checkout", "--detach", original); await git("update-ref", "refs/remotes/origin/main", confirmed);
       const stateDir = join(repo, "data/state"); await mkdir(stateDir, { recursive: true });
-      const sourcePath = platform === "windows" ? "scripts/ops/ops.ps1" : "scripts/ops/ops.sh";
+      const sourcePath = platform === "windows" ? "scripts/ops.ps1" : "scripts/ops.sh";
       const source = (await readFile(join(project, sourcePath), "utf8")).replaceAll("\r\n", "\n");
       const script = join(fixture.root, platform === "windows" ? "dispatch.ps1" : "dispatch.sh");
       if (platform === "linux") {
@@ -122,7 +122,7 @@ Invoke-Update -ConfirmedTarget $request.Target | Out-Null
       const checked = await routes["POST /api/lifecycle/check-update"]!.run(context) as { target: string };
       expect(checked.target).toBe(confirmed); expect(checkedFetches).toBe(1);
       const params = await operationPreparer(repo, new Views())("update", {
-        target: checked.target, switchMain: true, cleanup: "apply", directory: "all",
+        target: checked.target, switchMain: true, directory: "all",
       }, "fixture");
       await git("update-ref", "refs/remotes/origin/main", later);
       const args = operationArgs("update", params);

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { readDockerDataAccess, type AccessFiles } from "../../scripts/ops/core/docker-access.ts";
+import { readDockerDataAccess, type AccessFiles } from "../../ops/core/docker-access.ts";
 import { validateDockerDataAccess } from "../../src/contracts/ops-task-access.ts";
 
 function fixture(rootless = false) {

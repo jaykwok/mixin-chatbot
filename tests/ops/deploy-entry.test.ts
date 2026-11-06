@@ -2,12 +2,12 @@ import { expect, test } from "bun:test";
 import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseCandidateRecord } from "../../scripts/ops/core/docker-deployment.ts";
-import { readDeployStage } from "../../scripts/ops/core/deploy-stage.ts";
-import { serializeTransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
+import { parseCandidateRecord } from "../../ops/core/docker-deployment.ts";
+import { readDeployStage } from "../../ops/core/deploy-stage.ts";
+import { serializeTransactionRecord } from "../../ops/core/transaction-record.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
-// The Linux deployment entry (scripts/deploy/deploy.sh): first its hand-over pieces cut out with the preview container and
+// The Linux deployment entry (scripts/deploy.sh): first its hand-over pieces cut out with the preview container and
 // the record writers stubbed, then the unmodified script run up to the hand-over with Docker, the build and the core
 // replaced (tests/helpers/deploy-entry-stubs.sh, deploy-entry-bun.sh). Stop, configuration, verification and rollback run
 // in core-docker-deploy.test.ts.
@@ -19,7 +19,7 @@ const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-
 const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(BOT_|PI_)/i.test(name)));
 
 function entryFunctions(...names: string[]): string {
-  const source = "\n" + readFileSync(join(project, "scripts/deploy/deploy.sh"), "utf8").replaceAll("\r\n", "\n");
+  const source = "\n" + readFileSync(join(project, "scripts/deploy.sh"), "utf8").replaceAll("\r\n", "\n");
   return names.map(name => {
     const from = source.indexOf("\n" + name + "() {\n");
     if (from < 0) throw new Error("deploy.sh has no function " + name);
@@ -52,7 +52,7 @@ test.skipIf(!available)("部署暂存运行参数：按名称模式转交已导�
     expect(forwarded.slice(0, -2).sort()).toEqual(["BOT_CLOSEOUT_SECONDS", "BOT_RUN_TIMEOUT_SECONDS", "PI_CACHE_RETENTION"]);
     expect(forwarded.slice(-2)).toEqual(["BOT_PORT=2022", "BOT_HOST=127.0.0.1"]);
     expect(args.slice(tail)).toEqual(["-v", "/project/data:/app/data:ro", "-v", "/stage:/preview", "sha256:fixture",
-      "bun", "run", "scripts/config/runtime-settings.ts", "--prepare-values", "/preview/runtime-values.json", "--deployment", "docker", "seen=7"]);
+      "bun", "run", "ops/config/runtime-settings.ts", "--prepare-values", "/preview/runtime-values.json", "--deployment", "docker", "seen=7"]);
 
     const refused = await run(f.root, [...body, "run_preview() { return 3; }", "stage_runtime_values", "echo continued"], env);
     expect(refused.code).toBe(1); expect(refused.out).not.toContain("continued");
@@ -67,20 +67,20 @@ test.skipIf(!available)("部署暂存的选择和事实：核心能读回入口�
     mkdirSync(stage);
     writeFileSync(join(stage, "runtime-values.json"), JSON.stringify({ format: 1, base: null, values: { BOT_PORT: "2022" } }));
     const result = await run(f.root, [entryFunctions("write_stage_records"),
-      `declare -A CANDIDATE=([target_sha]=${target}); PREVIEW_DIR='${posixPath(stage)}'; BOT_PORT=2022; REVISION_CLEANUP_CHOICE=skip`,
+      `declare -A CANDIDATE=([target_sha]=${target}); PREVIEW_DIR='${posixPath(stage)}'; BOT_PORT=2022`,
       "ORIGINAL_CONTAINER_ID=''; ORIGINAL_CONTAINER_IMAGE=''; ORIGINAL_CONTAINER_DATA=''", 'HOST_WORKSPACE_ROOT="$FIXTURE_WORKSPACE"',
       'write_candidate_record() { echo candidate > "$1/candidate-image"; }; write_service_user_record() { echo user > "$1/service-user"; }',
       'task_runtime_record() { echo daemon > "$1"; }', "write_stage_records"], { FIXTURE_WORKSPACE: workspace });
     expect(result.code, result.out + result.err).toBe(0);
     const read = readDeployStage(stage);
-    expect(read.choices).toEqual({ format: 1, target, port: 2022, workspace, cleanup: "skip" });
+    expect(read.choices).toEqual({ format: 1, target, port: 2022, workspace });
     expect(read.platform).toEqual({ "candidate-image": "candidate\n", "service-user": "user\n", "task-runtime": "daemon\n", facts: "format=1\ncontainer=\nimage=\ndata=\n" });
     if (process.platform !== "win32") for (const name of ["deployment.json", "facts"]) expect(statSync(join(stage, name)).mode & 0o777, name).toBe(0o600);
 
     // A record writer that fails stops before the choices: the core then refuses the incomplete stage.
     const failed = join(f.root, "failed"); mkdirSync(failed);
     const refused = await run(f.root, [entryFunctions("write_stage_records"),
-      `declare -A CANDIDATE=([target_sha]=${target}); PREVIEW_DIR='${posixPath(failed)}'; BOT_PORT=2022; REVISION_CLEANUP_CHOICE=skip; HOST_WORKSPACE_ROOT=''`,
+      `declare -A CANDIDATE=([target_sha]=${target}); PREVIEW_DIR='${posixPath(failed)}'; BOT_PORT=2022; HOST_WORKSPACE_ROOT=''`,
       "ORIGINAL_CONTAINER_ID=''; ORIGINAL_CONTAINER_IMAGE=''; ORIGINAL_CONTAINER_DATA=''",
       "write_candidate_record() { :; }; write_service_user_record() { return 1; }; task_runtime_record() { :; }",
       "write_stage_records || echo refused=$?"]);
@@ -99,12 +99,12 @@ const git = (cwd: string, ...args: string[]) => {
 /** A release checkout with the real deploy.sh and libraries plus the stubs, initialized as a Git repository. */
 async function release(name: string, setup: { config?: boolean; deployed?: boolean; directory?: boolean } = {}) {
   const f = await tempFixture(name), root = join(realpathSync(f.root), "project");
-  for (const directory of ["scripts/deploy", "scripts/lib", "scripts/config", "src/server", "data/config", "data/state", "data/runtime/pi"]) mkdirSync(join(root, directory), { recursive: true });
-  copyFileSync(join(project, "scripts/deploy/deploy.sh"), join(root, "scripts/deploy/deploy.sh"));
+  for (const directory of ["scripts", "scripts/lib", "ops/config", "src/server", "data/config", "data/state", "data/runtime/pi"]) mkdirSync(join(root, directory), { recursive: true });
+  copyFileSync(join(project, "scripts/deploy.sh"), join(root, "scripts/deploy.sh"));
   for (const name of readdirSync(join(project, "scripts/lib"))) if (name.endsWith(".sh")) copyFileSync(join(project, "scripts/lib", name), join(root, "scripts/lib", name));
   appendFileSync(join(root, "scripts/lib/core-handoff.sh"), "\n" + readFileSync(join(project, "tests/helpers/deploy-entry-stubs.sh"), "utf8"));
   const bun = join(f.root, "bun"); copyFileSync(join(project, "tests/helpers/deploy-entry-bun.sh"), bun); chmodSync(bun, 0o755);
-  for (const path of ["package.json", "src/server/index.ts", "scripts/config/configure.ts"]) writeFileSync(join(root, path), "");
+  for (const path of ["package.json", "src/server/index.ts", "ops/config/configure.ts"]) writeFileSync(join(root, path), "");
   if (setup.config) for (const path of ["data/config/models.json", "data/config/app-bot.json", "data/runtime/pi/settings.json"]) writeFileSync(join(root, path), "{}\n");
   if (setup.deployed) writeFileSync(join(root, "data/state/bot-port"), "3000\n");
   if (setup.directory) writeFileSync(join(root, "data/config/directory.json"), '{"format":1,"all":true}\n');
@@ -112,7 +112,7 @@ async function release(name: string, setup: { config?: boolean; deployed?: boole
   const head = git(root, "rev-parse", "HEAD"), events = join(f.root, "events"), capture = join(f.root, "capture");
   const run = async (env: Record<string, string> = {}, input = "") => {
     writeFileSync(events, ""); rmSync(capture, { recursive: true, force: true });
-    const child = Bun.spawn(["bash", join(root, "scripts/deploy/deploy.sh")], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    const child = Bun.spawn(["bash", join(root, "scripts/deploy.sh")], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe",
       env: { ...inherited, FIXTURE_EVENTS: events, FIXTURE_BUN: bun, FIXTURE_CAPTURE: capture, FIXTURE_IMAGE: IMAGE,
         ...setup.deployed ? { FIXTURE_ORIGINAL: ORIGINAL, FIXTURE_ORIGINAL_IMAGE: ORIGINAL_IMAGE } : {}, ...env } });
     child.stdin.write(input); child.stdin.end();
@@ -137,20 +137,20 @@ test.skipIf(!linux)("部署入口：停机前问完全部问题、核对完全�
     const order = ["operator", "bun ", "build ", "task-runtime", "docker run --rm --network none", "stop-space"]
       .map(prefix => result.events.findIndex(line => line.startsWith(prefix)));
     expect(order.every((at, index) => at >= 0 && (index === 0 || at > order[index - 1]!)), result.events.join("\n")).toBe(true);
-    expect(result.events[order[1]!]).toBe(`bun --no-env-file ${f.root}/scripts/ops/core/cli.ts deployment deploy --project ${f.root} --preflight`);
+    expect(result.events[order[1]!]).toBe(`bun --no-env-file ${f.root}/ops/core/cli.ts deployment deploy --project ${f.root} --preflight`);
     const core = handover(result.events), stagePath = result.events[core]!.split(" --stage ")[1]!.split(" ")[0]!;
     expect(core).toBeGreaterThan(order.at(-1)!);
-    expect(result.events[core]).toBe(`bun --no-env-file ${f.root}/scripts/ops/core/cli.ts deployment deploy --project ${f.root} --stage ${stagePath} --command deploy`);
+    expect(result.events[core]).toBe(`bun --no-env-file ${f.root}/ops/core/cli.ts deployment deploy --project ${f.root} --stage ${stagePath} --command deploy`);
     expect(result.events.slice(core + 1).filter(line => line.startsWith("bun ") || line.startsWith("docker run"))).toEqual([]);
     // Previews run the candidate by ID as the recorded identity, without network, with data/ read-only.
-    const previews = result.events.filter(line => / scripts\/(runtime\/(data-current|revision-cleanup)|config\/runtime-settings)\.ts /.test(line));
-    expect(previews).toHaveLength(3);
+    const previews = result.events.filter(line => / ops\/(tools\/data-current|config\/runtime-settings)\.ts /.test(line));
+    expect(previews).toHaveLength(2);
     for (const line of previews) {
       expect(line, line).toContain("--network none --user 0:0"); expect(line, line).toContain(`-v ${f.root}/data:/app/data:ro`); expect(line, line).toContain(IMAGE);
     }
     // The hand-over carries every decision and fact; the core inherits the deployment lock and gets no terminal.
     const stage = readDeployStage(f.capture);
-    expect(stage.choices).toEqual({ format: 1, target: f.head, port: 3000, workspace: "", cleanup: "apply" });
+    expect(stage.choices).toEqual({ format: 1, target: f.head, port: 3000, workspace: "" });
     expect(stage.runtime.value.values).toEqual({ BOT_PORT: "3000", BOT_HOST: "127.0.0.1" });
     expect(stage.plan).toBe("{}\n"); expect(stage.directoryPlan).toBeNull(); expect(stage.configuration).toEqual({});
     expect(parseCandidateRecord(stage.platform["candidate-image"]!)).toMatchObject({ source: "workspace", target_sha: f.head, image_id: IMAGE });
@@ -159,7 +159,7 @@ test.skipIf(!linux)("部署入口：停机前问完全部问题、核对完全�
     expect(stage.platform.facts).toBe(`format=1\ncontainer=${ORIGINAL}\nimage=${ORIGINAL_IMAGE}\ndata=${f.root}/data\n`);
     expect(readFileSync(f.capture + ".env", "utf8")).toBe(`stdin=/dev/null\nlock=${f.root}/data/state/deploy.lock\nhost=unset\n`);
     // The entry removes its stage (it holds credentials) and the reserved tag the finished transaction no longer needs.
-    expect(f.stages()).toEqual([]); expect(result.events.slice(core).some(line => line.startsWith("release mixin-chatbot:candidate-"))).toBe(true);
+    expect(f.stages()).toEqual([]); expect(result.events.slice(core).some(line => line.startsWith("release mixin-bot:candidate-"))).toBe(true);
   } finally { await f.cleanup(); }
 });
 
@@ -187,7 +187,7 @@ test.skipIf(!linux)("部署入口：缺少的通讯录范围在停机前选定�
     expect(handover(refused.events)).toBe(-1); expect(f.stages()).toEqual([]);
     const result = await f.run({ BOT_DIRECTORY_SCOPE: "all" }, "n\n");
     expect(result.code, result.output).toBe(0);
-    const choose = result.events.find(line => line.includes(" scripts/config/directory-scope.ts choose "))!;
+    const choose = result.events.find(line => line.includes(" ops/config/directory-scope.ts choose "))!;
     expect(choose).toContain("-e BOT_DIRECTORY_SCOPE"); expect(choose).toContain("--plan /preview/directory-scope-plan.json");
     expect(result.events.indexOf(choose)).toBeLessThan(handover(result.events));
     expect(readDeployStage(f.capture).directoryPlan).toBe('{"format":1,"all":true}\n');
@@ -200,9 +200,9 @@ test.skipIf(!linux)("部署入口：首次部署没有终端时在停机前拒�
     const result = await f.run();
     expect(result.code, result.output).toBe(1);
     expect(result.output).toContain("首次配置 AI（provider/key/model）需要在终端里运行向导；服务尚未停止，未做任何改动");
-    expect(result.events.some(line => line.includes(" scripts/runtime/data-current.ts check "))).toBe(true);
+    expect(result.events.some(line => line.includes(" ops/tools/data-current.ts check "))).toBe(true);
     expect(handover(result.events)).toBe(-1); expect(result.events.filter(line => line === "FORBIDDEN")).toEqual([]);
-    expect(result.events.some(line => line.startsWith("release mixin-chatbot:candidate-"))).toBe(true); expect(f.stages()).toEqual([]);
+    expect(result.events.some(line => line.startsWith("release mixin-bot:candidate-"))).toBe(true); expect(f.stages()).toEqual([]);
   } finally { await f.cleanup(); }
 });
 
@@ -237,7 +237,7 @@ test.skipIf(!linux)("部署入口：核心的退出码原样带回；事务已�
     rmSync(join(f.root, "data/state/deploy-transaction"));
     const refused = await f.run({ FIXTURE_CORE: "1" }, "n\n");
     expect(refused.code).toBe(1); expect(refused.output).not.toContain("部署未完成，事务已保留");
-    expect(refused.events.slice(handover(refused.events)).some(line => line.startsWith("release mixin-chatbot:candidate-"))).toBe(true);
+    expect(refused.events.slice(handover(refused.events)).some(line => line.startsWith("release mixin-bot:candidate-"))).toBe(true);
   } finally { await f.cleanup(); }
 });
 

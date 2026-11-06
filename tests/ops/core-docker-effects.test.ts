@@ -6,9 +6,9 @@ import { expect, test } from "bun:test";
 import { existsSync, symlinkSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { DockerPlatform } from "../../scripts/ops/core/docker-host.ts";
-import { candidateProjectId, DockerDeployment } from "../../scripts/ops/core/docker-deployment.ts";
-import type { NativeRunner } from "../../scripts/ops/core/native-process.ts";
+import { DockerPlatform } from "../../ops/core/docker-host.ts";
+import { candidateProjectId, DockerDeployment } from "../../ops/core/docker-deployment.ts";
+import type { NativeRunner } from "../../ops/core/native-process.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const MAIN = "unix:///run/main/docker.sock", TASK = "unix:///run/user/1002/docker.sock", TASK_UID = 1002;
@@ -84,11 +84,11 @@ test("发布标签后核对它确实指向候选镜像；没有指向时报告�
   const f = await fixture();
   try {
     const effects = await f.effects();
-    await effects.tag(ids.current!, "mixin-chatbot");
-    expect(f.tags.get("mixin-chatbot")).toBe(ids.current);
+    await effects.tag(ids.current!, "mixin-bot");
+    expect(f.tags.get("mixin-bot")).toBe(ids.current);
     f.tagNoop = true;
-    await expect(effects.tag(ids.old!, "mixin-chatbot")).rejects.toThrow(`mixin-chatbot 没有指向 ${ids.old}（当前 ${ids.current}）`);
-    await expect(effects.tag(ids.old!, "mixin-chatbot:other")).rejects.toThrow("（当前 不存在）");
+    await expect(effects.tag(ids.old!, "mixin-bot")).rejects.toThrow(`mixin-bot 没有指向 ${ids.old}（当前 ${ids.current}）`);
+    await expect(effects.tag(ids.old!, "mixin-bot:other")).rejects.toThrow("（当前 不存在）");
   } finally { await f.cleanup(); }
 });
 

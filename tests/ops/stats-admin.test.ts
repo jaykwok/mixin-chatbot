@@ -7,8 +7,8 @@ import { mkdtemp, mkdir } from "node:fs/promises";
 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { collectAll, collectGroup } from "../../scripts/ops/stats-admin.ts";
-import { cacheReadRate, formatCacheRate } from "../../scripts/lib/usage.ts";
+import { collectAll, collectGroup } from "../../ops/tools/stats-admin.ts";
+import { cacheReadRate, formatCacheRate } from "../../ops/lib/usage.ts";
 import { emptyTokens } from "../../src/agent/stats-ledger.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -59,7 +59,7 @@ function assistantMsg(at: string): string {
 }
 
 async function makeRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-stats-"));
+  const root = await mkdtemp(join(tmpdir(), "mixin-bot-stats-"));
   const write = async (group: string, user: string, lines: string[]) => {
     await mkdir(join(root, group, "users", user), { recursive: true });
     await writeFile(join(root, group, "users", user, "stats.records"), lines.join("\n") + "\n");
@@ -97,7 +97,7 @@ describe("usage stats", () => {
     const user = join(fixture.root, "data/g/users/u"); await mkdir(user, { recursive: true });
     await writeFile(join(user, "stats.records"), JSON.stringify({ type: "compaction", timestamp: "2026-09-11T12:01:00Z",
       usage: { input: 321, output: 20, cacheRead: 0, cacheWrite: 9, cost: { total: 0.5 } } }) + "\n");
-    const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../../scripts/ops/stats-admin.ts", import.meta.url)), "g", "--group-id"],
+    const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../../ops/tools/stats-admin.ts", import.meta.url)), "g", "--group-id"],
       { cwd: fixture.root, env: process.env, stdout: "pipe", stderr: "pipe", windowsHide: true });
     const timer = setTimeout(() => child.kill(), 15000);
     try {

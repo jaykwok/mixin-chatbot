@@ -26,7 +26,7 @@ test.skipIf(!bash || !existsSync(bash))("update handles pending transactions bef
   const git = async (...args: string[]) => {
     const result = await run(["git", ...args]); expect(result.code, result.text).toBe(0); return result.text.trim();
   };
-  const source = await readFile(join(project, "scripts/ops/ops.sh"), "utf8");
+  const source = await readFile(join(project, "scripts/ops.sh"), "utf8");
   const start = source.indexOf("\nchoose_pending_action() {"), end = source.indexOf("\nshow_logs() {");
   expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
   const launcher = join(f.root, "launch.sh");
@@ -35,7 +35,7 @@ set -uo pipefail
 PROJECT_DIR="$1"
 . '${posix(join(project, "scripts/lib/common.sh"))}'
 . '${posix(join(project, "scripts/lib/ops-runtime.sh"))}'
-CONTAINER=mixin-chatbot; STATE_DIR="$PROJECT_DIR/data/state"; LOG_DIR="$PROJECT_DIR/logs"; OPS_SOURCE_DIR=/fixed-source
+CONTAINER=mixin-bot; STATE_DIR="$PROJECT_DIR/data/state"; LOG_DIR="$PROJECT_DIR/logs"; OPS_SOURCE_DIR=/fixed-source
 cd "$PROJECT_DIR"
 P(){ echo "$*"; }; OK(){ echo "$*"; }; WA(){ echo "$*"; }; ER(){ echo "$*" >&2; }
 acquire_deploy_lock(){ :; }; doctor(){ echo DOCTOR; }
@@ -69,12 +69,12 @@ update
     await mkdir(state, { recursive: true });
     await writeFile(join(work, ".gitignore"), "data/\nlogs/\ntmp/\nbackup/\n");
     // Every path of UPGRADER_EXPORT_PATHS exists in each commit; the Dockerfile content names the version.
-    await mkdir(join(work, "scripts/deploy"), { recursive: true }); await mkdir(join(work, "scripts/lib")); await mkdir(join(work, "scripts/runtime"));
-    await writeFile(join(work, "scripts/lib/fixture.sh"), ""); await writeFile(join(work, "scripts/runtime/fixture.ts"), "");
-    await writeFile(join(work, "scripts/deploy/upgrade.sh"), `#!/usr/bin/env bash
+    await mkdir(join(work, "scripts"), { recursive: true }); await mkdir(join(work, "scripts/lib")); await mkdir(join(work, "ops/tools"), { recursive: true });
+    await writeFile(join(work, "scripts/lib/fixture.sh"), ""); await writeFile(join(work, "ops/tools/fixture.ts"), "");
+    await writeFile(join(work, "scripts/upgrade.sh"), `#!/usr/bin/env bash
 set -euo pipefail
-here="$(cd "$(dirname "\${BASH_SOURCE[0]}")/../.." && pwd)"
-[ -f "$here/scripts/lib/fixture.sh" ] && [ -f "$here/scripts/runtime/fixture.ts" ] || exit 44
+here="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
+[ -f "$here/scripts/lib/fixture.sh" ] && [ -f "$here/ops/tools/fixture.ts" ] || exit 44
 input=''; IFS= read -r input || true
 printf 'upgrader version=%s dir=%s args=%s stdin=%s\\n' "$(cat "$here/Dockerfile")" "\${here#"$1"/}" "\${*:2}" "$input" >> "$FIXTURE_EVENTS"
 if [ "\${FIXTURE_UPGRADER_HOLD:-0}" = 1 ]; then
@@ -163,9 +163,9 @@ exit "\${FIXTURE_UPGRADER_EXIT:-0}"
     // A transaction without a pinned runtime was not started by the core: this release does not take it over.
     result = await update({ UPDATE_TRANSACTION_ACTION: "rollback" }, "unexpected\n");
     expect(result.code, result.text).toBe(1); expect(result.text).toContain("不是由运维核心开始的"); expect(await events_()).toEqual([]);
-    const pinnedRuntime = "a".repeat(64), pinned = `.console/runtime/source-${pinnedRuntime}/scripts/ops/core/cli.ts`;
+    const pinnedRuntime = "a".repeat(64), pinned = `.console/runtime/source-${pinnedRuntime}/ops/core/cli.ts`;
     await writeFile(join(snapshot, "host-runtime"), pinnedRuntime + "\n");
-    await mkdir(join(work, `.console/runtime/source-${pinnedRuntime}/scripts/ops/core`), { recursive: true }); await writeFile(join(work, pinned), "");
+    await mkdir(join(work, `.console/runtime/source-${pinnedRuntime}/ops/core`), { recursive: true }); await writeFile(join(work, pinned), "");
     result = await update({ UPDATE_TRANSACTION_ACTION: "rollback" }, "unexpected\n");
     expect(result.code, result.text).toBe(0);
     expect(await events_()).toEqual([`core --no-env-file <project>/${pinned} deployment upgrade --project <project> --original ${old} --target ${"b".repeat(40)} --branch main --rollback stdin=`]);
@@ -180,7 +180,7 @@ exit "\${FIXTURE_UPGRADER_EXIT:-0}"
     for (const action of ["continue", "rollback"]) {
       result = await update({ UPDATE_TRANSACTION_ACTION: action }, "unexpected\n");
       expect(result.code, result.text).toBe(0); expect(result.text).toContain("未完成的部署");
-      expect(await events_()).toEqual([`core --no-env-file /fixed-source/scripts/ops/core/cli.ts deployment deploy --project <project>${action === "rollback" ? " --rollback" : ""} stdin=`]);
+      expect(await events_()).toEqual([`core --no-env-file /fixed-source/ops/core/cli.ts deployment deploy --project <project>${action === "rollback" ? " --rollback" : ""} stdin=`]);
     }
     await writeFile(join(snapshot, "host-runtime"), pinnedRuntime + "\n");
     result = await update({ UPDATE_TRANSACTION_ACTION: "continue" }, "unexpected\n");

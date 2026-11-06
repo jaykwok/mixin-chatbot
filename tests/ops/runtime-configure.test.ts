@@ -2,15 +2,15 @@ import { expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { runRuntime } from "../../scripts/ops/core/runtime-configure.ts";
-import { createMaintenanceHost, type MaintenanceHostOptions } from "../../scripts/ops/core/maintenance-host.ts";
-import { acquireDeploymentLock, type DeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { configurationSnapshot } from "../../scripts/config/configuration-form.ts";
-import { applyConfiguration, restoreConfiguration, finishConfiguration } from "../../scripts/config/configuration-transaction.ts";
+import { runRuntime } from "../../ops/core/runtime-configure.ts";
+import { createMaintenanceHost, type MaintenanceHostOptions } from "../../ops/core/maintenance-host.ts";
+import { acquireDeploymentLock, type DeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { configurationSnapshot } from "../../ops/config/configuration-form.ts";
+import { applyConfiguration, restoreConfiguration, finishConfiguration } from "../../ops/config/configuration-transaction.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
-import { prepareConsoleDir } from "../../scripts/ops/console/state.ts";
-import { nextRuntimeDraft, readRuntimeSettings, writeRuntimeDraft } from "../../scripts/config/runtime-draft.ts";
+import { prepareConsoleDir } from "../../ops/core/console-state.ts";
+import { nextRuntimeDraft, readRuntimeSettings, writeRuntimeDraft } from "../../ops/config/runtime-draft.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 // All prior Shell/PowerShell lifecycle cases now exercise the one host policy. Thin-wrapper argv/exit codes are
@@ -21,9 +21,9 @@ test("共用运行参数窗口：预检后停机，保留原状态，拒绝陌�
     const f = await tempFixture("runtime-window-" + scenario + "-");
     let server: ReturnType<typeof Bun.serve> | undefined, lock: DeploymentLock | undefined;
     try {
-      for (const tree of ["scripts", "src", "ui"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};"); }
+      for (const tree of ["console", "ops", "scripts", "src"]) { await mkdir(join(f.root, tree)); await writeFile(join(f.root, tree, "fixture.ts"), "export {};"); }
       for (const dir of ["data/state", "data/config"]) await mkdir(join(f.root, dir), { recursive: true });
-      await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+      await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
       prepareConsoleDir(join(f.root, ".console"));
       const config = join(f.root, "data/config/runtime.json"), original = '{ "BOT_MAX_ACTIVE_REQUESTS": "32" }\n';
       await writeFile(config, original);
@@ -31,7 +31,7 @@ test("共用运行参数窗口：预检后停机，保留原状态，拒绝陌�
       const initial = scenario === "stopped" ? "stopped" : scenario === "missing" ? "absent" : ["foreground", "foreground-task", "paused"].includes(scenario) ? "unsupported" : "running";
       let state: "running" | "stopped" | "absent" | "unsupported" = initial;
       let current = original, starts = 0; const events: string[] = [];
-      const ready = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+      const ready = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
       server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(ready, { status: starts === 1 && ["health-fail", "rollback-fail"].includes(scenario) ? 503 : 200 }) });
       await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...ready, port: server.port }));
       if (scenario === "guarded") await writeFile(join(f.root, "data/state/deploy-transaction"), "fixture\n");

@@ -136,10 +136,10 @@ data_owner_user() { service_user_from_data "$1"; }
 container_cases() {
     local data="$PROJECT_DIR/data" name
     rootful
-    container mixin-chatbot "c0ffee|1000:1000|sha256:old|$data"
+    container mixin-bot "c0ffee|1000:1000|sha256:old|$data"
     check read original_service_container
     result read-fields "$ORIGINAL_CONTAINER_ID|$ORIGINAL_CONTAINER_USER|$ORIGINAL_CONTAINER_IMAGE|$ORIGINAL_CONTAINER_DATA"
-    container mixin-chatbot
+    container mixin-bot
     check read-missing original_service_container
     : > "$fixture/down"
     check read-down original_service_container
@@ -148,7 +148,7 @@ container_cases() {
     identity() {
         local name="$1" rootless="$2"
         shift 2
-        container mixin-chatbot "$*"
+        container mixin-bot "$*"
         SERVICE_USER='' SERVICE_USER_SOURCE=''
         original_service_container 2> /dev/null
         check "from-$name" service_user_from_container "$rootless"
@@ -165,9 +165,9 @@ container_cases() {
     identity rootless-user 1 "c0ffee|1000:1000|sha256:old|$data"
     # One-off containers of the operations entry use the service container's identity, then the owner of data/config.
     capture one-off-container service_container_user
-    container mixin-chatbot "c0ffee|appuser|sha256:old|$data"
+    container mixin-bot "c0ffee|appuser|sha256:old|$data"
     owner 1234:1234; capture one-off-named service_container_user
-    container mixin-chatbot
+    container mixin-bot
     capture one-off-owner service_container_user
     rootless; capture one-off-rootless service_container_user
     rootful; owner ''; capture one-off-unreadable service_container_user
@@ -182,7 +182,7 @@ container_cases() {
 
 deploy_cases() {
     local data="$PROJECT_DIR/data"
-    load_function "$here/../../scripts/deploy/deploy.sh" determine_service_user
+    load_function "$here/../../scripts/deploy.sh" determine_service_user
     deploy_identity() {
         local name="$1"
         SERVICE_USER='' SERVICE_USER_SOURCE='' DOCKER_ROOTLESS="$2"
@@ -192,18 +192,18 @@ deploy_cases() {
         result "deploy-$name-questions" "$(wc -l < "$fixture/questions" | tr -d ' ')"
     }
     rootful; uid 0; echo n > "$fixture/answer"
-    container mixin-chatbot "c0ffee|1000:1000|sha256:old|$data"
+    container mixin-bot "c0ffee|1000:1000|sha256:old|$data"
     deploy_identity container 0
-    container mixin-chatbot "c0ffee|appuser|sha256:old|$data"
+    container mixin-bot "c0ffee|appuser|sha256:old|$data"
     deploy_identity unclear 0
     : > "$fixture/down"
     deploy_identity down 0
     rm -f -- "$fixture/down"
     # No service container: a leftover rollback container is looked at first.
-    container mixin-chatbot
-    container mixin-chatbot-rollback "d00d|1000:1000|sha256:old|$data"
+    container mixin-bot
+    container mixin-bot-rollback "d00d|1000:1000|sha256:old|$data"
     deploy_identity rollback-left 0
-    container mixin-chatbot-rollback
+    container mixin-bot-rollback
     # Never deployed: the image default.
     deploy_identity first 0
     deploy_identity first-rootless 1
@@ -220,7 +220,7 @@ deploy_cases() {
     deploy_identity confirmed-rootless 1
     rm -f -- "$STATE_DIR/bot-port"
     # The directory step: data/ itself (made by root before the first deployment) goes to the default identity as well.
-    load_function "$here/../../scripts/deploy/deploy.sh" prepare_service_directories
+    load_function "$here/../../scripts/deploy.sh" prepare_service_directories
     DATA_DIR="$data" CONFIG_DIR="$data/config" RUNTIME_DIR="$data/runtime" RUNTIME_HOME_DIR="$data/runtime/home"
     LOG_DIR="$PROJECT_DIR/logs"
     mkdir -p "$RUNTIME_HOME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup"
@@ -274,8 +274,8 @@ files_cases() {
 }
 
 guard_cases() {
-    load_function "$here/../../scripts/ops/ops.sh" guard_one_off_container
-    load_function "$here/../../scripts/ops/ops.sh" deployment_in_progress
+    load_function "$here/../../scripts/ops.sh" guard_one_off_container
+    load_function "$here/../../scripts/ops.sh" deployment_in_progress
     check guard-clear isolated guard_one_off_container
     : > "$fixture/held"
     check guard-busy isolated guard_one_off_container
@@ -296,7 +296,7 @@ guard_cases() {
     check busy-pointer deployment_in_progress
     rm -f -- "$STATE_DIR/deploy-transaction"
     # root upgrading a checkout that a docker group user owns: git's refusal is explained, never overridden.
-    load_function "$here/../../scripts/ops/ops.sh" require_git_checkout
+    load_function "$here/../../scripts/ops.sh" require_git_checkout
     owner jay
     git() { printf "fatal: detected dubious ownership in repository at '%s'\n" "$PROJECT_DIR" >&2; return 128; }
     check git-foreign require_git_checkout

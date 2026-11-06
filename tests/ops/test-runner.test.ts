@@ -4,7 +4,7 @@ import { mkdir, readdir, readFile, realpath, rename, rm, symlink, writeFile } fr
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tempFixture } from "../helpers/temp.ts";
-import { defaultJobs, measuredWeights, mergeJunit, parseOptions, partition, recordWeights, summarize, testFiles, testTargets, timingKey } from "../../scripts/test.ts";
+import { defaultJobs, measuredWeights, mergeJunit, parseOptions, partition, recordWeights, summarize, testFiles, testTargets, timingKey } from "../run.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const gitBash = process.platform === "win32" ? [process.env.ProgramFiles, process.env["ProgramFiles(x86)"]]
@@ -17,7 +17,7 @@ async function runTests(root: string | undefined, file: string | string[], overr
   else env.MIXIN_TEST_WORK_ROOT = root;
   // Bun's agent mode (set by coding agents) leaves out the "(pass)" lines these tests read.
   delete env.CLAUDECODE; delete env.AI_AGENT;
-  const child = Bun.spawn([process.execPath, join(project, "scripts/test.ts"), ...(Array.isArray(file) ? file : [file])], {
+  const child = Bun.spawn([process.execPath, join(project, "tests/run.ts"), ...(Array.isArray(file) ? file : [file])], {
     env, stdout: "pipe", stderr: "pipe", windowsHide: true });
   let exitedAt = 0;
   const [code, out, err] = await Promise.all([child.exited.then(code => { exitedAt = Date.now(); return code; }),
@@ -39,7 +39,7 @@ test("explicit missing test paths fail before creating a run or executing any te
     // Keep the regression bounded even if missing paths accidentally expand to the whole suite again.
     const copy = join(fixture.root, "project"), work = join(fixture.root, "work"), marker = join(fixture.root, "ran");
     await mkdir(join(copy, "scripts"), { recursive: true }); await mkdir(join(copy, "tests"));
-    await writeFile(join(copy, "scripts/test.ts"), await readFile(join(project, "scripts/test.ts")));
+    await writeFile(join(copy, "tests/run.ts"), await readFile(join(project, "tests/run.ts")));
     await writeFile(join(copy, "tests/sentinel.test.ts"), `import { test } from "bun:test";
 import { writeFileSync } from "node:fs";
 test("sentinel", () => { writeFileSync(${JSON.stringify(marker)}, "unexpected run"); });`);
@@ -47,7 +47,7 @@ test("sentinel", () => { writeFileSync(${JSON.stringify(marker)}, "unexpected ru
       join(copy, "absolute-missing.test.ts"), "deleted.test.ts"];
     for (const [i, path] of missing.entries()) {
       const args = i % 2 ? ["tests/sentinel.test.ts", path, "--jobs=2"] : [path, "--jobs=1"];
-      const child = Bun.spawn([process.execPath, join(copy, "scripts/test.ts"), ...args], {
+      const child = Bun.spawn([process.execPath, join(copy, "tests/run.ts"), ...args], {
         cwd: fixture.root, env: { ...process.env, MIXIN_TEST_WORK_ROOT: work }, stdout: "pipe", stderr: "pipe", windowsHide: true,
       });
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);

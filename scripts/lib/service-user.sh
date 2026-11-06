@@ -55,14 +55,14 @@ default_service_user() {
     if [ "$1" = 1 ]; then echo 0:0; else echo "$DEFAULT_ROOTFUL_SERVICE_USER"; fi
 }
 
-# 原服务容器 mixin-chatbot（运行或停止）：ORIGINAL_CONTAINER_ID、_USER（--user 的值）、_IMAGE 和 _DATA
+# 原服务容器 mixin-bot（运行或停止）：ORIGINAL_CONTAINER_ID、_USER（--user 的值）、_IMAGE 和 _DATA
 # （/app/data 挂载的来源，没有时为空）。返回 0 找到；2 不存在；1 其他错误（原因写到标准错误）。
 original_service_container() {
     local output
     ORIGINAL_CONTAINER_ID='' ORIGINAL_CONTAINER_USER='' ORIGINAL_CONTAINER_IMAGE='' ORIGINAL_CONTAINER_DATA=''
-    if ! output="$(docker container inspect --format '{{.Id}}|{{.Config.User}}|{{.Image}}|{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' mixin-chatbot 2>&1)"; then
+    if ! output="$(docker container inspect --format '{{.Id}}|{{.Config.User}}|{{.Image}}|{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' mixin-bot 2>&1)"; then
         [[ "$output" != *"No such container"* ]] || return 2
-        printf '无法读取原容器 mixin-chatbot：%s\n' "$output" >&2
+        printf '无法读取原容器 mixin-bot：%s\n' "$output" >&2
         return 1
     fi
     IFS='|' read -r ORIGINAL_CONTAINER_ID ORIGINAL_CONTAINER_USER ORIGINAL_CONTAINER_IMAGE ORIGINAL_CONTAINER_DATA <<< "$output"
@@ -74,11 +74,11 @@ service_user_from_container() {
     local rootless="$1" data
     data="$(realpath -m -- "$PROJECT_DIR/data")"
     if [ -z "$ORIGINAL_CONTAINER_DATA" ] || [ "$(realpath -m -- "$ORIGINAL_CONTAINER_DATA")" != "$data" ]; then
-        echo "容器 mixin-chatbot 的数据目录（${ORIGINAL_CONTAINER_DATA:-未挂载}）不是本项目的 ${data}，无法确认它是本项目的服务" >&2
+        echo "容器 mixin-bot 的数据目录（${ORIGINAL_CONTAINER_DATA:-未挂载}）不是本项目的 ${data}，无法确认它是本项目的服务" >&2
         return 1
     fi
     service_user_value_valid user "$ORIGINAL_CONTAINER_USER" ||
-        { echo "原容器 mixin-chatbot 的运行身份不是数值 UID:GID（${ORIGINAL_CONTAINER_USER:-镜像默认用户}），无法可靠确定" >&2; return 1; }
+        { echo "原容器 mixin-bot 的运行身份不是数值 UID:GID（${ORIGINAL_CONTAINER_USER:-镜像默认用户}），无法可靠确定" >&2; return 1; }
     service_user_fits_daemon "$ORIGINAL_CONTAINER_USER" "$rootless" || return 1
     SERVICE_USER="$ORIGINAL_CONTAINER_USER"
     SERVICE_USER_SOURCE=container

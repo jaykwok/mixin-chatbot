@@ -11,7 +11,7 @@ import { mkdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { symlinkUnavailable } from "../helpers/links.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import { DeploymentGit } from "../../scripts/ops/core/deployment-git.ts";
+import { DeploymentGit } from "../../ops/core/deployment-git.ts";
 import { windowsUpgradeFixture } from "../helpers/windows-upgrade.ts";
 
 type Files = Record<string, string>;

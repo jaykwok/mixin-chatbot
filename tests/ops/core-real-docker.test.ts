@@ -3,10 +3,10 @@ import { expect, test } from "bun:test";
 import { chown, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { DockerPlatform } from "../../scripts/ops/core/docker-host.ts";
-import { newDockerTask, recoverDockerTask, runDockerTask } from "../../scripts/ops/core/docker-task.ts";
+import { DockerPlatform } from "../../ops/core/docker-host.ts";
+import { newDockerTask, recoverDockerTask, runDockerTask } from "../../ops/core/docker-task.ts";
 import type { DockerTaskRecord } from "../../src/contracts/ops-writer.ts";
-import { publishJson } from "../../scripts/lib/atomic-file.ts";
+import { publishJson } from "../../src/lib/atomic-file.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const enabled = process.platform === "linux" && process.env.MIXIN_CORE_DOCKER === "1";
@@ -44,9 +44,9 @@ test.skipIf(!enabled)("真实 Docker：非零退出、客户端取消、强杀�
 
     const crashArgs = looping("crash"), third = make(crashArgs), thirdPath = join(f.root, "third.json"), launcher = join(f.root, "launcher.ts");
     const moduleUrl = (relative: string) => pathToFileURL(join(import.meta.dir, "../../", relative)).href;
-    await writeFile(launcher, `import {DockerPlatform} from ${JSON.stringify(moduleUrl("scripts/ops/core/docker-host.ts"))};
-import {runDockerTask} from ${JSON.stringify(moduleUrl("scripts/ops/core/docker-task.ts"))};
-import {publishJson} from ${JSON.stringify(moduleUrl("scripts/lib/atomic-file.ts"))};
+    await writeFile(launcher, `import {DockerPlatform} from ${JSON.stringify(moduleUrl("ops/core/docker-host.ts"))};
+import {runDockerTask} from ${JSON.stringify(moduleUrl("ops/core/docker-task.ts"))};
+import {publishJson} from ${JSON.stringify(moduleUrl("src/lib/atomic-file.ts"))};
 const host=await DockerPlatform.connect(${JSON.stringify(f.root)});
 await runDockerTask(host.taskDriver(),${JSON.stringify(third)},${JSON.stringify(crashArgs)},value=>publishJson(${JSON.stringify(thirdPath)},value));`);
     child = Bun.spawn([process.execPath, "--no-env-file", launcher], { cwd: f.root, env: process.env, stdin: "ignore", stdout: "ignore", stderr: "pipe" });

@@ -28,7 +28,7 @@ test("a deep branch cannot hide a shallow sibling", async () => {
 
 
 async function makeWorkspace(): Promise<{ root: string; workspace: string }> {
-  const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-index-"));
+  const root = await mkdtemp(join(tmpdir(), "mixin-bot-index-"));
   const workspace = join(root, "workspace");
   await mkdir(join(workspace, "产品资料", "安全大脑"), { recursive: true });
   await mkdir(join(workspace, "案例"), { recursive: true });
@@ -213,7 +213,7 @@ describe("materials index", () => {
   });
 
   test("survives a missing workspace instead of blocking session creation", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-index-missing-"));
+    const root = await mkdtemp(join(tmpdir(), "mixin-bot-index-missing-"));
     try {
       const summary = await ensureMaterialsIndex({
         workspaceDir: join(root, "workspace"),
@@ -227,7 +227,7 @@ describe("materials index", () => {
   });
 
   test("an unreadable workspace is not advertised as a complete empty index", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-index-incomplete-"));
+    const root = await mkdtemp(join(tmpdir(), "mixin-bot-index-incomplete-"));
     try {
       const summary = await ensureMaterialsIndex({
         workspaceDir: join(root, "missing"),

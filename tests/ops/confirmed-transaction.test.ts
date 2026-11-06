@@ -2,11 +2,11 @@ import { expect, test } from "bun:test";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertConfirmedTransaction, confirmTransaction, readTransaction } from "../../scripts/lib/confirmed-transaction.ts";
-import { opsCommand } from "../../scripts/ops/shared/platform.ts";
-import { operationPreparer } from "../../scripts/ops/console/prepare-operation.ts";
-import { operationArgs, operationScope } from "../../scripts/ops/console/operations.ts";
-import { Views } from "../../scripts/ops/console/views.ts";
+import { assertConfirmedTransaction, confirmTransaction, readTransaction } from "../../ops/lib/confirmed-transaction.ts";
+import { opsCommand } from "../../ops/core/platform.ts";
+import { operationPreparer } from "../../console/server/prepare-operation.ts";
+import { operationArgs, operationScope } from "../../ops/core/operations.ts";
+import { Views } from "../../console/server/views.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { opsShellFunctions } from "../helpers/ops-shell.ts";
 
@@ -75,10 +75,10 @@ for (const action of ["resume", "rollback"] as const) test(`console ${action} ca
 // The check runs with the ops runtime (ops_bun): the console's Bun when it names one, never a bare `bun` from PATH.
 test.skipIf(!bash)("Bash ops rejects a changed confirmation under its deployment lock before dispatch", async () => {
   const fixture = await tempFixture("confirmed-bash-");
-  const root = join(fixture.root, "project"), lib = join(root, "scripts/lib");
+  const root = join(fixture.root, "project"), lib = join(root, "ops/lib");
   await synthetic(root); await mkdir(lib, { recursive: true });
-  await copyFile(join(project, "scripts/lib/confirmed-transaction.ts"), join(lib, "confirmed-transaction.ts"));
-  const ops = await readFile(join(project, "scripts/ops/ops.sh"), "utf8");
+  await copyFile(join(project, "ops/lib/confirmed-transaction.ts"), join(lib, "confirmed-transaction.ts"));
+  const ops = await readFile(join(project, "scripts/ops.sh"), "utf8");
   const update = ops.match(/^update\(\) \{[\s\S]*?^\}/m)![0];
   const command = ops.match(/^transaction_command\(\) \{[\s\S]*?^\}/m)![0];
   const driver = join(fixture.root, "check.sh");

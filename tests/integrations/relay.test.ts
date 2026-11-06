@@ -509,7 +509,7 @@ test("relay test runs the self-check from the deployment directory and prints la
   try {
     await mkdir(join(f.root, "data", "config"), { recursive: true });
     await writeFile(join(f.root, "data", "config", "relay.json"), JSON.stringify({ ...base, endpoint: f.config.endpoint, forcePathStyle: true }));
-    const admin = fileURLToPath(new URL("../../scripts/ops/relay-admin.ts", import.meta.url));
+    const admin = fileURLToPath(new URL("../../ops/tools/relay-admin.ts", import.meta.url));
     const run = async () => {
       const child = Bun.spawn([process.execPath, admin, "test"], { cwd: f.root, stdout: "pipe", stderr: "pipe", env: { ...process.env, FORCE_COLOR: "0" } });
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);

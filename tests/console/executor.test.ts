@@ -1,13 +1,13 @@
 import { expect, test } from "bun:test";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { executeTask } from "../../scripts/ops/console/executor.ts";
-import { operationArgs, operationCommand, operationObserver } from "../../scripts/ops/console/operations.ts";
-import { PlanStore } from "../../scripts/ops/console/plans.ts";
-import type { PlanFacts } from "../../scripts/ops/console/plans.ts";
-import { buildExecutor, executorIdentity, hostedTask, launchTask, reconcileTasks, verifyExecutor } from "../../scripts/ops/console/task-host.ts";
-import { TaskStore } from "../../scripts/ops/console/tasks.ts";
-import type { TaskRequest } from "../../scripts/ops/console/tasks.ts";
+import { executeTask } from "../../console/server/executor.ts";
+import { operationArgs, operationCommand, operationObserver } from "../../ops/core/operations.ts";
+import { PlanStore } from "../../ops/core/plans.ts";
+import type { PlanFacts } from "../../ops/core/plans.ts";
+import { buildExecutor, executorIdentity, hostedTask, launchTask, reconcileTasks, verifyExecutor } from "../../console/server/task-host.ts";
+import { TaskStore } from "../../ops/core/tasks.ts";
+import type { TaskRequest } from "../../ops/core/tasks.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const actor = { pid: 1234, startedAt: "fixture" };

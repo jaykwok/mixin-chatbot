@@ -1,18 +1,18 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { AuditLog } from "../../scripts/ops/console/audit.ts";
-import { readPage } from "../../scripts/ops/console/read-pages.ts";
-import { readRoutes } from "../../scripts/ops/console/read-routes.ts";
+import { AuditLog } from "../../console/server/audit.ts";
+import { readPage } from "../../console/server/read-pages.ts";
+import { readRoutes } from "../../console/server/read-routes.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import type { ReadPage } from "../../ui/console/src/contract.ts";
+import type { ReadPage } from "../../console/ui/src/contract.ts";
 
 test("只读页：无数据/无配置，日志筛选脱敏，设置错误不泄漏配置片段", async () => {
   const fixture = await tempFixture("console-read-pages-");
   try {
     mkdirSync(join(fixture.root, "logs"));
     mkdirSync(join(fixture.root, "data/config"), { recursive: true });
-    writeFileSync(join(fixture.root, "logs/mixin-chatbot.log"), "2026 - INFO - job-123 13800138000 token=very-secret\n2026 - ERROR - job-456 failed\n");
+    writeFileSync(join(fixture.root, "logs/mixin-bot.log"), "2026 - INFO - job-123 13800138000 token=very-secret\n2026 - ERROR - job-456 failed\n");
     expect((await readPage(fixture.root, "logs", { task: "job-123", level: "info" })).rows).toEqual([["info", "2026 - INFO - job-123 138****8000 token=***"]]);
     expect((await readPage(fixture.root, "logs", { keyword: "nothing" })).rows).toEqual([]);
     expect((await readPage(fixture.root, "storage")).rows).toEqual([]);

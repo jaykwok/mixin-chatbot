@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
-import { assertDataDirectory } from "../../../scripts/lib/group-data.ts";
+import { assertDataDirectory } from "../../lib/group-data.ts";
 import { groupSegment } from "../../core/layout.ts";
 import { assertDurableSchema } from "../schema-gate.ts";
 import { missing, spaceDirectories } from "../space-databases.ts";

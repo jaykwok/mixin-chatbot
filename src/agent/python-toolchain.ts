@@ -6,7 +6,7 @@ import { DOCUMENT_TOOLCHAIN_PACKAGES, DOCUMENT_TOOLCHAIN_TIMEOUT } from "../core
 import { KeyedQueue, application, waitFor } from "../core/lifecycle.ts";
 import { runProcess } from "../core/process.ts";
 import { log } from "../core/log.ts";
-import { DOCUMENT_TOOLCHAIN_MARKER, documentMarker } from "../../scripts/runtime/document-manifest.ts";
+import { DOCUMENT_TOOLCHAIN_MARKER, documentMarker } from "./document-manifest.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
 const lock = join(project, "uv.lock"), manifest = join(project, "pyproject.toml"), pythonPin = join(project, ".python-version");

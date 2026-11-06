@@ -20,7 +20,7 @@ export interface DockerTaskRecord {
   network: OpsNetwork;
   access?: DockerDataAccess;
   input?: OpsTaskInput;
-  /** Fixed host code over the image's scripts/src; dependencies still come from the deployed image. */
+  /** Fixed host code over the image's ops/src; dependencies still come from the deployed image. */
   runtime?: string;
   runtimeEnvironment?: string;
   reports?: OpsReports;

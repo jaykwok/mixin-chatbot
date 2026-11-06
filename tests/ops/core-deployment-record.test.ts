@@ -1,14 +1,14 @@
 import { expect, test } from "bun:test";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { DeploymentRecord } from "../../scripts/ops/core/deployment-record.ts";
+import { DeploymentRecord } from "../../ops/core/deployment-record.ts";
 import { OPS_DEPLOYMENT_FILE } from "../../src/core/ops-deployment-state.ts";
-import { parseDeploymentExecution, type DeploymentCheckpoint } from "../../scripts/ops/core/deployment-contract.ts";
-import { serializeTransactionRecord, type TransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
-import { newDockerTask } from "../../scripts/ops/core/docker-task.ts";
+import { parseDeploymentExecution, type DeploymentCheckpoint } from "../../ops/core/deployment-contract.ts";
+import { serializeTransactionRecord, type TransactionRecord } from "../../ops/core/transaction-record.ts";
+import { newDockerTask } from "../../ops/core/docker-task.ts";
 import type { DockerTaskRecord } from "../../src/contracts/ops-writer.ts";
-import { recoveryPlan, recoveryView } from "../../scripts/ops/console/lifecycle.ts";
-import type { OpsResult } from "../../scripts/ops/core/result.ts";
+import { recoveryPlan, recoveryView } from "../../ops/core/recovery-plan.ts";
+import type { OpsResult } from "../../ops/core/result.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 async function fixture() {
@@ -35,7 +35,7 @@ test("部署执行日志先保存阶段，再记不可变写入者；未回收�
     await f.store.checkpoint(f.checkpoint); await f.store.writer(f.writer);
     const before = await readFile(f.path, "utf8");
     expect(before).not.toContain("synthetic-private-value"); expect(before).not.toContain('"args"');
-    await expect(f.store.checkpoint({ ...f.checkpoint, step: "cleanup-revisions" })).rejects.toThrow("尚未回收");
+    await expect(f.store.checkpoint({ ...f.checkpoint, step: "enable-verification" })).rejects.toThrow("尚未回收");
     await expect(f.store.writer({ ...f.writer, id: "e".repeat(32) })).rejects.toThrow("覆盖");
     await expect(f.store.writer({ ...f.writer, image: "sha256:" + "b".repeat(64) })).rejects.toThrow("固定身份");
     expect(await readFile(f.path, "utf8")).toBe(before);
@@ -44,7 +44,7 @@ test("部署执行日志先保存阶段，再记不可变写入者；未回收�
     await expect(f.store.writer(created)).rejects.toThrow("退回");
     await expect(f.store.writer({ ...created, phase: "reaped", container: "b".repeat(64) })).rejects.toThrow("固定身份");
     await f.store.writer({ ...created, phase: "reaped" });
-    await f.store.checkpoint({ ...f.checkpoint, step: "cleanup-revisions" });
+    await f.store.checkpoint({ ...f.checkpoint, step: "enable-verification" });
     expect(f.store.read()?.writer?.phase).toBe("reaped");
     f.unlock(); expect(() => f.store.read()).toThrow("not locked");
   } finally { await f.cleanup(); }
@@ -66,7 +66,7 @@ test("损坏、未知格式、另一个运行包或替换的快照都拒绝覆�
         const path = join(f.snapshot, "transaction"); await writeFile(path, (await readFile(path, "utf8")).replace("bot_port=2022", "bot_port=2023"));
       }
       const before = await readFile(f.path, "utf8");
-      await expect(f.store.checkpoint({ ...f.checkpoint, step: "cleanup-revisions" })).rejects.toThrow();
+      await expect(f.store.checkpoint({ ...f.checkpoint, step: "enable-verification" })).rejects.toThrow();
       expect(await readFile(f.path, "utf8")).toBe(before);
     } finally { await f.cleanup(); }
   }
@@ -87,7 +87,7 @@ test("成功收尾要求磁盘提交、写入者回收及明确最终运行状�
     await f.store.finish({ ...f.result, command: "resume", message: "再次确认" }, "forward");
     expect(await readFile(f.path, "utf8")).toBe(before);
     await expect(f.store.checkpoint({ ...f.checkpoint, direction: "rollback", step: "restore-data" })).rejects.toThrow();
-    await expect(f.store.checkpoint({ ...f.checkpoint, step: "prepare-data" })).rejects.toThrow("不能重复");
+    await expect(f.store.checkpoint({ ...f.checkpoint, step: "enable-verification" })).rejects.toThrow("不能重复");
     expect(await readFile(f.path, "utf8")).toBe(before);
     await f.store.checkpoint({ ...f.checkpoint, step: "start-candidate" });
     expect(f.store.read()?.completion).toBeUndefined();

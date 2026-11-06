@@ -3,12 +3,12 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { configurationSnapshot, CONFIGURATION_FILES } from "../../scripts/config/configuration-form.ts";
+import { configurationSnapshot, CONFIGURATION_FILES } from "../../ops/config/configuration-form.ts";
 import { installConfigurationStage, parseConfigurationStage, sameConfiguration, serializeConfigurationStage, stageName,
-  type ConfigurationStage } from "../../scripts/config/configuration-stage.ts";
+  type ConfigurationStage } from "../../ops/config/configuration-stage.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
-const installer = fileURLToPath(new URL("../../scripts/config/configuration-install.ts", import.meta.url));
+const installer = fileURLToPath(new URL("../../ops/config/configuration-install.ts", import.meta.url));
 const app = (secret: string) => JSON.stringify({ appId: "fixture", appSecret: secret, environment: "production" });
 const models = (key: string) => JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1", apiKey: key,
   models: [{ id: "fixture", name: "合成模型", contextWindow: 8192, maxTokens: 1024, reasoning: false, input: ["text"] }] } } });

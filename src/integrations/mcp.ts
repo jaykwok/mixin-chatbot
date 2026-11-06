@@ -6,7 +6,7 @@ import type { McpConfig, McpServerConfig } from "../core/mcp-config.ts";
 import { mcpOAuth } from "./mcp-oauth.ts";
 import type { Scope } from "../core/layout.ts";
 import { APP_VERSION } from "../core/version.ts";
-import { SUPERVISOR_ENV } from "../../scripts/lib/process.ts";
+import { SUPERVISOR_ENV } from "../lib/process.ts";
 
 /** The calling member; `tempDir` is the directory a stdio server starts in (the request's directory in a run). */
 export interface McpMember { scope: Scope; phone: string; workspaceDir: string; tempDir: string }
@@ -14,7 +14,7 @@ export type ExternalGate = <T>(dispatch: () => Promise<T>, signal: AbortSignal) 
 export interface McpCatalogueTool { server: McpServerConfig; tool: Tool }
 /** Every request except tools/call ends after requestMs; a tools/call after callMs. */
 export interface McpTimeouts { requestMs: number; callMs: number }
-const supervisor = fileURLToPath(new URL("../../scripts/lib/process-supervisor.ts", import.meta.url));
+const supervisor = fileURLToPath(new URL("../lib/process-supervisor.ts", import.meta.url));
 const sameSchema = (a: Tool, b: Tool) => JSON.stringify(a.inputSchema) === JSON.stringify(b.inputSchema) && JSON.stringify(a.outputSchema) === JSON.stringify(b.outputSchema);
 
 /** Official protocol/transports, short-lived member sessions, and a fixed administrator tool allowlist. */
@@ -64,7 +64,7 @@ export class McpTools {
     const requestSignal = AbortSignal.any([signal, this.#closing.signal]);
     return this.#scope.run({ signal: requestSignal, gate }, async () => {
       requestSignal.throwIfAborted();
-      const client = new McpClient({ name: "mixin-chatbot", version: APP_VERSION, requestTimeoutMs: this.#timeouts.requestMs,
+      const client = new McpClient({ name: "mixin-bot", version: APP_VERSION, requestTimeoutMs: this.#timeouts.requestMs,
         roots: member ? [{ uri: pathToFileURL(member.workspaceDir).href, name: "workspace (read only)" }, { uri: pathToFileURL(member.tempDir).href, name: "member tmp" }] : [],
       });
       this.#clients.add(client);

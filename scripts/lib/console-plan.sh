@@ -6,7 +6,6 @@ assert_console_lifecycle() {
     if [ "${MIXIN_OPS_LIFECYCLE:-}" != "$operation" ] || [ -z "${MIXIN_OPS_TASK_ID:-}" ]; then
         echo '控制台部署缺少明确选择或任务记录；服务尚未停止' >&2; return 1
     fi
-    case "${BOT_REVISION_CLEANUP:-}" in apply|skip) ;; *) echo '必须明确选择整理或跳过；服务尚未停止' >&2; return 1 ;; esac
     case "${MIXIN_OPS_SWITCH_MAIN:-}" in 0|1) ;; *) echo '必须明确选择是否允许切换分支；服务尚未停止' >&2; return 1 ;; esac
     if [ "$operation" = update ] && [ "$branch" != main ] && [ "$MIXIN_OPS_SWITCH_MAIN" != 1 ]; then
         echo '未允许切换到 main；服务尚未停止' >&2; return 1

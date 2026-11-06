@@ -2,16 +2,16 @@ import { expect, test } from "bun:test";
 import { chmod, mkdir, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { runCore } from "../../scripts/ops/core/cli.ts";
-import { backupRequest, runBackups } from "../../scripts/ops/core/backups.ts";
-import { checkReports, inspectReports, prepareReports, reportsPath } from "../../scripts/ops/core/reports.ts";
-import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../scripts/ops/core/maintenance-host.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { MaintenanceRecord } from "../../scripts/ops/core/maintenance-record.ts";
-import { recoverMaintenance } from "../../scripts/ops/core/maintenance-recovery.ts";
-import { newWindowsTask } from "../../scripts/ops/core/windows-task.ts";
+import { runCore } from "../../ops/core/cli.ts";
+import { backupRequest, runBackups } from "../../ops/core/backups.ts";
+import { checkReports, inspectReports, prepareReports, reportsPath } from "../../ops/core/reports.ts";
+import { createMaintenanceHost, maintenanceRequest, type MaintenanceHostOptions } from "../../ops/core/maintenance-host.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { MaintenanceRecord } from "../../ops/core/maintenance-record.ts";
+import { recoverMaintenance } from "../../ops/core/maintenance-recovery.ts";
+import { newWindowsTask } from "../../ops/core/windows-task.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
-import { apply, scan } from "../../scripts/ops/backup-cleanup.ts";
+import { apply, scan } from "../../ops/tools/backup-cleanup.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const report = "20261031T000000Z-abcdef", confirmation = "a".repeat(16), repo = join(import.meta.dir, "../..");
@@ -49,10 +49,10 @@ test("报告目录固定在项目 tmp 下，拒绝父目录链接、替换和跨
 
 async function fixture() {
   const f = await tempFixture("core-backups-");
-  for (const tree of ["scripts", "src", "ui", "data/state"]) await mkdir(join(f.root, tree), { recursive: true });
-  for (const tree of ["scripts", "src", "ui"]) await writeFile(join(f.root, tree, "fixture.ts"), "export {};\n");
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
-  const ready = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+  for (const tree of ["console", "ops", "scripts", "src", "data/state"]) await mkdir(join(f.root, tree), { recursive: true });
+  for (const tree of ["console", "ops", "scripts", "src"]) await writeFile(join(f.root, tree, "fixture.ts"), "export {};\n");
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+  const ready = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(ready) });
   await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...ready, port: server.port }));
   const facts = { identity: "a".repeat(64), owned: true, state: "running" as "running" | "stopped" }, effects: string[] = [];
@@ -70,7 +70,7 @@ test("备份扫描、预演和确认删除始终持同一锁且不停止机器�
         const context = createMaintenanceHost(options, operation);
         return { ...context, data: async step => {
           expect(() => acquireDeploymentLock(f.root)).toThrow();
-          expect(step).toEqual({ script: "scripts/ops/backup-cleanup.ts", args: request.args, online: true, currentCode: true, reports: true });
+          expect(step).toEqual({ script: "ops/tools/backup-cleanup.ts", args: request.args, online: true, currentCode: true, reports: true });
           expect(f.facts.state).toBe(running ? "running" : "stopped"); expect(inspectReports(f.root)).toBeDefined();
           return { code: 17, stdout: "" };
         } };

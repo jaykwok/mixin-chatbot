@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { DockerPlatform } from "../../scripts/ops/core/docker-host.ts";
-import type { NativeCommand, NativeRunner } from "../../scripts/ops/core/native-process.ts";
+import { DockerPlatform } from "../../ops/core/docker-host.ts";
+import type { NativeCommand, NativeRunner } from "../../ops/core/native-process.ts";
 
 function fixture(uid = 0) {
   const project = resolve("fixture-project"), data = resolve(project, "data"), calls: NativeCommand[] = [];
   const env: NodeJS.ProcessEnv = { DOCKER_HOST: `unix:///run/${uid}/docker.sock`, DOCKER_TLS_VERIFY: "1" };
-  const c = { Id: "a".repeat(64), Name: "/mixin-chatbot", Image: "sha256:" + "b".repeat(64),
+  const c = { Id: "a".repeat(64), Name: "/mixin-bot", Image: "sha256:" + "b".repeat(64),
     Config: { User: uid ? "0:0" : "1001:1001" }, Mounts: [{ Destination: "/app/data", Source: data, Type: "bind", RW: true }],
     State: { Status: "running", Running: true, Paused: false, Restarting: false } };
   const facts = { daemon: "daemon-fixture", rootless: uid !== 0, present: true, socketUid: uid, socket: true, link: false, failed: "" };

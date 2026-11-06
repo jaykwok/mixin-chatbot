@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { executeProcess, PROCESS_INPUT_MAX_BYTES } from "../../scripts/lib/process.ts";
-import { runNative } from "../../scripts/ops/core/native-process.ts";
+import { executeProcess, PROCESS_INPUT_MAX_BYTES } from "../../src/lib/process.ts";
+import { runNative } from "../../ops/core/native-process.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
@@ -65,7 +65,7 @@ test.each(["cancel", "parent-death"])("输入受背压阻塞时仍回收整个�
   const command = join(f.root, "wait.ts"), parentFile = join(f.root, "parent.ts");
   const abort = new AbortController(); let parent: ReturnType<typeof Bun.spawn> | undefined;
   let running: Promise<unknown> | undefined, ready = "", ids: number[] = [], endedAt = 0;
-  const module = fileURLToPath(new URL("../../scripts/lib/process.ts", import.meta.url));
+  const module = fileURLToPath(new URL("../../src/lib/process.ts", import.meta.url));
   try {
     await writeFile(command, `import {spawn} from 'node:child_process';
 process.stdin.pause();

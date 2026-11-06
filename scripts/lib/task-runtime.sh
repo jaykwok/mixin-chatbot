@@ -73,6 +73,6 @@ task_runtime_manifest() {
     docker run --rm --user "$SERVICE_USER" --read-only --network none --cap-drop ALL --security-opt no-new-privileges \
         --tmpfs /tmp:rw,nosuid,nodev,size=16m -e HOME=/tmp \
         "${TASK_RUNTIME_ARGS[@]}" "${WORKSPACE_ARGS[@]}" -v "$PROJECT_DIR/data:/app/data" \
-        "$IMAGE_ID" bun run scripts/runtime/task-deployment.ts "$command" --image "$IMAGE_ID" \
+        "$IMAGE_ID" bun run ops/tools/task-deployment.ts "$command" --image "$IMAGE_ID" \
         --data "$(realpath -- "$PROJECT_DIR/data")" "${extra[@]}"
 }

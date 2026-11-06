@@ -1,4 +1,4 @@
-// The deployment's directory-scope tool (scripts/config/directory-scope.ts). Departments are only ticked in its terminal
+// The deployment's directory-scope tool (ops/config/directory-scope.ts). Departments are only ticked in its terminal
 // wizard; BOT_DIRECTORY_SCOPE takes only the whole directory. The tool's own processes get the whole directory, another
 // value it refuses before any client is made, or a project without application credentials, so they never reach a platform.
 import { afterAll, expect, test } from "bun:test";
@@ -6,12 +6,12 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { installScopePlan, parseScopeArgs, scopeFromEnvironment, stagedAppBotConfig } from "../../scripts/config/directory-scope.ts";
-import { serializeConfigurationStage } from "../../scripts/config/configuration-stage.ts";
+import { installScopePlan, parseScopeArgs, scopeFromEnvironment, stagedAppBotConfig } from "../../ops/config/directory-scope.ts";
+import { serializeConfigurationStage } from "../../ops/config/configuration-stage.ts";
 import { WHOLE_DIRECTORY } from "../../src/integrations/open-platform/directory-scope.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
-const TOOL = fileURLToPath(new URL("../../scripts/config/directory-scope.ts", import.meta.url));
+const TOOL = fileURLToPath(new URL("../../ops/config/directory-scope.ts", import.meta.url));
 const fixture = await tempFixture("directory-scope-tool-");
 afterAll(() => fixture.cleanup());
 

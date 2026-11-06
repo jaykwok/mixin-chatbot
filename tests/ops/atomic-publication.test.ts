@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { publish } from "../../scripts/lib/atomic-file.ts";
+import { publish } from "../../src/lib/atomic-file.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test("排他发布只让一个完整事务指针获胜，其他竞争者不覆盖或残留临时文件", async () => {

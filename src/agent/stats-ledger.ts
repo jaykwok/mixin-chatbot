@@ -14,12 +14,12 @@
 // source means an older copy of the database (a restore) whose usage was already counted: the current totals become
 // the baseline, nothing is added, and the key is reported. Totals stay a lower bound; a restore never counts twice.
 //
-// Imported rows (scripts/ops/stats-import.ts, the old webhook ledger) are kept apart by `origin` and read together.
+// Imported rows (ops/tools/stats-import.ts, the old webhook ledger) are kept apart by `origin` and read together.
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 3;
 /** The tables of the current format; data validation reads each once. */
 export const STATS_TABLES = ["asks_daily", "ask_ids", "ask_horizon", "usage_sources", "usage_daily", "imports"] as const;
 /** How long a counted requestId is remembered (run records are pruned a day after they close). */
@@ -45,7 +45,7 @@ const hasSchema = (db: Database) => !!db.query("SELECT 1 FROM sqlite_master WHER
 function assertSchemaVersion(db: Database): void {
   const version = (db.query("SELECT version FROM stats_schema WHERE id = 1").get() as { version: number } | null)?.version;
   if (version !== SCHEMA_VERSION) {
-    throw new Error(`统计账本版本 ${version ?? "未知"} 与当前 ${SCHEMA_VERSION} 不一致；请保留 stats.sqlite，旧版统计按 docs/data-migrations.md 用导入工具导入新账本`);
+    throw new Error(`统计账本版本 ${version ?? "未知"} 与当前 ${SCHEMA_VERSION} 不一致；请保留 stats.sqlite`);
   }
 }
 
@@ -204,16 +204,16 @@ export interface ImportRows {
 }
 
 /**
- * Add an old ledger's rows once, marked as imported. `digest` identifies the source file: the same file again adds
+ * Add a saved ledger's rows to an empty one once, marked as imported. `digest` identifies the source file: the same file again adds
  * nothing ("already"); a second, different file is refused, since two old ledgers may overlap.
  */
-export function importRows(db: Database, digest: string, rows: ImportRows, now = Date.now(), requireEmpty = false): "imported" | "already" {
+export function importRows(db: Database, digest: string, rows: ImportRows, now = Date.now()): "imported" | "already" {
   return db.transaction(() => {
     const done = importedDigests(db);
     if (done.includes(digest)) return "already" as const;
-    if (done.length) throw new Error("新账本已导入过另一份旧统计，拒绝再导入，以免重复计数");
-    if (requireEmpty && (db.query("SELECT 1 FROM asks_daily LIMIT 1").get() || db.query("SELECT 1 FROM usage_daily LIMIT 1").get())) {
-      throw new Error("同版本统计仅可恢复到空账本；当前已有统计，拒绝导入以免重复计数");
+    if (done.length) throw new Error("账本已导入过另一份统计，拒绝再导入，以免重复计数");
+    if ((db.query("SELECT 1 FROM asks_daily LIMIT 1").get() || db.query("SELECT 1 FROM usage_daily LIMIT 1").get())) {
+      throw new Error("统计仅可恢复到空账本；当前已有统计，拒绝导入以免重复计数");
     }
     const ask = db.query(ADD_ASKS);
     for (const row of rows.asks) ask.run(row.day, row.space, row.user, "import", row.asks, row.firstAt, row.lastAt);
@@ -228,7 +228,7 @@ export function importRows(db: Database, digest: string, rows: ImportRows, now =
   }).immediate();
 }
 
-/** Digests of the old ledgers imported so far (at most one); read-only. */
+/** Digests of the ledgers imported so far (at most one); read-only. */
 export function importedDigests(db: Database): string[] {
   return (db.query("SELECT digest FROM imports").all() as { digest: string }[]).map(row => row.digest);
 }

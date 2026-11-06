@@ -3,8 +3,8 @@ import { constants } from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { assertDataDirectory } from "../../scripts/lib/group-data.ts";
-import type { UserTmp } from "../../scripts/lib/tmp-scan.ts";
+import { assertDataDirectory } from "../lib/group-data.ts";
+import type { UserTmp } from "../lib/tmp-scan.ts";
 import { hashFile } from "../core/file-hash.ts";
 
 type LegacyItem = { path: string; token?: string; createdAt: number; reason?: string };

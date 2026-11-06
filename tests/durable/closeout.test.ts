@@ -14,7 +14,7 @@ import { queueMemberCompaction } from "../../src/durable/offline.ts";
 import { ASK_ID_RETENTION_MS, readLedger, openStatsLedger } from "../../src/agent/stats-ledger.ts";
 import { ReclamationItems } from "../../src/durable/results/queue.ts";
 import { ResultsDoc } from "../../src/durable/results/ownership.ts";
-import { createDataBackup, restoreDataBackup } from "../../scripts/ops/data-backup.ts";
+import { createDataBackup, restoreDataBackup } from "../../ops/tools/data-backup.ts";
 import { fauxModels, gatedResponse, TEST_PROGRESS } from "../helpers/durable.ts";
 import { referTo } from "../helpers/pending-reply.ts";
 import { recordingOutbound } from "../helpers/recording-outbound.ts";

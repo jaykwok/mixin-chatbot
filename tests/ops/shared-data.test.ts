@@ -3,11 +3,11 @@ import { writeTestData as writeFile } from "../helpers/stats-fixture.ts";
 import { expect, test } from "bun:test";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { loadTmp, probeService } from "../../scripts/ops/shared/data.ts";
-import * as settingsData from "../../scripts/ops/shared/data.ts";
-import { serviceView } from "../../scripts/ops/console/status.ts";
-import { collectAll, parseDate } from "../../scripts/ops/stats-admin.ts";
-import { trend } from "../../scripts/ops/stats-summary.ts";
+import { loadTmp, probeService } from "../../console/server/data.ts";
+import * as settingsData from "../../console/server/data.ts";
+import { serviceView } from "../../console/server/status.ts";
+import { collectAll, parseDate } from "../../ops/tools/stats-admin.ts";
+import { trend } from "../../ops/tools/stats-summary.ts";
 import { createApp } from "../../src/server/http-app.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -75,7 +75,7 @@ test("健康探针拒绝 503、未知状态和无 PID，运行时长只来自匹
   const fixture = await tempFixture("shared-health-");
   let status = 200;
   const startedAt = Date.now() - 3_600_000;
-  const identity = { service: "mixin-chatbot", version: 1, instanceId: crypto.randomUUID(), startedAt, pid: 42 };
+  const identity = { service: "mixin-bot", version: 1, instanceId: crypto.randomUUID(), startedAt, pid: 42 };
   let body: unknown = { ...identity, status: "ready" };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(body, { status }) });
   const port = server.port!;

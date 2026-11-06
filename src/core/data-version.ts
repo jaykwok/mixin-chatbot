@@ -39,7 +39,7 @@ export function verificationPending(project: string): boolean {
 
 /**
  * A deployment record whose base version fields (data format, transaction, program version and build) are valid, of a
- * data format this program does not support. Unlike a damaged or legacy record, only an upgrader of the target version
+ * data format this program does not support. Unlike a damaged record, only an upgrader of the target version
  * can say whether it takes the data over; the application binding is that version's to check as well.
  */
 export class UnsupportedDataFormat extends Error {}
@@ -50,8 +50,7 @@ export function readMetadata(path: string): unknown {
 }
 
 /**
- * The deployment record, or null when there is none. A damaged record, one with missing fields (legacy webhook releases
- * recorded no program version) or an unsupported data format is an error: nothing is initialised over it.
+ * The deployment record, or null when there is none. A damaged record, one with missing fields or an unsupported data format is an error: nothing is initialised over it.
  */
 export function readDataVersion(path: string): DataVersion | null {
   const value = readMetadata(path) as Partial<DataVersion> | null;
@@ -59,18 +58,18 @@ export function readDataVersion(path: string): DataVersion | null {
   if (typeof value !== "object" || !Number.isSafeInteger(value.dataVersion) || typeof value.transaction !== "string" || !value.transaction)
     throw new Error(`版本标记损坏：${path}；${FRESH_DIRECTORY}`);
   if (typeof value.appVersion !== "string" || !SEMVER.test(value.appVersion) || typeof value.build !== "string")
-    throw new Error(`版本标记没有程序版本（旧版 webhook 数据或标记损坏），不支持原地安装或升级；${FRESH_DIRECTORY}`);
+    throw new Error(`版本标记没有程序版本（标记损坏），不支持原地安装或升级；${FRESH_DIRECTORY}`);
   // A format this program does not know may name its application differently: the format decides first.
   if (value.dataVersion !== DATA_VERSION)
     throw new UnsupportedDataFormat(`数据格式 ${value.dataVersion}（程序 ${value.appVersion}）不受当前程序支持（数据格式 ${DATA_VERSION}）；现场已保留`);
   if (typeof value.application !== "string" || !/^[0-9a-f]{64}$/.test(value.application))
-    throw new Error(`版本标记没有应用绑定（未发布的测试数据或标记损坏），不支持原地安装或升级；${FRESH_DIRECTORY}`);
+    throw new Error(`版本标记没有应用绑定（标记损坏），不支持原地安装或升级；${FRESH_DIRECTORY}`);
   return value as DataVersion;
 }
 
 /**
  * Stores a deployment of this program would own, found in a data directory without a deployment record: any of them means
- * data of another (typically the legacy webhook) release. Configuration written before the first deployment and
+ * data of another release. Configuration written before the first deployment and
  * operator materials under workspace/ are not data in this sense.
  */
 export function unrecordedData(project: string): string[] {

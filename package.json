@@ -1,6 +1,6 @@
 {
-  "name": "mixin-chatbot",
-  "version": "1.1.0",
+  "name": "mixin-bot",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,18 +9,18 @@
   "scripts": {
     "start": "bun run src/server/index.ts",
     "dev": "bun --watch run src/server/index.ts",
-    "console": "bun run scripts/ops/console.ts",
-    "configure": "bun run scripts/config/configure.ts",
-    "configure-app-bot": "bun run scripts/config/configure-app-bot.ts",
-    "configure-runtime": "bun run scripts/config/runtime-settings.ts",
-    "relay": "bun run scripts/ops/relay-admin.ts",
-    "mcp": "bun run scripts/ops/mcp-admin.ts",
-    "tmp": "bun run scripts/ops/tmp-admin.ts",
-    "history": "bun run scripts/ops/history-admin.ts",
-    "stat": "bun run scripts/ops/stats-admin.ts",
-    "stat-import": "bun run scripts/ops/stats-import.ts",
-    "test": "bun run scripts/test.ts",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p ui/console && tsc --noEmit -p tests/console",
+    "console": "bun run console/server/start.ts",
+    "configure": "bun run ops/config/configure.ts",
+    "configure-app-bot": "bun run ops/config/configure-app-bot.ts",
+    "configure-runtime": "bun run ops/config/runtime-settings.ts",
+    "relay": "bun run ops/tools/relay-admin.ts",
+    "mcp": "bun run ops/tools/mcp-admin.ts",
+    "tmp": "bun run ops/tools/tmp-admin.ts",
+    "history": "bun run ops/tools/history-admin.ts",
+    "stat": "bun run ops/tools/stats-admin.ts",
+    "stat-import": "bun run ops/tools/stats-import.ts",
+    "test": "bun run tests/run.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p console/ui && tsc --noEmit -p tests/console",
     "deadcode": "knip",
     "check": "bun run typecheck && bun run test && bun run deadcode && bun run deadcode --production"
   },
@@ -57,6 +57,6 @@
     "zod": "4.6.6"
   },
   "patchedDependencies": {
-    "knip@6.40.0": "scripts/patches/knip@6.40.0.patch"
+    "knip@6.40.0": "patches/knip@6.40.0.patch"
   }
 }

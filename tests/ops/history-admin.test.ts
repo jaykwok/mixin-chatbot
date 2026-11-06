@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
 import { createSession } from '@earendil-works/pi-durable';
 import { fauxAssistantMessage } from '@earendil-works/pi-ai/providers/faux';
-import { clearAllSpaces, clearSpace, collect } from '../../scripts/ops/history-admin.ts';
+import { clearAllSpaces, clearSpace, collect } from '../../ops/tools/history-admin.ts';
 import { memberConversation } from '../../src/durable/identity.ts';
 import { ControlsDoc } from '../../src/durable/inbox.ts';
 import { openGroupStorage } from '../../src/durable/sqlite.ts';

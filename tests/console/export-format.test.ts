@@ -3,8 +3,8 @@
 import { expect, test } from "bun:test";
 import {
   attachment, csvCell, csvRow, fenced, inline, isoLocal, jsonWriter, markdownWriter, personalMark, safeFileName, type ConversationHeader,
-} from "../../scripts/ops/console/export-format.ts";
-import type { EntryView } from "../../ui/console/src/contract.ts";
+} from "../../console/server/export-format.ts";
+import type { EntryView } from "../../console/ui/src/contract.ts";
 
 const AT = new Date(2026, 9, 27, 15, 30, 12, 345).getTime();
 const header: ConversationHeader = {

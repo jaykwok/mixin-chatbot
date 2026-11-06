@@ -5,7 +5,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { documentMarker, documentPackages } from "../../scripts/runtime/document-manifest.ts";
+import { documentMarker, documentPackages } from "../../src/agent/document-manifest.ts";
 import {
   documentToolchainReady,
   venvPythonPath,
@@ -16,7 +16,7 @@ const MARKER = ".mixin-doc-toolchain";
 const sorted = [...DOCUMENT_TOOLCHAIN_PACKAGES].sort();
 
 async function venvWithMarker(content: string | null): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "mixin-chatbot-venv-"));
+  const dir = await mkdtemp(join(tmpdir(), "mixin-bot-venv-"));
   if (content !== null) await writeFile(join(dir, MARKER), content, "utf8");
   return dir;
 }
@@ -30,7 +30,7 @@ describe("document toolchain readiness", () => {
     await writeFile(join(root, "uv.lock"), "version = 1\n");
     await writeFile(join(root, ".python-version"), "3.14\n");
     const child = Bun.spawn([process.execPath,
-      fileURLToPath(new URL("../../scripts/runtime/document-manifest.ts", import.meta.url)), root, root],
+      fileURLToPath(new URL("../../src/agent/document-manifest.ts", import.meta.url)), root, root],
       { cwd: root, stdout: "pipe", stderr: "pipe", windowsHide: true });
     const timer = setTimeout(() => child.kill(), 10000);
     try {

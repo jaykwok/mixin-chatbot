@@ -3,7 +3,7 @@
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { Harness, Storage } from "@earendil-works/pi-durable";
 import { join } from "node:path";
-import { assertDataDirectory } from "../../scripts/lib/group-data.ts";
+import { assertDataDirectory } from "../lib/group-data.ts";
 import { scopeKey, spacePath, userSegment } from "../core/layout.ts";
 import type { ResultOwnership } from "../contracts/maintenance.ts";
 import { exists } from "../maintenance/plans.ts";

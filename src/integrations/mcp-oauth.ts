@@ -13,7 +13,7 @@ export function mcpOAuth(server: McpServerConfig, onRedirect: (url: URL) => void
   const path = join(stateRoot, `${server.name}.json`);
   const provider = new McpOAuthProvider({ serverUrl: server.url,
     redirectUrl: `http://127.0.0.1:${server.oauth.port}/mcp/${server.name}/callback`,
-    clientMetadata: { client_name: "mixin-chatbot", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: server.oauth.clientSecretEnv ? "client_secret_post" : "none" },
+    clientMetadata: { client_name: "mixin-bot", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: server.oauth.clientSecretEnv ? "client_secret_post" : "none" },
     clientId: server.oauth.clientId,
     clientSecret: server.oauth.clientSecretEnv ? process.env[server.oauth.clientSecretEnv] : undefined,
     store: {

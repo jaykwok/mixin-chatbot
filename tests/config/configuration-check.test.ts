@@ -2,11 +2,11 @@ import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { checkConfiguration, configurationCatalog } from "../../scripts/config/configuration-check.ts";
-import type { ConfigurationSnapshot } from "../../scripts/config/configuration-form.ts";
+import { checkConfiguration, configurationCatalog } from "../../ops/config/configuration-check.ts";
+import type { ConfigurationSnapshot } from "../../ops/config/configuration-form.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
-const source = fileURLToPath(new URL("../../scripts/config/configuration-check.ts", import.meta.url));
+const source = fileURLToPath(new URL("../../ops/config/configuration-check.ts", import.meta.url));
 const snapshot = (): ConfigurationSnapshot => ({ kind: "models", binding: null, files: {
   models: JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1", apiKey: "fixture-private-key",
     models: [{ id: "fixture", name: "合成模型", contextWindow: 8192, maxTokens: 1024, reasoning: false, input: ["text"] }] } } }),

@@ -98,7 +98,7 @@ MCP stdio 程序在两个平台上都具有服务用户权限。当前部署面�
 
 PDF、DOCX、PPTX、XLSX 文本优先使用 `document_extract`，它会按需检查解析环境，并按原件 SHA-256、解析器与依赖锁版本复用缓存：共享资料的结果位于 `data/index/parsed`，用户私有文件的结果只放本用户 tmp。特殊解析或文件生成先调用 `document_environment`；模型不能自行安装包或改写共享环境。不提供 OCR，文档工具只接受现代 Office 格式。
 
-Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) 管理，[.python-version](../.python-version) 选择 3.14 系列，默认使用应用共享的 `data/runtime/document-env`。Docker 构建、原生准备和就绪检测共用 [document-manifest.ts](../scripts/runtime/document-manifest.ts)。修改依赖后运行 `uv lock`，再做[文档回归](#文档回归)。
+Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) 管理，[.python-version](../.python-version) 选择 3.14 系列，默认使用应用共享的 `data/runtime/document-env`。Docker 构建、原生准备和就绪检测共用 [document-manifest.ts](../src/agent/document-manifest.ts)。修改依赖后运行 `uv lock`，再做[文档回归](#文档回归)。
 
 ## 文档加工
 
@@ -153,7 +153,7 @@ Python 依赖由 [pyproject.toml](../pyproject.toml) 和 [uv.lock](../uv.lock) �
 
 [projection.ts](../src/durable/projection.ts) 在每轮结束、`/compact`、`/clear`、维护和打开空间时同步一位成员：先按请求记录补计提问，再读该会话的 `pi.usage` 快照，与账本里这个来源（会话库代际 + 会话 ID）上次的累计值相减，把增长量记到当天。同一成员的同步串行执行，快照在轮次内读取，较旧的快照不会覆盖新的累计值；累计值回退（较早的副本）时以当前值为新基准、不入账并写告警。补计提问用的请求 ID 保留 30 天（`ASK_ID_RETENTION_MS`），维护时裁剪并把只进不退的 `ask_horizon` 推到裁剪点，更早的提问不再补计。口径与导入见[统计账本](data-migrations.md#统计账本)。
 
-统计数据独立存放在 `data/state/stats.sqlite`，CLI、控制台和 HTML 报表都读这一份。账本由 [stats-ledger.ts](../src/agent/stats-ledger.ts) 维护（schema 3）：提问按请求 ID 去重，token 按来源记最近的累计值并只加增长量，重复同步不会重复累加；读取方只用只读连接。一次性导入旧版统计的工具是 [stats-import.ts](../scripts/ops/stats-import.ts)。**不得删库重建**：原件可能已删除，账本是仅存的历史。
+统计数据独立存放在 `data/state/stats.sqlite`，CLI、控制台和 HTML 报表都读这一份。账本由 [stats-ledger.ts](../src/agent/stats-ledger.ts) 维护（schema 3）：提问按请求 ID 去重，token 按来源记最近的累计值并只加增长量，重复同步不会重复累加；读取方只用只读连接。一次性导入旧版统计的工具是 [stats-import.ts](../ops/tools/stats-import.ts)。**不得删库重建**：原件可能已删除，账本是仅存的历史。
 
 ## 开发与检查
 
@@ -181,7 +181,7 @@ Windows 使用标准安装位置的 Git Bash 时，最外层运行器会先启�
 - **不能直接传入的选项**：Bun 自带的 `--parallel`、`--shard`、`--timings` 和 `--update-timings` 由运行器接管。`--parallel` 的 worker 共用一个工作目录，而测试里相对工作目录的路径会互相干扰。
 - **默认超时**：没有自带超时的测试，默认超时为 20 秒（Bun 的默认是 5 秒），因为启动子进程的测试在多组同时运行时会变慢。命令行给了 `--timeout` 时以它为准。
 
-`package.json` 的 overrides 把个别传递依赖固定到修复已知问题的版本。`scripts/patches` 只保留一份构建期补丁：Knip 传播 Bun 脚本入口的 production 标记。Pi 依赖不打补丁。Knip 6.40.0 原版仍会排除这个生产入口，即使在配置中显式声明；`tests/ops/knip.test.ts` 同时验证已用代码不误报、无用文件和依赖仍会报错。依赖均精确固定版本，升级时同步检查覆盖、补丁、锁文件和 `bun audit`，并跑普通与 production 两种死代码检查。
+`package.json` 的 overrides 把个别传递依赖固定到修复已知问题的版本。`patches` 只保留一份构建期补丁：Knip 传播 Bun 脚本入口的 production 标记。Pi 依赖不打补丁。Knip 6.40.0 原版仍会排除这个生产入口，即使在配置中显式声明；`tests/ops/knip.test.ts` 同时验证已用代码不误报、无用文件和依赖仍会报错。依赖均精确固定版本，升级时同步检查覆盖、补丁、锁文件和 `bun audit`，并跑普通与 production 两种死代码检查。
 
 命令行入口放在 `scripts/{config,ops,runtime}` 下，由 `package.json` 和 `knip.json` 登记为生产入口；新增命令时同步更新入口声明。截图维护见[截图说明](assets/README.md)。
 
@@ -196,13 +196,18 @@ Windows 使用标准安装位置的 Git Bash 时，最外层运行器会先启�
 | [projection.ts](../src/durable/projection.ts)、[stats-ledger.ts](../src/agent/stats-ledger.ts)、[compaction.ts](../src/durable/compaction.ts) | 提问与 `pi.usage` 同步入账、统计账本与上下文压缩 |
 | [results](../src/durable/results) | codemode 结果的归属登记、引用保护与过期回收 |
 | [prompt.ts](../src/agent/prompt.ts)、[base-tools.ts](../src/durable/base-tools.ts)、[member-env.ts](../src/durable/member-env.ts) | 资料助手提示词与本地工具边界 |
-| [process.ts](../src/core/process.ts)、[process-supervisor.ts](../scripts/lib/process-supervisor.ts) | 工具进程执行与后代回收 |
+| [process.ts](../src/core/process.ts)、[process-supervisor.ts](../src/lib/process-supervisor.ts) | 工具进程执行与后代回收 |
 | [rootless-tasks.ts](../src/core/rootless-tasks.ts)、[task-runtime](../src/core/task-runtime)、[task-backend.ts](../src/core/task-backend.ts) | Linux 每任务隔离：阶段回执、容器、输入快照与回收；工具入口统一结束任务 |
 | [maintenance](../src/maintenance)、[maintenance-view.ts](../src/durable/maintenance-view.ts) | tmp 维护计划、离线回收与归档；空间库视图由 durable 一侧提供 |
 | [contracts](../src/contracts) | 各层共用的维护格式、任务回执与路径规则 |
 | [outbound.ts](../src/durable/outbound.ts)、[send.ts](../src/durable/send.ts)、[file-delivery.ts](../src/durable/file-delivery.ts)、[relay.ts](../src/integrations/relay.ts) | 回复格式、持久交付、文件发送与外链对象 |
-| [scripts/ops](../scripts/ops)、[scripts/deploy](../scripts/deploy) | 日常运维与部署事务 |
-| [scripts/ops/console](../scripts/ops/console)、[ui/console](../ui/console)、[scripts/ops/shared](../scripts/ops/shared) | 网页控制台：宿主服务与后台执行器、浏览器界面、宿主机数据读取与查询进程池 |
+| [ops/core](../ops/core) | 宿主机运维核心：部署、升级与维护事务，服务控制，中断恢复 |
+| [ops/config](../ops/config)、[ops/tools](../ops/tools)、[ops/lib](../ops/lib) | 配置向导与发布、数据工具（镜像内也运行）、运维共用的参数和协议 |
+| [scripts](../scripts) | Shell/PowerShell 入口：`ops`、`deploy`、`upgrade` 和它们共用的 `scripts/lib` |
+| [console/server](../console/server)、[console/ui](../console/ui) | 网页控制台：宿主服务与后台执行器、宿主机数据读取与查询进程池；浏览器界面 |
+| [src/lib](../src/lib) | 服务与运维共用的底层代码：原子写入、进程监督、操作日志、脱敏 |
+
+代码按 `console → ops → src` 单向依赖：`src` 不引用其他目录，`ops` 不引用控制台，浏览器界面只引用自己；镜像只复制 `src`、`ops/lib`、`ops/config` 和 `ops/tools`，其中运行的代码也只能引用这些目录。[boundaries.test.ts](../tests/contracts/boundaries.test.ts) 检查这些规则。
 
 CI 配置了 Windows/Linux 检查，以及受限 Linux 镜像中的解析器、进程回收、部署登记和文档集成（文档加工、Durable 引擎、Office 预览）验证。部署验收还需在目标机器和真实客户端中检查服务、事件 Stream、通讯录同步和真实交付流程。
 
@@ -224,7 +229,7 @@ bash、文档操作与解析在任务容器中运行。镜像需要预先具备 
 
 隔离文档环境使用镜像内预先锁定的 `/app/.venv/bin/python`，不会在宿主共享文档环境按需安装依赖；现有 Dockerfile 会准备此环境及 Office 能力。管理端需要在本机 Linux 上以 rootless daemon 的身份运行；原生模式的 `BOT_DOCUMENT_ENV` 仍用于原生文档环境。成功文档任务在写者退出后回收 `.work`，产物与报告按引用/保留期稍后回收。可用现有文档集成入口加 `BOT_TASK_IMAGE`、独立 `BOT_TASK_CONTROL_ROOT` 和 `--root <合成目录>` 验证新模式。
 
-常规测试里的 Docker 都是桩。真实 Docker 的部署和升级由可选测试 [real-docker.test.ts](../tests/ops/real-docker.test.ts) 验证，**只能在没有真实服务的 Linux 测试机**（WSL 发行版或虚拟机）上运行：`MIXIN_REAL_DOCKER=1 bun run test tests/ops/real-docker.test.ts`。测试用合成数据，只清理挂载源在其目录下的容器和本次测试项目的镜像，发现其他 `mixin-chatbot*` 容器时拒绝运行；失败或设置 `MIXIN_REAL_DOCKER_KEEP=1` 时保留现场。SELinux 强制模式尚未验证。
+常规测试里的 Docker 都是桩。真实 Docker 的部署和升级由可选测试 [real-docker.test.ts](../tests/ops/real-docker.test.ts) 验证，**只能在没有真实服务的 Linux 测试机**（WSL 发行版或虚拟机）上运行：`MIXIN_REAL_DOCKER=1 bun run test tests/ops/real-docker.test.ts`。测试用合成数据，只清理挂载源在其目录下的容器和本次测试项目的镜像，发现其他 `mixin-bot*` 容器时拒绝运行；失败或设置 `MIXIN_REAL_DOCKER_KEEP=1` 时保留现场。SELinux 强制模式尚未验证。
 
 其他可选测试只在设置对应变量时运行，CI 不运行，都用合成数据：
 
@@ -232,7 +237,7 @@ bash、文档操作与解析在任务容器中运行。镜像需要预先具备 
 | --- | --- | --- |
 | [real-docker.test.ts](../tests/ops/real-docker.test.ts) | `MIXIN_REAL_DOCKER=1`；`MIXIN_REAL_DOCKER_LAYOUTS=default,external` 选共享资料布局；`MIXIN_REAL_DOCKER_CONSOLE=1` 另跑控制台后台任务一组；`MIXIN_REAL_DOCKER_PLATFORM_HOST` 指定 rootless 容器访问本机假平台的地址 | 同上 |
 | [real-rootless-tasks.test.ts](../tests/ops/real-rootless-tasks.test.ts) | `MIXIN_REAL_TASKS=1`、`MIXIN_TASK_TEST_IMAGE` | 见上文任务隔离 |
-| [core-real-docker.test.ts](../tests/ops/core-real-docker.test.ts)、[core-real-input.test.ts](../tests/ops/core-real-input.test.ts)、[core-real-maintenance.test.ts](../tests/ops/core-real-maintenance.test.ts) | `MIXIN_CORE_DOCKER=1`、`MIXIN_CORE_DOCKER_IMAGE=sha256:<已拉取的镜像 ID>` | Linux；root 用 `DOCKER_HOST=unix:///var/run/docker.sock`，或 UID 1002 用 `unix:///run/user/1002/docker.sock`；不能设 `DOCKER_CONTEXT` |
+| [core-real-docker.test.ts](../tests/ops/core-real-docker.test.ts)、[core-real-input.test.ts](../tests/ops/core-real-input.test.ts) | `MIXIN_CORE_DOCKER=1`、`MIXIN_CORE_DOCKER_IMAGE=sha256:<已拉取的镜像 ID>` | Linux；root 用 `DOCKER_HOST=unix:///var/run/docker.sock`，或 UID 1002 用 `unix:///run/user/1002/docker.sock`；不能设 `DOCKER_CONTEXT` |
 | [legacy-reclamation.test.ts](../tests/core/legacy-reclamation.test.ts) | `MIXIN_REAL_RECLAMATION=1` | Linux，以 root 运行；夹具建在 `/var/lib/mixin-reclamation-test-*` 并保留供查看 |
 
 ### 文档回归
@@ -243,7 +248,7 @@ bash、文档操作与解析在任务容器中运行。镜像需要预先具备 
 $env:UV_PROJECT_ENVIRONMENT = (Join-Path $PWD 'tmp/document-validation/group/venv')
 uv sync --locked --no-dev --no-install-project
 if ($LASTEXITCODE -ne 0) { throw 'uv sync failed' }
-bun scripts/runtime/document-manifest.ts . $env:UV_PROJECT_ENVIRONMENT
+bun src/agent/document-manifest.ts . $env:UV_PROJECT_ENVIRONMENT
 bun tests/helpers/document-work-integration.ts $env:UV_PROJECT_ENVIRONMENT --office
 bun tests/helpers/document-durable-integration.ts $env:UV_PROJECT_ENVIRONMENT --office
 bun tests/helpers/document-office-integration.ts $env:UV_PROJECT_ENVIRONMENT
@@ -254,14 +259,12 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 
 ## 数据版本与升级
 
-程序版本取自 `package.json`（1.1.0），数据格式 `DATA_VERSION` 为 1，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`scripts/runtime/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。旧数据中只有统计可一次性导入，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。
+程序版本取自 `package.json`（2.0.0），数据格式 `DATA_VERSION` 为 2，构建为 Git 提交，三者都由 [version.ts](../src/core/version.ts) 读出；`/health` 报告 `appVersion` 与 `build`。正式程序只支持当前配置和数据格式，不含历史迁移器、旧字段别名、跨代重置或旧入口处理，规则见[版本、数据格式与从旧版切换](data-migrations.md)。`ops/tools/data-current.ts` 负责按部署记录判断新装或升级、当前格式验证（含统计 schema 3）与发布提交，只在提交时写部署记录，回滚恢复发布前的记录。部署记录同时登记数据所属的应用（环境与 AppID 的摘要），预检、验证实例、提交与服务启动共用 `src/core/data-validation.ts` 的校验（应用绑定、资料目录布局、配置、统计）。更早部署的数据中只有统计（schema 3）可恢复到全新部署的空账本，其余没有导入工具。只有不兼容的数据变化才递增 `DATA_VERSION`，并随版本另行提供专门的升级方案。
 
 七个直接 Pi 依赖（含 `pi-schema`）精确锁为 1.5.0，内部包使用官方精确依赖和 Bun 锁文件，不重复设置 Pi overrides，也不打补丁。请求门（[door.ts](../src/durable/door.ts)）按官方随每次生成与压缩请求传入的 `sessionId`（会话的 `pi.provider`）找到会话和成员：映射只取成员目录、会话身份与 `pi.provider` 三者一致的已提交数据，空间开启时在恢复调度前载入，新建成员会话提交后登记，遇到未知 `sessionId` 重读一次，仍未知或被两个会话占用则不发送；分叉不继承身份，没有发送资格。门在最后一次同步检查（取消、关闭、总时限、待执行控制命令）之后直接交给 provider，中间没有 await；凭证解析等异步步骤都在检查之前。门本身不写记录，用量由 Durable 记入 `pi.usage`。升级 Pi 时需要重新验证 `sessionId` 仍随生成与压缩请求传入，以及取消、恢复语义。
 
 会话库只接受 Durable SQLite schema 2：`src/durable/schema-gate.ts` 在官方打开（会自动升级旧 schema）之前只读核对，服务、离线维护和诊断快照共用。Durable 的退避重试、压缩重试和延迟轮询是 `sleeping` 任务，`src/durable/task-states.ts` 把它列为未完成工作（发现、闲置回收、结果回收和维护预览都据此保护）；看门狗按 `pi.live` 的 retry／deferred 判断，不把它当作模型无进展；它读的是 Session 内存里的进度，流式进度最多晚 `persistWithinMs` 才写入会话库，不影响判断。运行设置显式写明 `afterFailedRun: "keep"`（成员工作者一次只提交一条，失败由服务自己答复）和 `restartLimit` 5：连续因崩溃中断且没有进展的任务到限即结束（工具调用得到错误结果，运行以 `restart_limit` 结束）；模型回答途中服务异常停止算一次失败的尝试，重试用完时运行以 `interrupted` 结束。两种情况 Durable 都报告 `task_interrupted`，写入服务日志并记为关注项；成员收到按 `pi.live.runFailure` 的原因和说明写的失败答复，下一条消息照常处理。按模型的压缩预算作为 Durable 原生 `modelOverrides` 传入，后台阈值按各模型窗口算好显式给出。
 
-修订链有上限：Durable 给每次变更的文档追加一条增量，`checkpointWhen` 决定何时改写基准（同一提交删除这份文档的旧修订，本项目的文档都只保留当前值）。[checkpoint.ts](../src/durable/checkpoint.ts) 让所有机器人文档每 64 条修订写一次基准，读入一份文档最多折叠 64 条。旧版本从不写基准，增量达到 1,024 条的旧链不在线改写：在共享的 SQL 线程上一次删除整条链会拖住其他提交。按上限实测（增量 256 B–16 KB、4 GB 的空间库），压缩 1,024 条的那次提交在 WSL 最多 67 ms、Windows 167 ms，约 2,100 个 WAL 帧（8.7 MB）。更长的链由停机后的首次整理处理（[revision-cleanup/](../src/durable/revision-cleanup/)，命令行 `scripts/runtime/revision-cleanup.ts`，运维说明见[会话库的修订整理](operations.md#会话库的修订整理)）：先备份并核对，再逐份文档在同一个存储实例上用一次 `document.change`（`kind: "base"`，原版本和当前值）换成一条基准。提交前要求值的 JSON 往返摘要不变；整理日志只记文档身份、提交前的 `next_seq`（N₀）和值摘要，不记值和键；提交后要求 `next_seq` 为 N₀ + 1、这份文档只剩序号 N₀ 的一条基准、新打开的存储读出的摘要相同。中断后按 `next_seq` 与这份文档的修订收尾（N₀ 未提交，N₀ + 1 已提交，其他停止）。提交后的摘要不同时记为需要恢复（日志顶层 `restore`）：[restore.ts](../src/durable/revision-cleanup/restore.ts) 先核对现场能完全由本次整理解释（备份之后的每个序号恰好对应日志里的一份文档），再核对备份的大小与 SHA-256，用收缩的替换协议（[replace.ts](../src/durable/revision-cleanup/replace.ts)）换回备份。服务和各维护动作能否进行由 [maintenance-state.ts](../src/core/maintenance-state.ts) 只读整理日志、收缩记录、未完成的配置提交和运维核心记录的顶层状态判断，运维核心和控制台在进程内调用。维护命令的机器结果见 [maintenance-protocol.ts](../scripts/lib/maintenance-protocol.ts)：`--json` 一行，Bash 用 `--shell` 的 key=value 行（以 `end=1` 结尾，由 `scripts/lib/maintenance-protocol.sh` 读取），只有退出码 0、结果完整且 `outcome` 为 `success` 才算成功；运维核心是否重新启动服务只看之后重读的维护状态。预览对没有 `-wal` 的库按 immutable 只读打开，不在只读挂载的 `data/` 旁创建文件。
-
-整理留下的空闲页由单独的离线收缩还给磁盘（[shrink.ts](../src/durable/revision-cleanup/shrink.ts)，同一命令行的 `shrink*` 子命令，运维说明见[收缩会话库文件](operations.md#收缩会话库文件)）。每个库：`wal_checkpoint(TRUNCATE)` 的返回 `busy` 为 0 且 WAL 为空后关闭连接；`VACUUM INTO` 在同一目录写出副本（输出是回滚日志模式，改回 WAL 并沿用原库的权限位），按完整性、Durable 元数据、各表行数、空闲页为 0 和逐表按 rowid（无 rowid 表按主键）排序的行摘要与原库核对；原库连同 `-wal`、`-shm` 改名为 `.old`，副本改名为正式路径，最后 `quick_check`。读原库和副本用拒绝写入的读写连接（`query_only`），关闭时不留下只读连接会遗留的 `-wal`、`-shm`。恢复记录 `data/state/shrink.json` 在每次改名前写入；重跑按记录阶段和三个路径上的文件身份（副本另核对 sha256）只接受方案中的几种组合，其余停止。有库未替换完成时，`validateCurrentData`（服务、验证实例、发布提交）、修订整理和整理预览（升级在停机前就失败）都拒绝，`openGroupDatabase` 在正式路径缺失而旁边有 `.old` 时拒绝新建空库。
+修订链有上限：Durable 给每次变更的文档追加一条增量，`checkpointWhen` 决定何时改写基准（同一提交删除这份文档的旧修订，本项目的文档都只保留当前值）。[checkpoint.ts](../src/durable/checkpoint.ts) 让所有机器人文档每 64 条修订写一次基准，读入一份文档最多折叠 64 条。服务和各维护动作能否进行由 [maintenance-state.ts](../src/core/maintenance-state.ts) 只读未完成的配置提交和运维核心记录的顶层状态判断，运维核心和控制台在进程内调用。维护命令的机器结果见 [maintenance-protocol.ts](../ops/lib/maintenance-protocol.ts)：`--json` 一行，只有退出码 0、结果完整且 `outcome` 为 `success` 才算成功；运维核心是否重新启动服务只看之后重读的维护状态。
 
 Codemode 仍需宿主负责成员结果目录、合并 store 总量校验和可靠交付；子调用用量由 Durable 在子调用结算时记入 `pi.usage`，不复制 VM、journal、参数解析或 provider 转换。

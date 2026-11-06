@@ -34,9 +34,9 @@
 
 Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。Docker 的配置向导与应用运行在镜像内；部署、升级和命令行运维的宿主侧核心用 Bun 运行：`PATH` 上有 Bun 1.4.4+ 时直接使用，没有时入口首次运行会从 GitHub 下载固定版本 Bun 1.4.4 到项目的 `.console/bun`，按脚本内置的 SHA-256 核对后才使用，为此需要 `curl`、`unzip`、`sha256sum`、`flock` 和对 github.com 的 HTTPS 访问。不能访问 GitHub 的主机请先自行安装 Bun 1.4.4 或更高版本。[网页控制台](console.md)用 `bun run console` 启动，需要 `PATH` 上的 Bun 1.4.4+。
 
-rootful Docker（以 root 运行的默认安装）下，部署、升级、继续和回滚都要由 root 执行，例如 `sudo bash scripts/deploy/deploy.sh`：只有 root 能完整查看镜像存储所在磁盘的剩余空间，并按服务的身份给新建的文件设置属主。docker 组中的普通用户会在任何提问、构建和停机之前被拒绝，脚本不会自动 sudo。rootless Docker 由它所属的普通用户运行，不要用 sudo。
+rootful Docker（以 root 运行的默认安装）下，部署、升级、继续和回滚都要由 root 执行，例如 `sudo bash scripts/deploy.sh`：只有 root 能完整查看镜像存储所在磁盘的剩余空间，并按服务的身份给新建的文件设置属主。docker 组中的普通用户会在任何提问、构建和停机之前被拒绝，脚本不会自动 sudo。rootless Docker 由它所属的普通用户运行，不要用 sudo。
 
-容器进程的身份：真正的首次部署时，root 部署的容器降权到 UID/GID 1001，并把挂载目录的属主改成它；rootless Docker 下以容器内的 root 运行，它映射回宿主机上的部署用户，所以挂载目录仍归这个用户。之后的重新部署和升级沿用原容器 `mixin-chatbot`（运行或停止均可）的数值 UID/GID：停机前从原容器读取并核对，写入本次事务的快照，预览、迁移、验证实例、正式实例以及中断后的继续和回滚都用它；只给本次新建的目录和文件设置属主，不批量改已有数据的属主。原容器的身份不能可靠确定时（不是数值 UID:GID、数据目录不是本项目的、与 Docker 的模式不符），部署和升级在停机前停止，不猜测。原容器已被删除但部署过时，重新部署按 `data/state` 的属主提出身份，经确认后才使用；升级要求原容器存在。以前由 docker 组普通用户部署的实例改由 root 升级后，服务仍以原来的 UID/GID 运行。检出属于那个用户，git 拒绝以 root 操作它（仓库中的钩子和配置会以 root 运行）：确认信任这份检出后，由 root 执行一次 `git config --global --add safe.directory <项目目录>`，脚本不会代为加入；此后 root 升级时写入检出的文件属于 root。
+容器进程的身份：真正的首次部署时，root 部署的容器降权到 UID/GID 1001，并把挂载目录的属主改成它；rootless Docker 下以容器内的 root 运行，它映射回宿主机上的部署用户，所以挂载目录仍归这个用户。之后的重新部署和升级沿用原容器 `mixin-bot`（运行或停止均可）的数值 UID/GID：停机前从原容器读取并核对，写入本次事务的快照，预览、迁移、验证实例、正式实例以及中断后的继续和回滚都用它；只给本次新建的目录和文件设置属主，不批量改已有数据的属主。原容器的身份不能可靠确定时（不是数值 UID:GID、数据目录不是本项目的、与 Docker 的模式不符），部署和升级在停机前停止，不猜测。原容器已被删除但部署过时，重新部署按 `data/state` 的属主提出身份，经确认后才使用；升级要求原容器存在。以前由 docker 组普通用户部署的实例改由 root 升级后，服务仍以原来的 UID/GID 运行。检出属于那个用户，git 拒绝以 root 操作它（仓库中的钩子和配置会以 root 运行）：确认信任这份检出后，由 root 执行一次 `git config --global --add safe.directory <项目目录>`，脚本不会代为加入；此后 root 升级时写入检出的文件属于 root。
 
 机器人的 HTTP 服务只供本机管理（控制台、`/health`、关机与通讯录管理），原生部署和 rootful Docker（host 网络）都只监听 `127.0.0.1`。rootless 下 host 网络只是 rootlesskit 的网络命名空间，宿主机连不到，所以部署改为把端口发布到宿主机的 `127.0.0.1:<端口>`，容器内监听所有接口（由部署脚本设置，不来自用户配置）。发布端口的是以部署用户身份运行的 rootlesskit，低于 `net.ipv4.ip_unprivileged_port_start`（通常 1024）的端口默认发布不了：首次部署的默认端口因此改为 `11011`，`BOT_PORT` 指定或已保存的低端口会在停机前被拒绝，并提示改用高端口，或调低该内核参数、给 rootlesskit 加 `CAP_NET_BIND_SERVICE` 后重试；升级沿用的低端口同样在停机前停止。rootless 下机器人容器和外链管理的一次性容器都访问不到只监听宿主机 `127.0.0.1` 的服务（例如本机的 MinIO 或本地模型接口），监听非回环地址的服务可以用宿主机的该地址访问。启用 SELinux 强制模式的主机尚未验证。
 
@@ -54,12 +54,12 @@ Python 小版本范围固定为 `>=3.14,<3.15`，补丁版本由 uv 选择；依
 $env:UV_PROJECT_ENVIRONMENT = (Join-Path $PWD 'data/runtime/document-env')
 uv sync --locked --no-dev --no-install-project
 if ($LASTEXITCODE -eq 0) {
-    bun scripts/runtime/document-manifest.ts . $env:UV_PROJECT_ENVIRONMENT
+    bun src/agent/document-manifest.ts . $env:UV_PROJECT_ENVIRONMENT
 }
 Remove-Item Env:UV_PROJECT_ENVIRONMENT
 ```
 
-Linux 的同等操作为 `UV_PROJECT_ENVIRONMENT="$PWD/data/runtime/document-env" uv sync --locked --no-dev --no-install-project`，成功后运行 `bun scripts/runtime/document-manifest.ts . "$PWD/data/runtime/document-env"`。marker 只记录预期配置，运行时仍验证实际解释器、依赖及导入。
+Linux 的同等操作为 `UV_PROJECT_ENVIRONMENT="$PWD/data/runtime/document-env" uv sync --locked --no-dev --no-install-project`，成功后运行 `bun src/agent/document-manifest.ts . "$PWD/data/runtime/document-env"`。marker 只记录预期配置，运行时仍验证实际解释器、依赖及导入。
 
 Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffice.org/download/download-libreoffice/)安装。在控制台「设置 → 高级运行参数 → 文档处理」的「LibreOffice 程序路径」中填写程序的绝对路径，例如 `C:/Program Files/LibreOffice/program/soffice.exe`；便携版填写其 `program/soffice.exe` 的绝对路径。留空时先从服务账户的 PATH 查找 `soffice`、`libreoffice`，Windows 再查标准安装目录。Linux 同样可设置，如 `/usr/bin/soffice`；隔离任务须填写任务容器内已存在的程序路径，Docker 镜像预装 LibreOffice，通常保持自动查找即可。指定路径无效时会报错，请修正或恢复自动查找。变更后重启服务。PDF 预览直接使用 Python 库。预览字体取自运行主机，建议安装与客户模板一致的字体；Docker 提供 Noto CJK。缺少 LibreOffice 时仍可编辑和组装文件，工具会明确报告未完成视觉检查。
 
@@ -70,8 +70,8 @@ Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffic
 先获取代码，再进入项目目录：
 
 ```sh
-git clone https://github.com/jaykwok/mixin-chatbot.git
-cd mixin-chatbot
+git clone https://github.com/jaykwok/mixin-bot.git
+cd mixin-bot
 ```
 
 项目目录必须是单独的 Git 检出，不要放在另一个 Git 仓库的工作区里：部署和升级按项目目录读取提交，不支持嵌套检出。
@@ -81,34 +81,34 @@ cd mixin-chatbot
 Windows，在管理员 PowerShell 中执行：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy/deploy.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 doctor
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops.ps1 doctor
 ```
 
 Linux / Docker：
 
 ```sh
-bash scripts/deploy/deploy.sh
-bash scripts/ops/ops.sh doctor
+bash scripts/deploy.sh
+bash scripts/ops.sh doctor
 ```
 
-首次部署直接创建当前存储结构。后续重复部署时，脚本先暂停已有实例并保存配置、启动定义、依赖或镜像及原运行状态，停止时明确提示“已停止机器人服务”；Windows 与 Docker 都在停止前确定共享资料目录、问完是否重新配置 AI 并选定[通讯录同步范围](#通讯录同步范围)（还没有时），本机端口不询问（见下节）；凭据和 AI 向导也在停止前运行，回答只写进本次部署的暂存目录，停止后才写入正式位置；取消不会改动部署。部署失败会尝试回滚，恢复失败则保留现场并报错。旧版 webhook 发布的目录不能重新部署或升级，见[从旧版 webhook 发布切换](data-migrations.md#从旧版-webhook-发布切换)。部署被强制中断或回滚未完成时，重新运行部署脚本会先显示上次操作的记录，询问继续还是回滚；继续只使用停机前确认的设置，数据已提交时只能继续，详见[中断恢复](operations.md#中断恢复)。Windows 计划任务优先使用 S4U 开机启动，受系统限制时回退到登录启动，并显示实际方式。
+首次部署直接创建当前存储结构。后续重复部署时，脚本先暂停已有实例并保存配置、启动定义、依赖或镜像及原运行状态，停止时明确提示“已停止机器人服务”；Windows 与 Docker 都在停止前确定共享资料目录、问完是否重新配置 AI 并选定[通讯录同步范围](#通讯录同步范围)（还没有时），本机端口不询问（见下节）；凭据和 AI 向导也在停止前运行，回答只写进本次部署的暂存目录，停止后才写入正式位置；取消不会改动部署。部署失败会尝试回滚，恢复失败则保留现场并报错。更早版本（v1.x 和 webhook 发布）的目录不能重新部署或升级，见[从更早的版本切换](data-migrations.md#从更早的版本切换)。部署被强制中断或回滚未完成时，重新运行部署脚本会先显示上次操作的记录，询问继续还是回滚；继续只使用停机前确认的设置，数据已提交时只能继续，详见[中断恢复](operations.md#中断恢复)。Windows 计划任务优先使用 S4U 开机启动，受系统限制时回退到登录启动，并显示实际方式。
 
 ### 通讯录同步范围
 
-机器人只认识同步范围内的成员，部署时必须明确选择，没有默认值：整个通讯录，或选定的部门及其全部子部门（最多 200 个）。首次部署在填完应用机器人凭据之后选择；已有凭据却还没有范围的部署（1.0.1 及更早版本同步整个通讯录时没有这个文件，重新部署或升级时都要选）在停止服务之前选择，取消或失败都不停机、不改动部署。在终端里运行时由向导选择：先选“选择部门”或“整个通讯录”；选部门时从一级部门逐层进入勾选，完成时向平台核对并列出各部门的完整路径，再确认一次；选整个通讯录同样要再确认一次。部门只能这样逐层勾选，不接受手填的部门 ID。不交互时只能选择整个通讯录，预先设置 `BOT_DIRECTORY_SCOPE=all`：
+机器人只认识同步范围内的成员，部署时必须明确选择，没有默认值：整个通讯录，或选定的部门及其全部子部门（最多 200 个）。首次部署在填完应用机器人凭据之后选择；已有凭据却还没有范围的部署（例如手工删除了这个文件）重新部署或升级时在停止服务之前选择，取消或失败都不停机、不改动部署。在终端里运行时由向导选择：先选“选择部门”或“整个通讯录”；选部门时从一级部门逐层进入勾选，完成时向平台核对并列出各部门的完整路径，再确认一次；选整个通讯录同样要再确认一次。部门只能这样逐层勾选，不接受手填的部门 ID。不交互时只能选择整个通讯录，预先设置 `BOT_DIRECTORY_SCOPE=all`：
 
 ```sh
-BOT_DIRECTORY_SCOPE=all bash scripts/deploy/deploy.sh         # rootful Docker：sudo BOT_DIRECTORY_SCOPE=all bash scripts/deploy/deploy.sh
+BOT_DIRECTORY_SCOPE=all bash scripts/deploy.sh         # rootful Docker：sudo BOT_DIRECTORY_SCOPE=all bash scripts/deploy.sh
 ```
 
 ```powershell
-$env:BOT_DIRECTORY_SCOPE='all'; powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy/deploy.ps1
+$env:BOT_DIRECTORY_SCOPE='all'; powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1
 ```
 
 该变量只接受 `all`，写成部门 ID 等其他值时部署停止，什么都不改；只同步部分部门时清除它，在终端里运行部署，由向导勾选。没有终端又没有设置该变量时部署同样停止。选定的范围随部署事务保存，停机后写入 `data/config/directory.json`；中断后继续时沿用停机前的选择，不再运行向导。已经有范围的部署和升级不再询问，部署后修改范围见[同步范围](operations.md#事件-stream-与通讯录)。
 
-没有范围的服务（例如手工删除了该文件）不同步通讯录：已同步的成员照常使用，不认识的成员收到“机器人还没有设置通讯录同步范围”的提示，`doctor` 判为失败。1.0.1 及更早版本不认识整个通讯录的记录 `{"format":1,"all":true}`，会拒绝启动；部署和升级的回滚恢复停机前的 `data/config`，不受影响。
+没有范围的服务（例如手工删除了该文件）不同步通讯录：已同步的成员照常使用，不认识的成员收到“机器人还没有设置通讯录同步范围”的提示，`doctor` 判为失败。
 
 ### 本机管理端口
 
@@ -117,11 +117,11 @@ $env:BOT_DIRECTORY_SCOPE='all'; powershell -NoProfile -ExecutionPolicy Bypass -F
 端口与其他程序冲突或需要指定时，设置环境变量 `BOT_PORT` 后重新部署；新端口会保存下来，之后沿用：
 
 ```sh
-BOT_PORT=12011 bash scripts/deploy/deploy.sh    # rootful Docker：sudo BOT_PORT=12011 bash scripts/deploy/deploy.sh
+BOT_PORT=12011 bash scripts/deploy.sh    # rootful Docker：sudo BOT_PORT=12011 bash scripts/deploy.sh
 ```
 
 ```powershell
-$env:BOT_PORT='12011'; powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy/deploy.ps1
+$env:BOT_PORT='12011'; powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1
 ```
 
 端口无效、rootless Docker 发布不了，或者新端口已被其他程序占用时，部署在停止服务前报错并说明改法，不会自动换用别的端口。沿用的端口不做占用探测（原服务可能正在使用它）。升级不读取 `BOT_PORT`，改端口只能重新部署。
@@ -134,7 +134,7 @@ $env:BOT_PORT='12011'; powershell -NoProfile -ExecutionPolicy Bypass -File scrip
 2. 确认服务正在运行（`doctor` 中“事件 Stream”为通过），点 **验证连接**，显示连接成功后点 **保存** 订阅配置。只有验证成功并保存后，才能勾选下方的事件。
 3. 勾选机器人接收消息事件（单聊消息、群 @ 消息）和卡片交互事件（`callback:card_interaction`，推送卡片上的按钮靠它），保存事件选择。
 4. 在 **版本管理** 中提交版本并发布，订阅的事件随版本发布生效：企业超级管理员提交后直接生效，其他有发布权限的成员提交后须由超级管理员审核通过。服务连上 Stream 不代表后台已验证，验证成功也不代表事件已保存并发布；`doctor` 显示“事件 Stream”通过但收不到消息时，依次检查这几步。
-5. 在客户端把应用机器人加入要使用的群。从旧版（webhook 自定义机器人）切换时，同时从各群移除旧的自定义机器人。
+5. 在客户端把应用机器人加入要使用的群。从 webhook 发布（自定义机器人）切换时，同时从各群移除旧的自定义机器人。
 
 部署后按以下顺序验证：
 
@@ -234,8 +234,7 @@ data/
 ├── index/                     资料索引 materials.md、扫描 manifest 与 parsed/ 解析缓存，可重建
 ├── conversations/
 │   ├── direct/durable.sqlite  单聊空间库（Pi Durable）：全部单聊成员的会话、排队消息、控制命令、待交付内容与附件登记
-│   ├── groups/<群>/durable.sqlite  群空间库（另有 -wal 等，需一起备份）
-│   └── .../durable.sqlite.shrink-<运行>.old  收缩保留的原库（及 .old-wal、.old-shm），确认后用 shrink-remove-old 删除
+│   └── groups/<群>/durable.sqlite  群空间库（另有 -wal 等，需一起备份）
 ├── tmp/
 │   ├── direct/<成员>/         单聊成员 tmp：received/ 收到的文件，tasks/msg-<请求>/ 生成物与中间产物
 │   └── groups/<群>/<成员>/    群成员 tmp
@@ -248,8 +247,6 @@ data/
 │   ├── instance.json          实例 PID、启动时间与关闭令牌
 │   ├── workspace-root         Linux 部署保存的外置资料目录（空为默认）
 │   ├── reclamation/           tmp 离线回收的清单、快照与归档（backup/rm）
-│   ├── revision-cleanup.json  会话库修订整理的日志（上一次或进行中的整理），更早的在 revision-cleanup/
-│   ├── shrink.json            会话库收缩的恢复记录（上一次或进行中的收缩），更早的在 shrink/
 │   └── ...                    部署状态与维护租约
 └── runtime/
     ├── pi/settings.json       Pi 选型与 Durable 原生运行策略（需备份）
@@ -259,7 +256,6 @@ data/
     └── ...                    其余 Pi 资源与启动脚本，可重建
 backup/                        为了能撤销某个操作而留的；清理用 backup-scan / backup-clean，别手动删
 ├── snapshots/                 部署与升级的回滚现场
-├── revision-cleanup/          修订整理前的会话库备份，每次整理一个目录
 └── rm/                        部署期间被替换的旧文件；操作期间的归档在 rm/<快照名>/
 tmp/                           报告、测试隔离 cwd、诊断产物、一次性脚本；无任务使用时可清理
 └── backup-cleanup/            历史归档清理的清单和执行结果
@@ -274,7 +270,7 @@ logs/                          应用日志与操作日志
 
 建议正常停机后备份整个 `data/`，并单独备份外置的共享资料目录。`data/runtime/pi/settings.json` 是必须保留的模型选型；`data/runtime/models-store.json` 也应随配置备份，动态目录服务商依赖它离线启动，移除后需重新运行向导联网刷新。SQLite 使用 WAL，运行中只复制主 `.sqlite` 文件可能遗漏数据。
 
-空间库和 tmp 里的结果文件必须作为同一批数据备份；只有数据库不能恢复图片、附件或全文。停机后可运行 `bun scripts/ops/data-backup.ts backup <新目录>`：取得维护租约、检查并 checkpoint 所有数据库，再复制 `state`、`conversations`、`tmp`、`index` 和默认的 `workspace`（外置资料目录不在内，tmp 归档和诊断快照跳过），写入逐文件 SHA-256 清单。配置、密钥、模型目录缓存和选型仍需另行备份。恢复命令 `bun scripts/ops/data-backup.ts restore <备份目录> <空暂存项目>` 先验证全部摘要，再复制到空目录并检查 SQLite；配置补齐后运行 `bun scripts/runtime/data-current.ts validate --project <暂存项目>`，验收通过再切换。恢复工具不会覆盖正在使用的数据。
+空间库和 tmp 里的结果文件必须作为同一批数据备份；只有数据库不能恢复图片、附件或全文。停机后可运行 `bun ops/tools/data-backup.ts backup <新目录>`：取得维护租约、检查并 checkpoint 所有数据库，再复制 `state`、`conversations`、`tmp`、`index` 和默认的 `workspace`（外置资料目录不在内，tmp 归档和诊断快照跳过），写入逐文件 SHA-256 清单。配置、密钥、模型目录缓存和选型仍需另行备份。恢复命令 `bun ops/tools/data-backup.ts restore <备份目录> <空暂存项目>` 先验证全部摘要，再复制到空目录并检查 SQLite；配置补齐后运行 `bun ops/tools/data-current.ts validate --project <暂存项目>`，验收通过再切换。恢复工具不会覆盖正在使用的数据。
 
 Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 999 次，正常退出不重试；停止机器人也会停止启动器。此退避让旧服务租约有时间过期。修改代码后需按正常部署流程更新启动器；运行中的服务不会自动切换到这份代码。
 
@@ -331,11 +327,9 @@ Windows 启动器对非零退出等待 60 秒后启动新进程，最多重试 9
 
 ## 数据版本与升级
 
-当前程序版本 1.1.0、数据格式 1，Pi 精确锁为 1.5.0（会话库为 Durable SQLite schema 2）。部署与升级按部署记录 `data/state/data-version.json` 判断：没有记录也没有数据时全新安装；记录有效且数据格式一致时正常升级；有数据但没有有效记录，或记录损坏、缺字段、格式不受支持时拒绝，现场保留。部署记录还登记数据所属的应用（平台环境与 AppID），换应用或环境时拒绝。旧版 webhook 发布不能原地升级，需在新目录全新部署；只有旧版统计可一次性导入（见[导入旧版统计](data-migrations.md#导入旧版统计)），其余数据都不迁移。完整规则见[版本、数据格式与从旧版切换](data-migrations.md)。
+当前程序版本 2.0.0、数据格式 2，Pi 精确锁为 1.5.0（会话库为 Durable SQLite schema 2）。部署与升级按部署记录 `data/state/data-version.json` 判断：没有记录也没有数据时全新安装；记录有效且数据格式一致时正常升级；有数据但没有有效记录，或记录损坏、缺字段、格式不受支持时拒绝，现场保留。部署记录还登记数据所属的应用（平台环境与 AppID），换应用或环境时拒绝。更早的版本（v1.x 和 webhook 发布）不能原地升级，需在新目录全新部署；v1.x 的统计可恢复到新部署的空账本（见[恢复统计](data-migrations.md#恢复统计)），其余数据都不迁移。完整规则见[版本、数据格式与从旧版切换](data-migrations.md)。
 
-会话库里旧版本留下的长修订链（读入慢、占空间）在部署和升级时整理：停机前只读预览并估计用时和空间，询问是否停机后整理（默认整理，总是先备份），也可用 `BOT_REVISION_CLEANUP=apply|skip` 预先选择；空间不够时停机前就拒绝，释放空间或显式选择 `skip`。停机时间因此延长；平台只补推 5 分钟内的消息，长链很多时可以先跳过、另找时间整理。见[会话库的修订整理](operations.md#会话库的修订整理)。
-
-还没有通讯录同步范围的部署（1.0.1 及更早版本默认同步整个通讯录，没有 `data/config/directory.json`）升级时必须在停机前选择，选定之前升级不会继续；要继续同步整个通讯录也得明确选它。不交互时只能预先设置 `BOT_DIRECTORY_SCOPE=all`，规则同[通讯录同步范围](#通讯录同步范围)。
+还没有通讯录同步范围的部署（没有 `data/config/directory.json`）升级时必须在停机前选择，选定之前升级不会继续；要继续同步整个通讯录也得明确选它。不交互时只能预先设置 `BOT_DIRECTORY_SCOPE=all`，规则同[通讯录同步范围](#通讯录同步范围)。
 
 ## 任务隔离部署
 

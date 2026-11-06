@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { catalogDefaults, catalogMatches, discoverModelIds } from "../../scripts/config/configure.ts";
+import { catalogDefaults, catalogMatches, discoverModelIds } from "../../ops/config/configure.ts";
 
 /** 只读 Pi 随包目录，不碰仓库里的 data/ 和网络。 */
 function builtinRuntime(): Promise<ModelRuntime> {

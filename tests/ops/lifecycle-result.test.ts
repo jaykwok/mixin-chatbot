@@ -43,7 +43,7 @@ for (const platform of ["linux", "windows"] as const) test.skipIf(platform === "
           const script = join(f.root, "run.ps1");
           writeFileSync(script, "\uFEFF" + [
             "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
-            "$tokens=$null; $errors=$null; $ast=[Management.Automation.Language.Parser]::ParseFile(" + ps(join(root, "scripts/ops/ops.ps1")) + ",[ref]$tokens,[ref]$errors)",
+            "$tokens=$null; $errors=$null; $ast=[Management.Automation.Language.Parser]::ParseFile(" + ps(join(root, "scripts/ops.ps1")) + ",[ref]$tokens,[ref]$errors)",
             "if($errors){throw 'syntax'}; foreach($name in @('Invoke-LifecycleOperation','Wait-Local','Write-OpsResult')) { $fn=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true); . ([scriptblock]::Create($fn.Extent.Text)) }",
             "$Command='resume'; function Err($s) { Write-Host $s }; function Get-FinalRunState { return $env:FIXTURE_STATE }",
             "$script:probeCount=0; function Start-Sleep {}",

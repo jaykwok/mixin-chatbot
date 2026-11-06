@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import { existsSync } from "node:fs";
 import { appendFile, chmod, lstat, mkdir, readFile, readdir, rename, symlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { apply, scan, type Entry } from "../../scripts/ops/backup-cleanup.ts";
+import { apply, scan, type Entry } from "../../ops/tools/backup-cleanup.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = join(import.meta.dir, "../..");
@@ -41,14 +41,14 @@ async function backupProject(root: string) {
   const names = {
     self: `deploy-flow-Q9wErT-${randomUUID()}`, testRoot: `log-retention-Zx81Kp-${randomUUID()}`, filler: `relay-sign-M3nB7v-${randomUUID()}`,
     domain: `relay-ttl-Pq5Rs2-${randomUUID()}`, file: `draft.json-${randomUUID()}`, changed: `change-me-Gh56Jk-${randomUUID()}`,
-    replaced: `replace-me-Rt67Yu-${randomUUID()}`, swapped: `swap-me-Vb89Nm-${randomUUID()}`, suspected: `mixin-chatbot-relay-Kk3Jj9-${randomUUID()}`,
+    replaced: `replace-me-Rt67Yu-${randomUUID()}`, swapped: `swap-me-Vb89Nm-${randomUUID()}`, suspected: `mixin-bot-relay-Kk3Jj9-${randomUUID()}`,
     weak: `pattern-Hh8Gg7-${randomUUID()}`, innerLink: `inner-link-Cd34Ef-${randomUUID()}`, topLink: `escape-Ab12Cd-${randomUUID()}`,
     session: `1758000000000-${randomUUID()}-session.jsonl`, shell: "1758000000-12345-678-models.json",
     windows: `${randomUUID().replace(/-/g, "")}-relay.json`, transaction: "deploy-Ab12Cd34", unknown: "random-notes",
   };
   const migration = `deploy-${randomUUID().replaceAll("-", "")}`;
   await put(root, `${rm(names.self)}/state.txt`, `fixture root ${base(names.self)}/data`);
-  await put(root, `${rm(names.testRoot)}/config.json`, JSON.stringify({ root: "D:\\Projects\\mixin-chatbot\\tmp\\tests-Ab12Cd\\fixtures\\other" }));
+  await put(root, `${rm(names.testRoot)}/config.json`, JSON.stringify({ root: "D:\\Projects\\mixin-bot\\tmp\\tests-Ab12Cd\\fixtures\\other" }));
   await put(root, `${rm(names.filler)}/outside/secret.bin`, Buffer.alloc(1024 * 1024));
   await put(root, `${rm(names.domain)}/relay.json`, JSON.stringify({ url: "https://files.example.test/relay" }));
   await put(root, rm(names.file), JSON.stringify({ domain: "bot.example.test" }));
@@ -112,42 +112,6 @@ test("backup scan classifies archives by name and content evidence without chang
     expect(scanned.skipped).toEqual(["reports"]);
     const tsv = await readFile(join(root, "tmp/backup-cleanup", scanned.report!, "manifest.tsv"), "utf8");
     expect(tsv).toContain("可确认测试数据"); expect(tsv).toContain("疑似测试数据"); expect(tsv).toContain("业务归档"); expect(tsv).toContain("无法判断");
-  } finally { await fixture.cleanup(); }
-}, 30000);
-
-test("backup scan lists revision cleanup backups by run; the backups of a run that has not ended are kept", async () => {
-  const fixture = await tempFixture("backup-revision-");
-  try {
-    const root = fixture.root, [ended, open] = ["20261027-0123abcd", "20261027-4567cdef"];
-    const area = (name: string) => `backup/revision-cleanup/${name}`;
-    for (const run of [ended, open]) await put(root, `${area(run)}/direct.sqlite`, "SQLite format 3\0");
-    await put(root, `${area("notes")}/readme.txt`, "manual notes");
-    const journal = (state: string) => put(root, "data/state/revision-cleanup.json", JSON.stringify({ version: 2, run: open, state, databases: [] }, null, 2));
-    await journal("running");
-    const scanned = scan(root);
-    const entry = (path: string) => scanned.entries.find(item => item.path === path)!;
-    for (const run of [ended, open]) {
-      expect(entry(area(run)).category).toBe("business");
-      expect(entry(area(run)).basis[0]).toContain("修订整理前的会话库备份");
-    }
-    expect(entry(area(open)).basis.join(" ")).toContain("修订整理尚未结束");
-    expect(entry(area(ended)).basis.join(" ")).not.toContain("修订整理尚未结束");
-    expect(entry(area("notes")).category).toBe("unknown");
-    await editActions(root, scanned.report!, { [area(ended)]: "delete", [area(open)]: "delete", [area("notes")]: "delete" });
-    const preview = apply(root, scanned.report!), done = apply(root, scanned.report!, preview.code);
-    const outcome = (path: string) => done.results.find(result => result.path === path)!;
-    expect(outcome(area(ended)).outcome).toBe("deleted");
-    expect(outcome(area(open))).toMatchObject({ outcome: "refused", reason: expect.stringContaining("修订整理尚未结束") });
-    expect(outcome(area("notes")).reason).toContain("从不删除");
-    expect([existsSync(join(root, area(ended))), existsSync(join(root, area(open))), existsSync(join(root, area("notes")))]).toEqual([false, true, true]);
-    // Once the run has ended its backups may go too; a journal that cannot be read stops the scan.
-    await journal("finished");
-    const later = scan(root);
-    await editActions(root, later.report!, { [area(open)]: "delete" });
-    const again = apply(root, later.report!, apply(root, later.report!).code);
-    expect(again.results.find(result => result.path === area(open))!.outcome).toBe("deleted");
-    await put(root, "data/state/revision-cleanup.json", "{}");
-    expect(() => scan(root)).toThrow("修订整理日志格式不匹配");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -242,7 +206,7 @@ test("backup cleanup rejects a tampered manifest, a pending transaction and a re
 
     const legacy = JSON.parse(original); legacy.format = 1;
     await writeFile(manifestPath, JSON.stringify(legacy));
-    expect(() => apply(root, report!)).toThrow("旧版清单没有文件内容摘要");
+    expect(() => apply(root, report!)).toThrow("格式不符");
     expect(existsSync(join(root, target))).toBe(true);
     await writeFile(manifestPath, original);
 
@@ -384,7 +348,7 @@ test("backup-cleanup command scans by default, previews with a confirmation code
   try {
     const root = fixture.root, { names } = await backupProject(root);
     const run = async (...args: string[]) => {
-      const child = Bun.spawn([process.execPath, join(project, "scripts/ops/backup-cleanup.ts"), ...args], { cwd: root, stdout: "pipe", stderr: "pipe", windowsHide: true });
+      const child = Bun.spawn([process.execPath, join(project, "ops/tools/backup-cleanup.ts"), ...args], { cwd: root, stdout: "pipe", stderr: "pipe", windowsHide: true });
       const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
       return { code, text: out + err };
     };

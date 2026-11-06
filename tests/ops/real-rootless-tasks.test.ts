@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RootlessTasks, type TaskDriver } from "../../src/core/rootless-tasks.ts";
-import { executeProcess } from "../../scripts/lib/process.ts";
+import { executeProcess } from "../../src/lib/process.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { resultReferences } from "../../src/durable/results/references.ts";
 

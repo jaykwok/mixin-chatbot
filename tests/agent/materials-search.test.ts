@@ -39,7 +39,7 @@ test("filename/body searches respect ignore, hidden paths and group boundaries; 
 test("a cache entry without source fields needs one explicit extraction; a cache hit registers a pointer without parsing and source edits invalidate it", async () => {
   const f = await setup(), source = join(f.options.workspaceDir, "manual.docx");
   const digest = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
-  const parser = createHash("sha256").update(await readFile(fileURLToPath(new URL("../../scripts/runtime/extract_document.py", import.meta.url))))
+  const parser = createHash("sha256").update(await readFile(fileURLToPath(new URL("../../src/agent/python/extract_document.py", import.meta.url))))
     .update(await readFile(fileURLToPath(new URL("../../uv.lock", import.meta.url)))).digest("hex");
   const key = digest(JSON.stringify([digest("original"), ".docx", parser, 250000])), cache = join(f.root, "index/parsed", key);
   await writeFile(source, "original"); await mkdir(cache, { recursive: true });

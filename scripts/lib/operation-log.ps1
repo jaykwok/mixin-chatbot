@@ -1,5 +1,5 @@
 ﻿function Protect-OperationMessage([string]$Message) {
-    # Same rules and order as scripts/lib/redact.ts and operation-log.sh; tests/ops/redaction-parity.test.ts runs one sample table through all three.
+    # Same rules and order as src/lib/redact.ts and operation-log.sh; tests/ops/redaction-parity.test.ts runs one sample table through all three.
     $text = $Message -replace '\x1b\[[0-?]*[ -/]*[@-~]', ''
     $text = $text -replace '(?i)\b((?:sk|pk|ghp|xoxb|hf)[-_]|github_pat_)[A-Za-z0-9_-]{6,}', '$1***'
     $text = $text -replace '(?i)(Bearer\s+)[^\s"'',;]+', '$1***'

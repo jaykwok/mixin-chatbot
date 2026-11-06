@@ -9,7 +9,7 @@ import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { symlinkUnavailable } from "../helpers/links.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import { DeploymentGit } from "../../scripts/ops/core/deployment-git.ts";
+import { DeploymentGit } from "../../ops/core/deployment-git.ts";
 
 type Files = Record<string, string>;
 /** A commit's content: file contents, or symbolic links by their target. */

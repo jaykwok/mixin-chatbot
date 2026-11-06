@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { loadDeploymentState } from "../../scripts/ops/core/deployment-state.ts";
-import { deploymentRuntime } from "../../scripts/ops/core/deployment-runtime.ts";
+import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
+import { deploymentRuntime } from "../../ops/core/deployment-runtime.ts";
 import { windowsUpgradeFixture as fixture } from "../helpers/windows-upgrade.ts";
 
 const source = resolve(import.meta.dir, "../.."), original = "a".repeat(40), target = "b".repeat(40);
@@ -37,7 +37,7 @@ test.skipIf(process.platform !== "win32")("Windows 提交回复丢失保留已�
   try {
     f.loseCommit(); expect(await f.run()).toMatchObject({ outcome: "failed", exitCode: 1, finalState: "stopped" });
     const pending = loadDeploymentState(f.project)!; expect(pending.committed).toBe(true);
-    const fixed = deploymentRuntime(f.project, source, pending), file = join(fixed.root, "scripts/ops/core/windows-lifecycle.ts"), bytes = readFileSync(file);
+    const fixed = deploymentRuntime(f.project, source, pending), file = join(fixed.root, "ops/core/windows-lifecycle.ts"), bytes = readFileSync(file);
     writeFileSync(file, "throw new Error('do not import altered code');");
     const count = f.events.length;
     expect(await f.run({ original, target, branch: "main", command: "resume" })).toMatchObject({ outcome: "refused", exitCode: 1 });

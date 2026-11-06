@@ -16,7 +16,7 @@ IMAGE_C="sha256:$(printf 'c%.0s' {1..64})"
 DAEMON=5eec1de4-4518-46da-a461-80c0866ec11d
 ROOTLESS='[name=seccomp,profile=builtin name=rootless name=cgroupns]'
 ROOTFUL='[name=seccomp,profile=builtin name=cgroupns]'
-TAG="$(candidate_tag mixin-chatbot 0123456789ab 0123456789abcdef)"
+TAG="$(candidate_tag mixin-bot 0123456789ab 0123456789abcdef)"
 
 result() { printf '%s=%s\n' "$1" "$2"; }
 # Runs in this shell, so a function's variables stay visible to later cases.
@@ -63,9 +63,9 @@ docker() {
                     --label)
                         case "$2" in
                             org.opencontainers.image.revision=*) revision="${2#*=}" ;;
-                            org.mixin-chatbot.project=*) project="${2#*=}" ;;
-                            org.mixin-chatbot.operation=*) operation="${2#*=}" ;;
-                            org.mixin-chatbot.source=*) source="${2#*=}" ;;
+                            org.mixin-bot.project=*) project="${2#*=}" ;;
+                            org.mixin-bot.operation=*) operation="${2#*=}" ;;
+                            org.mixin-bot.source=*) source="${2#*=}" ;;
                         esac
                         shift 2 ;;
                     *) shift ;;
@@ -91,7 +91,7 @@ docker() {
                     id="$(resolve_ref "$5")" || { echo "Error response from daemon: No such image: $5" >&2; return 1; }
                     case "$4" in
                         '{{.Id}}') printf '%s\n' "$id" ;;
-                        '{{index .Config.Labels "org.mixin-chatbot.operation"}}') cut -d'|' -f5 "$DSTATE/images/${id#sha256:}" ;;
+                        '{{index .Config.Labels "org.mixin-bot.operation"}}') cut -d'|' -f5 "$DSTATE/images/${id#sha256:}" ;;
                         *) printf '%s|%s\n' "$id" "$(cat "$DSTATE/images/${id#sha256:}")" ;;
                     esac ;;
                 rm) rm -f -- "$(ref_file "${*: -1}")" ;;
@@ -173,7 +173,7 @@ docker_cases() {
     printf arm64 > "$DSTATE/arch"
     check verify-arch candidate_verify
     printf amd64 > "$DSTATE/arch"
-    CANDIDATE[operation_id]=fedcba9876543210; CANDIDATE[image_tag]="$(candidate_tag mixin-chatbot 0123456789ab fedcba9876543210)"
+    CANDIDATE[operation_id]=fedcba9876543210; CANDIDATE[image_tag]="$(candidate_tag mixin-bot 0123456789ab fedcba9876543210)"
     check verify-owner candidate_verify
     valid_candidate
     # Another image takes the reserved tag: execution stays bound to the recorded ID.
@@ -189,7 +189,7 @@ docker_cases() {
     DOCKER_DOWN=1 check verify-down candidate_verify
 
     # The official tag the core published (core-docker-effects.test.ts); releasing the reserved tag leaves it alone.
-    printf '%s' "$IMAGE_B" > "$(ref_file mixin-chatbot)"
+    printf '%s' "$IMAGE_B" > "$(ref_file mixin-bot)"
 
     printf '%s' "$IMAGE_C" > "$(ref_file "$TAG")"
     check release-moved candidate_release_tag "$TAG" "$IMAGE_B"
@@ -197,7 +197,7 @@ docker_cases() {
     printf '%s' "$IMAGE_B" > "$(ref_file "$TAG")"
     check release candidate_release_tag "$TAG" "$IMAGE_B"
     result release-tag-left "$(exists "$(ref_file "$TAG")")"
-    result release-published "$(cat "$(ref_file mixin-chatbot)")"
+    result release-published "$(cat "$(ref_file mixin-bot)")"
     check release-absent candidate_release_tag "$TAG" "$IMAGE_B"
     DOCKER_DOWN=1 check release-down candidate_release_tag "$TAG" "$IMAGE_B"
     result rm-calls "$(grep -c '^image rm' "$DSTATE/calls")"
@@ -213,7 +213,7 @@ prepare_cases() {
     mkdir -p "$fixture/project"
     check prepare prepare_candidate_image "$fixture/context" "$SHA" commit "$fixture/project"
     result prepare-record "${CANDIDATE[source]}|${CANDIDATE[target_sha]}|${CANDIDATE[image_id]}|${CANDIDATE[daemon_id]}"
-    tag="mixin-chatbot:candidate-$(candidate_project_id "$fixture/project")-${CANDIDATE[operation_id]}"
+    tag="mixin-bot:candidate-$(candidate_project_id "$fixture/project")-${CANDIDATE[operation_id]}"
     result prepare-tag "$([ "${CANDIDATE[image_tag]}" = "$tag" ] && [[ "${CANDIDATE[operation_id]}" =~ ^[0-9a-f]{16}$ ]] && echo ours)"
     result prepare-tagged "$(cat "$(ref_file "$tag")")"
     check prepare-release release_candidate
@@ -593,17 +593,17 @@ disk_cases() {
     # The build estimate: the Docker root and containerd root share /fs-a and count once; a data path there adds the reserve.
     docker_storage_paths() { DOCKER_STORAGE_PATHS=(/fs-a/docker /fs-a/containerd); }
     printf 'linux|amd64||||\n' > "$DSTATE/images/${IMAGE_B#sha256:}"
-    printf '%s' "$IMAGE_B" > "$(ref_file mixin-chatbot)"
+    printf '%s' "$IMAGE_B" > "$(ref_file mixin-bot)"
     printf '%s 322MB\n%s 9GB\n' "$IMAGE_B" "$IMAGE_C" > "$DSTATE/sizes"
     set_free /mnt/1 5147483648
-    check build-exact check_build_disk_space mixin-chatbot /fs-a/data
+    check build-exact check_build_disk_space mixin-bot /fs-a/data
     set_free /mnt/1 5147483647
-    check build-short check_build_disk_space mixin-chatbot /fs-a/data
+    check build-short check_build_disk_space mixin-bot /fs-a/data
     printf '%s 2.5GB\n' "$IMAGE_B" > "$DSTATE/sizes"
     set_free /mnt/1 4823741824
-    check build-large check_build_disk_space mixin-chatbot
+    check build-large check_build_disk_space mixin-bot
     set_free /mnt/1 4823741823
-    check build-large-short check_build_disk_space mixin-chatbot
+    check build-large-short check_build_disk_space mixin-bot
     set_free /mnt/1 4073741824
     check build-no-previous check_build_disk_space ''
     # Docker on one btrfs subvolume and the data on another: both report the pool's 4.5 GB, which has to hold the build
@@ -628,7 +628,7 @@ disk_cases() {
     set_free /tank/containerd 4073741824
     check zfs-quota-enough check_build_disk_space ''
     docker_storage_paths() { echo 'storage unknown' >&2; return 1; }
-    check build-unknown-storage check_build_disk_space mixin-chatbot /fs-b/data
+    check build-unknown-storage check_build_disk_space mixin-bot /fs-b/data
     local size
     for size in 322MB 1.23GB 976.6kB 0B 12XB ''; do result "bytes-$size" "$(human_to_bytes "$size" 2>/dev/null || echo fail)"; done
 }
@@ -665,15 +665,7 @@ snapshot_cases() {
     mkdir -p "$PROJECT_DIR/backup"
     check stop check_stop_disk_space
     result stop-args "$(cat "$fixture/free-args")"
-    # A revision cleanup decided before the stop adds its backup to backup/ and the largest deletion's WAL to data/.
-    REVISION_CLEANUP_BACKUP_BYTES=7000; REVISION_CLEANUP_WAL_BYTES=300
-    check stop-cleanup check_stop_disk_space
-    result stop-cleanup-args "$(cat "$fixture/free-args")"
     check_free_space() { return 1; }
-    check stop-cleanup-short check_stop_disk_space
-    # A console task cannot set the variable: it is told to preview again and choose to skip.
-    MIXIN_OPS_CONSOLE=1 check stop-cleanup-console check_stop_disk_space
-    REVISION_CLEANUP_BACKUP_BYTES=0; REVISION_CLEANUP_WAL_BYTES=0
     check stop-short check_stop_disk_space
     snapshot_size_estimate() { echo 'du: cannot access' >&2; return 1; }
     rm -f -- "$fixture/free-args"

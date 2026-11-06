@@ -3,13 +3,13 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { freezeRuntime } from "../../scripts/ops/console/runtime.ts";
-import { consoleDir, prepareConsoleDir } from "../../scripts/ops/console/state.ts";
-import { runDeploymentHost, validUpgradeInput, type DeploymentContext, type DeploymentPlatform, type UpgradeInput } from "../../scripts/ops/core/deployment-host.ts";
-import { loadDeploymentState } from "../../scripts/ops/core/deployment-state.ts";
-import { MaintenanceRefused } from "../../scripts/ops/core/maintenance.ts";
-import type { OpsResult } from "../../scripts/ops/core/result.ts";
-import { serializeTransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
+import { freezeRuntime } from "../../ops/core/source-runtime.ts";
+import { consoleDir, prepareConsoleDir } from "../../ops/core/console-state.ts";
+import { runDeploymentHost, validUpgradeInput, type DeploymentContext, type DeploymentPlatform, type UpgradeInput } from "../../ops/core/deployment-host.ts";
+import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
+import { MaintenanceRefused } from "../../ops/core/maintenance.ts";
+import type { OpsResult } from "../../ops/core/result.ts";
+import { serializeTransactionRecord } from "../../ops/core/transaction-record.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 type Hooks = { start?(context: DeploymentContext<UpgradeInput>): void; capture?(context: DeploymentContext<UpgradeInput>): void };
@@ -47,7 +47,7 @@ test("新事务发布：名称已被占用时拒绝且不动原有内容；发�
   try {
     const source = join(f.root, "source");
     // The pinned runtime copies files only: each tree needs one.
-    for (const tree of ["scripts", "src", "ui"]) { mkdirSync(join(source, tree), { recursive: true }); writeFileSync(join(source, tree, "fixture.ts"), "export {};\n"); }
+    for (const tree of ["console", "ops", "scripts", "src"]) { mkdirSync(join(source, tree), { recursive: true }); writeFileSync(join(source, tree, "fixture.ts"), "export {};\n"); }
     let n = 0;
     const run = async (hooks: Hooks) => {
       const project = join(f.root, `项目 ${++n}`);
@@ -55,7 +55,7 @@ test("新事务发布：名称已被占用时拒绝且不动原有内容；发�
       const plan = join(f.root, `plan-${n}.json`); writeFileSync(plan, "{}\n");
       prepareConsoleDir(consoleDir(project));
       const pinned = freezeRuntime(consoleDir(project), source), results: OpsResult[] = [];
-      const input: UpgradeInput = { operation: "upgrade", original: "a".repeat(40), target: "b".repeat(40), branch: "main", plan, cleanup: "skip", command: "update" };
+      const input: UpgradeInput = { operation: "upgrade", original: "a".repeat(40), target: "b".repeat(40), branch: "main", plan, command: "update" };
       const result = await runDeploymentHost(input, { project, source: pinned.root, async verify() {}, async finish(value) { results.push(value); },
         output: () => {} }, platform(hooks));
       const snapshots = existsSync(join(project, "backup/snapshots")) ? readdirSync(join(project, "backup/snapshots")) : [];

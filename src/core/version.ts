@@ -8,10 +8,10 @@ export const APP_VERSION: string = manifest.version;
  * Data format version: whether this program can open the existing databases and directories. It changes only with the
  * storage format, not with every release.
  *
- * 1: the app-bot release. Application-shared workspace, per-space conversation databases under data/conversations,
- * data/tmp, data/state/stats.sqlite. Legacy (webhook) releases are not upgraded: deploy fresh and import statistics.
+ * 2: application-shared workspace, per-space conversation databases under data/conversations, data/tmp and
+ * data/state/stats.sqlite. Deployments of earlier formats are not upgraded: deploy fresh and restore the statistics.
  */
-export const DATA_VERSION = 1;
+export const DATA_VERSION = 2;
 
 /**
  * Build identity: the commit the running code was built from, `-dirty` when built from a modified working tree. Set by

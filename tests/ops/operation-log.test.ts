@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { latestStartupError, openOperationLog, operationError } from "../../scripts/lib/operation-log.ts";
+import { latestStartupError, openOperationLog, operationError } from "../../src/lib/operation-log.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
@@ -22,7 +22,7 @@ for (const entry of ["current-data", ...(process.platform === "win32" ? ["powers
   for (const status of [0, 1]) test(`${entry} announces one operation log, repeating it only on failure (exit ${status})`, async () => {
     const f = await tempFixture("operation-log-chain-");
     try {
-      const migration = join(project, "scripts/runtime/data-current.ts");
+      const migration = join(project, "ops/tools/data-current.ts");
       await mkdir(join(f.root, "data/runtime/pi"), { recursive: true });
       await writeFile(join(f.root, "data/runtime/pi/settings.json"), JSON.stringify({ defaultProvider: "fixture", defaultModel: "fixture" }));
       // Failure: conversations without a deployment record are refused before any configuration is read.
@@ -56,7 +56,7 @@ for (const entry of ["current-data", ...(process.platform === "win32" ? ["powers
       if (entry !== "current-data") expect(text).toContain(`operation finished; exit=${status}`);
       if (status) expect(text).toContain("目录中已有数据但没有有效的版本标记");
       else {
-        expect(result.text).toContain("数据格式 1：全新安装");
+        expect(result.text).toContain("数据格式 2：全新安装");
         expect(result.text).not.toContain('"decisions"');
         expect(text).toContain("action=preview");
       }
@@ -153,7 +153,7 @@ test("the data preflight records failures without loading project configuration 
     await mkdir(join(f.root, "data/config"), { recursive: true });
     await writeFile(join(f.root, "data/config/runtime.json"), "invalid-json");
     await mkdir(join(f.root, "data/conversations/groups/g"), { recursive: true });
-    const result = await run([process.execPath, join(project, "scripts/runtime/data-current.ts"), "preview", "--project", f.root], f.root);
+    const result = await run([process.execPath, join(project, "ops/tools/data-current.ts"), "preview", "--project", f.root], f.root);
     expect(result.code, result.text).toBe(1);
     const logs = await readdir(join(f.root, "logs/operations")); expect(logs).toHaveLength(1);
     const text = await readFile(join(f.root, "logs/operations", logs[0]!), "utf8");

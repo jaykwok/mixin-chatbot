@@ -22,7 +22,7 @@ const backend = {
 };
 const { finishTask } = await import("../../src/core/task-backend.ts");
 mock.module("../../src/core/task-backend.ts", () => ({ configuredRootlessTasks: () => backend, assertTaskPathAllowed: async () => {}, finishTask, ISOLATED_PYTHON: "/fixture/python" }));
-const { buildLocalTools } = await import("../helpers/native-tools.ts");
+const { buildLocalTools } = await import("./native-tools.ts");
 const { documentTools } = await import("../../src/agent/document-extract.ts");
 const { documentWorkTools } = await import("../../src/agent/modules/document-work/tools.ts");
 

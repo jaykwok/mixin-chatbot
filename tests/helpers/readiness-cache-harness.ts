@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { mock, spyOn } from "bun:test";
 import { application, waitFor } from "../../src/core/lifecycle.ts";
 import { DOCUMENT_TOOLCHAIN_PACKAGES } from "../../src/core/config.ts";
-import { documentMarker, DOCUMENT_TOOLCHAIN_MARKER } from "../../scripts/runtime/document-manifest.ts";
+import { documentMarker, DOCUMENT_TOOLCHAIN_MARKER } from "../../src/agent/document-manifest.ts";
 let runs = 0, success = true, release: (() => void) | undefined, hold = false;
 const prepared: string[] = [];
 // The late-reader race of CI 40277116967, made explicit. While `late` is set, the second marker read announces itself and

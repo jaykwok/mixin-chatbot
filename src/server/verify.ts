@@ -30,7 +30,7 @@ try {
   server = Bun.serve({ hostname: HOST, port: PORT, fetch(request) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return Response.json({
-      service: "mixin-chatbot", version: 1, appVersion: APP_VERSION, build: APP_BUILD, status: "ready", instanceId, startedAt, pid: process.pid, verificationOnly: true,
+      service: "mixin-bot", version: 1, appVersion: APP_VERSION, build: APP_BUILD, status: "ready", instanceId, startedAt, pid: process.pid, verificationOnly: true,
     });
     if (request.method === "POST" && url.pathname === "/_admin/shutdown" && constantTimeEqual(request.headers.get("Authorization") ?? "", `Bearer ${token}`)) {
       setTimeout(() => void stop(), 0);

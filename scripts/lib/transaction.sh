@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 部署/升级事务记录：快照目录中的 transaction 文件，每行一个 key=value。
 # 记录停机前确认的全部选择；续做和回滚只使用记录值，不重新读取默认值。凭据永不写入。
-# Windows 写入同一格式，共用核心与控制台按同一规则读取（scripts/ops/core/transaction-record.ts）。format 2 起没有入口模式、域名和平台 IP（应用机器人不需要入站入口）。
+# Windows 写入同一格式，共用核心与控制台按同一规则读取（ops/core/transaction-record.ts）。format 2 起没有入口模式、域名和平台 IP（应用机器人不需要入站入口）。
 TRANSACTION_KEYS=(format operation snapshot target_sha original_sha original_branch original_workspace_root target_workspace_root
     was_running bot_port reconfigure_ai)
 

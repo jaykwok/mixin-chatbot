@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync, writeFileSync } from "node:fs";
-import { cliArgs, groupOptions, groupSelection } from "../../scripts/lib/cli.ts";
-import { opsCommand } from "../../scripts/ops/shared/platform.ts";
+import { cliArgs, groupOptions, groupSelection } from "../../ops/lib/cli.ts";
+import { opsCommand } from "../../ops/core/platform.ts";
 import { ADVANCED_RUNTIME_KEYS } from "../../src/core/runtime-schema.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -26,7 +26,7 @@ test("tmp and stat return one for duplicate or targetless selectors without unha
   try {
     for (const [file, args] of [["tmp-admin.ts", ["list"]], ["stats-admin.ts", []]] as const) {
       for (const flags of [["--group-id"], ["--group-id", "--group-id"], ["--storage-segment", "--group-id"]]) {
-        const child = Bun.spawn([process.execPath, join(fileURLToPath(new URL("../../scripts/ops/", import.meta.url)), file), ...args, ...flags],
+        const child = Bun.spawn([process.execPath, join(fileURLToPath(new URL("../../ops/tools/", import.meta.url)), file), ...args, ...flags],
           { cwd: f.root, env: process.env, stdout: "pipe", stderr: "pipe", windowsHide: true });
         const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
         expect(code).toBe(1); expect(stderr).not.toContain("at main");
@@ -52,7 +52,7 @@ test("网页命令提示使用实际页面，显示上下文不启用写操作�
     }
     for (const [command, expected] of [["resume", "「维护 → 继续上次操作」"], ["logs", "「日志」"],
       ["doctor", "「体检 → 刷新」"], ["configure-app-bot", "「设置 → 应用机器人凭据」"], ["relay-configure", "「设置 → 外链配置」"],
-      ["uninstall", "scripts/ops/ops.sh uninstall"]]) {
+      ["uninstall", "scripts/ops.sh uninstall"]]) {
       const child = Bun.spawn([bash, script.replaceAll("\\", "/"), command!], { cwd: f.root, windowsHide: true,
         env: { ...process.env, MIXIN_OPS_UI: "console" }, stdout: "pipe", stderr: "pipe" });
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);

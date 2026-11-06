@@ -2,7 +2,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { TaskResult, TaskView } from "../../scripts/ops/console/tasks.ts";
+import type { TaskResult, TaskView } from "../../ops/core/tasks.ts";
 
 export type WebTask = Pick<TaskView, "id" | "state" | "needsRecovery" | "result" | "reason">;
 const safe = (text: string) => text.replace(/#login=[A-Za-z0-9_-]+/g, "#login=[redacted]");
@@ -18,7 +18,7 @@ export class LifecycleConsole {
   constructor(readonly work: string, port: number, private readonly log: string, env: NodeJS.ProcessEnv) {
     if (!work.startsWith("/var/tmp/mixin-real-docker-") || process.platform !== "linux") throw new Error("not an isolated Docker fixture");
     this.origin = `http://127.0.0.1:${port}`;
-    this.child = spawn(process.execPath, ["--no-env-file", "scripts/ops/console.ts", "--port", String(port), "--no-open"], {
+    this.child = spawn(process.execPath, ["--no-env-file", "console/server/start.ts", "--port", String(port), "--no-open"], {
       cwd: work, env, stdio: ["ignore", "pipe", "pipe"],
     });
     for (const stream of [this.child.stdout!, this.child.stderr!]) {

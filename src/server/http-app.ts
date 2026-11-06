@@ -90,7 +90,7 @@ const expired = (signal: AbortSignal, error: unknown) => signal.aborted && error
 export function createApp(options: AppOptions): Hono {
   const app = new Hono();
   // version is the health protocol; appVersion and build name the running program.
-  const identity = { service: "mixin-chatbot" as const, version: 1 as const, appVersion: APP_VERSION, build: APP_BUILD, instanceId: options.instanceId ?? randomUUID(),
+  const identity = { service: "mixin-bot" as const, version: 1 as const, appVersion: APP_VERSION, build: APP_BUILD, instanceId: options.instanceId ?? randomUUID(),
     startedAt: options.startedAt ?? Date.now(), pid: process.pid };
 
   app.get("/health", (c) => {

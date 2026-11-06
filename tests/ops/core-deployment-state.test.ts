@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { loadDeploymentState } from "../../scripts/ops/core/deployment-state.ts";
-import { parseTransactionRecord, serializeTransactionRecord, type TransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
-import { assertConfirmedTransaction, confirmTransaction, readTransaction } from "../../scripts/lib/confirmed-transaction.ts";
-import { recoveryView } from "../../scripts/ops/console/lifecycle.ts";
+import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
+import { parseTransactionRecord, serializeTransactionRecord, type TransactionRecord } from "../../ops/core/transaction-record.ts";
+import { assertConfirmedTransaction, confirmTransaction, readTransaction } from "../../ops/lib/confirmed-transaction.ts";
+import { recoveryView } from "../../ops/core/recovery-plan.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const record: TransactionRecord = { format: "2", operation: "upgrade", snapshot: "deploy-synthetic", target_sha: "a".repeat(40),

@@ -9,7 +9,7 @@ import { appLayout } from "./layout.ts";
 import { readFileSync } from "node:fs";
 import { runtimeSetting } from "./runtime-config.ts";
 import { RUNTIME_DEFAULTS, RUNTIME_RANGES } from "./runtime-schema.ts";
-import { documentPackages } from "../../scripts/runtime/document-manifest.ts";
+import { documentPackages } from "../agent/document-manifest.ts";
 
 function integerEnv(name: keyof typeof RUNTIME_RANGES): number {
   const [min, max] = RUNTIME_RANGES[name];

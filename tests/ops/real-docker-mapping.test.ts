@@ -3,7 +3,7 @@
 // read-only, refusals for a twin directory and a missing one, and one real task that reads the materials, cannot write
 // them and writes its own work directory in the request tmp. It builds a small image from the working tree on the
 // oven/bun base (the service code, Bun and the Docker CLI; no document toolchain), labels it with this run and removes it
-// by ID afterwards. It never touches containers it did not create or a container named mixin-chatbot.
+// by ID afterwards. It never touches containers it did not create or a container named mixin-bot.
 //
 // Two topologies, run one after the other on a disposable Docker host:
 // - rootful service daemon + the service UID's rootless task daemon (run as root; tasks go to /run/user/1001):
@@ -59,7 +59,7 @@ function exportTree(target: string): void {
     `FROM ${cliImage} AS docker_cli`, `FROM ${baseImage}`,
     "COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker",
     "RUN groupadd -r -g 1001 appgroup && useradd -r -u 1001 -g appgroup -m -d /home/appuser -s /bin/bash appuser",
-    "WORKDIR /app", "COPY package.json bun.lock ./", "COPY scripts/patches ./scripts/patches",
+    "WORKDIR /app", "COPY package.json bun.lock ./", "COPY patches ./patches",
     "RUN bun install --frozen-lockfile --production", "COPY src ./src", "COPY scripts ./scripts", ""].join("\n"));
 }
 
@@ -119,7 +119,7 @@ console.log("PROBE=" + JSON.stringify({ serviceWrite, serviceMount, exitCode: re
 describe.skipIf(!enabled || operator === "group")(`real Docker task mapping proof (uid ${process.getuid?.()}, ${operator})`, () => {
   let root = "", image = "", socket = "";
   const suffix = Math.random().toString(16).slice(2, 10);
-  const label = `org.mixin-chatbot.mapping-test=${suffix}`;
+  const label = `org.mixin-bot.mapping-test=${suffix}`;
   const daemons: Record<string, string> = {};
   let failed = false;
   const step = (name: string, body: () => void | Promise<void>, timeout = 180_000) => test(name, async () => {
@@ -193,8 +193,8 @@ describe.skipIf(!enabled || operator === "group")(`real Docker task mapping proo
     writeFileSync(join(shared, "notes.md"), "# notes"); chmodSync(join(shared, "sub"), 0o755);
   };
   const noHelpers = () => {
-    const helpers = onTask("ps", "-aq", "--filter", "label=org.mixin-chatbot.mapping-probe=1").out;
-    const tasks = onTask("ps", "-aq", "--filter", "label=org.mixin-chatbot.task").out;
+    const helpers = onTask("ps", "-aq", "--filter", "label=org.mixin-bot.mapping-probe=1").out;
+    const tasks = onTask("ps", "-aq", "--filter", "label=org.mixin-bot.task").out;
     return { helpers, tasks };
   };
 

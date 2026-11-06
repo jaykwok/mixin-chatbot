@@ -30,18 +30,18 @@ async function staticGraph(entries: string[]): Promise<{ files: Set<string>; ext
 }
 
 test("控制台入口、任务执行器和共用核心的静态依赖只有内置模块", async () => {
-  const { files, external } = await staticGraph(["scripts/ops/console.ts", "scripts/ops/console/main.ts", "scripts/ops/console/executor.ts", "scripts/ops/core/cli.ts"]);
+  const { files, external } = await staticGraph(["console/server/start.ts", "console/server/main.ts", "console/server/executor.ts", "ops/core/cli.ts"]);
   expect(Object.fromEntries(external)).toEqual({});
   const reached = [...files].map(file => relative(project, file).replaceAll("\\", "/"));
   // The host never loads page code at runtime; the page shares only erased types with it.
   expect(reached.filter(file => file.startsWith("ui/"))).toEqual([]);
-  expect(reached).toContain("scripts/ops/shared/data.ts");
+  expect(reached).toContain("console/server/data.ts");
 });
 
 test("页面代码只引用 Preact 和自身文件，不引用 Node/Bun 或宿主机代码", async () => {
   const offending: string[] = [];
-  for await (const file of new Glob("**/*.{ts,tsx}").scan(join(project, "ui/console/src"))) {
-    const text = await readFile(join(project, "ui/console/src", file), "utf8");
+  for await (const file of new Glob("**/*.{ts,tsx}").scan(join(project, "console/ui/src"))) {
+    const text = await readFile(join(project, "console/ui/src", file), "utf8");
     for (const match of text.matchAll(/\bfrom\s*["']([^"']+)["']|^\s*import\s*["']([^"']+)["']|\bimport\(\s*["']([^"']+)["']/gm)) {
       const specifier = match[1] ?? match[2] ?? match[3]!;
       if (/^preact(\/hooks)?$/.test(specifier) || /^\.\/[\w-]+\.(ts|tsx|css)$/.test(specifier)) continue;

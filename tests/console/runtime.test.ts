@@ -2,22 +2,23 @@ import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { CodeFence, codeDigest, freezeRuntime, pruneRuntimes } from "../../scripts/ops/console/runtime.ts";
-import { pruneUnusedRuntimes } from "../../scripts/ops/console/task-host.ts";
-import { TaskStore } from "../../scripts/ops/console/tasks.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { CodeFence, codeDigest, freezeRuntime, pruneRuntimes } from "../../ops/core/source-runtime.ts";
+import { pruneUnusedRuntimes } from "../../console/server/task-host.ts";
+import { TaskStore } from "../../ops/core/tasks.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { cp, rm } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { prepareConsoleDir } from "../../scripts/ops/console/state.ts";
+import { prepareConsoleDir } from "../../ops/core/console-state.ts";
 
 test("固定运行包只包含代码，代码替换后固定副本不变；校验失配后不会因回滚解锁旧入口", async () => {
   const f = await tempFixture("console-runtime-");
   try {
-    for (const dir of ["scripts", "src", "ui", "data", "node_modules"]) mkdirSync(join(f.root, dir));
+    for (const dir of ["console", "ops", "scripts", "src", "data", "node_modules"]) mkdirSync(join(f.root, dir));
     writeFileSync(join(f.root, "scripts/main.ts"), 'export const value = "first"');
+    writeFileSync(join(f.root, "ops/tool.ts"), "export {};");
     writeFileSync(join(f.root, "src/version.ts"), 'export const value = 1');
-    writeFileSync(join(f.root, "ui/icon.svg"), "<svg/>");
+    writeFileSync(join(f.root, "console/icon.svg"), "<svg/>");
     writeFileSync(join(f.root, "pyproject.toml"), "[project]\nname='fixture'\n");
     writeFileSync(join(f.root, "uv.lock"), "fixture lock\n");
     writeFileSync(join(f.root, ".python-version"), "3.12\n");
@@ -44,14 +45,14 @@ test("源码被替换后，固定查询 worker/host 仍能新建并回收查询�
   const f = await tempFixture("console-fixed-workers-");
   try {
     const project = fileURLToPath(new URL("../..", import.meta.url));
-    for (const name of ["scripts", "src", "ui", "package.json", "pyproject.toml", "uv.lock", ".python-version"]) await cp(join(project, name), join(f.root, name), { recursive: true });
+    for (const name of ["console", "ops", "scripts", "src", "package.json", "pyproject.toml", "uv.lock", ".python-version"]) await cp(join(project, name), join(f.root, name), { recursive: true });
     prepareConsoleDir(join(f.root, ".console"));
     const runtime = freezeRuntime(join(f.root, ".console"), f.root);
-    await rm(join(f.root, "scripts"), { recursive: true });
+    await rm(join(f.root, "console"), { recursive: true });
     await rm(join(f.root, "pyproject.toml"));
     const runner = join(f.root, "worker-check.ts");
     writeFileSync(runner, [
-      "const { QueryPool } = await import(" + JSON.stringify(pathToFileURL(join(runtime.root, "scripts/ops/shared/exec-client.ts")).href) + ");",
+      "const { QueryPool } = await import(" + JSON.stringify(pathToFileURL(join(runtime.root, "console/server/exec-client.ts")).href) + ");",
       "const pool = new QueryPool();",
       "try { const result = await pool.capture(process.execPath, ['--no-env-file', '-e', 'console.log(\"fixed-query\")'], { timeout: 10000 });",
       "const configured = await pool.capture(process.execPath, ['--no-env-file', '-e', " + JSON.stringify("const { DOCUMENT_TOOLCHAIN_PACKAGES } = await import(" + JSON.stringify(pathToFileURL(join(runtime.root, "src/core/config.ts")).href) + "); if(!DOCUMENT_TOOLCHAIN_PACKAGES.length)throw Error('empty manifest'); console.log('fixed-manifest');") + "], { timeout: 10000 });",
@@ -68,10 +69,11 @@ test.skipIf(process.platform === "win32")("固定代码可供容器身份只读�
   const f = await tempFixture("console-runtime-modes-");
   const previous = process.umask(0o077);
   try {
-    for (const dir of ["scripts/lib", "src", "ui"]) mkdirSync(join(f.root, dir), { recursive: true });
+    for (const dir of ["console", "ops", "scripts/lib", "src"]) mkdirSync(join(f.root, dir), { recursive: true });
     writeFileSync(join(f.root, "scripts/lib/test.ts"), "export const value = 1");
     writeFileSync(join(f.root, "src/version.ts"), "export const value = 1");
-    writeFileSync(join(f.root, "ui/icon.svg"), "<svg/>");
+    writeFileSync(join(f.root, "console/icon.svg"), "<svg/>");
+    writeFileSync(join(f.root, "ops/tool.ts"), "export {};");
     const directory = join(f.root, ".console"), runtime = freezeRuntime(directory, f.root);
     for (const path of [directory, join(directory, "runtime")]) expect(statSync(path).mode & 0o777).toBe(0o700);
     for (const path of [runtime.root, join(runtime.root, "scripts"), join(runtime.root, "scripts/lib")]) expect(statSync(path).mode & 0o777).toBe(0o755);
@@ -106,7 +108,7 @@ test("旧版本运行包按保留集合和 7 天内的使用清理：先移开�
 test("复用已有的运行包算作使用，刷新清理的计时", async () => {
   const f = await tempFixture("console-runtime-reuse-");
   try {
-    for (const dir of ["scripts", "src", "ui"]) { mkdirSync(join(f.root, dir)); writeFileSync(join(f.root, dir, "main.ts"), "export const value = 1"); }
+    for (const dir of ["console", "ops", "scripts", "src"]) { mkdirSync(join(f.root, dir)); writeFileSync(join(f.root, dir, "main.ts"), "export const value = 1"); }
     const dir = join(f.root, ".console"), runtime = freezeRuntime(dir, f.root), month = new Date(Date.now() - 30 * DAY);
     utimesSync(runtime.root, month, month);
     expect(freezeRuntime(dir, f.root)).toEqual(runtime);

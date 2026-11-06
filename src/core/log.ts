@@ -8,11 +8,11 @@ import {
   statSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { redactSecrets } from "../../scripts/lib/redact.ts";
+import { redactSecrets } from "../lib/redact.ts";
 
 // 不依赖 config.ts：那里在导入时校验 runtime.json 和环境变量。部署恢复、维护和只读查询的宿主工具都写日志，配置损坏时
 // 它们仍要能运行（回滚正是恢复这份配置的办法）。
-export const LOG_FILE = "mixin-chatbot.log";
+export const LOG_FILE = "mixin-bot.log";
 export const LOG_MAX_BYTES = 5 * 1024 ** 2; // 5MB
 export const LOG_BACKUP_COUNT = 3;
 const LOG_DIR = "logs";

@@ -1,7 +1,7 @@
 // Opt-in check of scripts/lib/candidate-image.sh against a real Docker Engine: build by --iidfile, inspect and run by ID,
 // the image a container actually uses, tags kept through the switch and the rollback, a moved reserved tag, the daemon
 // identity and the storage locations the disk check measures. It uses its own repository and container names (never the
-// mixin-chatbot tag) and synthetic images from the oven/bun base. Run it on a disposable Docker host, once each as a
+// mixin-bot tag) and synthetic images from the oven/bun base. Run it on a disposable Docker host, once each as a
 // docker-group user (the storage lookup must refuse the rootful daemon), as root and against a rootless daemon as the
 // user it belongs to (DOCKER_HOST):
 // MIXIN_REAL_DOCKER=1 bun run test tests/ops/real-docker-image.test.ts
@@ -94,7 +94,7 @@ describe.skipIf(!enabled)(`real Docker candidate image (uid ${process.getuid?.()
       docker("image", "rm", reference);
     }
     for (const id of built) {
-      const owner = docker("image", "inspect", "--format", '{{index .Config.Labels "org.mixin-chatbot.project"}}', id);
+      const owner = docker("image", "inspect", "--format", '{{index .Config.Labels "org.mixin-bot.project"}}', id);
       if (owner.code === 0 && owner.out === projectId) docker("image", "rm", id);
     }
     return built.filter(exists);
@@ -152,7 +152,7 @@ describe.skipIf(!enabled)(`real Docker candidate image (uid ${process.getuid?.()
     expect(idOf(candidate.tag)).toBe(candidate.id);
     expect(idOf(candidate.id)).toBe(candidate.id);
     const labels = JSON.parse(docker("image", "inspect", "--format", "{{json .Config.Labels}}", candidate.id).out) as Record<string, string>;
-    expect(labels).toMatchObject({ "org.opencontainers.image.revision": commits.new, "org.mixin-chatbot.project": projectId, "org.mixin-chatbot.source": "commit" });
+    expect(labels).toMatchObject({ "org.opencontainers.image.revision": commits.new, "org.mixin-bot.project": projectId, "org.mixin-bot.source": "commit" });
     expect(run("docker", ["run", "--rm", candidate.id]).out).toBe("new");
     must("docker", ["create", "--name", containers[2]!, candidate.id]);
     expect(usedImage(containers[2]!)).toBe(candidate.id);
@@ -248,7 +248,7 @@ describe.skipIf(!enabled)(`real Docker candidate image (uid ${process.getuid?.()
     const untagged = built.filter(id => exists(id) && tagsOf(id)?.length === 0);
     console.log(`images without any tag before cleanup: ${untagged.length}`);
     expect(cleanup()).toEqual([]);
-    expect(docker("image", "ls", "--quiet", "--filter", `label=org.mixin-chatbot.project=${projectId}`).out).toBe("");
+    expect(docker("image", "ls", "--quiet", "--filter", `label=org.mixin-bot.project=${projectId}`).out).toBe("");
     // The base image is shared with other work and stays.
     expect(exists(baseImage)).toBe(true);
   });

@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { configurationForm, configurationSnapshot, editConfiguration, CONFIGURATION_FILES } from "../../scripts/config/configuration-form.ts";
-import { ConfigurationDrafts } from "../../scripts/ops/console/configuration-drafts.ts";
-import { configurationDigest } from "../../scripts/config/configuration-draft.ts";
-import { TaskStore } from "../../scripts/ops/console/tasks.ts";
+import { configurationForm, configurationSnapshot, editConfiguration, CONFIGURATION_FILES } from "../../ops/config/configuration-form.ts";
+import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
+import { configurationDigest } from "../../ops/config/configuration-draft.ts";
+import { TaskStore } from "../../ops/core/tasks.ts";
 import { applicationBinding } from "../../src/core/data-version.ts";
 import { DATA_VERSION } from "../../src/core/version.ts";
 import { tempFixture } from "../helpers/temp.ts";

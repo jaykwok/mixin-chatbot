@@ -12,7 +12,7 @@ import { isPathInside } from "../contracts/paths.ts";
 import { venvPythonPath } from "../agent/python-toolchain.ts";
 import { fromShellPath } from "../agent/tool-path.ts";
 import { runProcess, timedCommand } from "../core/process.ts";
-import { ProcessFailure } from "../../scripts/lib/process.ts";
+import { ProcessFailure } from "../lib/process.ts";
 import { holdDirectory } from "../core/held-directory.ts";
 import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../core/task-backend.ts";
 

@@ -63,7 +63,7 @@ describe("attachment send tools", () => {
   });
 
   test("relays an oversized local file and posts the link to the group", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-relay-"));
+    const root = await mkdtemp(join(tmpdir(), "mixin-bot-relay-"));
     const workspace = join(root, "workspace");
     const userTemp = join(root, "user-tmp");
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
@@ -136,7 +136,7 @@ describe("attachment send tools", () => {
   }, 20_000);
 
   test("announces a signed GET link with its expiry before it and persists only its unsigned identity", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-relay-sign-"));
+    const root = await mkdtemp(join(tmpdir(), "mixin-bot-relay-sign-"));
     const workspace = join(root, "workspace");
     const userTemp = join(root, "user-tmp");
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
@@ -183,7 +183,7 @@ describe("attachment send tools", () => {
   }, 20_000);
 
   test("rejects an oversized local file when no relay is configured", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-norelay-"));
+    const root = await mkdtemp(join(tmpdir(), "mixin-bot-norelay-"));
     const workspace = join(root, "workspace");
     const userTemp = join(root, "user-tmp");
     await Promise.all([mkdir(workspace), mkdir(userTemp)]);
@@ -229,7 +229,7 @@ describe("attachment send tools", () => {
   }, 20_000);
 
   test("keeps the workspace boundary on the relay path", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mixin-chatbot-relay-guard-"));
+    const root = await mkdtemp(join(tmpdir(), "mixin-bot-relay-guard-"));
     const workspace = join(root, "workspace");
     const userTemp = join(root, "user-tmp");
     const outside = join(root, "outside");

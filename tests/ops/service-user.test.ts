@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseServiceUser } from "../../scripts/ops/core/docker-deployment.ts";
+import { parseServiceUser } from "../../ops/core/docker-deployment.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 // The service identity library (scripts/lib/service-user.sh), the deployment's choice of identity (deploy.sh) and the
@@ -51,7 +51,7 @@ test("服务身份记录：核心拒绝缺失、重复、未知或无效的内�
     "no-final-newline": "format=1\nuser=1000:1000\nsource=default",
     missing: "format=1\nuser=1000:1000\n",
     duplicate: "format=1\nuser=1000:1000\nsource=container\nuser=1001:1001\n",
-    extra: "format=1\nuser=1000:1000\nsource=container\nimage=mixin-chatbot\n",
+    extra: "format=1\nuser=1000:1000\nsource=container\nimage=mixin-bot\n",
     named: "format=1\nuser=appuser\nsource=container\n",
     "leading-zero": "format=1\nuser=01000:1000\nsource=container\n",
     "format-2": "format=2\nuser=1000:1000\nsource=container\n",
@@ -94,7 +94,7 @@ test.skipIf(!available)("身份取值和 Docker 模式：rootless 只用 0:0，r
       rootlessUser: results["operator-rootless-user"] + "/" + results["operator-rootless-user-mode"], rootlessRoot: results["operator-rootless-root"],
     }).toEqual({ rootfulRoot: "0/0", rootfulUser: "1", rootlessUser: "0/1", rootlessRoot: "1" });
     // Each refusal names the command to run again and never retries with sudo by itself.
-    expect(await message("operator-rootful-user")).toContain("sudo scripts/ops/ops.sh update");
+    expect(await message("operator-rootful-user")).toContain("sudo scripts/ops.sh update");
     expect(await message("operator-rootful-user")).toContain("UID 1000");
     expect(await message("operator-rootless-root")).toContain("不要用 sudo");
     expect(await message("operator-rootless-root")).toContain("ops.sh rollback");
@@ -116,7 +116,7 @@ test.skipIf(!available)("原容器的身份：只认本项目的数据挂载和�
       .toEqual(["0", `c0ffee|1000:1000|sha256:old|${posixPath(fixture.root)}/project/data`, "2", "1"]);
     // A missing container is a status for the caller, not an error; an unreachable daemon is reported.
     expect(await message("read-missing")).toBe("");
-    expect(await message("read-down")).toContain("无法读取原容器 mixin-chatbot");
+    expect(await message("read-down")).toContain("无法读取原容器 mixin-bot");
 
     const identities: Record<string, string> = {
       rootful: "1000:1000|container", "rootful-dotted": "1000:1000|container", rootless: "0:0|container",
@@ -136,7 +136,7 @@ test.skipIf(!available)("原容器的身份：只认本项目的数据挂载和�
     }).toEqual({ container: "0:1000:1000", named: "0:1234:1234", owner: "0:1234:1234", rootless: "0:0:0", unreadable: "1:" });
     expect([results["validate-default"], results["validate-unreadable"]]).toEqual(["0", "1"]);
     // Offline and read-only, in the released image, as the service identity.
-    expect(results["validate-runs"]).toBe("run --rm --network none --user 1234:1234 -v <p>/data:/app/data:ro mixin-chatbot bun run scripts/config/validate-models.ts /app;");
+    expect(results["validate-runs"]).toBe("run --rm --network none --user 1234:1234 -v <p>/data:/app/data:ro mixin-bot bun run ops/config/validate-models.ts /app;");
   } finally { await fixture.cleanup(); }
 }, 30000);
 
@@ -160,7 +160,7 @@ test.skipIf(!available)("部署确定服务身份：沿用原容器；从未部�
       [name, [results[`deploy-${name}`], results[`deploy-${name}-user`], results[`deploy-${name}-questions`]]]))).toEqual(expected);
     expect(await message("deploy-unclear")).toContain("无法可靠确定原服务的运行身份");
     expect(await message("deploy-down")).toContain("无法读取原容器");
-    expect(await message("deploy-rollback-left")).toContain("mixin-chatbot-rollback");
+    expect(await message("deploy-rollback-left")).toContain("mixin-bot-rollback");
     expect(results["deploy-declined-question"]).toContain("1000:1000");
     expect(results["deploy-declined-question"]).toContain("已有数据的属主不变");
     expect(await message("deploy-declined")).toContain("未确认服务的运行身份");

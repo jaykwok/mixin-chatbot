@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import { Auth } from "../../scripts/ops/console/auth.ts";
-import type { Bundle } from "../../scripts/ops/console/bundle.ts";
-import { guardConfig, SECURITY_HEADERS } from "../../scripts/ops/console/guard.ts";
-import { createHandler, startServer } from "../../scripts/ops/console/server.ts";
-import type { Overview, SessionResponse } from "../../ui/console/src/contract.ts";
+import { Auth } from "../../console/server/auth.ts";
+import type { Bundle } from "../../console/server/bundle.ts";
+import { guardConfig, SECURITY_HEADERS } from "../../console/server/guard.ts";
+import { createHandler, startServer } from "../../console/server/server.ts";
+import type { Overview, SessionResponse } from "../../console/ui/src/contract.ts";
 
 const PORT = 11012, ORIGIN = `http://127.0.0.1:${PORT}`;
 const bundle: Bundle = {

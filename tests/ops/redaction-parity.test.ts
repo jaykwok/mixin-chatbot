@@ -1,11 +1,11 @@
 // The three operation-log redactions (TypeScript, native Bash, Windows PowerShell) apply one rule set: each runs the
-// same sample table and must agree with scripts/lib/redact.ts, which in turn must leave none of the secrets behind.
+// same sample table and must agree with src/lib/redact.ts, which in turn must leave none of the secrets behind.
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { redactSecrets } from "../../scripts/lib/redact.ts";
+import { redactSecrets } from "../../src/lib/redact.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));

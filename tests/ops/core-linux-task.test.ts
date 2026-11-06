@@ -3,12 +3,12 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFile, writeFile } from "node:fs/promises";
 import { tempFixture } from "../helpers/temp.ts";
-import { newLinuxTask, recoverLinuxTask, runLinuxTask } from "../../scripts/ops/core/linux-task.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
-import { publishJson } from "../../scripts/lib/atomic-file.ts";
-import { writeProcessReceipt } from "../../scripts/lib/process-receipt.ts";
+import { newLinuxTask, recoverLinuxTask, runLinuxTask } from "../../ops/core/linux-task.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
+import { publishJson } from "../../src/lib/atomic-file.ts";
+import { writeProcessReceipt } from "../../src/lib/process-receipt.ts";
 import { validateHostProcess, type LinuxTaskRecord } from "../../src/contracts/ops-host-process.ts";
-import type { NativeCommand } from "../../scripts/ops/core/native-process.ts";
+import type { NativeCommand } from "../../ops/core/native-process.ts";
 const linux = process.platform === "linux";
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 async function read(path: string): Promise<any | null> {
@@ -42,7 +42,7 @@ test.skipIf(!linux)("Linux 宿主命令的完成、非零退出、取消均等�
 }, 30_000);
 
 test.skipIf(!linux)("Linux 强杀宿主后凭 ECHILD 收尾记录恢复，独立进程组孙进程也结束且不重跑命令", async () => {
-  const f = await tempFixture("core-linux-task-kill-"), moduleUrl = (name: string) => pathToFileURL(join(import.meta.dir, "../../scripts", name)).href;
+  const f = await tempFixture("core-linux-task-kill-"), moduleUrl = (name: string) => pathToFileURL(join(import.meta.dir, "../..", name)).href;
   let host: ReturnType<typeof Bun.spawn> | undefined, pids: number[] = [];
   try {
     const writer = join(f.root, "writer.ts"), launcher = join(f.root, "launcher.ts"), pidPath = join(f.root, "pid.json"), recordPath = join(f.root, "record.json"), beat = join(f.root, "beats");
@@ -52,7 +52,7 @@ else{spawn(process.execPath,["--no-env-file",import.meta.path,"child",process.ar
 setTimeout(()=>process.exit(0),15000);`);
     const command: NativeCommand = { command: process.execPath, args: ["--no-env-file", writer, pidPath, beat], cwd: f.root, protocol: true };
     await writeFile(launcher, `import{acquireDeploymentLock}from${JSON.stringify(moduleUrl("ops/core/deployment-lock.ts"))};
-import{newLinuxTask,runLinuxTask}from${JSON.stringify(moduleUrl("ops/core/linux-task.ts"))};import{publishJson}from${JSON.stringify(moduleUrl("lib/atomic-file.ts"))};
+import{newLinuxTask,runLinuxTask}from${JSON.stringify(moduleUrl("ops/core/linux-task.ts"))};import{publishJson}from${JSON.stringify(moduleUrl("src/lib/atomic-file.ts"))};
 const root=${JSON.stringify(f.root)},lock=acquireDeploymentLock(root),command=${JSON.stringify(command)};
 try{await runLinuxTask(root,command,newLinuxTask(root,command,()=>lock.assertHeld()),r=>publishJson(${JSON.stringify(recordPath)},r),()=>lock.assertHeld())}finally{lock.close()}`);
     const launched = Bun.spawn([process.execPath, "--no-env-file", launcher], { cwd: f.root, stdout: "ignore", stderr: "pipe" });

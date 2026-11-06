@@ -4,7 +4,7 @@ import { expect, test } from "bun:test";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DOCUMENT_TOOLCHAIN_MARKER, documentMarker } from "../../scripts/runtime/document-manifest.ts";
+import { DOCUMENT_TOOLCHAIN_MARKER, documentMarker } from "../../src/agent/document-manifest.ts";
 import { venvPythonPath } from "../../src/agent/python-toolchain.ts";
 import { DOCUMENT_TOOLCHAIN_PACKAGES } from "../../src/core/config.ts";
 import { tempFixture } from "../helpers/temp.ts";

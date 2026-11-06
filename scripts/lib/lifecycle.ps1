@@ -70,7 +70,7 @@ function Get-ProjectBotPids([string]$ProjectRoot) {
         Select-Object -ExpandProperty ProcessId
 }
 
-function Stop-ProjectBot([string]$ProjectRoot, [string]$TaskName = 'mixin-chatbot', [switch]$KeepDisabled) {
+function Stop-ProjectBot([string]$ProjectRoot, [string]$TaskName = 'mixin-bot', [switch]$KeepDisabled) {
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $wasEnabled = $task -and $task.State -ne 'Disabled'
     $stopped = $false

@@ -19,7 +19,7 @@ prepare_candidate_image() {
     fixture_event "build source=$3 head=$2"
     [ "${FIXTURE_BUILD:-0}" = 0 ] || return "$FIXTURE_BUILD"
     declare -gA CANDIDATE=([format]=1 [source]="$3" [target_sha]="$2" [image_id]="$FIXTURE_IMAGE"
-        [image_tag]="mixin-chatbot:candidate-${project_id}-0123456789abcdef" [daemon_id]=main-daemon-01 [project_id]="$project_id"
+        [image_tag]="mixin-bot:candidate-${project_id}-0123456789abcdef" [daemon_id]=main-daemon-01 [project_id]="$project_id"
         [operation_id]=0123456789abcdef)
 }
 
@@ -28,7 +28,7 @@ docker() {
     case "$1" in
         info|logs) return 0 ;;
         container)
-            if [ "$2" = inspect ] && [ "${*: -1}" = mixin-chatbot ] && [ -n "${FIXTURE_ORIGINAL:-}" ]; then
+            if [ "$2" = inspect ] && [ "${*: -1}" = mixin-bot ] && [ -n "${FIXTURE_ORIGINAL:-}" ]; then
                 case "$*" in
                     *'{{.Id}}|'*) printf '%s|0:0|%s|%s\n' "$FIXTURE_ORIGINAL" "$FIXTURE_ORIGINAL_IMAGE" "$PROJECT_DIR/data" ;;
                     *) printf '%s\n' "$FIXTURE_ORIGINAL_IMAGE" ;;
@@ -55,18 +55,15 @@ fixture_docker_run() {
     done
     [ "$1" = --rm ] && [[ " $* " == *" $FIXTURE_IMAGE "* ]] || { fixture_event FORBIDDEN; return 1; }
     case " $* " in
-        *" scripts/runtime/data-current.ts "*)
+        *" ops/tools/data-current.ts "*)
             [ "${FIXTURE_DATA:-0}" = 0 ] || return "$FIXTURE_DATA"
             [[ " $* " != *" --plan /preview/data-plan.json "* ]] || printf '{}\n' > "$preview/data-plan.json" ;;
-        *" scripts/runtime/revision-cleanup.ts preview "*)
-            printf '%s\n' protocol=mixin-maintenance version=1 command=preview outcome=success documents=0 revisions=0 longest=0 legacy=0 \
-                backup_bytes=0 wal_bytes=0 seconds=0 run_state=none end=1 ;;
-        *" scripts/config/directory-scope.ts choose "*)
+        *" ops/config/directory-scope.ts choose "*)
             [ "${BOT_DIRECTORY_SCOPE:-}" = all ] || { echo '没有终端，不能运行通讯录同步范围的选择向导' >&2; return 1; }
             printf '{"format":1,"all":true}\n' > "$preview/directory-scope-plan.json" ;;
-        *" scripts/config/runtime-settings.ts --prepare-values "*)
+        *" ops/config/runtime-settings.ts --prepare-values "*)
             printf '{"format":1,"base":null,"values":{"BOT_PORT":"%s","BOT_HOST":"%s"}}\n' "$port" "$host" > "$preview/runtime-values.json" ;;
-        *" scripts/runtime/layout-check.ts "*|*" --entrypoint sh "*) ;;
+        *" ops/tools/layout-check.ts "*|*" --entrypoint sh "*) ;;
         *) fixture_event FORBIDDEN; return 1 ;;
     esac
 }

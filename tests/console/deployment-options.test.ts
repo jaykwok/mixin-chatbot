@@ -1,22 +1,22 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, realpathSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { deploymentOptions, deploymentEnvironment, deploymentScope } from "../../scripts/ops/console/deployment-options.ts";
-import { operationArgs, operationCommand } from "../../scripts/ops/console/operations.ts";
-import { codeDigest } from "../../scripts/ops/console/runtime.ts";
-import { checkTaskPlan } from "../../scripts/ops/console/check-plan.ts";
-import { PlanStore, type PlanFacts } from "../../scripts/ops/console/plans.ts";
-import { TaskStore } from "../../scripts/ops/console/tasks.ts";
-import type { Runner } from "../../scripts/ops/console/hosting.ts";
+import { deploymentOptions, deploymentEnvironment, deploymentScope } from "../../ops/core/deployment-options.ts";
+import { operationArgs, operationCommand } from "../../ops/core/operations.ts";
+import { codeDigest } from "../../ops/core/source-runtime.ts";
+import { checkTaskPlan } from "../../ops/core/check-plan.ts";
+import { PlanStore, type PlanFacts } from "../../ops/core/plans.ts";
+import { TaskStore } from "../../ops/core/tasks.ts";
+import type { Runner } from "../../ops/core/hosting.ts";
 import { RUNTIME_KEYS } from "../../src/core/runtime-schema.ts";
 import { tempFixture } from "../helpers/temp.ts";
-import { directoryAppHash } from "../../scripts/lib/directory-choice.ts";
+import { directoryAppHash } from "../../ops/lib/directory-choice.ts";
 
 const target = "a".repeat(40);
-const choice = { target, switchMain: false, cleanup: "apply", directory: "saved" };
+const choice = { target, switchMain: false, directory: "saved" };
 async function fixture() {
   const f = await tempFixture("console-deployment-");
-  for (const name of ["scripts", "src", "ui"]) mkdirSync(join(f.root, name), { recursive: true });
+  for (const name of ["console", "ops", "scripts", "src"]) mkdirSync(join(f.root, name), { recursive: true });
   for (const [path, value] of Object.entries({ "data/state/data-version.json": "{}", "data/state/bot-port": "1011", ".console/port": "11012",
     "data/config/app-bot.json": '{"secret":"synthetic-secret"}', "data/config/models.json": "{}", "data/runtime/pi/settings.json": "{}", "data/config/directory.json": '{"format":1,"all":true}' })) {
     mkdirSync(dirname(join(f.root, path)), { recursive: true }); writeFileSync(join(f.root, path), value);
@@ -35,23 +35,23 @@ async function fixture() {
   return { ...f, state, run };
 }
 
-test("升级只接收完整显式选择；环境覆盖受限，不接受 argv、no-backup 或隐式目标", () => {
+test("升级只接收完整显式选择；环境覆盖受限，不接受 argv、多余选择或隐式目标", () => {
   expect(operationArgs("update", choice)).toEqual(["update", target]);
-  for (const params of [{}, { ...choice, target: "origin/main" }, { ...choice, switchMain: "false" }, { ...choice, cleanup: "no-backup" },
+  for (const params of [{}, { ...choice, target: "origin/main" }, { ...choice, switchMain: "false" }, { ...choice, cleanup: "apply" },
     { ...choice, directory: ["saved"] }, { ...choice, env: { BOT_PORT: "1" } }, { ...choice, argv: [] }, { ...choice, ai: "keep" }]) {
     expect(() => operationArgs("update", params)).toThrow();
   }
   const command = operationCommand("fixture", "update", choice);
-  expect(command.env.BOT_REVISION_CLEANUP).toBe("apply"); expect(command.env.MIXIN_OPS_SWITCH_MAIN).toBe("0");
+  expect(command.env.MIXIN_OPS_SWITCH_MAIN).toBe("0");
   expect(command.env.BOT_DIRECTORY_SCOPE).toBe("");
-  const deploy = { port: 2022, workspace: "", cleanup: "skip", directory: "saved" };
+  const deploy = { port: 2022, workspace: "", directory: "saved" };
   expect(operationArgs("deploy", deploy)).toEqual(["deploy"]);
   expect(operationCommand("fixture", "deploy", deploy).env.BOT_PORT).toBe("2022");
   expect(operationArgs("repair", process.platform === "win32" ? {} : deploy)).toEqual(["repair"]);
   expect(() => operationArgs("repair", process.platform === "win32" ? { argv: [] } : {})).toThrow();
   for (const key of RUNTIME_KEYS) expect(command.env[key], key).toBe("");
   for (const params of [{ port: 11012, workspace: "relative" }, { port: 1.5, workspace: "" }, { port: 0, workspace: "" }]) {
-    expect(() => deploymentOptions("deploy", { cleanup: "skip", directory: "saved", ...params })).toThrow();
+    expect(() => deploymentOptions("deploy", { directory: "saved", ...params })).toThrow();
   }
 });
 
@@ -83,7 +83,7 @@ test("预览绑定配置、部署身份及选择；拒绝脏树、旧协议、�
 test("重部署目标端口与控制台相同时停机前拒绝；预览期间配置变化也拒绝", async () => {
   const f = await fixture();
   try {
-    const params = { cleanup: "skip", directory: "saved", port: 11012, workspace: "" };
+    const params = { directory: "saved", port: 11012, workspace: "" };
     await expect(deploymentScope(f.root, "deploy", params, f.run)).rejects.toThrow("控制台端口");
     params.port = 1011; await deploymentScope(f.root, "deploy", params, f.run);
     await expect(deploymentScope(f.root, "deploy", params, async (...args) => {
@@ -103,7 +103,7 @@ test("锁内复核拒绝丢失或污染的命名选择，不只检查保存的�
       mechanism: process.platform === "win32" ? "windows-task" : "systemd-system" }, "fixture");
     Object.assign(process.env, env); const digest = codeDigest(f.root);
     await checkTaskPlan(f.root, task.id, digest, observe);
-    for (const key of ["BOT_REVISION_CLEANUP", "MIXIN_OPS_DIRECTORY", "MIXIN_OPS_DIRECTORY_INPUT", "MIXIN_OPS_DIRECTORY_APP", "MIXIN_OPS_SWITCH_MAIN", "BOT_PORT", "BOT_BASH_TIMEOUT"]) {
+    for (const key of ["MIXIN_OPS_DIRECTORY", "MIXIN_OPS_DIRECTORY_INPUT", "MIXIN_OPS_DIRECTORY_APP", "MIXIN_OPS_SWITCH_MAIN", "BOT_PORT", "BOT_BASH_TIMEOUT"]) {
       process.env[key] = "polluted";
       await expect(checkTaskPlan(f.root, task.id, digest, observe)).rejects.toThrow("选择未完整传递"); process.env[key] = env[key];
     }

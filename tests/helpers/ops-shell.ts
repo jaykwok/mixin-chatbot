@@ -1,10 +1,10 @@
-// Function definitions cut out of scripts/ops/ops.sh for the wrapper tests, which stub everything around them. A
+// Function definitions cut out of scripts/ops.sh for the wrapper tests, which stub everything around them. A
 // definition starts at "<name>() (" or "<name>() {" at the start of a line and ends at the first ")" or "}" alone on a
 // line: nested definitions are indented.
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-const OPS = fileURLToPath(new URL("../../scripts/ops/ops.sh", import.meta.url));
+const OPS = fileURLToPath(new URL("../../scripts/ops.sh", import.meta.url));
 
 export async function opsShellFunctions(...names: string[]): Promise<string> {
   const source = "\n" + (await readFile(OPS, "utf8")).replaceAll("\r\n", "\n");

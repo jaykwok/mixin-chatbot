@@ -2,13 +2,13 @@ import { expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { codeDigest } from "../../scripts/ops/console/runtime.ts";
-import { checkTaskPlan } from "../../scripts/ops/console/check-plan.ts";
-import { PlanStore } from "../../scripts/ops/console/plans.ts";
-import type { PlanFacts } from "../../scripts/ops/console/plans.ts";
-import { TaskStore } from "../../scripts/ops/console/tasks.ts";
-import { runCore } from "../../scripts/ops/core/cli.ts";
-import { createServiceHost, type Platform } from "../../scripts/ops/core/service-host.ts";
+import { codeDigest } from "../../ops/core/source-runtime.ts";
+import { checkTaskPlan } from "../../ops/core/check-plan.ts";
+import { PlanStore } from "../../ops/core/plans.ts";
+import type { PlanFacts } from "../../ops/core/plans.ts";
+import { TaskStore } from "../../ops/core/tasks.ts";
+import { runCore } from "../../ops/core/cli.ts";
+import { createServiceHost, type Platform } from "../../ops/core/service-host.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const repository = resolve(import.meta.dir, "../..");
@@ -22,7 +22,7 @@ async function heldElsewhere(lock: string): Promise<boolean> {
 }
 async function fixture() {
   const f = await tempFixture("console-lock-plan-");
-  for (const name of ["scripts", "src", "ui", "data/state"]) mkdirSync(join(f.root, name), { recursive: true });
+  for (const name of ["console", "ops", "scripts", "src", "data/state"]) mkdirSync(join(f.root, name), { recursive: true });
   writeFileSync(join(f.root, "src/version.ts"), "export const version = 1;\n");
   const facts: PlanFacts = { project: f.root, platform: process.platform, identity: "fixture", head: "a".repeat(40), protocol: 1, scope: "stop", runState: "running" };
   const plan = await new PlanStore(join(f.root, ".console"), async () => ({ facts, summary: [] })).create("stop", {});
@@ -52,7 +52,7 @@ test.skipIf(process.platform === "win32")("Shell 入口的真实部署锁在复�
   try {
     const helper = join(f.root, "guard.ts"), marker = join(f.root, "action"), lock = join(f.root, "data/state/deploy.lock");
     writeFileSync(helper, [
-      `import { checkTaskPlan } from ${JSON.stringify(pathToFileURL(join(repository, "scripts/ops/console/check-plan.ts")).href)};`,
+      `import { checkTaskPlan } from ${JSON.stringify(pathToFileURL(join(repository, "ops/core/check-plan.ts")).href)};`,
       'import { writeFileSync } from "node:fs";',
       'const lock = process.env.FIXTURE_LOCK!;',
       'const code = await Bun.spawn(["flock", "-n", lock, "true"], { stdout: "ignore", stderr: "ignore" }).exited;',

@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { runDeployment, type DeploymentCheckpoint, type DeploymentDirection, type DeploymentHost, type DeploymentRequest,
-  type DeploymentService } from "../../scripts/ops/core/deployment.ts";
-import type { DeploymentState } from "../../scripts/ops/core/deployment-state.ts";
-import type { TransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
-import type { OpsResult } from "../../scripts/ops/core/result.ts";
-import { MaintenanceRefused } from "../../scripts/ops/core/maintenance.ts";
+  type DeploymentService } from "../../ops/core/deployment.ts";
+import type { DeploymentState } from "../../ops/core/deployment-state.ts";
+import type { TransactionRecord } from "../../ops/core/transaction-record.ts";
+import type { OpsResult } from "../../ops/core/result.ts";
+import { MaintenanceRefused } from "../../ops/core/maintenance.ts";
 
 function fixture(operation: "deploy" | "upgrade" = "upgrade", wasRunning = true) {
   const record: TransactionRecord = { format: "2", operation, snapshot: "deploy-synthetic", target_sha: "a".repeat(40), original_sha: "b".repeat(40),
@@ -27,7 +27,7 @@ function fixture(operation: "deploy" | "upgrade" = "upgrade", wasRunning = true)
     async preflight(direction, signal) { expect(locked).toBe(true); expect(signal?.aborted).not.toBe(true); events.push("preflight:" + direction); },
     async perform(name, signal) {
       expect(locked).toBe(true); expect(signal?.aborted).not.toBe(true); expect(saved?.step).toBe(name); events.push(name);
-      if (["prepare-data", "cleanup-revisions", "commit-data", "settle-revisions", "restore-data", "restore-configuration"].includes(name))
+      if (["prepare-data", "commit-data", "restore-data", "restore-configuration"].includes(name))
         expect(facts.state, name).not.toBe("running");
       if (name === "stop") { facts.state = facts.role === "absent" ? "absent" : "stopped"; facts.ready = false; }
       if (name === "prepare-data") phase = "prepared";
@@ -53,7 +53,7 @@ test("部署核心先验证后提交，再启动正式实例；升级保持原�
     const f = fixture(operation, running), result = await f.run();
     expect(result).toMatchObject({ outcome: "success", exitCode: 0, finalState: operation === "deploy" || running ? "running" : "stopped" });
     expect(f.published()).toEqual(result); expect(f.completed()).toBe("forward");
-    for (const [before, after] of [["prepare-data", "cleanup-revisions"], ["cleanup-revisions", "start-verification"],
+    for (const [before, after] of [["prepare-data", "start-verification"],
       ["ready:verification", "commit-data"], ["commit-data", "retire-previous-writers"], ["retire-previous-writers", "publish-target"]]) {
       expect(f.events.indexOf(before!)).toBeLessThan(f.events.indexOf(after!));
     }
@@ -63,13 +63,13 @@ test("部署核心先验证后提交，再启动正式实例；升级保持原�
   }
 });
 
-test("强杀后先回收写入者再判定提交；已提交续做不重复安装、配置、数据准备或整理", async () => {
+test("强杀后先回收写入者再判定提交；已提交续做不重复安装、配置或数据准备", async () => {
   const f = fixture(); f.request.command = "resume"; f.facts.role = "candidate"; f.facts.state = "stopped"; f.facts.ready = false;
   f.phase("prepared"); f.saved({ version: 1, snapshot: f.request.snapshot, runtime: f.request.runtime, direction: "forward", step: "commit-data" });
   f.host.reap = async () => { f.events.push("reap"); f.phase("committed"); };
   expect(await f.run()).toMatchObject({ outcome: "success", finalState: "running" });
   expect(f.events.indexOf("reap")).toBeLessThan(f.events.indexOf("preflight:forward"));
-  for (const name of ["switch-code", "prepare-dependencies", "prepare-data", "cleanup-revisions", "install-candidate", "commit-data", "restore-data"])
+  for (const name of ["switch-code", "prepare-dependencies", "prepare-data", "install-candidate", "commit-data", "restore-data"])
     expect(f.events).not.toContain(name);
 });
 
@@ -91,13 +91,13 @@ test("提交回执未知、损坏或提交后丢失答复均不回退数据；�
   }
 });
 
-test("验证未通过、提交前步骤失败和普通取消均先收尾整理，再恢复原状态；成功回滚仍报告原任务失败", async () => {
-  for (const mode of ["configure-directory", "prepare-data", "cleanup-revisions", "verification", "commit-assessment", "cancel"]) {
+test("验证未通过、提交前步骤失败和普通取消均恢复原状态；成功回滚仍报告原任务失败", async () => {
+  for (const mode of ["configure-directory", "prepare-data", "verification", "commit-assessment", "cancel"]) {
     const f = fixture(), perform = f.host.perform;
     f.host.perform = async (name, signal) => {
       await perform(name, signal);
       if (name === mode) throw new MaintenanceRefused("步骤失败", 3);
-      if (mode === "cancel" && name === "cleanup-revisions") f.controller.abort();
+      if (mode === "cancel" && name === "prepare-data") f.controller.abort();
     };
     if (mode === "verification") {
       const wait = f.host.waitReady; f.host.waitReady = async (role, signal) => role === "verification" ? false : wait(role, signal);
@@ -106,15 +106,14 @@ test("验证未通过、提交前步骤失败和普通取消均先收尾整理�
     const result = await f.run();
     expect(result.outcome, mode).toBe("failed"); expect(result.exitCode).not.toBe(0); expect(result.finalState).toBe("running");
     expect(f.completed()).toBe("rollback");
-    expect(f.events.indexOf("settle-revisions")).toBeLessThan(f.events.indexOf("restore-data"));
     expect(f.events.indexOf("restore-data")).toBeLessThan(f.events.indexOf("restore-code"));
     expect(f.events.indexOf("restore-code")).toBeLessThan(f.events.indexOf("start-original"));
     expect(f.events).not.toContain("publish-target");
     if (mode === "cancel") expect(result.exitCode).toBe(130);
     // The cause is announced once, before the first restoration step.
-    const notices = f.events.filter(value => value.startsWith("notice:")), settle = f.events.indexOf("settle-revisions");
+    const notices = f.events.filter(value => value.startsWith("notice:")), restore = f.events.indexOf("restore-data");
     expect(notices, mode).toEqual(["notice:" + result.message.replace(/；已自动恢复到操作前的状态$/, "") + "；正在自动恢复到操作前的状态"]);
-    expect(f.events.indexOf(notices[0]!)).toBeLessThan(f.events.lastIndexOf("stop", settle));
+    expect(f.events.indexOf(notices[0]!)).toBeLessThan(f.events.lastIndexOf("stop", restore));
   }
 });
 
@@ -169,14 +168,13 @@ test("自动恢复遇到并发代码改动先恢复本次数据，代码预检�
     await preflight(direction, signal); if (direction === "rollback") throw new MaintenanceRefused("操作员修改了代码，不能覆盖");
   };
   const result = await f.run(); expect(result.exitCode).toBe(1); expect(result.message).toContain("不能覆盖");
-  expect(f.events.indexOf("restore-data")).toBeGreaterThan(f.events.indexOf("settle-revisions"));
   expect(f.events.indexOf("preflight:rollback")).toBeGreaterThan(f.events.indexOf("restore-data"));
   for (const event of ["restore-code", "restore-configuration", "restore-service", "start-original"]) expect(f.events).not.toContain(event);
   expect(f.facts.state).toBe("stopped"); expect(f.completed()).toBeUndefined();
 });
 
 test("无法回收写入者、停止失败或恢复失败时不启动旧服务，也不清掉事务", async () => {
-  for (const mode of ["writer", "stop", "settle-revisions", "restore-data", "restore-code", "restore-service"]) {
+  for (const mode of ["writer", "stop", "restore-data", "restore-code", "restore-service"]) {
     const f = fixture(); f.request.action = "rollback"; f.request.command = "rollback"; f.phase("prepared");
     f.saved({ version: 1, snapshot: f.request.snapshot, runtime: f.request.runtime, direction: "forward", step: "prepare-data" });
     const perform = f.host.perform;
@@ -207,7 +205,7 @@ test("恢复后启动请求已发出时被强杀，重试只核对或启动原�
     f.saved({ version: 1, snapshot: f.request.snapshot, runtime: f.request.runtime, direction: "rollback", step: "start-original" });
     expect(await f.run()).toMatchObject({ outcome: "success", finalState: "running" });
     expect(f.completed()).toBe("rollback"); expect(f.events).toContain("ready:original");
-    for (const name of ["stop", "settle-revisions", "restore-data", "restore-code", "restore-configuration", "restore-service"])
+    for (const name of ["stop", "restore-data", "restore-code", "restore-configuration", "restore-service"])
       expect(f.events).not.toContain(name);
     // Only a ready instance is left alone: a running but unready one is a supervisor retrying, started again under the step.
     expect(f.events.includes("start-original")).toBe(!ready);

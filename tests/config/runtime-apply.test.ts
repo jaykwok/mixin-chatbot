@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { readRuntimeSettings } from "../../scripts/config/runtime-draft.ts";
+import { readRuntimeSettings } from "../../ops/config/runtime-draft.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -16,7 +16,7 @@ test("运行参数数据 CLI 使用 stdin 与完整结果；环境冲突、错�
     const raw = JSON.stringify({ expectedHash: (await readRuntimeSettings(path)).hash, changes: { BOT_MAX_ACTIVE_REQUESTS: "64" } });
     const hash = (text: string) => createHash("sha256").update(text).digest("hex"), digest = hash(raw);
     const run = async (action: string, input = raw, extra: string[] = [], override?: string, sum = digest) => {
-      const child = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../scripts/config/runtime-apply.ts"), action,
+      const child = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../ops/config/runtime-apply.ts"), action,
         "--id", id, "--digest", sum, "--stdin", "--json", ...extra], { cwd: f.root, stdin: Buffer.from(input), stdout: "pipe", stderr: "pipe", windowsHide: true,
         env: { ...process.env, BOT_MAX_ACTIVE_REQUESTS: override } });
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -35,7 +35,7 @@ test("运行参数数据 CLI 使用 stdin 与完整结果；环境冲突、错�
     expect((await readRuntimeSettings(path)).values).toEqual({ BOT_HOST: "127.0.0.1", BOT_MAX_ACTIVE_REQUESTS: "64" });
     const restore = async () => {
       for (const action of ["restore", "finish"]) {
-        const child = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../scripts/config/configuration-apply.ts"), action, "--id", id, "--json"],
+        const child = Bun.spawn([process.execPath, "--no-env-file", join(import.meta.dir, "../../ops/config/configuration-apply.ts"), action, "--id", id, "--json"],
           { cwd: f.root, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true });
         const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
         expect(code, err).toBe(0); expect(JSON.parse(out)).toMatchObject({ outcome: "success", result: null });

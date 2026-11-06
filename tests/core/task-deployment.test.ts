@@ -4,7 +4,7 @@ import { TaskPaths, type TaskDeployment } from "../../src/core/task-deployment.t
 const image = "sha256:" + "a".repeat(64);
 function manifest(): TaskDeployment {
   return { version: 1, image, mounts: [{ manager: "/app/data", daemon: "/srv/bot/data" }, { manager: "/app/groups", daemon: "/srv/groups" }],
-    imagePaths: ["/app/scripts/runtime", "/app/src/agent/modules/document-work", "/usr/local/bin/bun"] };
+    imagePaths: ["/app/src/agent/python", "/app/src/agent/modules/document-work", "/usr/local/bin/bun"] };
 }
 
 test("task deployment translates only registered roots and preserves worker-visible paths", () => {
@@ -14,9 +14,9 @@ test("task deployment translates only registered roots and preserves worker-visi
   for (const path of ["/app/database", "/app", "/unregistered", "/app/data/../secret", "/app/data//member", "/app/data/"]) {
     expect(() => paths.source(path)).toThrow();
   }
-  expect(paths.suppliedByImage("/app/scripts/runtime/extract_document.py")).toBe(true);
+  expect(paths.suppliedByImage("/app/src/agent/python/extract_document.py")).toBe(true);
   expect(paths.suppliedByImage("/usr/local/bin/bun")).toBe(true);
-  expect(paths.suppliedByImage("/app/scripts/runtime-other")).toBe(false);
+  expect(paths.suppliedByImage("/app/src/agent/python-other")).toBe(false);
   expect(() => paths.source("/usr/local/bin/bun")).toThrow();
 });
 

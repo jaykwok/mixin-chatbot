@@ -3,9 +3,9 @@ import { existsSync } from "node:fs";
 import { copyFile, cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { opsCommand } from "../../scripts/ops/shared/platform.ts";
-import { describePendingTransaction, loadPendingTransaction } from "../../scripts/ops/shared/transaction.ts";
-import { parseTransactionRecord, serializeTransactionRecord, transactionValueValid, type TransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
+import { opsCommand } from "../../ops/core/platform.ts";
+import { describePendingTransaction, loadPendingTransaction } from "../../ops/core/pending-transaction.ts";
+import { parseTransactionRecord, serializeTransactionRecord, transactionValueValid, type TransactionRecord } from "../../ops/core/transaction-record.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
@@ -172,7 +172,7 @@ Write-Output 'RECORD_OK'
 async function entryFixture(prefix: string, entry: string) {
   const fixture = await tempFixture(prefix), root = fixture.root, state = join(root, "data/state");
   await cp(join(project, "scripts/lib"), join(root, "scripts/lib"), { recursive: true });
-  await mkdir(join(root, "scripts/ops"), { recursive: true }); await mkdir(join(root, "scripts/deploy"), { recursive: true });
+  await mkdir(join(root, "scripts"), { recursive: true });
   await copyFile(join(project, entry), join(root, entry));
   await mkdir(state, { recursive: true });
   await writeFile(join(state, "bot-port"), "invalid");
@@ -180,19 +180,19 @@ async function entryFixture(prefix: string, entry: string) {
 }
 
 test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，普通设置损坏不挡住继续或回滚", async () => {
-  const fixture = await entryFixture("transaction-entry-linux-", "scripts/ops/ops.sh"), root = fixture.root;
+  const fixture = await entryFixture("transaction-entry-linux-", "scripts/ops.sh"), root = fixture.root;
   try {
     // A pending deployment goes to the core through the host Bun, here a stand-in; a new one to the deploy entry.
     const runtime = join(root, "bun-stand-in");
     await writeFile(runtime, '#!/usr/bin/env bash\nif [ "$1" = --version ]; then echo 1.4.4; exit 0; fi\necho "DISPATCHED ${*:3} end"\n', { mode: 0o755 });
-    await writeFile(join(root, "scripts/deploy/deploy.sh"), '#!/usr/bin/env bash\necho "DEPLOY ENTRY command=$1"\n');
+    await writeFile(join(root, "scripts/deploy.sh"), '#!/usr/bin/env bash\necho "DEPLOY ENTRY command=$1"\n');
     await mkdir(join(root, "backup/snapshots/deploy-abc123"), { recursive: true });
     await writeFile(join(root, "backup/snapshots/deploy-abc123/transaction"), serialize(record));
     await writeFile(join(root, "data/state/deploy-transaction"), "deploy-abc123");
     // resume / rollback read the record under the deployment lock; Git Bash has no util-linux flock, Linux uses the real one.
     // An exported function, not a PATH stub: the Windows CI runner did not find a stub script written just before.
     const lock = process.platform === "win32" ? { "BASH_FUNC_flock%%": "() { return 0\n}" } : {};
-    const ops = (command: string, entry = "scripts/ops/ops.sh") => execute([bash!, posixPath(join(root, entry)), command], root,
+    const ops = (command: string, entry = "scripts/ops.sh") => execute([bash!, posixPath(join(root, entry)), command], root,
       { ...process.env, ...lock, MSYS_NO_PATHCONV: "1", BOT_PORT: "", MIXIN_OPS_BUN: posixPath(runtime) });
     for (const [command, tail] of [["resume", " end"], ["rollback", " --rollback end"]] as const) {
       const result = await ops(command);
@@ -201,11 +201,11 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
       expect(result.output).not.toContain("无效");
     }
     // The health check after a resumed upgrade uses the recorded settings, not the broken saved ones.
-    const source = await readFile(join(root, "scripts/ops/ops.sh"), "utf8");
+    const source = await readFile(join(root, "scripts/ops.sh"), "utf8");
     // Everything before the command dispatch (the last case), including the entry's settings gate.
-    await writeFile(join(root, "scripts/ops/settings.sh"), source.slice(0, source.lastIndexOf('\ncase "${1:-}" in\n')) +
+    await writeFile(join(root, "scripts/settings.sh"), source.slice(0, source.lastIndexOf('\ncase "${1:-}" in\n')) +
       '\necho "SETTINGS port=$PORT root=$DEPLOYED_WORKSPACE_ROOT"\n');
-    const settings = await ops("resume", "scripts/ops/settings.sh");
+    const settings = await ops("resume", "scripts/settings.sh");
     expect(settings.output).toContain("SETTINGS port=2022 root=/srv/new\n");
     // The deployment script validates saved settings itself, and takes the command it runs for.
     expect((await ops("deploy")).output).toContain("DEPLOY ENTRY command=deploy\n");
@@ -232,8 +232,8 @@ test.skipIf(!bash || !existsSync(bash))("Linux 恢复入口先读事务记录，
 }, 60000);
 
 test.skipIf(process.platform !== "win32")("Windows 恢复入口先读事务记录，普通设置损坏不挡住继续或回滚", async () => {
-  const fixture = await entryFixture("transaction-entry-windows-", "scripts/ops/ops.ps1"), root = fixture.root;
-  const entry = join(root, "scripts/ops/ops.ps1");
+  const fixture = await entryFixture("transaction-entry-windows-", "scripts/ops.ps1"), root = fixture.root;
+  const entry = join(root, "scripts/ops.ps1");
   try {
     const positional = (command: string) => execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
       `[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); & ${quotePS(entry)} ${command}; exit $LASTEXITCODE`], root,

@@ -4,7 +4,7 @@ import { GlobalRegistrator } from "@happy-dom/global-registrator";
 const registered = !GlobalRegistrator.isRegistered;
 if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:11012/" });
 const { render } = await import("preact");
-const { ReadOnlyPage } = await import("../../ui/console/src/read-pages.tsx");
+const { ReadOnlyPage } = await import("../../console/ui/src/read-pages.tsx");
 afterAll(async () => { if (registered) await GlobalRegistrator.unregister(); });
 const until = async (check: () => boolean) => { const limit = Date.now() + 2000; while (!check() && Date.now() < limit) await Bun.sleep(10); expect(check()).toBe(true); };
 

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { runMaintenance, MaintenanceRefused, type MaintenanceHost, type MaintenanceWork, type ServiceFacts,
-  type MaintenanceCheckpoint } from "../../scripts/ops/core/maintenance.ts";
-import { readOpsResult, type OpsResult } from "../../scripts/ops/core/result.ts";
+  type MaintenanceCheckpoint } from "../../ops/core/maintenance.ts";
+import { readOpsResult, type OpsResult } from "../../ops/core/result.ts";
 
 const request = { id: "fixture", runtime: "a".repeat(64), command: "configuration-apply", intent: "configuration" as const, label: "应用配置" };
 function fixture() {

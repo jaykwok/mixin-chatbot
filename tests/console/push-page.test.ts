@@ -1,12 +1,12 @@
-// The console's push page (scripts/ops/console/push-page.ts) over the bot's real local control interface
+// The console's push page (console/server/push-page.ts) over the bot's real local control interface
 // (src/server/http-app.ts `/_admin/push/*`) with a recording push service: masked people and their keys, the audit,
 // refusals passed through, malformed requests refused by the bot, and the package download by a one-time ticket.
 import { expect, test } from "bun:test";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { AuditLog } from "../../scripts/ops/console/audit.ts";
-import { PushPage, servicePushSource } from "../../scripts/ops/console/push-page.ts";
-import type { RouteContext } from "../../scripts/ops/console/routes.ts";
+import { AuditLog } from "../../console/server/audit.ts";
+import { PushPage, servicePushSource } from "../../console/server/push-page.ts";
+import type { RouteContext } from "../../console/server/routes.ts";
 import { PushRefused, type PushAdmin, type PushDetail, type PushListItem } from "../../src/push/service.ts";
 import { createApp } from "../../src/server/http-app.ts";
 import { tempFixture } from "../helpers/temp.ts";

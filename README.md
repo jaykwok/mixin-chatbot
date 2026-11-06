@@ -1,4 +1,4 @@
-# mixin-chatbot
+# mixin-bot
 
 中国电信量子密信开发者平台的Agent应用机器人。
 
@@ -8,7 +8,7 @@
 
 机器人以开放平台**应用机器人**接入，经事件 Stream 主动连出接收消息，服务器不需要公网入口。
 
-> **⚠️ 注意：从 v1.0.0 开始，本项目改为应用机器人。** 此前发布的 webhook 版本（legacy version，没有版本号）**不能升级**到本版本：请在新目录全新部署，旧会话、资料目录和配置都不迁移；旧统计的提问数和 token 用量可用一次性工具导入新账本。步骤见[从旧版 webhook 发布切换](docs/data-migrations.md#从旧版-webhook-发布切换)。
+> **⚠️ 注意：v2.0.0 需要全新部署。** v1.x 和更早的 webhook 版本都**不能升级**到本版本：请在新目录全新部署，会话、资料目录和配置都不迁移；v1.x 统计的提问数和 token 用量可恢复到新部署的空账本。步骤见[从更早的版本切换](docs/data-migrations.md#从更早的版本切换)。
 
 [群聊与单聊](#群聊与单聊) · [快速开始](#快速开始) · [使用](#使用) · [日常管理](#日常管理) · [详细文档](#详细文档)
 
@@ -81,25 +81,25 @@ Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需�
 ### 2. 获取代码并部署
 
 ```sh
-git clone https://github.com/jaykwok/mixin-chatbot.git
-cd mixin-chatbot
+git clone https://github.com/jaykwok/mixin-bot.git
+cd mixin-bot
 ```
 
-请在**新的空目录**部署，不要在旧版 webhook 部署的目录上部署。运行对应平台的部署脚本，按向导填写 AppID 和 AppSecret、选择模型并填写凭据：
+请在**新的空目录**部署，不要在更早版本的部署目录上部署。运行对应平台的部署脚本，按向导填写 AppID 和 AppSecret、选择模型并填写凭据：
 
 **Windows**（管理员 PowerShell）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy/deploy.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1
 ```
 
 **Linux / Docker**：
 
 ```sh
-bash scripts/deploy/deploy.sh
+bash scripts/deploy.sh
 ```
 
-rootful Docker（默认安装）下用 root 运行（`sudo bash scripts/deploy/deploy.sh`），rootless Docker 下用其所属用户运行。脚本会准备依赖、保存配置并启动服务；凭据和模型配置由向导生成，通常无需手写 JSON。
+rootful Docker（默认安装）下用 root 运行（`sudo bash scripts/deploy.sh`），rootless Docker 下用其所属用户运行。脚本会准备依赖、保存配置并启动服务；凭据和模型配置由向导生成，通常无需手写 JSON。
 
 - 共享资料默认放在 `data/workspace/`；部署时可用 `WORKSPACE_ROOT` 指向已有的外置目录，服务只读。
 - 本机管理端口自动使用 `1011`，不需要填写；大文件外链可稍后配置。
@@ -113,13 +113,13 @@ rootful Docker（默认安装）下用 root 运行（`sudo bash scripts/deploy/d
    **Windows**：
 
    ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops/ops.ps1 doctor
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ops.ps1 doctor
    ```
 
    **Linux / Docker**：
 
    ```sh
-   bash scripts/ops/ops.sh doctor
+   bash scripts/ops.sh doctor
    ```
 
 3. **验证群聊**：在客户端把应用机器人加入测试群，@ 机器人发送“只回复 OK”，确认能收到回答。
@@ -198,7 +198,7 @@ Windows 自动打开浏览器；Linux 打印 SSH 转发命令和一次性登录�
 
 ### 版本与升级
 
-版本分三项：程序版本（当前 1.1.0）、数据格式（当前 1）和构建（Git 提交）。部署记录 `data/state/data-version.json` 写明实际部署的版本，并绑定部署时的应用；升级按它判断，数据格式一致才升级，没有有效记录的目录拒绝原地安装或升级。规则见[版本、数据格式与从旧版切换](docs/data-migrations.md)。
+版本分三项：程序版本（当前 2.0.0）、数据格式（当前 2）和构建（Git 提交）。部署记录 `data/state/data-version.json` 写明实际部署的版本，并绑定部署时的应用；升级按它判断，数据格式一致才升级，没有有效记录的目录拒绝原地安装或升级。规则见[版本、数据格式与从旧版切换](docs/data-migrations.md)。
 
 ## 详细文档
 
@@ -208,7 +208,7 @@ Windows 自动打开浏览器；Linux 打印 SSH 转发命令和一次性登录�
 | [使用指南](docs/usage.md) | 群聊与单聊的提问方式、指令、发文件给机器人、文件交付和推送 |
 | [网页控制台](docs/console.md) | 启动与登录、各页面用途、身份模式与导出、管理任务与恢复 |
 | [运维手册](docs/operations.md) | 命令行管理、排查故障、通讯录同步、配置外链 |
-| [版本与从旧版切换](docs/data-migrations.md) | 版本、数据格式与应用绑定规则，以后的升级边界，从旧版 webhook 发布切换 |
+| [版本与从旧版切换](docs/data-migrations.md) | 版本、数据格式与应用绑定规则，以后的升级边界，从更早的版本切换与恢复统计 |
 | [开发指南](docs/development.md) | 理解架构、修改提示词与工具、了解文档加工能力、运行开发检查 |
 
 基于 Bun、Hono 和 Pi（Durable 引擎，全部单聊一个、每个群一个 SQLite 空间库）。项目面向可信内部成员：`bash` 工具拥有运行账户的系统权限，详细边界见[提示词与工具](docs/development.md#提示词与工具)。

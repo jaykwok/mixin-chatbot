@@ -10,9 +10,9 @@ import { writeTestData as writeFile } from "../helpers/stats-fixture.ts";
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { collectAll, collectGroup } from "../../scripts/ops/stats-admin.ts";
-import { maskUser } from "../../scripts/ops/shared/format.ts";
-import { renderReport, type ReportInput } from "../../scripts/ops/shared/report.ts";
+import { collectAll, collectGroup } from "../../ops/tools/stats-admin.ts";
+import { maskUser } from "../../ops/lib/format.ts";
+import { renderReport, type ReportInput } from "../../console/server/report.ts";
 import { archiveFixture as rm, testTempDir as tmpdir } from "../helpers/temp.ts";
 
 const MASKED: ReportInput["identity"] = { label: maskUser, note: "手机号已打码。", banner: "不含个人信息" };

@@ -18,10 +18,10 @@ async function fixture(platform: Platform) {
   const root = join(temporary.root, "生产 [测试] 项目");
   const logs = join(root, "logs");
   await mkdir(logs, { recursive: true });
-  await mkdir(join(root, "scripts/ops"), { recursive: true });
+  await mkdir(join(root, "scripts"), { recursive: true });
   const filename = "task-logs." + (platform === "powershell" ? "ps1" : "sh");
-  const script = join(root, "scripts/ops", filename);
-  await copyFile(join(project, "scripts/ops", filename), script);
+  const script = join(root, "scripts", filename);
+  await copyFile(join(project, "scripts", filename), script);
   return { ...temporary, root, logs, script, cwd: temporary.root };
 }
 
@@ -64,19 +64,19 @@ for (const platform of ["powershell", "bash"] as const) {
     test("extracts the task across numeric rotations with deduplicated context and the correct model", async () => {
       const f = await fixture(platform);
       const contents = {
-        "mixin-chatbot.log.10": "2026-09-08 12:59:00 - INFO - Pi ModelRuntime 就绪（provider=before-provider, model=test-model）\n",
-        "mixin-chatbot.log.2": [
+        "mixin-bot.log.10": "2026-09-08 12:59:00 - INFO - Pi ModelRuntime 就绪（provider=before-provider, model=test-model）\n",
+        "mixin-bot.log.2": [
           "2026-09-08 12:59:59 - INFO - before task",
           progress("任务开始", "准备会话", 0, 0),
           progress("模型调用开始", "模型调用准备（含历史检查）", 1, 0),
         ].join("\n") + "\n",
-        "mixin-chatbot.log.1": [
+        "mixin-bot.log.1": [
           "2026-09-08 13:00:01 - INFO - context across rotation",
           progress("任务进展", "接收模型输出", 2, 0, "555D838A"),
           progress("任务仍在运行", "接收模型输出", 60, 0),
           ...Array.from({ length: 9 }, (_, i) => "2026-09-08 13:02:00 - INFO - noise-" + i),
         ].join("\n") + "\n",
-        "mixin-chatbot.log": [
+        "mixin-bot.log": [
           progress("任务仍在运行", "接收模型输出", 1140, 1020),
           progress("任务总时限到达", "接收模型输出", 1200, 1080),
           progress("任务进展", "等待取消清理", 1200, 0),
@@ -85,7 +85,7 @@ for (const platform of ["powershell", "bash"] as const) {
           progress("任务开始", "准备会话", 0, 0, "555d838a0"),
           "2026-09-08 13:21:01 - INFO - mentioned 555d838a without a task field",
         ].join("\r\n"), // A final line without a newline must not crash extraction.
-        "mixin-chatbot.log.old": progress("任务开始", "wrong file", 0, 0),
+        "mixin-bot.log.old": progress("任务开始", "wrong file", 0, 0),
       };
       try {
         for (const [name, text] of Object.entries(contents)) await writeFile(join(f.logs, name), text);
@@ -97,7 +97,7 @@ for (const platform of ["powershell", "bash"] as const) {
         const context = report["context.log"]!;
         const summary = report["summary.txt"]!;
         expect(task.trim().split("\n")).toHaveLength(8);
-        expect(task.startsWith("mixin-chatbot.log.2:2:")).toBe(true);
+        expect(task.startsWith("mixin-bot.log.2:2:")).toBe(true);
         expect(task).toContain("任务：555d838a");
         expect(task).not.toContain("555d838a0");
         expect(task).not.toContain("mentioned");
@@ -109,7 +109,7 @@ for (const platform of ["powershell", "bash"] as const) {
         const contextLines = context.trim().split("\n").filter(line => line !== "--");
         expect(new Set(contextLines).size).toBe(contextLines.length);
         expect(summary).toContain("匹配行数: 8");
-        expect(summary.indexOf("  mixin-chatbot.log.10")).toBeLessThan(summary.indexOf("  mixin-chatbot.log.2"));
+        expect(summary.indexOf("  mixin-bot.log.10")).toBeLessThan(summary.indexOf("  mixin-bot.log.2"));
         expect(summary).toContain("provider=before-provider");
         expect(summary).not.toContain("provider=after-provider");
         expect(summary).toContain("耗时: 1140秒, 最近进展距今: 1020秒");
@@ -134,7 +134,7 @@ for (const platform of ["powershell", "bash"] as const) {
           ", 模型流: " + JSON.stringify(stats) + ", 取消原因: " + reason;
         const ended = progress("模型流结束", "等待取消清理", elapsed, 0) +
           ", 模型流: " + JSON.stringify({ ...stats, lastEvent: "message_end", stopReason: "aborted" });
-        await writeFile(join(f.logs, "mixin-chatbot.log"), [
+        await writeFile(join(f.logs, "mixin-bot.log"), [
           progress("任务开始", "准备会话", 0, 0), timeout, ended,
           progress("模型流结束", "模型响应结束", 1, 0, "abcdef12") + ", responseId: other-task-response",
           progress("任务取消清理完成", "等待取消清理", elapsed, 0),
@@ -143,7 +143,7 @@ for (const platform of ["powershell", "bash"] as const) {
         expect(result.code, result.output).toBe(0);
         const report = await readReport(f.root);
         const summary = report["summary.txt"]!;
-        expect(summary).toContain(kind + "记录（取消清理前）:\n" + "mixin-chatbot.log:2: " + timeout);
+        expect(summary).toContain(kind + "记录（取消清理前）:\n" + "mixin-bot.log:2: " + timeout);
         expect(summary).toContain(ended);
         expect(summary).toContain('"emptyDeltas":179');
         expect(summary).toContain('"rawStopReason":null');
@@ -160,7 +160,7 @@ for (const platform of ["powershell", "bash"] as const) {
       try {
         const alternate = join(f.root, "另一份 [日志]");
         await mkdir(alternate);
-        await writeFile(join(alternate, "mixin-chatbot.log"), "unrelated before\n" +
+        await writeFile(join(alternate, "mixin-bot.log"), "unrelated before\n" +
           progress("任务开始", "准备会话", 0, 0) + "\nunrelated after\n");
         const options = platform === "powershell"
           ? ["-Context", "0", "-LogDir", alternate]
@@ -183,7 +183,7 @@ for (const platform of ["powershell", "bash"] as const) {
         const empty = await execute(platform, f.script, ["555d838a"], f.cwd);
         expect(empty.code, empty.output).toBe(2);
         expect(existsSync(join(f.root, "tmp"))).toBe(false);
-        await writeFile(join(f.logs, "mixin-chatbot.log"), progress("任务开始", "准备会话", 0, 0, "abcdef12"));
+        await writeFile(join(f.logs, "mixin-bot.log"), progress("任务开始", "准备会话", 0, 0, "abcdef12"));
         const result = await execute(platform, f.script, ["555d838a"], f.cwd);
         expect(result.code, result.output).toBe(2);
         const report = await readReport(f.root);

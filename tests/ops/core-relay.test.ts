@@ -2,12 +2,12 @@ import { expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { runCore } from "../../scripts/ops/core/cli.ts";
-import { relayRequest, runRelay } from "../../scripts/ops/core/relay.ts";
-import { createMaintenanceHost, type MaintenanceHostOptions } from "../../scripts/ops/core/maintenance-host.ts";
-import { acquireDeploymentLock } from "../../scripts/ops/core/deployment-lock.ts";
+import { runCore } from "../../ops/core/cli.ts";
+import { relayRequest, runRelay } from "../../ops/core/relay.ts";
+import { createMaintenanceHost, type MaintenanceHostOptions } from "../../ops/core/maintenance-host.ts";
+import { acquireDeploymentLock } from "../../ops/core/deployment-lock.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
-import { relayScope } from "../../scripts/lib/operation-scope.ts";
+import { relayScope } from "../../src/lib/operation-scope.ts";
 import { openRelayIndex, readRelayIndex } from "../../src/integrations/relay-index.ts";
 import { storedObjectUrl, validateRelayConfig } from "../../src/integrations/relay-s3.ts";
 import { relayBackendId } from "../../src/integrations/relay-s3.ts";
@@ -33,10 +33,10 @@ test("外链入口拒绝未知和混用参数；显式关键字中的选项样�
 
 async function fixture() {
   const f = await tempFixture("core-relay-");
-  for (const tree of ["scripts", "src", "ui", "data/state", "data/config"]) await mkdir(join(f.root, tree), { recursive: true });
-  for (const tree of ["scripts", "src", "ui"]) await writeFile(join(f.root, tree, "fixture.ts"), "export {};\n");
-  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
-  const ready = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+  for (const tree of ["console", "ops", "scripts", "src", "data/state", "data/config"]) await mkdir(join(f.root, tree), { recursive: true });
+  for (const tree of ["console", "ops", "scripts", "src"]) await writeFile(join(f.root, tree, "fixture.ts"), "export {};\n");
+  await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture", transaction: "deploy-fixture", application: "a".repeat(64) }));
+  const ready = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json(ready) });
   await writeFile(join(f.root, "data/state/instance.json"), JSON.stringify({ ...ready, port: server.port }));
   const facts = { identity: "a".repeat(64), owned: true, state: "running" as "running" | "stopped" }, effects: string[] = [];

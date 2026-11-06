@@ -1,5 +1,5 @@
 // The stats ledger (src/agent/stats-ledger.ts, schema 3) and the one-off import of the old ledger
-// (scripts/ops/stats-import.ts). Synthetic ledgers in temporary directories only.
+// (ops/tools/stats-import.ts). Synthetic ledgers in temporary directories only.
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
@@ -9,7 +9,7 @@ import { Database } from "bun:sqlite";
 import {
   ASK_ID_RETENTION_MS, dayKey, importRows, openExistingStatsLedger, openStatsLedger, pruneAskIds, readLedger, recordAsks, settledAsks, syncUsage, type UsageState,
 } from "../../src/agent/stats-ledger.ts";
-import { importDigest, importLegacyStats, previewLegacyStats, readImport } from "../../scripts/ops/stats-import-core.ts";
+import { importDigest, importStats, previewStatsImport, readImport } from "../../ops/tools/stats-import-core.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { statsOf } from "../helpers/layout.ts";
 
@@ -158,7 +158,7 @@ describe("usage", () => {
 });
 
 describe("ledger file", () => {
-  test("a missing ledger reads as none; another schema version is refused with the import hint", async () => {
+  test("a missing ledger reads as none; another schema version is refused", async () => {
     expect(openExistingStatsLedger(join(fixture.root, "missing.sqlite"))).toBeNull();
     const dir = join(fixture.root, `old-${++counter}`);
     await mkdir(dir, { recursive: true });
@@ -166,44 +166,30 @@ describe("ledger file", () => {
     const old = new Database(path, { create: true });
     old.exec("CREATE TABLE stats_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO stats_schema VALUES (1, 2);");
     old.close();
-    expect(() => openExistingStatsLedger(path)).toThrow("导入工具");
+    expect(() => openExistingStatsLedger(path)).toThrow("请保留 stats.sqlite");
     expect(() => openStatsLedger(path)).toThrow("统计账本版本 2");
   });
 });
 
-/** How the old ledger sits on disk: rollback journal; WAL mode as the webhook release kept it (checkpointed when it
- * stopped); WAL mode with frames never checkpointed (copied while the writer was open, as after a crash). */
-type LegacyMode = "delete" | "wal" | "pending";
+/** How the saved ledger sits on disk: rollback journal; WAL mode, checkpointed; WAL mode with frames never checkpointed
+ * (copied while the writer was open, as after a crash). */
+type SavedMode = "delete" | "wal" | "pending";
 
-/** A schema-2 ledger of the webhook release: only the tables and columns the import reads, plus fields it must drop. */
-async function legacyLedger(mode: LegacyMode = "delete"): Promise<string> {
-  const dir = join(fixture.root, `legacy-${++counter}`);
+const DAY = new Date(2026, 8, 1, 12).getTime(), DAY_KEY = "2026-09-01";
+
+/** A ledger of this format with three asks of one member and model and tool usage. */
+async function savedLedger(mode: SavedMode = "delete", asks = 3): Promise<string> {
+  const dir = join(fixture.root, `saved-${++counter}`);
   await mkdir(join(dir, "writer"), { recursive: true });
   const path = join(dir, "stats.sqlite");
-  const db = new Database(mode === "pending" ? join(dir, "writer", "stats.sqlite") : path, { create: true });
-  if (mode !== "delete") db.exec("PRAGMA journal_mode = WAL");
-  db.exec(`CREATE TABLE stats_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
-    INSERT INTO stats_schema VALUES (1, 2);
-    CREATE TABLE sources (id TEXT PRIMARY KEY, group_segment TEXT NOT NULL, user_segment TEXT NOT NULL);
-    CREATE TABLE activity (source TEXT NOT NULL, day TEXT NOT NULL, asks INTEGER NOT NULL, replies INTEGER NOT NULL,
-      files INTEGER NOT NULL, first_at INTEGER NOT NULL, last_at INTEGER NOT NULL);
-    CREATE TABLE usage_totals (source TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
-      requests INTEGER NOT NULL, input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL,
-      cost REAL NOT NULL);`);
-  const source = db.query("INSERT INTO sources VALUES (?, ?, ?)");
-  source.run("s1", "g", "u");
-  source.run("s2", "g", "u");
-  source.run("s3", "direct", "v");
-  const activity = db.query("INSERT INTO activity VALUES (?, ?, ?, ?, ?, ?, ?)");
-  activity.run("s1", "2026-09-01", 2, 2, 1, 100, 200);
-  activity.run("s2", "2026-09-01", 1, 1, 0, 50, 150);
-  activity.run("s3", "2026-09-02", 0, 3, 0, 300, 300);
+  const db = openStatsLedger(mode === "pending" ? join(dir, "writer", "stats.sqlite") : path);
+  db.exec(`PRAGMA journal_mode = ${mode === "delete" ? "DELETE" : "WAL"}`);
+  recordAsks(db, Array.from({ length: asks }, (_, index) => ({ requestId: `r${index}`, space: "g", user: "u", at: DAY + index })));
   if (mode === "pending") db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint = 0");
-  const usage = db.query("INSERT INTO usage_totals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-  usage.run("s1", "2026-09-01", "assistant", "p", "m", 2, 10, 5, 20, 1, 0.5);
-  usage.run("s2", "2026-09-01", "compaction", "p", "m", 1, 7, 3, 0, 0, 0.1);
-  usage.run("s3", "2026-09-02", "assistant", "", "", 1, 4, 0, 0, 0, 0);
-  usage.run("s3", "2026-09-02", "interrupted", "q", "x", 1, 0, 0, 0, 0, 0);
+  const usage = db.query(`INSERT INTO usage_daily (day, space, user, bucket, key, origin, input, output, cache_read, cache_write, total_tokens)
+    VALUES (?, 'g', 'u', ?, ?, 'live', ?, ?, ?, ?, ?)`);
+  usage.run(DAY_KEY, "models", "p/m", 17, 8, 20, 1, 46);
+  usage.run(DAY_KEY, "tools", "probe", 4, 0, 0, 0, 4);
   if (mode === "pending") {
     // The usage rows exist only in the -wal: copy both files before the writer's close would checkpoint them.
     copyFileSync(join(dir, "writer", "stats.sqlite"), path);
@@ -213,81 +199,70 @@ async function legacyLedger(mode: LegacyMode = "delete"): Promise<string> {
   return path;
 }
 
-/** The names and contents of everything in the old ledger's directory. */
+/** The names and contents of everything in the saved ledger's directory. */
 function directoryState(path: string): Record<string, string> {
   const dir = dirname(path);
   return Object.fromEntries(readdirSync(dir).filter(name => name !== "writer").sort()
     .map(name => [name, createHash("sha256").update(readFileSync(join(dir, name))).digest("hex")]));
 }
 
-describe("import of the old ledger", () => {
+describe("restore of a saved ledger", () => {
   test.each(["delete", "wal", "pending"] as const)(
-    "asks per member day and tokens per member, day and model; everything else is dropped; the old directory is not changed (%s)",
+    "asks and model and tool tokens are read from a snapshot; the saved directory is not changed (%s)",
     async mode => {
-      const path = await legacyLedger(mode);
+      const path = await savedLedger(mode);
       const before = directoryState(path);
-      expect(Object.keys(before)).toEqual(mode === "pending" ? ["stats.sqlite", "stats.sqlite-wal"] : ["stats.sqlite"]);
-      const rows = readLegacyLedger(path);
-      expect(rows.asks).toEqual([{ day: "2026-09-01", space: "g", user: "u", asks: 3, firstAt: 50, lastAt: 200 }]);
-      expect(rows.usage).toEqual([
-        { day: "2026-09-01", space: "g", user: "u", key: "p/m", input: 17, output: 8, cacheRead: 20, cacheWrite: 1, totalTokens: 46 },
-        { day: "2026-09-02", space: "direct", user: "v", key: "unknown/unknown", input: 4, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 4 },
-      ]);
+      if (mode === "pending") expect(Object.keys(before)).toEqual(["stats.sqlite", "stats.sqlite-wal"]);
+      const rows = readImport(path);
+      expect(rows.asks).toEqual([{ day: DAY_KEY, space: "g", user: "u", asks: 3, firstAt: DAY, lastAt: DAY + 2 }]);
+      expect(rows.usage.map(({ bucket, key, totalTokens }) => [bucket, key, totalTokens]).sort()).toEqual([["models", "p/m", 46], ["tools", "probe", 4]]);
       // Not even the -shm/-wal a read-only WAL connection would create beside the file.
       expect(directoryState(path)).toEqual(before);
-      expect(importDigest(readLegacyLedger(path))).toBe(importDigest(rows));
+      expect(importDigest(readImport(path))).toBe(importDigest(rows));
       const root = join(fixture.root, `root-${++counter}`);
-      expect(previewLegacyStats(path, root)).toMatchObject({ asks: 3, usageRows: 2, totalTokens: 50, status: "new" });
-      expect(importLegacyStats(path, root).result).toBe("imported");
+      expect(previewStatsImport(path, root)).toMatchObject({ asks: 3, usageRows: 2, totalTokens: 50, status: "new" });
+      expect(importStats(path, root).result).toBe("imported");
       expect(directoryState(path)).toEqual(before);
     });
 
-  test("imported rows read together with live ones; the same ledger again adds nothing; a different one is refused", async () => {
-    const path = await legacyLedger("wal");
+  test("restored rows read back; the same ledger again adds nothing; a different one and a ledger with data are refused", async () => {
+    const path = await savedLedger("wal");
     const root = join(fixture.root, `root-${++counter}`);
-    const live = openStatsLedger(statsOf(root));
-    try {
-      recordAsks(live, [{ requestId: "r1", space: "g", user: "u", at: new Date(2026, 8, 1, 12).getTime() }]);
-    } finally { live.close(); }
-    expect(importLegacyStats(path, root).result).toBe("imported");
-    expect(importLegacyStats(path, root).result).toBe("already");
-    const other = await legacyLedger("wal");
-    const changed = new Database(other);
-    changed.exec("UPDATE activity SET asks = 5 WHERE source = 's1'");
-    changed.close();
-    expect(() => importLegacyStats(other, root)).toThrow("拒绝再导入");
-    expect(() => importLegacyStats(statsOf(root), root)).toThrow("不能是当前数据目录");
+    expect(importStats(path, root).result).toBe("imported");
+    expect(importStats(path, root).result).toBe("already");
+    const other = await savedLedger("wal", 5);
+    expect(() => importStats(other, root)).toThrow("拒绝再导入");
+    expect(() => importStats(statsOf(root), root)).toThrow("不能是当前数据目录");
     const db = openExistingStatsLedger(statsOf(root))!;
     try {
       const rows = readLedger(db);
-      expect(rows.asks.find(row => row.group === "g" && row.day === "2026-09-01")!.asks).toBe(4);
-      expect(rows.usage.map(row => row.totalTokens)).toEqual([4, 46]);
+      expect(rows.asks.find(row => row.group === "g" && row.day === DAY_KEY)!.asks).toBe(3);
+      expect(rows.usage.map(row => row.totalTokens).sort()).toEqual([4, 46]);
       expect(db.query("SELECT asks, usage_rows FROM imports").all()).toEqual([{ asks: 3, usage_rows: 2 }]);
     } finally { db.close(); }
+    const occupied = join(fixture.root, `root-${++counter}`), live = openStatsLedger(statsOf(occupied));
+    try { recordAsks(live, [{ requestId: "live", space: "g", user: "u", at: DAY }]); } finally { live.close(); }
+    expect(() => importStats(path, occupied)).toThrow("空账本");
   });
 
   test("the preview counts what an import adds and tells new, already imported and blocked apart without writing", async () => {
-    const path = await legacyLedger();
+    const path = await savedLedger();
     const root = join(fixture.root, `root-${++counter}`);
-    const expected = { asks: 3, memberDays: 1, usageRows: 2, totalTokens: 50, firstDay: "2026-09-01", lastDay: "2026-09-02" };
-    expect(previewLegacyStats(path, root)).toEqual({ ...expected, status: "new" });
+    const expected = { asks: 3, memberDays: 1, usageRows: 2, totalTokens: 50, firstDay: DAY_KEY, lastDay: DAY_KEY };
+    expect(previewStatsImport(path, root)).toEqual({ ...expected, status: "new" });
     expect(existsSync(statsOf(root))).toBe(false);
-    expect(importLegacyStats(path, root).result).toBe("imported");
-    expect(previewLegacyStats(path, root)).toEqual({ ...expected, status: "already" });
-    const other = await legacyLedger();
-    const changed = new Database(other);
-    changed.exec("UPDATE activity SET asks = 5 WHERE source = 's1'");
-    changed.close();
-    expect(previewLegacyStats(other, root).status).toBe("other");
-    expect(() => previewLegacyStats(statsOf(root), root)).toThrow("不能是当前数据目录");
+    expect(importStats(path, root).result).toBe("imported");
+    expect(previewStatsImport(path, root)).toEqual({ ...expected, status: "already" });
+    expect(previewStatsImport(await savedLedger("delete", 5), root).status).toBe("other");
+    expect(() => previewStatsImport(statsOf(root), root)).toThrow("不能是当前数据目录");
   });
 
   test("a ledger of another schema version is refused", async () => {
-    const path = await legacyLedger();
+    const path = await savedLedger();
     const db = new Database(path);
-    db.exec("UPDATE stats_schema SET version = 4");
+    db.exec("UPDATE stats_schema SET version = 2");
     db.close();
-    expect(() => readLegacyLedger(path)).toThrow("只接受 schema 2 或 3");
+    expect(() => readImport(path)).toThrow("只接受 schema 3");
   });
 
   test("an import of no rows still marks the ledger as imported", () => {
@@ -299,5 +274,3 @@ describe("import of the old ledger", () => {
     } finally { db.close(); }
   });
 });
-
-function readLegacyLedger(path: string) { return readImport(path).rows; }

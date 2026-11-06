@@ -2,31 +2,31 @@
 
 [返回运维手册](operations.md) · [部署与配置](deployment.md)
 
-应用机器人从 **v1.0.0** 起使用新的发布体系。此前的 webhook 发布（代码见标签 `legacy-webhook`）没有程序版本，**不能原地升级**：在新目录全新部署，旧会话、资料目录和配置都不迁移，只有旧版统计可一次性导入新账本（见[导入旧版统计](#导入旧版统计)），切换步骤见[从旧版 webhook 发布切换](#从旧版-webhook-发布切换)。
+**v2.0.0** 使用数据格式 2。更早的部署（v1.x 应用机器人，以及没有程序版本的 webhook 发布，代码见标签 `legacy-webhook`）**不能原地升级**：在新目录全新部署，会话、资料目录和配置都不迁移；v1.x 的统计可恢复到新部署的空账本（见[恢复统计](#恢复统计)），切换步骤见[从更早的版本切换](#从更早的版本切换)。
 
 ## 版本与存储格式
 
 | 名称 | 来源 | 用途 |
 | --- | --- | --- |
-| 程序版本 | `package.json` 的 `version`（当前 1.1.0） | 发布与升级判断、控制台显示 |
-| 数据格式 | `src/core/version.ts` 的 `DATA_VERSION`（当前 1） | 程序能否打开现有数据 |
+| 程序版本 | `package.json` 的 `version`（当前 2.0.0） | 发布与升级判断、控制台显示 |
+| 数据格式 | `src/core/version.ts` 的 `DATA_VERSION`（当前 2） | 程序能否打开现有数据 |
 | 构建 | Git 提交（12 位，有已跟踪改动时带 `-dirty`） | 区分同一版本号的不同构建 |
 | 会话存储 schema | Pi Durable 的 SQLite schema（当前 2） | 依赖库内部格式，由数据格式一并约束 |
 | 统计 schema | 统计账本自己的版本（当前 3） | 统计账本格式，独立维护 |
 
-这几个数字互不对应：数据格式 1 与统计 schema 3 没有关系，Pi 的包版本也不是数据格式。
+这几个数字互不对应：数据格式 2 与会话存储 schema 2、统计 schema 3 都没有关系，Pi 的包版本也不是数据格式。
 
 Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版程序无法再打开。本程序不使用这项自动升级：服务、离线维护和诊断在官方打开会话库之前先核对 schema，已有的会话库不是当前 schema 2（例如 Pi 1.3 时期未发布的测试库，或不是会话库的文件）就拒绝并原样保留文件，新库照常创建。部署和升级的数据校验、验证实例和最终提交也以只读连接逐个核对 `data/conversations/` 下已有的会话库（无法读取的同样拒绝），所以不兼容的库在提交之前就被拒绝，发布仍可回滚，而不是提交后业务启动才失败。未发布的测试数据请在新目录全新部署。
 
 部署提交时把**实际部署**的版本和数据所属的应用写入部署记录 `data/state/data-version.json`：
 
 ```json
-{ "dataVersion": 1, "appVersion": "1.0.0", "build": "0123456789ab", "transaction": "deploy-…", "application": "<64 位十六进制>" }
+{ "dataVersion": 2, "appVersion": "2.0.0", "build": "0123456789ab", "transaction": "deploy-…", "application": "<64 位十六进制>" }
 ```
 
 `application` 是平台环境与 AppID 的 SHA-256 摘要（不含 AppSecret，不保存 AppID 原文）。整个数据目录属于这一个应用：会话、成员身份、通讯录和待交付消息都不能跨应用或跨环境沿用。部署预检、验证实例、提交和服务启动都核对它，在打开通讯录、会话库或恢复任务之前拒绝不一致的配置；配置向导也不接受另一个 AppID 或环境。更换同一应用的 AppSecret 不受影响。要改用另一个应用，在新目录全新部署。
 
-运行中的服务在 `/health` 中报告自己的 `appVersion` 和 `build`（`version` 字段是健康协议版本，与程序版本无关）。控制台总览和 `ops doctor` 显示的是**正在运行的服务**报告的版本；服务没有运行时取自部署记录并注明“未运行”。检出的代码比运行中的服务新时另起一行，例如“本地工具 v1.1.0 · 运行服务 v1.0.0”。检出代码的 `package.json` 不代表已经部署的版本。
+运行中的服务在 `/health` 中报告自己的 `appVersion` 和 `build`（`version` 字段是健康协议版本，与程序版本无关）。控制台总览和 `ops doctor` 显示的是**正在运行的服务**报告的版本；服务没有运行时取自部署记录并注明“未运行”。检出的代码比运行中的服务新时另起一行，例如“本地工具 v2.1.0 · 运行服务 v2.0.0”。检出代码的 `package.json` 不代表已经部署的版本。
 
 ## 新装与升级
 
@@ -36,8 +36,8 @@ Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版�
 | --- | --- |
 | 没有部署记录，也没有运行数据 | 全新安装 |
 | 部署记录有效，数据格式与程序一致，应用与配置一致 | 正常升级或重新部署，沿用配置、会话和统计 |
-| 有运行数据（`data/conversations`、`data/tmp`、`data/index`、`data/state/*.sqlite`，或旧版的 `data/groups` 等），但没有部署记录 | 拒绝原地安装或升级，提示在新目录全新部署 |
-| 部署记录损坏、缺字段（旧版没有程序版本，未发布的测试数据没有应用绑定）或数据格式不受支持（包括比程序新的格式） | 报错，现场原样保留，不自动初始化、不清理 |
+| 有运行数据（`data/conversations`、`data/tmp`、`data/index`、`data/state/*.sqlite`，或 webhook 发布的 `data/groups`），但没有部署记录 | 拒绝原地安装或升级，提示在新目录全新部署 |
+| 部署记录损坏、缺字段（没有程序版本或应用绑定）或数据格式不受支持（包括 v1.x 的数据格式 1 和比程序新的格式） | 报错，现场原样保留，不自动初始化、不清理 |
 | 部署记录登记的应用或平台环境与 `data/config/app-bot.json` 不一致 | 拒绝，现场保留 |
 
 缺少版本标记不会被当作“可以覆盖旧数据”的理由。有运行数据却没有部署记录、记录损坏或缺字段（缺少程序版本、事务或应用绑定，程序版本格式无效）的目录，控制台总览显示原因，升级和重新部署都会拒绝，请在新目录部署；只有基础版本字段（数据格式、事务、程序版本与构建）有效、数据格式不受支持时，升级才交给目标版本的升级器判断能否接手；这时应用绑定也由目标版本校验。
@@ -57,35 +57,37 @@ Durable 打开旧 schema 的会话库时会自动原地升级，升级后旧版�
 
 程序版本按完整的 `主.次.修订` 解析；构建只用于定位代码，不参与兼容判断。预检、验证实例和健康检查不会在真实数据上打开会自动迁移存储格式的库。将来确需改写数据的版本，必须在改写之前确定备份与恢复边界。
 
-## 从旧版 webhook 发布切换
+## 从更早的版本切换
 
-旧版的会话历史、群目录、成员 tmp、索引和配置都不迁移。旧版统计可用一次性导入工具并入新账本（见[导入旧版统计](#导入旧版统计)），其余数据没有导入工具。旧目录保留不动（其中的统计账本 `data/groups/stats.sqlite` 导入后仍可作为历史原件留存），确认新部署运行正常后再自行处理。
+旧目录的会话历史、资料目录、成员 tmp、索引和配置都不迁移；统计按[恢复统计](#恢复统计)恢复。旧目录里的命令按旧版本的目录结构执行：v1.x 和 webhook 发布的运维入口都是 `scripts/ops/ops.sh` 和 `scripts\ops\ops.ps1`。旧目录保留不动，确认新部署运行正常后再自行处理。
 
-1. **处理旧外链对象**（配置过大文件外链时）：在旧目录用 `bun run relay list`（Linux 为 `bash scripts/ops/ops.sh relay-ls`）查看仍在册的对象。旧服务停止后不会再按期删除它们：要么先用旧版 `relay purge --all`（`relay-purge --all`）删除，要么确认存储桶的生命周期规则会清理，或稍后在对象存储控制台手动删除。新部署的外链账本不认识旧对象。
-2. **停止旧服务**：旧目录中 `bash scripts/ops/ops.sh stop` 或 `scripts\ops\ops.ps1 stop`。
-3. **退役旧入口**：
-   - Cloudflare 模式：Windows 在旧目录以管理员运行 `scripts\ops\ops.ps1 uninstall-tunnel`（删除 `Cloudflared` 服务）；Linux 结束旧连接器进程（PID 记在旧目录 `data/state/cloudflared.pid`，先用 `ps -p <PID> -o args=` 核对是旧项目根目录下的 `cloudflared`）。随后在 Cloudflare 控制台删除机器人子域名的公开路由、对应 DNS 记录和不再使用的隧道。
-   - 直连模式：Linux 删除注释为 `Mixin-Chatbot (平台IP)` 的 UFW 规则（`sudo ufw status numbered` 后按编号 `sudo ufw delete <编号>`）；Windows 以管理员运行 `Remove-NetFirewallRule -Group mixin-chatbot`。
-   - 在 Mixin 后台停用旧的 webhook 回调。
-4. **让出全局名称**：容器名 `mixin-chatbot` 和 Windows 计划任务 `mixin-chatbot` 是全机唯一的。Linux 执行 `docker rm mixin-chatbot`（还有 `mixin-chatbot-rollback` 时一并删除；数据在旧目录的挂载里，不受影响）；Windows 以管理员执行 `Unregister-ScheduledTask -TaskName mixin-chatbot -Confirm:$false`。新部署发现属于其他目录的容器时会拒绝继续。
-5. **全新部署当前版本**：在新目录克隆仓库并按[部署与配置](deployment.md)部署，配置应用机器人凭据和模型。外链和运行参数在控制台「设置」中重新设置；MCP 和辅助模型按旧目录的 `data/config/mcp.json`、`auxiliary.json` 重新写入（控制台只显示它们的状态）。
-6. **验收**：在客户端做最小验收（单聊、群里提问、文件回复）；新部署的统计从零开始，需要旧数字时按下一节导入。
+1. **处理旧外链对象**（配置过大文件外链时）：在旧目录用 `bun run relay list`（Linux 为 `bash scripts/ops/ops.sh relay-ls`）查看仍在册的对象。旧服务停止后不会再按期删除它们：要么先用 `relay purge --all`（`relay-purge --all`）删除，要么确认存储桶的生命周期规则会清理，或稍后在对象存储控制台手动删除。新部署的外链账本不认识旧对象。
+2. **停止并删除旧部署**：旧版本的容器和 Windows 计划任务都叫 `mixin-chatbot`，与新部署的 `mixin-bot` 不同名，但仍在运行的旧服务会和新部署争用机器人端口，并用同一个应用机器人接收消息，所以必须先停止并删除。
+   - v1.x：在旧目录运行 `bash scripts/ops/ops.sh uninstall`（Windows 以管理员运行 `scripts\ops\ops.ps1 uninstall`）。它停止并删除实例；问到是否删除 `data/` 和 `logs/` 时，选“是”会把它们移入旧目录的 `backup/rm`（统计账本随之在 `backup/rm` 下以 `-data` 结尾的归档目录里，`state/stats.sqlite`），选“否”则原样保留。
+   - webhook 发布：在旧目录运行 `bash scripts/ops/ops.sh stop` 或 `scripts\ops\ops.ps1 stop`，再退役旧入口并删除实例：
+     - Cloudflare 模式：Windows 在旧目录以管理员运行 `scripts\ops\ops.ps1 uninstall-tunnel`（删除 `Cloudflared` 服务）；Linux 结束旧连接器进程（PID 记在旧目录 `data/state/cloudflared.pid`，先用 `ps -p <PID> -o args=` 核对是旧项目根目录下的 `cloudflared`）。随后在 Cloudflare 控制台删除机器人子域名的公开路由、对应 DNS 记录和不再使用的隧道。
+     - 直连模式：Linux 删除注释为 `Mixin-Chatbot (平台IP)` 的 UFW 规则（`sudo ufw status numbered` 后按编号 `sudo ufw delete <编号>`）；Windows 以管理员运行 `Remove-NetFirewallRule -Group mixin-chatbot`。
+     - 在 Mixin 后台停用旧的 webhook 回调。
+     - Linux 执行 `docker rm mixin-chatbot`（还有 `mixin-chatbot-rollback` 时一并删除；数据在旧目录的挂载里，不受影响）；Windows 以管理员执行 `Unregister-ScheduledTask -TaskName mixin-chatbot -Confirm:$false`。
+3. **全新部署当前版本**：在新目录克隆仓库并按[部署与配置](deployment.md)部署，配置应用机器人凭据和模型。外链和运行参数在控制台「设置」中重新设置；MCP 和辅助模型按旧目录的 `data/config/mcp.json`、`auxiliary.json` 重新写入（控制台只显示它们的状态）。
+4. **恢复统计**（需要旧数字时）：在新部署开始使用之前按下一节恢复。新账本一旦记下提问或用量，就不再接受恢复。
+5. **验收**：在客户端做最小验收（单聊、群里提问、文件回复）。
 
-### 导入旧版统计
+### 恢复统计
 
-一次性工具只取新统计用到的字段：按天、按成员的提问数，以及按天、按成员、按模型（`provider/model`）的 input、output、cacheRead、cacheWrite token。费用、请求次数、回复数、工具次数、附件和中断记录一律不导入；旧账本没有 totalTokens，按四项相加补出。旧版的压缩、分支摘要等用量也按其模型计入。
+导入工具把保存下来的统计账本（统计 schema 3，即 v1.x 和当前版本的 `stats.sqlite`）恢复到新部署的**空账本**：按天、按成员的提问数，以及按天、按成员、按模型和工具的 token 用量汇总。会话不会恢复。webhook 发布的统计（schema 2）本版本不接受：需要时先用 v1.0.1 部署导入它，再从那份账本恢复。
 
-1. 先停止旧服务（让旧账本的 WAL 落盘）。旧账本是旧部署目录里的 `data/groups/stats.sqlite`，不用复制或改名。
+1. 找到账本：v1.x 的是旧目录的 `data/state/stats.sqlite`（卸载时选择删除 `data/` 的，在 `backup/rm` 下以 `-data` 结尾的归档目录里，`state/stats.sqlite`）；旧服务须已停止。不用复制或改名；同目录有 `stats.sqlite-wal` 时一并选择。
 2. 选择文件并导入，任选一种：
    - 控制台 **统计** 页的“导入统计”：填写运行控制台的宿主机上的文件路径，或从自己的电脑上传数据库（有 `-wal` 时一并选择）。先只读预览将导入的提问数、成员日、token 和日期范围，确认后执行。
-   - Windows 运行 `scripts\ops\ops.ps1 stat-import`，不带路径时弹出系统“打开文件”对话框；也可以直接 `ops.ps1 stat-import <路径>`。
-   - Linux 运行 `bash scripts/ops/ops.sh stat-import <路径>`。包装器把所选文件（有 `-wal` 时一并）复制到 `backup/` 下的私有临时目录供一次性容器读取，导入后删除副本。
+   - Windows 运行 `scripts\ops.ps1 stat-import`，不带路径时弹出系统“打开文件”对话框；也可以直接 `scripts\ops.ps1 stat-import <路径>`。
+   - Linux 运行 `bash scripts/ops.sh stat-import <路径>`。包装器把所选文件（有 `-wal` 时一并）复制到 `backup/` 下的私有临时目录供一次性容器读取，导入后删除副本。
    - 不用包装器时先停机，再 `bun run stat-import <路径>`。
 
    包装器停机导入，再恢复调用前的运行状态。
 3. 用 `bun run stat` 或控制台 **统计** 页核对。
 
-工具在内存快照上读旧账本，只接受旧版统计 schema 2。旧版以 WAL 模式保存账本；工具把账本和尚未 checkpoint 的 `-wal`（如有）复制到私有临时目录再读，原文件不变，旧目录里也不会多出 `-shm`／`-wal`。导入行在新账本中标为导入来源，与服务实时写入的行分开存放、合并显示。同一份旧账本重复导入不会重复计数（输出“已经导入过”）；新账本导入过另一份旧统计后拒绝再导入，以免两份旧账本重叠计数。
+工具在内存快照上读账本，只接受统计 schema 3：账本和尚未 checkpoint 的 `-wal`（如有）先复制到私有临时目录再读，原文件不变，所在目录里也不会多出 `-shm`／`-wal`。导入行在新账本中标为导入来源，与服务实时写入的行分开存放、合并显示。同一份账本重复导入不会重复计数（输出“已经导入过”）；导入过另一份账本或已有统计时拒绝，以免重复计数。
 
 ## 统计账本
 

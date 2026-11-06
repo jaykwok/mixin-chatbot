@@ -7,7 +7,6 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lifecycle.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/operation-log.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/transaction.sh"
-. "$(dirname "${BASH_SOURCE[0]}")/maintenance-protocol.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/console-plan.sh"
 
 # 管理界面中显示对应页面；命令行调用仍显示可直接执行的命令。
@@ -32,7 +31,7 @@ ops_command_hint() {
         esac
         if [ -n "$path" ]; then printf '「%s」' "$path"; return; fi
     fi
-    printf 'scripts/ops/ops.sh %s' "$command"
+    printf 'scripts/ops.sh %s' "$command"
 }
 
 # Host-port response must identify this project's current instance. Docker provides Bun when the host does not.
@@ -42,9 +41,9 @@ bot_local_ready() {
     shift
     body="$(curl --noproxy '*' --max-time 3 -fsS "http://127.0.0.1:$port/health")" || return 1
     if command -v bun >/dev/null 2>&1; then
-        (cd "$PROJECT_DIR" && printf '%s' "$body" | BOT_PORT="$port" bun --no-env-file run scripts/ops/health-check.ts --stdin "$@")
+        (cd "$PROJECT_DIR" && printf '%s' "$body" | BOT_PORT="$port" bun --no-env-file run ops/tools/health-check.ts --stdin "$@")
     else
-        printf '%s' "$body" | docker exec -i -e BOT_PORT="$port" mixin-chatbot bun run scripts/ops/health-check.ts --stdin "$@"
+        printf '%s' "$body" | docker exec -i -e BOT_PORT="$port" mixin-bot bun run ops/tools/health-check.ts --stdin "$@"
     fi
 }
 
@@ -103,17 +102,17 @@ local_port_in_use() {
 validate_model_configuration() {
     local user
     if command -v bun >/dev/null 2>&1 && [ -d "$PROJECT_DIR/node_modules" ]; then
-        bun --no-env-file run "$PROJECT_DIR/scripts/config/validate-models.ts" "$PROJECT_DIR"
+        bun --no-env-file run "$PROJECT_DIR/ops/config/validate-models.ts" "$PROJECT_DIR"
     else
         user="$(service_container_user)" || return 1
-        docker run --rm --network none --user "$user" -v "$PROJECT_DIR/data:/app/data:ro" mixin-chatbot bun run scripts/config/validate-models.ts /app
+        docker run --rm --network none --user "$user" -v "$PROJECT_DIR/data:/app/data:ro" mixin-bot bun run ops/config/validate-models.ts /app
     fi
 }
 
-# 运维入口的一次性容器使用的身份：服务容器 mixin-chatbot 记录的数值 UID:GID；没有容器时按 data/config 的属主。
+# 运维入口的一次性容器使用的身份：服务容器 mixin-bot 记录的数值 UID:GID；没有容器时按 data/config 的属主。
 service_container_user() {
     local user owner
-    user="$(docker container inspect --format '{{.Config.User}}' mixin-chatbot 2>/dev/null)" || user=''
+    user="$(docker container inspect --format '{{.Config.User}}' mixin-bot 2>/dev/null)" || user=''
     if [[ "$user" =~ ^[0-9]+:[0-9]+$ ]]; then echo "$user"; return 0; fi
     owner="$(stat -c '%u:%g' -- "$PROJECT_DIR/data/config")" || return 1
     container_user "$owner"
@@ -169,7 +168,7 @@ RUNTIME_ENV_KEYS=(BOT_MAX_ACTIVE_REQUESTS BOT_ACKNOWLEDGE_IDLE_MINUTES BOT_BASH_
 
 # 当前升级器的引导依赖：ops.sh update 从目标提交导出这些路径，再运行其中的升级器。
 # 镜像另从目标提交完整导出构建上下文（见 candidate_export_context）。
-UPGRADER_EXPORT_PATHS=(scripts/deploy/upgrade.sh scripts/lib scripts/runtime Dockerfile)
+UPGRADER_EXPORT_PATHS=(scripts/upgrade.sh scripts/lib ops/tools Dockerfile)
 
 # git 只经这里调用：GIT_TERMINAL_PROMPT=0 让缺凭证时立刻失败，而不是挂在无人应答的提示上。
 git_here() {

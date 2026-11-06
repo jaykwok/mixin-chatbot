@@ -9,9 +9,9 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readdir, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { publishJson } from "../../scripts/lib/atomic-file.ts";
-import { scanTmp, type UserTmp } from "../../scripts/lib/tmp-scan.ts";
-import type { GroupSelection } from "../../scripts/lib/group-data.ts";
+import { publishJson } from "../lib/atomic-file.ts";
+import { scanTmp, type UserTmp } from "../lib/tmp-scan.ts";
+import type { GroupSelection } from "../lib/group-data.ts";
 import { isPathInside } from "../contracts/paths.ts";
 import { memberTmpDir, decodeArchivePlan, decodeArchiveProgress, decodeRemovalPlan, decodeRemovalProgress, DIGEST_PATTERN, finishedEarlier, ID_PATTERN, planDigest, sameOwnership,
   type ArchiveItem, type ArchiveRemovalPlan, type ArchiveRemovalProgress, type RemovalItem, type ResultOwnership, type TmpArchivePlan,

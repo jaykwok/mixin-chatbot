@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { AuditLog } from "../../scripts/ops/console/audit.ts";
-import { FormRoutes } from "../../scripts/ops/console/form-routes.ts";
-import type { RouteContext } from "../../scripts/ops/console/routes.ts";
-import type { ServiceStatus } from "../../scripts/ops/directory-admin.ts";
+import { AuditLog } from "../../console/server/audit.ts";
+import { FormRoutes } from "../../console/server/form-routes.ts";
+import type { RouteContext } from "../../console/server/routes.ts";
+import type { ServiceStatus } from "../../ops/tools/directory-admin.ts";
 import type { DirectoryScope } from "../../src/integrations/open-platform/directory-scope.ts";
 import { ADVANCED_RUNTIME_KEYS } from "../../src/core/runtime-schema.ts";
 import { tempFixture } from "../helpers/temp.ts";

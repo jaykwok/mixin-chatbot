@@ -28,7 +28,7 @@ for (const shell of ["powershell", "bash"] as const) {
             "ConvertTo-Json -InputObject @(Get-RelayDoctorRows) -Compress",
           ].join("\n"));
         } else {
-          const source = (await readFile(join(project, "scripts/ops/ops.sh"), "utf8")).replaceAll("\r\n", "\n");
+          const source = (await readFile(join(project, "scripts/ops.sh"), "utf8")).replaceAll("\r\n", "\n");
           const fn = (name: string) => {
             const start = source.indexOf(name + "() {\n"), end = source.indexOf("\n}\n", start);
             expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
@@ -52,7 +52,7 @@ for (const shell of ["powershell", "bash"] as const) {
             : [bash!, "--noprofile", "--norc", posix(runner)], {
             cwd: f.root, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
             env: { ...process.env, DOCTOR_CONFIG: shell === "powershell" ? configPath : posix(configPath),
-              DOCTOR_SOURCE: join(project, "scripts/ops/ops.ps1"), DOCTOR_VALID: state === "s3" ? "1" : "0" },
+              DOCTOR_SOURCE: join(project, "scripts/ops.ps1"), DOCTOR_VALID: state === "s3" ? "1" : "0" },
           });
           const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
           expect(code, out + err).toBe(0);

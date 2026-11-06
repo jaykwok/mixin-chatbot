@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DeploymentDirectory, type DepartmentQuery } from "../../scripts/ops/console/deployment-directory.ts";
-import { directoryAppHash } from "../../scripts/lib/directory-choice.ts";
-import { deploymentEnvironment } from "../../scripts/ops/console/deployment-options.ts";
-import { operationPreparer } from "../../scripts/ops/console/prepare-operation.ts";
-import { Views } from "../../scripts/ops/console/views.ts";
-import type { RouteContext } from "../../scripts/ops/console/routes.ts";
+import { DeploymentDirectory, type DepartmentQuery } from "../../console/server/deployment-directory.ts";
+import { directoryAppHash } from "../../ops/lib/directory-choice.ts";
+import { deploymentEnvironment } from "../../ops/core/deployment-options.ts";
+import { operationPreparer } from "../../console/server/prepare-operation.ts";
+import { Views } from "../../console/server/views.ts";
+import type { RouteContext } from "../../console/server/routes.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const context = (body: unknown = {}, label = "one"): RouteContext => ({ body, session: { label } as RouteContext["session"], signal: new AbortController().signal });
@@ -34,7 +34,7 @@ test("机器人停止时直接查部门；只接受当前登录的树键，预�
     expect(f.calls).toEqual([{ action: "children", ids: ["1"] }]);
     const children = await f.routes["POST /api/lifecycle/directory/children"]!.run(context({ view: opened.view, parent: key })) as { children: { key: string }[] };
     const prepare = operationPreparer(f.root, new Views(), undefined, undefined, undefined, undefined, undefined, f.picker);
-    const input = { port: 2022, workspace: "", cleanup: "skip", directory: { view: opened.view, selected: [children.children[0]!.key] } };
+    const input = { port: 2022, workspace: "", directory: { view: opened.view, selected: [children.children[0]!.key] } };
     const params = await prepare("deploy", input, "one");
     expect(params.directory).toEqual({ departments: ["dept-child"], names: ["已核对部门"], appHash: directoryAppHash(f.root) });
     expect(f.calls.at(-1)).toEqual({ action: "verify", ids: ["dept-child"] });

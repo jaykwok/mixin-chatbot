@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { assertWindowsAcl } from "../../scripts/lib/windows-private-directory.ts";
-import { prepareConsoleDir } from "../../scripts/ops/console/state.ts";
+import { assertWindowsAcl } from "../../src/lib/windows-private-directory.ts";
+import { prepareConsoleDir } from "../../ops/core/console-state.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test("Windows ACL 策略接受 Administrators 属主，拒绝其他主体、错误 SID 和继承", () => {
@@ -16,7 +16,7 @@ test("Windows ACL 策略接受 Administrators 属主，拒绝其他主体、错�
   expect(() => assertWindowsAcl({ ...snapshot, entries: [{ ...entry, protected: false }] }, root)).toThrow("继承");
   // An inherited .console left by an earlier console: the refusal names both ways out, with this account's SID.
   expect(() => assertWindowsAcl({ ...snapshot, entries: [{ ...entry, protected: false }] }, root))
-    .toThrow(`移出项目目录，再启动控制台`);
+    .toThrow(`的权限继承上级目录`);
   expect(() => assertWindowsAcl({ ...snapshot, entries: [{ ...entry, protected: false }] }, root))
     .toThrow(`icacls "${root}" /inheritance:r /grant:r "*${sid}:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"`);
   expect(() => assertWindowsAcl({ ...snapshot, entries: [{ ...entry, owner: "S-1-5-21-9999" }] }, root)).toThrow("属主");

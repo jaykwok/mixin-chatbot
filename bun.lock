@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "mixin-chatbot",
+      "name": "mixin-bot",
       "dependencies": {
         "@clack/prompts": "1.7.0",
         "@earendil-works/chord": "1.5.0",
@@ -31,7 +31,7 @@
     },
   },
   "patchedDependencies": {
-    "knip@6.40.0": "scripts/patches/knip@6.40.0.patch",
+    "knip@6.40.0": "patches/knip@6.40.0.patch",
   },
   "overrides": {
     "@types/node": "18.19.130",

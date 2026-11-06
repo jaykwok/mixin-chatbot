@@ -3,11 +3,11 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tempFixture } from "../helpers/temp.ts";
-import { WindowsDeployment } from "../../scripts/ops/core/windows-deployment.ts";
-import { WindowsPlatform } from "../../scripts/ops/core/windows-host.ts";
-import { runNative, type NativeRunner } from "../../scripts/ops/core/native-process.ts";
-import { readTransaction } from "../../scripts/lib/confirmed-transaction.ts";
-import { serializeTransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
+import { WindowsDeployment } from "../../ops/core/windows-deployment.ts";
+import { WindowsPlatform } from "../../ops/core/windows-host.ts";
+import { runNative, type NativeRunner } from "../../ops/core/native-process.ts";
+import { readTransaction } from "../../ops/lib/confirmed-transaction.ts";
+import { serializeTransactionRecord } from "../../ops/core/transaction-record.ts";
 const source = resolve(import.meta.dir, "../.."), windows = process.platform === "win32";
 const harness = `
 $ErrorActionPreference='Stop'
@@ -30,7 +30,7 @@ exit $code
 `;
 async function fixture() {
   const f = await tempFixture("core-windows-deployment-"), script = join(f.root, "native.ps1"), project = join(f.root, "中文 project");
-  const facts = join(f.root, "facts.json"), effects = join(f.root, "effects.json"), task = { TaskName: "mixin-chatbot", TaskPath: "\\", State: "Ready",
+  const facts = join(f.root, "facts.json"), effects = join(f.root, "effects.json"), task = { TaskName: "mixin-bot", TaskPath: "\\", State: "Ready",
     Principal: { UserId: "fixture", GroupId: null, LogonType: "S4U", RunLevel: "Highest" },
     Actions: [{ Execute: "powershell.exe", Arguments: "-File fixture.ps1", WorkingDirectory: project }] };
   await mkdir(join(project, "data/config"), { recursive: true }); await mkdir(join(project, "data/state"));
@@ -112,7 +112,7 @@ function Register-ScheduledTask { param($TaskName,$Xml,$Action,$Trigger,$Setting
   if ($Xml) { $global:effects.Add('register-xml'); $global:fixture.task=$global:fixture.saved; return }
   if ($Principal.LogonType -eq 'S4U' -and $global:fixture.refuseS4U) { $global:effects.Add('refused-S4U'); throw 'S4U refused by policy' }
   $global:effects.Add('register-' + $Principal.LogonType)
-  $global:fixture.task=[pscustomobject]@{ TaskName='mixin-chatbot'; TaskPath='\\'; State=$(if ($Settings.Enabled) { 'Ready' } else { 'Disabled' }); Principal=$Principal;
+  $global:fixture.task=[pscustomobject]@{ TaskName='mixin-bot'; TaskPath='\\'; State=$(if ($Settings.Enabled) { 'Ready' } else { 'Disabled' }); Principal=$Principal;
     Actions=@($Action | ForEach-Object { [pscustomobject]@{ Execute=$_.Execute; Arguments=$_.Arguments; WorkingDirectory=$_.WorkingDirectory } }); Settings=$Settings; Trigger=$Trigger } }
 function Unregister-ScheduledTask { param($TaskName,[switch]$Confirm,$ErrorAction); $global:effects.Add('unregister'); $global:fixture.task=$null }
 function Disable-ScheduledTask { param($TaskName,$ErrorAction); $global:effects.Add('disable'); $global:fixture.task.State='Disabled'; $global:fixture.task.Settings.Enabled=$false }
@@ -136,7 +136,7 @@ interface DeployFacts { task: any; saved?: any; lastResult?: number; refuseS4U?:
 async function deployFixture(task: "none" | "ours" | "foreign") {
   const f = await tempFixture("core-windows-deploy-"), script = join(f.root, "native.ps1"), project = join(f.root, "中文 project");
   const factsPath = join(f.root, "facts.json"), effects = join(f.root, "effects.json");
-  const original = { TaskName: "mixin-chatbot", TaskPath: "\\", State: "Ready", Principal: { UserId: "fixture", GroupId: null, LogonType: "S4U", RunLevel: "Limited" },
+  const original = { TaskName: "mixin-bot", TaskPath: "\\", State: "Ready", Principal: { UserId: "fixture", GroupId: null, LogonType: "S4U", RunLevel: "Limited" },
     Actions: [{ Execute: "powershell.exe", Arguments: "-File old-launcher.ps1", WorkingDirectory: task === "foreign" ? f.root : project }], Settings: { Enabled: true } };
   const facts: { value: DeployFacts } = { value: { task: task === "none" ? null : original, saved: original, lastResult: 0 } };
   await mkdir(project, { recursive: true });

@@ -1,5 +1,5 @@
 // 通讯录同步范围：data/config/directory.json。`{"format":1,"departments":["<部门 ID>", ...]}` 只同步这些部门及其全部子部门，
-// `{"format":1,"all":true}` 同步整个通讯录；文件不存在为未设置，服务不同步通讯录（部署时必须选择：scripts/config/directory-scope.ts）。
+// `{"format":1,"all":true}` 同步整个通讯录；文件不存在为未设置，服务不同步通讯录（部署时必须选择：ops/config/directory-scope.ts）。
 // 部署后经服务的本机控制接口修改（控制台的部门选择器、终端向导 directory-scope，或 directory-scope all；服务先向平台核对部门），
 // 服务启动时读取。部门只能逐层勾选：命令行参数和 BOT_DIRECTORY_SCOPE 只接受 all，不接受手填的部门 ID。
 // 这是保存的范围；名单按它建成后才生效，生效范围记在状态库里（identity-directory.ts）。

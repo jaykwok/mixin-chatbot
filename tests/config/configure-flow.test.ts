@@ -6,10 +6,10 @@ import { fileURLToPath } from "node:url";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { tempFixture } from "../helpers/temp.ts";
 import { CURRENT_APPLICATION } from "../helpers/current-config.ts";
-import { installConfigurationStage, parseConfigurationStage } from "../../scripts/config/configuration-stage.ts";
+import { installConfigurationStage, parseConfigurationStage } from "../../ops/config/configuration-stage.ts";
 
-const CONFIGURE = fileURLToPath(new URL("../../scripts/config/configure.ts", import.meta.url));
-const VALIDATE = fileURLToPath(new URL("../../scripts/config/validate-models.ts", import.meta.url));
+const CONFIGURE = fileURLToPath(new URL("../../ops/config/configure.ts", import.meta.url));
+const VALIDATE = fileURLToPath(new URL("../../ops/config/validate-models.ts", import.meta.url));
 const MODELS_JSON = join("data", "config", "models.json");
 const PI_SETTINGS = join("data", "runtime", "pi", "settings.json");
 const MODEL_CATALOG = join("data", "runtime", "models-store.json");
@@ -155,7 +155,7 @@ test("缺少应用机器人凭据时先填写 AppID/AppSecret，再配置模型�
 test("已部署的目录只接受原应用：另一个 AppID 被拒绝并重新填写，部署记录不变", async () => {
   const files = await tempFixture("pi-configure-app-bot-bound-");
   try {
-    const record = JSON.stringify({ dataVersion: 1, appVersion: "1.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
+    const record = JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
     await mkdir(join(files.root, "data", "state"), { recursive: true });
     await writeFile(join(files.root, "data", "state", "data-version.json"), record);
     const result = await runConfigure(files.root, {
@@ -434,14 +434,14 @@ test("重新配置内置服务商清除过时 overrides，使用当前官方元�
   }
 }, 30000);
 
-const CONFIGURE_APP_BOT = fileURLToPath(new URL("../../scripts/config/configure-app-bot.ts", import.meta.url));
+const CONFIGURE_APP_BOT = fileURLToPath(new URL("../../ops/config/configure-app-bot.ts", import.meta.url));
 const BUILTIN = { "模型接入方式": "builtin", "内置服务商": "zai-coding-cn", "模型": "glm-5.3-flash" };
 
 test("部署停机前的模型向导只写暂存：项目文件不变，不取维护租约；基准是现有文件和登记的应用，暂存装上后通过只读校验", async () => {
   const files = await tempFixture("pi-configure-stage-");
   try {
     const originals = await existingConfiguration(files.root), stage = join(files.root, "stage");
-    const record = JSON.stringify({ dataVersion: 1, appVersion: "1.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
+    const record = JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
     await mkdir(join(files.root, "data", "state"), { recursive: true }); await mkdir(stage);
     await writeFile(join(files.root, "data", "state", "data-version.json"), record);
     const result = await runConfigure(files.root, BUILTIN, { args: ["--stage", stage] });
@@ -505,7 +505,7 @@ test("首次部署停机前先暂存应用机器人凭据、再暂存模型配�
 test("单独暂存应用机器人凭据：已部署的目录只接受原应用，基准是现有文件，项目文件不变", async () => {
   const files = await tempFixture("pi-configure-stage-app-");
   try {
-    const record = JSON.stringify({ dataVersion: 1, appVersion: "1.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
+    const record = JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "", transaction: "deploy-bound", application: CURRENT_APPLICATION });
     await mkdir(join(files.root, "data", "state"), { recursive: true });
     await writeFile(join(files.root, "data", "state", "data-version.json"), record);
     await mkdir(join(files.root, "data", "config"), { recursive: true });

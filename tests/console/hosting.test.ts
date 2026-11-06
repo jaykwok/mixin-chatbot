@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { hostingCheck, systemdRunArgv, windowsArguments, type HostFacts } from "../../scripts/ops/console/hosting.ts";
-import { sshForwardHint } from "../../scripts/ops/console/open.ts";
+import { hostingCheck, systemdRunArgv, windowsArguments, type HostFacts } from "../../ops/core/hosting.ts";
+import { sshForwardHint } from "../../console/server/open.ts";
 
 type Reply = { code?: number; stdout?: string; stderr?: string };
 

@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { TaskStore } from "../../scripts/ops/console/tasks.ts";
-import type { TaskObservers, TaskRequest } from "../../scripts/ops/console/tasks.ts";
+import { TaskStore } from "../../ops/core/tasks.ts";
+import type { TaskObservers, TaskRequest } from "../../ops/core/tasks.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const actor = { pid: 1234, startedAt: "2026-10-29T00:00:00.123Z" };

@@ -3,11 +3,11 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseRuntimeValues, runtimeDigest, runtimeText } from "../../scripts/config/runtime-values.ts";
+import { parseRuntimeValues, runtimeDigest, runtimeText } from "../../ops/config/runtime-values.ts";
 import { RUNTIME_KEYS } from "../../src/core/runtime-schema.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
-const script = fileURLToPath(new URL("../../scripts/config/runtime-settings.ts", import.meta.url));
+const script = fileURLToPath(new URL("../../ops/config/runtime-settings.ts", import.meta.url));
 const image = "sha256:" + "a".repeat(64);
 
 /** The real CLI in `project`; the caller's environment never contributes a runtime key. */

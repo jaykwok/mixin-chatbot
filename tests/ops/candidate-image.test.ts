@@ -3,8 +3,8 @@ import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseCandidateRecord } from "../../scripts/ops/core/docker-deployment.ts";
-import { parseTransactionRecord } from "../../scripts/ops/core/transaction-record.ts";
+import { parseCandidateRecord } from "../../ops/core/docker-deployment.ts";
+import { parseTransactionRecord } from "../../ops/core/transaction-record.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 // The candidate image library (scripts/lib/candidate-image.sh) with Docker and the filesystem stubbed; the scenarios
@@ -35,7 +35,7 @@ async function scenarios(group: string, root: string) {
 
 const candidate = {
   format: "1", source: "commit", target_sha: "a".repeat(40), image_id: "sha256:" + "b".repeat(64),
-  image_tag: "mixin-chatbot:candidate-0123456789ab-0123456789abcdef", daemon_id: "5eec1de4-4518-46da-a461-80c0866ec11d",
+  image_tag: "mixin-bot:candidate-0123456789ab-0123456789abcdef", daemon_id: "5eec1de4-4518-46da-a461-80c0866ec11d",
   project_id: "0123456789ab", operation_id: "0123456789abcdef",
 };
 const serialize = (value: Record<string, string>) => Object.entries(value).map(([key, item]) => `${key}=${item}`).join("\n") + "\n";
@@ -55,7 +55,7 @@ const records: Record<string, string> = {
   "short-id": serialize({ ...candidate, image_id: "sha256:abc" }),
   "upper-id": serialize({ ...candidate, image_id: "sha256:" + "B".repeat(64) }),
   "other-project": serialize({ ...candidate, project_id: "ffffffffffff" }),
-  "floating-tag": serialize({ ...candidate, image_tag: "mixin-chatbot:latest" }),
+  "floating-tag": serialize({ ...candidate, image_tag: "mixin-bot:latest" }),
   "bad-source": serialize({ ...candidate, source: "tag" }),
   "bad-daemon": serialize({ ...candidate, daemon_id: "not a daemon" }),
   crlf: serialize(candidate).replaceAll("\n", "\r\n"),
@@ -134,8 +134,8 @@ test.skipIf(!available)("候选镜像按 ID 构建和核对：daemon、归属、
     expect({ code: results.build, id: results["build-id"], tagged: results.tagged }).toEqual({ code: "0", id: b, tagged: b });
     expect(results["build-call"]).toContain(`build --iidfile `);
     expect(results["build-call"]).toContain(`--tag ${candidate.image_tag} --build-arg APP_BUILD=${"a".repeat(12)} --label org.opencontainers.image.revision=${"a".repeat(40)} ` +
-      "--label org.mixin-chatbot.project=0123456789ab --label org.mixin-chatbot.operation=0123456789abcdef --label org.mixin-chatbot.source=commit");
-    expect(results["build-call"]).not.toMatch(/--tag mixin-chatbot( |$)/);
+      "--label org.mixin-bot.project=0123456789ab --label org.mixin-bot.operation=0123456789abcdef --label org.mixin-bot.source=commit");
+    expect(results["build-call"]).not.toMatch(/--tag mixin-bot( |$)/);
     expect([results["build-failed"], results["build-failed-id"], results["build-bad-iid"], results["build-bad-iid-id"]]).toEqual(["1", "", "1", ""]);
     expect(await message("build-bad-iid")).toContain("没有给出有效的镜像 ID：not-an-id");
     // A failed build leaves no iidfile; only the build's own output and the failure are reported.
@@ -336,15 +336,7 @@ test.skipIf(!available)("停机前复核：备份目录要放得下停机后的�
     // Before the first backup the project directory stands in for backup/, which it will be made in.
     expect({ code: results["stop-no-backup"], args: results["stop-no-backup-args"] })
       .toEqual({ code: "0", args: `<f>/project ${reserve + 5000} <f>/project/data ${reserve} <f>/upgrader ${reserve}` });
-    expect({ code: results["stop-cleanup"], args: results["stop-cleanup-args"] })
-      .toEqual({ code: "0", args: `<f>/project/backup ${reserve + 5000 + 7000} <f>/project/data ${reserve + 300}` });
-    // Short of space with a cleanup: the way out is to skip it, never to drop its backup; without one nothing is said about it.
-    expect([results["stop-cleanup-short"], results["stop-short"]]).toEqual(["1", "1"]);
-    expect(await message("stop-cleanup-short")).toContain("BOT_REVISION_CLEANUP=skip 跳过整理（不会自动省略备份）");
-    expect(results["stop-cleanup-console"]).toBe("1");
-    expect(await message("stop-cleanup-console")).toContain("或重新预览并选择“跳过整理”（不会自动省略备份）");
-    expect(await message("stop-cleanup-console")).not.toContain("BOT_REVISION_CLEANUP");
-    expect(await message("stop-short")).not.toContain("修订整理");
+    expect(results["stop-short"]).toBe("1");
     expect([results["stop-unknown"], results["stop-unknown-checked"]]).toEqual(["1", "no"]);
     expect(await message("stop-unknown")).toContain("无法估算快照的大小");
   } finally { await fixture.cleanup(); }

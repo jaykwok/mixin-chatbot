@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { opsCommand, PROJECT_DIR } from "../../scripts/ops/shared/platform.ts";
-import { QueryPool } from "../../scripts/ops/shared/exec-client.ts";
+import { opsCommand, PROJECT_DIR } from "../../ops/core/platform.ts";
+import { QueryPool } from "../../console/server/exec-client.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const windowsTest = process.platform === "win32" ? test : test.skip;
@@ -63,12 +63,12 @@ function Test-ModelConfiguration($project) {
     return $LASTEXITCODE -eq 0
 }
 $AppBotFile = Join-Path $PSScriptRoot 'data\config\app-bot.json'
-# Stands in for "bun run scripts\ops\directory-admin.ts doctor" (the service's Stream and directory rows: status, name, detail)
-# and "bun run scripts\ops\version-info.ts" (name, value).
+# Stands in for "bun run ops\tools\directory-admin.ts doctor" (the service's Stream and directory rows: status, name, detail)
+# and "bun run ops\tools\version-info.ts" (name, value).
 # The rows come from the environment: Bun's transpiler escapes non-ASCII text, which String.raw would keep as "\uXXXX".
 function Get-BunPath { return {
     $global:LASTEXITCODE = 0
-    if ($args -contains 'scripts\ops\version-info.ts') { $env:OPS_TEST_VERSION -split [char]10 } else { $env:OPS_TEST_STREAM -split [char]10 }
+    if ($args -contains 'ops\tools\version-info.ts') { $env:OPS_TEST_VERSION -split [char]10 } else { $env:OPS_TEST_STREAM -split [char]10 }
 } }
 function Test-Local { if ($env:OPS_TEST_HEALTH -eq 'fail') { return 0 }; if ($env:OPS_TEST_HEALTH -eq 'verification') { return 503 }; return 200 }
 function Get-BotPids { if ($env:OPS_TEST_HEALTH -ne 'fail') { return 42 } }
@@ -80,7 +80,7 @@ function Get-RelayDoctorRows { }
 function Err($message) { [Console]::Error.WriteLine($message) }
 function Invoke-ConsoleProcess([string]$FilePath, [string[]]$Arguments) {
     if ($Arguments[2] -ceq 'maintenance') { Write-Captured 'ops-core' @($Arguments[3..($Arguments.Length-3)]); return 0 }
-    if ($Arguments[0] -cne '--no-env-file' -or $Arguments[1] -notlike '*scripts*ops*core*cli.ts' -or $Arguments[2] -cne 'service') { throw 'wrong core entry' }
+    if ($Arguments[0] -cne '--no-env-file' -or $Arguments[1] -notlike '*ops*core*cli.ts' -or $Arguments[2] -cne 'service') { throw 'wrong core entry' }
     Step $env:OPS_TEST_PROGRESS
     [Console]::Error.WriteLine($env:OPS_TEST_DIAGNOSTIC)
     [Console]::Out.WriteLine([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from("机器人运行中（实例身份与就绪检查通过）").toString("base64")}')))
@@ -92,7 +92,7 @@ function Write-Captured([string]$Script, [string[]]$CliArgs) {
 }
 function Invoke-DataAdmin([string]$Script, [string[]]$CliArgs) { Write-Captured $Script $CliArgs; return $true }
 # The system "open file" dialog: the path the test names, or nothing (cancelled).
-function Select-LegacyStatsFile { if ($env:OPS_TEST_PICK) { return $env:OPS_TEST_PICK } }
+function Select-StatsFile { if ($env:OPS_TEST_PICK) { return $env:OPS_TEST_PICK } }
 '@
 $jsonEntry = @($ast.EndBlock.Statements | Where-Object { $_.Extent.Text.StartsWith('if ($Json -and $Command -in') })
 $parts += ($ast.EndBlock.Statements | Where-Object { $_.Extent.Text.StartsWith('if ($RequestBase64)') }).Extent.Text
@@ -119,7 +119,7 @@ async function fixtureWrapper() {
   await writeFile(join(fixture.root, "data", "config", "app-bot.json"), '{"appId":"test-app","appSecret":"test-only-secret"}');
   const child = Bun.spawn(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", builder], {
     stdout: "pipe", stderr: "pipe", windowsHide: true,
-    env: { ...process.env, OPS_TEST_OPS: join(PROJECT_DIR, "scripts", "ops", "ops.ps1"),
+    env: { ...process.env, OPS_TEST_OPS: join(PROJECT_DIR, "scripts", "ops.ps1"),
       OPS_TEST_COMMON: join(PROJECT_DIR, "scripts", "lib", "common.ps1"), OPS_TEST_WRAPPER: wrapper },
   });
   const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
@@ -127,7 +127,7 @@ async function fixtureWrapper() {
   const spawn = async (argv: string[], health: string, env: Record<string, string>) => {
     const child = Bun.spawn(argv, {
       stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
-      env: { ...process.env, OPS_TEST_HEALTH: health, OPS_TEST_BUN: process.execPath, OPS_TEST_VALIDATOR: join(PROJECT_DIR, "scripts/config/validate-models.ts"),
+      env: { ...process.env, OPS_TEST_HEALTH: health, OPS_TEST_BUN: process.execPath, OPS_TEST_VALIDATOR: join(PROJECT_DIR, "ops/config/validate-models.ts"),
         OPS_TEST_PROGRESS: "正在启动机器人", OPS_TEST_DIAGNOSTIC: "测试诊断：Stream 信息",
         OPS_TEST_STREAM: "pass\t事件 Stream\t已连接 3 分钟\nwarn\t通讯录同步\t范围状态：正在应用，完成前之前的范围（整个通讯录）仍然生效",
         OPS_TEST_VERSION: "应用机器人\tv1.0.0\n构建\tabc1234\n数据格式\t1", ...env },
@@ -179,7 +179,7 @@ windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非�
         if (state === "verification") {
           const health = payload.checks.find((check: { name: string }) => check.name === "本地机器人健康");
           expect(health.detail).toContain("只验证");
-          expect(health.fix).toContain("scripts\\ops\\ops.ps1 resume");
+          expect(health.fix).toContain("scripts\\ops.ps1 resume");
         }
         for (const check of payload.checks) expect(typeof check.fix).toBe("string");
         const names = payload.checks.map((check: { name: string }) => check.name);
@@ -196,8 +196,8 @@ windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非�
       }
     }
     // An unreadable deployment record fails the check and warns against deploying over it.
-    const unknown = JSON.parse((await fixture.run(["doctor", "--json"], "pass", { OPS_TEST_VERSION: "应用机器人\t未知：部署记录没有程序版本（旧版数据）" })).stdout);
-    expect(unknown.checks.find((check: { name: string }) => check.name === "应用机器人")).toMatchObject({ status: "fail", detail: "未知：部署记录没有程序版本（旧版数据）" });
+    const unknown = JSON.parse((await fixture.run(["doctor", "--json"], "pass", { OPS_TEST_VERSION: "应用机器人\t未知：部署记录没有程序版本" })).stdout);
+    expect(unknown.checks.find((check: { name: string }) => check.name === "应用机器人")).toMatchObject({ status: "fail", detail: "未知：部署记录没有程序版本" });
     expect(unknown.checks.find((check: { name: string }) => check.name === "应用机器人").fix).toContain("不要在此目录覆盖部署");
     const repair = await fixture.native(["doctor", "-Json", "-Repair"]);
     expect(repair.code).toBe(2);
@@ -208,9 +208,9 @@ windowsTest("Windows doctor/status -Json 只输出 JSON，真实失败返回非�
 windowsTest("Windows 管理入口调用部署脚本并保留失败退出码", async () => {
   const fixture = await fixtureWrapper();
   try {
-    await mkdir(join(fixture.root, "scripts/deploy"), { recursive: true });
+    await mkdir(join(fixture.root, "scripts"), { recursive: true });
     for (const code of [0, 17]) {
-      await writeFile(join(fixture.root, "scripts/deploy/deploy.ps1"), '\ufeffWrite-Output "DEPLOY_FIXTURE"\nWrite-Output "UI=$env:MIXIN_OPS_UI"\nexit ' + code + '\n');
+      await writeFile(join(fixture.root, "scripts/deploy.ps1"), '\ufeffWrite-Output "DEPLOY_FIXTURE"\nWrite-Output "UI=$env:MIXIN_OPS_UI"\nexit ' + code + '\n');
       const result = await fixture.run(["deploy"]);
       expect(result.stdout).toContain("DEPLOY_FIXTURE"); expect(result.code, result.stderr).toBe(code);
       expect(result.stdout).toContain("UI=cli");
@@ -227,17 +227,17 @@ windowsTest("控制台体检与修复输出使用控制台页面，直接调用�
       const web = ui === "console", env = { MIXIN_OPS_UI: ui };
       const passing = JSON.parse((await fixture.run(["doctor", "--json"], "pass", env)).stdout);
       expect(passing.checks.find((check: { name: string }) => check.name === "通讯录同步").fix)
-        .toContain(web ? "「通讯录」" : "scripts\\ops\\ops.ps1 directory");
+        .toContain(web ? "「通讯录」" : "scripts\\ops.ps1 directory");
       const result = await fixture.run(["doctor", "--json"], "fail", env);
       expect(result.code, result.stderr).toBe(1);
       const health = JSON.parse(result.stdout);
       const fixes = health.checks.map((check: { fix: string }) => check.fix).join("\n");
-      expect(fixes).toContain(web ? "设置 → 应用机器人凭据" : "scripts\\ops\\ops.ps1 configure-app-bot");
-      expect(fixes).toContain(web ? "维护 → 重新部署" : "scripts\\ops\\ops.ps1 deploy");
-      expect(fixes).toContain(web ? "「日志」" : "scripts\\ops\\ops.ps1 logs");
+      expect(fixes).toContain(web ? "设置 → 应用机器人凭据" : "scripts\\ops.ps1 configure-app-bot");
+      expect(fixes).toContain(web ? "维护 → 重新部署" : "scripts\\ops.ps1 deploy");
+      expect(fixes).toContain(web ? "「日志」" : "scripts\\ops.ps1 logs");
       if (web) expect(fixes).not.toMatch(/ops\.ps1|scripts[\\/]|bun run/);
       const printed = await fixture.run(["doctor"], "fail", env);
-      expect(printed.stdout).toContain(web ? "维护 → 修复部署" : "scripts\\ops\\ops.ps1 doctor -Repair");
+      expect(printed.stdout).toContain(web ? "维护 → 修复部署" : "scripts\\ops.ps1 doctor -Repair");
       if (web) expect(printed.stdout).not.toMatch(/ops\.ps1|scripts[\\/]|bun run/);
     }
   } finally { await fixture.cleanup(); }
@@ -273,7 +273,7 @@ windowsTest("Windows 通讯录、外链全清和临时目录范围都到达正�
   const fixture = await fixtureWrapper();
   try {
     const cases = [
-      { input: ["directory"], argv: ["status"], script: "scripts\\ops\\directory-admin.ts" },
+      { input: ["directory"], argv: ["status"], script: "ops\\tools\\directory-admin.ts" },
       { input: ["relay-test"], argv: ["test"], script: "relay" },
       { input: ["relay-purge", "--all"], argv: ["purge", "--all"], script: "relay" },
       ...["-All", "-all", "-A", "--all", "--group", "含 空格与'引号"].map(keyword => ({
@@ -297,10 +297,10 @@ windowsTest("Windows 通讯录、外链全清和临时目录范围都到达正�
     }
     // Command-line calls with the entry's own parameters, which the console does not send.
     for (const { input, argv, script } of [
-      { input: ["directory-scope", "all"], argv: ["scope", "all"], script: "scripts\\ops\\directory-admin.ts" },
+      { input: ["directory-scope", "all"], argv: ["scope", "all"], script: "ops\\tools\\directory-admin.ts" },
       { input: ["tmp-ls", "-Group", "support team", "-GroupId"], argv: ["tmp-ls", "--group=support team", "--group-id"], script: "ops-core" },
-      { input: ["stat", "support", "-GroupId"], argv: ["--group-id", "--", "support"], script: "scripts\\ops\\stats-admin.ts" },
-      { input: ["stat", "support", "-Period", "last-month"], argv: ["--period", "last-month", "--", "support"], script: "scripts\\ops\\stats-admin.ts" },
+      { input: ["stat", "support", "-GroupId"], argv: ["--group-id", "--", "support"], script: "ops\\tools\\stats-admin.ts" },
+      { input: ["stat", "support", "-Period", "last-month"], argv: ["--period", "last-month", "--", "support"], script: "ops\\tools\\stats-admin.ts" },
     ]) {
       const result = await fixture.native(input);
       expect(result.stderr).toBe("");

@@ -55,7 +55,7 @@ function decode(payload: string, expected: { id: string; destination: string; ev
 }
 
 export class DiscardJournals {
-  /** `publish`: the caller's atomic JSON writer (two-space indent, trailing newline), so this module stays below scripts/. */
+  /** `publish`: the caller's atomic JSON writer (two-space indent, trailing newline), so this module stays below ops/. */
   constructor(private readonly control: TaskControl, private readonly publish: (path: string, value: unknown) => Promise<void>) {}
   #path(id: string) { if (!ID_PATTERN.test(id)) throw new Error("任务 ID 无效"); return join(this.control.root, "discards", id + ".json"); }
 

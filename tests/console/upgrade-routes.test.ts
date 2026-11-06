@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { upgradeRoutes } from "../../scripts/ops/console/upgrade-routes.ts";
-import type { RouteContext } from "../../scripts/ops/console/routes.ts";
+import { upgradeRoutes } from "../../console/server/upgrade-routes.ts";
+import type { RouteContext } from "../../console/server/routes.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const context = (body: unknown = {}): RouteContext => ({ body, signal: new AbortController().signal, session: {} as RouteContext["session"] });

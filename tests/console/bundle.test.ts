@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { buildBundle, UI_DIR } from "../../scripts/ops/console/bundle.ts";
+import { buildBundle, UI_DIR } from "../../console/server/bundle.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const packageVersion = async (path: string) => JSON.parse(await readFile(path, "utf8")).version as string;
@@ -39,7 +39,7 @@ test("内置 Preact 与锁定的 node_modules 版本逐字节一致", async () =
   }
 });
 
-test("页面代码只能引用 ui/console/src 内的文件和内置 Preact", async () => {
+test("页面代码只能引用 console/ui/src 内的文件和内置 Preact", async () => {
   const fixture = await tempFixture("console-bundle-");
   try {
     await cp(join(UI_DIR, "vendor"), join(fixture.root, "vendor"), { recursive: true });
@@ -52,7 +52,7 @@ test("页面代码只能引用 ui/console/src 内的文件和内置 Preact", asy
     await expect(attempt(`import { readFileSync } from "node:fs"; console.log(readFileSync);`)).rejects.toThrow("不能引用 node:fs");
     await expect(attempt(`import "bun:sqlite";`)).rejects.toThrow("不能引用 bun:sqlite");
     await expect(attempt(`import { Hono } from "hono"; console.log(Hono);`)).rejects.toThrow("不能引用 hono");
-    await expect(attempt(`import { x } from "../outside.ts"; console.log(x);`)).rejects.toThrow("只能引用 ui/console/src 内的文件");
+    await expect(attempt(`import { x } from "../outside.ts"; console.log(x);`)).rejects.toThrow("只能引用 console/ui/src 内的文件");
     await writeFile(join(fixture.root, "src", "styles.css"), "body { color: red; }");
     const ok = await attempt(`import { render } from "preact"; import { useState } from "preact/hooks"; import "./styles.css";
       function App() { const [n] = useState(1); return <p>{n}</p>; } render(<App />, document.body);`);

@@ -19,7 +19,7 @@ function app(options: { stopping?: boolean; shutdown?: () => void; health?: () =
 test("health reports the instance, readiness and the supplied status fields", async () => {
   const response = await app({ health: () => ({ stream: { connected: true } }) }).request("/health");
   expect(response.status).toBe(200);
-  expect(await response.json()).toMatchObject({ service: "mixin-chatbot", version: 1, appVersion: APP_VERSION, build: APP_BUILD, instanceId: "instance", status: "ready", stream: { connected: true } });
+  expect(await response.json()).toMatchObject({ service: "mixin-bot", version: 1, appVersion: APP_VERSION, build: APP_BUILD, instanceId: "instance", status: "ready", stream: { connected: true } });
   expect(APP_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
   const stopping = await app({ stopping: true }).request("/health");
   expect(stopping.status).toBe(503);

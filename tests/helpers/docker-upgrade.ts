@@ -6,19 +6,19 @@ import { expect } from "bun:test";
 import { randomBytes, randomUUID } from "node:crypto";
 import { chownSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { configurationSnapshot } from "../../scripts/config/configuration-form.ts";
-import { installConfigurationStage, parseConfigurationStage, serializeConfigurationStage, stageName, type StagedKind } from "../../scripts/config/configuration-stage.ts";
-import { installRuntimeValues } from "../../scripts/config/runtime-settings.ts";
-import { RUNTIME_VALUES_FILE, runtimeDigest, serializeRuntimeValues } from "../../scripts/config/runtime-values.ts";
-import { DEPLOY_CHOICES_FILE, type DeployChoices, type PlatformStageFile } from "../../scripts/ops/core/deploy-stage.ts";
-import type { DeployInput } from "../../scripts/ops/core/deployment-host.ts";
-import { candidateProjectId, serializeCandidateRecord, serializeServiceUser, serializeTaskRuntime, type CandidateRecord } from "../../scripts/ops/core/docker-deployment.ts";
-import { preflightDockerDeploy, preflightDockerUpgrade, runDockerLifecycle, type DockerInput, type DockerUpgradeInput } from "../../scripts/ops/core/docker-lifecycle.ts";
-import { loadDeploymentState } from "../../scripts/ops/core/deployment-state.ts";
-import { runNative, type NativeCommand, type NativeOutput, type NativeResult, type NativeRunner } from "../../scripts/ops/core/native-process.ts";
-import { releaseDataResult } from "../../scripts/lib/release-data-protocol.ts";
-import { PROTOCOL, PROTOCOL_VERSION } from "../../scripts/lib/maintenance-protocol.ts";
-import type { OpsResult } from "../../scripts/ops/core/result.ts";
+import { configurationSnapshot } from "../../ops/config/configuration-form.ts";
+import { installConfigurationStage, parseConfigurationStage, serializeConfigurationStage, stageName, type StagedKind } from "../../ops/config/configuration-stage.ts";
+import { installRuntimeValues } from "../../ops/config/runtime-settings.ts";
+import { RUNTIME_VALUES_FILE, runtimeDigest, serializeRuntimeValues } from "../../ops/config/runtime-values.ts";
+import { DEPLOY_CHOICES_FILE, type DeployChoices, type PlatformStageFile } from "../../ops/core/deploy-stage.ts";
+import type { DeployInput } from "../../ops/core/deployment-host.ts";
+import { candidateProjectId, serializeCandidateRecord, serializeServiceUser, serializeTaskRuntime, type CandidateRecord } from "../../ops/core/docker-deployment.ts";
+import { preflightDockerDeploy, preflightDockerUpgrade, runDockerLifecycle, type DockerInput, type DockerUpgradeInput } from "../../ops/core/docker-lifecycle.ts";
+import { loadDeploymentState } from "../../ops/core/deployment-state.ts";
+import { runNative, type NativeCommand, type NativeOutput, type NativeResult, type NativeRunner } from "../../ops/core/native-process.ts";
+import { releaseDataResult } from "../../ops/lib/release-data-protocol.ts";
+import { PROTOCOL, PROTOCOL_VERSION } from "../../ops/lib/maintenance-protocol.ts";
+import type { OpsResult } from "../../ops/core/result.ts";
 import { tempFixture } from "./temp.ts";
 
 const source = resolve(import.meta.dir, "../..");
@@ -75,12 +75,11 @@ const render = (format: string, image: Image, daemon: Daemon) => format.replaceA
   .replace(/\{\{index \.Config\.Labels "([^"]+)"\}\}/g, (_, key: string) => image.Config.Labels[key] ?? "")
   .replaceAll("{{len .RepoTags}}", String(daemon.references(image.Id).length)).replaceAll("{{len .RepoDigests}}", "0");
 
-/** interrupt: the entry dies right after publishing the transaction, before the stop (the first image lookup then throws). task-cleanup: the separate task daemon cannot list its images. abandon: the first revision abandon fails and leaves its journal as it was. candidate-loop: the formal candidate start keeps failing under the restart policy (restarting, never ready) until the failure is removed. */
-export type DockerFailure = "verification-health" | "verification-exit" | "apply" | "commit-reply" | "restore-data" | "layout" | "cleanup" | "interrupt" | "task-cleanup" | "abandon" | "candidate-loop";
+/** interrupt: the entry dies right after publishing the transaction, before the stop (the first image lookup then throws). task-cleanup: the separate task daemon cannot list its images. candidate-loop: the formal candidate start keeps failing under the restart policy (restarting, never ready) until the failure is removed. */
+export type DockerFailure = "verification-health" | "verification-exit" | "apply" | "commit-reply" | "restore-data" | "layout" | "interrupt" | "task-cleanup" | "candidate-loop";
 export interface DockerFixtureOptions {
   failures?: DockerFailure[];
   directory?: boolean;
-  cleanup?: "apply" | "skip";
   /** The service daemon doubles as the task daemon, so nothing is reclaimed there. */
   sharedDaemon?: boolean;
 }
@@ -97,7 +96,6 @@ export interface DeployStageOptions {
   target?: string;
   port?: number;
   workspace?: string;
-  cleanup?: "apply" | "skip";
   /** Supported keys besides BOT_PORT. */
   runtime?: Record<string, string>;
   /** A first deployment answers both configurations and the directory scope and previews after the stop; a redeployment keeps its configuration and previews before. */
@@ -151,17 +149,17 @@ async function dockerHarness(running: boolean, options: DockerFixtureOptions, de
   const main = new Daemon("fixture-main-daemon"), task = options.sharedDaemon ? main : new Daemon("fixture-task-daemon");
 
   const projectId = candidateProjectId(project), operationId = hex(8), originalImage = imageId(), candidateImage = imageId(), keptImage = imageId(), foreignImage = imageId();
-  const labels = (revision: string, operation: string, owner = projectId, from = "commit") => ({ "org.opencontainers.image.revision": revision, "org.mixin-chatbot.project": owner,
-    "org.mixin-chatbot.operation": operation, "org.mixin-chatbot.source": from });
+  const labels = (revision: string, operation: string, owner = projectId, from = "commit") => ({ "org.opencontainers.image.revision": revision, "org.mixin-bot.project": owner,
+    "org.mixin-bot.operation": operation, "org.mixin-bot.source": from });
   const image = (id: string, values: Record<string, string>): Image => ({ Id: id, Os: "linux", Architecture: "amd64",
     Config: { Labels: values, Env: [`APP_BUILD=${values["org.opencontainers.image.revision"]!.slice(0, 12)}`] } });
   const candidate: CandidateRecord = { format: "1", source: deploy ? "workspace" : "commit", target_sha: built, image_id: candidateImage,
-    image_tag: `mixin-chatbot:candidate-${projectId}-${operationId}`, daemon_id: main.id, project_id: projectId, operation_id: operationId };
+    image_tag: `mixin-bot:candidate-${projectId}-${operationId}`, daemon_id: main.id, project_id: projectId, operation_id: operationId };
   for (const daemon of new Set([main, task])) {
     if (withOriginal) daemon.images.set(originalImage, image(originalImage, labels(original, hex(8))));
     daemon.images.set(candidateImage, image(candidateImage, labels(built, operationId, projectId, candidate.source)));
   }
-  if (withOriginal) main.tags.set("mixin-chatbot:latest", originalImage);
+  if (withOriginal) main.tags.set("mixin-bot:latest", originalImage);
   main.tags.set(candidate.image_tag, candidateImage);
   // What a successful operation may reclaim on a separate task daemon: only the old image, never a named or foreign one.
   task.images.set(keptImage, image(keptImage, labels(original, hex(8)))); task.tags.set("kept:named", keptImage);
@@ -171,7 +169,7 @@ async function dockerHarness(running: boolean, options: DockerFixtureOptions, de
     Config: { User: user, Env: [], Labels: {}, Entrypoint: null, Cmd: [], OpenStdin: false, StdinOnce: false, Tty: false },
     HostConfig: { Privileged: false, ReadonlyRootfs: true, NetworkMode: rootless ? "bridge" : "host", RestartPolicy: { Name: "unless-stopped" }, AutoRemove: false }, Mounts: mounts, State: state });
   const stopped = { Status: "exited", Running: false, Paused: false, Restarting: false, ExitCode: 0 }, up = { ...stopped, Status: "running", Running: true };
-  const originalContainer = withOriginal ? service("mixin-chatbot", originalImage, [{ Type: "bind", Source: data, Destination: "/app/data", RW: true }], running ? up : stopped) : undefined;
+  const originalContainer = withOriginal ? service("mixin-bot", originalImage, [{ Type: "bind", Source: data, Destination: "/app/data", RW: true }], running ? up : stopped) : undefined;
   if (originalContainer) main.containers.set(originalContainer.Id, originalContainer);
 
   const failures = new Set(options.failures ?? []), events: string[] = [], unexpected: string[] = [], outputs: string[] = [], results: OpsResult[] = [], reclaims: boolean[] = [];
@@ -182,7 +180,7 @@ async function dockerHarness(running: boolean, options: DockerFixtureOptions, de
     const active = instances();
     if (active.length !== 1) return new Response("no instance", { status: 503 });
     const current = active[0]!, verificationOnly = !!current.verification;
-    return Response.json({ ...instance, service: "mixin-chatbot", version: 1, build: (role(current) === "candidate" ? built : original).slice(0, 12),
+    return Response.json({ ...instance, service: "mixin-bot", version: 1, build: (role(current) === "candidate" ? built : original).slice(0, 12),
       status: verificationOnly && failures.has("verification-health") || current.State.Restarting ? "starting" : "ready", verificationOnly, port: server.port });
   } });
   // The service writes its identity when it starts; the original of an upgrade or redeployment already did.
@@ -209,17 +207,17 @@ async function dockerHarness(running: boolean, options: DockerFixtureOptions, de
       try { events.push(label + (await work() ? "" : ":in-place")); return maintenanceReply(command, 0); }
       catch (error) { events.push(label + ":failed"); outputs.push((error as Error).message + "\n"); return maintenanceReply(command, 1); }
     };
-    if (script === "scripts/config/runtime-settings.ts") {
+    if (script === "ops/config/runtime-settings.ts") {
       expect(args).toEqual(["--values", option("--values"), "--json"]);
       return install(`${name}:values`, "values", () => installRuntimeValues(hostPath(option("--values")!), join(project, "data/config/runtime.json")));
     }
-    if (script === "scripts/config/configuration-install.ts") {
+    if (script === "ops/config/configuration-install.ts") {
       const kind = option("--kind") as StagedKind;
       expect(args).toEqual(["--kind", kind, "--stage", option("--stage"), "--json"]);
       return install(`${name}:${kind}`, "install", () => installConfigurationStage(project, parseConfigurationStage(readFileSync(hostPath(option("--stage")!), "utf8"), kind)));
     }
     events.push(`${name}:${action}`);
-    if (script === "scripts/runtime/data-current.ts") {
+    if (script === "ops/tools/data-current.ts") {
       expect(option("--deployment")).toBe(deployment);
       const reply = (code: number) => ({ code, stdout: JSON.stringify(releaseDataResult(action!, code)) });
       // Without a plan from before the stop, the target release previews into the snapshot as the service user.
@@ -232,15 +230,8 @@ async function dockerHarness(running: boolean, options: DockerFixtureOptions, de
       if (failures.delete("restore-data")) return reply(1);
       rmSync(join(project, "data/state/release-data.json"), { force: true }); return reply(0);
     }
-    if (script === "scripts/runtime/revision-cleanup.ts") {
-      if (action === "abandon" && failures.delete("abandon")) return maintenanceReply(action, 1);
-      const failed = action === "apply" && failures.has("cleanup");
-      writeFileSync(join(project, "data/state/revision-cleanup.json"), JSON.stringify({ version: 2, run: "fixture-cleanup", databases: [], interval: 64, startedAt: new Date().toISOString(),
-        state: failed ? "stopped" : action === "abandon" ? "abandoned" : "finished", ...(failed ? { current: { space: "direct" } } : {}) }, null, 2) + "\n");
-      return maintenanceReply(action!, failed ? 3 : 0);
-    }
-    if (script === "scripts/config/directory-scope.ts") { writeFileSync(directoryFile, readFileSync(hostPath(option("--plan")!))); return maintenanceReply(action!, 0); }
-    if (script === "scripts/runtime/task-deployment.ts") {
+    if (script === "ops/config/directory-scope.ts") { writeFileSync(directoryFile, readFileSync(hostPath(option("--plan")!))); return maintenanceReply(action!, 0); }
+    if (script === "ops/tools/task-deployment.ts") {
       expect(option("--image")).toBe(candidateImage); expect(option("--data")).toBe(data);
       writeFileSync(join(project, "data/config/task-deployment.json"), JSON.stringify({ image: candidateImage }));
       return { code: 0, stdout: "" };
@@ -357,7 +348,7 @@ async function dockerHarness(running: boolean, options: DockerFixtureOptions, de
       return ok([...daemon.containers.values()].filter(c => c.Image === ancestor).map(c => c.Id + "\n").join(""));
     }
     if (action === "run") {
-      expect(args).toContain("scripts/runtime/layout-check.ts"); expect(args).toContain(candidateImage); events.push("layout-check");
+      expect(args).toContain("ops/tools/layout-check.ts"); expect(args).toContain(candidateImage); events.push("layout-check");
       return failures.has("layout") ? refuse("fixture: workspace boundary changed") : ok();
     }
     unexpected.push(args.join(" ")); return refuse("fixture docker: unexpected command");
@@ -401,7 +392,7 @@ export async function dockerUpgradeFixture(running: boolean, options: DockerFixt
   writeFacts();
   writeFileSync(join(h.project, "data/state/task-runtime"), serializeTaskRuntime({ endpoint: h.taskEndpoint, daemon: h.task.id }));
   const { original, target, project, native } = h;
-  const input: DockerUpgradeInput = { original, target, branch: "main", plan: h.plan, cleanup: options.cleanup ?? "skip", candidate: candidateFile, facts: factsFile,
+  const input: DockerUpgradeInput = { original, target, branch: "main", plan: h.plan, candidate: candidateFile, facts: factsFile,
     ...(options.directory ? { directoryPlan: h.directoryPlan } : {}) };
   const recovery = (command: "resume" | "rollback"): DockerUpgradeInput => ({ original, target, branch: "main", command, ...(command === "rollback" ? { rollback: true } : {}) });
   type Overrides = Parameters<typeof h.lifecycle>[1];
@@ -433,7 +424,7 @@ export async function dockerDeployFixture(options: DockerDeployOptions = {}) {
     const pick = <T>(value: T | null | undefined, fallback: T | null) => value === undefined ? fallback : value;
     const app = pick(choices.app, first ? APP : null), models = pick(choices.models, first ? MODELS : null);
     const files: Record<string, string | null> = {
-      [DEPLOY_CHOICES_FILE]: JSON.stringify({ format: 1, target: choices.target ?? h.built, port, workspace: choices.workspace ?? "", cleanup: choices.cleanup ?? "skip" } satisfies DeployChoices),
+      [DEPLOY_CHOICES_FILE]: JSON.stringify({ format: 1, target: choices.target ?? h.built, port, workspace: choices.workspace ?? "" } satisfies DeployChoices),
       [RUNTIME_VALUES_FILE]: serializeRuntimeValues({ format: 1, base: runtimeDigest(current("data/config/runtime.json")), values: { BOT_PORT: String(port), ...choices.runtime } }),
       "data-plan.json": pick(choices.plan, first ? null : "{}\n"), "directory-scope-plan.json": pick(choices.directory, first ? DIRECTORY : null),
       [stageName("app")]: app === null ? null : staged("app", { app }),
@@ -449,6 +440,5 @@ export async function dockerDeployFixture(options: DockerDeployOptions = {}) {
     deploy: (directory: string, command: "deploy" | "repair" = "deploy", overrides: Overrides = {}) => h.lifecycle(input({ stage: directory, command }), overrides),
     resume: (overrides: Overrides = {}) => h.lifecycle(input({ command: "resume" }), overrides),
     rollback: (overrides: Overrides = {}) => h.lifecycle(input({ command: "rollback", rollback: true }), overrides),
-    restore: (space: string) => h.lifecycle(input({ command: "revision-cleanup", restore: space })),
     preflight: () => preflightDockerDeploy(input({ command: "deploy" }), { project: h.project, source, native: h.native }) };
 }

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Auth } from "../../scripts/ops/console/auth.ts";
+import { Auth } from "../../console/server/auth.ts";
 
 const limits = { exchangeMs: 5 * 60_000, idleMs: 30 * 60_000, absoluteMs: 8 * 3_600_000 };
 const clock = (start = 1_000_000) => {

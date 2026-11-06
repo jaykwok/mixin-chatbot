@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { AuditLog } from "../../scripts/ops/console/audit.ts";
-import { type PushSettingsSource, PushRoutes } from "../../scripts/ops/console/push-routes.ts";
-import type { RouteContext } from "../../scripts/ops/console/routes.ts";
+import { AuditLog } from "../../console/server/audit.ts";
+import { type PushSettingsSource, PushRoutes } from "../../console/server/push-routes.ts";
+import type { RouteContext } from "../../console/server/routes.ts";
 import { type PushAdmin, PushSettingsRefused } from "../../src/push/service.ts";
 import { createApp } from "../../src/server/http-app.ts";
 import { tempFixture } from "../helpers/temp.ts";

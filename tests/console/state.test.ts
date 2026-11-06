@@ -2,11 +2,11 @@ import { expect, test } from "bun:test";
 import { chmodSync, statSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { Auth } from "../../scripts/ops/console/auth.ts";
-import type { Bundle } from "../../scripts/ops/console/bundle.ts";
-import { guardConfig } from "../../scripts/ops/console/guard.ts";
-import { startServer } from "../../scripts/ops/console/server.ts";
-import { liveInstance, prepareConsoleDir, readInstance, readSavedPort, removeInstance, savePort, writeInstance } from "../../scripts/ops/console/state.ts";
+import { Auth } from "../../console/server/auth.ts";
+import type { Bundle } from "../../console/server/bundle.ts";
+import { guardConfig } from "../../console/server/guard.ts";
+import { startServer } from "../../console/server/server.ts";
+import { liveInstance, prepareConsoleDir, readInstance, readSavedPort, removeInstance, savePort, writeInstance } from "../../ops/core/console-state.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const bundle: Bundle = { index: { path: "/", type: "text/html", body: new Uint8Array() }, assets: new Map() };

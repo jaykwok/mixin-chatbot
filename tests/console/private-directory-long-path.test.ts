@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { prepareConsoleDir } from "../../scripts/ops/console/state.ts";
+import { prepareConsoleDir } from "../../ops/core/console-state.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 test.skipIf(process.platform !== "win32")("Windows 权限检查遍历超过 260 字符的运行包路径，仍拒绝外来 ACL", async () => {

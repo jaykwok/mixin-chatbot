@@ -3,11 +3,11 @@ import { expect, test } from "bun:test";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tempFixture } from "../helpers/temp.ts";
-import { collectAll, collectComparisons, parseDate } from "../../scripts/ops/stats-admin.ts";
-import { change, comparisons, comparisonWindows, describeStatsWindow, engagement, periodWindow, summarize, trend } from "../../scripts/ops/stats-summary.ts";
-import { renderReport } from "../../scripts/ops/shared/report.ts";
-import { maskUser } from "../../scripts/ops/shared/format.ts";
-import { executeProcess } from "../../scripts/lib/process.ts";
+import { collectAll, collectComparisons, parseDate } from "../../ops/tools/stats-admin.ts";
+import { change, comparisons, comparisonWindows, describeStatsWindow, engagement, periodWindow, summarize, trend } from "../../ops/tools/stats-summary.ts";
+import { renderReport } from "../../console/server/report.ts";
+import { maskUser } from "../../ops/lib/format.ts";
+import { executeProcess } from "../../src/lib/process.ts";
 import { fileURLToPath } from "node:url";
 
 const at = (date: string) => parseDate(date, false);
@@ -104,7 +104,7 @@ test("每日补零、周月去重、跨群排行、空本期比较与报表脱�
     expect(html).not.toContain("13812345678");
     expect(html).not.toContain("13612345678");
     expect(html).not.toMatch(/(?:src|href)\s*=\s*["']https?:/i);
-    const script = fileURLToPath(new URL("../../scripts/ops/stats-admin.ts", import.meta.url));
+    const script = fileURLToPath(new URL("../../ops/tools/stats-admin.ts", import.meta.url));
     const cli = await executeProcess({ command: process.execPath, args: [script, "--since", "2026-10-01", "--until", "2026-10-03"], cwd: f.root, env: process.env, timeoutMs: 30000 });
     expect(cli.exitCode).toBe(0);
     expect(cli.stdout).toContain("总提问数 7 次 · 覆盖提问人数 2 人");

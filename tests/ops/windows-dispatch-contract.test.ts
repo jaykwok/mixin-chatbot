@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { tempFixture } from "../../tests/helpers/temp.ts";
+import { tempFixture } from "../helpers/temp.ts";
 
 // The unmodified Invoke-TransactionCommand and Invoke-PendingDeployment of ops.ps1: a pending deployment goes to the shared core
 // of this release with the console's confirmation as it came, and the core's exit code is the command's. The core's own check
@@ -10,7 +10,7 @@ import { tempFixture } from "../../tests/helpers/temp.ts";
 test.skipIf(process.platform !== "win32")("Windows ops dispatch hands a pending deployment and its confirmation to the shared core", async () => {
   const fixture = await tempFixture("dispatch-contract-"), root = join(fixture.root, "中文 project"), opsSource = join(fixture.root, "release");
   await mkdir(join(root, "data/state"), { recursive: true });
-  const source = await readFile(new URL("../../scripts/ops/ops.ps1", import.meta.url), "utf8");
+  const source = await readFile(new URL("../../scripts/ops.ps1", import.meta.url), "utf8");
   const pending = source.match(/^function Invoke-PendingDeployment\([^\n]+[\s\S]*?^\}/m)![0];
   const command = source.match(/^function Invoke-TransactionCommand\([^\n]+[\s\S]*?^\}/m)![0];
   const quote = (text: string) => "'" + text.replaceAll("'", "''") + "'";
@@ -43,7 +43,7 @@ if (-not $ok) { exit 7 }
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     return { code, output: stdout + stderr, dispatched: existsSync(marker) ? await readFile(marker, "utf8") : null };
   };
-  const core = `--no-env-file ${join(opsSource, "scripts/ops/core/cli.ts")} deployment deploy --project ${root}`;
+  const core = `--no-env-file ${join(opsSource, "ops/core/cli.ts")} deployment deploy --project ${root}`;
   try {
     await writeFile(join(root, "data/state/deploy-transaction"), "deploy-fixture\n");
     for (const action of ["continue", "rollback"] as const) {

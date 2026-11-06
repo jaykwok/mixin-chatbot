@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { QueryPool } from "../../scripts/ops/shared/exec-client.ts";
+import { QueryPool } from "../../console/server/exec-client.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
@@ -12,7 +12,7 @@ const quotePS = (value: string) => "'" + value.replaceAll("'", "''") + "'";
 // single shared budget for all variants ran out on a loaded machine.
 describe("deployment health requires a ready matching instance, including UUID with reused PID", () => {
   const queries = new QueryPool();
-  const identity = { service: "mixin-chatbot", version: 1, instanceId: crypto.randomUUID(), pid: 42, startedAt: Date.now() };
+  const identity = { service: "mixin-bot", version: 1, instanceId: crypto.randomUUID(), pid: 42, startedAt: Date.now() };
   let fixture: Awaited<ReturnType<typeof tempFixture>>, server: ReturnType<typeof Bun.serve>, port = 0, instance = "", ps = "";
   let status = 200;
   let body: unknown = { ...identity, status: "ready" };
@@ -44,7 +44,7 @@ describe("deployment health requires a ready matching instance, including UUID w
       ...(variant === "wrong-pid" && { pid: 43 }) };
     status = variant === "503" ? 503 : 200;
     await writeFile(instance, JSON.stringify({ ...identity, port: variant === "wrong-port" ? port + 1 : port }));
-    const child = Bun.spawn([process.execPath, join(project, "scripts/ops/health-check.ts")], {
+    const child = Bun.spawn([process.execPath, join(project, "ops/tools/health-check.ts")], {
       cwd: fixture.root, env: { ...process.env, BOT_PORT: String(port) }, stdout: "pipe", stderr: "pipe", windowsHide: true,
     });
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);

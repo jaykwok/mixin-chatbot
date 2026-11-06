@@ -1,11 +1,11 @@
-// The directory-scope terminal wizard (scripts/config/directory-scope-wizard.ts): shared by the deployment's choice and the
+// The directory-scope terminal wizard (ops/config/directory-scope-wizard.ts): shared by the deployment's choice and the
 // change after deployment (directory-admin.ts scope without a value), which reads, checks and saves through the running service.
 import { expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { scopeLabels, serviceWizard } from "../../scripts/config/directory-scope-wizard.ts";
-import { SCOPE_APPLY_NOTE, SCOPE_PROGRESS_HINT, type DepartmentSource } from "../../scripts/ops/directory-admin.ts";
+import { scopeLabels, serviceWizard } from "../../ops/config/directory-scope-wizard.ts";
+import { SCOPE_APPLY_NOTE, SCOPE_PROGRESS_HINT, type DepartmentSource } from "../../ops/tools/directory-admin.ts";
 import type { DepartmentDetail, DepartmentInfo } from "../../src/integrations/open-platform/directory.ts";
 import { type DirectoryScope, WHOLE_DIRECTORY } from "../../src/integrations/open-platform/directory-scope.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -108,7 +108,7 @@ async function runTerminal(scenario: Scenario): Promise<{ code: number; calls: {
           message() {},
         }),
       }));
-      const { changeScopeInTerminal } = await import(${JSON.stringify(import.meta.resolve("../../scripts/config/directory-scope-wizard.ts"))});
+      const { changeScopeInTerminal } = await import(${JSON.stringify(import.meta.resolve("../../ops/config/directory-scope-wizard.ts"))});
       const calls = { children: [], describe: [], saves: [] };
       const pending = signal => new Promise((_resolve, reject) => {
         if (signal.aborted) reject(signal.reason);
@@ -233,7 +233,7 @@ test("directory-admin.ts scope in a terminal loads the wizard (no wait between t
         spinner: () => ({ start: show("START"), stop: show("STOP"), error: show("FAILED"), message() {} }),
       }));
     `);
-    const proc = Bun.spawn([process.execPath, "--preload", preload, fileURLToPath(new URL("../../scripts/ops/directory-admin.ts", import.meta.url)), "scope"],
+    const proc = Bun.spawn([process.execPath, "--preload", preload, fileURLToPath(new URL("../../ops/tools/directory-admin.ts", import.meta.url)), "scope"],
       { cwd: fixture.root, stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env, FORCE_COLOR: "0" } });
     const timer = setTimeout(() => proc.kill(), 15_000);
     const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);

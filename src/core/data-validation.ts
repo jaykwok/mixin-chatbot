@@ -58,9 +58,8 @@ export async function validateConfiguration(project: string, options: Validation
  * Used by the service, the verification instance and the release commit. No database creation, migrations or requests.
  * Besides the configuration: the relay index, the stats ledger and every existing conversation database must be in the
  * format this program opens, so an incompatible database is refused while the release can still be rolled back, not
- * when the committed service first opens it. First the maintenance state: a revision cleanup with a document in flight
- * or a database to restore from its backup refuses, so do an unfinished shrink (which may have left a database away from
- * its path) and a state file this version cannot read.
+ * when the committed service first opens it. First the maintenance state: a state file this version cannot read, or
+ * an unfinished transaction that has not allowed this step, refuses.
  */
 export async function validateCurrentData(project: string, options: ValidationOptions = {}): Promise<void> {
   assertMaintenanceAction(project, options.intent ?? "service");

@@ -3,12 +3,12 @@
 // answer to an earlier login's page), the command palette, and which requests renew the idle timer.
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
-import type { Overview, SessionResponse } from "../../ui/console/src/contract.ts";
+import type { Overview, SessionResponse } from "../../console/ui/src/contract.ts";
 
 GlobalRegistrator.register({ url: "http://127.0.0.1:11012/" });
 const { render } = await import("preact");
-const { Root } = await import("../../ui/console/src/app.tsx");
-const { takeLoginToken } = await import("../../ui/console/src/login.ts");
+const { Root } = await import("../../console/ui/src/app.tsx");
+const { takeLoginToken } = await import("../../console/ui/src/login.ts");
 
 type Call = { path: string; method: string; headers: Record<string, string>; body?: string; signal: boolean };
 type Reply = { status: number; body: unknown } | "offline";

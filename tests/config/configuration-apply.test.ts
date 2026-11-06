@@ -2,9 +2,9 @@ import { expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { configurationDigest } from "../../scripts/config/configuration-draft.ts";
-import { configurationSnapshot } from "../../scripts/config/configuration-form.ts";
-import { ConfigurationDrafts } from "../../scripts/ops/console/configuration-drafts.ts";
+import { configurationDigest } from "../../ops/config/configuration-draft.ts";
+import { configurationSnapshot } from "../../ops/config/configuration-form.ts";
+import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
 import { readConfigurationState, configurationStateDigest, CONFIGURATION_STATE_FILE } from "../../src/core/configuration-state.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
@@ -17,7 +17,7 @@ test("配置提交 CLI 校验摘要并持维护租约；草稿只经 stdin 传�
     const input = drafts.validationInput(view.id, "test", 1); drafts.validated(view.id, "test", 1, input.digest, ["通过"]);
     const { digest } = drafts.prepare(view.id, "test");
     const invoke = async (action: string, options: string[], stdin?: string) => {
-      const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../../scripts/config/configuration-apply.ts", import.meta.url)), action,
+      const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../../ops/config/configuration-apply.ts", import.meta.url)), action,
         "--id", view.id, ...options, "--json"], { cwd: f.root, stdin: stdin === undefined ? "ignore" : Buffer.from(stdin), stdout: "pipe", stderr: "pipe", windowsHide: true });
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       expect(out + err).not.toContain(key); return { code, value: JSON.parse(out) as { outcome: string; message?: string } };

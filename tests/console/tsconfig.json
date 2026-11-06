@@ -1,7 +1,7 @@
 {
-  "extends": "../../ui/console/tsconfig.json",
+  "extends": "../../console/ui/tsconfig.json",
   "compilerOptions": {
     "types": ["bun"]
   },
-  "include": ["*.tsx", "../../ui/console/src"]
+  "include": ["*.tsx", "../../console/ui/src"]
 }

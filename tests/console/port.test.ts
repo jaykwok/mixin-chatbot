@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { assertNoBotConflict, botPorts, choosePort, DEFAULT_CONSOLE_PORT, parsePort } from "../../scripts/ops/console/port.ts";
+import { assertNoBotConflict, botPorts, choosePort, DEFAULT_CONSOLE_PORT, parsePort } from "../../ops/core/console-port.ts";
 import { tempFixture } from "../helpers/temp.ts";
 
 const record = {

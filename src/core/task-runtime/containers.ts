@@ -92,7 +92,7 @@ export class TaskContainers {
     try {
       output = await this.must(["run", "--rm", "--name", name, "--pull", "never", "--no-healthcheck", "--read-only", "--network", "none",
         "--ipc", "private", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "0:0", "--pids-limit", "32", "--memory", "128m",
-        "--label", "org.mixin-chatbot.mapping-probe=1", "--mount", mount(source, "/mapping-proof", true), "--entrypoint", "/usr/local/bin/bun", this.image,
+        "--label", "org.mixin-bot.mapping-probe=1", "--mount", mount(source, "/mapping-proof", true), "--entrypoint", "/usr/local/bin/bun", this.image,
         "-e", MAPPING_PROBE], { timeoutMs: 60_000 });
     } catch (error) {
       // A CLI that timed out or lost its daemon may leave the helper behind: remove it by name, best effort.
@@ -109,8 +109,8 @@ export class TaskContainers {
     const result = await this.driver.run(["container", "inspect", cid]);
     if (result.exitCode !== 0) throw new Error(`无法证明容器 ${cid} 已回收；保留任务 ${receipt.id}`);
     const containers = JSON.parse(result.stdout ?? result.output), container = containers[0];
-    if (containers.length !== 1 || container.Id !== cid || container.Image !== receipt.image || container.Config?.Labels?.["org.mixin-chatbot.task"] !== receipt.id
-      || container.Config?.Labels?.["org.mixin-chatbot.manager"] !== receipt.manager || container.Config?.Labels?.["org.mixin-chatbot.nonce"] !== receipt.nonce) throw new Error("容器与管理回执不匹配");
+    if (containers.length !== 1 || container.Id !== cid || container.Image !== receipt.image || container.Config?.Labels?.["org.mixin-bot.task"] !== receipt.id
+      || container.Config?.Labels?.["org.mixin-bot.manager"] !== receipt.manager || container.Config?.Labels?.["org.mixin-bot.nonce"] !== receipt.nonce) throw new Error("容器与管理回执不匹配");
     const work = workPath(receipt);
     const writable = container.Mounts.filter((mount: { RW: boolean; Type: string }) => mount.RW && mount.Type !== "tmpfs");
     const expected = receipt.mounts[cid];
@@ -163,7 +163,7 @@ export class TaskContainers {
     env: [string, string | undefined][]): Promise<string> {
     const args = ["create", "--name", name, "--pull", "never", "--no-healthcheck", "--read-only", "--network", "none", "--ipc", "private", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
       "--pids-limit", "128", "--memory", "1g", "--cpus", "2", "--user", "0:0", "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m,mode=1777", "--workdir", run.cwd,
-      "--label", `org.mixin-chatbot.task=${receipt.id}`, "--label", `org.mixin-chatbot.manager=${receipt.manager}`, "--label", `org.mixin-chatbot.nonce=${receipt.nonce}`,
+      "--label", `org.mixin-bot.task=${receipt.id}`, "--label", `org.mixin-bot.manager=${receipt.manager}`, "--label", `org.mixin-bot.nonce=${receipt.nonce}`,
       ...mounts.flatMap(value => ["--mount", value]), ...env.flatMap(([key, value]) => ["--env", `${key}=${value}`]), "--entrypoint", run.command, this.image, ...run.args];
     const cid = await this.must(args, { timeoutMs: 30_000 });
     if (!/^[a-f\d]{64}$/.test(cid)) throw new Error("容器创建未返回固定身份，保留任务");

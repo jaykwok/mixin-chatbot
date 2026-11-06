@@ -1,21 +1,21 @@
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { DockerPlatform } from "../../scripts/ops/core/docker-host.ts";
-import { DockerWriterUnsettled, newDockerTask, recoverDockerTask, runDockerTask, taskCommandDigest, taskInput, taskName } from "../../scripts/ops/core/docker-task.ts";
+import { DockerPlatform } from "../../ops/core/docker-host.ts";
+import { DockerWriterUnsettled, newDockerTask, recoverDockerTask, runDockerTask, taskCommandDigest, taskInput, taskName } from "../../ops/core/docker-task.ts";
 import type { DockerTaskRecord } from "../../src/contracts/ops-writer.ts";
-import type { NativeCommand, NativeRunner } from "../../scripts/ops/core/native-process.ts";
-import { runtimeEnvironmentDigest } from "../../scripts/ops/core/runtime-environment.ts";
-import { prepareReports, reportsPath } from "../../scripts/ops/core/reports.ts";
+import type { NativeCommand, NativeRunner } from "../../ops/core/native-process.ts";
+import { runtimeEnvironmentDigest } from "../../ops/core/runtime-environment.ts";
+import { prepareReports, reportsPath } from "../../ops/core/reports.ts";
 import { mkdir, rename } from "node:fs/promises";
 import { tempFixture } from "../helpers/temp.ts";
 
 /** Only the Docker process boundary is replaced; creation, attach, validation and reaping use the real platform. */
 function fixture(uid = 0, project = resolve("docker-task-fixture")) {
   const endpoint = `unix:///run/${uid}/docker.sock`, daemon = "task-daemon";
-  const args = ["run", "scripts/runtime/revision-cleanup.ts", "apply", "--project", "/app", "--json"];
+  const args = ["run", "ops/tools/data-current.ts", "apply", "--project", "/app", "--json"];
   const record = newDockerTask({ daemon, endpoint, image: "sha256:" + "b".repeat(64), user: uid ? "0:0" : "1001:1001",
     data: resolve(project, "data"), backup: resolve(project, "backup"), network: "none" }, args);
-  const service: any = { Id: "d".repeat(64), Name: "/mixin-chatbot", Image: record.image, Config: { User: record.user },
+  const service: any = { Id: "d".repeat(64), Name: "/mixin-bot", Image: record.image, Config: { User: record.user },
     Mounts: [{ Type: "bind", Source: record.data, Destination: "/app/data", RW: true }], State: { Status: "running", Running: true } };
   const calls: NativeCommand[] = [], saves: DockerTaskRecord[] = [];
   const tasks = { uid: uid || 1001, daemon: "recorded-task-daemon", rootless: true, socket: true, link: false };
@@ -30,7 +30,7 @@ function fixture(uid = 0, project = resolve("docker-task-fixture")) {
     const argv = command.args.slice(2), verb = argv[0] === "info" ? "info" : argv[1];
     if (verb === failure) return { code: 1, stdout: "" };
     if (verb === "info") return { code: 0, stdout: JSON.stringify({ ID: daemonId, SecurityOptions: uid ? ["name=rootless"] : [] }) };
-    if (verb === "ls") return { code: 0, stdout: argv.includes("name=^/mixin-chatbot$") ? service.Id : container?.Id ?? "" };
+    if (verb === "ls") return { code: 0, stdout: argv.includes("name=^/mixin-bot$") ? service.Id : container?.Id ?? "" };
     if (verb === "inspect") return { code: 0, stdout: JSON.stringify([argv[2] === service.Id ? service : container]) };
     if (verb === "create") {
       expect(saves.at(-1)?.phase).toBe("prepared");
@@ -80,7 +80,7 @@ test.each([0, 1002])("Docker 数据写入 UID %s：意图先落盘；固定镜�
     expect(result.code).toBe(code); expect(f.container).toBeUndefined();
     expect(f.saves.map(row => row.phase)).toEqual(["prepared", "created", "starting", "reaped"]);
     expect(f.saves.at(-1)?.container).toMatch(/^[a-f0-9]{64}$/);
-    expect(JSON.stringify(f.saves)).not.toContain("revision-cleanup.ts");
+    expect(JSON.stringify(f.saves)).not.toContain("data-current.ts");
     const create = f.calls.find(call => call.args[3] === "create")!;
     expect(create.args).toContain("--read-only"); expect(create.args).toContain("no-new-privileges");
   }

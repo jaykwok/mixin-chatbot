@@ -69,7 +69,7 @@ test.skipIf(process.platform !== "linux")("ops one-off containers check the task
   const f = await tempFixture("task-runtime-ops-"), socket = join(f.root, "docker.sock"), project = join(f.root, "project");
   const server = Bun.listen({ unix: socket, socket: { data() {} } });
   try {
-    const ops = await readFile(fileURLToPath(new URL("../../scripts/ops/ops.sh", import.meta.url)), "utf8");
+    const ops = await readFile(fileURLToPath(new URL("../../scripts/ops.sh", import.meta.url)), "utf8");
     const admin = /^data_admin\(\) \{\n[\s\S]*?\n\}\n/m.exec(ops)?.[0];
     expect(admin).toBeDefined();
     await Bun.write(join(project, "data/config/task-deployment.json"), "{}");
@@ -78,7 +78,7 @@ test.skipIf(process.platform !== "linux")("ops one-off containers check the task
     // ops.sh runs with set -u: every variable the check reads must be assigned before it.
     await writeFile(script, `set -uo pipefail
 . ${quote(library)}
-PROJECT_DIR=${quote(project)} CONTAINER=mixin-chatbot DEPLOYED_WORKSPACE_ROOT=''
+PROJECT_DIR=${quote(project)} CONTAINER=mixin-bot DEPLOYED_WORKSPACE_ROOT=''
 docker() {
   case "$1" in
     ps) return 0 ;;
@@ -93,7 +93,7 @@ service_container_user() { printf '%s' "$FIXTURE_USER"; }
 WA() { :; }
 ER() { printf 'ERR %s\n' "$*" >&2; }
 ${admin}
-data_admin scripts/ops/tmp-admin.ts preview --all
+data_admin ops/tools/tmp-admin.ts preview --all
 `);
     const run = async (user: string) => {
       const proc = Bun.spawn(["bash", script], { cwd: f.root, env: { ...process.env, FIXTURE_USER: user }, stdout: "pipe", stderr: "pipe" });

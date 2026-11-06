@@ -11,7 +11,7 @@ import { tempFixture } from "../helpers/temp.ts";
 
 const f = await tempFixture("mcp-"); afterAll(() => f.cleanup());
 const fixtureServer = fileURLToPath(new URL("../helpers/mcp-fixture.ts", import.meta.url));
-const supervisor = fileURLToPath(new URL("../../scripts/lib/process-supervisor.ts", import.meta.url));
+const supervisor = fileURLToPath(new URL("../../src/lib/process-supervisor.ts", import.meta.url));
 let n = 0;
 const GROUP_ID = "群-A";
 const member: McpMember = { scope: { kind: "group", groupId: GROUP_ID }, phone: "+86 alice", workspaceDir: join(f.root, "workspace"), tempDir: join(f.root, "alice") };

@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { applyConfiguration, assertRestorable, restoreConfiguration, finishConfiguration } from "../../scripts/config/configuration-transaction.ts";
-import { configurationSnapshot, CONFIGURATION_FILES } from "../../scripts/config/configuration-form.ts";
+import { applyConfiguration, assertRestorable, restoreConfiguration, finishConfiguration } from "../../ops/config/configuration-transaction.ts";
+import { configurationSnapshot, CONFIGURATION_FILES } from "../../ops/config/configuration-form.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
 import { assessMaintenanceAction, MAINTENANCE_INTENTS, readMaintenanceState } from "../../src/core/maintenance-state.ts";
 import { tempFixture } from "../helpers/temp.ts";
@@ -92,7 +92,7 @@ test("配置发布在每个文件边界被强杀后，磁盘状态可判断并�
     const f = await tempFixture("configuration-kill-");
     try {
       const values = fixtureFiles(f.root), material = join(f.root, "synthetic.json"); writeFileSync(material, JSON.stringify(values));
-      const module = pathToFileURL(fileURLToPath(new URL("../../scripts/config/configuration-transaction.ts", import.meta.url))).href;
+      const module = pathToFileURL(fileURLToPath(new URL("../../ops/config/configuration-transaction.ts", import.meta.url))).href;
       const runner = join(f.root, "kill-fixture.ts");
       writeFileSync(runner, `import { applyConfiguration } from ${JSON.stringify(module)}; const [project, id, point] = process.argv.slice(2); const { base, next } = await Bun.file(project + '/synthetic.json').json(); await applyConfiguration(project, id, base, next, async value => { if (value === point) { console.log('AT_POINT'); await new Promise(() => {}); } });`);
       const child = Bun.spawn([process.execPath, runner, f.root, id, point], { cwd: f.root, stdin: "ignore", stdout: "pipe", stderr: "pipe" });

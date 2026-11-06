@@ -3,10 +3,10 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFile, writeFile } from "node:fs/promises";
 import { tempFixture } from "../helpers/temp.ts";
-import { newWindowsTask, recoverWindowsTask, runWindowsTask } from "../../scripts/ops/core/windows-task.ts";
+import { newWindowsTask, recoverWindowsTask, runWindowsTask } from "../../ops/core/windows-task.ts";
 import type { WindowsTaskRecord } from "../../src/contracts/ops-writer.ts";
-import { publishJson } from "../../scripts/lib/atomic-file.ts";
-import type { NativeCommand } from "../../scripts/ops/core/native-process.ts";
+import { publishJson } from "../../src/lib/atomic-file.ts";
+import type { NativeCommand } from "../../ops/core/native-process.ts";
 
 const windows = process.platform === "win32";
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
@@ -43,8 +43,8 @@ test.skipIf(!windows)("Windows 强杀父运维进程后，从磁盘 Job 名称�
     const writer = join(f.root, "writer.ts"), launcher = join(f.root, "launcher.ts"), pidPath = join(f.root, "pid.json"), recordPath = join(f.root, "record.json");
     await writeFile(writer, 'import {writeFileSync} from "node:fs"; writeFileSync(process.argv[2], JSON.stringify(process.pid)); setInterval(()=>{}, 100);');
     const command: NativeCommand = { command: process.execPath, args: ["--no-env-file", writer, pidPath], cwd: f.root, protocol: true };
-    const taskModule = pathToFileURL(join(import.meta.dir, "../../scripts/ops/core/windows-task.ts")).href;
-    const publishModule = pathToFileURL(join(import.meta.dir, "../../scripts/lib/atomic-file.ts")).href;
+    const taskModule = pathToFileURL(join(import.meta.dir, "../../ops/core/windows-task.ts")).href;
+    const publishModule = pathToFileURL(join(import.meta.dir, "../../src/lib/atomic-file.ts")).href;
     await writeFile(launcher, `import {newWindowsTask,runWindowsTask} from ${JSON.stringify(taskModule)};
 import {publishJson} from ${JSON.stringify(publishModule)};
 const command=${JSON.stringify(command)};

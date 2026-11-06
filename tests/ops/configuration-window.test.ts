@@ -3,11 +3,11 @@ import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { ConfigurationDrafts } from "../../scripts/ops/console/configuration-drafts.ts";
-import { prepareConsoleDir } from "../../scripts/ops/console/state.ts";
-import { createMaintenanceHost, type MaintenanceHostOptions } from "../../scripts/ops/core/maintenance-host.ts";
-import { runConfiguration, configurationRequest } from "../../scripts/ops/core/configuration.ts";
-import { runNative } from "../../scripts/ops/core/native-process.ts";
+import { ConfigurationDrafts } from "../../ops/core/configuration-drafts.ts";
+import { prepareConsoleDir } from "../../ops/core/console-state.ts";
+import { createMaintenanceHost, type MaintenanceHostOptions } from "../../ops/core/maintenance-host.ts";
+import { runConfiguration, configurationRequest } from "../../ops/core/configuration.ts";
+import { runNative } from "../../ops/core/native-process.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
 import { applicationBinding } from "../../src/core/data-version.ts";
 import { assessMaintenanceAction, readMaintenanceState } from "../../src/core/maintenance-state.ts";
@@ -27,7 +27,7 @@ test("共用配置窗口使用实际草稿、校验、发布及恢复工具；�
       for (const tree of ["data/config", "data/state"]) await mkdir(join(f.root, tree), { recursive: true });
       await writeFile(config, JSON.stringify({ appId: "fixture", environment: "production", appSecret: oldKey }));
       const original = await readFile(config, "utf8");
-      await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 1, appVersion: "1.0.1", build: "fixture",
+      await writeFile(join(f.root, "data/state/data-version.json"), JSON.stringify({ dataVersion: 2, appVersion: "2.0.0", build: "fixture",
         transaction: "deploy-fixture", application: applicationBinding({ appId: "fixture", environment: "production" }) }));
       prepareConsoleDir(join(f.root, ".console"));
       await symlink(join(project, "node_modules"), join(f.root, "node_modules"), process.platform === "win32" ? "junction" : "dir");
@@ -36,7 +36,7 @@ test("共用配置窗口使用实际草稿、校验、发布及恢复工具；�
       const input = drafts.validationInput(opened.id, "fixture", 1); drafts.validated(opened.id, "fixture", 1, input.digest, ["通过"]);
       const params = drafts.prepare(opened.id, "fixture");
       let state: "running" | "stopped" = scenario === "stopped" ? "stopped" : "running", starts = 0, output = "";
-      const ready = { service: "mixin-chatbot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
+      const ready = { service: "mixin-bot", version: 1, status: "ready", instanceId: randomUUID(), pid: process.pid, startedAt: Date.now() };
       server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
         const failing = starts === 1 && ["unready", "restore-refused"].includes(scenario);
         if (failing && scenario === "restore-refused") writeFileSync(config, "{}");

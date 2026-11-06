@@ -4,7 +4,7 @@ import { GlobalRegistrator } from "@happy-dom/global-registrator";
 const registered = !GlobalRegistrator.isRegistered;
 if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:11012/" });
 const { render } = await import("preact");
-const { PushGroups } = await import("../../ui/console/src/push-groups.tsx");
+const { PushGroups } = await import("../../console/ui/src/push-groups.tsx");
 afterAll(async () => { if (registered) await GlobalRegistrator.unregister(); });
 const until = async (check: () => boolean) => { const end = Date.now() + 3000; while (!check() && Date.now() < end) await Bun.sleep(10); expect(check()).toBe(true); };
 const button = (root: Element, text: string) => [...root.querySelectorAll("button")].find(value => value.textContent === text);

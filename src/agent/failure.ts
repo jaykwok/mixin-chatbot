@@ -8,7 +8,7 @@
 // Pi 把 provider 的报错写在 assistant 消息的
 // errorMessage 上，额度耗尽、key 失效、限流都长这样。
 import { isContextOverflow, type AssistantMessage } from "@earendil-works/pi-ai";
-import { redactSecrets } from "../../scripts/lib/redact.ts";
+import { redactSecrets } from "../lib/redact.ts";
 
 /** 群聊里放不下 provider 动辄几千字的报文，原文只留够定位的一段。 */
 const MAX_DETAIL_CHARS = 300;

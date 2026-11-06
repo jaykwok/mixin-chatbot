@@ -1,7 +1,7 @@
 import { CURRENT_APPLICATION, writeCurrentConfig } from "../helpers/current-config.ts";
 import { expect, test } from "bun:test";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DATA_VERSION } from "../../src/core/version.ts";
@@ -41,7 +41,7 @@ test("every relative import of the code in the image resolves to a file the Dock
     }
   }
   // The console runs on the host; the glob copies their entry files, which the image never runs.
-  const hostOnly = new Set(["scripts/ops/console.ts"]);
+  const hostOnly = new Set(["console/server/start.ts"]);
   const loaders = { ts: new Bun.Transpiler({ loader: "ts" }), tsx: new Bun.Transpiler({ loader: "tsx" }) };
   const missing: string[] = [];
   for (const file of [...copied].filter(file => /\.tsx?$/.test(file) && !hostOnly.has(file))) {
@@ -52,7 +52,7 @@ test("every relative import of the code in the image resolves to a file the Dock
       if (!copied.has(target)) missing.push(`${file} -> ${target}`);
     }
   }
-  expect(copied.has("scripts/runtime/revision-cleanup.ts")).toBe(true);
+  expect(copied.has("ops/tools/data-current.ts")).toBe(true);
   expect(missing).toEqual([]);
 });
 
@@ -145,7 +145,7 @@ test.skipIf(process.platform !== "win32")("Windows directory scope choice runs t
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
 . ${quotePS(join(project, "scripts/lib/deployment.ps1"))}
 $bun=${quotePS(process.execPath)}
-$tool=${quotePS(join(project, "scripts/config/directory-scope.ts"))}
+$tool=${quotePS(join(project, "ops/config/directory-scope.ts"))}
 $root=Join-Path $PSScriptRoot 'project with spaces'
 $scopeFile=Join-Path $root 'data\\config\\directory.json'
 $plan=Join-Path $root 'tmp\\directory-scope-plan-fixture.json'
@@ -179,56 +179,6 @@ Show 'scope-before-install' (Content $scopeFile)
   } finally { await fixture.cleanup(); }
 }, 60000);
 
-test.skipIf(process.platform !== "win32")("Windows: an upgrader that the 1.0.1 ops.ps1 starts through | Out-Host still runs the scope wizard on the console; a non-interactive choice keeps the pipe", async () => {
-  const fixture = await tempFixture("directory-scope-outhost-");
-  const result = join(fixture.root, "result.txt");
-  // Stands in for directory-scope.ts: records what it got as stdin/stdout/stderr, then writes the plan.
-  await writeFile(join(fixture.root, "reporter.ts"), `import { appendFileSync, writeFileSync } from "node:fs";
-const plan = process.argv[process.argv.indexOf("--plan") + 1]!;
-appendFileSync(${JSON.stringify(result)}, \`\${process.env.PROBE_LABEL} stdin=\${!!process.stdin.isTTY} stdout=\${!!process.stdout.isTTY} stderr=\${!!process.stderr.isTTY}\\n\`);
-writeFileSync(plan, JSON.stringify({ format: 1, all: true }));
-`);
-  // Stands in for upgrade.ps1: the real Select-DirectoryScope, first with the wizard to run, then with BOT_DIRECTORY_SCOPE set.
-  await writeFile(join(fixture.root, "inner.ps1"), String.fromCharCode(0xfeff) + `param([string]$Bun)
-$ErrorActionPreference = 'Stop'
-. ${quotePS(join(project, "scripts/lib/common.ps1"))}
-$plan = Join-Path $PSScriptRoot 'plan.json'
-$reporter = Join-Path $PSScriptRoot 'reporter.ts'
-Remove-Item Env:BOT_DIRECTORY_SCOPE -ErrorAction SilentlyContinue
-$env:PROBE_LABEL = 'wizard'
-Select-DirectoryScope $Bun $reporter $PSScriptRoot $plan
-$env:PROBE_LABEL = 'environment'; $env:BOT_DIRECTORY_SCOPE = 'all'
-Select-DirectoryScope $Bun $reporter $PSScriptRoot $plan
-exit 0
-`);
-  // Stands in for Invoke-Update of the released ops.ps1 (1.0.1 and earlier), run in a console of its own.
-  await writeFile(join(fixture.root, "outer.ps1"), String.fromCharCode(0xfeff) + `param([string]$Bun)
-$shell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'
-& $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'inner.ps1') -Bun $Bun | Out-Host
-Add-Content -LiteralPath ${quotePS(result)} "exit=$LASTEXITCODE"
-`);
-  // Start-Process gives outer.ps1 a new (hidden) console, as an operator's terminal would.
-  await writeFile(join(fixture.root, "launch.ps1"), String.fromCharCode(0xfeff) + `param([string]$Bun)
-$outer = Join-Path $PSScriptRoot 'outer.ps1'
-$p = Start-Process -FilePath powershell.exe -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', ('"' + $outer + '"'), '-Bun', ('"' + $Bun + '"'))
-exit $p.ExitCode
-`);
-  try {
-    const { BOT_DIRECTORY_SCOPE: _, ...env } = process.env;
-    const run = await execute(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(fixture.root, "launch.ps1"), "-Bun", process.execPath],
-      fixture.root, env);
-    expect(run.code, run.output).toBe(0);
-    const lines = (await readFile(result, "utf8")).trim().split(/\r?\n/);
-    expect(lines).toHaveLength(3);
-    // Without the console the wizard would see no terminal and refuse; the old Out-Host pipe is the 1.0.1 starting point.
-    expect(lines[0]).toBe("wizard stdin=true stdout=true stderr=true");
-    // How PowerShell hands stderr to a native command under Out-Host is not asserted here.
-    expect(lines[1]).toStartWith("environment stdin=true stdout=false ");
-    expect(lines[2]).toBe("exit=0");
-  } finally { await fixture.cleanup(); }
-}, 60000);
-
 for (const [name, shell] of [["Windows PowerShell 5.1", "powershell.exe"], ["PowerShell 7", Bun.which("pwsh") ?? "C:/Program Files/PowerShell/7/pwsh.exe"]] as const) {
   test.skipIf(process.platform !== "win32" || (shell !== "powershell.exe" && !existsSync(shell)))(`${name}: data previews preserve native arguments`, async () => {
     const fixture = await tempFixture("migration-native-args-");
@@ -244,7 +194,7 @@ $bun=$bunPath=${quotePS(process.execPath)}
 $preview=$dataTool=${quotePS(probe)}
 $Project=${quotePS(root)}; $plan=${quotePS(plan)}; $Stage=${quotePS(stage)}
 $workspace=$finalWorkspace=${quotePS(workspace)}
-foreach($file in @(${quotePS(join(project, "scripts/deploy/upgrade.ps1"))},${quotePS(join(project, "scripts/deploy/deploy.ps1"))})) {
+foreach($file in @(${quotePS(join(project, "scripts/upgrade.ps1"))},${quotePS(join(project, "scripts/deploy.ps1"))})) {
     $tokens=$null; $errors=$null
     $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]$errors)
     if($errors.Count){throw ($errors | Out-String)}
@@ -272,7 +222,7 @@ test.skipIf(process.platform !== "win32")("Windows target upgrade really boots a
   const fixture = await tempFixture("upgrade-bootstrap-");
   try {
     const command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-      join(project, "scripts/deploy/upgrade.ps1"), "-Project", fixture.root,
+      join(project, "scripts/upgrade.ps1"), "-Project", fixture.root,
       "-OriginalSha", "1".repeat(40), "-TargetSha", "2".repeat(40),
       "-BunPath", process.execPath, "-GitPath", Bun.which("git")!];
     // A compatible upgrade keeps the existing app-bot credentials: without them it stops before the preview.
@@ -319,14 +269,14 @@ test.skipIf(process.platform !== "win32")("Windows target upgrade really boots a
 test.skipIf(process.platform !== "win32")("Windows upgrade removes only its own export on success, export failure and child failure", async () => {
   const fixture = await tempFixture("upgrade-export-cleanup-");
   const script = join(fixture.root, "cleanup.ps1");
-  const source = await readFile(join(project, "scripts/ops/ops.ps1"), "utf8");
+  const source = await readFile(join(project, "scripts/ops.ps1"), "utf8");
   const update = source.match(/^function Invoke-Update\([^\n]+[\s\S]*?^\}/m)?.[0] ?? "";
   expect(update).toContain("Invoke-ConsoleProcess $shell $arguments");
   expect(update).not.toContain("| Out-Host");
   await writeFile(script, `\ufeff$ErrorActionPreference='Stop'
 . ${quotePS(join(project, "scripts/lib/common.ps1"))}
 $tokens=$null; $errors=$null
-$ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/ops/ops.ps1"))},[ref]$tokens,[ref]$errors)
+$ast=[Management.Automation.Language.Parser]::ParseFile(${quotePS(join(project, "scripts/ops.ps1"))},[ref]$tokens,[ref]$errors)
 if($errors.Count){throw ($errors | Out-String)}
 $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Update'},$true)
 Invoke-Expression $definition.Extent.Text
@@ -341,7 +291,7 @@ function Invoke-GitCapture([string[]]$GitArgs) {
     return @{ExitCode=0;Text=$text}
 }
 function Expand-Archive($LiteralPath,$DestinationPath) {
-    $target=Join-Path $DestinationPath 'scripts/deploy'
+    $target=Join-Path $DestinationPath 'scripts'
     New-Item -ItemType Directory -Force -Path $target | Out-Null
     Set-Content -LiteralPath (Join-Path $target 'upgrade.ps1') -Encoding ASCII -Value @'
 param([string]$Project, [string]$BunPath, [string]$OriginalBranch)
@@ -444,7 +394,7 @@ try {
 
 test.skipIf(!bash || !existsSync(bash))("Docker deployment picks the port without asking and stops a bad, unpublishable or taken one before the build", async () => {
   const fixture = await tempFixture("deployment-rootless-port-");
-  const source = await readFile(join(project, "scripts/deploy/deploy.sh"), "utf8");
+  const source = await readFile(join(project, "scripts/deploy.sh"), "utf8");
   const section = source.split("# 本机管理端口不再询问")[1]?.split('print_success "本机管理端口：127.0.0.1:$BOT_PORT')[0]?.replace(/^[^\n]*/, "");
   const trim = /^trim_input\(\) \{[\s\S]*?^\}/m.exec(source)?.[0];
   expect(section).toBeDefined(); expect(trim).toBeDefined();
@@ -524,37 +474,6 @@ echo "PORT=$BOT_PORT"
       fixture.root, { ...process.env, MSYS_NO_PATHCONV: "1" });
     try { expect((await probe()).output).toContain("TAKEN"); } finally { listener.stop(true); }
     expect((await probe()).output).toContain("FREE");
-  } finally { await fixture.cleanup(); }
-}, 60000);
-
-test.skipIf(!bash || !existsSync(bash))("Docker deployment refuses the legacy update entry before any change", async () => {
-  const fixture = await tempFixture("deployment-legacy-entry-");
-  const root = join(fixture.root, "project"), dockerLog = join(fixture.root, "docker.log");
-  await mkdir(join(root, "scripts/deploy"), { recursive: true });
-  await Bun.write(join(root, "scripts/deploy/deploy.sh"), Bun.file(join(project, "scripts/deploy/deploy.sh")));
-  for (const name of await readdir(join(project, "scripts/lib"))) {
-    if (name.endsWith(".sh")) await Bun.write(join(root, "scripts/lib", name), Bun.file(join(project, "scripts/lib", name)));
-  }
-  // An exported function, not a PATH stub: the Windows CI runner skipped the stub and reached its real Docker.
-  const docker = `() { echo "$*" >> '${posixPath(dockerLog)}'; return 1\n}`;
-  const run = (env: Record<string, string>) => execute([bash!, posixPath(join(root, "scripts/deploy/deploy.sh"))], root,
-    { ...process.env, MSYS_NO_PATHCONV: "1", "BASH_FUNC_docker%%": docker, ...env });
-  try {
-    // The previous ops.sh stopped the service and handed over with DEPLOY_REUSE_SETTINGS=1: refuse before Docker, data or state.
-    let result = await run({ DEPLOY_REUSE_SETTINGS: "1" });
-    expect(result.code, result.output).toBe(1);
-    expect(result.output).toContain("旧版（webhook）部署不支持升级到应用机器人版本，请在新目录全新部署");
-    expect(result.output).toContain("本次未改动数据和配置");
-    expect(existsSync(dockerLog)).toBe(false);
-    expect(existsSync(join(root, "data"))).toBe(false); expect(existsSync(join(root, "backup"))).toBe(false);
-    // Without the legacy flag deployment proceeds to its normal checks.
-    for (const env of [{}, { DEPLOY_REUSE_SETTINGS: "0" }] as Record<string, string>[]) {
-      await rm(dockerLog, { force: true });
-      result = await run(env);
-      expect(result.code, result.output).toBe(1);
-      expect(result.output).not.toContain("旧版（webhook）部署"); expect(result.output).toContain("无法连接 Docker");
-      expect(await readFile(dockerLog, "utf8")).toBe("info\n");
-    }
   } finally { await fixture.cleanup(); }
 }, 60000);
 

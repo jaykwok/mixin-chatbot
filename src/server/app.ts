@@ -43,7 +43,7 @@ import { PUSH_EXTENSION, pushExtension } from "../push/tools.ts";
 import { applicationBinding, assertDataVersion } from "../core/data-version.ts";
 import { APP_BUILD, APP_VERSION, DATA_VERSION } from "../core/version.ts";
 import { validateCurrentData } from "../core/data-validation.ts";
-import { openOperationLog, operationError } from "../../scripts/lib/operation-log.ts";
+import { openOperationLog, operationError } from "../lib/operation-log.ts";
 
 let stopping = false;
 let server: ReturnType<typeof Bun.serve> | undefined;
@@ -159,7 +159,7 @@ try {
   await mkdir(RUNTIME_DIR, { recursive: true });
   const retention = runtimeSetting("PI_CACHE_RETENTION") as CacheRetention | undefined;
   const selection = await openModelSelection({ signal: application.signal, ...(retention ? { cacheRetention: retention } : {}) });
-  // The task log extraction (scripts/ops/task-logs.*) reports the last line starting so before a task.
+  // The task log extraction (scripts/task-logs.*) reports the last line starting so before a task.
   log.info(`Pi ModelRuntime 就绪（provider=${selection.model.provider}, model=${selection.model.id}, api=${selection.model.api}, ` +
     `thinkingLevel=${selection.thinkingLevel}, 资料 workspace=${resolve(LAYOUT.workspace)}）`);
   application.signal.throwIfAborted();
