@@ -17,8 +17,8 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.4
-      - name: Probe 4
-        run: SPIKE_REPORT4="${{ runner.temp }}/report4.json" bun spike/probe4.ts
+      - name: Probe 5
+        run: brew install bash; SPIKE_REPORT5="${{ runner.temp }}/report5.json" bun spike/probe5.ts
         continue-on-error: true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -29,3 +29,4 @@ jobs:
             ${{ runner.temp }}/report2.json
             ${{ runner.temp }}/report3.json
             ${{ runner.temp }}/report4.json
+            ${{ runner.temp }}/report5.json
