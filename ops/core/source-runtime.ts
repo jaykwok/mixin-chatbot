@@ -3,6 +3,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
+import { passable } from "./console-state.ts";
 
 const TREES = ["console", "ops", "scripts", "src"];
 const FILES = ["package.json", "bun.lock", "Dockerfile", "pyproject.toml", "uv.lock", ".python-version"];
@@ -32,7 +33,8 @@ export function codeDigest(project: string): string { return digestOf(sources(pr
 
 export function freezeRuntime(consoleDir: string, project: string): { root: string; digest: string } {
   const rows = sources(project), digest = digestOf(rows), parent = join(consoleDir, "runtime"), root = join(parent, "source-" + digest);
-  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  mkdirSync(parent, { recursive: true, mode: passable() ? 0o711 : 0o700 });
+  if (passable()) chmodSync(parent, 0o711);
   let exists = false;
   try { const stat = lstatSync(root); if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("固定版本运行包路径异常"); exists = true; }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { opsShellFunctions } from "../helpers/ops-shell.ts";
@@ -106,24 +106,31 @@ for (const platform of ["windows", "linux"] as const) test.skipIf(platform === "
 test("真实部署入口从固定包加载库，但项目目录与当前目录均指向实际部署", async () => {
   const f = await tempFixture("deployer-source-");
   try {
-    const project = join(f.root, "live project"), source = join(f.root, "fixed source"), windows = process.platform === "win32";
+    const project = join(f.root, "live project"), source = join(f.root, "fixed source"), windows = process.platform === "win32", darwin = process.platform === "darwin";
     for (const path of [project, join(source, "scripts"), join(source, "scripts/lib")]) mkdirSync(path, { recursive: true });
     const name = windows ? "deploy.ps1" : "deploy.sh";
     writeFileSync(join(source, "scripts", name), readFileSync(join(repo, "scripts", name)));
     if (windows) writeFileSync(join(source, "scripts/lib/common.ps1"), "\uFEFF" + [
       "function Start-OperationLog { [Console]::WriteLine(('PROJECT=' + $Project)); [Console]::WriteLine(('CWD=' + (Get-Location).Path)); exit 0 }",
     ].join("\r\n"));
-    else {
+    else if (darwin) {
+      // macOS hands deploy.sh to the fixed source's own entry, which resolves the project from MIXIN_OPS_PROJECT.
+      writeFileSync(join(source, "scripts/lib/macos-entry.sh"), readFileSync(join(repo, "scripts/lib/macos-entry.sh")));
+      mkdirSync(join(source, "ops/core"), { recursive: true });
+      writeFileSync(join(source, "ops/core/macos-entry.ts"), 'console.log(`PROJECT=${process.env.MIXIN_OPS_PROJECT}\\nCWD=${process.cwd()}\\nARGS=${process.argv.slice(2).join(" ")}`);\n');
+    } else {
       writeFileSync(join(source, "scripts/lib/common.sh"), 'operation_start() { printf "PROJECT=%s\\nCWD=%s\\n" "$PROJECT_DIR" "$PWD"; exit 0; }\n');
       for (const library of ["deployment.sh", "ops-runtime.sh", "core-handoff.sh"]) writeFileSync(join(source, "scripts/lib", library), "# fixture library\n");
       // The real entry changes cwd after operation_start, so capture its resolved project at this early boundary.
     }
     const child = Bun.spawn(windows ? ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(source, "scripts", name)]
       : ["bash", join(source, "scripts", name)], {
-      cwd: project, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env, MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_PROJECT: project },
+      cwd: project, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true, env: { ...process.env, MIXIN_OPS_CONSOLE: "1", MIXIN_OPS_PROJECT: project, MIXIN_OPS_BUN: process.execPath },
     });
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-    expect(code, out + err).toBe(0); expect(out).toContain("PROJECT=" + project); expect(out).toContain("CWD=" + project);
+    expect(code, out + err).toBe(0); expect(out).toContain("PROJECT=" + project);
+    expect(out).toContain("CWD=" + (darwin ? realpathSync(project) : project));
+    if (darwin) expect(out).toContain("ARGS=deploy");
   } finally { await f.cleanup(); }
 });
 

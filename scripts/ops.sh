@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # mixin-bot 运维工具（Linux / Docker）。
 # 用法：./scripts/ops.sh <命令>；不带参数显示完整帮助。
+# macOS：交给 bash 3.2 也能运行的引导，命令由 TypeScript 入口执行（scripts/lib/macos-entry.sh）。
+if [ "$(uname -s)" = Darwin ]; then exec /bin/bash "$(dirname "${BASH_SOURCE[0]}")/lib/macos-entry.sh" ops "$@"; fi
 set -uo pipefail
 
 OPS_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,7 +29,7 @@ BOT_PORT_FILE="${STATE_DIR}/bot-port"
 # 已保存的本机端口和外置共享资料目录（空为默认 data/workspace）。普通操作再叠加 BOT_PORT 环境变量（见文件末尾的入口判断）；
 # 升级、继续和回滚只用已保存设置或事务记录，升级结束后的体检也重新读取这里。
 load_saved_settings() {
-    PORT="1011"
+    PORT="10000"
     if [ -f "$BOT_PORT_FILE" ]; then PORT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"; fi
     DEPLOYED_WORKSPACE_ROOT="$(saved_workspace_root)"
 }

@@ -10,6 +10,8 @@
 # 未完成的升级：由核心按事务记录继续或回滚（改用事务固定的运维运行包），不重新询问，只用记录的镜像和身份。
 #
 # 用法：bash <导出目录>/scripts/upgrade.sh <项目目录> <目标提交> [continue|rollback]
+# macOS：交给 bash 3.2 也能运行的引导，升级器由导出树中的 TypeScript 入口执行（scripts/lib/macos-entry.sh）。
+if [ "$(uname -s)" = Darwin ]; then exec /bin/bash "$(dirname "${BASH_SOURCE[0]}")/lib/macos-entry.sh" upgrade "$@"; fi
 set -euo pipefail
 UPGRADER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
@@ -151,7 +153,7 @@ resume_upgrade() {
 # 升级沿用已保存的设置；无效时在停机前停止，由部署脚本修正。
 read_saved_settings() {
     local hint="升级沿用现有配置，请先用 $(ops_command_hint deploy) 修正（服务尚未停止）"
-    BOT_PORT=1011
+    BOT_PORT=10000
     if [ -f "$STATE_DIR/bot-port" ]; then BOT_PORT="$(tr -d '[:space:]' < "$STATE_DIR/bot-port")"; fi
     transaction_value_valid bot_port "$BOT_PORT" || { print_error "data/state/bot-port 中的端口无效：${BOT_PORT}；${hint}"; exit 1; }
     WORKSPACE_ROOT_SAVED="$(saved_workspace_root)"

@@ -11,6 +11,7 @@
     "console/server/{start,main,executor,read-cli}.ts!",
     "ops/core/check-plan.ts!",
     "ops/core/cli.ts!",
+    "ops/core/{launchd-supervisor,macos-entry,macos-become}.ts!",
     "ops/lib/confirmed-transaction.ts!",
     "console/ui/src/main.tsx!",
     "ops/tools/*.ts!",

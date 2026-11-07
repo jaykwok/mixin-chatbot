@@ -1,7 +1,8 @@
 // Durable remote-object ledger backed by Bun's SQLite API. Live rows are never evicted.
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
+import { openReadable } from "../lib/sqlite-open.ts";
 import { openState } from "../core/state.ts";
 
 export interface RelayIndexEntry {
@@ -41,7 +42,7 @@ export function readRelayIndex(path: string): RelayIndexEntry[] {
   if (!existsSync(path)) return [];
   let db: Database | undefined;
   try {
-    db = new Database(path, { readonly: true, strict: true });
+    db = openReadable(path, { strict: true });
     if (!db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().length) return [];
     assertRelaySchema(db);
     return db.query("SELECT * FROM objects ORDER BY at, key").all() as RelayIndexEntry[];

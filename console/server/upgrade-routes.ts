@@ -7,6 +7,7 @@ import { assertLifecycleTarget } from "../../ops/core/recovery-plan.ts";
 import { ApiProblem, type Route } from "./routes.ts";
 import { runCommand, type Runner } from "../../ops/core/hosting.ts";
 import { parsePort } from "../../ops/core/console-port.ts";
+import { hostPlatform } from "../../ops/core/platform.ts";
 
 function setting(project: string, name: string): string {
   const path = join(project, "data/state", name);
@@ -29,7 +30,7 @@ export function upgradeRoutes(project: string, run: Runner = runCommand): Record
       try {
         const saved = await settings(), port = parsePort(setting(project, "bot-port"), "机器人 "), workspace = setting(project, "workspace-root");
         if (workspace && !isAbsolute(workspace)) throw new Error("保存的共享目录不是绝对路径，请先检查部署记录");
-        return { ...saved, port, workspace, platform: process.platform === "win32" ? "windows" : "linux" };
+        return { ...saved, port, workspace, platform: hostPlatform() };
       } catch { throw new ApiProblem(409, "input", "无法读取已有部署设置，请检查未完成的维护事务及 data/state 中的端口和共享目录记录"); }
     } },
     "GET /api/lifecycle/upgrade": { run: async () => {

@@ -29,6 +29,8 @@ export interface ProcessOptions {
   /** Linux only: durable parent authorization before handing the command to the subreaper. */
   beforeCommand?: () => void;
   reapReceipt?: ProcessReceipt;
+  /** macOS only, from root: the identity the supervisor takes before it starts the command. */
+  identity?: { uid: number; gid: number };
 }
 export interface ProcessResult {
   exitCode: number; commandExitCode: number | null; commandSignal: string | null;
@@ -50,6 +52,7 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
   const input = options.input === undefined ? undefined : Buffer.from(options.input);
   if (options.jobName && !/^Global\\mixin-process-[a-f0-9-]{36}$/.test(options.jobName)) throw new Error("持久进程作业名称无效");
   if (options.reapReceipt && process.platform !== "linux") throw new Error("进程收尾凭据仅适用于 Linux");
+  if (options.identity && process.platform !== "darwin") throw new Error("命令身份切换仅适用于 macOS");
   const started = performance.now();
   const result: ProcessResult = { exitCode: 1, commandExitCode: null, commandSignal: null, supervisorExitCode: null, supervisorSignal: null,
     stdout: "", stderr: "", output: "", lastPhase: "spawn-request" };
@@ -62,7 +65,8 @@ export async function executeProcess(options: ProcessOptions): Promise<ProcessRe
   event("spawn-request");
   const jobName = options.jobName ?? `Local\\mixin-process-${randomUUID()}`;
   const child = spawn(process.execPath, [supervisor], { cwd: options.cwd, env: { ...process.env, ...SUPERVISOR_ENV, MIXIN_PROCESS_EVENTS: "1", MIXIN_PROCESS_JOB: jobName,
-    MIXIN_PROCESS_REAP_RECEIPT: options.reapReceipt ? JSON.stringify(options.reapReceipt) : undefined },
+    MIXIN_PROCESS_REAP_RECEIPT: options.reapReceipt ? JSON.stringify(options.reapReceipt) : undefined,
+    MIXIN_PROCESS_IDENTITY: options.identity ? options.identity.uid + ":" + options.identity.gid : undefined },
     stdio: ["pipe", "pipe", "pipe", "pipe", input === undefined ? "ignore" : "pipe"], detached: process.platform !== "win32", windowsHide: true });
   const inputPipe = child.stdio[4] as import("node:stream").Writable | null;
   result.pid = child.pid;

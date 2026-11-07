@@ -8,7 +8,6 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Database } from "bun:sqlite";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { Harness } from "@earendil-works/pi-durable";
 import { applicationBinding, VERSION_FILE } from "../../src/core/data-version.ts";
@@ -22,13 +21,14 @@ import { IdentityDirectory } from "../../src/integrations/open-platform/identity
 import type { AppBotConfig } from "../../src/integrations/open-platform/config.ts";
 import { fauxModels, harnessOptions } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { openReadable } from "../../src/lib/sqlite-open.ts";
 
 const harness = fileURLToPath(new URL("../helpers/binding-harness.ts", import.meta.url));
 const APP_A: AppBotConfig = { environment: "production", appId: "application-a", appSecret: "secret-of-application-a" };
 const sha256 = (data: string | Buffer) => createHash("sha256").update(data).digest("hex");
 
 function rows(path: string): string {
-  const db = new Database(path, { readonly: true });
+  const db = openReadable(path);
   try {
     const tables = db.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as { name: string }[];
     return JSON.stringify(tables.map(({ name }) => [name, db.query(`SELECT * FROM "${name}"`).all().map(row => JSON.stringify(row)).sort()]));

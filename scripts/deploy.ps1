@@ -78,13 +78,13 @@ if (-not (Test-Path -LiteralPath (Join-Path $Project 'node_modules') -PathType C
     if ($installCode -ne 0) { throw "bun install 执行失败（退出码 $installCode）；$Unchanged" }
 }
 
-# ---- 3. 本机管理端口（不询问：显式 BOT_PORT 高级覆盖 > 已保存值 > 1011）----
+# ---- 3. 本机管理端口（不询问：显式 BOT_PORT 高级覆盖 > 已保存值 > 10000）----
 # 无效或被其他程序占用的端口在停机前停止并说明改法，不自动换成别的端口。
 $savedPort = if (Test-Path -LiteralPath $PortFile) { "$(Get-Content -LiteralPath $PortFile -Raw)".Trim() } else { $null }
 $portSource = ""
 $rawPort = if (-not [string]::IsNullOrWhiteSpace($env:BOT_PORT)) { $portSource = "BOT_PORT"; $env:BOT_PORT.Trim() }
     elseif ($null -ne $savedPort) { $portSource = "data\state\bot-port"; $savedPort }
-    else { "1011" }
+    else { "10000" }
 $portFix = "改端口：设置环境变量 BOT_PORT=<端口> 后重新部署（$(Get-OpsCommandHint deploy)）；服务尚未停止"
 $portNumber = 0
 if (-not ([int]::TryParse($rawPort, [ref]$portNumber) -and $portNumber -ge 1 -and $portNumber -le 65535)) {
@@ -160,7 +160,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $ConfigDir 'directory.json') -PathTy
 # 目录和监听地址用本次确定的值，只交给这个工具；本进程的环境保持接单时的样子（见 Invoke-ConsoleProcess）。
 Set-OperationStage 'runtime-values'
 $runtimeCode = Invoke-ConsoleProcess $bunPath @('--no-env-file', 'run', (Join-Path $Project 'ops\config\runtime-settings.ts'), '--prepare-values',
-    (Join-Path $Stage 'runtime-values.json'), '--deployment', 'windows') -Environment @{ BOT_PORT = $Port; BOT_HOST = '127.0.0.1'; WORKSPACE_ROOT = $finalWorkspace }
+    (Join-Path $Stage 'runtime-values.json'), '--deployment', 'native') -Environment @{ BOT_PORT = $Port; BOT_HOST = '127.0.0.1'; WORKSPACE_ROOT = $finalWorkspace }
 if ($runtimeCode -ne 0) { throw "运行参数校验未通过（原因见上方）；$Unchanged" }
 # 本次的选择和计划任务要运行的工具交给核心，它在部署锁内复核：提交须仍是这里读到的（解压得到的部署没有提交）。
 $target = ''

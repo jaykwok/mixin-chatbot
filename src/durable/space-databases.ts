@@ -3,8 +3,9 @@
 import type { Dirent } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { assertDataDirectory } from "../lib/group-data.ts";
+import { openReadable } from "../lib/sqlite-open.ts";
 import { isSegment } from "../core/layout.ts";
 import { assertDurableSchema } from "./schema-gate.ts";
 
@@ -59,7 +60,7 @@ export async function assertSpaceSchemas(root: string): Promise<void> {
     if (info === undefined) continue;
     if (!info.isFile()) throw new Error(`会话库路径不是普通文件：${path}`);
     let db: Database;
-    try { db = new Database(path, { readonly: true, strict: true }); }
+    try { db = openReadable(path, { strict: true }); }
     catch (error) { throw new Error(`无法读取会话库 ${path}：${(error as Error).message}`, { cause: error }); }
     try {
       await assertDurableSchema({ get: <T extends object>(sql: string) => (db.query(sql).get() as T | null) ?? undefined }, path);

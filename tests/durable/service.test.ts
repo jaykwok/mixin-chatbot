@@ -8,7 +8,6 @@ import { chmod, mkdir, readFile, readdir, rename, writeFile } from "node:fs/prom
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { Database } from "bun:sqlite";
 import { type AssistantMessage, createModels, type Message, type Models } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, type FauxResponseFactory, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { type ConversationId, createSession, defineExtension, type Harness, LiveDoc, type ModelRef, type Tx } from "@earendil-works/pi-durable";
@@ -37,6 +36,8 @@ import "../helpers/restore-spies.ts";
 import { databaseOf, scopeOf, statsOf, tmpOf } from "../helpers/layout.ts";
 import { awaitingRemoval } from "../helpers/results.ts";
 import { appLayout } from "../../src/core/layout.ts";
+import { openReadable } from "../../src/lib/sqlite-open.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 const fixture = await tempFixture("durable-service-");
 afterAll(() => fixture.cleanup());
@@ -597,19 +598,19 @@ describe("durable service: controls", () => {
       // busy finishing the reply). The receipt is checked in the database below.
       await until(async () => {
         await service.maintain();
-        return process.platform === "linux" ? await awaitingRemoval(databaseOf(where.root, GROUP), ALICE) > 0
+        return removalNeedsPermit() ? await awaitingRemoval(databaseOf(where.root, GROUP), ALICE) > 0
           : (await readdir(resultsRoot(tmpOf(where.root, GROUP, ALICE)))).length === 0;
       }, "idle result reclamation");
-      expect(await readdir(resultsRoot(tmpOf(where.root, GROUP, ALICE)))).toEqual(process.platform === "linux" ? ["1-call_a"] : []);
-      if (process.platform === "linux") expect(await readFile(join(results, "index.txt"), "utf8")).toBe("x");
+      expect(await readdir(resultsRoot(tmpOf(where.root, GROUP, ALICE)))).toEqual(removalNeedsPermit() ? ["1-call_a"] : []);
+      if (removalNeedsPermit()) expect(await readFile(join(results, "index.txt"), "utf8")).toBe("x");
     } finally { await service.close(); }
     const database = createSession(await openGroupStorage(databaseOf(where.root, GROUP)));
     try {
-      const receipt = process.platform === "linux"
+      const receipt = removalNeedsPermit()
         ? (await database.snapshot(ReclamationItems, "1-call_a", context))!.call
         : (await database.snapshot(ResultsDoc, context))!.calls["1-call_a"]!;
       expect(receipt.expiryRequestedAt).toBeDefined();
-      if (process.platform === "linux") { expect(receipt.expiredAt).toBeUndefined(); expect(receipt.reclamation?.status).toBe("deferred"); }
+      if (removalNeedsPermit()) { expect(receipt.expiredAt).toBeUndefined(); expect(receipt.reclamation?.status).toBe("deferred"); }
       else expect(receipt.expiredAt).toBeDefined();
     } finally { await database.close(context); }
   });
@@ -776,7 +777,7 @@ describe("durable service: watchdog", () => {
     });
     /** Whether any stored row of the group's database holds streamed text. */
     const stored = () => {
-      const db = new Database(databaseOf(where.root, GROUP), { readonly: true });
+      const db = openReadable(databaseOf(where.root, GROUP));
       try {
         const tables = db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
         return tables.some(({ name }) => db.query(`SELECT * FROM "${name}"`).all().some((row) => JSON.stringify(row).includes("流")));
@@ -1259,7 +1260,7 @@ test.skipIf(process.getuid?.() === 0)("a held result defers idle reclamation wit
     }, "held result remains recorded for maintenance");
     expect(resets).toBe(1);
     expect(await readFile(join(locked, "index.txt"), "utf8")).toBe("synthetic");
-    if (process.platform === "linux") return;
+    if (removalNeedsPermit()) return;
     if (held) { await held.release(); held = undefined; } else await chmod(locked, 0o755);
     const later = Date.now() + 61_000, clock = spyOn(Date, "now").mockReturnValue(later);
     try { await until(async () => { await service.maintain(later); return !(await readdir(resultsRoot(temp))).includes("1-locked"); }, "unlocked result reclaimed"); }

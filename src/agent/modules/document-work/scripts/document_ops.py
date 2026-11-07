@@ -23,6 +23,8 @@ NS = {
     "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
 }
 MAX_FILE = 128 * 1024 * 1024
+MACOS_OFFICE = "/Applications/LibreOffice.app/Contents/MacOS/soffice"
+MACOS_FONTS = Path(__file__).with_name("macos-fonts.conf")
 
 
 def xml(data):
@@ -400,6 +402,8 @@ def office_binary(configured=None):
         for folder in (os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
             if folder:
                 candidates.append(str(Path(folder) / "LibreOffice/program/soffice.exe"))
+    if sys.platform == "darwin":
+        candidates.append(MACOS_OFFICE)
     return next((p for p in candidates if p and Path(p).is_file()), None)
 
 
@@ -409,7 +413,7 @@ def convert_office(source, folder, profile, configured=None):
     package(source)
     binary = office_binary(configured)
     if not binary:
-        raise ValueError("缺少 LibreOffice，无法渲染 Office 预览；请在设置中填写 LibreOffice 程序路径，或安装后将 soffice 加入 PATH，Windows 也支持标准安装目录。文件编辑能力仍可用，不能声称已完成视觉检查。")
+        raise ValueError("缺少 LibreOffice，无法渲染 Office 预览；请在设置中填写 LibreOffice 程序路径，或安装后将 soffice 加入 PATH，Windows 和 macOS 也支持标准安装目录。文件编辑能力仍可用，不能声称已完成视觉检查。")
     (profile / "user").mkdir()
     # Dedicated profile isolates concurrent conversions and disables macro execution.
     (profile / "user/registrymodifications.xcu").write_text(
@@ -422,11 +426,15 @@ def convert_office(source, folder, profile, configured=None):
         path.mkdir()
         env[key] = str(path)
     env.update(TMPDIR=str(folder), TMP=str(folder), TEMP=str(folder))
+    if sys.platform == "darwin" and "FONTCONFIG_FILE" not in env:
+        # Without it, headless LibreOffice on macOS sees only its bundled fonts and drops Chinese text.
+        env["FONTCONFIG_FILE"] = str(MACOS_FONTS)
     # Unix IPC still requires writable /tmp (TMPDIR does not redirect it).
-    # Keep stderr/stdout: CalledProcessError alone hides the actual Office failure.
+    # Keep stderr/stdout: CalledProcessError alone hides the actual Office failure. LibreOffice cannot load even an
+    # absolute source from a working directory its account cannot reach (seen on macOS), so it starts in the job folder.
     result = subprocess.run([binary, "-env:UserInstallation=" + profile.as_uri(), "--headless", "--nologo", "--nodefault",
                              "--norestore", "--convert-to", "pdf", "--outdir", str(folder), str(source)],
-                            timeout=150, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                            timeout=150, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=str(folder),
                             **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
     diagnostic = (result.stdout + b"\n" + result.stderr).decode("utf-8", errors="replace").strip()[-1400:]
     if result.returncode != 0:

@@ -14,6 +14,7 @@ import type { IsolatedTask } from "../core/rootless-tasks.ts";
 import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../core/task-backend.ts";
 import { log } from "../core/log.ts";
 import { hashFile } from "../core/file-hash.ts";
+import { removalNeedsPermit } from "../core/reclamation.ts";
 import { ensureDocumentToolchain, venvPythonPath } from "./python-toolchain.ts";
 import { isPathInside } from "../contracts/paths.ts";
 import { resolveToolPath } from "./tool-path.ts";
@@ -60,9 +61,9 @@ async function sourceDigest(path: string, signal: AbortSignal): Promise<string> 
 }
 
 async function pruneCache(root: string, keep: string): Promise<void> {
-  // Linux without the isolated task backend (development only): the cache is shared with the service identity, so its
-  // ownership proves neither a protected parent nor the absence of other writers.
-  if (process.platform === "linux") return;
+  // Without the isolated task backend the cache is shared with the service identity, so its ownership proves neither a
+  // protected parent nor the absence of other writers.
+  if (removalNeedsPermit()) return;
   const entries = await readdir(root, { withFileTypes: true });
   const candidates = await Promise.all(entries.filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && /^[a-f0-9]{64}$/.test(entry.name))
     .map(async entry => ({ path: join(root, entry.name), at: (await stat(join(root, entry.name))).mtimeMs })));
@@ -161,7 +162,7 @@ export async function extractDocument(options: DocumentOptions, source: string, 
           if (isolated) {
             if (!retained) await finishTask(backend!, isolated, "discard");
           }
-          else if (process.platform !== "linux") await Promise.allSettled([snapshot && rm(snapshot, { force: true }), output && rm(output, { force: true }), report && rm(report, { force: true })]);
+          else if (!removalNeedsPermit()) await Promise.allSettled([snapshot && rm(snapshot, { force: true }), output && rm(output, { force: true }), report && rm(report, { force: true })]);
           else if (snapshot) log.warn("共享解析临时文件保留待物理回收：" + snapshot + " / " + output);
         } finally { release(); }
       }

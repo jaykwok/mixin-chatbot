@@ -9,8 +9,12 @@ import { tempFixture } from '../helpers/temp.ts';
 import { groupScope } from '../../src/core/layout.ts';
 
 test('string commands run with argv shells only; the stdin-only WSL launcher is refused with what to install',()=>{
- expect(memberShell({shell:'/bin/bash',args:['-c']})).toEqual({shell:'/bin/bash',args:['-c']});
- expect(memberShell({shell:'C:\\Program Files\\Git\\bin\\bash.exe',args:['-c'],commandTransport:'argv'})).toEqual({shell:'C:\\Program Files\\Git\\bin\\bash.exe',args:['-c']});
+ // macOS: whatever Pi found, the shell is the first bash on PATH, and Apple's 3.2 is not accepted.
+ if(process.platform==='darwin') expect(memberShell({shell:'/bin/bash',args:['-c']})).toEqual({shell:Bun.which('bash')!,args:['-c']});
+ else{
+  expect(memberShell({shell:'/bin/bash',args:['-c']})).toEqual({shell:'/bin/bash',args:['-c']});
+  expect(memberShell({shell:'C:\\Program Files\\Git\\bin\\bash.exe',args:['-c'],commandTransport:'argv'})).toEqual({shell:'C:\\Program Files\\Git\\bin\\bash.exe',args:['-c']});
+ }
  expect(()=>memberShell({shell:'C:\\Windows\\System32\\bash.exe',args:['-s'],commandTransport:'stdin'})).toThrow('WSL 启动器');
 });
 

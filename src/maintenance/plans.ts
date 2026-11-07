@@ -4,13 +4,13 @@ import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 
 /** A saved plan, progress or journal: a regular file of at most 32 MiB, opened without following a link. With
- * `private`, Linux also requires the current identity's own 0600-style file. */
+ * `private`, Linux and macOS also require the current identity's own 0600-style file. */
 export async function readPlanFile(path: string, rule: { private: boolean; message: string }): Promise<any> {
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const info = await file.stat();
     if (!info.isFile() || info.size > 32 * 1024 * 1024
-      || (rule.private && process.platform === "linux" && (info.uid !== process.getuid!() || (info.mode & 0o077) !== 0))) throw new Error(rule.message);
+      || (rule.private && process.platform !== "win32" && (info.uid !== process.getuid!() || (info.mode & 0o077) !== 0))) throw new Error(rule.message);
     return JSON.parse(await file.readFile("utf8"));
   } finally { await file.close(); }
 }

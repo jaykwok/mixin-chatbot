@@ -3,6 +3,8 @@ import { codeDigest } from "./source-runtime.ts";
 import { DockerPlatform } from "./docker-host.ts";
 import { recoverDockerTask } from "./docker-task.ts";
 import { recoverWindowsTask } from "./windows-task.ts";
+import { recoverMacosTask } from "./macos-task.ts";
+import { LaunchdPlatform } from "./launchd-host.ts";
 import { MaintenanceRecord } from "./maintenance-record.ts";
 import { createServiceHost, type Platform } from "./service-host.ts";
 import { MaintenanceRefused } from "./maintenance.ts";
@@ -58,6 +60,11 @@ export async function recoverMaintenance(options: MaintenanceHostOptions): Promi
             if (!(platform instanceof DockerPlatform)) throw new Error("Docker 维护必须由原宿主恢复");
             await recoverDockerTask(platform.taskDriver(), current.writer, value => store!.writer(value));
           } else if (current.writer?.kind === "windows-job") await recoverWindowsTask(current.writer, value => store!.writer(value));
+          else if (current.writer?.kind === "macos-session") {
+            if (!(platform instanceof LaunchdPlatform)) throw new Error("macOS 维护必须由原宿主恢复");
+            const service = platform;
+            await recoverMacosTask(current.writer, value => store!.writer(value), () => service.sweep());
+          }
           if (current.staging) await removeStatsStage(options.project, current.staging, value => store!.staging(value));
           let after = await host.inspect();
           if (!after.owned || after.identity !== original.identity || after.state === "unsupported") throw new MaintenanceRefused("回收写入者后部署状态变化");

@@ -172,7 +172,9 @@ test("results directory changed at every write of a codemode call: never into Bo
     for (const o of observed) {
       console.log(`codemode paths, ${o.name}: attacks ${JSON.stringify(o.attacks)}; ${JSON.stringify((o.texts[0] ?? o.last).slice(0, 160))}; moved ${JSON.stringify(o.movedEntries)}`);
     }
-    expect(observed.map((o) => o.name).sort()).toEqual(Object.keys(expected).filter((name) => expected[name]![platform] !== undefined).sort());
+    // macOS behaves as Linux here, except that it has no /proc to go without.
+    const applies = (name: string) => expected[name]![platform] !== undefined && !(process.platform === "darwin" && name === "no /proc: nothing is held");
+    expect(observed.map((o) => o.name).sort()).toEqual(Object.keys(expected).filter(applies).sort());
     for (const o of observed) {
       const label = o.name;
       expect([label, o.bobChanges, o.pathProblems, o.leftovers]).toEqual([label, [], [], []]);

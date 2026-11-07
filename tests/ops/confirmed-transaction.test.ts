@@ -11,7 +11,8 @@ import { tempFixture } from "../helpers/temp.ts";
 import { opsShellFunctions } from "../helpers/ops-shell.ts";
 
 const project = fileURLToPath(new URL("../../", import.meta.url));
-const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
+// The Docker entries' Bash (with /proc, flock and GNU tools) does not run on macOS, which has its own launcher.
+const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : process.platform === "linux" ? Bun.which("bash") : null;
 const posix = (value: string) => value.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 const first = "deploy-" + "a".repeat(32), second = "deploy-" + "b".repeat(32);
 

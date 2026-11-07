@@ -6,7 +6,7 @@ import { fields, textParam } from "../../ops/core/operations.ts";
 import { ApiProblem, type Route } from "./routes.ts";
 import { readConfigurationState } from "../../src/core/configuration-state.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
-import { runtimeQuery } from "./runtime-query.ts";
+import { localHost, runtimeQuery } from "./runtime-query.ts";
 import { redactSecrets } from "../../src/lib/redact.ts";
 
 export type ConfigurationQuery = (action: "check" | "catalog", input: unknown, signal?: AbortSignal) => Promise<unknown>;
@@ -25,9 +25,9 @@ function configurationReason(text: string): string | undefined {
 const ownReason = (error: unknown) => error instanceof Error && error.constructor === Error && !("code" in error) ? configurationReason(error.message) : undefined;
 
 /** Same installed runtime and service identity on Docker hosts, without stopping the service or mounting the console. */
-export function configurationQuery(project: string, query = capture): ConfigurationQuery {
+export function configurationQuery(project: string, query = capture, host = localHost): ConfigurationQuery {
   return async (action, input, signal) => {
-    const result = await runtimeQuery(project, "configuration-check", action, action === "check" ? input : undefined, signal, query);
+    const result = await runtimeQuery(project, "configuration-check", action, action === "check" ? input : undefined, signal, query, host);
     if (result.timedOut) throw new ApiProblem(504, "timeout", `配置校验超时，请检查网络和镜像依赖；${UNCHANGED}`);
     if (result.code !== 0) throw new ApiProblem(409, "input", configurationReason(result.stderr) ?? `配置校验未完成，请检查字段、凭据引用、镜像依赖和网络；${UNCHANGED}`);
     try {

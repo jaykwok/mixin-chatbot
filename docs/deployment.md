@@ -38,7 +38,7 @@ rootful Docker（以 root 运行的默认安装）下，部署、升级、继续
 
 容器进程的身份：真正的首次部署时，root 部署的容器降权到 UID/GID 1001，并把挂载目录的属主改成它；rootless Docker 下以容器内的 root 运行，它映射回宿主机上的部署用户，所以挂载目录仍归这个用户。之后的重新部署和升级沿用原容器 `mixin-bot`（运行或停止均可）的数值 UID/GID：停机前从原容器读取并核对，写入本次事务的快照，预览、迁移、验证实例、正式实例以及中断后的继续和回滚都用它；只给本次新建的目录和文件设置属主，不批量改已有数据的属主。原容器的身份不能可靠确定时（不是数值 UID:GID、数据目录不是本项目的、与 Docker 的模式不符），部署和升级在停机前停止，不猜测。原容器已被删除但部署过时，重新部署按 `data/state` 的属主提出身份，经确认后才使用；升级要求原容器存在。以前由 docker 组普通用户部署的实例改由 root 升级后，服务仍以原来的 UID/GID 运行。检出属于那个用户，git 拒绝以 root 操作它（仓库中的钩子和配置会以 root 运行）：确认信任这份检出后，由 root 执行一次 `git config --global --add safe.directory <项目目录>`，脚本不会代为加入；此后 root 升级时写入检出的文件属于 root。
 
-机器人的 HTTP 服务只供本机管理（控制台、`/health`、关机与通讯录管理），原生部署和 rootful Docker（host 网络）都只监听 `127.0.0.1`。rootless 下 host 网络只是 rootlesskit 的网络命名空间，宿主机连不到，所以部署改为把端口发布到宿主机的 `127.0.0.1:<端口>`，容器内监听所有接口（由部署脚本设置，不来自用户配置）。发布端口的是以部署用户身份运行的 rootlesskit，低于 `net.ipv4.ip_unprivileged_port_start`（通常 1024）的端口默认发布不了：首次部署的默认端口因此改为 `11011`，`BOT_PORT` 指定或已保存的低端口会在停机前被拒绝，并提示改用高端口，或调低该内核参数、给 rootlesskit 加 `CAP_NET_BIND_SERVICE` 后重试；升级沿用的低端口同样在停机前停止。rootless 下机器人容器和外链管理的一次性容器都访问不到只监听宿主机 `127.0.0.1` 的服务（例如本机的 MinIO 或本地模型接口），监听非回环地址的服务可以用宿主机的该地址访问。启用 SELinux 强制模式的主机尚未验证。
+机器人的 HTTP 服务只供本机管理（控制台、`/health`、关机与通讯录管理），原生部署和 rootful Docker（host 网络）都只监听 `127.0.0.1`。rootless 下 host 网络只是 rootlesskit 的网络命名空间，宿主机连不到，所以部署改为把端口发布到宿主机的 `127.0.0.1:<端口>`，容器内监听所有接口（由部署脚本设置，不来自用户配置）。发布端口的是以部署用户身份运行的 rootlesskit，低于 `net.ipv4.ip_unprivileged_port_start`（通常 1024）的端口默认发布不了：`BOT_PORT` 指定或已保存的低端口会在停机前被拒绝，并提示改用高端口，或调低该内核参数、给 rootlesskit 加 `CAP_NET_BIND_SERVICE` 后重试；升级沿用的低端口同样在停机前停止。rootless 下机器人容器和外链管理的一次性容器都访问不到只监听宿主机 `127.0.0.1` 的服务（例如本机的 MinIO 或本地模型接口），监听非回环地址的服务可以用宿主机的该地址访问。启用 SELinux 强制模式的主机尚未验证。
 
 基础组件通过官方渠道安装：[Bun](https://bun.sh/docs/installation)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Docker Engine（Debian）](https://docs.docker.com/engine/install/debian/)。
 
@@ -112,7 +112,7 @@ $env:BOT_DIRECTORY_SCOPE='all'; powershell -NoProfile -ExecutionPolicy Bypass -F
 
 ### 本机管理端口
 
-本机端口只供控制台、`/health`、关机和通讯录管理使用，只在本机回环地址上可达；消息经 Stream 主动连出接收，不需要开放入站端口、域名或隧道。部署不询问端口：首次部署使用 `1011`，rootless Docker 不能发布低端口时使用 `11011`；之后的重新部署和升级沿用已保存的端口（`data/state/bot-port`），继续和回滚只用事务记录中的端口。
+本机端口只供控制台、`/health`、关机和通讯录管理使用，只在本机回环地址上可达；消息经 Stream 主动连出接收，不需要开放入站端口、域名或隧道。部署不询问端口：首次部署使用 `10000`；之后的重新部署和升级沿用已保存的端口（`data/state/bot-port`），继续和回滚只用事务记录中的端口。
 
 端口与其他程序冲突或需要指定时，设置环境变量 `BOT_PORT` 后重新部署；新端口会保存下来，之后沿用：
 
@@ -185,7 +185,7 @@ Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原�
 
 | 设置 | 默认值 | 范围 / 说明 |
 | --- | --- | --- |
-| `BOT_PORT` | 1011（rootless Docker 不能发布低端口时为 11011） | 1–65535；部署时用环境变量指定，保存在 `data/state/bot-port`，见[本机管理端口](#本机管理端口) |
+| `BOT_PORT` | 10000 | 1–65535；部署时用环境变量指定，保存在 `data/state/bot-port`，见[本机管理端口](#本机管理端口) |
 | `BOT_HOST` | 127.0.0.1 | 只接受回环地址 `127.0.0.1`、`::1` 或 `localhost`；HTTP 只供本机管理 |
 | `WORKSPACE_ROOT` | data/workspace | 共享资料目录；可指向已存在的外置目录，服务只读，部署不创建、不改属主。部署时用环境变量指定（设为空恢复默认），见[数据目录](#数据目录) |
 | `BOT_MAX_ACTIVE_REQUESTS` | 32 | 1–1000，普通请求总量 |

@@ -1,11 +1,11 @@
-// How this host runs a detached console task: a Windows one-shot scheduled task, a system transient service (rootful) or a
-// user transient service with linger (rootless). Launching, observing and reconciling the tasks is in task-host.ts.
+// How this host runs a detached console task: a Windows one-shot scheduled task, a one-shot LaunchDaemon on macOS, a system
+// transient service (rootful) or a user transient service with linger (rootless). Launching, observing and reconciling the tasks is in task-host.ts.
 import { existsSync } from "node:fs";
 
 const UNIT_PREFIX = "mixin-console-";
 export const WINDOWS_TASK_PATH = "\\MixinConsole\\";
 
-export type Mechanism = "windows-task" | "systemd-system" | "systemd-user";
+export type Mechanism = "windows-task" | "launchd-system" | "systemd-system" | "systemd-user";
 export type HostingCheck = { ok: true; mechanism: Mechanism; facts: string[] } | { ok: false; reason: string; facts: string[] };
 
 interface Run { code: number; stdout: string; stderr: string }
@@ -52,6 +52,10 @@ export async function hostingCheck(host: HostFacts = realHost()): Promise<Hostin
     if (admin.code !== 0) return { ok: false, reason: `无法确认管理员权限：${admin.stderr.trim() || admin.code}`, facts: [] };
     if (admin.stdout.trim() !== "True") return { ok: false, reason: "需要在管理员终端运行：后台任务沿用运维操作的管理员权限", facts: ["当前终端未提升权限"] };
     return { ok: true, mechanism: "windows-task", facts: ["管理员终端"] };
+  }
+  if (platform === "darwin") {
+    if (uid !== 0) return { ok: false, reason: "需要用 sudo 运行控制台：后台任务以 LaunchDaemon 运行，沿用运维操作的 root 权限", facts: ["当前不是 root"] };
+    return { ok: true, mechanism: "launchd-system", facts: ["root（sudo）"] };
   }
   const facts: string[] = [];
   if (!host.systemdBooted()) return { ok: false, reason: "本机没有以 systemd 启动，无法托管后台任务；只读功能和 CLI 不受影响", facts };

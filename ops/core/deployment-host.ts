@@ -286,7 +286,7 @@ export async function runDeploymentHost<I extends DeploymentInput, O extends Dep
           if (upgrade!.directoryPlan && directoryPlan === null) throw new MaintenanceRefused("通讯录范围计划缺失");
           const workspace = readText(join(project, "data/state/workspace-root"))?.trim() ?? "";
           if (workspace) directory(workspace);
-          const port = readText(join(project, "data/state/bot-port"))?.trim() || "1011";
+          const port = readText(join(project, "data/state/bot-port"))?.trim() || "10000";
           chosen = { format: "2", operation: "upgrade", snapshot: name, target_sha: upgrade!.target, original_sha: upgrade!.original,
             original_branch: upgrade!.branch, original_workspace_root: workspace, target_workspace_root: workspace, was_running: start!.wasRunning ? "1" : "0",
             bot_port: port, reconfigure_ai: "0" };

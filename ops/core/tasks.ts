@@ -85,7 +85,7 @@ function identity(value: unknown): value is ExecutorIdentity {
 }
 function validRequest(value: unknown, id: string): value is TaskRequest {
   return object(value) && value.version === 1 && value.id === id && text(value.planId) && text(value.operation)
-    && object(value.params) && text(value.project) && ["windows-task", "systemd-system", "systemd-user"].includes(String(value.mechanism))
+    && object(value.params) && text(value.project) && ["windows-task", "launchd-system", "systemd-system", "systemd-user"].includes(String(value.mechanism))
     && number(value.createdAt) && number(value.acceptBy) && value.acceptBy > value.createdAt;
 }
 function validClaim(value: unknown): value is Claim {

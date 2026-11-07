@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { capture } from "./query.ts";
-import { opsCommand, SOURCE_DIR } from "../../ops/core/platform.ts";
+import { hostPlatform, opsCommand, SOURCE_DIR } from "../../ops/core/platform.ts";
 import { readRuntimeSettings, sweepRuntimeDrafts, writeRuntimeDraft, type RuntimeChanges } from "../../ops/config/runtime-draft.ts";
 import { withRuntimeLabels } from "../../ops/core/runtime-options.ts";
 import { fields, operationArgs, textParam, tmpReader } from "../../ops/core/operations.ts";
@@ -51,7 +51,7 @@ export function operationPreparer(project: string, views: Views, query = capture
         argv.push("--user", selected.user, "--group", selected.space === "direct" ? "direct" : selected.space.slice(7));
         if (selected.space !== "direct") argv.push("--storage-segment");
       }
-      const command = opsCommand(process.platform === "win32" ? "windows" : "linux", argv, project, SOURCE_DIR, "console");
+      const command = opsCommand(hostPlatform(), argv, project, SOURCE_DIR, "console");
       const result = await query(command.command, command.args, { env: command.env, timeout: 90_000 });
       if (result.code !== 0 || result.timedOut) throw new Error("生成文件清单失败，请查看运维日志并重新预览");
       const saved = await tmpReader(operation)(join(project, "data"), id);

@@ -272,7 +272,27 @@ def check_office_errors(root):
                 assert target.is_dir() and target.is_relative_to(folder)
             # The profile is the directory the caller supplied, not one inside the job folder.
             assert "-env:UserInstallation=" + profile.as_uri() in run.call_args.args[0]
+            # Started in the job folder: the caller's working directory may be out of the account's reach.
+            assert run.call_args.kwargs["cwd"] == str(folder)
+            assert "FONTCONFIG_FILE" not in env or sys.platform == "darwin"
             assert (profile / "user/registrymodifications.xcu").is_file() and not (folder / "office-profile").exists()
+    # macOS: the shipped font configuration, unless the operator set one.
+    for preset, expected in (({}, str(operations.MACOS_FONTS)), ({"FONTCONFIG_FILE": "/etc/custom-fonts.conf"}, "/etc/custom-fonts.conf")):
+        folder, profile = root / f"office-fonts-{len(preset)}", root / f"office-fonts-profile-{len(preset)}"
+        folder.mkdir()
+        profile.mkdir()
+        result = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"fixture")
+        with patch.object(operations, "office_binary", return_value="fixture-soffice"), patch.object(operations.subprocess, "run", return_value=result) as run, \
+                patch.object(operations.sys, "platform", "darwin"), patch.dict(operations.os.environ, preset):
+            if not preset:
+                operations.os.environ.pop("FONTCONFIG_FILE", None)
+            try:
+                operations.convert_office(source, folder, profile)
+                raise AssertionError("conversion failure must be reported")
+            except ValueError:
+                pass
+            assert run.call_args.kwargs["env"]["FONTCONFIG_FILE"] == expected
+    assert operations.MACOS_FONTS.is_file() and "<dir>/System/Library/Fonts</dir>" in operations.MACOS_FONTS.read_text(encoding="utf-8")
 
 
 def prepare(root):

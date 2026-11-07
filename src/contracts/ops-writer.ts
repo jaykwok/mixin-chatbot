@@ -1,5 +1,6 @@
 // The writer of a maintenance or deployment data step, as recorded before it starts: a Docker container (daemon-side
-// lifetime) or a Windows job object. Ordinary maintenance and deployment recovery share these records and their checks.
+// lifetime), a Windows job object or a macOS supervised session. Ordinary maintenance and deployment recovery share these
+// records and their checks.
 import { validateDockerDataAccess, type DockerDataAccess } from "./ops-task-access.ts";
 import { validateOpsTaskInput, type OpsTaskInput } from "./ops-task-input.ts";
 import { validateOpsReports, type OpsReports } from "./ops-reports.ts";
@@ -37,17 +38,31 @@ export interface WindowsTaskRecord {
   commandDigest: string;
   phase: "prepared" | "reaped";
 }
+/**
+ * `service`: it ran as the service account, whose processes can all be listed; "reaped" then means that account had
+ * nothing left besides a running service. Otherwise "reaped" means only the supervisor's own bounded cleanup, which a
+ * setsid() escapes: never a proof that nothing is left, and nothing may authorize a deletion from it.
+ */
+export interface MacosTaskRecord {
+  kind: "macos-session";
+  version: 1;
+  id: string;
+  service: boolean;
+  commandDigest: string;
+  phase: "prepared" | "reaped";
+}
 
 const hash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const id = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
 const text = (value: unknown, max = 1024): value is string => typeof value === "string" && value.length > 0 && value.length <= max && !/[\x00-\x1f]/.test(value);
 
-export function validateOpsWriter(value: unknown, runtime: string): asserts value is DockerTaskRecord | WindowsTaskRecord {
-  const writer = value as DockerTaskRecord | WindowsTaskRecord;
+export function validateOpsWriter(value: unknown, runtime: string): asserts value is DockerTaskRecord | WindowsTaskRecord | MacosTaskRecord {
+  const writer = value as DockerTaskRecord | WindowsTaskRecord | MacosTaskRecord;
   if (!writer || typeof writer !== "object" || Array.isArray(writer) || writer.version !== 1 || !id(writer.id)
-    || !hash(writer.commandDigest) || !["docker", "windows-job"].includes(writer.kind)) throw new Error("运维写入者类型不支持");
+    || !hash(writer.commandDigest) || !["docker", "windows-job", "macos-session"].includes(writer.kind)) throw new Error("运维写入者类型不支持");
   if (writer.kind === "windows-job" && (!/^Global\\mixin-process-[a-f0-9-]{36}$/.test(writer.job)
     || writer.job.slice("Global\\mixin-process-".length).replaceAll("-", "") !== writer.id || !["prepared", "reaped"].includes(writer.phase))) throw new Error("Windows 写入者记录不完整");
+  if (writer.kind === "macos-session" && (typeof writer.service !== "boolean" || !["prepared", "reaped"].includes(writer.phase))) throw new Error("macOS 写入者记录不完整");
   if (writer.kind === "docker") {
     if (!text(writer.daemon, 128) || !/^unix:\/\/\/[^\x00-\x1f,]+$/.test(writer.endpoint)
       || !/^sha256:[a-f0-9]{64}$/.test(writer.image) || !/^\d+(?::\d+)?$/.test(writer.user)

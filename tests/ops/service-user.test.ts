@@ -10,7 +10,8 @@ import { tempFixture } from "../helpers/temp.ts";
 // operations entry's guard for one-off containers (ops.sh), with Docker, id, stat, chown and flock stubbed; the scenarios
 // are in tests/helpers/service-user-cases.sh.
 const project = fileURLToPath(new URL("../../", import.meta.url));
-const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
+// The Docker entries' Bash (with /proc, flock and GNU tools) does not run on macOS, which has its own launcher.
+const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : process.platform === "linux" ? Bun.which("bash") : null;
 const available = !!bash && existsSync(bash);
 const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 const cases = posixPath(join(project, "tests/helpers/service-user-cases.sh"));

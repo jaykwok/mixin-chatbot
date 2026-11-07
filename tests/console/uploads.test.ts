@@ -16,16 +16,16 @@ const observers = { hosting: async () => ({ state: "ended" as const }), needsRec
 function source(path: string): Buffer {
   const db = new Database(path, { create: true }); db.exec("PRAGMA journal_mode=DELETE; CREATE TABLE fixture (id INTEGER); INSERT INTO fixture VALUES (1)"); db.close(); return readFileSync(path);
 }
-const uploadRequest = (bytes: Uint8Array) => new Request("http://127.0.0.1:11012/upload", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: bytes });
+const uploadRequest = (bytes: Uint8Array) => new Request("http://127.0.0.1:10001/upload", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: bytes });
 
 test("统计上传受来源和登录保护，封存及取消路由不会误匹配原始流，JSON 仍限制 16 KB", async () => {
   const f = await tempFixture("console-upload-http-");
   try {
     const uploads = new UploadStore(join(f.root, ".console")), auth = new Auth(), login = auth.exchange(auth.issueToken().token)!;
-    const handler = createHandler({ port: 11012, guard: guardConfig(11012), auth, instanceId: "fixture", overview: async () => { throw new Error("unused"); },
+    const handler = createHandler({ port: 10001, guard: guardConfig(10001), auth, instanceId: "fixture", overview: async () => { throw new Error("unused"); },
       bundle: { index: { path: "/", type: "text/html", body: new Uint8Array() }, assets: new Map() }, routes: uploads.routes() });
-    const call = (path: string, body: unknown, raw = false, origin = "http://127.0.0.1:11012") => handler(new Request(`http://127.0.0.1:11012${path}`, {
-      method: "POST", headers: { Host: "127.0.0.1:11012", Origin: origin, "X-Console-Request": "1", "Content-Type": raw ? "application/octet-stream" : "application/json", cookie: `${auth.cookieName}=${login.sessionId}` },
+    const call = (path: string, body: unknown, raw = false, origin = "http://127.0.0.1:10001") => handler(new Request(`http://127.0.0.1:10001${path}`, {
+      method: "POST", headers: { Host: "127.0.0.1:10001", Origin: origin, "X-Console-Request": "1", "Content-Type": raw ? "application/octet-stream" : "application/json", cookie: `${auth.cookieName}=${login.sessionId}` },
       body: raw ? body as Uint8Array : JSON.stringify(body),
     }));
     const bytes = source(join(f.root, "fixture.sqlite"));

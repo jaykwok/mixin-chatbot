@@ -93,7 +93,8 @@ test("发给查询线程的取消和退役消息丢失时，回收线程仍能�
 }, 45000);
 
 test("超时会终止整棵查询进程树，正常完成的查询也不会遗留后台孙进程", async () => {
-  for (const mode of ["timeout", "leave-descendant"] as const) {
+  // macOS: a setsid grandchild whose parent exited first belongs to launchd and is out of reach (the accepted limit, src/lib/darwin.ts killDescendants).
+  for (const mode of process.platform === "darwin" ? ["timeout"] as const : ["timeout", "leave-descendant"] as const) {
     // Warm the reused host first so this test's deadline exercises a running tree.
     expect((await capture(process.execPath, ["-e", "console.log('ready')"])).code).toBe(0);
     const fixture = await treeFixture();

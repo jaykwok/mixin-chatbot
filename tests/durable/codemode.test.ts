@@ -33,6 +33,7 @@ import { type GroupHarness, openGroupHarness, PROJECT_PROGRESS as PROGRESS } fro
 import { tempFixture } from "../helpers/temp.ts";
 import { scopeOf } from "../helpers/layout.ts";
 import { appLayout, groupScope } from "../../src/core/layout.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 const fixture = await tempFixture("durable-codemode-");
 afterAll(() => fixture.cleanup());
@@ -1347,9 +1348,9 @@ text("x".repeat(100)); image("data:image/png;base64,${PNG}"); text("y".repeat(10
 
       // Expiry removes the saved images with their call directories (Linux keeps them for the rootless reclaimer).
       const removed = await removeResultDirectories(aliceTmp, Number.POSITIVE_INFINITY);
-      if (process.platform === "linux") expect(removed).toEqual([]);
+      if (removalNeedsPermit()) expect(removed).toEqual([]);
       else expect(removed).toEqual(expect.arrayContaining([basename(dir), basename(dirname(after!.path))]));
-      expect(existsSync(labels[0]!.path) || existsSync(after!.path)).toBe(process.platform === "linux");
+      expect(existsSync(labels[0]!.path) || existsSync(after!.path)).toBe(removalNeedsPermit());
     } finally { await group.close(); }
   }, 60_000);
 });

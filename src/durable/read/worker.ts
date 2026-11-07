@@ -1,11 +1,12 @@
 // The bot's read-only thread for the host console. One operation at a time, each on its own read-only connection and in
 // one read transaction that ends with it; never on the shared write thread (sqlite-client.ts). A database is only opened
 // when it is a regular file inside the conversations root: nothing is created, migrated or recovered.
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import { assertDataDirectory } from "../../lib/group-data.ts";
+import { openReadable } from "../../lib/sqlite-open.ts";
 import { groupSegment } from "../../core/layout.ts";
 import { assertDurableSchema } from "../schema-gate.ts";
 import { missing, spaceDirectories } from "../space-databases.ts";
@@ -30,7 +31,7 @@ function guard(message: ReadMessage): q.Guard {
 
 /** A read transaction on a read-only connection; the connection closes with it. */
 function withReader<T>(path: string, read: (db: Database) => T | Promise<T>): Promise<T> {
-  const db = new Database(path, { readonly: true, strict: true });
+  const db = openReadable(path, { strict: true });
   return (async () => {
     try {
       db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { OpsResult } from "../contracts/ops-result.ts";
 import type { MaintenanceIntent } from "./maintenance-state.ts";
 import { validateOpsRuntimeDraft, type OpsRuntimeDraft } from "../contracts/ops-runtime-draft.ts";
-import { validateOpsWriter, type DockerTaskRecord, type WindowsTaskRecord } from "../contracts/ops-writer.ts";
+import { validateOpsWriter, type DockerTaskRecord, type MacosTaskRecord, type WindowsTaskRecord } from "../contracts/ops-writer.ts";
 
 export const OPS_MAINTENANCE_FILE = "data/state/ops-maintenance.json";
 export interface ServiceFacts {
@@ -45,7 +45,7 @@ export interface OpsMaintenanceRecord {
   version: 1;
   checkpoint: MaintenanceCheckpoint;
   /** No document keys, action argv, credentials or message bodies. */
-  writer?: DockerTaskRecord | WindowsTaskRecord;
+  writer?: DockerTaskRecord | WindowsTaskRecord | MacosTaskRecord;
   staging?: StatsStageRecord;
   runtimeDraft?: OpsRuntimeDraft;
   result?: OpsResult;

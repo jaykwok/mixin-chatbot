@@ -19,6 +19,7 @@ import { tempFixture } from "../helpers/temp.ts";
 import { handoffFullResults, stubResultsBackend } from "../helpers/results-backend.ts";
 import { scopeOf } from "../helpers/layout.ts";
 import { appLayout, groupScope } from "../../src/core/layout.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 const f = await tempFixture("durable-mcp-"); afterAll(() => f.cleanup());
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=";
@@ -77,7 +78,7 @@ test.each(process.platform === "linux" ? [false, true] : [false])("deferred MCP 
       expect(await removeResultDirectories(tempDir, Infinity, policy)).toEqual([]);
       expect(await readFile(join(mcpDir, "output-1.png"))).toEqual(Buffer.from(png, "base64"));
       policy.protected.clear();
-      expect((await removeResultDirectories(tempDir, Infinity, policy)).sort()).toEqual(process.platform === "linux" && !isolated ? [] : [...owned].sort());
+      expect((await removeResultDirectories(tempDir, Infinity, policy)).sort()).toEqual(removalNeedsPermit() && !isolated ? [] : [...owned].sort());
       if (runtime) for (const id of mapping.values()) expect((await runtime.backend.describe(id, tempDir)).phase).toBe("removed");
     }
     expect(identities).toEqual(["alice", "bob"]);

@@ -3,8 +3,9 @@
 // task daemon.
 // runDeployment owns ordering, commit boundaries and rollback; nothing here decides them.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, lchownSync, lstatSync, mkdirSync, realpathSync, rmdirSync, rmSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync, lchownSync, lstatSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { captureFiles, removeCompleted, resolvedPath, restoreFiles, serviceDirectories, type Owner } from "./deployment-files.ts";
 import type { DockerPlatform } from "./docker-host.ts";
 import { parseRecord, serializeRecord, type Values } from "./key-value-record.ts";
 import type { NativeOutput, NativeRunner } from "./native-process.ts";
@@ -16,6 +17,7 @@ export const DEPLOY_FILES = ["data/config", "data/runtime/pi/settings.json", "da
 export const SERVICE_CONTAINER = "mixin-bot", ROLLBACK_CONTAINER = "mixin-bot-rollback", SERVICE_IMAGE = "mixin-bot";
 export const PREVIOUS_IMAGE_TAG = "mixin-bot:previous";
 export const failedContainerName = () => `mixin-bot-failed-${Math.floor(Date.now() / 1000)}-${randomBytes(2).toString("hex")}`;
+const GNU = { cp: "cp", mv: "mv" };
 const LABEL_REVISION = "org.opencontainers.image.revision", LABEL_PROJECT = "org.mixin-bot.project",
   LABEL_OPERATION = "org.mixin-bot.operation", LABEL_SOURCE = "org.mixin-bot.source";
 
@@ -56,19 +58,6 @@ export const serializeTaskRuntime = (record: TaskRuntimeRecord) => serializeReco
 /** The candidate tags of several deployments on one daemon stay apart by a digest of the project path. */
 export const candidateProjectId = (project: string) => createHash("sha256").update(realpathSync(project)).digest("hex").slice(0, 12);
 
-/** realpath that also accepts a missing tail (`realpath -m`): the backup and log directories may not exist yet. */
-function resolvedPath(path: string): string {
-  const rest: string[] = [];
-  for (let at = resolve(path); ; at = dirname(at)) {
-    try { return join(realpathSync(at), ...rest.reverse()); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(at) === at) throw error;
-      // A dangling link is no missing tail: it would hide where the directory gets created later.
-      try { lstatSync(at); } catch (missing) { if ((missing as NodeJS.ErrnoException).code === "ENOENT") { rest.push(basename(at)); continue; } throw missing; }
-      throw new Error("路径含有失效的链接：" + at);
-    }
-  }
-}
 const done = (result: { code: number; stderr: string }, action: string) => {
   if (result.code !== 0) throw new Error(`${action}失败：${result.stderr.trim() || "退出码 " + result.code}`);
 };
@@ -195,16 +184,7 @@ export class DockerDeployment {
     done(result, "核对共享资料目录的边界");
   }
 
-  /** Only directories this run creates go to the service; existing ones and their data keep their owner. */
-  serviceDirectories(paths: readonly string[], owner?: { uid: number; gid: number }): void {
-    for (const relative of paths) {
-      const path = join(this.project, relative), created: string[] = [];
-      if (existsSync(path)) { if (!lstatSync(path).isDirectory()) throw new Error(`${relative} 不是目录`); continue; }
-      for (let at = path; !existsSync(at) && dirname(at) !== at; at = dirname(at)) created.push(at);
-      mkdirSync(path, { recursive: true });
-      if (owner) for (const directory of created) lchownSync(directory, owner.uid, owner.gid);
-    }
-  }
+  serviceDirectories(paths: readonly string[], owner?: Owner): void { serviceDirectories(this.project, paths, owner); }
 
   /** The service identity appends to this operation's log and starts its own diagnostics: only these two levels and the log change owner. */
   operationLogAccess(log: string | undefined, owner?: { uid: number; gid: number }): void {
@@ -215,46 +195,9 @@ export class DockerDeployment {
     }
   }
 
-  private async copy(run: NativeRunner, source: string, destination: string): Promise<void> {
-    mkdirSync(dirname(destination), { recursive: true });
-    const result = await run({ command: "cp", args: ["-a", "--", source, destination], cwd: this.project, protocol: true, timeoutMs: 10 * 60_000 });
-    if (result.code !== 0) throw new Error(`无法复制 ${source}（退出码 ${result.code}）`);
-  }
-  /** Owner, mode and links preserved. Nothing here touches the running service or a conversation database. */
-  async captureFiles(snapshot: string, run: NativeRunner): Promise<void> {
-    for (const relative of DEPLOY_FILES) {
-      const source = join(this.project, relative);
-      if (existsSync(source)) await this.copy(run, source, join(snapshot, relative));
-    }
-  }
-  /** Moved aside under the transaction's name, never deleted. A rerun archives what it restored and copies it again. */
-  private async archive(path: string, name: string, run: NativeRunner): Promise<void> {
-    try { lstatSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-    const project = realpathSync(this.project), parent = realpathSync(dirname(path));
-    if (parent !== project && !parent.startsWith(project + "/")) throw new Error("归档父目录越界");
-    const archive = join(this.project, "backup/rm", name); mkdirSync(archive, { recursive: true });
-    const result = await run({ command: "mv", args: ["--", path, join(archive, `${Math.floor(Date.now() / 1000)}-${randomBytes(4).toString("hex")}-${basename(path)}`)],
-      cwd: this.project, protocol: true, timeoutMs: 10 * 60_000 });
-    if (result.code !== 0) throw new Error(`无法归档 ${path}（退出码 ${result.code}）`);
-  }
-  async restoreFiles(snapshot: string, name: string, run: NativeRunner): Promise<void> {
-    for (const relative of DEPLOY_FILES) {
-      const current = join(this.project, relative), saved = join(snapshot, relative);
-      await this.archive(current, name, run);
-      if (existsSync(saved)) await this.copy(run, saved, current);
-    }
-  }
-  /** A successful operation discards only what it owns: its snapshot and the archive under its name. */
-  removeCompleted(name: string): void {
-    const project = realpathSync(this.project), backup = join(project, "backup"), targets = [join(backup, "snapshots", name), join(backup, "rm", name)];
-    // Refuse a redirected path before removing anything; rm unlinks links inside without following them.
-    for (const target of targets) if (resolvedPath(target) !== target) throw new Error("快照路径含有链接");
-    for (const target of targets) rmSync(target, { recursive: true, force: true });
-    // The service holds backup/ itself as a bind mount, so only these empty parents may go.
-    for (const parent of ["snapshots", "rm"]) {
-      try { rmdirSync(join(backup, parent)); } catch { /* Other snapshots or archives remain. */ }
-    }
-  }
+  async captureFiles(snapshot: string, run: NativeRunner): Promise<void> { await captureFiles(this.project, snapshot, DEPLOY_FILES, run, GNU); }
+  async restoreFiles(snapshot: string, name: string, run: NativeRunner): Promise<void> { await restoreFiles(this.project, snapshot, name, DEPLOY_FILES, run, GNU); }
+  removeCompleted(name: string): void { removeCompleted(this.project, name); }
 
   async taskDaemon(record: TaskRuntimeRecord, uid: number): Promise<void> {
     const result = await this.docker.taskProbe(record.endpoint, uid, ["info", "--format", "{{json .}}"]);

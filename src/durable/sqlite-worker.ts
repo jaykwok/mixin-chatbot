@@ -1,9 +1,10 @@
 // Only SQL connections and synchronous I/O live here; transactions are sequenced by the caller. Every reply carries when
 // its request arrived, started and ended (sql-timing.ts).
-import { Database, type Statement } from "bun:sqlite";
+import type { Database, Statement } from "bun:sqlite";
 import { mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { parentPort } from "node:worker_threads";
+import { openWritable } from "../lib/sqlite-open.ts";
 import { encodeError, sharedNow, type Command, type Reply, type Request } from "./sqlite-protocol.ts";
 
 if (!parentPort) throw new Error("The SQLite worker must run on a worker thread");
@@ -45,7 +46,7 @@ function execute(command: Command): unknown {
   if (command.kind === "open") {
     if (connections.has(command.connection)) throw new Error("Duplicate SQLite connection");
     mkdirSync(dirname(command.path), { recursive: true });
-    const db = new Database(command.path, { create: true, readwrite: true, strict: true });
+    const db = openWritable(command.path, { create: true, readwrite: true, strict: true });
     try {
       const info = statSync(command.path, { bigint: true });
       connections.set(command.connection, { db, file: `${info.dev}:${info.ino}`, statements: new Map() });

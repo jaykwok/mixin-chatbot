@@ -16,6 +16,7 @@ import { join } from "node:path";
 import type { ResultOwnership } from "../../contracts/maintenance.ts";
 import type { ReferenceText } from "../../core/reference-text.ts";
 import { configuredRootlessTasks } from "../../core/task-backend.ts";
+import { removalNeedsPermit } from "../../core/reclamation.ts";
 import { removeResultDirectories } from "./files.ts";
 import { RESULT_PRESSURE, ResultsDoc } from "./ownership.ts";
 import { handoffResults, reclamationBatch, ReclamationItems, settleReclamation } from "./queue.ts";
@@ -72,7 +73,7 @@ export class ResultMaintenance {
     await this.#reconcileRemoved(calls, tempDir, due.names, removed);
     // Only successful removals may be retired. A failed deletion remains registered for the next sweep/clear retry.
     if (removed.length) await harness.commit(async tx => retireRemoved((await tx.doc(ResultsDoc)).calls, removed), this.options.context);
-    if (process.platform === "linux") {
+    if (removalNeedsPermit()) {
       const pendingNames = due.eligible.filter(name => !protectedNames.has(name) && !removed.includes(name));
       if (pendingNames.length) await harness.commit(tx => handoffResults(tx, phone, pendingNames, Date.now()), this.options.context);
     }
@@ -97,7 +98,7 @@ export class ResultMaintenance {
 
   /** Step 3: reconcile a crash after deletion but before its completion receipt was committed (adds to `removed`). */
   async #reconcileRemoved(calls: Readonly<Record<string, ResultOwnership>>, tempDir: string, names: readonly string[], removed: string[]): Promise<void> {
-    if (process.platform === "linux") return; // An absent shared name does not prove physical deletion.
+    if (removalNeedsPermit()) return; // An absent shared name does not prove physical deletion.
     for (const name of names) {
       // An isolated result is never under `codemode/`: its task's receipt says whether it is gone (step 2).
       if (!/^\d+-[A-Za-z0-9_.-]+$/.test(name) || calls[name]!.isolatedTask !== undefined || calls[name]!.expiryRequestedAt === undefined

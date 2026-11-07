@@ -6,6 +6,8 @@ import { MaintenanceRecord } from "./maintenance-record.ts";
 import { DockerPlatform, type DockerService } from "./docker-host.ts";
 import { newDockerTask, runDockerTask, taskInput } from "./docker-task.ts";
 import { newWindowsTask, runWindowsTask } from "./windows-task.ts";
+import { newMacosTask, runMacosTask } from "./macos-task.ts";
+import { LaunchdPlatform, serviceEnvironment, type LaunchdService } from "./launchd-host.ts";
 import { runNative, type NativeOutput, type NativeRunner, type NativeResult } from "./native-process.ts";
 import type { MaintenanceHost, MaintenanceRequest } from "./maintenance.ts";
 import { MaintenanceRefused } from "./maintenance.ts";
@@ -68,6 +70,11 @@ export function createMaintenanceHost(options: MaintenanceHostOptions, request: 
       if (gid === undefined) throw new MaintenanceRefused("缺少服务的数值 GID，不能准备备份目录");
       return { uid: uid!, gid };
     }
+    if (platform instanceof LaunchdPlatform) {
+      const user = (deployment as LaunchdService).user;
+      if (!user) throw new MaintenanceRefused("服务账户不存在，不能准备数据目录");
+      return user;
+    }
     return { uid: process.geteuid?.() ?? 0, gid: process.getegid?.() ?? 0 };
   };
   const service = createServiceHost({ ...options, maintenanceId: request.id,
@@ -115,6 +122,7 @@ export function createMaintenanceHost(options: MaintenanceHostOptions, request: 
       current(); deployment = await platform!.inspect();
       if (!deployment.owned || !["running", "stopped", "absent"].includes(deployment.state)) throw new MaintenanceRefused("部署身份或运行方式不支持维护");
       if (platform instanceof DockerPlatform && deployment.state === "absent") throw new MaintenanceRefused("机器人容器不存在，无法确定数据步骤的版本，请先部署");
+      if (platform instanceof LaunchdPlatform && !(deployment as LaunchdService).user) throw new MaintenanceRefused("服务账户不存在，请先部署");
       if (codeDigest(options.source) !== request.runtime) throw new MaintenanceRefused("维护运行包已经变化，请重新预览");
       prepareConsoleDir(consoleDir(options.project));
       const pinned = freezeRuntime(consoleDir(options.project), options.source);
@@ -156,6 +164,13 @@ export function createMaintenanceHost(options: MaintenanceHostOptions, request: 
           ...(step.reports ? { reports } : {}),
           ...(step.currentCode ? { runtime: request.runtime } : {}), ...(environment ? { runtimeEnvironment: runtimeEnvironmentDigest(environment) } : {}) }, args);
         return runDockerTask(platform.taskDriver(step.timeoutMs, !!step.protocol, output, step.input, environment), writer, args, value => record.writer(value), signal);
+      }
+      if (platform instanceof LaunchdPlatform) {
+        // As the service account: what it leaves behind is listed by UID once the service is down (MacosTaskRecord).
+        const command = { command: process.execPath, args: ["--no-env-file", "run", join(source, step.script), ...step.args], cwd: options.project,
+          env: serviceEnvironment(options.project), signal, protocol: !!step.protocol, timeoutMs: step.timeoutMs ?? 60 * 60_000, input: step.input, identity: dataOwner() };
+        const service = platform;
+        return runMacosTask(command, newMacosTask(command, true), value => record.writer(value), () => service.sweep(), command => (options.native ?? runNative)(command, output));
       }
       const command = { command: process.execPath, args: ["--no-env-file", "run", join(source, step.script), ...step.args], cwd: options.project,
         env: { ...process.env }, signal, protocol: !!step.protocol, timeoutMs: step.timeoutMs ?? 60 * 60_000, input: step.input };

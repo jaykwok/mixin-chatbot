@@ -12,7 +12,7 @@
 bun run console
 ```
 
-宿主机需要 Bun 1.4.4+。Windows 自动打开默认浏览器；Linux 打印 SSH 转发命令和登录链接。控制台只监听 `127.0.0.1`，初始端口为 `11012`，成功启动后保存在 `.console/port`，后续沿用。
+宿主机需要 Bun 1.4.4+。Windows 自动打开默认浏览器；Linux 打印 SSH 转发命令和登录链接。控制台只监听 `127.0.0.1`，初始端口为 `10001`，成功启动后保存在 `.console/port`，后续沿用。
 
 | 环境 | 管理操作使用的身份 | 后台任务 |
 | --- | --- | --- |
@@ -25,7 +25,7 @@ rootless 使用该用户自己的 `DOCKER_HOST`、`XDG_RUNTIME_DIR` 和登录会
 常用参数：
 
 ```sh
-bun run console --port 12012
+bun run console --port 12001
 bun run console --no-open
 bun run console --help
 ```
@@ -41,17 +41,17 @@ bun run console --help
 在服务器启动控制台，在自己的电脑建立转发，再在电脑的浏览器打开终端打印的登录链接。例如：
 
 ```sh
-ssh -N -L 11012:127.0.0.1:11012 user@server
+ssh -N -L 10001:127.0.0.1:10001 user@server
 ```
 
 可以将转发写入 SSH 配置。电脑上的本地端口需要不同时，在服务器显式指定该端口：
 
 ```sh
 # 服务器
-bun run console --forwarded-port 12012
+bun run console --forwarded-port 12001
 
 # 自己的电脑
-ssh -N -L 12012:127.0.0.1:11012 user@server
+ssh -N -L 12001:127.0.0.1:10001 user@server
 ```
 
 使用输出中的 `127.0.0.1` 地址和端口，不将页面发布到公网。控制台检查 Host、请求来源和登录 cookie；同一主机其他端口的网页也不能代发管理请求。

@@ -6,7 +6,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { renameSync } from "node:fs";
 import { join } from "node:path";
-import { Database } from "bun:sqlite";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { AssistantMessage, Models } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
@@ -22,6 +21,7 @@ import { fauxModels, TEST_PROGRESS } from "../helpers/durable.ts";
 import { databaseOf, statsOf } from "../helpers/layout.ts";
 import { recordingOutbound, replyTexts, type Sent } from "../helpers/recording-outbound.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { openReadable } from "../../src/lib/sqlite-open.ts";
 
 const fixture = await tempFixture("durable-service-sleeping-");
 afterAll(() => fixture.cleanup());
@@ -99,7 +99,7 @@ function usage(root: string) {
 /** The committed state of the group database now, as a crash would leave it; `restore()` puts it in place after a close. */
 function crashImage(root: string): { restore(): void } {
   const path = databaseOf(root, GROUP), image = `${path}.crash-${++counter}`;
-  const db = new Database(path, { readonly: true });
+  const db = openReadable(path);
   try { db.query("VACUUM INTO ?").run(image); } finally { db.close(); }
   return { restore: () => renameSync(image, path) };
 }

@@ -21,6 +21,7 @@ import { tempFixture } from "../helpers/temp.ts";
 import { handoffFullResults, stubResultsBackend } from "../helpers/results-backend.ts";
 import { scopeOf, statsOf } from "../helpers/layout.ts";
 import { appLayout, groupScope } from "../../src/core/layout.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 const f = await tempFixture("durable-auxiliary-");
 afterAll(() => f.cleanup());
@@ -111,7 +112,7 @@ test.each(process.platform === "linux" ? [false, true] : [false])("native auxili
     expect(await removeResultDirectories(tempDir, Infinity, policy)).toEqual([]);
     expect(await readFile(imagePath)).toEqual(Buffer.from(PNG, "base64"));
     policy.protected.clear();
-    expect(await removeResultDirectories(tempDir, Infinity, policy)).toEqual(process.platform === "linux" && !isolated ? [] : names);
+    expect(await removeResultDirectories(tempDir, Infinity, policy)).toEqual(removalNeedsPermit() && !isolated ? [] : names);
     if (runtime) for (const id of mapping.values()) expect((await runtime.backend.describe(id, tempDir)).phase).toBe("removed");
     if (isolated) expect((await g.harness.snapshot(ResultsDoc, context))!.calls["999999-protected"]!.phone).toBe("protected-member");
     expect(g.reports).toEqual([]);

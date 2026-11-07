@@ -2,6 +2,11 @@
 
 const pad = (value: number) => String(value).padStart(2, "0");
 
+/** The host system as people name it. */
+export function platformName(platform: "windows" | "linux" | "macos"): string {
+  return platform === "windows" ? "Windows" : platform === "macos" ? "macOS" : "Linux";
+}
+
 export function duration(ms: number): string {
   const minutes = Math.max(0, Math.floor(ms / 60_000));
   if (minutes < 1) return "不到 1 分钟";

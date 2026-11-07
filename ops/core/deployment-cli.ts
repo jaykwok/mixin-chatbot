@@ -6,6 +6,7 @@ import { loadDeploymentState, type DeploymentState } from "./deployment-state.ts
 import { MaintenanceRefused, refusing } from "./maintenance.ts";
 import { preflightWindowsDeploy, preflightWindowsUpgrade, runWindowsLifecycle } from "./windows-lifecycle.ts";
 import { preflightDockerDeploy, preflightDockerUpgrade, runDockerLifecycle, type DockerInput } from "./docker-lifecycle.ts";
+import { preflightMacosDeploy, preflightMacosUpgrade, runMacosLifecycle } from "./macos-lifecycle.ts";
 import { readDeployStage } from "./deploy-stage.ts";
 import type { DeploymentOptions } from "./deployment-host.ts";
 import { checkTaskPlan } from "./check-plan.ts";
@@ -110,6 +111,13 @@ interface Invocation {
   matches(request: TaskRequest): boolean;
 }
 
+/** Windows and macOS run the checkout itself; Linux builds and runs a candidate image. */
+function lifecycle(platform: NodeJS.Platform) {
+  if (platform === "win32") return { native: "Windows ", upgrade: preflightWindowsUpgrade, deploy: preflightWindowsDeploy, run: runWindowsLifecycle };
+  if (platform === "darwin") return { native: "macOS ", upgrade: preflightMacosUpgrade, deploy: preflightMacosDeploy, run: runMacosLifecycle };
+  return { native: "", upgrade: preflightDockerUpgrade, deploy: preflightDockerDeploy, run: runDockerLifecycle };
+}
+
 /** The same captured transaction must survive the pre-lock read, including the case where there was no transaction. */
 function hostOptions(call: Invocation, dependencies: Dependencies, source: string): DeploymentOptions {
   const { noun, project, pending, command } = call, env = dependencies.env ?? process.env, load = dependencies.load ?? loadDeploymentState;
@@ -133,17 +141,17 @@ function hostOptions(call: Invocation, dependencies: Dependencies, source: strin
 }
 
 async function runUpgradeCli(args: UpgradeArgs, dependencies: Dependencies, signal?: AbortSignal): Promise<OpsResult> {
-  const project = resolve(args.project), source = dependencies.source ?? resolve(import.meta.dir, "../.."), windows = (dependencies.platform ?? process.platform) === "win32";
+  const project = resolve(args.project), source = dependencies.source ?? resolve(import.meta.dir, "../.."), host = lifecycle(dependencies.platform ?? process.platform);
   // The real run repeats these checks under deploy.lock, so a passed preflight is not a result of the operation.
-  if (args.preflight) return (dependencies.preflight ?? (windows ? preflightWindowsUpgrade : preflightDockerUpgrade))({ original: args.original, target: args.target, branch: args.branch,
+  if (args.preflight) return (dependencies.preflight ?? host.upgrade)({ original: args.original, target: args.target, branch: args.branch,
     command: "update" }, { project, source, ...(args.gitPath ? { gitPath: args.gitPath } : {}) }, signal);
   const pending = (dependencies.load ?? loadDeploymentState)(project);
   if (pending && (pending.operation !== "upgrade" || pending.record.target_sha !== args.target)) throw new MaintenanceRefused("升级入口与原事务的目标不一致");
   if (!pending && (args.rollback || args.confirmation)) throw new MaintenanceRefused("确认过的升级事务不存在，请刷新预览");
   if (pending && [args.plan, args.directoryPlan, args.candidate, args.facts].some(value => value !== undefined)) throw new MaintenanceRefused("续做和回滚只使用事务中记录的选择，不接受新计划");
   if (!pending && !args.plan) throw new MaintenanceRefused("新升级必须提供停机前的数据计划");
-  if (!pending && !windows && (!args.candidate || !args.facts)) throw new MaintenanceRefused("新升级必须提供停机前构建的候选镜像记录和准备记录");
-  if (windows && (args.candidate || args.facts)) throw new MaintenanceRefused("Windows 升级不使用候选镜像记录和准备记录");
+  if (!pending && !host.native && (!args.candidate || !args.facts)) throw new MaintenanceRefused("新升级必须提供停机前构建的候选镜像记录和准备记录");
+  if (host.native && (args.candidate || args.facts)) throw new MaintenanceRefused(`${host.native}升级不使用候选镜像记录和准备记录`);
   const command = args.rollback ? "rollback" : pending ? "resume" : "update";
   // The caller may still be the released wrapper, which passes its current HEAD. Recovery takes the original checkout from disk.
   const input: DockerInput = { original: pending?.record.original_sha ?? args.original, target: args.target,
@@ -151,15 +159,15 @@ async function runUpgradeCli(args: UpgradeArgs, dependencies: Dependencies, sign
     ...(args.plan ? { plan: resolve(args.plan) } : {}), ...(args.directoryPlan ? { directoryPlan: resolve(args.directoryPlan) } : {}),
     ...(args.candidate ? { candidate: resolve(args.candidate) } : {}), ...(args.facts ? { facts: resolve(args.facts) } : {}),
     ...(args.confirmation ? { confirmation: args.confirmation } : {}) };
-  return (dependencies.host ?? (windows ? runWindowsLifecycle : runDockerLifecycle))(input, hostOptions({ noun: "升级", project, pending, command, json: args.json,
+  return (dependencies.host ?? host.run)(input, hostOptions({ noun: "升级", project, pending, command, json: args.json,
     ...(args.gitPath ? { gitPath: args.gitPath } : {}),
     matches: request => command !== "update" || request.params.target === args.target }, dependencies, source), signal);
 }
 
 async function runDeployCli(args: DeployArgs, dependencies: Dependencies, signal?: AbortSignal): Promise<OpsResult> {
-  const project = resolve(args.project), source = dependencies.source ?? resolve(import.meta.dir, "../.."), windows = (dependencies.platform ?? process.platform) === "win32";
+  const project = resolve(args.project), source = dependencies.source ?? resolve(import.meta.dir, "../.."), host = lifecycle(dependencies.platform ?? process.platform);
   // The real run repeats these checks under deploy.lock, so a passed preflight is not a result of the operation.
-  if (args.preflight) return (dependencies.preflightDeploy ?? (windows ? preflightWindowsDeploy : preflightDockerDeploy))({ operation: "deploy", command: "deploy" },
+  if (args.preflight) return (dependencies.preflightDeploy ?? host.deploy)({ operation: "deploy", command: "deploy" },
     { project, source, ...(args.gitPath ? { gitPath: args.gitPath } : {}) }, signal);
   const pending = (dependencies.load ?? loadDeploymentState)(project);
   if (pending && pending.operation !== "deploy") throw new MaintenanceRefused("未完成的是升级，部署入口不能继续或回滚它");
@@ -175,7 +183,7 @@ async function runDeployCli(args: DeployArgs, dependencies: Dependencies, signal
       return path;
     } catch { return null; }
   };
-  return (dependencies.host ?? (windows ? runWindowsLifecycle : runDockerLifecycle))({ operation: "deploy", command, rollback: args.rollback, ...(stage ? { stage } : {}),
+  return (dependencies.host ?? host.run)({ operation: "deploy", command, rollback: args.rollback, ...(stage ? { stage } : {}),
     ...(args.confirmation ? { confirmation: args.confirmation } : {}) }, hostOptions({ noun: "部署", project, pending, command, json: args.json,
     ...(args.gitPath ? { gitPath: args.gitPath } : {}),
     matches(request) {

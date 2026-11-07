@@ -14,6 +14,7 @@ export interface NativeCommand {
   input?: Uint8Array;
   beforeCommand?: ProcessOptions["beforeCommand"];
   reapReceipt?: ProcessOptions["reapReceipt"];
+  identity?: ProcessOptions["identity"];
 }
 export type NativeOutput = (text: string, stream: "stdout" | "stderr") => void;
 export interface NativeResult { code: number; stdout: string }

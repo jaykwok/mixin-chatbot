@@ -12,6 +12,7 @@ import { ResultMaintenance } from "../../src/durable/results/maintenance.ts";
 import { resultReferences } from "../../src/durable/results/references.ts";
 import { stubResultsBackend } from "../helpers/results-backend.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 test("ownership handoff crosses the 4096 active limit, survives restart and rolls back atomically", async () => {
   const f = await tempFixture("reclamation-handoff-"), path = join(f.root, "group.sqlite");
@@ -83,7 +84,7 @@ test("a full ownership table refuses new results until a maintenance pass frees 
     const queued = (await session.snapshot(ReclamationQueues, "member", context))?.count ?? 0;
     expect(existsSync(join(tempDir, "codemode", live[0]!))).toBe(true);
     expect(calls[live[0]!]).toEqual({ phone: "member", createdAt: now });
-    if (process.platform === "linux") {
+    if (removalNeedsPermit()) {
       // Shared directories without proof of exclusive writers (and missing names) are no removal proof: every
       // unreferenced record moves to the queue, which frees the quota without retiring anything.
       for (const name of live.slice(1, 4)) expect(existsSync(join(tempDir, "codemode", name))).toBe(true);

@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import type { Overview, SessionResponse } from "../../console/ui/src/contract.ts";
 
-GlobalRegistrator.register({ url: "http://127.0.0.1:11012/" });
+GlobalRegistrator.register({ url: "http://127.0.0.1:10001/" });
 const { render } = await import("preact");
 const { Root } = await import("../../console/ui/src/app.tsx");
 const { takeLoginToken } = await import("../../console/ui/src/login.ts");
@@ -33,8 +33,8 @@ afterEach(() => { render(null, container); container.remove(); calls = []; route
 const NOW = Date.now();
 const session = (idleMs = 30 * 60_000): SessionResponse => ({ session: { label: "s-test", createdAt: NOW, idleExpiresAt: NOW + idleMs, expiresAt: NOW + 8 * 3_600_000 }, now: NOW });
 const overview: Overview = {
-  checkedAt: NOW, console: { version: "1.0.1", build: "abc", hostname: "synthetic-host", platform: "linux", port: 11012, pid: 1, startedAt: NOW },
-  deployment: { platform: "linux", runtime: "docker", mode: "rootless", port: 11011, dataRoot: "/srv/data", workspaceRoot: "/srv/workspace" },
+  checkedAt: NOW, console: { version: "1.0.1", build: "abc", hostname: "synthetic-host", platform: "linux", port: 10001, pid: 1, startedAt: NOW },
+  deployment: { platform: "linux", runtime: "docker", mode: "rootless", port: 10000, dataRoot: "/srv/data", workspaceRoot: "/srv/workspace" },
   deploymentError: null, recovery: null, pending: null, service: { state: "ready", pid: 2, latency: 3, attention: [] }, versions: [["机器人", "1.0.1"]],
 };
 const unauthorized: Reply = { status: 401, body: { error: "登录已失效，请重新登录", code: "session" } };

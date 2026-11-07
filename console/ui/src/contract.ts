@@ -19,7 +19,7 @@ export interface ConsoleInfo {
   version: string;
   build: string;
   hostname: string;
-  platform: "windows" | "linux";
+  platform: "windows" | "linux" | "macos";
   port: number;
   pid: number;
   startedAt: number;
@@ -44,8 +44,8 @@ export interface ServiceView {
 }
 
 export interface DeploymentView {
-  platform: "windows" | "linux";
-  runtime: "scheduled-task" | "docker";
+  platform: "windows" | "linux" | "macos";
+  runtime: "scheduled-task" | "docker" | "launchd";
   mode: string;
   port: number;
   dataRoot: string;

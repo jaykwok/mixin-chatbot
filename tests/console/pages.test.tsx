@@ -11,7 +11,7 @@ import type {
 import { dateTime, stamp } from "../../console/ui/src/format.ts";
 
 const registered = !GlobalRegistrator.isRegistered;
-if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:11012/" });
+if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:10001/" });
 const { render } = await import("preact");
 const { Root } = await import("../../console/ui/src/app.tsx");
 const { Markdown } = await import("../../console/ui/src/markdown.tsx");
@@ -53,7 +53,7 @@ const NOW = Date.now();
 const T = NOW - 3_600_000;
 const session: SessionResponse = { session: { label: "s-test", createdAt: NOW, idleExpiresAt: NOW + 1_800_000, expiresAt: NOW + 8 * 3_600_000 }, now: NOW };
 const overview: Overview = {
-  checkedAt: NOW, console: { version: "1.0.1", build: "abc", hostname: "synthetic-host", platform: "linux", port: 11012, pid: 1, startedAt: NOW },
+  checkedAt: NOW, console: { version: "1.0.1", build: "abc", hostname: "synthetic-host", platform: "linux", port: 10001, pid: 1, startedAt: NOW },
   deployment: null, deploymentError: null, recovery: null, pending: null, service: { state: "ready", attention: [] }, versions: [],
 };
 const GEN = "00000000-0000-4000-8000-000000000001";

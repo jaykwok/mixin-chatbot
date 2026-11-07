@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createOfficeProfile, recoverOfficeProfiles } from "../../src/agent/office-profiles.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { HeldDirectory, type Entries } from "../../src/core/held-directory.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 async function until<T>(probe: () => Promise<T | undefined>) {
   const end = Date.now() + 30_000;
@@ -17,9 +18,9 @@ test("a live registered profile is retained; normal close removes only its own p
   try {
     await writeFile(join(profile.path, "work"), "owned");
     expect(await recoverOfficeProfiles(fixture.root)).toBe(0); expect(await readFile(join(profile.path, "work"), "utf8")).toBe("owned");
-    const outcome = await profile.close(); expect(outcome.status).toBe(process.platform === "linux" ? "deferred" : "removed");
-    expect((await readdir(join(fixture.root, ".office-jobs"))).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(process.platform === "linux" ? 1 : 0);
-    if (process.platform === "linux") expect(await readFile(join(profile.path, "work"), "utf8")).toBe("owned");
+    const outcome = await profile.close(); expect(outcome.status).toBe(removalNeedsPermit() ? "deferred" : "removed");
+    expect((await readdir(join(fixture.root, ".office-jobs"))).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(removalNeedsPermit() ? 1 : 0);
+    if (removalNeedsPermit()) expect(await readFile(join(profile.path, "work"), "utf8")).toBe("owned");
   } finally { await profile.close(); await fixture.cleanup(); }
 });
 test("recovery without a receipt creates no journal and changes nothing; a journal that is not a directory is still refused", async () => {
@@ -46,10 +47,10 @@ test("SIGKILL leaves a receipt; supervision stops the descendant; cold recovery 
     const ready = await until(() => readFile(join(fixture.root, "descendant.json"), "utf8").then(text => JSON.parse(text) as { pid: number; path: string }, () => undefined));
     child.kill("SIGKILL"); await child.exited;
     await until(async () => { try { process.kill(ready.pid, 0); return undefined; } catch { return true; } });
-    expect(await recoverOfficeProfiles(fixture.root)).toBe(process.platform === "linux" ? 0 : 1);
+    expect(await recoverOfficeProfiles(fixture.root)).toBe(removalNeedsPermit() ? 0 : 1);
     expect(await recoverOfficeProfiles(fixture.root)).toBe(0);
     expect(await readFile(join(unowned, "keep"), "utf8")).toBe("not registered");
-    expect((await readdir(join(fixture.root, ".office-jobs"))).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(process.platform === "linux" ? 1 : 0);
+    expect((await readdir(join(fixture.root, ".office-jobs"))).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(removalNeedsPermit() ? 1 : 0);
   } finally { child.kill("SIGKILL"); await child.exited; await rm(unowned, { recursive: true, force: true }); await fixture.cleanup(); }
 }, 90_000);
 
@@ -96,9 +97,9 @@ test("cleanup keeps its authorized entity across a directory replacement after t
     }) })) as Promise<T>;
   });
   try {
-    const outcome = await profile.close(); expect(outcome.status).toBe(process.platform === "linux" ? "deferred" : "removed");
+    const outcome = await profile.close(); expect(outcome.status).toBe(removalNeedsPermit() ? "deferred" : "removed");
     expect(checked).toBe(true);
-    expect(exchanged).toBe(process.platform === "linux");
+    expect(exchanged).toBe(removalNeedsPermit());
     expect(await readFile(join(exchanged ? profile.path : foreign, "unrelated.txt"), "utf8")).toBe("keep");
     if (exchanged) expect((await readdir(join(fixture.root, ".office-jobs"))).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(1);
   } finally {
@@ -117,14 +118,14 @@ test("a profile gone before its cleanup: off Linux its receipt retires; on Linux
   const profile = await createOfficeProfile(fixture.root);
   try {
     await rm(profile.path, { recursive: true });
-    expect(await profile.close()).toMatchObject(process.platform === "linux" ? { status: "deferred" } : { status: "removed", completedEarlier: true });
-    expect(await receipts()).toHaveLength(process.platform === "linux" ? 1 : 0);
+    expect(await profile.close()).toMatchObject(removalNeedsPermit() ? { status: "deferred" } : { status: "removed", completedEarlier: true });
+    expect(await receipts()).toHaveLength(removalNeedsPermit() ? 1 : 0);
     // An owner killed between its receipt and the mkdir left only the receipt.
     const id = "0123456789abcdef";
     await writeFile(join(journal, id + ".json"), JSON.stringify({ version: 1, id, owner: "a".repeat(32), pid: 2147483647,
       tempRoot: await realpath(fixture.root), systemRoot: await realpath(tmpdir()) }));
-    expect(await recoverOfficeProfiles(fixture.root)).toBe(process.platform === "linux" ? 0 : 1);
-    expect((await receipts()).includes(id + ".json")).toBe(process.platform === "linux");
+    expect(await recoverOfficeProfiles(fixture.root)).toBe(removalNeedsPermit() ? 0 : 1);
+    expect((await receipts()).includes(id + ".json")).toBe(removalNeedsPermit());
   } finally { await fixture.cleanup(); }
 });
 
@@ -144,7 +145,7 @@ test("a marker created but never written counts as none: the otherwise empty pro
   const fixture = await tempFixture("office-unwritten-"), profile = await createOfficeProfile(fixture.root);
   try {
     await writeFile(join(profile.path, ".mixin-office-owner.json"), "");
-    expect((await profile.close()).status).toBe(process.platform === "linux" ? "deferred" : "removed");
+    expect((await profile.close()).status).toBe(removalNeedsPermit() ? "deferred" : "removed");
   } finally { await rm(profile.path, { recursive: true, force: true }); await fixture.cleanup(); }
 });
 
@@ -158,7 +159,7 @@ test("a junction or an unmarked replacement is retained with its recovery receip
     expect(await readdir(join(fixture.root, ".office-jobs"))).toHaveLength(1);
     expect(await readFile(join(foreign, "unrelated.txt"), "utf8")).toBe("keep");
     await rm(profile.path); await rename(moved, profile.path); await profile.close();
-    expect((await readdir(join(fixture.root, ".office-jobs"))).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(process.platform === "linux" ? 1 : 0);
+    expect((await readdir(join(fixture.root, ".office-jobs"))).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(removalNeedsPermit() ? 1 : 0);
   } finally {
     await rm(profile.path, { recursive: true, force: true }); await rm(moved, { recursive: true, force: true });
     await rm(foreign, { recursive: true, force: true }); await fixture.cleanup();

@@ -408,7 +408,7 @@ export async function dockerDeployFixture(options: DockerDeployOptions = {}) {
   const first = !h.originalContainer;
   /** The original container as the entry saw it; all empty for a first deployment. */
   const facts = { format: "1", container: h.originalContainer?.Id ?? "", image: first ? "" : h.originalImage, data: first ? "" : h.data };
-  const platform: Record<Exclude<PlatformStageFile, "windows-tools">, string> = { "candidate-image": serializeCandidateRecord(h.candidate),
+  const platform: Record<Exclude<PlatformStageFile, "windows-tools" | "macos-tools">, string> = { "candidate-image": serializeCandidateRecord(h.candidate),
     "service-user": serializeServiceUser({ format: "1", user: h.user, source: first ? "default" : "container" }),
     "task-runtime": serializeTaskRuntime({ endpoint: h.taskEndpoint, daemon: h.task.id }),
     facts: Object.entries(facts).map(([key, value]) => `${key}=${value}\n`).join("") };

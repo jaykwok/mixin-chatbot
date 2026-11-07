@@ -23,7 +23,7 @@ import { describeUnfinished, existingLegacyJournalRoot, finishLegacy, legacyBloc
   reclaimLegacy, unfinishedLegacy, unfinishedLegacyError } from "./legacy.ts";
 import { directoryEntity, exists, memberIndexes, readPlanFile } from "./plans.ts";
 import type { MemberScope } from "./scope.ts";
-import { reclaimWindows } from "./windows.ts";
+import { journaledDeletion, removeJournaled, type OfflineProof } from "./offline.ts";
 
 export interface TmpArchiveOptions { root: string; state: string; archive: string; scope: MemberScope; recordedRoot?: string;
   backend?: Pick<RootlessTasks, "inventory" | "archive">; }
@@ -199,6 +199,8 @@ export interface ArchiveRemovalOptions extends TmpArchiveOptions {
   backend?: Pick<RootlessTasks, "inventory" | "archive" | "discardArchive" | "discardStarted" | "forgetDiscard">;
   /** Linux shared-identity entries: root-owned private journal for the fenced privileged backend. */
   legacy?: boolean; journal?: string;
+  /** macOS: the proof that no writer is left (offline.ts); tests only. */
+  offline?: OfflineProof;
 }
 /** Host maintenance names the container's group root with `recordedRoot`; both names must reach the same entity (checked by the plan's root identity). */
 async function removalSource(options: ArchiveRemovalOptions, archive: string, plans: string, id: string, expectedDigest?: string): Promise<TmpArchivePlan> {
@@ -250,7 +252,7 @@ export async function previewArchiveRemoval(options: ArchiveRemovalOptions, requ
       try {
         if (resumable) { /* The backend checks the remaining entries against its journal. */ }
         else if (!matches(await reclamationEvidence(destination), item.evidence)) { entry.status = "kept"; entry.reason = "归档后内容或实体已变化，保留并人工核对"; }
-        else if (process.platform !== "win32" && !item.task && !options.legacy) {
+        else if (!journaledDeletion() && !item.task && !options.legacy) {
           entry.status = "deferred"; entry.reason = "旧共享身份的归档项需要宿主特权离线后端（--legacy --journal）";
         } else if (item.task && (options.legacy || !options.backend)) {
           entry.status = "deferred"; entry.reason = "隔离任务的归档由任务管理后端删除，请以服务身份运行（不带 --legacy）";
@@ -280,7 +282,7 @@ export async function applyArchiveRemoval(options: ArchiveRemovalOptions, id: st
   try { progress = decodeRemovalProgress(await readJson(progressPath), removal); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; progress = { version: 1, digest: expectedDigest, started: [], outcomes: {} }; }
   const save = () => publishJson(progressPath, progress), journals = join(plans, "removal");
-  if (process.platform === "win32") {
+  if (journaledDeletion()) {
     await mkdir(journals, { mode: 0o700 }).catch(error => { if (error.code !== "EEXIST") throw error; });
     await entity(journals);
     if (await realpath(journals) !== journals) throw new Error("删除事务目录不能经过链接");
@@ -309,7 +311,7 @@ export async function applyArchiveRemoval(options: ArchiveRemovalOptions, id: st
       if (item.task && !options.backend) throw new Error("隔离任务归档需要任务管理后端");
       // Backends keep their own journal; only they may resume after the content changed or the root is gone.
       const journaled = item.task ? await options.backend!.discardStarted(item.task, item.destination, item.evidence)
-        : started && (process.platform === "win32"
+        : started && (journaledDeletion()
           || !!options.legacy && !!options.journal && await legacyJournalSaved(options.journal, `${id}-${index}`, item.destination, item.evidence));
       const present = await exists(item.destination);
       if (!present && !journaled) { progress.outcomes[index] = { status: "missing", bytes: 0, reason: "归档目标已不存在；无法证明由本操作删除" }; await save(); continue; }
@@ -324,7 +326,7 @@ export async function applyArchiveRemoval(options: ArchiveRemovalOptions, id: st
         if (result.status === "removed") await options.backend!.forgetDiscard(item.task, item.destination, item.evidence).catch(() => {});
         continue;
       }
-      if (process.platform === "win32") await reclaimWindows(item.destination, item.evidence, journals, `${id}-${index}`);
+      if (journaledDeletion()) await removeJournaled(item.destination, item.evidence, journals, `${id}-${index}`, options.offline);
       else if (options.legacy && options.journal) await reclaimLegacy(item.destination, item.evidence, options.journal, `${id}-${index}`);
       else throw new Error("旧共享身份的归档项需要宿主特权离线后端（--legacy --journal）");
       progress.outcomes[index] = { status: "removed", bytes: item.evidence.bytes };

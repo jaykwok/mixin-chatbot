@@ -23,6 +23,8 @@ import { databaseOf, statsOf, tmpOf } from "../helpers/layout.ts";
 import { awaitingRemoval } from "../helpers/results.ts";
 import { appLayout, groupScope, scopeKey } from "../../src/core/layout.ts";
 import { SpaceHarnesses } from "../../src/durable/spaces.ts";
+import { openReadable } from "../../src/lib/sqlite-open.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 const fixture = await tempFixture("durable-closeout-");
 afterAll(() => fixture.cleanup());
@@ -191,7 +193,7 @@ test("cold maintenance finishes an expiry receipt left after bytes were already 
       (await tx.doc(ResultsDoc)).calls["1-deleted-before-crash"] = { phone, createdAt: 1, expiryRequestedAt: 2 };
     }, context));
     service = w.open(); await service.start();
-    if (process.platform === "linux") {
+    if (removalNeedsPermit()) {
       await service.maintain();
       await database(w.root, async session => {
         expect((await session.snapshot(ResultsDoc, context))!.calls["1-deleted-before-crash"]).toBeUndefined();
@@ -238,14 +240,14 @@ test("current history survives retention and /clear, unknown directories stay; a
       await service.maintain();
       // The expiry is requested from /clear on; wait for the maintenance outcome itself (Linux: an isolated result's
       // removal is deferred).
-      return process.platform === "linux" ? await awaitingRemoval(databaseOf(w.root, group), phone) > 0 : !(await readdir(root)).includes(name);
+      return removalNeedsPermit() ? await awaitingRemoval(databaseOf(w.root, group), phone) > 0 : !(await readdir(root)).includes(name);
     });
-    expect((await readdir(root)).sort()).toEqual(process.platform === "linux" ? [name, "9-unknown"].sort() : ["9-unknown"]);
+    expect((await readdir(root)).sort()).toEqual(removalNeedsPermit() ? [name, "9-unknown"].sort() : ["9-unknown"]);
     await service.close();
     await database(w.root, async session => {
-      const call = process.platform === "linux" ? (await session.snapshot(ReclamationItems, name, context))!.call : (await session.snapshot(ResultsDoc, context))!.calls[name]!;
+      const call = removalNeedsPermit() ? (await session.snapshot(ReclamationItems, name, context))!.call : (await session.snapshot(ResultsDoc, context))!.calls[name]!;
       expect(call.expiryRequestedAt).toBeGreaterThan(0);
-      if (process.platform === "linux") { expect(call.expiredAt).toBeUndefined(); expect(call.reclamation?.status).toBe("deferred"); }
+      if (removalNeedsPermit()) { expect(call.expiredAt).toBeUndefined(); expect(call.reclamation?.status).toBe("deferred"); }
       else expect(call.expiredAt).toBeGreaterThan(0);
     });
   } finally { await service.close(); }
@@ -273,7 +275,7 @@ test("closed DB and external-result hash manifest restores exactly; tampered fil
   // An external workspace belongs to its operator and is left out.
   expect((await createDataBackup(data, join(root, "snapshot-external"), true)).files.some(file => file.area === "workspace")).toBe(false);
   const restored = join(root, "restored", "data"); await restoreDataBackup(snapshot, restored);
-  const read = new Database(databaseOf(restored, group), { readonly: true });
+  const read = openReadable(databaseOf(restored, group));
   try { expect(read.query("SELECT value FROM proof").get()).toEqual({ value: "persisted" }); } finally { read.close(); }
   expect(await readFile(join(tmpOf(restored, group, phone), "codemode", "1-call", "output.txt"), "utf8")).toBe("exact bytes");
   await expect(restoreDataBackup(snapshot, restored)).rejects.toThrow("恢复目标必须为空");

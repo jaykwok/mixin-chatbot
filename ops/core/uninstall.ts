@@ -24,15 +24,20 @@ async function underEntryLock<T>(project: string, env: NodeJS.ProcessEnv, work: 
   }
 }
 
+/** What still needs this deployment; the caller holds deploy.lock (the macOS entry checks in its own process). */
+export function assertUninstallable(root: string): void {
+  if (loadDeploymentState(root)) throw new MaintenanceRefused("有未完成的部署或升级：卸载会删除续做和回滚所需的容器与记录；请先继续或回滚，卸载未开始");
+  const maintenance = readOpsMaintenanceRecord(root);
+  if (maintenance && !maintenance.result) throw new MaintenanceRefused("有未收尾的运维任务；请先用 maintenance-recover 收尾，卸载未开始");
+  if (readConfigurationState(root)) throw new MaintenanceRefused("有未结束的配置提交；请先在控制台恢复或收尾，卸载未开始");
+}
+
 export async function checkUninstall(project: string, env: NodeJS.ProcessEnv = process.env): Promise<OpsResult> {
   const base: OpsResult = { protocol: "mixin-ops", version: 1, command: "uninstall", outcome: "failed", exitCode: 1, wasRunning: false, finalState: "unknown", message: "" };
   const root = resolve(project);
   try {
     return await underEntryLock(root, env, () => {
-      if (loadDeploymentState(root)) throw new MaintenanceRefused("有未完成的部署或升级：卸载会删除续做和回滚所需的容器与记录；请先继续或回滚，卸载未开始");
-      const maintenance = readOpsMaintenanceRecord(root);
-      if (maintenance && !maintenance.result) throw new MaintenanceRefused("有未收尾的运维任务；请先用 maintenance-recover 收尾，卸载未开始");
-      if (readConfigurationState(root)) throw new MaintenanceRefused("有未结束的配置提交；请先在控制台恢复或收尾，卸载未开始");
+      assertUninstallable(root);
       return { ...base, outcome: "success" as const, exitCode: 0, message: "卸载前检查通过：没有未完成的部署、升级、运维任务或配置提交" };
     });
   } catch (error) {

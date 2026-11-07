@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { stubDocumentPython } from "./document-python-stub.ts";
 import { runMemberTool, toolNamed } from "./member-tools.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 const root = process.cwd(), systemTemp = join(root, "system-temp");
 for (const name of ["TMPDIR", "TEMP", "TMP"]) process.env[name] = systemTemp;
@@ -32,7 +33,7 @@ const alice = await user("alice"), bob = await user("bob");
 const systemEntries = () => readdir(systemTemp);
 let expectedProfiles = 0;
 const profilesRetained = async () => {
-  if (process.platform === "linux") assert.equal((await systemEntries()).length, ++expectedProfiles);
+  if (removalNeedsPermit()) assert.equal((await systemEntries()).length, ++expectedProfiles);
   else assert.deepEqual(await systemEntries(), []);
 };
 const jobs = async (tempDir: string) => (await readdir(tempDir)).filter(name => name !== ".office-jobs");
@@ -51,7 +52,7 @@ assert.deepEqual(render.office, { existed: true, entries: 1 });
 assert.ok(!isPathInside(profile, alice.tempDir) && !isPathInside(profile, workspace));
 await profilesRetained();
 const [job] = await jobs(alice.tempDir);
-assert.ok(job && (await readdir(join(alice.tempDir, job))).includes(".work") === (process.platform === "linux"));
+assert.ok(job && (await readdir(join(alice.tempDir, job))).includes(".work") === (removalNeedsPermit()));
 assert.equal((deck.structuredOutput as { pages: number }).pages, 3);
 
 // No LibreOffice, no profile: PDF previews and image extraction without crops.
@@ -74,7 +75,7 @@ mark = stub.requests.length;
 await assert.rejects(alice.call("document_render", { source: "fail.pptx" }), /文档操作失败：fixture failure/);
 assert.equal(sent(mark, "render")[0]?.office?.existed, true);
 await profilesRetained();
-if (process.platform !== "linux") assert.deepEqual(await jobs(alice.tempDir), before);
+if (!removalNeedsPermit()) assert.deepEqual(await jobs(alice.tempDir), before);
 
 // Cancelling while document_ops.py runs removes the job and the profile; earlier results stay.
 mark = stub.requests.length;
@@ -89,7 +90,7 @@ assert.equal((await systemEntries()).length, expectedProfiles + 1);
 controller.abort();
 assert.equal(await settled, "rejected");
 await profilesRetained();
-if (process.platform !== "linux") assert.deepEqual(await jobs(alice.tempDir), before);
+if (!removalNeedsPermit()) assert.deepEqual(await jobs(alice.tempDir), before);
 
 // Two members at once: two profile directories, both present while both conversions run, both removed.
 mark = stub.requests.length;
@@ -99,12 +100,12 @@ assert.equal(pair.length, 2);
 assert.ok(pair.every((entry) => entry.office?.existed && entry.office.entries === 1));
 assert.notEqual(pair[0]!.request.office, pair[1]!.request.office);
 assert.equal(stub.peak.operations, 2);
-if (process.platform === "linux") expectedProfiles++;
+if (removalNeedsPermit()) expectedProfiles++;
 await profilesRetained();
 for (const [member, entry] of [[alice, pair.find((item) => item.request.original.endsWith("资料.docx"))!], [bob, pair.find((item) => item.request.original.endsWith("方案.pptx"))!]] as const) {
   assert.ok(isPathInside(entry.request.directory, member.tempDir), "a job wrote outside its member's tmp");
   const receipts = await readdir(join(member.tempDir, ".office-jobs"));
-  if (process.platform === "linux") {
+  if (removalNeedsPermit()) {
     assert(receipts.some(name => name.endsWith(".deferred.json")));
     for (const name of receipts.filter(value => value.endsWith(".deferred.json"))) assert.equal(JSON.parse(await readFile(join(member.tempDir, ".office-jobs", name), "utf8")).result.status, "deferred");
   } else assert.deepEqual(receipts, [], "profile receipt left behind after completion");

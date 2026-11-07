@@ -29,7 +29,8 @@ export interface MemberScope {
 /** Built once per protected view: each path is a lookup in the same normalized text, not another serialization of it.
  * A path counts as referenced under its host name or, for container deployments, its recorded name. */
 export function reclamationReferences(values: unknown[], options: Pick<ViewPaths, "root" | "recordedRoot">): (path: string) => boolean {
-  const fold = (value: string) => process.platform === "win32" ? value.toLowerCase() : value;
+  // Folding where volumes usually compare without case (Windows, macOS) only adds matches, so it keeps more.
+  const fold = (value: string) => process.platform === "win32" || process.platform === "darwin" ? value.toLowerCase() : value;
   const text = new ReferenceText(() => fold(JSON.stringify(values).replaceAll("\\\\", "\\").replaceAll("\\", "/")), "/");
   return path => {
     const needle = path.replaceAll("\\", "/"), original = options.recordedRoot ? needle.replace(options.root.replaceAll("\\", "/"), options.recordedRoot.replaceAll("\\", "/")) : needle;

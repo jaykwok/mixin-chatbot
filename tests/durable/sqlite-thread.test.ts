@@ -7,6 +7,7 @@ import { BunSqliteDatabase, openGroupDatabase } from "../../src/durable/sqlite.t
 import { sqliteClient, SqliteClient, SqliteWorkerLost } from "../../src/durable/sqlite-client.ts";
 import { slowSqlLog, sqlWatched, watchSql, type SqlRequestTiming, type SqlTiming, type SqlTransactionTiming } from "../../src/durable/sql-timing.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { openReadable } from "../../src/lib/sqlite-open.ts";
 
 const fixture = await tempFixture("durable-sql-thread-");
 afterAll(() => fixture.cleanup());
@@ -191,7 +192,8 @@ test("a reply the busy service thread takes late reports the delay as its return
       const reply = db.get("SELECT 3 AS late");
       // Let the request leave before blocking: the queue hands it to the worker on the next microtask.
       await Promise.resolve();
-      const until = performance.now() + 80;
+      // Long enough that the worker's answer, slow on a loaded runner, still lands well inside it.
+      const until = performance.now() + 250;
       while (performance.now() < until) { /* the service thread is busy */ }
       await reply;
     });
@@ -225,7 +227,7 @@ test("the slow-request log names the database and the statement, never the param
 
 test("closing does not wait for a reader's transaction: the checkpoint is best effort", async () => {
   const file = path(), db = await openGroupDatabase(file);
-  const reader = new Database(file, { readonly: true });
+  const reader = openReadable(file);
   try {
     await db.exec("CREATE TABLE t (value INTEGER)");
     await db.run("INSERT INTO t VALUES (1)");

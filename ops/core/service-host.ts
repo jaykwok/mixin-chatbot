@@ -5,6 +5,7 @@ import { assertDataVersion, readRelease } from "../../src/core/data-version.ts";
 import { withDeploymentLock, type DeploymentLock } from "./deployment-lock.ts";
 import { DockerPlatform } from "./docker-host.ts";
 import { WindowsPlatform } from "./windows-host.ts";
+import { LaunchdPlatform } from "./launchd-host.ts";
 import { MaintenanceRefused } from "./maintenance.ts";
 import { serviceReady } from "./readiness.ts";
 import type { ServiceControlHost } from "./service.ts";
@@ -45,8 +46,8 @@ export function createServiceHost(options: ServiceHostOptions): ServiceControlHo
       return withDeploymentLock(options.project, async acquired => {
         lock = acquired;
         try {
-          platform = await (options.platform?.() ?? (process.platform === "win32"
-            ? Promise.resolve(new WindowsPlatform(options.project, options.source)) : DockerPlatform.connect(options.project)));
+          platform = await (options.platform?.() ?? (process.platform === "win32" ? Promise.resolve(new WindowsPlatform(options.project, options.source))
+            : process.platform === "darwin" ? Promise.resolve(new LaunchdPlatform(options.project)) : DockerPlatform.connect(options.project)));
           await options.locked?.(lock, platform);
           return await body();
         } finally { lock = undefined; platform = undefined; expected = undefined; }

@@ -4,6 +4,7 @@ import { dlopen, FFIType, ptr, read } from "bun:ffi";
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { WindowsHandles } from "../../src/core/windows-handles.ts";
+import { tryLock } from "../../src/lib/darwin.ts";
 import { MaintenanceRefused } from "./maintenance.ts";
 
 export class DeploymentBusy extends MaintenanceRefused {
@@ -11,7 +12,7 @@ export class DeploymentBusy extends MaintenanceRefused {
 }
 export interface DeploymentLock {
   readonly path: string;
-  /** Called again before mutations; on Linux, a removed/replaced lock is no longer exclusive for this pathname. */
+  /** Called again before mutations; on Linux and macOS, a removed/replaced lock is no longer exclusive for this pathname. */
   assertHeld(): void;
   close(): void;
 }
@@ -22,6 +23,15 @@ function linuxNative() {
     flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
     __errno_location: { args: [], returns: FFIType.ptr },
   }).symbols;
+}
+/** Non-blocking exclusive flock; false when another open file description holds it. */
+function lockFile(fd: number): boolean {
+  if (process.platform === "darwin") return tryLock(fd);
+  const native = libc ??= linuxNative();
+  if (native.flock(fd, 2 | 4) === 0) return true; // LOCK_EX | LOCK_NB
+  const errno = read.i32(native.__errno_location()!);
+  if (errno === 11) return false; // EWOULDBLOCK
+  throw new Error(`无法取得部署锁（flock errno ${errno}）`);
 }
 const longPath = (path: string) => path.startsWith("\\\\?\\") ? path
   : path.startsWith("\\\\") ? "\\\\?\\UNC\\" + path.slice(2) : "\\\\?\\" + path;
@@ -38,24 +48,20 @@ function inheritedLock(path: string): number | undefined {
 
 /** Non-blocking, same native lock as the shipping CLI; it is not a PID file or a second lock namespace. */
 export function acquireDeploymentLock(project: string): DeploymentLock {
-  if (process.platform !== "linux" && process.platform !== "win32") throw new Error("此平台不支持部署锁");
+  if (!["linux", "darwin", "win32"].includes(process.platform)) throw new Error("此平台不支持部署锁");
   const state = join(resolve(project), "data", "state");
   mkdirSync(state, { recursive: true });
   const directory = realpathSync(state), path = join(directory, "deploy.lock");
   let closed = false, closeError: unknown;
   const assertOpen = () => { if (closed) throw new Error("部署锁已经释放"); };
-  if (process.platform === "linux") {
-    const native = libc ??= linuxNative(), inherited = inheritedLock(path);
+  if (process.platform !== "win32") {
+    const inherited = inheritedLock(path);
     const fd = inherited ?? openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
     const release = () => { if (inherited === undefined) closeSync(fd); };
     try {
       const held = fstatSync(fd, { bigint: true });
       if (!held.isFile()) throw new Error("部署锁不是普通文件");
-      if (native.flock(fd, 2 | 4) !== 0) { // LOCK_EX | LOCK_NB
-        const errno = read.i32(native.__errno_location()!);
-        if (errno === 11) throw new DeploymentBusy(); // EWOULDBLOCK
-        throw new Error(`无法取得部署锁（flock errno ${errno}）`);
-      }
+      if (!lockFile(fd)) throw new DeploymentBusy();
       const lock: DeploymentLock = {
         path,
         assertHeld() {

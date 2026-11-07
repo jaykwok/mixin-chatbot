@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { holdDirectory } from "../../src/core/held-directory.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { type HandleEvent, WindowsHandles } from "../../src/core/windows-handles.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 test("removal is relative to the held parent when its pathname is replaced by a junction or link", async () => {
   const fixture = await tempFixture("held-parent-"), base = join(fixture.root, "parent"), moved = base + "-moved", foreign = join(fixture.root, "foreign");
@@ -25,9 +26,9 @@ test("removal is relative to the held parent when its pathname is replaced by a 
         return true;
       },
     }));
-    expect(exchanged).toBe(process.platform === "linux");
-    expect(removed).toHaveLength(1); expect(removed[0]).toMatchObject({ name: "owned", status: process.platform === "linux" ? "deferred" : "removed" });
-    if (process.platform === "linux") expect(await readFile(join(moved, "owned/marker"), "utf8")).toBe("authorized");
+    expect(exchanged).toBe(removalNeedsPermit());
+    expect(removed).toHaveLength(1); expect(removed[0]).toMatchObject({ name: "owned", status: removalNeedsPermit() ? "deferred" : "removed" });
+    if (removalNeedsPermit()) expect(await readFile(join(moved, "owned/marker"), "utf8")).toBe("authorized");
     expect(await readFile(join(foreign, "owned/unrelated.txt"), "utf8")).toBe("keep");
   } finally { await held.release(); if (exchanged) await rm(base); await fixture.cleanup(); }
 });

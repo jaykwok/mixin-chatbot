@@ -15,12 +15,12 @@ const STATE_DIR = join(DATA_DIR, "state");
 
 export const LOG_FILE = join(PROJECT_DIR, "logs", "mixin-bot.log");
 
-export type Platform = "windows" | "linux";
+export type Platform = "windows" | "linux" | "macos";
 
 export interface Deployment {
   platform: Platform;
-  /** Windows 是 Bun + 计划任务，Linux 是 Docker 容器。运行时形态决定了哪些命令可用。 */
-  runtime: "scheduled-task" | "docker";
+  /** Windows 是 Bun + 计划任务，Linux 是 Docker 容器，macOS 是 Bun + LaunchDaemon。运行时形态决定了哪些命令可用。 */
+  runtime: "scheduled-task" | "docker" | "launchd";
   port: number;
   /** 数据目录（data/）的绝对路径：会话、tmp、统计账本和索引都在它下面。 */
   dataRoot: string;
@@ -30,7 +30,12 @@ export interface Deployment {
 
 /** 宿主平台只取决于运行环境；恢复入口用它转交命令，不读取已保存的设置。 */
 export function hostPlatform(): Platform {
-  return process.platform === "win32" ? "windows" : "linux";
+  return process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux";
+}
+
+/** Windows 与 macOS 由系统的服务管理器直接运行机器人，Linux 运行在 Docker 容器里。 */
+export function nativeService(): boolean {
+  return hostPlatform() !== "linux";
 }
 
 function readState(name: string): string {
@@ -50,7 +55,7 @@ function readState(name: string): string {
 export function loadDeployment(): Deployment {
   const platform = hostPlatform();
 
-  const rawPort = process.env.BOT_PORT?.trim() || readState("bot-port") || "1011";
+  const rawPort = process.env.BOT_PORT?.trim() || readState("bot-port") || "10000";
   const port = Number(rawPort);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`端口无效：${rawPort}（来自 BOT_PORT 或 data/state/bot-port）`);
@@ -59,7 +64,7 @@ export function loadDeployment(): Deployment {
   const workspace = readState("workspace-root");
   return {
     platform,
-    runtime: platform === "windows" ? "scheduled-task" : "docker",
+    runtime: platform === "windows" ? "scheduled-task" : platform === "macos" ? "launchd" : "docker",
     port,
     dataRoot: DATA_DIR,
     workspaceRoot: workspace ? resolve(workspace) : "",
@@ -128,10 +133,12 @@ export function opsCommand(platform: Platform, args: string[], project = PROJECT
       }
     }
   }
+  // macOS: the system's bash 3.2 runs only the hand-over to the TS entry, which needs Bun the console already runs on.
+  if (platform === "macos") return { command: "/bin/bash", args: [join(source, "scripts", "ops.sh"), ...commandArgs], env: { ...env, MIXIN_OPS_BUN: process.execPath } };
   return { command: "bash", args: [join(source, "scripts", "ops.sh"), ...commandArgs], env };
 }
 
 /** 人话的运行形态标签，界面和报表共用。 */
 export function describeMode(deployment: Deployment): string {
-  return deployment.runtime === "docker" ? "Docker" : "计划任务";
+  return deployment.runtime === "docker" ? "Docker" : deployment.runtime === "launchd" ? "LaunchDaemon" : "计划任务";
 }

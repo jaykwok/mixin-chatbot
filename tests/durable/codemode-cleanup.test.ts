@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { removeResultDirectories } from "../../src/durable/results/files.ts";
 import { junctionInPlace } from "../helpers/junction-in-place.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 const name = "42-synthetic";
 const link = (target: string, path: string) => symlink(target, path, process.platform === "win32" ? "junction" : "dir");
@@ -38,13 +39,13 @@ for (const level of ["parent", "call"] as const) for (const replacement of ["lin
           }
         },
       });
-      expect(removed).toEqual(process.platform === "linux" ? [] : [name]); expect(await readFile(sentinel, "utf8")).toBe("keep");
-      expect(swapped).toBe(process.platform === "linux");
+      expect(removed).toEqual(removalNeedsPermit() ? [] : [name]); expect(await readFile(sentinel, "utf8")).toBe("keep");
+      expect(swapped).toBe(removalNeedsPermit());
       if (swapped && replacement === "directory") {
         expect(await readFile(join(attacked, ...(level === "parent" ? [name] : []), "keep.txt"), "utf8")).toBe("replacement");
       }
       const original = swapped ? join(moved, ...(level === "parent" ? [name] : [])) : call;
-      expect(existsSync(join(original, "index.txt"))).toBe(process.platform === "linux");
+      expect(existsSync(join(original, "index.txt"))).toBe(removalNeedsPermit());
     } finally { await fixture.cleanup(); }
   });
 }
@@ -62,9 +63,9 @@ test("cleanup removes nested owned files and links themselves, preserves unregis
     expect(await removeResultDirectories(member, Infinity, {
       registered: new Set([name, "43-protected", "45-link"]), protected: new Set(["43-protected"]),
       expire: async (names) => { expired.push(...names); },
-    })).toEqual(process.platform === "linux" ? [] : [name]);
-    expect(expired).toEqual([name]); expect(existsSync(call)).toBe(process.platform === "linux");
-    if (process.platform === "linux") expect(await readFile(join(call, "nested/deeper/owned.txt"), "utf8")).toBe("owned");
+    })).toEqual(removalNeedsPermit() ? [] : [name]);
+    expect(expired).toEqual([name]); expect(existsSync(call)).toBe(removalNeedsPermit());
+    if (removalNeedsPermit()) expect(await readFile(join(call, "nested/deeper/owned.txt"), "utf8")).toBe("owned");
     for (const remaining of ["43-protected", "44-unknown", "45-link"]) expect(existsSync(join(root, remaining))).toBe(true);
     expect(await readFile(sentinel, "utf8")).toBe("keep");
     await rename(root, join(member, "old")); await link(outside, root);
@@ -72,7 +73,7 @@ test("cleanup removes nested owned files and links themselves, preserves unregis
   } finally { await fixture.cleanup(); }
 });
 
-test.skipIf(process.platform !== "linux")("missing shared names keep logical expiry and a pending receipt without claiming physical removal", async () => {
+test.skipIf(!removalNeedsPermit())("missing shared names keep logical expiry and a pending receipt without claiming physical removal", async () => {
   const fixture = await tempFixture("cleanup-missing-");
   try {
     const expired: string[] = [], records: { name: string; status: string; reason?: string }[] = [];
@@ -94,7 +95,7 @@ test("failed expiry leaves all bytes intact and releases handles for a retry", a
       registered: new Set([name]), protected: new Set(), expire: async () => { throw new Error("receipt failed"); },
     })).rejects.toThrow("receipt failed");
     expect(await readFile(join(call, "index.txt"), "utf8")).toBe("owned");
-    expect(await removeResultDirectories(fixture.root, Infinity)).toEqual(process.platform === "linux" ? [] : [name]);
+    expect(await removeResultDirectories(fixture.root, Infinity)).toEqual(removalNeedsPermit() ? [] : [name]);
   } finally { await fixture.cleanup(); }
 });
 

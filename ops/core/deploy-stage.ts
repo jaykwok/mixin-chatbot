@@ -11,7 +11,7 @@ import { MaintenanceRefused } from "./maintenance.ts";
 
 export const DEPLOY_CHOICES_FILE = "deployment.json";
 /** Records the platform session parses itself (Docker: candidate image, service identity, task daemon, original container; Windows: the tools the launcher runs). */
-export const PLATFORM_STAGE_FILES = ["candidate-image", "service-user", "task-runtime", "facts", "windows-tools"] as const;
+export const PLATFORM_STAGE_FILES = ["candidate-image", "service-user", "task-runtime", "facts", "windows-tools", "macos-tools"] as const;
 export type PlatformStageFile = typeof PLATFORM_STAGE_FILES[number];
 export interface DeployChoices {
   format: 1;

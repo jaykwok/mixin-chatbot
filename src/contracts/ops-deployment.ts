@@ -1,5 +1,5 @@
 // Non-secret deployment execution metadata. No native process or database modules are loaded here.
-import { validateOpsWriter, type DockerTaskRecord, type WindowsTaskRecord } from "./ops-writer.ts";
+import { validateOpsWriter, type DockerTaskRecord, type MacosTaskRecord, type WindowsTaskRecord } from "./ops-writer.ts";
 import { readOpsResult, type OpsResult } from "./ops-result.ts";
 import { validateHostProcess, type LinuxTaskRecord } from "./ops-host-process.ts";
 const TRANSACTION_NAME = /^deploy-[A-Za-z0-9]+$/;
@@ -20,7 +20,7 @@ export interface DeploymentCheckpoint {
 export interface DeploymentExecution {
   version: 1;
   checkpoint: DeploymentCheckpoint;
-  writer?: DockerTaskRecord | WindowsTaskRecord | LinuxTaskRecord;
+  writer?: DockerTaskRecord | WindowsTaskRecord | LinuxTaskRecord | MacosTaskRecord;
   result?: OpsResult;
   completion?: DeploymentDirection;
 }

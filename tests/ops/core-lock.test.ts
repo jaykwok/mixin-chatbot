@@ -20,7 +20,8 @@ async function readReady(child: ReturnType<typeof Bun.spawn<"pipe", "pipe", "pip
   } finally { reader.releaseLock(); }
 }
 
-test("TS 部署锁与现有平台锁双向互斥，释放不删除或截断锁文件", async () => {
+// macOS has no flock command or second lock implementation: its entries take the same TS lock.
+test.skipIf(process.platform === "darwin")("TS 部署锁与现有平台锁双向互斥，释放不删除或截断锁文件", async () => {
   const f = await tempFixture("core-native-lock-");
   const project = join(f.root, "含空格 项目"), path = join(project, "data/state/deploy.lock");
   await mkdir(join(project, "data/state"), { recursive: true });

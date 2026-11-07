@@ -34,7 +34,8 @@ async function fixture(durable = false) {
     const group = await openGroupHarness(path, fauxModels().models);
     try { await referTo(group.harness, "bob", "msg:pending", target); } finally { await group.close(); }
   };
-  return { f, root, temp, path, refer, options: { root, state, archive: join(root, "state/reclamation/backup/rm"), scope: durableMemberScope },
+  // macOS: this test account runs other processes, so the offline proof stands in (offline.ts; maintenance-faults covers the refusal).
+  return { f, root, temp, path, refer, options: { root, state, archive: join(root, "state/reclamation/backup/rm"), scope: durableMemberScope, offline: () => null },
     async close() { db.close(); await f.cleanup(); } };
 }
 
@@ -92,7 +93,7 @@ test("archived entries are discarded only as proven by their plan, and only whil
     await writeFile(at("changed.txt"), "after");
     const removal = await previewArchiveRemoval(f.options), status = (name: string) => removal.items.find(item => item.destination === at(name))?.status;
     // Linux: entries of the old shared identity wait for the privileged backend, files and directories alike.
-    const plain = process.platform === "win32";
+    const plain = process.platform !== "linux";
     expect([status("a.txt"), status("d"), status("changed.txt")]).toEqual([plain ? "ready" : "deferred", plain ? "ready" : "deferred", "kept"]);
     await expect(applyArchiveRemoval(f.options, removal.id, "0".repeat(64))).rejects.toThrow("摘要");
     const done = await applyArchiveRemoval(f.options, removal.id, removal.digest), outcome = (name: string) => done.outcomes[removal.items.findIndex(item => item.destination === at(name))]!.status;
@@ -114,8 +115,8 @@ test("a discard list rechecks the entry right before deletion", async () => {
     const plan = await previewTmpArchive(f.options, 0); await applyTmpArchive(f.options, plan.id, plan.digest);
     const removal = await previewArchiveRemoval(f.options);
     await writeFile(plan.items[0]!.destination, "rewritten");
-    // Linux defers it already in the preview (privileged backend); Windows rechecks it right before deletion.
-    expect((await applyArchiveRemoval(f.options, removal.id, removal.digest)).outcomes[0]!.status).toBe(process.platform === "win32" ? "failed" : "deferred");
+    // Linux defers it already in the preview (privileged backend); Windows and macOS recheck it right before deletion.
+    expect((await applyArchiveRemoval(f.options, removal.id, removal.digest)).outcomes[0]!.status).toBe(process.platform !== "linux" ? "failed" : "deferred");
     expect(await readFile(plan.items[0]!.destination, "utf8")).toBe("rewritten");
   } finally { await f.close(); }
 });

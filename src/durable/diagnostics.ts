@@ -6,6 +6,7 @@ import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, createSession, Harness, type ConversationId, type EntryId, type Storage, type Tx } from "@earendil-works/pi-durable";
 import { SqliteStorage, type SqliteDatabase, type SqliteExecutor } from "@earendil-works/pi-durable/storage/sqlite";
 import { memorySnapshot } from "../core/sqlite-snapshot.ts";
+import { openReadable, openWritable } from "../lib/sqlite-open.ts";
 import { MemberDirectory } from "./identity.ts";
 import { assertDurableSchema, unsupportedSchema } from "./schema-gate.ts";
 import { LIVE_TASK_STATES } from "./task-states.ts";
@@ -21,7 +22,7 @@ export async function withSpaceSnapshot<T>(path: string, read: (harness: Harness
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("诊断只接受普通会话库文件");
   // Offline reclamation keeps a write reservation until its reference checks and physical
   // operations finish. Opening/recovering the Harness still only changes the memory copy.
-  const source = new Database(path, { readonly: !exclusive, strict: true });
+  const source = exclusive ? openWritable(path, { strict: true }) : openReadable(path, { strict: true });
   let memory: Database, scratch: string | undefined;
   try {
     source.exec(exclusive ? "BEGIN IMMEDIATE" : "BEGIN");
@@ -34,7 +35,7 @@ export async function withSpaceSnapshot<T>(path: string, read: (harness: Harness
       // VACUUM INTO cannot run inside the source transaction. Under its write reservation (exclusive) a second
       // connection reads exactly that state; a read-only preview just needs any consistent state.
       scratch = await mkdtemp(join(await snapshotRoot(path), "snapshot-"));
-      const file = join(scratch, "space.sqlite"), copier = new Database(path, { readonly: true, strict: true });
+      const file = join(scratch, "space.sqlite"), copier = openReadable(path, { strict: true });
       try { copier.query("VACUUM INTO ?").run(file); } finally { copier.close(); }
       memory = new Database(file, { strict: true });
       memory.exec("PRAGMA journal_mode = DELETE");

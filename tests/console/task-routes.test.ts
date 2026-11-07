@@ -21,7 +21,7 @@ async function setup() {
   const observers = { hosting: async () => ({ state: "running" as const, executor: actor }), needsRecovery: async () => false };
   const auth = new Auth({ exchangeMs: 60_000, idleMs: 30_000, absoluteMs: 999_999 }, () => time.at);
   const login = auth.exchange(auth.issueToken().token)!;
-  const handler = createHandler({ port: 11012, guard: guardConfig(11012), auth, instanceId: "fixture", overview: async () => { throw new Error("unused"); },
+  const handler = createHandler({ port: 10001, guard: guardConfig(10001), auth, instanceId: "fixture", overview: async () => { throw new Error("unused"); },
     bundle: { index: { path: "/", type: "text/html", body: new Uint8Array() }, assets: new Map() },
     routes: taskRoutes({ tasks, plans, observers, audit: new AuditLog(join(fixture.root, ".console/audit")),
       current: () => time.current,
@@ -29,9 +29,9 @@ async function setup() {
       launch: async id => { time.launches++; if (time.accept) tasks.accept(id, actor); else { time.at += 20_000; tasks.abandon(id); } },
     }),
   });
-  const request = (path: string, body?: unknown, headers: Record<string, string> = {}, signal?: AbortSignal) => handler(new Request(`http://127.0.0.1:11012${path}`, {
+  const request = (path: string, body?: unknown, headers: Record<string, string> = {}, signal?: AbortSignal) => handler(new Request(`http://127.0.0.1:10001${path}`, {
     method: body === undefined ? "GET" : "POST", body: body === undefined ? undefined : JSON.stringify(body), signal,
-    headers: { Host: "127.0.0.1:11012", Origin: "http://127.0.0.1:11012", "X-Console-Request": "1", "Content-Type": "application/json", cookie: `${auth.cookieName}=${login.sessionId}`, ...headers },
+    headers: { Host: "127.0.0.1:10001", Origin: "http://127.0.0.1:10001", "X-Console-Request": "1", "Content-Type": "application/json", cookie: `${auth.cookieName}=${login.sessionId}`, ...headers },
   }));
   const plan = async () => (await (await request("/api/plans", { operation: "stop", params: {} })).json()) as { id: string };
   return { fixture, time, tasks, request, plan, auth };

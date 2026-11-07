@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { assessMaintenanceAction, readMaintenanceState } from "../../src/core/maintenance-state.ts";
 import { readOpsMaintenanceRecord } from "../../src/core/ops-maintenance-state.ts";
@@ -12,6 +12,19 @@ import { pruneRuntimes } from "../../ops/core/source-runtime.ts";
 import { consoleDir, writeAtomic } from "../../ops/core/console-state.ts";
 import type { ExecutorIdentity, HostedState, TaskObservers, TaskRequest } from "../../ops/core/tasks.ts";
 import { TaskStore } from "../../ops/core/tasks.ts";
+import { processIncarnation } from "../../src/lib/darwin.ts";
+import { parseLaunchctlPrint, plistDocument } from "../../ops/core/launchd-host.ts";
+
+// macOS: one LaunchDaemon per task in launchd's system domain, from a definition under .console/launchd. It runs once
+// (RunAtLoad, no KeepAlive) and stays loaded, not running, after it ends; reconcileTasks boots ended ones out.
+const LAUNCHD_TASK = "com.mixin-bot.console.";
+const launchdLabel = (id: string) => LAUNCHD_TASK + id;
+const launchdPlist = (project: string, id: string) => join(consoleDir(project), "launchd", `${launchdLabel(id)}.plist`);
+async function launchdJob(id: string, run: Runner) {
+  const printed = await run(["/bin/launchctl", "print", `system/${launchdLabel(id)}`]);
+  if (printed.code === 113) return { loaded: false as const };
+  return printed.code === 0 ? parseLaunchctlPrint(printed.stdout) : null;
+}
 
 /** Stable process creation identity, including across a PID being reused. */
 export async function executorIdentity(pid = process.pid, run: Runner = runCommand): Promise<ExecutorIdentity> {
@@ -22,6 +35,8 @@ export async function executorIdentity(pid = process.pid, run: Runner = runComma
       "$ErrorActionPreference='Stop'; (Get-Process -Id ([int]$env:MIXIN_TASK_PID)).StartTime.ToUniversalTime().Ticks.ToString()"], { MIXIN_TASK_PID: String(pid) });
     if (value.code !== 0) throw new Error("无法核对执行者创建时间");
     startedAt = value.stdout.trim();
+  } else if (process.platform === "darwin") {
+    startedAt = processIncarnation(pid) ?? "";
   } else {
     const value = readFileSync(`/proc/${pid}/stat`, "utf8");
     const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
@@ -35,6 +50,14 @@ export async function executorIdentity(pid = process.pid, run: Runner = runComma
 }
 
 export async function hostedTask(request: TaskRequest, accepted: ExecutorIdentity, run: Runner = runCommand): Promise<HostedState> {
+  if (request.mechanism === "launchd-system") {
+    const job = await launchdJob(request.id, run);
+    if (!job) return { state: "unknown" };
+    if (!job.loaded || job.state === "not running" || job.state === "exited") return { state: "ended" };
+    if (job.state !== "running" || !job.pid) return { state: "unknown" };
+    try { return { state: "running", executor: await executorIdentity(job.pid, run) }; }
+    catch { return { state: "unknown" }; }
+  }
   if (request.mechanism === "windows-task") {
     const found = await run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
       "$ErrorActionPreference='Stop'; $t=Get-ScheduledTask -TaskName $env:MIXIN_CONSOLE_TASK -TaskPath $env:MIXIN_CONSOLE_TASK_PATH -ErrorAction SilentlyContinue; if ($t) { $t.State.ToString() } else { 'absent' }"],
@@ -65,6 +88,16 @@ export function taskObservers(run: Runner = runCommand): TaskObservers {
 }
 
 export async function unregisterTask(request: TaskRequest, run: Runner = runCommand): Promise<void> {
+  if (request.mechanism === "launchd-system") {
+    const job = await launchdJob(request.id, run);
+    // The executor cleaning up after itself is the job's own process: a bootout would end it here. Reconciliation does that later.
+    if (job?.loaded && job.pid !== process.pid) {
+      await run(["/bin/launchctl", "bootout", `system/${launchdLabel(request.id)}`]);
+      if ((await launchdJob(request.id, run))?.loaded !== false) throw new Error("任务已结束，但托管项尚未清除");
+    }
+    rmSync(launchdPlist(request.project, request.id), { force: true });
+    return;
+  }
   if (request.mechanism !== "windows-task") return; // transient services use --collect
   const result = await run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
     "$ErrorActionPreference='Stop'; Unregister-ScheduledTask -TaskName $env:MIXIN_CONSOLE_TASK -TaskPath $env:MIXIN_CONSOLE_TASK_PATH -Confirm:$false -ErrorAction SilentlyContinue"],
@@ -99,7 +132,13 @@ export async function launchTask(store: TaskStore, id: string, bundle: ExecutorB
   verifyExecutor(bundle);
   const argv = [process.execPath, bundle.path, "--project", request.project, "--task", id];
   let result;
-  if (request.mechanism === "windows-task") {
+  if (request.mechanism === "launchd-system") {
+    const plist = launchdPlist(request.project, id);
+    mkdirSync(dirname(plist), { recursive: true, mode: 0o700 });
+    writeAtomic(plist, plistDocument({ Label: launchdLabel(id), ProgramArguments: argv, WorkingDirectory: request.project, RunAtLoad: true,
+      ProcessType: "Standard", StandardOutPath: "/dev/null", StandardErrorPath: "/dev/null", EnvironmentVariables: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LANG: "C.UTF-8" } }));
+    result = await run(["/bin/launchctl", "bootstrap", "system", plist]);
+  } else if (request.mechanism === "windows-task") {
     result = await run(["powershell", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_REGISTER], {
       MIXIN_CONSOLE_TASK: unitName(id), MIXIN_CONSOLE_TASK_PATH: WINDOWS_TASK_PATH,
       MIXIN_CONSOLE_TASK_EXECUTE: argv[0]!, MIXIN_CONSOLE_TASK_ARGUMENTS: windowsArguments(argv.slice(1)), MIXIN_CONSOLE_TASK_CWD: request.project,
@@ -117,14 +156,16 @@ export async function launchTask(store: TaskStore, id: string, bundle: ExecutorB
 
 /** Unknown names and missing records are retained for inspection. Never remove another project's unit. */
 export async function reconcileTasks(store: TaskStore, mechanism: Mechanism, run: Runner = runCommand): Promise<string[]> {
-  const list = mechanism === "windows-task"
+  const list = mechanism === "launchd-system" ? await run(["/bin/launchctl", "list"])
+    : mechanism === "windows-task"
     ? await run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
       "Get-ScheduledTask -TaskPath $env:MIXIN_CONSOLE_TASK_PATH -ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName }"], { MIXIN_CONSOLE_TASK_PATH: WINDOWS_TASK_PATH })
     : await run(["systemctl", ...(mechanism === "systemd-user" ? ["--user"] : []), "list-units", "--all", "--no-legend", "--plain", "mixin-console-task-*.service"]);
   if (list.code !== 0) return [];
   const removed: string[] = [];
   for (const line of list.stdout.split("\n")) {
-    const id = /^mixin-console-(task-[a-f0-9]{32})(?:\.service)?(?:\s|$)/.exec(line.trim())?.[1];
+    const id = mechanism === "launchd-system" ? /\scom\.mixin-bot\.console\.(task-[a-f0-9]{32})$/.exec(line.trim())?.[1]
+      : /^mixin-console-(task-[a-f0-9]{32})(?:\.service)?(?:\s|$)/.exec(line.trim())?.[1];
     if (!id) continue;
     const view = await store.view(id, taskObservers(run));
     if (!view.request || view.request.mechanism !== mechanism || resolve(view.request.project, ".console", "tasks") !== store.root) continue;
@@ -132,7 +173,7 @@ export async function reconcileTasks(store: TaskStore, mechanism: Mechanism, run
     // A final record may precede the process exit. Never stop a still-running unit while reconciling.
     const state = await hostedTask(view.request, { pid: 1, startedAt: "reconcile" }, run);
     if (state.state !== "ended") continue;
-    if (mechanism === "windows-task") await unregisterTask(view.request, run);
+    if (mechanism === "windows-task" || mechanism === "launchd-system") await unregisterTask(view.request, run);
     else {
       const reset = await run(["systemctl", ...(mechanism === "systemd-user" ? ["--user"] : []), "reset-failed", `${unitName(id)}.service`]);
       if (reset.code !== 0) continue;
