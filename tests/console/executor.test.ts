@@ -122,7 +122,7 @@ test.skipIf(process.platform === "win32")("后台任务沿用控制台的 Docker
   }
 }, 60_000);
 
-test.skipIf(process.platform === "win32")("启停计划绑定容器 ID：重建的容器或另一个 daemon 上的同名容器都算变化", async () => {
+test.skipIf(process.platform !== "linux")("启停计划绑定容器 ID：重建的容器或另一个 daemon 上的同名容器都算变化", async () => {
   let listing = "";
   const run = async (args: string[]) => args[0] === "git" ? { code: 0, stdout: "c".repeat(40) + "\n", stderr: "" }
     : args[0] === "docker" && args[1] === "ps" ? { code: 0, stdout: listing, stderr: "" } : { code: 1, stdout: "", stderr: "unexpected" };

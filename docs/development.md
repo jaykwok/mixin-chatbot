@@ -8,7 +8,7 @@
 
 ## 工作原理
 
-基于 **Bun + Hono + Pi Durable 1.5.0 引擎**，支持 Windows 原生部署和 Linux / Docker。消息经量子密信开放平台的应用机器人事件 Stream 进入，回复和文件经开放平台接口发出。每个空间（一个群，或所有单聊共用的 `direct`）一个 Durable 数据库（`<空间目录>/durable.sqlite`），空间内每位成员一个对话。下面是任务处理与取消、交付之间的关系：
+基于 **Bun + Hono + Pi Durable 1.5.0 引擎**，支持 Windows 原生部署、Linux / Docker 和 macOS 原生部署（实验性支持）。消息经量子密信开放平台的应用机器人事件 Stream 进入，回复和文件经开放平台接口发出。每个空间（一个群，或所有单聊共用的 `direct`）一个 Durable 数据库（`<空间目录>/durable.sqlite`），空间内每位成员一个对话。下面是任务处理与取消、交付之间的关系：
 
 ```mermaid
 flowchart TD
@@ -209,7 +209,7 @@ Windows 使用标准安装位置的 Git Bash 时，最外层运行器会先启�
 
 代码按 `console → ops → src` 单向依赖：`src` 不引用其他目录，`ops` 不引用控制台，浏览器界面只引用自己；镜像只复制 `src`、`ops/lib`、`ops/config` 和 `ops/tools`，其中运行的代码也只能引用这些目录。[boundaries.test.ts](../tests/contracts/boundaries.test.ts) 检查这些规则。
 
-CI 配置了 Windows/Linux 检查，以及受限 Linux 镜像中的解析器、进程回收、部署登记和文档集成（文档加工、Durable 引擎、Office 预览）验证。部署验收还需在目标机器和真实客户端中检查服务、事件 Stream、通讯录同步和真实交付流程。
+CI 配置了 Windows、Linux、macOS 15 和 26 的检查（macOS 另以 root 运行真实 LaunchDaemon、服务账户、控制台后台任务和 Office 预览测试），以及受限 Linux 镜像中的解析器、进程回收、部署登记和文档集成（文档加工、Durable 引擎、Office 预览）验证。部署验收还需在目标机器和真实客户端中检查服务、事件 Stream、通讯录同步和真实交付流程。
 
 ### Linux 任务隔离与物理回收
 

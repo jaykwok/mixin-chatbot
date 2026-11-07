@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "digest": "<HEX64>",
+  "started": [
+    0,
+    1,
+    2
+  ],
+  "outcomes": {
+    "0": {
+      "status": "archived",
+      "bytes": 6
+    },
+    "1": {
+      "status": "archived",
+      "bytes": 4
+    },
+    "2": {
+      "status": "archived",
+      "bytes": 1
+    }
+  }
+}

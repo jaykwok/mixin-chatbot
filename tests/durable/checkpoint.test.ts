@@ -3,7 +3,6 @@
 // chains left by an older release beyond the legacy limit keep receiving deltas, shorter ones are compacted by their
 // next change.
 import { afterAll, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createSession, defineDoc } from "@earendil-works/pi-durable";
@@ -11,6 +10,7 @@ import { CHECKPOINT_INTERVAL, checkpointDue, checkpointPolicy } from "../../src/
 import { openGroupStorage } from "../../src/durable/sqlite.ts";
 import { BOT_DOCUMENTS } from "../helpers/checkpoint-policy.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { openReadable } from "../../src/lib/sqlite-open.ts";
 
 const fixture = await tempFixture("durable-checkpoint-");
 afterAll(() => fixture.cleanup());
@@ -19,7 +19,7 @@ const nextPath = () => join(fixture.root, `db-${++counter}`, "durable.sqlite");
 
 /** Stored revisions of the documents of one kind (kinds are stored JSON-encoded). */
 function chain(path: string, kind: string): { revisions: number; bases: number } {
-  const db = new Database(path, { readonly: true });
+  const db = openReadable(path);
   try {
     const row = db.query(`SELECT count(*) AS revisions, coalesce(sum(r.kind = 'base'), 0) AS bases FROM document_revisions r
       JOIN documents d ON d.id = r.document_id WHERE d.kind = ?`).get(JSON.stringify(kind)) as { revisions: number; bases: number };

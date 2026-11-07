@@ -14,13 +14,14 @@ import { queueSpaceClear } from "../../src/durable/offline.ts";
 import { assertSpaceSchemas } from "../../src/durable/space-databases.ts";
 import { openGroupDatabase, openGroupStorage } from "../../src/durable/sqlite.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { openReadable } from "../../src/lib/sqlite-open.ts";
 
 const fixture = await tempFixture("durable-schema-gate-");
 afterAll(() => fixture.cleanup());
 let n = 0;
 const digest = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
 const version = (path: string) => {
-  const db = new Database(path, { readonly: true });
+  const db = openReadable(path);
   try { return (db.query("SELECT version FROM durable_schema WHERE singleton = 1").get() as { version: number }).version; } finally { db.close(); }
 };
 

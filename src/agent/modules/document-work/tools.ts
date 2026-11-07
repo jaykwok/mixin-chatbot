@@ -15,6 +15,7 @@ import { runtimeSetting } from "../../../core/runtime-config.ts";
 import type { IsolatedTask } from "../../../core/rootless-tasks.ts";
 import { assertTaskPathAllowed, configuredRootlessTasks, finishTask, ISOLATED_PYTHON } from "../../../core/task-backend.ts";
 import { holdDirectory } from "../../../core/held-directory.ts";
+import { removalNeedsPermit } from "../../../core/reclamation.ts";
 import { isPathInside } from "../../../contracts/paths.ts";
 import { resolveToolPath } from "../../tool-path.ts";
 import { ensureDocumentToolchain, venvPythonPath } from "../../python-toolchain.ts";
@@ -199,7 +200,7 @@ async function withJob<T>(options: DocumentOptions, signal: AbortSignal | undefi
       // Only directories created by this invocation are removed. Successful jobs
       // retain their outputs/reports; failed or cancelled jobs have no deliverable.
       if (isolated) await finishTask(backend!, isolated, succeeded ? "keep-outputs" : "discard");
-      else if (directory && process.platform === "linux") {
+      else if (directory && removalNeedsPermit()) {
         const held = await holdDirectory(directory, [], false);
         try { await held.use(async entries => {
           const receipt = await entries.create(".reclamation.json");

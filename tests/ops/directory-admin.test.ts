@@ -295,7 +295,8 @@ const project = join(import.meta.dir, "../..");
 const bash = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : Bun.which("bash");
 const posixPath = (path: string) => path.replaceAll("\\", "/").replace(/^([A-Za-z]):/, (_, drive: string) => "/" + drive.toLowerCase());
 
-test.skipIf(!bash || !existsSync(bash))("ops.sh directory-scope passes its arguments through; without host Bun and without a terminal it runs in the container without -it", async () => {
+// macOS hands ops.sh to its own entry, which runs the tool as the service account and needs root.
+test.skipIf(!bash || !existsSync(bash) || process.platform === "darwin")("ops.sh directory-scope passes its arguments through; without host Bun and without a terminal it runs in the container without -it", async () => {
   const fixture = await tempFixture("directory-scope-ops-");
   const root = fixture.root, log = join(root, "calls.log");
   try {

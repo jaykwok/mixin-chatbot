@@ -32,11 +32,11 @@ test("部署停机前算出运行参数：现有文件加上环境中受支持�
     if (process.platform !== "win32") expect((await stat(docker)).mode & 0o777).toBe(0o600);
 
     const windows = join(f.root, "stage-windows/runtime-values.json");
-    expect((await run(f.root, ["--prepare-values", windows, "--deployment", "windows"], environment)).code).toBe(0);
+    expect((await run(f.root, ["--prepare-values", windows, "--deployment", "native"], environment)).code).toBe(0);
     expect(parseRuntimeValues(await readFile(windows, "utf8")).values).toEqual({ BOT_PORT: "2022", BOT_MAX_ACTIVE_REQUESTS: "16", BOT_CLOSEOUT_SECONDS: "60",
       WORKSPACE_ROOT: join(f.root, "shared"), BOT_TASK_IMAGE: image });
     const fallback = join(f.root, "stage-default/runtime-values.json");
-    expect((await run(f.root, ["--prepare-values", fallback, "--deployment", "windows"], { WORKSPACE_ROOT: join(f.root, "data", "workspace") })).code).toBe(0);
+    expect((await run(f.root, ["--prepare-values", fallback, "--deployment", "native"], { WORKSPACE_ROOT: join(f.root, "data", "workspace") })).code).toBe(0);
     expect(parseRuntimeValues(await readFile(fallback, "utf8")).values).toEqual({ BOT_PORT: "1011", BOT_MAX_ACTIVE_REQUESTS: "16" });
     expect(await readFile(runtime, "utf8")).toBe(current);
 
@@ -46,7 +46,7 @@ test("部署停机前算出运行参数：现有文件加上环境中受支持�
     for (const [args, env, message] of [
       [["--prepare-values", join(f.root, "bad-port.json"), "--deployment", "docker"], { BOT_PORT: "0" }, "BOT_PORT 必须是 1-65535 的整数"],
       [["--prepare-values", join(f.root, "no-deployment.json")], {}, "需要 --deployment"],
-      [["--prepare-values", join(f.root, "bad-deployment.json"), "--deployment", "linux"], {}, "只能是 docker 或 windows"],
+      [["--prepare-values", join(f.root, "bad-deployment.json"), "--deployment", "linux"], {}, "只能是 docker 或 native"],
     ] as const) {
       const failed = await run(f.root, [...args], env);
       expect([failed.code, failed.stdout], args.join(" ")).toEqual([1, ""]); expect(failed.stderr).toContain(message);

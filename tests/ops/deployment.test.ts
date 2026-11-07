@@ -429,15 +429,14 @@ echo "PORT=$BOT_PORT"
     const kernel = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
     const start = process.platform !== "win32" && existsSync(kernel) ? Number((await readFile(kernel, "utf8")).trim()) : 1024;
     expect(result.output).toContain(`START=${start}`);
-    expect({ code: result.code, port: result.port }).toEqual({ code: 0, port: "1011" });
-    // A first rootless deployment defaults to a port it can publish.
-    const fallback = start > 1011 ? "11011" : "1011";
+    expect({ code: result.code, port: result.port }).toEqual({ code: 0, port: "10000" });
+    // The default is above the unprivileged start, so rootless Docker publishes it too.
     result = await run({ FIXTURE_ROOTLESS: "1" });
-    expect({ code: result.code, port: result.port }).toEqual({ code: 0, port: fallback });
+    expect({ code: result.code, port: result.port }).toEqual({ code: 0, port: "10000" });
     // A new port another program already listens on stops the deployment with the way to choose another.
-    result = await run({ FIXTURE_ROOTLESS: "0", FIXTURE_TAKEN: "1011" });
+    result = await run({ FIXTURE_ROOTLESS: "0", FIXTURE_TAKEN: "10000" });
     expect(result.code, result.output).toBe(1); expect(result.port).toBeUndefined();
-    expect(result.output).toContain("本机端口 1011 已被其他程序占用"); expect(result.output).toContain(fix);
+    expect(result.output).toContain("本机端口 10000 已被其他程序占用"); expect(result.output).toContain(fix);
     // The explicit override is trimmed and probed as well.
     result = await run({ FIXTURE_ROOTLESS: "0", FIXTURE_PORT: " 3000 " });
     expect({ code: result.code, port: result.port }).toEqual({ code: 0, port: "3000" });

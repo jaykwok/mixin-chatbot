@@ -19,12 +19,14 @@ import { finishLegacy, legacyBlocker, legacyJournalRoot, legacyParent, LegacyRec
 import { legacyInventory } from "./legacy-inventory.ts";
 import { directoryEntity, exists, memberIndexes, readPlanFile } from "./plans.ts";
 import type { MemberScope, MemberView } from "./scope.ts";
-import { reclaimWindows } from "./windows.ts";
+import { journaledDeletion, removeJournaled, type OfflineProof } from "./offline.ts";
 
 export interface ReclamationOptions { root: string; state: string; directory: string; scope: MemberScope;
   backend?: Pick<RootlessTasks, "inventory" | "reclaim">;
   /** Explicit host command: root-owned journal, never inferred from a stale lease. */
-  legacy?: boolean; recordedRoot?: string; }
+  legacy?: boolean; recordedRoot?: string;
+  /** macOS: the proof that no writer is left (offline.ts); tests only. */
+  offline?: OfflineProof; }
 
 const identity = (path: string) => directoryEntity(path, "回收根不是普通目录");
 const readPrivate = (path: string) => readPlanFile(path, { private: true, message: "回收清单/进度不是当前身份的私有普通文件，或超过 32 MiB" });
@@ -35,7 +37,7 @@ async function plansRoot(options: ReclamationOptions): Promise<string> {
   await mkdir(directory, { recursive: true, mode: 0o700 }); await identity(directory);
   if (await realpath(directory) !== directory) throw new Error("回收清单目录不能经过链接");
   const info = await lstat(directory);
-  if (process.platform === "linux" && (info.uid !== process.getuid!() || (info.mode & 0o077) !== 0)) throw new Error("回收清单目录必须属于当前身份且权限为 0700");
+  if (process.platform !== "win32" && (info.uid !== process.getuid!() || (info.mode & 0o077) !== 0)) throw new Error("回收清单目录必须属于当前身份且权限为 0700");
   if (process.platform === "linux") taskOwner(directory);
   return directory;
 }
@@ -44,7 +46,7 @@ async function plansRoot(options: ReclamationOptions): Promise<string> {
 async function memberItems(options: ReclamationOptions, user: UserTmp, view: MemberView, before: number, preview: boolean): Promise<Item[]> {
   const common = { space: user.space, user: user.user }, items: Item[] = [];
   // Old shared directories are only removable by a platform backend that can fence them.
-  const sharedReady = !!options.legacy || process.platform === "win32", sharedReason = "旧共享目录需要宿主特权离线回收";
+  const sharedReady = !!options.legacy || journaledDeletion(), sharedReason = "旧共享目录需要宿主特权离线回收";
   const add = async (item: Item, createdAt: number) => {
     if (view.protectedPath(item.path)) { item.status = "kept"; item.reason = view.liveWork ? "群库有可恢复任务或未结算输入" : "当前上下文或待交付内容引用"; }
     else if (Number.isFinite(createdAt) && createdAt >= before) { item.status = "kept"; item.reason = "未到保留期限"; }
@@ -163,7 +165,7 @@ export async function applyReclamation(options: ReclamationOptions, id: string, 
           const current = fresh.get(JSON.stringify([item.path, item.token]));
           const receipt = item.task === undefined ? undefined : receipts.get(JSON.stringify([item.task, item.token])), started = progress.started.includes(key);
           let legacyResume = false;
-          if (started && !item.task && (options.legacy || process.platform === "win32")) {
+          if (started && !item.task && (options.legacy || journaledDeletion())) {
             try {
               legacyResume = journalRecordsDeletion(await readPrivate(join(directory, id + "-" + key + ".json")), item.path, item.evidence);
             } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -181,7 +183,7 @@ export async function applyReclamation(options: ReclamationOptions, id: string, 
             outcome = result.status !== "removed" ? { status: "deferred", bytes: 0, reason: result.reason }
               : result.completedEarlier ? finishedEarlier() : { status: "removed", bytes: item.evidence.bytes };
           } else {
-            if (process.platform === "win32") await reclaimWindows(item.path, item.evidence, directory, id + "-" + key);
+            if (journaledDeletion()) await removeJournaled(item.path, item.evidence, directory, id + "-" + key, options.offline);
             else {
               if (!options.legacy) throw new Error("旧共享目录未启用宿主特权离线后端");
               await reclaimLegacy(item.path, item.evidence, directory, id + "-" + key);

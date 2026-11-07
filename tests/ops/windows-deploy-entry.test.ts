@@ -120,7 +120,7 @@ for (const mode of MODES) test.skipIf(process.platform !== "win32")(`Windows dep
     const own = `own=${first ? port : ""}|${mode === "reconfigure" ? shared : mode === "workspace-missing" ? join(f.root, "missing") : ""}|`;
     const stage = "<project>\\tmp\\deploy-stage-<id>", workspace = mode === "reconfigure" ? shared : "<project>\\data\\workspace";
     const preflight = `core deployment deploy --project <project> --preflight --git-path fixture-git ${own}`;
-    const runtime = `runtime --prepare-values ${stage}\\runtime-values.json --deployment windows child=BOT_HOST=127.0.0.1,BOT_PORT=${port},WORKSPACE_ROOT=${workspace} ${own}`;
+    const runtime = `runtime --prepare-values ${stage}\\runtime-values.json --deployment native child=BOT_HOST=127.0.0.1,BOT_PORT=${port},WORKSPACE_ROOT=${workspace} ${own}`;
     const core = `core deployment deploy --project <project> --stage ${stage} --command deploy --git-path fixture-git ${own}`;
     const preview = `data preview --project <project> --plan ${stage}\\data-plan.json --workspace ${workspace}`;
     const before = ["lifecycle deploy", preflight];

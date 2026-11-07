@@ -65,7 +65,7 @@ test("task-runtime submodules reach neither ops code nor the durable or agent la
   const entries = (await readdir(directory)).filter(name => name.endsWith(".ts")).map(name => join(directory, name));
   expect(entries.length).toBeGreaterThan(0);
   const { files } = await graph(entries);
-  expect(files.filter(file => !file.startsWith("src/core/") && !file.startsWith("src/contracts/"))).toEqual([]);
+  expect(files.filter(file => !file.startsWith("src/core/") && !file.startsWith("src/contracts/") && !file.startsWith("src/lib/"))).toEqual([]);
 });
 
 test("offline maintenance reaches the business layers only through its injected scope", async () => {

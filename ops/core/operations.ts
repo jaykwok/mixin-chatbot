@@ -1,7 +1,8 @@
 // Whitelisted argv builders. Values remain opaque data through the PowerShell base64 request / Bash argv boundary.
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { opsCommand, SOURCE_DIR } from "./platform.ts";
+import { hostPlatform, nativeService, opsCommand, SOURCE_DIR } from "./platform.ts";
+import { LaunchdPlatform, type LaunchdHostFacts } from "./launchd-host.ts";
 import { codeDigest } from "./source-runtime.ts";
 import { runCommand } from "./hosting.ts";
 import type { Runner } from "./hosting.ts";
@@ -50,7 +51,7 @@ export function operationArgs(operation: string, params: Record<string, unknown>
   const argv = [operation];
   switch (operation) {
     case "repair":
-      if (process.platform === "win32") fields(params, []); else deploymentOptions("deploy", params); break;
+      if (nativeService()) fields(params, []); else deploymentOptions("deploy", params); break;
     case "update": case "deploy": {
       const options = deploymentOptions(operation, params); if ("target" in options) argv.push(options.target); break;
     }
@@ -90,7 +91,7 @@ export function operationArgs(operation: string, params: Record<string, unknown>
 }
 
 export function operationCommand(project: string, operation: string, params: Record<string, unknown>, facts?: PlanFacts): ReturnType<typeof opsCommand> {
-  const command = opsCommand(process.platform === "win32" ? "windows" : "linux", operationArgs(operation, params, facts?.scope), project, SOURCE_DIR, "console");
+  const command = opsCommand(hostPlatform(), operationArgs(operation, params, facts?.scope), project, SOURCE_DIR, "console");
   return { ...command, env: { ...command.env, ...(operation === "update" || operation === "deploy" ? deploymentEnvironment(operation, params, project)
     : operation === "repair" ? repairEnvironment(project, params) : {}), MIXIN_OPS_BUN: process.execPath,
     MIXIN_OPS_GUARD: join(SOURCE_DIR, "ops/core/check-plan.ts"), MIXIN_OPS_EXPECT_CODE: codeDigest(SOURCE_DIR),
@@ -99,10 +100,11 @@ export function operationCommand(project: string, operation: string, params: Rec
 }
 
 /** Existing saved manifests remain the authority for item-level changes. Never recreate one while verifying. */
-export async function operationScope(project: string, operation: string, params: Record<string, unknown>, run: Runner = runCommand): Promise<{ scope: string; summary: string[] }> {
+export async function operationScope(project: string, operation: string, params: Record<string, unknown>, run: Runner = runCommand,
+  launchd: Partial<LaunchdHostFacts> = {}): Promise<{ scope: string; summary: string[] }> {
   operationArgs(operation, params);
-  if (operation === "update" || operation === "deploy") return deploymentScope(project, operation, params, run);
-  if (operation === "repair") return repairScope(project, params, run);
+  if (operation === "update" || operation === "deploy") return deploymentScope(project, operation, params, run, launchd);
+  if (operation === "repair") return repairScope(project, params, run, launchd);
   const data = join(project, "data"), summary: string[] = []; let scope = planDigest([operation, params]);
   if (operation === "start" || operation === "restart") {
     // The core refuses these under its lock; say so before the confirmation, not after it. Stopping is always allowed.
@@ -188,12 +190,13 @@ export async function operationScope(project: string, operation: string, params:
 const CONFIGURATION_PHASES: Record<string, string> = { publishing: "正在写入", ready: "已写入、待确认", restoring: "正在恢复", committed: "已提交", "rolled-back": "已恢复原配置" };
 /** Windows task and Docker container states, as the operator reads them. */
 const RUN_STATES: Record<string, string> = { Running: "运行中", Ready: "已停止（计划任务就绪）", Disabled: "已停止（计划任务已禁用）",
-  running: "运行中", exited: "已停止", created: "已创建、未启动", absent: "未部署" };
+  running: "运行中", exited: "已停止", created: "已创建、未启动", absent: "未部署", "not-loaded": "已停止（LaunchDaemon 未加载）" };
 
 /** Observe metadata and the hosting manager, not the conversation bodies. Scripts repeat the check under their lock. */
-export function operationObserver(project: string, run: Runner = runCommand): ObservePlan {
+/** `launchd`: the service definition's place and the host facts beside `run`, for tests. */
+export function operationObserver(project: string, run: Runner = runCommand, launchd: Partial<LaunchdHostFacts> = {}): ObservePlan {
   return async (operation, params) => {
-    const read = await operationScope(project, operation, params, run);
+    const read = await operationScope(project, operation, params, run, launchd);
     const head = await run(["git", "-C", project, "rev-parse", "HEAD"]);
     if (head.code !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim())) throw new Error("无法核对代码版本");
     let identity: string, state: string, container: string | undefined;
@@ -205,6 +208,13 @@ export function operationObserver(project: string, run: Runner = runCommand): Ob
       if (result.code !== 0) throw new Error("无法核对机器人计划任务状态");
       state = result.stdout.trim();
       if (!["Running", "Ready", "Disabled", "absent"].includes(state)) throw new Error("机器人计划任务处于过渡状态");
+    } else if (process.platform === "darwin") {
+      identity = String(process.geteuid?.());
+      // The same raw state the service host compares before it acts (MIXIN_OPS_EXPECT_STATE).
+      const service = await new LaunchdPlatform(project, { ...launchd, run }).inspect();
+      if (!service.owned || service.state === "unsupported") throw new Error("机器人 LaunchDaemon 不属于此部署或运行方式不受支持");
+      state = service.rawState;
+      if (!["running", "not-loaded", "absent"].includes(state)) throw new Error("机器人 LaunchDaemon 处于过渡状态");
     } else {
       identity = String(process.geteuid?.());
       // The container ID binds the plan to this container on this daemon: a recreated container or another daemon is a change.

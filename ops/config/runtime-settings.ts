@@ -5,7 +5,7 @@
 // 不带参数（`bun run configure-runtime`）：Windows 本机停机后按当前环境变量保存受支持项。Linux 的 Docker 部署由部署入口
 // 写入，这里拒绝。高级运行参数由控制台经运维核心交给 runtime-apply.ts。
 //
-// 用法：runtime-settings.ts --prepare-values <文件> --deployment docker|windows
+// 用法：runtime-settings.ts --prepare-values <文件> --deployment docker|native
 //       runtime-settings.ts --values <文件> --json
 //       runtime-settings.ts
 import { mkdir, stat } from "node:fs/promises";
@@ -29,7 +29,7 @@ async function writeAtomic(path: string, raw: string): Promise<void> {
 
 /** A Docker deployment computes the container's workspace path and owns the task runtime; native runs set them. */
 const DOCKER_MANAGED: readonly RuntimeKey[] = ["WORKSPACE_ROOT", "BOT_TASK_IMAGE", "BOT_TASK_CONTROL_ROOT"];
-export type RuntimeDeployment = "docker" | "windows";
+export type RuntimeDeployment = "docker" | "native";
 
 /** The settings a deployment keeps: the current values, overridden by the supported values set in the environment. */
 function deploymentSettings(values: RuntimeConfig, env: NodeJS.ProcessEnv, deployment: RuntimeDeployment): RuntimeConfig {
@@ -38,14 +38,14 @@ function deploymentSettings(values: RuntimeConfig, env: NodeJS.ProcessEnv, deplo
     if (deployment === "docker" && DOCKER_MANAGED.includes(name)) continue;
     if (env[name]?.trim()) settings[name] = env[name]!.trim();
   }
-  // The default workspace is not a setting: naming it (the Windows deployment does, to return from an external one) drops the key.
+  // The default workspace is not a setting: naming it (a native deployment does, to return from an external one) drops the key.
   if (settings.WORKSPACE_ROOT && resolve(settings.WORKSPACE_ROOT) === resolve(DATA_DIR, "workspace")) delete settings.WORKSPACE_ROOT;
   return validateRuntimeConfig(settings);
 }
 
 /** Persist explicit deployment settings, including supported values inherited from the shell. */
 export async function saveRuntimeSettings(path = RUNTIME_CONFIG_PATH, env = process.env): Promise<void> {
-  await writeAtomic(path, runtimeText(deploymentSettings((await readRuntimeSettings(path)).values, env, "windows")));
+  await writeAtomic(path, runtimeText(deploymentSettings((await readRuntimeSettings(path)).values, env, "native")));
 }
 
 /**
@@ -92,7 +92,7 @@ if (import.meta.main) {
     try {
       const parsed = parseOptions("prepare-values", argv, { values: ["--prepare-values", "--deployment"], required: ["--prepare-values", "--deployment"] });
       const deployment = parsed.values.get("--deployment")![0];
-      if (deployment !== "docker" && deployment !== "windows") throw new UsageError("--deployment 只能是 docker 或 windows");
+      if (deployment !== "docker" && deployment !== "native") throw new UsageError("--deployment 只能是 docker 或 native");
       await prepareRuntimeValues(resolve(parsed.values.get("--prepare-values")![0]!), deployment);
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
@@ -101,7 +101,7 @@ if (import.meta.main) {
   } else try {
     if (argv.length) throw new Error("不带参数时按当前环境变量保存；高级运行参数请在控制台的「设置」中修改");
     // The native settings: a Docker host's own working directory and task runtime are not the container's.
-    if (process.platform !== "win32") throw new Error("Docker 部署的运行参数由部署入口写入，没有保存；高级运行参数请在控制台的「设置」中修改");
+    if (process.platform === "linux") throw new Error("Docker 部署的运行参数由部署入口写入，没有保存；高级运行参数请在控制台的「设置」中修改");
     const { withMaintenance } = await import("../../src/core/maintenance.ts");
     const { assertLocalConfigurationWrite } = await import("../../src/core/maintenance-state.ts");
     await withMaintenance(() => { assertLocalConfigurationWrite("."); return saveRuntimeSettings(); });

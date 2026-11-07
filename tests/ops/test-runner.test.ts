@@ -466,7 +466,7 @@ test("test files, times and reports: Bun's file names, cwd-relative times record
 });
 
 test("the committed timing tables name project test files with whole milliseconds", () => {
-  for (const platform of ["linux", "win32"]) {
+  for (const platform of ["linux", "win32", "darwin"]) {
     const table = JSON.parse(readFileSync(join(project, "tests", "timings", `${platform}.json`), "utf8")) as { version: number; files: Record<string, unknown> };
     expect(table.version).toBe(1);
     for (const [key, ms] of Object.entries(table.files)) {

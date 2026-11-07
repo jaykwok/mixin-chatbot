@@ -69,8 +69,9 @@ flowchart TD
 | --- | --- |
 | Windows 原生 | Bun 1.4.4+、Git for Windows（含 GNU Bash）、原生 `uv.exe`；使用管理员 PowerShell |
 | Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；rootful Docker 由 root 部署和升级（docker 组普通用户会被拒绝），rootless Docker 由其所属用户部署 |
+| macOS 原生（实验性支持） | Apple 芯片的 macOS 15 或 26；用 Homebrew 安装的 Bun 1.4.4+、bash、coreutils、uv，以及 Git；用 sudo 部署 |
 
-Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需安装 Bun；使用网页控制台时，宿主机另需 Bun 1.4.4+。Linux 需要可访问 `/proc`，不支持 macOS、Alpine/musl。安装链接见[选择部署方式](docs/deployment.md#选择部署方式)。
+Docker 镜像已包含应用运行环境和文档解析依赖，宿主机无需安装 Bun；使用网页控制台时，宿主机另需 Bun 1.4.4+。Linux 需要可访问 `/proc`，不支持 Alpine/musl。macOS 的检出位置、服务账户和限制见 [macOS 原生部署](docs/deployment.md#macos-原生部署实验性支持)。安装链接见[选择部署方式](docs/deployment.md#选择部署方式)。
 
 同时准备：
 
@@ -99,10 +100,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1
 bash scripts/deploy.sh
 ```
 
-rootful Docker（默认安装）下用 root 运行（`sudo bash scripts/deploy.sh`），rootless Docker 下用其所属用户运行。脚本会准备依赖、保存配置并启动服务；凭据和模型配置由向导生成，通常无需手写 JSON。
+rootful Docker（默认安装）下用 root 运行（`sudo bash scripts/deploy.sh`），rootless Docker 下用其所属用户运行。
+
+**macOS**（实验性支持；检出放在服务账户能读取的目录，例如 `/opt/mixin-bot`）：
+
+```sh
+sudo bash scripts/deploy.sh
+```
+脚本会准备依赖、保存配置并启动服务；凭据和模型配置由向导生成，通常无需手写 JSON。
 
 - 共享资料默认放在 `data/workspace/`；部署时可用 `WORKSPACE_ROOT` 指向已有的外置目录，服务只读。
-- 本机管理端口自动使用 `1011`，不需要填写；大文件外链可稍后配置。
+- 本机管理端口自动使用 `10000`，不需要填写；大文件外链可稍后配置。
 - 各项配置说明见[部署与配置](docs/deployment.md)。
 
 ### 3. 接入开发者后台并验证
@@ -120,6 +128,12 @@ rootful Docker（默认安装）下用 root 运行（`sudo bash scripts/deploy.s
 
    ```sh
    bash scripts/ops.sh doctor
+   ```
+
+   **macOS**：
+
+   ```sh
+   sudo bash scripts/ops.sh doctor
    ```
 
 3. **验证群聊**：在客户端把应用机器人加入测试群，@ 机器人发送“只回复 OK”，确认能收到回答。
@@ -171,7 +185,7 @@ rootful Docker（默认安装）下用 root 运行（`sudo bash scripts/deploy.s
 bun run console
 ```
 
-Windows 自动打开浏览器；Linux 打印 SSH 转发命令和一次性登录链接。控制台只监听本机，机器人停止时也能使用；需要时启动，用完在终端按 Ctrl+C 退出。
+macOS 上用 `sudo bun run console` 启动。Windows 和 macOS 自动打开浏览器；Linux 打印 SSH 转发命令和一次性登录链接。控制台只监听本机，机器人停止时也能使用；需要时启动，用完在终端按 Ctrl+C 退出。
 
 | 总览 | 统计 |
 | --- | --- |

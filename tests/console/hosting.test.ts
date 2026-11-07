@@ -71,7 +71,7 @@ test("计划任务参数逐个加引号", () => {
 });
 
 test("SSH 转发提示：主机取自本次 SSH 连接，sudo 时用登录用户；取不到时保留占位符", () => {
-  expect(sshForwardHint(11012, 11012, { SSH_CONNECTION: "203.0.113.9 51234 198.51.100.7 22", SUDO_USER: "ops" }))
-    .toEqual({ command: "ssh -N -L 127.0.0.1:11012:127.0.0.1:11012 ops@198.51.100.7", guessed: true });
-  expect(sshForwardHint(11012, 18080, { SUDO_USER: "ops" })).toEqual({ command: "ssh -N -L 127.0.0.1:18080:127.0.0.1:11012 ops@<主机>", guessed: false });
+  expect(sshForwardHint(10001, 10001, { SSH_CONNECTION: "203.0.113.9 51234 198.51.100.7 22", SUDO_USER: "ops" }))
+    .toEqual({ command: "ssh -N -L 127.0.0.1:10001:127.0.0.1:10001 ops@198.51.100.7", guessed: true });
+  expect(sshForwardHint(10001, 18080, { SUDO_USER: "ops" })).toEqual({ command: "ssh -N -L 127.0.0.1:18080:127.0.0.1:10001 ops@<主机>", guessed: false });
 });

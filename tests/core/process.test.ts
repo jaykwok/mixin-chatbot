@@ -136,7 +136,8 @@ describe("supervised real subprocesses", () => {
     } finally { clearTimeout(watchdog); parent.kill(); await parent.exited; await fixture.cleanup(); }
   }, 42000);
 
-  test.each(["exit", "cancel"])("reaps a detached child on parent %s", async (mode) => {
+  // macOS: a setsid child whose parent exited first belongs to launchd and is out of reach (the accepted limit, src/lib/darwin.ts killDescendants).
+  test.each(process.platform === "darwin" ? ["cancel"] : ["exit", "cancel"])("reaps a detached child on parent %s", async (mode) => {
     const fixture = await tempFixture("supervised-process-");
     const childFile = join(fixture.root, "child.cjs");
     const parentFile = join(fixture.root, "parent.cjs");

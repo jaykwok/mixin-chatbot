@@ -17,7 +17,9 @@ const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
 async function heldElsewhere(lock: string): Promise<boolean> {
   const argv = process.platform === "win32"
     ? ["powershell", "-NoProfile", "-Command", "try { $f=[IO.File]::Open($env:FIXTURE_LOCK,'OpenOrCreate','ReadWrite','None'); $f.Dispose(); exit 0 } catch { exit 7 }"]
-    : ["flock", "-n", lock, "true"];
+    : process.platform === "darwin"
+      ? [process.execPath, "-e", `const { openSync } = require("node:fs"); const { tryLock } = require(${JSON.stringify(join(repository, "src/lib/darwin.ts"))}); process.exit(tryLock(openSync(process.argv[1], "r+")) ? 0 : 7);`, lock]
+      : ["flock", "-n", lock, "true"];
   return await Bun.spawn(argv, { stdout: "ignore", stderr: "ignore", windowsHide: true, env: { ...process.env, FIXTURE_LOCK: lock } }).exited !== 0;
 }
 async function fixture() {
@@ -47,7 +49,7 @@ test("锁内复核代码和完整计划；复核期间再次改代码也拒绝",
 });
 
 // ops.sh and deploy.sh still take deploy.lock themselves (acquire_deploy_lock) and run the guard while holding it.
-test.skipIf(process.platform === "win32")("Shell 入口的真实部署锁在复核期间保持独占；拒绝计划后释放锁且不运行操作", async () => {
+test.skipIf(process.platform !== "linux")("Shell 入口的真实部署锁在复核期间保持独占；拒绝计划后释放锁且不运行操作", async () => {
   const f = await fixture();
   try {
     const helper = join(f.root, "guard.ts"), marker = join(f.root, "action"), lock = join(f.root, "data/state/deploy.lock");

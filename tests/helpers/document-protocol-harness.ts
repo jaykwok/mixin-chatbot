@@ -8,6 +8,7 @@ import { compile, type JsonSchema } from "@earendil-works/pi-schema";
 import type { MemberPlaces, MemberToolSpec } from "../../src/durable/tools.ts";
 import { stubDocumentPython } from "./document-python-stub.ts";
 import { runMemberTool } from "./member-tools.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 const root = process.cwd(), configuredOffice = join(root, "Office files", "soffice.exe");
 await mkdir(join(root, "data/config"), { recursive: true });
@@ -181,7 +182,7 @@ controls.extraComposedPages = -1;
 await assert.rejects(runMemberTool(compose, { items: [{ source: "方案.pptx", slides: [1] }, { content: "## 新页" }] },
   { places: options }), /组装结果 1 页，与选择的 2 页不符/);
 controls.extraComposedPages = 0;
-if (process.platform === "linux") {
+if (removalNeedsPermit()) {
   const added = (await jobs()).filter(name => !jobsBefore.includes(name)); assert.equal(added.length, 2);
   for (const name of added) assert.equal(JSON.parse(await readFile(join(tempDir, name, ".reclamation.json"), "utf8")).status, "deferred");
 } else assert.deepEqual(await jobs(), jobsBefore);

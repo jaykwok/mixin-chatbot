@@ -37,13 +37,16 @@ test(".console 只保存端口和实例记录，保存值无效时报错而不�
   } finally { await fixture.cleanup(); }
 });
 
-test.skipIf(process.platform === "win32")("POSIX 上 .console 为 700，组/其他用户可访问时拒绝且不自动改权限", async () => {
+test.skipIf(process.platform === "win32")("POSIX 上 .console 为 700（macOS 为 711），组/其他用户可读写时拒绝且不自动改权限", async () => {
   const fixture = await tempFixture("console-mode-");
   const dir = join(fixture.root, ".console");
   try {
     prepareConsoleDir(dir);
-    expect(statSync(dir).mode & 0o777).toBe(0o700);
-    savePort(dir, 11012);
+    // macOS lets the service account pass through to the frozen code (0711); an existing 0700 is opened up the same way.
+    const mode = process.platform === "darwin" ? 0o711 : 0o700;
+    expect(statSync(dir).mode & 0o777).toBe(mode);
+    if (process.platform === "darwin") { chmodSync(dir, 0o700); prepareConsoleDir(dir); expect(statSync(dir).mode & 0o777).toBe(0o711); }
+    savePort(dir, 10001);
     expect(statSync(join(dir, "port")).mode & 0o777).toBe(0o600);
     chmodSync(dir, 0o750);
     expect(() => prepareConsoleDir(dir)).toThrow("组或其他用户可以访问");

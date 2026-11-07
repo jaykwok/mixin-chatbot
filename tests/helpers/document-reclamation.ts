@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 /** Verify the cleanup contract without turning an unproven shared directory into removal authority. */
 export async function checkDocumentReclamation(job: string, succeeded?: boolean, isolated = false) {
   const files = await readdir(job);
-  if (process.platform === "linux" && !isolated) {
+  if (removalNeedsPermit() && !isolated) {
     const receipt = JSON.parse(await readFile(join(job, ".reclamation.json"), "utf8"));
     assert.equal(receipt.version, 1); assert.equal(receipt.status, "deferred");
     assert.equal(receipt.reason, "shared-parent-writers-not-isolated");
@@ -22,7 +23,7 @@ export async function retainedOfficeProfiles(tempDirs: string[], systemTemp: str
   const retained: string[] = [];
   for (const tempDir of tempDirs) {
     const root = join(tempDir, ".office-jobs"), files = await readdir(root);
-    if (process.platform !== "linux") { assert.deepEqual(files, []); continue; }
+    if (!removalNeedsPermit()) { assert.deepEqual(files, []); continue; }
     const receipts = files.filter(name => !name.endsWith(".deferred.json"));
     assert.equal(files.length, receipts.length * 2, "every retained profile needs ownership and deferred receipts");
     for (const file of receipts) {

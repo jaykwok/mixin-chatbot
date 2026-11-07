@@ -31,14 +31,40 @@
 | --- | --- | --- |
 | Windows 原生 | Bun 1.4.4+、Git for Windows 的 GNU Bash（找到的若是 WSL 启动器 `System32\bash.exe` 或 `WindowsApps\bash.exe`，bash 工具会拒绝运行）、原生 `uv.exe`；管理员 PowerShell 部署 | Python 3.14 共享文档环境按需准备；Word/PPT 预览另需 LibreOffice |
 | Linux / Docker | glibc Linux、Git、Docker Engine、Bash、curl、coreutils、util-linux 的 `flock`；rootful Docker 由 root 部署和升级，rootless Docker 由其所属用户部署 | 镜像预装 Python 3.14、锁定的文档库、LibreOffice 和中文字体 |
+| macOS 原生（实验性支持） | Apple 芯片的 macOS 15 或 26；Homebrew 安装的 Bun 1.4.4+、bash 5、coreutils、uv，以及 Git（Homebrew 或 Xcode 命令行工具）；用 sudo 部署 | 同 Windows：共享文档环境按需准备；Word/PPT 预览另需 LibreOffice |
 
-Linux 工具进程监督需要访问 `/proc`；不支持 macOS、Alpine/musl。Docker 的配置向导与应用运行在镜像内；部署、升级和命令行运维的宿主侧核心用 Bun 运行：`PATH` 上有 Bun 1.4.4+ 时直接使用，没有时入口首次运行会从 GitHub 下载固定版本 Bun 1.4.4 到项目的 `.console/bun`，按脚本内置的 SHA-256 核对后才使用，为此需要 `curl`、`unzip`、`sha256sum`、`flock` 和对 github.com 的 HTTPS 访问。不能访问 GitHub 的主机请先自行安装 Bun 1.4.4 或更高版本。[网页控制台](console.md)用 `bun run console` 启动，需要 `PATH` 上的 Bun 1.4.4+。
+Linux 工具进程监督需要访问 `/proc`；不支持 Alpine/musl。Docker 的配置向导与应用运行在镜像内；部署、升级和命令行运维的宿主侧核心用 Bun 运行：`PATH` 上有 Bun 1.4.4+ 时直接使用，没有时入口首次运行会从 GitHub 下载固定版本 Bun 1.4.4 到项目的 `.console/bun`，按脚本内置的 SHA-256 核对后才使用，为此需要 `curl`、`unzip`、`sha256sum`、`flock` 和对 github.com 的 HTTPS 访问。不能访问 GitHub 的主机请先自行安装 Bun 1.4.4 或更高版本。[网页控制台](console.md)用 `bun run console` 启动，需要 `PATH` 上的 Bun 1.4.4+。
 
 rootful Docker（以 root 运行的默认安装）下，部署、升级、继续和回滚都要由 root 执行，例如 `sudo bash scripts/deploy.sh`：只有 root 能完整查看镜像存储所在磁盘的剩余空间，并按服务的身份给新建的文件设置属主。docker 组中的普通用户会在任何提问、构建和停机之前被拒绝，脚本不会自动 sudo。rootless Docker 由它所属的普通用户运行，不要用 sudo。
 
 容器进程的身份：真正的首次部署时，root 部署的容器降权到 UID/GID 1001，并把挂载目录的属主改成它；rootless Docker 下以容器内的 root 运行，它映射回宿主机上的部署用户，所以挂载目录仍归这个用户。之后的重新部署和升级沿用原容器 `mixin-bot`（运行或停止均可）的数值 UID/GID：停机前从原容器读取并核对，写入本次事务的快照，预览、迁移、验证实例、正式实例以及中断后的继续和回滚都用它；只给本次新建的目录和文件设置属主，不批量改已有数据的属主。原容器的身份不能可靠确定时（不是数值 UID:GID、数据目录不是本项目的、与 Docker 的模式不符），部署和升级在停机前停止，不猜测。原容器已被删除但部署过时，重新部署按 `data/state` 的属主提出身份，经确认后才使用；升级要求原容器存在。以前由 docker 组普通用户部署的实例改由 root 升级后，服务仍以原来的 UID/GID 运行。检出属于那个用户，git 拒绝以 root 操作它（仓库中的钩子和配置会以 root 运行）：确认信任这份检出后，由 root 执行一次 `git config --global --add safe.directory <项目目录>`，脚本不会代为加入；此后 root 升级时写入检出的文件属于 root。
 
-机器人的 HTTP 服务只供本机管理（控制台、`/health`、关机与通讯录管理），原生部署和 rootful Docker（host 网络）都只监听 `127.0.0.1`。rootless 下 host 网络只是 rootlesskit 的网络命名空间，宿主机连不到，所以部署改为把端口发布到宿主机的 `127.0.0.1:<端口>`，容器内监听所有接口（由部署脚本设置，不来自用户配置）。发布端口的是以部署用户身份运行的 rootlesskit，低于 `net.ipv4.ip_unprivileged_port_start`（通常 1024）的端口默认发布不了：首次部署的默认端口因此改为 `11011`，`BOT_PORT` 指定或已保存的低端口会在停机前被拒绝，并提示改用高端口，或调低该内核参数、给 rootlesskit 加 `CAP_NET_BIND_SERVICE` 后重试；升级沿用的低端口同样在停机前停止。rootless 下机器人容器和外链管理的一次性容器都访问不到只监听宿主机 `127.0.0.1` 的服务（例如本机的 MinIO 或本地模型接口），监听非回环地址的服务可以用宿主机的该地址访问。启用 SELinux 强制模式的主机尚未验证。
+机器人的 HTTP 服务只供本机管理（控制台、`/health`、关机与通讯录管理），原生部署和 rootful Docker（host 网络）都只监听 `127.0.0.1`。rootless 下 host 网络只是 rootlesskit 的网络命名空间，宿主机连不到，所以部署改为把端口发布到宿主机的 `127.0.0.1:<端口>`，容器内监听所有接口（由部署脚本设置，不来自用户配置）。发布端口的是以部署用户身份运行的 rootlesskit，低于 `net.ipv4.ip_unprivileged_port_start`（通常 1024）的端口默认发布不了：`BOT_PORT` 指定或已保存的低端口会在停机前被拒绝，并提示改用高端口，或调低该内核参数、给 rootlesskit 加 `CAP_NET_BIND_SERVICE` 后重试；升级沿用的低端口同样在停机前停止。rootless 下机器人容器和外链管理的一次性容器都访问不到只监听宿主机 `127.0.0.1` 的服务（例如本机的 MinIO 或本地模型接口），监听非回环地址的服务可以用宿主机的该地址访问。启用 SELinux 强制模式的主机尚未验证。
+
+### macOS 原生部署（实验性支持）
+
+只支持 Apple 芯片（arm64），已验证 macOS 15 和 26；Intel Mac 和 Rosetta 下的终端会被拒绝。这一平台仍在验证中：开机后未登录即启动、重启恢复、睡眠唤醒等还需在真实机器上确认，生产使用前请先在自己的机器上完成[验证](../README.md#3-接入开发者后台并验证)。
+
+先用 Homebrew 安装工具（Git 也可以用 `xcode-select --install` 安装的版本）：
+
+```sh
+brew install oven-sh/bun/bun bash coreutils uv git
+brew install --cask libreoffice    # 可选：Word/PPT 预览
+```
+
+机器人以 LaunchDaemon（`com.mixin-bot.service`）运行：开机即启动，不需要有人登录；`stop` 之后保持停止，重启电脑也不会自行拉起。它使用部署时创建的隐藏服务账户 `_mixinbot`（自己的同名组，没有登录 shell 和家目录）。`data/`、`logs/`、`backup/` 归这个账户；代码仍归你自己，拉取更新和安装依赖以你的身份运行。部署、升级和命令行运维都用 sudo 运行，例如 `sudo bash scripts/deploy.sh`、`sudo bash scripts/ops.sh doctor`；[网页控制台](console.md)用 `sudo bun run console` 启动。
+
+服务账户必须能读取检出。个人目录默认不允许其他用户进入，「桌面」「文稿」「下载」等目录还受系统隐私保护，放在这些位置时部署会在开始前拒绝。建议放在 `/opt` 下，属主为你自己：
+
+```sh
+sudo mkdir -p /opt/mixin-bot && sudo chown "$USER" /opt/mixin-bot
+git clone https://github.com/jaykwok/mixin-bot.git /opt/mixin-bot
+cd /opt/mixin-bot
+```
+
+部署按服务账户实际检查每个工具的版本和路径，并把找到的路径写进服务定义；以后升级 Homebrew 后若工具位置变化，重新部署即可。服务的 `PATH` 只包含这些工具和系统目录，语言环境为 `C.UTF-8`，不读取任何登录 shell 的配置。
+
+与 Linux 相比的限制：成员的工具进程脱离自己的会话后，停止时不一定能找全；临时文件的物理删除只在停机维护中、确认服务账户没有残留进程后进行，否则保留现场。卸载（`sudo bash scripts/ops.sh uninstall`）删除服务定义并归档数据，但保留服务账户，并打印删除它的命令。
 
 基础组件通过官方渠道安装：[Bun](https://bun.sh/docs/installation)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Docker Engine（Debian）](https://docs.docker.com/engine/install/debian/)。
 
@@ -61,7 +87,7 @@ Remove-Item Env:UV_PROJECT_ENVIRONMENT
 
 Linux 的同等操作为 `UV_PROJECT_ENVIRONMENT="$PWD/data/runtime/document-env" uv sync --locked --no-dev --no-install-project`，成功后运行 `bun src/agent/document-manifest.ts . "$PWD/data/runtime/document-env"`。marker 只记录预期配置，运行时仍验证实际解释器、依赖及导入。
 
-Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffice.org/download/download-libreoffice/)安装。在控制台「设置 → 高级运行参数 → 文档处理」的「LibreOffice 程序路径」中填写程序的绝对路径，例如 `C:/Program Files/LibreOffice/program/soffice.exe`；便携版填写其 `program/soffice.exe` 的绝对路径。留空时先从服务账户的 PATH 查找 `soffice`、`libreoffice`，Windows 再查标准安装目录。Linux 同样可设置，如 `/usr/bin/soffice`；隔离任务须填写任务容器内已存在的程序路径，Docker 镜像预装 LibreOffice，通常保持自动查找即可。指定路径无效时会报错，请修正或恢复自动查找。变更后重启服务。PDF 预览直接使用 Python 库。预览字体取自运行主机，建议安装与客户模板一致的字体；Docker 提供 Noto CJK。缺少 LibreOffice 时仍可编辑和组装文件，工具会明确报告未完成视觉检查。
+Windows 若需 Word/PPT 预览，从 [LibreOffice 官网](https://www.libreoffice.org/download/download-libreoffice/)安装。在控制台「设置 → 高级运行参数 → 文档处理」的「LibreOffice 程序路径」中填写程序的绝对路径，例如 `C:/Program Files/LibreOffice/program/soffice.exe`；便携版填写其 `program/soffice.exe` 的绝对路径。留空时先从服务账户的 PATH 查找 `soffice`、`libreoffice`，Windows 再查标准安装目录，macOS 再查 `/Applications/LibreOffice.app`。Linux 同样可设置，如 `/usr/bin/soffice`；隔离任务须填写任务容器内已存在的程序路径，Docker 镜像预装 LibreOffice，通常保持自动查找即可。指定路径无效时会报错，请修正或恢复自动查找。变更后重启服务。PDF 预览直接使用 Python 库。预览字体取自运行主机，建议安装与客户模板一致的字体；Docker 提供 Noto CJK；macOS 使用系统自带的冬青黑体、黑体-简和宋体-简，文档中的微软雅黑、等线、黑体、宋体等按此替换。缺少 LibreOffice 时仍可编辑和组装文件，工具会明确报告未完成视觉检查。
 
 只读 Docker 容器需要可写的 `/tmp`，例如 `--tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777`；部署脚本已提供该挂载。LibreOffice 的 Unix 进程通信文件使用 `/tmp`，仅设置 `TMPDIR` 无法代替它。每次转换的 LibreOffice 用户配置（profile）放在系统临时目录下单独创建的目录（容器内即该 `/tmp`），任务结束、失败或取消后删除，文档工具同时最多两次转换；缓存和输出放在本次任务临时目录。Windows 上 profile 目录较深时曾出现 LibreOffice 退出码为 0 却不生成 PDF，因此不放在数据目录下，服务账户的 TEMP 也应保持较短路径。转换错误会保留 LibreOffice 的诊断输出。
 
@@ -92,6 +118,13 @@ bash scripts/deploy.sh
 bash scripts/ops.sh doctor
 ```
 
+macOS（实验性支持，检出位置见 [macOS 原生部署](#macos-原生部署实验性支持)）：
+
+```sh
+sudo bash scripts/deploy.sh
+sudo bash scripts/ops.sh doctor
+```
+
 首次部署直接创建当前存储结构。后续重复部署时，脚本先暂停已有实例并保存配置、启动定义、依赖或镜像及原运行状态，停止时明确提示“已停止机器人服务”；Windows 与 Docker 都在停止前确定共享资料目录、问完是否重新配置 AI 并选定[通讯录同步范围](#通讯录同步范围)（还没有时），本机端口不询问（见下节）；凭据和 AI 向导也在停止前运行，回答只写进本次部署的暂存目录，停止后才写入正式位置；取消不会改动部署。部署失败会尝试回滚，恢复失败则保留现场并报错。更早版本（v1.x 和 webhook 发布）的目录不能重新部署或升级，见[从更早的版本切换](data-migrations.md#从更早的版本切换)。部署被强制中断或回滚未完成时，重新运行部署脚本会先显示上次操作的记录，询问继续还是回滚；继续只使用停机前确认的设置，数据已提交时只能继续，详见[中断恢复](operations.md#中断恢复)。Windows 计划任务优先使用 S4U 开机启动，受系统限制时回退到登录启动，并显示实际方式。
 
 ### 通讯录同步范围
@@ -99,7 +132,7 @@ bash scripts/ops.sh doctor
 机器人只认识同步范围内的成员，部署时必须明确选择，没有默认值：整个通讯录，或选定的部门及其全部子部门（最多 200 个）。首次部署在填完应用机器人凭据之后选择；已有凭据却还没有范围的部署（例如手工删除了这个文件）重新部署或升级时在停止服务之前选择，取消或失败都不停机、不改动部署。在终端里运行时由向导选择：先选“选择部门”或“整个通讯录”；选部门时从一级部门逐层进入勾选，完成时向平台核对并列出各部门的完整路径，再确认一次；选整个通讯录同样要再确认一次。部门只能这样逐层勾选，不接受手填的部门 ID。不交互时只能选择整个通讯录，预先设置 `BOT_DIRECTORY_SCOPE=all`：
 
 ```sh
-BOT_DIRECTORY_SCOPE=all bash scripts/deploy.sh         # rootful Docker：sudo BOT_DIRECTORY_SCOPE=all bash scripts/deploy.sh
+BOT_DIRECTORY_SCOPE=all bash scripts/deploy.sh         # rootful Docker 和 macOS：sudo BOT_DIRECTORY_SCOPE=all bash scripts/deploy.sh
 ```
 
 ```powershell
@@ -112,12 +145,12 @@ $env:BOT_DIRECTORY_SCOPE='all'; powershell -NoProfile -ExecutionPolicy Bypass -F
 
 ### 本机管理端口
 
-本机端口只供控制台、`/health`、关机和通讯录管理使用，只在本机回环地址上可达；消息经 Stream 主动连出接收，不需要开放入站端口、域名或隧道。部署不询问端口：首次部署使用 `1011`，rootless Docker 不能发布低端口时使用 `11011`；之后的重新部署和升级沿用已保存的端口（`data/state/bot-port`），继续和回滚只用事务记录中的端口。
+本机端口只供控制台、`/health`、关机和通讯录管理使用，只在本机回环地址上可达；消息经 Stream 主动连出接收，不需要开放入站端口、域名或隧道。部署不询问端口：首次部署使用 `10000`；之后的重新部署和升级沿用已保存的端口（`data/state/bot-port`），继续和回滚只用事务记录中的端口。
 
 端口与其他程序冲突或需要指定时，设置环境变量 `BOT_PORT` 后重新部署；新端口会保存下来，之后沿用：
 
 ```sh
-BOT_PORT=12011 bash scripts/deploy.sh    # rootful Docker：sudo BOT_PORT=12011 bash scripts/deploy.sh
+BOT_PORT=12011 bash scripts/deploy.sh    # rootful Docker 和 macOS：sudo BOT_PORT=12011 bash scripts/deploy.sh
 ```
 
 ```powershell
@@ -185,7 +218,7 @@ Pi Durable 的引擎策略独立保存在 `data/runtime/pi/settings.json`；原�
 
 | 设置 | 默认值 | 范围 / 说明 |
 | --- | --- | --- |
-| `BOT_PORT` | 1011（rootless Docker 不能发布低端口时为 11011） | 1–65535；部署时用环境变量指定，保存在 `data/state/bot-port`，见[本机管理端口](#本机管理端口) |
+| `BOT_PORT` | 10000 | 1–65535；部署时用环境变量指定，保存在 `data/state/bot-port`，见[本机管理端口](#本机管理端口) |
 | `BOT_HOST` | 127.0.0.1 | 只接受回环地址 `127.0.0.1`、`::1` 或 `localhost`；HTTP 只供本机管理 |
 | `WORKSPACE_ROOT` | data/workspace | 共享资料目录；可指向已存在的外置目录，服务只读，部署不创建、不改属主。部署时用环境变量指定（设为空恢复默认），见[数据目录](#数据目录) |
 | `BOT_MAX_ACTIVE_REQUESTS` | 32 | 1–1000，普通请求总量 |

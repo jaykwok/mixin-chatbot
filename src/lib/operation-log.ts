@@ -3,6 +3,7 @@ import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, open
   unlinkSync, writeSync } from "node:fs";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { descriptorPath } from "./darwin.ts";
 import { redactSecrets as redact } from "./redact.ts";
 
 const namePattern = /^(upgrade|deploy|startup)-[\dTZ]+-[\w-]+\.log$/;
@@ -11,12 +12,12 @@ const maxBytes = 2 * 1024 * 1024;
 // append opens without O_CREAT, refusing a link (O_NOFOLLOW) or a FIFO (O_NONBLOCK, then fstat) in place of the log.
 const appendFlags = constants.O_WRONLY | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 
-/** Exclusive creation. On Linux the new file must be the project's own logs/operations entry; one created through a replaced directory is removed again. */
+/** Exclusive creation. On Linux and macOS the new file must be the project's own logs/operations entry; one created through a replaced directory is removed again. */
 function createLog(project: string, path: string): void {
   const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600);
   try {
-    if (process.platform !== "linux") return;
-    const actual = readlinkSync(`/proc/self/fd/${fd}`);
+    if (process.platform === "win32") return;
+    const actual = process.platform === "darwin" ? descriptorPath(fd) : readlinkSync(`/proc/self/fd/${fd}`);
     if (actual !== join(realpathSync(join(project, "logs")), "operations", basename(path))) {
       unlinkSync(actual);
       throw new Error("diagnostic directory was replaced");

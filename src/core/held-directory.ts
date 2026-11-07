@@ -17,7 +17,11 @@
 //   held, without creating, after checking that it is the file created (volume and file index): Bun's own I/O is
 //   asynchronous, a write or flush through the system handle would stop the service's thread. Renames and removals go
 //   through the handle that created it.
-// Other platforms have neither and are refused.
+// - macOS: as on Linux, each directory is an open descriptor, but there is no /proc and `/dev/fd/<fd>/<name>` does not
+//   resolve through the directory. So every entry is reached with the *at calls of libSystem (src/lib/darwin.ts)
+//   relative to its held directory, and a file created that way becomes a Bun FileHandle by opening `/dev/fd/<fd>`,
+//   which gives another descriptor of the same open file.
+// Other platforms have none of these and are refused.
 //
 // Errors name entries by their path below the base, not by /proc/self/fd or a handle. A directory is released only
 // after the operations running through it: a closed descriptor's number is reused, and /proc/self/fd/<fd> would then
@@ -28,6 +32,7 @@ import { constants } from "node:fs";
 import { type FileHandle, lstat, mkdir, open, readdir, realpath, rename, rm, rmdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { WindowsTreeEntry } from "../contracts/maintenance.ts";
+import { AT_FDCWD, close, directoryRemoved, fstat, isDirectory, isFile, mkdirAt, namesAt, O, openAt, renameAt as renameDarwin, statAt, unlinkAt } from "../lib/darwin.ts";
 import { finishWindows, type WindowsHandle, WindowsHandles, WIN32_CODES } from "./windows-handles.ts";
 import type { RemovalPermit } from "./reclamation.ts";
 
@@ -124,7 +129,8 @@ export class HeldDirectory {
 export async function holdDirectory(base: string, names: readonly string[], create = true, windows = defaultWindows): Promise<HeldDirectory> {
   if (process.platform === "linux") return holdLinux(base, names, create);
   if (process.platform === "win32") return holdWindows(base, names, create, windows);
-  throw new Error(`codemode result files need Linux or Windows, not ${process.platform}`);
+  if (process.platform === "darwin") return holdDarwin(base, names, create);
+  throw new Error(`codemode result files need Linux, Windows or macOS, not ${process.platform}`);
 }
 
 function refused(path: string, why: string): Error {
@@ -312,6 +318,179 @@ async function readLinux(path: string): Promise<string | undefined> {
     if (!info.isFile() || info.size > 1024 * 1024) throw new Error(`not a small regular file: ${path}`);
     return await file.readFile("utf8");
   } finally { await file.close(); }
+}
+
+// macOS.
+
+const DARWIN_DIRECTORY = O.RDONLY | O.DIRECTORY | O.NOFOLLOW;
+
+async function holdDarwin(base: string, names: readonly string[], create: boolean): Promise<HeldDirectory> {
+  let held = openAt(AT_FDCWD, base, DARWIN_DIRECTORY);
+  let path = base;
+  try {
+    for (const name of names) {
+      path = join(path, name);
+      if (create) {
+        try { mkdirAt(held, name, DIR_MODE); }
+        catch (error) { if (codeOf(error) !== "EEXIST") throw failed(`make directory ${path}`, codeOf(error), error); }
+      }
+      let next: number;
+      try { next = openAt(held, name, DARWIN_DIRECTORY); }
+      catch (error) {
+        // A symbolic link as the last component: ELOOP, or ENOTDIR with O_DIRECTORY.
+        if (codeOf(error) === "ELOOP" || codeOf(error) === "ENOTDIR") throw refused(path, "is a link or not a directory");
+        throw failed(`open directory ${path}`, codeOf(error), error);
+      }
+      const parent = held;
+      held = next;
+      close(parent);
+    }
+    const info = fstat(held);
+    const fd = held;
+    const directory = path;
+    return new HeldDirectory({ dev: info.dev, ino: info.ino }, {
+      read: async (name) => readDarwin(fd, name, join(directory, name)),
+      names: async () => namesAt(fd),
+      create: (name, append) => createDarwin(fd, directory, name, append),
+      removeDirectories: (policy) => removeDarwinDirectories(fd, directory, policy),
+    }, async () => close(fd));
+  } catch (error) {
+    close(held);
+    throw error;
+  }
+}
+
+/** A Bun handle of the open file `fd` refers to (only the access mode is given: nothing is created or truncated); `fd`
+ * itself is closed either way. */
+async function darwinHandle(fd: number, flags: number): Promise<FileHandle> {
+  try { return await open(`/dev/fd/${fd}`, flags); }
+  finally { close(fd); }
+}
+
+async function readDarwin(dir: number, name: string, path: string): Promise<string | undefined> {
+  // Obtain the descriptor without waiting for a FIFO writer, then check and read that same entity.
+  let fd: number;
+  try { fd = openAt(dir, name, O.RDONLY | O.NOFOLLOW | O.NONBLOCK); }
+  catch (error) { if (codeOf(error) === "ENOENT") return; throw error; }
+  try {
+    const info = fstat(fd);
+    if (!isFile(info) || info.size > 1024n * 1024n) throw new Error(`not a small regular file: ${path}`);
+  } catch (error) { close(fd); throw error; }
+  const file = await darwinHandle(fd, constants.O_RDONLY);
+  try { return await file.readFile("utf8"); }
+  finally { await file.close(); }
+}
+
+async function createDarwin(dir: number, directory: string, name: string, append = false): Promise<NewFile> {
+  let fd: number;
+  try { fd = openAt(dir, name, O.WRONLY | O.CREAT | O.EXCL | O.NOFOLLOW | (append ? O.APPEND : 0), FILE_MODE); }
+  catch (error) { throw failed(`create ${join(directory, name)}`, codeOf(error), error); }
+  let current = name;
+  const handle = await darwinHandle(fd, constants.O_WRONLY | (append ? constants.O_APPEND : 0)).catch((error) => {
+    try { unlinkAt(dir, current); } catch {}
+    throw failed(`create ${join(directory, name)}`, codeOf(error), error);
+  });
+  let closing: Promise<void> | undefined;
+  try {
+    const info = await handle.stat({ bigint: true });
+    return {
+      handle,
+      identity: { dev: info.dev, ino: info.ino },
+      rename: async (to) => {
+        try { renameDarwin(dir, current, dir, to); }
+        catch (error) { throw failed(`rename ${join(directory, current)} to ${to}`, codeOf(error), error); }
+        current = to;
+      },
+      close: (remove = false) => closing ??= (async () => {
+        if (remove) try { unlinkAt(dir, current); } catch {}
+        await handle.close();
+      })(),
+    };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+/** The directory `name` in `dir`, opened only if it is the directory observed there, never a link put in its place. */
+function existingDarwinDirectory(dir: number, name: string): number | undefined {
+  const observed = statAt(dir, name);
+  if (!observed || !isDirectory(observed)) return;
+  let fd: number;
+  try { fd = openAt(dir, name, DARWIN_DIRECTORY); }
+  catch (error) { if (["ENOENT", "ENOTDIR", "ELOOP"].includes(codeOf(error))) return; throw error; }
+  try {
+    if (sameIdentity(observed, fstat(fd))) return fd;
+  } catch (error) {
+    close(fd);
+    throw error;
+  }
+  close(fd);
+}
+
+/** Every recursion is through a held descriptor; unlinkat never recurses or follows a final symlink. */
+function checkDarwinDevices(held: number, device: bigint): void {
+  for (const name of namesAt(held)) {
+    const info = statAt(held, name);
+    if (!info) throw failed("reclaim a changing directory", "ENOENT");
+    if (info.dev !== device) throw failed("reclaim across devices", "EXDEV");
+    const child = existingDarwinDirectory(held, name);
+    if (child !== undefined) { try { checkDarwinDevices(child, device); } finally { close(child); } }
+  }
+}
+
+function emptyDarwinDirectory(held: number): void {
+  for (const name of namesAt(held)) {
+    const child = existingDarwinDirectory(held, name);
+    if (child !== undefined) {
+      try {
+        emptyDarwinDirectory(child);
+        unlinkDarwinDirectory(held, name, child);
+      } finally { close(child); }
+    } else {
+      // A concurrent replacement by a directory fails closed; unlinkat without AT_REMOVEDIR cannot remove it.
+      try { unlinkAt(held, name); } catch (error) { if (codeOf(error) !== "ENOENT") throw error; }
+    }
+  }
+}
+
+function unlinkDarwinDirectory(parent: number, name: string, held: number): boolean {
+  const named = statAt(parent, name);
+  if (named && sameIdentity(named, fstat(held))) {
+    // Reached only with a management permit: the parent is protected and every writer has exited.
+    try { unlinkAt(parent, name, true); } catch (error) { if (!["ENOENT", "ENOTDIR"].includes(codeOf(error))) throw error; }
+  }
+  return directoryRemoved(held);
+}
+
+async function removeDarwinDirectories(root: number, directory: string, policy: RemovalPolicy): Promise<DirectoryRemoval[]> {
+  const removed: DirectoryRemoval[] = [];
+  for (const name of policy.candidates ?? namesAt(root).sort()) {
+    if (!name || name === "." || name === ".." || /[\\/\0]/.test(name)) throw new Error("Invalid removal candidate");
+    if (!policy.select(name)) continue;
+    const child = existingDarwinDirectory(root, name);
+    if (child === undefined) { removed.push({ name, status: "refused", reason: "entry-is-not-the-held-directory" }); continue; }
+    try {
+      const info = fstat(child), index = statAt(child, "index.txt");
+      const identity = { dev: info.dev, ino: info.ino };
+      if (!await policy.beforeRemove(name, Math.max(info.mtimeMs, index && isFile(index) ? index.mtimeMs : 0), {
+        read: async (file) => readDarwin(child, file, join(directory, name, file)),
+        names: async () => namesAt(child),
+      }, identity)) continue;
+      const recorded = { dev: String(identity.dev), ino: String(identity.ino) };
+      // Defer before entering the subtree: nested name-based removals have the same last-comparison window.
+      if (!policy.permit?.permits(fstat(root), identity)) {
+        removed.push({ name, status: "deferred", identity: recorded, reason: "exclusive-writers-not-proven" }); continue;
+      }
+      checkDarwinDevices(child, identity.dev);
+      emptyDarwinDirectory(child);
+      const unlinked = unlinkDarwinDirectory(root, name, child);
+      if (policy.requireRemoval && !unlinked) throw failed(`unlink moved directory ${join(directory, name)}`, "EBUSY");
+      removed.push({ name, status: unlinked ? "removed" : "deferred", identity: recorded, ...(!unlinked ? { reason: "held-directory-moved" } : {}) });
+    } catch (error) { throw failed(`remove directory ${join(directory, name)}`, codeOf(error), error); }
+    finally { close(child); }
+  }
+  return removed;
 }
 
 // Windows.

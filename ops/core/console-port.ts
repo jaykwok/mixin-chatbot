@@ -1,13 +1,13 @@
-// Console port: --port → saved .console/port → 11012. Never scans for a free port, and never takes a port the bot may
+// Console port: --port → saved .console/port → 10001. Never scans for a free port, and never takes a port the bot may
 // need later: a stopped bot or a bot in the middle of a transaction leaves its port free, so binding success proves
 // nothing about conflicts.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadPendingTransaction } from "./pending-transaction.ts";
 
-export const DEFAULT_CONSOLE_PORT = 11012;
-/** deploy.sh / deploy.ps1 fall back to 1011, and rootless Docker without low-port publishing to 11011. */
-const BOT_DEFAULT_PORTS = [1011, 11011];
+export const DEFAULT_CONSOLE_PORT = 10001;
+/** deploy.sh / deploy.ps1 fall back to 10000. */
+const BOT_DEFAULT_PORTS = [10000];
 
 export function parsePort(raw: string, source: string): number {
   const text = raw.trim();

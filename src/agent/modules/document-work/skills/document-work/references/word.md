@@ -54,4 +54,4 @@ uv run --no-project --python "$PI_PYTHON" "<skill目录>/scripts/flowchart.py" "
   --docx "$PI_USER_TMP/成稿.docx" --after "处理流程" --caption "图 1 问题处理流程" --out "$PI_USER_TMP/成稿-调整.docx"
 ```
 
-`--after` 匹配第一个包含该文字的段落，省略则放在文末；`--width-cm` 控制图宽；`--png 路径` 只输出图片。Word 里的流程图是位图，需要服务器有中文字体（Docker 镜像自带 Noto CJK，Windows 用微软雅黑）；没有字体时脚本报错、生成时保留源码并在 `warnings` 中说明。
+`--after` 匹配第一个包含该文字的段落，省略则放在文末；`--width-cm` 控制图宽；`--png 路径` 只输出图片。Word 里的流程图是位图，需要服务器有中文字体（Docker 镜像自带 Noto CJK，Windows 用微软雅黑，macOS 用系统自带的冬青黑体或华文黑体）；没有字体时脚本报错、生成时保留源码并在 `warnings` 中说明。

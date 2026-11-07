@@ -10,6 +10,7 @@
 // Prints one `SCENARIO <json>` line of observations each and `HARNESS_RESULT=<json>`; the test asserts on them.
 //   bun tests/helpers/codemode-path-race-harness.ts <fixture-root>
 import { mock } from "bun:test";
+import { mkdirSync, readdirSync, renameSync, rmSync, symlinkSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
@@ -29,8 +30,8 @@ type Hook = {
   /** Fire at the `nth` match (default the first). */
   nth?: number;
   seen?: number;
-  /** The other writer's change; its outcome is recorded. */
-  act?: () => Promise<string>;
+  /** The other writer's change; its outcome is recorded. Synchronous where macOS reaches it from a libSystem call. */
+  act?: () => string | Promise<string>;
   /** Instead of the call: this error. */
   fail?: (path: string) => Error;
   outcome?: string;
@@ -45,6 +46,43 @@ async function fire(point: Point, path: string) {
     hook.outcome = hook.act === undefined ? "failed" : await hook.act();
     if (hook.fail !== undefined) throw hook.fail(path);
   }
+}
+/** The same, from inside a synchronous libSystem call of the macOS held directory. */
+function fireNow(point: Point, path: string) {
+  for (const hook of hooks) {
+    if (hook.outcome !== undefined || hook.point !== point || !hook.match(basename(path), path)) continue;
+    hook.seen = (hook.seen ?? 0) + 1;
+    if (hook.seen < (hook.nth ?? 1)) continue;
+    const outcome = hook.act === undefined ? "failed" : hook.act();
+    if (typeof outcome !== "string") throw new Error("this change must be synchronous on macOS");
+    hook.outcome = outcome;
+    if (hook.fail !== undefined) throw hook.fail(path);
+  }
+}
+// macOS reaches a held directory's entries through libSystem, not node:fs: the same points, on the same names.
+if (process.platform === "darwin") {
+  // A copy: mock.module updates an imported namespace in place, and these must stay the real functions.
+  const real = { ...await import("../../src/lib/darwin.ts") };
+  const at = (dir: number, name: string) => dir === real.AT_FDCWD ? name : join(real.descriptorPath(dir), name);
+  mock.module("../../src/lib/darwin.ts", () => ({ ...real,
+    openAt(dir: number, name: string, flags: number, mode?: number) {
+      if (name !== ".") fireNow("open", at(dir, name));
+      return real.openAt(dir, name, flags, mode);
+    },
+    mkdirAt(dir: number, name: string, mode: number) {
+      const path = at(dir, name);
+      real.mkdirAt(dir, name, mode);
+      fireNow("mkdir", path);
+    },
+    renameAt(fromDir: number, from: string, toDir: number, to: string, exclusive?: boolean) {
+      fireNow("rename", at(fromDir, from));
+      real.renameAt(fromDir, from, toDir, to, exclusive);
+    },
+    unlinkAt(dir: number, name: string, directory?: boolean) {
+      fireNow("rm", at(dir, name));
+      real.unlinkAt(dir, name, directory);
+    },
+  }));
 }
 mock.module("node:fs/promises", () => ({ ...actual,
   async open(...args: Parameters<typeof fs.open>) {
@@ -138,17 +176,17 @@ async function resultOf(conversation: Conversation, id: string) {
 
 const errorCode = (error: unknown) => (error as NodeJS.ErrnoException).code ?? String(error);
 /** The other writer: move (or move into `to`, as `MOVED_INTO_BOB`) or remove `target`, then put a link in its place. */
-async function swap(kind: "rename" | "remove" | "into", target: string, to: string): Promise<string> {
+function swap(kind: "rename" | "remove" | "into", target: string, to: string): string {
   let linkTo = to;
   try {
-    if (kind === "rename") await actual.rename(target, `${target}.moved`);
-    else if (kind === "into") await actual.rename(target, linkTo = join(to, MOVED_INTO_BOB));
-    else await actual.rm(target, { recursive: true, force: true });
+    if (kind === "rename") renameSync(target, `${target}.moved`);
+    else if (kind === "into") renameSync(target, linkTo = join(to, MOVED_INTO_BOB));
+    else rmSync(target, { recursive: true, force: true });
   } catch (error) {
     return `refused:${errorCode(error)}`;
   }
   try {
-    await actual.symlink(linkTo, target, LINK);
+    symlinkSync(linkTo, target, LINK);
   } catch (error) {
     return `no-link:${errorCode(error)}`;
   }
@@ -166,8 +204,8 @@ async function inPlace(target: string, to: string, clear = false): Promise<strin
   return changed.set ? "done" : `refused:${changed.error}`;
 }
 /** Alice's call directory (the only one in a fresh group's results root). */
-async function callDir(g: Group): Promise<string> {
-  const names = (await actual.readdir(resultsRoot(g.aliceTmp))).filter((name) => !name.endsWith(".moved"));
+function callDir(g: Group): string {
+  const names = readdirSync(resultsRoot(g.aliceTmp)).filter((name) => !name.endsWith(".moved"));
   if (names.length !== 1) throw new Error(`expected one call directory, found ${JSON.stringify(names)}`);
   return join(resultsRoot(g.aliceTmp), names[0]!);
 }
@@ -243,8 +281,8 @@ const isTemp = (name: string) => (entry: string) => entry.startsWith(`${name}.`)
 
 type Scenario = {
   name: string;
-  /** Where it applies (default both): some calls exist only on one system. */
-  only?: NodeJS.Platform;
+  /** Where it applies (default all): some calls exist only on one system, or only on Linux and macOS (posix). */
+  only?: "linux" | "win32" | "posix";
   code: string;
   /** The full output text, when the script spills it. */
   full?: string;
@@ -253,10 +291,10 @@ type Scenario = {
 };
 /** An empty directory the other writer made in Bob's tmp (allowed there, must stay empty). */
 let madeInBob: string | undefined;
-const callSwap = (g: Group, kind: "rename" | "remove" | "into") => async () => swap(kind, await callDir(g), g.bobTmp);
-const callInPlace = (g: Group, clear = false) => async () => inPlace(await callDir(g), g.bobTmp, clear);
+const callSwap = (g: Group, kind: "rename" | "remove" | "into") => () => swap(kind, callDir(g), g.bobTmp);
+const callInPlace = (g: Group, clear = false) => () => inPlace(callDir(g), g.bobTmp, clear);
 /** Just before a write through the held call directory: after its check (the last call of which is this realpath). */
-const beforeWrite = (nth: number, act: () => Promise<string>): Hook => ({ point: "realpath", match: isCallDir, nth, act });
+const beforeWrite = (nth: number, act: () => string | Promise<string>): Hook => ({ point: "realpath", match: isCallDir, nth, act });
 const full = "x".repeat(2000);
 const scenarios: Scenario[] = [
   { name: "control: full output and image", code: `// @options: {"max_output_tokens": 10}
@@ -267,17 +305,17 @@ const a = await tools.probe_long({}); image("data:image/gif;base64,${GIF}"); tex
     arm: (g) => { hooks = [{ point: "open", match: isTemp("output.txt"), act: callSwap(g, "remove") }]; } },
   { name: "first file: codemode/ renamed before its temporary file", code: OUTPUT_TEXT, full,
     arm: (g) => {
-      hooks = [{ point: "open", match: isTemp("output.txt"), act: async () => {
+      hooks = [{ point: "open", match: isTemp("output.txt"), act: () => {
         // Bob's tmp gets an empty directory with the call's name, so the swapped path leads into it.
-        madeInBob = basename(await callDir(g));
-        await actual.mkdir(join(g.bobTmp, madeInBob));
+        madeInBob = basename(callDir(g));
+        mkdirSync(join(g.bobTmp, madeInBob));
         return swap("rename", resultsRoot(g.aliceTmp), g.bobTmp);
       } }];
     } },
-  // Linux makes a directory, then opens it; Windows makes and opens it in one call through its parent's handle.
-  { name: "call directory swapped after mkdir, before it is held", only: "linux", code: OUTPUT_TEXT, full,
+  // Linux and macOS make a directory, then open it; Windows makes and opens it in one call through its parent's handle.
+  { name: "call directory swapped after mkdir, before it is held", only: "posix", code: OUTPUT_TEXT, full,
     arm: (g) => { hooks = [{ point: "mkdir", match: isCallDir, act: callSwap(g, "rename") }]; } },
-  { name: "codemode/ swapped after mkdir, before it is held", only: "linux", code: OUTPUT_TEXT, full,
+  { name: "codemode/ swapped after mkdir, before it is held", only: "posix", code: OUTPUT_TEXT, full,
     arm: (g) => { hooks = [{ point: "mkdir", match: (name) => name === "codemode", act: () => swap("rename", resultsRoot(g.aliceTmp), g.bobTmp) }]; } },
   // Windows: a directory made a junction in place (D23-R2-1 round 3): before it is held, while empty, once it is not.
   { name: "codemode/ made a junction in place before it is held", only: "win32", code: OUTPUT_TEXT, full,
@@ -294,13 +332,13 @@ const a = await tools.probe_long({}); image("data:image/gif;base64,${GIF}"); tex
   { name: "standalone image before its temporary file", code: OUTPUT_IMAGE,
     arm: (g) => { hooks = [{ point: "open", match: isTemp("image-1.gif"), act: callSwap(g, "rename") }]; } },
   // Windows renames through the file's handle, not through fs.rename.
-  { name: "output-only full text before the rename", only: "linux", code: OUTPUT_TEXT, full,
+  { name: "output-only full text before the rename", only: "posix", code: OUTPUT_TEXT, full,
     arm: (g) => { hooks = [{ point: "rename", match: isTemp("output.txt"), act: callSwap(g, "rename") }]; } },
   { name: "failure cleanup: swapped before the temporary file is removed", code: OUTPUT_TEXT, full,
     arm: (g) => {
       hooks = [
         // Not the other writer: a directory where output.txt goes makes the rename fail, so the cleanup runs.
-        { point: "open", match: isTemp("output.txt"), act: async () => { await actual.mkdir(join(await callDir(g), "output.txt")); return "prepared"; } },
+        { point: "open", match: isTemp("output.txt"), act: () => { mkdirSync(join(callDir(g), "output.txt")); return "prepared"; } },
         // Windows removes the file through its handle: the swap comes before the write instead.
         { point: WINDOWS ? "open" : "rm", match: isTemp("output.txt"), act: callSwap(g, "rename") },
       ];
@@ -316,15 +354,15 @@ const a = await tools.probe_long({}); image("data:image/gif;base64,${GIF}"); tex
   // ... and when that happened between two files: the directory's check (its real path) stops the next write.
   { name: "full output, then image: call directory moved into Bob's tmp and linked back before the image's check", code: TEXT_THEN_IMAGE, full,
     arm: (g) => { hooks = [beforeWrite(2, callSwap(g, "into"))]; } },
-  // ... and a file alone, its directory in place: only the file's own check (its real path) withdraws it. Linux only:
-  // making a file symlink on Windows needs a privilege a member does not have (a junction is a directory).
-  { name: "full output, then image: the full output moved into Bob's tmp and linked back", only: "linux", code: TEXT_THEN_IMAGE, full,
-    arm: (g) => { hooks = [{ point: "open", match: isTemp("image-1.gif"), act: async () => swap("into", join(await callDir(g), "output.txt"), g.bobTmp) }]; } },
+  // ... and a file alone, its directory in place: only the file's own check (its real path) withdraws it. Not on
+  // Windows: making a file symlink there needs a privilege a member does not have (a junction is a directory).
+  { name: "full output, then image: the full output moved into Bob's tmp and linked back", only: "posix", code: TEXT_THEN_IMAGE, full,
+    arm: (g) => { hooks = [{ point: "open", match: isTemp("image-1.gif"), act: () => swap("into", join(callDir(g), "output.txt"), g.bobTmp) }]; } },
   // D23-R3-2 on both systems: the full output removed once saved, before the image; the directory stays in place.
   { name: "full output, then image: the full output removed before the image", code: TEXT_THEN_IMAGE, full,
     arm: (g) => {
-      hooks = [{ point: "open", match: isTemp("image-1.gif"), act: async () => {
-        await actual.rm(join(await callDir(g), "output.txt"));
+      hooks = [{ point: "open", match: isTemp("image-1.gif"), act: () => {
+        rmSync(join(callDir(g), "output.txt"));
         return "done";
       } }];
     } },
@@ -345,7 +383,7 @@ const a = await tools.probe_long({}); image("data:image/gif;base64,${GIF}"); tex
 
 const results = [];
 for (const scenario of scenarios) {
-  if (scenario.only !== undefined && scenario.only !== process.platform) continue;
+  if (scenario.only !== undefined && scenario.only !== process.platform && !(scenario.only === "posix" && !WINDOWS)) continue;
   const g = await group();
   hooks = [];
   madeInBob = undefined;

@@ -3,7 +3,8 @@ import { resolve, sep } from "node:path";
 import { ReferenceText } from "../../core/reference-text.ts";
 import { resultsRoot } from "./files.ts";
 
-const fold = (value: string) => process.platform === "win32" ? value.toLowerCase() : value;
+/** Windows and macOS volumes usually compare names without case; folding there only adds matches, so it keeps more. */
+const fold = (value: string) => process.platform === "win32" || process.platform === "darwin" ? value.toLowerCase() : value;
 
 /** Conservative matching: references may occur in message text, tool details or attachment originals.
  * Build once per maintenance pass of a space; every member, queued item and receipt reuses it. */

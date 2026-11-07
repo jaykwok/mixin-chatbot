@@ -254,6 +254,19 @@ export function decodeWindowsJournal(value: unknown, path: string, proof: TreeEv
   return value as unknown as WindowsJournal;
 }
 
+export type OfflineJournal = { version: 1; path: string; proof: TreeEvidence; phase: "deleting" | "removed" };
+
+/** A macOS offline deletion journal for exactly this path and reviewed evidence. */
+export function decodeOfflineJournal(value: unknown, path: string, proof: TreeEvidence): OfflineJournal {
+  const need: Check = checker("离线回收事务与清单不符");
+  need(isRecord(value), "事务");
+  need(value.version === 1, "version");
+  need(value.path === path, "path");
+  need(sameJson(value.proof, proof), "proof");
+  need(oneOf(["deleting", "removed"], value.phase), "phase");
+  return value as unknown as OfflineJournal;
+}
+
 export type FrozenDirectory = { relative: string; dev: string; ino: string; uid: number; gid: number; mode: number };
 export type LegacyJournal = { version: 1; path: string; parent: string; proof: TreeEvidence; phase: "fencing" | "deleting" | "removed" | "restored";
   directories: FrozenDirectory[] };

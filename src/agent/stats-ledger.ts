@@ -18,6 +18,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { openReadable, openWritable } from "../lib/sqlite-open.ts";
 
 export const SCHEMA_VERSION = 3;
 /** The tables of the current format; data validation reads each once. */
@@ -54,7 +55,7 @@ const TOKENS_SQL = "input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read 
 /** The ledger at `path`, created with its schema when missing. */
 export function openStatsLedger(path: string): Database {
   mkdirSync(dirname(resolve(path)), { recursive: true });
-  const db = new Database(path, { create: true, strict: true });
+  const db = openWritable(path, { create: true, strict: true });
   try {
     db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 3000;");
     db.transaction(() => {
@@ -88,7 +89,7 @@ export function openStatsLedger(path: string): Database {
  */
 export function openExistingStatsLedger(path: string): Database | null {
   if (!existsSync(path)) return null;
-  const db = new Database(path, { readonly: true, strict: true });
+  const db = openReadable(path, { strict: true });
   let ready = false;
   try {
     db.exec("PRAGMA busy_timeout = 3000");

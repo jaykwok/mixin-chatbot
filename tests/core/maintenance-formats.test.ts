@@ -23,7 +23,7 @@ import { tempFixture } from "../helpers/temp.ts";
 import { scopeOf } from "../helpers/layout.ts";
 
 const golden = join(import.meta.dir, "../fixtures/maintenance-formats");
-const platform = process.platform === "win32" ? "win32" : "linux";
+const platform = process.platform === "win32" ? "win32" : process.platform === "darwin" ? "darwin" : "linux";
 const writing = process.env.MIXIN_WRITE_FORMAT_GOLDEN === "1";
 const PLAN = "11111111-1111-4111-8111-111111111111", REMOVAL = "22222222-2222-4222-8222-222222222222", RECLAIM = "33333333-3333-4333-8333-333333333333";
 
@@ -85,7 +85,8 @@ test("archive plan, progress, removal list and removal progress keep the baselin
     await writeFile(join(temp, "note.txt"), "note");
     await mkdir(join(temp, "folder/inner"), { recursive: true }); await writeFile(join(temp, "folder/inner/x"), "x");
     await group(root, ["1-result"]);
-    const options = { root, state: join(f.root, "state.sqlite"), archive: join(root, "state/reclamation/backup/rm"), scope: durableMemberScope };
+    // macOS: this test account runs other processes, so the offline proof stands in (offline.ts).
+    const options = { root, state: join(f.root, "state.sqlite"), archive: join(root, "state/reclamation/backup/rm"), scope: durableMemberScope, offline: () => null };
     const plan = await previewTmpArchive(options, 0, undefined, undefined, "auto", PLAN);
     expectDigest(plan);
     const progress = await applyTmpArchive(options, plan.id, plan.digest);
@@ -101,9 +102,9 @@ test("archive plan, progress, removal list and removal progress keep the baselin
     expect(await json(join(plans, REMOVAL + ".removal-progress.json"))).toEqual(removed);
     await check("removal-plan", removal, [f.root]);
     await check("removal-progress", removed, [f.root]);
-    if (process.platform === "win32") {
+    if (process.platform !== "linux") {
       const journals = join(plans, "removal");
-      await check("removal-windows-journals", await Promise.all((await readdir(journals)).sort().map(name => json(join(journals, name)))), [f.root]);
+      await check(process.platform === "win32" ? "removal-windows-journals" : "removal-offline-journals", await Promise.all((await readdir(journals)).sort().map(name => json(join(journals, name)))), [f.root]);
     }
   } finally { db.close(); await f.cleanup(); }
 });
@@ -115,7 +116,7 @@ test("physical reclamation plan, progress and journals keep the baseline format"
     await mkdir(join(temp, "codemode/1-result"), { recursive: true });
     await writeFile(join(temp, "codemode/1-result/output"), "result");
     await group(root, ["1-result"]);
-    const options = { root, state: join(f.root, "state.sqlite"), directory: join(f.root, "plans"), scope: durableMemberScope };
+    const options = { root, state: join(f.root, "state.sqlite"), directory: join(f.root, "plans"), scope: durableMemberScope, offline: () => null };
     const plan = await previewReclamation(options, 0, undefined, undefined, "auto", RECLAIM);
     expectDigest(plan);
     const progress = await applyReclamation(options, plan.id, plan.digest);
@@ -123,7 +124,7 @@ test("physical reclamation plan, progress and journals keep the baseline format"
     expect(await json(join(options.directory, RECLAIM + ".progress.json"))).toEqual(progress);
     await check("reclaim-plan", plan, [f.root]);
     await check("reclaim-progress", progress, [f.root]);
-    if (process.platform === "win32") await check("reclaim-windows-journal", await json(join(options.directory, RECLAIM + "-0.json")), [f.root]);
+    if (process.platform !== "linux") await check(process.platform === "win32" ? "reclaim-windows-journal" : "reclaim-offline-journal", await json(join(options.directory, RECLAIM + "-0.json")), [f.root]);
   } finally { db.close(); await f.cleanup(); }
 });
 

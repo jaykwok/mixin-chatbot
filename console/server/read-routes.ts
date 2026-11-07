@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { ReadPage } from "../ui/src/contract.ts";
 import { redactSecrets } from "../../src/lib/redact.ts";
 import { capture } from "./query.ts";
-import { opsCommand, SOURCE_DIR } from "../../ops/core/platform.ts";
+import { hostPlatform, opsCommand, SOURCE_DIR } from "../../ops/core/platform.ts";
 import type { AuditLog } from "./audit.ts";
 import { ApiProblem } from "./routes.ts";
 import type { Route } from "./routes.ts";
@@ -18,7 +18,7 @@ export function readRoutes(project: string, audit: AuditLog, query = capture): R
         || ["keyword", "task", "level"].some(key => args[key] !== undefined && (typeof args[key] !== "string" || (args[key] as string).length > 128))
         || (args.export !== undefined && typeof args.export !== "boolean")) throw new ApiProblem(400, "input", "筛选参数无效");
       if (page === "logs") audit.write({ action: args.export ? "log-export" : "log-view", session: session.label, scope: "logs", mode: "default" });
-      const { command, args: argv, env } = page === "health" ? opsCommand(process.platform === "win32" ? "windows" : "linux", ["doctor", "--json"], project, SOURCE_DIR, "console")
+      const { command, args: argv, env } = page === "health" ? opsCommand(hostPlatform(), ["doctor", "--json"], project, SOURCE_DIR, "console")
         : { command: process.execPath, args: ["--no-env-file", join(SOURCE_DIR, "console/server/read-cli.ts"), "--project", project, "--page", page,
           "--filters", Buffer.from(JSON.stringify({ keyword: args.keyword, level: args.level, task: args.task })).toString("base64")], env: {} };
       const result = await query(command, argv, { env, signal, timeout: 90_000 });

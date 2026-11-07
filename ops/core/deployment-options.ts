@@ -12,6 +12,8 @@ import { parsePort } from "./console-port.ts";
 import { canonical, planDigest } from "./plans.ts";
 import { runCommand, type Runner } from "./hosting.ts";
 import { ownsDataMount } from "./deployment-data.ts";
+import { nativeService } from "./platform.ts";
+import { LaunchdPlatform, type LaunchdHostFacts } from "./launchd-host.ts";
 import { directoryChoice, checkedDirectoryChoice, directoryChoiceText, type DirectoryChoice } from "../lib/directory-choice.ts";
 
 type Common = { directory: "saved" | "all" | DirectoryChoice };
@@ -47,7 +49,7 @@ export function deploymentEnvironment(operation: DeploymentOperation, input: Rec
     MIXIN_OPS_DIRECTORY_APP: typeof value.directory === "string" ? "" : value.directory.appHash,
     MIXIN_OPS_SWITCH_MAIN: "switchMain" in value && value.switchMain ? "1" : "0",
     BOT_PORT: "port" in value ? String(value.port) : "",
-    WORKSPACE_ROOT: "workspace" in value ? value.workspace || (process.platform === "win32" ? join(project, "data/workspace") : "") : "" };
+    WORKSPACE_ROOT: "workspace" in value ? value.workspace || (nativeService() ? join(project, "data/workspace") : "") : "" };
 }
 
 export function assertDeploymentEnvironment(operation: string, input: Record<string, unknown>, project: string, env = process.env): void {
@@ -59,18 +61,18 @@ export function assertDeploymentEnvironment(operation: string, input: Record<str
 }
 
 export function repairEnvironment(project: string, params: Record<string, unknown>): Record<string, string> {
-  return process.platform === "win32" ? { ...Object.fromEntries(RUNTIME_KEYS.map(key => [key, ""])), MIXIN_OPS_LIFECYCLE: "repair" }
+  return nativeService() ? { ...Object.fromEntries(RUNTIME_KEYS.map(key => [key, ""])), MIXIN_OPS_LIFECYCLE: "repair" }
     : deploymentEnvironment("deploy", params, project);
 }
 
-export async function repairScope(project: string, params: Record<string, unknown>, run: Runner = runCommand) {
-  if (process.platform !== "win32") return deploymentScope(project, "deploy", params, run);
+export async function repairScope(project: string, params: Record<string, unknown>, run: Runner = runCommand, launchd: Partial<LaunchdHostFacts> = {}) {
+  if (!nativeService()) return deploymentScope(project, "deploy", params, run);
   if (loadPendingTransaction(project) || readConfigurationState(project)) throw new Error("请先完成或恢复未结束的维护事务");
   assertMaintenanceAction(project, "service");
-  const before = INPUTS.map(path => [path, fileHash(join(project, path))]), identity = await deploymentIdentity(project, run);
+  const before = INPUTS.map(path => [path, fileHash(join(project, path))]), identity = await deploymentIdentity(project, run, launchd);
   if (planDigest(before) !== planDigest(INPUTS.map(path => [path, fileHash(join(project, path))]))) throw new Error("预览期间部署设置已变化，请重试");
   return { scope: planDigest([before, identity]), summary: ["检查本机实例身份与就绪状态，未就绪时尝试重启（包括当前停止的实例）。",
-    "本机已就绪时不重启。不改配置或数据；计划任务缺失或安装损坏时，请使用重新部署。"] };
+    `本机已就绪时不重启。不改配置或数据；${process.platform === "darwin" ? "LaunchDaemon" : "计划任务"}缺失或安装损坏时，请使用重新部署。`] };
 }
 
 function fileHash(path: string): string | null {
@@ -81,7 +83,8 @@ function fileHash(path: string): string | null {
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
 }
 
-export async function deploymentScope(project: string, operation: DeploymentOperation, params: Record<string, unknown>, run: Runner = runCommand) {
+export async function deploymentScope(project: string, operation: DeploymentOperation, params: Record<string, unknown>, run: Runner = runCommand,
+  launchd: Partial<LaunchdHostFacts> = {}) {
   const options = deploymentOptions(operation, params);
   if (loadPendingTransaction(project)) throw new Error("请先继续或回滚未完成的部署或升级");
   if (readConfigurationState(project)) throw new Error("请先完成或恢复未结束的配置事务");
@@ -115,7 +118,7 @@ export async function deploymentScope(project: string, operation: DeploymentOper
       workspaceIdentity = [path, String(stat.dev), String(stat.ino)];
     }
   }
-  const identity = await deploymentIdentity(project, run);
+  const identity = await deploymentIdentity(project, run, launchd);
   if (planDigest(before) !== planDigest(INPUTS.map(path => [path, fileHash(join(project, path))]))) throw new Error("预览期间部署设置已变化，请重试");
   return { scope: planDigest([before, options, branch.stdout.trim(), workspaceIdentity, identity]), summary: [
     "target" in options ? `目标提交：${options.target}；当前分支：${branch.stdout.trim()}；${options.switchMain ? "允许切换到 main" : "不允许切换分支"}。`
@@ -127,7 +130,8 @@ export async function deploymentScope(project: string, operation: DeploymentOper
   ] };
 }
 
-async function deploymentIdentity(project: string, run: Runner): Promise<unknown> {
+/** `launchd`: the service definition's place and the host facts beside `run`, for tests. */
+async function deploymentIdentity(project: string, run: Runner, launchd: Partial<LaunchdHostFacts>): Promise<unknown> {
   let identity: unknown;
   if (process.platform === "win32") {
     const result = await run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -136,6 +140,11 @@ async function deploymentIdentity(project: string, run: Runner): Promise<unknown
     identity = JSON.parse(result.stdout);
     const actions = (identity as { Actions: { WorkingDirectory: string }[] }).Actions;
     if (actions?.length !== 1 || resolve(actions[0]!.WorkingDirectory ?? "") !== resolve(project)) throw new Error("机器人计划任务不属于此部署");
+  } else if (process.platform === "darwin") {
+    const service = await new LaunchdPlatform(project, { ...launchd, run }).inspect();
+    if (service.state === "absent") throw new Error("请先完成首次部署，无法核对机器人 LaunchDaemon");
+    if (!service.owned || service.state === "unsupported") throw new Error("机器人 LaunchDaemon 不属于此部署");
+    identity = service.identity;
   } else {
     const result = await run(["docker", "container", "inspect", "mixin-bot"]);
     if (result.code !== 0) throw new Error("请先完成首次部署，无法核对机器人容器身份");

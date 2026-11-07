@@ -74,8 +74,11 @@ test.skipIf(process.platform === "win32")("固定代码可供容器身份只读�
     writeFileSync(join(f.root, "src/version.ts"), "export const value = 1");
     writeFileSync(join(f.root, "console/icon.svg"), "<svg/>");
     writeFileSync(join(f.root, "ops/tool.ts"), "export {};");
-    const directory = join(f.root, ".console"), runtime = freezeRuntime(directory, f.root);
-    for (const path of [directory, join(directory, "runtime")]) expect(statSync(path).mode & 0o777).toBe(0o700);
+    // As every caller does: .console is prepared before the runtime is frozen in it.
+    const directory = join(f.root, ".console"); prepareConsoleDir(directory);
+    const runtime = freezeRuntime(directory, f.root);
+    // macOS: the service account's data tools pass through both to the frozen code; they still cannot list them.
+    for (const path of [directory, join(directory, "runtime")]) expect(statSync(path).mode & 0o777).toBe(process.platform === "darwin" ? 0o711 : 0o700);
     for (const path of [runtime.root, join(runtime.root, "scripts"), join(runtime.root, "scripts/lib")]) expect(statSync(path).mode & 0o777).toBe(0o755);
     expect(statSync(join(runtime.root, "scripts/lib/test.ts")).mode & 0o777).toBe(0o644);
   } finally { process.umask(previous); await f.cleanup(); }

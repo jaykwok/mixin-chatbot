@@ -422,7 +422,7 @@ function New-DoctorRow([string]$Name, [string]$Status, [string]$Detail, [string]
 $pendingTransaction = (Test-Path -LiteralPath (Join-Path $StateDir 'deploy-transaction')) -or
     (Test-Path -LiteralPath (Join-Path $StateDir 'upgrade-transaction'))
 $recovering = $Command -in @('resume', 'rollback', 'maintenance-recover') -or ($pendingTransaction -and $Command -in @('update', 'upgrade'))
-$Port = '1011'; $DeployedWorkspaceRoot = ''
+$Port = '10000'; $DeployedWorkspaceRoot = ''
 function Read-StateText([string]$Name) {
     $path = Join-Path $StateDir $Name
     if (Test-Path -LiteralPath $path -PathType Leaf) { return "$(Get-Content -LiteralPath $path -Raw)".Trim() }
@@ -431,7 +431,7 @@ function Read-StateText([string]$Name) {
 if (-not $recovering) {
     # 普通操作使用已保存设置（环境变量优先）；空文件与损坏的值一样报错；共享资料目录为空表示默认 data\workspace。
     $savedPort = Read-StateText 'bot-port'
-    $Port = if ($env:BOT_PORT) { $env:BOT_PORT } elseif ($null -ne $savedPort) { $savedPort } else { '1011' }
+    $Port = if ($env:BOT_PORT) { $env:BOT_PORT } elseif ($null -ne $savedPort) { $savedPort } else { '10000' }
     $DeployedWorkspaceRoot = Get-SavedWorkspaceRoot $Project
 }
 # 部署脚本自行校验并提供修正。
@@ -702,7 +702,7 @@ function Invoke-LifecycleOperation([scriptblock]$Action) {
         $state = Get-FinalRunState
         if ($state -eq 'running') {
             try {
-                $saved = Read-StateText 'bot-port'; $Port = if ($null -eq $saved) { '1011' } else { $saved }
+                $saved = Read-StateText 'bot-port'; $Port = if ($null -eq $saved) { '10000' } else { $saved }
                 if ((Wait-Local) -ne 200) { $state = 'start-requested'; if ($code -eq 0) { $code = 1 } }
             } catch { $state = 'unknown'; if ($code -eq 0) { $code = 1 } }
         } elseif ($state -eq 'unknown' -and $code -eq 0) { $code = 1 }

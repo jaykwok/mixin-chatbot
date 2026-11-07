@@ -5,7 +5,7 @@ import type { ComponentChildren } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { api, ApiFailure, newLoginGeneration, onConnectionLost } from "./api.ts";
 import type { Overview, SessionResponse, SessionView } from "./contract.ts";
-import { duration } from "./format.ts";
+import { duration, platformName } from "./format.ts";
 import { BrandMark, Icon, type IconName } from "./icons.tsx";
 import { available, NAV, routeFromHash, type NavItem } from "./nav.ts";
 import { ConversationsPage } from "./conversations.tsx";
@@ -326,7 +326,7 @@ function Sidebar({ route, overview, resultsOnly = false, onSearch, onClose }: { 
           <Icon name="server" />
           <div>
             <div class="host-name">{overview?.console.hostname ?? "—"}</div>
-            <div class="host-sub">{resultsOnly ? "代码已变化，不再读取部署" : deployment ? `${deployment.platform === "windows" ? "Windows" : "Linux"} · ${deployment.mode}` : "读取部署中…"}</div>
+            <div class="host-sub">{resultsOnly ? "代码已变化，不再读取部署" : deployment ? `${platformName(deployment.platform)} · ${deployment.mode}` : "读取部署中…"}</div>
           </div>
         </div>
         {!resultsOnly && <div class="version-line">控制台 v{overview?.console.version ?? "—"}</div>}

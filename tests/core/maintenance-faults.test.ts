@@ -96,7 +96,27 @@ test.skipIf(process.platform !== "win32")("archive removal (Windows): a file who
   } finally { await f.cleanup(); }
 });
 
-test.skipIf(process.platform === "win32")("archive removal (Linux): entries of the old shared identity wait for the privileged backend; nothing is deleted", async () => {
+test.skipIf(process.platform !== "darwin")("archive removal (macOS): without the offline proof nothing is deleted and the scene stays; with it the entries go once", async () => {
+  const { f, options } = await archiveFixture("faults-removal-macos-");
+  try {
+    const plan = await previewTmpArchive(options, 0);
+    await applyTmpArchive(options, plan.id, plan.digest);
+    const removal = await previewArchiveRemoval(options);
+    expect(removal.items.map(item => item.status)).toEqual(removal.items.map(() => "ready"));
+    // This test account runs other processes (the runner): no writer can be ruled out.
+    const refused = await applyArchiveRemoval(options, removal.id, removal.digest);
+    expect(Object.values(refused.outcomes).map(outcome => outcome.status)).toEqual(removal.items.map(() => "failed"));
+    for (const outcome of Object.values(refused.outcomes)) expect(outcome.reason).toContain("保留现场");
+    for (const item of removal.items) expect(await exists(item.destination)).toBe(true);
+    const again = await previewArchiveRemoval(options);
+    const done = await applyArchiveRemoval({ ...options, offline: () => null }, again.id, again.digest);
+    expect(Object.values(done.outcomes).map(outcome => outcome.status)).toEqual(again.items.map(() => "removed"));
+    for (const item of again.items) expect(await exists(item.destination)).toBe(false);
+    expect(await applyArchiveRemoval({ ...options, offline: () => null }, again.id, again.digest)).toEqual(done);
+  } finally { await f.cleanup(); }
+});
+
+test.skipIf(process.platform !== "linux")("archive removal (Linux): entries of the old shared identity wait for the privileged backend; nothing is deleted", async () => {
   const { f, options } = await archiveFixture("faults-removal-");
   try {
     const plan = await previewTmpArchive(options, 0);

@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 const stateFiles = ["deploy-transaction", "upgrade-transaction", "release-data.json", "data-version.json", "verify-only", "ops-deployment.json"];
 const snapshotFiles = ["transaction", "deployment.xml", "target-sha", "was-running", "previous-image", "data-plan.json",
   "directory-scope-plan.json", "candidate-image", "service-user", "task-runtime", "task-previous-cid", "host-runtime",
-  "runtime-values.json", "configuration-app.json", "configuration-models.json", "windows-tools"];
+  "runtime-values.json", "configuration-app.json", "configuration-models.json", "windows-tools", "macos-tools", "macos-state.json", "service.plist"];
 const hash = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
 export type TransactionReadSet = { operation: "deploy" | "upgrade"; id: string; digest: string; text(path: string): string | null };
 export type ConfirmedTransaction = { version: 1; operation: "deploy" | "upgrade"; id: string; digest: string; action: "continue" | "rollback" };

@@ -71,6 +71,22 @@ if (process.platform === "win32") {
       await Bun.sleep(10);
     }
   })().finally(() => { reaping = undefined; });
+} else if (process.platform === "darwin") {
+  // No subreaper or parent-death signal: the host leads a session of its own and kills its session and its
+  // descendants by parent links, as the command supervisor does (src/lib/process-supervisor.ts); a parent that dies
+  // closes stdin, which stops the host.
+  const { killDescendants, leadSession, processIncarnation, reapChildren } = await import("../../src/lib/darwin.ts");
+  leadSession();
+  if (process.ppid !== Number(process.argv[2])) process.exit(130);
+  birth = processIncarnation(process.pid);
+  let reaping: Promise<void> | undefined;
+  reap = () => reaping ??= (async () => {
+    for (;;) {
+      const signalled = killDescendants(process.pid);
+      if (reapChildren() && signalled === 0) return;
+      await Bun.sleep(10);
+    }
+  })().finally(() => { reaping = undefined; });
 }
 
 let closing = false;

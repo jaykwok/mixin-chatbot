@@ -11,6 +11,8 @@
 #
 # 用法：bash scripts/deploy.sh [deploy|repair]
 
+# macOS：交给 bash 3.2 也能运行的引导，部署由 TypeScript 入口执行（scripts/lib/macos-entry.sh）。
+if [ "$(uname -s)" = Darwin ]; then exec /bin/bash "$(dirname "${BASH_SOURCE[0]}")/lib/macos-entry.sh" deploy "$@"; fi
 set -euo pipefail
 DEPLOY_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_DIR="$(cd "${MIXIN_OPS_PROJECT:-$DEPLOY_SOURCE_DIR}" && pwd)"
@@ -328,11 +330,10 @@ print_warning "转换数据前先预览；应用变更时保持停机，提交�
 # 只有本次新建的目录交给服务身份，已有目录和数据的属主不变。
 make_service_directories "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_HOME_DIR" "$LOG_DIR" "$PROJECT_DIR/backup/snapshots" "$PROJECT_DIR/backup/rm" ||
     { print_error "无法创建数据目录"; exit 1; }
-# 本机管理端口不再询问：依次取显式 BOT_PORT（高级覆盖）、已保存端口、默认 1011。
-# rootless Docker 通常不能发布 1024 以下的端口（见 rootless_port_publishable），这时默认改用 11011。
-# 无效、发布不了或被其他程序占用的端口在停机前停止并说明改法，不自动换成别的端口。
-FALLBACK_PORT=1011
-if [ "$DOCKER_ROOTLESS" = 1 ] && ! rootless_port_publishable "$FALLBACK_PORT"; then FALLBACK_PORT=11011; fi
+# 本机管理端口不再询问：依次取显式 BOT_PORT（高级覆盖）、已保存端口、默认 10000。
+# 无效、发布不了（rootless Docker 的低端口，见 rootless_port_publishable）或被其他程序占用的端口在停机前停止并说明改法，
+# 不自动换成别的端口。
+FALLBACK_PORT=10000
 SAVED_PORT=""
 [ ! -f "$BOT_PORT_FILE" ] || SAVED_PORT="$(tr -d '[:space:]' < "$BOT_PORT_FILE")"
 if [ -n "$(trim_input "${BOT_PORT:-}")" ]; then

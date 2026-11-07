@@ -1,7 +1,7 @@
 /** @jsxImportSource preact */
 // Home page: what is deployed here, whether the bot answers, and what needs attention.
 import type { Overview, ServiceView } from "./contract.ts";
-import { ago, clock, dateTime, duration } from "./format.ts";
+import { ago, clock, dateTime, duration, platformName } from "./format.ts";
 import { Icon, type IconName } from "./icons.tsx";
 import { Banner, Card, Rows, type Tone } from "./ui.tsx";
 
@@ -115,7 +115,7 @@ function OverviewBody({ data, sessionLeft }: { data: Overview; sessionLeft: numb
         <Card title="部署" icon="server" span={6}>
           {deployment ? (
             <Rows rows={[
-              ["运行方式", `${deployment.platform === "windows" ? "Windows" : "Linux"} · ${deployment.mode}`],
+              ["运行方式", `${platformName(deployment.platform)} · ${deployment.mode}`],
               ["主机", data.console.hostname],
               ["管理端口", <span class="mono">127.0.0.1:{deployment.port}</span>],
               ["数据目录", <span class="mono path">{deployment.dataRoot}</span>],

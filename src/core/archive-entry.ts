@@ -2,6 +2,7 @@ import { dlopen, FFIType, ptr, toArrayBuffer } from "bun:ffi";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
+import { AT_FDCWD, close, fstat, O, openAt, renameAt, statAt, sync, systemError } from "../lib/darwin.ts";
 import { archiveWindowsEntry, type Identity, sameIdentity } from "./held-directory.ts";
 
 let native: ReturnType<typeof loadNative> | undefined;
@@ -13,13 +14,14 @@ function loadNative() {
 }
 
 /** A same-device, no-replace rename. Never copies, recursively removes or follows the selected entry.
- * Linux cannot bind renameat2 to an inode. A swapped entry is preserved at the journaled destination
+ * Neither Linux (renameat2) nor macOS (renameatx_np with RENAME_EXCL) can bind the rename to an inode. A swapped entry is preserved at the journaled destination
  * and reported as a mismatch; the caller must not settle ownership or claim success in that case.
  */
 export async function archiveEntry(source: string, destination: string, expected: Identity): Promise<void> {
   if (resolve(source) !== source || resolve(destination) !== destination) throw new Error("归档需要绝对路径");
   if (process.platform === "win32") return archiveWindowsEntry(source, destination, expected);
-  if (process.platform !== "linux") throw new Error("安全归档只支持 Linux 和 Windows");
+  if (process.platform === "darwin") return archiveDarwinEntry(source, destination, expected);
+  if (process.platform !== "linux") throw new Error("安全归档只支持 Linux、Windows 和 macOS");
   const from = await open(dirname(source), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   let to;
   try {
@@ -40,4 +42,25 @@ export async function archiveEntry(source: string, destination: string, expected
       throw new Error("归档时源实体被换入；内容保留在清单中的目标，未删除或结算，请核对清单");
     }
   } finally { try { await to?.close(); } finally { await from.close(); } }
+}
+
+function archiveDarwinEntry(source: string, destination: string, expected: Identity): void {
+  const directory = O.RDONLY | O.DIRECTORY | O.NOFOLLOW;
+  const from = openAt(AT_FDCWD, dirname(source), directory);
+  let to: number | undefined;
+  try {
+    to = openAt(AT_FDCWD, dirname(destination), directory);
+    const entry = statAt(from, basename(source));
+    if (!entry) throw systemError(`stat ${basename(source)}`, 2);
+    if (!sameIdentity(entry, expected)) throw new Error("归档源实体已变化");
+    if (fstat(to).dev !== expected.dev) throw new Error("归档目标不在同一文件系统；请指定同盘的 backup/rm，拒绝退化为复制后删除");
+    try { renameAt(from, basename(source), to, basename(destination), true); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      throw Object.assign(new Error(`原子归档失败，${code}`), { code: ["ENOENT", "EEXIST", "EXDEV"].includes(code ?? "") ? code : "EIO" });
+    }
+    sync(from); sync(to);
+    const moved = statAt(to, basename(destination));
+    if (!moved || !sameIdentity(moved, expected)) throw new Error("归档时源实体被换入；内容保留在清单中的目标，未删除或结算，请核对清单");
+  } finally { try { if (to !== undefined) close(to); } finally { close(from); } }
 }

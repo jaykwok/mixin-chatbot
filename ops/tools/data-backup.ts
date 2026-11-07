@@ -1,5 +1,4 @@
 // Offline snapshot under the maintenance lease. DB checkpoint/close precedes every external-file copy.
-import { Database } from "bun:sqlite";
 import { lstat, mkdir, readdir, realpath, readFile, copyFile, open, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -8,6 +7,7 @@ import { DATA_DIR } from "../../src/core/storage.ts";
 import { withMaintenance } from "../../src/core/maintenance.ts";
 import { isPathInside } from "../../src/contracts/paths.ts";
 import { hashFile } from "../../src/core/file-hash.ts";
+import { openReadable, openWritable } from "../../src/lib/sqlite-open.ts";
 
 /** The data directories a backup holds (below data/); configuration, secrets and runtime/ are backed up separately.
  * The default workspace is included; an external WORKSPACE_ROOT belongs to its operator and is not. */
@@ -66,7 +66,7 @@ export async function createDataBackup(data: string, destination: string, extern
   for (const { root } of roots) await checkedRoot(root);
   const entries = await Promise.all(roots.map(async ({ area, root }) => ({ area, root, names: await files(root, "", area === "state") })));
   for (const { root, names } of entries) for (const name of names.filter(name => name.endsWith(".sqlite"))) {
-    const db = new Database(join(root, name), { strict: true });
+    const db = openWritable(join(root, name), { strict: true });
     try {
       if ((db.query("PRAGMA quick_check").get() as { quick_check: string }).quick_check !== "ok") throw new Error("备份前数据库校验失败");
       const checkpoint = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number; log: number; checkpointed: number };
@@ -117,7 +117,7 @@ export async function restoreDataBackup(source: string, data: string): Promise<v
     if ((await lstat(target)).size !== file.bytes || await hashFile(target) !== file.sha256) throw new Error("恢复复制时备份发生变化，保留暂存目录供检查");
   }
   for (const file of manifest.files.filter(file => file.path.endsWith(".sqlite"))) {
-    const db = new Database(join(roots[file.area], file.path), { readonly: true });
+    const db = openReadable(join(roots[file.area], file.path));
     try { if ((db.query("PRAGMA quick_check").get() as { quick_check: string }).quick_check !== "ok") throw new Error("恢复的数据库完整性检查失败"); }
     finally { db.close(); }
   }

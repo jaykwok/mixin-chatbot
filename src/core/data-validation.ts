@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Database } from "bun:sqlite";
+import { openReadable } from "../lib/sqlite-open.ts";
 import { validateRuntimeConfig } from "./runtime-schema.ts";
 import { openModelRuntime, openSettings, resolveModelSelection } from "./model-config.ts";
 import { openExistingStatsLedger, STATS_TABLES } from "../agent/stats-ledger.ts";
@@ -71,7 +71,7 @@ export async function validateCurrentData(project: string, options: ValidationOp
     if (stats) {
       for (const table of STATS_TABLES) stats.query(`SELECT * FROM ${table} LIMIT 0`).all();
     } else if (existsSync(path)) {
-      const db = new Database(path, { readonly: true });
+      const db = openReadable(path);
       try { if (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all().length) throw new Error("统计账本缺少 schema，拒绝登记"); }
       finally { db.close(); }
     }

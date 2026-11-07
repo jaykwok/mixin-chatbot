@@ -11,6 +11,7 @@ import { loadModuleDefinitions } from "../../src/agent/modules.ts";
 import { buildChatContext } from "../../src/agent/prompt.ts";
 import { tempFixture } from "../helpers/temp.ts";
 import { groupScope } from "../../src/core/layout.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 describe("project document resources", () => {
   test.each([true, false])("loads tools, skill, prompt and read access together; enabled=%s", async enabled => {
@@ -96,7 +97,7 @@ describe("project document resources", () => {
         filename: "NUL.docx", edits: [] })).rejects.toThrow("filename");
       expect(await readFile(source, "utf8")).toBe("unchanged");
       const retained = (await readdir(own)).filter(name => name !== ".office-jobs");
-      if (process.platform === "linux") {
+      if (removalNeedsPermit()) {
         expect(retained.length).toBeGreaterThan(0);
         for (const name of retained) {
           const receipt = JSON.parse(await readFile(join(own, name, ".reclamation.json"), "utf8"));

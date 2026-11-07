@@ -1,5 +1,4 @@
 import { afterAll, describe, mock, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { expectAsync as expect } from "../helpers/async-expect.ts";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, rmSync, symlinkSync, type PathLike, type StatOptions } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -15,6 +14,7 @@ import { memberConversation, MemberDirectory } from "../../src/durable/identity.
 import { openGroupDatabase, openGroupStorage } from "../../src/durable/sqlite.ts";
 import { fauxModels, gatedResponse, harnessOptions } from "../helpers/durable.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { openReadable } from "../../src/lib/sqlite-open.ts";
 
 const fixture = await tempFixture("durable-spaces-");
 afterAll(() => fixture.cleanup());
@@ -62,7 +62,7 @@ async function seed(root: string, groupId: string, running = false): Promise<str
  * leaves one `running` (and the next open's recovery then writes).
  */
 function crashImage(path: string): () => void {
-  const image = `${path}.crash`, db = new Database(path, { readonly: true });
+  const image = `${path}.crash`, db = openReadable(path);
   try { db.query("VACUUM INTO ?").run(image); } finally { db.close(); }
   return () => renameSync(image, path);
 }

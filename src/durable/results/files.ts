@@ -28,6 +28,8 @@ import { isPathInside } from "../../contracts/paths.ts";
 import { type DirectoryRemoval, type Entries, type HeldDirectory, holdDirectory, type Identity, sameIdentity } from "../../core/held-directory.ts";
 import type { IsolatedTask, TaskReservation } from "../../core/rootless-tasks.ts";
 import { configuredRootlessTasks } from "../../core/task-backend.ts";
+import { removalNeedsPermit } from "../../core/reclamation.ts";
+import { caseSensitive } from "../../lib/darwin.ts";
 
 const IMAGE_EXTENSIONS: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
 
@@ -50,8 +52,10 @@ function gone(path: string): Error {
   return new Error(`${path} no longer names what this call wrote there (moved or replaced): results are only written inside the caller's tmp`);
 }
 
+/** Names compare as the volume compares them: Windows without case, macOS as `a`'s volume says (APFS by default without). */
 function samePath(a: string, b: string): boolean {
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  const folds = process.platform === "win32" || process.platform === "darwin" && !caseSensitive(a);
+  return folds ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
 /** The files of one call in a member's tmp. The directory is created and held with the first file, until `release`. */
@@ -203,7 +207,7 @@ export async function removeResultDirectories(tempDir: string, before: number, p
     } catch (error) { results.push({ name, status: "refused", reason: String(error) }); }
   }
   const finish = async () => {
-    if (process.platform === "linux" && policy) for (const name of policy.registered) {
+    if (removalNeedsPermit() && policy) for (const name of policy.registered) {
       if (!isResultsDirName(name) || policy.protected.has(name) || policy.isolated?.has(name) || seen.has(name)) continue;
       await policy.expire([name]);
       results.push({ name, status: "deferred", reason: "shared-name-missing-or-unavailable-is-not-removal-proof" });

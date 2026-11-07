@@ -27,6 +27,12 @@ export function memberShell(config: ReturnType<typeof getShellConfig> = getShell
   if (config.commandTransport === "stdin" || (process.platform === "win32" && /(^|\\)windowsapps\\[^\\]+$/i.test(win32.normalize(config.shell)))) {
     throw new Error(`${config.shell} 是 Windows 自带的 WSL 启动器，不能运行 bash 工具；请安装 Git for Windows，并让它的 bash.exe 在 PATH 中排在前面`);
   }
+  if (process.platform === "darwin") {
+    // Pi's discovery finds Apple's bash 3.2 first. Deployment requires Homebrew's bash 5 and puts it first on PATH.
+    const bash = Bun.which("bash");
+    if (!bash || bash === "/bin/bash") throw new Error("macOS 的 bash 工具需要 Homebrew bash 5，并让它在 PATH 中排在 /bin 前面");
+    return { shell: bash, args: config.args };
+  }
   return { shell: config.shell, args: config.args };
 }
 

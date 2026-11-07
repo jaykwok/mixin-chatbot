@@ -38,6 +38,12 @@ Linux / Docker：
 bash scripts/ops.sh doctor
 ```
 
+macOS（实验性支持）：
+
+```sh
+sudo bash scripts/ops.sh doctor
+```
+
 将示例中的 `doctor` 替换为所需命令：
 
 | 命令 | 用途 |

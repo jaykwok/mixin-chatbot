@@ -2,7 +2,7 @@
 
 [返回 README](../README.md) · [部署](deployment.md) · [命令行运维](operations.md)
 
-控制台在部署机器上单独运行，机器人停止时仍可使用。需要管理时启动，用完退出；首次部署和卸载仍使用命令行。Windows 和 Linux 共用网页界面；管理动作经对应平台的运维入口交给与命令行共用的运维核心，规则与命令行一致。
+控制台在部署机器上单独运行，机器人停止时仍可使用。需要管理时启动，用完退出；首次部署和卸载仍使用命令行。Windows、Linux 和 macOS 共用网页界面；管理动作经对应平台的运维入口交给与命令行共用的运维核心，规则与命令行一致。
 
 ## 启动与登录
 
@@ -12,20 +12,21 @@
 bun run console
 ```
 
-宿主机需要 Bun 1.4.4+。Windows 自动打开默认浏览器；Linux 打印 SSH 转发命令和登录链接。控制台只监听 `127.0.0.1`，初始端口为 `11012`，成功启动后保存在 `.console/port`，后续沿用。
+宿主机需要 Bun 1.4.4+。macOS 上用 sudo 运行：`sudo bun run console`。Windows 和 macOS 自动打开默认浏览器（macOS 经 SSH 登录时改为打印转发命令）；Linux 打印 SSH 转发命令和登录链接。控制台只监听 `127.0.0.1`，初始端口为 `10001`，成功启动后保存在 `.console/port`，后续沿用。
 
 | 环境 | 管理操作使用的身份 | 后台任务 |
 | --- | --- | --- |
 | Windows 原生部署 | 管理员终端中的部署身份 | 一次性计划任务 |
 | Linux rootful Docker | root，与命令行运维相同 | systemd 临时服务 |
 | Linux rootless Docker | 拥有该 Docker daemon 的部署用户 | 用户级 systemd 临时服务，需要 linger |
+| macOS 原生部署（实验性支持） | root（用 sudo 启动控制台）；读取数据和查询以服务账户运行 | 一次性 LaunchDaemon |
 
 rootless 使用该用户自己的 `DOCKER_HOST`、`XDG_RUNTIME_DIR` 和登录会话；后台任务沿用启动控制台时的 `DOCKER_HOST`、`DOCKER_CONTEXT` 和 `DOCKER_CONFIG`，与预览连接同一个 Docker daemon。控制台不会自动切换用户、启用 linger 或安装系统服务。后台托管条件不满足时，页面说明原因并拒绝后台写操作。
 
 常用参数：
 
 ```sh
-bun run console --port 12012
+bun run console --port 12001
 bun run console --no-open
 bun run console --help
 ```
@@ -41,17 +42,17 @@ bun run console --help
 在服务器启动控制台，在自己的电脑建立转发，再在电脑的浏览器打开终端打印的登录链接。例如：
 
 ```sh
-ssh -N -L 11012:127.0.0.1:11012 user@server
+ssh -N -L 10001:127.0.0.1:10001 user@server
 ```
 
 可以将转发写入 SSH 配置。电脑上的本地端口需要不同时，在服务器显式指定该端口：
 
 ```sh
 # 服务器
-bun run console --forwarded-port 12012
+bun run console --forwarded-port 12001
 
 # 自己的电脑
-ssh -N -L 12012:127.0.0.1:11012 user@server
+ssh -N -L 12001:127.0.0.1:10001 user@server
 ```
 
 使用输出中的 `127.0.0.1` 地址和端口，不将页面发布到公网。控制台检查 Host、请求来源和登录 cookie；同一主机其他端口的网页也不能代发管理请求。

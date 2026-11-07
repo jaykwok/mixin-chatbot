@@ -695,7 +695,10 @@ def render_on_slide(slide, presentation, text, region=None, accent=("theme", 5),
 FONT_CANDIDATES = ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/simsun.ttc",
                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
                    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf", "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-                   "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", "/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/STHeiti Light.ttc"]
+                   "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                   "/System/Library/Fonts/STHeiti Medium.ttc", "/System/Library/Fonts/STHeiti Light.ttc", "/System/Library/Fonts/Supplemental/Songti.ttc"]
+# Collections whose first face is not Simplified Chinese: Noto's SC face, Heiti SC, Songti SC Light.
+FONT_INDEX = {"NotoSansCJK-": 2, "STHeiti ": 1, "Songti.ttc": 3}
 
 
 def find_cjk_font():
@@ -715,7 +718,7 @@ def load_font(path, size_px):
     from PIL import ImageFont
     if not path:
         return ImageFont.load_default()
-    index = 2 if "NotoSansCJK-" in Path(path).name else 0
+    index = next((value for key, value in FONT_INDEX.items() if key in Path(path).name), 0)
     try:
         return ImageFont.truetype(path, size_px, index=index)
     except OSError:

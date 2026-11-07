@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "path": "<ROOT0>/data/tmp/groups/group-a/alice/codemode/1-result",
+  "proof": {
+    "dev": "<string>",
+    "ino": "<string>",
+    "uid": "<number>",
+    "fingerprint": "<HEX64>",
+    "bytes": 6,
+    "files": 1,
+    "newest": "<number>"
+  },
+  "phase": "removed"
+}

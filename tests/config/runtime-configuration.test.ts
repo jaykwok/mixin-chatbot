@@ -78,7 +78,7 @@ test("拒绝非法值、部署字段、格式不符和过期的草稿，避免�
   } finally { await fixture.cleanup(); }
 });
 
-test("不带参数按当前环境保存（Windows 本机运行）；多余参数或 Docker 主机上的调用不写入", async () => {
+test("不带参数按当前环境保存（Windows、macOS 本机运行）；多余参数或 Docker 主机上的调用不写入", async () => {
   const fixture = await tempFixture("runtime-save-cli-");
   try {
     await seed(fixture.root, { BOT_INDEX_TTL_MINUTES: "5" });
@@ -98,7 +98,8 @@ test("不带参数按当前环境保存（Windows 本机运行）；多余参数
       expect(await readFile(configFile(fixture.root), "utf8")).toBe(raw);
     }
     const result = await run();
-    if (process.platform === "win32") {
+    // A native deployment (Windows, macOS) saves its own settings; a Docker host's entry writes them for the container.
+    if (process.platform !== "linux") {
       expect(result.code, result.output).toBe(0);
       expect((await readRuntimeSettings(configFile(fixture.root))).values).toEqual({ BOT_INDEX_TTL_MINUTES: "5", BOT_BASH_TIMEOUT: "456" });
     } else {

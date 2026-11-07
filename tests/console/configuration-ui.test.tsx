@@ -2,7 +2,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 const registered = !GlobalRegistrator.isRegistered;
-if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:11012/" });
+if (registered) GlobalRegistrator.register({ url: "http://127.0.0.1:10001/" });
 const { render } = await import("preact");
 const { ConfigurationForm, ConfigurationRecovery } = await import("../../console/ui/src/configuration.tsx");
 afterAll(async () => { if (registered) await GlobalRegistrator.unregister(); });

@@ -84,7 +84,7 @@ export async function readPage(project: string, page: ReadPageName, filters: Rea
     response.note += " 外链地址可能含签名，不在列表中输出；查看列表不会延长有效期。";
   } else if (page === "directory") {
     response.columns = ["项目", "状态"];
-    const savedPort = await Bun.file(join(data, "state/bot-port")).exists() ? (await Bun.file(join(data, "state/bot-port")).text()).trim() : "1011";
+    const savedPort = await Bun.file(join(data, "state/bot-port")).exists() ? (await Bun.file(join(data, "state/bot-port")).text()).trim() : "10000";
     const port = Number(process.env.BOT_PORT || savedPort);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("机器人端口无效");
     const service = serviceView(await probeService(port, join(data, "state/instance.json")));

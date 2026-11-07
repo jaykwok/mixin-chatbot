@@ -1,11 +1,16 @@
 // .console/: private console state, tasks and short-lived configuration drafts. No chat export copies.
-import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { parsePort } from "./console-port.ts";
 import { windowsPrivateOwner } from "../../src/lib/windows-private-directory.ts";
 
 export const consoleDir = (project: string) => join(project, ".console");
+/**
+ * macOS: the data tools run as the service account from the frozen code under .console/runtime, so these two directories
+ * let others pass (0711), never list or read. Everything inside them stays private on its own (0700/0600).
+ */
+export const passable = () => process.platform === "darwin";
 
 /**
  * Creates .console/ with 0700 and refuses one this identity does not own (e.g. first run under sudo, later run as the
@@ -18,16 +23,18 @@ export function prepareConsoleDir(dir: string): void {
     if (readOptional(join(dir, "owner.json")) === null) writeAtomic(join(dir, "owner.json"), JSON.stringify({ version: 1, sid }) + "\n");
     return;
   }
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const stat = lstatSync(dir);
+  mkdirSync(dir, { recursive: true, mode: passable() ? 0o711 : 0o700 });
+  let stat = lstatSync(dir);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`${dir} 不是目录`);
   const uid = process.geteuid?.();
   if (uid !== undefined && stat.uid !== uid) {
     throw new Error(`${dir} 的属主（UID ${stat.uid}）不是当前运行身份（UID ${uid}）。控制台需要用部署时的运维身份运行；` +
       `请换回该身份，不要改目录属主后混用两种身份。`);
   }
-  if ((stat.mode & 0o077) !== 0) {
-    throw new Error(`${dir} 的权限是 ${(stat.mode & 0o777).toString(8)}，组或其他用户可以访问；请改为 700 后重试（chmod 700 .console）`);
+  if (passable() && stat.isDirectory() && (stat.mode & 0o777) === 0o700) { chmodSync(dir, 0o711); stat = lstatSync(dir); }
+  if ((stat.mode & (passable() ? 0o066 : 0o077)) !== 0) {
+    const mode = passable() ? "711" : "700";
+    throw new Error(`${dir} 的权限是 ${(stat.mode & 0o777).toString(8)}，组或其他用户可以访问；请改为 ${mode} 后重试（chmod ${mode} .console）`);
   }
 }
 
@@ -50,7 +57,7 @@ export function writeAtomic(path: string, text: string): void {
   }
 }
 
-/** The saved port, null when none was saved. An invalid saved value is an error, not a silent fallback to 11012. */
+/** The saved port, null when none was saved. An invalid saved value is an error, not a silent fallback to 10001. */
 export function readSavedPort(dir: string): number | null {
   const text = readOptional(join(dir, "port"));
   if (text === null) return null;

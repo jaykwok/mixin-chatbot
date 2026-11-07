@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createOfficeProfile } from "../../src/agent/office-profiles.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { removalNeedsPermit } from "../../src/core/reclamation.ts";
 
 const linux = process.platform === "linux";
 const markerName = ".mixin-office-owner.json";
@@ -63,7 +64,7 @@ test("missing markers allow empty profiles, retain nonempty profiles and permit 
     await fs.writeFile(marker, proof); await profile.close();
     const empty = await createOfficeProfile(fixture.root);
     await fs.rm(join(empty.path, markerName)); await empty.close();
-    expect((await fs.readdir(journal)).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(linux ? 2 : 0);
+    expect((await fs.readdir(journal)).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(removalNeedsPermit() ? 2 : 0);
   } finally { await fs.rm(profile.path, { recursive: true, force: true }); await fixture.cleanup(); }
 });
 
@@ -76,7 +77,7 @@ test("a directory marker is refused with its receipt and contents retained", asy
     expect(await fs.readdir(journal)).toHaveLength(1);
     expect(await fs.readFile(join(marker, "keep"), "utf8")).toBe("keep");
     await fs.rm(marker, { recursive: true }); await fs.writeFile(marker, proof); await profile.close();
-    expect((await fs.readdir(journal)).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(linux ? 1 : 0);
+    expect((await fs.readdir(journal)).filter(name => /^[a-f0-9]{16}\.json$/.test(name))).toHaveLength(removalNeedsPermit() ? 1 : 0);
   } finally { await fs.rm(profile.path, { recursive: true, force: true }); await fixture.cleanup(); }
 });
 

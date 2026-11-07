@@ -98,7 +98,7 @@ afterAll(async () => {
 
 // ─── Console side ──────────────────────────────────────────────────────────
 
-const PORT = 11012;
+const PORT = 10001;
 const bundle: Bundle = { index: { path: "/", type: "text/html; charset=utf-8", body: new Uint8Array() }, assets: new Map() };
 /** Every response body the page received, to check none carries a complete number or the bot's token. */
 const received: string[] = [];

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "plan": "<HEX64>",
+  "outcomes": {
+    "0": {
+      "status": "removed",
+      "bytes": 6
+    }
+  },
+  "started": [
+    "0"
+  ]
+}

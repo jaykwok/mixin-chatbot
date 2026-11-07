@@ -4,6 +4,8 @@ import { lstat, mkdir, open, readdir, readFile, readlink, realpath, rm } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { holdDirectory, type DirectoryRemoval } from "../core/held-directory.ts";
+import { removalNeedsPermit } from "../core/reclamation.ts";
+import { processIncarnation } from "../lib/darwin.ts";
 import { publishJson } from "../lib/atomic-file.ts";
 
 const owner = randomBytes(16).toString("hex");
@@ -20,9 +22,16 @@ async function linuxIncarnation(pid: number): Promise<string> {
   return `${boot.trim()}:${namespace}:${start}`;
 }
 
+/** The owner's process identity across PID reuse, where the platform gives one cheaply. */
+async function incarnation(pid: number): Promise<string | undefined> {
+  if (process.platform === "linux") return linuxIncarnation(pid);
+  if (process.platform === "darwin") return processIncarnation(pid);
+  return undefined;
+}
+
 async function ownerLive(receipt: Receipt): Promise<boolean> {
   try {
-    if (process.platform === "linux" && receipt.incarnation !== undefined) return await linuxIncarnation(receipt.pid) === receipt.incarnation;
+    if (process.platform !== "win32" && receipt.incarnation !== undefined) return await incarnation(receipt.pid) === receipt.incarnation;
     // Old receipts lack a start identity; retain them when the PID is still present.
     process.kill(receipt.pid, 0); return true;
   } catch (error) { return !["ESRCH", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? ""); }
@@ -70,11 +79,12 @@ async function removeOwned(root: string, receipt: Receipt) {
       });
       const selected = removed.find(item => item.name === name);
       if (selected && selected.status !== "refused") { result = selected; return; }
-      // Linux refuses a link, a non-directory and a missing name alike; Windows skips them. A name still listed was not
+      // Linux and macOS refuse a link, a non-directory and a missing name alike; Windows skips them. A name still listed was not
       // removed: retain its recovery record.
       if ((await entries.names()).includes(name)) throw new Error("Office 配置目录身份已变化，保留清理记录");
-      // An absent name proves the removal only off Linux (as for codemode results): the receipt has nothing left to clean.
-      if (process.platform !== "linux") result = { name, status: "removed", completedEarlier: true };
+      // An absent name proves the removal only where removal needs no permit (as for codemode results): the receipt has
+      // nothing left to clean.
+      if (!removalNeedsPermit()) result = { name, status: "removed", completedEarlier: true };
     });
   } finally { await held.release(); }
   if (result.status === "removed") {
@@ -91,7 +101,7 @@ async function removeOwned(root: string, receipt: Receipt) {
 export async function createOfficeProfile(tempDir: string): Promise<{ path: string; close(): Promise<DirectoryRemoval> }> {
   const { temp, root } = await journalRoot(tempDir);
   const receipt: Receipt = { version: 1, id: randomBytes(8).toString("hex"), owner, pid: process.pid,
-    ...(process.platform === "linux" ? { incarnation: await linuxIncarnation(process.pid) } : {}),
+    incarnation: await incarnation(process.pid),
     tempRoot: temp, systemRoot: await realpath(tmpdir()) };
   await writeNew(join(root, receipt.id + ".json"), receipt);
   const path = join(receipt.systemRoot, `mixin-office-${receipt.id}`);

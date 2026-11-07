@@ -3,7 +3,7 @@ import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { api, ApiFailure } from "./api.ts";
 import { Dialog } from "./ui.tsx";
-import { dateTime } from "./format.ts";
+import { dateTime, platformName } from "./format.ts";
 import { DeploymentDirectoryPicker, type DeploymentSelection } from "./deployment-directory.tsx";
 
 export interface TaskView { id: string; operation: string; state: string; needsRecovery: boolean; createdAt: number;
@@ -184,7 +184,7 @@ export function TasksPage({ resultsOnly = false }: { resultsOnly?: boolean }) {
 
 export function DeployForm() {
   const [selected, setSelected] = useState<DeploymentSelection | null>(null);
-  const [saved, setSaved] = useState<{ port: number; workspace: string; hasDirectory: boolean; platform: "windows" | "linux" } | null>(null);
+  const [saved, setSaved] = useState<{ port: number; workspace: string; hasDirectory: boolean; platform: "windows" | "linux" | "macos" } | null>(null);
   const [port, setPort] = useState(""), [workspace, setWorkspace] = useState(""), [directory, setDirectory] = useState("");
   const [operation, setOperation] = useState("deploy"), [busy, setBusy] = useState(false), [error, setError] = useState("");
   const live = useRef(true), controller = useRef<AbortController | null>(null), lock = useRef(false);
@@ -203,7 +203,7 @@ export function DeployForm() {
     {saved && <>
       {saved.platform === "linux" ? <label>操作<select aria-label="部署操作" value={operation} onChange={event => setOperation(event.currentTarget.value)}>
         <option value="deploy">重新部署</option><option value="repair">重建容器以修复部署</option></select></label>
-        : <><p>Windows 本机未就绪时可先尝试重启修复；计划任务缺失或安装损坏时使用下面的重新部署。</p><TaskAction operation="repair" params={{}}>预览本机修复</TaskAction></>}
+        : <><p>{platformName(saved.platform)} 本机未就绪时可先尝试重启修复；{saved.platform === "macos" ? "LaunchDaemon" : "计划任务"}缺失或安装损坏时使用下面的重新部署。</p><TaskAction operation="repair" params={{}}>预览本机修复</TaskAction></>}
       <label>机器人端口<input aria-label="机器人端口" type="number" min="1" max="65535" value={port} onInput={event => setPort(event.currentTarget.value)} /></label>
       <label>共享资料目录<input aria-label="共享资料目录" value={workspace} onInput={event => setWorkspace(event.currentTarget.value)} /></label>
       <p>留空使用 data/workspace；外置目录必须已经存在。不会移动或删除共享资料。</p>

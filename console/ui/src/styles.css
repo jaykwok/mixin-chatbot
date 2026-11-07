@@ -180,12 +180,7 @@ kbd {
 }
 
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px 10px; }
-.brand-mark {
-  display: inline-grid; place-items: center; flex: none;
-  border-radius: 8px; color: #fff;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 6px 14px -6px color-mix(in srgb, var(--accent) 70%, transparent);
-}
+.brand-mark { display: block; flex: none; border-radius: 6px; box-shadow: 0 6px 14px -6px rgba(15, 26, 108, 0.6); }
 .brand-text { min-width: 0; line-height: 1.25; }
 .brand-name { font-weight: 600; font-size: 14px; letter-spacing: -0.01em; }
 .brand-sub { font-size: 12px; color: var(--muted); }

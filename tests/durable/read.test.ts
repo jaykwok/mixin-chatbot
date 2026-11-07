@@ -244,10 +244,13 @@ describe("read channel against a running service", () => {
       expect([error.name, readStatus(error)]).toEqual(["ReadExpired", 504]);
       expect(await stuck.run({ op: "spaces" }).catch(error => error) instanceof ReadBusy).toBe(true);
       spy.mockRestore();
+      // The replacement worker loads first; on a slow runner that alone can outlast the 50 ms deadline, so an expired
+      // answer is retried like a busy one.
       let answer: unknown = new ReadBusy("");
-      for (const end = Date.now() + 10_000; answer instanceof ReadBusy && Date.now() < end;) {
+      const again = (value: unknown) => value instanceof ReadBusy || (value as Error | undefined)?.name === "ReadExpired";
+      for (const end = Date.now() + 10_000; again(answer) && Date.now() < end;) {
         answer = await stuck.run({ op: "spaces" }).catch(error => error);
-        if (answer instanceof ReadBusy) await Bun.sleep(50);
+        if (again(answer)) await Bun.sleep(50);
       }
       expect((answer as Spaces).spaces.length).toBe(2);
     } finally { spy.mockRestore(); await stuck.close(); }

@@ -14,6 +14,8 @@ function event(phase: string, data: Record<string, unknown> = {}) {
 }
 
 let terminate: (code: number) => Promise<never>;
+/** macOS: called before a command may exit on its own, which would take its setsid descendants out of reach. */
+let remember = () => {};
 const receipt: ProcessReceipt | undefined = process.env.MIXIN_PROCESS_REAP_RECEIPT && process.env.MIXIN_PROCESS_EVENTS === "1"
   ? JSON.parse(process.env.MIXIN_PROCESS_REAP_RECEIPT) : undefined;
 if (receipt) assertReceiptDirectory(receipt);
@@ -75,6 +77,30 @@ if (process.platform === "win32") {
     process.stderr.write("子进程回收超过 1 秒，监督进程失败退出\n");
     process.exit(125);
   };
+} else if (process.platform === "darwin") {
+  // No subreaper: the helper leads a session of its own and kills its session and its descendants by parent
+  // links (src/lib/darwin.ts killDescendants) until none is left. A descendant that called setsid() and whose parent
+  // has already exited is not reached, so this never writes a reap receipt (src/lib/process-receipt.ts accepts none off
+  // Linux).
+  const { descendants, dropIdentity, killDescendants, leadSession, reapChildren } = await import("./darwin.ts");
+  leadSession();
+  if (process.env.MIXIN_PROCESS_IDENTITY) {
+    const [uid, gid] = process.env.MIXIN_PROCESS_IDENTITY.split(":").map(Number);
+    dropIdentity(uid!, gid!);
+  }
+  const sid = process.pid;
+  let known: ReadonlyMap<number, string> = new Map();
+  remember = () => { known = descendants(sid); };
+  terminate = async (code) => {
+    for (let round = 0; round < 100; round++) {
+      const signalled = killDescendants(sid, known);
+      const childless = reapChildren();
+      if (signalled === 0 && childless) { event("reaped", { code }); process.exit(code); }
+      await Bun.sleep(10);
+    }
+    process.stderr.write("子进程回收超过 1 秒，监督进程失败退出\n");
+    process.exit(125);
+  };
 } else {
   throw new Error(`不支持受监督的命令执行平台: ${process.platform}`);
 }
@@ -95,6 +121,7 @@ process.on("SIGINT", () => finish(130));
 process.stdin.once("end", () => {
   if (!stdioChild) return finish(143);
   // MCP EOF is graceful for a short interval; the same job/subreaper still owns every descendant.
+  remember();
   stdioChild.stdin?.end();
   setTimeout(() => finish(143), 500);
 }); // Parent died or cancelled, including forced parent exit.

@@ -39,8 +39,18 @@ def check(operations, root):
         with patch.object(operations, "os", SimpleNamespace(name="nt", environ={key: str(root / key)})), \
                 patch.object(operations.shutil, "which", return_value=str(path_program)):
             assert operations.office_binary() == str(path_program)
-    with patch.object(operations, "os", SimpleNamespace(name="posix", environ={})), \
-            patch.object(operations.shutil, "which", return_value=None):
+    # macOS: the application bundle when PATH has no soffice; PATH still wins.
+    bundle = root / "LibreOffice.app/Contents/MacOS/soffice"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text("fixture", encoding="utf-8")
+    with patch.object(operations, "os", SimpleNamespace(name="posix", environ={})), patch.object(operations, "MACOS_OFFICE", str(bundle)), \
+            patch.object(operations.sys, "platform", "darwin"):
+        with patch.object(operations.shutil, "which", return_value=None):
+            assert operations.office_binary() == str(bundle)
+        with patch.object(operations.shutil, "which", return_value=str(path_program)):
+            assert operations.office_binary() == str(path_program)
+    with patch.object(operations, "os", SimpleNamespace(name="posix", environ={})), patch.object(operations, "MACOS_OFFICE", str(bundle)), \
+            patch.object(operations.sys, "platform", "linux"), patch.object(operations.shutil, "which", return_value=None):
         assert operations.office_binary() is None
 
 

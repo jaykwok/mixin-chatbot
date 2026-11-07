@@ -5,7 +5,7 @@ import { guardConfig, SECURITY_HEADERS } from "../../console/server/guard.ts";
 import { createHandler, startServer } from "../../console/server/server.ts";
 import type { Overview, SessionResponse } from "../../console/ui/src/contract.ts";
 
-const PORT = 11012, ORIGIN = `http://127.0.0.1:${PORT}`;
+const PORT = 10001, ORIGIN = `http://127.0.0.1:${PORT}`;
 const bundle: Bundle = {
   index: { path: "/", type: "text/html; charset=utf-8", body: new TextEncoder().encode("<!doctype html><title>t</title>") },
   assets: new Map([["/assets/app.abc.js", { path: "/assets/app.abc.js", type: "text/javascript; charset=utf-8", body: new TextEncoder().encode("1") }]]),
@@ -48,7 +48,7 @@ test("Host 必须精确匹配，Origin/Sec-Fetch-Site 只接受控制台自身�
     expect(response.status, text).toBe(403);
     expect((await response.json() as { error: string }).error).toContain(text);
   };
-  await refusedWith(request("/api/instance", { host: "localhost:11012" }), "Host");
+  await refusedWith(request("/api/instance", { host: "localhost:10001" }), "Host");
   await refusedWith(request("/api/instance", { host: "127.0.0.1:11013" }), "Host");
   await refusedWith(request("/api/instance", { host: "evil.example" }), "Host");
   await refusedWith(request("/api/instance", { headers: { host: "" } }), "Host");

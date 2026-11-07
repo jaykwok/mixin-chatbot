@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs";
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import { WindowsHandles, type WindowsHandle } from "../../src/core/windows-handles.ts";
+import { processIncarnation } from "../../src/lib/darwin.ts";
 
 export interface QueryOwner {
   stop(): Promise<void>;
@@ -49,10 +50,10 @@ let win: Loaded | undefined;
 
 /** `native` replaces single kernel32 calls, e.g. to inject a blocking OpenProcess. */
 export function ownQueryHost(pid: number, exited: Promise<void>, expectedBirth?: string, native?: Partial<Native>): QueryOwner {
-  if (!["win32", "linux"].includes(process.platform)) throw new Error(`不支持查询进程监督: ${process.platform}`);
+  if (!["win32", "linux", "darwin"].includes(process.platform)) throw new Error(`不支持查询进程监督: ${process.platform}`);
   // The host reports its own creation time before receiving execution permission. A handle is opened
   // and verified only for the lost-ack fallback, so ownership grants never wait for cold FFI setup.
-  if (process.platform === "win32" && !expectedBirth) throw new Error("查询进程缺少身份信息");
+  if (process.platform !== "linux" && !expectedBirth) throw new Error("查询进程缺少身份信息");
   let api: Native | undefined;
   let handle: ReturnType<Native["OpenProcess"]>;
   let owned: WindowsHandle | undefined, failure: unknown;
@@ -62,6 +63,8 @@ export function ownQueryHost(pid: number, exited: Promise<void>, expectedBirth?:
       const identity = linuxIdentity(pid);
       return !!identity && identity.birth === birth && !identity.zombie;
     }
+    // Boot session and start time (src/lib/darwin.ts); a zombie has none.
+    if (process.platform === "darwin") return processIncarnation(pid) === expectedBirth;
     if (!api) {
       api = { ...(win ??= windowsApi()), ...native };
       // Handle observations stay off the console's terminal, which shows only its own status. Failures still throw.
@@ -121,7 +124,7 @@ export function ownQueryHost(pid: number, exited: Promise<void>, expectedBirth?:
           }
           deadline = Date.now() + TERMINATION_WAIT_MS;
         } else if (Date.now() >= deadline) {
-          // Linux must keep its subreaper alive until detached descendants are reaped.
+          // Linux and macOS hosts stay alive until their descendants are reaped.
           throw new Error("等待查询进程树回收超时");
         }
         await Bun.sleep(10);

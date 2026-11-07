@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { openReadable } from "../lib/sqlite-open.ts";
 
 /** An in-memory copy of what `source` currently reads. sqlite3_deserialize cannot read WAL images, so only the copy's
  * header is set back to the rollback journal (file format bytes 18–19); the source file is never changed. */
@@ -20,7 +21,7 @@ export function fileSnapshot(path: string): Database {
     const copy = join(scratch, "copy.sqlite");
     copyFileSync(path, copy);
     if (existsSync(path + "-wal")) copyFileSync(path + "-wal", copy + "-wal");
-    const file = new Database(copy, { readonly: true, strict: true });
+    const file = openReadable(copy, { strict: true });
     try { return memorySnapshot(file, { readonly: true, strict: true }); } finally { file.close(); }
   } finally { rmSync(scratch, { recursive: true, force: true }); }
 }

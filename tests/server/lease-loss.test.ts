@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
 import { acquireLease } from "../../src/core/maintenance.ts";
 import { tempFixture } from "../helpers/temp.ts";
+import { openReadable } from "../../src/lib/sqlite-open.ts";
 
 const harness = fileURLToPath(new URL("../helpers/service-harness.ts", import.meta.url));
 const HEARTBEAT = "data/workspace/tool-heartbeat.txt";
@@ -22,7 +23,7 @@ const sha256 = (data: string | Buffer) => createHash("sha256").update(data).dige
  * WAL: committed pages move into the main file under SQLite's own locks, the content stays the same.
  */
 function rows(path: string): string {
-  const db = new Database(path, { readonly: true });
+  const db = openReadable(path);
   try {
     const tables = db.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as { name: string }[];
     return JSON.stringify(tables.map(({ name }) => [name, db.query(`SELECT * FROM "${name}"`).all().map((row) => JSON.stringify(row)).sort()]));

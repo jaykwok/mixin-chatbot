@@ -10,11 +10,11 @@ const record = {
 };
 const serialize = (value: Record<string, string>) => Object.entries(value).map(([key, item]) => `${key}=${item}`).join("\n") + "\n";
 
-test("端口按 --port、保存值、默认 11012 取用，非法值直接报错", () => {
+test("端口按 --port、保存值、默认 10001 取用，非法值直接报错", () => {
   expect(choosePort(undefined, null)).toEqual({ port: DEFAULT_CONSOLE_PORT, source: "默认值" });
   expect(choosePort(undefined, 12000)).toEqual({ port: 12000, source: "保存值" });
   expect(choosePort("13000", 12000)).toEqual({ port: 13000, source: "参数" });
-  expect(parsePort(" 11012\n", "x")).toBe(11012);
+  expect(parsePort(" 10001\n", "x")).toBe(10001);
   for (const bad of ["0", "65536", "080", "12a", "", "-1", "1.5"]) expect(() => choosePort(bad, null), bad).toThrow("端口无效");
 });
 
@@ -23,18 +23,18 @@ test("保护集合包含 BOT_PORT、端口记录、未完成事务的端口；�
   const root = fixture.root, state = join(root, "data", "state");
   try {
     await mkdir(state, { recursive: true });
-    // No record yet: the first deployment would take 1011 (or 11011 for rootless without low ports).
-    expect([...botPorts(root, {}).keys()].sort()).toEqual([1011, 11011]);
+    // No record yet: the first deployment would take 10000.
+    expect([...botPorts(root, {}).keys()]).toEqual([10000]);
 
-    await writeFile(join(state, "bot-port"), "1011\n");
-    expect([...botPorts(root, {}).keys()]).toEqual([1011]);
+    await writeFile(join(state, "bot-port"), "3000\n");
+    expect([...botPorts(root, {}).keys()]).toEqual([3000]);
 
     // The terminal's BOT_PORT wins over the saved value in the ops scripts, so it is protected as well.
-    const withEnv = botPorts(root, { BOT_PORT: " 11012 " });
-    expect(withEnv.get(11012)).toEqual(["环境变量 BOT_PORT"]);
-    expect(() => assertNoBotConflict(11012, root, { BOT_PORT: "11012" })).toThrow(/控制台端口 11012 与机器人端口相同（来源：环境变量 BOT_PORT）/);
-    expect(() => assertNoBotConflict(1011, root, {})).toThrow("data/state/bot-port");
-    expect(() => assertNoBotConflict(11012, root, {})).not.toThrow();
+    const withEnv = botPorts(root, { BOT_PORT: " 10001 " });
+    expect(withEnv.get(10001)).toEqual(["环境变量 BOT_PORT"]);
+    expect(() => assertNoBotConflict(10001, root, { BOT_PORT: "10001" })).toThrow(/控制台端口 10001 与机器人端口相同（来源：环境变量 BOT_PORT）/);
+    expect(() => assertNoBotConflict(3000, root, {})).toThrow("data/state/bot-port");
+    expect(() => assertNoBotConflict(10001, root, {})).not.toThrow();
     expect(() => botPorts(root, { BOT_PORT: "abc" })).toThrow("环境变量 BOT_PORT 中的端口无效");
 
     // A pending deploy or upgrade will start the bot on its recorded port even while it is stopped now.
